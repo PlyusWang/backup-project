@@ -72,3 +72,13 @@ VMware Ubuntu
 ```
 
 后续网络备份可连接 Alibaba Cloud ECS。
+## Sprint 1：基础 CLI Backup / Restore（v0.1）
+
+```bash
+make                      # 构建 build/backupctl
+./build/backupctl backup <source_directory> <repository>
+./build/backupctl restore <repository> <destination>
+```
+
+备份数据存放于 `<repository>/data/`。更多用法、行为约定与测试方法见
+`docs/basic_cli_usage.md`。
