@@ -1,0 +1,29 @@
+* text=auto
+
+# Linux shell scripts and build files
+*.sh text eol=lf
+Makefile text eol=lf
+*.mk text eol=lf
+
+# C / C++
+*.c text eol=lf
+*.cc text eol=lf
+*.cpp text eol=lf
+*.h text eol=lf
+*.hpp text eol=lf
+
+# Python / Web
+*.py text eol=lf
+*.html text eol=lf
+*.css text eol=lf
+*.js text eol=lf
+
+# Documentation
+*.md text eol=lf
+*.tex text eol=lf
+*.bib text eol=lf
+
+# Repository configuration
+.gitignore text eol=lf
+.gitattributes text eol=lf
+.clang-format text eol=lf
