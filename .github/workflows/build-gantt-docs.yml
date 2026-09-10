@@ -10,6 +10,10 @@ on:
 permissions:
   contents: write
 
+concurrency:
+  group: build-gantt-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -18,14 +22,12 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Install LaTeX dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y texlive-xetex texlive-lang-chinese texlive-pictures texlive-latex-extra
-
       - name: Build Gantt PDF
-        working-directory: docs/gantt
-        run: xelatex -interaction=nonstopmode -halt-on-error project_gantt.tex
+        uses: xu-cheng/latex-action@v3
+        with:
+          root_file: project_gantt.tex
+          working_directory: docs/gantt
+          latexmk_use_xelatex: true
 
       - name: Commit rebuilt PDF
         run: |
