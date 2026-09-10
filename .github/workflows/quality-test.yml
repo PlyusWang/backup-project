@@ -4,6 +4,9 @@ on:
   push:
     branches:
       - test/sprint1-quality-regression
+  pull_request:
+    branches:
+      - main
   workflow_dispatch:
 
 jobs:
