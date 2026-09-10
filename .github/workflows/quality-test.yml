@@ -3,7 +3,7 @@ name: Sprint 1 Quality Regression
 on:
   push:
     branches:
-      - test/sprint1-quality-regression
+      - main
   pull_request:
     branches:
       - main
