@@ -1,0 +1,37 @@
+name: Sprint 1 Quality Regression
+
+on:
+  push:
+    branches:
+      - test/sprint1-quality-regression
+  workflow_dispatch:
+
+jobs:
+  quality:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Run quality regression suite
+        run: |
+          chmod +x scripts/quality_test.sh
+          QUALITY_REPEAT=10 QUALITY_LARGE_MB=16 QUALITY_MANY_FILES=500 ./scripts/quality_test.sh
+
+      - name: Show result summary
+        if: always()
+        run: |
+          latest="$(find tests/output/quality -mindepth 1 -maxdepth 1 -type d 2>/dev/null | sort | tail -n 1)"
+          if [ -n "$latest" ] && [ -f "$latest/summary.md" ]; then
+            cat "$latest/summary.md"
+          fi
+
+      - name: Upload quality evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sprint1-quality-evidence
+          path: tests/output/quality/
+          if-no-files-found: error
+          retention-days: 30
