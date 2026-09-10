@@ -1,5 +1,5 @@
 \documentclass[UTF8,10pt]{ctexart}
-\usepackage[a4paper,landscape,margin=1.25cm]{geometry}
+\usepackage[a4paper,landscape,margin=1.15cm]{geometry}
 \usepackage{pgfgantt}
 \usepackage{xcolor}
 \usepackage{array}
@@ -10,74 +10,72 @@
 \definecolor{stretchgold}{RGB}{176,126,28}
 \definecolor{docgreen}{RGB}{77,126,94}
 \definecolor{gridgray}{RGB}{220,223,228}
+\definecolor{currentorange}{RGB}{186,105,38}
 
 \begin{document}
 \begin{center}
-{\LARGE\bfseries 数据备份软件课程项目甘特图}\par
-\vspace{0.2em}
-{\small 以 10 次课程为时间轴；第 1 次课为当前已完成的 Sprint 1，后续按实际进度滚动调整}\par
-\vspace{0.7em}
+{\LARGE\bfseries 数据备份软件课程项目滚动甘特图}\par
+\vspace{0.15em}
+{\small 以 10 次课程为检查节点；每个 Sprint 从本次课启动，到下一次课评审、回顾并收口}\par
+\vspace{0.55em}
 \end{center}
 
 \begin{ganttchart}[
     hgrid style/.style={draw=gridgray},
-    vgrid={*{9}{draw=gridgray}, draw=gray!55, *{0}{draw=gridgray}},
-    x unit=1.43cm,
-    y unit title=0.65cm,
-    y unit chart=0.58cm,
-    title height=1,
+    vgrid={*{9}{draw=gridgray}, draw=gray!55},
+    x unit=1.34cm,
+    y unit title=0.58cm,
+    y unit chart=0.45cm,
+    title height=0.95,
     title label font=\bfseries\small,
     bar height=0.48,
-    group height=0.36,
+    group height=0.34,
     group peaks tip position=0,
-    group peaks height=0.18,
-    bar label font=\small,
+    group peaks height=0.16,
+    bar label font=\scriptsize,
     group label font=\bfseries\small,
-    milestone label font=\small,
-    milestone height=0.50,
+    milestone label font=\scriptsize,
+    milestone height=0.48,
     milestone top shift=0.15,
     bar/.append style={fill=planblue!78, draw=planblue!95},
-    group/.append style={fill=planblue!20, draw=planblue!75},
+    group/.append style={fill=planblue!18, draw=planblue!72},
     milestone/.append style={fill=donegray, draw=donegray},
 ]{1}{10}
 
-\gantttitle{课程 / Sprint}{10} \\
+\gantttitle{课程检查节点}{10} \\
 \gantttitlelist{1,...,10}{1} \\
 
-\ganttgroup[group/.append style={fill=donegray!18,draw=donegray!80}]{Sprint 1：基础 CLI（已完成）}{1}{1} \\
-\ganttbar[bar/.append style={fill=donegray!82,draw=donegray}]{项目基线、Git、构建环境}{1}{1} \\
-\ganttbar[bar/.append style={fill=donegray!82,draw=donegray}]{基础 Backup / Restore}{1}{1} \\
-\ganttbar[bar/.append style={fill=donegray!82,draw=donegray}]{自动测试与人工鲁棒性验收}{1}{1} \\
-\ganttmilestone{v0.1 基础功能通过}{1} \\
+\ganttgroup[group/.append style={fill=donegray!18,draw=donegray!80}]{Sprint 迭代主线}{1}{10} \\
+\ganttbar[bar/.append style={fill=currentorange!76,draw=currentorange!95}]{S1：v0.1 基础 Backup / Restore；第2次课收口}{1}{2} \\
+\ganttbar{S2：v0.2 Backup Package：Archive v0.1 + Metadata v0.1 + 极简 UI}{2}{3} \\
+\ganttbar{S3：v0.3 Filter + Package Hardening + 测试环境完善}{3}{4} \\
+\ganttbar{S4：v0.4 程序框架 / 接口收口 + 特殊文件 + UML 同步}{4}{5} \\
+\ganttbar{S5：v0.5 Archive 规范化与集成；结合打包解包课程完善}{5}{6} \\
+\ganttbar{S6：v0.6 Huffman 压缩 / 解压 + Round-trip 测试}{6}{7} \\
+\ganttbar{S7：v0.7 加密 / 解密 + 压缩加密流水线集成}{7}{8} \\
+\ganttbar{S8：v0.8 定时备份 + inotify 实时备份 + 后台状态}{8}{9} \\
+\ganttbar[bar/.append style={fill=stretchgold!72,draw=stretchgold!95}]{S9：Release Candidate；全量回归 + 增量 / 网络等 Stretch}{9}{10} \\
+\ganttmilestone[milestone/.append style={fill=docgreen,draw=docgreen}]{Final Release / 答辩}{10} \\
 
-\ganttgroup{本地核心能力}{2}{7} \\
-\ganttbar{元数据恢复 + 特殊文件}{2}{2} \\
-\ganttbar{自定义文件筛选}{3}{3} \\
-\ganttbar{打包 / 解包}{3}{3} \\
-\ganttbar{压缩 / 解压算法}{4}{4} \\
-\ganttbar{加密 / 解密算法}{5}{5} \\
-\ganttbar{Web GUI}{6}{6} \\
-\ganttbar{定时备份 + 实时备份（inotify）}{7}{7} \\
+\ganttgroup[group/.append style={fill=docgreen!18,draw=docgreen!85}]{持续工程活动}{1}{10} \\
+\ganttbar[bar/.append style={fill=docgreen!68,draw=docgreen!95}]{需求 / 架构 / UML 随实现滚动更新}{1}{9} \\
+\ganttbar[bar/.append style={fill=docgreen!68,draw=docgreen!95}]{自动测试 / CI / Regression：每个 Sprint 都执行}{1}{9} \\
+\ganttbar[bar/.append style={fill=docgreen!68,draw=docgreen!95}]{Kanban + Sprint Backlog + Review / Retrospective}{2}{9} \\
+\ganttbar[bar/.append style={fill=docgreen!68,draw=docgreen!95}]{测试报告、最终报告、演示材料持续归档}{7}{10} \\
 
-\ganttgroup[group/.append style={fill=stretchgold!18,draw=stretchgold!85}]{网络与进阶能力（Stretch）}{8}{9} \\
-\ganttbar[bar/.append style={fill=stretchgold!78,draw=stretchgold!95}]{网络备份 + 用户管理 + 远程元数据}{8}{8} \\
-\ganttbar[bar/.append style={fill=stretchgold!78,draw=stretchgold!95}]{传输加密 + 增量备份}{8}{9} \\
-\ganttbar[bar/.append style={fill=stretchgold!78,draw=stretchgold!95}]{综合集成、性能与鲁棒性测试}{9}{9} \\
-
-\ganttgroup[group/.append style={fill=docgreen!18,draw=docgreen!85}]{文档、UML 与验收}{1}{10} \\
-\ganttbar[bar/.append style={fill=docgreen!72,draw=docgreen!95}]{需求 / 架构 / UML 随代码持续更新}{1}{9} \\
-\ganttbar[bar/.append style={fill=docgreen!72,draw=docgreen!95}]{测试报告与最终报告整理}{8}{10} \\
-\ganttbar[bar/.append style={fill=docgreen!72,draw=docgreen!95}]{答辩 PPT、演示脚本与最终检查}{9}{10} \\
-\ganttmilestone[milestone/.append style={fill=docgreen,draw=docgreen}]{最终演示 / 答辩}{10}
+\ganttgroup[group/.append style={fill=stretchgold!14,draw=stretchgold!78}]{主要责任线（Primary Owner）}{2}{9} \\
+\ganttbar[bar/.append style={fill=stretchgold!66,draw=stretchgold!92}]{Core Algorithm \& Integration：Archive → Huffman → Encryption → Integration}{2}{9} \\
+\ganttbar[bar/.append style={fill=stretchgold!52,draw=stretchgold!82}]{Architecture / Product / UI：UML、UI、交互与演示}{2}{9} \\
+\ganttbar[bar/.append style={fill=stretchgold!38,draw=stretchgold!74}]{Filesystem / Engineering：Metadata、Filter、特殊文件、Automation、Quality}{2}{9}
 
 \end{ganttchart}
 
-\vspace{0.8em}
+\vspace{0.55em}
 {\small
-\begin{tabular}{@{}>{\raggedright\arraybackslash}p{0.18\linewidth} p{0.77\linewidth}@{}}
-\textbf{当前状态} & 第 1 次课已完成：工程骨架、C++17 CLI、普通文件/目录递归备份与恢复、20 项自动测试及人工验收。 \\
-\textbf{主线目标} & 优先完成本地高价值功能，稳定达到 120+ 功能点；网络与增量能力作为后续扩展，不以牺牲核心正确性和可解释性为代价。 \\
-\textbf{执行原则} & 每次课尽量形成“可运行功能 + 自动测试 + 源码可解释 + UML/文档同步”的闭环；第 10 次课只做最终检查、演示与答辩，不再承担大规模开发。 \\
+\begin{tabular}{@{}>{\raggedright\arraybackslash}p{0.17\linewidth} p{0.78\linewidth}@{}}
+\textbf{当前节点} & 第 2 次课：完成 Sprint 1 的测试、缺陷修复、Review / Retrospective，并在同一节点启动 Sprint 2；Sprint 1 不是“第 1 次课当天完成”，而是跨第 1--2 次课的一周迭代。 \\
+\textbf{每轮 DoD} & 必须形成“可运行版本 + 自动测试 / 回归结果 + 关键源码可解释 + UML / 文档同步”；测试不再集中到第 9 次课，第 9--10 次课主要用于 Release Candidate、全量回归和答辩准备。 \\
+\textbf{开发策略} & 本地 120+ 分能力优先；网络、增量、多算法等属于后续 Stretch。三人按 Primary Owner 分工，但关键代码至少有 Secondary Reviewer，避免三个子项目到最后才第一次集成。 \\
 \end{tabular}
 }
 

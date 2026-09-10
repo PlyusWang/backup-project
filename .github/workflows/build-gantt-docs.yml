@@ -1,0 +1,39 @@
+name: Build Gantt PDF
+
+on:
+  push:
+    branches:
+      - docs/update-gantt-sprint-cycle
+    paths:
+      - docs/gantt/project_gantt.tex
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install LaTeX dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y texlive-xetex texlive-lang-chinese texlive-pictures texlive-latex-extra
+
+      - name: Build Gantt PDF
+        working-directory: docs/gantt
+        run: xelatex -interaction=nonstopmode -halt-on-error project_gantt.tex
+
+      - name: Commit rebuilt PDF
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add docs/gantt/project_gantt.pdf
+          if git diff --cached --quiet; then
+            exit 0
+          fi
+          git commit -m "docs: rebuild project gantt pdf"
+          git push
