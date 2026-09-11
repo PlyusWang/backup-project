@@ -6,8 +6,8 @@ Linux 环境下的数据备份与恢复软件课程项目。
 
 - 核心后端：C++17
 - 主要运行平台：Linux
-- 前端：Web
-- Web 辅助层：Python
+- 桌面前端：Qt 6 Widgets
+- 异步执行：Qt Concurrent
 - 构建：GNU Make
 - 版本控制：Git / GitHub
 - C++ 编程规范：Google C++ Style Guide
@@ -82,3 +82,15 @@ make                      # 构建 build/backupctl
 
 备份数据存放于 `<repository>/data/`。更多用法、行为约定与测试方法见
 `docs/basic_cli_usage.md`。
+
+## 桌面 GUI（Qt 6 Widgets）
+
+```bash
+make gui                                                     # 构建 build/backup-gui
+./build/backup-gui                                           # 启动图形界面
+QT_QPA_PLATFORM=offscreen ./build/backup-gui --smoke-test    # 无显示环境下自检
+./scripts/gui_smoke_test.sh                                  # 构建 + 自检一步完成
+```
+
+依赖：Qt 6 开发包（Ubuntu：`sudo apt-get install -y qt6-base-dev qt6-base-dev-tools`）。
+GUI 与 CLI 共用同一个 `BackupEngine`，详见 `docs/ui/desktop_gui.md`。
