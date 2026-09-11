@@ -10,6 +10,7 @@
 #include <QFutureWatcher>
 #include <QString>
 #include <QWidget>
+#include <functional>
 
 #include "theme.h"
 
@@ -48,9 +49,16 @@ class OperationPage : public QWidget {
   // 主题变化时只需要更新状态标题的颜色，其余样式由应用级 QSS 负责。
   void ApplyTheme(const ThemeColors& colors);
 
-  // 主窗口用它判断“是否还有任务在跑”，以便决定要不要拦住关闭窗口；
-  // 状态由 watcher 决定，不额外维护一个布尔量，避免两处状态不同步。
+  // 主窗口用它判断“是否还有任务在跑”，以便决定要不要拦住关闭窗口。
   bool IsRunning() const;
+
+  // 任务开始 / 结束时回调一次 true / false，交给 MainWindow 统一协调：
+  // 同一时刻整个窗口只允许一个备份或恢复在跑，另一个页面的“开始”要锁住。
+  // 用 std::function 而不是自定义信号，是为了继续避开 Q_OBJECT 与 moc。
+  void SetBusyChangedCallback(std::function<void(bool)> callback);
+
+  // 另一页正在跑任务时，把本页的“开始”按钮锁住（输入框仍然可以编辑）。
+  void SetActionBlocked(bool blocked);
 
  private:
   // 真正的后台函数：必须是 static，而且不碰任何 QWidget。
@@ -62,7 +70,9 @@ class OperationPage : public QWidget {
   void StartOperation();
   void SetStatus(StatusKind kind, const QString& title, const QString& message);
   void ApplyStatusColors();
-  void SetControlsEnabled(bool enabled);
+  // 按 running_ / action_blocked_ 两个状态统一刷新控件可用性，
+  // 避免出现“按钮恢复了但输入框还锁着”这种只改一半的情况。
+  void UpdateControlStates();
 
   QString WindowTitleText() const;
   QString SubtitleText() const;
@@ -85,8 +95,16 @@ class OperationPage : public QWidget {
   QLabel* status_message_ = nullptr;
   QLineEdit* first_edit_ = nullptr;
   QLineEdit* second_edit_ = nullptr;
+  // 两个“选择”按钮也要随 busy 一起禁用，所以必须留成员，
+  // 不能像以前那样建成局部变量之后就不管了。
+  QPushButton* choose_buttons_[2] = {nullptr, nullptr};
   QPushButton* action_button_ = nullptr;
   QProgressBar* progress_ = nullptr;
+  // 本页是否在跑，和“另一页在跑”造成的锁定，两者分开记：
+  // 前者决定输入框与选择按钮，后者只决定“开始”按钮。
+  bool running_ = false;
+  bool action_blocked_ = false;
+  std::function<void(bool)> busy_changed_callback_;
   // watcher 作为成员存在，生命周期跟着页面走；页面被销毁时它会被一起析构，
   // 未完成的回调不会再命中任何已经释放的控件。
   QFutureWatcher<OperationResult> watcher_;

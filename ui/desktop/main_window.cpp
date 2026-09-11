@@ -62,6 +62,12 @@ void MainWindow::BuildLayout() {
   // 加入顺序就是页面索引，必须和侧栏导航按钮的顺序保持一致。
   stack_->addWidget(backup_page_);
   stack_->addWidget(restore_page_);
+  // 两个页面互相通报忙碌状态：谁在跑，谁就负责把对方的“开始”锁住。
+  // 这里仍然没有 Q_OBJECT，回调只是 std::function，够用且不引入 moc。
+  backup_page_->SetBusyChangedCallback(
+      [this](bool busy) { HandleOperationBusyChanged(backup_page_, busy); });
+  restore_page_->SetBusyChangedCallback(
+      [this](bool busy) { HandleOperationBusyChanged(restore_page_, busy); });
   root->addWidget(stack_, 1);
 
   // QMainWindow 必须显式接收中央控件，否则内容区不会被显示。
@@ -166,6 +172,13 @@ void MainWindow::FadeInCurrentPage() {
     QTimer::singleShot(0, page, [page]() { page->setGraphicsEffect(nullptr); });
   });
   animation->start(QAbstractAnimation::DeleteWhenStopped);
+}
+
+// 全局只允许一个备份 / 恢复在跑：某页开始任务时锁住另一页的“开始”，
+// 结束时放开。页面切换、主题切换都不受影响，用户仍然可以边等边看。
+void MainWindow::HandleOperationBusyChanged(OperationPage* source, bool busy) {
+  OperationPage* other = source == backup_page_ ? restore_page_ : backup_page_;
+  other->SetActionBlocked(busy);
 }
 
 void MainWindow::closeEvent(QCloseEvent* event) {
