@@ -18,6 +18,11 @@ LINT_DIRS="app src include"
 if [[ -d ui/desktop ]]; then
     LINT_DIRS="$LINT_DIRS ui/desktop"
 fi
+# 现代 QML GUI 的 C++ 部分（moc 桥 + 主题）同样走这个入口；
+# QML 本身由 scripts/modern_gui_check.sh 用 qmllint 与冒烟测试检查。
+if [[ -d ui/modern ]]; then
+    LINT_DIRS="$LINT_DIRS ui/modern"
+fi
 
 mapfile -d '' FILES < <(
     # $LINT_DIRS 有意不加引号：它就是一组空格分隔的目录名。
