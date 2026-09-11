@@ -72,6 +72,7 @@ bool BackupEngine::Backup(const std::string& source_directory,
                "Repository data directory already exists and is not empty: " +
                    data_directory);
     }
+    // 不覆盖错误信息，直接返回 false。
     return false;
   }
 
