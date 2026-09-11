@@ -1,0 +1,14 @@
+<!DOCTYPE RCC>
+<RCC version="1.0">
+  <qresource prefix="/">
+    <file>qml/Main.qml</file>
+    <file>qml/components/AppButton.qml</file>
+    <file>qml/components/AppCard.qml</file>
+    <file>qml/components/AppIcon.qml</file>
+    <file>qml/components/AppTextField.qml</file>
+    <file>qml/components/NavItem.qml</file>
+    <file>qml/components/StatusBanner.qml</file>
+    <file>qml/pages/HomePage.qml</file>
+    <file>qml/pages/OperationPage.qml</file>
+  </qresource>
+</RCC>
