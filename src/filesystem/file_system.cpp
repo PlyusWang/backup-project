@@ -77,6 +77,8 @@ class ScopedDirectory {
 
   DIR* get() const { return dir_; }
 
+  // closedir 的失败不影响数据正确性，而 close(fd) 的失败可能意味着数据丢失，因此 DIR 不用 release()。
+
  private:
   DIR* dir_;
 };
