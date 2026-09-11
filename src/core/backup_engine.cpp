@@ -55,8 +55,11 @@ bool BackupEngine::Backup(const std::string& source_directory,
     return false;
   }
 
-  // 仓库可以顺手建出来，但里面已有内容时绝不覆盖。
-  if (!file_system_.MakeDirectories(repository, error_message)) {
+  // 空字符串不是合法仓库路径。以前这一步由 MakeDirectories("") 拦下，
+  // 现在建目录推迟到 CopyTree 内部了，这里显式拦一次，免得它被当成
+  // “当前目录下的 data” 悄悄写进工作目录。
+  if (repository.empty()) {
+    SetError(error_message, "Repository path is empty.");
     return false;
   }
 
@@ -72,11 +75,17 @@ bool BackupEngine::Backup(const std::string& source_directory,
                "Repository data directory already exists and is not empty: " +
                    data_directory);
     }
-    // 不覆盖错误信息，直接返回 false。
+    // error_message 里可能已经是 IsMissingOrEmptyDirectory 写好的具体原因，
+    // 就不再用自己的文案盖掉它了。
     return false;
   }
 
   // 前置检查全部通过，剩下就是把整棵树复制过去。
+  // 这里刻意不提前 MakeDirectories(repository)：建目录是写操作，必须等
+  // CopyTree 做完路径拓扑检查、确认这次复制合法之后再发生，否则像
+  // “repository 放在 source 里面” 这种非法拓扑会先留下一个空仓库。
+  // CopyTree 建 destination 用的是 mkdir -p 语义，会连 repository 一起
+  // 建出来，所以提前建本来就是多余的。
   return file_system_.CopyTree(source_directory, data_directory, error_message);
 }
 
