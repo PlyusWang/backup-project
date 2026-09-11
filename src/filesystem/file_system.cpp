@@ -18,11 +18,15 @@
 #include <array>
 #include <cerrno>
 #include <cstring>
+#include <filesystem>
 #include <string>
+#include <system_error>
 
 namespace backupproject {
 
 namespace {
+
+namespace fs = std::filesystem;
 
 // 一次 read 多少字节。64 KiB 是个折中：太小了系统调用次数多，
 // 太大了又占内存。这个量级对本地盘够用，v0.1 不做更细的调优。
@@ -77,7 +81,8 @@ class ScopedDirectory {
 
   DIR* get() const { return dir_; }
 
-  // closedir 的失败不影响数据正确性，而 close(fd) 的失败可能意味着数据丢失，因此 DIR 不用 release()。
+  // closedir 的失败不影响数据正确性，而 close(fd)
+  // 的失败可能意味着数据丢失，因此 DIR 不用 release()。
 
  private:
   DIR* dir_;
@@ -93,6 +98,48 @@ std::string Describe(int error, const std::string& reason,
     message += std::strerror(error);
   }
   return message;
+}
+
+// 把路径整理成可以逐段比较的形式：先 absolute 补成绝对路径（weakly_canonical
+// 对整条都不存在的相对路径会原样返回，绝对/相对混在一起就比不出来），再用
+// weakly_canonical 解析存在的部分（"."、".."、软链接），它允许尾部不存在，
+// 正适合 destination 还没建出来的情况；最后 lexically_normal 清掉残留的
+// "." 和 ".."。全程用 error_code 版本，出错返回 false，不抛异常。
+bool CanonicalizePath(const std::string& path, fs::path* result,
+                      std::string* error_message) {
+  std::error_code error;
+  const fs::path absolute = fs::absolute(fs::path(path), error);
+  if (error) {
+    if (error_message != nullptr) {
+      *error_message =
+          "Failed to resolve path: " + path + ": " + error.message();
+    }
+    return false;
+  }
+  const fs::path resolved = fs::weakly_canonical(absolute, error);
+  if (error) {
+    if (error_message != nullptr) {
+      *error_message =
+          "Failed to resolve path: " + path + ": " + error.message();
+    }
+    return false;
+  }
+  *result = resolved.lexically_normal();
+  return true;
+}
+
+// 判断 candidate 是不是 base 本身或其后代：逐组件比较，全段匹配才算包含。
+bool IsSameOrDescendantPath(const fs::path& base, const fs::path& candidate) {
+  auto base_component = base.begin();
+  auto candidate_component = candidate.begin();
+  for (; base_component != base.end();
+       ++base_component, ++candidate_component) {
+    if (candidate_component == candidate.end() ||
+        *candidate_component != *base_component) {
+      return false;
+    }
+  }
+  return true;
 }
 
 }  // namespace
@@ -126,7 +173,8 @@ FileSystem::PathStatus FileSystem::InspectPath(const std::string& path,
     }
     return PathStatus::kError;
   }
-  // st_mode 的类型位和 lstat 的结果一一对应，按它分支。
+  // 除目录和普通文件外一律归 kOther（软链接、FIFO、设备……），
+  // 由调用方决定是拒绝还是继续。
   if (S_ISDIR(info.st_mode)) {
     return PathStatus::kDirectory;
   }
@@ -364,14 +412,57 @@ bool FileSystem::CopyRegularFile(const std::string& source,
   return true;
 }
 
-// 递归复制一个节点，是本文件的核心。
-// 目录：先建目标目录，再逐个孩子递归；普通文件：复制内容；
-// 其他类型（软链接、FIFO、设备、socket）：明确失败。
-// 任何一个孩子失败，整次调用都失败——宁可备份不完整也要显式报错，
-// 不能生成“看起来成功、其实缺东西”的备份。
+// 对外的复制入口：整次复制只做一次拓扑检查，然后把活交给 CopyTreeInternal。
 bool FileSystem::CopyTree(const std::string& source,
                           const std::string& destination,
                           std::string* error_message) {
+  if (error_message != nullptr) {
+    error_message->clear();
+  }
+
+  if (!IsDestinationOutsideSource(source, destination, error_message)) {
+    return false;
+  }
+  return CopyTreeInternal(source, destination, error_message);
+}
+
+// destination 必须在 source 外面。相等是自己复制自己；在 source 里面更糟：
+// 每复制一层，新写出来的目录又变成待复制的输入，路径无限变长（ROB-02 /
+// ROB-03）。这个判断在任何建目录动作之前完成，所以拒绝时不留半成品。
+bool FileSystem::IsDestinationOutsideSource(const std::string& source,
+                                            const std::string& destination,
+                                            std::string* error_message) {
+  fs::path canonical_source;
+  fs::path canonical_destination;
+  if (!CanonicalizePath(source, &canonical_source, error_message)) {
+    return false;
+  }
+  if (!CanonicalizePath(destination, &canonical_destination, error_message)) {
+    return false;
+  }
+  if (!IsSameOrDescendantPath(canonical_source, canonical_destination)) {
+    return true;
+  }
+
+  if (error_message != nullptr) {
+    if (canonical_source == canonical_destination) {
+      *error_message =
+          "Destination is the same as the source directory: " + destination;
+    } else {
+      *error_message =
+          "Destination is inside the source directory: " + destination;
+    }
+  }
+  return false;
+}
+
+// 递归复制一个节点，是本文件的核心。
+// 目录：先建目标目录，再逐个孩子递归；普通文件：复制内容；
+// 其他类型（软链接、FIFO、设备、socket）：明确失败。
+// 任何一层失败整次调用都失败——宁可备份不完整，也不生成“看似成功”的备份。
+bool FileSystem::CopyTreeInternal(const std::string& source,
+                                  const std::string& destination,
+                                  std::string* error_message) {
   // 先 lstat 定类型：目录走递归，文件走复制，其余类型报错。
   struct stat source_info;
   if (lstat(source.c_str(), &source_info) != 0) {
@@ -421,8 +512,8 @@ bool FileSystem::CopyTree(const std::string& source,
       }
       // 子路径直接用 d_name 拼接：文件名里的空格、UTF-8 字符都
       // 原样保留，不在这里做任何清洗。
-      if (!CopyTree(JoinPath(source, name), JoinPath(destination, name),
-                    error_message)) {
+      if (!CopyTreeInternal(JoinPath(source, name), JoinPath(destination, name),
+                            error_message)) {
         return false;
       }
     }
