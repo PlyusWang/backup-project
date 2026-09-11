@@ -23,6 +23,8 @@ namespace backup_gui {
 // 构造顺序：先定窗口尺寸和标题，再搭界面，最后套主题。
 // 主题必须放在搭界面之后——QSS 依赖控件上已经设置好的 objectName。
 MainWindow::MainWindow(QWidget* parent) : QMainWindow(parent) {
+  // 保留 GNOME 原生标题栏：自绘无边框标题栏会连带引入 Wayland、HiDPI、
+  // 拖拽、最大化、系统快捷键等一堆兼容问题，而这一轮的目标只是内部界面好看。
   setWindowTitle(QString::fromUtf8("备份工具"));
   resize(1100, 700);
   // 1100x700 在普通笔记本上排得比较舒服；
@@ -38,6 +40,9 @@ MainWindow::MainWindow(QWidget* parent) : QMainWindow(parent) {
 void MainWindow::BuildLayout() {
   // 中央区域只有一层水平布局：左边固定宽度侧栏，右边自适应内容区。
   auto* central = new QWidget(this);
+  // 中央区域自己承担页面底色（QSS 里的 #CentralArea）；
+  // 子控件不写背景就不会再画出色带。
+  central->setObjectName("CentralArea");
   auto* root = new QHBoxLayout(central);
   root->setContentsMargins(0, 0, 0, 0);
   root->setSpacing(0);
@@ -65,8 +70,8 @@ void MainWindow::BuildLayout() {
 
 void MainWindow::BuildSidebar(QWidget* sidebar) {
   auto* layout = new QVBoxLayout(sidebar);
-  layout->setContentsMargins(16, 20, 16, 20);
-  layout->setSpacing(8);
+  layout->setContentsMargins(14, 18, 14, 18);
+  layout->setSpacing(6);
 
   // 侧栏信息密度刻意做低：只有工具名、两个导航和一个主题按钮。
   auto* title = new QLabel(QString::fromUtf8("备份工具"), sidebar);
@@ -96,6 +101,8 @@ void MainWindow::BuildSidebar(QWidget* sidebar) {
   layout->addStretch(1);
 
   theme_button_ = new QPushButton(sidebar);
+  // 主题按钮用 flat 样式（#FlatButton）：它是次要操作，不该长得像表单按钮。
+  theme_button_->setObjectName("FlatButton");
   theme_button_->setCursor(Qt::PointingHandCursor);
   connect(theme_button_, &QPushButton::clicked, this,
           [this]() { ToggleTheme(); });

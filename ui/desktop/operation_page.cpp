@@ -5,11 +5,13 @@
 
 #include "operation_page.h"
 
+#include <QColor>
 #include <QDir>
 #include <QFileDialog>
 #include <QHBoxLayout>
 #include <QLabel>
 #include <QLineEdit>
+#include <QPalette>
 #include <QProgressBar>
 #include <QPushButton>
 #include <QVBoxLayout>
@@ -33,6 +35,9 @@ QString StartDirectoryFor(const QLineEdit* edit) {
 // 反过来的话，SetStatus 会在状态控件还没建出来时就被调用。
 OperationPage::OperationPage(OperationKind kind, QWidget* parent)
     : QWidget(parent), kind_(kind) {
+  // 页面根节点自己承担背景色（QSS 里由 #PageRoot 选中）。
+  // 这样 QLabel 之类的子控件可以保持完全透明，不会再画出横向色带。
+  setObjectName("PageRoot");
   BuildLayout();
   // watcher 以 this 作为上下文对象：页面被销毁时 Qt 会自动断开，
   // 后台任务即使还在跑也不会回调到已经释放的控件上。
@@ -59,30 +64,39 @@ OperationPage::OperationPage(OperationKind kind, QWidget* parent)
 }
 
 void OperationPage::BuildLayout() {
-  // 页面根部是竖直布局：标题、说明、操作卡片、状态卡片自上而下。
-  // 末尾留一个 stretch，窗口变高时多出来的空间落在底部，
-  // 而不是把几个控件之间的距离一起拽开。
-  auto* root = new QVBoxLayout(this);
-  root->setContentsMargins(32, 28, 32, 28);
-  root->setSpacing(18);
+  // 外层水平布局只干一件事：把内容列居中。
+  // 内容列限宽，窗口拉得很宽时输入框不会被无限拉长——
+  // 一行横跨 1600px 的输入框既难读，也让页面显得松散。
+  auto* root = new QHBoxLayout(this);
+  root->setContentsMargins(36, 30, 36, 30);
+  root->setSpacing(0);
+
+  auto* content = new QWidget(this);
+  content->setMaximumWidth(880);
+  auto* column = new QVBoxLayout(content);
+  column->setContentsMargins(0, 0, 0, 0);
+  column->setSpacing(0);
 
   // 大标题 + 一行说明是右侧内容区的固定开头，两个页面保持一致，
   // 用户在两个页面之间切换时视觉起点不会跳。
   auto* title = new QLabel(WindowTitleText(), this);
   title->setObjectName("PageTitle");
-  root->addWidget(title);
+  column->addWidget(title);
+  // 标题和说明贴紧一点，让它们读起来是一段，而不是两行散开的文字。
+  column->addSpacing(6);
 
   auto* subtitle = new QLabel(SubtitleText(), this);
   subtitle->setObjectName("PageSubtitle");
-  root->addWidget(subtitle);
+  column->addWidget(subtitle);
+  column->addSpacing(20);
 
   // 操作卡片把两条路径和主按钮放在一起：它们是同一次操作的输入，
   // 和下面的状态区分开之后，状态变化不会牵动输入区的位置。
   auto* card = new QWidget(this);
   card->setObjectName("Card");
   auto* card_layout = new QVBoxLayout(card);
-  card_layout->setContentsMargins(22, 22, 22, 22);
-  card_layout->setSpacing(14);
+  card_layout->setContentsMargins(22, 20, 22, 20);
+  card_layout->setSpacing(0);
 
   // 两条路径的结构完全一样，用循环生成，省得维护两份几乎相同的代码。
   const QString labels[2] = {FirstFieldLabel(), SecondFieldLabel()};
@@ -91,6 +105,9 @@ void OperationPage::BuildLayout() {
     auto* label = new QLabel(labels[index], card);
     label->setObjectName("FieldLabel");
     card_layout->addWidget(label);
+    // 标签紧贴自己的输入框（8px），两组之间留 18px：
+    // 这样一眼能看出哪行标签配哪个框，而不是像表格那样等距铺开。
+    card_layout->addSpacing(8);
 
     auto* row = new QHBoxLayout();
     row->setSpacing(10);
@@ -108,6 +125,9 @@ void OperationPage::BuildLayout() {
     row->addWidget(choose);
 
     card_layout->addLayout(row);
+    if (index == 0) {
+      card_layout->addSpacing(18);
+    }
     edits[index] = edit;
   }
   first_edit_ = edits[0];
@@ -123,27 +143,27 @@ void OperationPage::BuildLayout() {
   auto* action_row = new QHBoxLayout();
   action_row->addWidget(action_button_);
   action_row->addStretch(1);
-  card_layout->addSpacing(4);
+  card_layout->addSpacing(20);
   card_layout->addLayout(action_row);
 
-  root->addWidget(card);
+  column->addWidget(card);
+  column->addSpacing(16);
 
   // 状态卡片单独成块：标题给结论（等待/进行中/成功/失败），
   // 正文给细节，失败时直接把核心的 error_message 原文放在这里。
   auto* status_card = new QWidget(this);
   status_card->setObjectName("Card");
   auto* status_layout = new QVBoxLayout(status_card);
-  status_layout->setContentsMargins(22, 18, 22, 18);
-  status_layout->setSpacing(10);
+  status_layout->setContentsMargins(22, 16, 22, 16);
+  status_layout->setSpacing(0);
 
   status_title_ = new QLabel(status_card);
   status_title_->setObjectName("StatusTitle");
   status_layout->addWidget(status_title_);
+  status_layout->addSpacing(6);
 
   status_message_ = new QLabel(status_card);
   status_message_->setObjectName("StatusMessage");
-  // 错误信息里常常是很长的绝对路径：允许换行、允许选中复制，
-  // 并且限定最小宽度不要让长路径把窗口越撑越宽。
   // 错误信息里常带很长的绝对路径：允许换行、允许用鼠标选中复制，
   // 用户才能把原因完整贴给别人，而不是只看到被截断的半句话。
   status_message_->setWordWrap(true);
@@ -160,7 +180,13 @@ void OperationPage::BuildLayout() {
   progress_->setVisible(false);
   status_layout->addWidget(progress_);
 
-  root->addWidget(status_card);
+  column->addWidget(status_card);
+  column->addStretch(1);
+
+  // 内容列两侧各留一段弹性空间：窗口变宽时多出来的宽度给空白，
+  // 内容本身仍停在 880px 以内，不会被拉变形。
+  root->addStretch(1);
+  root->addWidget(content, 1);
   root->addStretch(1);
 }
 
@@ -169,6 +195,12 @@ void OperationPage::BuildLayout() {
 void OperationPage::ApplyTheme(const ThemeColors& colors) {
   colors_ = colors;
   ApplyStatusColors();
+  // QSS 没有 placeholder 颜色的属性，只能走 QPalette；
+  // 放在这里刷新，切换主题时提示文字的颜色才会跟着变。
+  QPalette palette = first_edit_->palette();
+  palette.setColor(QPalette::PlaceholderText, QColor(colors.text_secondary));
+  first_edit_->setPalette(palette);
+  second_edit_->setPalette(palette);
 }
 
 void OperationPage::ApplyStatusColors() {

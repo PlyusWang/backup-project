@@ -13,6 +13,8 @@
 namespace backup_gui {
 
 // 一套主题用到的颜色。字段按用途命名而不是按色值命名，
+// hover_background 是导航/次级按钮悬停时的浅背景，accent_soft 是强调色
+// 的低透明度版本（导航选中态用它，既不抢眼又能看出被选中）。
 // 这样新增主题时只要重新填一遍这张表，QSS 本身不用动。
 // 颜色存成 QString 而不是 QColor：它们的最终去处是 QSS 文本，
 // 保持字符串形态可以直接拼进去，不必每一处再转换一次。
@@ -24,6 +26,8 @@ struct ThemeColors {
   QString text_primary;
   QString text_secondary;
   QString border;
+  QString hover_background;
+  QString accent_soft;
   QString accent;
   QString accent_hover;
   QString error;
