@@ -42,6 +42,8 @@ class MainWindow : public QMainWindow {
   void ToggleTheme();
   void UpdateThemeButtonText();
   void FadeInCurrentPage();
+  // 某个页面开始 / 结束任务时调用，把“全局同时只跑一个操作”这条规则落到按钮上。
+  void HandleOperationBusyChanged(OperationPage* source, bool busy);
 
   ThemeKind theme_kind_ = ThemeKind::kLight;
   bool animation_enabled_ = true;

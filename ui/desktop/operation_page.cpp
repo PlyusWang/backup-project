@@ -48,7 +48,12 @@ OperationPage::OperationPage(OperationKind kind, QWidget* parent)
         // 先把“进行中”的视觉收掉，再更新结果文字，
         // 避免出现“进度条还在转，但下面已经写成功”的中间状态。
         progress_->setVisible(false);
-        SetControlsEnabled(true);
+        running_ = false;
+        // 先解除全局 busy，另一个页面的“开始”随即可用。
+        if (busy_changed_callback_) {
+          busy_changed_callback_(false);
+        }
+        UpdateControlStates();
         // finished 之后 result() 才保证可用；提前调用会阻塞主线程等任务结束。
         const OperationResult result = watcher_.result();
         if (result.succeeded) {
@@ -123,6 +128,7 @@ void OperationPage::BuildLayout() {
     connect(choose, &QPushButton::clicked, this,
             [this, edit]() { ChooseDirectory(edit); });
     row->addWidget(choose);
+    choose_buttons_[index] = choose;
 
     card_layout->addLayout(row);
     if (index == 0) {
@@ -226,9 +232,10 @@ void OperationPage::ChooseDirectory(QLineEdit* target) {
 }
 
 void OperationPage::StartOperation() {
-  // 双保险：正常路径下主按钮已经被禁用，但快捷键或程序化调用仍可能走到这里，
-  // 一旦重复提交就会有两个复制任务同时写同一个仓库。
-  if (IsRunning()) {
+  // 双保险：正常路径下主按钮已经被禁用，但快捷键或程序化调用仍可能走到这里。
+  // 除了本页是否在跑，还要看另一页是否正在跑（action_blocked_）：
+  // 否则“备份运行中切到恢复页再点开始”就会同时跑两个文件系统操作。
+  if (running_ || action_blocked_) {
     return;
   }
 
@@ -245,7 +252,12 @@ void OperationPage::StartOperation() {
 
   // 先把界面锁住再启动任务：否则用户可能在任务已经开跑之后再点一次，
   // 两次复制同时写同一个仓库，结果谁也说不清。
-  SetControlsEnabled(false);
+  running_ = true;
+  UpdateControlStates();
+  // 通知 MainWindow：全局 busy 生效，另一个页面的“开始”立刻锁住。
+  if (busy_changed_callback_) {
+    busy_changed_callback_(true);
+  }
   SetStatus(StatusKind::kRunning, RunningTitle(), RunningMessage());
   progress_->setVisible(true);
   // QtConcurrent 走全局线程池，主线程只等 finished 信号，
@@ -286,13 +298,26 @@ void OperationPage::SetStatus(StatusKind kind, const QString& title,
 }
 
 // 只锁输入框和主按钮，不动左侧导航：任务在跑时用户仍然可以切到另一页看看。
-void OperationPage::SetControlsEnabled(bool enabled) {
-  first_edit_->setEnabled(enabled);
-  second_edit_->setEnabled(enabled);
-  action_button_->setEnabled(enabled);
+void OperationPage::UpdateControlStates() {
+  const bool editable = !running_;
+  first_edit_->setEnabled(editable);
+  second_edit_->setEnabled(editable);
+  choose_buttons_[0]->setEnabled(editable);
+  choose_buttons_[1]->setEnabled(editable);
+  // “开始”同时受两个条件约束：本页没在跑，且另一页也没在跑。
+  action_button_->setEnabled(editable && !action_blocked_);
 }
 
-bool OperationPage::IsRunning() const { return watcher_.isRunning(); }
+void OperationPage::SetActionBlocked(bool blocked) {
+  action_blocked_ = blocked;
+  UpdateControlStates();
+}
+
+void OperationPage::SetBusyChangedCallback(std::function<void(bool)> callback) {
+  busy_changed_callback_ = callback;
+}
+
+bool OperationPage::IsRunning() const { return running_; }
 
 // 下面这组文案按操作类型分支。集中放在一处的好处是改措辞只改一个地方，
 // 也不会出现两个页面用词不一致的情况。
