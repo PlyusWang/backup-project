@@ -1,0 +1,97 @@
+// operation_page.h
+//
+// 备份页和恢复页的控件结构完全一样：两个路径输入 + 一个主按钮 + 状态卡片，
+// 区别只有文案和最终调用的引擎方法，所以合成一个类，用 OperationKind 区分。
+// 这样避免两份几乎逐行重复的页面代码，也没有引入“Controller/Service”之类的层级。
+
+#ifndef BACKUP_PROJECT_UI_DESKTOP_OPERATION_PAGE_H_
+#define BACKUP_PROJECT_UI_DESKTOP_OPERATION_PAGE_H_
+
+#include <QFutureWatcher>
+#include <QString>
+#include <QWidget>
+
+#include "theme.h"
+
+class QLabel;
+class QLineEdit;
+class QProgressBar;
+class QPushButton;
+
+namespace backup_gui {
+
+// 两种操作共用一个页面类，只在这里区分最终调用哪个引擎方法。
+enum class OperationKind { kBackup, kRestore };
+
+// 后台任务的输入。只放值类型，跨线程传的是副本，不共享可变状态；
+// 两个路径在语义上分别代表什么，由 kind 决定，后台函数不需要理解界面状态。
+struct OperationRequest {
+  OperationKind kind = OperationKind::kBackup;
+  QString first_path;
+  QString second_path;
+};
+
+// 后台任务的返回值。成功与否 + 核心给出的原始错误信息。
+// 失败时 error_message 一定来自 BackupEngine：GUI 不做二次加工，
+// 否则“哪个路径、什么原因”这类关键信息会在转述里丢掉。
+struct OperationResult {
+  bool succeeded = false;
+  QString error_message;
+};
+
+// 这一版刻意不使用 Q_OBJECT：信号槽全部用 Qt 现成的信号 + lambda 完成，
+// 于是构建过程不需要 moc 生成步骤，Makefile 也就能保持简单。
+class OperationPage : public QWidget {
+ public:
+  explicit OperationPage(OperationKind kind, QWidget* parent = nullptr);
+
+  // 主题变化时只需要更新状态标题的颜色，其余样式由应用级 QSS 负责。
+  void ApplyTheme(const ThemeColors& colors);
+
+  // 主窗口用它判断“是否还有任务在跑”，以便决定要不要拦住关闭窗口；
+  // 状态由 watcher 决定，不额外维护一个布尔量，避免两处状态不同步。
+  bool IsRunning() const;
+
+ private:
+  // 真正的后台函数：必须是 static，而且不碰任何 QWidget。
+  // 它跑在别的线程上，任何对 this 成员的隐式访问都可能是跨线程读写。
+  static OperationResult RunOperation(const OperationRequest& request);
+
+  void BuildLayout();
+  void ChooseDirectory(QLineEdit* target);
+  void StartOperation();
+  void SetStatus(StatusKind kind, const QString& title, const QString& message);
+  void ApplyStatusColors();
+  void SetControlsEnabled(bool enabled);
+
+  QString WindowTitleText() const;
+  QString SubtitleText() const;
+  QString FirstFieldLabel() const;
+  QString SecondFieldLabel() const;
+  QString ActionButtonText() const;
+  QString RunningTitle() const;
+  QString RunningMessage() const;
+  QString SucceededTitle() const;
+  QString SucceededMessage() const;
+  QString IdleMessage() const;
+
+  // 界面层自己的状态：操作类型、当前主题颜色副本、状态卡片处于哪种状态，
+  // 以及一串控件指针。这些只会在主线程被访问。
+  OperationKind kind_;
+  ThemeColors colors_;
+  StatusKind status_kind_ = StatusKind::kIdle;
+
+  QLabel* status_title_ = nullptr;
+  QLabel* status_message_ = nullptr;
+  QLineEdit* first_edit_ = nullptr;
+  QLineEdit* second_edit_ = nullptr;
+  QPushButton* action_button_ = nullptr;
+  QProgressBar* progress_ = nullptr;
+  // watcher 作为成员存在，生命周期跟着页面走；页面被销毁时它会被一起析构，
+  // 未完成的回调不会再命中任何已经释放的控件。
+  QFutureWatcher<OperationResult> watcher_;
+};
+
+}  // namespace backup_gui
+
+#endif  // BACKUP_PROJECT_UI_DESKTOP_OPERATION_PAGE_H_
