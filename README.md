@@ -83,7 +83,11 @@ make                      # 构建 build/backupctl
 备份数据存放于 `<repository>/data/`。更多用法、行为约定与测试方法见
 `docs/basic_cli_usage.md`。
 
-## 桌面 GUI（Qt 6 Widgets）
+## 桌面 GUI
+
+项目里有两套并行存在的桌面界面，共用同一份 `BackupEngine`，互不依赖、互不覆盖：
+
+### Qt 6 Widgets 版（稳定）
 
 ```bash
 make gui                                                     # 构建 build/backup-gui
@@ -93,4 +97,21 @@ QT_QPA_PLATFORM=offscreen ./build/backup-gui --smoke-test    # 无显示环境�
 ```
 
 依赖：Qt 6 开发包（Ubuntu：`sudo apt-get install -y qt6-base-dev qt6-base-dev-tools`）。
-GUI 与 CLI 共用同一个 `BackupEngine`，详见 `docs/ui/desktop_gui.md`。
+详见 `docs/ui/desktop_gui.md`。
+
+### Qt Quick / QML 现代版
+
+```bash
+make gui-modern                                              # 构建 build/backup-gui-modern
+make gui-all                                                 # 两套一起构建
+./build/backup-gui-modern                                   # 启动图形界面
+QT_QPA_PLATFORM=offscreen QSG_RHI_BACKEND=software ./build/backup-gui-modern --smoke-test
+./scripts/modern_gui_check.sh                               # 构建 + 启动 + 静态约束 + 端到端
+```
+
+依赖：Qt 6 QML 开发包（`sudo apt-get install -y qt6-declarative-dev qt6-declarative-dev-tools
+qml6-module-qtquick qml6-module-qtquick-controls qml6-module-qtquick-layouts
+qml6-module-qtquick-dialogs qml6-module-qtquick-window qml6-module-qtqml-workerscript`）。
+详见 `docs/ui/modern_qml_gui.md`。
+
+`make` 仍然只构建 CLI；两套 GUI 各自独立，`make gui` 不会顺手把现代版也编出来。
