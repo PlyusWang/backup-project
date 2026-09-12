@@ -10,6 +10,7 @@
 
 #include <QFutureWatcher>
 #include <QString>
+#include <QStringList>
 #include <QWidget>
 #include <functional>
 
@@ -17,6 +18,7 @@
 
 class QLabel;
 class QLineEdit;
+class QListWidget;
 class QProgressBar;
 class QPushButton;
 
@@ -31,6 +33,10 @@ struct OperationRequest {
   OperationKind kind = OperationKind::kBackup;
   QString first_path;
   QString second_path;
+  // 备份筛选规则（恢复页为空）。跨线程按值传递，后台线程用自己的副本，
+  // 解析与匹配统一交给 C++ 的 Filter。
+  QStringList include_rules;
+  QStringList exclude_rules;
 };
 
 // 后台任务的返回值。成功与否 + 核心给出的原始错误信息。
@@ -67,6 +73,11 @@ class OperationPage : public QWidget {
   static OperationResult RunOperation(const OperationRequest& request);
 
   void BuildLayout();
+  // 备份页的筛选规则编辑：添加 / 删除 / 收集。规则合法性统一由核心 Filter
+  // 判断。
+  void AddFilterRule(bool exclude);
+  void RemoveSelectedFilterRule();
+  QStringList CollectFilterRules(bool exclude) const;
   // 两种字段用两种对话框：目录字段选目录，归档文件字段按操作类型
   // 走"另存"（备份）或"打开"（恢复）。
   void ChoosePath(int field_index);
@@ -107,6 +118,9 @@ class OperationPage : public QWidget {
   // 不能像以前那样建成局部变量之后就不管了。
   QPushButton* choose_buttons_[2] = {nullptr, nullptr};
   QPushButton* action_button_ = nullptr;
+  // 筛选规则控件只在备份页创建，恢复页保持为空指针。
+  QLineEdit* filter_edit_ = nullptr;
+  QListWidget* filter_list_ = nullptr;
   QProgressBar* progress_ = nullptr;
   // 本页是否在跑，和“另一页在跑”造成的锁定，两者分开记：
   // 前者决定输入框与选择按钮，后者只决定“开始”按钮。

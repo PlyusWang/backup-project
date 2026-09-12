@@ -98,6 +98,81 @@ QUrl BackupController::directoryDialogStartUrl(const QString& path) const {
   return QUrl::fromLocalFile(path);
 }
 
+bool BackupController::addFilterRule(const QString& action,
+                                     const QString& rule) {
+  FilterAction filter_action = FilterAction::kInclude;
+  QStringList* target = nullptr;
+  if (action == QStringLiteral("include")) {
+    filter_action = FilterAction::kInclude;
+    target = &include_rules_;
+  } else if (action == QStringLiteral("exclude")) {
+    filter_action = FilterAction::kExclude;
+    target = &exclude_rules_;
+  } else {
+    SetStatus(QString::fromLatin1(kError), QStringLiteral("规则无效"),
+              QStringLiteral("筛选动作只能是 include 或 exclude。"));
+    return false;
+  }
+
+  // 语法判断只做一次，而且用的是和 CLI、归档层完全相同的 Filter 实现：
+  // 界面不复制一套解析规则，两边不会漂移。
+  Filter probe;
+  std::string error_message;
+  if (!probe.AddRule(filter_action, rule.toStdString(), &error_message)) {
+    SetStatus(QString::fromLatin1(kError), QStringLiteral("规则无效"),
+              QString::fromStdString(error_message));
+    return false;
+  }
+  target->append(rule);
+  emit filtersChanged();
+  clearStatus();
+  return true;
+}
+
+bool BackupController::removeFilterRule(int index) {
+  if (index < 0) {
+    return false;
+  }
+  if (index < include_rules_.size()) {
+    include_rules_.removeAt(index);
+    emit filtersChanged();
+    return true;
+  }
+  const int exclude_index = index - include_rules_.size();
+  if (exclude_index >= 0 && exclude_index < exclude_rules_.size()) {
+    exclude_rules_.removeAt(exclude_index);
+    emit filtersChanged();
+    return true;
+  }
+  return false;
+}
+
+void BackupController::clearFilterRules() {
+  if (include_rules_.isEmpty() && exclude_rules_.isEmpty()) {
+    return;
+  }
+  include_rules_.clear();
+  exclude_rules_.clear();
+  emit filtersChanged();
+}
+
+bool BackupController::BuildFilter(Filter* filter,
+                                   std::string* error_message) const {
+  for (const QString& rule : include_rules_) {
+    if (!filter->AddRule(FilterAction::kInclude, rule.toStdString(),
+                         error_message)) {
+      return false;
+    }
+  }
+  for (const QString& rule : exclude_rules_) {
+    if (!filter->AddRule(FilterAction::kExclude, rule.toStdString(),
+                         error_message)) {
+      return false;
+    }
+  }
+  return true;
+}
+
 bool BackupController::startBackup() {
   if (source_path_.isEmpty() || backup_file_path_.isEmpty()) {
     // 只做“有没有填”的检查；路径是否存在、拓扑是否合法都交给核心判断。
@@ -105,7 +180,16 @@ bool BackupController::startBackup() {
               QStringLiteral("请先填写源目录与备份文件。"));
     return false;
   }
-  return Start(Kind::kBackup, source_path_, backup_file_path_);
+  // 规则只有全部合法才会走到这里（添加时已经验证过），
+  // 这里再编一次是为了把规则随任务一起交给后台线程。
+  Filter filter;
+  std::string filter_error;
+  if (!BuildFilter(&filter, &filter_error)) {
+    SetStatus(QString::fromLatin1(kError), QStringLiteral("规则无效"),
+              QString::fromStdString(filter_error));
+    return false;
+  }
+  return Start(Kind::kBackup, source_path_, backup_file_path_, filter);
 }
 
 bool BackupController::startRestore() {
@@ -114,14 +198,15 @@ bool BackupController::startRestore() {
               QStringLiteral("请先填写备份文件与恢复目录。"));
     return false;
   }
-  return Start(Kind::kRestore, backup_file_path_, restore_path_);
+  // 恢复不需要筛选：归档里有什么就恢复什么，和 CLI 的语义一致。
+  return Start(Kind::kRestore, backup_file_path_, restore_path_, Filter());
 }
 
 // 先置忙再启动线程：QML 收到 busyChanged 之后才会禁用按钮，
 // 顺序反过来的话，线程已经跑起来而界面还允许再点一次。
 // 忙的时候直接返回 false，不排队——界面上的按钮本来就是禁用的。
 bool BackupController::Start(Kind kind, const QString& first_path,
-                             const QString& second_path) {
+                             const QString& second_path, const Filter& filter) {
   if (busy_) {
     // 双保险：QML 侧已经用 busy
     // 禁用了按钮，但快捷键或程序化调用仍可能走到这里。
@@ -133,8 +218,9 @@ bool BackupController::Start(Kind kind, const QString& first_path,
                                   : QStringLiteral("正在恢复……"),
             QStringLiteral("正在复制目录，期间界面仍可正常操作。"));
   // 函数指针 + 值拷贝的参数：后台线程拿到的是自己的副本，不需要加锁。
+  // Filter 按值一起拷进后台任务：后台线程有自己的副本，不需要加锁。
   watcher_.setFuture(QtConcurrent::run(&BackupController::RunOperation, kind,
-                                       first_path, second_path));
+                                       first_path, second_path, filter));
   return true;
 }
 
@@ -143,7 +229,8 @@ bool BackupController::Start(Kind kind, const QString& first_path,
 // QString 到 std::string 走的是 UTF-8，中文路径能原样传给核心。
 OperationOutcome BackupController::RunOperation(Kind kind,
                                                 const QString& first_path,
-                                                const QString& second_path) {
+                                                const QString& second_path,
+                                                const Filter& filter) {
   // 这个函数跑在后台线程：只创建引擎、调一次接口，绝不触碰任何 QML 对象。
   backupproject::BackupEngine engine;
   std::string error_message;
@@ -152,7 +239,7 @@ OperationOutcome BackupController::RunOperation(Kind kind,
 
   OperationOutcome outcome;
   if (kind == Kind::kBackup) {
-    outcome.succeeded = engine.Backup(first, second, &error_message);
+    outcome.succeeded = engine.Backup(first, second, filter, &error_message);
   } else {
     outcome.succeeded = engine.Restore(first, second, &error_message);
   }
