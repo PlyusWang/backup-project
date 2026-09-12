@@ -16,7 +16,6 @@ const char kDarkModeKey[] = "appearance/modern_dark";
 
 // accent 用偏冷的现代蓝：比纯蓝灰一点，长时间看不刺眼，也不照抄任何产品色板。
 // 写调色板时用 Rgb() 而不是 #rrggbb 字符串：拼错了编译期就能发现。
-// 写调色板时用 Rgb() 而不是 #rrggbb 字符串：拼错了编译期就能发现。
 QColor Rgb(int r, int g, int b) { return QColor(r, g, b); }
 
 }  // namespace
@@ -29,7 +28,6 @@ AppTheme::AppTheme(QObject* parent) : QObject(parent) {
   dark_ = settings.value(kDarkModeKey, false).toBool();
 }
 
-// 发一次 changed() 就够了：QML 里所有引用 theme.xxx 的绑定会一起重算。
 // 发一次 changed() 就够了：QML 里所有引用 theme.xxx 的绑定会一起重算。
 void AppTheme::setDark(bool dark) {
   if (dark_ == dark) {
@@ -72,7 +70,6 @@ AppTheme::Palette AppTheme::MakeLightPalette() {
 // 长时间盯着也不累。
 AppTheme::Palette AppTheme::MakeDarkPalette() {
   Palette palette;
-  // 深色不压到纯黑：纯黑配亮蓝会显得刺眼，中性灰更接近现代桌面工具。
   palette.background = Rgb(0x1b, 0x1c, 0x20);
   palette.surface = Rgb(0x23, 0x25, 0x2a);
   palette.surface_elevated = Rgb(0x2a, 0x2c, 0x32);

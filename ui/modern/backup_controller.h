@@ -84,7 +84,6 @@ class BackupController : public QObject {
   bool lastSucceeded() const { return last_succeeded_; }
 
   // busy / status / 三条路径各有独立信号，QML 只订阅自己用到的那些。
-  // busy / status / 三条路径各有独立信号，QML 只订阅自己用到的那些。
  signals:
   void busyChanged();
   void statusChanged();
