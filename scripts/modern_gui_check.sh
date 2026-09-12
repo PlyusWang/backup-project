@@ -10,7 +10,8 @@
 #   2. offscreen 启动自检：QML 运行期告警会让进程自己以非 0 退出。
 #   3. qmllint 静态检查；机器上没装就明确说“跳过”，而不是静默算通过。
 #   4. 几条 grep 断言：资源清单、忙时禁用、拒绝假进度、拒绝网络栈。
-#   5. --self-test 真跑一次备份 + 恢复，再用 diff -r 比对目录树。
+#   5. --self-test 真跑一次打包 + 解包（source -> .bak -> restore），
+#      再用 diff -r 比对目录树，并确认产物是单个普通文件。
 #   6. --path-test：本地路径与 URL 互转（中文、空格、#、%）不丢字符。
 #   7. --close-guard-test：任务进行中关窗被拦下，结束后可以正常退出。
 #
@@ -287,14 +288,20 @@ printf 'binary\000\001\002' > "$WORK_DIR/source/sub/nested.bin"
 set +e
 QT_QPA_PLATFORM=offscreen QSG_RHI_BACKEND=software timeout 120 \
   ./build/backup-gui-modern --self-test \
-  "$WORK_DIR/source" "$WORK_DIR/repo" "$WORK_DIR/restore" >> "$LOG_FILE" 2>&1
+  "$WORK_DIR/source" "$WORK_DIR/backup.bak" "$WORK_DIR/restore" >> "$LOG_FILE" 2>&1
 selftest_status=$?
 set -e
 if [[ "$selftest_status" -eq 0 ]]; then
-  record_pass "--self-test 备份与恢复都成功"
+  record_pass "--self-test 打包与解包都成功"
 else
   record_fail "--self-test 退出码 $selftest_status"
   tail -10 "$LOG_FILE"
+fi
+# 备份产物必须是一个普通归档文件，不能再是"目录里放 data"的老结构。
+if [[ -f "$WORK_DIR/backup.bak" && ! -d "$WORK_DIR/backup.bak" ]]; then
+  record_pass "备份产物是单个普通文件（不是目录）"
+else
+  record_fail "备份产物不是普通文件"
 fi
 # 自测自己说 ok 还不够，必须真的逐文件比对一遍目录树，
 # 确认恢复出来的东西与原始目录一致。
