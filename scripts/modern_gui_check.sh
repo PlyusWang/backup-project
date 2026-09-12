@@ -149,9 +149,11 @@ classify_qmllint() {
     function classify(msg, snippet) {
       # easing.type 这类分组属性 6.4 解析不了，qmllint 会额外报一条
       # Unqualified access；同一行已经由上面的 easing 规则放行，这里一并认掉。
+      # Repeater 委托里的 index / modelData 是委托自己的上下文属性，
+      # qmllint 6.4 不认识它们，同样属于工具局限。
       if (msg ~ /Unqualified access/ &&
           (snippet ~ /theme/ || snippet ~ /controller/ || snippet ~ /useNativeFrame/ ||
-           snippet ~ /easing\./)) {
+           snippet ~ /easing\./ || snippet ~ /modelData/ || snippet ~ /\bindex\b/)) {
         print "ALLOWED\t" msg; return
       }
       if (msg ~ /Cannot defer property assignment to "contentItem"/) {
@@ -250,7 +252,8 @@ fi
 # 和一个主操作按钮，五处都要绑 !controller.busy，忙的时候不能重复点。
 # 这条断言同时防两种退化：漏绑 busy（忙时还能点）和
 # 多出绑定位（复制粘贴出来的多余按钮）。
-expect_count "$QML_DIR/pages/OperationPage.qml" "enabled: !controller.busy" 5 \
+# 两个路径框 + 两个"浏览" + 主按钮 + 筛选规则的输入框与两个添加按钮 = 8 处。
+expect_count "$QML_DIR/pages/OperationPage.qml" "enabled: !controller.busy" 8 \
   "忙碌时禁用输入与按钮"
 
 # 进度显示是最容易“看起来能用、其实是假的”的地方，
@@ -350,6 +353,55 @@ if [[ "$guard_status" -eq 0 ]]; then
   record_pass "忙时关窗被拒绝并给出提示，任务结束后可正常关闭"
 else
   record_fail "关闭守卫行为与预期不符"
+fi
+
+echo "[modern-gui] 8) 文件筛选在 GUI 路径上生效"
+# 界面只负责收集规则文本，解析与匹配都在 C++ Filter 里：
+# 下面先做静态确认，再用 --self-test 走一遍真实控制器路径。
+expect_count_re "$QML_DIR/pages/OperationPage.qml" "controller.addFilterRule" 2 \
+  "Modern GUI 提供 include / exclude 两个添加入口"
+expect_count_re "$QML_DIR/pages/OperationPage.qml" "controller.removeFilterRule" 2 \
+  "Modern GUI 可以删除规则"
+expect_count_re "$ROOT_DIR/ui/desktop/operation_page.cpp" "AddFilterRule" 3 \
+  "Classic GUI 也走同一套规则逻辑"
+expect_count_re "$ROOT_DIR/ui/desktop/operation_page.cpp" "CollectFilterRules" 3 \
+  "Classic GUI 把规则收集后交给核心"
+
+FILTER_DIR="$WORK_DIR/filter-src"
+mkdir -p "$FILTER_DIR/build"
+printf 'cpp\n' > "$FILTER_DIR/a.cpp"
+printf 'log\n' > "$FILTER_DIR/b.log"
+mkfifo "$FILTER_DIR/build/pipe"
+set +e
+QT_QPA_PLATFORM=offscreen QSG_RHI_BACKEND=software \
+  ./build/backup-gui-modern --self-test "$FILTER_DIR" "$WORK_DIR/filter.bak" \
+  "$WORK_DIR/filter-out" --include 'ext:cpp' --exclude 'path:**/build/**' \
+  >> "$LOG_FILE" 2>&1
+filter_status=$?
+set -e
+if [[ "$filter_status" -eq 0 ]]; then
+  record_pass "带筛选的打包 / 解包成功（被剪掉的子树里有 FIFO）"
+else
+  record_fail "带筛选的打包 / 解包失败（退出码 $filter_status）"
+  tail -10 "$LOG_FILE"
+fi
+if [[ -f "$WORK_DIR/filter-out/a.cpp" && ! -e "$WORK_DIR/filter-out/b.log" \
+      && ! -e "$WORK_DIR/filter-out/build" ]]; then
+  record_pass "筛选结果正确：只保留 a.cpp"
+else
+  record_fail "筛选结果不符合预期"
+  find "$WORK_DIR/filter-out" -mindepth 1 | sed 's/^/      /'
+fi
+set +e
+QT_QPA_PLATFORM=offscreen QSG_RHI_BACKEND=software \
+  ./build/backup-gui-modern --self-test "$FILTER_DIR" "$WORK_DIR/bad.bak" \
+  "$WORK_DIR/bad-out" --include 'bogus:x' >> "$LOG_FILE" 2>&1
+bad_status=$?
+set -e
+if [[ "$bad_status" -ne 0 && ! -e "$WORK_DIR/bad.bak" ]]; then
+  record_pass "非法规则在 GUI 路径上同样被拒绝，且不留归档"
+else
+  record_fail "非法规则没有被正确拒绝（退出码 $bad_status）"
 fi
 
 echo "[modern-gui] 通过 $PASS_COUNT 项，失败 $FAIL_COUNT 项"
