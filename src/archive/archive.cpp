@@ -294,6 +294,12 @@ class ArchiveOutput {
                  Describe(errno, "Failed to patch archive header", path_));
         return false;
       }
+      if (written == 0) {
+        // pwrite 返回 0 时 remaining 永远不会减少，循环就成了死循环。
+        // 和 Write() 一样，把这种情况当成明确的失败。
+        SetError(error_message, "Short write to archive header: " + path_);
+        return false;
+      }
       cursor += written;
       remaining -= static_cast<std::size_t>(written);
       position += static_cast<std::uint64_t>(written);
@@ -385,10 +391,21 @@ bool WriteGlobalHeader(ArchiveOutput* output, std::string* error_message) {
 }
 
 // 写一条 entry 的 header + path，并让 entry_count 加一。
+// 路径语法校验写侧也要用，而它的定义在读侧那一段，所以先声明一次。
+bool ValidateArchivePath(const std::string& path, bool is_first_entry,
+                         std::uint8_t type, std::string* error_message);
+
 bool WriteEntryPrefix(ArchiveOutput* output, std::uint8_t type,
                       const std::string& archive_path,
                       const EntryMetadata& metadata, std::uint64_t payload_size,
                       std::uint64_t* entry_count, std::string* error_message) {
+  // 写之前先用读侧那一套规则校验一遍路径，保证"写侧能产出"蕴含"读侧能接受"。
+  // 这里的 is_first_entry 用 entry_count 判断：第一条永远是 source root。
+  if (!ValidateArchivePath(archive_path, *entry_count == 0, type,
+                           error_message)) {
+    return false;
+  }
+
   std::string header;
   BuildEntryHeader(type, static_cast<std::uint32_t>(archive_path.size()),
                    metadata, payload_size, &header);
@@ -408,7 +425,11 @@ bool WriteEntryPrefix(ArchiveOutput* output, std::uint8_t type,
 
 // 普通文件的 payload 必须流式照抄：固定 64 KiB 缓冲，绝不把文件读进内存。
 bool WriteFilePayload(ArchiveOutput* output, const std::string& disk_path,
-                      std::uint64_t expected_size, std::string* error_message) {
+                      const struct stat& initial_info,
+                      std::string* error_message) {
+  // 以打包开始时那次 stat 为准：读完再和它逐项比（见函数末尾）。
+  const std::uint64_t expected_size =
+      static_cast<std::uint64_t>(initial_info.st_size);
   const int raw_fd = ::open(disk_path.c_str(), O_RDONLY);
   if (raw_fd < 0) {
     SetError(error_message,
@@ -448,15 +469,22 @@ bool WriteFilePayload(ArchiveOutput* output, const std::string& disk_path,
   //   * 读取循环以初始 stat 的 size 为准，读不满就是源文件被截短了；
   //   * 读满之后还要再 fstat 一次，确认文件没有在读取过程中被改写。
   //
-  // 再 fstat 一次：size 或 mtime 与开始时不同，说明文件在打包过程中被改过，
-  // 归档里这份内容不可信，直接失败。v0.1 不做快照，只是不假装成功。
+  // 再 fstat 一次，和开始时的 stat 逐项比较：size、mtime 秒、mtime 纳秒。
+  // 只比 size 是不够的——等长覆盖（原地改几个字节、长度不变）不会改变
+  // st_size，但内容和 mtime 都变了，那种归档不能被报告成成功。
+  // v0.1 不做快照，只是不假装成功。
   struct stat after;
   if (::fstat(source.get(), &after) != 0) {
     SetError(error_message,
              Describe(errno, "Failed to re-inspect source file", disk_path));
     return false;
   }
-  if (static_cast<std::uint64_t>(after.st_size) != expected_size) {
+  const bool size_changed =
+      static_cast<std::uint64_t>(after.st_size) != expected_size;
+  const bool mtime_changed =
+      after.st_mtim.tv_sec != initial_info.st_mtim.tv_sec ||
+      after.st_mtim.tv_nsec != initial_info.st_mtim.tv_nsec;
+  if (size_changed || mtime_changed) {
     SetError(error_message, "Source file changed while packing: " + disk_path);
     return false;
   }
@@ -479,7 +507,7 @@ bool WriteRegularFileEntry(ArchiveOutput* output, const std::string& disk_path,
                         payload_size, entry_count, error_message)) {
     return false;
   }
-  return WriteFilePayload(output, disk_path, payload_size, error_message);
+  return WriteFilePayload(output, disk_path, info, error_message);
 }
 
 // 递归写目录：先写目录自己的 entry（这样读侧能拿到目录的 mode / mtime），
@@ -579,14 +607,19 @@ struct ParsedEntry {
   std::uint64_t payload_offset = 0;
 };
 
-// 归档内路径的合法性。v0.1 只接受相对路径，分隔符固定 '/'。
+// 归档内路径的语法校验：写侧和读侧共用这一份实现。
+// v0.1 只接受相对路径，分隔符固定 '/'。
+//
+// 共用不是"顺手抽象"：Linux 允许文件名里出现反斜杠，也允许 C:note.txt
+// 这种形状，而归档格式不接受它们。如果只有读侧检查，写侧就会产出
+// "自己刚写的包自己读不回来"的归档——备份工具的失败方式里最不该有这一种。
 //
 // 这是防 path traversal 的第一道闸，也是整个读侧最要紧的一段判断：
 // 恢复时的目标路径是 destination + 归档内路径拼接出来的，只要归档里能出现
 // ".."、绝对路径或者空 component，拼接结果就可能跑到 destination 之外。
 // 与其在拼接的时候做归一化（那要处理软链接、大小写、符号等价等一堆情况），
 // 不如在这里就把这类路径判死：合法的归档根本不需要它们。
-bool ValidateArchivePath(const std::string& path, std::uint64_t index,
+bool ValidateArchivePath(const std::string& path, bool is_first_entry,
                          std::uint8_t type, std::string* error_message) {
   if (path.empty()) {
     SetError(error_message, "Invalid archive path: empty path");
@@ -620,7 +653,7 @@ bool ValidateArchivePath(const std::string& path, std::uint64_t index,
   }
   if (path == ".") {
     // "." 代表 source root 本身，只允许作为第一条 entry，而且必须是目录。
-    if (index != 0 || type != kTypeDirectory) {
+    if (!is_first_entry || type != kTypeDirectory) {
       SetError(error_message, "Invalid root entry in archive");
       return false;
     }
@@ -806,7 +839,7 @@ bool PreflightArchive(int fd, const std::string& archive_path,
     }
     position += path_length;
 
-    if (!ValidateArchivePath(entry_path, index, type, error_message)) {
+    if (!ValidateArchivePath(entry_path, index == 0, type, error_message)) {
       return false;
     }
     if (entry_types.find(entry_path) != entry_types.end()) {

@@ -2,7 +2,8 @@
 //
 // Sprint 1 的本地文件系统层：路径检查、建目录、递归复制目录树、
 // 逐字节复制普通文件都在这里。只认普通目录和普通文件，软链接、FIFO、
-// 设备、socket 一律明确拒绝；元数据（权限、属主、时间戳）v0.1 不保存。
+// 设备、socket 一律明确拒绝；权限与时间戳的保存由归档层负责
+// （见 docs/format/archive_v0.1.md），这一层只提供文件系统原语。
 
 #ifndef BACKUP_PROJECT_INCLUDE_FILE_SYSTEM_H_
 #define BACKUP_PROJECT_INCLUDE_FILE_SYSTEM_H_

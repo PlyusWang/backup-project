@@ -536,6 +536,12 @@ def build(case):
     if case == "path_deep_dotdot":
         return (global_header(2) + entry(DIRECTORY, ".") +
                 entry(REGULAR, "../../escape", b"x"))
+    if case == "path_backslash":
+        return (global_header(2) + entry(DIRECTORY, ".") +
+                entry(REGULAR, "a\\b.txt", b"x"))
+    if case == "path_drive_letter":
+        return (global_header(2) + entry(DIRECTORY, ".") +
+                entry(REGULAR, "C:note.txt", b"x"))
     if case == "path_mid_dotdot":
         return (global_header(2) + entry(DIRECTORY, ".") +
                 entry(REGULAR, "foo/../bar", b"x"))
@@ -924,6 +930,48 @@ else
   record_fail "NOCMP-04 all-zero payload does not shrink" \
     "archive $ZERO_ARCHIVE_BYTES <= payload $ZERO_BYTES"
 fi
+
+# ---- J. SYM：Writer / Reader 的路径规则必须对称 -----------------------
+
+echo "[test] J. writer and reader path rules are symmetric"
+# Linux 允许文件名里出现反斜杠，也允许 "C:note.txt" 这种形状；归档格式
+# （Archive v0.1）两者都不接受。写侧必须和读侧用同一套判断，否则会出现
+# "备份成功、恢复失败"——自己刚写出来的包自己读不回来。
+mkdir -p "$TEST_ROOT/sym/backslash"
+printf 'x\n' > "$TEST_ROOT/sym/backslash/a\\b.txt"
+expect_failure "SYM-01 filename with a backslash is rejected by the writer" 1 \
+  "Invalid archive path" \
+  backup "$TEST_ROOT/sym/backslash" "$TEST_ROOT/sym/sym01.bak"
+expect_path_absent "SYM-01b rejected backup left no archive" \
+  "$TEST_ROOT/sym/sym01.bak"
+
+mkdir -p "$TEST_ROOT/sym/drive"
+printf 'x\n' > "$TEST_ROOT/sym/drive/C:note.txt"
+expect_failure "SYM-02 drive-letter style filename is rejected by the writer" 1 \
+  "Invalid archive path" \
+  backup "$TEST_ROOT/sym/drive" "$TEST_ROOT/sym/sym02.bak"
+expect_path_absent "SYM-02b rejected backup left no archive" \
+  "$TEST_ROOT/sym/sym02.bak"
+
+# 判的是归档内路径，不只是根目录下的名字：嵌一层同样要拒。
+mkdir -p "$TEST_ROOT/sym/nested/sub"
+printf 'x\n' > "$TEST_ROOT/sym/nested/sub/a\\b.txt"
+expect_failure "SYM-03 nested backslash path is rejected by the writer" 1 \
+  "Invalid archive path" \
+  backup "$TEST_ROOT/sym/nested" "$TEST_ROOT/sym/sym03.bak"
+expect_path_absent "SYM-03b rejected backup left no archive" \
+  "$TEST_ROOT/sym/sym03.bak"
+
+# 反向对照：同样的形状由手工样本喂给读侧，读侧给出同一类拒绝信息。
+# 两边一致，才说明校验规则真的只有一份。
+python3 "$ARCHIVE_TOOL" path_backslash "$TEST_ROOT/sym/sym04.bak"
+expect_failure "SYM-04 reader rejects a backslash path with the same rule" 1 \
+  "Invalid archive path" \
+  restore "$TEST_ROOT/sym/sym04.bak" "$TEST_ROOT/sym/sym04-out"
+python3 "$ARCHIVE_TOOL" path_drive_letter "$TEST_ROOT/sym/sym05.bak"
+expect_failure "SYM-05 reader rejects a drive-letter path with the same rule" 1 \
+  "Invalid archive path" \
+  restore "$TEST_ROOT/sym/sym05.bak" "$TEST_ROOT/sym/sym05-out"
 
 # ---- CLI 约定 --------------------------------------------------------
 
