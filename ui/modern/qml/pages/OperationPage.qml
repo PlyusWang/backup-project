@@ -77,7 +77,9 @@ Item {
                         enabled: !controller.busy
                         onClicked: {
                             page.targetField = 0
-                            folderDialog.currentFolder = page.isBackup ? controller.sourcePath : controller.repositoryPath
+                            const current = page.isBackup ? controller.sourcePath
+                                                         : controller.repositoryPath
+                            folderDialog.currentFolder = controller.directoryDialogStartUrl(current)
                             folderDialog.open()
                         }
                     }
@@ -113,7 +115,9 @@ Item {
                         enabled: !controller.busy
                         onClicked: {
                             page.targetField = 1
-                            folderDialog.currentFolder = page.isBackup ? controller.repositoryPath : controller.restorePath
+                            const current = page.isBackup ? controller.repositoryPath
+                                                         : controller.restorePath
+                            folderDialog.currentFolder = controller.directoryDialogStartUrl(current)
                             folderDialog.open()
                         }
                     }
@@ -179,8 +183,11 @@ Item {
         id: folderDialog
         title: "选择目录"
         onAccepted: {
-            var path = folderDialog.selectedFolder.toString()
-            path = path.replace(/^file:\/\//, "")
+            // 转换交给 QUrl::toLocalFile()：中文、空格、# 与 % 都能原样还原；
+            // 手写去掉 file:// 前缀会把 percent-encoding 留在路径里。
+            const path = controller.localPathFromUrl(folderDialog.selectedFolder)
+            if (path === "")
+                return
             if (page.targetField === 0) {
                 if (page.isBackup)
                     controller.sourcePath = path

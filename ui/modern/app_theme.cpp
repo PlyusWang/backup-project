@@ -24,9 +24,6 @@ QColor Rgb(int r, int g, int b) { return QColor(r, g, b); }
 // 读上次的选择，读不到就用浅色。
 // 这里不跟随桌面环境的深浅色设置：6.4.2 上要拿到这个信息得多引一层依赖，
 // 而工具本身的主题选择是可以记住的，下次启动沿用即可。
-// 读上次的选择，读不到就用浅色。
-// 这里不跟随桌面环境的深浅色设置：6.4.2 上要拿到这个信息得多引一层依赖，
-// 而工具本身的主题选择是可以记住的，下次启动沿用即可。
 AppTheme::AppTheme(QObject* parent) : QObject(parent) {
   QSettings settings;
   dark_ = settings.value(kDarkModeKey, false).toBool();
@@ -46,8 +43,6 @@ void AppTheme::setDark(bool dark) {
 
 void AppTheme::toggle() { setDark(!dark_); }
 
-// 浅色不是纯白打底：窗口给一点冷灰，白卡片才能靠明度差自然浮起来，
-// 也不至于在显示器上白得发晃。
 // 浅色不是纯白打底：窗口给一点冷灰，白卡片才能靠明度差自然浮起来，
 // 也不至于在显示器上白得发晃。
 AppTheme::Palette AppTheme::MakeLightPalette() {
@@ -73,8 +68,6 @@ AppTheme::Palette AppTheme::MakeLightPalette() {
   return palette;
 }
 
-// 深色不压到纯黑：纯黑配亮蓝会显得刺眼，中性灰更接近现代桌面工具，
-// 长时间盯着也不累。
 // 深色不压到纯黑：纯黑配亮蓝会显得刺眼，中性灰更接近现代桌面工具，
 // 长时间盯着也不累。
 AppTheme::Palette AppTheme::MakeDarkPalette() {

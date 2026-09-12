@@ -5,7 +5,9 @@
 
 #include "backup_controller.h"
 
+#include <QDir>
 #include <QEventLoop>
+#include <QFileInfo>
 #include <QTimer>
 #include <QtConcurrent/QtConcurrentRun>
 #include <string>
@@ -49,8 +51,6 @@ BackupController::BackupController(QObject* parent) : QObject(parent) {
 
 // 相等就不发信号：QML 的双向绑定会把输入框的值再写回来一次，
 // 少了这个判断会来回触发，形成绑定环。
-// 相等就不发信号：QML 的双向绑定会把输入框的值再写回来一次，
-// 少了这个判断会来回触发，形成绑定环。
 void BackupController::setSourcePath(const QString& path) {
   if (source_path_ == path) {
     return;
@@ -77,6 +77,20 @@ void BackupController::setRestorePath(const QString& path) {
   emit restorePathChanged();
 }
 
+QString BackupController::localPathFromUrl(const QUrl& url) const {
+  // 非本地 URL（远端、qrc 等）返回空串，由调用方决定怎么办，
+  // 而不是硬拼出一个看起来像路径的字符串。
+  return url.isLocalFile() ? url.toLocalFile() : QString();
+}
+
+QUrl BackupController::directoryDialogStartUrl(const QString& path) const {
+  const QFileInfo info(path);
+  if (path.isEmpty() || !info.exists() || !info.isDir()) {
+    return QUrl::fromLocalFile(QDir::homePath());
+  }
+  return QUrl::fromLocalFile(path);
+}
+
 bool BackupController::startBackup() {
   if (source_path_.isEmpty() || repository_path_.isEmpty()) {
     // 只做“有没有填”的检查；路径是否存在、拓扑是否合法都交给核心判断。
@@ -99,9 +113,6 @@ bool BackupController::startRestore() {
 // 先置忙再启动线程：QML 收到 busyChanged 之后才会禁用按钮，
 // 顺序反过来的话，线程已经跑起来而界面还允许再点一次。
 // 忙的时候直接返回 false，不排队——界面上的按钮本来就是禁用的。
-// 先置忙再启动线程：QML 收到 busyChanged 之后才会禁用按钮，
-// 顺序反过来的话，线程已经跑起来而界面还允许再点一次。
-// 忙的时候直接返回 false，不排队——界面上的按钮本来就是禁用的。
 bool BackupController::Start(Kind kind, const QString& first_path,
                              const QString& second_path) {
   if (busy_) {
@@ -120,9 +131,6 @@ bool BackupController::Start(Kind kind, const QString& first_path,
   return true;
 }
 
-// 每次调用都新建一个 BackupEngine：核心没有全局状态，
-// 一个任务一个实例最省心，也不存在后台线程共享对象的问题。
-// QString 到 std::string 走的是 UTF-8，中文路径能原样传给核心。
 // 每次调用都新建一个 BackupEngine：核心没有全局状态，
 // 一个任务一个实例最省心，也不存在后台线程共享对象的问题。
 // QString 到 std::string 走的是 UTF-8，中文路径能原样传给核心。
@@ -167,8 +175,6 @@ void BackupController::SetStatus(const QString& kind, const QString& title,
 
 // 用户一动输入就把上一次的结果提示收回去；任务进行中不清，
 // 否则会把“正在备份”这条提示提前抹掉。
-// 用户一动输入就把上一次的结果提示收回去；任务进行中不清，
-// 否则会把“正在备份”这条提示提前抹掉。
 void BackupController::clearStatus() {
   if (busy_) {
     return;
@@ -176,8 +182,6 @@ void BackupController::clearStatus() {
   SetStatus(QString::fromLatin1(kIdle), QStringLiteral("等待操作"), QString());
 }
 
-// busyChanged 先到就立即返回；超时则返回 false，让调用方知道任务可能还在跑。
-// --self-test 用它替代 QML 的事件循环，不起窗口也能等任务结束。
 // busyChanged 先到就立即返回；超时则返回 false，让调用方知道任务可能还在跑。
 // --self-test 用它替代 QML 的事件循环，不起窗口也能等任务结束。
 bool BackupController::waitForIdle(int timeout_ms) {
