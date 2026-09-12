@@ -54,6 +54,14 @@ class FileSystem {
   bool CopyTree(const std::string& source, const std::string& destination,
                 std::string* error_message);
 
+  // destination 是否在 source 外面（既不相等也不在其下）。发布成公开接口
+  // 是为了让归档写入复用同一套拓扑判断：归档文件同样不能落在源目录里面。
+  // 逐段比较规范化后的路径组件，不用字符串前缀，避免 /tmp/a 与 /tmp/abc
+  // 被误判成父子关系。
+  bool IsDestinationOutsideSource(const std::string& source,
+                                  const std::string& destination,
+                                  std::string* error_message);
+
  private:
   // 复制单个普通文件：短读、半写和 EINTR 这些 POSIX 坑在实现里兜住。
   bool CopyRegularFile(const std::string& source,
@@ -65,12 +73,6 @@ class FileSystem {
   bool CopyTreeInternal(const std::string& source,
                         const std::string& destination,
                         std::string* error_message);
-
-  // 检查 destination 是否在 source 外面（既不相等也不在其下）：逐段比较
-  // 规范化后的路径组件，不用字符串前缀，避免 /tmp/a 与 /tmp/abc 被误判。
-  bool IsDestinationOutsideSource(const std::string& source,
-                                  const std::string& destination,
-                                  std::string* error_message);
 };
 
 }  // namespace backupproject
