@@ -3,7 +3,7 @@
 // 现代 QML GUI 的入口。除正常启动外还带几个开发期开关：
 //   --smoke-test                        建引擎、建窗口、切页、换主题后退出
 //   --screenshot <目录>                 三个页面 × 两套主题渲染成 PNG
-//   --self-test <源> <仓库> <恢复目录>   真跑一次备份 + 恢复并报告结果
+//   --self-test <源> <备份文件> <恢复目录>   真跑一次打包 + 解包并报告结果
 //   --path-test                         验证本地路径与 URL 互转不丢字符
 //   --close-guard-test                  验证任务进行中关窗会被拦下
 //   --native-frame                      退回系统原生标题栏（Wayland 兜底）
@@ -112,12 +112,16 @@ int CaptureScreenshots(QQuickWindow* window, backup_modern::AppTheme* theme,
 
 // 它验的是桥加核心这一整条链路：先备份再恢复，任何一步失败
 // 就把核心的原文错误打到 stderr 并以非 0 退出。
+// --self-test 走的是和界面完全相同的控制器路径：source 目录打成一个
+// .bak，再从那个 .bak 恢复到目标目录。任何一步失败都直接以非 0 退出，
+// 所以它可以被脚本当作"桥 + 核心 + 归档"整条链路的冒烟测试。
+//
 // --self-test：命令行下没有 QML 绑定，用控制器自带的状态等待任务结束。
 int RunSelfTest(backup_modern::BackupController* controller,
-                const QString& source, const QString& repository,
+                const QString& source, const QString& archive_file,
                 const QString& destination) {
   controller->setSourcePath(source);
-  controller->setRepositoryPath(repository);
+  controller->setBackupFilePath(archive_file);
   controller->setRestorePath(destination);
 
   if (!controller->startBackup() || !controller->waitForIdle(600000) ||
@@ -200,7 +204,7 @@ int RunCloseGuardTest(QQuickWindow* window,
                       backup_modern::BackupController* controller) {
   QTemporaryDir dir;
   const QString source = dir.filePath(QStringLiteral("source"));
-  const QString repository = dir.filePath(QStringLiteral("repo"));
+  const QString archive = dir.filePath(QStringLiteral("backup.bak"));
   if (!dir.isValid() || !QDir().mkpath(source)) {
     std::fprintf(stderr, "临时目录创建失败\n");
     return 1;
@@ -214,7 +218,7 @@ int RunCloseGuardTest(QQuickWindow* window,
   }
 
   controller->setSourcePath(source);
-  controller->setRepositoryPath(repository);
+  controller->setBackupFilePath(archive);
   if (!controller->startBackup() || !controller->busy()) {
     std::fprintf(stderr, "FAIL 备份没有启动起来\n");
     return 1;
@@ -312,7 +316,7 @@ int main(int argc, char* argv[]) {
   if (self_test_index >= 0) {
     if (self_test_index + 3 >= arguments.size()) {
       std::fprintf(
-          stderr, "--self-test 需要三个参数: <源目录> <备份仓库> <恢复目录>\n");
+          stderr, "--self-test 需要三个参数: <源目录> <备份文件> <恢复目录>\n");
       return 2;
     }
     return RunSelfTest(&controller, arguments.at(self_test_index + 1),

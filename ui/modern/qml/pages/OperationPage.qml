@@ -34,7 +34,7 @@ Item {
         }
 
         Text {
-            text: page.isBackup ? "把一个目录完整备份到指定仓库。" : "从备份仓库恢复目录树。"
+            text: page.isBackup ? "把一个目录打包成一个备份文件。" : "从备份文件恢复目录树。"
             font.pixelSize: 13
             color: theme.textSecondary
             Layout.topMargin: -8
@@ -49,7 +49,7 @@ Item {
                 spacing: 6
 
                 Text {
-                    text: page.isBackup ? "源目录" : "备份仓库"
+                    text: page.isBackup ? "源目录" : "备份文件"
                     font.pixelSize: 12
                     font.weight: Font.DemiBold
                     color: theme.textSecondary
@@ -63,12 +63,12 @@ Item {
                         Layout.fillWidth: true
                         enabled: !controller.busy
                         placeholderText: "可直接输入路径，也可以点击“浏览”"
-                        text: page.isBackup ? controller.sourcePath : controller.repositoryPath
+                        text: page.isBackup ? controller.sourcePath : controller.backupFilePath
                         onTextEdited: {
                             if (page.isBackup)
                                 controller.sourcePath = text
                             else
-                                controller.repositoryPath = text
+                                controller.backupFilePath = text
                         }
                     }
 
@@ -77,16 +77,19 @@ Item {
                         enabled: !controller.busy
                         onClicked: {
                             page.targetField = 0
-                            const current = page.isBackup ? controller.sourcePath
-                                                         : controller.repositoryPath
-                            folderDialog.currentFolder = controller.directoryDialogStartUrl(current)
-                            folderDialog.open()
+                            if (page.isBackup) {
+                                folderDialog.currentFolder = controller.directoryDialogStartUrl(controller.sourcePath)
+                                folderDialog.open()
+                            } else {
+                                fileDialog.currentFile = controller.fileDialogStartUrl(controller.backupFilePath)
+                                fileDialog.open()
+                            }
                         }
                     }
                 }
 
                 Text {
-                    text: page.isBackup ? "备份仓库" : "恢复目录"
+                    text: page.isBackup ? "备份文件" : "恢复目录"
                     font.pixelSize: 12
                     font.weight: Font.DemiBold
                     color: theme.textSecondary
@@ -101,10 +104,10 @@ Item {
                         Layout.fillWidth: true
                         enabled: !controller.busy
                         placeholderText: "可直接输入路径，也可以点击“浏览”"
-                        text: page.isBackup ? controller.repositoryPath : controller.restorePath
+                        text: page.isBackup ? controller.backupFilePath : controller.restorePath
                         onTextEdited: {
                             if (page.isBackup)
-                                controller.repositoryPath = text
+                                controller.backupFilePath = text
                             else
                                 controller.restorePath = text
                         }
@@ -115,10 +118,13 @@ Item {
                         enabled: !controller.busy
                         onClicked: {
                             page.targetField = 1
-                            const current = page.isBackup ? controller.repositoryPath
-                                                         : controller.restorePath
-                            folderDialog.currentFolder = controller.directoryDialogStartUrl(current)
-                            folderDialog.open()
+                            if (page.isBackup) {
+                                fileDialog.currentFile = controller.fileDialogStartUrl(controller.backupFilePath)
+                                fileDialog.open()
+                            } else {
+                                folderDialog.currentFolder = controller.directoryDialogStartUrl(controller.restorePath)
+                                folderDialog.open()
+                            }
                         }
                     }
                 }
@@ -177,29 +183,45 @@ Item {
         Item { Layout.fillHeight: true }
     }
 
-    // 目录选择器只负责“帮忙填”：选完之后输入框仍然可以手改，
-    // 因为备份仓库允许是一个还不存在的路径，不能被选择器限制住。
+    // 选择器只负责“帮忙填”：选完之后输入框仍然可以手改，
+    // 因为备份文件允许是一个还不存在的路径，不能被选择器限制住。
+    // 两个对话框都走这一个函数，省得把“填哪个字段”的分支写两遍。
+    function applyChosenPath(path) {
+        if (path === "")
+            return
+        if (targetField === 0) {
+            if (isBackup)
+                controller.sourcePath = path
+            else
+                controller.backupFilePath = path
+        } else {
+            if (isBackup)
+                controller.backupFilePath = path
+            else
+                controller.restorePath = path
+        }
+        controller.clearStatus()
+    }
+
     FolderDialog {
         id: folderDialog
         title: "选择目录"
         onAccepted: {
             // 转换交给 QUrl::toLocalFile()：中文、空格、# 与 % 都能原样还原；
             // 手写去掉 file:// 前缀会把 percent-encoding 留在路径里。
-            const path = controller.localPathFromUrl(folderDialog.selectedFolder)
-            if (path === "")
-                return
-            if (page.targetField === 0) {
-                if (page.isBackup)
-                    controller.sourcePath = path
-                else
-                    controller.repositoryPath = path
-            } else {
-                if (page.isBackup)
-                    controller.repositoryPath = path
-                else
-                    controller.restorePath = path
-            }
-            controller.clearStatus()
+            page.applyChosenPath(controller.localPathFromUrl(folderDialog.selectedFolder))
+        }
+    }
+
+    // 归档文件用文件对话框：备份页是“另存为”，恢复页是“打开”。
+    // selectedFile 同样是 URL，转换复用同一个 helper。
+    FileDialog {
+        id: fileDialog
+        title: "选择备份文件"
+        fileMode: page.isBackup ? FileDialog.SaveFile : FileDialog.OpenFile
+        nameFilters: ["Backup files (*.bak)", "All files (*)"]
+        onAccepted: {
+            page.applyChosenPath(controller.localPathFromUrl(fileDialog.selectedFile))
         }
     }
 }
