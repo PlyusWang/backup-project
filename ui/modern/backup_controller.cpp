@@ -60,12 +60,12 @@ void BackupController::setSourcePath(const QString& path) {
   emit sourcePathChanged();
 }
 
-void BackupController::setRepositoryPath(const QString& path) {
-  if (repository_path_ == path) {
+void BackupController::setBackupFilePath(const QString& path) {
+  if (backup_file_path_ == path) {
     return;
   }
-  repository_path_ = path;
-  emit repositoryPathChanged();
+  backup_file_path_ = path;
+  emit backupFilePathChanged();
 }
 
 void BackupController::setRestorePath(const QString& path) {
@@ -82,6 +82,14 @@ QString BackupController::localPathFromUrl(const QUrl& url) const {
   return url.isLocalFile() ? url.toLocalFile() : QString();
 }
 
+QUrl BackupController::fileDialogStartUrl(const QString& path) const {
+  // 保存归档时目标文件通常还不存在，所以这里不能像目录版那样要求路径存在。
+  if (path.isEmpty()) {
+    return QUrl::fromLocalFile(QDir::homePath());
+  }
+  return QUrl::fromLocalFile(path);
+}
+
 QUrl BackupController::directoryDialogStartUrl(const QString& path) const {
   const QFileInfo info(path);
   if (path.isEmpty() || !info.exists() || !info.isDir()) {
@@ -91,22 +99,22 @@ QUrl BackupController::directoryDialogStartUrl(const QString& path) const {
 }
 
 bool BackupController::startBackup() {
-  if (source_path_.isEmpty() || repository_path_.isEmpty()) {
+  if (source_path_.isEmpty() || backup_file_path_.isEmpty()) {
     // 只做“有没有填”的检查；路径是否存在、拓扑是否合法都交给核心判断。
     SetStatus(QString::fromLatin1(kError), QStringLiteral("操作失败"),
-              QStringLiteral("请先填写源目录与备份仓库。"));
+              QStringLiteral("请先填写源目录与备份文件。"));
     return false;
   }
-  return Start(Kind::kBackup, source_path_, repository_path_);
+  return Start(Kind::kBackup, source_path_, backup_file_path_);
 }
 
 bool BackupController::startRestore() {
-  if (repository_path_.isEmpty() || restore_path_.isEmpty()) {
+  if (backup_file_path_.isEmpty() || restore_path_.isEmpty()) {
     SetStatus(QString::fromLatin1(kError), QStringLiteral("操作失败"),
-              QStringLiteral("请先填写备份仓库与恢复目录。"));
+              QStringLiteral("请先填写备份文件与恢复目录。"));
     return false;
   }
-  return Start(Kind::kRestore, repository_path_, restore_path_);
+  return Start(Kind::kRestore, backup_file_path_, restore_path_);
 }
 
 // 先置忙再启动线程：QML 收到 busyChanged 之后才会禁用按钮，

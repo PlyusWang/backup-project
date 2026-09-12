@@ -1,7 +1,8 @@
 // operation_page.h
 //
 // 备份页和恢复页的控件结构完全一样：两个路径输入 + 一个主按钮 + 状态卡片，
-// 区别只有文案和最终调用的引擎方法，所以合成一个类，用 OperationKind 区分。
+// 区别只有文案、哪个字段是归档文件、以及最终调用的引擎方法，
+// 所以合成一个类，用 OperationKind 区分。
 // 这样避免两份几乎逐行重复的页面代码，也没有引入“Controller/Service”之类的层级。
 
 #ifndef BACKUP_PROJECT_UI_DESKTOP_OPERATION_PAGE_H_
@@ -66,7 +67,14 @@ class OperationPage : public QWidget {
   static OperationResult RunOperation(const OperationRequest& request);
 
   void BuildLayout();
-  void ChooseDirectory(QLineEdit* target);
+  // 两种字段用两种对话框：目录字段选目录，归档文件字段按操作类型
+  // 走"另存"（备份）或"打开"（恢复）。
+  void ChoosePath(int field_index);
+  // 备份页的第二个字段、恢复页的第一个字段是归档文件，其余是目录。
+  bool IsFileField(int field_index) const {
+    return kind_ == OperationKind::kBackup ? field_index == 1
+                                           : field_index == 0;
+  }
   void StartOperation();
   void SetStatus(StatusKind kind, const QString& title, const QString& message);
   void ApplyStatusColors();

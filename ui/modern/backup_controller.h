@@ -39,8 +39,8 @@ class BackupController : public QObject {
   // 点“浏览”选完目录也会写回这里，控制器只负责原样保存。
   Q_PROPERTY(QString sourcePath READ sourcePath WRITE setSourcePath NOTIFY
                  sourcePathChanged)
-  Q_PROPERTY(QString repositoryPath READ repositoryPath WRITE setRepositoryPath
-                 NOTIFY repositoryPathChanged)
+  Q_PROPERTY(QString backupFilePath READ backupFilePath WRITE setBackupFilePath
+                 NOTIFY backupFilePathChanged)
   Q_PROPERTY(QString restorePath READ restorePath WRITE setRestorePath NOTIFY
                  restorePathChanged)
 
@@ -56,8 +56,8 @@ class BackupController : public QObject {
 
   QString sourcePath() const { return source_path_; }
   void setSourcePath(const QString& path);
-  QString repositoryPath() const { return repository_path_; }
-  void setRepositoryPath(const QString& path);
+  QString backupFilePath() const { return backup_file_path_; }
+  void setBackupFilePath(const QString& path);
   QString restorePath() const { return restore_path_; }
   void setRestorePath(const QString& path);
 
@@ -65,10 +65,15 @@ class BackupController : public QObject {
   // 这里只信 QUrl::toLocalFile()：percent-encoding（%20、%E4%B8%AD）和 #
   // 这类字符靠手写字符串处理还原必然出错，URL 解析也不该由 QML 自己实现。
   Q_INVOKABLE QString localPathFromUrl(const QUrl& url) const;
-  // 反向：对话框的 currentFolder 是 URL，起始位置由本地路径转过去。
+  // 反向：对话框的 currentFolder / currentFile 是
+  // URL，起始位置由本地路径转过去。
   // 路径为空、不存在或不是目录时回退到主目录；这个回退只决定对话框从哪里
-  // 打开，不会写回路径字段，所以用户照样可以手工输入尚不存在的仓库路径。
+  // 打开，不会写回路径字段，所以用户照样可以手工输入尚不存在的备份文件路径。
   Q_INVOKABLE QUrl directoryDialogStartUrl(const QString& path) const;
+  // 归档文件对话框的起始位置。和目录版刻意不同：这里不检查路径是否存在，
+  // 只要非空就原样转成 URL——"另存为"本来就要允许一个还不存在的文件名，
+  // Qt 会把路径最后一段当成预填的文件名。
+  Q_INVOKABLE QUrl fileDialogStartUrl(const QString& path) const;
   // 供 QML 的按钮调用：返回 false 表示这次点击没有启动任务（busy 或输入为空）。
   Q_INVOKABLE bool startBackup();
   Q_INVOKABLE bool startRestore();
@@ -88,7 +93,7 @@ class BackupController : public QObject {
   void busyChanged();
   void statusChanged();
   void sourcePathChanged();
-  void repositoryPathChanged();
+  void backupFilePathChanged();
   void restorePathChanged();
   // 任务结束时发一次，附带结果，便于 QML 或测试代码做后续动作。
   void operationFinished(bool succeeded);
@@ -109,7 +114,7 @@ class BackupController : public QObject {
 
   // 界面状态：路径、忙碌标记、状态卡片文案。只在 GUI 线程访问。
   QString source_path_;
-  QString repository_path_;
+  QString backup_file_path_;
   QString restore_path_;
   // busy_ 是界面唯一的“正在干活”依据：按钮禁用、输入框禁用、
   // 进度条动画全部绑它，避免三处各判一次、判出不一致的结果。
