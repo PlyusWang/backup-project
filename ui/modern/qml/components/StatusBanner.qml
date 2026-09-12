@@ -63,15 +63,24 @@ Rectangle {
                 wrapMode: Text.WordWrap
             }
 
-            Text {
+            // 错误正文常带很长的绝对路径，必须能选中复制。Text 本身不支持
+            // 选择，所以用只读的 TextEdit：背景透明、无边框，字号与颜色不变，
+            // 不选中时和一段普通文字看不出区别。
+            TextEdit {
                 text: banner.message
                 visible: banner.message !== ""
+                readOnly: true
+                selectByMouse: true
+                selectByKeyboard: true
+                persistentSelection: true
+                cursorVisible: false
+                textFormat: TextEdit.PlainText
                 font.pixelSize: 12
                 color: theme.textSecondary
+                selectionColor: theme.accent
+                selectedTextColor: theme.surface
                 Layout.fillWidth: true
-                wrapMode: Text.WrapAnywhere
-                // 错误里常带很长的绝对路径，允许选中复制，方便贴给别人看。
-                textFormat: Text.PlainText
+                wrapMode: TextEdit.WrapAnywhere
             }
         }
     }

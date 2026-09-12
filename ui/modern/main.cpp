@@ -1,23 +1,26 @@
 // main.cpp
 //
-// 现代 QML GUI 的入口。除了正常启动，还带三个开发期开关：
-//   --smoke-test                        建引擎、建窗口、跑几帧就退出
+// 现代 QML GUI 的入口。除正常启动外还带几个开发期开关：
+//   --smoke-test                        建引擎、建窗口、切页、换主题后退出
 //   --screenshot <目录>                 三个页面 × 两套主题渲染成 PNG
 //   --self-test <源> <仓库> <恢复目录>   真跑一次备份 + 恢复并报告结果
-// 另有 --native-frame：退回系统原生标题栏（Wayland
+//   --path-test                         验证本地路径与 URL 互转不丢字符
+//   --close-guard-test                  验证任务进行中关窗会被拦下
+//   --native-frame                      退回系统原生标题栏（Wayland 兜底）
 //
 // 这些开关让没有显示器的环境也能验证界面：离屏平台插件把窗口真正建出来，
-// 自检模式再切一遍页面、换一次主题、跑一次备份恢复，不需要人盯着屏幕。
-// 上自绘标题栏万一不稳时的兜底）。
+// 自检再切一遍页面、换一次主题、跑一次备份恢复，不需要人盯着屏幕。
 
 #include <QDir>
 #include <QEventLoop>
+#include <QFile>
 #include <QGuiApplication>
 #include <QQmlApplicationEngine>
 #include <QQmlContext>
 #include <QQuickStyle>
 #include <QQuickWindow>
 #include <QStringList>
+#include <QTemporaryDir>
 #include <QTimer>
 #include <cstdio>
 
@@ -135,6 +138,121 @@ int RunSelfTest(backup_modern::BackupController* controller,
   return 0;
 }
 
+// --path-test：验证「本地路径 → URL → 本地路径」不丢字符。
+// 界面上“浏览”按钮选完目录走的就是 controller.localPathFromUrl()，
+// 所以这里测的正是 QML 侧实际使用的那条转换。
+int RunPathTest(backup_modern::BackupController* controller) {
+  int failures = 0;
+  const QStringList cases = {
+      QStringLiteral("/tmp/normal"),   QStringLiteral("/tmp/with space"),
+      QStringLiteral("/tmp/中文目录"), QStringLiteral("/tmp/a#b"),
+      QStringLiteral("/tmp/a%b"),      QStringLiteral("/tmp/中文 空格#百分号%"),
+  };
+  for (const QString& path : cases) {
+    const QUrl url = QUrl::fromLocalFile(path);
+    const QString back = controller->localPathFromUrl(url);
+    const bool ok = back == path;
+    std::printf("%s path=[%s] url=[%s] back=[%s]\n", ok ? "ok  " : "FAIL",
+                qPrintable(path), qPrintable(url.toString()), qPrintable(back));
+    failures += ok ? 0 : 1;
+  }
+
+  // 真实目录再走一遍：确认文件系统里确实存在这个带中文、空格、#、% 的名字。
+  QTemporaryDir dir;
+  const QString real = dir.filePath(QStringLiteral("中文 空格#百分号%"));
+  QDir().mkpath(real);
+  const QString back = controller->localPathFromUrl(QUrl::fromLocalFile(real));
+  const bool real_ok = back == real && QFileInfo(real).isDir();
+  std::printf("%s 真实目录 path=[%s] back=[%s]\n", real_ok ? "ok  " : "FAIL",
+              qPrintable(real), qPrintable(back));
+  failures += real_ok ? 0 : 1;
+
+  // 非本地 URL 必须给空串，不能拼出一个看起来像路径的字符串。
+  const QString remote = controller->localPathFromUrl(
+      QUrl(QStringLiteral("https://example.com/a.txt")));
+  const bool remote_ok = remote.isEmpty();
+  std::printf("%s 非本地 URL 返回空串 (got=[%s])\n",
+              remote_ok ? "ok  " : "FAIL", qPrintable(remote));
+  failures += remote_ok ? 0 : 1;
+
+  // 对话框起始位置：存在的目录原样给出，缺失或为空时回退主目录。
+  const QUrl start_existing = controller->directoryDialogStartUrl(real);
+  const QUrl start_missing = controller->directoryDialogStartUrl(
+      QStringLiteral("/tmp/不存在的目录-xyz"));
+  const QUrl start_empty = controller->directoryDialogStartUrl(QString());
+  const bool start_ok =
+      start_existing == QUrl::fromLocalFile(real) &&
+      start_missing == QUrl::fromLocalFile(QDir::homePath()) &&
+      start_empty == QUrl::fromLocalFile(QDir::homePath());
+  std::printf("%s 对话框起始位置：存在=[%s] 缺失回退=[%s]\n",
+              start_ok ? "ok  " : "FAIL", qPrintable(start_existing.toString()),
+              qPrintable(start_missing.toString()));
+  failures += start_ok ? 0 : 1;
+
+  std::printf("path-test 失败项: %d\n", failures);
+  return failures == 0 ? 0 : 1;
+}
+
+// --close-guard-test：验证“任务进行中不许关窗”的契约。
+// busy 在 startBackup() 返回前就已置位，而任务结束信号要等回到事件循环
+// 才会派发，所以在同一个事件循环回合里检查，结论不取决于任务跑得多快。
+int RunCloseGuardTest(QQuickWindow* window,
+                      backup_modern::BackupController* controller) {
+  QTemporaryDir dir;
+  const QString source = dir.filePath(QStringLiteral("source"));
+  const QString repository = dir.filePath(QStringLiteral("repo"));
+  if (!dir.isValid() || !QDir().mkpath(source)) {
+    std::fprintf(stderr, "临时目录创建失败\n");
+    return 1;
+  }
+  // 造一批文件让任务真的跑起来：文件多少不重要，重要的是它会跨事件循环。
+  for (int i = 0; i < 200; ++i) {
+    QFile file(QStringLiteral("%1/file-%2.bin").arg(source).arg(i));
+    if (file.open(QIODevice::WriteOnly)) {
+      file.write(QByteArray(4096, 'x'));
+    }
+  }
+
+  controller->setSourcePath(source);
+  controller->setRepositoryPath(repository);
+  if (!controller->startBackup() || !controller->busy()) {
+    std::fprintf(stderr, "FAIL 备份没有启动起来\n");
+    return 1;
+  }
+
+  int failures = 0;
+  // 忙的时候关窗：必须被 onClosing 拒绝，窗口留着。
+  const bool closed_while_busy = window->close();
+  std::printf("%s 忙时 close() 被拒绝 (返回=%s)\n",
+              closed_while_busy ? "FAIL" : "ok  ",
+              closed_while_busy ? "true" : "false");
+  failures += closed_while_busy ? 1 : 0;
+
+  // 光拒绝还不够：得给用户一个说明，而不是点了没反应。
+  QObject* dialog =
+      window->findChild<QObject*>(QStringLiteral("busyCloseDialog"));
+  const bool dialog_open =
+      dialog != nullptr && dialog->property("visible").toBool();
+  std::printf("%s 忙时关窗会弹出提示 (visible=%s)\n",
+              dialog_open ? "ok  " : "FAIL", dialog_open ? "true" : "false");
+  failures += dialog_open ? 0 : 1;
+
+  if (!controller->waitForIdle(120000) || controller->busy()) {
+    std::fprintf(stderr, "FAIL 等待任务结束超时\n");
+    return 1;
+  }
+
+  // 任务结束后同一条路径必须放行，否则就成了“永远关不掉”。
+  const bool closed_when_idle = window->close();
+  std::printf("%s 空闲时 close() 被接受 (返回=%s)\n",
+              closed_when_idle ? "ok  " : "FAIL",
+              closed_when_idle ? "true" : "false");
+  failures += closed_when_idle ? 0 : 1;
+
+  std::printf("close-guard-test 失败项: %d\n", failures);
+  return failures == 0 ? 0 : 1;
+}
+
 }  // namespace
 
 int main(int argc, char* argv[]) {
@@ -153,6 +271,9 @@ int main(int argc, char* argv[]) {
   const bool smoke_test = arguments.contains(QStringLiteral("--smoke-test"));
   const bool native_frame =
       arguments.contains(QStringLiteral("--native-frame"));
+  const bool path_test = arguments.contains(QStringLiteral("--path-test"));
+  const bool close_guard_test =
+      arguments.contains(QStringLiteral("--close-guard-test"));
   const int screenshot_index =
       arguments.indexOf(QStringLiteral("--screenshot"));
   const int self_test_index = arguments.indexOf(QStringLiteral("--self-test"));
@@ -210,6 +331,14 @@ int main(int argc, char* argv[]) {
       return result;
     }
     return g_qml_warnings == 0 ? 0 : 1;
+  }
+
+  if (path_test) {
+    return RunPathTest(&controller);
+  }
+
+  if (close_guard_test) {
+    return RunCloseGuardTest(window, &controller);
   }
 
   if (smoke_test) {

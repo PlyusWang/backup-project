@@ -27,6 +27,16 @@ ApplicationWindow {
     flags: useNativeFrame ? Qt.Window : (Qt.Window | Qt.FramelessWindowHint)
     readonly property bool maximized: root.visibility === Window.Maximized
 
+    // 核心没有取消能力，所以任务进行中一律不允许关窗，免得让用户以为
+    // “关掉窗口 = 安全取消”。自绘的 ×、Alt+F4、系统菜单、窗口管理器走的
+    // 都是这一个信号，所以守卫放在这里，而不是只放在那个按钮里。
+    onClosing: function (close) {
+        if (controller.busy) {
+            close.accepted = false
+            busyCloseDialog.open()
+        }
+    }
+
     // 当前页面索引；--screenshot 模式会直接从 C++ 改这个属性逐页抓图。
     property int currentPage: 0
 
@@ -78,6 +88,7 @@ ApplicationWindow {
                 }
                 AppButton {
                     iconName: "close"; variant: "flat"; implicitWidth: 40; implicitHeight: 30
+                    // 和系统关闭走同一条路径：任务进行中会被 onClosing 拦下。
                     onClicked: root.close()
                 }
             }
@@ -216,6 +227,48 @@ ApplicationWindow {
             width: parent.width; height: 6; anchors.bottom: parent.bottom
             cursorShape: Qt.SizeVerCursor
             onPressed: root.startSystemResize(Qt.BottomEdge)
+        }
+    }
+
+    // 任务进行中尝试关窗时的提示。只给“知道了”：核心没有安全取消，
+    // 所以这里不提供“强制退出 / 取消任务”这种做不到的按钮。
+    Dialog {
+        id: busyCloseDialog
+        objectName: "busyCloseDialog"
+        anchors.centerIn: parent
+        modal: true
+        padding: 0
+
+        background: Rectangle {
+            color: theme.surfaceElevated
+            border.width: 1
+            border.color: theme.border
+            radius: 10
+        }
+
+        contentItem: ColumnLayout {
+            spacing: 12
+
+            Text {
+                text: "操作正在进行"
+                color: theme.textPrimary
+                font.pixelSize: 15
+                font.weight: Font.DemiBold
+            }
+
+            Text {
+                Layout.preferredWidth: 300
+                text: "备份或恢复尚未完成。为避免留下不完整结果，请等待当前操作结束后再退出。"
+                color: theme.textSecondary
+                font.pixelSize: 13
+                wrapMode: Text.WordWrap
+            }
+
+            AppButton {
+                Layout.alignment: Qt.AlignRight
+                text: "知道了"
+                onClicked: busyCloseDialog.close()
+            }
         }
     }
 }

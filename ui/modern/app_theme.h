@@ -1,14 +1,11 @@
 // app_theme.h
 //
 // 现代 GUI 的设计系统：所有颜色 token 和 Light / Dark 两套取值都集中在这里。
-// 之所以做成 C++ 的 QObject 而不是 QML singleton，是因为 QML singleton 需要
+// 做成 C++ 的 QObject 而不是 QML singleton，是因为 QML singleton 需要
 // qmldir + import 配合，在 qrc 场景下容易出问题；做成上下文属性之后，
-//
-// 这一层只有颜色，不含任何尺寸与间距：按钮多高、卡片留白多少由 QML 决定，
-// 免得设计 token 和布局实现耦合成一个文件。//
-// 这一层只有颜色，不含任何尺寸与间距：按钮多高、卡片留白多少由 QML 决定，
-// 免得设计 token 和布局实现耦合成一个文件。// 任何 QML 文件都能直接写
-// theme.accent，切主题时靠 NOTIFY 自动刷新绑定。
+// 任何 QML 文件都能直接写 theme.accent，切主题时靠 NOTIFY 自动刷新绑定。
+// 这一层只有颜色，不含尺寸与间距：按钮多高、卡片留白多少由 QML 决定，
+// 免得设计 token 和布局实现耦合成一个文件。
 
 #ifndef BACKUP_PROJECT_UI_MODERN_APP_THEME_H_
 #define BACKUP_PROJECT_UI_MODERN_APP_THEME_H_
@@ -22,13 +19,8 @@ namespace backup_modern {
 // QML 只认这些名字，换配色时不需要动任何 QML 文件。
 // QML 里的颜色一律来自这里，页面和组件不写死任何色值。
 // 切主题时所有绑定一起刷新，不需要挨个页面去改。
-// QML 里的颜色一律来自这里，页面和组件不写死任何色值。
-// 切主题时所有绑定一起刷新，不需要挨个页面去改。
 class AppTheme : public QObject {
   Q_OBJECT
-  // 所有 token 共用一个 changed() 通知：切主题时整套配色一起变，
-  // 拆成十几个独立信号既没意义，也多一堆要维护的连接。
-  // dark 是唯一带 WRITE 的属性，其余 token 都是只读的派生值。
   // 所有 token 共用一个 changed() 通知：切主题时整套配色一起变，
   // 拆成十几个独立信号既没意义，也多一堆要维护的连接。
   // dark 是唯一带 WRITE 的属性，其余 token 都是只读的派生值。
@@ -62,8 +54,6 @@ class AppTheme : public QObject {
   // 侧栏的主题开关直接调它；写成 Q_INVOKABLE 才能在 QML 的 onClicked 里调到。
   Q_INVOKABLE void toggle();
 
-  // getter 全部从“当前生效的那套 Palette”取，QML 侧看到的永远只有一个来源，
-  // 不会出现某些 token 已经切了、某些还是旧值的情况。
   // getter 全部从“当前生效的那套 Palette”取，QML 侧看到的永远只有一个来源，
   // 不会出现某些 token 已经切了、某些还是旧值的情况。
   QColor background() const { return palette().background; }
@@ -111,8 +101,6 @@ class AppTheme : public QObject {
     QColor warning;
   };
 
-  // 两套取值由这两个静态函数生成，AppTheme 构造时各算一次；
-  // 第三套主题（比如跟随系统的自动模式）加一个函数就够了。
   // 两套取值由这两个静态函数生成，AppTheme 构造时各算一次；
   // 第三套主题（比如跟随系统的自动模式）加一个函数就够了。
   static Palette MakeLightPalette();
