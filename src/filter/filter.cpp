@@ -282,7 +282,7 @@ bool ParseMtimeValue(const std::string& value, int* kind, std::int64_t* low,
     *high = start + kSecondsPerDay - 1;
     return true;
   }
-  if (value.size() > 5 && value.compare(value.size() - 4, 4, "days") == 0) {
+  if (value.size() > 4 && value.compare(value.size() - 4, 4, "days") == 0) {
     std::uint64_t days = 0;
     if (!ParseUnsigned(value.substr(0, value.size() - 4), &days) || days == 0 ||
         days > kMaxDaysBack) {
