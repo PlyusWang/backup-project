@@ -41,6 +41,7 @@
 #include <vector>
 
 #include "file_system.h"
+#include "filter.h"
 
 namespace backupproject {
 
@@ -493,7 +494,7 @@ bool WriteFilePayload(ArchiveOutput* output, const std::string& disk_path,
 
 bool WriteDirectoryTree(ArchiveOutput* output,
                         const std::string& disk_directory,
-                        const std::string& archive_path,
+                        const std::string& archive_path, const Filter* filter,
                         std::uint64_t* entry_count, std::string* error_message);
 
 // 写一个普通文件 entry：header + path + 原始 payload。
@@ -514,7 +515,7 @@ bool WriteRegularFileEntry(ArchiveOutput* output, const std::string& disk_path,
 // 再按文件名排序写 children。排序让同样的源每次产出同样的归档，便于比对。
 bool WriteDirectoryTree(ArchiveOutput* output,
                         const std::string& disk_directory,
-                        const std::string& archive_path,
+                        const std::string& archive_path, const Filter* filter,
                         std::uint64_t* entry_count,
                         std::string* error_message) {
   struct stat info;
@@ -575,19 +576,42 @@ bool WriteDirectoryTree(ArchiveOutput* output,
                Describe(errno, "Failed to inspect path", child_disk));
       return false;
     }
+    // Filter 只看这些元数据，不读文件内容。
+    FilterEntry filter_entry;
+    filter_entry.archive_path = child_archive;
+    filter_entry.name = name;
+    filter_entry.is_directory = S_ISDIR(child_info.st_mode) != 0;
+    filter_entry.size = S_ISREG(child_info.st_mode)
+                            ? static_cast<std::uint64_t>(child_info.st_size)
+                            : 0;
+    filter_entry.mtime_sec =
+        static_cast<std::int64_t>(child_info.st_mtim.tv_sec);
+
     if (S_ISDIR(child_info.st_mode)) {
-      if (!WriteDirectoryTree(output, child_disk, child_archive, entry_count,
-                              error_message)) {
+      // 命中 exclude 的目录整棵剪掉：不再递归，子树里的特殊文件也不再检查。
+      if (filter != nullptr && filter->ShouldPruneDirectory(filter_entry)) {
+        continue;
+      }
+      if (!WriteDirectoryTree(output, child_disk, child_archive, filter,
+                              entry_count, error_message)) {
         return false;
       }
     } else if (S_ISREG(child_info.st_mode)) {
+      // 普通文件：exclude 优先；有 include 时必须命中至少一条。
+      if (filter != nullptr && !filter->ShouldIncludeFile(filter_entry)) {
+        continue;
+      }
       if (!WriteRegularFileEntry(output, child_disk, child_archive, child_info,
                                  entry_count, error_message)) {
         return false;
       }
     } else {
-      // 软链接、FIFO、设备、socket：v0.1 明确失败，不跳过、不跟随、
+      // 软链接、FIFO、设备、socket：默认整次失败，不跳过、不跟随、
       // 也不当普通文件复制——那三种做法都会让"备份成功"变成假话。
+      // 只有用户明确写了 exclude 才跳过它。
+      if (filter != nullptr && filter->ShouldSkipSpecialEntry(filter_entry)) {
+        continue;
+      }
       SetError(error_message, "Unsupported source entry type: " + child_disk);
       return false;
     }
@@ -1022,6 +1046,13 @@ std::size_t ArchivePathDepth(const std::string& path) {
 bool ArchiveWriter::Write(const std::string& source_directory,
                           const std::string& archive_file,
                           std::string* error_message) const {
+  // 没有筛选规则：等价于一个空 Filter，行为与 PR #8 完全一致。
+  return Write(source_directory, archive_file, nullptr, error_message);
+}
+
+bool ArchiveWriter::Write(const std::string& source_directory,
+                          const std::string& archive_file, const Filter* filter,
+                          std::string* error_message) const {
   if (error_message != nullptr) {
     error_message->clear();
   }
@@ -1085,8 +1116,10 @@ bool ArchiveWriter::Write(const std::string& source_directory,
   std::uint64_t entry_count = 0;
   if (ok) {
     // 第一条永远是 "."：源目录本身的 mode / mtime 也进归档。
-    ok = WriteDirectoryTree(&output, source_directory, ".", &entry_count,
-                            error_message);
+    // 源目录根条目 "." 永远保留：即使规则把内容全过滤掉，归档仍然是一个
+    // 合法归档（只有根目录），恢复出来就是空目录。
+    ok = WriteDirectoryTree(&output, source_directory, ".", filter,
+                            &entry_count, error_message);
   }
   if (ok) {
     ok = output.PatchU64(kEntryCountOffset, entry_count, error_message);

@@ -3,7 +3,8 @@
 // 现代 QML GUI 的入口。除正常启动外还带几个开发期开关：
 //   --smoke-test                        建引擎、建窗口、切页、换主题后退出
 //   --screenshot <目录>                 三个页面 × 两套主题渲染成 PNG
-//   --self-test <源> <备份文件> <恢复目录>   真跑一次打包 + 解包并报告结果
+//   --self-test <源> <备份文件> <恢复目录> [--include R] [--exclude R]
+//                                       真跑一次打包 + 解包并报告结果
 //   --path-test                         验证本地路径与 URL 互转不丢字符
 //   --close-guard-test                  验证任务进行中关窗会被拦下
 //   --native-frame                      退回系统原生标题栏（Wayland 兜底）
@@ -112,6 +113,34 @@ int CaptureScreenshots(QQuickWindow* window, backup_modern::AppTheme* theme,
 
 // 它验的是桥加核心这一整条链路：先备份再恢复，任何一步失败
 // 就把核心的原文错误打到 stderr 并以非 0 退出。
+// --self-test 可以带 --include / --exclude：这些规则和界面点"添加"时走的是
+// 同一条路径（BackupController::addFilterRule → 同一个 C++ Filter）。
+// 规则非法就直接报错退出，不会跑出一个"看起来成功"的备份。
+int ApplyFilterArguments(backup_modern::BackupController* controller,
+                         const QStringList& arguments) {
+  for (int index = 0; index < arguments.size(); ++index) {
+    const QString option = arguments.at(index);
+    if (option != QStringLiteral("--include") &&
+        option != QStringLiteral("--exclude")) {
+      continue;
+    }
+    if (index + 1 >= arguments.size()) {
+      std::fprintf(stderr, "%s 需要一个规则参数\n", qPrintable(option));
+      return 1;
+    }
+    const QString action = (option == QStringLiteral("--include"))
+                               ? QStringLiteral("include")
+                               : QStringLiteral("exclude");
+    if (!controller->addFilterRule(action, arguments.at(index + 1))) {
+      std::fprintf(stderr, "规则无效: %s\n",
+                   qPrintable(controller->statusMessage()));
+      return 1;
+    }
+    ++index;
+  }
+  return 0;
+}
+
 // --self-test 走的是和界面完全相同的控制器路径：source 目录打成一个
 // .bak，再从那个 .bak 恢复到目标目录。任何一步失败都直接以非 0 退出，
 // 所以它可以被脚本当作"桥 + 核心 + 归档"整条链路的冒烟测试。
@@ -318,6 +347,10 @@ int main(int argc, char* argv[]) {
       std::fprintf(
           stderr, "--self-test 需要三个参数: <源目录> <备份文件> <恢复目录>\n");
       return 2;
+    }
+    const int filter_status = ApplyFilterArguments(&controller, arguments);
+    if (filter_status != 0) {
+      return filter_status;
     }
     return RunSelfTest(&controller, arguments.at(self_test_index + 1),
                        arguments.at(self_test_index + 2),

@@ -18,6 +18,9 @@ Qt Quick GUI (ui/modern)
 BackupEngine（include/backup_engine.h）
         │  只做校验与编排：路径是否合理、什么时候可以动手
         ▼
+Filter（include/filter.h）  ← 决定哪些条目进入归档（可选，无规则即全收）
+        │
+        ▼
 ArchiveWriter / ArchiveReader（include/archive.h）
         │  Archive Format v0.1：全局 header + 逐条 entry header + 原样 payload
         ▼
@@ -33,6 +36,8 @@ POSIX 文件系统（open / read / write / mkdir / chmod / utimensat）
 - 是**打包**不是压缩：payload 逐字节原样保存，归档只会比原内容大；
 - 保存相对路径、条目类型、mode（0777 位）、mtime（秒 + 纳秒）和文件大小；
 - 读侧先 preflight 校验整个归档，结构合法之后才动磁盘，坏归档不会留下半个恢复目录；
+- 筛选（Filter）在归档层之前：CLI 与两套 GUI 共用同一份 C++ 实现，
+  规则语法与语义见 docs/filter_usage.md，后续计划见 docs/backlog/filter_future.md；
 - 软链接、FIFO、socket、设备文件一律让整次备份失败，不跳过、不跟随。
 
 **压缩（Compression）与加密（Encryption）当前都不存在**：本仓库没有实现任何压缩算法，
