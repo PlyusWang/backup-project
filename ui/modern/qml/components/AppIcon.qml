@@ -104,9 +104,25 @@ Canvas {
             }
             break
         case "moon":
+            // 月牙 = 外圆减掉一个右移的等半径圆：外弧走左半边，内弧反向咬回来，
+            // 两条弧交在上下两个尖点上，闭合后填充就是一轮弯月。
+            // 之前只画了一条 0.35π~1.55π 的弧，缺口是张开的，看着像个 C。
+            // 这里用填充而不是描边：16px 下描边版两条弧之间只剩 2~3px，
+            // 看上去像一对括号；填充版在这个尺寸上才认得出是月亮。
+            var moon_radius = 6.8
+            var moon_gap = 5.2
+            var moon_half_gap = moon_gap / 2
+            var cusp = Math.atan2(
+                Math.sqrt(moon_radius * moon_radius - moon_half_gap * moon_half_gap),
+                moon_half_gap)
+            // 月牙左右不对称，外圆圆心右移半个宽度，整体才是居中的。
+            var moon_center_x = 9 + (moon_radius - moon_half_gap) / 2
             ctx.beginPath()
-            ctx.arc(10, 9, 5.2, Math.PI * 0.35, Math.PI * 1.55, false)
-            ctx.stroke()
+            ctx.arc(moon_center_x, 9, moon_radius, cusp, Math.PI * 2 - cusp, false)
+            ctx.arc(moon_center_x + moon_gap, 9, moon_radius, Math.PI + cusp,
+                    Math.PI - cusp, true)
+            ctx.closePath()
+            ctx.fill()
             break
         case "check":
             ctx.beginPath()
