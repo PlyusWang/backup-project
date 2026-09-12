@@ -51,7 +51,6 @@ class AppTheme : public QObject {
   bool dark() const { return dark_; }
   void setDark(bool dark);
   // 侧栏的主题开关直接调它；写成 Q_INVOKABLE 才能在 QML 的 onClicked 里调到。
-  // 侧栏的主题开关直接调它；写成 Q_INVOKABLE 才能在 QML 的 onClicked 里调到。
   Q_INVOKABLE void toggle();
 
   // getter 全部从“当前生效的那套 Palette”取，QML 侧看到的永远只有一个来源，
@@ -75,7 +74,6 @@ class AppTheme : public QObject {
   QColor warning() const { return palette().warning; }
 
  signals:
-  // 只有这一个信号：切主题时发一次，所有 QML 绑定自动重算。
   // 只有这一个信号：切主题时发一次，所有 QML 绑定自动重算。
   void changed();
 
@@ -109,7 +107,6 @@ class AppTheme : public QObject {
     return dark_ ? dark_palette_ : light_palette_;
   }
 
-  // 两套调色板在构造时各生成一次，切主题只是换一个引用，不重算颜色。
   // 两套调色板在构造时各生成一次，切主题只是换一个引用，不重算颜色。
   bool dark_ = false;
   Palette light_palette_ = MakeLightPalette();

@@ -19,7 +19,6 @@ namespace backup_modern {
 namespace {
 
 // 这四个字符串本身也是接口的一部分：改名要同时改 StatusBanner.qml。
-// 这四个字符串本身也是接口的一部分：改名要同时改 StatusBanner.qml。
 // 状态种类，QML 用它决定 banner 的颜色和图标。
 const char kIdle[] = "idle";
 const char kRunning[] = "running";
@@ -155,7 +154,6 @@ OperationOutcome BackupController::RunOperation(Kind kind,
   return outcome;
 }
 
-// 只在真正变化时发信号，避免多余的界面重算。
 // 只在真正变化时发信号，避免多余的界面重算。
 void BackupController::SetBusy(bool busy) {
   if (busy_ == busy) {
