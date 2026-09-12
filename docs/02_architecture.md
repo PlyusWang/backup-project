@@ -7,6 +7,38 @@
 
 ---
 
+## 分层与备份流水线（Archive v0.1）
+
+```text
+CLI (app/backupctl.cpp)
+Qt Widgets GUI (ui/desktop)
+Qt Quick GUI (ui/modern)
+        │
+        ▼
+BackupEngine（include/backup_engine.h）
+        │  只做校验与编排：路径是否合理、什么时候可以动手
+        ▼
+ArchiveWriter / ArchiveReader（include/archive.h）
+        │  Archive Format v0.1：全局 header + 逐条 entry header + 原样 payload
+        ▼
+POSIX 文件系统（open / read / write / mkdir / chmod / utimensat）
+```
+
+三个入口共用同一份 BackupEngine 和同一份归档实现：`make`、`make gui`、
+`make gui-modern` 链接的都是 `src/core/backup_engine.cpp` 与 `src/archive/archive.cpp`，
+不存在"某个入口还在用旧结构"的情况。
+
+归档格式见 `docs/format/archive_v0.1.md`，要点：
+
+- 是**打包**不是压缩：payload 逐字节原样保存，归档只会比原内容大；
+- 保存相对路径、条目类型、mode（0777 位）、mtime（秒 + 纳秒）和文件大小；
+- 读侧先 preflight 校验整个归档，结构合法之后才动磁盘，坏归档不会留下半个恢复目录；
+- 软链接、FIFO、socket、设备文件一律让整次备份失败，不跳过、不跟随。
+
+**压缩（Compression）与加密（Encryption）当前都不存在**：本仓库没有实现任何压缩算法，
+也没有加密、文件过滤、增量备份、去重、多版本、网络备份等能力。
+归档层将来的定位是压缩层的输入层，但这一层本身只负责打包。
+
 ## 已知可靠性限制与后续改进
 
 ### TOCTOU 路径竞争风险
@@ -31,9 +63,9 @@ std::filesystem::absolute
 
 这一条规则解决的是**调用开始时路径就已经非法**的真实 Bug（ROB-02 / ROB-03），覆盖：
 
-- repository 位于 source 内部；
-- restore 的 destination 位于 `repository/data` 内部；
-- `destination == source`；
+- 归档文件（backup file）位于 source 内部；
+- restore 的 destination 与归档文件、源目录形成危险的父子关系；
+- `archive_file == source_directory`；
 - 相对路径，以及 `.`、`..` 规范化之后才暴露出来的危险拓扑；
 - 父目录中存在软链接而形成的实际父子关系。
 

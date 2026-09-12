@@ -24,8 +24,9 @@ namespace backup_gui {
 
 namespace {
 
-// 路径选择器的起始目录。空输入时退回家目录，避免对话框停在奇怪的位置。
-QString StartDirectoryFor(const QLineEdit* edit) {
+// 路径选择器的起始位置。空输入时退回家目录，避免对话框停在奇怪的位置。
+// 归档文件字段传的是文件路径本身：Qt 会把最后一段当成预填的文件名。
+QString StartLocationFor(const QLineEdit* edit) {
   return edit->text().isEmpty() ? QDir::homePath() : edit->text();
 }
 
@@ -117,8 +118,8 @@ void OperationPage::BuildLayout() {
     auto* row = new QHBoxLayout();
     row->setSpacing(10);
     auto* edit = new QLineEdit(card);
-    // 输入框保持可编辑：备份仓库允许是一个尚不存在的路径，
-    // 而 QFileDialog 只能方便地选已存在的目录，不能把核心支持的能力卡掉。
+    // 输入框保持可编辑：备份文件允许是一个尚不存在的路径，
+    // 而文件对话框一次只能选一个已存在的文件，不能把核心支持的能力卡掉。
     edit->setPlaceholderText(tr("可直接输入路径，也可以点击右侧按钮选择"));
     // stretch 给输入框：路径通常很长，按钮只需要自然宽度。
     edit->setMinimumWidth(240);
@@ -126,7 +127,7 @@ void OperationPage::BuildLayout() {
 
     auto* choose = new QPushButton(tr("选择"), card);
     connect(choose, &QPushButton::clicked, this,
-            [this, edit]() { ChooseDirectory(edit); });
+            [this, index]() { ChoosePath(index); });
     row->addWidget(choose);
     choose_buttons_[index] = choose;
 
@@ -219,11 +220,24 @@ void OperationPage::ApplyStatusColors() {
       QString("color: %1;").arg(StatusColor(colors_, status_kind_)));
 }
 
-void OperationPage::ChooseDirectory(QLineEdit* target) {
-  // 目录选择器只是“帮你填”：填完仍然可以手改，不在这里做任何路径规范化，
+void OperationPage::ChoosePath(int field_index) {
+  // 选择器只是“帮你填”：填完仍然可以手改，不在这里做任何路径规范化，
   // 路径是否合法由核心判断，GUI 不复制一套校验规则。
-  const QString chosen = QFileDialog::getExistingDirectory(
-      this, tr("选择目录"), StartDirectoryFor(target));
+  QLineEdit* target = (field_index == 0) ? first_edit_ : second_edit_;
+  const QString start = StartLocationFor(target);
+  const QString filters = tr("Backup files (*.bak);;All files (*)");
+  QString chosen;
+  if (IsFileField(field_index)) {
+    // 备份时是"存成哪个归档文件"，恢复时是"打开哪个归档文件"，
+    // 两种场景在同一个字段上，所以按 kind_ 选对话框。
+    chosen = (kind_ == OperationKind::kBackup)
+                 ? QFileDialog::getSaveFileName(this, tr("选择备份文件"), start,
+                                                filters)
+                 : QFileDialog::getOpenFileName(this, tr("选择备份文件"), start,
+                                                filters);
+  } else {
+    chosen = QFileDialog::getExistingDirectory(this, tr("选择目录"), start);
+  }
   if (chosen.isEmpty()) {
     return;  // 用户取消，保持原输入不动。
   }
@@ -326,16 +340,16 @@ QString OperationPage::WindowTitleText() const {
 }
 
 QString OperationPage::SubtitleText() const {
-  return kind_ == OperationKind::kBackup ? tr("把一个目录完整备份到指定仓库。")
-                                         : tr("从备份仓库恢复目录树。");
+  return kind_ == OperationKind::kBackup ? tr("把一个目录打包成一个备份文件。")
+                                         : tr("从备份文件恢复目录树。");
 }
 
 QString OperationPage::FirstFieldLabel() const {
-  return kind_ == OperationKind::kBackup ? tr("源目录") : tr("备份仓库");
+  return kind_ == OperationKind::kBackup ? tr("源目录") : tr("备份文件");
 }
 
 QString OperationPage::SecondFieldLabel() const {
-  return kind_ == OperationKind::kBackup ? tr("备份仓库") : tr("恢复目录");
+  return kind_ == OperationKind::kBackup ? tr("备份文件") : tr("恢复目录");
 }
 
 QString OperationPage::ActionButtonText() const {
@@ -347,7 +361,9 @@ QString OperationPage::RunningTitle() const {
 }
 
 QString OperationPage::RunningMessage() const {
-  return tr("正在复制目录，完成前请勿关闭窗口。");
+  return kind_ == OperationKind::kBackup
+             ? tr("正在打包目录，完成前请勿关闭窗口。")
+             : tr("正在解包归档，完成前请勿关闭窗口。");
 }
 
 QString OperationPage::SucceededTitle() const {
@@ -355,14 +371,14 @@ QString OperationPage::SucceededTitle() const {
 }
 
 QString OperationPage::SucceededMessage() const {
-  return kind_ == OperationKind::kBackup ? tr("源目录已写入备份仓库。")
-                                         : tr("备份仓库已恢复到目标目录。");
+  return kind_ == OperationKind::kBackup ? tr("源目录已打包进备份文件。")
+                                         : tr("备份文件已恢复到目标目录。");
 }
 
 QString OperationPage::IdleMessage() const {
   return kind_ == OperationKind::kBackup
-             ? tr("选择源目录和备份仓库后，点击“开始备份”。")
-             : tr("选择备份仓库和恢复目录后，点击“开始恢复”。");
+             ? tr("选择源目录和备份文件后，点击“开始备份”。")
+             : tr("选择备份文件和恢复目录后，点击“开始恢复”。");
 }
 
 }  // namespace backup_gui
