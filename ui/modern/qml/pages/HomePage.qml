@@ -57,7 +57,7 @@ Item {
                         color: theme.textPrimary
                     }
                     Text {
-                        text: "选择一个目录并保存到备份仓库"
+                        text: "选择一个目录，打包成一个备份文件"
                         font.pixelSize: 12
                         color: theme.textSecondary
                         Layout.fillWidth: true
@@ -88,7 +88,7 @@ Item {
                         color: theme.textPrimary
                     }
                     Text {
-                        text: "从已有备份仓库恢复目录"
+                        text: "从已有备份文件恢复目录"
                         font.pixelSize: 12
                         color: theme.textSecondary
                         Layout.fillWidth: true
