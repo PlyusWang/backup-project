@@ -76,11 +76,15 @@ VMware Ubuntu
 
 ```bash
 make                      # 构建 build/backupctl
-./build/backupctl backup <source_directory> <repository>
-./build/backupctl restore <repository> <destination>
+./build/backupctl backup <source_directory> <backup_file>
+./build/backupctl restore <backup_file> <destination_directory>
 ```
 
-备份数据存放于 `<repository>/data/`。更多用法、行为约定与测试方法见
+备份产物是一个单独的归档文件（推荐扩展名 `.bak`），里面是我们自己的
+Archive Format v0.1：全局 header + 逐条 entry header + 原样照抄的文件正文。
+这是**打包**而不是压缩——payload 与源文件逐字节相同，归档只会比原内容大。
+
+格式说明见 `docs/format/archive_v0.1.md`，用法与行为约定见
 `docs/basic_cli_usage.md`。
 
 ## 桌面 GUI

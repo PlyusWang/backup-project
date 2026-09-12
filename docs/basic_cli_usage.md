@@ -1,6 +1,6 @@
 # 基础 CLI 使用说明（Sprint 1 / v0.1）
 
-> 分支：feature/basic-backup-restore
+> 分支：feature/archive-format-v01
 > 状态：v0.1 实现文档
 
 ## 1. 本阶段实现范围
@@ -33,24 +33,27 @@ make clean && make
 ## 4. CLI 用法
 
 ```bash
-./build/backupctl backup <source_directory> <repository>
-./build/backupctl restore <repository> <destination>
+./build/backupctl backup <source_directory> <backup_file>
+./build/backupctl restore <backup_file> <destination_directory>
 ./build/backupctl --help
 ```
 
-备份数据保存在 `<repository>/data/` 下。
+备份产物是一个单独的归档文件（推荐扩展名 `.bak`），格式为
+Archive Format v0.1：全局 header + 逐条 entry header + 原样保存的文件正文。
+是打包不是压缩，详见 `docs/format/archive_v0.1.md`。
 
 ## 5. 完整示例
 
 ```bash
-./build/backupctl backup testdata/source repository
-./build/backupctl restore repository restored
+./build/backupctl backup testdata/source backup.bak
+./build/backupctl restore backup.bak restored
 diff -r testdata/source restored   # 应无差异
 ```
 
 ## 6. 目标路径已存在时的策略
 
-- `repository/data` 已存在且非空 → 备份失败，拒绝覆盖；
+- 归档文件已存在 → 备份失败，拒绝覆盖、拒绝截断；
+- 归档文件所在目录不存在 → 会自动补建（mkdir -p 语义）；
 - restore 的 destination 已存在且非空 → 恢复失败，拒绝覆盖；
 - 已存在的**空目录** → 允许直接使用。
 
@@ -77,6 +80,7 @@ make sanitize   # ASan + UBSan 构建，产物 build-sanitize/backupctl
 | 文件 | 职责 |
 | --- | --- |
 | app/backupctl.cpp | CLI 参数解析、结果输出、退出码 |
-| include/backup_engine.h / src/core/backup_engine.cpp | Backup / Restore 高层流程 |
-| include/file_system.h / src/filesystem/file_system.cpp | 目录树递归复制（CopyTree） |
+| include/backup_engine.h / src/core/backup_engine.cpp | Backup / Restore 高层流程（校验 + 编排） |
+| include/archive.h / src/archive/archive.cpp | Archive Format v0.1 的打包与解包 |
+| include/file_system.h / src/filesystem/file_system.cpp | 路径检查、目录创建、目录树复制（CopyTree，GUI 与归档不再直接使用，保留备用） |
 | scripts/test.sh | 自动测试脚本 |
