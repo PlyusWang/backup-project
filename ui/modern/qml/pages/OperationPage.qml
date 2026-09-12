@@ -129,6 +129,98 @@ Item {
                     }
                 }
 
+        // 筛选规则：只在备份页出现。QML 只负责收集文本和显示列表，
+        // 规则是否合法由 C++ 控制器判断——界面不实现任何 glob。
+        AppCard {
+            visible: page.isBackup
+            Layout.fillWidth: true
+            Layout.topMargin: 4
+
+            ColumnLayout {
+                anchors.fill: parent
+                spacing: 8
+
+                Text {
+                    text: "筛选规则（可选）"
+                    font.pixelSize: 12
+                    font.weight: Font.DemiBold
+                    color: theme.textSecondary
+                }
+
+                RowLayout {
+                    Layout.fillWidth: true
+                    spacing: 8
+
+                    AppTextField {
+                        id: ruleInput
+                        Layout.fillWidth: true
+                        enabled: !controller.busy
+                        placeholderText: "如 ext:cpp;h 或 path:**/build/**"
+                    }
+
+                    AppButton {
+                        text: "加为 Include"
+                        enabled: !controller.busy && ruleInput.text.length > 0
+                        onClicked: {
+                            if (controller.addFilterRule("include", ruleInput.text))
+                                ruleInput.text = ""
+                        }
+                    }
+
+                    AppButton {
+                        text: "加为 Exclude"
+                        enabled: !controller.busy && ruleInput.text.length > 0
+                        onClicked: {
+                            if (controller.addFilterRule("exclude", ruleInput.text))
+                                ruleInput.text = ""
+                        }
+                    }
+                }
+
+                ColumnLayout {
+                    Layout.fillWidth: true
+                    spacing: 2
+
+                    Repeater {
+                        model: controller.includeRules
+                        Text {
+                            Layout.fillWidth: true
+                            text: "include: " + modelData
+                            font.pixelSize: 12
+                            color: theme.textPrimary
+                            MouseArea {
+                                anchors.fill: parent
+                                onClicked: controller.removeFilterRule(index)
+                            }
+                        }
+                    }
+
+                    Repeater {
+                        model: controller.excludeRules
+                        Text {
+                            Layout.fillWidth: true
+                            text: "exclude: " + modelData
+                            font.pixelSize: 12
+                            color: theme.textSecondary
+                            MouseArea {
+                                anchors.fill: parent
+                                onClicked: controller.removeFilterRule(controller.includeRules.length + index)
+                            }
+                        }
+                    }
+                }
+
+                Text {
+                    visible: controller.includeRules.length + controller.excludeRules.length > 0
+                    text: "点击规则可删除；没有规则时按 PR #8 行为备份全部内容。"
+                    font.pixelSize: 11
+                    color: theme.textSecondary
+                    Layout.fillWidth: true
+                    wrapMode: Text.WordWrap
+                }
+            }
+        }
+
                 RowLayout {
                     Layout.fillWidth: true
                     Layout.topMargin: 14

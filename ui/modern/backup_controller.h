@@ -14,9 +14,17 @@
 #include <QFutureWatcher>
 #include <QObject>
 #include <QString>
+#include <QStringList>
 #include <QUrl>
 
+#include "filter.h"
+
 namespace backup_modern {
+
+// 归档与筛选核心在 backupproject 命名空间里。这里用别名引入，正文就能直接写
+// Filter / FilterAction，不必到处加限定名。
+using Filter = backupproject::Filter;
+using FilterAction = backupproject::FilterAction;
 
 // 错误原文不翻译、不截断：核心的报错里带着具体路径和原因，
 // 直接显示比在桥这层换成一句笼统提示有用得多。
@@ -43,6 +51,10 @@ class BackupController : public QObject {
                  NOTIFY backupFilePathChanged)
   Q_PROPERTY(QString restorePath READ restorePath WRITE setRestorePath NOTIFY
                  restorePathChanged)
+  // 筛选规则：界面只负责收集字符串，解析与匹配全部走 C++ 的 Filter，
+  // QML 侧不实现任何 glob。
+  Q_PROPERTY(QStringList includeRules READ includeRules NOTIFY filtersChanged)
+  Q_PROPERTY(QStringList excludeRules READ excludeRules NOTIFY filtersChanged)
 
  public:
   // 构造期只建立 finished 连接，不做任何文件系统访问，
@@ -74,6 +86,18 @@ class BackupController : public QObject {
   // 只要非空就原样转成 URL——"另存为"本来就要允许一个还不存在的文件名，
   // Qt 会把路径最后一段当成预填的文件名。
   Q_INVOKABLE QUrl fileDialogStartUrl(const QString& path) const;
+  QStringList includeRules() const { return include_rules_; }
+  QStringList excludeRules() const { return exclude_rules_; }
+
+  // 添加一条筛选规则：action 取 "include" / "exclude"。
+  // 规则非法时返回 false，并把原因写进状态条，界面直接显示。
+  // 语法检查用的是和 CLI、归档层完全相同的 Filter 实现。
+  Q_INVOKABLE bool addFilterRule(const QString& action, const QString& rule);
+  // 按界面列表顺序删除：先 include，后 exclude。
+  Q_INVOKABLE bool removeFilterRule(int index);
+  // 清空所有规则：回到"没有筛选"的 PR #8 行为。
+  Q_INVOKABLE void clearFilterRules();
+
   // 供 QML 的按钮调用：返回 false 表示这次点击没有启动任务（busy 或输入为空）。
   Q_INVOKABLE bool startBackup();
   Q_INVOKABLE bool startRestore();
@@ -95,6 +119,8 @@ class BackupController : public QObject {
   void sourcePathChanged();
   void backupFilePathChanged();
   void restorePathChanged();
+  // 规则列表变化（增删清空）时发一次。
+  void filtersChanged();
   // 任务结束时发一次，附带结果，便于 QML 或测试代码做后续动作。
   void operationFinished(bool succeeded);
 
@@ -105,14 +131,23 @@ class BackupController : public QObject {
 
   // 后台函数：static，运行在别的线程上，只碰值类型和 BackupEngine。
   static OperationOutcome RunOperation(Kind kind, const QString& first_path,
-                                       const QString& second_path);
+                                       const QString& second_path,
+                                       const Filter& filter);
 
-  bool Start(Kind kind, const QString& first_path, const QString& second_path);
+  bool Start(Kind kind, const QString& first_path, const QString& second_path,
+             const Filter& filter);
+
+  // 把界面收集的规则编成 Filter；失败时 error_message 里是原因。
+  bool BuildFilter(Filter* filter, std::string* error_message) const;
   void SetStatus(const QString& kind, const QString& title,
                  const QString& message);
   void SetBusy(bool busy);
 
   // 界面状态：路径、忙碌标记、状态卡片文案。只在 GUI 线程访问。
+  // 筛选规则原文，按 include / exclude 分两组保存。
+  QStringList include_rules_;
+  QStringList exclude_rules_;
+
   QString source_path_;
   QString backup_file_path_;
   QString restore_path_;
