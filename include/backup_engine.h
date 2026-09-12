@@ -20,6 +20,7 @@
 #include <string>
 
 #include "file_system.h"
+#include "filter.h"
 
 namespace backupproject {
 
@@ -34,6 +35,11 @@ class BackupEngine {
   // （否则扫描过程中归档文件自己会成为输入树的一部分）。
   bool Backup(const std::string& source_directory,
               const std::string& archive_file, std::string* error_message);
+
+  // 带筛选的版本：Filter 决定哪些条目进入归档；不传则等价于 PR #8 行为。
+  bool Backup(const std::string& source_directory,
+              const std::string& archive_file, const Filter& filter,
+              std::string* error_message);
 
   // 把归档文件 archive_file 恢复到 destination_directory。
   // 归档必须是普通文件；目标目录不存在或存在但为空时都可以。
