@@ -1,20 +1,19 @@
 // backup_engine.cpp
 //
-// v0.1 的流程很简单：backup = 验源目录 + 建仓库 + 整树复制到
-// <repository>/data；restore = 验仓库 + 把 data 整树复制到目标。
-// 真正动文件系统的是 FileSystem，这里只决定“什么时候允许复制”。
+// 引擎只做两件事：把参数检查干净，然后把活儿交给归档读写器。
+// 这里没有一行二进制格式处理的代码：header 怎么排、payload 怎么流式复制、
+// 恶意路径怎么拦，全部在 ArchiveWriter / ArchiveReader 里，
+// 这样将来如果把归档层换成"归档 + 压缩"的组合，这个文件不用跟着改。
 
 #include "backup_engine.h"
 
 #include <string>
 
+#include "archive.h"
+
 namespace backupproject {
 
 namespace {
-
-// 仓库里真正放备份内容的目录名。后续版本会在旁边加清单、元数据，
-// 所以从 v0.1 就把名字固定下来，而不是到处写 "data"。
-constexpr const char* kDataDirectoryName = "data";
 
 // 统一写错误信息的小工具，省得每个失败分支都判一次空指针。
 void SetError(std::string* error_message, const std::string& text) {
@@ -25,19 +24,26 @@ void SetError(std::string* error_message, const std::string& text) {
 
 }  // namespace
 
-// 引擎本身没有状态，默认构造即可；实际工作全靠成员 FileSystem 完成。
+// 引擎本身没有状态，默认构造即可。
 BackupEngine::BackupEngine() = default;
 
-// 流程详见 backup_engine.h，这里拆成三步：验源、备仓库、复制。
+// 打包流程：验源目录 → 交给 ArchiveWriter。
+// 归档文件自身的存在性、是否落在源目录内部这些检查由写入器负责，
+// 它会把它们放在创建输出文件之前，保证拒绝时不留下任何文件系统改动。
 bool BackupEngine::Backup(const std::string& source_directory,
-                          const std::string& repository,
+                          const std::string& archive_file,
                           std::string* error_message) {
   // 先清掉上一次遗留的错误信息，避免调用方误读。
   if (error_message != nullptr) {
     error_message->clear();
   }
 
-  // 源必须是已存在的目录。不存在、以及“存在但只是普通文件”分开报错，
+  if (archive_file.empty()) {
+    SetError(error_message, "Backup file path is empty.");
+    return false;
+  }
+
+  // 源必须是已存在的目录。不存在、以及"存在但只是普通文件"分开报错，
   // 消息里带上具体路径，方便用户定位。
   const FileSystem::PathStatus source_status =
       file_system_.InspectPath(source_directory, error_message);
@@ -55,98 +61,45 @@ bool BackupEngine::Backup(const std::string& source_directory,
     return false;
   }
 
-  // 空字符串不是合法仓库路径。以前这一步由 MakeDirectories("") 拦下，
-  // 现在建目录推迟到 CopyTree 内部了，这里显式拦一次，免得它被当成
-  // “当前目录下的 data” 悄悄写进工作目录。
-  if (repository.empty()) {
-    SetError(error_message, "Repository path is empty.");
-    return false;
-  }
-
-  // 仓库和数据目录的路径统一由 JoinPath 拼，不手写 '/'。
-  const std::string data_directory =
-      FileSystem::JoinPath(repository, kDataDirectoryName);
-  // repository/data 已经有内容就直接拒绝。v0.1 不做覆盖或合并，
-  // 避免一次误操作把旧备份冲掉。空目录例外：里面没有可丢的东西，
-  // 允许直接复用。
-  if (!file_system_.IsMissingOrEmptyDirectory(data_directory, error_message)) {
-    if (error_message == nullptr || error_message->empty()) {
-      SetError(error_message,
-               "Repository data directory already exists and is not empty: " +
-                   data_directory);
-    }
-    // error_message 里可能已经是 IsMissingOrEmptyDirectory 写好的具体原因，
-    // 就不再用自己的文案盖掉它了。
-    return false;
-  }
-
-  // 前置检查全部通过，剩下就是把整棵树复制过去。
-  // 这里刻意不提前 MakeDirectories(repository)：建目录是写操作，必须等
-  // CopyTree 做完路径拓扑检查、确认这次复制合法之后再发生，否则像
-  // “repository 放在 source 里面” 这种非法拓扑会先留下一个空仓库。
-  // CopyTree 建 destination 用的是 mkdir -p 语义，会连 repository 一起
-  // 建出来，所以提前建本来就是多余的。
-  return file_system_.CopyTree(source_directory, data_directory, error_message);
+  const ArchiveWriter writer;
+  return writer.Write(source_directory, archive_file, error_message);
 }
 
-// restore 是 backup 的镜像：先验仓库，再验目标，最后整树复制。
-bool BackupEngine::Restore(const std::string& repository,
-                           const std::string& destination,
+// 这里刻意不做"先建目标目录再解包"的优化：目标目录一旦建出来，
+// 后面任何一步失败都会在用户磁盘上留下痕迹。解包的两阶段校验
+// （preflight + 写入）全部在 ArchiveReader 里，引擎只负责参数层。
+// 归档内容的合法性（magic、每条 header、路径、payload 边界）由读取器在
+// preflight 阶段整体校验，校验不过就不会碰目标目录。
+bool BackupEngine::Restore(const std::string& archive_file,
+                           const std::string& destination_directory,
                            std::string* error_message) {
   // 同样先清空错误信息，保持和 Backup 一致的约定。
   if (error_message != nullptr) {
     error_message->clear();
   }
 
-  // 仓库必须已经存在，restore 不会替用户补建仓库。
-  const FileSystem::PathStatus repository_status =
-      file_system_.InspectPath(repository, error_message);
-  if (repository_status == FileSystem::PathStatus::kError) {
-    // 原因已经由 InspectPath 写好，直接失败。
-    return false;
-  }
-  if (repository_status == FileSystem::PathStatus::kMissing) {
-    SetError(error_message, "Repository does not exist: " + repository);
-    return false;
-  }
-  if (repository_status != FileSystem::PathStatus::kDirectory) {
-    SetError(error_message, "Repository is not a directory: " + repository);
+  if (destination_directory.empty()) {
+    SetError(error_message, "Destination directory is empty.");
     return false;
   }
 
-  const std::string data_directory =
-      FileSystem::JoinPath(repository, kDataDirectoryName);
-  // data 目录也必须已经存在，而且必须是目录：不存在、或者被换成
-  // 普通文件，都要明确报错。
-  const FileSystem::PathStatus data_status =
-      file_system_.InspectPath(data_directory, error_message);
-  if (data_status == FileSystem::PathStatus::kError) {
+  const FileSystem::PathStatus archive_status =
+      file_system_.InspectPath(archive_file, error_message);
+  if (archive_status == FileSystem::PathStatus::kError) {
     return false;
   }
-  if (data_status == FileSystem::PathStatus::kMissing) {
+  if (archive_status == FileSystem::PathStatus::kMissing) {
+    SetError(error_message, "Backup file does not exist: " + archive_file);
+    return false;
+  }
+  if (archive_status != FileSystem::PathStatus::kRegularFile) {
     SetError(error_message,
-             "Repository data directory does not exist: " + data_directory);
-    return false;
-  }
-  if (data_status != FileSystem::PathStatus::kDirectory) {
-    SetError(error_message,
-             "Repository data directory is not a directory: " + data_directory);
+             "Backup file is not a regular file: " + archive_file);
     return false;
   }
 
-  // destination 已存在且非空时拒绝，避免覆盖用户文件。
-  // 和备份侧一样：空目录可以复用。
-  if (!file_system_.IsMissingOrEmptyDirectory(destination, error_message)) {
-    if (error_message == nullptr || error_message->empty()) {
-      SetError(error_message,
-               "Destination directory already exists and is not empty: " +
-                   destination);
-    }
-    return false;
-  }
-
-  // 前置检查全部通过，整树复制到目标。
-  return file_system_.CopyTree(data_directory, destination, error_message);
+  const ArchiveReader reader;
+  return reader.Extract(archive_file, destination_directory, error_message);
 }
 
 }  // namespace backupproject
