@@ -490,7 +490,34 @@ bool Filter::has_include() const {
 }
 
 bool Filter::ShouldPruneDirectory(const FilterEntry& entry) const {
-  return MatchesAny(FilterAction::kExclude, entry);
+  if (MatchesAny(FilterAction::kExclude, entry)) {
+    return true;
+  }
+  // 目录再按"前缀形式"匹配一次：把路径末尾补上 '/' 再比一次 glob。
+  // 这样 exclude path:**/build/** 会直接剪掉 build 目录本身（连同子树），
+  // 而不只是过滤它里面的文件——剪掉之后，子树里的特殊文件也不再触发失败。
+  // 只有"整条规则都是 path 子句"时才走这条路径，避免绕过 type:/size: 等条件。
+  for (const Rule& rule : rules_) {
+    if (rule.action != FilterAction::kExclude) {
+      continue;
+    }
+    bool all_path_clauses = !rule.clauses.empty();
+    bool matched = true;
+    for (const Clause& clause : rule.clauses) {
+      if (clause.field != Clause::Field::kPath) {
+        all_path_clauses = false;
+        break;
+      }
+      if (!GlobMatch(clause.pattern, entry.archive_path + "/")) {
+        matched = false;
+        break;
+      }
+    }
+    if (all_path_clauses && matched) {
+      return true;
+    }
+  }
+  return false;
 }
 
 bool Filter::ShouldIncludeFile(const FilterEntry& entry) const {
