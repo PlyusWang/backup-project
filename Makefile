@@ -6,7 +6,7 @@ BUILD_DIR ?= build
 TARGET := $(BUILD_DIR)/backupctl
 
 APP_SOURCES := app/backupctl.cpp
-CORE_SOURCES := src/core/backup_engine.cpp
+CORE_SOURCES := src/core/backup_engine.cpp src/archive/archive.cpp
 FILESYSTEM_SOURCES := src/filesystem/file_system.cpp
 SOURCES := $(APP_SOURCES) $(CORE_SOURCES) $(FILESYSTEM_SOURCES)
 OBJECTS := $(patsubst %.cpp,$(BUILD_DIR)/%.o,$(SOURCES))
