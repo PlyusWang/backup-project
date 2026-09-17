@@ -14,6 +14,7 @@ import "pages"
 ApplicationWindow {
     id: root
 
+
     width: 1180
     height: 760
     minimumWidth: 960
