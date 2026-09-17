@@ -24,7 +24,13 @@ namespace backupproject {
 enum class RuleField { kName, kPath, kStem, kExt, kType, kSize, kMtime };
 
 // size 的比较运算符（range 对应核心的 kRange）。
-enum class RuleSizeCompare { kLess, kLessEqual, kGreater, kGreaterEqual, kRange };
+enum class RuleSizeCompare {
+  kLess,
+  kLessEqual,
+  kGreater,
+  kGreaterEqual,
+  kRange
+};
 
 // 1024 进制，与文档固定下来的语义一致。
 enum class RuleSizeUnit { kByte, kKilo, kMega, kGiga };
@@ -44,9 +50,9 @@ struct FilterClauseDraft {
   std::uint64_t size_high = 0;  // 仅 kRange 使用
   RuleSizeUnit unit = RuleSizeUnit::kKilo;
   RuleMtimeKind mtime_kind = RuleMtimeKind::kToday;
-  int days_back = 7;            // 仅 kLastDays
-  std::string date_low;         // "YYYY-MM-DD"，kDay / kDayRange
-  std::string date_high;        // 仅 kDayRange
+  int days_back = 7;      // 仅 kLastDays
+  std::string date_low;   // "YYYY-MM-DD"，kDay / kDayRange
+  std::string date_high;  // 仅 kDayRange
 };
 
 // 一条规则 = 一个动作 + 若干子条件（子条件之间是 AND，与核心语义一致）。
@@ -59,7 +65,8 @@ const char* RuleFieldName(RuleField field);
 
 // 结构校验：只查"表单填得对不对"（空值、非法日期、range 反向）。
 // 不做语法裁决——那是 ValidateRule 的事。
-bool ValidateClause(const FilterClauseDraft& clause, std::string* error_message);
+bool ValidateClause(const FilterClauseDraft& clause,
+                    std::string* error_message);
 
 // 单个子条件 -> DSL 片段，例如 "size:>=1KB"、"path:**/build/**"。
 bool ToDsl(const FilterClauseDraft& clause, std::string* dsl,
@@ -80,7 +87,8 @@ std::string SummarizeClause(const FilterClauseDraft& clause);
 std::string Summarize(const FilterRuleDraft& rule);
 
 // 拼 CLI 参数：--include / --exclude 与规则文本交替出现，供"复制为 CLI 参数"。
-std::vector<std::string> CliArguments(const std::vector<FilterRuleDraft>& rules);
+std::vector<std::string> CliArguments(
+    const std::vector<FilterRuleDraft>& rules);
 
 }  // namespace backupproject
 

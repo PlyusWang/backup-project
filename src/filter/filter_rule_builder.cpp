@@ -12,21 +12,30 @@ namespace {
 
 const char* UnitSuffix(RuleSizeUnit unit) {
   switch (unit) {
-    case RuleSizeUnit::kByte: return "";      // 字节直接写数字
-    case RuleSizeUnit::kKilo: return "KB";
-    case RuleSizeUnit::kMega: return "MB";
-    case RuleSizeUnit::kGiga: return "GB";
+    case RuleSizeUnit::kByte:
+      return "";  // 字节直接写数字
+    case RuleSizeUnit::kKilo:
+      return "KB";
+    case RuleSizeUnit::kMega:
+      return "MB";
+    case RuleSizeUnit::kGiga:
+      return "GB";
   }
   return "";
 }
 
 const char* CompareOperator(RuleSizeCompare compare) {
   switch (compare) {
-    case RuleSizeCompare::kLess: return "<";
-    case RuleSizeCompare::kLessEqual: return "<=";
-    case RuleSizeCompare::kGreater: return ">";
-    case RuleSizeCompare::kGreaterEqual: return ">=";
-    case RuleSizeCompare::kRange: return "..";
+    case RuleSizeCompare::kLess:
+      return "<";
+    case RuleSizeCompare::kLessEqual:
+      return "<=";
+    case RuleSizeCompare::kGreater:
+      return ">";
+    case RuleSizeCompare::kGreaterEqual:
+      return ">=";
+    case RuleSizeCompare::kRange:
+      return "..";
   }
   return "";
 }
@@ -53,7 +62,9 @@ bool ParseDate(const std::string& text, int* year, int* month, int* day) {
   if (y < 1970 || y > 9999) return false;
   if (m < 1 || m > 12) return false;
   if (d < 1 || d > 31) return false;
-  *year = y; *month = m; *day = d;
+  *year = y;
+  *month = m;
+  *day = d;
   return true;
 }
 
@@ -90,18 +101,26 @@ std::string FormatBytes(std::uint64_t value) {
 
 const char* RuleFieldName(RuleField field) {
   switch (field) {
-    case RuleField::kName: return "name";
-    case RuleField::kPath: return "path";
-    case RuleField::kStem: return "stem";
-    case RuleField::kExt: return "ext";
-    case RuleField::kType: return "type";
-    case RuleField::kSize: return "size";
-    case RuleField::kMtime: return "mtime";
+    case RuleField::kName:
+      return "name";
+    case RuleField::kPath:
+      return "path";
+    case RuleField::kStem:
+      return "stem";
+    case RuleField::kExt:
+      return "ext";
+    case RuleField::kType:
+      return "type";
+    case RuleField::kSize:
+      return "size";
+    case RuleField::kMtime:
+      return "mtime";
   }
   return "?";
 }
 
-bool ValidateClause(const FilterClauseDraft& clause, std::string* error_message) {
+bool ValidateClause(const FilterClauseDraft& clause,
+                    std::string* error_message) {
   const auto fail = [error_message](const std::string& text) {
     if (error_message != nullptr) *error_message = text;
     return false;
@@ -180,7 +199,8 @@ bool ToDsl(const FilterClauseDraft& clause, std::string* dsl,
       break;
     }
     case RuleField::kType:
-      text = clause.type == RuleTypeValue::kFolder ? "type:folder" : "type:file";
+      text =
+          clause.type == RuleTypeValue::kFolder ? "type:folder" : "type:file";
       break;
     case RuleField::kSize: {
       const char* suffix = UnitSuffix(clause.unit);
@@ -195,12 +215,18 @@ bool ToDsl(const FilterClauseDraft& clause, std::string* dsl,
     }
     case RuleField::kMtime:
       switch (clause.mtime_kind) {
-        case RuleMtimeKind::kToday: text = "mtime:today"; break;
-        case RuleMtimeKind::kYesterday: text = "mtime:yesterday"; break;
+        case RuleMtimeKind::kToday:
+          text = "mtime:today";
+          break;
+        case RuleMtimeKind::kYesterday:
+          text = "mtime:yesterday";
+          break;
         case RuleMtimeKind::kLastDays:
           text = "mtime:" + std::to_string(clause.days_back) + "days";
           break;
-        case RuleMtimeKind::kDay: text = "mtime:" + clause.date_low; break;
+        case RuleMtimeKind::kDay:
+          text = "mtime:" + clause.date_low;
+          break;
         case RuleMtimeKind::kDayRange:
           text = "mtime:" + clause.date_low + ".." + clause.date_high;
           break;
@@ -258,19 +284,21 @@ std::string SummarizeClause(const FilterClauseDraft& clause) {
       const std::string low =
           FormatBytes(clause.size_low) + " " + UnitSuffix(clause.unit);
       if (clause.compare == RuleSizeCompare::kRange) {
-        return "大小在 " + low + " 到 " +
-               FormatBytes(clause.size_high) + " " + UnitSuffix(clause.unit) +
-               " 之间";
+        return "大小在 " + low + " 到 " + FormatBytes(clause.size_high) + " " +
+               UnitSuffix(clause.unit) + " 之间";
       }
       return std::string("大小 ") + CompareOperator(clause.compare) + " " + low;
     }
     case RuleField::kMtime:
       switch (clause.mtime_kind) {
-        case RuleMtimeKind::kToday: return "修改时间是今天";
-        case RuleMtimeKind::kYesterday: return "修改时间是昨天";
+        case RuleMtimeKind::kToday:
+          return "修改时间是今天";
+        case RuleMtimeKind::kYesterday:
+          return "修改时间是昨天";
         case RuleMtimeKind::kLastDays:
           return "最近 " + std::to_string(clause.days_back) + " 天内修改过";
-        case RuleMtimeKind::kDay: return "修改日期是 " + clause.date_low;
+        case RuleMtimeKind::kDay:
+          return "修改日期是 " + clause.date_low;
         case RuleMtimeKind::kDayRange:
           return "修改日期在 " + clause.date_low + " 至 " + clause.date_high;
       }
