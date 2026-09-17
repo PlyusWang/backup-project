@@ -27,6 +27,7 @@
 
 #include "app_theme.h"
 #include "backup_controller.h"
+#include "filter_rule_model.h"
 
 namespace {
 
@@ -320,8 +321,11 @@ int main(int argc, char* argv[]) {
   // 用上下文属性而不是注册 QML 类型：QML 侧直接写 theme.accent /
   // controller.busy， 不需要任何 import 声明，也就不会碰到模块路径问题。
   engine.rootContext()->setContextProperty(QStringLiteral("theme"), &theme);
+  backup_modern::FilterRuleModel filter_rule_model(&controller);
   engine.rootContext()->setContextProperty(QStringLiteral("controller"),
                                            &controller);
+  engine.rootContext()->setContextProperty(QStringLiteral("filterRuleModel"),
+                                           &filter_rule_model);
   // 窗口用不用系统边框由 C++ 决定、QML 只读：窗口标志必须在窗口创建时定下来，
   // 之后再改会出现“已经画了一帧才换边框”的闪动。
   engine.rootContext()->setContextProperty(QStringLiteral("useNativeFrame"),
