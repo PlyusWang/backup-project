@@ -54,11 +54,23 @@ FilterRuleModel::FilterRuleModel(BackupController* controller, QObject* parent)
   connect(&watcher_, &QFutureWatcher<PreviewOutcome>::finished, this, [this]() {
     const PreviewOutcome outcome = watcher_.result();
     preview_busy_ = false;
+    // 扫描期间又来了请求：丢掉这次（已过期的）结果，立刻用最新的 source +
+    // drafts 重新扫描，中间不展示旧结果。这样界面最终显示的必然对应"当前 source
+    // + 当前 rules"。
+    if (preview_pending_) {
+      preview_pending_ = false;
+      const QString next_source = pending_source_;
+      const std::vector<backupproject::FilterRuleDraft> next_drafts =
+          pending_drafts_;
+      StartScan(next_source, next_drafts);
+      return;
+    }
     if (!outcome.error.isEmpty()) {
       SetError(outcome.error);
     } else {
       preview_items_ = outcome.items;
       preview_truncated_ = outcome.truncated;
+      preview_source_ = outcome.source_path;
     }
     emit previewChanged();
   });
@@ -258,21 +270,29 @@ void FilterRuleModel::RebuildRules() {
 
 void FilterRuleModel::requestPreview(const QString& source_path,
                                      const QString& restore_path) {
-  if (preview_busy_) return;
-  // 恢复页没有筛选语义（恢复端不重新筛选），不扫描。
-  if (restore_path.isEmpty() && source_path.isEmpty()) {
-    SetError(QStringLiteral("请先填写源目录，再刷新预览。"));
-    return;
-  }
   if (source_path.isEmpty()) {
-    SetError(QStringLiteral("请先填写源目录，再刷新预览。"));
+    SetError(restore_path.isEmpty()
+                 ? QStringLiteral("请先填写源目录，再刷新预览。")
+                 : QStringLiteral("恢复不重新筛选，无需预览。"));
     return;
   }
-  preview_busy_ = true;
-  preview_truncated_ = false;
   clearError();
+  // 记下最新一次请求；正在扫描时不排队第二次，等当前这次结束立刻用最新参数重扫。
+  pending_source_ = source_path;
+  pending_drafts_ = drafts_;
+  if (preview_busy_) {
+    preview_pending_ = true;
+    return;
+  }
+  StartScan(pending_source_, pending_drafts_);
+}
+
+void FilterRuleModel::StartScan(
+    const QString& source_path,
+    const std::vector<backupproject::FilterRuleDraft>& drafts) {
+  preview_busy_ = true;
+  preview_pending_ = false;
   emit previewChanged();
-  const std::vector<bp::FilterRuleDraft> drafts = drafts_;
   watcher_.setFuture(QtConcurrent::run([source_path, drafts]() {
     return ScanPreview(source_path, drafts, kPreviewLimit);
   }));
@@ -283,6 +303,7 @@ FilterRuleModel::PreviewOutcome FilterRuleModel::ScanPreview(
     int limit) {
   namespace fs = std::filesystem;
   PreviewOutcome outcome;
+  outcome.source_path = source_path;
   const fs::path root(source_path.toStdString());
   std::error_code ec;
   if (!fs::is_directory(root, ec)) {

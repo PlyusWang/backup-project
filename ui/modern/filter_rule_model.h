@@ -36,6 +36,8 @@ class FilterRuleModel : public QObject {
   Q_PROPERTY(int previewShown READ previewShown NOTIFY previewChanged)
   Q_PROPERTY(int previewLimit READ previewLimit CONSTANT)
   Q_PROPERTY(QString lastError READ lastError NOTIFY lastErrorChanged)
+  // 当前展示的预览结果对应哪个源目录（界面据此提示“结果已过期”）。
+  Q_PROPERTY(QString previewSource READ previewSource NOTIFY previewChanged)
 
  public:
   explicit FilterRuleModel(BackupController* controller,
@@ -50,6 +52,7 @@ class FilterRuleModel : public QObject {
   int previewShown() const { return static_cast<int>(preview_items_.size()); }
   int previewLimit() const { return kPreviewLimit; }
   QString lastError() const { return last_error_; }
+  QString previewSource() const { return preview_source_; }
 
   // 表单 -> DSL / 摘要（只读，用来做实时预览，不改动规则列表）
   Q_INVOKABLE QString dslForForm(const QVariantMap& form) const;
@@ -78,6 +81,7 @@ class FilterRuleModel : public QObject {
     QVariantList items;
     bool truncated = false;
     QString error;
+    QString source_path;  // 这份结果对应哪个源目录
   };
   static PreviewOutcome ScanPreview(
       const QString& source_path,
@@ -88,6 +92,8 @@ class FilterRuleModel : public QObject {
   void SyncController();
   void RebuildRules();
   void SetError(const QString& message);
+  void StartScan(const QString& source_path,
+                 const std::vector<backupproject::FilterRuleDraft>& drafts);
 
   static constexpr int kPreviewLimit = 300;
 
@@ -97,6 +103,12 @@ class FilterRuleModel : public QObject {
   QVariantList preview_items_;
   bool preview_busy_ = false;
   bool preview_truncated_ = false;
+  // latest request wins：扫描期间来的新请求只记下来，等当前扫描结束立刻用最新
+  // 的 source + drafts 重扫；旧结果不会作为稳定结果展示。
+  bool preview_pending_ = false;
+  QString pending_source_;
+  std::vector<backupproject::FilterRuleDraft> pending_drafts_;
+  QString preview_source_;
   QString last_error_;
   QFutureWatcher<PreviewOutcome> watcher_;
 };

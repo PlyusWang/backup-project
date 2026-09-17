@@ -32,6 +32,7 @@ Item {
     property bool previewTruncated: false
     property int previewShown: 0
     property int previewLimit: 300
+    property string previewSource: ""
     property string summaryLine: ""
     property string dslPreview: ""
     property string errorText: ""
@@ -47,7 +48,6 @@ Item {
     property string formUnit: "KB"
     property int formSizeLow: 1
     property int formSizeHigh: 10
-    property int editingIndex: -1
     property string formError: ""
 
     readonly property bool wide: width >= 760
@@ -91,7 +91,6 @@ Item {
     }
 
     function resetForm(action) {
-        panel.editingIndex = -1
         panel.formAction = action
         panel.formField = "ext"
         panel.formPattern = ""
@@ -117,6 +116,12 @@ Item {
 
     onRuleModelChanged: syncFromModel()
 
+    // 规则变化后：同步本地状态，并刷新预览（latest-request-wins 由模型负责）。
+    function onRulesChanged() {
+        panel.syncFromModel()
+        panel.refreshPreview()
+    }
+
     // 用显式信号连接，而不是 QML 的 Connections 元素：
     // 静态检查工具的 6.4 版 qmltypes 解析不了 Connections（以及随之而来的 target），
     // 会连锁出一批假告警；显式 connect 行为等价，也不引入新的告警。
@@ -124,7 +129,7 @@ Item {
     Component.onCompleted: {
         panel.syncFromModel()
         if (panel.ruleModel) {
-            panel.ruleModel.rulesChanged.connect(panel.syncFromModel)
+            panel.ruleModel.rulesChanged.connect(panel.onRulesChanged)
             panel.ruleModel.previewChanged.connect(panel.syncFromModel)
             panel.ruleModel.lastErrorChanged.connect(panel.syncFromModel)
         }
@@ -182,6 +187,8 @@ Item {
                             return "还没有预览结果，点“刷新”。"
                         if (panel.previewTruncated)
                             return "仅预览前 " + panel.previewLimit + " 项（目录过大时只显示开头部分）。"
+                        if (panel.previewSource.length > 0 && panel.previewSource !== controller.sourcePath)
+                            return "共 " + panel.previewShown + " 项（结果对应 " + panel.previewSource + "，源目录已改，请刷新）。"
                         return "共 " + panel.previewShown + " 项。"
                     }
                 }
@@ -278,68 +285,11 @@ Item {
                 Repeater {
                     model: panel.ruleList
 
-                    delegate: Rectangle {
-                        Layout.fillWidth: true
-                        implicitHeight: ruleColumn.implicitHeight + 12
-                        radius: 4
-                        color: theme.hover
-
-                        ColumnLayout {
-                            id: ruleColumn
-                            anchors.left: parent.left
-                            anchors.right: parent.right
-                            anchors.top: parent.top
-                            anchors.margins: 6
-                            spacing: 2
-
-                            Text {
-                                Layout.fillWidth: true
-                                text: (modelData.action === "include" ? "[Include] " : "[Exclude] ") + modelData.summary
-                                font.pixelSize: 12
-                                font.weight: Font.DemiBold
-                                color: theme.textPrimary
-                                wrapMode: Text.WordWrap
-                            }
-
-                            Text {
-                                Layout.fillWidth: true
-                                text: modelData.dsl
-                                font.pixelSize: 11
-                                font.family: "monospace"
-                                color: theme.textSecondary
-                            }
-
-                            RowLayout {
-                                spacing: 6
-
-                                AppButton {
-                                    text: "上移"
-                                    enabled: !controller.busy && index > 0
-                                    onClicked: {
-                                        panel.ruleModel.moveRule(index, -1)
-                                        panel.refreshPreview()
-                                    }
-                                }
-
-                                AppButton {
-                                    text: "下移"
-                                    enabled: !controller.busy && index < panel.ruleList.length - 1
-                                    onClicked: {
-                                        panel.ruleModel.moveRule(index, 1)
-                                        panel.refreshPreview()
-                                    }
-                                }
-
-                                AppButton {
-                                    text: "删除"
-                                    enabled: !controller.busy
-                                    onClicked: {
-                                        panel.ruleModel.removeRule(index)
-                                        panel.refreshPreview()
-                                    }
-                                }
-                            }
-                        }
+                    delegate: RuleCard {
+                        ruleData: modelData
+                        ruleModelRef: panel.ruleModel
+                        busy: controller.busy
+                        totalRules: panel.ruleList.length
                     }
                 }
 
@@ -399,7 +349,10 @@ Item {
                             Layout.preferredWidth: 120
                             model: ["file", "folder"]
                             currentIndex: panel.formType === "folder" ? 1 : 0
-                            onActivated: panel.formType = currentText
+                            onActivated: {
+                                panel.formType = currentText
+                                panel.refreshFormError()
+                            }
                         }
 
                         ComboBox {
@@ -407,21 +360,30 @@ Item {
                             Layout.preferredWidth: 80
                             model: ["<", "<=", ">", ">=", ".."]
                             currentIndex: Math.max(0, model.indexOf(panel.formCompare))
-                            onActivated: panel.formCompare = currentText
+                            onActivated: {
+                                panel.formCompare = currentText
+                                panel.refreshFormError()
+                            }
                         }
 
                         AppTextField {
                             visible: panel.formField === "size"
                             Layout.preferredWidth: 80
                             text: String(panel.formSizeLow)
-                            onTextEdited: panel.formSizeLow = parseInt(text) || 0
+                            onTextEdited: {
+                                panel.formSizeLow = parseInt(text) || 0
+                                panel.refreshFormError()
+                            }
                         }
 
                         AppTextField {
                             visible: panel.formField === "size" && panel.formCompare === ".."
                             Layout.preferredWidth: 80
                             text: String(panel.formSizeHigh)
-                            onTextEdited: panel.formSizeHigh = parseInt(text) || 0
+                            onTextEdited: {
+                                panel.formSizeHigh = parseInt(text) || 0
+                                panel.refreshFormError()
+                            }
                         }
 
                         ComboBox {
@@ -429,7 +391,10 @@ Item {
                             Layout.preferredWidth: 80
                             model: ["B", "KB", "MB", "GB"]
                             currentIndex: Math.max(0, model.indexOf(panel.formUnit))
-                            onActivated: panel.formUnit = currentText
+                            onActivated: {
+                                panel.formUnit = currentText
+                                panel.refreshFormError()
+                            }
                         }
                     }
 
@@ -446,17 +411,13 @@ Item {
                         spacing: 8
 
                         AppButton {
-                            text: panel.editingIndex >= 0 ? "保存为新规则" : "添加规则"
+                            text: "添加规则"
                             variant: "primary"
                             enabled: !controller.busy && panel.formError.length === 0
                             onClicked: {
                                 if (!ruleModel)
                                     return
                                 if (panel.ruleModel.addRule(panel.formMap())) {
-                                    if (panel.editingIndex >= 0) {
-                                        panel.ruleModel.removeRule(panel.editingIndex)
-                                        panel.editingIndex = -1
-                                    }
                                     panel.resetForm(panel.formAction)
                                     editor.visible = false
                                     panel.syncFromModel()
