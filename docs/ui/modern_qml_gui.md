@@ -148,3 +148,9 @@ QT_QPA_PLATFORM=offscreen QSG_RHI_BACKEND=software ./build/backup-gui-modern --s
 > 截图位置：待演示现场补拍（本仓库不放入伪造截图）。
 > 建议内容：Include ext:txt;md 与 Exclude name:secret.txt 同时存在时的左右两栏，
 > 以及左侧预览里的 Included / Excluded 标签。
+
+### 规则编辑的当前范围
+
+规则卡片提供上移 / 下移 / 删除；**已有规则暂不支持编辑**，需要修改时删除后重新添加
+（字段回填式编辑入口留到后续版本）。规则列表下方始终显示人类可读摘要与只读 DSL，
+便于对照当前规则的实际语义。
