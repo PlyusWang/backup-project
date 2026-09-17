@@ -134,9 +134,10 @@ fi
 # qmllint 的输出里噪音不少，判定规则见下面的注释：
 # 只挑真正的错误，其余按提示计数写进日志。
 # qmllint 6.4.2 的已知工具局限，逐条对应已确认的误报，只有这里列出的才放行：
-#   1. 上下文属性 theme / controller / useNativeFrame：qmllint 不知道它们是什么，
-#      凡是引用都报 Unqualified access。判定时会看一眼紧邻的代码行，
-#      只有确实是这三个名字才放行。
+#   1. 上下文属性 theme / controller / useNativeFrame / filterRuleModel：
+#      qmllint 不知道它们是什么，凡是引用都报 Unqualified access。判定时会看一眼
+#      紧邻的代码行，只有确实是这几个名字才放行。filterRuleModel 由 main.cpp 注册，
+#      面板通过 OperationPage 显式注入（面板内部不直接访问全局属性）。
 #   2. contentItem 的延迟赋值提示：Qt 自己的优化建议，运行期无影响。
 #   3. easing 组：6.4 的 qmltypes 不完整，运行期动画实测正常。
 #   4. Window.flags / MouseArea.cursorShape / Layout.alignment：同样缺 qmltypes，
@@ -151,9 +152,17 @@ classify_qmllint() {
       # Unqualified access；同一行已经由上面的 easing 规则放行，这里一并认掉。
       # Repeater 委托里的 index / modelData 是委托自己的上下文属性，
       # qmllint 6.4 不认识它们，同样属于工具局限。
+      # 委托/嵌套组件里引用所属组件的根 id（本文件里是 panel.）也属于同一类局限：
+      # 运行期合法（实测 --smoke-test 无任何运行期告警），静态检查解析不到根 id。
       if (msg ~ /Unqualified access/ &&
           (snippet ~ /theme/ || snippet ~ /controller/ || snippet ~ /useNativeFrame/ ||
+           snippet ~ /filterRuleModel/ || snippet ~ /panel\./ || snippet ~ /ruleModel/ ||
            snippet ~ /easing\./ || snippet ~ /modelData/ || snippet ~ /\bindex\b/)) {
+        print "ALLOWED\t" msg; return
+      }
+      # 上面那条 Unqualified access 的配套提示（qmllint 对委托作用域的说明），
+      # 不是独立诊断，随主告警一起放行。
+      if (msg ~ /is a member of a parent element/) {
         print "ALLOWED\t" msg; return
       }
       if (msg ~ /Cannot defer property assignment to "contentItem"/) {
@@ -252,9 +261,15 @@ fi
 # 和一个主操作按钮，五处都要绑 !controller.busy，忙的时候不能重复点。
 # 这条断言同时防两种退化：漏绑 busy（忙时还能点）和
 # 多出绑定位（复制粘贴出来的多余按钮）。
-# 两个路径框 + 两个"浏览" + 主按钮 + 筛选规则的输入框与两个添加按钮 = 8 处。
-expect_count "$QML_DIR/pages/OperationPage.qml" "enabled: !controller.busy" 8 \
+# 两个路径框 + 两个"浏览" + 主按钮 = 5 处。
+# 筛选编辑器独立成组件后，它自己的忙时禁用单独断言（见下）。
+expect_count "$QML_DIR/pages/OperationPage.qml" "enabled: !controller.busy" 5 \
   "忙碌时禁用输入与按钮"
+
+# 筛选编辑器：刷新、添加 Include、添加 Exclude、清空、上移、下移、删除、
+# 添加规则 = 8 处。仍然钉死数量，防止漏绑 busy 或复制粘贴出多余按钮。
+expect_count "$QML_DIR/components/FilterEditorPanel.qml" "enabled: !controller.busy" 8 \
+  "筛选编辑器忙碌时禁用全部按钮"
 
 # 进度显示是最容易“看起来能用、其实是假的”的地方，
 # 所以这里用断言把它钉死。
@@ -358,10 +373,18 @@ fi
 echo "[modern-gui] 8) 文件筛选在 GUI 路径上生效"
 # 界面只负责收集规则文本，解析与匹配都在 C++ Filter 里：
 # 下面先做静态确认，再用 --self-test 走一遍真实控制器路径。
-expect_count_re "$QML_DIR/pages/OperationPage.qml" "controller.addFilterRule" 2 \
-  "Modern GUI 提供 include / exclude 两个添加入口"
-expect_count_re "$QML_DIR/pages/OperationPage.qml" "controller.removeFilterRule" 2 \
+# 可视化编辑器的链路固定为：面板 -> FilterRuleModel -> BackupController -> 真实 Filter。
+# 面板只跟 model 打交道，model 才调用控制器，所以断言按这个真实结构落在两处。
+expect_count_re "$QML_DIR/components/FilterEditorPanel.qml" "resetForm\(\"include\"\)" 1 \
+  "Modern GUI 提供 Include 添加入口"
+expect_count_re "$QML_DIR/components/FilterEditorPanel.qml" "resetForm\(\"exclude\"\)" 1 \
+  "Modern GUI 提供 Exclude 添加入口"
+expect_count_re "$QML_DIR/components/FilterEditorPanel.qml" "ruleModel.removeRule" 2 \
   "Modern GUI 可以删除规则"
+expect_count_re "$ROOT_DIR/ui/modern/filter_rule_model.cpp" "addFilterRule" 1 \
+  "规则文本统一经模型提交给控制器"
+expect_count_re "$ROOT_DIR/ui/modern/filter_rule_model.cpp" "clearFilterRules" 1 \
+  "规则列表变化时整体重放给控制器"
 expect_count_re "$ROOT_DIR/ui/desktop/operation_page.cpp" "AddFilterRule" 3 \
   "Classic GUI 也走同一套规则逻辑"
 expect_count_re "$ROOT_DIR/ui/desktop/operation_page.cpp" "CollectFilterRules" 3 \
