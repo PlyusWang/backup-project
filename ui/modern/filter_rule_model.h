@@ -38,7 +38,8 @@ class FilterRuleModel : public QObject {
   Q_PROPERTY(QString lastError READ lastError NOTIFY lastErrorChanged)
 
  public:
-  explicit FilterRuleModel(BackupController* controller, QObject* parent = nullptr);
+  explicit FilterRuleModel(BackupController* controller,
+                           QObject* parent = nullptr);
 
   QVariantList rules() const { return rules_; }
   QString summaryText() const;
@@ -78,9 +79,9 @@ class FilterRuleModel : public QObject {
     bool truncated = false;
     QString error;
   };
-  static PreviewOutcome ScanPreview(const QString& source_path,
-                                    const std::vector<backupproject::FilterRuleDraft>& drafts,
-                                    int limit);
+  static PreviewOutcome ScanPreview(
+      const QString& source_path,
+      const std::vector<backupproject::FilterRuleDraft>& drafts, int limit);
   bool DraftFromForm(const QVariantMap& form,
                      backupproject::FilterRuleDraft* draft,
                      QString* error) const;

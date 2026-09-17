@@ -3,7 +3,6 @@
 
 #include <QDateTime>
 #include <QtConcurrent>
-
 #include <algorithm>
 #include <chrono>
 #include <filesystem>
@@ -70,7 +69,8 @@ QString FilterRuleModel::summaryText() const {
   for (const bp::FilterRuleDraft& draft : drafts_) {
     parts << QString::fromStdString(bp::Summarize(draft));
   }
-  if (parts.isEmpty()) return QStringLiteral("没有规则：按 PR #8 行为备份全部内容。");
+  if (parts.isEmpty())
+    return QStringLiteral("没有规则：按 PR #8 行为备份全部内容。");
   return parts.join(QStringLiteral("；"));
 }
 
@@ -92,29 +92,35 @@ bool FilterRuleModel::DraftFromForm(const QVariantMap& form,
                                     QString* error) const {
   const QString action = form.value(QStringLiteral("action")).toString();
   const QString field = form.value(QStringLiteral("field")).toString();
-  draft->action = action == QStringLiteral("exclude") ? bp::FilterAction::kExclude
-                                                     : bp::FilterAction::kInclude;
+  draft->action = action == QStringLiteral("exclude")
+                      ? bp::FilterAction::kExclude
+                      : bp::FilterAction::kInclude;
   bp::FilterClauseDraft clause;
   if (field == QStringLiteral("name") || field == QStringLiteral("path") ||
       field == QStringLiteral("stem")) {
-    clause.field = field == QStringLiteral("path")
-                       ? bp::RuleField::kPath
-                       : (field == QStringLiteral("stem") ? bp::RuleField::kStem
-                                                          : bp::RuleField::kName);
-    clause.pattern = form.value(QStringLiteral("pattern")).toString().toStdString();
+    clause.field =
+        field == QStringLiteral("path")
+            ? bp::RuleField::kPath
+            : (field == QStringLiteral("stem") ? bp::RuleField::kStem
+                                               : bp::RuleField::kName);
+    clause.pattern =
+        form.value(QStringLiteral("pattern")).toString().toStdString();
   } else if (field == QStringLiteral("ext")) {
     clause.field = bp::RuleField::kExt;
     const QString raw = form.value(QStringLiteral("extensions")).toString();
     const QStringList pieces = raw.split(QLatin1Char(';'), Qt::SkipEmptyParts);
-    for (const QString& piece : pieces) clause.extensions.push_back(piece.toStdString());
+    for (const QString& piece : pieces)
+      clause.extensions.push_back(piece.toStdString());
   } else if (field == QStringLiteral("type")) {
     clause.field = bp::RuleField::kType;
-    clause.type = form.value(QStringLiteral("type")).toString() == QStringLiteral("folder")
+    clause.type = form.value(QStringLiteral("type")).toString() ==
+                          QStringLiteral("folder")
                       ? bp::RuleTypeValue::kFolder
                       : bp::RuleTypeValue::kFile;
   } else if (field == QStringLiteral("size")) {
     clause.field = bp::RuleField::kSize;
-    clause.compare = CompareFromText(form.value(QStringLiteral("compare")).toString());
+    clause.compare =
+        CompareFromText(form.value(QStringLiteral("compare")).toString());
     clause.unit = UnitFromText(form.value(QStringLiteral("unit")).toString());
     clause.size_low = form.value(QStringLiteral("sizeLow")).toULongLong();
     clause.size_high = form.value(QStringLiteral("sizeHigh")).toULongLong();
@@ -199,8 +205,9 @@ QString FilterRuleModel::cliArguments() const {
   QStringList parts;
   for (const std::string& arg : bp::CliArguments(drafts_)) {
     const QString text = QString::fromStdString(arg);
-    parts << (text.startsWith(QStringLiteral("--")) ? text
-                                                    : QStringLiteral("'") + text + QStringLiteral("'"));
+    parts << (text.startsWith(QStringLiteral("--"))
+                  ? text
+                  : QStringLiteral("'") + text + QStringLiteral("'"));
   }
   return parts.join(QStringLiteral(" "));
 }
@@ -225,10 +232,10 @@ void FilterRuleModel::SyncController() {
   for (const bp::FilterRuleDraft& draft : drafts_) {
     std::string dsl;
     if (!bp::ToDsl(draft, &dsl, nullptr)) continue;
-    controller_->addFilterRule(
-        draft.action == bp::FilterAction::kInclude ? QStringLiteral("include")
-                                                   : QStringLiteral("exclude"),
-        QString::fromStdString(dsl));
+    controller_->addFilterRule(draft.action == bp::FilterAction::kInclude
+                                   ? QStringLiteral("include")
+                                   : QStringLiteral("exclude"),
+                               QString::fromStdString(dsl));
   }
 }
 
@@ -239,8 +246,9 @@ void FilterRuleModel::RebuildRules() {
     bp::ToDsl(draft, &dsl, nullptr);
     QVariantMap item;
     item.insert(QStringLiteral("action"),
-                draft.action == bp::FilterAction::kInclude ? QStringLiteral("include")
-                                                           : QStringLiteral("exclude"));
+                draft.action == bp::FilterAction::kInclude
+                    ? QStringLiteral("include")
+                    : QStringLiteral("exclude"));
     item.insert(QStringLiteral("summary"),
                 QString::fromStdString(bp::Summarize(draft)));
     item.insert(QStringLiteral("dsl"), QString::fromStdString(dsl));
@@ -265,13 +273,14 @@ void FilterRuleModel::requestPreview(const QString& source_path,
   clearError();
   emit previewChanged();
   const std::vector<bp::FilterRuleDraft> drafts = drafts_;
-  watcher_.setFuture(QtConcurrent::run(
-      [source_path, drafts]() { return ScanPreview(source_path, drafts, kPreviewLimit); }));
+  watcher_.setFuture(QtConcurrent::run([source_path, drafts]() {
+    return ScanPreview(source_path, drafts, kPreviewLimit);
+  }));
 }
 
 FilterRuleModel::PreviewOutcome FilterRuleModel::ScanPreview(
-    const QString& source_path,
-    const std::vector<bp::FilterRuleDraft>& drafts, int limit) {
+    const QString& source_path, const std::vector<bp::FilterRuleDraft>& drafts,
+    int limit) {
   namespace fs = std::filesystem;
   PreviewOutcome outcome;
   const fs::path root(source_path.toStdString());
@@ -281,7 +290,8 @@ FilterRuleModel::PreviewOutcome FilterRuleModel::ScanPreview(
     return outcome;
   }
   const bp::Filter filter = BuildFilterFromDrafts(drafts);
-  fs::recursive_directory_iterator it(root, fs::directory_options::skip_permission_denied, ec);
+  fs::recursive_directory_iterator it(
+      root, fs::directory_options::skip_permission_denied, ec);
   const fs::recursive_directory_iterator end;
   for (; it != end; it.increment(ec)) {
     if (ec) break;
@@ -328,7 +338,8 @@ FilterRuleModel::PreviewOutcome FilterRuleModel::ScanPreview(
       }
     } else if (is_regular) {
       included = filter.ShouldIncludeFile(fe);
-      tag = included ? QStringLiteral("进入归档") : QStringLiteral("被规则排除");
+      tag =
+          included ? QStringLiteral("进入归档") : QStringLiteral("被规则排除");
     } else {
       const bool skipped = filter.ShouldSkipSpecialEntry(fe);
       included = false;
@@ -337,14 +348,17 @@ FilterRuleModel::PreviewOutcome FilterRuleModel::ScanPreview(
     }
 
     QVariantMap item;
-    item.insert(QStringLiteral("path"), QString::fromStdString(fe.archive_path));
+    item.insert(QStringLiteral("path"),
+                QString::fromStdString(fe.archive_path));
     item.insert(QStringLiteral("isDirectory"), is_dir);
-    item.insert(QStringLiteral("size"), is_regular ? FormatSize(fe.size) : QString());
-    item.insert(QStringLiteral("mtime"),
-                fe.mtime_sec > 0
-                    ? QDateTime::fromSecsSinceEpoch(static_cast<qint64>(fe.mtime_sec))
-                          .toString(QStringLiteral("yyyy-MM-dd HH:mm"))
-                    : QString());
+    item.insert(QStringLiteral("size"),
+                is_regular ? FormatSize(fe.size) : QString());
+    item.insert(
+        QStringLiteral("mtime"),
+        fe.mtime_sec > 0
+            ? QDateTime::fromSecsSinceEpoch(static_cast<qint64>(fe.mtime_sec))
+                  .toString(QStringLiteral("yyyy-MM-dd HH:mm"))
+            : QString());
     item.insert(QStringLiteral("included"), included);
     item.insert(QStringLiteral("tag"), tag);
     outcome.items.push_back(item);
