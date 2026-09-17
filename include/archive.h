@@ -31,6 +31,8 @@
 
 namespace backupproject {
 
+class Filter;  // 前向声明：归档层只需要 Filter 的指针
+
 // v0.1 的格式常量，数值与 docs/format/archive_v0.1.md 的偏移表一一对应。
 // 这些字段是格式契约的一部分，改动任何一个都必须同时改文档和版本号。
 namespace archive_v01 {
@@ -73,6 +75,12 @@ class ArchiveWriter {
   // 打包失败，不跳过、不跟随、也不当普通文件复制。
   bool Write(const std::string& source_directory,
              const std::string& archive_file, std::string* error_message) const;
+
+  // 带筛选的版本：filter 为 nullptr 表示"没有规则"，行为与上面完全一致。
+  // Filter 只决定条目是否进入归档，归档格式本身不因为筛选而变化。
+  bool Write(const std::string& source_directory,
+             const std::string& archive_file, const Filter* filter,
+             std::string* error_message) const;
 };
 
 // 从归档文件恢复目录树。

@@ -5,12 +5,14 @@
 
 #include "operation_page.h"
 
+#include <QAbstractItemView>
 #include <QColor>
 #include <QDir>
 #include <QFileDialog>
 #include <QHBoxLayout>
 #include <QLabel>
 #include <QLineEdit>
+#include <QListWidget>
 #include <QPalette>
 #include <QProgressBar>
 #include <QPushButton>
@@ -19,6 +21,7 @@
 #include <string>
 
 #include "backup_engine.h"
+#include "filter.h"
 
 namespace backup_gui {
 
@@ -153,6 +156,48 @@ void OperationPage::BuildLayout() {
   card_layout->addSpacing(20);
   card_layout->addLayout(action_row);
 
+  // 筛选规则编辑只出现在备份页：恢复页既不显示，也不会收集规则。
+  if (kind_ == OperationKind::kBackup) {
+    auto* filter_card = new QWidget(this);
+    filter_card->setObjectName("Card");
+    auto* filter_layout = new QVBoxLayout(filter_card);
+    filter_layout->setContentsMargins(22, 18, 22, 18);
+    filter_layout->setSpacing(8);
+
+    auto* filter_label = new QLabel(tr("筛选规则（可选）"), filter_card);
+    filter_label->setObjectName("FieldLabel");
+    filter_layout->addWidget(filter_label);
+
+    auto* filter_row = new QHBoxLayout();
+    filter_row->setSpacing(10);
+    filter_edit_ = new QLineEdit(filter_card);
+    filter_edit_->setPlaceholderText(tr("如 ext:cpp;h 或 path:**/build/**"));
+    filter_row->addWidget(filter_edit_, 1);
+
+    auto* include_button = new QPushButton(tr("加为 Include"), filter_card);
+    connect(include_button, &QPushButton::clicked, this,
+            [this]() { AddFilterRule(false); });
+    filter_row->addWidget(include_button);
+
+    auto* exclude_button = new QPushButton(tr("加为 Exclude"), filter_card);
+    connect(exclude_button, &QPushButton::clicked, this,
+            [this]() { AddFilterRule(true); });
+    filter_row->addWidget(exclude_button);
+    filter_layout->addLayout(filter_row);
+
+    filter_list_ = new QListWidget(filter_card);
+    filter_list_->setSelectionMode(QAbstractItemView::SingleSelection);
+    filter_layout->addWidget(filter_list_);
+
+    auto* remove_button = new QPushButton(tr("删除选中规则"), filter_card);
+    connect(remove_button, &QPushButton::clicked, this,
+            [this]() { RemoveSelectedFilterRule(); });
+    filter_layout->addWidget(remove_button);
+
+    column->addWidget(filter_card);
+    column->addSpacing(16);
+  }
+
   column->addWidget(card);
   column->addSpacing(16);
 
@@ -245,6 +290,56 @@ void OperationPage::ChoosePath(int field_index) {
   target->setText(chosen);
 }
 
+void OperationPage::AddFilterRule(bool exclude) {
+  if (filter_edit_ == nullptr || filter_list_ == nullptr) {
+    return;
+  }
+  const QString rule = filter_edit_->text();
+  if (rule.isEmpty()) {
+    return;
+  }
+  // 语法只在这里验一次，用的是核心的 Filter：与 CLI、归档层完全同一份实现。
+  backupproject::Filter probe;
+  std::string error_message;
+  const backupproject::FilterAction action =
+      exclude ? backupproject::FilterAction::kExclude
+              : backupproject::FilterAction::kInclude;
+  if (!probe.AddRule(action, rule.toStdString(), &error_message)) {
+    SetStatus(StatusKind::kError, tr("规则无效"),
+              QString::fromStdString(error_message));
+    return;
+  }
+  filter_list_->addItem((exclude ? tr("exclude: ") : tr("include: ")) + rule);
+  filter_edit_->clear();
+  SetStatus(StatusKind::kIdle, tr("等待操作"), IdleMessage());
+}
+
+void OperationPage::RemoveSelectedFilterRule() {
+  if (filter_list_ == nullptr) {
+    return;
+  }
+  const int row = filter_list_->currentRow();
+  if (row < 0) {
+    return;
+  }
+  delete filter_list_->takeItem(row);
+}
+
+QStringList OperationPage::CollectFilterRules(bool exclude) const {
+  QStringList rules;
+  if (filter_list_ == nullptr) {
+    return rules;
+  }
+  const QString prefix = exclude ? tr("exclude: ") : tr("include: ");
+  for (int row = 0; row < filter_list_->count(); ++row) {
+    const QListWidgetItem* item = filter_list_->item(row);
+    if (item != nullptr && item->text().startsWith(prefix)) {
+      rules.append(item->text().mid(prefix.size()));
+    }
+  }
+  return rules;
+}
+
 void OperationPage::StartOperation() {
   // 双保险：正常路径下主按钮已经被禁用，但快捷键或程序化调用仍可能走到这里。
   // 除了本页是否在跑，还要看另一页是否正在跑（action_blocked_）：
@@ -257,6 +352,9 @@ void OperationPage::StartOperation() {
   request.kind = kind_;
   request.first_path = first_edit_->text();
   request.second_path = second_edit_->text();
+  // 规则列表里的每一条都已在添加时验证过；这里只是把它们交给后台任务。
+  request.include_rules = CollectFilterRules(false);
+  request.exclude_rules = CollectFilterRules(true);
   if (request.first_path.isEmpty() || request.second_path.isEmpty()) {
     // 只检查“有没有填”。路径对不对、拓扑合不合法，全部交给 BackupEngine 判断，
     // GUI 不再复制一套路径校验逻辑。
@@ -289,9 +387,20 @@ OperationResult OperationPage::RunOperation(const OperationRequest& request) {
   const std::string first = request.first_path.toStdString();
   const std::string second = request.second_path.toStdString();
 
+  // 规则在界面线程已经验证过，这里重建一份随任务传过来的副本。
+  backupproject::Filter filter;
+  for (const QString& rule : request.include_rules) {
+    filter.AddRule(backupproject::FilterAction::kInclude, rule.toStdString(),
+                   nullptr);
+  }
+  for (const QString& rule : request.exclude_rules) {
+    filter.AddRule(backupproject::FilterAction::kExclude, rule.toStdString(),
+                   nullptr);
+  }
+
   OperationResult result;
   if (request.kind == OperationKind::kBackup) {
-    result.succeeded = engine.Backup(first, second, &error_message);
+    result.succeeded = engine.Backup(first, second, filter, &error_message);
   } else {
     result.succeeded = engine.Restore(first, second, &error_message);
   }

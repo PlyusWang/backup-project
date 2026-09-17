@@ -33,6 +33,14 @@ BackupEngine::BackupEngine() = default;
 bool BackupEngine::Backup(const std::string& source_directory,
                           const std::string& archive_file,
                           std::string* error_message) {
+  // 不带筛选：空 Filter 与"没有规则"完全等价。
+  const Filter no_filter;
+  return Backup(source_directory, archive_file, no_filter, error_message);
+}
+
+bool BackupEngine::Backup(const std::string& source_directory,
+                          const std::string& archive_file, const Filter& filter,
+                          std::string* error_message) {
   // 先清掉上一次遗留的错误信息，避免调用方误读。
   if (error_message != nullptr) {
     error_message->clear();
@@ -62,7 +70,7 @@ bool BackupEngine::Backup(const std::string& source_directory,
   }
 
   const ArchiveWriter writer;
-  return writer.Write(source_directory, archive_file, error_message);
+  return writer.Write(source_directory, archive_file, &filter, error_message);
 }
 
 // 这里刻意不做"先建目标目录再解包"的优化：目标目录一旦建出来，
