@@ -147,42 +147,56 @@ fi
 # 其它任何 Warning / Error / Info 一律算未知问题，直接判失败。
 classify_qmllint() {
   awk '
+    BEGIN { prev_panel_allowed = 0 }
+    # 上一条诊断是否“已精确放行且来自 FilterEditorPanel.qml”。
+    # 只用来放行紧跟其后的那条 companion Info，遇到任何别的诊断立即清空。
+    function MarkAllowed(msg) {
+      print "ALLOWED\t" msg
+      prev_panel_allowed = (msg ~ /FilterEditorPanel\.qml/) ? 1 : 0
+    }
     function classify(msg, snippet) {
-      # easing.type 这类分组属性 6.4 解析不了，qmllint 会额外报一条
-      # Unqualified access；同一行已经由上面的 easing 规则放行，这里一并认掉。
-      # Repeater 委托里的 index / modelData 是委托自己的上下文属性，
-      # qmllint 6.4 不认识它们，同样属于工具局限。
-      # 委托/嵌套组件里引用所属组件的根 id（本文件里是 panel.）也属于同一类局限：
-      # 运行期合法（实测 --smoke-test 无任何运行期告警），静态检查解析不到根 id。
+      # 既有放行：上下文属性 theme / controller / useNativeFrame，以及委托里的
+      # index / modelData，easing 组等已知工具局限。
       if (msg ~ /Unqualified access/ &&
           (snippet ~ /theme/ || snippet ~ /controller/ || snippet ~ /useNativeFrame/ ||
-           snippet ~ /filterRuleModel/ || snippet ~ /panel\./ || snippet ~ /ruleModel/ ||
            snippet ~ /easing\./ || snippet ~ /modelData/ || snippet ~ /\bindex\b/)) {
-        print "ALLOWED\t" msg; return
+        MarkAllowed(msg); return
       }
-      # 上面那条 Unqualified access 的配套提示（qmllint 对委托作用域的说明），
-      # 不是独立诊断，随主告警一起放行。
-      if (msg ~ /is a member of a parent element/) {
-        print "ALLOWED\t" msg; return
+      # PR #12：filterRuleModel 是 main.cpp 注册的上下文属性，只在 OperationPage.qml 注入一次。
+      if (msg ~ /Unqualified access/ && msg ~ /OperationPage\.qml/ &&
+          snippet ~ /filterRuleModel/) {
+        MarkAllowed(msg); return
+      }
+      # PR #12：编辑器面板内部引用本组件根 id / 注入属性（含必需的 ruleModelRef）。
+      if (msg ~ /Unqualified access/ && msg ~ /FilterEditorPanel\.qml/ &&
+          (snippet ~ /panel\./ || snippet ~ /ruleModel/ || snippet ~ /ruleModelRef/)) {
+        MarkAllowed(msg); return
+      }
+      # PR #12：紧随上述已放行主诊断的 companion Info（qmllint 不给它文件路径）。
+      # 只认这一句精确文本，且只在直接前一条是 FilterEditorPanel.qml 的已放行诊断时才放行；
+      # 放行后立刻清状态，避免变成“全局允许某类提示”。
+      if (msg ~ /^Info: ruleModel is a member of a parent element\.?$/ && prev_panel_allowed == 1) {
+        print "ALLOWED\t" msg
+        prev_panel_allowed = 0
+        return
       }
       if (msg ~ /Cannot defer property assignment to "contentItem"/) {
-        print "ALLOWED\t" msg; return
+        MarkAllowed(msg); return
       }
       if (msg ~ /unknown grouped property scope easing/ ||
           msg ~ /is used but it is not resolved/ ||
           msg ~ /Binding assigned to "type"/) {
-        print "ALLOWED\t" msg; return
+        MarkAllowed(msg); return
       }
       if (msg ~ /No type found for property "(flags|cursorShape|alignment)"/) {
-        print "ALLOWED\t" msg; return
+        MarkAllowed(msg); return
       }
       if (msg ~ /Property "(AlignTop|AlignRight|LeftEdge|RightEdge|TopEdge|BottomEdge|SizeHorCursor|SizeVerCursor)" not found on type "Qt"/) {
-        print "ALLOWED\t" msg; return
+        MarkAllowed(msg); return
       }
+      prev_panel_allowed = 0
       print "UNKNOWN\t" msg
     }
-    # “Info: Did you mean ...” 是上一条告警的补充说明，不是独立诊断，
-    # 混进待判定队列会把后面那条告警的代码行抢走，导致误判。
     /^Info: Did you mean/ { next }
     /^(Warning|Error|Info):/ { pending[++n] = $0; next }
     {
@@ -268,8 +282,11 @@ expect_count "$QML_DIR/pages/OperationPage.qml" "enabled: !controller.busy" 5 \
 
 # 筛选编辑器：刷新、添加 Include、添加 Exclude、清空、上移、下移、删除、
 # 添加规则 = 8 处。仍然钉死数量，防止漏绑 busy 或复制粘贴出多余按钮。
-expect_count "$QML_DIR/components/FilterEditorPanel.qml" "enabled: !controller.busy" 8 \
-  "筛选编辑器忙碌时禁用全部按钮"
+expect_count "$QML_DIR/components/FilterEditorPanel.qml" "enabled: !controller.busy" 5 \
+  "筛选编辑器忙碌时禁用输入与按钮"
+# 规则卡片上的三个动作按钮（上移 / 下移 / 删除）沿用各自的忙碌开关。
+expect_count "$QML_DIR/components/RuleCard.qml" "enabled: !card.busy" 3 \
+  "规则卡片忙碌时禁用上移 / 下移 / 删除"
 
 # 进度显示是最容易“看起来能用、其实是假的”的地方，
 # 所以这里用断言把它钉死。
@@ -379,8 +396,10 @@ expect_count_re "$QML_DIR/components/FilterEditorPanel.qml" "resetForm\(\"includ
   "Modern GUI 提供 Include 添加入口"
 expect_count_re "$QML_DIR/components/FilterEditorPanel.qml" "resetForm\(\"exclude\"\)" 1 \
   "Modern GUI 提供 Exclude 添加入口"
-expect_count_re "$QML_DIR/components/FilterEditorPanel.qml" "ruleModel.removeRule" 2 \
-  "Modern GUI 可以删除规则"
+expect_count_re "$QML_DIR/components/RuleCard.qml" "ruleModelRef.removeRule" 1 \
+  "Modern GUI 可以删除规则（由规则卡片调用模型）"
+expect_count_re "$QML_DIR/components/RuleCard.qml" "ruleModelRef.moveRule" 2 \
+  "Modern GUI 可以上移 / 下移规则"
 expect_count_re "$ROOT_DIR/ui/modern/filter_rule_model.cpp" "addFilterRule" 1 \
   "规则文本统一经模型提交给控制器"
 expect_count_re "$ROOT_DIR/ui/modern/filter_rule_model.cpp" "clearFilterRules" 1 \
