@@ -132,3 +132,4 @@ qml6-module-qtquick-dialogs qml6-module-qtquick-window qml6-module-qtqml-workers
 详见 `docs/ui/modern_qml_gui.md`。
 
 `make` 仍然只构建 CLI；两套 GUI 各自独立，`make gui` 不会顺手把现代版也编出来。
+Filter 可视化规则编辑器：Modern GUI 提供可视化 Filter 规则编辑器（字段表单 + 规则列表 + 后台预览 + 只读 DSL + CLI 等价参数），规则最终仍由同一个 C++ Filter 核心匹配，语义与 CLI 一致。
