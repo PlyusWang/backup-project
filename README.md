@@ -80,6 +80,19 @@ make                      # 构建 build/backupctl
 ./build/backupctl restore <backup_file> <destination_directory>
 ```
 
+打包时可以按需筛选哪些内容进入备份文件：
+
+```bash
+./build/backupctl backup ./source ./backup.bak \
+  --include 'ext:cpp;h;hpp' \
+  --exclude 'path:**/build/**' \
+  --exclude 'ext:tmp;log'
+```
+
+`--include` / `--exclude` 都可以重复出现，规则语法与语义见
+`docs/filter_usage.md`，后续计划见 `docs/backlog/filter_future.md`。
+不加任何规则时行为与之前完全一致。
+
 备份产物是一个单独的归档文件（推荐扩展名 `.bak`），里面是我们自己的
 Archive Format v0.1：全局 header + 逐条 entry header + 原样照抄的文件正文。
 这是**打包**而不是压缩——payload 与源文件逐字节相同，归档只会比原内容大。

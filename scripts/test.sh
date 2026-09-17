@@ -973,6 +973,232 @@ expect_failure "SYM-05 reader rejects a drive-letter path with the same rule" 1 
   "Invalid archive path" \
   restore "$TEST_ROOT/sym/sym05.bak" "$TEST_ROOT/sym/sym05-out"
 
+# ---- K. FILTER：文件筛选 ------------------------------------------------
+
+echo "[test] K. file filtering"
+FIL="$TEST_ROOT/filter"
+rm -rf "$FIL"
+mkdir -p "$FIL/src/build/sub" "$FIL/src/keep" "$FIL/src/中文 空格#%"
+printf 'cpp\n'    > "$FIL/src/a.cpp"
+printf 'header\n' > "$FIL/src/b.h"
+printf 'log\n'    > "$FIL/src/c.log"
+printf 'text\n'   > "$FIL/src/d.txt"
+printf 'obj\n'    > "$FIL/src/build/out.o"
+printf 'deep\n'   > "$FIL/src/build/sub/deep.txt"
+printf 'keep\n'   > "$FIL/src/keep/k.cpp"
+printf 'cn\n'     > "$FIL/src/中文 空格#%/file.cpp"
+printf 'sp\n'     > "$FIL/src/re port?.txt"
+
+# 断言筛选结果：只比"普通文件"的相对路径集合（结构目录由 K3 单独检查）。
+expect_filtered_files() {
+  local name="$1" expected="$2" src="$3" bak="$4"
+  shift 4
+  local out="$bak.out"
+  rm -rf "$bak" "$out"
+  run_backupctl backup "$src" "$bak" "$@"
+  if [[ $STATUS -ne 0 ]]; then
+    record_fail "$name" "backup failed: $(first_line)"
+    return
+  fi
+  run_backupctl restore "$bak" "$out"
+  if [[ $STATUS -ne 0 ]]; then
+    record_fail "$name" "restore failed: $(first_line)"
+    return
+  fi
+  local actual
+  actual="$(cd "$out" && find . -type f -printf '%P\n' | LC_ALL=C sort | tr '\n' ' ')"
+  actual="${actual% }"
+  if [[ "$actual" == "$expected" ]]; then
+    record_pass "$name"
+  else
+    record_fail "$name" "got [$actual] expected [$expected]"
+  fi
+}
+
+# 断言整棵恢复树（含目录）与期望一致，用来验证"目录剪枝"。
+expect_filtered_tree() {
+  local name="$1" expected="$2" src="$3" bak="$4"
+  shift 4
+  local out="$bak.out"
+  rm -rf "$bak" "$out"
+  run_backupctl backup "$src" "$bak" "$@"
+  if [[ $STATUS -ne 0 ]]; then
+    record_fail "$name" "backup failed: $(first_line)"
+    return
+  fi
+  run_backupctl restore "$bak" "$out"
+  local actual
+  actual="$(cd "$out" && find . -mindepth 1 -printf '%P\n' | LC_ALL=C sort | tr '\n' ' ')"
+  actual="${actual% }"
+  if [[ "$actual" == "$expected" ]]; then
+    record_pass "$name"
+  else
+    record_fail "$name" "got [$actual] expected [$expected]"
+  fi
+}
+
+ALL_FILES="a.cpp b.h build/out.o build/sub/deep.txt c.log d.txt keep/k.cpp re port?.txt 中文 空格#%/file.cpp"
+NO_BUILD="a.cpp b.h c.log d.txt keep/k.cpp re port?.txt 中文 空格#%/file.cpp"
+CPP_ONLY="a.cpp b.h keep/k.cpp 中文 空格#%/file.cpp"
+
+echo "[test] K1. include / exclude 语义"
+expect_filtered_files "FIL-01 no rules keeps everything (PR #8 behaviour)" \
+  "$ALL_FILES" "$FIL/src" "$FIL/f01.bak"
+expect_filtered_files "FIL-02 include ext" "$CPP_ONLY" \
+  "$FIL/src" "$FIL/f02.bak" --include 'ext:cpp;h'
+expect_filtered_files "FIL-03 exclude ext" \
+  "a.cpp b.h build/sub/deep.txt d.txt keep/k.cpp re port?.txt 中文 空格#%/file.cpp" \
+  "$FIL/src" "$FIL/f03.bak" --exclude 'ext:log;o'
+expect_filtered_files "FIL-04 exclude wins over include" \
+  "a.cpp keep/k.cpp 中文 空格#%/file.cpp" \
+  "$FIL/src" "$FIL/f04.bak" --include 'ext:cpp;h' --exclude 'ext:h'
+expect_filtered_files "FIL-05 multiple include is OR" \
+  "a.cpp build/sub/deep.txt d.txt keep/k.cpp re port?.txt 中文 空格#%/file.cpp" \
+  "$FIL/src" "$FIL/f05.bak" --include 'ext:cpp' --include 'ext:txt'
+expect_filtered_files "FIL-06 multiple exclude is OR" \
+  "a.cpp b.h build/sub/deep.txt d.txt keep/k.cpp re port?.txt 中文 空格#%/file.cpp" \
+  "$FIL/src" "$FIL/f06.bak" --exclude 'ext:log' --exclude 'name:out.o'
+
+echo "[test] K2. 字段与通配符"
+expect_filtered_files "FIL-07 name:" \
+  "a.cpp b.h build/sub/deep.txt c.log d.txt keep/k.cpp re port?.txt 中文 空格#%/file.cpp" \
+  "$FIL/src" "$FIL/f07.bak" --exclude 'name:out.o'
+expect_filtered_files "FIL-08 path:**/build/** filters the subtree" "$NO_BUILD" \
+  "$FIL/src" "$FIL/f08.bak" --exclude 'path:**/build/**'
+expect_filtered_files "FIL-09 stem:" \
+  "b.h build/out.o build/sub/deep.txt c.log d.txt keep/k.cpp re port?.txt 中文 空格#%/file.cpp" \
+  "$FIL/src" "$FIL/f09.bak" --exclude 'stem:a'
+expect_filtered_files "FIL-10 ext list is OR" "$CPP_ONLY" \
+  "$FIL/src" "$FIL/f10.bak" --include 'ext:cpp;h;hpp'
+# path:*.txt 只匹配"根目录下"的 .txt：* 不跨 '/'，因此 build/sub/deep.txt
+# 不会被命中——这正是 * 与 ** 的区别。
+expect_filtered_files "FIL-11 * does not cross / (path:*.txt)" \
+  "d.txt re port?.txt" \
+  "$FIL/src" "$FIL/f11.bak" --include 'path:*.txt'
+expect_filtered_files "FIL-12 ? matches exactly one character" \
+  "a.cpp b.h build/out.o build/sub/deep.txt c.log keep/k.cpp re port?.txt 中文 空格#%/file.cpp" \
+  "$FIL/src" "$FIL/f12.bak" --exclude 'name:d.tx?'
+expect_filtered_files "FIL-13 ** crosses directories" "keep/k.cpp" \
+  "$FIL/src" "$FIL/f13.bak" --include 'path:**/keep/**'
+expect_filtered_files "FIL-14 type:file matches every regular file" "$ALL_FILES" \
+  "$FIL/src" "$FIL/f14.bak" --include 'type:file'
+expect_filtered_files "FIL-15 中文 / 空格 / # / % 路径" \
+  "中文 空格#%/file.cpp" \
+  "$FIL/src" "$FIL/f15.bak" --include 'path:**/中文*/**'
+
+echo "[test] K3. 目录剪枝与特殊文件"
+# 被剪掉的子树里即使有 FIFO / symlink，也不再触发"不支持的类型"失败。
+mkdir -p "$FIL/prune/build"
+printf 'o\n' > "$FIL/prune/build/out.o"
+mkfifo "$FIL/prune/build/pipe"
+ln -s /etc/hostname "$FIL/prune/build/link"
+printf 'ok\n' > "$FIL/prune/keep.txt"
+expect_filtered_tree "FIL-16 excluded subtree with FIFO and symlink still succeeds" \
+  "keep.txt" "$FIL/prune" "$FIL/f16.bak" --exclude 'path:**/build/**'
+# 没有被排除时，特殊文件仍然让备份失败。
+mkdir -p "$FIL/unsup"
+printf 'ok\n' > "$FIL/unsup/keep.txt"
+mkfifo "$FIL/unsup/pipe"
+rm -rf "$FIL/f17.bak"
+run_backupctl backup "$FIL/unsup" "$FIL/f17.bak" --exclude 'ext:nosuch'
+if [[ $STATUS -ne 0 ]] && grep -qF 'Unsupported source entry type' "$OUT_FILE"; then
+  record_pass "FIL-17 non-excluded FIFO still fails the backup"
+else
+  record_fail "FIL-17 non-excluded FIFO still fails the backup" "exit=$STATUS"
+fi
+expect_path_absent "FIL-17b failure left no archive" "$FIL/f17.bak"
+# 明确把 FIFO 排除掉则允许成功。
+expect_filtered_tree "FIL-18 explicitly excluded FIFO is skipped" "keep.txt" \
+  "$FIL/unsup" "$FIL/f18.bak" --exclude 'name:pipe'
+
+echo "[test] K4. size"
+mkdir -p "$FIL/size"
+head -c 100 /dev/zero     > "$FIL/size/small.bin"
+head -c 2048 /dev/zero    > "$FIL/size/mid.bin"
+head -c 3145728 /dev/zero > "$FIL/size/big.bin"
+expect_filtered_files "FIL-19 size:<2KB" "small.bin" \
+  "$FIL/size" "$FIL/f19.bak" --include 'size:<2KB'
+expect_filtered_files "FIL-20 size:<=2KB" "mid.bin small.bin" \
+  "$FIL/size" "$FIL/f20.bak" --include 'size:<=2KB'
+expect_filtered_files "FIL-21 size:>2KB" "big.bin" \
+  "$FIL/size" "$FIL/f21.bak" --include 'size:>2KB'
+expect_filtered_files "FIL-22 size:>=2KB" "big.bin mid.bin" \
+  "$FIL/size" "$FIL/f22.bak" --include 'size:>=2KB'
+expect_filtered_files "FIL-23 size range is inclusive" "big.bin mid.bin" \
+  "$FIL/size" "$FIL/f23.bak" --include 'size:2KB..3MB'
+expect_filtered_files "FIL-24 size boundary 100B..100B" "small.bin" \
+  "$FIL/size" "$FIL/f24.bak" --include 'size:100B..100B'
+expect_filtered_files "FIL-25 size:<100B matches nothing" "" \
+  "$FIL/size" "$FIL/f25.bak" --include 'size:<100B'
+
+echo "[test] K5. mtime（固定 TZ=UTC，避免依赖执行时刻）"
+mkdir -p "$FIL/time"
+TODAY="$(date -u +%F)"
+YESTERDAY="$(date -u -d 'yesterday' +%F)"
+printf 't\n' > "$FIL/time/today.txt"
+printf 'y\n' > "$FIL/time/yesterday.txt"
+printf 'o\n' > "$FIL/time/old.txt"
+touch -d "$TODAY 12:00:00 UTC" "$FIL/time/today.txt"
+touch -d "$YESTERDAY 12:00:00 UTC" "$FIL/time/yesterday.txt"
+touch -d '2020-01-01 12:00:00 UTC' "$FIL/time/old.txt"
+export TZ=UTC
+expect_filtered_files "FIL-26 mtime:today" "today.txt" \
+  "$FIL/time" "$FIL/f26.bak" --include 'mtime:today'
+expect_filtered_files "FIL-27 mtime:yesterday" "yesterday.txt" \
+  "$FIL/time" "$FIL/f27.bak" --include 'mtime:yesterday'
+expect_filtered_files "FIL-28 mtime:7days" "today.txt yesterday.txt" \
+  "$FIL/time" "$FIL/f28.bak" --include 'mtime:7days'
+expect_filtered_files "FIL-29 mtime exact date" "today.txt" \
+  "$FIL/time" "$FIL/f29.bak" --include "mtime:$TODAY"
+expect_filtered_files "FIL-30 mtime date range" "today.txt yesterday.txt" \
+  "$FIL/time" "$FIL/f30.bak" --include "mtime:$YESTERDAY..$TODAY"
+unset TZ
+
+echo "[test] K6. 空结果与错误规则"
+# include 只决定普通文件；目录作为结构项保留，所以"匹配不到任何文件"时
+# 恢复出来是只有目录骨架的空树。
+expect_filtered_tree "FIL-31 include matches nothing keeps only the directory skeleton" \
+  "build build/sub keep 中文 空格#%" \
+  "$FIL/src" "$FIL/f31.bak" --include 'ext:nosuchext'
+rm -rf "$FIL/f32.bak"
+run_backupctl backup "$FIL/src" "$FIL/f32.bak" --include 'bogus:x'
+if [[ $STATUS -eq 2 ]] && grep -qF 'Invalid filter rule' "$OUT_FILE"; then
+  record_pass "FIL-32 malformed rule is rejected with exit 2"
+else
+  record_fail "FIL-32 malformed rule is rejected with exit 2" "exit=$STATUS"
+fi
+expect_path_absent "FIL-32b malformed rule left no archive" "$FIL/f32.bak"
+rm -rf "$FIL/f33.bak"
+run_backupctl backup "$FIL/src" "$FIL/f33.bak" --include 'size:1XB'
+if [[ $STATUS -eq 2 ]] && grep -qF 'Invalid filter rule' "$OUT_FILE"; then
+  record_pass "FIL-33 malformed size is rejected"
+else
+  record_fail "FIL-33 malformed size is rejected" "exit=$STATUS"
+fi
+expect_path_absent "FIL-33b no archive left behind" "$FIL/f33.bak"
+rm -rf "$FIL/f34.bak"
+run_backupctl backup "$FIL/src" "$FIL/f34.bak" --include 'mtime:2026-13-99'
+if [[ $STATUS -eq 2 ]] && grep -qF 'Invalid filter rule' "$OUT_FILE"; then
+  record_pass "FIL-34 malformed mtime is rejected"
+else
+  record_fail "FIL-34 malformed mtime is rejected" "exit=$STATUS"
+fi
+expect_path_absent "FIL-34b no archive left behind" "$FIL/f34.bak"
+rm -rf "$FIL/f35.bak"
+run_backupctl backup "$FIL/src" "$FIL/f35.bak" --from-filter 'ext:cpp'
+if [[ $STATUS -eq 2 ]]; then
+  record_pass "FIL-35 unknown option is a usage error"
+else
+  record_fail "FIL-35 unknown option is a usage error" "exit=$STATUS"
+fi
+
+echo "[test] K7. 筛选后的往返完整性"
+run_backupctl restore "$FIL/f02.bak" "$FIL/f36.out" >/dev/null 2>&1
+expect_same_sha256 "FIL-36 retained file is byte-identical after filtering" \
+  "$FIL/src/a.cpp" "$FIL/f36.out/a.cpp"
+expect_path_absent "FIL-37 filtered file is absent from the restored tree" \
+  "$FIL/f36.out/c.log"
+
 # ---- CLI 约定 --------------------------------------------------------
 
 expect_success "CLI-01 --help exits 0" --help
