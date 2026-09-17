@@ -46,8 +46,8 @@ Item {
     property string formType: "file"
     property string formCompare: ">="
     property string formUnit: "KB"
-    property int formSizeLow: 1
-    property int formSizeHigh: 10
+    property string formSizeLowText: "1"
+    property string formSizeHighText: "10"
     property string formError: ""
 
     readonly property bool wide: width >= 760
@@ -65,6 +65,7 @@ Item {
         panel.dslPreview = panel.ruleModel.dslText
         panel.errorText = panel.ruleModel.lastError
         panel.cliLine = panel.ruleModel.cliArguments()
+        panel.previewSource = ruleModel.previewSource
     }
 
     function formMap() {
@@ -76,16 +77,38 @@ Item {
             "type": panel.formType,
             "compare": panel.formCompare,
             "unit": panel.formUnit,
-            "sizeLow": panel.formSizeLow,
-            "sizeHigh": panel.formSizeHigh
+            "sizeLow": panel.sizeLowValue(),
+            "sizeHigh": panel.sizeHighValue()
         }
     }
 
     // 表单校验同样交给 C++（builder + 真实 Filter 裁决），QML 不自判语法。
+    function isNonNegativeInt(text) {
+        return /^[0-9]+$/.test(text)
+    }
+
+    function sizeLowValue() {
+        return panel.isNonNegativeInt(panel.formSizeLowText) ? parseInt(panel.formSizeLowText) : 0
+    }
+
+    function sizeHighValue() {
+        return panel.isNonNegativeInt(panel.formSizeHighText) ? parseInt(panel.formSizeHighText) : 0
+    }
+
     function refreshFormError() {
         if (!ruleModel) {
             panel.formError = ""
             return
+        }
+        if (panel.formField === "size") {
+            if (!panel.isNonNegativeInt(panel.formSizeLowText)) {
+                panel.formError = "size 的数值必须是非负整数（当前是 " + panel.formSizeLowText + "）"
+                return
+            }
+            if (panel.formCompare === ".." && !panel.isNonNegativeInt(panel.formSizeHighText)) {
+                panel.formError = "size 区间的上界必须是非负整数（当前是 " + panel.formSizeHighText + "）"
+                return
+            }
         }
         panel.formError = panel.ruleModel.validateForm(panel.formMap())
     }
@@ -98,8 +121,8 @@ Item {
         panel.formType = "file"
         panel.formCompare = ">="
         panel.formUnit = "KB"
-        panel.formSizeLow = 1
-        panel.formSizeHigh = 10
+        panel.formSizeLowText = "1"
+        panel.formSizeHighText = "10"
         if (ruleModel)
             panel.ruleModel.clearError()
         panel.refreshFormError()
@@ -185,10 +208,10 @@ Item {
                             return "填写源目录后可预览筛选结果。"
                         if (panel.previewShown === 0)
                             return "还没有预览结果，点“刷新”。"
-                        if (panel.previewTruncated)
-                            return "仅预览前 " + panel.previewLimit + " 项（目录过大时只显示开头部分）。"
                         if (panel.previewSource.length > 0 && panel.previewSource !== controller.sourcePath)
                             return "共 " + panel.previewShown + " 项（结果对应 " + panel.previewSource + "，源目录已改，请刷新）。"
+                        if (panel.previewTruncated)
+                            return "仅预览前 " + panel.previewLimit + " 项（目录过大时只显示开头部分）。"
                         return "共 " + panel.previewShown + " 项。"
                     }
                 }
@@ -277,7 +300,6 @@ Item {
                         onClicked: {
                             if (ruleModel)
                                 panel.ruleModel.clearRules()
-                            panel.refreshPreview()
                         }
                     }
                 }
@@ -369,9 +391,9 @@ Item {
                         AppTextField {
                             visible: panel.formField === "size"
                             Layout.preferredWidth: 80
-                            text: String(panel.formSizeLow)
+                            text: panel.formSizeLowText
                             onTextEdited: {
-                                panel.formSizeLow = parseInt(text) || 0
+                                panel.formSizeLowText = text
                                 panel.refreshFormError()
                             }
                         }
@@ -379,9 +401,9 @@ Item {
                         AppTextField {
                             visible: panel.formField === "size" && panel.formCompare === ".."
                             Layout.preferredWidth: 80
-                            text: String(panel.formSizeHigh)
+                            text: panel.formSizeHighText
                             onTextEdited: {
-                                panel.formSizeHigh = parseInt(text) || 0
+                                panel.formSizeHighText = text
                                 panel.refreshFormError()
                             }
                         }
@@ -420,8 +442,6 @@ Item {
                                 if (panel.ruleModel.addRule(panel.formMap())) {
                                     panel.resetForm(panel.formAction)
                                     editor.visible = false
-                                    panel.syncFromModel()
-                                    panel.refreshPreview()
                                 }
                             }
                         }

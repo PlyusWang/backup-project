@@ -1,10 +1,11 @@
 // RuleCard.qml
 //
-// 一条筛选规则的卡片：只负责展示与发出动作信号，不触碰规则模型。
+// 一条筛选规则的卡片：负责展示，并在点击时通过注入的 ruleModelRef 直接调用
+// 上移 / 下移 / 删除（改完之后由面板的 rulesChanged 统一同步状态与刷新预览）。
 //
-// 之所以单独成组件：委托作用域里引用所属组件的根 id（panel.）会让 Qt 6.4 的
-// 静态检查工具报 Unqualified access 假告警。把卡片独立出来后，移动 / 删除
-// 的动作在面板自己的作用域里处理，既不需要放行，也让依赖方向更清楚。
+// 之所以单独成组件：委托作用域里引用所属组件的根 id（panel.）会让 Qt 6.4 的静态
+// 检查工具报假告警。卡片用 required property 显式声明依赖（index / ruleData /
+// ruleModelRef），不引用父级成员，依赖方向清楚，也不必扩大静态检查的放行范围。
 
 import QtQuick
 import QtQuick.Layouts
