@@ -12,8 +12,10 @@ CORE_SOURCES := src/core/archive_entry.cpp src/core/backup_engine.cpp \
                 src/archive/mypack_v2.cpp src/archive/pack_stream.cpp \
                 src/archive/ustar.cpp src/catalog/backup_catalog.cpp \
                 src/config/config_manager.cpp src/compression/huffman.cpp \
-                src/compression/lzss.cpp src/filter/filter.cpp \
-                src/filter/filter_rule_builder.cpp
+                src/compression/lzss.cpp src/crypto/aes.cpp \
+                src/crypto/des.cpp src/crypto/hmac.cpp src/crypto/pbkdf2.cpp \
+                src/crypto/random.cpp src/crypto/sha256.cpp \
+                src/filter/filter.cpp src/filter/filter_rule_builder.cpp
 FILESYSTEM_SOURCES := src/filesystem/file_system.cpp
 SOURCES := $(APP_SOURCES) $(CORE_SOURCES) $(FILESYSTEM_SOURCES)
 OBJECTS := $(patsubst %.cpp,$(BUILD_DIR)/%.o,$(SOURCES))
