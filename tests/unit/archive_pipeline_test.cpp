@@ -790,6 +790,149 @@ void RunFilterScan(const std::string& workdir) {
   }
 }
 
+// ---- 三种 pack 后端的语义一致性 + 备份确定性 -------------------------------
+
+// 同一个条目模型交给三种 pack 后端，解出来的字段必须逐项一致：
+// 只要有一个后端悄悄少存或多存了什么，"换个 pack 方法备份"就会得到不同的东西。
+void RunPackAgreement(const std::string& workdir) {
+  test_support::Section("three pack backends agree on the entry model");
+  const std::string source = workdir + "/agree-source";
+  BuildRegularTree(source);
+  test_support::CreateSymlink("hello.txt", source + "/link");
+  test_support::CreateFifo(source + "/pipe", 0644);
+  test_support::CreateHardlink(source + "/hello.txt", source + "/hard.txt");
+  test_support::NormalizeTimes(source, 1700000000);
+
+  std::string error;
+  std::vector<ArchiveEntry> entries;
+  if (!backupproject::ScanSourceTree(source, nullptr, &entries, &error)) {
+    test_support::Check(false, "agreement fixture scan", error);
+    return;
+  }
+
+  const PackMethod packs[3] = {PackMethod::kMyPack, PackMethod::kUstar,
+                               PackMethod::kFastUstar};
+  std::vector<std::vector<backupproject::PackedEntry>> scanned(3);
+  for (int index = 0; index < 3; ++index) {
+    const std::string packed =
+        workdir + "/agree-" + std::to_string(index) + ".pack";
+    test_support::RemoveTree(packed);
+    if (!backupproject::PackEntries(packs[index], entries, packed, &error)) {
+      test_support::Check(false, std::string("agree pack ") +
+                                      backupproject::PackMethodName(packs[index]),
+                          error);
+      continue;
+    }
+    backupproject::PackedStreamReader reader;
+    if (!reader.Open(packed, &error) ||
+        !reader.Scan(packs[index], &error)) {
+      test_support::Check(false, std::string("agree scan ") +
+                                      backupproject::PackMethodName(packs[index]),
+                          error);
+      continue;
+    }
+    scanned[index] = reader.entries();
+  }
+
+  for (int index = 0; index < 3; ++index) {
+    const std::string label =
+        std::string(backupproject::PackMethodName(packs[index]));
+    if (scanned[index].size() != entries.size()) {
+      test_support::Check(false, label + " keeps every entry",
+                          std::to_string(scanned[index].size()) + " vs " +
+                              std::to_string(entries.size()));
+      continue;
+    }
+    std::string detail;
+    for (std::size_t position = 0; position < entries.size(); ++position) {
+      const ArchiveEntry& before = entries[position];
+      const ArchiveEntry& after = scanned[index][position].entry;
+      if (before.archive_path != after.archive_path) {
+        detail = "path: " + before.archive_path + " vs " + after.archive_path;
+        break;
+      }
+      if (before.type != after.type) {
+        detail = "type of " + before.archive_path;
+        break;
+      }
+      if (before.mode != after.mode || before.uid != after.uid ||
+          before.gid != after.gid || before.mtime_sec != after.mtime_sec ||
+          before.size != after.size || before.link_target != after.link_target ||
+          before.dev_major != after.dev_major ||
+          before.dev_minor != after.dev_minor) {
+        detail = "metadata of " + before.archive_path;
+        break;
+      }
+    }
+    test_support::Check(detail.empty(), label + " preserves every field", detail);
+  }
+
+  // 备份确定性：同样的源 + 同样的选项（不加密）必须产出逐字节相同的 .bak；
+  // 加密之后 salt/IV 是随机的，字节必然不同，但两份都必须能恢复。
+  for (const PackMethod pack : packs) {
+    const std::string label =
+        std::string(backupproject::PackMethodName(pack));
+    BackupOptions options;
+    options.pack_method = pack;
+    options.compression_method = CompressionMethod::kLzssHuffman;
+    const std::string first = workdir + "/det-a.bak";
+    const std::string second = workdir + "/det-b.bak";
+    test_support::RemoveTree(first);
+    test_support::RemoveTree(second);
+    BackupEngine engine;
+    error.clear();
+    const bool ok_first =
+        engine.Backup(source, first, Filter(), options, &error);
+    const bool ok_second =
+        engine.Backup(source, second, Filter(), options, &error);
+    std::string bytes_first;
+    std::string bytes_second;
+    test_support::ReadFile(first, &bytes_first);
+    test_support::ReadFile(second, &bytes_second);
+    test_support::Check(ok_first && ok_second && !bytes_first.empty() &&
+                            bytes_first == bytes_second,
+                        label + " unencrypted backup is byte-for-byte reproducible");
+
+    options.encryption_method = EncryptionMethod::kAes256CtrHmacSha256;
+    options.password = "determinism check";
+    const std::string third = workdir + "/det-c.bak";
+    const std::string fourth = workdir + "/det-d.bak";
+    test_support::RemoveTree(third);
+    test_support::RemoveTree(fourth);
+    error.clear();
+    const bool ok_third =
+        engine.Backup(source, third, Filter(), options, &error);
+    const bool ok_fourth =
+        engine.Backup(source, fourth, Filter(), options, &error);
+    std::string bytes_third;
+    std::string bytes_fourth;
+    test_support::ReadFile(third, &bytes_third);
+    test_support::ReadFile(fourth, &bytes_fourth);
+    test_support::Check(ok_third && ok_fourth && !bytes_third.empty() &&
+                            bytes_third != bytes_fourth,
+                        label + " encrypted backup uses a fresh random salt/IV");
+    const std::string out_third = workdir + "/det-c-out";
+    const std::string out_fourth = workdir + "/det-d-out";
+    test_support::RemoveTree(out_third);
+    test_support::RemoveTree(out_fourth);
+    RestoreOptions restore_options;
+    restore_options.password = options.password;
+    RestoreReport report;
+    std::string detail_third;
+    std::string detail_fourth;
+    error.clear();
+    const bool restored_third =
+        engine.Restore(third, out_third, restore_options, &report, &error) &&
+        test_support::CompareTrees(source, out_third, &detail_third);
+    const bool restored_fourth =
+        engine.Restore(fourth, out_fourth, restore_options, &report, &error) &&
+        test_support::CompareTrees(source, out_fourth, &detail_fourth);
+    test_support::Check(restored_third && restored_fourth,
+                        label + " both encrypted backups restore",
+                        error + detail_third + detail_fourth);
+  }
+}
+
 }  // namespace
 
 int main() {
@@ -818,6 +961,7 @@ int main() {
   RunSocketSemantics(workdir);
   RunDeviceAndFormat(workdir);
   RunFilterScan(workdir);
+  RunPackAgreement(workdir);
 
   return test_support::Finish("archive-pipeline");
 }
