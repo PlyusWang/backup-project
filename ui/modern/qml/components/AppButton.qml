@@ -17,13 +17,13 @@ AbstractButton {
     readonly property bool primary: variant === "primary"
     readonly property bool flat: variant === "flat"
 
-    implicitHeight: primary ? 36 : 34
-    implicitWidth: Math.max(80, contentRoot.implicitWidth + (flat ? 16 : 32))
+    implicitHeight: primary ? 46 : 42
+    implicitWidth: Math.max(96, contentRoot.implicitWidth + (flat ? 22 : 40))
     padding: 0
     hoverEnabled: true
 
     background: Rectangle {
-        radius: 7
+        radius: 9
         // 主按钮用强调色，次级按钮用容器色，flat 完全透明——
         // 三者的层级差异靠背景而不是靠边框粗细来区分。
         color: {
@@ -64,7 +64,7 @@ AbstractButton {
                 id: label
                 text: control.text
                 anchors.verticalCenter: parent.verticalCenter
-                font.pixelSize: 13
+                font.pixelSize: 16
                 font.weight: control.primary ? Font.DemiBold : Font.Normal
                 color: {
                     if (!control.enabled)

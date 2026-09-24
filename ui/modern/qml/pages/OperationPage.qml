@@ -4,6 +4,7 @@
 // 所以用一个 mode 参数区分，避免维护两份几乎逐行重复的 QML。
 
 import QtQuick
+import QtQuick.Controls
 import QtQuick.Dialogs
 import QtQuick.Layouts
 
@@ -18,24 +19,42 @@ Item {
     // 两个路径框共用一个目录选择器；targetField 记录这次是给哪个框选的。
     property int targetField: 0
 
+
+    // 整页纵向滚动：内容超过窗口高度时页面本身可以滚（不是只给某个列表加滚轮）。
+    ScrollView {
+        id: pageScroll
+        objectName: "operationPageScroll"
+        anchors.fill: parent
+        clip: true
+        contentWidth: availableWidth
+        // 到顶/到底后继续滚不再被拉出去再弹回：ScrollView 的滚动主体是 Flickable，
+        // 显式设成 StopAtBounds（默认是 DragAndOvershootBounds）。
+        // contentItem 由样式在运行期提供、静态类型是 Item，所以只能运行期赋值，
+        // 写成 contentItem.boundsBehavior: ... 这种静态绑定会被判成非法属性。
+        Component.onCompleted: {
+            if (pageScroll.contentItem)
+                pageScroll.contentItem.boundsBehavior = Flickable.StopAtBounds
+        }
+        ScrollBar.horizontal.policy: ScrollBar.AlwaysOff
+        ScrollBar.vertical.policy: ScrollBar.AsNeeded
+
     ColumnLayout {
         id: column
-        anchors.horizontalCenter: parent.horizontalCenter
-        anchors.top: parent.top
-        anchors.topMargin: 30
-        width: Math.min(parent.width - 64, 900)
+        x: Math.max(32, (pageScroll.availableWidth - width) / 2)
+        y: 20
+        width: Math.min(pageScroll.availableWidth - 64, 1400)
         spacing: 16
 
         Text {
             text: page.isBackup ? "备份" : "恢复"
-            font.pixelSize: 24
+            font.pixelSize: 30
             font.weight: Font.DemiBold
             color: theme.textPrimary
         }
 
         Text {
             text: page.isBackup ? "把一个目录打包成一个备份文件。" : "从备份文件恢复目录树。"
-            font.pixelSize: 13
+            font.pixelSize: 17
             color: theme.textSecondary
             Layout.topMargin: -8
         }
@@ -50,7 +69,7 @@ Item {
 
                 Text {
                     text: page.isBackup ? "源目录" : "备份文件"
-                    font.pixelSize: 12
+                    font.pixelSize: 16
                     font.weight: Font.DemiBold
                     color: theme.textSecondary
                 }
@@ -90,7 +109,7 @@ Item {
 
                 Text {
                     text: page.isBackup ? "备份文件" : "恢复目录"
-                    font.pixelSize: 12
+                    font.pixelSize: 16
                     font.weight: Font.DemiBold
                     color: theme.textSecondary
                     Layout.topMargin: 8
@@ -129,96 +148,13 @@ Item {
                     }
                 }
 
-        // 筛选规则：只在备份页出现。QML 只负责收集文本和显示列表，
-        // 规则是否合法由 C++ 控制器判断——界面不实现任何 glob。
-        AppCard {
+        // 筛选规则交给可视化编辑器：QML 只收集表单值，
+        // DSL、校验与匹配全部在 C++ 侧（FilterRuleModel + Filter）。
+        FilterEditorPanel {
+            ruleModel: filterRuleModel
             visible: page.isBackup
             Layout.fillWidth: true
             Layout.topMargin: 4
-
-            ColumnLayout {
-                anchors.fill: parent
-                spacing: 8
-
-                Text {
-                    text: "筛选规则（可选）"
-                    font.pixelSize: 12
-                    font.weight: Font.DemiBold
-                    color: theme.textSecondary
-                }
-
-                RowLayout {
-                    Layout.fillWidth: true
-                    spacing: 8
-
-                    AppTextField {
-                        id: ruleInput
-                        Layout.fillWidth: true
-                        enabled: !controller.busy
-                        placeholderText: "如 ext:cpp;h 或 path:**/build/**"
-                    }
-
-                    AppButton {
-                        text: "加为 Include"
-                        enabled: !controller.busy && ruleInput.text.length > 0
-                        onClicked: {
-                            if (controller.addFilterRule("include", ruleInput.text))
-                                ruleInput.text = ""
-                        }
-                    }
-
-                    AppButton {
-                        text: "加为 Exclude"
-                        enabled: !controller.busy && ruleInput.text.length > 0
-                        onClicked: {
-                            if (controller.addFilterRule("exclude", ruleInput.text))
-                                ruleInput.text = ""
-                        }
-                    }
-                }
-
-                ColumnLayout {
-                    Layout.fillWidth: true
-                    spacing: 2
-
-                    Repeater {
-                        model: controller.includeRules
-                        Text {
-                            Layout.fillWidth: true
-                            text: "include: " + modelData
-                            font.pixelSize: 12
-                            color: theme.textPrimary
-                            MouseArea {
-                                anchors.fill: parent
-                                onClicked: controller.removeFilterRule(index)
-                            }
-                        }
-                    }
-
-                    Repeater {
-                        model: controller.excludeRules
-                        Text {
-                            Layout.fillWidth: true
-                            text: "exclude: " + modelData
-                            font.pixelSize: 12
-                            color: theme.textSecondary
-                            MouseArea {
-                                anchors.fill: parent
-                                onClicked: controller.removeFilterRule(controller.includeRules.length + index)
-                            }
-                        }
-                    }
-                }
-
-                Text {
-                    visible: controller.includeRules.length + controller.excludeRules.length > 0
-                    text: "点击规则可删除；没有规则时按 PR #8 行为备份全部内容。"
-                    font.pixelSize: 11
-                    color: theme.textSecondary
-                    Layout.fillWidth: true
-                    wrapMode: Text.WordWrap
-                }
-            }
         }
 
                 RowLayout {
@@ -273,6 +209,7 @@ Item {
         }
 
         Item { Layout.fillHeight: true }
+    }
     }
 
     // 选择器只负责“帮忙填”：选完之后输入框仍然可以手改，

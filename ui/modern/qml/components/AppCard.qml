@@ -11,7 +11,7 @@ Rectangle {
 
     // radius 直接用 Rectangle 自带的属性，调用方写 AppCard { radius: ... } 就能覆盖；
     // 不需要再声明一个同名属性（那会被 QML 判成“同一属性被赋值两次”）。
-    property int padding: 20
+    property int padding: 18
 
     default property alias content: inner.data
 

@@ -56,7 +56,7 @@ Rectangle {
 
             Text {
                 text: banner.title
-                font.pixelSize: 13
+                font.pixelSize: 16
                 font.weight: Font.DemiBold
                 color: banner.kind === "idle" ? theme.textSecondary : banner.tone
                 Layout.fillWidth: true
@@ -75,7 +75,7 @@ Rectangle {
                 persistentSelection: true
                 cursorVisible: false
                 textFormat: TextEdit.PlainText
-                font.pixelSize: 12
+                font.pixelSize: 15
                 color: theme.textSecondary
                 selectionColor: theme.accent
                 selectedTextColor: theme.surface

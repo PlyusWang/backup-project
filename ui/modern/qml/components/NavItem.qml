@@ -11,7 +11,7 @@ AbstractButton {
 
     property string iconName: ""
 
-    implicitHeight: 38
+    implicitHeight: 46
     padding: 0
     hoverEnabled: true
 
@@ -52,7 +52,7 @@ AbstractButton {
 
         Text {
             text: control.text
-            font.pixelSize: 13
+            font.pixelSize: 16
             font.weight: control.checked ? Font.DemiBold : Font.Normal
             color: control.checked ? theme.accent : theme.textPrimary
             anchors.verticalCenter: parent.verticalCenter
