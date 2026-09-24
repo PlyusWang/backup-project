@@ -10,6 +10,7 @@
 #include <string>
 
 #include "archive.h"
+#include "archive_pipeline.h"
 
 namespace backupproject {
 
@@ -106,8 +107,45 @@ bool BackupEngine::Restore(const std::string& archive_file,
     return false;
   }
 
+  // v2 容器也能被这个旧签名认出来。识别失败时不在这里报错：交给 legacy
+  // reader 给出它自己的诊断信息（"Invalid archive magic" 之类），
+  // 免得同一个坏文件出现两套不同措辞。
+  ArchiveFileInfo info;
+  if (IdentifyArchiveFile(archive_file, &info, nullptr) &&
+      info.kind == ArchiveFileInfo::Kind::kContainerV2) {
+    const RestoreOptions no_password;
+    return RunRestorePipeline(archive_file, destination_directory, no_password,
+                              nullptr, error_message);
+  }
+
   const ArchiveReader reader;
   return reader.Extract(archive_file, destination_directory, error_message);
+}
+
+// 显式选择 v2 pipeline 的备份入口。参数层检查（源是不是目录、归档文件是否
+// 已经存在）由 pipeline 自己做，这里只负责把 Filter 传下去。
+bool BackupEngine::Backup(const std::string& source_directory,
+                          const std::string& archive_file, const Filter& filter,
+                          const BackupOptions& options,
+                          std::string* error_message) {
+  return RunBackupPipeline(source_directory, archive_file, filter, options,
+                           error_message);
+}
+
+bool BackupEngine::Restore(const std::string& archive_file,
+                           const std::string& destination_directory,
+                           const RestoreOptions& options, RestoreReport* report,
+                           std::string* error_message) {
+  return RunRestorePipeline(archive_file, destination_directory, options,
+                            report, error_message);
+}
+
+bool BackupEngine::Restore(const std::string& archive_file,
+                           const std::string& destination_directory,
+                           const RestoreOptions& options,
+                           std::string* error_message) {
+  return RunRestorePipeline(archive_file, destination_directory, options,
+                            nullptr, error_message);
 }
 
 }  // namespace backupproject
