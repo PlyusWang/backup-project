@@ -391,6 +391,69 @@ bool WriteGlobalHeader(ArchiveOutput* output, std::string* error_message) {
   return output->Write(header.data(), header.size(), error_message);
 }
 
+// 全局 header 的解码结果。
+struct GlobalHeaderFields {
+  std::uint16_t format_version = 0;
+  std::uint16_t flags = 0;
+  std::uint64_t entry_count = 0;
+};
+
+// 全局 header 的唯一解码入口：preflight 与 ArchiveReader::InspectHeader 都
+// 走这里。
+//
+// 之所以要收成一个函数，是因为"这个文件是不是我们的归档"这条判断只能有一份
+// 实现。如果 InspectHeader 自己再抄一遍 magic / version / flags / header_size
+// 的规则，"备份列表认得"和"恢复认得"迟早会分叉——一边放行的归档，另一边打
+// 不开。那份分叉在用户那里表现为"列表里显示得好好的备份，点恢复却失败"。
+//
+// 只看这 24 个字节，不碰 entry、不碰 payload。
+bool DecodeGlobalHeader(const unsigned char* header, std::size_t size,
+                        const std::string& archive_path,
+                        GlobalHeaderFields* fields,
+                        std::string* error_message) {
+  if (size < kGlobalHeaderSize) {
+    SetError(error_message, "Truncated archive header: " + archive_path);
+    return false;
+  }
+  if (std::memcmp(header, kMagic, sizeof(kMagic)) != 0) {
+    SetError(error_message, "Invalid archive magic: " + archive_path);
+    return false;
+  }
+
+  std::size_t cursor = sizeof(kMagic);
+  std::uint16_t version = 0;
+  std::uint16_t flags = 0;
+  std::uint32_t header_size = 0;
+  std::uint64_t entry_count = 0;
+  if (!ReadU16LE(header, size, &cursor, &version) ||
+      !ReadU16LE(header, size, &cursor, &flags) ||
+      !ReadU32LE(header, size, &cursor, &header_size) ||
+      !ReadU64LE(header, size, &cursor, &entry_count)) {
+    SetError(error_message, "Truncated archive header: " + archive_path);
+    return false;
+  }
+  if (version != kFormatVersion) {
+    SetError(error_message, "Unsupported archive version: " +
+                                std::to_string(static_cast<int>(version)));
+    return false;
+  }
+  if (flags != kFormatFlags) {
+    SetError(error_message, "Unsupported archive flags: " +
+                                std::to_string(static_cast<int>(flags)));
+    return false;
+  }
+  if (header_size != kGlobalHeaderSize) {
+    SetError(error_message,
+             "Invalid archive header size: " + std::to_string(header_size));
+    return false;
+  }
+
+  fields->format_version = version;
+  fields->flags = flags;
+  fields->entry_count = entry_count;
+  return true;
+}
+
 // 写一条 entry 的 header + path，并让 entry_count 加一。
 // 路径语法校验写侧也要用，而它的定义在读侧那一段，所以先声明一次。
 bool ValidateArchivePath(const std::string& path, bool is_first_entry,
@@ -735,38 +798,15 @@ bool PreflightArchive(int fd, const std::string& archive_path,
     SetError(error_message, "Truncated archive header: " + archive_path);
     return false;
   }
-  if (std::memcmp(header, kMagic, sizeof(kMagic)) != 0) {
-    SetError(error_message, "Invalid archive magic: " + archive_path);
+  // 全局 header 的校验与 InspectHeader 共用同一份实现：preflight 和"备份
+  // 列表"必须用同一套规则认归档，不能各抄一份。
+  GlobalHeaderFields global;
+  if (!DecodeGlobalHeader(header, sizeof(header), archive_path, &global,
+                          error_message)) {
     return false;
   }
 
-  std::size_t cursor = sizeof(kMagic);
-  std::uint16_t version = 0;
-  std::uint16_t flags = 0;
-  std::uint32_t header_size = 0;
-  std::uint64_t entry_count = 0;
-  if (!ReadU16LE(header, sizeof(header), &cursor, &version) ||
-      !ReadU16LE(header, sizeof(header), &cursor, &flags) ||
-      !ReadU32LE(header, sizeof(header), &cursor, &header_size) ||
-      !ReadU64LE(header, sizeof(header), &cursor, &entry_count)) {
-    SetError(error_message, "Truncated archive header: " + archive_path);
-    return false;
-  }
-  if (version != kFormatVersion) {
-    SetError(error_message, "Unsupported archive version: " +
-                                std::to_string(static_cast<int>(version)));
-    return false;
-  }
-  if (flags != kFormatFlags) {
-    SetError(error_message, "Unsupported archive flags: " +
-                                std::to_string(static_cast<int>(flags)));
-    return false;
-  }
-  if (header_size != kGlobalHeaderSize) {
-    SetError(error_message,
-             "Invalid archive header size: " + std::to_string(header_size));
-    return false;
-  }
+  const std::uint64_t entry_count = global.entry_count;
 
   // path -> type。既用来查重，也用来确认每条路径的父目录确实是个目录。
   // 有了它，"重复路径"和"文件被当成父目录"这两种结构性错误都能在读 header
@@ -1251,6 +1291,73 @@ bool ArchiveReader::Extract(const std::string& archive_file,
       return false;
     }
   }
+  return true;
+}
+
+// 只读全局 header 的快速摘要。这是本文件里唯一一个"只看开头 24 个字节"的
+// 公开入口，其余校验一律走 Extract 的 preflight。
+//
+// 它和 preflight 共用 DecodeGlobalHeader，所以"能被列出来"和"能被恢复"在
+// header 这一层上永远是一致的；但 entry、payload、路径、EOF 这些它一概不看，
+// 因此它的成功不构成"归档可用"的证据。
+bool ArchiveReader::InspectHeader(const std::string& archive_file,
+                                  ArchiveSummary* summary,
+                                  std::string* error_message) const {
+  if (error_message != nullptr) {
+    error_message->clear();
+  }
+  if (summary == nullptr) {
+    SetError(error_message, "InspectHeader: summary must not be null");
+    return false;
+  }
+  *summary = ArchiveSummary();
+
+  if (archive_file.empty()) {
+    SetError(error_message, "InspectHeader: archive file path is empty");
+    return false;
+  }
+
+  // 和 Extract 一样先看路径本身：软链接、目录、FIFO 都不是归档文件。
+  // 用 lstat 而不是 stat，软链接必须如实暴露成软链接。
+  struct stat archive_info;
+  if (lstat(archive_file.c_str(), &archive_info) != 0) {
+    SetError(error_message,
+             Describe(errno, "Failed to inspect archive file", archive_file));
+    return false;
+  }
+  if (!S_ISREG(archive_info.st_mode)) {
+    SetError(error_message,
+             "Archive path is not a regular file: " + archive_file);
+    return false;
+  }
+
+  const int fd = ::open(archive_file.c_str(), O_RDONLY);
+  if (fd < 0) {
+    SetError(error_message,
+             Describe(errno, "Failed to open archive file", archive_file));
+    return false;
+  }
+  // 只读 fd 的 close 失败不会丢数据，交给 RAII 关闭即可。
+  ScopedFd archive_fd(fd);
+
+  // 只读全局 header 这一块。读完就返回，所以"坏在后面的归档"在这里依然会被
+  // 认出来——这正是本方法要暴露的边界，也是它不能替代 preflight 的原因。
+  unsigned char header[kGlobalHeaderSize];
+  if (ReadAt(archive_fd.get(), header, sizeof(header), 0) !=
+      static_cast<ssize_t>(sizeof(header))) {
+    SetError(error_message, "Truncated archive header: " + archive_file);
+    return false;
+  }
+
+  GlobalHeaderFields fields;
+  if (!DecodeGlobalHeader(header, sizeof(header), archive_file, &fields,
+                          error_message)) {
+    return false;
+  }
+
+  summary->format_version = fields.format_version;
+  summary->flags = fields.flags;
+  summary->entry_count = fields.entry_count;
   return true;
 }
 
