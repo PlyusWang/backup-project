@@ -9,9 +9,11 @@
 - 归档里的文件正文（payload）是**原始字节**：不压缩、不编码、不转码、不 base64、不加密。
 - 源文件里的 `ABCDEF0123456789` 在归档中仍然是这 16 个字节。
 - 归档只会比原始内容**大**（多了全局 header、每条 entry 的 header 和路径），绝不会更小。
-- 因此本项目不使用也没有实现 Huffman / zlib / gzip / deflate / zstd / lz4 / bzip2 等任何压缩算法，
-  也不使用 tar / zip / 7z / libarchive 等任何第三方打包库：header、entry、路径、payload
-  全部由本仓库的 C++ 代码自己写、自己读。
+- 因此 v0.1 这一层不使用也没有实现 Huffman / zlib / gzip / deflate / zstd / lz4 / bzip2 等
+  任何压缩算法，也不使用 tar / zip / 7z / libarchive 等任何第三方打包库：header、entry、
+  路径、payload 全部由本仓库的 C++ 代码自己写、自己读。
+  （v2 是另一条可组合的流水线，它自己实现了 Canonical Huffman / LZSS / USTAR / 手写加密，
+  见 `archive_v2_container.md`；v0.1 的格式与语义不因此改变。）
 
 测试 `scripts/test.sh` 的 NOCMP 区用三条断言守住这件事：
 源文件里的 `UNCOMPRESSED_ARCHIVE_PAYLOAD_0123456789` 必须能在归档里原样搜到；
@@ -171,7 +173,9 @@ v0.1 只支持普通目录和普通文件。源目录里出现下列任何一种
 
 - 本文件描述的是中间那一层的格式。`ArchiveWriter` / `ArchiveReader` 不依赖
   BackupEngine、CLI 或 GUI，只认路径参数，可以单独测试、单独复用；
-- **压缩、加密、过滤、增量、去重、多版本、网络都不属于 v0.1**，本仓库当前也没有实现；
+- **压缩、加密、过滤、增量、去重、多版本、网络都不属于 v0.1**；其中压缩 / 加密 / USTAR
+  已在 v2 流水线（`archive_v2_container.md`）里实现，但那是另一个容器格式（`BKPCNT2\0`），
+  v0.1 本身仍然只做打包，行为与格式都没有变；
 - 将来接入压缩层时，`version` 与 `flags` 是现成的演进位：压缩可以做成 payload 的
   一层包装（改 flags），也可以做成整个归档之外的一道流水线工序（归档层完全不变）。
   无论哪种，v0.1 的归档仍然是压缩层的输入，格式本身不需要推翻重来。
