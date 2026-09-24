@@ -6,7 +6,8 @@
 //   源目录 → Filter → ArchiveWriter → .bak
 //
 // Filter 只回答"这条路径要不要进备份"，不负责压缩、加密、增量或校验；
-// 它只看 lstat 拿到的元数据（名字、路径、类型、大小、mtime），不读文件内容。
+// 它只看 lstat
+// 拿到的元数据（名字、路径、类型、属主、大小、mtime），不读文件内容。
 //
 // 规则语法、include / exclude 语义、glob 规则见 docs/filter_usage.md；
 // 明确不做与后续计划见 docs/backlog/filter_future.md。
@@ -19,6 +20,8 @@
 #include <string>
 #include <vector>
 
+#include "archive_entry.h"
+
 namespace backupproject {
 
 // 规则动作。exclude 优先于 include。
@@ -26,12 +29,26 @@ enum class FilterAction { kInclude, kExclude };
 
 // 被判断对象的最小信息集合。archive_path 使用归档内部形式：
 // 相对 source root、'/' 分隔；source root 自身是 "."。
+//
+// 字段分两代：is_directory / size / mtime_sec 是初版就有的，只填它们的调用方
+// 行为必须一字不变；type / uid / gid / user_name / group_name 是补上的元数据，
+// 填了才能命中 type: 的细分取值与 uid: / gid: / user: / group: 规则。
 struct FilterEntry {
   std::string archive_path;
   std::string name;
   bool is_directory = false;
+  // 条目类型。type:file / type:folder 仍按 is_directory 判断（见 filter.cpp），
+  // 只有 symlink / fifo / char / block / socket 才读这个字段——这样"只填
+  // is_directory"的旧调用方不会因为默认值而改变匹配结果。
+  EntryType type = EntryType::kRegularFile;
   std::uint64_t size = 0;
   std::int64_t mtime_sec = 0;
+  std::uint32_t uid = 0;
+  std::uint32_t gid = 0;
+  // getpwuid_r / getgrgid_r 解析失败时为空。user: / group: 遇到空名字一律
+  // 视为不匹配：既不报错，也不会把"解析不出来"当成"匹配所有人"。
+  std::string user_name;
+  std::string group_name;
 };
 
 class Filter {
@@ -64,17 +81,54 @@ class Filter {
   // 一条规则内部可以写多个子句（用空白分隔，且空白后面紧跟已知字段名），
   // 子句之间是 AND；规则之间是 OR。
   struct Clause {
-    enum class Field { kName, kPath, kStem, kExt, kType, kSize, kMtime };
-    enum class Compare { kLess, kLessEqual, kGreater, kGreaterEqual, kRange };
+    enum class Field {
+      kName,
+      kPath,
+      kStem,
+      kExt,
+      kType,
+      kSize,
+      kMtime,
+      kUid,
+      kGid,
+      kUser,
+      kGroup
+    };
+    // size / uid / gid 共用的数值比较。kEqual 目前只由 uid:/gid: 的裸数字
+    // 产生（size 没有裸数字形式，等于用 a..a 表达）。
+    enum class Compare {
+      kLess,
+      kLessEqual,
+      kGreater,
+      kGreaterEqual,
+      kRange,
+      kEqual
+    };
+    // type: 的取值。file / folder 只看 is_directory，其余看 EntryType。
+    enum class TypeKind {
+      kFile,
+      kFolder,
+      kSymlink,
+      kFifo,
+      kCharDevice,
+      kBlockDevice,
+      kSocket
+    };
     enum class TimeKind { kDay, kDayRange, kLastDays };
 
     Field field = Field::kName;
-    std::string pattern;                  // name / path / stem 的 glob
-    std::vector<std::string> extensions;  // ext 的多个取值
-    bool wants_directory = false;         // type:file / type:folder
-    Compare compare = Compare::kLess;     // size
+    std::string pattern;                   // name / path / stem 的 glob
+    std::vector<std::string> extensions;   // ext 的多个取值
+    TypeKind type_kind = TypeKind::kFile;  // type
+    Compare compare = Compare::kLess;      // size / uid / gid
     std::uint64_t size_low = 0;
     std::uint64_t size_high = 0;
+    std::uint32_t uid_low = 0;
+    std::uint32_t uid_high = 0;
+    std::uint32_t gid_low = 0;
+    std::uint32_t gid_high = 0;
+    std::string user_name;   // user：精确匹配，大小写敏感
+    std::string group_name;  // group：精确匹配，大小写敏感
     TimeKind time_kind = TimeKind::kDay;  // mtime 的闭区间 [low, high]
     std::int64_t time_low = 0;
     std::int64_t time_high = 0;
