@@ -11,7 +11,8 @@ CORE_SOURCES := src/core/archive_entry.cpp src/core/backup_engine.cpp \
                 src/archive/archive.cpp src/archive/archive_path.cpp \
                 src/archive/mypack_v2.cpp src/archive/pack_stream.cpp \
                 src/archive/ustar.cpp src/catalog/backup_catalog.cpp \
-                src/config/config_manager.cpp src/filter/filter.cpp \
+                src/config/config_manager.cpp src/compression/huffman.cpp \
+                src/compression/lzss.cpp src/filter/filter.cpp \
                 src/filter/filter_rule_builder.cpp
 FILESYSTEM_SOURCES := src/filesystem/file_system.cpp
 SOURCES := $(APP_SOURCES) $(CORE_SOURCES) $(FILESYSTEM_SOURCES)
