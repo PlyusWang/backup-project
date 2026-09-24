@@ -14,6 +14,7 @@
 #   ARCHIVE_PIPELINE_OUT_DIR       指定产物目录（默认 mktemp -d，结束时删除）
 #   ARCHIVE_PIPELINE_EXTRA_FLAGS   追加编译参数（例如 sanitizer）
 #   ARCHIVE_PIPELINE_SKIP_BENCH=1  跳过 128 MiB 级别的打包 benchmark
+#   ARCHIVE_PIPELINE_SKIP_MUTATION=1  跳过确定性 mutation 扫描（约 5 分钟）
 #   ARCHIVE_PIPELINE_BENCH_BIG     大文件 MiB（默认 128）
 #   ARCHIVE_PIPELINE_BENCH_SMALL   小文件个数（默认 10000）
 
@@ -114,6 +115,15 @@ build_library
 compile_and_run pipeline_test tests/unit/archive_pipeline_test.cpp | tee "$OUT_DIR/pipeline_test.log"
 
 compile_and_run container_test tests/unit/archive_container_test.cpp | tee "$OUT_DIR/container_test.log"
+
+# 确定性 mutation 扫描：对 v2 容器 / 裸 packed 流 / HUF1 / LZH1 逐偏移翻 bit，
+# 要求"要么成功，要么干净失败"，绝不允许崩溃、越界、无限循环或半恢复。
+# 它比较慢（几千次 restore），所以给了跳过开关。
+if [[ "${ARCHIVE_PIPELINE_SKIP_MUTATION:-0}" == "1" ]]; then
+    echo "SKIP  mutation sweep"
+else
+    compile_and_run mutation_test tests/unit/archive_mutation_test.cpp | tee "$OUT_DIR/mutation_test.log"
+fi
 
 # ---- GNU tar 互操作 --------------------------------------------------------
 say "GNU tar 互操作"
