@@ -4,11 +4,14 @@
 //
 //   1. 只认仓库的直接子项。所有对外部路径的读写都要先过 ValidateFileName，
 //      路径拼接永远发生在校验之后；
-//   2. 只认普通文件。一律用 lstat 而不是 stat，所以软链接被当成链接本身看，
-//      不会顺着它走到仓库外面去；
+//   2. 只认普通文件。一律用 lstat 而不是 stat，路径最后一段的软链接被当成
+//      链接本身看，不会被顺着走到别处去；
 //   3. 坏归档不阻断列表。InspectHeader 失败只是给这条记录写一句 diagnostic，
 //      不改变 List 的成功与否——列表的价值之一就是让用户看见"这个文件还在，
 //      但已经不是能被恢复的归档了"。
+//
+// 这三条只覆盖路径的安全解析，不覆盖并发修改：祖先路径组件的符号链接替换与
+// check/use 竞态都不在防护范围内，确切边界见 backup_catalog.h 的"安全边界"。
 
 #include "backup_catalog.h"
 
@@ -185,8 +188,8 @@ bool LocateDirectChildFile(const std::string& repository,
 
   const std::string candidate = FileSystem::JoinPath(normalized, file_name);
 
-  // 用 lstat 而不是 stat：软链接在这里就已经被判成"不是普通文件"，
-  // 不会顺着它走到仓库外面。
+  // 用 lstat 而不是 stat：路径最后一段是软链接时，这里就已经被判成
+  // "不是普通文件"，不会被顺着走到别处去。
   struct stat info;
   if (lstat(candidate.c_str(), &info) != 0) {
     SetError(error_message, Describe(errno, action, candidate));
@@ -524,15 +527,16 @@ bool BackupCatalog::Delete(const std::string& repository,
   // 不要求 InspectHeader 成功：坏掉的备份仍然是普通 .bak 文件，必须删得掉，
   // 否则损坏的存档会永远留在列表里。
   //
-  // 校验与 unlink 之间确实存在时间窗。这个窗口逃不出仓库需要两个前提，
-  // 两个都已经在上面那个 LocateDirectChildFile 里成立：
-  //   * 仓库根不是软链接——否则 POSIX 会跟随这个中间组件，真正被 unlink 的
-  //     是链接指向的那个目录里的文件。这一条只靠"最后一段不是软链接"是挡不住
-  //     的，本文件早期版本的注释漏了它；
-  //   * 最后一段是普通文件。
-  // 在这个前提下，unlink 不跟随软链接（删的是链接本身，不是它指向的目标），
-  // 也不会删目录（会以 EISDIR 失败）。所以即使这个名字在这一瞬间被换掉，
-  // 最坏结果也只是仓库内少了一个软链接。
+  // 校验与 unlink 之间确实存在时间窗。LocateDirectChildFile 里那两条前提
+  // （仓库根不是软链接、最后一段是普通文件）只在"校验那一刻"成立：
+  //   * 仓库根若是软链接，POSIX 会跟随这个中间组件，真正被 unlink 的是链接
+  //     指向的那个目录里的文件。这一条只靠"最后一段不是软链接"挡不住，所以
+  //     必须单独验，本文件早期版本的注释漏了它；
+  //   * unlink 本身不跟随软链接（删的是链接本身，不是它指向的目标），也不会
+  //     删目录（会以 EISDIR 失败）。
+  // 因此在这个时间窗里把最后一段换成别的东西，最坏结果是仓库内少了一个软链接。
+  // 但校验之后文件系统若被并发改写（包括把某个祖先目录换成软链接），上面的
+  // 结论就不再成立——那属于 backup_catalog.h 顶部列出的、当前不提供防护的范围。
   if (::unlink(archive_path.c_str()) != 0) {
     SetError(error_message,
              Describe(errno, "Failed to delete backup file", archive_path));
