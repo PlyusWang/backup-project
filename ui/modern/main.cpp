@@ -1,10 +1,14 @@
 // main.cpp
 //
 // 现代 QML GUI 的入口。除正常启动外还带几个开发期开关：
-//   --smoke-test                        建引擎、建窗口、切页、换主题后退出
-//   --screenshot <目录>                 三个页面 × 两套主题渲染成 PNG
+//   --smoke-test 建引擎、建窗口、切四个页面、换主题后退出
+//   --screenshot <目录>                 四个页面 × 两套主题渲染成 PNG
 //   --self-test <源> <备份文件> <恢复目录> [--include R] [--exclude R]
-//                                       真跑一次打包 + 解包并报告结果
+//                                       真跑一次 direct archive 备份 + 恢复
+//   --repository-test <源> <仓库> <恢复目录>
+//                                       走 ConfigManager + BackupCatalog 的
+//                                       repository-driven 产品链路端到端验证
+//   --config-file <路径>                指定配置文件（测试隔离真实用户配置）
 //   --path-test                         验证本地路径与 URL 互转不丢字符
 //   --close-guard-test                  验证任务进行中关窗会被拦下
 //   --native-frame                      退回系统原生标题栏（Wayland 兜底）
@@ -20,9 +24,12 @@
 #include <QQmlContext>
 #include <QQuickStyle>
 #include <QQuickWindow>
+#include <QStandardPaths>
 #include <QStringList>
 #include <QTemporaryDir>
 #include <QTimer>
+#include <QVariantList>
+#include <QVariantMap>
 #include <cstdio>
 
 #include "app_theme.h"
@@ -31,7 +38,7 @@
 
 namespace {
 
-const int kPageCount = 3;
+const int kPageCount = 4;
 int g_qml_warnings = 0;
 
 // QML 的运行期问题（binding loop、类型错误、模块缺失……）都以 Qt warning 发出。
@@ -75,7 +82,25 @@ void WaitForAnimation(int milliseconds) {
   loop.exec();
 }
 
-// --screenshot：三个页面 × 两套主题各抓一张 PNG。
+// 配置文件路径：正常启动由 Qt 按应用名算出 AppConfigLocation，
+// 显式给了 --config-file 时用调用方指定的那一个（自动测试据此隔离真实配置）。
+//
+// 这里刻意不猜 HOME、不写死 ~/.config、不假设运行在 Ubuntu 上：
+// 路径的来源只有 QStandardPaths 和命令行这两个。
+QString ResolveConfigFilePath(const QStringList& arguments) {
+  const int index = arguments.indexOf(QStringLiteral("--config-file"));
+  if (index >= 0 && index + 1 < arguments.size()) {
+    return arguments.at(index + 1);
+  }
+  const QString directory =
+      QStandardPaths::writableLocation(QStandardPaths::AppConfigLocation);
+  if (directory.isEmpty()) {
+    return QString();
+  }
+  return QDir(directory).filePath(QStringLiteral("config.json"));
+}
+
+// --screenshot：四个页面 × 两套主题各抓一张 PNG。
 // 抓帧走窗口自己的 grabWindow()，和用户看到的是同一条渲染路径，
 // 不是另画一份示意图。
 int CaptureScreenshots(QQuickWindow* window, backup_modern::AppTheme* theme,
@@ -86,7 +111,8 @@ int CaptureScreenshots(QQuickWindow* window, backup_modern::AppTheme* theme,
   }
   // 文件名固定成 页面-主题.png，方便文档和脚本按名字引用，
   // 不用在文档里写死带时间戳的路径。
-  const char* page_names[kPageCount] = {"home", "backup", "restore"};
+  const char* page_names[kPageCount] = {"home", "backup", "management",
+                                        "settings"};
   for (int dark = 0; dark < 2; ++dark) {
     theme->setDark(dark == 1);
     for (int page = 0; page < kPageCount; ++page) {
@@ -142,33 +168,123 @@ int ApplyFilterArguments(backup_modern::BackupController* controller,
   return 0;
 }
 
-// --self-test 走的是和界面完全相同的控制器路径：source 目录打成一个
-// .bak，再从那个 .bak 恢复到目标目录。任何一步失败都直接以非 0 退出，
-// 所以它可以被脚本当作"桥 + 核心 + 归档"整条链路的冒烟测试。
+// --self-test：验证 controller → engine 的 direct archive 路径，也就是
+// "备份文件由调用方显式指定"这一种用法。产品 QML 已经不再提供这个入口
+// （界面改成 repository + 自动命名），但这条核心链路本身依然要有人测，
+// 而且它仍然应用当前的 include / exclude 规则。
 //
-// --self-test：命令行下没有 QML 绑定，用控制器自带的状态等待任务结束。
+// 两个 start*ForTest 入口都是 C++ 专供、不是 Q_INVOKABLE，所以它们不会
+// 变成 QML 可以调用的东西。
 int RunSelfTest(backup_modern::BackupController* controller,
                 const QString& source, const QString& archive_file,
                 const QString& destination) {
   controller->setSourcePath(source);
-  controller->setBackupFilePath(archive_file);
-  controller->setRestorePath(destination);
 
-  if (!controller->startBackup() || !controller->waitForIdle(600000) ||
-      !controller->lastSucceeded()) {
+  if (!controller->startDirectBackupForTest(source, archive_file) ||
+      !controller->waitForIdle(600000) || !controller->lastSucceeded()) {
     std::fprintf(stderr, "backup failed: %s\n",
                  qPrintable(controller->statusMessage()));
     return 1;
   }
   std::printf("backup ok\n");
 
-  if (!controller->startRestore() || !controller->waitForIdle(600000) ||
-      !controller->lastSucceeded()) {
+  if (!controller->startDirectRestoreForTest(archive_file, destination) ||
+      !controller->waitForIdle(600000) || !controller->lastSucceeded()) {
     std::fprintf(stderr, "restore failed: %s\n",
                  qPrintable(controller->statusMessage()));
     return 1;
   }
   std::printf("restore ok\n");
+  return 0;
+}
+
+// --repository-test：repository-driven 的产品链路端到端验证。
+// 它走 ConfigManager + BackupCatalog + BackupController + BackupEngine，
+// 不使用任何 direct archive 捷径：文件名由 Catalog 自动生成，恢复只传 file
+// name。
+//
+// 每一步失败都把真实 diagnostic 打到 stderr 并以非 0 退出，
+// 所以脚本可以只信退出码，也可以从 stderr 看到核心的原文原因。
+int RunRepositoryTest(backup_modern::BackupController* controller,
+                      const QString& source, const QString& repository,
+                      const QString& destination) {
+  // 1. 保存仓库设置：EnsureRepository + ConfigManager::Save
+  if (!controller->saveRepositoryPath(repository)) {
+    std::fprintf(stderr, "repository save failed: %s\n",
+                 qPrintable(controller->statusMessage()));
+    return 1;
+  }
+  std::printf("repository save ok\n");
+
+  // 2. 自动命名的备份：界面不提供归档路径输入框
+  controller->setSourcePath(source);
+  if (!controller->startBackup() || !controller->waitForIdle(600000) ||
+      !controller->lastSucceeded()) {
+    std::fprintf(stderr, "automatic backup failed: %s\n",
+                 qPrintable(controller->statusMessage()));
+    return 1;
+  }
+  std::printf("automatic backup ok\n");
+
+  // 3. 仓库列表
+  controller->refreshBackups();
+  if (!controller->waitForCatalogIdle(600000)) {
+    std::fprintf(stderr, "catalog list timed out\n");
+    return 1;
+  }
+  if (!controller->catalogError().isEmpty()) {
+    std::fprintf(stderr, "catalog list failed: %s\n",
+                 qPrintable(controller->catalogError()));
+    return 1;
+  }
+  const QVariantList records = controller->backupRecords();
+  if (records.size() != 1) {
+    std::fprintf(stderr, "catalog list 期望 1 条记录，实际 %d 条\n",
+                 static_cast<int>(records.size()));
+    return 1;
+  }
+  const QVariantMap record = records.at(0).toMap();
+  if (!record.value(QStringLiteral("recognizedArchive")).toBool()) {
+    std::fprintf(
+        stderr, "归档头未被识别: %s\n",
+        qPrintable(record.value(QStringLiteral("diagnostic")).toString()));
+    return 1;
+  }
+  const QString file_name = record.value(QStringLiteral("fileName")).toString();
+  std::printf("catalog list ok\n");
+  std::printf(
+      "record: fileName=%s size=%s mtime=%s entryCount=%llu\n",
+      qPrintable(file_name),
+      qPrintable(record.value(QStringLiteral("sizeText")).toString()),
+      qPrintable(record.value(QStringLiteral("modifiedTimeText")).toString()),
+      static_cast<unsigned long long>(
+          record.value(QStringLiteral("entryCount")).toULongLong()));
+
+  // 4. 从管理页发起恢复：QML 只传 file name，解析交给 Catalog::Resolve
+  if (!controller->startManagedRestore(file_name, destination) ||
+      !controller->waitForIdle(600000) || !controller->lastSucceeded()) {
+    std::fprintf(stderr, "managed restore failed: %s\n",
+                 qPrintable(controller->statusMessage()));
+    return 1;
+  }
+  std::printf("managed restore ok\n");
+
+  // 5. 删除并确认列表真的空了
+  if (!controller->deleteBackup(file_name)) {
+    std::fprintf(stderr, "delete failed: %s\n",
+                 qPrintable(controller->statusMessage()));
+    return 1;
+  }
+  if (!controller->waitForCatalogIdle(600000)) {
+    std::fprintf(stderr, "catalog refresh after delete timed out\n");
+    return 1;
+  }
+  if (!controller->backupRecords().isEmpty()) {
+    std::fprintf(stderr, "delete 之后列表仍然有 %d 条记录\n",
+                 static_cast<int>(controller->backupRecords().size()));
+    return 1;
+  }
+  std::printf("delete ok\n");
   return 0;
 }
 
@@ -230,6 +346,9 @@ int RunPathTest(backup_modern::BackupController* controller) {
 // --close-guard-test：验证“任务进行中不许关窗”的契约。
 // busy 在 startBackup() 返回前就已置位，而任务结束信号要等回到事件循环
 // 才会派发，所以在同一个事件循环回合里检查，结论不取决于任务跑得多快。
+//
+// 这里用 direct archive 入口：close guard 只关心 busy 这一位，
+// 而 direct 入口不需要先配置仓库，测试因此更短、更聚焦。
 int RunCloseGuardTest(QQuickWindow* window,
                       backup_modern::BackupController* controller) {
   QTemporaryDir dir;
@@ -248,8 +367,8 @@ int RunCloseGuardTest(QQuickWindow* window,
   }
 
   controller->setSourcePath(source);
-  controller->setBackupFilePath(archive);
-  if (!controller->startBackup() || !controller->busy()) {
+  if (!controller->startDirectBackupForTest(source, archive) ||
+      !controller->busy()) {
     std::fprintf(stderr, "FAIL 备份没有启动起来\n");
     return 1;
   }
@@ -291,7 +410,8 @@ int RunCloseGuardTest(QQuickWindow* window,
 
 int main(int argc, char* argv[]) {
   QGuiApplication app(argc, argv);
-  // QSettings 依赖这两个名字决定配置落盘位置，必须在读主题之前设置好。
+  // 这两个名字同时决定 QSettings 与 QStandardPaths 的落盘位置，
+  // 所以必须在读主题、解析配置文件路径之前设置好。
   QCoreApplication::setApplicationName("backup-gui-modern");
   QCoreApplication::setOrganizationName("backup-project");
   // 固定用 Basic 风格：不跟随发行版的 GTK/GNOME 主题，
@@ -311,11 +431,37 @@ int main(int argc, char* argv[]) {
   const int screenshot_index =
       arguments.indexOf(QStringLiteral("--screenshot"));
   const int self_test_index = arguments.indexOf(QStringLiteral("--self-test"));
+  const int repository_test_index =
+      arguments.indexOf(QStringLiteral("--repository-test"));
+  const int config_file_index =
+      arguments.indexOf(QStringLiteral("--config-file"));
+
+  // 需要参数的开关：参数没跟上就是用法错误，明确说清楚并以 2 退出，
+  // 而不是悄悄退化成默认行为（那会让测试以为它隔离了配置，其实没有）。
+  if (config_file_index >= 0 && config_file_index + 1 >= arguments.size()) {
+    std::fprintf(stderr, "--config-file 需要一个配置文件路径参数\n");
+    return 2;
+  }
+  if (repository_test_index >= 0 &&
+      repository_test_index + 3 >= arguments.size()) {
+    std::fprintf(
+        stderr,
+        "--repository-test 需要三个参数: <源目录> <备份仓库> <恢复目录>\n");
+    return 2;
+  }
+  if (self_test_index >= 0 && self_test_index + 3 >= arguments.size()) {
+    std::fprintf(stderr,
+                 "--self-test 需要三个参数: <源目录> <备份文件> <恢复目录>\n");
+    return 2;
+  }
 
   qInstallMessageHandler(MessageHandler);
 
   backup_modern::AppTheme theme;
-  backup_modern::BackupController controller;
+  // 配置路径在这里定型：正常启动是 AppConfigLocation/config.json，
+  // 自动测试用 --config-file 指到临时目录，绝不读写真实用户配置。
+  const QString config_file_path = ResolveConfigFilePath(arguments);
+  backup_modern::BackupController controller(config_file_path);
 
   QQmlApplicationEngine engine;
   // 用上下文属性而不是注册 QML 类型：QML 侧直接写 theme.accent /
@@ -347,11 +493,6 @@ int main(int argc, char* argv[]) {
   WaitForAnimation(200);
 
   if (self_test_index >= 0) {
-    if (self_test_index + 3 >= arguments.size()) {
-      std::fprintf(
-          stderr, "--self-test 需要三个参数: <源目录> <备份文件> <恢复目录>\n");
-      return 2;
-    }
     const int filter_status = ApplyFilterArguments(&controller, arguments);
     if (filter_status != 0) {
       return filter_status;
@@ -359,6 +500,13 @@ int main(int argc, char* argv[]) {
     return RunSelfTest(&controller, arguments.at(self_test_index + 1),
                        arguments.at(self_test_index + 2),
                        arguments.at(self_test_index + 3));
+  }
+
+  if (repository_test_index >= 0) {
+    return RunRepositoryTest(&controller,
+                             arguments.at(repository_test_index + 1),
+                             arguments.at(repository_test_index + 2),
+                             arguments.at(repository_test_index + 3));
   }
 
   if (screenshot_index >= 0) {
@@ -383,12 +531,17 @@ int main(int argc, char* argv[]) {
   }
 
   if (smoke_test) {
-    // 至少跑一轮事件循环：加载 QML、建窗口、切页、换主题都真正执行一遍。
-    QTimer::singleShot(150, &app, [window, &theme]() {
-      window->setProperty("currentPage", 1);
-      theme.toggle();
-    });
-    QTimer::singleShot(320, &app, &QCoreApplication::quit);
+    // 四个页面都要真的被实例化并切换一次，两套主题也都要切到。
+    // 只把 kPageCount 改成 4 而不真正切页，等于根本没有验证新页面。
+    for (int page = 0; page < kPageCount; ++page) {
+      QTimer::singleShot(120 + page * 90, &app, [window, page]() {
+        window->setProperty("currentPage", page);
+      });
+    }
+    const int after_pages = 120 + kPageCount * 90;
+    QTimer::singleShot(after_pages, &app, [&theme]() { theme.toggle(); });
+    QTimer::singleShot(after_pages + 120, &app, [&theme]() { theme.toggle(); });
+    QTimer::singleShot(after_pages + 260, &app, &QCoreApplication::quit);
   }
 
   const int exit_code = app.exec();
