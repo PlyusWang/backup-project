@@ -19,6 +19,7 @@
 
 #include <string>
 
+#include "archive_pipeline.h"
 #include "file_system.h"
 #include "filter.h"
 
@@ -43,9 +44,30 @@ class BackupEngine {
 
   // 把归档文件 archive_file 恢复到 destination_directory。
   // 归档必须是普通文件；目标目录不存在或存在但为空时都可以。
+  //
+  // 格式判断只看 magic，不看扩展名：v0.1 的 BKPARCH 走 legacy reader，
+  // v2 的 BKPCNT2 走 container pipeline。需要密码的容器在这个签名下会明确
+  // 失败（它没有密码参数），而不是被当成"坏文件"。
   bool Restore(const std::string& archive_file,
                const std::string& destination_directory,
                std::string* error_message);
+
+  // ---- v2 pipeline：显式选择打包 / 压缩 / 加密策略 ----
+  //
+  // 不传 options 的旧重载行为一字不变，仍然走 legacy v0.1 路径。
+  // 传了 options 就走 v2 container：pack → compress → encrypt。
+  bool Backup(const std::string& source_directory,
+              const std::string& archive_file, const Filter& filter,
+              const BackupOptions& options, std::string* error_message);
+
+  // 恢复 v2 容器。report 可以为空。
+  bool Restore(const std::string& archive_file,
+               const std::string& destination_directory,
+               const RestoreOptions& options, RestoreReport* report,
+               std::string* error_message);
+  bool Restore(const std::string& archive_file,
+               const std::string& destination_directory,
+               const RestoreOptions& options, std::string* error_message);
 
  private:
   FileSystem file_system_;

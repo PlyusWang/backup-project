@@ -40,6 +40,7 @@
 #include <string>
 #include <vector>
 
+#include "container_format.h"
 #include "file_system.h"
 #include "filter.h"
 
@@ -1339,6 +1340,27 @@ bool ArchiveReader::InspectHeader(const std::string& archive_file,
   }
   // 只读 fd 的 close 失败不会丢数据，交给 RAII 关闭即可。
   ScopedFd archive_fd(fd);
+
+  // v2 容器（BKPCNT2）不是 v0.1 格式，但同样是本项目的 .bak：备份列表必须
+  // 认得出它，否则用户会看到"备份还在，但列表不认识了"。
+  //
+  // 分流只看 magic，两条路径各自调用自己那份 header 解码实现；这里不复制
+  // 任何字段解析逻辑。
+  unsigned char magic[container_v2::kMagicSize];
+  if (ReadAt(archive_fd.get(), magic, sizeof(magic), 0) ==
+          static_cast<ssize_t>(sizeof(magic)) &&
+      LooksLikeContainer(magic, sizeof(magic))) {
+    ContainerHeader container;
+    std::string detail;
+    if (!InspectContainerFile(archive_file, &container, &detail)) {
+      SetError(error_message, detail);
+      return false;
+    }
+    summary->format_version = container_v2::kVersion;
+    summary->flags = container.flags;
+    summary->entry_count = container.entry_count;
+    return true;
+  }
 
   // 只读全局 header 这一块。读完就返回，所以"坏在后面的归档"在这里依然会被
   // 认出来——这正是本方法要暴露的边界，也是它不能替代 preflight 的原因。
