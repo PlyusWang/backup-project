@@ -83,6 +83,17 @@ class ArchiveWriter {
              std::string* error_message) const;
 };
 
+// 归档全局 header 的摘要。三个字段全部来自全局 header 本身。
+//
+// 它刻意只有这三项：v0.1 的归档里本来就没有源目录名、没有创建时间、没有压缩
+// 或加密算法、也没有校验和，所以"备份列表"能显示的额外信息只有归档文件自己的
+// 大小和 mtime——那是文件系统的属性，不需要为它升级二进制格式。
+struct ArchiveSummary {
+  std::uint16_t format_version = 0;
+  std::uint16_t flags = 0;
+  std::uint64_t entry_count = 0;
+};
+
 // 从归档文件恢复目录树。
 class ArchiveReader {
  public:
@@ -90,9 +101,28 @@ class ArchiveReader {
 
   // 两阶段执行：先把整个归档完整校验一遍（preflight），确认结构合法之后
   // 才动磁盘。校验失败时 destination 保持原状，连一个空目录都不会留下。
+  //
+  // 有了 InspectHeader 之后这里照样走完整 preflight：那只是一个快速筛选，
+  // Extract 不因为"调用方先 Inspect 过"就放松校验。
   bool Extract(const std::string& archive_file,
                const std::string& destination_directory,
                std::string* error_message) const;
+
+  // 快速读取全局 header 的摘要：只读开头 kGlobalHeaderSize 个字节，校验
+  // magic / version / flags / header_size 之后解出 format_version、flags 和
+  // entry_count。不遍历 entry、不读 payload，代价与归档大小无关。
+  //
+  // 语义边界要说清楚：成功只证明"这个文件的全局 header 是当前实现认识的
+  // 格式"，不证明 entry 数据完整、payload 没被截断、路径安全、父目录关系
+  // 正确、trailing bytes 正确，也不证明这个归档恢复得出来。
+  // 完整的安全校验仍然只由 Extract() 内部的 preflight 完成，两者用的是同一
+  // 份 header 解码实现。
+  //
+  // 也正因为如此，它叫 InspectHeader 而不是 ValidateArchive / VerifyArchive
+  // / CheckIntegrity：它回答的是"这看起来是不是我们的归档"，不是"这个归档
+  // 能不能用"。
+  bool InspectHeader(const std::string& archive_file, ArchiveSummary* summary,
+                     std::string* error_message) const;
 };
 
 }  // namespace backupproject
