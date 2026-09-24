@@ -8,6 +8,7 @@ TARGET := $(BUILD_DIR)/backupctl
 APP_SOURCES := app/backupctl.cpp
 CORE_SOURCES := src/core/backup_engine.cpp src/archive/archive.cpp \
                 src/catalog/backup_catalog.cpp \
+                src/config/config_manager.cpp \
                 src/filter/filter.cpp src/filter/filter_rule_builder.cpp
 FILESYSTEM_SOURCES := src/filesystem/file_system.cpp
 SOURCES := $(APP_SOURCES) $(CORE_SOURCES) $(FILESYSTEM_SOURCES)
