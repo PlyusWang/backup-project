@@ -14,6 +14,7 @@ import "pages"
 ApplicationWindow {
     id: root
 
+
     width: 1180
     height: 760
     minimumWidth: 960
@@ -71,7 +72,7 @@ ApplicationWindow {
                 AppIcon { name: "app"; size: 18; color: theme.accent }
                 Text {
                     text: "备份工具"
-                    font.pixelSize: 13
+                    font.pixelSize: 16
                     font.weight: Font.DemiBold
                     color: theme.textPrimary
                 }
@@ -130,7 +131,7 @@ ApplicationWindow {
 
                     Text {
                         text: "备份工具"
-                        font.pixelSize: 15
+                        font.pixelSize: 18
                         font.weight: Font.DemiBold
                         color: theme.textPrimary
                         Layout.leftMargin: 8
@@ -252,7 +253,7 @@ ApplicationWindow {
             Text {
                 text: "操作正在进行"
                 color: theme.textPrimary
-                font.pixelSize: 15
+                font.pixelSize: 16
                 font.weight: Font.DemiBold
             }
 
@@ -260,7 +261,7 @@ ApplicationWindow {
                 Layout.preferredWidth: 300
                 text: "备份或恢复尚未完成。为避免留下不完整结果，请等待当前操作结束后再退出。"
                 color: theme.textSecondary
-                font.pixelSize: 13
+                font.pixelSize: 15
                 wrapMode: Text.WordWrap
             }
 

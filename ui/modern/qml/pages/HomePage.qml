@@ -24,14 +24,14 @@ Item {
 
         Text {
             text: "备份工具"
-            font.pixelSize: 26
+            font.pixelSize: 30
             font.weight: Font.DemiBold
             color: theme.textPrimary
         }
 
         Text {
             text: "本地数据备份与恢复"
-            font.pixelSize: 13
+            font.pixelSize: 17
             color: theme.textSecondary
             Layout.topMargin: -10
         }
@@ -52,13 +52,13 @@ Item {
                     AppIcon { name: "backup"; size: 22; color: theme.accent }
                     Text {
                         text: "备份"
-                        font.pixelSize: 16
+                        font.pixelSize: 20
                         font.weight: Font.DemiBold
                         color: theme.textPrimary
                     }
                     Text {
                         text: "选择一个目录，打包成一个备份文件"
-                        font.pixelSize: 12
+                        font.pixelSize: 16
                         color: theme.textSecondary
                         Layout.fillWidth: true
                         wrapMode: Text.WordWrap
@@ -89,7 +89,7 @@ Item {
                     }
                     Text {
                         text: "从已有备份文件恢复目录"
-                        font.pixelSize: 12
+                        font.pixelSize: 16
                         color: theme.textSecondary
                         Layout.fillWidth: true
                         wrapMode: Text.WordWrap
@@ -106,7 +106,7 @@ Item {
 
         Text {
             text: "当前状态"
-            font.pixelSize: 12
+            font.pixelSize: 16
             font.weight: Font.DemiBold
             color: theme.textSecondary
             Layout.topMargin: 4

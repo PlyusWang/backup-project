@@ -4,8 +4,11 @@
     <file>qml/Main.qml</file>
     <file>qml/components/AppButton.qml</file>
     <file>qml/components/AppCard.qml</file>
+    <file>qml/components/AppComboBox.qml</file>
     <file>qml/components/AppIcon.qml</file>
     <file>qml/components/AppTextField.qml</file>
+    <file>qml/components/FilterEditorPanel.qml</file>
+    <file>qml/components/RuleCard.qml</file>
     <file>qml/components/NavItem.qml</file>
     <file>qml/components/StatusBanner.qml</file>
     <file>qml/pages/HomePage.qml</file>
