@@ -4,6 +4,7 @@
 // 所以用一个 mode 参数区分，避免维护两份几乎逐行重复的 QML。
 
 import QtQuick
+import QtQuick.Controls
 import QtQuick.Dialogs
 import QtQuick.Layouts
 
@@ -19,24 +20,41 @@ Item {
     property int targetField: 0
 
 
+    // 整页纵向滚动：内容超过窗口高度时页面本身可以滚（不是只给某个列表加滚轮）。
+    ScrollView {
+        id: pageScroll
+        objectName: "operationPageScroll"
+        anchors.fill: parent
+        clip: true
+        contentWidth: availableWidth
+        // 到顶/到底后继续滚不再被拉出去再弹回：ScrollView 的滚动主体是 Flickable，
+        // 显式设成 StopAtBounds（默认是 DragAndOvershootBounds）。
+        // contentItem 由样式在运行期提供、静态类型是 Item，所以只能运行期赋值，
+        // 写成 contentItem.boundsBehavior: ... 这种静态绑定会被判成非法属性。
+        Component.onCompleted: {
+            if (pageScroll.contentItem)
+                pageScroll.contentItem.boundsBehavior = Flickable.StopAtBounds
+        }
+        ScrollBar.horizontal.policy: ScrollBar.AlwaysOff
+        ScrollBar.vertical.policy: ScrollBar.AsNeeded
+
     ColumnLayout {
         id: column
-        anchors.horizontalCenter: parent.horizontalCenter
-        anchors.top: parent.top
-        anchors.topMargin: 30
-        width: Math.min(parent.width - 64, 900)
+        x: Math.max(32, (pageScroll.availableWidth - width) / 2)
+        y: 20
+        width: Math.min(pageScroll.availableWidth - 64, 1400)
         spacing: 16
 
         Text {
             text: page.isBackup ? "备份" : "恢复"
-            font.pixelSize: 24
+            font.pixelSize: 30
             font.weight: Font.DemiBold
             color: theme.textPrimary
         }
 
         Text {
             text: page.isBackup ? "把一个目录打包成一个备份文件。" : "从备份文件恢复目录树。"
-            font.pixelSize: 13
+            font.pixelSize: 17
             color: theme.textSecondary
             Layout.topMargin: -8
         }
@@ -51,7 +69,7 @@ Item {
 
                 Text {
                     text: page.isBackup ? "源目录" : "备份文件"
-                    font.pixelSize: 12
+                    font.pixelSize: 16
                     font.weight: Font.DemiBold
                     color: theme.textSecondary
                 }
@@ -91,7 +109,7 @@ Item {
 
                 Text {
                     text: page.isBackup ? "备份文件" : "恢复目录"
-                    font.pixelSize: 12
+                    font.pixelSize: 16
                     font.weight: Font.DemiBold
                     color: theme.textSecondary
                     Layout.topMargin: 8
@@ -191,6 +209,7 @@ Item {
         }
 
         Item { Layout.fillHeight: true }
+    }
     }
 
     // 选择器只负责“帮忙填”：选完之后输入框仍然可以手改，

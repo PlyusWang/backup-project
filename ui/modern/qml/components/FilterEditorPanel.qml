@@ -14,7 +14,6 @@
 // 正确的，不需要在每处绑定上散落 null 判断。
 
 import QtQuick
-import QtQuick.Controls
 import QtQuick.Layouts
 
 import "../components"
@@ -170,27 +169,28 @@ Item {
         // ---------------- 左：文件预览（真实 Filter 判定 + 后台扫描） ----------------
         AppCard {
             Layout.fillWidth: true
-            Layout.preferredWidth: panel.wide ? 340 : 0
+            Layout.preferredWidth: panel.wide ? Math.max(360, panel.width * 0.36) : 0
+            padding: 14
             Layout.alignment: Qt.AlignTop
 
             ColumnLayout {
                 anchors.fill: parent
-                spacing: 6
+                spacing: 12
 
                 RowLayout {
                     Layout.fillWidth: true
-                    spacing: 8
+                    spacing: 12
 
                     Text {
                         text: "文件预览"
-                        font.pixelSize: 12
+                        font.pixelSize: 20
                         font.weight: Font.DemiBold
                         color: theme.textSecondary
                         Layout.fillWidth: true
                     }
 
                     AppButton {
-                        text: "刷新"
+                        text: "刷新预览"
                         enabled: !controller.busy && controller.sourcePath.length > 0
                         onClicked: panel.refreshPreview()
                     }
@@ -199,15 +199,15 @@ Item {
                 Text {
                     Layout.fillWidth: true
                     wrapMode: Text.WordWrap
-                    font.pixelSize: 11
+                    font.pixelSize: 18
                     color: theme.textSecondary
                     text: {
                         if (panel.previewBusy)
                             return "扫描中…"
                         if (controller.sourcePath.length === 0)
-                            return "填写源目录后可预览筛选结果。"
+                            return "选定源目录后，这里会显示应用当前规则的结果。"
                         if (panel.previewShown === 0)
-                            return "还没有预览结果，点“刷新”。"
+                            return "尚未生成预览，点“刷新预览”即可。"
                         if (panel.previewSource.length > 0 && panel.previewSource !== controller.sourcePath)
                             return "共 " + panel.previewShown + " 项（结果对应 " + panel.previewSource + "，源目录已改，请刷新）。"
                         if (panel.previewTruncated)
@@ -219,7 +219,7 @@ Item {
                 ListView {
                     id: previewList
                     Layout.fillWidth: true
-                    Layout.preferredHeight: 260
+                    Layout.preferredHeight: panel.previewShown === 0 ? 60 : Math.min(320, previewList.contentHeight)
                     clip: true
                     model: panel.previewList
 
@@ -230,7 +230,7 @@ Item {
                         Text {
                             Layout.fillWidth: true
                             text: modelData.isDirectory ? "📁 " + modelData.path : modelData.path
-                            font.pixelSize: 12
+                            font.pixelSize: 17
                             color: modelData.included ? theme.textPrimary : theme.textSecondary
                             elide: Text.ElideMiddle
                         }
@@ -238,7 +238,7 @@ Item {
                         Text {
                             Layout.fillWidth: true
                             text: modelData.tag + (modelData.size.length > 0 ? " · " + modelData.size : "")
-                            font.pixelSize: 10
+                            font.pixelSize: 17
                             color: modelData.included ? theme.textSecondary : theme.accent
                             elide: Text.ElideRight
                         }
@@ -250,7 +250,7 @@ Item {
         // ---------------- 右：规则编辑 ----------------
         AppCard {
             Layout.fillWidth: true
-            Layout.preferredWidth: panel.wide ? 520 : 0
+            Layout.preferredWidth: panel.wide ? Math.max(420, panel.width * 0.64 - 14) : 0
             Layout.alignment: Qt.AlignTop
 
             ColumnLayout {
@@ -259,7 +259,7 @@ Item {
 
                 Text {
                     text: "过滤规则（可选）"
-                    font.pixelSize: 12
+                    font.pixelSize: 18
                     font.weight: Font.DemiBold
                     color: theme.textSecondary
                 }
@@ -267,9 +267,9 @@ Item {
                 Text {
                     Layout.fillWidth: true
                     wrapMode: Text.WordWrap
-                    font.pixelSize: 11
+                    font.pixelSize: 16
                     color: theme.textSecondary
-                    text: "没有规则时按 PR #8 行为备份全部内容；exclude 优先于 include。"
+                    text: "未设置过滤规则时，将备份源目录中的全部文件与目录结构；若某项同时命中 Include 与 Exclude，则以 Exclude 为准。"
                 }
 
                 RowLayout {
@@ -308,7 +308,14 @@ Item {
                     model: panel.ruleList
 
                     delegate: RuleCard {
-                        ruleData: modelData
+                        required property int index
+                        required property var modelData
+
+                        ruleIndex: index
+                        actionText: String(modelData["action"] || "")
+                        summaryText: String(modelData["summary"] || "")
+                        dslText: String(modelData["dsl"] || "")
+                        detailText: String(modelData["detail"] || "")
                         ruleModelRef: panel.ruleModel
                         busy: controller.busy
                         totalRules: panel.ruleList.length
@@ -325,7 +332,7 @@ Item {
                     Text {
                         Layout.fillWidth: true
                         text: panel.formAction === "include" ? "新建 Include 规则" : "新建 Exclude 规则"
-                        font.pixelSize: 12
+                        font.pixelSize: 16
                         font.weight: Font.DemiBold
                         color: theme.textPrimary
                     }
@@ -334,7 +341,7 @@ Item {
                         Layout.fillWidth: true
                         spacing: 8
 
-                        ComboBox {
+                        AppComboBox {
                             Layout.preferredWidth: 120
                             model: ["ext", "name", "path", "stem", "type", "size"]
                             currentIndex: Math.max(0, model.indexOf(panel.formField))
@@ -366,7 +373,7 @@ Item {
                             }
                         }
 
-                        ComboBox {
+                        AppComboBox {
                             visible: panel.formField === "type"
                             Layout.preferredWidth: 120
                             model: ["file", "folder"]
@@ -377,7 +384,7 @@ Item {
                             }
                         }
 
-                        ComboBox {
+                        AppComboBox {
                             visible: panel.formField === "size"
                             Layout.preferredWidth: 80
                             model: ["<", "<=", ">", ">=", ".."]
@@ -408,7 +415,7 @@ Item {
                             }
                         }
 
-                        ComboBox {
+                        AppComboBox {
                             visible: panel.formField === "size"
                             Layout.preferredWidth: 80
                             model: ["B", "KB", "MB", "GB"]
@@ -423,7 +430,7 @@ Item {
                     Text {
                         Layout.fillWidth: true
                         wrapMode: Text.WordWrap
-                        font.pixelSize: 11
+                        font.pixelSize: 15
                         color: theme.accent
                         text: panel.formError
                         visible: text.length > 0
@@ -458,7 +465,7 @@ Item {
                     Text {
                         Layout.fillWidth: true
                         wrapMode: Text.WordWrap
-                        font.pixelSize: 11
+                        font.pixelSize: 15
                         color: theme.textSecondary
                         text: "通配符：* 匹配任意字符但不跨 /，? 匹配一个字符，** 可以跨 /。"
                     }
@@ -467,7 +474,7 @@ Item {
                 Text {
                     Layout.fillWidth: true
                     wrapMode: Text.WordWrap
-                    font.pixelSize: 12
+                    font.pixelSize: 17
                     color: theme.textPrimary
                     text: panel.summaryLine
                 }
@@ -475,7 +482,7 @@ Item {
                 Text {
                     Layout.fillWidth: true
                     wrapMode: Text.WordWrap
-                    font.pixelSize: 11
+                    font.pixelSize: 16
                     font.family: "monospace"
                     color: theme.textSecondary
                     text: panel.dslPreview.length > 0 ? panel.dslPreview : "（还没有规则）"
@@ -484,7 +491,7 @@ Item {
                 Text {
                     Layout.fillWidth: true
                     wrapMode: Text.WordWrap
-                    font.pixelSize: 11
+                    font.pixelSize: 15
                     color: theme.accent
                     text: panel.errorText
                     visible: text.length > 0
@@ -493,7 +500,7 @@ Item {
                 Text {
                     Layout.fillWidth: true
                     wrapMode: Text.WordWrap
-                    font.pixelSize: 11
+                    font.pixelSize: 16
                     font.family: "monospace"
                     color: theme.textSecondary
                     visible: panel.ruleList.length > 0
