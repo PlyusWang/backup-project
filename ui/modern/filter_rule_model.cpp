@@ -1,17 +1,209 @@
 // filter_rule_model.cpp
 #include "filter_rule_model.h"
 
+#include <grp.h>
+#include <pwd.h>
+#include <sys/stat.h>
+#include <unistd.h>
+
 #include <QDateTime>
 #include <QtConcurrent>
 #include <algorithm>
 #include <chrono>
+#include <cstddef>
+#include <cstdint>
 #include <filesystem>
+#include <map>
 #include <string>
 
 namespace backup_modern {
 namespace {
 
 namespace bp = backupproject;
+
+// ---- 表单取值 <-> 枚举 ------------------------------------------------------
+//
+// 这里只做"界面用的一组稳定键"与枚举之间的翻译，不含任何匹配或语法裁决：
+// 生成的草稿一律交给 FilterRuleBuilder 序列化、由 Filter::AddRule 最终裁决。
+
+// type 的 7 个取值，字符串与 DSL 逐字一致（见 docs/filter_usage.md 12.3）。
+const char* TypeText(bp::RuleTypeValue type) {
+  switch (type) {
+    case bp::RuleTypeValue::kFile:
+      return "file";
+    case bp::RuleTypeValue::kFolder:
+      return "folder";
+    case bp::RuleTypeValue::kSymlink:
+      return "symlink";
+    case bp::RuleTypeValue::kFifo:
+      return "fifo";
+    case bp::RuleTypeValue::kCharDevice:
+      return "char";
+    case bp::RuleTypeValue::kBlockDevice:
+      return "block";
+    case bp::RuleTypeValue::kSocket:
+      return "socket";
+  }
+  return "file";
+}
+
+// 表单文本 -> type。未知取值返回 false，由调用方报错：以后核心再添类型而界面
+// 没跟上时，会明确失败，而不是静默按"普通文件"生成一条看起来正常的规则。
+bool TypeFromText(const QString& text, bp::RuleTypeValue* type) {
+  if (text == "file") {
+    *type = bp::RuleTypeValue::kFile;
+  } else if (text == "folder") {
+    *type = bp::RuleTypeValue::kFolder;
+  } else if (text == "symlink") {
+    *type = bp::RuleTypeValue::kSymlink;
+  } else if (text == "fifo") {
+    *type = bp::RuleTypeValue::kFifo;
+  } else if (text == "char") {
+    *type = bp::RuleTypeValue::kCharDevice;
+  } else if (text == "block") {
+    *type = bp::RuleTypeValue::kBlockDevice;
+  } else if (text == "socket") {
+    *type = bp::RuleTypeValue::kSocket;
+  } else {
+    return false;
+  }
+  return true;
+}
+
+// 明细 / 摘要里的比较运算符文本。
+const char* CompareText(bp::RuleSizeCompare compare) {
+  switch (compare) {
+    case bp::RuleSizeCompare::kLess:
+      return "<";
+    case bp::RuleSizeCompare::kLessEqual:
+      return "<=";
+    case bp::RuleSizeCompare::kGreater:
+      return ">";
+    case bp::RuleSizeCompare::kGreaterEqual:
+      return ">=";
+    case bp::RuleSizeCompare::kRange:
+      return "..";
+    case bp::RuleSizeCompare::kEqual:
+      return "=";
+  }
+  return "=";
+}
+
+// uid / gid 的比较运算符用独立的一组键（eq/lt/le/gt/ge/range），不复用 size 的
+// 符号键：size 的表单键就是符号本身，已经定型。空值按"等于"处理，与
+// FilterClauseDraft 的默认值一致。
+bool IdCompareFromText(const QString& text, bp::RuleSizeCompare* compare) {
+  if (text.isEmpty() || text == "eq") {
+    *compare = bp::RuleSizeCompare::kEqual;
+  } else if (text == "lt") {
+    *compare = bp::RuleSizeCompare::kLess;
+  } else if (text == "le") {
+    *compare = bp::RuleSizeCompare::kLessEqual;
+  } else if (text == "gt") {
+    *compare = bp::RuleSizeCompare::kGreater;
+  } else if (text == "ge") {
+    *compare = bp::RuleSizeCompare::kGreaterEqual;
+  } else if (text == "range") {
+    *compare = bp::RuleSizeCompare::kRange;
+  } else {
+    return false;
+  }
+  return true;
+}
+
+// uid / gid 的表单值是十进制文本。这里只做"文本 -> uint32"的转换：超范围或非
+// 数字明确报错，绝不截断——把 uid:4294967296 截成 uid:0（root）会静默变成一条
+// 完全不同的规则；真正的语法裁决仍然在 Filter::AddRule 里。
+bool IdValueFromForm(const QVariantMap& form, const QString& key,
+                     std::uint32_t* value, QString* error_message) {
+  const QString text = form.value(key).toString();
+  bool ok = false;
+  const std::uint32_t parsed = text.trimmed().toUInt(&ok);
+  if (!ok) {
+    if (error_message != nullptr) {
+      *error_message = key +
+                       QStringLiteral(" 必须是 0..4294967295 的整数（当前是 ") +
+                       text + QStringLiteral("）");
+    }
+    return false;
+  }
+  *value = parsed;
+  return true;
+}
+
+// mtime 的紧凑明细：5 种形态都写清楚，规则列表里不用再猜。
+QString MtimeDetail(const bp::FilterClauseDraft& clause) {
+  switch (clause.mtime_kind) {
+    case bp::RuleMtimeKind::kToday:
+      return QStringLiteral("mtime = 今天");
+    case bp::RuleMtimeKind::kYesterday:
+      return QStringLiteral("mtime = 昨天");
+    case bp::RuleMtimeKind::kLastDays:
+      return QStringLiteral("mtime = 最近 ") +
+             QString::number(clause.days_back) + QStringLiteral(" 天");
+    case bp::RuleMtimeKind::kDay:
+      return QStringLiteral("mtime = ") +
+             QString::fromStdString(clause.date_low);
+    case bp::RuleMtimeKind::kDayRange:
+      return QStringLiteral("mtime = ") +
+             QString::fromStdString(clause.date_low) + QStringLiteral("..") +
+             QString::fromStdString(clause.date_high);
+  }
+  return QStringLiteral("mtime");
+}
+
+// uid / gid 的紧凑明细：等于写成 "uid = 1000"，其余带运算符。
+QString IdDetail(const char* field, std::uint32_t low, std::uint32_t high,
+                 bp::RuleSizeCompare compare) {
+  const QString name = QString::fromLatin1(field);
+  if (compare == bp::RuleSizeCompare::kRange) {
+    return name + QStringLiteral(" = ") + QString::number(low) +
+           QStringLiteral("..") + QString::number(high);
+  }
+  if (compare == bp::RuleSizeCompare::kEqual) {
+    return name + QStringLiteral(" = ") + QString::number(low);
+  }
+  return name + QStringLiteral(" ") +
+         QString::fromLatin1(CompareText(compare)) + QStringLiteral(" ") +
+         QString::number(low);
+}
+
+// mtime 的类型键（today/yesterday/last_days/day/day_range）-> 枚举。
+// 未知取值明确失败：核心以后再加时间形态时，界面没跟上会报错而不是静默落成"今天"。
+bool MtimeKindFromText(const QString& text, bp::RuleMtimeKind* kind) {
+  if (text == "today") {
+    *kind = bp::RuleMtimeKind::kToday;
+  } else if (text == "yesterday") {
+    *kind = bp::RuleMtimeKind::kYesterday;
+  } else if (text == "last_days") {
+    *kind = bp::RuleMtimeKind::kLastDays;
+  } else if (text == "day") {
+    *kind = bp::RuleMtimeKind::kDay;
+  } else if (text == "day_range") {
+    *kind = bp::RuleMtimeKind::kDayRange;
+  } else {
+    return false;
+  }
+  return true;
+}
+
+// "最近 N 天"的天数：这里只做"文本 -> int"的转换；天数必须大于 0、不能超过
+// 核心的上限，这些裁决全部在 FilterRuleBuilder 与 Filter::AddRule 里。
+bool DaysBackFromForm(const QVariantMap& form, const QString& key, int* value,
+                      QString* error_message) {
+  const QString text = form.value(key).toString();
+  bool ok = false;
+  const int parsed = text.trimmed().toInt(&ok);
+  if (!ok) {
+    if (error_message != nullptr) {
+      *error_message = QStringLiteral("mtime 的天数必须是整数（当前是 ") +
+                       text + QStringLiteral("）");
+    }
+    return false;
+  }
+  *value = parsed;
+  return true;
+}
 
 // 给界面用的紧凑明细：field = value（不含动作）。纯展示，不参与匹配。
 QString ClauseDetail(const bp::FilterClauseDraft& clause) {
@@ -34,9 +226,7 @@ QString ClauseDetail(const bp::FilterClauseDraft& clause) {
     }
     case bp::RuleField::kType:
       return QStringLiteral("type = ") +
-             (clause.type == bp::RuleTypeValue::kFolder
-                  ? QStringLiteral("folder")
-                  : QStringLiteral("file"));
+             QString::fromLatin1(TypeText(clause.type));
     case bp::RuleField::kSize: {
       const char* unit = clause.unit == bp::RuleSizeUnit::kByte   ? ""
                          : clause.unit == bp::RuleSizeUnit::kKilo ? " KB"
@@ -57,7 +247,15 @@ QString ClauseDetail(const bp::FilterClauseDraft& clause) {
              QStringLiteral(" ") + low;
     }
     case bp::RuleField::kMtime:
-      return QStringLiteral("mtime");
+      return MtimeDetail(clause);
+    case bp::RuleField::kUid:
+      return IdDetail("uid", clause.uid, clause.uid_high, clause.uid_compare);
+    case bp::RuleField::kGid:
+      return IdDetail("gid", clause.gid, clause.gid_high, clause.gid_compare);
+    case bp::RuleField::kUser:
+      return QStringLiteral("user = ") + QString::fromStdString(clause.user);
+    case bp::RuleField::kGroup:
+      return QStringLiteral("group = ") + QString::fromStdString(clause.group);
   }
   return QString();
 }
@@ -82,6 +280,106 @@ bp::RuleSizeCompare CompareFromText(const QString& text) {
   if (text == "..") return bp::RuleSizeCompare::kRange;
   return bp::RuleSizeCompare::kGreaterEqual;
 }
+
+// 预览条目的类型名。socket 在归档格式里没有对应表示（见 tree_scanner.h），
+// 标签直接把后果写出来，而不是让它看起来像一个能备份的条目。
+QString PreviewTypeLabel(bp::EntryType type) {
+  switch (type) {
+    case bp::EntryType::kDirectory:
+      return QStringLiteral("目录");
+    case bp::EntryType::kRegularFile:
+      return QStringLiteral("普通文件");
+    case bp::EntryType::kSymlink:
+      return QStringLiteral("符号链接");
+    case bp::EntryType::kHardLink:
+      return QStringLiteral("硬链接");
+    case bp::EntryType::kFifo:
+      return QStringLiteral("FIFO");
+    case bp::EntryType::kCharDevice:
+      return QStringLiteral("字符设备");
+    case bp::EntryType::kBlockDevice:
+      return QStringLiteral("块设备");
+    case bp::EntryType::kSocket:
+      return QStringLiteral("socket（不支持归档）");
+  }
+  return QStringLiteral("未知类型");
+}
+
+// lstat 的 st_mode -> EntryType，判定与 src/core/tree_scanner.cpp 的 FactsOf
+// 同一套：预览看到的类型必须和真实扫描一致。
+bool TypeFromStat(const struct stat& info, bp::EntryType* type) {
+  if (S_ISDIR(info.st_mode)) {
+    *type = bp::EntryType::kDirectory;
+  } else if (S_ISREG(info.st_mode)) {
+    *type = bp::EntryType::kRegularFile;
+  } else if (S_ISLNK(info.st_mode)) {
+    *type = bp::EntryType::kSymlink;
+  } else if (S_ISFIFO(info.st_mode)) {
+    *type = bp::EntryType::kFifo;
+  } else if (S_ISCHR(info.st_mode)) {
+    *type = bp::EntryType::kCharDevice;
+  } else if (S_ISBLK(info.st_mode)) {
+    *type = bp::EntryType::kBlockDevice;
+  } else if (S_ISSOCK(info.st_mode)) {
+    *type = bp::EntryType::kSocket;
+  } else {
+    return false;
+  }
+  return true;
+}
+
+// uid / gid -> 名字。预览必须给出与真实扫描（tree_scanner.cpp 的 NameResolver）
+// 同样的元数据，否则 user: / group:
+// 规则在预览里会永远不匹配，而真实备份却匹配。 解析失败留空：Filter
+// 对空名字一律视为不匹配（见 include/filter.h）。
+//
+// 不直接把扫描交给 ScanSourceTree 的原因：那个入口遇到"没有被排除的 socket"会
+// 整次失败，而预览要做的恰恰是把这类条目列出来并提示后果。
+class PreviewNameResolver {
+ public:
+  const std::string& UserName(std::uint32_t uid) {
+    const auto found = users_.find(uid);
+    if (found != users_.end()) {
+      return found->second;
+    }
+    struct passwd entry;
+    struct passwd* result = nullptr;
+    std::vector<char> buffer(BufferSize());
+    const int status = ::getpwuid_r(static_cast<uid_t>(uid), &entry,
+                                    buffer.data(), buffer.size(), &result);
+    const std::string name =
+        (status == 0 && result != nullptr) ? std::string(entry.pw_name) : "";
+    return users_.emplace(uid, name).first->second;
+  }
+
+  const std::string& GroupName(std::uint32_t gid) {
+    const auto found = groups_.find(gid);
+    if (found != groups_.end()) {
+      return found->second;
+    }
+    struct group entry;
+    struct group* result = nullptr;
+    std::vector<char> buffer(BufferSize());
+    const int status = ::getgrgid_r(static_cast<gid_t>(gid), &entry,
+                                    buffer.data(), buffer.size(), &result);
+    const std::string name =
+        (status == 0 && result != nullptr) ? std::string(entry.gr_name) : "";
+    return groups_.emplace(gid, name).first->second;
+  }
+
+ private:
+  static std::size_t BufferSize() {
+    const long hint = ::sysconf(_SC_GETPW_R_SIZE_MAX);
+    // sysconf 返回 -1 表示"没有上限提示"，这时用一个保守的固定值。
+    if (hint < 1024) {
+      return 4096;
+    }
+    return static_cast<std::size_t>(hint);
+  }
+
+  std::map<std::uint32_t, std::string> users_;
+  std::map<std::uint32_t, std::string> groups_;
+};
 
 // 预览扫描在后台线程执行：先按当前草稿构造真实 Filter，再逐条问它。
 bp::Filter BuildFilterFromDrafts(
@@ -152,43 +450,145 @@ QString FilterRuleModel::dslText() const {
 bool FilterRuleModel::DraftFromForm(const QVariantMap& form,
                                     bp::FilterRuleDraft* draft,
                                     QString* error) const {
+  const auto fail = [error](const QString& text) {
+    if (error != nullptr) *error = text;
+    return false;
+  };
+
   const QString action = form.value(QStringLiteral("action")).toString();
   const QString field = form.value(QStringLiteral("field")).toString();
   draft->action = action == QStringLiteral("exclude")
                       ? bp::FilterAction::kExclude
                       : bp::FilterAction::kInclude;
-  bp::FilterClauseDraft clause;
-  if (field == QStringLiteral("name") || field == QStringLiteral("path") ||
-      field == QStringLiteral("stem")) {
-    clause.field =
-        field == QStringLiteral("path")
-            ? bp::RuleField::kPath
-            : (field == QStringLiteral("stem") ? bp::RuleField::kStem
-                                               : bp::RuleField::kName);
-    clause.pattern =
-        form.value(QStringLiteral("pattern")).toString().toStdString();
+
+  // 表单字段名 -> RuleField。这一步只做名字映射；未知字段名直接失败，
+  // 不会落进别的分支生成一条不相干的规则。
+  bp::RuleField rule_field = bp::RuleField::kName;
+  if (field == QStringLiteral("name")) {
+    rule_field = bp::RuleField::kName;
+  } else if (field == QStringLiteral("path")) {
+    rule_field = bp::RuleField::kPath;
+  } else if (field == QStringLiteral("stem")) {
+    rule_field = bp::RuleField::kStem;
   } else if (field == QStringLiteral("ext")) {
-    clause.field = bp::RuleField::kExt;
-    const QString raw = form.value(QStringLiteral("extensions")).toString();
-    const QStringList pieces = raw.split(QLatin1Char(';'), Qt::SkipEmptyParts);
-    for (const QString& piece : pieces)
-      clause.extensions.push_back(piece.toStdString());
+    rule_field = bp::RuleField::kExt;
   } else if (field == QStringLiteral("type")) {
-    clause.field = bp::RuleField::kType;
-    clause.type = form.value(QStringLiteral("type")).toString() ==
-                          QStringLiteral("folder")
-                      ? bp::RuleTypeValue::kFolder
-                      : bp::RuleTypeValue::kFile;
+    rule_field = bp::RuleField::kType;
   } else if (field == QStringLiteral("size")) {
-    clause.field = bp::RuleField::kSize;
-    clause.compare =
-        CompareFromText(form.value(QStringLiteral("compare")).toString());
-    clause.unit = UnitFromText(form.value(QStringLiteral("unit")).toString());
-    clause.size_low = form.value(QStringLiteral("sizeLow")).toULongLong();
-    clause.size_high = form.value(QStringLiteral("sizeHigh")).toULongLong();
+    rule_field = bp::RuleField::kSize;
+  } else if (field == QStringLiteral("uid")) {
+    rule_field = bp::RuleField::kUid;
+  } else if (field == QStringLiteral("gid")) {
+    rule_field = bp::RuleField::kGid;
+  } else if (field == QStringLiteral("user")) {
+    rule_field = bp::RuleField::kUser;
+  } else if (field == QStringLiteral("group")) {
+    rule_field = bp::RuleField::kGroup;
+  } else if (field == QStringLiteral("mtime")) {
+    // mtime 是已知字段，只是表单里还没有对应控件：照常映射成 RuleField，
+    // 让下面的 switch 给出"还没有表单控件"这个准确原因。
+    rule_field = bp::RuleField::kMtime;
   } else {
-    if (error != nullptr) *error = QStringLiteral("未知字段：") + field;
-    return false;
+    return fail(QStringLiteral("未知字段：") + field);
+  }
+
+  bp::FilterClauseDraft clause;
+  clause.field = rule_field;
+  switch (rule_field) {
+    case bp::RuleField::kName:
+    case bp::RuleField::kPath:
+    case bp::RuleField::kStem:
+      clause.pattern =
+          form.value(QStringLiteral("pattern")).toString().toStdString();
+      break;
+    case bp::RuleField::kExt: {
+      const QString raw = form.value(QStringLiteral("extensions")).toString();
+      const QStringList pieces =
+          raw.split(QLatin1Char(';'), Qt::SkipEmptyParts);
+      for (const QString& piece : pieces) {
+        clause.extensions.push_back(piece.toStdString());
+      }
+      break;
+    }
+    case bp::RuleField::kType: {
+      const QString text = form.value(QStringLiteral("type")).toString();
+      if (!TypeFromText(text, &clause.type)) {
+        return fail(QStringLiteral("未知的 type 取值：") + text);
+      }
+      break;
+    }
+    case bp::RuleField::kSize:
+      clause.compare =
+          CompareFromText(form.value(QStringLiteral("compare")).toString());
+      clause.unit = UnitFromText(form.value(QStringLiteral("unit")).toString());
+      clause.size_low = form.value(QStringLiteral("sizeLow")).toULongLong();
+      clause.size_high = form.value(QStringLiteral("sizeHigh")).toULongLong();
+      break;
+    case bp::RuleField::kUid:
+    case bp::RuleField::kGid: {
+      const bool is_uid = rule_field == bp::RuleField::kUid;
+      const QString prefix =
+          is_uid ? QStringLiteral("uid") : QStringLiteral("gid");
+      bp::RuleSizeCompare compare = bp::RuleSizeCompare::kEqual;
+      const QString compare_text =
+          form.value(prefix + QStringLiteral("_compare")).toString();
+      if (!IdCompareFromText(compare_text, &compare)) {
+        return fail(QStringLiteral("未知的 ") + prefix +
+                    QStringLiteral(" 比较运算符：") + compare_text);
+      }
+      std::uint32_t low = 0;
+      std::uint32_t high = 0;
+      if (!IdValueFromForm(form, prefix, &low, error)) {
+        return false;
+      }
+      // 上界只在区间里用：不是区间时表单一侧的残留值不该拦住这条规则。
+      if (compare == bp::RuleSizeCompare::kRange &&
+          !IdValueFromForm(form, prefix + QStringLiteral("_high"), &high,
+                           error)) {
+        return false;
+      }
+      if (is_uid) {
+        clause.uid = low;
+        clause.uid_high = high;
+        clause.uid_compare = compare;
+      } else {
+        clause.gid = low;
+        clause.gid_high = high;
+        clause.gid_compare = compare;
+      }
+      break;
+    }
+    case bp::RuleField::kUser:
+      // 名字是精确匹配、大小写敏感，这里不做 trim 之类的清洗。
+      clause.user = form.value(QStringLiteral("user")).toString().toStdString();
+      break;
+    case bp::RuleField::kGroup:
+      clause.group =
+          form.value(QStringLiteral("group")).toString().toStdString();
+      break;
+    case bp::RuleField::kMtime: {
+      const QString kind = form.value(QStringLiteral("mtime_kind")).toString();
+      bp::RuleMtimeKind mtime_kind = bp::RuleMtimeKind::kToday;
+      if (!MtimeKindFromText(kind, &mtime_kind)) {
+        return fail(QStringLiteral("未知的 mtime 类型：") + kind);
+      }
+      clause.mtime_kind = mtime_kind;
+      // 日期原样透传：格式、区间方向是否合法由 builder 与 Filter::AddRule
+      // 裁决， 界面里没有第二套日期解析。
+      clause.date_low =
+          form.value(QStringLiteral("date_low")).toString().toStdString();
+      clause.date_high =
+          form.value(QStringLiteral("date_high")).toString().toStdString();
+      if (mtime_kind == bp::RuleMtimeKind::kLastDays &&
+          !DaysBackFromForm(form, QStringLiteral("days_back"),
+                            &clause.days_back, error)) {
+        return false;
+      }
+      break;
+    }
+    default:
+      // 以后 RuleField 再添取值而这里忘了补分支时，会带着字段名明确失败。
+      return fail(QStringLiteral("未知字段：") + field);
   }
   draft->clauses.clear();
   draft->clauses.push_back(clause);
@@ -367,6 +767,7 @@ FilterRuleModel::PreviewOutcome FilterRuleModel::ScanPreview(
     return outcome;
   }
   const bp::Filter filter = BuildFilterFromDrafts(drafts);
+  PreviewNameResolver names;
   fs::recursive_directory_iterator it(
       root, fs::directory_options::skip_permission_denied, ec);
   const fs::recursive_directory_iterator end;
@@ -376,60 +777,66 @@ FilterRuleModel::PreviewOutcome FilterRuleModel::ScanPreview(
       outcome.truncated = true;
       break;
     }
-    const fs::directory_entry& entry = *it;
-    const fs::path& path = entry.path();
-    std::error_code status_ec;
-    const fs::file_status status = entry.symlink_status(status_ec);
-    if (status_ec) continue;
+    const fs::path& path = it->path();
+    // lstat：软链接不会被跟随，预览看到的就是条目自己；mtime / uid / gid 也都
+    // 取自链接本身，口径与真实扫描（tree_scanner）一致。
+    struct stat info;
+    if (::lstat(path.c_str(), &info) != 0) continue;
+    bp::EntryType type = bp::EntryType::kRegularFile;
+    if (!TypeFromStat(info, &type)) continue;
 
-    const bool is_dir = fs::is_directory(status);
-    const bool is_regular = fs::is_regular_file(status);
     bp::FilterEntry fe;
     fe.archive_path = path.lexically_relative(root).generic_string();
     fe.name = path.filename().string();
-    fe.is_directory = is_dir;
-    if (is_regular) {
-      std::error_code size_ec;
-      fe.size = fs::file_size(path, size_ec);
+    fe.is_directory = type == bp::EntryType::kDirectory;
+    fe.type = type;
+    fe.mtime_sec = static_cast<std::int64_t>(info.st_mtim.tv_sec);
+    fe.uid = static_cast<std::uint32_t>(info.st_uid);
+    fe.gid = static_cast<std::uint32_t>(info.st_gid);
+    if (type == bp::EntryType::kRegularFile) {
+      fe.size = static_cast<std::uint64_t>(info.st_size);
     }
-    std::error_code time_ec;
-    const fs::file_time_type file_time = fs::last_write_time(path, time_ec);
-    if (!time_ec) {
-      const auto sys_time =
-          std::chrono::time_point_cast<std::chrono::system_clock::duration>(
-              file_time - fs::file_time_type::clock::now() +
-              std::chrono::system_clock::now());
-      fe.mtime_sec = std::chrono::system_clock::to_time_t(sys_time);
+    // 与 tree_scanner 一致：软链接不解析属主 / 属组名字。
+    if (type != bp::EntryType::kSymlink) {
+      fe.user_name = names.UserName(fe.uid);
+      fe.group_name = names.GroupName(fe.gid);
     }
 
+    // 归属判定全部问真实 Filter：GUI 里没有第二套匹配逻辑。
     bool included = false;
     QString tag;
-    if (is_dir) {
+    if (type == bp::EntryType::kDirectory) {
       if (filter.ShouldPruneDirectory(fe)) {
-        included = false;
+        // 命中 exclude 的目录整棵剪掉：子树里的 socket 也不再是问题。
         tag = QStringLiteral("目录被排除（整棵剪掉）");
         it.disable_recursion_pending();
       } else {
         included = true;
         tag = QStringLiteral("目录（保留结构）");
       }
-    } else if (is_regular) {
+    } else if (type == bp::EntryType::kSocket) {
+      // socket 不作为可恢复备份：只有明确写了 exclude 才会被跳过，
+      // 否则真实备份会整次失败（见 tree_scanner.h 的失败语义）。
+      if (filter.ShouldSkipSpecialEntry(fe)) {
+        tag = PreviewTypeLabel(type) + QStringLiteral(" · 被规则排除");
+      } else {
+        tag = QStringLiteral("不支持的 socket（会导致备份失败）");
+      }
+    } else {
+      // 普通文件与软链接 / FIFO / 设备走同一条 include/exclude 判定。
       included = filter.ShouldIncludeFile(fe);
       tag =
-          included ? QStringLiteral("进入归档") : QStringLiteral("被规则排除");
-    } else {
-      const bool skipped = filter.ShouldSkipSpecialEntry(fe);
-      included = false;
-      tag = skipped ? QStringLiteral("特殊文件（已被规则排除）")
-                    : QStringLiteral("特殊文件（会导致备份失败）");
+          PreviewTypeLabel(type) + (included ? QStringLiteral(" · 进入归档")
+                                             : QStringLiteral(" · 被规则排除"));
     }
 
     QVariantMap item;
     item.insert(QStringLiteral("path"),
                 QString::fromStdString(fe.archive_path));
-    item.insert(QStringLiteral("isDirectory"), is_dir);
-    item.insert(QStringLiteral("size"),
-                is_regular ? FormatSize(fe.size) : QString());
+    item.insert(QStringLiteral("isDirectory"), fe.is_directory);
+    item.insert(QStringLiteral("size"), type == bp::EntryType::kRegularFile
+                                            ? FormatSize(fe.size)
+                                            : QString());
     item.insert(
         QStringLiteral("mtime"),
         fe.mtime_sec > 0
