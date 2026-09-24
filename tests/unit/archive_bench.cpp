@@ -253,16 +253,21 @@ int main(int argc, char** argv) {
       "TARBENCH\tcorpus\tbaseline_ms\tfast_ms\tspeedup\tbaseline_MiBps\t"
       "fast_MiBps\tbaseline_bytes\tfast_bytes\tsize\tresult\n");
 
-  // corpus 1
+  // corpus 1：§76 要求 1 MiB / 10 MiB / 128 MiB 三档都测一遍
   {
-    const std::string source = workdir + "/corpus1";
-    std::printf("building corpus 1 (%llu MiB single file)...\n",
-                static_cast<unsigned long long>(big_mib));
-    std::fflush(stdout);
-    BuildBigFileCorpus(source, big_mib);
-    PrintRow("single-128MiB-file", RunCorpus("corpus1", source, workdir),
-             FileSize(source + "/big.bin"));
-    test_support::RemoveTree(source);
+    const std::uint64_t sizes[] = {1, 10, big_mib};
+    for (const std::uint64_t mebibytes : sizes) {
+      const std::string tag = std::to_string(mebibytes);
+      const std::string source = workdir + "/corpus1-" + tag;
+      std::printf("building single-file corpus (%llu MiB)...\n",
+                  static_cast<unsigned long long>(mebibytes));
+      std::fflush(stdout);
+      BuildBigFileCorpus(source, mebibytes);
+      PrintRow("single-" + tag + "MiB-file",
+               RunCorpus("corpus1-" + tag, source, workdir),
+               FileSize(source + "/big.bin"));
+      test_support::RemoveTree(source);
+    }
   }
   // corpus 2
   {
