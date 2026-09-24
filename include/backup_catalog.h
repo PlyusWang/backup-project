@@ -16,8 +16,24 @@
 // 显示的额外信息只有归档文件自己的大小与 mtime——那是文件系统属性，不是格式
 // 字段，所以不需要动 archive v0.1。
 //
-// 一条贯穿全文件的安全规则：本类不跟随软链接。仓库根自己、以及仓库里的每一项，
+// 一条贯穿全文件的规则：本类不跟随软链接。仓库根自己、以及仓库里的每一项，
 // 都用 lstat 判断，软链接既不会出现在列表里，也不会被解析、被删除。
+//
+// ---- 安全边界（别读过头）----
+//
+// 当前实现做的是三件事：拒绝 repository 本身是符号链接；拒绝最终目标文件是
+// 符号链接；把 file_name 限制成 repository 的单个直接子项名称（不含分隔符、
+// 不是 "." / ".."、不含内嵌 NUL）。这覆盖的是普通使用场景下的路径越界。
+//
+// 它不保证：
+//   * repository 的祖先路径组件中没有符号链接——lstat 只能证明最后一个组件
+//     不是链接，无法证明 /a/b/repo 里的 /a、/a/b 也没被替换；
+//   * 检查与随后的 open / unlink 之间没有竞态（check/use TOCTOU）：校验通过
+//     之后、真正动文件之前，文件系统仍然可能被并发修改；
+//   * 在"恶意并发修改文件系统"这一威胁模型下的完全隔离。
+//
+// 若将来需要更强的本地对抗安全边界，可以把校验与使用绑到同一个目录句柄上
+// （dirfd + openat / openat2 / unlinkat）；当前版本没有这么做。
 
 #ifndef BACKUP_PROJECT_INCLUDE_BACKUP_CATALOG_H_
 #define BACKUP_PROJECT_INCLUDE_BACKUP_CATALOG_H_
@@ -124,11 +140,15 @@ class BackupCatalog {
   // 刻意不要求 InspectHeader 成功：坏掉的备份同样是普通 .bak 文件，必须删得
   // 掉，否则损坏的存档会永远留在列表里删不掉。
   //
-  // repository 的前置条件与 Resolve 相同（存在、真实目录、自身不是软链接）：
-  // 校验与 unlink 之间的时间窗之所以逃不出仓库，靠的正是"根不是软链接"与
-  // "最后一段是普通文件"这两条同时成立。
+  // repository 的前置条件与 Resolve 相同（存在、真实目录、自身不是软链接）。
   //
-  // 不递归、不删目录、不删软链接、不碰仓库外的任何文件。
+  // 不递归、不删目录、不删软链接；普通路径下不会去动仓库之外的文件。
+  // 校验与 unlink 之间仍有时间窗，确切边界见本文件顶部的"安全边界"。
+  //
+  // 路径安全边界（拒绝软链接仓库根、拒绝软链接目标、file_name 必须是直接
+  // 子项名）覆盖普通使用场景；它不构成对祖先路径符号链接替换或 check/use
+  // 竞态的完整防护。更强的本地对抗边界可用 dirfd + openat/openat2/unlinkat
+  // 实现，本版本未采用。
   bool Delete(const std::string& repository, const std::string& file_name,
               std::string* error_message) const;
 };
