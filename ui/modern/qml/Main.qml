@@ -153,12 +153,21 @@ ApplicationWindow {
                         checked: root.currentPage === 1
                         onClicked: root.currentPage = 1
                     }
+                    // 恢复不再是独立页面：它是"备份管理"里的一个动作，
+                    // 与课程设计里的"备份 / 管理备份数据 / 备份设置"结构一致。
                     NavItem {
                         Layout.fillWidth: true
-                        text: "恢复"
-                        iconName: "restore"
+                        text: "备份管理"
+                        iconName: "folder"
                         checked: root.currentPage === 2
                         onClicked: root.currentPage = 2
+                    }
+                    NavItem {
+                        Layout.fillWidth: true
+                        text: "设置"
+                        iconName: "settings"
+                        checked: root.currentPage === 3
+                        onClicked: root.currentPage = 3
                     }
 
                     Item { Layout.fillHeight: true }
@@ -173,7 +182,7 @@ ApplicationWindow {
                 }
             }
 
-            // 页面区：三页叠在同一位置，切换时当前页淡入。
+            // 页面区：四页叠在同一位置，切换时当前页淡入。
             StackLayout {
                 id: pageStack
                 Layout.fillWidth: true
@@ -186,15 +195,21 @@ ApplicationWindow {
                     onNavigateTo: function (pageIndex) { root.currentPage = pageIndex }
                 }
 
-                OperationPage {
-                    mode: "backup"
+                BackupPage {
                     opacity: root.currentPage === 1 ? 1 : 0
                     Behavior on opacity { NumberAnimation { duration: 150; easing.type: Easing.OutCubic } }
+                    // 页面自己不改 root.currentPage，只发意图，跳转由窗口决定。
+                    onOpenSettings: root.currentPage = 3
                 }
 
-                OperationPage {
-                    mode: "restore"
+                BackupManagementPage {
                     opacity: root.currentPage === 2 ? 1 : 0
+                    Behavior on opacity { NumberAnimation { duration: 150; easing.type: Easing.OutCubic } }
+                    onOpenSettings: root.currentPage = 3
+                }
+
+                SettingsPage {
+                    opacity: root.currentPage === 3 ? 1 : 0
                     Behavior on opacity { NumberAnimation { duration: 150; easing.type: Easing.OutCubic } }
                 }
             }

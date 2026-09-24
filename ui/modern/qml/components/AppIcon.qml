@@ -165,6 +165,53 @@ Canvas {
             ctx.lineTo(11.8, 11.6)
             ctx.stroke()
             break
+        case "settings":
+            // 齿轮：一个中心圆 + 八根径向短齿。18x18 下再画齿形轮廓就糊成一团了。
+            ctx.beginPath()
+            ctx.arc(9, 9, 3.1, 0, Math.PI * 2)
+            ctx.stroke()
+            for (var s = 0; s < 8; ++s) {
+                var sa = s * Math.PI / 4
+                ctx.beginPath()
+                ctx.moveTo(9 + Math.cos(sa) * 4.7, 9 + Math.sin(sa) * 4.7)
+                ctx.lineTo(9 + Math.cos(sa) * 6.7, 9 + Math.sin(sa) * 6.7)
+                ctx.stroke()
+            }
+            break
+        case "refresh":
+            // 一段留缺口的圆弧 + 起点处的小箭头：缺口让方向可读，
+            // 箭头只是加强它，不额外画第二段弧。
+            var refresh_radius = 5.4
+            var refresh_start = Math.PI * 0.42
+            ctx.beginPath()
+            ctx.arc(9, 9, refresh_radius, refresh_start, Math.PI * 1.92)
+            ctx.stroke()
+            var tip_x = 9 + Math.cos(refresh_start) * refresh_radius
+            var tip_y = 9 + Math.sin(refresh_start) * refresh_radius
+            ctx.beginPath()
+            ctx.moveTo(tip_x - 2.3, tip_y - 0.4)
+            ctx.lineTo(tip_x, tip_y)
+            ctx.lineTo(tip_x + 0.4, tip_y - 2.4)
+            ctx.stroke()
+            break
+        case "trash":
+            // 盖子、提手、桶身三段。桶身用开口梯形而不是矩形：
+            // 直上直下的桶在 16px 下和"删除"两个字一样没有辨识度。
+            ctx.beginPath()
+            ctx.moveTo(3.4, 5.4)
+            ctx.lineTo(14.6, 5.4)
+            ctx.moveTo(7.2, 5.4)
+            ctx.lineTo(7.2, 3.6)
+            ctx.lineTo(10.8, 3.6)
+            ctx.lineTo(10.8, 5.4)
+            ctx.stroke()
+            ctx.beginPath()
+            ctx.moveTo(5.2, 5.4)
+            ctx.lineTo(6.0, 14.4)
+            ctx.lineTo(12.0, 14.4)
+            ctx.lineTo(12.8, 5.4)
+            ctx.stroke()
+            break
         case "close":
             ctx.beginPath()
             ctx.moveTo(5.2, 5.2)
