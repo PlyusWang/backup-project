@@ -57,7 +57,7 @@ Item {
                         color: theme.textPrimary
                     }
                     Text {
-                        text: "选择一个目录，打包成一个备份文件"
+                        text: "选择一个目录，自动命名并保存到备份仓库"
                         font.pixelSize: 16
                         color: theme.textSecondary
                         Layout.fillWidth: true
@@ -80,15 +80,15 @@ Item {
                     anchors.fill: parent
                     spacing: 10
 
-                    AppIcon { name: "restore"; size: 22; color: theme.accent }
+                    AppIcon { name: "folder"; size: 22; color: theme.accent }
                     Text {
-                        text: "恢复"
-                        font.pixelSize: 16
+                        text: "备份管理"
+                        font.pixelSize: 20
                         font.weight: Font.DemiBold
                         color: theme.textPrimary
                     }
                     Text {
-                        text: "从已有备份文件恢复目录"
+                        text: "查看仓库中的备份，从中恢复或删除"
                         font.pixelSize: 16
                         color: theme.textSecondary
                         Layout.fillWidth: true
@@ -96,7 +96,7 @@ Item {
                     }
                     Item { Layout.fillHeight: true }
                     AppButton {
-                        text: "开始恢复"
+                        text: "打开备份管理"
                         variant: "primary"
                         onClicked: page.navigateTo(2)
                     }
