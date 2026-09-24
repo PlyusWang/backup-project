@@ -9,11 +9,19 @@
 #   1. 构建（复用 Makefile 的 gui-modern 目标，不在这里重复拼编译参数）。
 #   2. offscreen 启动自检：QML 运行期告警会让进程自己以非 0 退出。
 #   3. qmllint 静态检查；机器上没装就明确说“跳过”，而不是静默算通过。
-#   4. 几条 grep 断言：资源清单、忙时禁用、拒绝假进度、拒绝网络栈。
-#   5. --self-test 真跑一次打包 + 解包（source -> .bak -> restore），
-#      再用 diff -r 比对目录树，并确认产物是单个普通文件。
+#   4. 几条 grep 断言：资源清单、忙时禁用、拒绝假进度、拒绝网络栈，
+#      以及 repository-driven 架构约束（四页结构、没有 standalone 恢复页、
+#      QML 不出现 archive 完整路径、不自己拼 repository 路径）。
+#   5. --self-test 真跑一次 direct archive 打包 + 解包，再用 diff -r 比对目录树。
 #   6. --path-test：本地路径与 URL 互转（中文、空格、#、%）不丢字符。
 #   7. --close-guard-test：任务进行中关窗被拦下，结束后可以正常退出。
+#   8. 文件筛选在 GUI 路径上生效。
+#   9. --repository-test：ConfigManager + BackupCatalog + BackupController +
+#      BackupEngine 的真实产品链路（保存仓库 / 自动命名备份 / 列表 / 恢复 / 删除）。
+#  10. 损坏 .bak 场景下管理页仍能正常渲染。
+#
+# 所有 GUI 调用都带 --config-file 指向临时目录，并且导出临时 XDG_CONFIG_HOME：
+# AppTheme 的 QSettings 与 QStandardPaths 都跟着它走，测试绝不读写真实用户配置。
 #
 #
 # 用法：在仓库根目录执行 ./scripts/modern_gui_check.sh，不需要任何参数。
@@ -94,6 +102,17 @@ expect_count_re() {
 mkdir -p "$LOG_DIR"
 echo "[modern-gui] 现代 QML GUI 检查开始" | tee "$LOG_FILE"
 
+# 真实用户配置隔离。AppTheme 的 QSettings 与 QStandardPaths 都以
+# XDG_CONFIG_HOME 为根，指向临时目录之后，测试既不读也不写 ~/.config。
+# 每个 GUI 调用另外显式传 --config-file，让 ConfigManager 也落在临时目录里。
+TEST_STATE_DIR="$(mktemp -d)"
+cleanup_test_state() {
+  rm -rf "$TEST_STATE_DIR"
+}
+trap cleanup_test_state EXIT
+export XDG_CONFIG_HOME="$TEST_STATE_DIR/xdg"
+TEST_CONFIG_FILE="$TEST_STATE_DIR/config.json"
+
 # 依赖缺失要尽早失败，并且给出能照抄的安装命令；
 # 直接往下走只会得到一屏找不到头文件的编译错误。
 if ! pkg-config --exists Qt6Quick Qt6Qml Qt6QuickControls2 Qt6Concurrent; then
@@ -121,7 +140,8 @@ fi
 echo "[modern-gui] 2) offscreen 启动自检"
 set +e
 QT_QPA_PLATFORM=offscreen QSG_RHI_BACKEND=software timeout 60 \
-  ./build/backup-gui-modern --smoke-test >> "$LOG_FILE" 2>&1
+  ./build/backup-gui-modern --smoke-test \
+  --config-file "$TEST_CONFIG_FILE" >> "$LOG_FILE" 2>&1
 smoke_status=$?
 set -e
 if [[ "$smoke_status" -eq 0 ]]; then
@@ -162,10 +182,13 @@ classify_qmllint() {
            snippet ~ /easing\./ || snippet ~ /modelData/ || snippet ~ /\bindex\b/)) {
         MarkAllowed(msg); return
       }
-      # PR #12：filterRuleModel 是 main.cpp 注册的上下文属性，只在 OperationPage.qml 注入一次。
-      if (msg ~ /Unqualified access/ && msg ~ /OperationPage\.qml/ &&
-          snippet ~ /filterRuleModel/) {
-        MarkAllowed(msg); return
+      # PR #12 起：filterRuleModel 是 main.cpp 注册的上下文属性，qmllint 不认识上下文属性，
+      # 凡是引用都报 Unqualified access。repository-driven 改造后注入点从
+      # OperationPage.qml 搬到了 BackupPage.qml，放行规则跟着搬家 ——
+      # 仍然精确限定到"这个文件 + filterRuleModel 这个名字"，不是按文件整体放行。
+      if (msg ~ /Unqualified access/ && msg ~ /BackupPage\.qml/ &&
+      snippet ~ /filterRuleModel/) {
+      MarkAllowed(msg); return
       }
       # PR #12：编辑器面板内部引用本组件根 id / 注入属性（含必需的 ruleModelRef）。
       if (msg ~ /Unqualified access/ && msg ~ /FilterEditorPanel\.qml/ &&
@@ -288,14 +311,85 @@ else
   record_fail "有 QML 文件没进资源清单"
 fi
 
-# 两个操作页共用一个 OperationPage.qml：两个文本框、两个“浏览”按钮
-# 和一个主操作按钮，五处都要绑 !controller.busy，忙的时候不能重复点。
-# 这条断言同时防两种退化：漏绑 busy（忙时还能点）和
-# 多出绑定位（复制粘贴出来的多余按钮）。
-# 两个路径框 + 两个"浏览" + 主按钮 = 5 处。
-# 筛选编辑器独立成组件后，它自己的忙时禁用单独断言（见下）。
-expect_count "$QML_DIR/pages/OperationPage.qml" "enabled: !controller.busy" 5 \
-  "忙碌时禁用输入与按钮"
+# 页面结构：首页 / 备份 / 备份管理 / 设置 四页。
+# 恢复已经不是独立页面，而是备份管理页里的一个动作 —— 这几条断言把结构钉死，
+# 免得日后又长回一个"恢复页"。
+expect_count "$QML_DIR/Main.qml" "NavItem {" 4 \
+  "侧栏有四个导航项（首页 / 备份 / 备份管理 / 设置）"
+expect_count "$QML_DIR/Main.qml" "opacity: root.currentPage === " 4 \
+  "StackLayout 里四页各自绑定可见性"
+expect_count_re "$QML_DIR/Main.qml" "^[[:space:]]*currentIndex: root.currentPage" 1 \
+  "StackLayout 跟随 root.currentPage"
+if grep -rq 'OperationPage' "$QML_DIR" "$RESOURCE_FILE"; then
+  record_fail "仍然存在 standalone OperationPage（恢复应当是管理页里的动作）"
+else
+  record_pass "没有 standalone OperationPage"
+fi
+for page in BackupPage BackupManagementPage SettingsPage; do
+  expect_count_re "$RESOURCE_FILE" "qml/pages/${page}\.qml" 1 "resources.qrc 收录 $page.qml"
+done
+
+# 备份页：源目录输入框 + 浏览 + 开始备份 = 3 处绑定 !controller.busy。
+# 计数式断言同时防"漏绑 busy"和"复制粘贴出多余按钮"。
+expect_count "$QML_DIR/pages/BackupPage.qml" "enabled: !controller.busy" 3 \
+  "备份页忙碌时禁用输入与按钮"
+# 设置页：仓库输入框 + 浏览目录 + 保存设置 = 3 处。
+expect_count "$QML_DIR/pages/SettingsPage.qml" "enabled: !controller.busy" 3 \
+  "设置页忙碌时禁用输入与按钮"
+# 管理页刷新按钮：列表刷新期间与数据操作期间都不能重复点。
+expect_count "$QML_DIR/pages/BackupManagementPage.qml" \
+  "enabled: !controller.catalogBusy && !controller.busy" 1 \
+  "管理页刷新按钮在刷新或操作期间禁用"
+# 记录卡片上的恢复 / 删除两个动作都受自己的 busy 约束。
+expect_count "$QML_DIR/components/BackupRecordCard.qml" "card.busy" 2 \
+  "备份记录卡片的恢复 / 删除受忙碌状态约束"
+
+# QML 与核心的分工：界面只调用控制器，不自己持有核心对象、不拼路径。
+expect_count_re "$QML_DIR/pages/BackupPage.qml" 'controller\.startBackup\(\)' 1 \
+  "备份页调用 controller.startBackup()"
+expect_count_re "$QML_DIR/pages/SettingsPage.qml" 'controller\.saveRepositoryPath\(' 1 \
+  "设置页调用 controller.saveRepositoryPath()"
+expect_count_re "$QML_DIR/pages/BackupManagementPage.qml" 'controller\.refreshBackups\(\)' 1 \
+  "管理页调用 controller.refreshBackups()"
+expect_count_re "$QML_DIR/pages/BackupManagementPage.qml" 'BackupRecordCard' 1 \
+  "管理页的列表项是 BackupRecordCard"
+expect_count_re "$QML_DIR/components/BackupRecordCard.qml" 'controller\.startManagedRestore\(' 1 \
+  "恢复动作调用 controller.startManagedRestore()（只传 file name）"
+expect_count_re "$QML_DIR/components/BackupRecordCard.qml" 'controller\.deleteBackup\(' 1 \
+  "删除动作调用 controller.deleteBackup()（只传 file name）"
+# recognizedArchive 只表示"全局 header 可读"，不能当作"可以恢复"的充分条件；
+# 界面上至少要把不认得的那些挡在恢复入口之外。
+expect_count_re "$QML_DIR/components/BackupRecordCard.qml" \
+  'enabled: !card\.busy && card\.recognized' 1 \
+  "恢复按钮受 recognizedArchive 约束"
+
+# 产品 QML 里不允许再出现"任意归档完整路径"这个概念。
+if grep -rq 'backupFilePath' "$QML_DIR"; then
+  record_fail "产品 QML 里仍然出现 backupFilePath"
+else
+  record_pass "产品 QML 里没有 backupFilePath（不再手填归档完整路径）"
+fi
+if grep -rq 'restorePath' "$QML_DIR"; then
+  record_fail "产品 QML 里仍然出现 restorePath"
+else
+  record_pass "产品 QML 里没有 restorePath"
+fi
+# 界面不得自己拼 repository + file name：解析必须交给 BackupCatalog::Resolve。
+if grep -rqE 'repositoryPath[[:space:]]*\+' "$QML_DIR"; then
+  record_fail "QML 自己拼接了 repositoryPath"
+else
+  record_pass "QML 不拼接 repositoryPath（路径解析交给 Catalog）"
+fi
+# 界面不得自己读配置 JSON、不得直接引用核心类。
+# 只认代码行：注释里解释"这里由 Catalog 负责解析"是正常的，不能算违规。
+core_hits="$(grep -rnE 'ConfigManager|BackupCatalog|BackupEngine|QSettings' "$QML_DIR" \
+  | grep -vE ':[0-9]+:[[:space:]]*//' || true)"
+if [[ -n "$core_hits" ]]; then
+  record_fail "QML 直接引用了核心类"
+  printf '%s\n' "$core_hits" | sed 's/^/      /'
+else
+  record_pass "QML 不直接引用 ConfigManager / BackupCatalog / BackupEngine"
+fi
 
 # 筛选编辑器：刷新、添加 Include、添加 Exclude、清空、上移、下移、删除、
 # 添加规则 = 8 处。仍然钉死数量，防止漏绑 busy 或复制粘贴出多余按钮。
@@ -340,7 +434,8 @@ printf 'binary\000\001\002' > "$WORK_DIR/source/sub/nested.bin"
 set +e
 QT_QPA_PLATFORM=offscreen QSG_RHI_BACKEND=software timeout 120 \
   ./build/backup-gui-modern --self-test \
-  "$WORK_DIR/source" "$WORK_DIR/backup.bak" "$WORK_DIR/restore" >> "$LOG_FILE" 2>&1
+  "$WORK_DIR/source" "$WORK_DIR/backup.bak" "$WORK_DIR/restore" \
+  --config-file "$TEST_CONFIG_FILE" >> "$LOG_FILE" 2>&1
 selftest_status=$?
 set -e
 if [[ "$selftest_status" -eq 0 ]]; then
@@ -371,7 +466,8 @@ echo "[modern-gui] 6) 路径转换（本地路径 ↔ URL）"
 # 这个开关把它在中文、空格、#、% 上的行为摊开验证，而不是只测 ASCII。
 set +e
 QT_QPA_PLATFORM=offscreen QSG_RHI_BACKEND=software \
-  ./build/backup-gui-modern --path-test > /tmp/modern-gui-path.log 2>&1
+  ./build/backup-gui-modern --path-test \
+  --config-file "$TEST_CONFIG_FILE" > /tmp/modern-gui-path.log 2>&1
 path_status=$?
 set -e
 sed 's/^/[modern-gui]     /' /tmp/modern-gui-path.log
@@ -393,7 +489,8 @@ expect_count_re "$QML_DIR/components/StatusBanner.qml" "selectByMouse:[[:space:]
 # 运行期契约：忙时拒绝关闭并提示，任务结束后放行。
 set +e
 QT_QPA_PLATFORM=offscreen QSG_RHI_BACKEND=software \
-  ./build/backup-gui-modern --close-guard-test > /tmp/modern-gui-guard.log 2>&1
+  ./build/backup-gui-modern --close-guard-test \
+  --config-file "$TEST_CONFIG_FILE" > /tmp/modern-gui-guard.log 2>&1
 guard_status=$?
 set -e
 sed 's/^/[modern-gui]     /' /tmp/modern-gui-guard.log
@@ -435,7 +532,7 @@ set +e
 QT_QPA_PLATFORM=offscreen QSG_RHI_BACKEND=software \
   ./build/backup-gui-modern --self-test "$FILTER_DIR" "$WORK_DIR/filter.bak" \
   "$WORK_DIR/filter-out" --include 'ext:cpp' --exclude 'path:**/build/**' \
-  >> "$LOG_FILE" 2>&1
+  --config-file "$TEST_CONFIG_FILE" >> "$LOG_FILE" 2>&1
 filter_status=$?
 set -e
 if [[ "$filter_status" -eq 0 ]]; then
@@ -454,7 +551,8 @@ fi
 set +e
 QT_QPA_PLATFORM=offscreen QSG_RHI_BACKEND=software \
   ./build/backup-gui-modern --self-test "$FILTER_DIR" "$WORK_DIR/bad.bak" \
-  "$WORK_DIR/bad-out" --include 'bogus:x' >> "$LOG_FILE" 2>&1
+  "$WORK_DIR/bad-out" --include 'bogus:x' \
+  --config-file "$TEST_CONFIG_FILE" >> "$LOG_FILE" 2>&1
 bad_status=$?
 set -e
 if [[ "$bad_status" -ne 0 && ! -e "$WORK_DIR/bad.bak" ]]; then
@@ -462,6 +560,98 @@ if [[ "$bad_status" -ne 0 && ! -e "$WORK_DIR/bad.bak" ]]; then
 else
   record_fail "非法规则没有被正确拒绝（退出码 $bad_status）"
 fi
+
+echo "[modern-gui] 9) repository-driven 产品链路（--repository-test）"
+# 这一条测的是产品入口本身：仓库设置 -> 自动命名备份 -> 列表 -> 恢复 -> 删除。
+# 它和上面的 --self-test 互补：那个测的是"归档路径由调用方指定"的 direct 路径，
+# 这个测的是界面真正使用的那条 repository-driven 路径，全程不传 archive 路径。
+REPO_WORK="${TEST_STATE_DIR}/repo-test"
+rm -rf "$REPO_WORK"
+REPO_SRC="$REPO_WORK/source"
+REPO_DIR="$REPO_WORK/repository"
+REPO_DEST="$REPO_WORK/restored"
+REPO_CFG="$REPO_WORK/product-config.json"
+mkdir -p "$REPO_SRC/sub" "$REPO_SRC/emptydir"
+printf 'plain\n' > "$REPO_SRC/plain.txt"
+printf '中文内容\n' > "$REPO_SRC/中文文件.txt"
+printf 'space name\n' > "$REPO_SRC/with space.txt"
+: > "$REPO_SRC/empty.txt"
+printf 'nested\n' > "$REPO_SRC/sub/nested.txt"
+
+set +e
+QT_QPA_PLATFORM=offscreen QSG_RHI_BACKEND=software timeout 180 \
+  ./build/backup-gui-modern --repository-test "$REPO_SRC" "$REPO_DIR" "$REPO_DEST" \
+  --config-file "$REPO_CFG" > "${TEST_STATE_DIR}/repo-test.log" 2>&1
+repo_status=$?
+set -e
+sed 's/^/[modern-gui]     /' "${TEST_STATE_DIR}/repo-test.log"
+cat "${TEST_STATE_DIR}/repo-test.log" >> "$LOG_FILE"
+if [[ "$repo_status" -eq 0 ]]; then
+  record_pass "--repository-test 全链路通过（保存仓库 / 自动命名备份 / 列表 / 恢复 / 删除）"
+else
+  record_fail "--repository-test 退出码 $repo_status"
+fi
+
+# 配置文件必须真的产生，并且产生在我们指定的那个路径上 ——
+# 这一条同时证明 --config-file 生效、真实用户配置没有被碰。
+if [[ -f "$REPO_CFG" ]] && grep -q '"backup_repository_path"' "$REPO_CFG"; then
+  record_pass "配置文件确实产生在 --config-file 指定的路径"
+else
+  record_fail "配置文件没有产生：$REPO_CFG"
+fi
+
+# 恢复结果必须与源目录逐字节一致（含中文名、空格名、空文件、空目录、子目录）。
+if diff -r "$REPO_SRC" "$REPO_DEST" >> "$LOG_FILE" 2>&1; then
+  record_pass "diff -r 源目录与恢复目录完全一致"
+else
+  record_fail "diff -r 源目录与恢复目录有差异"
+fi
+
+# 自动命名的产物：名字必须由核心按 <source-base>_YYYYMMDD_HHMMSS.bak 生成，
+# 而不是用户在界面上指定的完整归档路径（产品 QML 已经没有那个输入框了）。
+auto_name="$(grep -oE 'fileName=[^ ]+' "${TEST_STATE_DIR}/repo-test.log" | head -1 | cut -d= -f2 || true)"
+if [[ "$auto_name" =~ ^source_[0-9]{8}_[0-9]{6}\.bak$ ]]; then
+  record_pass "自动命名符合核心规则（$auto_name）"
+else
+  record_fail "自动命名不符合 <source-base>_YYYYMMDD_HHMMSS.bak（得到 [$auto_name]）"
+fi
+
+# 删除之后仓库里不该再有 .bak。
+remaining="$(find "$REPO_DIR" -maxdepth 1 -name '*.bak' 2>/dev/null | wc -l)"
+if [[ "$remaining" -eq 0 ]]; then
+  record_pass "delete 之后 repository 中不再有 .bak"
+else
+  record_fail "delete 之后 repository 仍有 $remaining 个 .bak"
+fi
+
+echo "[modern-gui] 10) 损坏 .bak 场景"
+# 仓库里放一个内容不是归档的 .bak：控制器加载配置后会自动列目录，
+# 管理页必须能把它渲染出来而不是崩掉或报 QML 警告。
+BAD_REPO="${TEST_STATE_DIR}/bad-repo"
+BAD_CFG="${TEST_STATE_DIR}/bad-config.json"
+rm -rf "$BAD_REPO"
+mkdir -p "$BAD_REPO"
+printf 'this file is definitely not a backup archive.\n' > "$BAD_REPO/broken.bak"
+printf '{\n  "version": 1,\n  "backup_repository_path": "%s"\n}\n' "$BAD_REPO" > "$BAD_CFG"
+set +e
+QT_QPA_PLATFORM=offscreen QSG_RHI_BACKEND=software timeout 60 \
+  ./build/backup-gui-modern --smoke-test \
+  --config-file "$BAD_CFG" >> "$LOG_FILE" 2>&1
+bad_repo_status=$?
+set -e
+if [[ "$bad_repo_status" -eq 0 ]]; then
+  record_pass "损坏 .bak 出现在列表里时管理页仍能正常渲染（QML 无告警）"
+else
+  record_fail "损坏 .bak 场景启动自检退出码 $bad_repo_status"
+fi
+# "坏 .bak 仍会出现在列表里"与"坏 .bak 必须能删掉"这两条契约由 core 测试直接覆盖，
+# 这里只静态确认那两条测试确实存在，不重复实现一遍。
+expect_count_re "$ROOT_DIR/tests/unit/backup_catalog_test.cpp" \
+  'TEST\(CatalogList, KeepsCorruptedArchivesWithDiagnostic\)' 1 \
+  "坏 .bak 仍进列表（由 core 测试覆盖）"
+expect_count_re "$ROOT_DIR/tests/unit/backup_catalog_test.cpp" \
+  'TEST\(CatalogDelete, DeletesCorruptedArchive\)' 1 \
+  "坏 .bak 仍可删除（由 core 测试覆盖）"
 
 echo "[modern-gui] 通过 $PASS_COUNT 项，失败 $FAIL_COUNT 项"
 echo "[modern-gui] 日志: $LOG_FILE"

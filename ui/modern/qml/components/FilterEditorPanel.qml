@@ -4,7 +4,7 @@
 //
 // 分工与依赖方向：
 //   main.cpp 注册 filterRuleModel
-//     -> OperationPage 显式注入 ruleModel
+//     -> BackupPage 显式注入 ruleModel
 //       -> 本面板只在自己的根节点读取 model，把结果放进本地属性
 //         -> 子项一律绑定本地属性，从不直接访问 model
 //
@@ -21,7 +21,7 @@ import "../components"
 Item {
     id: panel
 
-    // 由 OperationPage 注入的规则模型（见上）。
+    // 由 BackupPage 注入的规则模型（见上）。
     required property var ruleModel
 
     // 本地派生状态：子项只读这些。

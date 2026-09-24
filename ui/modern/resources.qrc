@@ -7,11 +7,14 @@
     <file>qml/components/AppComboBox.qml</file>
     <file>qml/components/AppIcon.qml</file>
     <file>qml/components/AppTextField.qml</file>
+    <file>qml/components/BackupRecordCard.qml</file>
     <file>qml/components/FilterEditorPanel.qml</file>
     <file>qml/components/RuleCard.qml</file>
     <file>qml/components/NavItem.qml</file>
     <file>qml/components/StatusBanner.qml</file>
     <file>qml/pages/HomePage.qml</file>
-    <file>qml/pages/OperationPage.qml</file>
+    <file>qml/pages/BackupPage.qml</file>
+    <file>qml/pages/BackupManagementPage.qml</file>
+    <file>qml/pages/SettingsPage.qml</file>
   </qresource>
 </RCC>
