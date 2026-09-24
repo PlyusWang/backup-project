@@ -79,7 +79,7 @@ build_library() {
         xargs -P "$(nproc)" -I{} bash -c '
             src="$1"; out="$2"
             name="$(echo "$src" | tr "/" "_").o"
-            '"$CXX"' -Iinclude -std=c++17 -Wall -Wextra -Wpedantic '"$EXTRA_FLAGS"' -c "$src" -o "$out/$name" || exit 1
+            '"$CXX"' -Iinclude -std=c++17 -Wall -Wextra -Wpedantic -O1 '"$EXTRA_FLAGS"' -c "$src" -o "$out/$name" || exit 1
         ' _ {} "$objects_dir"
     if [[ $? -ne 0 ]]; then
         echo "产品代码编译失败" >&2
