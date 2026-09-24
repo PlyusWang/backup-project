@@ -3,7 +3,7 @@
 // 基础筛选规则的解析与匹配。设计上只有三件事：
 //
 //   1. 解析：把 "exclude path:**/build/**" 这样的文本变成若干子句；
-//   2. 匹配：glob / 扩展名列表 / 数值范围 / 日期范围；
+//   2. 匹配：glob / 扩展名列表 / 数值范围 / 属主 / 日期范围；
 //   3. 决策：exclude 优先，存在 include 时普通文件必须命中至少一条。
 //
 // 刻意不做的事：布尔表达式、regex、内容搜索、后代统计——它们都记在
@@ -219,6 +219,23 @@ bool ParseSizeLiteral(const std::string& text, std::uint64_t* out,
   return true;
 }
 
+// ---- uid / gid ----------------------------------------------------------
+
+// uid:/gid: 的数值：先按 uint64 解析（顺带查溢出），再卡到 uint32 上界。
+// 99999999999 这类超范围输入必须明确报错，而不是截断成一个"看起来能跑"的数。
+bool ParseIdNumber(const std::string& field, const std::string& text,
+                   std::uint32_t* out, std::string* error_message) {
+  std::uint64_t value = 0;
+  if (!ParseUnsigned(text, &value) || value > UINT32_MAX) {
+    SetError(error_message,
+             "Invalid filter rule: " + field +
+                 " value out of range (0..4294967295): " + field + ":" + text);
+    return false;
+  }
+  *out = static_cast<std::uint32_t>(value);
+  return true;
+}
+
 // ---- mtime --------------------------------------------------------------
 
 // 本地时区某一天的 00:00:00。day_offset 用来取"前一天 / 后一天"，
@@ -333,7 +350,8 @@ bool ParseMtimeValue(const std::string& value, int* kind, std::int64_t* low,
 bool IsKnownField(const std::string& field) {
   return field == "name" || field == "path" || field == "stem" ||
          field == "ext" || field == "type" || field == "size" ||
-         field == "mtime";
+         field == "mtime" || field == "uid" || field == "gid" ||
+         field == "user" || field == "group";
 }
 
 // 只在"空白后面紧跟已知字段名 + 冒号"处切分，这样 name:my file.txt 里的
@@ -409,6 +427,25 @@ bool ParseClause(const std::string& text, std::string* field_out,
 
 bool Filter::ClauseMatches(const Clause& clause,
                            const FilterEntry& entry) const {
+  // size / uid / gid 共用同一套数值比较；闭区间两端都算命中。
+  const auto numeric_match = [](std::uint64_t value, Clause::Compare compare,
+                                std::uint64_t low, std::uint64_t high) {
+    switch (compare) {
+      case Clause::Compare::kLess:
+        return value < low;
+      case Clause::Compare::kLessEqual:
+        return value <= low;
+      case Clause::Compare::kGreater:
+        return value > low;
+      case Clause::Compare::kGreaterEqual:
+        return value >= low;
+      case Clause::Compare::kEqual:
+        return value == low;
+      case Clause::Compare::kRange:
+        return value >= low && value <= high;
+    }
+    return false;
+  };
   switch (clause.field) {
     case Clause::Field::kName:
       return GlobMatch(clause.pattern, entry.name);
@@ -428,28 +465,54 @@ bool Filter::ClauseMatches(const Clause& clause,
       }
       return false;
     }
-    case Clause::Field::kType:
-      return entry.is_directory == clause.wants_directory;
+    case Clause::Field::kType: {
+      // file / folder 保持初版语义：只看 is_directory。只填 is_directory 的
+      // 旧调用方匹配结果必须一字不变，所以这两个取值不能改读 entry.type。
+      if (clause.type_kind == Clause::TypeKind::kFile) {
+        return !entry.is_directory;
+      }
+      if (clause.type_kind == Clause::TypeKind::kFolder) {
+        return entry.is_directory;
+      }
+      if (entry.is_directory) {
+        return false;
+      }
+      switch (clause.type_kind) {
+        case Clause::TypeKind::kSymlink:
+          return entry.type == EntryType::kSymlink;
+        case Clause::TypeKind::kFifo:
+          return entry.type == EntryType::kFifo;
+        case Clause::TypeKind::kCharDevice:
+          return entry.type == EntryType::kCharDevice;
+        case Clause::TypeKind::kBlockDevice:
+          return entry.type == EntryType::kBlockDevice;
+        case Clause::TypeKind::kSocket:
+          return entry.type == EntryType::kSocket;
+        case Clause::TypeKind::kFile:
+        case Clause::TypeKind::kFolder:
+          return false;  // 上面已经处理，这里只为穷尽枚举
+      }
+      return false;
+    }
     case Clause::Field::kSize:
       // 目录没有"文件大小"的语义，size 规则一律不命中目录。
       if (entry.is_directory) {
         return false;
       }
-      switch (clause.compare) {
-        case Clause::Compare::kLess:
-          return entry.size < clause.size_low;
-        case Clause::Compare::kLessEqual:
-          return entry.size <= clause.size_low;
-        case Clause::Compare::kGreater:
-          return entry.size > clause.size_low;
-        case Clause::Compare::kGreaterEqual:
-          return entry.size >= clause.size_low;
-        case Clause::Compare::kRange:
-          // 闭区间：两端都算命中。
-          return entry.size >= clause.size_low &&
-                 entry.size <= clause.size_high;
-      }
-      return false;
+      return numeric_match(entry.size, clause.compare, clause.size_low,
+                           clause.size_high);
+    case Clause::Field::kUid:
+      return numeric_match(entry.uid, clause.compare, clause.uid_low,
+                           clause.uid_high);
+    case Clause::Field::kGid:
+      return numeric_match(entry.gid, clause.compare, clause.gid_low,
+                           clause.gid_high);
+    case Clause::Field::kUser:
+      // 精确匹配、大小写敏感。user_name 为空（解析失败）时不匹配：既不报错
+      // 也不崩，更不会把"读不出名字"当成"匹配所有用户"。
+      return !entry.user_name.empty() && entry.user_name == clause.user_name;
+    case Clause::Field::kGroup:
+      return !entry.group_name.empty() && entry.group_name == clause.group_name;
     case Clause::Field::kMtime: {
       if (clause.time_kind == Clause::TimeKind::kLastDays) {
         const std::int64_t now = static_cast<std::int64_t>(std::time(nullptr));
@@ -544,6 +607,56 @@ bool Filter::AddRule(FilterAction action, const std::string& text,
     SetError(error_message, "Invalid filter rule: empty rule");
     return false;
   }
+  // uid:/gid: 共用的解析：裸数字表示"等于"，另支持 < <= > >= 与 a..b 闭区间。
+  // 写成 AddRule 内的 lambda，是为了能直接写出私有的 Clause::Compare 类型。
+  const auto parse_id = [](const std::string& field, const std::string& value,
+                           Clause::Compare* compare, std::uint32_t* low,
+                           std::uint32_t* high,
+                           std::string* error_message) -> bool {
+    const std::size_t range = value.find("..");
+    if (range != std::string::npos) {
+      std::uint32_t start = 0;
+      std::uint32_t end = 0;
+      if (!ParseIdNumber(field, value.substr(0, range), &start,
+                         error_message) ||
+          !ParseIdNumber(field, value.substr(range + 2), &end, error_message)) {
+        return false;
+      }
+      if (end < start) {
+        SetError(error_message, "Invalid filter rule: " + field +
+                                    " range is reversed: " + field + ":" +
+                                    value);
+        return false;
+      }
+      *compare = Clause::Compare::kRange;
+      *low = start;
+      *high = end;
+      return true;
+    }
+    Clause::Compare kind = Clause::Compare::kEqual;
+    std::string rest = value;
+    if (value.compare(0, 2, "<=") == 0) {
+      kind = Clause::Compare::kLessEqual;
+      rest = value.substr(2);
+    } else if (value.compare(0, 2, ">=") == 0) {
+      kind = Clause::Compare::kGreaterEqual;
+      rest = value.substr(2);
+    } else if (value[0] == '<') {
+      kind = Clause::Compare::kLess;
+      rest = value.substr(1);
+    } else if (value[0] == '>') {
+      kind = Clause::Compare::kGreater;
+      rest = value.substr(1);
+    }
+    std::uint32_t bound = 0;
+    if (!ParseIdNumber(field, rest, &bound, error_message)) {
+      return false;
+    }
+    *compare = kind;
+    *low = bound;
+    *high = bound;
+    return true;
+  };
   std::string clause_error;
   const std::vector<std::string> clause_texts =
       SplitClauses(text, &clause_error);
@@ -592,12 +705,24 @@ bool Filter::AddRule(FilterAction action, const std::string& text,
     } else if (field == "type") {
       clause.field = Clause::Field::kType;
       if (value == "file") {
-        clause.wants_directory = false;
+        clause.type_kind = Clause::TypeKind::kFile;
       } else if (value == "folder") {
-        clause.wants_directory = true;
+        clause.type_kind = Clause::TypeKind::kFolder;
+      } else if (value == "symlink") {
+        clause.type_kind = Clause::TypeKind::kSymlink;
+      } else if (value == "fifo") {
+        clause.type_kind = Clause::TypeKind::kFifo;
+      } else if (value == "char") {
+        clause.type_kind = Clause::TypeKind::kCharDevice;
+      } else if (value == "block") {
+        clause.type_kind = Clause::TypeKind::kBlockDevice;
+      } else if (value == "socket") {
+        clause.type_kind = Clause::TypeKind::kSocket;
       } else {
-        SetError(error_message, "Invalid filter rule: unknown type '" + value +
-                                    "' (expected file or folder)");
+        SetError(error_message,
+                 "Invalid filter rule: unknown type '" + value +
+                     "' (expected file, folder, symlink, fifo, char, block "
+                     "or socket)");
         ok = false;
       }
     } else if (field == "size") {
@@ -652,7 +777,32 @@ bool Filter::AddRule(FilterAction action, const std::string& text,
           }
         }
       }
-    } else {
+    } else if (field == "uid" || field == "gid") {
+      clause.field =
+          (field == "uid") ? Clause::Field::kUid : Clause::Field::kGid;
+      Clause::Compare compare = Clause::Compare::kEqual;
+      std::uint32_t low = 0;
+      std::uint32_t high = 0;
+      if (!parse_id(field, value, &compare, &low, &high, error_message)) {
+        ok = false;
+      } else if (field == "uid") {
+        clause.compare = compare;
+        clause.uid_low = low;
+        clause.uid_high = high;
+      } else {
+        clause.compare = compare;
+        clause.gid_low = low;
+        clause.gid_high = high;
+      }
+    } else if (field == "user" || field == "group") {
+      clause.field =
+          (field == "user") ? Clause::Field::kUser : Clause::Field::kGroup;
+      if (field == "user") {
+        clause.user_name = value;
+      } else {
+        clause.group_name = value;
+      }
+    } else if (field == "mtime") {
       clause.field = Clause::Field::kMtime;
       int kind = 0;
       std::int64_t low = 0;
@@ -666,6 +816,11 @@ bool Filter::AddRule(FilterAction action, const std::string& text,
         clause.time_high = high;
         clause.days_back = days;
       }
+    } else {
+      // IsKnownField 已经过滤过一次，这里只是穷尽分支，正常不可达。
+      SetError(error_message,
+               "Invalid filter rule: unknown field '" + field + "'");
+      ok = false;
     }
     if (!ok) {
       return false;

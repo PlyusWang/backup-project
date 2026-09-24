@@ -21,21 +21,44 @@
 namespace backupproject {
 
 // 编辑器支持的字段，与 Filter 的 Clause::Field 一一对应。
-enum class RuleField { kName, kPath, kStem, kExt, kType, kSize, kMtime };
+enum class RuleField {
+  kName,
+  kPath,
+  kStem,
+  kExt,
+  kType,
+  kSize,
+  kMtime,
+  kUid,
+  kGid,
+  kUser,
+  kGroup
+};
 
-// size 的比较运算符（range 对应核心的 kRange）。
+// size / uid / gid 的比较运算符（range 对应核心的 kRange）。
+// kEqual 追加在最后：已有取值的位置属于已经定型的序列化行为，不能插到中间。
 enum class RuleSizeCompare {
   kLess,
   kLessEqual,
   kGreater,
   kGreaterEqual,
-  kRange
+  kRange,
+  kEqual
 };
 
 // 1024 进制，与文档固定下来的语义一致。
 enum class RuleSizeUnit { kByte, kKilo, kMega, kGiga };
 
-enum class RuleTypeValue { kFile, kFolder };
+// type 下拉的取值，与 DSL 的 type: 一一对应。
+enum class RuleTypeValue {
+  kFile,
+  kFolder,
+  kSymlink,
+  kFifo,
+  kCharDevice,
+  kBlockDevice,
+  kSocket
+};
 
 enum class RuleMtimeKind { kToday, kYesterday, kLastDays, kDay, kDayRange };
 
@@ -53,6 +76,20 @@ struct FilterClauseDraft {
   int days_back = 7;      // 仅 kLastDays
   std::string date_low;   // "YYYY-MM-DD"，kDay / kDayRange
   std::string date_high;  // 仅 kDayRange
+
+  // uid / gid：uid / gid 是下界（kEqual 时就是唯一值），uid_high / gid_high
+  // 只在 kRange 用。默认 kEqual，因为表单里最常见的是"属主就是 1000"。
+  // 0 是合法值（root），不能拿它当"没填"。
+  std::uint32_t uid = 0;
+  RuleSizeCompare uid_compare = RuleSizeCompare::kEqual;
+  std::uint32_t uid_high = 0;
+  std::uint32_t gid = 0;
+  RuleSizeCompare gid_compare = RuleSizeCompare::kEqual;
+  std::uint32_t gid_high = 0;
+
+  // user / group：精确匹配的名字，大小写敏感；留空表示用户没填。
+  std::string user;
+  std::string group;
 };
 
 // 一条规则 = 一个动作 + 若干子条件（子条件之间是 AND，与核心语义一致）。

@@ -488,3 +488,141 @@ scripts/filter_rule_builder_int_test.sh 真实执行。
   都会立刻重新校验，非法时"添加规则"按钮不可用；后端 Filter::AddRule 仍会再校验一次。
 - **已有规则暂不支持编辑**：规则卡片上只有上移 / 下移 / 删除；需要修改规则时请删除后重新添加。
   字段回填式的编辑入口留到后续版本。
+
+---
+
+## 12. 元数据字段：uid / gid / user / group 与完整 type（已实现）
+
+本节只追加新字段的说明，前面各节的语法、优先级与剪枝语义一个字都没有改。
+第二节「高级文件系统属性」里把 owner / uid / gid 列为暂不支持，指的 ACL、xattr、
+hard-link count 等仍然不支持；**只有 uid / gid / user / group 这四个字段已经实现**，
+以下为它们的确切语义。
+
+### 12.1 uid / gid
+
+支持等于、四种比较和闭区间：
+
+```text
+uid:1000
+uid:<1000
+uid:<=1000
+uid:>1000
+uid:>=1000
+uid:1000..2000
+gid:100
+gid:>=1000
+gid:1000..2000
+```
+
+- 裸数字表示**等于**（这一点与 `size:` 不同：`size:` 必须写运算符，
+  `uid:1000` 合法而 `size:1000` 非法）。
+- `a..b` 是**闭区间**，两端都算命中；`a` 大于 `b` 会明确报错。
+- 取值必须是 0..4294967295 的十进制整数：`uid:4294967295` 合法，
+  `uid:4294967296` 与 `uid:99999999999` 都会被 `AddRule` 拒绝并给出
+  `uid value out of range (0..4294967295)`，不会被截断成一个"看起来能跑"的数。
+- `0` 是合法值（root / root 组），不能当成"没填"。
+- uid / gid 对目录同样生效：目录命中 exclude 时照常整棵剪枝。
+
+### 12.2 user / group
+
+```text
+user:alice
+group:staff
+```
+
+- **精确匹配、大小写敏感**：`user:Alice` 不匹配 `alice`，
+  `user:ali` 也不匹配（不是前缀匹配，也不做 glob）。
+- 名字里的空格不会被切开：子句切分只在"空白 + 已知字段名 + 冒号"处发生，
+  所以 `user:my user` 是一个完整的 user 子句。
+- 扫描层用 `getpwuid_r` / `getgrgid_r` 解析名字，**解析失败时名字为空**。
+  空名字遇到 `user:` / `group:` 一律视为**不匹配**：不报错、不崩，
+  更不会把"读不出名字"当成"匹配所有用户"。
+
+### 12.3 type 的 7 个取值
+
+```text
+type:file
+type:folder
+type:symlink
+type:fifo
+type:char
+type:block
+type:socket
+```
+
+| 取值 | 含义 |
+| --- | --- |
+| `type:file` | 非目录（沿用初版语义：只看 `is_directory`） |
+| `type:folder` | 目录（同样只看 `is_directory`） |
+| `type:symlink` | 符号链接 |
+| `type:fifo` | 命名管道（FIFO） |
+| `type:char` | 字符设备 |
+| `type:block` | 块设备 |
+| `type:socket` | 套接字 |
+
+- `file` / `folder` 继续按 `is_directory` 判断，不按类型枚举判断：
+  只填 `is_directory` 的旧调用方行为完全不变。
+- 其余 5 个取值读条目的 `EntryType`。旧调用方不填这个字段时，它们默认是
+  `kRegularFile`，因此这些规则对旧调用方**不会命中**（不会误伤），
+  要让它们生效，调用方必须填写条目类型。
+- 未知取值（如 `type:hardlink`、`type:regular`）会被明确拒绝。
+- 特殊文件（symlink / FIFO / socket / 设备）的既有约定不变：没有被 exclude 就仍然让
+  整次备份失败，只有明确写了 exclude 才跳过；现在可以用 `type:symlink` 这类规则
+  精确地只排除某一类。
+
+### 12.4 优先级与组合（未变）
+
+- 子句之间 AND，规则之间 OR，`exclude` 优先于 `include`；
+- `size:` 只对普通文件生效，目录一律不命中；uid / gid / user / group / type 对
+  目录同样有效；
+- 目录剪枝条件不变：目录命中任意 exclude 就整棵剪掉，剪掉之后子树里的路径
+  不会再被询问（子路径上的规则也不会再被求值）。
+
+示例：
+
+```text
+include type:file uid:1000 size:>=1KB
+exclude user:alice
+exclude type:socket
+include uid:1000..2000 mtime:2026-09-01..2026-09-12
+```
+
+### 12.5 调用方契约
+
+`FilterEntry` 新增字段都有默认值（`uid` / `gid` 为 0，`type` 为
+`kRegularFile`，名字为空串）。因此：
+
+- 只填 `is_directory` / `size` / `mtime_sec` 的老调用方语义不变，
+  但 `uid:0` / `gid:0` 会命中它们——要用 uid / gid 规则，调用方必须
+  真的把 uid / gid 填进去。
+- 名字字段留空时 `user:` / `group:` 不匹配，这是有意的：
+  宁可漏匹配，也不能把"解析失败"变成"匹配所有"。
+
+### 12.6 GUI 规则编辑器映射
+
+| 表单控件 | 用户填什么 | 生成的 DSL |
+| --- | --- | --- |
+| uid + 运算符 + 数值 | = 1000 | `uid:1000` |
+| uid + 区间 | 1000 .. 2000 | `uid:1000..2000` |
+| gid 同上 | >= 100 | `gid:>=100` |
+| user 文本框 | alice | `user:alice` |
+| group 文本框 | staff | `group:staff` |
+| type 下拉 | symlink / fifo / char / block / socket | `type:symlink` 等 |
+
+- 表单校验只查结构：uid / gid 区间反了、user / group 为空都会拦下并给出中文原因；
+  最终语法仍然由 `Filter::AddRule` 裁决（builder 不复制匹配逻辑）。
+- size 没有"等于"运算符：builder 的等于会序列化成 `size:1024..1024`，
+  生成的 DSL 一样被核心接受。
+- 人类可读摘要示例：`属主 uid = 1000`、`属组 gid 在 100 到 200 之间`、
+  `用户 user = alice`、`用户组 group = staff`、`类型 = 符号链接`。
+
+### 12.7 测试入口
+
+```bash
+bash scripts/filter_metadata_test.sh
+FILTER_METADATA_SANITIZE=1 bash scripts/filter_metadata_test.sh   # ASan + UBSan
+```
+
+覆盖：uid / gid 的全部运算符与区间、边界值（0、4294967295、超 uint32 被拒绝）、
+user / group 精确匹配与空名字、type 的 7 个取值、exclude 优先、目录剪枝后子路径不再
+被询问、子句 AND、与 mtime 的组合，以及 builder 的 ToDsl / ValidateRule / Summarize。
