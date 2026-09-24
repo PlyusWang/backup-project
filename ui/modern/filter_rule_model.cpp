@@ -13,6 +13,55 @@ namespace {
 
 namespace bp = backupproject;
 
+// 给界面用的紧凑明细：field = value（不含动作）。纯展示，不参与匹配。
+QString ClauseDetail(const bp::FilterClauseDraft& clause) {
+  switch (clause.field) {
+    case bp::RuleField::kName:
+    case bp::RuleField::kPath:
+    case bp::RuleField::kStem: {
+      const char* field = bp::RuleFieldName(clause.field);
+      return QString::fromLatin1(field) + QStringLiteral(" = ") +
+             QString::fromStdString(clause.pattern);
+    }
+    case bp::RuleField::kExt: {
+      QStringList exts;
+      for (const std::string& raw : clause.extensions) {
+        QString e = QString::fromStdString(raw).trimmed();
+        while (e.startsWith(QLatin1Char('.'))) e.remove(0, 1);
+        if (!e.isEmpty()) exts << e;
+      }
+      return QStringLiteral("ext = ") + exts.join(QStringLiteral(";"));
+    }
+    case bp::RuleField::kType:
+      return QStringLiteral("type = ") +
+             (clause.type == bp::RuleTypeValue::kFolder
+                  ? QStringLiteral("folder")
+                  : QStringLiteral("file"));
+    case bp::RuleField::kSize: {
+      const char* unit = clause.unit == bp::RuleSizeUnit::kByte   ? ""
+                         : clause.unit == bp::RuleSizeUnit::kKilo ? " KB"
+                         : clause.unit == bp::RuleSizeUnit::kMega ? " MB"
+                                                                  : " GB";
+      const QString low =
+          QString::number(clause.size_low) + QString::fromLatin1(unit);
+      if (clause.compare == bp::RuleSizeCompare::kRange) {
+        return QStringLiteral("size = ") + low + QStringLiteral(" .. ") +
+               QString::number(clause.size_high) + QString::fromLatin1(unit);
+      }
+      const char* op = clause.compare == bp::RuleSizeCompare::kLess ? "<"
+                       : clause.compare == bp::RuleSizeCompare::kLessEqual
+                           ? "<="
+                       : clause.compare == bp::RuleSizeCompare::kGreater ? ">"
+                                                                         : ">=";
+      return QStringLiteral("size ") + QString::fromLatin1(op) +
+             QStringLiteral(" ") + low;
+    }
+    case bp::RuleField::kMtime:
+      return QStringLiteral("mtime");
+  }
+  return QString();
+}
+
 QString FormatSize(std::uint64_t bytes) {
   if (bytes < 1024) return QString::number(bytes) + " B";
   if (bytes < 1024 * 1024) return QString::number(bytes / 1024) + " KB";
@@ -82,7 +131,8 @@ QString FilterRuleModel::summaryText() const {
     parts << QString::fromStdString(bp::Summarize(draft));
   }
   if (parts.isEmpty())
-    return QStringLiteral("没有规则：按 PR #8 行为备份全部内容。");
+    return QStringLiteral(
+        "未设置过滤规则：将备份源目录中的全部文件与目录结构。");
   return parts.join(QStringLiteral("；"));
 }
 
@@ -261,6 +311,12 @@ void FilterRuleModel::RebuildRules() {
                 draft.action == bp::FilterAction::kInclude
                     ? QStringLiteral("include")
                     : QStringLiteral("exclude"));
+    QString detail;
+    for (const bp::FilterClauseDraft& clause : draft.clauses) {
+      if (!detail.isEmpty()) detail += QStringLiteral("，且 ");
+      detail += ClauseDetail(clause);
+    }
+    item.insert(QStringLiteral("detail"), detail);
     item.insert(QStringLiteral("summary"),
                 QString::fromStdString(bp::Summarize(draft)));
     item.insert(QStringLiteral("dsl"), QString::fromStdString(dsl));

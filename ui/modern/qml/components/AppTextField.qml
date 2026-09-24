@@ -10,10 +10,10 @@ import QtQuick.Controls.Basic
 TextField {
     id: control
 
-    implicitHeight: 36
+    implicitHeight: 46
     leftPadding: 11
     rightPadding: 11
-    font.pixelSize: 13
+    font.pixelSize: 17
     color: enabled ? theme.textPrimary : theme.textDisabled
     placeholderTextColor: theme.textSecondary
     selectionColor: theme.accent
@@ -23,7 +23,7 @@ TextField {
     verticalAlignment: TextInput.AlignVCenter
 
     background: Rectangle {
-        radius: 7
+        radius: 9
         color: theme.surface
         // 聚焦时只换边框颜色，不加发光：发光在深色主题里最容易显得廉价。
         border.width: control.activeFocus ? 2 : 1

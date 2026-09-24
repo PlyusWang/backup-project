@@ -180,6 +180,23 @@ classify_qmllint() {
         prev_panel_allowed = 0
         return
       }
+      # AppComboBox 的静态工具局限（runtime 已实测正常：gui-all 0 warning、
+      # smoke exit 0 / 0 告警、close-guard exit 0）。逐条限定到该文件 + 精确诊断：
+      #   1) delegateModel 的 QQmlInstanceModel 类型在 6.4 的 qmltypes 里没有暴露；
+      #   2) popup 是 deferred property，qmllint 提示不要在里面放 id（这是优化提示，
+      #      运行期正确，且去掉 id 会让滚轮/滚动条拿不到列表对象）；
+      #   3) 委托与 popup 内部对 theme.*（上下文属性）与 control.*（本组件根 id）的访问。
+      #      委托是独立组件作用域，6.4 的静态检查解析不到外层 id，运行期正常；
+      #      实测诊断：AppComboBox.qml:107:16 与 109:22 的 "Unqualified access"。
+      if (msg ~ /AppComboBox\.qml/ &&
+          (msg ~ /Type "QQmlInstanceModel" of property "delegateModel" not found/ ||
+           msg ~ /Cannot defer property assignment to "popup"/)) {
+        print "ALLOWED\t" msg; return
+      }
+      if (msg ~ /Unqualified access/ && msg ~ /AppComboBox\.qml/ &&
+          (snippet ~ /theme\./ || snippet ~ /control\./)) {
+        print "ALLOWED\t" msg; return
+      }
       if (msg ~ /Cannot defer property assignment to "contentItem"/) {
         MarkAllowed(msg); return
       }
