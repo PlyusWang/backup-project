@@ -9,8 +9,9 @@ APP_SOURCES := app/backupctl.cpp
 CORE_SOURCES := src/core/archive_entry.cpp src/core/backup_engine.cpp \
                 src/core/file_io.cpp src/core/tree_scanner.cpp \
                 src/archive/archive.cpp src/archive/archive_path.cpp \
-                src/catalog/backup_catalog.cpp src/config/config_manager.cpp \
-                src/filter/filter.cpp src/filter/filter_rule_builder.cpp
+                src/archive/ustar.cpp src/catalog/backup_catalog.cpp \
+                src/config/config_manager.cpp src/filter/filter.cpp \
+                src/filter/filter_rule_builder.cpp
 FILESYSTEM_SOURCES := src/filesystem/file_system.cpp
 SOURCES := $(APP_SOURCES) $(CORE_SOURCES) $(FILESYSTEM_SOURCES)
 OBJECTS := $(patsubst %.cpp,$(BUILD_DIR)/%.o,$(SOURCES))
