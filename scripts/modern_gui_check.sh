@@ -523,6 +523,104 @@ expect_count_re "$ROOT_DIR/ui/desktop/operation_page.cpp" "AddFilterRule" 3 \
 expect_count_re "$ROOT_DIR/ui/desktop/operation_page.cpp" "CollectFilterRules" 3 \
   "Classic GUI 把规则收集后交给核心"
 
+# 元数据字段（uid / gid / user / group）与 type 的 7 个取值：表单与模型两层都要
+# 真的有接线，否则界面上能看到字段名，规则却永远生成不出来。下面只查"这一项
+# 存在且成对"，具体实现细节不钉死，避免把重构变成改断言。
+if grep -q -- '"uid", "gid", "user", "group"' "$QML_DIR/components/FilterEditorPanel.qml"; then
+  record_pass "筛选编辑器字段下拉含 uid / gid / user / group"
+else
+  record_fail "筛选编辑器字段下拉缺 uid / gid / user / group"
+fi
+if grep -q -- '"symlink", "fifo", "char",' "$QML_DIR/components/FilterEditorPanel.qml"; then
+  record_pass "type 下拉含 symlink / fifo / char / block / socket"
+else
+  record_fail "type 下拉缺新的 type 取值"
+fi
+if grep -q -- '"eq", "lt", "le", "gt", "ge", "range"' "$QML_DIR/components/FilterEditorPanel.qml"; then
+  record_pass "uid / gid 比较运算符含 eq / lt / le / gt / ge / range"
+else
+  record_fail "uid / gid 比较运算符缺项"
+fi
+if grep -q -- '"uid_high": panel.formUidHighText' "$QML_DIR/components/FilterEditorPanel.qml"; then
+  record_pass "表单把 uid / gid 的上下界一起交给模型"
+else
+  record_fail "表单没有提交 uid / gid 的区间上界"
+fi
+# 模型侧：四个新字段都必须真的映射成 FilterClauseDraft 的成员。
+for rule_field in kUid kGid kUser kGroup kMtime; do
+  if grep -qE "RuleField::${rule_field}\b" "$ROOT_DIR/ui/modern/filter_rule_model.cpp"; then
+    record_pass "模型处理 RuleField::${rule_field}"
+  else
+    record_fail "模型没有处理 RuleField::${rule_field}"
+  fi
+done
+# 字段分发必须有 default 兜底：以后再添 RuleField，也不会静默落进已有分支。
+if grep -qE '^[[:space:]]*default:$' "$ROOT_DIR/ui/modern/filter_rule_model.cpp"; then
+  record_pass "表单字段分发有 default 兜底"
+else
+  record_fail "表单字段分发没有 default 兜底"
+fi
+# 预览必须继续复用真实 Filter，并且用 lstat（不跟随软链接）。
+if grep -qF 'filter.ShouldIncludeFile(' "$ROOT_DIR/ui/modern/filter_rule_model.cpp" \
+   && grep -qF 'filter.ShouldPruneDirectory(' "$ROOT_DIR/ui/modern/filter_rule_model.cpp" \
+   && grep -qF 'filter.ShouldSkipSpecialEntry(' "$ROOT_DIR/ui/modern/filter_rule_model.cpp"; then
+  record_pass "预览沿用真实 Filter 的三条判定（include / 剪枝 / 特殊文件）"
+else
+  record_fail "预览没有走真实 Filter 判定"
+fi
+if grep -qF '::lstat(' "$ROOT_DIR/ui/modern/filter_rule_model.cpp"; then
+  record_pass "预览用 lstat 取元数据（不跟随软链接）"
+else
+  record_fail "预览没有用 lstat"
+fi
+# 预览要能把各类条目分开说清楚，并且点出 socket 的后果。
+for tag in '符号链接' 'FIFO' '字符设备' '块设备' 'socket（不支持归档）'; do
+  if grep -qF "QStringLiteral(\"${tag}\")" "$ROOT_DIR/ui/modern/filter_rule_model.cpp"; then
+    record_pass "预览能标注 ${tag}"
+  else
+    record_fail "预览缺 ${tag} 标注"
+  fi
+done
+if grep -qF '不支持的 socket（会导致备份失败）' "$ROOT_DIR/ui/modern/filter_rule_model.cpp" \
+   && grep -qF '被规则排除' "$ROOT_DIR/ui/modern/filter_rule_model.cpp"; then
+  record_pass "预览区分被规则排除与不支持的 socket"
+else
+  record_fail "预览缺排除 / socket 提示"
+fi
+
+# mtime 的 5 种形态：字段下拉、类型键、天数与两个日期都要真的接到模型上。
+if grep -q -- '"uid", "gid", "user", "group", "mtime"' "$QML_DIR/components/FilterEditorPanel.qml"; then
+  record_pass "筛选编辑器字段下拉含 mtime"
+else
+  record_fail "筛选编辑器字段下拉缺 mtime"
+fi
+if grep -q -- '"today", "yesterday", "last_days", "day",' "$QML_DIR/components/FilterEditorPanel.qml"; then
+  record_pass "mtime 类型下拉含 today / yesterday / last_days / day / day_range"
+else
+  record_fail "mtime 类型下拉缺项"
+fi
+if grep -q -- '"mtime_kind": panel.formMtimeKind' "$QML_DIR/components/FilterEditorPanel.qml" \
+   && grep -q -- '"days_back": panel.formDaysBackText' "$QML_DIR/components/FilterEditorPanel.qml" \
+   && grep -q -- '"date_low": panel.formDateLow' "$QML_DIR/components/FilterEditorPanel.qml" \
+   && grep -q -- '"date_high": panel.formDateHigh' "$QML_DIR/components/FilterEditorPanel.qml"; then
+  record_pass "表单把 mtime 类型 / 天数 / 两个日期一起交给模型"
+else
+  record_fail "表单没有提交 mtime 的完整取值"
+fi
+# 5 种形态在模型里都要有落点；日期合法性由 builder / 真实 Filter 裁决。
+for mtime_kind in kToday kYesterday kLastDays kDay kDayRange; do
+  if grep -qF "RuleMtimeKind::${mtime_kind}" "$ROOT_DIR/ui/modern/filter_rule_model.cpp"; then
+    record_pass "模型处理 mtime 形态 ${mtime_kind}"
+  else
+    record_fail "模型没有处理 mtime 形态 ${mtime_kind}"
+  fi
+done
+if grep -qF 'mtime 还没有表单控件' "$ROOT_DIR/ui/modern/filter_rule_model.cpp"; then
+  record_fail "模型里还留着 mtime 无控件的兜底错误"
+else
+  record_pass "模型里没有 mtime 无控件的兜底错误"
+fi
+
 FILTER_DIR="$WORK_DIR/filter-src"
 mkdir -p "$FILTER_DIR/build"
 printf 'cpp\n' > "$FILTER_DIR/a.cpp"
