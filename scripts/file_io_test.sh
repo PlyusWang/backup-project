@@ -120,6 +120,23 @@ compile_and_run() {
 compile_and_run file_io_test tests/unit/file_io_test.cpp
 compile_and_run pipeline_security_test tests/unit/pipeline_security_test.cpp
 
+# 静态检查：PublishNoReplace 里不许再出现普通 rename()。
+# "lstat(final) 确认不存在 + 普通 rename" 有真实 TOCTOU：检查与 rename 之间
+# 另一个进程可以创建 final，而普通 rename 会直接覆盖它。这条断言把"绝不再
+# 退回非原子发布"钉在源码上，而不是只钉在行为测试上。
+publish_body="$(awk '/^bool PublishNoReplace[(]/{inside=1} inside{print} inside && /^}$/{exit}' "$ROOT_DIR/src/core/file_io.cpp")"
+if [[ -z "$publish_body" ]]; then
+    echo "[file-io] 静态检查失败：找不到 PublishNoReplace 函数体" >&2
+    FAILURES=$((FAILURES + 1))
+elif printf '%s' "$publish_body" | grep -q '::rename('; then
+    echo "[file-io] 静态检查失败：PublishNoReplace 仍在使用普通 rename()" >&2
+    FAILURES=$((FAILURES + 1))
+else
+    TOTAL_CHECKS=$((TOTAL_CHECKS + 1))
+    TOTAL_PASSED=$((TOTAL_PASSED + 1))
+    echo "[file-io] PASS: PublishNoReplace 里没有普通 rename() 回退"
+fi
+
 echo
 echo "file-io: $TOTAL_PASSED/$TOTAL_CHECKS checks passed"
 if [[ $FAILURES -ne 0 || $TOTAL_CHECKS -eq 0 || $TOTAL_PASSED -ne $TOTAL_CHECKS ]]; then
