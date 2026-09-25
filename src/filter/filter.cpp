@@ -23,6 +23,8 @@ namespace backupproject {
 
 namespace {
 
+// mtime:Ndays 里的"N 天"是 N x 24 小时（一段时长），不是 N 个日历日；
+// 日历日的边界一律交给 mktime 归一化，见 LocalDayStart / LocalDayEnd。
 constexpr std::int64_t kSecondsPerDay = 24 * 60 * 60;
 constexpr std::uint64_t kMaxDaysBack = 36500;  // 约 100 年，防止离谱输入
 
@@ -238,8 +240,11 @@ bool ParseIdNumber(const std::string& field, const std::string& text,
 
 // ---- mtime --------------------------------------------------------------
 
-// 本地时区某一天的 00:00:00。day_offset 用来取"前一天 / 后一天"，
-// 交给 mktime 归一化，这样夏令时切换也不会算错。
+// 本地时区某一天的 00:00:00。day_offset 是相对 (year, month, day) 的自然日
+// 偏移（可以为负），跨月 / 跨年 / 跨 DST 全部交给 mktime 归一化，不自己算日期。
+//
+// 只有 day_offset == 0 时才校验"日期本身合法"：带偏移的日期本来就允许落到
+// 相邻的月份或年份，归一化是预期行为而不是错误。
 bool LocalDayStart(int year, int month, int day, int day_offset,
                    std::int64_t* out) {
   struct tm parts;
@@ -260,7 +265,21 @@ bool LocalDayStart(int year, int month, int day, int day_offset,
   return true;
 }
 
-bool ParseDate(const std::string& text, std::int64_t* out) {
+// 某一天的最后一秒 = 下一天 00:00:00 - 1。不能写成 start + 86400 - 1：
+// DST 切换那天只有 23 或 25 小时，写死 86400 会让窗口端点落进相邻的日历日。
+bool LocalDayEnd(int year, int month, int day, std::int64_t* out) {
+  std::int64_t next_start = 0;
+  if (!LocalDayStart(year, month, day, 1, &next_start)) {
+    return false;
+  }
+  *out = next_start - 1;
+  return true;
+}
+
+// YYYY-MM-DD -> 本地日历日。年月日一并回给调用方：窗口上界要用它们算
+// "这一天的最后一秒"（见 LocalDayEnd），只回一个时间戳是算不出来的。
+bool ParseDate(const std::string& text, int* year, int* month, int* day,
+               std::int64_t* out) {
   if (text.size() != 10 || text[4] != '-' || text[7] != '-') {
     return false;
   }
@@ -270,13 +289,20 @@ bool ParseDate(const std::string& text, std::int64_t* out) {
       return false;
     }
   }
-  const int year = std::atoi(text.substr(0, 4).c_str());
-  const int month = std::atoi(text.substr(5, 2).c_str());
-  const int day = std::atoi(text.substr(8, 2).c_str());
-  if (month < 1 || month > 12 || day < 1 || day > 31) {
+  const int parsed_year = std::atoi(text.substr(0, 4).c_str());
+  const int parsed_month = std::atoi(text.substr(5, 2).c_str());
+  const int parsed_day = std::atoi(text.substr(8, 2).c_str());
+  if (parsed_month < 1 || parsed_month > 12 || parsed_day < 1 ||
+      parsed_day > 31) {
     return false;
   }
-  return LocalDayStart(year, month, day, 0, out);
+  if (!LocalDayStart(parsed_year, parsed_month, parsed_day, 0, out)) {
+    return false;
+  }
+  *year = parsed_year;
+  *month = parsed_month;
+  *day = parsed_day;
+  return true;
 }
 
 // mtime 取值换算成闭区间 [low, high]。kLastDays 只记天数，匹配时再拿
@@ -285,18 +311,26 @@ bool ParseMtimeValue(const std::string& value, int* kind, std::int64_t* low,
                      std::int64_t* high, std::int64_t* days_back,
                      std::string* error_message) {
   if (value == "today" || value == "yesterday") {
+    const bool is_today = value == "today";
     const std::time_t now = std::time(nullptr);
     struct tm local;
     localtime_r(&now, &local);
+    const int year = local.tm_year + 1900;
+    const int month = local.tm_mon + 1;
+    const int day = local.tm_mday;
+    // today     = [今天 00:00, 明天 00:00 - 1]
+    // yesterday = [昨天 00:00, 今天 00:00 - 1]
+    // 上界一律写成"下一天的开始减一秒"，DST 那天才会自动变成 23 / 25 小时。
     std::int64_t start = 0;
-    if (!LocalDayStart(local.tm_year + 1900, local.tm_mon + 1, local.tm_mday,
-                       value == "today" ? 0 : -1, &start)) {
+    std::int64_t next_start = 0;
+    if (!LocalDayStart(year, month, day, is_today ? 0 : -1, &start) ||
+        !LocalDayStart(year, month, day, is_today ? 1 : 0, &next_start)) {
       SetError(error_message, "Invalid filter rule: bad mtime value " + value);
       return false;
     }
     *kind = 0;  // kDay
     *low = start;
-    *high = start + kSecondsPerDay - 1;
+    *high = next_start - 1;
     return true;
   }
   if (value.size() > 4 && value.compare(value.size() - 4, 4, "days") == 0) {
@@ -315,10 +349,19 @@ bool ParseMtimeValue(const std::string& value, int* kind, std::int64_t* low,
   }
   const std::size_t range = value.find("..");
   if (range != std::string::npos) {
+    int start_year = 0;
+    int start_month = 0;
+    int start_day = 0;
+    int end_year = 0;
+    int end_month = 0;
+    int end_day = 0;
     std::int64_t start = 0;
     std::int64_t end = 0;
-    if (!ParseDate(value.substr(0, range), &start) ||
-        !ParseDate(value.substr(range + 2), &end)) {
+    if (!ParseDate(value.substr(0, range), &start_year, &start_month,
+                   &start_day, &start) ||
+        !ParseDate(value.substr(range + 2), &end_year, &end_month, &end_day,
+                   &end) ||
+        !LocalDayEnd(end_year, end_month, end_day, &end)) {
       SetError(error_message,
                "Invalid filter rule: invalid mtime range " + value);
       return false;
@@ -330,18 +373,23 @@ bool ParseMtimeValue(const std::string& value, int* kind, std::int64_t* low,
     }
     *kind = 1;  // kDayRange
     *low = start;
-    *high = end + kSecondsPerDay - 1;
+    *high = end;  // 结束日的最后一秒 = 次日 00:00 - 1
     return true;
   }
+  int year = 0;
+  int month = 0;
+  int day = 0;
   std::int64_t start = 0;
-  if (!ParseDate(value, &start)) {
+  std::int64_t end = 0;
+  if (!ParseDate(value, &year, &month, &day, &start) ||
+      !LocalDayEnd(year, month, day, &end)) {
     SetError(error_message,
              "Invalid filter rule: invalid mtime value " + value);
     return false;
   }
   *kind = 0;  // kDay
   *low = start;
-  *high = start + kSecondsPerDay - 1;
+  *high = end;
   return true;
 }
 
@@ -466,11 +514,17 @@ bool Filter::ClauseMatches(const Clause& clause,
       return false;
     }
     case Clause::Field::kType: {
-      // file / folder 保持初版语义：只看 is_directory。只填 is_directory 的
-      // 旧调用方匹配结果必须一字不变，所以这两个取值不能改读 entry.type。
+      // type:file 只表示普通文件。它曾经等价于 !is_directory，于是 symlink /
+      // FIFO / 字符设备 / 块设备 / socket 统统被"普通文件"命中——而界面上那个
+      // 下拉框写的正是"普通文件"，DSL 里也早有 type:symlink 等独立取值。
+      // 旧调用方不受影响：EntryType 的默认值就是 kRegularFile，只填
+      // is_directory=false 的条目照旧被当成普通文件。
+      // 边界：扫描层为硬链接去重生成的 kHardLink 条目不是源目录里的类型，
+      // 因此不命中 type:file（它的 size 也被清零，见下面的 size 分支）。
       if (clause.type_kind == Clause::TypeKind::kFile) {
-        return !entry.is_directory;
+        return !entry.is_directory && entry.type == EntryType::kRegularFile;
       }
+      // type:folder 仍然只看 is_directory：旧调用方没有 type 可填。
       if (clause.type_kind == Clause::TypeKind::kFolder) {
         return entry.is_directory;
       }
@@ -495,12 +549,14 @@ bool Filter::ClauseMatches(const Clause& clause,
       return false;
     }
     case Clause::Field::kSize:
-      // 目录没有"文件大小"的语义，size 规则一律不命中目录。
-      if (entry.is_directory) {
-        return false;
+      // size 只对普通文件有意义：扫描层把目录与 symlink / FIFO / 设备 /
+      // socket 的 size 一律置 0，若照旧参与比较，用户写 exclude size:<=1KB
+      // 会把它们全部误伤——而写 size: 时想的显然是文件内容的长度。
+      if (!entry.is_directory && entry.type == EntryType::kRegularFile) {
+        return numeric_match(entry.size, clause.compare, clause.size_low,
+                             clause.size_high);
       }
-      return numeric_match(entry.size, clause.compare, clause.size_low,
-                           clause.size_high);
+      return false;
     case Clause::Field::kUid:
       return numeric_match(entry.uid, clause.compare, clause.uid_low,
                            clause.uid_high);

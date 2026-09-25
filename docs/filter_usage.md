@@ -230,7 +230,8 @@ Filter 只负责“是否进入备份”，不负责：
 
 **size 语义。** 支持 `<` `<=` `>` `>=` 与 `a..b` 闭区间；
 单位 `B` / `KB` / `MB` / `GB` 按 1024 进制；数值溢出会在解析阶段直接报错。
-`size:` 只对普通文件生效，目录一律不命中。
+`size:` 只对**普通文件**生效：目录与特殊条目（软链接 / FIFO / 字符设备 / 块设备 /
+socket）一律不命中。硬链接在文件系统层就是普通文件，所以照常命中。
 
 **mtime 语义。** 只读 `st_mtim`。`today` / `yesterday` 取**本地时区**的整天区间；
 `Ndays` 表示"最近 N × 24 小时"；`YYYY-MM-DD` 表示那一整天；
@@ -552,7 +553,7 @@ type:socket
 
 | 取值 | 含义 |
 | --- | --- |
-| `type:file` | 非目录（沿用初版语义：只看 `is_directory`） |
+| `type:file` | **普通文件**（`!is_directory` 且 `type == kRegularFile`）；软链接 / FIFO / 设备 / socket 不再命中，请用下面的专用取值 |
 | `type:folder` | 目录（同样只看 `is_directory`） |
 | `type:symlink` | 符号链接 |
 | `type:fifo` | 命名管道（FIFO） |
@@ -573,8 +574,8 @@ type:socket
 ### 12.4 优先级与组合（未变）
 
 - 子句之间 AND，规则之间 OR，`exclude` 优先于 `include`；
-- `size:` 只对普通文件生效，目录一律不命中；uid / gid / user / group / type 对
-  目录同样有效；
+- `size:` 只对普通文件（含硬链接）生效，目录与特殊条目一律不命中；
+  uid / gid / user / group / type 对所有类型都有效；
 - 目录剪枝条件不变：目录命中任意 exclude 就整棵剪掉，剪掉之后子树里的路径
   不会再被询问（子路径上的规则也不会再被求值）。
 

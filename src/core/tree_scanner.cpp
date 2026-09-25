@@ -10,8 +10,6 @@
 #include "tree_scanner.h"
 
 #include <dirent.h>
-#include <grp.h>
-#include <pwd.h>
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <unistd.h>
@@ -26,6 +24,7 @@
 
 #include "archive_path.h"
 #include "file_system.h"
+#include "user_directory.h"
 
 namespace backupproject {
 
@@ -46,52 +45,11 @@ std::string Describe(int error_number, const std::string& action,
 //
 // 名字只是给 user:/group: 规则和 GUI 展示用的便利字段：解析失败（NSS 不可用、
 // uid 没有对应账号、线程重入失败）时留空，数字 uid/gid 仍然完全可用，
-// 既不报错也不崩。同一棵树里几千个文件常常只有几个 uid，所以顺手做个缓存。
-class NameResolver {
- public:
-  const std::string& UserName(std::uint32_t uid) {
-    const auto found = users_.find(uid);
-    if (found != users_.end()) {
-      return found->second;
-    }
-    struct passwd entry;
-    struct passwd* result = nullptr;
-    std::vector<char> buffer(BufferSize());
-    const int status = ::getpwuid_r(static_cast<uid_t>(uid), &entry,
-                                    buffer.data(), buffer.size(), &result);
-    const std::string name =
-        (status == 0 && result != nullptr) ? std::string(entry.pw_name) : "";
-    return users_.emplace(uid, name).first->second;
-  }
-
-  const std::string& GroupName(std::uint32_t gid) {
-    const auto found = groups_.find(gid);
-    if (found != groups_.end()) {
-      return found->second;
-    }
-    struct group entry;
-    struct group* result = nullptr;
-    std::vector<char> buffer(BufferSize());
-    const int status = ::getgrgid_r(static_cast<gid_t>(gid), &entry,
-                                    buffer.data(), buffer.size(), &result);
-    const std::string name =
-        (status == 0 && result != nullptr) ? std::string(entry.gr_name) : "";
-    return groups_.emplace(gid, name).first->second;
-  }
-
- private:
-  static std::size_t BufferSize() {
-    const long hint = ::sysconf(_SC_GETPW_R_SIZE_MAX);
-    // sysconf 返回 -1 表示"没有上限提示"，这时用一个保守的固定值。
-    if (hint < 1024) {
-      return 4096;
-    }
-    return static_cast<std::size_t>(hint);
-  }
-
-  std::map<std::uint32_t, std::string> users_;
-  std::map<std::uint32_t, std::string> groups_;
-};
+// 既不报错也不崩。缓存把调用次数从"文件数"降到"不同 uid 数"。
+//
+// 实现只有一份，在 src/core/user_directory.cpp 的 UserDirectoryCache 里：
+// 这里和 Modern GUI 预览曾经各写一份，group 还都错用了
+// _SC_GETPW_R_SIZE_MAX，于是同一棵树在两处会得到不同的名字。
 
 // 同一次扫描里出现过的 inode。hardlink 检测只在"这一棵树内部"成立：
 // 跨备份的 inode 复用没有意义，也不该被当成同一次复制。
@@ -194,7 +152,7 @@ bool ReadLinkTarget(const std::string& disk_path, std::uint64_t hint,
 
 class Scanner {
  public:
-  Scanner(const Filter* filter, NameResolver* names,
+  Scanner(const Filter* filter, UserDirectoryCache* names,
           std::map<InodeKey, std::string>* seen_inodes)
       : filter_(filter), names_(names), seen_inodes_(seen_inodes) {}
 
@@ -230,6 +188,11 @@ class Scanner {
     entry.size = facts.size;
     entry.dev_major = facts.dev_major;
     entry.dev_minor = facts.dev_minor;
+    // 扫描那一刻的 (st_dev, st_ino)。这是**内部快照字段**，不写进任何归档
+    // 格式，存在的意义只有一个：打包时确认"我现在读的还是扫描时那一个
+    // inode"。USTAR 的两个写入器在读完 payload 之后会拿它复核。
+    entry.source_dev = facts.device_id;
+    entry.source_ino = facts.inode;
 
     // 写侧也走读侧那一套路径规则：保证"自己能产出"蕴含"读侧能接受"。
     // is_directory 只在 path == "." 时起作用，其余路径不看它。
@@ -282,10 +245,10 @@ class Scanner {
         return false;
     }
 
-    if (entry.type != EntryType::kSymlink) {
-      entry.user_name = names_->UserName(facts.uid);
-      entry.group_name = names_->GroupName(facts.gid);
-    }
+    // 所有类型都解析属主 / 属组名字，软链接也在内：uid / gid 来自 lstat，
+    // 本来就是链接自己的属主，解析名字不涉及 follow，没有"跟过去"的风险。
+    entry.user_name = names_->UserName(facts.uid);
+    entry.group_name = names_->GroupName(facts.gid);
     entries_->push_back(std::move(entry));
     return true;
   }
@@ -366,10 +329,10 @@ class Scanner {
       filter_entry.mtime_sec = facts.mtime_sec;
       filter_entry.uid = facts.uid;
       filter_entry.gid = facts.gid;
-      if (facts.type != EntryType::kSymlink) {
-        filter_entry.user_name = names_->UserName(facts.uid);
-        filter_entry.group_name = names_->GroupName(facts.gid);
-      }
+      // 软链接同样填名字：预览与真实扫描必须给出同一份元数据，否则
+      // include user:<自己> 会在预览里命中、真实备份却把链接漏掉。
+      filter_entry.user_name = names_->UserName(facts.uid);
+      filter_entry.group_name = names_->GroupName(facts.gid);
 
       if (facts.type == EntryType::kDirectory) {
         // 命中 exclude 的目录整棵剪掉：不再递归，子树里的 socket 之类
@@ -410,7 +373,7 @@ class Scanner {
   }
 
   const Filter* filter_ = nullptr;
-  NameResolver* names_ = nullptr;
+  UserDirectoryCache* names_ = nullptr;
   std::map<InodeKey, std::string>* seen_inodes_ = nullptr;
   std::vector<ArchiveEntry>* entries_ = nullptr;
 };
@@ -451,7 +414,7 @@ bool ScanSourceTree(const std::string& source_directory, const Filter* filter,
   }
 
   std::vector<ArchiveEntry> scanned;
-  NameResolver names;
+  UserDirectoryCache names;
   std::map<InodeKey, std::string> seen_inodes;
   Scanner scanner(filter, &names, &seen_inodes);
   if (!scanner.Scan(source_directory, &scanned, error_message)) {

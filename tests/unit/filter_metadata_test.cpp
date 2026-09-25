@@ -332,15 +332,18 @@ void TypeValues() {
   const bp::FilterEntry blockdev = TypedEntry("b", bp::EntryType::kBlockDevice);
   const bp::FilterEntry socket = TypedEntry("k", bp::EntryType::kSocket);
 
-  // file / folder 沿用初版语义：只看 is_directory，所以 file = "非目录"。
+  // type:file 只表示普通文件（EntryType::kRegularFile）。它曾经等价于
+  // "非目录"，于是 symlink / FIFO / 字符设备 / 块设备 / socket 全被它命中；
+  // 语义改成"只有普通文件"之后这些断言跟着翻转——变的是语义本身，
+  // 不是为了迁就实现。type:folder 仍然只看 is_directory（旧调用方兼容）。
   bp::Filter file_rule;
   if (Add(&file_rule, bp::FilterAction::kExclude, "type:file")) {
     CHECK(!file_rule.ShouldIncludeFile(file));
-    CHECK(!file_rule.ShouldIncludeFile(symlink));
-    CHECK(!file_rule.ShouldIncludeFile(fifo));
-    CHECK(!file_rule.ShouldIncludeFile(chardev));
-    CHECK(!file_rule.ShouldIncludeFile(blockdev));
-    CHECK(!file_rule.ShouldIncludeFile(socket));
+    CHECK(file_rule.ShouldIncludeFile(symlink));
+    CHECK(file_rule.ShouldIncludeFile(fifo));
+    CHECK(file_rule.ShouldIncludeFile(chardev));
+    CHECK(file_rule.ShouldIncludeFile(blockdev));
+    CHECK(file_rule.ShouldIncludeFile(socket));
     CHECK(!file_rule.ShouldPruneDirectory(directory));
     CHECK(file_rule.ShouldIncludeFile(directory));
   }
