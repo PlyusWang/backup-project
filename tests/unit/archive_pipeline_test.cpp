@@ -7,6 +7,8 @@
 // 再和源树逐项比较（类型 / mode / mtime 秒+纳秒 / 属主 / 内容 / 软链接目标 /
 // 设备号 / 硬链接分组）。
 
+#include "archive_pipeline.h"
+
 #include <sys/stat.h>
 #include <sys/sysmacros.h>
 #include <sys/types.h>
@@ -17,7 +19,6 @@
 #include <string>
 #include <vector>
 
-#include "archive_pipeline.h"
 #include "backup_engine.h"
 #include "filter.h"
 #include "pack_stream.h"
@@ -34,8 +35,8 @@ using backupproject::EncryptionMethod;
 using backupproject::EntryType;
 using backupproject::Filter;
 using backupproject::FilterAction;
-using backupproject::PackMethod;
 using backupproject::PackedStreamReader;
+using backupproject::PackMethod;
 using backupproject::RestoreOptions;
 using backupproject::RestoreReport;
 
@@ -83,9 +84,11 @@ void BuildRegularTree(const std::string& root) {
   test_support::WriteFile(root + "/hello.txt", "hello world\n", 0644);
   test_support::WriteFile(root + "/empty.bin", "", 0644);
   test_support::WriteFile(root + "/with space.txt", "spaces matter\n", 0600);
-  test_support::WriteFile(root + "/\u4e2d\u6587.txt", "unicode payload\n", 0640);
+  test_support::WriteFile(root + "/\u4e2d\u6587.txt", "unicode payload\n",
+                          0640);
   test_support::Mkdir(root + "/sub", 0750);
-  test_support::WriteFile(root + "/sub/nested.txt", std::string(4096, 'n'), 0644);
+  test_support::WriteFile(root + "/sub/nested.txt", std::string(4096, 'n'),
+                          0644);
   test_support::Mkdir(root + "/sub/deep", 0700);
   test_support::WriteFile(root + "/sub/deep/script.sh", "#!/bin/sh\necho hi\n",
                           0755);
@@ -115,13 +118,14 @@ void CheckNode(const std::string& label, const std::string& path,
     detail += "entry type mismatch; ";
   }
   if (!mode_ok) {
-    detail += "mode " + test_support::Octal(info.st_mode & 07777) + " != " +
-              test_support::Octal(expected_mode) + "; ";
+    detail += "mode " + test_support::Octal(info.st_mode & 07777) +
+              " != " + test_support::Octal(expected_mode) + "; ";
   }
   if (!time_ok) {
     detail += "mtime " + std::to_string(info.st_mtim.tv_sec) + "." +
-              std::to_string(info.st_mtim.tv_nsec) + " != " +
-              std::to_string(mtime_sec) + "." + std::to_string(mtime_nsec);
+              std::to_string(info.st_mtim.tv_nsec) +
+              " != " + std::to_string(mtime_sec) + "." +
+              std::to_string(mtime_nsec);
   }
   test_support::Check(type_ok && mode_ok && time_ok, label, detail);
 }
@@ -224,19 +228,19 @@ void RunMatrix(const std::string& workdir, std::vector<MatrixRow>* rows) {
           bad_options.password = "definitely not the password";
           error.clear();
           RestoreReport bad_report;
-          const bool wrong_ok = engine.Restore(archive, bad_destination,
-                                               bad_options, &bad_report, &error);
+          const bool wrong_ok = engine.Restore(
+              archive, bad_destination, bad_options, &bad_report, &error);
           const bool failed = !wrong_ok;
           const bool no_leftover = !test_support::Exists(bad_destination);
           const bool auth_message =
               error.find("Authentication failed") != std::string::npos;
           row.wrong_password =
               (failed && no_leftover && auth_message) ? "PASS" : "FAIL";
-          test_support::Check(failed,
-                              "matrix wrong password rejected " + tag, error);
-          test_support::Check(no_leftover,
-                              "matrix wrong password leaves no destination " +
-                                  tag);
+          test_support::Check(failed, "matrix wrong password rejected " + tag,
+                              error);
+          test_support::Check(
+              no_leftover,
+              "matrix wrong password leaves no destination " + tag);
           test_support::Check(auth_message,
                               "matrix wrong password fails on HMAC " + tag,
                               error);
@@ -251,12 +255,13 @@ void RunMatrix(const std::string& workdir, std::vector<MatrixRow>* rows) {
 }
 
 void PrintMatrix(const std::vector<MatrixRow>& rows) {
-  std::printf("\nMATRIX\tPack\tCompression\tEncryption\tBackup\tRestore\tDiff\tWrongPwd\tResult\n");
+  std::printf(
+      "\nMATRIX\tPack\tCompression\tEncryption\tBackup\tRestore\tDiff\tWrongPwd"
+      "\tResult\n");
   for (const MatrixRow& row : rows) {
-    std::printf("MATRIX\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
-                row.pack.c_str(), row.compression.c_str(),
-                row.encryption.c_str(), row.backup.c_str(),
-                row.restore.c_str(), row.diff.c_str(),
+    std::printf("MATRIX\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n", row.pack.c_str(),
+                row.compression.c_str(), row.encryption.c_str(),
+                row.backup.c_str(), row.restore.c_str(), row.diff.c_str(),
                 row.wrong_password.c_str(), row.result.c_str());
   }
   std::fflush(stdout);
@@ -293,8 +298,8 @@ void RunMetadata(const std::string& workdir) {
   }
   RestoreOptions restore_options;
   RestoreReport report;
-  const bool restored = engine.Restore(archive, destination, restore_options,
-                                       &report, &error);
+  const bool restored =
+      engine.Restore(archive, destination, restore_options, &report, &error);
   test_support::Check(restored, "metadata restore", error);
   if (!restored) {
     return;
@@ -303,7 +308,8 @@ void RunMetadata(const std::string& workdir) {
             1000000000, 999999999);
   CheckNode("setgid bit survives", destination + "/setgid.bin", S_IFREG, 02755,
             -1, 0);
-  CheckNode("sticky bit survives", destination + "/sticky", S_IFDIR, 01777, -1, 0);
+  CheckNode("sticky bit survives", destination + "/sticky", S_IFDIR, 01777, -1,
+            0);
   CheckNode("source root mode survives", destination, S_IFDIR, 0751, -1, 0);
 
   struct stat source_info;
@@ -320,9 +326,9 @@ void RunMetadata(const std::string& workdir) {
   }
   test_support::Check(report.skipped_ownership == 0,
                       "ownership restored exactly for the current user");
-  test_support::Note("report: restored=" +
-                     std::to_string(report.restored_entries) + " skipped_owner=" +
-                     std::to_string(report.skipped_ownership));
+  test_support::Note(
+      "report: restored=" + std::to_string(report.restored_entries) +
+      " skipped_owner=" + std::to_string(report.skipped_ownership));
 }
 
 // ---- 特殊文件：真实文件系统上的 symlink / hardlink / FIFO -------------------
@@ -364,8 +370,8 @@ void RunSpecialFiles(const std::string& workdir, PackMethod pack) {
   }
   RestoreOptions restore_options;
   RestoreReport report;
-  const bool restored = engine.Restore(archive, destination, restore_options,
-                                       &report, &error);
+  const bool restored =
+      engine.Restore(archive, destination, restore_options, &report, &error);
   test_support::Check(restored, std::string(tag) + " special restore", error);
   if (!restored) {
     return;
@@ -380,11 +386,10 @@ void RunSpecialFiles(const std::string& workdir, PackMethod pack) {
       test_support::StatOf(destination + "/data.txt", &first);
   const bool have_second =
       test_support::StatOf(destination + "/hard.txt", &second);
-  test_support::Check(have_first && have_second &&
-                          first.st_ino == second.st_ino &&
-                          first.st_nlink >= 2,
-                      std::string(tag) +
-                          " hard link keeps a shared inode (st_ino equal)");
+  test_support::Check(
+      have_first && have_second && first.st_ino == second.st_ino &&
+          first.st_nlink >= 2,
+      std::string(tag) + " hard link keeps a shared inode (st_ino equal)");
   struct stat fifo_info;
   test_support::Check(test_support::StatOf(destination + "/pipe", &fifo_info) &&
                           S_ISFIFO(fifo_info.st_mode),
@@ -395,8 +400,8 @@ void RunSpecialFiles(const std::string& workdir, PackMethod pack) {
           S_ISLNK(link_info.st_mode),
       std::string(tag) + " symbolic link restored as symlink");
   char target[4096];
-  const ssize_t length =
-      ::readlink((destination + "/dir/up.link").c_str(), target, sizeof(target));
+  const ssize_t length = ::readlink((destination + "/dir/up.link").c_str(),
+                                    target, sizeof(target));
   test_support::Check(length == 11 && std::string(target, 11) == "../data.txt",
                       std::string(tag) + " symbolic link target preserved");
 }
@@ -417,8 +422,8 @@ void RunSocketSemantics(const std::string& workdir) {
   PackedStreamReader probe;
   std::vector<ArchiveEntry> entries;
   Filter prune;
-  const bool rule_ok =
-      prune.AddRule(FilterAction::kExclude, "type:folder name:excluded", &error);
+  const bool rule_ok = prune.AddRule(FilterAction::kExclude,
+                                     "type:folder name:excluded", &error);
   test_support::Check(rule_ok, "prune rule parsed", error);
   test_support::Check(
       backupproject::ScanSourceTree(ok_source, &prune, &entries, &error),
@@ -429,7 +434,8 @@ void RunSocketSemantics(const std::string& workdir) {
       saw_socket = true;
     }
   }
-  test_support::Check(!saw_socket, "pruned subtree contributed no socket entry");
+  test_support::Check(!saw_socket,
+                      "pruned subtree contributed no socket entry");
 
   const std::string ok_archive = workdir + "/socket-excluded.bak";
   const std::string ok_destination = workdir + "/socket-excluded-out";
@@ -575,7 +581,8 @@ void RunDeviceAndFormat(const std::string& workdir) {
     }
     PackedStreamReader reader;
     const bool opened = reader.Open(packed, &error);
-    test_support::Check(opened, std::string(tag) + " open packed stream", error);
+    test_support::Check(opened, std::string(tag) + " open packed stream",
+                        error);
     if (!opened) {
       continue;
     }
@@ -645,7 +652,8 @@ void RunDeviceAndFormat(const std::string& workdir) {
     const bool restored = backupproject::RunRestorePipeline(
         archive, destination, restore_options, &report, &error);
     if (::geteuid() == 0) {
-      test_support::Check(restored, std::string(tag) + " device restore", error);
+      test_support::Check(restored, std::string(tag) + " device restore",
+                          error);
       if (restored) {
         struct stat info;
         test_support::Check(
@@ -658,17 +666,17 @@ void RunDeviceAndFormat(const std::string& workdir) {
             std::string(tag) + " block device recreated with the same rdev");
       }
     } else {
-      test_support::Check(!restored,
-                          std::string(tag) +
-                              " device restore fails clearly without CAP_MKNOD",
-                          error);
-      test_support::Check(error.find("CAP_MKNOD") != std::string::npos,
-                          std::string(tag) +
-                              " failure message explains the privilege need",
-                          error);
-      test_support::Check(!test_support::Exists(destination),
-                          std::string(tag) +
-                              " failed device restore leaves no destination");
+      test_support::Check(
+          !restored,
+          std::string(tag) + " device restore fails clearly without CAP_MKNOD",
+          error);
+      test_support::Check(
+          error.find("CAP_MKNOD") != std::string::npos,
+          std::string(tag) + " failure message explains the privilege need",
+          error);
+      test_support::Check(
+          !test_support::Exists(destination),
+          std::string(tag) + " failed device restore leaves no destination");
       test_support::Note(std::string(tag) +
                          ": SKIP restore char/block: insufficient privilege");
     }
@@ -688,8 +696,8 @@ void RunDeviceAndFormat(const std::string& workdir) {
     options.pack_method = pack;
     const bool ok = backupproject::RunBackupPipelineFromEntries(
         with_socket, archive, options, &error);
-    test_support::Check(!ok, std::string(PackLabel(pack)) +
-                                 " rejects a socket entry");
+    test_support::Check(
+        !ok, std::string(PackLabel(pack)) + " rejects a socket entry");
     test_support::Check(!test_support::Exists(archive),
                         std::string(PackLabel(pack)) +
                             " leaves no archive after rejecting a socket");
@@ -714,11 +722,12 @@ void RunFilterScan(const std::string& workdir) {
   std::string error;
   {
     Filter filter;
-    const bool ok = filter.AddRule(FilterAction::kExclude, "ext:log", &error) &&
-                    filter.AddRule(FilterAction::kExclude, "type:folder name:cache",
-                                   &error) &&
-                    filter.AddRule(FilterAction::kExclude, "type:fifo", &error) &&
-                    filter.AddRule(FilterAction::kExclude, "type:symlink", &error);
+    const bool ok =
+        filter.AddRule(FilterAction::kExclude, "ext:log", &error) &&
+        filter.AddRule(FilterAction::kExclude, "type:folder name:cache",
+                       &error) &&
+        filter.AddRule(FilterAction::kExclude, "type:fifo", &error) &&
+        filter.AddRule(FilterAction::kExclude, "type:symlink", &error);
     test_support::Check(ok, "filter rules parsed", error);
     std::vector<ArchiveEntry> entries;
     const bool scanned =
@@ -770,10 +779,44 @@ void RunFilterScan(const std::string& workdir) {
   }
 
   {
+    // 硬链接在文件系统层就是普通文件：扫描层给 Filter 的 FilterEntry.type
+    // 永远是 kRegularFile（kHardLink 只是归档条目层的概念），所以
+    // type:file 与 size: 都必须照常命中硬链接。
+    test_support::Mkdir(source + "/hardlink-dir", 0755);
+    test_support::WriteFile(source + "/hardlink-dir/original.txt",
+                            std::string(4096, 'h'), 0644);
+    test_support::CreateHardlink(source + "/hardlink-dir/original.txt",
+                                 source + "/hardlink-dir/second.txt");
+    Filter filter;
+    const bool ok =
+        filter.AddRule(FilterAction::kInclude, "type:file size:>=1KB", &error);
+    test_support::Check(ok, "hard link filter rules parsed", error);
+    std::vector<ArchiveEntry> entries;
+    const bool scanned =
+        backupproject::ScanSourceTree(source, &filter, &entries, &error);
+    test_support::Check(scanned, "scan with hard links", error);
+    bool saw_hardlink = false;
+    bool saw_regular = false;
+    for (const ArchiveEntry& entry : entries) {
+      if (entry.archive_path == "hardlink-dir/second.txt") {
+        saw_hardlink = entry.type == EntryType::kHardLink;
+      }
+      if (entry.archive_path == "hardlink-dir/original.txt") {
+        saw_regular = entry.type == EntryType::kRegularFile;
+      }
+    }
+    test_support::Check(
+        saw_regular, "type:file + size: still match the first hard link copy");
+    test_support::Check(
+        saw_hardlink,
+        "the second copy becomes a hard link entry after the filter");
+  }
+
+  {
     // 不存在的用户名的规则不能崩，也不能匹配任何人。
     Filter filter;
-    const bool ok = filter.AddRule(FilterAction::kInclude,
-                                   "user:no-such-user-xyz", &error);
+    const bool ok =
+        filter.AddRule(FilterAction::kInclude, "user:no-such-user-xyz", &error);
     test_support::Check(ok, "user rule parsed", error);
     std::vector<ArchiveEntry> entries;
     const bool scanned =
@@ -818,16 +861,17 @@ void RunPackAgreement(const std::string& workdir) {
         workdir + "/agree-" + std::to_string(index) + ".pack";
     test_support::RemoveTree(packed);
     if (!backupproject::PackEntries(packs[index], entries, packed, &error)) {
-      test_support::Check(false, std::string("agree pack ") +
-                                      backupproject::PackMethodName(packs[index]),
+      test_support::Check(false,
+                          std::string("agree pack ") +
+                              backupproject::PackMethodName(packs[index]),
                           error);
       continue;
     }
     backupproject::PackedStreamReader reader;
-    if (!reader.Open(packed, &error) ||
-        !reader.Scan(packs[index], &error)) {
-      test_support::Check(false, std::string("agree scan ") +
-                                      backupproject::PackMethodName(packs[index]),
+    if (!reader.Open(packed, &error) || !reader.Scan(packs[index], &error)) {
+      test_support::Check(false,
+                          std::string("agree scan ") +
+                              backupproject::PackMethodName(packs[index]),
                           error);
       continue;
     }
@@ -857,21 +901,22 @@ void RunPackAgreement(const std::string& workdir) {
       }
       if (before.mode != after.mode || before.uid != after.uid ||
           before.gid != after.gid || before.mtime_sec != after.mtime_sec ||
-          before.size != after.size || before.link_target != after.link_target ||
+          before.size != after.size ||
+          before.link_target != after.link_target ||
           before.dev_major != after.dev_major ||
           before.dev_minor != after.dev_minor) {
         detail = "metadata of " + before.archive_path;
         break;
       }
     }
-    test_support::Check(detail.empty(), label + " preserves every field", detail);
+    test_support::Check(detail.empty(), label + " preserves every field",
+                        detail);
   }
 
   // 备份确定性：同样的源 + 同样的选项（不加密）必须产出逐字节相同的 .bak；
   // 加密之后 salt/IV 是随机的，字节必然不同，但两份都必须能恢复。
   for (const PackMethod pack : packs) {
-    const std::string label =
-        std::string(backupproject::PackMethodName(pack));
+    const std::string label = std::string(backupproject::PackMethodName(pack));
     BackupOptions options;
     options.pack_method = pack;
     options.compression_method = CompressionMethod::kLzssHuffman;
@@ -889,9 +934,10 @@ void RunPackAgreement(const std::string& workdir) {
     std::string bytes_second;
     test_support::ReadFile(first, &bytes_first);
     test_support::ReadFile(second, &bytes_second);
-    test_support::Check(ok_first && ok_second && !bytes_first.empty() &&
-                            bytes_first == bytes_second,
-                        label + " unencrypted backup is byte-for-byte reproducible");
+    test_support::Check(
+        ok_first && ok_second && !bytes_first.empty() &&
+            bytes_first == bytes_second,
+        label + " unencrypted backup is byte-for-byte reproducible");
 
     options.encryption_method = EncryptionMethod::kAes256CtrHmacSha256;
     options.password = "determinism check";
@@ -908,9 +954,10 @@ void RunPackAgreement(const std::string& workdir) {
     std::string bytes_fourth;
     test_support::ReadFile(third, &bytes_third);
     test_support::ReadFile(fourth, &bytes_fourth);
-    test_support::Check(ok_third && ok_fourth && !bytes_third.empty() &&
-                            bytes_third != bytes_fourth,
-                        label + " encrypted backup uses a fresh random salt/IV");
+    test_support::Check(
+        ok_third && ok_fourth && !bytes_third.empty() &&
+            bytes_third != bytes_fourth,
+        label + " encrypted backup uses a fresh random salt/IV");
     const std::string out_third = workdir + "/det-c-out";
     const std::string out_fourth = workdir + "/det-d-out";
     test_support::RemoveTree(out_third);
@@ -930,6 +977,186 @@ void RunPackAgreement(const std::string& workdir) {
     test_support::Check(restored_third && restored_fourth,
                         label + " both encrypted backups restore",
                         error + detail_third + detail_fourth);
+  }
+}
+
+// ---- 恢复顺序：隐式父目录 / 缺 root 条目 / forward hardlink / 唯一暂存目录
+// ----
+
+void RunRestoreOrdering(const std::string& workdir) {
+  test_support::Section("restore ordering and staging uniqueness");
+  const std::string payload = workdir + "/ordering-payload.bin";
+  test_support::WriteFile(payload, "ordering payload", 0644);
+  struct stat payload_info;
+  if (!test_support::StatOf(payload, &payload_info)) {
+    test_support::Check(false, "ordering payload stat");
+    return;
+  }
+  const auto make_file = [&payload, &payload_info](const std::string& path) {
+    ArchiveEntry entry;
+    entry.archive_path = path;
+    entry.source_path = payload;
+    entry.type = EntryType::kRegularFile;
+    entry.mode = 0644;
+    entry.size = static_cast<std::uint64_t>(payload_info.st_size);
+    entry.mtime_sec = static_cast<std::int64_t>(payload_info.st_mtim.tv_sec);
+    entry.mtime_nsec = static_cast<std::uint32_t>(payload_info.st_mtim.tv_nsec);
+    entry.source_dev = static_cast<std::uint64_t>(payload_info.st_dev);
+    entry.source_ino = static_cast<std::uint64_t>(payload_info.st_ino);
+    return entry;
+  };
+  const auto make_dir = [](const std::string& path) {
+    ArchiveEntry entry;
+    entry.archive_path = path;
+    entry.type = EntryType::kDirectory;
+    entry.mode = 0755;
+    return entry;
+  };
+
+  // 1) 隐式父目录：归档里只有 a/b.txt，没有 a/。标准 tar 允许这样，
+  //    恢复时父目录必须被补出来，而且保持 0700 这个安全默认值。
+  {
+    std::vector<ArchiveEntry> entries;
+    entries.push_back(make_dir("."));
+    entries.push_back(make_file("a/b.txt"));
+    const std::string packed = workdir + "/implicit-parent.pack";
+    const std::string destination = workdir + "/implicit-parent.out";
+    test_support::RemoveTree(packed);
+    test_support::RemoveTree(destination);
+    std::string error;
+    const bool packed_ok =
+        backupproject::PackEntries(PackMethod::kUstar, entries, packed, &error);
+    test_support::Check(packed_ok, "implicit-parent archive built", error);
+    if (packed_ok) {
+      backupproject::RestoreReport report;
+      error.clear();
+      const bool restored = backupproject::RunRestorePackedStream(
+          packed, PackMethod::kUstar, entries.size(), destination, &report,
+          &error);
+      test_support::Check(restored, "restore with an implicit parent", error);
+      std::string content;
+      test_support::Check(
+          restored &&
+              test_support::ReadFile(destination + "/a/b.txt", &content) &&
+              content == "ordering payload",
+          "file under an implicit parent restored");
+      struct stat info;
+      test_support::Check(test_support::StatOf(destination + "/a", &info) &&
+                              S_ISDIR(info.st_mode) &&
+                              (info.st_mode & 0777) == 0700,
+                          "implicit parent keeps the safe 0700 default");
+    }
+  }
+
+  // 2) 没有 "." 条目：仍然要能恢复；destination 保持 0700，不伪造
+  // uid/gid/mtime。
+  {
+    std::vector<ArchiveEntry> entries;
+    entries.push_back(make_file("solo.txt"));
+    const std::string packed = workdir + "/no-root.pack";
+    const std::string destination = workdir + "/no-root.out";
+    test_support::RemoveTree(packed);
+    test_support::RemoveTree(destination);
+    std::string error;
+    const bool packed_ok =
+        backupproject::PackEntries(PackMethod::kUstar, entries, packed, &error);
+    test_support::Check(packed_ok, "archive without a root entry built", error);
+    if (packed_ok) {
+      backupproject::RestoreReport report;
+      error.clear();
+      const bool restored = backupproject::RunRestorePackedStream(
+          packed, PackMethod::kUstar, entries.size(), destination, &report,
+          &error);
+      std::string content;
+      test_support::Check(
+          restored &&
+              test_support::ReadFile(destination + "/solo.txt", &content) &&
+              content == "ordering payload",
+          "archive without a root entry restores", error);
+      struct stat info;
+      test_support::Check(
+          test_support::StatOf(destination, &info) && S_ISDIR(info.st_mode) &&
+              (info.st_mode & 0777) == 0700,
+          "restored root keeps the safe 0700 default when the archive has no "
+          "root entry");
+    }
+  }
+
+  // 3) forward hardlink：hardlink 目标出现在 hardlink 之后。
+  {
+    std::vector<ArchiveEntry> entries;
+    entries.push_back(make_dir("."));
+    ArchiveEntry link = make_file("link.txt");
+    link.type = EntryType::kHardLink;
+    link.link_target = "target.txt";
+    link.size = 0;
+    link.source_path.clear();
+    entries.push_back(link);
+    entries.push_back(make_file("target.txt"));
+    const std::string packed = workdir + "/forward-hardlink.pack";
+    const std::string destination = workdir + "/forward-hardlink.out";
+    test_support::RemoveTree(packed);
+    test_support::RemoveTree(destination);
+    std::string error;
+    const bool packed_ok =
+        backupproject::PackEntries(PackMethod::kUstar, entries, packed, &error);
+    test_support::Check(packed_ok, "forward hard link archive built", error);
+    if (packed_ok) {
+      backupproject::RestoreReport report;
+      error.clear();
+      const bool restored = backupproject::RunRestorePackedStream(
+          packed, PackMethod::kUstar, entries.size(), destination, &report,
+          &error);
+      struct stat link_info;
+      struct stat target_info;
+      test_support::Check(restored, "forward hard link restores", error);
+      test_support::Check(
+          restored &&
+              test_support::StatOf(destination + "/link.txt", &link_info) &&
+              test_support::StatOf(destination + "/target.txt", &target_info) &&
+              link_info.st_ino == target_info.st_ino,
+          "forward hard link shares the inode with its later target");
+    }
+  }
+
+  // 4) 连续两次恢复：mkdtemp 出来的暂存目录不会撞名，parent 里不留残余。
+  {
+    const std::string source = workdir + "/staging-source";
+    BuildRegularTree(source);
+    BackupOptions options;
+    options.pack_method = PackMethod::kMyPack;
+    BackupEngine engine;
+    std::string error;
+    const std::string archive = workdir + "/staging.bak";
+    test_support::RemoveTree(archive);
+    if (!engine.Backup(source, archive, Filter(), options, &error)) {
+      test_support::Check(false, "staging fixture backup", error);
+      return;
+    }
+    for (int round = 0; round < 3; ++round) {
+      const std::string destination =
+          workdir + "/staging-out-" + std::to_string(round);
+      test_support::RemoveTree(destination);
+      RestoreOptions restore_options;
+      backupproject::RestoreReport report;
+      error.clear();
+      std::string detail;
+      test_support::Check(
+          engine.Restore(archive, destination, restore_options, &report,
+                         &error) &&
+              test_support::CompareTrees(source, destination, &detail),
+          "repeated restore #" + std::to_string(round) + " succeeds",
+          error + detail);
+    }
+    bool leftover = false;
+    for (const std::string& name : test_support::DirEntries(workdir)) {
+      if (name.find(".bptmp-") != std::string::npos ||
+          name.find(".bp-work-") != std::string::npos) {
+        leftover = true;
+      }
+    }
+    test_support::Check(!leftover,
+                        "no staging or workspace leftovers after restores");
   }
 }
 
@@ -962,6 +1189,7 @@ int main() {
   RunDeviceAndFormat(workdir);
   RunFilterScan(workdir);
   RunPackAgreement(workdir);
+  RunRestoreOrdering(workdir);
 
   return test_support::Finish("archive-pipeline");
 }
