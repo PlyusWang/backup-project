@@ -1,10 +1,7 @@
 // filter_rule_model.cpp
 #include "filter_rule_model.h"
 
-#include <grp.h>
-#include <pwd.h>
 #include <sys/stat.h>
-#include <unistd.h>
 
 #include <QDateTime>
 #include <QtConcurrent>
@@ -13,8 +10,9 @@
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
-#include <map>
 #include <string>
+
+#include "user_directory.h"
 
 namespace backup_modern {
 namespace {
@@ -328,60 +326,13 @@ bool TypeFromStat(const struct stat& info, bp::EntryType* type) {
   return true;
 }
 
-// uid / gid -> 名字。预览必须给出与真实扫描（tree_scanner.cpp 的 NameResolver）
-// 同样的元数据，否则 user: / group:
-// 规则在预览里会永远不匹配，而真实备份却匹配。 解析失败留空：Filter
-// 对空名字一律视为不匹配（见 include/filter.h）。
+// uid / gid -> 名字走共享实现（backupproject::UserDirectoryCache）：预览和
+// 真实扫描（tree_scanner.cpp）必须给出同一份元数据。各写一份时，group 用错
+// sysconf hint 这类问题会让 user: / group: 规则在预览里命中、真实备份却漏掉。
+// 解析失败留空，Filter 对空名字一律视为不匹配（见 include/filter.h）。
 //
 // 不直接把扫描交给 ScanSourceTree 的原因：那个入口遇到"没有被排除的 socket"会
 // 整次失败，而预览要做的恰恰是把这类条目列出来并提示后果。
-class PreviewNameResolver {
- public:
-  const std::string& UserName(std::uint32_t uid) {
-    const auto found = users_.find(uid);
-    if (found != users_.end()) {
-      return found->second;
-    }
-    struct passwd entry;
-    struct passwd* result = nullptr;
-    std::vector<char> buffer(BufferSize());
-    const int status = ::getpwuid_r(static_cast<uid_t>(uid), &entry,
-                                    buffer.data(), buffer.size(), &result);
-    const std::string name =
-        (status == 0 && result != nullptr) ? std::string(entry.pw_name) : "";
-    return users_.emplace(uid, name).first->second;
-  }
-
-  const std::string& GroupName(std::uint32_t gid) {
-    const auto found = groups_.find(gid);
-    if (found != groups_.end()) {
-      return found->second;
-    }
-    struct group entry;
-    struct group* result = nullptr;
-    std::vector<char> buffer(BufferSize());
-    const int status = ::getgrgid_r(static_cast<gid_t>(gid), &entry,
-                                    buffer.data(), buffer.size(), &result);
-    const std::string name =
-        (status == 0 && result != nullptr) ? std::string(entry.gr_name) : "";
-    return groups_.emplace(gid, name).first->second;
-  }
-
- private:
-  static std::size_t BufferSize() {
-    const long hint = ::sysconf(_SC_GETPW_R_SIZE_MAX);
-    // sysconf 返回 -1 表示"没有上限提示"，这时用一个保守的固定值。
-    if (hint < 1024) {
-      return 4096;
-    }
-    return static_cast<std::size_t>(hint);
-  }
-
-  std::map<std::uint32_t, std::string> users_;
-  std::map<std::uint32_t, std::string> groups_;
-};
-
-// 预览扫描在后台线程执行：先按当前草稿构造真实 Filter，再逐条问它。
 bp::Filter BuildFilterFromDrafts(
     const std::vector<bp::FilterRuleDraft>& drafts) {
   bp::Filter filter;
@@ -767,7 +718,7 @@ FilterRuleModel::PreviewOutcome FilterRuleModel::ScanPreview(
     return outcome;
   }
   const bp::Filter filter = BuildFilterFromDrafts(drafts);
-  PreviewNameResolver names;
+  bp::UserDirectoryCache names;
   fs::recursive_directory_iterator it(
       root, fs::directory_options::skip_permission_denied, ec);
   const fs::recursive_directory_iterator end;
@@ -796,11 +747,10 @@ FilterRuleModel::PreviewOutcome FilterRuleModel::ScanPreview(
     if (type == bp::EntryType::kRegularFile) {
       fe.size = static_cast<std::uint64_t>(info.st_size);
     }
-    // 与 tree_scanner 一致：软链接不解析属主 / 属组名字。
-    if (type != bp::EntryType::kSymlink) {
-      fe.user_name = names.UserName(fe.uid);
-      fe.group_name = names.GroupName(fe.gid);
-    }
+    // 与 tree_scanner 一致：所有类型（含软链接）都解析属主 / 属组名字。
+    // uid / gid 来自 lstat，属于链接自己，解析名字不 follow。
+    fe.user_name = names.UserName(fe.uid);
+    fe.group_name = names.GroupName(fe.gid);
 
     // 归属判定全部问真实 Filter：GUI 里没有第二套匹配逻辑。
     bool included = false;

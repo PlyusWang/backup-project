@@ -8,7 +8,7 @@ TARGET := $(BUILD_DIR)/backupctl
 APP_SOURCES := app/backupctl.cpp
 CORE_SOURCES := src/core/archive_entry.cpp src/core/archive_pipeline.cpp \
                 src/core/backup_engine.cpp src/core/file_io.cpp \
-                src/core/tree_scanner.cpp src/archive/archive.cpp \
+                src/core/tree_scanner.cpp src/core/user_directory.cpp src/archive/archive.cpp \
                 src/archive/archive_path.cpp src/archive/container_format.cpp \
                 src/archive/mypack_v2.cpp src/archive/pack_stream.cpp \
                 src/archive/ustar.cpp src/catalog/backup_catalog.cpp \

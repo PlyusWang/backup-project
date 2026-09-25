@@ -31,15 +31,16 @@ enum class FilterAction { kInclude, kExclude };
 // 相对 source root、'/' 分隔；source root 自身是 "."。
 //
 // 字段分两代：is_directory / size / mtime_sec 是初版就有的，只填它们的调用方
-// 行为必须一字不变；type / uid / gid / user_name / group_name 是补上的元数据，
+// 行为必须一字不变——不填 type 时默认值就是 kRegularFile，"非目录"因此仍然
+// 按普通文件处理；type / uid / gid / user_name / group_name 是补上的元数据，
 // 填了才能命中 type: 的细分取值与 uid: / gid: / user: / group: 规则。
 struct FilterEntry {
   std::string archive_path;
   std::string name;
   bool is_directory = false;
-  // 条目类型。type:file / type:folder 仍按 is_directory 判断（见 filter.cpp），
-  // 只有 symlink / fifo / char / block / socket 才读这个字段——这样"只填
-  // is_directory"的旧调用方不会因为默认值而改变匹配结果。
+  // 条目类型。type:file 只认 kRegularFile（普通文件），type:folder 仍然只看
+  // is_directory；symlink / fifo / char / block / socket 的取值同样读这里。
+  // 默认值是 kRegularFile，所以"只填 is_directory"的旧调用方行为一字不变。
   EntryType type = EntryType::kRegularFile;
   std::uint64_t size = 0;
   std::int64_t mtime_sec = 0;
@@ -104,7 +105,8 @@ class Filter {
       kRange,
       kEqual
     };
-    // type: 的取值。file / folder 只看 is_directory，其余看 EntryType。
+    // type: 的取值。file 看 EntryType::kRegularFile，folder 看 is_directory
+    // （旧调用方没有 type 可填），其余按 EntryType 精确匹配。
     enum class TypeKind {
       kFile,
       kFolder,
