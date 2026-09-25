@@ -229,6 +229,9 @@ BASE_TAR="$WORK_DIR/base.tar"
 FAST_TAR="$WORK_DIR/fast.tar"
 check "写 baseline 归档（真实目录树）" "$BIN" --pack "$SRC" "$BASE_TAR" baseline
 check "写 Fast 归档（真实目录树）" "$BIN" --pack "$SRC" "$FAST_TAR" fast
+# 归档权限统一 0600：归档里是用户数据的完整副本，不能留给同组 / 其他人读。
+check_mode "写出的 baseline 归档权限是 600" "$BASE_TAR" "600"
+check_mode "写出的 Fast 归档权限是 600" "$FAST_TAR" "600"
 
 OUR_COUNT="$("$BIN" --list "$BASE_TAR" | wc -l)"
 # 独立计数：源树自身（对应归档里的 "."）+ 全部子项。两边都是 0 时下面的
@@ -305,6 +308,82 @@ if [ "$HAVE_TAR" = "1" ]; then
   check_mode "interop D: 还原出的文件权限是 640" "$DEST_GNU/file.txt" "640"
 else
   echo "SKIP: 系统里没有 GNU tar，A / B / C / D 四组 interoperability 测试跳过"
+fi
+
+# ------------------------------------- forward hardlink（读取器端到端）
+# Scan 允许 forward hardlink（target 出现在 hardlink 之后），恢复侧靠延后的
+# link 把它建出来。GNU tar 自己总是把 target 写在前面，所以这里手工造一个标准
+# ustar：hard 在前、a 在后；再顺手确认环会被读取器拒绝。
+if command -v python3 > /dev/null 2>&1; then
+  FWD_TAR="$WORK_DIR/forward-hardlink.tar"
+  CYCLE_TAR="$WORK_DIR/hardlink-cycle.tar"
+  python3 - "$FWD_TAR" "$CYCLE_TAR" <<'PY'
+import sys
+
+def header(name, typeflag, size=0, linkname='', mode=0o644, mtime=1600000000):
+    block = bytearray(512)
+
+    def put(offset, data):
+        block[offset:offset + len(data)] = data
+
+    def octal(value, width):
+        return ('%0*o' % (width - 1, value)).encode() + b'\0'
+
+    put(0, name.encode())
+    put(100, octal(mode, 8))
+    put(108, octal(0, 8))
+    put(116, octal(0, 8))
+    put(124, octal(size, 12))
+    put(136, octal(mtime, 12))
+    block[148:156] = b' ' * 8
+    put(156, typeflag.encode())
+    put(157, linkname.encode())
+    put(257, b'ustar\0')
+    put(263, b'00')
+    put(265, b'user')
+    put(297, b'group')
+    put(329, octal(0, 8))
+    put(337, octal(0, 8))
+    put(148, ('%06o' % sum(block)).encode() + b'\0 ')
+    return bytes(block)
+
+def write_archive(path, entries):
+    out = bytearray()
+    for block, payload in entries:
+        out += block
+        if payload:
+            out += payload + b'\0' * (512 - len(payload))
+    out += b'\0' * 1024
+    with open(path, 'wb') as handle:
+        handle.write(out)
+
+payload = b'xyz'
+write_archive(sys.argv[1], [
+    (header('hard', '1', linkname='a'), b''),
+    (header('a', '0', size=len(payload)), payload),
+])
+write_archive(sys.argv[2], [
+    (header('a', '1', linkname='b'), b''),
+    (header('b', '1', linkname='a'), b''),
+])
+PY
+  check "forward hardlink: 构造出非空的 ustar" test -s "$FWD_TAR"
+  check "forward hardlink: Scan 接受 target 在后的 hardlink" \
+    "$BIN" --list "$FWD_TAR"
+  DEST_FWD="$WORK_DIR/dest-forward"
+  mkdir -p "$DEST_FWD"
+  check "forward hardlink: --restore 还原（延后 link）" \
+    "$BIN" --restore "$FWD_TAR" "$DEST_FWD"
+  check_same_inode "forward hardlink: 还原后 hard 与 a 共享 inode" \
+    "$DEST_FWD/hard" "$DEST_FWD/a"
+  check_eq "forward hardlink: 还原出的内容正确" "$(cat "$DEST_FWD/a")" "xyz"
+  if "$BIN" --list "$CYCLE_TAR" > /dev/null 2>&1; then
+    fail "forward hardlink: 环 A -> B -> A 必须被拒绝（Scan 却接受了）"
+  else
+    pass "forward hardlink: 环 A -> B -> A 被 Scan 拒绝"
+  fi
+else
+  echo "SKIP: 系统里没有 python3，跳过 forward hardlink 的端到端检查"
 fi
 
 # ------------------------------------------------------------ 性能对比
@@ -455,6 +534,62 @@ else
   run_corpus "A-128MiB" "$CORPUS_A"
   run_corpus "B-10000" "$CORPUS_B"
   run_corpus "C-mixed" "$CORPUS_C"
+
+  # 墙钟时间之外再直接数一遍系统调用：Fast 的价值就是把"每条 entry 一到多次
+  # write"压成大块 write，"Fast 没有更慢"必须有可复现的证据，而不是只看时间。
+  # 只在 strace 可用时做，它跑不动就 SKIP，不让环境问题变成假 FAIL。
+  count_writes_and_syscalls() {
+    local writer="$1"
+    local srcdir="$2"
+    local archive="$WORK_DIR/strace-$writer.tar"
+    local log="$WORK_DIR/strace-$writer.log"
+    local status=0
+    local writes=0
+    local total=0
+    rm -f "$archive" "$log"
+    strace -f -o "$log" "$BIN" --pack "$srcdir" "$archive" "$writer" \
+      > /dev/null 2>&1
+    status=$?
+    rm -f "$archive"
+    if [ "$status" -ne 0 ] || [ ! -s "$log" ]; then
+      echo "-1 -1"
+      return
+    fi
+    # 每行一次系统调用；带 pid 前缀（-f），unfinished / resumed 的续行不算。
+    writes=$(grep -E "^[0-9]+ +write\(" "$log" |
+      grep -v -E "unfinished|resumed" | wc -l)
+    total=$(grep -E "^[0-9]+ +[a-z_0-9]+\(" "$log" |
+      grep -v -E "unfinished|resumed" | wc -l)
+    echo "$writes $total"
+  }
+
+  if command -v strace > /dev/null 2>&1; then
+    measured=$(count_writes_and_syscalls baseline "$CORPUS_A")
+    base_writes=$(printf '%s' "$measured" | awk '{print $1}')
+    base_syscalls=$(printf '%s' "$measured" | awk '{print $2}')
+    measured=$(count_writes_and_syscalls fast "$CORPUS_A")
+    fast_writes=$(printf '%s' "$measured" | awk '{print $1}')
+    fast_syscalls=$(printf '%s' "$measured" | awk '{print $2}')
+    if [ "$base_writes" = "-1" ] || [ "$fast_writes" = "-1" ]; then
+      echo "SKIP: strace 计数不可用，只报告上面的墙钟数字"
+    else
+      echo "corpus A-128MiB 的 syscall 计数（strace -f，单条 128 MiB 文件）："
+      echo "          baseline: write $base_writes 次，总 syscall $base_syscalls 次"
+      echo "          Fast:     write $fast_writes 次，总 syscall $fast_syscalls 次"
+      if [ "$fast_writes" -lt "$base_writes" ]; then
+        pass "性能: Fast 的 write 次数少于 baseline（$fast_writes < $base_writes）"
+      else
+        fail "性能: Fast 的 write 次数没有少于 baseline（$fast_writes vs $base_writes）"
+      fi
+      if [ "$fast_syscalls" -lt "$base_syscalls" ]; then
+        pass "性能: Fast 的总 syscall 次数少于 baseline（$fast_syscalls < $base_syscalls）"
+      else
+        fail "性能: Fast 的总 syscall 次数没有少于 baseline（$fast_syscalls vs $base_syscalls）"
+      fi
+    fi
+  else
+    echo "SKIP: 系统里没有 strace，跳过 write / syscall 计数"
+  fi
 
   # 大文件用完就删，别占着磁盘。
   rm -rf "$CORPUS_A" "$CORPUS_B" "$CORPUS_C"

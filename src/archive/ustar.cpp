@@ -535,7 +535,9 @@ class OutputArchive {
 
   bool Create(const std::string& path, std::string* error_message) {
     // O_EXCL：已存在的文件一律不覆盖。备份文件被静默覆盖是最不能接受的失败模式。
-    fd_ = ::open(path.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0644);
+    // 权限 0600：归档是用户数据的完整副本，不给同组 / 其他人读的机会；legacy
+    // v0.1 写入器同样是 0600，两个后端产出的文件权限必须一致。
+    fd_ = ::open(path.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
     if (fd_ < 0) {
       SetError(error_message,
                DescribeErrno(errno, "创建归档失败（不覆盖已有文件）", path));
@@ -635,17 +637,211 @@ class OutputBuffer {
 
 // 只读打开源文件。O_NOFOLLOW 保证不会 follow 软链接：扫描层已经把软链接标成
 // kSymlink，这里再跟着链接走就等于备份了链接指向的东西，而不是条目本身。
-bool OpenSourceFile(const ArchiveEntry& entry, ScopedFd* source,
+bool OpenSourceFile(const std::string& source_path,
+                    const std::string& archive_path, ScopedFd* source,
                     std::string* error_message) {
-  const int fd =
-      ::open(entry.source_path.c_str(), O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
+  const int fd = ::open(source_path.c_str(), O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
   if (fd < 0) {
     SetError(error_message,
-             DescribeErrno(errno, "打开源文件失败", entry.source_path) +
-                 "（条目 " + entry.archive_path + "）");
+             DescribeErrno(errno, "打开源文件失败", source_path) + "（条目 " +
+                 archive_path + "）");
     return false;
   }
   source->Reset(fd);
+  return true;
+}
+
+// payload 的落地策略。两个写入器的差别只在"字节怎么进输出缓冲"：baseline 先读
+// 进固定大小的临时数组再 append 进 64 KiB 缓冲，Fast 直接读进 1 MiB 缓冲的空闲
+// 区。快照复核必须对两者完全一致，所以校验循环只有一份（CopyVerifiedPayload），
+// 读法通过这个接口注入。
+class PayloadSink {
+ public:
+  virtual ~PayloadSink() = default;
+
+  // fd 已定位在 payload 起点。最多读走 length 字节并写进输出。
+  // source_path 只用于出错信息：两个写入器都不缓存它，少一份脱节的状态。
+  // 返回实际读到的字节数；0 表示提前 EOF；-1 表示失败（error_message 已填写）。
+  virtual ssize_t ReadPayload(int fd, const std::string& source_path,
+                              std::uint64_t length,
+                              std::string* error_message) = 0;
+
+  // open 之后、第一次读之前的钩子。Fast 在这里给源 fd 加顺序读提示，baseline
+  // 什么也不做——这是两个策略除缓冲之外的唯一差别。
+  virtual void Prepare(int fd) { (void)fd; }
+};
+
+// baseline 的读法：读进临时数组，再 append 进输出缓冲。
+class BufferedPayloadSink : public PayloadSink {
+ public:
+  BufferedPayloadSink(OutputBuffer* output, std::size_t chunk_size)
+      : output_(output), chunk_(chunk_size) {}
+
+  ssize_t ReadPayload(int fd, const std::string& source_path,
+                      std::uint64_t length,
+                      std::string* error_message) override {
+    const std::size_t want = static_cast<std::size_t>(
+        std::min<std::uint64_t>(length, chunk_.size()));
+    ssize_t got = -1;
+    do {
+      got = ::read(fd, chunk_.data(), want);
+    } while (got < 0 && errno == EINTR);
+    if (got < 0) {
+      SetError(error_message,
+               DescribeErrno(errno, "读取源文件失败", source_path));
+      return -1;
+    }
+    if (got == 0) {
+      return 0;
+    }
+    if (!output_->Append(chunk_.data(), static_cast<std::size_t>(got),
+                         error_message)) {
+      return -1;
+    }
+    return got;
+  }
+
+ private:
+  OutputBuffer* output_;
+  std::vector<char> chunk_;
+};
+
+// Fast 的读法：直接读进输出缓冲的空闲区，省掉一次 memcpy。
+class DirectPayloadSink : public PayloadSink {
+ public:
+  explicit DirectPayloadSink(OutputBuffer* output) : output_(output) {}
+
+  void Prepare(int fd) override {
+    // 顺序读提示：大文件交给内核多做预读。失败直接忽略——这是纯优化，不影响
+    // 任何语义，某些文件系统也不支持这个 advice。
+    (void)::posix_fadvise(fd, 0, 0, POSIX_FADV_SEQUENTIAL);
+  }
+
+  ssize_t ReadPayload(int fd, const std::string& source_path,
+                      std::uint64_t length,
+                      std::string* error_message) override {
+    // 先保证缓冲里至少有 kFastReadChunk 的空闲（除非剩余 payload 更少），这样
+    // 每次 read 都是大块，不会退化成几十字节的小读。缓冲容量（1 MiB）大于这个
+    // 下限，所以 flush 之后一定放得下。
+    const std::size_t wanted = static_cast<std::size_t>(
+        std::min<std::uint64_t>(length, kFastReadChunk));
+    if (output_->FreeSpace() < wanted && !output_->Flush(error_message)) {
+      return -1;
+    }
+    const std::size_t want = static_cast<std::size_t>(
+        std::min<std::uint64_t>(length, output_->FreeSpace()));
+    if (want == 0) {
+      SetError(error_message,
+               "WriteFast: 输出缓冲没有空闲空间（内部不变量被破坏）");
+      return -1;
+    }
+    ssize_t got = -1;
+    do {
+      got = ::read(fd, output_->FreeData(), want);
+    } while (got < 0 && errno == EINTR);
+    if (got < 0) {
+      SetError(error_message,
+               DescribeErrno(errno, "读取源文件失败", source_path));
+      return -1;
+    }
+    if (got == 0) {
+      return 0;
+    }
+    output_->Commit(static_cast<std::size_t>(got));
+    return got;
+  }
+
+ private:
+  OutputBuffer* output_;
+};
+
+// 把源文件的 payload 读进 out，并在读完之后复核源文件快照。baseline 与 Fast
+// 共用这一份，两边不可能各自漂移。
+//
+// 复核必须在**读完 payload 之后**做，而且只用 fstat：读之前看到的元数据只能说
+// 明"开始读的那一刻是对的"，而这一层要挡住的是"读的过程中源文件被改写"，顺序
+// 反过来就等于什么也没查。四项依次是：仍然是普通文件、size 未变、mtime 秒与
+// 纳秒未变、扫描层提供了 (dev, ino) 时未变。
+//
+// 刻意不比较 atime：读 payload 本身就会推进 atime，而且"被备份工具读过"不该算
+// 源文件变了。
+//
+// 边界（不藏着）：原地改写、长度不变、mtime 被改回原值、inode 也没换的情况，
+// 这一层的全部证据都和扫描时一样，发现不了；要挡住它需要内容哈希。这里只保证
+// "扫描时看到的那一份 inode + 元数据"没有被换掉。
+bool CopyVerifiedPayload(const std::string& source_path,
+                         const ArchiveEntry& entry, PayloadSink* out,
+                         std::string* error_message) {
+  if (out == nullptr) {
+    SetError(error_message, "CopyVerifiedPayload: 输出 sink 是空指针");
+    return false;
+  }
+  // 即使 size 为 0 也打开一次：源文件不存在和"空文件"是两件事，写入端不能把
+  // 前者写成后者。打开失败时归档文件已经创建，由调用方的 OutputArchive 析构
+  // 负责删掉半成品。
+  ScopedFd source;
+  if (!OpenSourceFile(source_path, entry.archive_path, &source,
+                      error_message)) {
+    return false;
+  }
+  out->Prepare(source.get());
+  std::uint64_t remaining = entry.size;
+  while (remaining > 0) {
+    const ssize_t got =
+        out->ReadPayload(source.get(), source_path, remaining, error_message);
+    if (got < 0) {
+      return false;
+    }
+    if (got == 0) {
+      // 扫描之后源文件被改小或清空：读到的字节数不等于声明的 size，整次写入
+      // 失败，不补齐、不假装成功。
+      SetError(error_message, "源文件比声明的 size 短: " + source_path +
+                                  "（条目 " + entry.archive_path + "，还差 " +
+                                  std::to_string(remaining) + " 字节）");
+      return false;
+    }
+    remaining -= static_cast<std::uint64_t>(got);
+  }
+  struct stat after;
+  if (::fstat(source.get(), &after) != 0) {
+    SetError(error_message,
+             DescribeErrno(errno, "复核源文件属性失败", source_path) +
+                 "（条目 " + entry.archive_path + "）");
+    return false;
+  }
+  if (!S_ISREG(after.st_mode)) {
+    SetError(error_message, "源文件在读取期间不再是普通文件: " + source_path +
+                                "（条目 " + entry.archive_path + "）");
+    return false;
+  }
+  if (static_cast<std::uint64_t>(after.st_size) != entry.size) {
+    SetError(error_message, "源文件在读取期间大小变了: " + source_path +
+                                "（条目 " + entry.archive_path + "，扫描时 " +
+                                std::to_string(entry.size) + " 字节，现在 " +
+                                std::to_string(after.st_size) + " 字节）");
+    return false;
+  }
+  if (after.st_mtim.tv_sec != entry.mtime_sec ||
+      static_cast<std::uint32_t>(after.st_mtim.tv_nsec) != entry.mtime_nsec) {
+    SetError(error_message, "源文件在读取期间 mtime 变了: " + source_path +
+                                "（条目 " + entry.archive_path + "）");
+    return false;
+  }
+  // source_ino == 0 表示扫描层没有提供 (dev, ino)（例如调用方手工拼的条目），
+  // 这一项就跳过：不能拿占位的 0 去和磁盘上的真实 inode 比。
+  if (entry.source_ino != 0 &&
+      (static_cast<std::uint64_t>(after.st_dev) != entry.source_dev ||
+       static_cast<std::uint64_t>(after.st_ino) != entry.source_ino)) {
+    SetError(
+        error_message,
+        "源文件在读取期间被换成了另一个 inode: " + source_path + "（条目 " +
+            entry.archive_path + "，扫描时 dev/ino " +
+            std::to_string(entry.source_dev) + "/" +
+            std::to_string(entry.source_ino) + "，现在 " +
+            std::to_string(static_cast<std::uint64_t>(after.st_dev)) + "/" +
+            std::to_string(static_cast<std::uint64_t>(after.st_ino)) + "）");
+    return false;
+  }
   return true;
 }
 
@@ -1149,7 +1345,8 @@ bool WriteBaseline(const std::vector<ArchiveEntry>& entries,
   // 不对"的参照实现；它的 syscall 次数（每条 entry 至少一次 write）也正好
   // 反衬 Fast 的差别。
   OutputBuffer buffer(&output, kBaselineBufferSize);
-  std::vector<char> chunk(kBaselineReadChunk);
+  // baseline 的 payload 读法：64 KiB 临时数组 + append 进输出缓冲。
+  BufferedPayloadSink payload_sink(&buffer, kBaselineReadChunk);
   std::string header_block;
   for (const ArchiveEntry& entry : entries) {
     if (!PrepareEntry(entry, &header_block, error_message)) {
@@ -1160,39 +1357,11 @@ bool WriteBaseline(const std::vector<ArchiveEntry>& entries,
       return false;
     }
     if (entry.type == EntryType::kRegularFile) {
-      // 即使 size 为 0 也打开一次：源文件不存在和"空文件"是两件事，
-      // 写入端不能把前者写成后者。
-      ScopedFd source;
-      if (!OpenSourceFile(entry, &source, error_message)) {
+      // 读满 payload 之后再复核源文件快照；任何一条不满足都让整次写入失败，
+      // OutputArchive 析构会把已经创建的半成品删掉。
+      if (!CopyVerifiedPayload(entry.source_path, entry, &payload_sink,
+                               error_message)) {
         return false;
-      }
-      std::uint64_t remaining = entry.size;
-      while (remaining > 0) {
-        const std::size_t want = static_cast<std::size_t>(
-            std::min<std::uint64_t>(remaining, chunk.size()));
-        const ssize_t got = ::read(source.get(), chunk.data(), want);
-        if (got < 0) {
-          if (errno == EINTR) {
-            continue;
-          }
-          SetError(error_message,
-                   DescribeErrno(errno, "读取源文件失败", entry.source_path));
-          return false;
-        }
-        if (got == 0) {
-          // 扫描之后源文件被改小或清空：读到的字节数不等于声明的 size，
-          // 整次写入失败，不补齐、不假装成功。
-          SetError(error_message,
-                   "源文件比声明的 size 短: " + entry.source_path + "（条目 " +
-                       entry.archive_path + "，还差 " +
-                       std::to_string(remaining) + " 字节）");
-          return false;
-        }
-        if (!buffer.Append(chunk.data(), static_cast<std::size_t>(got),
-                           error_message)) {
-          return false;
-        }
-        remaining -= static_cast<std::uint64_t>(got);
       }
       if (!buffer.AppendZeros(PaddingFor(entry.size), error_message)) {
         return false;
@@ -1225,6 +1394,9 @@ bool WriteFast(const std::vector<ArchiveEntry>& entries,
   // 1 MiB 统一缓冲：header、payload、padding 全聚合进同一个缓冲，只有缓冲满
   // 或收尾时才 write。payload 直接 read 进缓冲的空闲区，省掉一次 memcpy。
   OutputBuffer buffer(&output, kFastBufferSize);
+  // Fast 的 payload 读法：大块 read 直接进输出缓冲的空闲区，open 之后给源 fd 加
+  // 顺序读提示。快照复核与 baseline 共用同一份。
+  DirectPayloadSink payload_sink(&buffer);
   std::string header_block;
   for (const ArchiveEntry& entry : entries) {
     if (!PrepareEntry(entry, &header_block, error_message)) {
@@ -1235,48 +1407,11 @@ bool WriteFast(const std::vector<ArchiveEntry>& entries,
       return false;
     }
     if (entry.type == EntryType::kRegularFile) {
-      ScopedFd source;
-      if (!OpenSourceFile(entry, &source, error_message)) {
+      // 读满 payload 之后再复核源文件快照；失败时 OutputArchive
+      // 析构删掉半成品。
+      if (!CopyVerifiedPayload(entry.source_path, entry, &payload_sink,
+                               error_message)) {
         return false;
-      }
-      // 顺序读提示：大文件交给内核多做预读。失败直接忽略——这是纯优化，
-      // 不影响任何语义，某些文件系统也不支持这个 advice。
-      (void)::posix_fadvise(source.get(), 0, 0, POSIX_FADV_SEQUENTIAL);
-      std::uint64_t remaining = entry.size;
-      while (remaining > 0) {
-        // 先保证缓冲里至少有 kFastReadChunk 的空闲（除非剩余 payload 更少），
-        // 这样每次 read 都是大块，不会退化成几十字节的小读。缓冲容量
-        // （1 MiB）大于这个下限，所以 flush 之后一定放得下。
-        const std::uint64_t wanted =
-            std::min<std::uint64_t>(remaining, kFastReadChunk);
-        if (buffer.FreeSpace() < wanted && !buffer.Flush(error_message)) {
-          return false;
-        }
-        const std::size_t want = static_cast<std::size_t>(
-            std::min<std::uint64_t>(remaining, buffer.FreeSpace()));
-        if (want == 0) {
-          SetError(error_message,
-                   "WriteFast: 输出缓冲没有空闲空间（内部不变量被破坏）");
-          return false;
-        }
-        const ssize_t got = ::read(source.get(), buffer.FreeData(), want);
-        if (got < 0) {
-          if (errno == EINTR) {
-            continue;
-          }
-          SetError(error_message,
-                   DescribeErrno(errno, "读取源文件失败", entry.source_path));
-          return false;
-        }
-        if (got == 0) {
-          SetError(error_message,
-                   "源文件比声明的 size 短: " + entry.source_path + "（条目 " +
-                       entry.archive_path + "，还差 " +
-                       std::to_string(remaining) + " 字节）");
-          return false;
-        }
-        buffer.Commit(static_cast<std::size_t>(got));
-        remaining -= static_cast<std::uint64_t>(got);
       }
       if (!buffer.AppendZeros(PaddingFor(entry.size), error_message)) {
         return false;
@@ -1476,34 +1611,72 @@ bool Scan(const std::string& archive_file, std::vector<Member>* members,
     offset = member.data_offset + padded;
   }
 
-  // 第二遍：硬链接目标必须在归档里，而且必须出现在硬链接之前——解包是顺序
-  // 执行的，指向后面某个条目的硬链接在真正恢复时是建不出来的。这一遍放在
-  // 收集完所有路径之后做，为的是给出确定的错误，而不是"解到一半才发现"。
-  for (std::size_t i = 0; i < members->size(); ++i) {
-    const Member& member = (*members)[i];
-    if (member.entry.type != EntryType::kHardLink) {
-      continue;
-    }
-    const auto found = index_by_path.find(member.entry.link_target);
-    if (found == index_by_path.end()) {
-      SetError(error_message,
-               "硬链接目标不在归档中: " + member.entry.link_target + "（来自 " +
-                   member.entry.archive_path + "）");
-      return false;
-    }
-    if (found->second >= i) {
-      SetError(error_message,
-               "硬链接目标出现在硬链接之后: " + member.entry.link_target +
-                   "（来自 " + member.entry.archive_path + "）");
-      return false;
-    }
-    const EntryType target_type = (*members)[found->second].entry.type;
-    if (target_type != EntryType::kRegularFile &&
-        target_type != EntryType::kHardLink) {
-      SetError(error_message,
-               "硬链接目标不是普通文件: " + member.entry.link_target + " 是 " +
-                   EntryTypeName(target_type));
-      return false;
+  // 第二遍：硬链接依赖图。
+  //
+  // target 出现在 hardlink 之后（forward link）是合法的：恢复侧有 pending
+  // 队列， 标准 tar 也允许。唯一的要求是顺着 link_target
+  // 走到终点必须是一条**普通文件** 条目——链（A -> B -> regular）可以，指向目录
+  // / 软链接 / FIFO / 设备不行， 那些东西 link(2)
+  // 造不出来，接受它们等于把坏归档推迟到恢复时才炸。
+  //
+  // 用 DFS + 三色标记（unvisited / visiting / resolved）：visiting 表示"这条链
+  // 还在当前 DFS 栈上"，再遇到就是环。刻意不用"反复迭代到不动点"——那种写法在
+  // 环上转不出来，还得额外设迭代上限兜底。链可以任意长，所以用显式栈而不是递归，
+  // 避免深链把调用栈打爆（成员数上限是 100 万）。
+  {
+    constexpr unsigned char kUnvisited = 0;
+    constexpr unsigned char kVisiting = 1;
+    constexpr unsigned char kResolved = 2;
+    std::vector<unsigned char> state(members->size(), kUnvisited);
+    std::vector<std::size_t> stack;
+    for (std::size_t i = 0; i < members->size(); ++i) {
+      if ((*members)[i].entry.type != EntryType::kHardLink ||
+          state[i] == kResolved) {
+        continue;
+      }
+      state[i] = kVisiting;
+      stack.push_back(i);
+      while (!stack.empty()) {
+        const std::size_t current = stack.back();
+        const Member& member = (*members)[current];
+        const auto found = index_by_path.find(member.entry.link_target);
+        if (found == index_by_path.end()) {
+          SetError(error_message,
+                   "硬链接目标不在归档中: " + member.entry.link_target +
+                       "（来自 " + member.entry.archive_path + "）");
+          return false;
+        }
+        const std::size_t target_index = found->second;
+        if (target_index == current) {
+          SetError(error_message,
+                   "硬链接指向自己: " + member.entry.link_target + "（来自 " +
+                       member.entry.archive_path + "）");
+          return false;
+        }
+        const EntryType target_type = (*members)[target_index].entry.type;
+        if (target_type == EntryType::kHardLink) {
+          if (state[target_index] == kVisiting) {
+            SetError(error_message, "硬链接成环: " + member.entry.archive_path +
+                                        " -> " + member.entry.link_target);
+            return false;
+          }
+          if (state[target_index] == kUnvisited) {
+            // 先解析 target 再回到 current。
+            state[target_index] = kVisiting;
+            stack.push_back(target_index);
+            continue;
+          }
+          // kResolved：这条链的终点已经确认是普通文件。
+        } else if (target_type != EntryType::kRegularFile) {
+          SetError(error_message,
+                   "硬链接目标不是普通文件: " + member.entry.link_target +
+                       " 是 " + EntryTypeName(target_type) + "（来自 " +
+                       member.entry.archive_path + "）");
+          return false;
+        }
+        state[current] = kResolved;
+        stack.pop_back();
+      }
     }
   }
   return true;
