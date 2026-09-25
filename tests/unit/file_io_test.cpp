@@ -10,6 +10,8 @@
 // fsync / close 失败没法天然制造，所以走 file_io.h 里的注入点。每次注入都用
 // RAII 守卫还原：任何一个用例提前 return，也不会把"总是失败"留给后面的用例。
 
+#include "file_io.h"
+
 #include <errno.h>
 #include <fcntl.h>
 #include <sys/stat.h>
@@ -21,7 +23,6 @@
 #include <string>
 #include <vector>
 
-#include "file_io.h"
 #include "test_support.h"
 
 namespace {
@@ -45,10 +46,10 @@ std::uint32_t ModeOf(const std::string& path) {
 void CheckMode(const std::string& path, std::uint32_t expected,
                const std::string& label) {
   const std::uint32_t actual = ModeOf(path);
-  const std::string detail =
-      actual == 0 ? std::string("file is missing")
-                  : "expected " + test_support::Octal(expected) + ", got " +
-                        test_support::Octal(actual);
+  const std::string detail = actual == 0
+                                 ? std::string("file is missing")
+                                 : "expected " + test_support::Octal(expected) +
+                                       ", got " + test_support::Octal(actual);
   test_support::Check(actual == expected, label, detail);
 }
 
@@ -109,7 +110,8 @@ void CheckCloseStillWorks(const std::string& root, const std::string& name) {
   const bool ok = sink.Open(path, &error) &&
                   sink.Write("restored", 8, &error) && sink.Close(&error);
   test_support::Check(ok, "hook restored: Close() works again", error);
-  test_support::Check(sink.committed(), "hook restored: commit state is correct");
+  test_support::Check(sink.committed(),
+                      "hook restored: commit state is correct");
 }
 
 void TestOpenThenAbandon(const std::string& root) {
@@ -141,7 +143,8 @@ void TestWriteThenAbandon(const std::string& root) {
                       "Write succeeds", error);
   test_support::Check(sink.bytes_written() == payload.size(),
                       "bytes_written() counts bytes still in the buffer");
-  test_support::Check(test_support::Exists(small), "the partial file is on disk");
+  test_support::Check(test_support::Exists(small),
+                      "the partial file is on disk");
   sink.Abandon();
   test_support::Check(!test_support::Exists(small),
                       "Abandon removes the partial file");
@@ -267,7 +270,8 @@ void TestRepeatedAbandon(const std::string& root) {
     std::string error;
     test_support::Check(sink.Open(committed, &error),
                         "Open (committed) succeeds", error);
-    test_support::Check(sink.Close(&error), "Close (committed) succeeds", error);
+    test_support::Check(sink.Close(&error), "Close (committed) succeeds",
+                        error);
     sink.Abandon();
     sink.Abandon();
   }
@@ -290,9 +294,9 @@ void TestOpenExisting(const std::string& root) {
                       "a failed Open takes no ownership (no foreign unlink)");
   test_support::Check(sink.fd() == -1, "a failed Open leaves no descriptor");
   std::string content;
-  test_support::Check(test_support::ReadFile(path, &content) &&
-                          content == original,
-                      "the existing file content is untouched");
+  test_support::Check(
+      test_support::ReadFile(path, &content) && content == original,
+      "the existing file content is untouched");
   CheckMode(path, 0640, "the existing file mode is untouched");
 
   // 失败的 Open 不能把对象弄成"半开"状态：换一个路径必须还能用。
@@ -317,7 +321,8 @@ void TestOpenTemp(const std::string& root) {
                       "OpenTemp succeeds", error);
   test_support::Check(second.OpenTemp(directory, "chunk-", &error),
                       "a second OpenTemp succeeds", error);
-  test_support::Check(first.path() != second.path(), "OpenTemp names are unique");
+  test_support::Check(first.path() != second.path(),
+                      "OpenTemp names are unique");
   CheckMode(first.path(), 0600, "the OpenTemp file is 0600");
   test_support::Check(
       first.path().compare(0, directory.size() + 1, directory + "/") == 0,
@@ -380,12 +385,13 @@ void TestPublishNoReplace(const std::string& root) {
                       "publishing onto an existing path must fail");
   test_support::Check(!error.empty(), "the refusal is explained", error);
   content.clear();
-  test_support::Check(test_support::ReadFile(taken, &content) &&
-                          content == "original",
-                      "the existing target content is untouched");
+  test_support::Check(
+      test_support::ReadFile(taken, &content) && content == "original",
+      "the existing target content is untouched");
   CheckMode(taken, 0600, "the existing target mode is untouched");
-  test_support::Check(test_support::Exists(temp_two),
-                      "the temp file survives a refused publish (caller cleans)");
+  test_support::Check(
+      test_support::Exists(temp_two),
+      "the temp file survives a refused publish (caller cleans)");
   test_support::Check(::unlink(temp_two.c_str()) == 0,
                       "the caller can remove the leftover temp file");
   test_support::Check(!test_support::Exists(temp_two),
@@ -404,9 +410,9 @@ void TestPublishNoReplace(const std::string& root) {
   test_support::Check(!test_support::Exists(temp_three),
                       "the cross-directory temp name is gone");
   content.clear();
-  test_support::Check(test_support::ReadFile(cross_final, &content) &&
-                          content == "cross dir",
-                      "the cross-directory target has the exact bytes");
+  test_support::Check(
+      test_support::ReadFile(cross_final, &content) && content == "cross dir",
+      "the cross-directory target has the exact bytes");
 }
 
 void TestTempDirectoryGuard(const std::string& root) {
@@ -417,9 +423,9 @@ void TestTempDirectoryGuard(const std::string& root) {
                       "Create succeeds", error);
   test_support::Check(guard.active(), "the guard is active after Create");
   const std::string path = guard.path();
-  test_support::Check(!path.empty() &&
-                          path.find("/.bp-work-") != std::string::npos,
-                      "the workspace name carries the requested prefix");
+  test_support::Check(
+      !path.empty() && path.find("/.bp-work-") != std::string::npos,
+      "the workspace name carries the requested prefix");
   test_support::Check(IsDirectory(path), "the workspace is a directory");
   CheckMode(path, 0700, "the private workspace is 0700");
 
@@ -429,9 +435,9 @@ void TestTempDirectoryGuard(const std::string& root) {
   FileSink child_sink;
   test_support::Check(child_sink.Open(child, &error),
                       "a file can be created through Child()", error);
-  test_support::Check(child_sink.Write("secret", 6, &error) &&
-                          child_sink.Close(&error),
-                      "the Child() file can be committed", error);
+  test_support::Check(
+      child_sink.Write("secret", 6, &error) && child_sink.Close(&error),
+      "the Child() file can be committed", error);
   CheckMode(child, 0600, "a file created through Child() is 0600");
 
   FileSink temp_sink;
@@ -439,15 +445,17 @@ void TestTempDirectoryGuard(const std::string& root) {
   test_support::Check(temp_sink.OpenTemp(path, "chunk-", &error),
                       "OpenTemp works inside the workspace", error);
   CheckMode(temp_sink.path(), 0600, "an OpenTemp file inside it is 0600");
-  test_support::Check(temp_sink.Write("x", 1, &error) && temp_sink.Close(&error),
-                      "the workspace OpenTemp file is committable", error);
+  test_support::Check(
+      temp_sink.Write("x", 1, &error) && temp_sink.Close(&error),
+      "the workspace OpenTemp file is committable", error);
 
   guard.Remove();
   test_support::Check(!test_support::Exists(path),
                       "Remove deletes the directory and its contents");
   test_support::Check(!guard.active(), "the guard is inactive after Remove");
   guard.Remove();
-  test_support::Check(!test_support::Exists(path), "a second Remove is a no-op");
+  test_support::Check(!test_support::Exists(path),
+                      "a second Remove is a no-op");
 
   // 析构路径：忘记显式 Remove 也必须清理（RAII 的意义就在这里）。
   std::string destroyed;
@@ -495,6 +503,192 @@ void TestCheckFreeSpace(const std::string& root) {
                       error);
 }
 
+// 把 link / renameat2 换成脚本化的返回值，析构时自动还原。
+// 三个真实分支（link 成功 / link 不可用而 renameat2 成功 / 两个都不可用）
+// 在正常文件系统上没法同时制造出来，所以必须能注入。
+class ScopedPublishHooks {
+ public:
+  ScopedPublishHooks(syscalls::LinkFn link_hook,
+                     syscalls::RenameNoReplaceFn rename_hook)
+      : saved_link_(syscalls::LinkHook()),
+        saved_rename_(syscalls::RenameNoReplaceHook()) {
+    syscalls::LinkHook() = link_hook;
+    syscalls::RenameNoReplaceHook() = rename_hook;
+  }
+  ~ScopedPublishHooks() {
+    syscalls::LinkHook() = saved_link_;
+    syscalls::RenameNoReplaceHook() = saved_rename_;
+  }
+  ScopedPublishHooks(const ScopedPublishHooks&) = delete;
+  ScopedPublishHooks& operator=(const ScopedPublishHooks&) = delete;
+
+ private:
+  syscalls::LinkFn saved_link_;
+  syscalls::RenameNoReplaceFn saved_rename_;
+};
+
+int LinkEexist(const char*, const char*) {
+  errno = EEXIST;
+  return -1;
+}
+
+int LinkUnsupported(const char*, const char*) {
+  errno = EOPNOTSUPP;
+  return -1;
+}
+
+int LinkEacces(const char*, const char*) {
+  errno = EACCES;
+  return -1;
+}
+
+// "这个文件系统没有 renameat2" 的正常替身：真的挪过去，语义与
+// RENAME_NOREPLACE 在"目标不存在"时一致。
+int RenameNoReplaceReal(const char* old_path, const char* new_path) {
+  return ::rename(old_path, new_path);
+}
+
+int RenameEnosys(const char*, const char*) {
+  errno = ENOSYS;
+  return -1;
+}
+
+int RenameEio(const char*, const char*) {
+  errno = EIO;
+  return -1;
+}
+
+// §1：两种原子 no-replace 都不可用时必须 fail closed，绝不能退回普通 rename。
+void TestPublishAtomicFallbacks(const std::string& root) {
+  test_support::Section("PublishNoReplace: atomic-only fallbacks");
+  const std::string base = root + "/publish-atomic";
+  test_support::Check(test_support::Mkdir(base, 0755), "atomic root created");
+  const std::string work = base + "/work";
+  test_support::Check(test_support::Mkdir(work, 0755),
+                      "atomic work dir created");
+
+  // 1) link 成功（走真实实现）：发布成功。
+  {
+    const std::string temp = work + "/link-ok.tmp";
+    const std::string final_path = base + "/link-ok.bak";
+    test_support::Check(test_support::WriteFile(temp, "via link", 0600),
+                        "link fixture written");
+    std::string error;
+    test_support::Check(PublishNoReplace(temp, final_path, &error),
+                        "link success publishes", error);
+    std::string content;
+    test_support::Check(
+        test_support::ReadFile(final_path, &content) && content == "via link",
+        "link success keeps the bytes");
+    test_support::Check(!test_support::Exists(temp),
+                        "link success removes the temp name");
+  }
+
+  // 2) link 返回 EEXIST：立即失败，已有目标的字节一字不改。
+  {
+    const std::string final_path = base + "/taken.bak";
+    test_support::Check(
+        test_support::WriteFile(final_path, "original bytes", 0600),
+        "existing target written");
+    const std::string temp = work + "/link-eexist.tmp";
+    test_support::Check(test_support::WriteFile(temp, "replacement", 0600),
+                        "eexist fixture written");
+    ScopedPublishHooks hooks(&LinkEexist, &RenameNoReplaceReal);
+    std::string error;
+    test_support::Check(!PublishNoReplace(temp, final_path, &error),
+                        "link EEXIST fails closed", error);
+    std::string content;
+    test_support::Check(test_support::ReadFile(final_path, &content) &&
+                            content == "original bytes",
+                        "link EEXIST leaves the target unchanged");
+    test_support::Check(test_support::Exists(temp),
+                        "link EEXIST leaves the temp for the caller");
+  }
+
+  // 3) link 不可用 + renameat2 成功：发布成功（这是唯一允许的备选路径）。
+  {
+    const std::string temp = work + "/rename-ok.tmp";
+    const std::string final_path = base + "/rename-ok.bak";
+    test_support::Check(test_support::WriteFile(temp, "via renameat2", 0600),
+                        "rename fixture written");
+    ScopedPublishHooks hooks(&LinkUnsupported, &RenameNoReplaceReal);
+    std::string error;
+    test_support::Check(PublishNoReplace(temp, final_path, &error),
+                        "renameat2 fallback publishes", error);
+    std::string content;
+    test_support::Check(test_support::ReadFile(final_path, &content) &&
+                            content == "via renameat2",
+                        "renameat2 fallback keeps the bytes");
+    test_support::Check(!test_support::Exists(temp),
+                        "renameat2 fallback consumes the temp name");
+  }
+
+  // 4) 两个原子方法都不可用：fail closed，final 一定不存在。
+  {
+    const std::string temp = work + "/both-unsupported.tmp";
+    const std::string final_path = base + "/both-unsupported.bak";
+    test_support::Check(test_support::WriteFile(temp, "payload", 0600),
+                        "unsupported fixture written");
+    ScopedPublishHooks hooks(&LinkUnsupported, &RenameEnosys);
+    std::string error;
+    test_support::Check(!PublishNoReplace(temp, final_path, &error),
+                        "both atomic methods unsupported -> fail", error);
+    test_support::Check(!test_support::Exists(final_path),
+                        "fail closed leaves no final file");
+    test_support::Check(test_support::Exists(temp),
+                        "fail closed leaves the temp for the caller");
+    test_support::Check(error.find("(unsupported here)") != std::string::npos,
+                        "the refusal names the unsupported methods", error);
+  }
+
+  // 5) link 不可用 + renameat2 返回真实错误（EIO）：必须失败，而且**不许**
+  //    把真实错误说成 "unsupported"。
+  {
+    const std::string temp = work + "/real-error.tmp";
+    const std::string final_path = base + "/real-error.bak";
+    test_support::Check(test_support::WriteFile(temp, "payload", 0600),
+                        "real error fixture written");
+    ScopedPublishHooks hooks(&LinkUnsupported, &RenameEio);
+    std::string error;
+    test_support::Check(!PublishNoReplace(temp, final_path, &error),
+                        "real renameat2 error -> fail", error);
+    test_support::Check(!test_support::Exists(final_path),
+                        "real error leaves no final file");
+    test_support::Check(error.find("Input/output error") != std::string::npos,
+                        "the real errno is surfaced", error);
+    // 只有 link 那一半可以标 unsupported；renameat2 的 EIO 是真错误。
+    std::size_t occurrences = 0;
+    for (std::size_t at = error.find("(unsupported here)");
+         at != std::string::npos;
+         at = error.find("(unsupported here)", at + 1)) {
+      ++occurrences;
+    }
+    test_support::Check(occurrences == 1,
+                        "a real I/O error is not dressed up as unsupported",
+                        error);
+  }
+
+  // 6) link 返回 EACCES（真实权限错误，不是"不支持"）：同样 fail closed，
+  //    并且不标 unsupported。
+  {
+    const std::string temp = work + "/eacces.tmp";
+    const std::string final_path = base + "/eacces.bak";
+    test_support::Check(test_support::WriteFile(temp, "payload", 0600),
+                        "eacces fixture written");
+    ScopedPublishHooks hooks(&LinkEacces, &RenameEnosys);
+    std::string error;
+    test_support::Check(!PublishNoReplace(temp, final_path, &error),
+                        "link EACCES -> fail", error);
+    test_support::Check(!test_support::Exists(final_path),
+                        "link EACCES leaves no final file");
+    test_support::Check(error.find("Permission denied") != std::string::npos,
+                        "the real EACCES is surfaced", error);
+    test_support::Check(error.find("(unsupported here)") != std::string::npos,
+                        "the truly unsupported renameat2 is still labelled",
+                        error);
+  }
+}
+
 }  // namespace
 
 int main() {
@@ -509,6 +703,7 @@ int main() {
   TestOpenExisting(root);
   TestOpenTemp(root);
   TestPublishNoReplace(root);
+  TestPublishAtomicFallbacks(root);
   TestTempDirectoryGuard(root);
   TestCheckFreeSpace(root);
   return test_support::Finish("file_io_test");
