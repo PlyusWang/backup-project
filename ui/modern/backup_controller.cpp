@@ -455,7 +455,8 @@ bool BackupController::startBackup() {
   // 只取最后一段用于提示。它的来源仍然是 Catalog 给的路径，
   // 而不是控制器重新拼一遍。
   const QString archive = QString::fromStdString(archive_path);
-  return Start(Kind::kBackup, source_path_, archive,
+  // 正常备份走 v2：界面上的 uid / gid / symlink / FIFO 说明必须与产物一致。
+  return Start(Kind::kBackup, BackupFlavor::kModernV2, source_path_, archive,
                QFileInfo(archive).fileName(), filter);
 }
 
@@ -493,8 +494,11 @@ bool BackupController::startManagedRestore(const QString& file_name,
   // 列表里的 recognizedArchive 只说明全局 header 可读，不构成“能恢复”的证据。
   // 这里刻意不信任它：真正的完整校验依然发生在
   // BackupEngine::Restore → ArchiveReader 的 preflight 里。
-  return Start(Kind::kRestore, QString::fromStdString(archive_path),
-               destination_path, file_name, Filter());
+  // 恢复的格式由归档自身的 magic 决定（BackupEngine::Restore 按 magic 分流），
+  // flavor 在这里不参与判断。
+  return Start(Kind::kRestore, BackupFlavor::kLegacyV01,
+               QString::fromStdString(archive_path), destination_path,
+               file_name, Filter());
 }
 
 bool BackupController::deleteBackup(const QString& file_name) {
@@ -546,16 +550,18 @@ bool BackupController::startDirectBackupForTest(const QString& source,
               QString::fromStdString(filter_error));
     return false;
   }
-  // 走的是同一个 Start()，direct backup 也照样应用当前 include / exclude 规则。
-  return Start(Kind::kBackup, source, archive_file,
+  // 走的是同一个 Start()，direct backup 也照样应用当前 include / exclude 规则；
+  // 但它固定产 legacy v0.1，作为旧格式的回归入口。
+  return Start(Kind::kBackup, BackupFlavor::kLegacyV01, source, archive_file,
                QFileInfo(archive_file).fileName(), filter);
 }
 
 bool BackupController::startDirectRestoreForTest(const QString& archive_file,
                                                  const QString& destination) {
   // 恢复不需要筛选：归档里有什么就恢复什么，和 CLI 的语义一致。
-  return Start(Kind::kRestore, archive_file, destination,
-               QFileInfo(archive_file).fileName(), Filter());
+  // 恢复也不看 flavor：格式由归档自己的 magic 决定。
+  return Start(Kind::kRestore, BackupFlavor::kLegacyV01, archive_file,
+               destination, QFileInfo(archive_file).fileName(), Filter());
 }
 
 // ---- 任务启动 ----
@@ -563,7 +569,8 @@ bool BackupController::startDirectRestoreForTest(const QString& archive_file,
 // 先置忙再启动线程：QML 收到 busyChanged 之后才会禁用按钮，
 // 顺序反过来的话，线程已经跑起来而界面还允许再点一次。
 // 忙的时候直接返回 false，不排队——界面上的按钮本来就是禁用的。
-bool BackupController::Start(Kind kind, const QString& first_path,
+bool BackupController::Start(Kind kind, BackupFlavor flavor,
+                             const QString& first_path,
                              const QString& second_path,
                              const QString& file_name, const Filter& filter) {
   if (busy_) {
@@ -581,14 +588,15 @@ bool BackupController::Start(Kind kind, const QString& first_path,
   // 函数指针 + 值拷贝的参数：后台线程拿到的是自己的副本，不需要加锁。
   // Filter 按值一起拷进后台任务：后台线程有自己的副本，不需要加锁。
   watcher_.setFuture(QtConcurrent::run(&BackupController::RunOperation, kind,
-                                       first_path, second_path, filter));
+                                       flavor, first_path, second_path,
+                                       filter));
   return true;
 }
 
 // 每次调用都新建一个 BackupEngine：核心没有全局状态，
 // 一个任务一个实例最省心，也不存在后台线程共享对象的问题。
 // QString 到 std::string 走的是 UTF-8，中文路径能原样传给核心。
-OperationOutcome BackupController::RunOperation(Kind kind,
+OperationOutcome BackupController::RunOperation(Kind kind, BackupFlavor flavor,
                                                 const QString& first_path,
                                                 const QString& second_path,
                                                 const Filter& filter) {
@@ -600,7 +608,19 @@ OperationOutcome BackupController::RunOperation(Kind kind,
 
   OperationOutcome outcome;
   if (kind == Kind::kBackup) {
-    outcome.succeeded = engine.Backup(first, second, filter, &error_message);
+    if (flavor == BackupFlavor::kModernV2) {
+      // 三项都取"不做额外加工"的取值：打包用 MyPack，不压缩、不加密。
+      // 加密需要密码，而界面没有、也不应该有密码输入框 —— 悄悄用空密码或者
+      // 写死一个密码，比不加密更糟。
+      backupproject::BackupOptions options;
+      options.pack_method = backupproject::PackMethod::kMyPack;
+      options.compression_method = backupproject::CompressionMethod::kNone;
+      options.encryption_method = backupproject::EncryptionMethod::kNone;
+      outcome.succeeded =
+          engine.Backup(first, second, filter, options, &error_message);
+    } else {
+      outcome.succeeded = engine.Backup(first, second, filter, &error_message);
+    }
   } else {
     outcome.succeeded = engine.Restore(first, second, &error_message);
   }
