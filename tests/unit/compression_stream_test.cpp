@@ -463,6 +463,176 @@ void RunStreamingRoundTrip(const std::string& workdir,
   }
 }
 
+// 手工拼一条 LZH1：magic + original_size + token_stream_size + 内层 HUF1。
+// 用它来构造"编码器永远不会产出、但解码器必须拒绝"的流。
+std::string MakeLzh1(std::uint64_t original_size,
+                     std::uint64_t token_stream_size,
+                     const std::string& inner) {
+  std::string out;
+  out.append("LZH1", 4);
+  for (int shift = 0; shift < 64; shift += 8) {
+    out.push_back(static_cast<char>((original_size >> shift) & 0xFF));
+  }
+  for (int shift = 0; shift < 64; shift += 8) {
+    out.push_back(static_cast<char>((token_stream_size >> shift) & 0xFF));
+  }
+  out += inner;
+  return out;
+}
+
+// ---- 5) 非规范 padding 必须被拒绝 -------------------------------------------
+
+void RunNoncanonicalPadding(const std::string& workdir,
+                            const std::string& fixtures_root,
+                            const std::string& workspace) {
+  test_support::Section("noncanonical padding bits are rejected");
+
+  // --- HUF1：bit_count 不是 8 的倍数时，最后一个字节里没被覆盖的低位必须是 0。
+  const char* names[] = {"empty", "single-symbol", "text", "all-256-symbols",
+                         "repetitive-binary"};
+  int huf_cases = 0;
+  for (const char* name : names) {
+    const std::string label = name;
+    const std::string huf_path = fixtures_root + "/frozen/" + label + ".huf1";
+    if (!test_support::Exists(huf_path)) {
+      continue;
+    }
+    compression::HuffmanStreamInfo info;
+    std::string error;
+    if (!compression::HuffmanReadStreamInfo(huf_path, 0, &info, &error)) {
+      continue;
+    }
+    if (info.bit_count % 8 == 0) {
+      continue;  // 这条 fixture 是字节对齐的，没有 padding 位可改
+    }
+    const std::string pristine = ReadAll(huf_path);
+    std::string clean;
+    error.clear();
+    test_support::Check(
+        compression::HuffmanDecompress(pristine, &clean, &error),
+        "pristine HUF1 still decodes (" + label + ")", error);
+
+    std::string dirty = pristine;
+    // 最低位一定是 padding 位（只在 bit_count % 8 != 0 时才会走到这里）。
+    dirty.back() =
+        static_cast<char>(static_cast<unsigned char>(dirty.back()) | 0x01);
+
+    std::string out;
+    error.clear();
+    const bool memory_ok = compression::HuffmanDecompress(dirty, &out, &error);
+    test_support::Check(
+        !memory_ok && error.find("padding") != std::string::npos,
+        "memory HuffmanDecompress rejects non-zero padding (" + label + ")",
+        error);
+
+    const std::string dirty_path =
+        workdir + "/dirty-padding-" + label + ".huf1";
+    const std::string dirty_out = workdir + "/dirty-padding-" + label + ".out";
+    test_support::Check(WriteAll(dirty_path, dirty),
+                        "write dirty HUF1 (" + label + ")");
+    test_support::RemoveTree(dirty_out);
+    FileSink sink;
+    error.clear();
+    std::uint64_t written = 0;
+    const bool opened = sink.Open(dirty_out, &error);
+    const bool stream_ok =
+        opened && compression::HuffmanDecompressStream(
+                      dirty_path, 0, &sink, clean.size(), &written, &error);
+    test_support::Check(
+        !stream_ok && error.find("padding") != std::string::npos,
+        "stream HuffmanDecompressStream rejects non-zero padding (" + label +
+            ")",
+        error);
+    sink.Abandon();
+    ++huf_cases;
+  }
+  test_support::Check(huf_cases > 0,
+                      "at least one frozen fixture exercises HUF1 padding bits",
+                      std::to_string(huf_cases));
+
+  // --- LZSS：最后一个 control byte 里没用到的低位必须是 0。
+  const std::size_t token_counts[] = {1, 3, 7};
+  for (const std::size_t tokens : token_counts) {
+    const std::string label = std::to_string(tokens) + "-token-final-group";
+    std::uint32_t control = 0;
+    for (std::size_t index = 0; index < tokens; ++index) {
+      control |= std::uint32_t{1} << (7 - index);
+    }
+    std::string token_stream;
+    token_stream.push_back(static_cast<char>(control));
+    for (std::size_t index = 0; index < tokens; ++index) {
+      token_stream.push_back(static_cast<char>('A' + static_cast<int>(index)));
+    }
+    const std::uint64_t original_size = tokens;
+
+    std::string clean;
+    std::string error;
+    test_support::Check(
+        compression::LzssDecode(token_stream, original_size, &clean, &error) &&
+            clean.size() == tokens,
+        "pristine token stream decodes (" + label + ")", error);
+
+    std::string dirty = token_stream;
+    dirty[0] = static_cast<char>(static_cast<unsigned char>(dirty[0]) | 0x01);
+    std::string out;
+    error.clear();
+    const bool memory_ok =
+        compression::LzssDecode(dirty, original_size, &out, &error);
+    test_support::Check(
+        !memory_ok && error.find("control bits") != std::string::npos,
+        "memory LzssDecode rejects dirty control bits (" + label + ")", error);
+
+    // LZH1 路径：手工包一层外层头部 + 内层 HUF1。
+    std::string inner;
+    error.clear();
+    test_support::Check(
+        compression::HuffmanCompress(token_stream, &inner, &error),
+        "inner HUF1 built (" + label + ")", error);
+    const std::string lzh1 =
+        MakeLzh1(original_size, token_stream.size(), inner);
+    std::string pristine_back;
+    error.clear();
+    test_support::Check(
+        compression::LzssHuffmanDecompress(lzh1, &pristine_back, &error) &&
+            pristine_back == clean,
+        "pristine LZH1 decodes (" + label + ")", error);
+
+    std::string dirty_inner;
+    error.clear();
+    compression::HuffmanCompress(dirty, &dirty_inner, &error);
+    const std::string dirty_lzh1 =
+        MakeLzh1(original_size, dirty.size(), dirty_inner);
+    std::string dirty_back;
+    error.clear();
+    const bool lzh_ok =
+        compression::LzssHuffmanDecompress(dirty_lzh1, &dirty_back, &error);
+    test_support::Check(
+        !lzh_ok && error.find("control bits") != std::string::npos,
+        "LZH1 rejects dirty control bits (" + label + ")", error);
+
+    const std::string dirty_path =
+        workdir + "/dirty-control-" + std::to_string(tokens) + ".lzh1";
+    const std::string dirty_out =
+        workdir + "/dirty-control-" + std::to_string(tokens) + ".out";
+    test_support::Check(WriteAll(dirty_path, dirty_lzh1),
+                        "write dirty LZH1 (" + label + ")");
+    test_support::RemoveTree(dirty_out);
+    FileSink sink;
+    error.clear();
+    std::uint64_t written = 0;
+    const bool opened = sink.Open(dirty_out, &error);
+    const bool stream_ok = opened && compression::LzssHuffmanDecompressStream(
+                                         dirty_path, &sink, workspace,
+                                         original_size, &written, &error);
+    test_support::Check(
+        !stream_ok && error.find("control bits") != std::string::npos,
+        "stream LzssHuffmanDecompressStream rejects dirty control bits (" +
+            label + ")",
+        error);
+    sink.Abandon();
+  }
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -489,6 +659,7 @@ int main(int argc, char** argv) {
   RunSizeChecks(workdir, workspace.path());
   RunMalformedStreams(workdir, workspace.path());
   RunStreamingRoundTrip(workdir, workspace.path());
+  RunNoncanonicalPadding(workdir, fixtures_root, workspace.path());
 
   return test_support::Finish("compression-stream");
 }
