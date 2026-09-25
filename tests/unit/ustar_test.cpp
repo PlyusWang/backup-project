@@ -193,6 +193,27 @@ bool FileExists(const std::string& path) {
   return ::access(path.c_str(), F_OK) == 0;
 }
 
+// 直接设定 (sec, nsec) 的 mtime，atime 不动。快照一致性测试需要把 mtime 改回
+// 原值，才能构造"内容变了但时间戳没变"的场景。
+bool SetFileTimes(const std::string& path, std::int64_t seconds,
+                  long nanoseconds) {
+  struct timespec times[2];
+  times[0].tv_sec = 0;
+  times[0].tv_nsec = UTIME_OMIT;
+  times[1].tv_sec = static_cast<time_t>(seconds);
+  times[1].tv_nsec = nanoseconds;
+  return ::utimensat(AT_FDCWD, path.c_str(), times, AT_SYMLINK_NOFOLLOW) == 0;
+}
+
+// 文件权限位（07777）。写入器创建的归档统一是 0600。
+std::uint32_t FileMode(const std::string& path) {
+  struct stat status;
+  if (::stat(path.c_str(), &status) != 0) {
+    return 0;
+  }
+  return static_cast<std::uint32_t>(status.st_mode & 07777);
+}
+
 // 手工算 checksum 并写回：用于"只改一个字段、其余保持合法"的坏样本。
 // 这里刻意不复用产品的 ComputeChecksum，第二份实现才能验证第一份。
 void FixChecksum(std::string* block) {
@@ -1261,17 +1282,6 @@ void TestScanRejects() {
   }
   {
     std::vector<RawEntry> raw;
-    RawEntry hard = MakeEntry("hard", '1', "");
-    hard.header.linkname = "later";
-    raw.push_back(hard);
-    raw.push_back(MakeEntry("later", '0', ""));
-    CheckFailsWith(WriteAndScan("hard-forward.tar", BuildRawArchive(raw),
-                                &members, &error),
-                   error, "硬链接目标出现在硬链接之后",
-                   "Scan 拒绝: 硬链接目标出现在后面");
-  }
-  {
-    std::vector<RawEntry> raw;
     raw.push_back(MakeEntry("dir", '5', ""));
     RawEntry hard = MakeEntry("hard", '1', "");
     hard.header.linkname = "dir";
@@ -1333,6 +1343,106 @@ void TestScanRejects() {
   }
 }
 
+// ---- 5b. Scan：硬链接依赖图 ----
+
+// forward hardlink（target 出现在 hardlink 之后）与链必须被接受；自指、环、以及
+// 终点不是普通文件的链必须被拒绝。
+void TestScanHardLinkGraph() {
+  std::string error;
+  std::vector<Member> members;
+
+  {
+    // forward：hard 在 later 之前。
+    std::vector<RawEntry> raw;
+    RawEntry hard = MakeEntry("hard", '1', "");
+    hard.header.linkname = "later";
+    raw.push_back(hard);
+    raw.push_back(MakeEntry("later", '0', "x"));
+    const bool ok = WriteAndScan("hard-forward-ok.tar", BuildRawArchive(raw),
+                                 &members, &error);
+    Check(ok, "Scan: forward hardlink（target 在后面）合法", error);
+    if (ok) {
+      Check(members.size() == 2 &&
+                members[0].entry.type == EntryType::kHardLink &&
+                members[0].entry.link_target == "later",
+            "Scan: forward hardlink 的 link_target 原样保留");
+    }
+  }
+  {
+    // 两条链：c -> b -> a(regular)。
+    std::vector<RawEntry> raw;
+    RawEntry c = MakeEntry("c", '1', "");
+    c.header.linkname = "b";
+    RawEntry b = MakeEntry("b", '1', "");
+    b.header.linkname = "a";
+    raw.push_back(c);
+    raw.push_back(b);
+    raw.push_back(MakeEntry("a", '0', "x"));
+    Check(
+        WriteAndScan("hard-chain.tar", BuildRawArchive(raw), &members, &error),
+        "Scan: 硬链接链 c -> b -> a(regular) 合法", error);
+  }
+  {
+    // 链的终点是目录：不是普通文件。
+    std::vector<RawEntry> raw;
+    RawEntry c = MakeEntry("c", '1', "");
+    c.header.linkname = "b";
+    RawEntry b = MakeEntry("b", '1', "");
+    b.header.linkname = "dir";
+    raw.push_back(c);
+    raw.push_back(b);
+    raw.push_back(MakeEntry("dir", '5', ""));
+    CheckFailsWith(WriteAndScan("hard-chain-dir.tar", BuildRawArchive(raw),
+                                &members, &error),
+                   error, "硬链接目标不是普通文件",
+                   "Scan 拒绝: 硬链接链的终点是目录");
+  }
+  {
+    // 环 A -> B -> A。
+    std::vector<RawEntry> raw;
+    RawEntry a = MakeEntry("a", '1', "");
+    a.header.linkname = "b";
+    RawEntry b = MakeEntry("b", '1', "");
+    b.header.linkname = "a";
+    raw.push_back(a);
+    raw.push_back(b);
+    CheckFailsWith(
+        WriteAndScan("hard-cycle.tar", BuildRawArchive(raw), &members, &error),
+        error, "硬链接成环", "Scan 拒绝: 硬链接环 A -> B -> A");
+  }
+  {
+    // 自指。
+    std::vector<RawEntry> raw;
+    RawEntry self = MakeEntry("self", '1', "");
+    self.header.linkname = "self";
+    raw.push_back(self);
+    CheckFailsWith(
+        WriteAndScan("hard-self.tar", BuildRawArchive(raw), &members, &error),
+        error, "硬链接指向自己", "Scan 拒绝: 硬链接指向自己");
+  }
+  {
+    // 终点是软链接 / FIFO / 设备：link(2) 造不出这些目标。
+    const char* kTargetNames[] = {"sym", "fifo", "char"};
+    const char kTargetFlags[] = {'2', '6', '3'};
+    for (std::size_t i = 0; i < 3; ++i) {
+      std::vector<RawEntry> raw;
+      RawEntry hard = MakeEntry("hard", '1', "");
+      hard.header.linkname = kTargetNames[i];
+      raw.push_back(hard);
+      RawEntry target = MakeEntry(kTargetNames[i], kTargetFlags[i], "");
+      if (kTargetFlags[i] == '2') {
+        target.header.linkname = "somewhere";  // 软链接必须有非空 linkname
+      }
+      raw.push_back(target);
+      CheckFailsWith(
+          WriteAndScan(std::string("hard-target-") + kTargetNames[i] + ".tar",
+                       BuildRawArchive(raw), &members, &error),
+          error, "硬链接目标不是普通文件",
+          std::string("Scan 拒绝: 硬链接目标是 ") + kTargetNames[i]);
+    }
+  }
+}
+
 // ---- 6. 写入器 ----
 
 bool MakeParentDirectories(const std::string& path) {
@@ -1372,6 +1482,24 @@ void MakeFixtureFiles() {
   }
 }
 
+// 普通文件的快照字段（size / mtime / dev / ino）必须来自真实 lstat：写入器读满
+// payload 之后会 fstat 再核对一遍，手工编造的 mtime 或 size 会被正确地判成
+// "扫描之后源文件变过"。目录 / FIFO / 设备 / 链接没有 payload，不参与这项检查，
+// 元数据继续沿用调用方给的数字。
+void FillSnapshotFromDisk(ArchiveEntry* entry) {
+  struct stat status;
+  if (::lstat(entry->source_path.c_str(), &status) != 0) {
+    std::fprintf(stderr, "lstat 失败: %s: %s\n", entry->source_path.c_str(),
+                 std::strerror(errno));
+    std::exit(2);
+  }
+  entry->size = static_cast<std::uint64_t>(status.st_size);
+  entry->mtime_sec = static_cast<std::int64_t>(status.st_mtim.tv_sec);
+  entry->mtime_nsec = static_cast<std::uint32_t>(status.st_mtim.tv_nsec);
+  entry->source_dev = static_cast<std::uint64_t>(status.st_dev);
+  entry->source_ino = static_cast<std::uint64_t>(status.st_ino);
+}
+
 ArchiveEntry MakeEntryMeta(const std::string& archive_path, EntryType type,
                            std::uint32_t mode, std::uint64_t size,
                            std::int64_t mtime) {
@@ -1385,6 +1513,7 @@ ArchiveEntry MakeEntryMeta(const std::string& archive_path, EntryType type,
   entry.size = size;
   if (type == EntryType::kRegularFile) {
     entry.source_path = PathJoin(g_root, archive_path);
+    FillSnapshotFromDisk(&entry);
   }
   return entry;
 }
@@ -1480,6 +1609,8 @@ void TestWriterRoundTrip(const std::vector<ArchiveEntry>& entries,
   if (!written) {
     return;
   }
+  CheckEqU64(FileMode(archive), 0600,
+             "写入器 " + writer_name + ": 归档文件权限是 0600");
   CheckEqU64(
       FileSize(archive), ExpectedArchiveBytes(entries),
       "写入器 " + writer_name + ": 归档字节数（含 padding 与两个结尾 block）");
@@ -1905,6 +2036,10 @@ class TreeScanner {
     entry.gid = status.st_gid;
     entry.mtime_sec = status.st_mtim.tv_sec;
     entry.mtime_nsec = static_cast<std::uint32_t>(status.st_mtim.tv_nsec);
+    // (dev, ino) 是内部快照字段：扫描层给了，写入器才会把它当作快照的一部分去
+    // 复核；source_ino 为 0 表示没提供，写入器跳过这一项。
+    entry.source_dev = static_cast<std::uint64_t>(status.st_dev);
+    entry.source_ino = static_cast<std::uint64_t>(status.st_ino);
     entry.user_name = LookupUser(entry.uid);
     entry.group_name = LookupGroup(entry.gid);
     if (S_ISDIR(status.st_mode)) {
@@ -1973,6 +2108,257 @@ class TreeScanner {
   std::string* error_ = nullptr;
   std::map<std::string, std::string> inodes_;
 };
+
+// ---- 9. 源文件快照一致性 ----
+
+// 扫描目录树（TreeScanner 给出真实 size / mtime / dev / ino），供快照测试使用。
+bool ScanSnapshotTree(const std::string& root,
+                      std::vector<ArchiveEntry>* entries,
+                      std::string* error_message) {
+  TreeScanner scanner;
+  return scanner.Scan(root, entries, error_message);
+}
+
+// 把一个已扫描的条目列表按指定写入器写出归档。
+bool WriteSnapshotArchive(const std::vector<ArchiveEntry>& entries, bool fast,
+                          const std::string& archive_name,
+                          std::string* error_message) {
+  const std::string archive = PathJoin(g_root, archive_name);
+  return fast ? WriteFast(entries, archive, error_message)
+              : WriteBaseline(entries, archive, error_message);
+}
+
+// 源文件快照一致性：写入器必须在**读完 payload 之后**再 fstat 一次，确认读到的
+// 还是扫描时那一份；失败时两个写入器都不留半成品归档。
+//
+// 已知边界（不假装能查出来）：inode 不变、长度不变、mtime 被改回原值、内容却被
+// 就地改写的情况，这一层的全部证据都与扫描时一致，发现不了——挡住它需要内容
+// 哈希，不在本轮范围。下面的"原地改写"用例断言的就是这个事实：写入成功，归档里
+// 是改写后的内容。能查出来的是：换 inode 的替换、size 变化、mtime 变化。
+void TestSnapshotConsistency() {
+  std::string error;
+  const std::string source_root = PathJoin(g_root, "snap-src");
+  const std::string source_file = PathJoin(source_root, "data.bin");
+  const std::string original = "0123456789abcdef";
+  const std::string rewritten = "FEDCBA9876543210";
+  const std::int64_t original_sec = 1700000000;
+  const long original_nsec = 123456789;
+
+  std::error_code filesystem_error;
+  std::filesystem::create_directories(source_root, filesystem_error);
+  Check(WriteFile(source_file, original) &&
+            SetFileTimes(source_file, original_sec, original_nsec),
+        "快照: 准备源文件（内容 + 确定的 mtime）");
+
+  // 每个场景开始前把源文件恢复成"干净且时间戳确定"的状态，再重新扫描。
+  auto prepare_source = [&]() {
+    return WriteFile(source_file, original) &&
+           SetFileTimes(source_file, original_sec, original_nsec);
+  };
+
+  // 1) 合法源（不动）：扫描层给了 dev/ino，两个写入器都必须成功。
+  {
+    std::vector<ArchiveEntry> entries;
+    Check(ScanSnapshotTree(source_root, &entries, &error),
+          "快照: 扫描未改动的源目录", error);
+    const ArchiveEntry* regular = nullptr;
+    for (const ArchiveEntry& entry : entries) {
+      if (entry.type == EntryType::kRegularFile) {
+        regular = &entry;
+      }
+    }
+    Check(regular != nullptr && regular->source_ino != 0 &&
+              regular->source_dev != 0,
+          "快照: 普通条目的 source_dev / source_ino 来自真实 lstat");
+    error.clear();
+    Check(WriteSnapshotArchive(entries, false, "snap-clean-base.tar", &error),
+          "快照: 未改动的源 → baseline PASS", error);
+    error.clear();
+    Check(WriteSnapshotArchive(entries, true, "snap-clean-fast.tar", &error),
+          "快照: 未改动的源 → Fast PASS", error);
+  }
+  // 2) 只改 mtime（内容不变）：读完 payload 之后必须发现。
+  {
+    Check(prepare_source(), "快照: 重置源文件");
+    std::vector<ArchiveEntry> entries;
+    Check(ScanSnapshotTree(source_root, &entries, &error), "快照: 扫描源目录",
+          error);
+    Check(SetFileTimes(source_file, original_sec + 5, original_nsec),
+          "快照: 只把 mtime 改掉");
+    const std::string archive = PathJoin(g_root, "snap-mtime.tar");
+    error.clear();
+    CheckFailsWith(
+        WriteSnapshotArchive(entries, false, "snap-mtime.tar", &error), error,
+        "mtime", "快照: 只改 mtime → baseline FAIL");
+    Check(!FileExists(archive), "快照: 只改 mtime → baseline 不留归档");
+    error.clear();
+    CheckFailsWith(
+        WriteSnapshotArchive(entries, true, "snap-mtime.tar", &error), error,
+        "mtime", "快照: 只改 mtime → Fast FAIL");
+    Check(!FileExists(archive), "快照: 只改 mtime → Fast 不留归档");
+  }
+  // 3) 截短：读不满声明的 size。
+  {
+    Check(prepare_source(), "快照: 重置源文件");
+    std::vector<ArchiveEntry> entries;
+    Check(ScanSnapshotTree(source_root, &entries, &error), "快照: 扫描源目录",
+          error);
+    Check(WriteFile(source_file, original.substr(0, 8)),
+          "快照: 把源文件截短到 8 字节");
+    const std::string archive = PathJoin(g_root, "snap-short.tar");
+    error.clear();
+    CheckFailsWith(
+        WriteSnapshotArchive(entries, false, "snap-short.tar", &error), error,
+        "比声明的 size 短", "快照: 截短 → baseline FAIL");
+    Check(!FileExists(archive), "快照: 截短 → baseline 不留归档");
+    error.clear();
+    CheckFailsWith(
+        WriteSnapshotArchive(entries, true, "snap-short.tar", &error), error,
+        "比声明的 size 短", "快照: 截短 → Fast FAIL");
+    Check(!FileExists(archive), "快照: 截短 → Fast 不留归档");
+  }
+  // 4) 变长：声明 16 字节，磁盘上变成 20。读循环只按 entry.size 读，不会多读，
+  //    所以这种情况只能靠读完之后的 fstat 发现。
+  {
+    Check(prepare_source(), "快照: 重置源文件");
+    std::vector<ArchiveEntry> entries;
+    Check(ScanSnapshotTree(source_root, &entries, &error), "快照: 扫描源目录",
+          error);
+    Check(WriteFile(source_file, original + "MORE"),
+          "快照: 把源文件追加成 20 字节");
+    const std::string archive = PathJoin(g_root, "snap-long.tar");
+    error.clear();
+    CheckFailsWith(
+        WriteSnapshotArchive(entries, false, "snap-long.tar", &error), error,
+        "大小变了", "快照: 源变长 → baseline FAIL");
+    Check(!FileExists(archive), "快照: 源变长 → baseline 不留归档");
+    error.clear();
+    CheckFailsWith(WriteSnapshotArchive(entries, true, "snap-long.tar", &error),
+                   error, "大小变了", "快照: 源变长 → Fast FAIL");
+    Check(!FileExists(archive), "快照: 源变长 → Fast 不留归档");
+  }
+  // 5) 换 inode 的等长替换：长度相同、mtime 被改回原值，只有 (dev, ino) 变了。
+  //    这正是 dev/ino 检查存在的意义。
+  {
+    Check(prepare_source(), "快照: 重置源文件");
+    std::vector<ArchiveEntry> entries;
+    Check(ScanSnapshotTree(source_root, &entries, &error), "快照: 扫描源目录",
+          error);
+    const std::string replacement = PathJoin(g_root, "snap-replacement.bin");
+    Check(WriteFile(replacement, rewritten) &&
+              SetFileTimes(replacement, original_sec, original_nsec) &&
+              ::rename(replacement.c_str(), source_file.c_str()) == 0,
+          "快照: 用同长度同 mtime 的新 inode 替换源文件");
+    const std::string archive = PathJoin(g_root, "snap-inode.tar");
+    error.clear();
+    CheckFailsWith(
+        WriteSnapshotArchive(entries, false, "snap-inode.tar", &error), error,
+        "inode", "快照: 换 inode → baseline FAIL");
+    Check(!FileExists(archive), "快照: 换 inode → baseline 不留归档");
+    error.clear();
+    CheckFailsWith(
+        WriteSnapshotArchive(entries, true, "snap-inode.tar", &error), error,
+        "inode", "快照: 换 inode → Fast FAIL");
+    Check(!FileExists(archive), "快照: 换 inode → Fast 不留归档");
+  }
+  // 6) 原地改写 + mtime 复原：已知盲区，如实断言（写入成功，归档里是改写后的
+  //    内容）。这一条是"不要假装能查出来"的可执行版本；如果哪天加了内容哈希，
+  //    它会失败，那时应当把它改成期望 FAIL。
+  {
+    Check(prepare_source(), "快照: 重置源文件");
+    std::vector<ArchiveEntry> entries;
+    Check(ScanSnapshotTree(source_root, &entries, &error), "快照: 扫描源目录",
+          error);
+    Check(WriteFile(source_file, rewritten) &&
+              SetFileTimes(source_file, original_sec, original_nsec),
+          "快照: 原地等长改写并把 mtime 改回原值（inode 不变）");
+    const std::string archive = PathJoin(g_root, "snap-inplace.tar");
+    error.clear();
+    const bool written =
+        WriteSnapshotArchive(entries, false, "snap-inplace.tar", &error);
+    Check(written, "快照: 原地等长改写 + mtime 复原是已知盲区（写入成功）",
+          error);
+    if (written) {
+      std::vector<Member> members;
+      std::string payload;
+      Check(Scan(archive, &members, &error), "快照: 读回盲区用例的归档", error);
+      bool extracted = false;
+      for (const Member& member : members) {
+        if (member.entry.archive_path == "data.bin") {
+          extracted = ExtractDataToString(archive, member, &payload, &error);
+        }
+      }
+      Check(extracted && payload == rewritten,
+            "快照: 盲区用例归档里是改写后的内容（不是扫描时的内容）",
+            error + " payload=" + payload);
+    }
+  }
+  // 7) source_ino 非 0 但与磁盘不一致：写入器必须拒绝。
+  {
+    Check(prepare_source(), "快照: 重置源文件");
+    std::vector<ArchiveEntry> entries;
+    Check(ScanSnapshotTree(source_root, &entries, &error), "快照: 扫描源目录",
+          error);
+    for (ArchiveEntry& entry : entries) {
+      if (entry.type == EntryType::kRegularFile) {
+        entry.source_ino += 1;  // 故意写错：磁盘上不是这个 inode
+      }
+    }
+    const std::string archive = PathJoin(g_root, "snap-wrong-ino.tar");
+    error.clear();
+    CheckFailsWith(
+        WriteSnapshotArchive(entries, false, "snap-wrong-ino.tar", &error),
+        error, "inode", "快照: source_ino 与磁盘不一致 → baseline FAIL");
+    Check(!FileExists(archive), "快照: source_ino 不一致 → baseline 不留归档");
+    error.clear();
+    CheckFailsWith(
+        WriteSnapshotArchive(entries, true, "snap-wrong-ino.tar", &error),
+        error, "inode", "快照: source_ino 与磁盘不一致 → Fast FAIL");
+    Check(!FileExists(archive), "快照: source_ino 不一致 → Fast 不留归档");
+  }
+  // 8) source_ino == 0：扫描层没提供，这一项跳过，写入仍然成功（不能让占位的 0
+  //    把合法备份挡在门外）。
+  {
+    Check(prepare_source(), "快照: 重置源文件");
+    std::vector<ArchiveEntry> entries;
+    Check(ScanSnapshotTree(source_root, &entries, &error), "快照: 扫描源目录",
+          error);
+    for (ArchiveEntry& entry : entries) {
+      entry.source_dev = 0;
+      entry.source_ino = 0;
+    }
+    error.clear();
+    Check(WriteSnapshotArchive(entries, false, "snap-no-ino-base.tar", &error),
+          "快照: source_ino 为 0（扫描层没提供）→ baseline PASS", error);
+    error.clear();
+    Check(WriteSnapshotArchive(entries, true, "snap-no-ino-fast.tar", &error),
+          "快照: source_ino 为 0（扫描层没提供）→ Fast PASS", error);
+  }
+  // 9) 源路径不是普通文件（这里换成一个目录）：open 会成功，read 会失败，绝不能
+  //    悄悄写出一条空 payload。
+  {
+    Check(prepare_source(), "快照: 重置源文件");
+    std::vector<ArchiveEntry> entries;
+    Check(ScanSnapshotTree(source_root, &entries, &error), "快照: 扫描源目录",
+          error);
+    for (ArchiveEntry& entry : entries) {
+      if (entry.type == EntryType::kRegularFile) {
+        entry.source_path = source_root;  // 目录
+      }
+    }
+    const std::string archive = PathJoin(g_root, "snap-dir-source.tar");
+    error.clear();
+    CheckFailsWith(
+        WriteSnapshotArchive(entries, false, "snap-dir-source.tar", &error),
+        error, "读取源文件失败", "快照: 源路径是目录 → baseline FAIL");
+    Check(!FileExists(archive), "快照: 源路径是目录 → baseline 不留归档");
+    error.clear();
+    CheckFailsWith(
+        WriteSnapshotArchive(entries, true, "snap-dir-source.tar", &error),
+        error, "读取源文件失败", "快照: 源路径是目录 → Fast FAIL");
+    Check(!FileExists(archive), "快照: 源路径是目录 → Fast 不留归档");
+  }
+}
 
 char TypeChar(EntryType type) {
   switch (type) {
@@ -2086,16 +2472,10 @@ int RunRestore(const std::string& archive, const std::string& destination) {
           return 1;
         }
         break;
-      case EntryType::kHardLink: {
-        const std::string target =
-            PathJoin(destination, member.entry.link_target);
-        if (::link(target.c_str(), path.c_str()) != 0) {
-          std::fprintf(stderr, "建硬链接失败: %s: %s\n", path.c_str(),
-                       std::strerror(errno));
-          return 1;
-        }
+      case EntryType::kHardLink:
+        // 留到下面单独一趟：Scan 允许 forward hardlink（target 出现在 hardlink
+        // 之后），link(2) 却要求目标已经存在。
         break;
-      }
       case EntryType::kFifo:
         if (::mkfifo(path.c_str(), 0600) != 0) {
           std::fprintf(stderr, "建 FIFO 失败: %s: %s\n", path.c_str(),
@@ -2120,6 +2500,24 @@ int RunRestore(const std::string& archive, const std::string& destination) {
       case EntryType::kSocket:
         std::fprintf(stderr, "socket 不该出现在归档里: %s\n", path.c_str());
         return 1;
+    }
+  }
+  // 硬链接单独一趟：等所有普通文件都落地之后再 link，否则 forward hardlink 会
+  // 因为目标还不存在而失败。
+  for (const Member& member : members) {
+    if (member.entry.type != EntryType::kHardLink) {
+      continue;
+    }
+    const std::string path = PathJoin(destination, member.entry.archive_path);
+    if (!MakeParentDirectories(path)) {
+      std::fprintf(stderr, "建父目录失败: %s\n", path.c_str());
+      return 1;
+    }
+    const std::string target = PathJoin(destination, member.entry.link_target);
+    if (::link(target.c_str(), path.c_str()) != 0) {
+      std::fprintf(stderr, "建硬链接失败: %s: %s\n", path.c_str(),
+                   std::strerror(errno));
+      return 1;
     }
   }
   // 权限与时间：从深到浅。创建子项会改父目录的 mtime，所以目录必须最后设。
@@ -2231,10 +2629,12 @@ int main(int argc, char** argv) {
   TestDecodeRejects();
   TestScanBasics();
   TestScanRejects();
+  TestScanHardLinkGraph();
   TestWriterRoundTrip(entries, "baseline", false, "baseline.tar");
   TestWriterRoundTrip(entries, "fast", true, "fast.tar");
   TestExtract(entries);
   TestWriterFailures(entries);
+  TestSnapshotConsistency();
   if (skip_big) {
     std::printf("SKIP: 条目数上限（100 万条，需要 512 MB 临时空间）\n");
   } else {

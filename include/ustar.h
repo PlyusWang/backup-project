@@ -11,8 +11,12 @@
 //
 //   1. 数字字段是八进制 ASCII（7 位数字 + NUL，或 11 位数字 + NUL）。数值放不下
 //      时明确失败，绝不截断——把 8 GiB 的文件声明成 8 GiB-1 比直接报错危险得多；
-//   2. 写侧只信 ArchiveEntry：不重新 stat 源文件、不 follow 软链接，header 里的
-//      每个字节都来自条目模型；
+//   2. 写侧 header 里的每个字节都来自 ArchiveEntry：不 follow
+//      软链接（O_NOFOLLOW），也不从磁盘回填任何字段。磁盘只在两处被用到：
+//      按条目给出的 source_path 打开源文件读 payload；
+//      读完 payload 之后再 fstat 一次，确认读到的还是扫描时那一份
+//      （普通文件 + size / mtime / dev+ino）。
+//      复核结论只决定"这次写入是否失败"，不会被写进 header；
 //   3. 读侧先 preflight：Scan 校验完 header、checksum、路径、边界之后才返回
 //      Member 列表，而且它自己不动文件系统；payload 只在 ExtractData 里按
 //      Member 给出的偏移读。
@@ -98,17 +102,27 @@ bool DecodeHeader(const char* block /*512 字节*/, Header* header,
 // 把一个条目列表写成 ustar 归档。
 //
 // entries 已经是 DFS 先序（父先于子），archive_path 已经过校验：扫描层负责
-// 这件事，写入器只按顺序落盘，不重新排树、不重新 stat 源文件。
+// 这件事，写入器只按顺序落盘，不重新排树。
 //
-// 两个写入器产出的 wire format 完全相同，区别只在 I/O 策略：
+// 两个写入器的格式逻辑完全共用，产出的 wire format 也逐字节相同，区别只在
+// I/O 策略：
 //
 //   * WriteBaseline：64 KiB 输出缓冲、逐 entry 处理、每条 entry 结束就 flush，
-//     写得直白，作为"格式对不对"的参照；
+//     payload 先读进 64 KiB 临时数组再 append 进缓冲，写得直白，作为"格式对
+//     不对"的参照；
 //   * WriteFast：1 MiB 统一缓冲，header / payload / padding 聚合进同一个缓冲，
 //     payload 用大块 read 直接读进缓冲空闲区，并给源 fd 加顺序读提示。
 //
-// 两者都用 O_WRONLY|O_CREAT|O_EXCL 创建输出（不覆盖已有文件），失败时删掉
-// 自己创建的半成品；写完的归档恰好以两个全零 block 结束，后面没有多余字节。
+// 普通文件的 payload 由两者共用的内部函数 CopyVerifiedPayload 读：读满
+// entry.size 之后**再** fstat 一次，确认源文件仍是扫描时那一份（普通文件、
+// size 与 mtime（秒 + 纳秒）未变，entry.source_ino 非 0 时 dev+ino 也未变）。
+// 任何一条不满足都让整次写入失败，磁盘上不留归档。这条检查挡不住"原地改写、
+// 长度不变、mtime 被改回原值、inode 也没换"的替换——那需要内容哈希，不在本轮
+// 范围内。
+//
+// 两者都用 O_WRONLY|O_CREAT|O_EXCL、权限 0600 创建输出（不覆盖已有文件），
+// 失败时删掉自己创建的半成品；写完的归档恰好以两个全零 block 结束，后面没有
+// 多余字节。
 bool WriteBaseline(const std::vector<ArchiveEntry>& entries,
                    const std::string& archive_file, std::string* error_message);
 bool WriteFast(const std::vector<ArchiveEntry>& entries,
@@ -129,6 +143,11 @@ struct Member {
 // checksum 与字段、payload 与 padding 边界、路径安全（绝对路径 / '..' / 空
 // component / NUL）、重复路径、父子冲突、typeflag、硬链接目标、条目数上限。
 // 任何一条失败都返回 false，此时 *members 的内容没有意义。
+//
+// 硬链接目标允许出现在硬链接之后（forward link）：恢复侧有 pending 队列，标准
+// tar 也允许。但它必须存在于完整 member set 里，并且顺着 link_target 走到终点
+// 必须是一条普通文件条目——链（A -> B -> regular）合法；指向目录 / 软链接 /
+// FIFO / 设备、自指、以及环都判失败。
 //
 // 目录条目的结尾 '/' 与 GNU tar 的 "./" 前缀在这里被归一化掉，所以
 // Member::entry.archive_path 与我们自己写出来的一模一样。
