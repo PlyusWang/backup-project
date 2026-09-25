@@ -74,6 +74,15 @@ std::string ParentDirectoryOf(const std::string& path) {
   return path.substr(0, slash);
 }
 
+// 路径最后一段。"out/dest" -> "dest"，"dest" -> "dest"。
+std::string BaseNameOf(const std::string& path) {
+  const std::size_t slash = path.rfind('/');
+  if (slash == std::string::npos) {
+    return path;
+  }
+  return path.substr(slash + 1);
+}
+
 // 去掉尾部的 '/'（保留根目录 "/"）。staging 目录名是在 destination 后面接后缀，
 // 带尾斜杠会让暂存目录跑到 destination 里面去。
 std::string StripTrailingSlashes(const std::string& path) {
@@ -102,32 +111,6 @@ bool IsEmptyDirectory(const std::string& path) {
 }
 
 // 尽力而为地删掉一棵树，用于失败时清理暂存目录。不 follow 软链接。
-void RemoveTreeQuietly(const std::string& path) {
-  struct stat info;
-  if (::lstat(path.c_str(), &info) != 0) {
-    return;
-  }
-  if (!S_ISDIR(info.st_mode)) {
-    ::unlink(path.c_str());
-    return;
-  }
-  DIR* raw_dir = ::opendir(path.c_str());
-  if (raw_dir != nullptr) {
-    while (struct dirent* item = ::readdir(raw_dir)) {
-      const std::string name = item->d_name;
-      if (name == "." || name == "..") {
-        continue;
-      }
-      RemoveTreeQuietly(path + "/" + name);
-    }
-    ::closedir(raw_dir);
-  }
-  ::rmdir(path.c_str());
-}
-
-// PKCS#7 一定补 1..8 个字节：DES-CBC 之后的长度是 8 的倍数且严格更大。
-// 这个公式必须和 container_format.cpp 里读侧用的那条完全一致，
-// 否则写出来的 header 会被自己的读侧拒绝。
 std::uint64_t DesPaddedSize(std::uint64_t plain_size) {
   return (plain_size / 8 + 1) * 8;
 }
@@ -145,47 +128,33 @@ bool FileSizeOf(const std::string& path, std::uint64_t* size,
 
 // ---- 压缩阶段 --------------------------------------------------------------
 //
-// 输入输出都是文件：packed 流与 compressed 流都不会只因为"要压缩"就被拆开，
-// 但这个模块内部按整条流处理（见文件头的内存边界说明）。
+// 输入输出都是文件，全程流式：峰值内存与归档大小无关。旧实现把整条输入读成
+// std::string、再把整条输出攒成另一个 std::string，一个 1 GiB 的归档就能让
+// 峰值 RSS 到 2 GiB 以上——那正是这一轮要修掉的 BLOCKER。
+//
+// 中间产物（LZSS 的 token 流）落在调用方给的 0700 私有工作目录里，0600，
+// 函数返回前由工作目录的守卫清掉。
 
 bool CompressFile(const std::string& input_file, const std::string& output_file,
-                  CompressionMethod method, std::uint64_t* output_size,
-                  std::string* error_message) {
-  FileSource source;
-  if (!source.Open(input_file, error_message)) {
-    return false;
-  }
+                  CompressionMethod method,
+                  const std::string& workspace_directory,
+                  std::uint64_t* output_size, std::string* error_message) {
   if (method == CompressionMethod::kNone) {
-    *output_size = source.size();
-    return true;
-  }
-  if (source.size() > kMaxCompressionInputSize) {
-    SetError(error_message,
-             "Compression stage is limited to 1 GiB per stream in this "
-             "version: " +
-                 input_file);
-    return false;
-  }
-  std::string input(static_cast<std::size_t>(source.size()), '\0');
-  if (!input.empty() &&
-      !source.ReadAt(0, &input[0], input.size(), error_message)) {
-    return false;
-  }
-  source.Close();
-
-  std::string output;
-  const bool ok =
-      method == CompressionMethod::kHuffman
-          ? compression::HuffmanCompress(input, &output, error_message)
-          : compression::LzssHuffmanCompress(input, &output, error_message);
-  if (!ok) {
-    return false;
+    return FileSizeOf(input_file, output_size, error_message);
   }
   FileSink sink;
   if (!sink.Open(output_file, error_message)) {
     return false;
   }
-  if (!sink.Write(output.data(), output.size(), error_message)) {
+  std::uint64_t produced = 0;
+  const bool ok =
+      method == CompressionMethod::kHuffman
+          ? compression::HuffmanCompressStream(input_file, &sink, nullptr,
+                                               &produced, error_message)
+          : compression::LzssHuffmanCompressStream(input_file, &sink,
+                                                   workspace_directory, nullptr,
+                                                   &produced, error_message);
+  if (!ok) {
     sink.Abandon();
     return false;
   }
@@ -193,20 +162,27 @@ bool CompressFile(const std::string& input_file, const std::string& output_file,
     sink.Abandon();
     return false;
   }
-  *output_size = output.size();
+  *output_size = produced;
   return true;
 }
 
 bool DecompressFile(const std::string& input_file,
                     const std::string& output_file, CompressionMethod method,
+                    const std::string& workspace_directory,
                     std::uint64_t expected_size, std::string* error_message) {
   if (method == CompressionMethod::kNone) {
-    FileSource source;
-    if (!source.Open(input_file, error_message)) {
+    // 没压缩：只要长度对上，就把字节流式搬过去。
+    std::uint64_t actual = 0;
+    if (!FileSizeOf(input_file, &actual, error_message)) {
       return false;
     }
-    if (source.size() != expected_size) {
-      SetError(error_message, "Archive payload size mismatch: " + input_file);
+    if (actual != expected_size) {
+      SetError(error_message,
+               "Packed stream size does not match the container header");
+      return false;
+    }
+    FileSource source;
+    if (!source.Open(input_file, error_message)) {
       return false;
     }
     FileSink sink;
@@ -220,45 +196,31 @@ bool DecompressFile(const std::string& input_file,
     }
     return true;
   }
-
-  FileSource source;
-  if (!source.Open(input_file, error_message)) {
-    return false;
-  }
-  if (source.size() > kMaxCompressionInputSize) {
-    SetError(error_message,
-             "Compression stage is limited to 1 GiB per stream in this "
-             "version: " +
-                 input_file);
-    return false;
-  }
-  std::string input(static_cast<std::size_t>(source.size()), '\0');
-  if (!input.empty() &&
-      !source.ReadAt(0, &input[0], input.size(), error_message)) {
-    return false;
-  }
-  source.Close();
-
-  std::string output;
-  const bool ok =
-      method == CompressionMethod::kHuffman
-          ? compression::HuffmanDecompress(input, &output, error_message)
-          : compression::LzssHuffmanDecompress(input, &output, error_message);
-  if (!ok) {
-    return false;
-  }
-  if (output.size() != expected_size) {
-    SetError(error_message,
-             "Decompressed size does not match the container header");
-    return false;
-  }
   FileSink sink;
   if (!sink.Open(output_file, error_message)) {
     return false;
   }
-  if (!sink.Write(output.data(), output.size(), error_message) ||
-      !sink.Close(error_message)) {
+  std::uint64_t written = 0;
+  // 两个 Stream 解码器都会在写任何输出之前先把头部读完、把 original_size 与
+  // expected_size 对上，所以"解完几 GB 才发现长度不对"这条路径不存在。
+  const bool ok =
+      method == CompressionMethod::kHuffman
+          ? compression::HuffmanDecompressStream(
+                input_file, 0, &sink, expected_size, &written, error_message)
+          : compression::LzssHuffmanDecompressStream(
+                input_file, &sink, workspace_directory, expected_size, &written,
+                error_message);
+  if (!ok) {
     sink.Abandon();
+    return false;
+  }
+  if (!sink.Close(error_message)) {
+    sink.Abandon();
+    return false;
+  }
+  if (written != expected_size) {
+    SetError(error_message,
+             "Decompressed size does not match the container header");
     return false;
   }
   return true;
@@ -308,30 +270,73 @@ bool ApplyMetadata(const std::string& path, const ArchiveEntry& entry,
 }
 
 // 把一条条目恢复到暂存目录里。硬链接目标在后时先挂起，主循环结束后再补。
-bool CreateEntry(const PackedStreamReader& reader, std::size_t index,
-                 const std::string& staging_root,
-                 std::vector<std::size_t>* directory_indices,
-                 std::vector<std::size_t>* pending_hardlinks,
-                 RestoreReport* report, std::string* error_message) {
+// 归档内的父路径："a/b/c" -> "a/b"，"a" -> "."。
+std::string ArchiveParentOf(const std::string& path) {
+  const std::size_t slash = path.rfind('/');
+  return slash == std::string::npos ? std::string(".") : path.substr(0, slash);
+}
+
+// Phase A + B：从全部条目路径推导出需要的目录集合（**含隐式父目录**），
+// 按深度升序把骨架建出来。
+//
+// 为什么必须处理隐式父目录：标准 tar 不保证 "a/" 一定先于 "a/b.txt" 出现，
+// 合法归档里完全可以只有后者。逐条往下建就会在 "staging/a 不存在" 上失败。
+//
+// "某个父路径被显式声明为非目录"这种归档在 Scan 阶段就已经被
+// ArchivePathRegistry 拒绝，所以这里只可能遇到正常结构。
+bool BuildDirectorySkeleton(const std::vector<PackedEntry>& entries,
+                            const std::string& staging_root,
+                            std::string* error_message) {
+  std::vector<std::string> directories;
+  for (const PackedEntry& record : entries) {
+    const std::string& path = record.entry.archive_path;
+    if (path == ".") {
+      continue;
+    }
+    if (record.entry.type == EntryType::kDirectory) {
+      directories.push_back(path);
+    }
+    std::string parent = ArchiveParentOf(path);
+    while (parent != "." && !parent.empty()) {
+      directories.push_back(parent);
+      parent = ArchiveParentOf(parent);
+    }
+  }
+  std::sort(directories.begin(), directories.end(),
+            [](const std::string& left, const std::string& right) {
+              const std::size_t depth_left = ArchivePathDepth(left);
+              const std::size_t depth_right = ArchivePathDepth(right);
+              if (depth_left != depth_right) {
+                return depth_left < depth_right;
+              }
+              return left < right;
+            });
+  directories.erase(std::unique(directories.begin(), directories.end()),
+                    directories.end());
+
+  for (const std::string& path : directories) {
+    const std::string target = JoinArchivePath(staging_root, path);
+    // 目录先一律 0700：归档里可能是 0555，先设成最终权限会让子文件写不进去。
+    // 已经是目录（显式条目 + 隐式父目录重合）不是错误。
+    if (::mkdir(target.c_str(), 0700) != 0 && errno != EEXIST) {
+      SetError(error_message,
+               Describe(errno, "Failed to create directory", target));
+      return false;
+    }
+  }
+  return true;
+}
+
+// Phase C：把一条"叶子条目"恢复到暂存目录里——普通文件 / 软链接 / FIFO /
+// 字符设备 / 块设备。目录在 Phase B 建好了，硬链接在 Phase D 统一解决。
+bool CreateLeafEntry(const PackedStreamReader& reader, std::size_t index,
+                     const std::string& staging_root, RestoreReport* report,
+                     std::string* error_message) {
   const ArchiveEntry& entry = reader.entries()[index].entry;
   const std::string target_path =
       JoinArchivePath(staging_root, entry.archive_path);
 
   switch (entry.type) {
-    case EntryType::kDirectory: {
-      // 先用 0700 建出来：归档里可能是 0555 的目录，先设成最终权限会让后面的
-      // 子文件写不进去。目录自己的 metadata 全部留到最后统一收尾。
-      //
-      // "." 是暂存目录自己，调用方已经建好了，不能再 mkdir 一次。
-      if (entry.archive_path != "." &&
-          ::mkdir(target_path.c_str(), 0700) != 0) {
-        SetError(error_message,
-                 Describe(errno, "Failed to create directory", target_path));
-        return false;
-      }
-      directory_indices->push_back(index);
-      return true;
-    }
     case EntryType::kRegularFile: {
       if (!reader.ExtractPayload(index, target_path, error_message)) {
         return false;
@@ -349,24 +354,6 @@ bool CreateEntry(const PackedStreamReader& reader, std::size_t index,
       return ApplyMetadata(target_path, entry, /*is_symlink=*/true, report,
                            error_message);
     }
-    case EntryType::kHardLink: {
-      const std::string link_source =
-          JoinArchivePath(staging_root, entry.link_target);
-      struct stat link_info;
-      if (::lstat(link_source.c_str(), &link_info) != 0) {
-        // 目标还没恢复出来（归档顺序反常）。挂起，主循环结束后重试。
-        pending_hardlinks->push_back(index);
-        return true;
-      }
-      if (::link(link_source.c_str(), target_path.c_str()) != 0) {
-        SetError(error_message,
-                 Describe(errno, "Failed to create hard link", target_path));
-        return false;
-      }
-      // 硬链接与目标共享 inode，metadata 由第一次出现的普通文件负责：
-      // 在这里再 chmod / utimensat 一次等于改同一个 inode，纯属重复。
-      return true;
-    }
     case EntryType::kFifo: {
       if (::mkfifo(target_path.c_str(), 0600) != 0) {
         SetError(error_message,
@@ -383,8 +370,8 @@ bool CreateEntry(const PackedStreamReader& reader, std::size_t index,
       const dev_t device =
           static_cast<dev_t>(MakeDevice(entry.dev_major, entry.dev_minor));
       if (::mknod(target_path.c_str(), type_bits | 0600, device) != 0) {
-        // 非 root 一定拿不到 CAP_MKNOD。这里明确失败并说清楚原因：
-        // 既不能静默降级成普通文件，也不能假装恢复了设备节点。
+        // 非 root 一定拿不到 CAP_MKNOD。明确失败并说清原因：既不静默降级成
+        // 普通文件，也不假装恢复了设备节点。
         SetError(
             error_message,
             Describe(errno, "Failed to create device node (requires CAP_MKNOD)",
@@ -394,18 +381,20 @@ bool CreateEntry(const PackedStreamReader& reader, std::size_t index,
       return ApplyMetadata(target_path, entry, /*is_symlink=*/false, report,
                            error_message);
     }
-    case EntryType::kSocket: {
+    case EntryType::kDirectory:
+    case EntryType::kHardLink:
+      SetError(error_message,
+               "Internal error: 该条目类型不由 CreateLeafEntry 处理");
+      return false;
+    case EntryType::kSocket:
       SetError(error_message,
                "Unsupported special type: socket: " + entry.archive_path);
       return false;
-    }
   }
   SetError(error_message, "Internal error: unknown entry type");
   return false;
 }
 
-// 目录 metadata 必须等孩子全部恢复完再设：创建子项会改父目录的 mtime。
-// 从深到浅处理，同一深度按路径逆序，保证结果与顺序无关地确定。
 void SortDirectoriesDeepestFirst(const PackedStreamReader& reader,
                                  std::vector<std::size_t>* indices) {
   std::sort(indices->begin(), indices->end(),
@@ -511,18 +500,15 @@ bool RunBackupPipelineFromEntries(const std::vector<ArchiveEntry>& entries,
       !file_system.MakeDirectories(archive_parent, error_message)) {
     return false;
   }
-  const std::string temp_directory =
-      archive_parent.empty() ? std::string(".") : archive_parent;
-  const std::string unique = std::to_string(static_cast<long>(::getpid()));
-
-  // 临时产物：packed 流与 compressed 流。两个都走 RAII 守卫，
-  // 成功或失败都会在函数返回时被清掉。
-  std::string packed_file;
-  if (!ReserveTempPath(temp_directory, ".bp-packed-" + unique + "-",
-                       &packed_file, error_message)) {
+  // 私有工作目录：一次备份的所有中间产物（packed / token / compressed /
+  // 未发布的 container）都住在里面。0700 的目录 + 0600 的文件意味着
+  // "加密之前先把明文落到 archive parent" 这件事不再可能被别人读到，
+  // 而 RAII 守卫保证成功失败都不留残余。
+  TempDirectoryGuard workspace;
+  if (!workspace.Create(archive_parent, ".bp-work-", error_message)) {
     return false;
   }
-  TempFileGuard packed_guard(packed_file);
+  const std::string packed_file = workspace.Child("packed.tmp");
 
   if (!PackEntries(options.pack_method, entries, packed_file, error_message)) {
     return false;
@@ -535,18 +521,19 @@ bool RunBackupPipelineFromEntries(const std::vector<ArchiveEntry>& entries,
     SetError(error_message, "Internal error: empty packed stream");
     return false;
   }
+  // 磁盘预算 sanity check：packed + compressed + 最终 container 都可能同时
+  // 存在。packed_size 是刚刚自己写出来的，不是不可信输入。
+  if (!CheckFreeSpace(workspace.path(), packed_size * 3 + (1u << 20),
+                      error_message)) {
+    return false;
+  }
 
   std::string compressed_file = packed_file;
-  std::unique_ptr<TempFileGuard> compressed_guard;
   std::uint64_t compressed_size = packed_size;
   if (options.compression_method != CompressionMethod::kNone) {
-    if (!ReserveTempPath(temp_directory, ".bp-packed-" + unique + "-",
-                         &compressed_file, error_message)) {
-      return false;
-    }
-    compressed_guard = std::make_unique<TempFileGuard>(compressed_file);
+    compressed_file = workspace.Child("compressed.tmp");
     if (!CompressFile(packed_file, compressed_file, options.compression_method,
-                      &compressed_size, error_message)) {
+                      workspace.path(), &compressed_size, error_message)) {
       return false;
     }
   }
@@ -615,8 +602,10 @@ bool RunBackupPipelineFromEntries(const std::vector<ArchiveEntry>& entries,
     return false;
   }
 
+  // 正式 .bak 不是边生成边发布的：先在私有目录里写完整的 container。
+  const std::string container_file = workspace.Child("container.tmp");
   FileSink sink;
-  if (!sink.Open(archive_file, error_message)) {
+  if (!sink.Open(container_file, error_message)) {
     return false;
   }
   bool ok = sink.Write(header_bytes.data(), header_bytes.size(), error_message);
@@ -760,6 +749,11 @@ bool RunBackupPipelineFromEntries(const std::vector<ArchiveEntry>& entries,
   }
   if (ok) {
     ok = sink.Close(error_message);
+  }
+  if (ok) {
+    // 完整、已 fsync 的 container 才发布成 archive_file，而且绝不覆盖：
+    // link() 的 EEXIST 由内核保证，不存在 "unlink 之后再 rename" 那段窗口。
+    ok = PublishNoReplace(container_file, archive_file, error_message);
   }
   if (!ok) {
     sink.Abandon();
@@ -1036,16 +1030,20 @@ bool RunRestorePipeline(const std::string& archive_file,
       !file_system.MakeDirectories(destination_parent, error_message)) {
     return false;
   }
-  const std::string temp_directory =
-      destination_parent.empty() ? std::string(".") : destination_parent;
-  const std::string unique = std::to_string(static_cast<long>(::getpid()));
-
-  std::string compressed_file;
-  if (!ReserveTempPath(temp_directory, ".bp-unpack-" + unique + "-",
-                       &compressed_file, error_message)) {
+  // 私有工作目录：解密结果与解压结果都落在里面，0600，用完即清。
+  TempDirectoryGuard workspace;
+  if (!workspace.Create(destination_parent, ".bp-work-", error_message)) {
     return false;
   }
-  TempFileGuard compressed_guard(compressed_file);
+  // 磁盘预算：解密后的 payload 与解压后的 packed 流会同时存在。
+  // payload_size / packed_size 都是不可信的归档元数据，这里只当作
+  // "需要多少空间"的估计，绝不当作数组大小。
+  if (!CheckFreeSpace(workspace.path(),
+                      header.payload_size + header.packed_size,
+                      error_message)) {
+    return false;
+  }
+  const std::string compressed_file = workspace.Child("compressed.tmp");
   // 第二遍：认证已过，这时才解密。
   if (!DecryptPayload(source, header, cipher_key, compressed_file,
                       error_message)) {
@@ -1055,28 +1053,46 @@ bool RunRestorePipeline(const std::string& archive_file,
 
   CompressionMethod compression = CompressionMethod::kNone;
   ParseCompressionMethodId(header.compression_method, &compression);
-  std::string packed_file = compressed_file;
-  std::unique_ptr<TempFileGuard> packed_guard;
-  if (compression != CompressionMethod::kNone) {
-    if (!ReserveTempPath(temp_directory, ".bp-unpack-" + unique + "-",
-                         &packed_file, error_message)) {
+  // 解压之前先把两层头部与三处长度对上。这一步不做任何大块输出：
+  // 坏归档在这里就被拒绝，而不是解完几个 GB 才发现长度不对。
+  std::uint64_t token_stream_size = 0;
+  if (compression == CompressionMethod::kHuffman) {
+    compression::HuffmanStreamInfo info;
+    if (!compression::HuffmanReadStreamInfo(compressed_file, 0, &info,
+                                            error_message)) {
       return false;
     }
-    packed_guard = std::make_unique<TempFileGuard>(packed_file);
-    if (!DecompressFile(compressed_file, packed_file, compression,
-                        header.packed_size, error_message)) {
-      return false;
-    }
-  } else {
-    std::uint64_t packed_size = 0;
-    if (!FileSizeOf(packed_file, &packed_size, error_message)) {
-      return false;
-    }
-    if (packed_size != header.packed_size) {
+    if (info.original_size != header.packed_size) {
       SetError(error_message,
-               "Packed stream size does not match the container header");
+               "Compressed stream original_size does not match the container "
+               "header");
       return false;
     }
+  } else if (compression == CompressionMethod::kLzssHuffman) {
+    compression::LzssHuffmanStreamInfo info;
+    if (!compression::LzssHuffmanReadStreamInfo(compressed_file, &info,
+                                                error_message)) {
+      return false;
+    }
+    if (info.original_size != header.packed_size ||
+        info.inner.original_size != info.token_stream_size) {
+      SetError(error_message,
+               "Compressed stream sizes do not match the container header");
+      return false;
+    }
+    token_stream_size = info.token_stream_size;
+    // 再加上 LZSS 的 token 临时文件：它和解压输出会同时存在。
+    if (!CheckFreeSpace(
+            workspace.path(),
+            header.payload_size + header.packed_size + token_stream_size,
+            error_message)) {
+      return false;
+    }
+  }
+  const std::string packed_file = workspace.Child("packed.tmp");
+  if (!DecompressFile(compressed_file, packed_file, compression,
+                      workspace.path(), header.packed_size, error_message)) {
+    return false;
   }
 
   PackMethod pack_method = PackMethod::kMyPack;
@@ -1128,7 +1144,6 @@ bool RunRestorePackedStream(const std::string& packed_file,
     return false;
   }
 
-  const std::string unique = std::to_string(static_cast<long>(::getpid()));
   PackedStreamReader reader;
   if (!reader.Open(packed_file, error_message)) {
     return false;
@@ -1142,22 +1157,43 @@ bool RunRestorePackedStream(const std::string& packed_file,
     return false;
   }
 
-  // 暂存目录：destination 的兄弟目录，同一个文件系统，所以最后一步是纯 rename。
-  const std::string staging =
-      destination + ".bptmp-" + unique + "-" + std::to_string(::getpid());
-  if (::mkdir(staging.c_str(), 0700) != 0) {
-    SetError(error_message,
-             Describe(errno, "Failed to create staging directory", staging));
+  // 暂存目录用 mkdtemp：同样一个进程连续恢复两次也不会撞名（以前是用 pid
+  // 拼出来的，pid 写了两遍，等于没有唯一性）。0700，与 destination 同一个
+  // 文件系统，所以最后一步是纯 rename。
+  const std::string staging_parent = ParentDirectoryOf(destination);
+  FileSystem file_system;
+  if (!staging_parent.empty() &&
+      !file_system.MakeDirectories(staging_parent, error_message)) {
     return false;
   }
+  TempDirectoryGuard staging_guard;
+  if (!staging_guard.Create(staging_parent, BaseNameOf(destination) + ".bptmp-",
+                            error_message)) {
+    return false;
+  }
+  const std::string staging = staging_guard.path();
+
   bool ok = true;
-  std::vector<std::size_t> directory_indices;
+  // Phase A + B：目录骨架（显式目录 + 隐式父目录），深度升序，一律 0700。
+  ok = BuildDirectorySkeleton(reader.entries(), staging, error_message);
+
+  // Phase C：普通文件 / 软链接 / FIFO / 设备。硬链接留到 Phase D。
   std::vector<std::size_t> pending_hardlinks;
   for (std::size_t index = 0; ok && index < reader.entries().size(); ++index) {
-    ok = CreateEntry(reader, index, staging, &directory_indices,
-                     &pending_hardlinks, report, error_message);
+    const EntryType type = reader.entries()[index].entry.type;
+    if (type == EntryType::kDirectory) {
+      continue;
+    }
+    if (type == EntryType::kHardLink) {
+      pending_hardlinks.push_back(index);
+      continue;
+    }
+    ok = CreateLeafEntry(reader, index, staging, report, error_message);
   }
-  // 硬链接目标在后时在这里补：反复重试直到没有进展，再判失败。
+
+  // Phase D：硬链接。目标已经出现就直接建，没出现就挂起；反复重试到没有进展
+  // 再判失败。环与自指已经在 preflight 被拒绝（ustar::Scan 的三色标记 /
+  // MyPack 的目标必须是普通文件那一条），所以这里不会死循环。
   while (ok && !pending_hardlinks.empty()) {
     std::vector<std::size_t> still_pending;
     bool progress = false;
@@ -1178,6 +1214,8 @@ bool RunRestorePackedStream(const std::string& packed_file,
         ok = false;
         break;
       }
+      // 硬链接与目标共享 inode，metadata 由第一次出现的普通文件负责：
+      // 在这里再 chmod / utimensat 一次等于改同一个 inode，纯属重复。
       progress = true;
     }
     if (!ok) {
@@ -1190,8 +1228,17 @@ bool RunRestorePackedStream(const std::string& packed_file,
     }
     pending_hardlinks = still_pending;
   }
-  // 目录 metadata 最后设，从深到浅：创建子项会改父目录的 mtime。
+
+  // Phase E：显式目录的 metadata 最后设，从深到浅（创建子项会改父目录的
+  // mtime）。归档里没有显式 "." 时，暂存根目录保持 0700 这个安全默认值——
+  // 不伪造一个它并没有声明过的 uid/gid/mtime。
   if (ok) {
+    std::vector<std::size_t> directory_indices;
+    for (std::size_t index = 0; index < reader.entries().size(); ++index) {
+      if (reader.entries()[index].entry.type == EntryType::kDirectory) {
+        directory_indices.push_back(index);
+      }
+    }
     SortDirectoriesDeepestFirst(reader, &directory_indices);
     for (const std::size_t index : directory_indices) {
       const ArchiveEntry& entry = reader.entries()[index].entry;
@@ -1204,15 +1251,16 @@ bool RunRestorePackedStream(const std::string& packed_file,
     }
   }
   if (!ok) {
-    RemoveTreeQuietly(staging);
+    staging_guard.Remove();
     return false;
   }
   if (::rename(staging.c_str(), destination.c_str()) != 0) {
     SetError(error_message,
              Describe(errno, "Failed to finalize destination", destination));
-    RemoveTreeQuietly(staging);
+    staging_guard.Remove();
     return false;
   }
+  staging_guard.Release();
   if (report != nullptr) {
     report->restored_entries = reader.entries().size();
   }
