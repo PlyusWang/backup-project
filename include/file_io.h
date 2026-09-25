@@ -36,6 +36,15 @@ using CloseFn = int (*)(int);
 FsyncFn& FsyncHook();
 CloseFn& CloseHook();
 
+// 发布路径用的两个"原子且不覆盖"的原语。它们也必须能注入：三个真实分支
+// （link 成功 / link 不可用而 renameat2 成功 / 两个都不可用）在正常文件系统上
+// 没法同时制造出来，而这三个分支的差别恰恰是"绝不覆盖已有备份"的全部内容。
+using LinkFn = int (*)(const char* existing_path, const char* new_path);
+using RenameNoReplaceFn = int (*)(const char* old_path, const char* new_path);
+
+LinkFn& LinkHook();
+RenameNoReplaceFn& RenameNoReplaceHook();
+
 }  // namespace file_io_syscalls
 
 // 只写、必须新建的输出文件，内部 256 KiB 缓冲，创建模式固定 0600。

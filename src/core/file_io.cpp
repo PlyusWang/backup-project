@@ -63,6 +63,15 @@ constexpr std::size_t kCopyBufferSize = 256 * 1024;
 int DefaultFsync(int fd) { return ::fsync(fd); }
 int DefaultClose(int fd) { return ::close(fd); }
 
+int DefaultLink(const char* existing_path, const char* new_path) {
+  return ::link(existing_path, new_path);
+}
+
+// RENAME_NOREPLACE：内核保证"目标已存在"时返回 EEXIST，不做任何覆盖。
+int DefaultRenameNoReplace(const char* old_path, const char* new_path) {
+  return ::renameat2(AT_FDCWD, old_path, AT_FDCWD, new_path, RENAME_NOREPLACE);
+}
+
 }  // namespace
 
 namespace file_io_syscalls {
@@ -74,6 +83,16 @@ FsyncFn& FsyncHook() {
 
 CloseFn& CloseHook() {
   static CloseFn hook = &DefaultClose;
+  return hook;
+}
+
+LinkFn& LinkHook() {
+  static LinkFn hook = &DefaultLink;
+  return hook;
+}
+
+RenameNoReplaceFn& RenameNoReplaceHook() {
+  static RenameNoReplaceFn hook = &DefaultRenameNoReplace;
   return hook;
 }
 
@@ -471,7 +490,9 @@ bool PublishNoReplace(const std::string& temp_file,
   const std::string parent = ParentDirectoryOf(final_path);
 
   // 首选：硬链接。同文件系统内原子，"目标已存在"由内核保证返回 EEXIST。
-  if (::link(temp_file.c_str(), final_path.c_str()) == 0) {
+  errno = 0;
+  if (file_io_syscalls::LinkHook()(temp_file.c_str(), final_path.c_str()) ==
+      0) {
     // final 已经是完整文件了；temp 只是同一 inode 的第二个名字，删掉即可。
     // 万一删不掉也不该让调用方以为发布失败——目录会在 workspace 清理时消失。
     (void)::unlink(temp_file.c_str());
@@ -485,8 +506,9 @@ bool PublishNoReplace(const std::string& temp_file,
   }
 
   // 备选一：renameat2(RENAME_NOREPLACE)。同样是原子的不覆盖语义。
-  if (::renameat2(AT_FDCWD, temp_file.c_str(), AT_FDCWD, final_path.c_str(),
-                  RENAME_NOREPLACE) == 0) {
+  errno = 0;
+  if (file_io_syscalls::RenameNoReplaceHook()(temp_file.c_str(),
+                                              final_path.c_str()) == 0) {
     SyncDirectoryQuietly(parent);
     return true;
   }
@@ -496,37 +518,33 @@ bool PublishNoReplace(const std::string& temp_file,
     return false;
   }
 
-  // 备选二：先确认不存在再 rename。这一步有理论上的 TOCTOU 窗口，只有在前两条
-  // 路都不可用的文件系统上才会走到；到不了就明确失败，不做更激进的猜测。
-  const bool link_unsupported = link_error == EPERM || link_error == EACCES ||
+  // 两个原子 no-replace 原语都不可用 / 都失败：**fail closed**。
+  //
+  // 这里绝不能再退回 "lstat(final) 确认不存在，然后普通 rename(temp, final)"：
+  // 检查与 rename 之间，另一个进程（或另一个 dsh 任务）完全可以创建 final，
+  // 而普通 rename() 会**直接覆盖**它。"绝不覆盖已有备份"是备份工具最不能
+  // 让步的一条，所以宁可用一个没有人读得懂的失败，也不要一次静默覆盖。
+  //
+  // 也不把真实错误掩盖成 "unsupported"：两个 errno 都原样报出来，
+  // 让调用方分得清"这个文件系统不支持"和"磁盘真的坏了"。
+  // 只有"这个文件系统/内核根本不支持"才算 unsupported。EACCES / EIO / EMLINK
+  // 都是真实错误，它们的 errno 必须原样透出去，不能被说成"不支持"——
+  // 那会让排障的人以为换个文件系统就好了。
+  const bool link_unsupported = link_error == EPERM ||
                                 link_error == EOPNOTSUPP ||
                                 link_error == ENOSYS || link_error == EXDEV;
   const bool rename_unsupported = rename_error == ENOSYS ||
                                   rename_error == EINVAL ||
                                   rename_error == EOPNOTSUPP;
-  if (!link_unsupported && !rename_unsupported) {
-    SetError(
-        error_message,
-        Describe(link_error, "Failed to publish archive file", final_path));
-    return false;
-  }
-  struct stat existing;
-  if (::lstat(final_path.c_str(), &existing) == 0) {
-    SetError(error_message, "Archive file already exists: " + final_path);
-    return false;
-  }
-  if (errno != ENOENT) {
-    SetError(error_message,
-             Describe(errno, "Failed to inspect archive file", final_path));
-    return false;
-  }
-  if (::rename(temp_file.c_str(), final_path.c_str()) != 0) {
-    SetError(error_message,
-             Describe(errno, "Failed to publish archive file", final_path));
-    return false;
-  }
-  SyncDirectoryQuietly(parent);
-  return true;
+  std::string reason =
+      "Failed to publish archive file atomically: " + final_path +
+      ": link(): " + std::strerror(link_error) +
+      (link_unsupported ? " (unsupported here)" : "") +
+      "; renameat2(RENAME_NOREPLACE): " + std::strerror(rename_error) +
+      (rename_unsupported ? " (unsupported here)" : "") +
+      "; refusing to fall back to a non-atomic rename";
+  SetError(error_message, reason);
+  return false;
 }
 
 bool CheckFreeSpace(const std::string& directory, std::uint64_t need_bytes,
