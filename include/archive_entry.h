@@ -83,9 +83,16 @@ struct ArchiveEntry {
   std::uint32_t dev_minor = 0;
 
   // 可选的名字缓存，扫描层通过 getpwuid_r / getgrgid_r 解析；解析失败时留空，
-  // 数字 uid/gid 仍然可用。
+  // 数字 uid/gid 仍然可用。所有类型都会尝试解析（包括软链接：lstat 拿到的
+  // 就是链接自己的 uid/gid，这不涉及 follow）。
   std::string user_name;
   std::string group_name;
+
+  // 扫描那一刻的 (st_dev, st_ino)。**这是内部快照字段，不写进任何归档格式**，
+  // 存在的意义只有一个：打包时确认"我现在读的还是扫描时那一个 inode"。
+  // 它为 0 表示扫描层没有提供，写侧就不做这项检查。
+  std::uint64_t source_dev = 0;
+  std::uint64_t source_ino = 0;
 };
 
 // Linux dev_t 的 major/minor 拆分（glibc 的编码不是简单的位移）。

@@ -4,8 +4,11 @@
 
 #include "file_io.h"
 
+#include <dirent.h>
 #include <fcntl.h>
+#include <stdio.h>
 #include <sys/stat.h>
+#include <sys/statvfs.h>
 #include <sys/types.h>
 #include <unistd.h>
 
@@ -28,6 +31,28 @@ std::string Describe(int error_number, const std::string& action,
   return action + ": " + path + ": " + std::strerror(error_number);
 }
 
+std::string ParentDirectoryOf(const std::string& path) {
+  const std::size_t slash = path.rfind('/');
+  if (slash == std::string::npos) {
+    return std::string(".");
+  }
+  if (slash == 0) {
+    return std::string("/");
+  }
+  return path.substr(0, slash);
+}
+
+// 目录项落盘不靠 fsync 文件本身，而靠 fsync 父目录。失败只当诊断：
+// 内容已经写完了，因为"目录项可能还没落盘"去报失败反而会误导调用方。
+void SyncDirectoryQuietly(const std::string& directory) {
+  const int fd = ::open(directory.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+  if (fd < 0) {
+    return;
+  }
+  (void)::fsync(fd);
+  ::close(fd);
+}
+
 // 缓冲大小取 256 KiB：足以把 512 字节 header、对齐填充和小文件正文聚合成
 // 大块写，同时又远小于内存关心量级。
 constexpr std::size_t kSinkBufferSize = 256 * 1024;
@@ -35,43 +60,40 @@ constexpr std::size_t kSinkBufferSize = 256 * 1024;
 // 区间复制的读缓冲：64 KiB～1 MiB 之间的保守取值。
 constexpr std::size_t kCopyBufferSize = 256 * 1024;
 
+int DefaultFsync(int fd) { return ::fsync(fd); }
+int DefaultClose(int fd) { return ::close(fd); }
+
 }  // namespace
 
+namespace file_io_syscalls {
+
+FsyncFn& FsyncHook() {
+  static FsyncFn hook = &DefaultFsync;
+  return hook;
+}
+
+CloseFn& CloseHook() {
+  static CloseFn hook = &DefaultClose;
+  return hook;
+}
+
+}  // namespace file_io_syscalls
+
+// ---- FileSink --------------------------------------------------------------
+
 FileSink::~FileSink() {
+  // 析构也是 fail-safe 清理点：只要路径还归本对象所有而且没提交，就删掉。
+  if (owns_path_ && !committed_) {
+    Abandon();
+    return;
+  }
   if (fd_ >= 0) {
     ::close(fd_);
   }
 }
 
-bool ReserveTempPath(const std::string& directory, const std::string& prefix,
-                     std::string* path, std::string* error_message) {
-  FileSink sink;
-  if (!sink.OpenTemp(directory, prefix, error_message)) {
-    return false;
-  }
-  const std::string reserved = sink.path();
-  if (!sink.Close(error_message)) {
-    sink.Abandon();
-    return false;
-  }
-  if (::unlink(reserved.c_str()) != 0 && errno != ENOENT) {
-    SetError(
-        error_message,
-        Describe(errno, "Failed to release temporary file name", reserved));
-    return false;
-  }
-  *path = reserved;
-  return true;
-}
-
-TempFileGuard::~TempFileGuard() {
-  if (!path_.empty()) {
-    ::unlink(path_.c_str());
-  }
-}
-
 bool FileSink::Open(const std::string& path, std::string* error_message) {
-  if (fd_ >= 0) {
+  if (fd_ >= 0 || owns_path_) {
     SetError(error_message, "Internal error: sink already open: " + path);
     return false;
   }
@@ -79,8 +101,10 @@ bool FileSink::Open(const std::string& path, std::string* error_message) {
     SetError(error_message, "Output file path is empty.");
     return false;
   }
+  // 0600：备份文件可能包含任何东西，没有理由让同机器上的其他用户读到它。
+  // legacy v0.1 一直就是 0600，新路径不能更宽松。
   const int raw_fd =
-      ::open(path.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0644);
+      ::open(path.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
   if (raw_fd < 0) {
     SetError(error_message, Describe(errno, "Failed to create file", path));
     return false;
@@ -90,12 +114,14 @@ bool FileSink::Open(const std::string& path, std::string* error_message) {
   bytes_written_ = 0;
   buffered_ = 0;
   buffer_.assign(kSinkBufferSize, 0);
+  owns_path_ = true;
+  committed_ = false;
   return true;
 }
 
 bool FileSink::OpenTemp(const std::string& directory, const std::string& prefix,
                         std::string* error_message) {
-  if (fd_ >= 0) {
+  if (fd_ >= 0 || owns_path_) {
     SetError(error_message, "Internal error: sink already open");
     return false;
   }
@@ -117,6 +143,8 @@ bool FileSink::OpenTemp(const std::string& directory, const std::string& prefix,
   bytes_written_ = 0;
   buffered_ = 0;
   buffer_.assign(kSinkBufferSize, 0);
+  owns_path_ = true;
+  committed_ = false;
   return true;
 }
 
@@ -206,34 +234,47 @@ bool FileSink::Patch(std::uint64_t offset, const void* data, std::size_t size,
 
 bool FileSink::Close(std::string* error_message) {
   if (fd_ < 0) {
-    return true;
+    if (committed_) {
+      return true;
+    }
+    SetError(error_message, "Internal error: sink is not open: " + path_);
+    return false;
   }
   bool ok = Flush(error_message);
-  if (ok && ::fsync(fd_) != 0) {
+  if (ok && file_io_syscalls::FsyncHook()(fd_) != 0) {
     SetError(error_message, Describe(errno, "Failed to sync file", path_));
     ok = false;
   }
   const int fd = fd_;
   fd_ = -1;
-  if (::close(fd) != 0 && ok) {
+  buffered_ = 0;
+  if (file_io_syscalls::CloseHook()(fd) != 0 && ok) {
     SetError(error_message, Describe(errno, "Failed to close file", path_));
     ok = false;
+  }
+  // 关键：失败时**不**清 owns_path_。此刻 fd 已经关了，但路径还归本对象所有，
+  // 所以 Abandon()（以及析构）仍然必须把它 unlink 掉。
+  if (ok) {
+    committed_ = true;
   }
   return ok;
 }
 
 void FileSink::Abandon() {
-  if (fd_ < 0) {
-    return;
+  if (fd_ >= 0) {
+    // 清理路径用真正的 close，不走注入点：测试把 close 换成"总是失败"之后，
+    // 句柄还是应该被真正关掉，否则测试进程会漏 fd。
+    ::close(fd_);
+    fd_ = -1;
   }
-  const int fd = fd_;
-  fd_ = -1;
   buffered_ = 0;
-  ::close(fd);
-  if (!path_.empty()) {
+  if (owns_path_ && !committed_ && !path_.empty()) {
     ::unlink(path_.c_str());
   }
+  owns_path_ = false;
 }
+
+// ---- FileSource ------------------------------------------------------------
 
 FileSource::~FileSource() { Close(); }
 
@@ -344,6 +385,172 @@ bool WriteFully(int fd, const void* data, std::size_t size,
       return false;
     }
     done += static_cast<std::size_t>(written);
+  }
+  return true;
+}
+
+// ---- 清理与私有工作目录 -----------------------------------------------------
+
+void RemoveTreeNoFollow(const std::string& path) {
+  struct stat info;
+  if (::lstat(path.c_str(), &info) != 0) {
+    return;
+  }
+  if (!S_ISDIR(info.st_mode)) {
+    ::unlink(path.c_str());
+    return;
+  }
+  DIR* raw_dir = ::opendir(path.c_str());
+  if (raw_dir != nullptr) {
+    while (struct dirent* item = ::readdir(raw_dir)) {
+      const std::string name = item->d_name;
+      if (name == "." || name == "..") {
+        continue;
+      }
+      RemoveTreeNoFollow(path + "/" + name);
+    }
+    ::closedir(raw_dir);
+  }
+  ::rmdir(path.c_str());
+}
+
+TempDirectoryGuard::~TempDirectoryGuard() { Remove(); }
+
+bool TempDirectoryGuard::Create(const std::string& parent,
+                                const std::string& prefix,
+                                std::string* error_message) {
+  Remove();
+  std::string base = parent.empty() ? std::string(".") : parent;
+  if (base.size() > 1 && base.back() == '/') {
+    base.pop_back();
+  }
+  std::string pattern = base + "/" + prefix + "XXXXXX";
+  std::vector<char> buffer(pattern.begin(), pattern.end());
+  buffer.push_back('\0');
+  if (::mkdtemp(buffer.data()) == nullptr) {
+    SetError(error_message,
+             Describe(errno, "Failed to create private workspace in", base));
+    return false;
+  }
+  path_.assign(buffer.data());
+  // mkdtemp 已经给 0700，但这条安全属性不能依赖 umask
+  // 或平台细节，显式再设一次。
+  if (::chmod(path_.c_str(), 0700) != 0) {
+    SetError(error_message,
+             Describe(errno, "Failed to secure private workspace", path_));
+    Remove();
+    return false;
+  }
+  return true;
+}
+
+std::string TempDirectoryGuard::Child(const std::string& name) const {
+  if (path_.empty()) {
+    return name;
+  }
+  return path_ + "/" + name;
+}
+
+void TempDirectoryGuard::Remove() {
+  if (path_.empty()) {
+    return;
+  }
+  RemoveTreeNoFollow(path_);
+  path_.clear();
+}
+
+// ---- 发布 ------------------------------------------------------------------
+
+bool PublishNoReplace(const std::string& temp_file,
+                      const std::string& final_path,
+                      std::string* error_message) {
+  if (temp_file.empty() || final_path.empty()) {
+    SetError(error_message, "Internal error: publish with an empty path");
+    return false;
+  }
+  const std::string parent = ParentDirectoryOf(final_path);
+
+  // 首选：硬链接。同文件系统内原子，"目标已存在"由内核保证返回 EEXIST。
+  if (::link(temp_file.c_str(), final_path.c_str()) == 0) {
+    // final 已经是完整文件了；temp 只是同一 inode 的第二个名字，删掉即可。
+    // 万一删不掉也不该让调用方以为发布失败——目录会在 workspace 清理时消失。
+    (void)::unlink(temp_file.c_str());
+    SyncDirectoryQuietly(parent);
+    return true;
+  }
+  const int link_error = errno;
+  if (link_error == EEXIST) {
+    SetError(error_message, "Archive file already exists: " + final_path);
+    return false;
+  }
+
+  // 备选一：renameat2(RENAME_NOREPLACE)。同样是原子的不覆盖语义。
+  if (::renameat2(AT_FDCWD, temp_file.c_str(), AT_FDCWD, final_path.c_str(),
+                  RENAME_NOREPLACE) == 0) {
+    SyncDirectoryQuietly(parent);
+    return true;
+  }
+  const int rename_error = errno;
+  if (rename_error == EEXIST) {
+    SetError(error_message, "Archive file already exists: " + final_path);
+    return false;
+  }
+
+  // 备选二：先确认不存在再 rename。这一步有理论上的 TOCTOU 窗口，只有在前两条
+  // 路都不可用的文件系统上才会走到；到不了就明确失败，不做更激进的猜测。
+  const bool link_unsupported = link_error == EPERM || link_error == EACCES ||
+                                link_error == EOPNOTSUPP ||
+                                link_error == ENOSYS || link_error == EXDEV;
+  const bool rename_unsupported = rename_error == ENOSYS ||
+                                  rename_error == EINVAL ||
+                                  rename_error == EOPNOTSUPP;
+  if (!link_unsupported && !rename_unsupported) {
+    SetError(
+        error_message,
+        Describe(link_error, "Failed to publish archive file", final_path));
+    return false;
+  }
+  struct stat existing;
+  if (::lstat(final_path.c_str(), &existing) == 0) {
+    SetError(error_message, "Archive file already exists: " + final_path);
+    return false;
+  }
+  if (errno != ENOENT) {
+    SetError(error_message,
+             Describe(errno, "Failed to inspect archive file", final_path));
+    return false;
+  }
+  if (::rename(temp_file.c_str(), final_path.c_str()) != 0) {
+    SetError(error_message,
+             Describe(errno, "Failed to publish archive file", final_path));
+    return false;
+  }
+  SyncDirectoryQuietly(parent);
+  return true;
+}
+
+bool CheckFreeSpace(const std::string& directory, std::uint64_t need_bytes,
+                    std::string* error_message) {
+  std::string base = directory.empty() ? std::string(".") : directory;
+  if (base.size() > 1 && base.back() == '/') {
+    base.pop_back();
+  }
+  struct statvfs info;
+  if (::statvfs(base.c_str(), &info) != 0) {
+    // 拿不到就不拦：这是 sanity check，不是配额系统，不该因为它失败而让用户
+    // 连正常的备份都做不了。
+    return true;
+  }
+  const std::uint64_t available = static_cast<std::uint64_t>(info.f_bavail) *
+                                  static_cast<std::uint64_t>(info.f_frsize);
+  // 留 1% 余量：目录项、文件系统元数据、以及同时发生的其他写入都要算进去。
+  const std::uint64_t reserve = available / 100;
+  if (need_bytes > available - reserve) {
+    SetError(error_message, "Not enough free space in " + base + ": need " +
+                                std::to_string(need_bytes) +
+                                " bytes, available " +
+                                std::to_string(available));
+    return false;
   }
   return true;
 }
