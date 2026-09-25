@@ -509,6 +509,13 @@ bool DecodeBody(SequentialReader* reader, ByteSinkAdapter* sink,
     SetError(error_message, "huffman: bitstream 的比特数与 original_size 不符");
     return false;
   }
+  // 最后一个字节里没被 bit_count 覆盖的低位必须是 0：编码器就是这么写的，
+  // 格式也是这么定的。不查的话，把 padding 位改脏的流照样解得出来，
+  // 等于 wire format 只约束了一半。
+  if (!bits.PaddingBitsAreZero()) {
+    SetError(error_message, "huffman: non-zero padding bits");
+    return false;
+  }
   if (!out.empty() && !sink->Write(out.data(), out.size(), error_message)) {
     return false;
   }

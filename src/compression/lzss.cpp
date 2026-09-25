@@ -320,9 +320,16 @@ bool LzssDecodeCore(SequentialReader* tokens, ByteSinkAdapter* sink,
       return false;
     }
     for (int bit = 7; bit >= 0; --bit) {
-      // original_size 是唯一的结束条件：凑够就停，control byte 里剩下的 bit
-      // （编码器保证是 0）不再产生 token。
+      // original_size 是唯一的结束条件：凑够就停。
       if (history.produced() >= expected_original_size) {
+        // 剩下的 bit 是编码器保证为 0 的 padding。以前这里直接 break，
+        // 于是"最后一个 control byte 的低位被改脏"的流也能通过——格式既然
+        // 规定了它们必须是 0，就必须真的查。
+        const std::uint32_t unused_mask = (std::uint32_t{1} << (bit + 1)) - 1;
+        if ((control & unused_mask) != 0) {
+          SetError(error_message, "lzss: unused control bits must be zero");
+          return false;
+        }
         break;
       }
       if (((control >> bit) & 1) != 0) {

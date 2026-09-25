@@ -123,6 +123,14 @@ class BitReader {
   // 读 1 bit；超过 bit_count（或字节流提前结束）返回 false。
   bool ReadBit(std::uint32_t* bit, std::string* error_message);
   std::uint64_t consumed() const { return consumed_; }
+  // 最后一个字节里没有被 bit_count 覆盖的低位是否全为 0。格式规定它们是
+  // padding，必须为 0；不查的话"把 padding 改脏"的流照样能解出来。
+  bool PaddingBitsAreZero() const {
+    if (bits_left_ <= 0) {
+      return true;
+    }
+    return (current_ & ((std::uint32_t{1} << bits_left_) - 1)) == 0;
+  }
 
  private:
   SequentialReader* reader_ = nullptr;

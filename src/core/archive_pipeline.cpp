@@ -11,10 +11,15 @@
 //   * 恢复先认证再解密（Encrypt-then-MAC 的必然要求），wrong password 必须
 //     在 HMAC 这一关就失败，而不是靠 PKCS#7 padding 校验失败才发现。
 //
-// 内存边界：pack 与 encrypt 阶段全程流式（256 KiB 缓冲）。压缩阶段例外——
-// HUF1 / LZH1 是"整条流一个 header + 一条 bitstream"的格式，频次表必须看过
-// 全部输入才能确定，所以这一层需要 O(n) 内存（上限见
-// kMaxCompressionInputSize）。
+// 内存边界：三个阶段全程 bounded memory，与归档大小无关。
+//   * pack       —— 逐条目流式写，固定 I/O 缓冲；
+//   * compress   —— Huffman 两遍扫输入（第一遍只攒 256 个频次，第二遍边读边
+//                   写比特）；LZSS 把 token
+//                   流落到**私有工作目录里的临时文件**， 内存只留 32 KiB 窗口 +
+//                   261 B 前瞻；
+//   * encrypt    —— 固定缓冲流式加解密。
+// 实测：256 MiB 语料在 RLIMIT_AS = 160 MiB 下跑完 Huffman 与 LZSS 的
+// backup + restore，峰值 RSS 约 6 MiB（见 tests/unit/stream_rlimit_test.cpp）。
 
 #include "archive_pipeline.h"
 
@@ -58,10 +63,6 @@ std::string Describe(int error_number, const std::string& action,
 }
 
 constexpr std::size_t kStreamBufferSize = 256 * 1024;
-
-// 压缩层是唯一需要整条流在内存里的阶段，这里给它一个明确的上限：
-// 与其在 2 GiB 的归档上 OOM，不如给一句能看懂的失败信息。
-constexpr std::uint64_t kMaxCompressionInputSize = 1ull << 30;
 
 std::string ParentDirectoryOf(const std::string& path) {
   const std::size_t slash = path.rfind('/');
