@@ -15,6 +15,7 @@
 #   ARCHIVE_PIPELINE_EXTRA_FLAGS   追加编译参数（例如 sanitizer）
 #   ARCHIVE_PIPELINE_SKIP_BENCH=1  跳过 128 MiB 级别的打包 benchmark
 #   ARCHIVE_PIPELINE_SKIP_MUTATION=1  跳过确定性 mutation 扫描（约 5 分钟）
+#   ARCHIVE_PIPELINE_SKIP_RLIMIT=1    跳过 RLIMIT_AS 资源测试（256 MiB 语料）
 #   ARCHIVE_PIPELINE_BENCH_BIG     大文件 MiB（默认 128）
 #   ARCHIVE_PIPELINE_BENCH_SMALL   小文件个数（默认 10000）
 
@@ -123,6 +124,20 @@ if [[ "${ARCHIVE_PIPELINE_SKIP_MUTATION:-0}" == "1" ]]; then
     echo "SKIP  mutation sweep"
 else
     compile_and_run mutation_test tests/unit/archive_mutation_test.cpp | tee "$OUT_DIR/mutation_test.log"
+fi
+
+# 压缩 wire format 与冻结 fixture 的逐字节对照 + 流式接口的尺寸交叉校验。
+compile_and_run stream_test tests/unit/compression_stream_test.cpp \
+    "$ROOT_DIR/tests/fixtures/compression" | tee "$OUT_DIR/stream_test.log"
+
+# RLIMIT_AS：在 160 MiB 地址空间的子进程里跑 256 MiB 语料的备份 + 恢复。
+# sanitizer 构建会把地址空间放大好几倍，和低 RLIMIT_AS 天生冲突，所以跳过。
+if [[ "$EXTRA_FLAGS" == *sanitize* ]]; then
+    echo "SKIP  RLIMIT_AS resource test（sanitizer 构建不适合低地址空间上限）"
+elif [[ "${ARCHIVE_PIPELINE_SKIP_RLIMIT:-0}" == "1" ]]; then
+    echo "SKIP  RLIMIT_AS resource test（ARCHIVE_PIPELINE_SKIP_RLIMIT=1）"
+else
+    compile_and_run rlimit_test tests/unit/stream_rlimit_test.cpp | tee "$OUT_DIR/rlimit_test.log"
 fi
 
 # ---- GNU tar 互操作 --------------------------------------------------------

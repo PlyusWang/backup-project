@@ -8,6 +8,14 @@
 //         → 用同一套 canonical 规则重建"每个码长段的起始码字" → 逐比特解码。
 //   探测：LooksLikeHuffman 只做头部自洽性检查，不解压。
 //
+// 编码与解码各**只有一份实现**：字节从内存来还是从文件来，由 SequentialReader
+// 决定；写到内存还是写到 FileSink，由 ByteSinkAdapter 决定。字符串接口与
+// Stream 接口因此不可能漂移——tests/fixtures/compression 里的冻结流会同时
+// 卡住两条路。
+//
+// 内存边界：文件后端全程用固定 256 KiB 缓冲；频次表是 256 个 uint64。
+// 峰值内存与输入大小无关。
+//
 // 确定性：所有遍历都按符号 0..255 升序，建树时用"子树里最小的符号"打破权重
 // 平局，因此同一输入永远得到 byte-for-byte 相同的流。这里不序列化指针，也不
 // 依赖任何无序容器的迭代顺序。
@@ -21,11 +29,13 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <limits>
 #include <queue>
 #include <string>
 #include <utility>
 #include <vector>
 
+#include "codec_io.h"
 #include "compression.h"
 
 namespace backupproject {
@@ -36,18 +46,10 @@ namespace {
 constexpr std::size_t kSymbolCount = 256;
 constexpr char kHuffmanMagic[4] = {'H', 'U', 'F', '1'};
 
-// 坏头部里的 original_size 可以是任意 64 bit 值，预留内存前先夹住：
-// 真正需要的内存由后面的解码循环按需增长，不会因为一个字段就分配几个 GB。
-constexpr std::uint64_t kMaxReserveBytes = std::uint64_t{1} << 26;
-
 void SetError(std::string* error_message, const std::string& text) {
   if (error_message != nullptr) {
     *error_message = text;
   }
-}
-
-std::uint8_t ByteAt(const std::string& data, std::size_t index) {
-  return static_cast<std::uint8_t>(data[index]);
 }
 
 // 头部所有多字节字段都是 little-endian，这里不假设主机字节序。
@@ -57,12 +59,13 @@ void AppendLittleEndian64(std::uint64_t value, std::string* out) {
   }
 }
 
-std::uint64_t ReadLittleEndian64(const std::string& data, std::size_t offset) {
+std::uint64_t ReadLittleEndian64(const unsigned char* data,
+                                 std::size_t offset) {
   std::uint64_t value = 0;
   for (int i = 0; i < 8; ++i) {
-    value |= static_cast<std::uint64_t>(
-                 ByteAt(data, offset + static_cast<std::size_t>(i)))
-             << (8 * i);
+    value |=
+        static_cast<std::uint64_t>(data[offset + static_cast<std::size_t>(i)])
+        << (8 * i);
   }
   return value;
 }
@@ -73,18 +76,19 @@ struct HuffmanHeader {
   std::array<std::uint32_t, kSymbolCount> lengths{};
 };
 
-bool ParseHuffmanHeader(const std::string& data, HuffmanHeader* header) {
-  if (data.size() < kHuffmanHeaderSize) {
+bool ParseHuffmanHeader(const unsigned char* bytes, std::size_t size,
+                        HuffmanHeader* header) {
+  if (size < kHuffmanHeaderSize) {
     return false;
   }
-  if (std::memcmp(data.data(), kHuffmanMagic, sizeof(kHuffmanMagic)) != 0) {
+  if (std::memcmp(bytes, kHuffmanMagic, sizeof(kHuffmanMagic)) != 0) {
     return false;
   }
-  header->original_size = ReadLittleEndian64(data, 4);
+  header->original_size = ReadLittleEndian64(bytes, 4);
   for (std::size_t symbol = 0; symbol < kSymbolCount; ++symbol) {
-    header->lengths[symbol] = ByteAt(data, 12 + symbol);
+    header->lengths[symbol] = bytes[12 + symbol];
   }
-  header->bit_count = ReadLittleEndian64(data, 268);
+  header->bit_count = ReadLittleEndian64(bytes, 268);
   return true;
 }
 
@@ -133,13 +137,9 @@ bool ValidateHuffmanHeader(const HuffmanHeader& header,
   return true;
 }
 
-// 流长度必须精确等于 276 + ceil(bit_count / 8)：多一个字节或少一个字节都算
-// 坏流。用除法算上取整，避免 bit_count + 7 溢出。
-bool PayloadSizeMatches(const std::string& data, const HuffmanHeader& header) {
-  const std::uint64_t payload =
-      header.bit_count / 8 + (header.bit_count % 8 != 0 ? 1 : 0);
-  return static_cast<std::uint64_t>(data.size() - kHuffmanHeaderSize) ==
-         payload;
+// bit_count 对应的净荷字节数。用除法算上取整，避免 bit_count + 7 溢出。
+std::uint64_t PayloadBytesFor(std::uint64_t bit_count) {
+  return bit_count / 8 + (bit_count % 8 != 0 ? 1 : 0);
 }
 
 // 标准 Huffman 建树，只保留每个叶子的深度（即码长）。
@@ -324,96 +324,164 @@ CanonicalTable BuildCanonicalTable(
   return table;
 }
 
-}  // namespace
+// bit_count = Σ frequency[s] * length[s]。frequency 是 uint64、length 最多 32，
+// 乘积可能溢出；一个回绕后的 bit_count 会让编码器写出一个自己都读不回来的流，
+// 所以这里必须查。
+bool ComputeBitCount(const std::array<std::uint64_t, kSymbolCount>& frequency,
+                     const std::array<std::uint32_t, kSymbolCount>& lengths,
+                     std::uint64_t* bit_count, std::string* error_message) {
+  std::uint64_t total = 0;
+  for (std::size_t symbol = 0; symbol < kSymbolCount; ++symbol) {
+    const std::uint64_t length = lengths[symbol];
+    if (length == 0 || frequency[symbol] == 0) {
+      continue;
+    }
+    const std::uint64_t limit =
+        (std::numeric_limits<std::uint64_t>::max() - total) / length;
+    if (frequency[symbol] > limit) {
+      SetError(error_message,
+               "huffman: bit_count 溢出（频率与码长的乘积超出 uint64）");
+      return false;
+    }
+    total += frequency[symbol] * length;
+  }
+  *bit_count = total;
+  return true;
+}
 
-bool HuffmanCompress(const std::string& input, std::string* output,
-                     std::string* error_message) {
-  if (output == nullptr) {
-    SetError(error_message, "huffman: output 是空指针");
+// 顺序读完整条输入，攒出频次表与原始长度。
+bool CountFrequency(SequentialReader* reader,
+                    std::array<std::uint64_t, kSymbolCount>* frequency,
+                    std::uint64_t* total, std::string* error_message) {
+  frequency->fill(0);
+  *total = 0;
+  std::vector<unsigned char> buffer(kStreamBufferSize);
+  while (reader->remaining() > 0) {
+    const std::size_t want = static_cast<std::size_t>(
+        reader->remaining() < kStreamBufferSize ? reader->remaining()
+                                                : kStreamBufferSize);
+    if (!reader->ReadExact(buffer.data(), want, error_message)) {
+      return false;
+    }
+    for (std::size_t index = 0; index < want; ++index) {
+      ++(*frequency)[buffer[index]];
+    }
+    *total += want;
+  }
+  return true;
+}
+
+bool WriteHeader(const std::array<std::uint32_t, kSymbolCount>& lengths,
+                 std::uint64_t original_size, std::uint64_t bit_count,
+                 ByteSinkAdapter* sink, std::string* error_message) {
+  std::string header;
+  header.reserve(kHuffmanHeaderSize);
+  header.append(kHuffmanMagic, sizeof(kHuffmanMagic));
+  AppendLittleEndian64(original_size, &header);
+  for (std::size_t symbol = 0; symbol < kSymbolCount; ++symbol) {
+    header.push_back(static_cast<char>(lengths[symbol]));
+  }
+  AppendLittleEndian64(bit_count, &header);
+  if (header.size() != kHuffmanHeaderSize) {
+    SetError(error_message, "internal: huffman header 长度不对");
     return false;
   }
-  std::array<std::uint64_t, kSymbolCount> frequency{};
-  for (std::size_t i = 0; i < input.size(); ++i) {
-    ++frequency[ByteAt(input, i)];
-  }
+  return sink->Write(header.data(), header.size(), error_message);
+}
+
+// 编码主体：body_reader 从头顺序提供 original_size 个字节。
+bool EncodeCore(std::uint64_t original_size,
+                const std::array<std::uint64_t, kSymbolCount>& frequency,
+                SequentialReader* body_reader, ByteSinkAdapter* sink,
+                std::uint64_t* stream_bytes, std::string* error_message) {
   std::array<std::uint32_t, kSymbolCount> lengths{};
   BuildCodeLengths(frequency, &lengths);
   std::array<std::uint32_t, kSymbolCount> codes{};
   BuildCanonicalTable(lengths, &codes);
-
   std::uint64_t bit_count = 0;
-  for (std::size_t symbol = 0; symbol < kSymbolCount; ++symbol) {
-    bit_count += frequency[symbol] * lengths[symbol];
+  if (!ComputeBitCount(frequency, lengths, &bit_count, error_message)) {
+    return false;
+  }
+  if (!WriteHeader(lengths, original_size, bit_count, sink, error_message)) {
+    return false;
   }
 
-  std::string result;
-  result.reserve(kHuffmanHeaderSize + static_cast<std::size_t>(bit_count / 8) +
-                 1);
-  result.append(kHuffmanMagic, sizeof(kHuffmanMagic));
-  AppendLittleEndian64(static_cast<std::uint64_t>(input.size()), &result);
-  for (std::size_t symbol = 0; symbol < kSymbolCount; ++symbol) {
-    result.push_back(static_cast<char>(lengths[symbol]));
-  }
-  AppendLittleEndian64(bit_count, &result);
-
-  // bitstream：每个字节从最高位开始填，最后一个字节剩下的低位补 0。
-  // buffer 里只保证低 buffered_bits 位有效，左移溢出的高位不参与输出。
-  std::uint64_t buffer = 0;
-  int buffered_bits = 0;
-  for (std::size_t i = 0; i < input.size(); ++i) {
-    const std::uint8_t symbol = ByteAt(input, i);
-    const std::uint32_t length = lengths[symbol];
-    buffer = (buffer << length) | codes[symbol];
-    buffered_bits += static_cast<int>(length);
-    while (buffered_bits >= 8) {
-      buffered_bits -= 8;
-      result.push_back(static_cast<char>((buffer >> buffered_bits) & 0xFF));
+  BitWriter writer;
+  writer.Open(sink);
+  std::vector<unsigned char> buffer(kStreamBufferSize);
+  while (body_reader->remaining() > 0) {
+    const std::size_t want = static_cast<std::size_t>(
+        body_reader->remaining() < kStreamBufferSize ? body_reader->remaining()
+                                                     : kStreamBufferSize);
+    if (!body_reader->ReadExact(buffer.data(), want, error_message)) {
+      return false;
+    }
+    for (std::size_t index = 0; index < want; ++index) {
+      const std::uint8_t symbol = buffer[index];
+      if (!writer.WriteBits(codes[symbol], lengths[symbol], error_message)) {
+        return false;
+      }
     }
   }
-  if (buffered_bits > 0) {
-    result.push_back(static_cast<char>((buffer << (8 - buffered_bits)) & 0xFF));
+  if (!writer.Flush(error_message)) {
+    return false;
   }
-  *output = std::move(result);
+  if (writer.bits_written() != bit_count ||
+      writer.payload_bytes() != PayloadBytesFor(bit_count)) {
+    SetError(error_message, "internal: huffman 写出的比特数与 bit_count 不符");
+    return false;
+  }
+  if (stream_bytes != nullptr) {
+    *stream_bytes = kHuffmanHeaderSize + writer.payload_bytes();
+  }
   return true;
 }
 
-bool HuffmanDecompress(const std::string& input, std::string* output,
-                       std::string* error_message) {
-  if (output == nullptr) {
-    SetError(error_message, "huffman: output 是空指针");
-    return false;
-  }
-  HuffmanHeader header;
-  if (!ParseHuffmanHeader(input, &header)) {
+// 从 reader 的当前位置读 276 字节头部并做全部头部级校验，同时检查"流长度
+// 必须精确等于 276 + ceil(bit_count/8)"。不解码、不分配。
+bool ReadHeaderAt(SequentialReader* reader, HuffmanHeader* header,
+                  std::uint64_t* payload_bytes, std::string* error_message) {
+  unsigned char bytes[kHuffmanHeaderSize];
+  if (!reader->ReadExact(bytes, sizeof(bytes), error_message)) {
     SetError(error_message, "huffman: magic 不是 HUF1 或流短于 276 字节");
     return false;
   }
-  if (!ValidateHuffmanHeader(header, error_message)) {
+  if (!ParseHuffmanHeader(bytes, sizeof(bytes), header)) {
+    SetError(error_message, "huffman: magic 不是 HUF1 或流短于 276 字节");
     return false;
   }
-  if (!PayloadSizeMatches(input, header)) {
+  if (!ValidateHuffmanHeader(*header, error_message)) {
+    return false;
+  }
+  *payload_bytes = PayloadBytesFor(header->bit_count);
+  if (reader->remaining() != *payload_bytes) {
     SetError(error_message, "huffman: 流长度与 bit_count 不符");
     return false;
   }
+  return true;
+}
+
+// 解码主体：从 reader 的当前位置（头部已经读过）解出 header.original_size 个
+// 字节写进 sink。
+bool DecodeBody(SequentialReader* reader, ByteSinkAdapter* sink,
+                const HuffmanHeader& header, std::string* error_message) {
   const CanonicalTable table = BuildCanonicalTable(header.lengths, nullptr);
-  std::string result;
-  result.reserve(static_cast<std::size_t>(
-      std::min<std::uint64_t>(header.original_size, kMaxReserveBytes)));
-  const std::uint8_t* payload =
-      reinterpret_cast<const std::uint8_t*>(input.data()) + kHuffmanHeaderSize;
-  std::uint64_t consumed = 0;
-  while (static_cast<std::uint64_t>(result.size()) < header.original_size) {
+  BitReader bits;
+  bits.Open(reader, header.bit_count);
+  std::string out;
+  out.reserve(kStreamBufferSize);
+  std::uint64_t produced = 0;
+  while (produced < header.original_size) {
     std::uint32_t code = 0;
     std::uint32_t length = 0;
     int symbol = -1;
     while (length < kMaxCodeLength) {
-      if (consumed >= header.bit_count) {
+      std::uint32_t bit = 0;
+      if (!bits.ReadBit(&bit, error_message)) {
         SetError(error_message, "huffman: bitstream 提前结束");
         return false;
       }
-      const int bit = (payload[consumed >> 3] >> (7 - (consumed & 7))) & 1;
-      ++consumed;
-      code = (code << 1) | static_cast<std::uint32_t>(bit);
+      code = (code << 1) | bit;
       ++length;
       if (table.length_count[length] != 0 && code >= table.first_code[length] &&
           code - table.first_code[length] < table.length_count[length]) {
@@ -426,27 +494,210 @@ bool HuffmanDecompress(const std::string& input, std::string* output,
       SetError(error_message, "huffman: 32 bit 内没有匹配的码字");
       return false;
     }
-    result.push_back(static_cast<char>(symbol));
+    out.push_back(static_cast<char>(symbol));
+    ++produced;
+    if (out.size() >= kStreamBufferSize) {
+      if (!sink->Write(out.data(), out.size(), error_message)) {
+        return false;
+      }
+      out.clear();
+    }
   }
   // 解码消耗的比特必须正好等于 bit_count：既能挡住"original_size 被改小"，
   // 也能挡住流尾多余的数据。
-  if (consumed != header.bit_count) {
+  if (bits.consumed() != header.bit_count) {
     SetError(error_message, "huffman: bitstream 的比特数与 original_size 不符");
+    return false;
+  }
+  if (!out.empty() && !sink->Write(out.data(), out.size(), error_message)) {
+    return false;
+  }
+  return true;
+}
+
+}  // namespace
+
+bool HuffmanCompress(const std::string& input, std::string* output,
+                     std::string* error_message) {
+  if (output == nullptr) {
+    SetError(error_message, "huffman: output 是空指针");
+    return false;
+  }
+  SequentialReader counter;
+  counter.OpenMemory(&input);
+  std::array<std::uint64_t, kSymbolCount> frequency{};
+  std::uint64_t total = 0;
+  if (!CountFrequency(&counter, &frequency, &total, error_message)) {
+    return false;
+  }
+  counter.Close();
+
+  std::string result;
+  ByteSinkAdapter sink;
+  sink.OpenMemory(&result);
+  SequentialReader body;
+  body.OpenMemory(&input);
+  if (!EncodeCore(total, frequency, &body, &sink, nullptr, error_message)) {
     return false;
   }
   *output = std::move(result);
   return true;
 }
 
-bool LooksLikeHuffman(const std::string& data) {
+bool HuffmanDecompress(const std::string& input, std::string* output,
+                       std::string* error_message) {
+  if (output == nullptr) {
+    SetError(error_message, "huffman: output 是空指针");
+    return false;
+  }
+  SequentialReader reader;
+  reader.OpenMemory(&input);
   HuffmanHeader header;
-  if (!ParseHuffmanHeader(data, &header)) {
+  std::uint64_t payload_bytes = 0;
+  if (!ReadHeaderAt(&reader, &header, &payload_bytes, error_message)) {
     return false;
   }
-  if (!ValidateHuffmanHeader(header, nullptr)) {
+  std::string result;
+  ByteSinkAdapter sink;
+  sink.OpenMemory(&result);
+  if (!DecodeBody(&reader, &sink, header, error_message)) {
     return false;
   }
-  return PayloadSizeMatches(data, header);
+  if (result.size() != header.original_size) {
+    SetError(error_message, "huffman: 解出的长度与 original_size 不符");
+    return false;
+  }
+  *output = std::move(result);
+  return true;
+}
+
+bool HuffmanReadStreamInfo(const std::string& input_file,
+                           std::uint64_t input_offset, HuffmanStreamInfo* info,
+                           std::string* error_message) {
+  if (info == nullptr) {
+    SetError(error_message, "huffman: info 是空指针");
+    return false;
+  }
+  *info = HuffmanStreamInfo();
+  SequentialReader reader;
+  if (!reader.OpenFile(input_file, error_message)) {
+    return false;
+  }
+  if (input_offset > reader.remaining() ||
+      !reader.Discard(input_offset, error_message)) {
+    SetError(error_message, "huffman: input_offset 超出文件长度");
+    return false;
+  }
+  HuffmanHeader header;
+  std::uint64_t payload_bytes = 0;
+  if (!ReadHeaderAt(&reader, &header, &payload_bytes, error_message)) {
+    return false;
+  }
+  info->original_size = header.original_size;
+  info->bit_count = header.bit_count;
+  info->header_bytes = kHuffmanHeaderSize;
+  info->payload_bytes = payload_bytes;
+  info->stream_bytes = kHuffmanHeaderSize + payload_bytes;
+  return true;
+}
+
+bool HuffmanCompressStream(const std::string& input_file, FileSink* sink,
+                           std::uint64_t* original_size,
+                           std::uint64_t* stream_bytes,
+                           std::string* error_message) {
+  if (sink == nullptr) {
+    SetError(error_message, "huffman: sink 是空指针");
+    return false;
+  }
+  // pass 1：只统计频次与总长度，不保留任何输入字节。
+  SequentialReader counter;
+  if (!counter.OpenFile(input_file, error_message)) {
+    return false;
+  }
+  std::array<std::uint64_t, kSymbolCount> frequency{};
+  std::uint64_t total = 0;
+  if (!CountFrequency(&counter, &frequency, &total, error_message)) {
+    return false;
+  }
+  counter.Close();
+
+  // pass 2：再顺序读一遍，边读边写比特。
+  SequentialReader body;
+  if (!body.OpenFile(input_file, error_message)) {
+    return false;
+  }
+  ByteSinkAdapter adapter;
+  if (!adapter.OpenFile(sink, error_message)) {
+    return false;
+  }
+  std::uint64_t written_bytes = 0;
+  if (!EncodeCore(total, frequency, &body, &adapter, &written_bytes,
+                  error_message)) {
+    return false;
+  }
+  if (original_size != nullptr) {
+    *original_size = total;
+  }
+  if (stream_bytes != nullptr) {
+    *stream_bytes = written_bytes;
+  }
+  return true;
+}
+
+bool HuffmanDecompressStream(const std::string& input_file,
+                             std::uint64_t input_offset, FileSink* sink,
+                             std::uint64_t expected_original_size,
+                             std::uint64_t* written,
+                             std::string* error_message) {
+  if (sink == nullptr) {
+    SetError(error_message, "huffman: sink 是空指针");
+    return false;
+  }
+  SequentialReader reader;
+  if (!reader.OpenFile(input_file, error_message)) {
+    return false;
+  }
+  if (input_offset > reader.remaining() ||
+      !reader.Discard(input_offset, error_message)) {
+    SetError(error_message, "huffman: input_offset 超出文件长度");
+    return false;
+  }
+  HuffmanHeader header;
+  std::uint64_t payload_bytes = 0;
+  if (!ReadHeaderAt(&reader, &header, &payload_bytes, error_message)) {
+    return false;
+  }
+  // 这一条是资源契约：在做任何大规模输出之前，先把"头部声明的长度"和
+  // "容器声明的长度"对上。不一致就直接失败，不等解完几个 GB 才发现。
+  if (header.original_size != expected_original_size) {
+    SetError(error_message, "huffman: original_size 与容器声明的长度不符（" +
+                                std::to_string(header.original_size) + " vs " +
+                                std::to_string(expected_original_size) + "）");
+    return false;
+  }
+  ByteSinkAdapter adapter;
+  if (!adapter.OpenFile(sink, error_message)) {
+    return false;
+  }
+  if (!DecodeBody(&reader, &adapter, header, error_message)) {
+    return false;
+  }
+  if (adapter.bytes_written() != expected_original_size) {
+    SetError(error_message, "huffman: 解出的长度与 original_size 不符");
+    return false;
+  }
+  if (written != nullptr) {
+    *written = adapter.bytes_written();
+  }
+  return true;
+}
+
+bool LooksLikeHuffman(const std::string& data) {
+  SequentialReader reader;
+  reader.OpenMemory(&data);
+  HuffmanHeader header;
+  std::uint64_t payload_bytes = 0;
+  return ReadHeaderAt(&reader, &header, &payload_bytes, nullptr);
 }
 
 }  // namespace compression

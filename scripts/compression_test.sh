@@ -3,7 +3,7 @@
 # 压缩模块的编译 + 测试 + 基准入口。
 #
 # 只做两件事：
-#   1. 用 -Wall -Wextra -Wpedantic 编译 include/compression.h + src/compression/*.cpp；
+#   1. 用 -Wall -Wextra -Wpedantic 编译 src/compression/*.cpp + 它们依赖的 src/core/file_io.cpp；
 #   2. 跑单元测试与 benchmark，最后打印 "compression: N/M checks passed"。
 #
 # 产物一律放在临时目录（默认 /tmp），不写 tests/output，避免和别的任务抢文件。
@@ -22,9 +22,13 @@ if [[ -n "${EXTRA_CXXFLAGS:-}" ]]; then
     CXXFLAGS+=(${EXTRA_CXXFLAGS})
 fi
 
+# 编解码器现在只有一份实现，字符串接口与文件接口共用同一套比特语义，
+# 因此也依赖 file_io 的 FileSink / FileSource / ByteSinkAdapter。
 SOURCES=(
+    "$ROOT_DIR/src/compression/codec_io.cpp"
     "$ROOT_DIR/src/compression/huffman.cpp"
     "$ROOT_DIR/src/compression/lzss.cpp"
+    "$ROOT_DIR/src/core/file_io.cpp"
 )
 
 mkdir -p "$OUT_DIR"

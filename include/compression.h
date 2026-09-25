@@ -3,8 +3,10 @@
 // 手写压缩编解码：Canonical Huffman（HUF1）与 LZSS + Canonical
 // Huffman（LZH1）。
 //
-// 两个格式都是"整段输入在内存里、输出是完整压缩流"的一次性接口，头部字段全部
-// little-endian：
+// 每个格式只有**一份**实现，两种后端：
+//   * 字符串接口（单元测试、已知向量、小数据）：内存后端；
+//   * Stream 接口（产品流水线）：文件后端，整条流不进内存。
+// 头部字段全部 little-endian：
 //
 //   HUF1  offset 0   4 字节  magic = "HUF1"
 //         offset 4   8 字节  uint64 original_size
@@ -32,6 +34,8 @@
 #include <cstddef>
 #include <cstdint>
 #include <string>
+
+#include "file_io.h"
 
 namespace backupproject {
 namespace compression {
@@ -75,6 +79,70 @@ bool LzssDecode(const std::string& tokens, std::uint64_t original_size,
 // 长度），不做完整解压，也不分配与 original_size 同量级的内存。
 bool LooksLikeHuffman(const std::string& data);
 bool LooksLikeLzssHuffman(const std::string& data);
+
+// ---- 流式（文件到文件）接口 ------------------------------------------------
+//
+// 产品流水线只走这一组。峰值内存与输入大小无关：
+//   Huffman：256 个频次 + 两个固定 I/O 缓冲；
+//   LZSS：32 KiB 窗口 + 261 字节前瞻 + 固定 I/O 缓冲 + 一个私有 token
+//   临时文件。
+//
+// expected_original_size 是调用方从 container header 知道的期望输出长度。
+// 头部里的 original_size 与它不一致时**立刻失败**，不等解完几 GB 才发现。
+
+struct HuffmanStreamInfo {
+  std::uint64_t original_size = 0;
+  std::uint64_t bit_count = 0;
+  std::uint64_t header_bytes = kHuffmanHeaderSize;
+  std::uint64_t payload_bytes = 0;  // ceil(bit_count / 8)
+  std::uint64_t stream_bytes = 0;  // header + payload，必须精确等于流长度
+};
+
+// 只读 HUF1 头部并做全部头部级校验，不解码。流从 input_offset 开始，
+// 必须正好用完文件剩下的字节。
+bool HuffmanReadStreamInfo(const std::string& input_file,
+                           std::uint64_t input_offset, HuffmanStreamInfo* info,
+                           std::string* error_message);
+
+// 把整个 input_file 压成一条 HUF1 流写进 sink。
+bool HuffmanCompressStream(const std::string& input_file, FileSink* sink,
+                           std::uint64_t* original_size,
+                           std::uint64_t* stream_bytes,
+                           std::string* error_message);
+
+// 解码 input_file 里从 input_offset 开始的 HUF1 流，输出写进 sink。
+bool HuffmanDecompressStream(const std::string& input_file,
+                             std::uint64_t input_offset, FileSink* sink,
+                             std::uint64_t expected_original_size,
+                             std::uint64_t* written,
+                             std::string* error_message);
+
+struct LzssHuffmanStreamInfo {
+  std::uint64_t original_size = 0;
+  std::uint64_t token_stream_size = 0;
+  std::uint64_t header_bytes = kLzssHuffmanHeaderSize;
+  HuffmanStreamInfo inner;  // inner.original_size 必须等于 token_stream_size
+  std::uint64_t stream_bytes = 0;  // 20 + inner.stream_bytes
+};
+
+// 只读 LZH1 外层头部与内层 HUF1 头部，并交叉校验两者的长度字段。
+bool LzssHuffmanReadStreamInfo(const std::string& input_file,
+                               LzssHuffmanStreamInfo* info,
+                               std::string* error_message);
+
+// workspace_directory 必须是调用方已经建好的 0700 私有目录：LZSS 的中间
+// token 流会以 0600 落在那里，成功或失败都会被清掉。
+bool LzssHuffmanCompressStream(const std::string& input_file, FileSink* sink,
+                               const std::string& workspace_directory,
+                               std::uint64_t* original_size,
+                               std::uint64_t* stream_bytes,
+                               std::string* error_message);
+
+bool LzssHuffmanDecompressStream(const std::string& input_file, FileSink* sink,
+                                 const std::string& workspace_directory,
+                                 std::uint64_t expected_original_size,
+                                 std::uint64_t* written,
+                                 std::string* error_message);
 
 }  // namespace compression
 }  // namespace backupproject

@@ -12,7 +12,7 @@ CORE_SOURCES := src/core/archive_entry.cpp src/core/archive_pipeline.cpp \
                 src/archive/archive_path.cpp src/archive/container_format.cpp \
                 src/archive/mypack_v2.cpp src/archive/pack_stream.cpp \
                 src/archive/ustar.cpp src/catalog/backup_catalog.cpp \
-                src/config/config_manager.cpp src/compression/huffman.cpp \
+                src/config/config_manager.cpp src/compression/codec_io.cpp src/compression/huffman.cpp \
                 src/compression/lzss.cpp src/crypto/aes.cpp \
                 src/crypto/des.cpp src/crypto/hmac.cpp src/crypto/pbkdf2.cpp \
                 src/crypto/random.cpp src/crypto/sha256.cpp \
