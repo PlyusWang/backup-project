@@ -25,6 +25,12 @@
 #      源目录含 symlink 与 FIFO 时，恢复后仍必须是 S_ISLNK（target 一致）与
 #      S_ISFIFO。
 #  10. 损坏 .bak 场景下管理页仍能正常渲染。
+#  11. 备份算法选项与密码：QML 结构约束（高级选项面板 / 两个密码框 / 禁用措辞 /
+#      产品 CLI 没有 --password 选项）；--backup-options-test 走真实控制器路径
+#      验证解析表、四种算法组合、密码校验、未知 key、加密与 legacy 恢复、
+#      目录字段、密码不落盘。
+#  12. 截图（写进 tests/output/，评审产物不进仓库）：两套主题 × 四页 +
+#      高级选项展开 + 加密恢复密码对话框。
 #
 # 所有 GUI 调用都带 --config-file 指向临时目录，并且导出临时 XDG_CONFIG_HOME：
 # AppTheme 的 QSettings 与 QStandardPaths 都跟着它走，测试绝不读写真实用户配置。
@@ -335,9 +341,10 @@ for page in BackupPage BackupManagementPage SettingsPage; do
   expect_count_re "$RESOURCE_FILE" "qml/pages/${page}\.qml" 1 "resources.qrc 收录 $page.qml"
 done
 
-# 备份页：源目录输入框 + 浏览 + 开始备份 = 3 处绑定 !controller.busy。
+# 备份页：源目录输入框 + 浏览 + 更改仓库 + 开始备份 = 4 处绑定 !controller.busy。
 # 计数式断言同时防"漏绑 busy"和"复制粘贴出多余按钮"。
-expect_count "$QML_DIR/pages/BackupPage.qml" "enabled: !controller.busy" 3 \
+# "更改仓库"属于这一组：任务期间不给跳走，与管理页的"刷新"用同一条禁用规则。
+expect_count "$QML_DIR/pages/BackupPage.qml" "enabled: !controller.busy" 4 \
   "备份页忙碌时禁用输入与按钮"
 # 设置页：仓库输入框 + 浏览目录 + 保存设置 = 3 处。
 expect_count "$QML_DIR/pages/SettingsPage.qml" "enabled: !controller.busy" 3 \
@@ -346,13 +353,21 @@ expect_count "$QML_DIR/pages/SettingsPage.qml" "enabled: !controller.busy" 3 \
 expect_count "$QML_DIR/pages/BackupManagementPage.qml" \
   "enabled: !controller.catalogBusy && !controller.busy" 1 \
   "管理页刷新按钮在刷新或操作期间禁用"
-# 记录卡片上的恢复 / 删除两个动作都受自己的 busy 约束。
-expect_count "$QML_DIR/components/BackupRecordCard.qml" "card.busy" 2 \
-  "备份记录卡片的恢复 / 删除受忙碌状态约束"
+# 记录卡片上的忙碌开关：恢复 / 删除 / 恢复密码输入 / 恢复密码确认共 4 处。
+# 数量从 2 涨到 4 是 PR #16 加了加密恢复对话框 —— 多出来的两处同样必须
+# 绑 busy，否则任务进行中密码框还能被编辑。
+expect_count "$QML_DIR/components/BackupRecordCard.qml" "card.busy" 4 \
+  "备份记录卡片的恢复 / 删除 / 密码输入 / 密码确认受忙碌状态约束"
 
 # QML 与核心的分工：界面只调用控制器，不自己持有核心对象、不拼路径。
-expect_count_re "$QML_DIR/pages/BackupPage.qml" 'controller\.startBackup\(\)' 1 \
-  "备份页调用 controller.startBackup()"
+# 备份页从 PR #16 起走带算法选项的入口；startBackup() 在控制器内部就是
+# 它的 mypack + none + none 等价形式，产品界面不再直接调用那个名字。
+expect_count_re "$QML_DIR/pages/BackupPage.qml" 'controller\.startBackupWithOptions\(' 1 \
+  "备份页调用 controller.startBackupWithOptions()"
+# 反向也钉死：产品页不再直接调用不带选项的旧入口。0 次是硬要求 ——
+# 少了这一条，"两个入口都被调用"这种半迁移状态照样能通过。
+expect_count_re "$QML_DIR/pages/BackupPage.qml" 'controller\.startBackup\(\)' 0 \
+  "备份页不再直接调用 controller.startBackup()"
 expect_count_re "$QML_DIR/pages/SettingsPage.qml" 'controller\.saveRepositoryPath\(' 1 \
   "设置页调用 controller.saveRepositoryPath()"
 expect_count_re "$QML_DIR/pages/BackupManagementPage.qml" 'controller\.refreshBackups\(\)' 1 \
@@ -847,6 +862,438 @@ expect_count_re "$ROOT_DIR/tests/unit/backup_catalog_test.cpp" \
 expect_count_re "$ROOT_DIR/tests/unit/backup_catalog_test.cpp" \
   'TEST\(CatalogDelete, DeletesCorruptedArchive\)' 1 \
   "坏 .bak 仍可删除（由 core 测试覆盖）"
+
+echo "[modern-gui] 11) 备份算法选项与密码（QML 静态约束 + --backup-options-test）"
+# 高级选项面板是独立组件：三个选择器 + 两个密码框都写在面板里，
+# 备份页只负责把面板当前选中的键与密码交给控制器，不自己解释枚举数字。
+expect_count_re "$QML_DIR/pages/BackupPage.qml" 'BackupOptionsPanel[[:space:]]*\{' 1 \
+  "备份页引用 BackupOptionsPanel"
+expect_count_re "$QML_DIR/components/BackupOptionsPanel.qml" \
+  'objectName:[[:space:]]*"backupOptionsPanel"' 1 \
+  "面板的 objectName 是 backupOptionsPanel"
+for selector in packSelector compressionSelector encryptionSelector passwordField confirmPasswordField; do
+  expect_count_re "$QML_DIR/components/BackupOptionsPanel.qml" \
+    "objectName:[[:space:]]*\"$selector\"" 1 \
+    "面板定义 $selector"
+done
+# 默认值必须与 PR #15 一字不差（mypack + 不压缩 + 不加密），并且默认收起：
+# 不展开高级选项的用户，拿到的产物与加这个面板之前完全相同。
+expect_count_re "$QML_DIR/components/BackupOptionsPanel.qml" \
+  'property string packKey:[[:space:]]*"mypack"' 1 "默认打包方式是 mypack"
+expect_count_re "$QML_DIR/components/BackupOptionsPanel.qml" \
+  'property string compressionKey:[[:space:]]*"none"' 1 "默认压缩方式是 none"
+expect_count_re "$QML_DIR/components/BackupOptionsPanel.qml" \
+  'property string encryptionKey:[[:space:]]*"none"' 1 "默认加密方式是 none"
+expect_count_re "$QML_DIR/components/BackupOptionsPanel.qml" \
+  'property bool expanded:[[:space:]]*false' 1 "面板默认收起"
+expect_count_re "$QML_DIR/components/BackupOptionsPanel.qml" \
+  '展开高级选项' 1 "收起状态提供「展开高级选项」入口"
+# 密码与确认密码都必须是密码框，数量一并钉死：少一个等于明文回显，
+# 多一个说明有人又加了一个没有说明的密码入口。
+expect_count "$QML_DIR/components/BackupOptionsPanel.qml" \
+  "echoMode: TextInput.Password" 2 "面板的两个密码框都遮住输入"
+expect_count "$QML_DIR/components/BackupRecordCard.qml" \
+  "echoMode: TextInput.Password" 1 "恢复密码框也遮住输入"
+# DES 是课程用的旧算法：下拉里的名字必须挂着这个标记，免得有人在真实数据上误选。
+if grep -qF '教学 / 旧算法' "$QML_DIR/components/BackupOptionsPanel.qml"; then
+  record_pass "DES 选项标注「教学 / 旧算法」"
+else
+  record_fail "DES 选项没有「教学 / 旧算法」标注"
+fi
+# 手写密码学实现的免责声明必须写在用户做选择的地方，而不是只写在文档里。
+if grep -qF '未经专业密码学审计' "$QML_DIR/components/BackupOptionsPanel.qml"; then
+  record_pass "选中加密时给出「未经专业密码学审计」声明"
+else
+  record_fail "缺少密码学免责声明"
+fi
+# 收起时的一行摘要：三段算法名用「 · 」连接，正好两个分隔符。
+expect_count "$QML_DIR/components/BackupOptionsPanel.qml" '" · "' 2 \
+  "摘要用「 · 」连接三段算法名"
+expect_count_re "$QML_DIR/components/BackupOptionsPanel.qml" \
+  'objectName:[[:space:]]*"backupOptionsSummary"' 1 "摘要文本有 objectName"
+
+# 记录卡片：加密记录要能提示需要密码，并且能在卡片内就地收一次恢复密码。
+for token in passwordRequired pendingRestoreDestination restorePassword; do
+  if grep -qF "$token" "$QML_DIR/components/BackupRecordCard.qml"; then
+    record_pass "记录卡片包含 $token"
+  else
+    record_fail "记录卡片缺少 $token"
+  fi
+done
+if grep -qF '需要密码恢复' "$QML_DIR/components/BackupRecordCard.qml"; then
+  record_pass "加密记录标注「需要密码恢复」"
+else
+  record_fail "加密记录没有「需要密码恢复」标注"
+fi
+# 对话框正文与规范原文逐字一致：PR #16 §13 要求的就是
+# 「此备份已加密，需要密码才能恢复。」。这里刻意只接受这一句 ——
+# 少一个"才能"就说明实现、规范和测试三处已经开始各说各话，
+# 而"两种措辞都接受"恰恰是让这种漂移不被发现的写法。
+if grep -qF '此备份已加密，需要密码才能恢复。' "$QML_DIR/components/BackupRecordCard.qml"; then
+  record_pass "恢复密码对话框说明「此备份已加密，需要密码才能恢复。」"
+else
+  record_fail "恢复密码对话框正文与规范不一致（应为「此备份已加密，需要密码才能恢复。」）"
+fi
+
+# 回调必须接在产品入口上：备份走带选项的入口，加密恢复走带密码的入口。
+expect_count_re "$QML_DIR/pages/BackupPage.qml" \
+  'controller\.startBackupWithOptions\(' 1 \
+  "备份页调用 controller.startBackupWithOptions()"
+expect_count_re "$QML_DIR/components/BackupRecordCard.qml" \
+  'controller\.startManagedRestoreWithPassword\(' 1 \
+  "加密恢复调用 controller.startManagedRestoreWithPassword()"
+
+# 密码生命周期：产品提交路径必须在 Start() 接受任务之后才清空密码框。
+# 只断言"面板里存在 clearPasswords() 函数"是挡不住问题的 —— 本轮修掉的洞正是
+# "函数存在，但按钮压根没调用它"。所以这两条要一起看：
+#   1) 结构断言：返回值被存进 started，且 clearPasswords() 只在 started 为真时调用；
+#   2) 计数断言：这个调用在备份页里恰好一次，多出来的无保护调用会被抓住。
+# QML 折行会把这个 if 拆成三行，正则跨不了行，所以先把文件压成一行再匹配整段结构。
+SQUASHED_BACKUP_PAGE="$(tr -d '\n' < "$QML_DIR/pages/BackupPage.qml" | tr -s ' ')"
+if printf '%s' "$SQUASHED_BACKUP_PAGE" \
+    | grep -qE 'const started = controller\.startBackupWithOptions\([^)]*\) if \(started\) panel\.clearPasswords\(\)'; then
+  record_pass "备份页检查 startBackupWithOptions() 的返回值，且只有成功才 panel.clearPasswords()"
+else
+  record_fail "备份页没有把 startBackupWithOptions() 的返回值与 clearPasswords() 关联（同步校验失败时会误清密码）"
+fi
+expect_count_re "$QML_DIR/pages/BackupPage.qml" 'panel\.clearPasswords\(\)' 1 \
+  "备份页调用 panel.clearPasswords()"
+expect_count_re "$QML_DIR/components/BackupOptionsPanel.qml" 'function clearPasswords\(\)' 1 \
+  "面板提供 clearPasswords()"
+# 光有函数还不够：它必须真的把两个输入框都清掉，并且在清空的同时复位"已请求过校验"，
+# 否则成功提交之后那行"密码不能为空"会立刻跳出来，看起来像刚输错。
+# password / confirmPassword 是这两个 TextField 的 text 的 readonly 绑定
+# （不是 property alias），所以清 text 就等于清掉对外暴露的那两个属性。
+SQUASHED_PANEL="$(tr -d '\n' < "$QML_DIR/components/BackupOptionsPanel.qml" | tr -s ' ')"
+if printf '%s' "$SQUASHED_PANEL" \
+    | grep -qE 'function clearPasswords\(\) \{ passwordField\.text = "" confirmField\.text = "" panel\.passwordValidationRequested = false \}'; then
+  record_pass "clearPasswords() 清空两个输入框并复位 passwordValidationRequested"
+else
+  record_fail "clearPasswords() 没有同时清空两个输入框并复位校验请求状态"
+fi
+
+# 被禁用的措辞。只认代码行：注释里写"这里绝不写校验通过"正是这些规则的用意，
+# 把解释性注释也算成违规，只会逼着人删掉解释。
+forbidden_hits="$(grep -rnE '军用级|不可破解|绝对安全|生产级安全|校验通过|HMAC verified|归档健康|密码正确|记住密码' "$QML_DIR" \
+  | grep -vE ':[0-9]+:[[:space:]]*//' || true)"
+if [[ -n "$forbidden_hits" ]]; then
+  record_fail "QML 里出现被禁用的安全措辞"
+  printf '%s\n' "$forbidden_hits" | sed 's/^/      /'
+else
+  record_pass "QML 没有出现被禁用的安全措辞（军用级 / 不可破解 / 校验通过 / 记住密码 …）"
+fi
+
+# 真实控制器路径：解析表 / 四种算法组合 / 密码校验 / 未知 key / 加密与 legacy 恢复 /
+# 目录字段 / 密码不落盘全部由它自己断言，脚本只信退出码并把它那一行结论抄进日志 ——
+# 在 bash 里重写一遍同样的断言，只会得到第二份需要同步维护的实现。
+OPTIONS_LOG="$TEST_STATE_DIR/backup-options.log"
+SHOT_ENC_BAK="$TEST_STATE_DIR/shot-encrypted.bak"
+rm -f "$SHOT_ENC_BAK"
+set +e
+BACKUP_MODERN_KEEP_OPTIONS_ARTIFACT="$SHOT_ENC_BAK" \
+  QT_QPA_PLATFORM=offscreen QSG_RHI_BACKEND=software timeout 600 \
+  ./build/backup-gui-modern --backup-options-test \
+  --config-file "$TEST_CONFIG_FILE" > "$OPTIONS_LOG" 2>&1
+options_status=$?
+set -e
+grep -E '^\[backup-options\] (PASS|FAIL) ' "$OPTIONS_LOG" | sed 's/^/[modern-gui]     /' || true
+sed 's/^/[modern-gui]     /' "$OPTIONS_LOG" | grep -E 'observed|records=' || true
+cat "$OPTIONS_LOG" >> "$LOG_FILE"
+if [[ "$options_status" -eq 0 ]] && grep -qE '^\[backup-options\] PASS [0-9]+/[0-9]+$' "$OPTIONS_LOG"; then
+  options_line="$(grep -E '^\[backup-options\] PASS [0-9]+/[0-9]+$' "$OPTIONS_LOG" | tail -1)"
+  record_pass "--backup-options-test 全部通过（$options_line）"
+else
+  record_fail "--backup-options-test 退出码 $options_status"
+  tail -20 "$OPTIONS_LOG"
+fi
+
+# 产品 CLI 不允许出现密码选项：argv 里的密码会出现在 ps 输出与 shell 历史里，
+# 这正是密码只走 GUI 输入框、测试只用固定密码的原因。
+# backupctl.cpp 自己解析参数（没有共用的 parser 头），所以 app/ 整个目录
+# 就是全部 CLI 选项面；将来多一个入口也跑不掉。
+cli_password_hits="$(grep -rn -- '--password' "$ROOT_DIR/app" || true)"
+if [[ -n "$cli_password_hits" ]]; then
+  record_fail "产品 CLI 出现了 --password 选项"
+  printf '%s\n' "$cli_password_hits" | sed 's/^/      /'
+else
+  record_pass "产品 CLI 没有 --password 选项（密码只经 GUI 输入框进控制器）"
+fi
+
+echo "[modern-gui] 12) 截图（人工评审用，不进仓库）"
+# 截图放 tests/output/ 下（已 gitignore），是评审产物不是仓库内容。
+SHOT_DIR="$ROOT_DIR/tests/output/screenshots"
+SHOT_STATE="$TEST_STATE_DIR/shot-state"
+SHOT_PLAIN_REPO="$SHOT_STATE/plain-repo"
+SHOT_ENC_REPO="$SHOT_STATE/encrypted-repo"
+SHOT_PLAIN_CFG="$SHOT_STATE/plain-config.json"
+SHOT_ENC_CFG="$SHOT_STATE/encrypted-config.json"
+rm -rf "$SHOT_DIR" "$SHOT_STATE"
+mkdir -p "$SHOT_PLAIN_REPO" "$SHOT_ENC_REPO"
+# 两种仓库状态各抓一轮：只含未加密 v2 记录 / 只含加密 v2 记录。
+# 两份记录都是产品路径真实产出的 v2 容器副本（--repository-test 的 kept artifact
+# 与 --backup-options-test 保留的 AES 产物），不是手工拼出来的假文件。
+if [[ -f "$REPO_KEPT" ]]; then
+  cp "$REPO_KEPT" "$SHOT_PLAIN_REPO/shot-plain_20260101_000000.bak"
+else
+  record_fail "截图用的未加密 v2 产物副本缺失：$REPO_KEPT"
+fi
+if [[ -f "$SHOT_ENC_BAK" ]]; then
+  cp "$SHOT_ENC_BAK" "$SHOT_ENC_REPO/shot-encrypted_20260101_000000.bak"
+else
+  record_fail "截图用的加密 v2 产物副本缺失：$SHOT_ENC_BAK"
+fi
+printf '{\n  "version": 1,\n  "backup_repository_path": "%s"\n}\n' "$SHOT_PLAIN_REPO" > "$SHOT_PLAIN_CFG"
+printf '{\n  "version": 1,\n  "backup_repository_path": "%s"\n}\n' "$SHOT_ENC_REPO" > "$SHOT_ENC_CFG"
+
+# 一轮截图 = 八张固定状态（四页 × 两主题）+ 高级选项展开两张（两主题）
+# + 调用方追加的状态（只有加密仓库那一轮才有恢复密码对话框）。
+shot_run() {
+  local label="$1"
+  local out_dir="$2"
+  local config="$3"
+  shift 3
+  set +e
+  QT_QPA_PLATFORM=offscreen QSG_RHI_BACKEND=software timeout 180 \
+    ./build/backup-gui-modern --screenshot "$out_dir" \
+    --config-file "$config" >> "$LOG_FILE" 2>&1
+  local status=$?
+  set -e
+  if [[ "$status" -ne 0 ]]; then
+    record_fail "截图模式失败（$label，退出码 $status）"
+    return
+  fi
+  local expected="home-light home-dark backup-light backup-dark"
+  expected="$expected management-light management-dark"
+  expected="$expected settings-light settings-dark"
+  expected="$expected backup-expanded-light backup-expanded-dark"
+  for extra in "$@"; do
+    expected="$expected $extra"
+  done
+  local expected_count=0
+  local missing=0
+  for name in $expected; do
+    expected_count=$((expected_count + 1))
+    if [[ ! -s "$out_dir/$name.png" ]]; then
+      echo "[modern-gui]     缺少截图: $out_dir/$name.png"
+      missing=$((missing + 1))
+    fi
+  done
+  if [[ "$missing" -eq 0 ]]; then
+    record_pass "截图 $label：$expected_count 张齐全"
+  else
+    record_fail "截图 $label：缺 $missing 张"
+  fi
+}
+
+shot_run "未加密 v2 记录（备份页收起 / 展开 + 管理页）" "$SHOT_DIR/plain" "$SHOT_PLAIN_CFG"
+shot_run "加密 v2 记录（管理页 + 恢复密码对话框）" "$SHOT_DIR/encrypted" \
+  "$SHOT_ENC_CFG" "management-password-dialog-light" "management-password-dialog-dark"
+echo "[modern-gui]     截图目录: $SHOT_DIR（评审产物，已被 gitignore）"
+
+# 截图是评审产物，不是仓库内容：目录必须仍然被 .gitignore 覆盖，
+# 否则下一次 git add -A 就会把 PNG 提交进去。
+if grep -qE '^/tests/output/' "$ROOT_DIR/.gitignore"; then
+  record_pass "截图目录 tests/output/ 仍被 .gitignore 覆盖"
+else
+  record_fail "tests/output/ 不再被 .gitignore 覆盖，截图有被提交的风险"
+fi
+
+echo "[modern-gui] 13) 仓库设置入口（configured 状态下也能直接改仓库）"
+
+# 人工验收发现的缺口：仓库配好之后，备份页与管理页都只剩"当前路径"这一行，
+# 没有回到设置页改仓库的入口 —— 而"配置还在、目录已经被删掉"恰恰是最需要它的时候。
+# 两个页面本来就都有 openSettings() 信号、Main.qml 也已经连到设置页，
+# 所以这里断言的是"按钮真的接在那个信号上"，而不是又造一套跳转机制。
+
+# 从一个 objectName 处取到该 AppButton 块的结尾，再在块内逐项断言。
+# 对整块写一条大正则太脆：缩进或换行一调就误报；块内断言则只在字段真的
+# 被删掉或改坏时才失败。
+button_block() {
+  local file="$1"
+  local name="$2"
+  awk -v want="objectName: \"$name\"" '
+    index($0, want) { inside = 1 }
+    inside { print }
+    inside && /^[[:space:]]*}[[:space:]]*$/ { exit }
+  ' "$file"
+}
+
+assert_button() {
+  local file="$1"
+  local name="$2"
+  local label="$3"
+  shift 3
+  local block
+  block="$(button_block "$file" "$name")"
+  if [[ -z "$block" ]]; then
+    record_fail "$label（$(basename "$file") 里找不到 objectName: $name 的按钮）"
+    return 0
+  fi
+  local missing=""
+  local needle
+  for needle in "$@"; do
+    printf '%s\n' "$block" | grep -qF -- "$needle" || missing="$missing [$needle]"
+  done
+  if [[ -z "$missing" ]]; then
+    record_pass "$label"
+  else
+    record_fail "$label（缺少：$missing）"
+  fi
+}
+
+BACKUP_PAGE="$QML_DIR/pages/BackupPage.qml"
+MGMT_PAGE="$QML_DIR/pages/BackupManagementPage.qml"
+
+# 没有信号就谈不上接线，所以先把两个信号本身钉住。
+expect_count_re "$BACKUP_PAGE" '^    signal openSettings\(\)$' 1 \
+  "备份页声明 openSettings 信号"
+expect_count_re "$MGMT_PAGE" '^    signal openSettings\(\)$' 1 \
+  "备份管理页声明 openSettings 信号"
+
+assert_button "$BACKUP_PAGE" changeRepositoryButton \
+  "备份页 configured 状态提供「更改仓库」并接到 page.openSettings()" \
+  'text: "更改仓库"' \
+  'visible: controller.repositoryConfigured' \
+  'iconName: "settings"' \
+  'onClicked: page.openSettings()'
+
+assert_button "$BACKUP_PAGE" goToSettingsButton \
+  "备份页 unconfigured 状态仍是「前往设置」" \
+  'text: "前往设置"' \
+  'visible: !controller.repositoryConfigured' \
+  'onClicked: page.openSettings()'
+
+assert_button "$MGMT_PAGE" changeRepositoryButton \
+  "管理页 configured 状态提供「更改仓库」并接到 page.openSettings()" \
+  'text: "更改仓库"' \
+  'visible: controller.repositoryConfigured' \
+  'iconName: "settings"' \
+  'onClicked: page.openSettings()'
+
+assert_button "$MGMT_PAGE" refreshBackupsButton \
+  "管理页「刷新」仍在，语义未变" \
+  'text: "刷新"' \
+  'iconName: "refresh"' \
+  'onClicked: controller.refreshBackups()'
+
+assert_button "$MGMT_PAGE" goToSettingsButton \
+  "管理页 unconfigured 状态只留「前往设置」" \
+  'text: "前往设置"' \
+  'visible: !controller.repositoryConfigured'
+
+# 「更改仓库」的可见性只能挂在 repositoryConfigured 上。人工验收遇到的正是
+# "配置还在、目录已被删"（catalogError 非空、记录为 0）：那种情况下这个入口
+# 恰恰最该出现，所以它绝不能顺带依赖 catalogError 或 backupRecords。
+if printf '%s\n' "$(button_block "$MGMT_PAGE" changeRepositoryButton)" \
+    | grep -qF -- 'visible: controller.repositoryConfigured'; then
+  record_pass "管理页「更改仓库」只看 repositoryConfigured，catalogError 场景下依然可进入设置"
+else
+  record_fail "管理页「更改仓库」的可见性被别的条件影响，catalogError 场景可能进不去设置"
+fi
+
+# 换仓库这件事只能发生在设置页：这两个页面都不许自己落盘。
+for repo_page in "$BACKUP_PAGE" "$MGMT_PAGE"; do
+  if grep -q 'saveRepositoryPath' "$repo_page"; then
+    record_fail "$(basename "$repo_page") 直接调用了 saveRepositoryPath()，绕过了设置页"
+  else
+    record_pass "$(basename "$repo_page") 没有绕过设置页直接保存仓库"
+  fi
+done
+
+echo "[modern-gui] 14) 密码校验时机与自定义 Dialog 内边距"
+
+PANEL_QML="$QML_DIR/components/BackupOptionsPanel.qml"
+BACKUP_PAGE_QML="$QML_DIR/pages/BackupPage.qml"
+SQUASHED_PANEL_V2="$(tr -d '\n' < "$PANEL_QML" | tr -s ' ')"
+SQUASHED_PAGE_V2="$(tr -d '\n' < "$BACKUP_PAGE_QML" | tr -s ' ')"
+
+# --- 密码校验从"纯实时"改成"提交时请求" ---
+expect_count_re "$PANEL_QML" 'property bool passwordValidationRequested: false' 1 \
+  "面板声明 passwordValidationRequested，默认 false"
+expect_count_re "$PANEL_QML" 'function requestPasswordValidation\(\)' 1 \
+  "面板提供 requestPasswordValidation()"
+if printf '%s' "$SQUASHED_PANEL_V2" \
+    | grep -qE 'function requestPasswordValidation\(\) \{ panel\.passwordValidationRequested = true \}'; then
+  record_pass "requestPasswordValidation() 会把 passwordValidationRequested 置真"
+else
+  record_fail "requestPasswordValidation() 没有把 passwordValidationRequested 置真"
+fi
+# 提示的显示条件必须同时看"请求过校验"和"当前文案非空"。只跟 validationMessage
+# 走就是本轮修掉的旧行为：密码被程序清空后立刻报"密码不能为空"。
+if printf '%s' "$SQUASHED_PANEL_V2" \
+    | grep -qE 'objectName: "passwordValidationText" .*visible: panel\.passwordValidationRequested && panel\.validationMessage\.length > 0'; then
+  record_pass "校验提示的 visible 同时依赖 passwordValidationRequested 与非空 validationMessage"
+else
+  record_fail "校验提示的 visible 条件不对（可能又变回只跟着 validationMessage 实时显示）"
+fi
+# 切换加密算法必须复位"已尝试提交"，否则刚点过 AES 又切到 DES 会继承上一次的红字。
+# 这一段先按行切出来再分别看两个分支：两个分支里都写了说明注释，直接把整段折叠成
+# 一行再写一条大正则会卡在注释文本上 —— 注释是代码的一部分，不是可以忽略的噪音。
+ENCRYPTION_HANDLER="$(awk '
+  /^    onEncryptionKeyChanged: \{/ { inside = 1 }
+  inside { print }
+  inside && /^    \}$/ { exit }
+' "$PANEL_QML" | tr -d '\n' | tr -s ' ')"
+NONE_BRANCH="$(printf '%s' "$ENCRYPTION_HANDLER" | sed 's/.*encryptionKey === "none") {//')"
+ELSE_BRANCH="$(printf '%s' "$ENCRYPTION_HANDLER" | sed 's/.*} else {//')"
+# 三个条件缺一不可：确实有 else 分支、none 分支清空、else 分支复位。
+# 少了第一条，sed 匹配不上时会原样返回整段，后面的 grep 就会变成"全文里存在"，
+# 那正好把"没有 else 分支"这种情况放过去。
+if printf '%s' "$ENCRYPTION_HANDLER" | grep -qF -- '} else {' \
+   && printf '%s' "$NONE_BRANCH" | grep -qF -- 'panel.clearPasswords()' \
+   && printf '%s' "$ELSE_BRANCH" | grep -qF -- 'panel.passwordValidationRequested = false'; then
+  record_pass "切换加密算法会复位 passwordValidationRequested，切到 none 时清空密码"
+else
+  record_fail "切换加密算法没有正确复位 / 清空（缺少 else 分支，或两个分支内容不对）"
+fi
+
+# --- 备份页提交顺序 ---
+assert_button "$BACKUP_PAGE_QML" startBackupButton \
+  "开始备份按钮只在 busy 时禁用（密码不合法不再直接禁用按钮）" \
+  'enabled: !controller.busy' \
+  'onClicked: {'
+
+START_BACKUP_BLOCK="$(button_block "$BACKUP_PAGE_QML" startBackupButton)"
+if printf '%s\n' "$START_BACKUP_BLOCK" | grep -qF -- 'enabled: !controller.busy && panel.passwordAcceptable'; then
+  record_fail "开始备份按钮仍被 passwordAcceptable 直接禁用（用户没有机会触发校验）"
+else
+  record_pass "开始备份按钮不再由 passwordAcceptable 直接禁用"
+fi
+if printf '%s' "$SQUASHED_PAGE_V2" \
+    | grep -qE 'onClicked: \{ panel\.requestPasswordValidation\(\) if \(!panel\.passwordAcceptable\) return const started = controller\.startBackupWithOptions\([^)]*\) if \(started\) panel\.clearPasswords\(\) \}'; then
+  record_pass "提交顺序正确：先请求校验 -> 不合法就 return（不碰控制器）-> 合法才提交 -> 成功才清空"
+else
+  record_fail "提交顺序不对（可能先调用了控制器，或清空时机被改）"
+fi
+
+# --- 自定义 Dialog 的内容边距 ---
+# 按 objectName 定位到各自 Dialog 之后的第一个 padding，而不是数全文的 "padding: 18"
+# 总量：后者在新增一个 Dialog 或改别处内边距时会给出误导性的结果。
+check_dialog_padding() {
+  local file="$1"
+  local name="$2"
+  local got
+  got="$(awk -v want="objectName: \"$name\"" '
+    index($0, want) { found = 1; next }
+    found && /padding:/ {
+      line = $0
+      sub(/^[[:space:]]*/, "", line)
+      print line
+      exit
+    }
+  ' "$file")"
+  if [[ -z "$got" ]]; then
+    record_fail "$(basename "$file") 的 $name 找不到 padding"
+  elif [[ "$got" == "padding: 18" ]]; then
+    record_pass "$(basename "$file") 的 $name 有 18 的内容边距"
+  else
+    record_fail "$(basename "$file") 的 $name 边距不是 18（实际：$got）"
+  fi
+}
+
+check_dialog_padding "$QML_DIR/components/BackupRecordCard.qml" restorePasswordDialog
+check_dialog_padding "$QML_DIR/components/BackupRecordCard.qml" deleteConfirmDialog
+check_dialog_padding "$QML_DIR/Main.qml" busyCloseDialog
 
 echo "[modern-gui] 通过 $PASS_COUNT 项，失败 $FAIL_COUNT 项"
 echo "[modern-gui] 日志: $LOG_FILE"

@@ -7,6 +7,7 @@
     <file>qml/components/AppComboBox.qml</file>
     <file>qml/components/AppIcon.qml</file>
     <file>qml/components/AppTextField.qml</file>
+    <file>qml/components/BackupOptionsPanel.qml</file>
     <file>qml/components/BackupRecordCard.qml</file>
     <file>qml/components/FilterEditorPanel.qml</file>
     <file>qml/components/RuleCard.qml</file>

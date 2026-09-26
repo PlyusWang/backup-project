@@ -27,6 +27,7 @@
 #include <QVariantList>
 #include <vector>
 
+#include "archive_pipeline.h"
 #include "backup_catalog.h"
 #include "config_manager.h"
 #include "filter.h"
@@ -37,6 +38,30 @@ namespace backup_modern {
 // Filter / FilterAction，不必到处加限定名。
 using Filter = backupproject::Filter;
 using FilterAction = backupproject::FilterAction;
+
+// ---- GUI 稳定 key 与核心 enum 的唯一映射 ----
+//
+// QML 只传字符串 key（"mypack" / "huffman" / "aes-256-ctr-hmac-sha256" …），
+// 不传 0/1/2 这类数值：数值枚举一旦调整顺序，界面就会静默选错算法，
+// 而字符串 key 是能写进测试、也能和核心头的枚举逐一对照的契约。
+//
+// 解析失败一律返回 false，绝不回退到默认值 —— 用户明确选了某个算法却拿到
+// 另一个算法的产物，比明确报错危险得多。
+bool ParsePackMethodKey(const QString& key, backupproject::PackMethod* method);
+bool ParseCompressionMethodKey(const QString& key,
+                               backupproject::CompressionMethod* method);
+bool ParseEncryptionMethodKey(const QString& key,
+                              backupproject::EncryptionMethod* method);
+
+// 反方向：enum 换回 key / 展示文本。
+// 展示文本只在 C++ 生成这一处，QML 不自己拼算法名字，
+// 免得同一个算法在界面上和测试里叫两个名字。
+QString PackMethodKey(backupproject::PackMethod method);
+QString PackMethodText(backupproject::PackMethod method);
+QString CompressionMethodKey(backupproject::CompressionMethod method);
+QString CompressionMethodText(backupproject::CompressionMethod method);
+QString EncryptionMethodKey(backupproject::EncryptionMethod method);
+QString EncryptionMethodText(backupproject::EncryptionMethod method);
 
 // 错误原文不翻译、不截断：核心的报错里带着具体路径和原因，
 // 直接显示比在桥这层换成一句笼统提示有用得多。
@@ -139,12 +164,27 @@ class BackupController : public QObject {
   Q_INVOKABLE void refreshBackups();
   // 自动命名的备份：源目录 + 已配置的 repository，文件名由 BackupCatalog 生成，
   // 界面不再要求用户填写归档完整路径。
-  // 产物是 v2 container（MyPack + 不压缩 + 不加密）：界面展示的 uid / gid /
-  // symlink / FIFO 只有 v2 装得下，v0.1 会把它们丢掉或者直接失败。
+  // 产物是 v2 container：界面展示的 uid / gid / symlink / FIFO 只有 v2 装得下，
+  // v0.1 会把它们丢掉或者直接失败。
+  // 这个入口保持 PR #15 的行为一字不变，等价于 MyPack + 不压缩 + 不加密。
   Q_INVOKABLE bool startBackup();
+  // 带显式算法选择的备份入口。三个 key 的取值见本文件顶部的映射表；
+  // 未知 key、以及"选了加密但密码为空 / 两次不一致"都在启动后台线程之前失败。
+  // QML 侧也会做同样的校验，但那只是为了即时反馈，不是安全边界。
+  Q_INVOKABLE bool startBackupWithOptions(const QString& pack_key,
+                                          const QString& compression_key,
+                                          const QString& encryption_key,
+                                          const QString& password,
+                                          const QString& confirm_password);
   // 从仓库里恢复一个备份。QML 只传 file name，解析成真实路径由 Catalog 负责。
+  // 加密的 v2 归档在这里会明确失败并提示需要恢复密码 —— 它不会拿空密码去试。
   Q_INVOKABLE bool startManagedRestore(const QString& file_name,
                                        const QString& destination_path);
+  // 带恢复密码的入口。名字与上面刻意不同：带默认参数的重载会让 QML 调用歧义，
+  // 两个名字各自对应一条明确的语义。密码为空一律失败。
+  Q_INVOKABLE bool startManagedRestoreWithPassword(
+      const QString& file_name, const QString& destination_path,
+      const QString& password);
   // 删除仓库里的一个备份。坏掉的 .bak 同样可以删。
   Q_INVOKABLE bool deleteBackup(const QString& file_name);
   // 回到“空闲”文案：界面上一动输入就调用它，免得上一次的结果一直挂着；
@@ -199,22 +239,36 @@ class BackupController : public QObject {
   //                 它保留 v0.1 产物，让旧格式始终有一条被真实执行的回归入口。
   enum class BackupFlavor { kLegacyV01, kModernV2 };
 
-  // 后台函数：static，运行在别的线程上，只碰值类型和核心对象。
+  // 一次操作需要的全部输入。刻意做成纯值类型：QtConcurrent 只拿它的拷贝，
+  // 后台线程因此不需要读取控制器的任何成员，也不需要加锁。
   //
-  // flavor 只被 kBackup 分支读取：恢复没有"产物格式"这一说，归档是什么格式由
-  // 它自己的 magic 决定（BackupEngine::Restore 按 magic 分流）。
-  static OperationOutcome RunOperation(Kind kind, BackupFlavor flavor,
-                                       const QString& first_path,
-                                       const QString& second_path,
-                                       const Filter& filter);
+  // backup_options / restore_options 里的密码只活在这个拷贝里，任务结束就随之
+  // 销毁。控制器没有、也不会有保存密码的成员。
+  struct OperationRequest {
+    Kind kind = Kind::kBackup;
+    // 只被 kBackup 分支读取：恢复没有"产物格式"这一说，归档是什么格式由它
+    // 自己的 magic 决定。
+    BackupFlavor backup_flavor = BackupFlavor::kModernV2;
+    QString first_path;
+    QString second_path;
+    Filter filter;
+    backupproject::BackupOptions backup_options;
+    backupproject::RestoreOptions restore_options;
+    // true 时恢复走带 options 的 v2 入口。只有"用户真的输入了恢复密码"这一条
+    // 路径会把它置 true；false 时走按 magic 分流的旧入口，legacy v0.1 与未加密
+    // 的 v2 都靠它，行为与 PR #15 完全一致。
+    bool restore_is_v2 = false;
+  };
+
+  // 后台函数：static，运行在别的线程上，只碰值类型和核心对象。
+  // 参数按值传，后台线程拿到的是自己的副本。
+  static OperationOutcome RunOperation(OperationRequest request);
   // 后台扫描：线程内自建 BackupCatalog，不与 GUI 线程共享任何对象。
   static CatalogOutcome RunCatalogList(const QString& repository);
 
   // file_name 只用于任务结束后的状态提示（备份是自动生成的名字，
   // 恢复是用户选的那个名字）；它不是输入状态，也不参与核心调用。
-  bool Start(Kind kind, BackupFlavor flavor, const QString& first_path,
-             const QString& second_path, const QString& file_name,
-             const Filter& filter);
+  bool Start(const OperationRequest& request, const QString& file_name);
 
   // 把界面收集的规则编成 Filter；失败时 error_message 里是原因。
   bool BuildFilter(Filter* filter, std::string* error_message) const;

@@ -6,9 +6,9 @@
 //      路径拼接永远发生在校验之后；
 //   2. 只认普通文件。一律用 lstat 而不是 stat，路径最后一段的软链接被当成
 //      链接本身看，不会被顺着走到别处去；
-//   3. 坏归档不阻断列表。InspectHeader 失败只是给这条记录写一句 diagnostic，
-//      不改变 List 的成功与否——列表的价值之一就是让用户看见"这个文件还在，
-//      但已经不是能被恢复的归档了"。
+//   3. 坏归档不阻断列表。IdentifyArchiveFile / InspectHeader 失败只是给这条
+//      记录写一句 diagnostic，不改变 List 的成功与否——列表的价值之一就是让
+//      用户看见"这个文件还在，但已经不是能被恢复的归档了"。
 //
 // 这三条只覆盖路径的安全解析，不覆盖并发修改：祖先路径组件的符号链接替换与
 // check/use 竞态都不在防护范围内，确切边界见 backup_catalog.h 的"安全边界"。
@@ -32,6 +32,8 @@
 #include <vector>
 
 #include "archive.h"
+#include "archive_pipeline.h"
+#include "container_format.h"
 #include "file_system.h"
 
 namespace backupproject {
@@ -378,15 +380,64 @@ bool BackupCatalog::List(const std::string& repository,
     // 坏掉的 .bak 照样进列表，只是带上诊断信息。
     // 注意 diagnostic 用的是局部变量而不是 error_message：一个坏文件不能
     // 把调用方的错误信息写成"失败"。
-    ArchiveSummary summary;
-    std::string diagnostic;
-    if (reader.InspectHeader(candidate, &summary, &diagnostic)) {
-      record.recognized_archive = true;
-      record.format_version = summary.format_version;
-      record.entry_count = summary.entry_count;
-    } else {
+    //
+    // 先认格式：IdentifyArchiveFile 只看 magic，就能把 legacy v0.1 与 v2
+    // container 分开，而且不需要密码就能读出 v2 的三个算法 id。
+    ArchiveFileInfo archive_info;
+    std::string identify_error;
+    if (!IdentifyArchiveFile(candidate, &archive_info, &identify_error)) {
+      // 既不是 legacy v0.1，也不是 header 可读的 v2 container。
+      //
+      // 诊断优先用 InspectHeader 的说法：列表里的 diagnostic 是要直接显示给
+      // 用户的文案，不能因为多认了一种格式就变样。IdentifyArchiveFile 的原因
+      // 只在它也说不出话时兜底——diagnostic 必须非空，否则用户只看到一个
+      // "认不出来"，什么线索都没有。
+      ArchiveSummary summary;
+      std::string legacy_diagnostic;
+      // magic 不是 BKPARCH 时 InspectHeader 必然失败，这里只取它的原因；
+      // 返回值不参与判断，识别结论已经由 IdentifyArchiveFile 给出。
+      reader.InspectHeader(candidate, &summary, &legacy_diagnostic);
       record.recognized_archive = false;
-      record.diagnostic = diagnostic;
+      record.has_pipeline_methods = false;
+      record.password_required = false;
+      if (!legacy_diagnostic.empty()) {
+        record.diagnostic = legacy_diagnostic;
+      } else if (!identify_error.empty()) {
+        record.diagnostic = identify_error;
+      } else {
+        record.diagnostic = "Unrecognized archive file: " + candidate;
+      }
+    } else if (archive_info.kind == ArchiveFileInfo::Kind::kLegacyV01) {
+      // legacy v0.1：IdentifyArchiveFile 认得 magic 就算成功，哪怕全局 header
+      // 是坏的（它此时静默地留下 entry_count = 0）。所以"认得"这条结论仍然由
+      // InspectHeader 决定，与本次改动之前逐字一致。
+      ArchiveSummary summary;
+      std::string diagnostic;
+      if (reader.InspectHeader(candidate, &summary, &diagnostic)) {
+        record.recognized_archive = true;
+        record.format_version = summary.format_version;
+        record.entry_count = summary.entry_count;
+      } else {
+        record.recognized_archive = false;
+        record.diagnostic = diagnostic.empty()
+                                ? "Unreadable archive header: " + candidate
+                                : diagnostic;
+      }
+      // v0.1 没有流水线，也从不加密：全部保持默认值。
+      record.has_pipeline_methods = false;
+      record.password_required = false;
+    } else {
+      // v2 container：160 字节外层 header 把三种算法写得很清楚，读它不需要
+      // 密码。这里记录的只是 header 的"声明"，不代表归档完整或恢复得出来。
+      record.recognized_archive = true;
+      record.format_version = archive_info.format_version;
+      record.entry_count = archive_info.entry_count;
+      record.has_pipeline_methods = true;
+      record.pack_method = archive_info.pack_method;
+      record.compression_method = archive_info.compression_method;
+      record.encryption_method = archive_info.encryption_method;
+      record.password_required =
+          (archive_info.encryption_method != EncryptionMethod::kNone);
     }
 
     found.push_back(std::move(record));

@@ -78,6 +78,38 @@ QVariantMap RecordToVariant(const backupproject::BackupRecord& record) {
               static_cast<qulonglong>(record.entry_count));
   item.insert(QStringLiteral("diagnostic"),
               QString::fromStdString(record.diagnostic));
+
+  // ---- v2 pipeline 方法 ----
+  // legacy v0.1 归档没有这三种方法，key 与 text 一律留空：界面不能给一份根本
+  // 没有 pipeline 的归档标上 MyPack / Huffman。
+  // 这些值全部来自归档 header 的声明，只说明"这份归档说它用了什么"，
+  // 不代表归档完整，也不代表密码正确。
+  item.insert(QStringLiteral("hasPipelineMethods"),
+              record.has_pipeline_methods);
+  item.insert(QStringLiteral("packMethodKey"),
+              record.has_pipeline_methods ? PackMethodKey(record.pack_method)
+                                          : QString());
+  item.insert(QStringLiteral("packMethodText"),
+              record.has_pipeline_methods ? PackMethodText(record.pack_method)
+                                          : QString());
+  item.insert(QStringLiteral("compressionMethodKey"),
+              record.has_pipeline_methods
+                  ? CompressionMethodKey(record.compression_method)
+                  : QString());
+  item.insert(QStringLiteral("compressionMethodText"),
+              record.has_pipeline_methods
+                  ? CompressionMethodText(record.compression_method)
+                  : QString());
+  item.insert(QStringLiteral("encryptionMethodKey"),
+              record.has_pipeline_methods
+                  ? EncryptionMethodKey(record.encryption_method)
+                  : QString());
+  item.insert(QStringLiteral("encryptionMethodText"),
+              record.has_pipeline_methods
+                  ? EncryptionMethodText(record.encryption_method)
+                  : QString());
+  // 只表示"恢复这份归档需要密码"。列表阶段没有、也不该有密码。
+  item.insert(QStringLiteral("passwordRequired"), record.password_required);
   return item;
 }
 
@@ -91,7 +123,146 @@ QVariantList RecordsToVariantList(
   return list;
 }
 
+// GUI key 与核心 enum 的对应表。表驱动而不是 if 链：加一种算法时只改这一张表，
+// 解析、反查 key、展示文本三处就不会走散。
+struct PackKeyEntry {
+  const char* key;
+  backupproject::PackMethod method;
+  const char* text;
+};
+
+const PackKeyEntry kPackKeys[] = {
+    {"mypack", backupproject::PackMethod::kMyPack, "MyPack"},
+    {"ustar", backupproject::PackMethod::kUstar, "USTAR"},
+    {"fast-ustar", backupproject::PackMethod::kFastUstar, "Fast USTAR"},
+};
+
+struct CompressionKeyEntry {
+  const char* key;
+  backupproject::CompressionMethod method;
+  const char* text;
+};
+
+const CompressionKeyEntry kCompressionKeys[] = {
+    {"none", backupproject::CompressionMethod::kNone, "不压缩"},
+    {"huffman", backupproject::CompressionMethod::kHuffman, "Huffman"},
+    {"lzss-huffman", backupproject::CompressionMethod::kLzssHuffman,
+     "LZSS + Huffman"},
+};
+
+struct EncryptionKeyEntry {
+  const char* key;
+  backupproject::EncryptionMethod method;
+  const char* text;
+};
+
+const EncryptionKeyEntry kEncryptionKeys[] = {
+    {"none", backupproject::EncryptionMethod::kNone, "不加密"},
+    {"des-cbc-hmac-sha256", backupproject::EncryptionMethod::kDesCbcHmacSha256,
+     "DES-CBC + HMAC-SHA256"},
+    {"aes-256-ctr-hmac-sha256",
+     backupproject::EncryptionMethod::kAes256CtrHmacSha256,
+     "AES-256-CTR + HMAC-SHA256"},
+};
+
 }  // namespace
+
+// ---- GUI 稳定 key 与核心 enum 的唯一映射 ----
+
+bool ParsePackMethodKey(const QString& key, backupproject::PackMethod* method) {
+  if (method == nullptr) {
+    return false;
+  }
+  for (const PackKeyEntry& entry : kPackKeys) {
+    if (key == QString::fromLatin1(entry.key)) {
+      *method = entry.method;
+      return true;
+    }
+  }
+  return false;
+}
+
+QString PackMethodKey(backupproject::PackMethod method) {
+  for (const PackKeyEntry& entry : kPackKeys) {
+    if (entry.method == method) {
+      return QString::fromLatin1(entry.key);
+    }
+  }
+  return QString();
+}
+
+QString PackMethodText(backupproject::PackMethod method) {
+  for (const PackKeyEntry& entry : kPackKeys) {
+    if (entry.method == method) {
+      return QString::fromUtf8(entry.text);
+    }
+  }
+  return QString();
+}
+
+bool ParseCompressionMethodKey(const QString& key,
+                               backupproject::CompressionMethod* method) {
+  if (method == nullptr) {
+    return false;
+  }
+  for (const CompressionKeyEntry& entry : kCompressionKeys) {
+    if (key == QString::fromLatin1(entry.key)) {
+      *method = entry.method;
+      return true;
+    }
+  }
+  return false;
+}
+
+QString CompressionMethodKey(backupproject::CompressionMethod method) {
+  for (const CompressionKeyEntry& entry : kCompressionKeys) {
+    if (entry.method == method) {
+      return QString::fromLatin1(entry.key);
+    }
+  }
+  return QString();
+}
+
+QString CompressionMethodText(backupproject::CompressionMethod method) {
+  for (const CompressionKeyEntry& entry : kCompressionKeys) {
+    if (entry.method == method) {
+      return QString::fromUtf8(entry.text);
+    }
+  }
+  return QString();
+}
+
+bool ParseEncryptionMethodKey(const QString& key,
+                              backupproject::EncryptionMethod* method) {
+  if (method == nullptr) {
+    return false;
+  }
+  for (const EncryptionKeyEntry& entry : kEncryptionKeys) {
+    if (key == QString::fromLatin1(entry.key)) {
+      *method = entry.method;
+      return true;
+    }
+  }
+  return false;
+}
+
+QString EncryptionMethodKey(backupproject::EncryptionMethod method) {
+  for (const EncryptionKeyEntry& entry : kEncryptionKeys) {
+    if (entry.method == method) {
+      return QString::fromLatin1(entry.key);
+    }
+  }
+  return QString();
+}
+
+QString EncryptionMethodText(backupproject::EncryptionMethod method) {
+  for (const EncryptionKeyEntry& entry : kEncryptionKeys) {
+    if (entry.method == method) {
+      return QString::fromUtf8(entry.text);
+    }
+  }
+  return QString();
+}
 
 BackupController::BackupController(const QString& config_file_path,
                                    QObject* parent)
@@ -407,7 +578,19 @@ bool BackupController::saveRepositoryPath(const QString& path) {
 
 // ---- 备份 / 恢复 / 删除 ----
 
+// 旧入口 = MyPack + 不压缩 + 不加密。保留它是为了让 PR #15 的自动测试、
+// main.cpp 的自测链路、以及任何还没更新的调用方一字不改地继续工作。
 bool BackupController::startBackup() {
+  return startBackupWithOptions(QStringLiteral("mypack"),
+                                QStringLiteral("none"), QStringLiteral("none"),
+                                QString(), QString());
+}
+
+bool BackupController::startBackupWithOptions(const QString& pack_key,
+                                              const QString& compression_key,
+                                              const QString& encryption_key,
+                                              const QString& password,
+                                              const QString& confirm_password) {
   if (busy_) {
     return false;
   }
@@ -421,6 +604,43 @@ bool BackupController::startBackup() {
               QStringLiteral("请先在设置中选择备份仓库。"));
     return false;
   }
+  // 未知 key 一律明确失败，绝不回退默认值：用户明确选了某个算法却拿到另一个
+  // 算法的产物，比明确报错危险得多。
+  backupproject::BackupOptions options;
+  if (!ParsePackMethodKey(pack_key, &options.pack_method)) {
+    SetStatus(QString::fromLatin1(kError), QStringLiteral("无法备份"),
+              QStringLiteral("未知打包方式：%1").arg(pack_key));
+    return false;
+  }
+  if (!ParseCompressionMethodKey(compression_key,
+                                 &options.compression_method)) {
+    SetStatus(QString::fromLatin1(kError), QStringLiteral("无法备份"),
+              QStringLiteral("未知压缩方式：%1").arg(compression_key));
+    return false;
+  }
+  if (!ParseEncryptionMethodKey(encryption_key, &options.encryption_method)) {
+    SetStatus(QString::fromLatin1(kError), QStringLiteral("无法备份"),
+              QStringLiteral("未知加密方式：%1").arg(encryption_key));
+    return false;
+  }
+
+  // 密码规则只有两条：非空、两次一致。刻意不加长度与复杂度要求 —— 那是产品
+  // 策略，不是这一层该发明的规则。QML 也会即时提示同样的两条，但真正的判定
+  // 在这里：QML 不是安全边界。
+  if (options.encryption_method != backupproject::EncryptionMethod::kNone) {
+    if (password.isEmpty()) {
+      SetStatus(QString::fromLatin1(kError), QStringLiteral("无法备份"),
+                QStringLiteral("密码不能为空。"));
+      return false;
+    }
+    if (password != confirm_password) {
+      SetStatus(QString::fromLatin1(kError), QStringLiteral("无法备份"),
+                QStringLiteral("两次输入的密码不一致。"));
+      return false;
+    }
+    options.password = password.toStdString();
+  }
+
   // 规则只有全部合法才会走到这里（添加时已经验证过），
   // 这里再编一次是为了把规则随任务一起交给后台线程。
   Filter filter;
@@ -456,8 +676,15 @@ bool BackupController::startBackup() {
   // 而不是控制器重新拼一遍。
   const QString archive = QString::fromStdString(archive_path);
   // 正常备份走 v2：界面上的 uid / gid / symlink / FIFO 说明必须与产物一致。
-  return Start(Kind::kBackup, BackupFlavor::kModernV2, source_path_, archive,
-               QFileInfo(archive).fileName(), filter);
+  OperationRequest request;
+  request.kind = Kind::kBackup;
+  request.backup_flavor = BackupFlavor::kModernV2;
+  request.first_path = source_path_;
+  request.second_path = archive;
+  request.filter = filter;
+  request.backup_options = options;
+  // file name 只用于状态提示，来自 Catalog 生成的归档名，与密码无关。
+  return Start(request, QFileInfo(archive).fileName());
 }
 
 bool BackupController::startManagedRestore(const QString& file_name,
@@ -496,9 +723,81 @@ bool BackupController::startManagedRestore(const QString& file_name,
   // BackupEngine::Restore → ArchiveReader 的 preflight 里。
   // 恢复的格式由归档自身的 magic 决定（BackupEngine::Restore 按 magic 分流），
   // flavor 在这里不参与判断。
-  return Start(Kind::kRestore, BackupFlavor::kLegacyV01,
-               QString::fromStdString(archive_path), destination_path,
-               file_name, Filter());
+  // QML 的 passwordRequired 只是它从列表里读到的一句 header 声明，不能当事实。
+  // 这里自己再辨认一次：普通恢复入口遇到加密的 v2 必须在启动后台线程之前失败，
+  // 否则后台会拿空密码去试，用户只会看到一句和密码无关的认证失败。
+  backupproject::ArchiveFileInfo info;
+  const bool identified =
+      backupproject::IdentifyArchiveFile(archive_path, &info, nullptr);
+  if (identified &&
+      info.kind == backupproject::ArchiveFileInfo::Kind::kContainerV2 &&
+      info.encryption_method != backupproject::EncryptionMethod::kNone) {
+    SetStatus(QString::fromLatin1(kError), QStringLiteral("无法恢复"),
+              QStringLiteral("此备份已加密，请输入恢复密码。"));
+    return false;
+  }
+  // 辨认失败不在这里拦：那个坏文件应该由真正的恢复路径给出它自己的诊断，
+  // 免得同一个文件出现两套措辞。行为与 PR #15 一致。
+  OperationRequest request;
+  request.kind = Kind::kRestore;
+  request.first_path = QString::fromStdString(archive_path);
+  request.second_path = destination_path;
+  return Start(request, file_name);
+}
+
+bool BackupController::startManagedRestoreWithPassword(
+    const QString& file_name, const QString& destination_path,
+    const QString& password) {
+  if (busy_) {
+    return false;
+  }
+  if (!repositoryConfigured()) {
+    SetStatus(QString::fromLatin1(kError), QStringLiteral("无法恢复"),
+              QStringLiteral("请先在设置中选择备份仓库。"));
+    return false;
+  }
+  if (file_name.isEmpty()) {
+    SetStatus(QString::fromLatin1(kError), QStringLiteral("无法恢复"),
+              QStringLiteral("请先选择要恢复的备份文件。"));
+    return false;
+  }
+  if (destination_path.isEmpty()) {
+    SetStatus(QString::fromLatin1(kError), QStringLiteral("无法恢复"),
+              QStringLiteral("请先选择恢复目录。"));
+    return false;
+  }
+  if (password.isEmpty()) {
+    SetStatus(QString::fromLatin1(kError), QStringLiteral("无法恢复"),
+              QStringLiteral("恢复密码不能为空。"));
+    return false;
+  }
+
+  std::string archive_path;
+  std::string error_message;
+  if (!catalog_.Resolve(repository_path_.toStdString(), file_name.toStdString(),
+                        &archive_path, &error_message)) {
+    SetStatus(QString::fromLatin1(kError), QStringLiteral("恢复失败"),
+              QString::fromStdString(error_message));
+    return false;
+  }
+
+  // 是否需要密码由归档自己的 header 决定，不信 QML 传进来的任何标志。
+  backupproject::ArchiveFileInfo info;
+  const bool identified =
+      backupproject::IdentifyArchiveFile(archive_path, &info, nullptr);
+  OperationRequest request;
+  request.kind = Kind::kRestore;
+  request.first_path = QString::fromStdString(archive_path);
+  request.second_path = destination_path;
+  if (identified &&
+      info.kind == backupproject::ArchiveFileInfo::Kind::kContainerV2 &&
+      info.encryption_method != backupproject::EncryptionMethod::kNone) {
+    request.restore_is_v2 = true;
+    request.restore_options.password = password.toStdString();
+  }
+  // legacy 与未加密的 v2 都走按 magic 分流的旧入口：它们根本不需要密码，
+  // 硬塞一个 RestoreOptions 进去只会让代码看起来像在用密码。
+  return Start(request, file_name);
 }
 
 bool BackupController::deleteBackup(const QString& file_name) {
@@ -552,16 +851,24 @@ bool BackupController::startDirectBackupForTest(const QString& source,
   }
   // 走的是同一个 Start()，direct backup 也照样应用当前 include / exclude 规则；
   // 但它固定产 legacy v0.1，作为旧格式的回归入口。
-  return Start(Kind::kBackup, BackupFlavor::kLegacyV01, source, archive_file,
-               QFileInfo(archive_file).fileName(), filter);
+  OperationRequest request;
+  request.kind = Kind::kBackup;
+  request.backup_flavor = BackupFlavor::kLegacyV01;
+  request.first_path = source;
+  request.second_path = archive_file;
+  request.filter = filter;
+  return Start(request, QFileInfo(archive_file).fileName());
 }
 
 bool BackupController::startDirectRestoreForTest(const QString& archive_file,
                                                  const QString& destination) {
   // 恢复不需要筛选：归档里有什么就恢复什么，和 CLI 的语义一致。
   // 恢复也不看 flavor：格式由归档自己的 magic 决定。
-  return Start(Kind::kRestore, BackupFlavor::kLegacyV01, archive_file,
-               destination, QFileInfo(archive_file).fileName(), Filter());
+  OperationRequest request;
+  request.kind = Kind::kRestore;
+  request.first_path = archive_file;
+  request.second_path = destination;
+  return Start(request, QFileInfo(archive_file).fileName());
 }
 
 // ---- 任务启动 ----
@@ -569,59 +876,55 @@ bool BackupController::startDirectRestoreForTest(const QString& archive_file,
 // 先置忙再启动线程：QML 收到 busyChanged 之后才会禁用按钮，
 // 顺序反过来的话，线程已经跑起来而界面还允许再点一次。
 // 忙的时候直接返回 false，不排队——界面上的按钮本来就是禁用的。
-bool BackupController::Start(Kind kind, BackupFlavor flavor,
-                             const QString& first_path,
-                             const QString& second_path,
-                             const QString& file_name, const Filter& filter) {
+bool BackupController::Start(const OperationRequest& request,
+                             const QString& file_name) {
   if (busy_) {
     // 双保险：QML 侧已经用 busy
     // 禁用了按钮，但快捷键或程序化调用仍可能走到这里。
     return false;
   }
-  active_kind_ = kind;
+  active_kind_ = request.kind;
   active_file_name_ = file_name;
   SetBusy(true);
   SetStatus(QString::fromLatin1(kRunning),
-            kind == Kind::kBackup ? QStringLiteral("正在备份……")
-                                  : QStringLiteral("正在恢复……"),
+            request.kind == Kind::kBackup ? QStringLiteral("正在备份……")
+                                          : QStringLiteral("正在恢复……"),
             QStringLiteral("正在复制目录，期间界面仍可正常操作。"));
   // 函数指针 + 值拷贝的参数：后台线程拿到的是自己的副本，不需要加锁。
-  // Filter 按值一起拷进后台任务：后台线程有自己的副本，不需要加锁。
-  watcher_.setFuture(QtConcurrent::run(&BackupController::RunOperation, kind,
-                                       flavor, first_path, second_path,
-                                       filter));
+  // request（含密码）按值拷进后台任务，本函数返回后本地副本立即销毁。
+  watcher_.setFuture(
+      QtConcurrent::run(&BackupController::RunOperation, request));
   return true;
 }
 
 // 每次调用都新建一个 BackupEngine：核心没有全局状态，
 // 一个任务一个实例最省心，也不存在后台线程共享对象的问题。
 // QString 到 std::string 走的是 UTF-8，中文路径能原样传给核心。
-OperationOutcome BackupController::RunOperation(Kind kind, BackupFlavor flavor,
-                                                const QString& first_path,
-                                                const QString& second_path,
-                                                const Filter& filter) {
+OperationOutcome BackupController::RunOperation(OperationRequest request) {
   // 这个函数跑在后台线程：只创建引擎、调一次接口，绝不触碰任何 QML 对象。
+  // request 是值拷贝，随本次调用结束一起销毁 —— 密码的生命周期到此为止。
   backupproject::BackupEngine engine;
   std::string error_message;
-  const std::string first = first_path.toStdString();
-  const std::string second = second_path.toStdString();
+  const std::string first = request.first_path.toStdString();
+  const std::string second = request.second_path.toStdString();
 
   OperationOutcome outcome;
-  if (kind == Kind::kBackup) {
-    if (flavor == BackupFlavor::kModernV2) {
-      // 三项都取"不做额外加工"的取值：打包用 MyPack，不压缩、不加密。
-      // 加密需要密码，而界面没有、也不应该有密码输入框 —— 悄悄用空密码或者
-      // 写死一个密码，比不加密更糟。
-      backupproject::BackupOptions options;
-      options.pack_method = backupproject::PackMethod::kMyPack;
-      options.compression_method = backupproject::CompressionMethod::kNone;
-      options.encryption_method = backupproject::EncryptionMethod::kNone;
-      outcome.succeeded =
-          engine.Backup(first, second, filter, options, &error_message);
+  if (request.kind == Kind::kBackup) {
+    if (request.backup_flavor == BackupFlavor::kModernV2) {
+      // 三项都由用户在界面上选择，这里不再写死任何一项。
+      outcome.succeeded = engine.Backup(first, second, request.filter,
+                                        request.backup_options, &error_message);
     } else {
-      outcome.succeeded = engine.Backup(first, second, filter, &error_message);
+      // legacy v0.1：旧格式始终保留一条被真实执行的回归入口。
+      outcome.succeeded =
+          engine.Backup(first, second, request.filter, &error_message);
     }
+  } else if (request.restore_is_v2) {
+    // 只有用户真的输入了恢复密码才会走这里。
+    outcome.succeeded =
+        engine.Restore(first, second, request.restore_options, &error_message);
   } else {
+    // legacy v0.1 与未加密的 v2 共用这条按 magic 分流的入口。
     outcome.succeeded = engine.Restore(first, second, &error_message);
   }
   if (!outcome.succeeded) {

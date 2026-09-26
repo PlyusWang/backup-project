@@ -129,7 +129,22 @@ Item {
                         wrapMode: Text.WordWrap
                     }
 
+                    // 仓库配好之后同样要留一个修改入口：上面就是当前路径，
+                    // 但"换仓库"统一发生在设置页 —— 这一页不直接编辑 repositoryPath，
+                    // 也不复制 SettingsPage 的保存逻辑，否则同一套校验会有两份实现。
                     AppButton {
+                        objectName: "changeRepositoryButton"
+                        visible: controller.repositoryConfigured
+                        text: "更改仓库"
+                        iconName: "settings"
+                        // 任务运行期间不给跳走，与"刷新"保持同一条禁用规则，
+                        // 用户在"正在备份"时看到的两页状态是一致的。
+                        enabled: !controller.busy
+                        onClicked: page.openSettings()
+                    }
+
+                    AppButton {
+                        objectName: "goToSettingsButton"
                         visible: !controller.repositoryConfigured
                         text: "前往设置"
                         iconName: "settings"
@@ -146,6 +161,15 @@ Item {
                 Layout.topMargin: 4
             }
 
+            // 高级选项（打包格式 / 压缩 / 加密 + 密码）：默认收起。
+            // 默认取值（mypack + 不压缩 + 不加密）与之前完全一致，
+            // 不展开就不会碰到新选项，默认产物也不会因为这一块而改变。
+            BackupOptionsPanel {
+                id: panel
+                Layout.fillWidth: true
+                Layout.topMargin: 4
+            }
+
             RowLayout {
                 Layout.fillWidth: true
                 Layout.topMargin: 14
@@ -156,8 +180,36 @@ Item {
                     text: "开始备份"
                     variant: "primary"
                     // busy 时禁用：整个程序只有一个控制器，天然保证同一时刻只有一个操作。
+                    // 密码为空或两次不一致时不再直接把按钮禁用 —— 那样用户根本没有
+                    // "再点一次提交、然后才看到错误"的机会。校验改成点击时请求：
+                    // 面板先亮出错误，合法才真的调用控制器。
+                    // 规则仍然只有那两条，判定也仍然只写在面板里。
                     enabled: !controller.busy
-                    onClicked: controller.startBackup()
+                    // 三个算法一律传冻结的字符串键；密码与确认密码原样交给控制器，
+                    // 界面不在这里做任何加工（不加盐、不截断、不拼进任何路径）。
+                    //
+                    // 顺序是刻意的：先请求校验 -> 不合法就 return（完全不碰控制器，
+                    // 错误提示由面板自己显示）-> 合法才提交。只有控制器真的收下了
+                    // 这次任务（返回 true —— 此时 Start() 已经把 OperationRequest
+                    // 的值拷贝交给 QtConcurrent）才清空两个密码框并收起提示。
+                    // 控制器同步失败时（没选源目录、没配仓库、未知 key）密码保留，
+                    // 用户改完可以直接再点一次；这里也不动 encryptionKey。
+                    onClicked: {
+                        panel.requestPasswordValidation()
+
+                        if (!panel.passwordAcceptable)
+                            return
+
+                        const started = controller.startBackupWithOptions(
+                            panel.packKey,
+                            panel.compressionKey,
+                            panel.encryptionKey,
+                            panel.password,
+                            panel.confirmPassword)
+
+                        if (started)
+                            panel.clearPasswords()
+                    }
                 }
 
                 // 不确定进度条：核心没有百分比回调，这里只表达“在跑”。
