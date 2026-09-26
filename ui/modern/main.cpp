@@ -10,7 +10,13 @@
 //                                       repository-driven 产品链路端到端验证
 //   --backup-options-test               验证算法选项 / 密码校验 / 加密恢复 /
 //                                       目录字段 / 密码不落盘（真实控制器路径）
+//   --schedule-test                     验证自动备份页的控制器链路：保存计划、
+//                                       立即运行、无变化跳过、变化建快照、
+//                                       retention、0600 权限、与 CLI 同源路径
 //   --config-file <路径>                指定配置文件（测试隔离真实用户配置）
+//   --schedule-file <路径>              指定计划存储文件（测试隔离真实计划）
+//   --schedule-show                     把控制器读到的计划配置打成 key=value，
+//                                       用来证明 GUI 与 CLI 读的是同一份 store
 //   --path-test                         验证本地路径与 URL 互转不丢字符
 //   --close-guard-test                  验证任务进行中关窗会被拦下
 //   --native-frame                      退回系统原生标题栏（Wayland 兜底）
@@ -40,14 +46,18 @@
 #include <cstdio>
 #include <cstring>
 
+#include "app_paths.h"
 #include "app_theme.h"
 #include "archive_pipeline.h"
 #include "backup_controller.h"
+#include "config_manager.h"
 #include "filter_rule_model.h"
+#include "schedule_controller.h"
+#include "schedule_store.h"
 
 namespace {
 
-const int kPageCount = 4;
+const int kPageCount = 5;
 int g_qml_warnings = 0;
 
 // QML 的运行期问题（binding loop、类型错误、模块缺失……）都以 Qt warning 发出。
@@ -101,12 +111,19 @@ QString ResolveConfigFilePath(const QStringList& arguments) {
   if (index >= 0 && index + 1 < arguments.size()) {
     return arguments.at(index + 1);
   }
-  const QString directory =
-      QStandardPaths::writableLocation(QStandardPaths::AppConfigLocation);
-  if (directory.isEmpty()) {
-    return QString();
+  // 默认位置与 backupctl 严格同源：两边走的都是 app_paths.h 里那一份实现。
+  // 这样"GUI 保存的计划 CLI 读不到"在结构上就不可能发生，
+  // 而不是靠两处各自记得写对同一个字符串。
+  return QString::fromStdString(backupproject::DefaultConfigFilePath());
+}
+
+// 计划存储文件：默认位置同样来自 app_paths.h，--schedule-file 只用于测试隔离。
+QString ResolveScheduleFilePath(const QStringList& arguments) {
+  const int index = arguments.indexOf(QStringLiteral("--schedule-file"));
+  if (index >= 0 && index + 1 < arguments.size()) {
+    return arguments.at(index + 1);
   }
-  return QDir(directory).filePath(QStringLiteral("config.json"));
+  return QString::fromStdString(backupproject::DefaultScheduleFilePath());
 }
 
 // 在可视项树里按 objectName 找一个 QQuickItem。
@@ -146,7 +163,7 @@ void ScrollBackupPage(QQuickWindow* window, int content_y) {
   }
 }
 
-// --screenshot：四个页面 × 两套主题各抓一张 PNG，另外补两种状态：
+// --screenshot：五个页面 × 两套主题各抓一张 PNG，另外补两种状态：
 // 高级选项展开、加密归档的恢复密码对话框。
 // 抓帧走窗口自己的 grabWindow()，和用户看到的是同一条渲染路径，
 // 不是另画一份示意图。
@@ -187,8 +204,10 @@ int CaptureScreenshots(QQuickWindow* window, backup_modern::AppTheme* theme,
     return true;
   };
 
-  const char* page_names[kPageCount] = {"home", "backup", "management",
-                                        "settings"};
+  // 顺序必须与 Main.qml 的 StackLayout 一致：首页 / 备份 / 自动备份 /
+  // 备份管理 / 设置。
+  const char* page_names[kPageCount] = {"home", "backup", "schedule",
+                                        "management", "settings"};
   for (int dark = 0; dark < 2; ++dark) {
     theme->setDark(dark == 1);
     for (int page = 0; page < kPageCount; ++page) {
@@ -701,6 +720,8 @@ const backupproject::EncryptionMethod kUntouchedEncryptionMethod =
 // 断言计数。所有检查只累加、不提前返回：中途退出会让后面的检查永远不执行，
 // 一次运行就只能看到一个失败。
 struct CheckRun {
+  // 输出前缀。默认值保持 PR #16 的既有输出不变，定时备份自检会换成 [schedule]。
+  const char* prefix = "[backup-options]";
   int passed = 0;
   int failed = 0;
   QStringList failures;
@@ -708,7 +729,7 @@ struct CheckRun {
   void Check(bool ok, const QString& label, const QString& detail = QString()) {
     if (ok) {
       ++passed;
-      std::printf("[backup-options]   ok   %s\n", qPrintable(label));
+      std::printf("%s   ok   %s\n", prefix, qPrintable(label));
       return;
     }
     ++failed;
@@ -716,7 +737,7 @@ struct CheckRun {
                              ? label
                              : QStringLiteral("%1（%2）").arg(label, detail);
     failures.append(text);
-    std::printf("[backup-options]   FAIL %s\n", qPrintable(text));
+    std::printf("%s   FAIL %s\n", prefix, qPrintable(text));
   }
 
   // 目录字段断言。fileName 一起写进标签：记录有七八条，失败时必须一眼看出
@@ -1592,14 +1613,294 @@ int RunBackupOptionsTest(backup_modern::BackupController* controller,
   return 1;
 }
 
+// ---- --schedule-show：把控制器看到的计划配置打成 key=value ----
+//
+// 存在的理由只有一个：证明 GUI 与 CLI 读的是**同一份** store。
+// 脚本先让 backupctl 写、再让 GUI 读（或反过来），两边逐项比对；
+// 没有这个开关，"共享 store"就只能靠读代码相信。
+int RunScheduleShow(backup_modern::ScheduleController* schedule) {
+  schedule->reload();
+  std::printf("enabled=%d\n", schedule->enabled() ? 1 : 0);
+  std::printf("trigger=%s\n", qPrintable(schedule->triggerKey()));
+  std::printf("strategy=%s\n", qPrintable(schedule->strategyKey()));
+  std::printf("source=%s\n", qPrintable(schedule->sourcePath()));
+  std::printf("interval=%d\n", schedule->intervalMinutes());
+  std::printf("retain=%d\n", schedule->retainCount());
+  std::printf("pack=%s\n", qPrintable(schedule->packKey()));
+  std::printf("compression=%s\n", qPrintable(schedule->compressionKey()));
+  std::printf("encryption=%s\n", qPrintable(schedule->encryptionKey()));
+  for (const QString& rule : schedule->includeRules()) {
+    std::printf("include=%s\n", qPrintable(rule));
+  }
+  for (const QString& rule : schedule->excludeRules()) {
+    std::printf("exclude=%s\n", qPrintable(rule));
+  }
+  std::printf("repository=%s\n", qPrintable(schedule->repositoryPath()));
+  std::printf("managed=%d\n",
+              static_cast<int>(schedule->managedSnapshots().size()));
+  std::printf("history=%d\n", static_cast<int>(schedule->history().size()));
+  std::printf("store=%s\n", qPrintable(schedule->storePath()));
+  if (!schedule->loadError().isEmpty()) {
+    std::printf("load_error=%s\n", qPrintable(schedule->loadError()));
+  }
+  return 0;
+}
+
+// ---- --schedule-test：自动备份页的控制器链路自检 ----
+//
+// 全程跑在临时目录里：临时 config.json、临时 schedule.json、临时仓库与源目录。
+// 绝不读写用户真实的计划配置。
+//
+// 它刻意不 mock 核心：控制器写进 store 的东西，紧接着用
+// backupproject::ScheduleStore 原样读回来逐项比对 —— 这正是
+// "GUI 与 CLI 读同一份 store、同一套 schema"在单元层面的证据。
+
+int CountArchives(const QString& repository) {
+  QDir directory(repository);
+  return directory
+      .entryList(QStringList() << QStringLiteral("*.bak"), QDir::Files,
+                 QDir::Name)
+      .size();
+}
+
+QVariantMap LastHistory(const backup_modern::ScheduleController& schedule) {
+  const QVariantList history = schedule.history();
+  if (history.isEmpty()) return QVariantMap();
+  return history.last().toMap();
+}
+
+int RunScheduleTest(backup_modern::ScheduleController* schedule,
+                    const QString& config_path) {
+  CheckRun run;
+  run.prefix = "[schedule]";
+
+  QTemporaryDir temp;
+  if (!temp.isValid()) {
+    std::fprintf(stderr, "[schedule] 无法创建临时目录\n");
+    return 1;
+  }
+  // 从一份干净的 store 开始：自检要断言"默认值"，残留的旧计划会让它
+  // 测的不是默认状态。这里删的是 --schedule-file 指到的文件（测试隔离目录），
+  // 正常启动不会走到这条路径。
+  QFile::remove(schedule->storePath());
+
+  const QString source = temp.path() + QStringLiteral("/source");
+  const QString repository = temp.path() + QStringLiteral("/repository");
+  QDir().mkpath(source);
+  QDir().mkpath(repository);
+  if (!WriteTestFile(source + QStringLiteral("/a.txt"), "alpha")) {
+    std::fprintf(stderr, "[schedule] 无法准备源文件\n");
+    return 1;
+  }
+
+  // 1) 临时 config.json：把仓库指到临时目录。
+  {
+    backupproject::ConfigManager manager(config_path.toStdString());
+    backupproject::AppConfig config;
+    config.backup_repository_path = repository.toStdString();
+    std::string error;
+    run.Check(manager.Save(config, &error),
+              QStringLiteral("SCH-01 临时 config.json 写入成功"),
+              QString::fromStdString(error));
+  }
+
+  schedule->reload();
+
+  run.Check(!schedule->enabled(), QStringLiteral("SCH-02 默认未启用"));
+  run.Check(schedule->intervalMinutes() == 60,
+            QStringLiteral("SCH-03 默认周期 60 分钟"),
+            QString::number(schedule->intervalMinutes()));
+  run.Check(schedule->retainCount() == 12,
+            QStringLiteral("SCH-04 默认保留 12 个"),
+            QString::number(schedule->retainCount()));
+  run.Check(schedule->packKey() == QStringLiteral("mypack") &&
+                schedule->compressionKey() == QStringLiteral("none") &&
+                schedule->encryptionKey() == QStringLiteral("none"),
+            QStringLiteral("SCH-05 默认 MyPack + 不压缩 + 不加密"));
+  run.Check(schedule->repositoryPath() == repository,
+            QStringLiteral("SCH-06 控制器读到了临时仓库"),
+            schedule->repositoryPath());
+  run.Check(schedule->supportedModeText().contains(
+                QStringLiteral("定时触发 + 完整快照")),
+            QStringLiteral("SCH-07 页面说明只承诺已实现的模式"));
+
+  // 2) 保存一份真实计划。
+  run.Check(schedule->saveConfig(true, source, 1, 3, QStringLiteral("ustar"),
+                                 QStringLiteral("huffman"), QStringList(),
+                                 QStringList()),
+            QStringLiteral("SCH-08 保存计划成功"));
+
+  const QString store_file = schedule->storePath();
+  run.Check(QFile::exists(store_file),
+            QStringLiteral("SCH-09 schedule.json 已落盘"), store_file);
+  struct stat store_info;
+  const bool stat_ok =
+      ::stat(store_file.toLocal8Bit().constData(), &store_info) == 0;
+  run.Check(stat_ok && (store_info.st_mode & 07777) == 0600,
+            QStringLiteral("SCH-10 schedule.json 权限是 0600"),
+            stat_ok ? QString::number(store_info.st_mode & 07777, 8)
+                    : QStringLiteral("stat 失败"));
+
+  // 3) 用共享核心原样读回来 —— GUI 存的东西必须是共享 schema。
+  {
+    backupproject::ScheduleStore store(store_file.toStdString());
+    backupproject::ScheduleDocument document;
+    std::string error;
+    const bool loaded = store.Load(&document, &error) ==
+                        backupproject::ScheduleLoadStatus::kLoaded;
+    run.Check(loaded, QStringLiteral("SCH-11 核心能读回 schedule.json"),
+              QString::fromStdString(error));
+    run.Check(document.config.interval_minutes == 1 &&
+                  document.config.retain_count == 3,
+              QStringLiteral("SCH-12 周期与保留数量逐项一致"));
+    run.Check(
+        document.config.pack_method == backupproject::PackMethod::kUstar &&
+            document.config.compression_method ==
+                backupproject::CompressionMethod::kHuffman,
+        QStringLiteral("SCH-13 pack / compression 逐项一致"));
+    run.Check(document.config.encryption_method ==
+                  backupproject::EncryptionMethod::kNone,
+              QStringLiteral("SCH-14 schedule.json 里没有加密"));
+    run.Check(document.config.source_path == source.toStdString(),
+              QStringLiteral("SCH-15 源目录逐项一致"));
+    run.Check(
+        document.config.trigger == backupproject::BackupTrigger::kScheduled &&
+            document.config.strategy == backupproject::BackupStrategy::kFull,
+        QStringLiteral("SCH-16 trigger / strategy 是 scheduled + full"));
+  }
+
+  // 4) 立即检查并运行：首次快照。
+  run.Check(schedule->runNow(), QStringLiteral("SCH-17 立即运行被接受"));
+  schedule->waitForIdle(180000);
+  run.Check(schedule->lastSucceeded(), QStringLiteral("SCH-18 首次运行成功"));
+  run.Check(schedule->managedSnapshots().size() == 1,
+            QStringLiteral("SCH-19 产生了一个计划快照"),
+            QString::number(schedule->managedSnapshots().size()));
+  run.Check(CountArchives(repository) == 1,
+            QStringLiteral("SCH-20 仓库里恰好一个归档"),
+            QString::number(CountArchives(repository)));
+  run.Check(
+      LastHistory(*schedule).value(QStringLiteral("resultKey")).toString() ==
+          QStringLiteral("success_created"),
+      QStringLiteral("SCH-21 历史记录为 success_created"),
+      LastHistory(*schedule).value(QStringLiteral("resultKey")).toString());
+
+  // 5) 再运行一次：没有变化必须跳过，不产生新归档。
+  schedule->runNow();
+  schedule->waitForIdle(180000);
+  run.Check(schedule->managedSnapshots().size() == 1,
+            QStringLiteral("SCH-22 无变化时没有新增快照"));
+  run.Check(CountArchives(repository) == 1,
+            QStringLiteral("SCH-23 无变化时没有新增归档"),
+            QString::number(CountArchives(repository)));
+  run.Check(
+      LastHistory(*schedule).value(QStringLiteral("resultKey")).toString() ==
+          QStringLiteral("skipped_no_changes"),
+      QStringLiteral("SCH-24 历史记录为 skipped_no_changes"),
+      LastHistory(*schedule).value(QStringLiteral("resultKey")).toString());
+
+  // 6) 新增文件：建立新快照，变化摘要里 added = 1。
+  if (!WriteTestFile(source + QStringLiteral("/b.txt"), "beta")) {
+    run.Check(false, QStringLiteral("SCH-25 新增源文件"));
+  }
+  schedule->runNow();
+  schedule->waitForIdle(180000);
+  run.Check(schedule->managedSnapshots().size() == 2,
+            QStringLiteral("SCH-25 变化后建立了新快照"),
+            QString::number(schedule->managedSnapshots().size()));
+  run.Check(
+      LastHistory(*schedule)
+          .value(QStringLiteral("changesText"))
+          .toString()
+          .startsWith(QStringLiteral("+1")),
+      QStringLiteral("SCH-26 变化摘要显示 +1 新增"),
+      LastHistory(*schedule).value(QStringLiteral("changesText")).toString());
+
+  // 7) retention：retain=1 之后只留最新一份。
+  run.Check(schedule->saveConfig(true, source, 1, 1, QStringLiteral("mypack"),
+                                 QStringLiteral("none"), QStringList(),
+                                 QStringList()),
+            QStringLiteral("SCH-27 保留数量改为 1"));
+  if (!WriteTestFile(source + QStringLiteral("/c.txt"), "gamma")) {
+    run.Check(false, QStringLiteral("SCH-28 再新增一个源文件"));
+  }
+  schedule->runNow();
+  schedule->waitForIdle(180000);
+  run.Check(schedule->managedSnapshots().size() == 1,
+            QStringLiteral("SCH-28 retention 后只剩一个计划快照"),
+            QString::number(schedule->managedSnapshots().size()));
+  run.Check(CountArchives(repository) == 1,
+            QStringLiteral("SCH-29 仓库里也只剩一个归档"),
+            QString::number(CountArchives(repository)));
+
+  // 8) 规则校验走的是真实 Filter；非法规则不许进配置。
+  run.Check(
+      !schedule
+           ->validateRule(QStringLiteral("include"), QStringLiteral("bogus:x"))
+           .isEmpty(),
+      QStringLiteral("SCH-30 非法规则被 Filter 拒绝"));
+  run.Check(
+      schedule
+          ->validateRule(QStringLiteral("include"), QStringLiteral("ext:cpp"))
+          .isEmpty(),
+      QStringLiteral("SCH-31 合法规则被 Filter 接受"));
+  run.Check(!schedule->saveConfig(true, source, 0, 1, QStringLiteral("mypack"),
+                                  QStringLiteral("none"), QStringList(),
+                                  QStringList()),
+            QStringLiteral("SCH-32 非法周期被拒绝"));
+  run.Check(!schedule->saveConfig(true, source, 1, 1, QStringLiteral("gzip"),
+                                  QStringLiteral("none"), QStringList(),
+                                  QStringList()),
+            QStringLiteral("SCH-33 未知打包方式被拒绝"));
+
+  // 8b) 最后留下一份"有代表性"的配置（retain=7 / interval=5 / ustar +
+  // huffman）， 供跨前端脚本用 backupctl schedule show 逐项比对 —— GUI
+  // 写的，CLI 必须读得一模一样。
+  run.Check(
+      schedule->saveConfig(true, source, 5, 7, QStringLiteral("ustar"),
+                           QStringLiteral("huffman"),
+                           QStringList() << QStringLiteral("ext:txt"),
+                           QStringList() << QStringLiteral("path:**/build/**")),
+      QStringLiteral("SCH-36 留下跨前端比对用的配置"));
+
+  // 9) 与 CLI 同源：默认路径必须与 QStandardPaths 算出来的完全一致。
+  const QString qsp =
+      QStandardPaths::writableLocation(QStandardPaths::AppConfigLocation);
+  run.Check(QString::fromStdString(backupproject::DefaultConfigFilePath()) ==
+                QDir(qsp).filePath(QStringLiteral("config.json")),
+            QStringLiteral("SCH-34 CLI 与 GUI 的 config.json 严格同路径"),
+            QString::fromStdString(backupproject::DefaultConfigFilePath()));
+  run.Check(QString::fromStdString(backupproject::DefaultScheduleFilePath()) ==
+                QDir(qsp).filePath(QStringLiteral("schedule.json")),
+            QStringLiteral("SCH-35 CLI 与 GUI 的 schedule.json 严格同路径"),
+            QString::fromStdString(backupproject::DefaultScheduleFilePath()));
+
+  const int total = run.passed + run.failed;
+  std::printf("[schedule] %s %d/%d\n", run.failed == 0 ? "PASS" : "FAIL",
+              run.passed, total);
+  if (run.failed != 0) {
+    for (const QString& failure : run.failures) {
+      std::fprintf(stderr, "[schedule]   失败: %s\n", qPrintable(failure));
+    }
+    temp.setAutoRemove(false);
+    std::printf("[schedule] 临时目录保留: %s\n", qPrintable(temp.path()));
+    return 1;
+  }
+  return 0;
+}
+
 }  // namespace
 
 int main(int argc, char* argv[]) {
   QGuiApplication app(argc, argv);
   // 这两个名字同时决定 QSettings 与 QStandardPaths 的落盘位置，
   // 所以必须在读主题、解析配置文件路径之前设置好。
-  QCoreApplication::setApplicationName("backup-gui-modern");
-  QCoreApplication::setOrganizationName("backup-project");
+  // 名字来自共享的 app_paths.h：CLI 侧的默认路径就是按这两个常量算出来的，
+  // 写死字符串会让"GUI 与 CLI 严格同路径"这条约束只靠约定维持。
+  QCoreApplication::setApplicationName(
+      QString::fromLatin1(backupproject::kAppApplicationName));
+  QCoreApplication::setOrganizationName(
+      QString::fromLatin1(backupproject::kAppOrganizationName));
   // 固定用 Basic 风格：不跟随发行版的 GTK/GNOME 主题，
   // 否则同一份 QML 在不同 Linux 上会长得完全不一样。
   // 样式名必须和 QML 里 import 的 QtQuick.Controls.Basic 对得上。
@@ -1621,13 +1922,23 @@ int main(int argc, char* argv[]) {
       arguments.indexOf(QStringLiteral("--repository-test"));
   const int config_file_index =
       arguments.indexOf(QStringLiteral("--config-file"));
+  const int schedule_file_index =
+      arguments.indexOf(QStringLiteral("--schedule-file"));
   const bool backup_options_test =
       arguments.contains(QStringLiteral("--backup-options-test"));
+  const bool schedule_test =
+      arguments.contains(QStringLiteral("--schedule-test"));
+  const bool schedule_show =
+      arguments.contains(QStringLiteral("--schedule-show"));
 
   // 需要参数的开关：参数没跟上就是用法错误，明确说清楚并以 2 退出，
   // 而不是悄悄退化成默认行为（那会让测试以为它隔离了配置，其实没有）。
   if (config_file_index >= 0 && config_file_index + 1 >= arguments.size()) {
     std::fprintf(stderr, "--config-file 需要一个配置文件路径参数\n");
+    return 2;
+  }
+  if (schedule_file_index >= 0 && schedule_file_index + 1 >= arguments.size()) {
+    std::fprintf(stderr, "--schedule-file 需要一个计划存储文件路径参数\n");
     return 2;
   }
   if (repository_test_index >= 0 &&
@@ -1650,16 +1961,29 @@ int main(int argc, char* argv[]) {
   // 自动测试用 --config-file 指到临时目录，绝不读写真实用户配置。
   const QString config_file_path = ResolveConfigFilePath(arguments);
   backup_modern::BackupController controller(config_file_path);
+  // 计划存储文件与配置走同一套默认位置策略（见 app_paths.h）：
+  // backupctl schedule show 读到的就是这一份。
+  const QString schedule_file_path = ResolveScheduleFilePath(arguments);
+  // 定时备份的桥。它自己不做任何业务判断，全部转发给共享核心；
+  // 同时订阅 controller.busy，保证手动备份与计划备份不会同时写盘。
+  //
+  // 声明顺序不是随意的：QObject 上下文属性必须在 QML 引擎**之前**构造、
+  // 在它**之后**析构。反过来（引擎先析构）会让析构期间的绑定重算拿到一个
+  // 已经变成 null 的 schedule，冒出一屏 "Cannot read property of null"。
+  backup_modern::ScheduleController schedule_controller(
+      schedule_file_path, config_file_path, &controller);
+  backup_modern::FilterRuleModel filter_rule_model(&controller);
 
   QQmlApplicationEngine engine;
   // 用上下文属性而不是注册 QML 类型：QML 侧直接写 theme.accent /
   // controller.busy， 不需要任何 import 声明，也就不会碰到模块路径问题。
   engine.rootContext()->setContextProperty(QStringLiteral("theme"), &theme);
-  backup_modern::FilterRuleModel filter_rule_model(&controller);
   engine.rootContext()->setContextProperty(QStringLiteral("controller"),
                                            &controller);
   engine.rootContext()->setContextProperty(QStringLiteral("filterRuleModel"),
                                            &filter_rule_model);
+  engine.rootContext()->setContextProperty(QStringLiteral("schedule"),
+                                           &schedule_controller);
   // 窗口用不用系统边框由 C++ 决定、QML 只读：窗口标志必须在窗口创建时定下来，
   // 之后再改会出现“已经画了一帧才换边框”的闪动。
   engine.rootContext()->setContextProperty(QStringLiteral("useNativeFrame"),
@@ -1679,6 +2003,19 @@ int main(int argc, char* argv[]) {
   // 已经建好的窗口，提前返回会让这两条路径测的不是真实情况。
   window->show();
   WaitForAnimation(200);
+
+  // 页面建好之后再启动计划：此时 QML 已经绑好了 schedule 的属性，
+  // 第一步读盘的结果能直接反映到界面上。
+  //
+  // 自检模式刻意不自动启动 runner：自检要自己控制每一步（从空 store 开始、
+  // 手动触发评估），自动 tick 会和它抢同一份状态。
+  if (schedule_test) {
+    return RunScheduleTest(&schedule_controller, config_file_path);
+  }
+  if (schedule_show) {
+    return RunScheduleShow(&schedule_controller);
+  }
+  schedule_controller.start();
 
   if (self_test_index >= 0) {
     const int filter_status = ApplyFilterArguments(&controller, arguments);
@@ -1723,17 +2060,35 @@ int main(int argc, char* argv[]) {
   }
 
   if (smoke_test) {
-    // 四个页面都要真的被实例化并切换一次，两套主题也都要切到。
-    // 只把 kPageCount 改成 4 而不真正切页，等于根本没有验证新页面。
+    // 五个页面都要真的被实例化并切换一次，两套主题也都要切到。
+    // 只把 kPageCount 加一而不真正切页，等于根本没有验证新页面。
     for (int page = 0; page < kPageCount; ++page) {
       QTimer::singleShot(120 + page * 90, &app, [window, page]() {
         window->setProperty("currentPage", page);
       });
     }
     const int after_pages = 120 + kPageCount * 90;
-    QTimer::singleShot(after_pages, &app, [&theme]() { theme.toggle(); });
-    QTimer::singleShot(after_pages + 120, &app, [&theme]() { theme.toggle(); });
-    QTimer::singleShot(after_pages + 260, &app, &QCoreApplication::quit);
+
+    // 再把窗口缩到最小尺寸走一遍：窄窗口下的裁切、绑定循环、隐式高度为 0
+    // 都会以 QML 运行期警告的形式暴露出来，而 --smoke-test 把警告算成失败。
+    QTimer::singleShot(after_pages, &app, [window]() {
+      window->setWidth(960);
+      window->setHeight(620);
+    });
+    for (int page = 0; page < kPageCount; ++page) {
+      QTimer::singleShot(after_pages + 80 + page * 70, &app, [window, page]() {
+        window->setProperty("currentPage", page);
+      });
+    }
+    const int after_narrow = after_pages + 80 + kPageCount * 70;
+    QTimer::singleShot(after_narrow, &app, [window]() {
+      window->setWidth(1180);
+      window->setHeight(760);
+    });
+    QTimer::singleShot(after_narrow + 80, &app, [&theme]() { theme.toggle(); });
+    QTimer::singleShot(after_narrow + 220, &app,
+                       [&theme]() { theme.toggle(); });
+    QTimer::singleShot(after_narrow + 360, &app, &QCoreApplication::quit);
   }
 
   const int exit_code = app.exec();

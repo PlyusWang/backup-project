@@ -11,11 +11,14 @@
 #include <QFileInfo>
 #include <QTimer>
 #include <QtConcurrent/QtConcurrentRun>
+#include <cstddef>
+#include <cstring>
 #include <string>
 #include <utility>
 #include <vector>
 
 #include "backup_engine.h"
+#include "backup_option_keys.h"
 
 namespace backup_modern {
 
@@ -86,28 +89,33 @@ QVariantMap RecordToVariant(const backupproject::BackupRecord& record) {
   // 不代表归档完整，也不代表密码正确。
   item.insert(QStringLiteral("hasPipelineMethods"),
               record.has_pipeline_methods);
+  // 显式写 backup_modern::：核心里的同名函数会因为参数类型触发 ADL 一起进来，
+  // 不限定的话这里就是二义性调用。
   item.insert(QStringLiteral("packMethodKey"),
-              record.has_pipeline_methods ? PackMethodKey(record.pack_method)
-                                          : QString());
+              record.has_pipeline_methods
+                  ? backup_modern::PackMethodKey(record.pack_method)
+                  : QString());
   item.insert(QStringLiteral("packMethodText"),
-              record.has_pipeline_methods ? PackMethodText(record.pack_method)
-                                          : QString());
+              record.has_pipeline_methods
+                  ? backup_modern::PackMethodText(record.pack_method)
+                  : QString());
   item.insert(QStringLiteral("compressionMethodKey"),
-              record.has_pipeline_methods
-                  ? CompressionMethodKey(record.compression_method)
-                  : QString());
-  item.insert(QStringLiteral("compressionMethodText"),
-              record.has_pipeline_methods
-                  ? CompressionMethodText(record.compression_method)
-                  : QString());
+              record.has_pipeline_methods ? backup_modern::CompressionMethodKey(
+                                                record.compression_method)
+                                          : QString());
+  item.insert(
+      QStringLiteral("compressionMethodText"),
+      record.has_pipeline_methods
+          ? backup_modern::CompressionMethodText(record.compression_method)
+          : QString());
   item.insert(QStringLiteral("encryptionMethodKey"),
               record.has_pipeline_methods
-                  ? EncryptionMethodKey(record.encryption_method)
+                  ? backup_modern::EncryptionMethodKey(record.encryption_method)
                   : QString());
   item.insert(QStringLiteral("encryptionMethodText"),
-              record.has_pipeline_methods
-                  ? EncryptionMethodText(record.encryption_method)
-                  : QString());
+              record.has_pipeline_methods ? backup_modern::EncryptionMethodText(
+                                                record.encryption_method)
+                                          : QString());
   // 只表示"恢复这份归档需要密码"。列表阶段没有、也不该有密码。
   item.insert(QStringLiteral("passwordRequired"), record.password_required);
   return item;
@@ -123,145 +131,93 @@ QVariantList RecordsToVariantList(
   return list;
 }
 
-// GUI key 与核心 enum 的对应表。表驱动而不是 if 链：加一种算法时只改这一张表，
-// 解析、反查 key、展示文本三处就不会走散。
-struct PackKeyEntry {
+// ---- 展示文案表：只回答"界面上怎么叫" ----
+//
+// PR #16 时这三张表同时承担了"key <-> enum 映射"和"中文展示文案"两件事，
+// 于是 CLI 想用同一套 key 就只能再抄一遍。PR #17 把映射提取到 Qt 无关的
+// 共享核心 include/backup_option_keys.h：
+//
+//   CLI、ScheduleStore、Modern GUI 读的是同一张表。
+//
+// 所以这里剩下的只有本地化文案，一条 enum 取值都不再出现。加一种算法时，
+// 映射只在核心改一次，这一层最多补一行中文。
+struct DisplayLabel {
   const char* key;
-  backupproject::PackMethod method;
-  const char* text;
+  const char* label;
 };
 
-const PackKeyEntry kPackKeys[] = {
-    {"mypack", backupproject::PackMethod::kMyPack, "MyPack"},
-    {"ustar", backupproject::PackMethod::kUstar, "USTAR"},
-    {"fast-ustar", backupproject::PackMethod::kFastUstar, "Fast USTAR"},
+const DisplayLabel kCompressionLabels[] = {
+    {"none", "不压缩"},
+    {"huffman", "Huffman"},
+    {"lzss-huffman", "LZSS + Huffman"},
 };
 
-struct CompressionKeyEntry {
-  const char* key;
-  backupproject::CompressionMethod method;
-  const char* text;
+const DisplayLabel kEncryptionLabels[] = {
+    {"none", "不加密"},
+    {"des-cbc-hmac-sha256", "DES-CBC + HMAC-SHA256"},
+    {"aes-256-ctr-hmac-sha256", "AES-256-CTR + HMAC-SHA256"},
 };
 
-const CompressionKeyEntry kCompressionKeys[] = {
-    {"none", backupproject::CompressionMethod::kNone, "不压缩"},
-    {"huffman", backupproject::CompressionMethod::kHuffman, "Huffman"},
-    {"lzss-huffman", backupproject::CompressionMethod::kLzssHuffman,
-     "LZSS + Huffman"},
-};
-
-struct EncryptionKeyEntry {
-  const char* key;
-  backupproject::EncryptionMethod method;
-  const char* text;
-};
-
-const EncryptionKeyEntry kEncryptionKeys[] = {
-    {"none", backupproject::EncryptionMethod::kNone, "不加密"},
-    {"des-cbc-hmac-sha256", backupproject::EncryptionMethod::kDesCbcHmacSha256,
-     "DES-CBC + HMAC-SHA256"},
-    {"aes-256-ctr-hmac-sha256",
-     backupproject::EncryptionMethod::kAes256CtrHmacSha256,
-     "AES-256-CTR + HMAC-SHA256"},
-};
+QString LabelForKey(const DisplayLabel* table, std::size_t count,
+                    const char* key) {
+  for (std::size_t index = 0; index < count; ++index) {
+    if (std::strcmp(table[index].key, key) == 0) {
+      return QString::fromUtf8(table[index].label);
+    }
+  }
+  return QString();
+}
 
 }  // namespace
 
 // ---- GUI 稳定 key 与核心 enum 的唯一映射 ----
+//
+// 全部转发到共享核心。GUI 在这里不再拥有任何映射知识，只负责 QString 的
+// 编码转换；展示文案单独查上面那张本地化表。
 
 bool ParsePackMethodKey(const QString& key, backupproject::PackMethod* method) {
-  if (method == nullptr) {
-    return false;
-  }
-  for (const PackKeyEntry& entry : kPackKeys) {
-    if (key == QString::fromLatin1(entry.key)) {
-      *method = entry.method;
-      return true;
-    }
-  }
-  return false;
+  if (method == nullptr) return false;
+  return backupproject::ParsePackMethodKey(key.toStdString(), method);
 }
 
 QString PackMethodKey(backupproject::PackMethod method) {
-  for (const PackKeyEntry& entry : kPackKeys) {
-    if (entry.method == method) {
-      return QString::fromLatin1(entry.key);
-    }
-  }
-  return QString();
+  return QString::fromLatin1(backupproject::PackMethodKey(method));
 }
 
 QString PackMethodText(backupproject::PackMethod method) {
-  for (const PackKeyEntry& entry : kPackKeys) {
-    if (entry.method == method) {
-      return QString::fromUtf8(entry.text);
-    }
-  }
-  return QString();
+  return QString::fromUtf8(backupproject::PackMethodDisplayName(method));
 }
 
 bool ParseCompressionMethodKey(const QString& key,
                                backupproject::CompressionMethod* method) {
-  if (method == nullptr) {
-    return false;
-  }
-  for (const CompressionKeyEntry& entry : kCompressionKeys) {
-    if (key == QString::fromLatin1(entry.key)) {
-      *method = entry.method;
-      return true;
-    }
-  }
-  return false;
+  if (method == nullptr) return false;
+  return backupproject::ParseCompressionMethodKey(key.toStdString(), method);
 }
 
 QString CompressionMethodKey(backupproject::CompressionMethod method) {
-  for (const CompressionKeyEntry& entry : kCompressionKeys) {
-    if (entry.method == method) {
-      return QString::fromLatin1(entry.key);
-    }
-  }
-  return QString();
+  return QString::fromLatin1(backupproject::CompressionMethodKey(method));
 }
 
 QString CompressionMethodText(backupproject::CompressionMethod method) {
-  for (const CompressionKeyEntry& entry : kCompressionKeys) {
-    if (entry.method == method) {
-      return QString::fromUtf8(entry.text);
-    }
-  }
-  return QString();
+  return LabelForKey(kCompressionLabels,
+                     sizeof(kCompressionLabels) / sizeof(kCompressionLabels[0]),
+                     backupproject::CompressionMethodKey(method));
 }
 
 bool ParseEncryptionMethodKey(const QString& key,
                               backupproject::EncryptionMethod* method) {
-  if (method == nullptr) {
-    return false;
-  }
-  for (const EncryptionKeyEntry& entry : kEncryptionKeys) {
-    if (key == QString::fromLatin1(entry.key)) {
-      *method = entry.method;
-      return true;
-    }
-  }
-  return false;
+  if (method == nullptr) return false;
+  return backupproject::ParseEncryptionMethodKey(key.toStdString(), method);
 }
 
 QString EncryptionMethodKey(backupproject::EncryptionMethod method) {
-  for (const EncryptionKeyEntry& entry : kEncryptionKeys) {
-    if (entry.method == method) {
-      return QString::fromLatin1(entry.key);
-    }
-  }
-  return QString();
+  return QString::fromLatin1(backupproject::EncryptionMethodKey(method));
 }
 
 QString EncryptionMethodText(backupproject::EncryptionMethod method) {
-  for (const EncryptionKeyEntry& entry : kEncryptionKeys) {
-    if (entry.method == method) {
-      return QString::fromUtf8(entry.text);
-    }
-  }
-  return QString();
+  return LabelForKey(kEncryptionLabels,
+                     sizeof(kEncryptionLabels) / sizeof(kEncryptionLabels[0]),
+                     backupproject::EncryptionMethodKey(method));
 }
 
 BackupController::BackupController(const QString& config_file_path,
