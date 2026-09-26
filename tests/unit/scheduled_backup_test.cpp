@@ -1466,6 +1466,327 @@ void TestStoreParentDirectoryAndLegacyFiles() {
 
 }  // namespace
 
+// ---- L. 崩溃一致性：三个文件的中间状态 ----
+//
+// archive / manifest / schedule.json 是三个独立文件，各自原子替换，
+// **没有任何时刻能让三个一起提交**。所以"崩在两次写盘之间"留下的中间状态
+// 是必然会出现的真实磁盘状态，不是假想的。这一节把每一种中间状态都摆出来，
+// 钉住同一条不变式：
+//
+//   *** 只有 manifest 自己声明的归属与 state 记录的 baseline 完全一致，
+//       才允许由 "manifest == current" 推出"可以跳过"。 ***
+//
+// 任何一环对不上都必须重建一份完整基线快照。多建一份是安全的代价；
+// 错误跳过是一个再也补不回来的数据缺口。
+//
+// 素材全部由**真实评估**跑出来，场景只做搬运与就地篡改——不手写字节，
+// 免得测试自己构造出一个产品永远写不出来的形状。
+
+std::string ManifestPath(const Env& env) {
+  return bp::ScheduleStore(env.schedule_file).manifest_file_path();
+}
+
+bool CopyFileTo(const std::string& from, const std::string& to) {
+  std::string bytes;
+  if (!test_support::ReadFile(from, &bytes)) return false;
+  return Write(to, bytes);
+}
+
+void RemoveFile(const std::string& path) { ::unlink(path.c_str()); }
+
+struct CrashCut {
+  Env env;
+  std::string archive1;
+  std::string archive2;
+};
+
+// 跑两轮真实评估，留下四份素材：S1/M1 与 S2/M2。
+CrashCut PrepareCrashCut(const std::string& name) {
+  CrashCut cut;
+  cut.env = MakeEnv(name, 12);
+  Write(cut.env.source + "/file.txt", "v1\n");
+  Write(cut.env.source + "/keep.log", "keep\n");
+
+  bp::ScheduleEvaluationResult result;
+  ExpectStatus("CUT-01 S1 is created", cut.env, 1000,
+               bp::ScheduleEvaluationStatus::kCreatedSnapshot, &result);
+  cut.archive1 = result.archive_file_name;
+  test_support::Check(
+      CopyFileTo(cut.env.schedule_file, cut.env.root + "/state-S1.json"),
+      "CUT-02 the state written together with S1 is kept");
+  test_support::Check(
+      CopyFileTo(ManifestPath(cut.env), cut.env.root + "/manifest-S1.dat"),
+      "CUT-03 the manifest written together with S1 is kept");
+
+  Write(cut.env.source + "/file.txt", "v2\n");
+  ExpectStatus("CUT-04 S2 is created after a change", cut.env, 2000,
+               bp::ScheduleEvaluationStatus::kCreatedSnapshot, &result);
+  cut.archive2 = result.archive_file_name;
+  test_support::Check(!cut.archive2.empty() && cut.archive2 != cut.archive1,
+                      "CUT-05 the second snapshot has its own name",
+                      cut.archive2);
+  test_support::Check(
+      CopyFileTo(cut.env.schedule_file, cut.env.root + "/state-S2.json"),
+      "CUT-06 the state written together with S2 is kept");
+  test_support::Check(
+      CopyFileTo(ManifestPath(cut.env), cut.env.root + "/manifest-S2.dat"),
+      "CUT-07 the manifest written together with S2 is kept");
+  return cut;
+}
+
+std::string StateMaterial(const CrashCut& cut, const std::string& which) {
+  return cut.env.root + "/state-" + which + ".json";
+}
+
+std::string ManifestMaterial(const CrashCut& cut, const std::string& which) {
+  return cut.env.root + "/manifest-" + which + ".dat";
+}
+
+// 把磁盘摆成某个中间状态。"S1" / "S2" / 空串表示"这个文件不存在"。
+void PlaceState(const CrashCut& cut, const std::string& which) {
+  if (which.empty()) {
+    RemoveFile(cut.env.schedule_file);
+    return;
+  }
+  CopyFileTo(StateMaterial(cut, which), cut.env.schedule_file);
+}
+
+void PlaceManifest(const CrashCut& cut, const std::string& which) {
+  if (which.empty()) {
+    RemoveFile(ManifestPath(cut.env));
+    return;
+  }
+  CopyFileTo(ManifestMaterial(cut, which), ManifestPath(cut.env));
+}
+
+// 读回一份素材的原文。
+std::string MaterialBytes(const CrashCut& cut, const std::string& which) {
+  std::string bytes;
+  test_support::ReadFile(ManifestMaterial(cut, which), &bytes);
+  return bytes;
+}
+
+// 跑一轮，核对结果，并且——只要这一轮应该新建快照——把**新建的那一份**
+// 单独恢复出来与当前源逐节点比较。"新快照等于当前源"必须是被证明的，
+// 不能只是被假设。
+bp::ScheduleEvaluationResult ExpectCut(const std::string& label, CrashCut* cut,
+                                       bp::ScheduleEvaluationStatus expected) {
+  bp::ScheduleEvaluationResult result;
+  const std::vector<std::string> before = RepoArchives(cut->env.repository);
+
+  std::string error;
+  if (!Evaluate(cut->env, 3000, &result, &error)) {
+    test_support::Check(false, label, error);
+    return result;
+  }
+  test_support::Check(
+      result.status == expected, label,
+      std::string("status=") + bp::ScheduleEvaluationStatusKey(result.status) +
+          " diagnostic=" + result.diagnostic);
+
+  const std::vector<std::string> after = RepoArchives(cut->env.repository);
+  std::vector<std::string> created;
+  for (const std::string& name : after) {
+    if (std::find(before.begin(), before.end(), name) == before.end()) {
+      created.push_back(name);
+    }
+  }
+
+  if (expected == bp::ScheduleEvaluationStatus::kSkippedNoChanges) {
+    test_support::Check(created.empty(),
+                        label + ": a skip must not create a snapshot",
+                        JoinNames(created));
+    return result;
+  }
+  if (created.size() != 1) {
+    test_support::Check(false, label + ": exactly one new snapshot", JoinNames(created));
+    return result;
+  }
+
+  // 单组件拷贝出去再恢复：只有这样才能证明它不依赖仓库里的别的文件。
+  const std::string lone = cut->env.root + "/lone-" + created[0];
+  test_support::Check(CopyFileTo(cut->env.repository + "/" + created[0], lone),
+                      label + ": the new snapshot can be copied out");
+  const std::string restored = cut->env.root + "/restored-" + created[0];
+  bp::BackupEngine engine;
+  std::string restore_error;
+  test_support::Check(engine.Restore(lone, restored, &restore_error),
+                      label + ": the new snapshot restores from a lone copy",
+                      restore_error);
+  std::string detail;
+  test_support::Check(test_support::CompareTrees(cut->env.source, restored, &detail),
+                      label + ": the new snapshot equals the current source", detail);
+  return result;
+}
+
+void TestCrashConsistency() {
+  test_support::Section(
+      "L. crash consistency: the manifest must name its baseline");
+
+  // C0 正常配对：state=S2、manifest 声明的也是 S2、两份归档都在、源没变。
+  // 这是唯一允许 skip 的形状。
+  {
+    CrashCut cut = PrepareCrashCut("cut-c0");
+    PlaceState(cut, "S2");
+    PlaceManifest(cut, "S2");
+    ExpectCut("CUT-C0 a matching pair still skips", &cut,
+              bp::ScheduleEvaluationStatus::kSkippedNoChanges);
+  }
+
+  // C1 **真实 bug**：崩在 SaveManifest 与 Save(state) 之间。
+  // state 还停在 S1，manifest 却已经是 S2 的（内容 = M2），两份归档都在。
+  // S1 依然存在、依然 managed，manifest 也依然等于当前源——只比这两条就会
+  // 错误地跳过一轮，而仓库里根本没有任何一份快照装得下 M2。
+  {
+    CrashCut cut = PrepareCrashCut("cut-c1");
+    PlaceState(cut, "S1");
+    PlaceManifest(cut, "S2");
+    const bp::ScheduleEvaluationResult result =
+        ExpectCut("CUT-C1 an old state with a new manifest must not skip", &cut,
+                  bp::ScheduleEvaluationStatus::kCreatedSnapshot);
+    test_support::Check(result.baseline_reset,
+                        "CUT-C1b the run is reported as a baseline reset",
+                        result.diagnostic);
+    test_support::Check(!result.first_snapshot,
+                        "CUT-C1c it is not reported as a first snapshot");
+    test_support::Check(
+        result.diagnostic.find("belongs to a different snapshot") !=
+            std::string::npos,
+        "CUT-C1d the diagnostic names the mismatch", result.diagnostic);
+
+    // 重建之后必须收敛：源没再变，下一轮就是一次正常的 skip。
+    PlaceState(cut, "S2");
+    PlaceManifest(cut, "S2");
+    ExpectCut("CUT-C1e the rebuilt baseline makes the next run skip again", &cut,
+              bp::ScheduleEvaluationStatus::kSkippedNoChanges);
+  }
+
+  // C2 崩在另一次写盘之间：state 前进到了 S2，manifest 还停在 M1。
+  {
+    CrashCut cut = PrepareCrashCut("cut-c2");
+    PlaceState(cut, "S2");
+    PlaceManifest(cut, "S1");
+    const bp::ScheduleEvaluationResult result =
+        ExpectCut("CUT-C2 a new state with an old manifest must not skip", &cut,
+                  bp::ScheduleEvaluationStatus::kCreatedSnapshot);
+    test_support::Check(result.baseline_reset,
+                        "CUT-C2b it is reported as a baseline reset",
+                        result.diagnostic);
+  }
+
+  // C3 manifest 整个不见了。
+  {
+    CrashCut cut = PrepareCrashCut("cut-c3");
+    PlaceState(cut, "S2");
+    PlaceManifest(cut, "");
+    const bp::ScheduleEvaluationResult result =
+        ExpectCut("CUT-C3 a missing manifest forces a full baseline", &cut,
+                  bp::ScheduleEvaluationStatus::kCreatedSnapshot);
+    test_support::Check(result.baseline_reset, "CUT-C3b baseline reset reported",
+                        result.diagnostic);
+  }
+
+  // C4 manifest 被截断：这是真实的"写到一半掉电"形状。
+  {
+    CrashCut cut = PrepareCrashCut("cut-c4");
+    const std::string whole = MaterialBytes(cut, "S2");
+    test_support::Check(whole.size() > 64, "CUT-C4a the material is big enough");
+    test_support::Check(Write(ManifestPath(cut.env), whole.substr(0, 64)),
+                        "CUT-C4b the manifest is truncated");
+    PlaceState(cut, "S2");
+    const bp::ScheduleEvaluationResult result =
+        ExpectCut("CUT-C4 a truncated manifest forces a full baseline", &cut,
+                  bp::ScheduleEvaluationStatus::kCreatedSnapshot);
+    test_support::Check(result.baseline_reset, "CUT-C4c baseline reset reported",
+                        result.diagnostic);
+  }
+
+  // C5 旧版本留下的 v1 manifest：读得出来，但它没有归属信息，不可信。
+  {
+    CrashCut cut = PrepareCrashCut("cut-c5");
+    const std::string whole = MaterialBytes(cut, "S2");
+    const std::size_t first_tab = whole.find('\t');
+    const std::size_t first_newline = whole.find('\n');
+    test_support::Check(first_tab != std::string::npos &&
+                            first_newline != std::string::npos &&
+                            first_tab < first_newline,
+                        "CUT-C5a the v2 header is shaped as expected");
+    // "BPMANIFEST2 <count>\t..." -> "BPMANIFEST1 <count>\n<same entries>"
+    const std::string version2 = "BPMANIFEST2";
+    const std::string v1 =
+        "BPMANIFEST1" + whole.substr(version2.size(), first_tab - version2.size()) +
+        whole.substr(first_newline);
+    test_support::Check(Write(ManifestPath(cut.env), v1),
+                        "CUT-C5b a version 1 manifest is written");
+    PlaceState(cut, "S2");
+    const bp::ScheduleEvaluationResult result =
+        ExpectCut("CUT-C5 a legacy manifest is never a trusted baseline", &cut,
+                  bp::ScheduleEvaluationStatus::kCreatedSnapshot);
+    test_support::Check(result.baseline_reset, "CUT-C5c baseline reset reported",
+                        result.diagnostic);
+    test_support::Check(
+        result.diagnostic.find("older version") != std::string::npos,
+        "CUT-C5d the diagnostic says the manifest is from an older version",
+        result.diagnostic);
+
+    // 重建出来的必须是 v2，否则升一次级就会永远重建下去。
+    std::string rebuilt;
+    test_support::ReadFile(ManifestPath(cut.env), &rebuilt);
+    test_support::Check(rebuilt.compare(0, 11, "BPMANIFEST2") == 0,
+                        "CUT-C5e the rebuilt manifest is version 2",
+                        rebuilt.substr(0, 32));
+  }
+
+  // C6 state 与 manifest 都指向 S2，但 S2 的归档已经不在了。
+  {
+    CrashCut cut = PrepareCrashCut("cut-c6");
+    RemoveFile(cut.env.repository + "/" + cut.archive2);
+    PlaceState(cut, "S2");
+    PlaceManifest(cut, "S2");
+    ExpectCut("CUT-C6 a missing baseline archive forces a full baseline", &cut,
+              bp::ScheduleEvaluationStatus::kCreatedSnapshot);
+  }
+
+  // C7 manifest 自己声明的仓库不是当前仓库。
+  {
+    CrashCut cut = PrepareCrashCut("cut-c7");
+    std::string bytes = MaterialBytes(cut, "S2");
+    const std::string from = "\t" + cut.env.repository + "\t";
+    const std::string to = "\t/tmp/other-repository\t";
+    test_support::Check(bytes.find(from) != std::string::npos,
+                        "CUT-C7a the header really carries the repository");
+    ReplaceOnce(&bytes, from, to);
+    test_support::Check(Write(ManifestPath(cut.env), bytes),
+                        "CUT-C7b the repository field is tampered with");
+    PlaceState(cut, "S2");
+    const bp::ScheduleEvaluationResult result =
+        ExpectCut("CUT-C7 a manifest bound to another repository must not skip",
+                  &cut, bp::ScheduleEvaluationStatus::kCreatedSnapshot);
+    test_support::Check(result.baseline_reset, "CUT-C7c baseline reset reported",
+                        result.diagnostic);
+  }
+
+  // C8 manifest 自己声明的源不是当前源。源路径是头行最后一个字段，
+  // 后面直接跟换行。
+  {
+    CrashCut cut = PrepareCrashCut("cut-c8");
+    std::string bytes = MaterialBytes(cut, "S2");
+    const std::string from = "\t" + cut.env.source + "\n";
+    const std::string to = "\t/tmp/other-source\n";
+    test_support::Check(bytes.find(from) != std::string::npos,
+                        "CUT-C8a the header really carries the source path");
+    ReplaceOnce(&bytes, from, to);
+    test_support::Check(Write(ManifestPath(cut.env), bytes),
+                        "CUT-C8b the source field is tampered with");
+    PlaceState(cut, "S2");
+    const bp::ScheduleEvaluationResult result =
+        ExpectCut("CUT-C8 a manifest bound to another source must not skip", &cut,
+                  bp::ScheduleEvaluationStatus::kCreatedSnapshot);
+    test_support::Check(result.baseline_reset, "CUT-C8c baseline reset reported",
+                        result.diagnostic);
+  }
+}
+
 int main() {
   std::printf("scheduled backup test\n");
   TestTimeSemantics();
@@ -1484,6 +1805,7 @@ int main() {
   TestRetentionKeepsTheBaselineInvariant();
   TestUnsupportedModeIsNeverRunAsFull();
   TestStoreParentDirectoryAndLegacyFiles();
+  TestCrashConsistency();
   TestStability();
   test_support::RemoveTree(test_support::TempRoot());
   return test_support::Finish("scheduled backup");
