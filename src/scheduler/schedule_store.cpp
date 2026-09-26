@@ -15,6 +15,7 @@
 #include <utility>
 #include <vector>
 
+#include "backup_catalog.h"
 #include "backup_option_keys.h"
 #include "simple_json.h"
 
@@ -39,6 +40,37 @@ std::string ParentDirectoryOf(const std::string& path) {
   if (slash == std::string::npos) return std::string(".");
   if (slash == 0) return std::string("/");
   return path.substr(0, slash);
+}
+
+// 递归创建目录，等价于 mkdir -p。
+//
+// 什么时候会真的用到它：用户把 --schedule-file 指到一个还不存在的深层路径
+// （首次运行、或者应用配置目录整个被清空过）。此时"保存计划"不该因为父目录
+// 不在就失败——那是保存路径的问题，不是用户的输入错误。
+//
+// 目录权限 0700：里面放的是 schedule.json + manifest，前者已经是 0600，
+// 目录没有理由是 0755 让同机器上任何人都能列出来。
+bool MakeDirectories(const std::string& path, std::string* error_message) {
+  if (path.empty() || path == "." || path == "/") return true;
+
+  struct stat status;
+  if (::lstat(path.c_str(), &status) == 0) {
+    if (S_ISDIR(status.st_mode)) return true;
+    SetError(error_message,
+             "Cannot create the schedule directory: not a directory: " + path);
+    return false;
+  }
+  if (errno != ENOENT) {
+    SetError(error_message, Describe(errno, "Failed to inspect", path));
+    return false;
+  }
+  if (!MakeDirectories(ParentDirectoryOf(path), error_message)) return false;
+  if (::mkdir(path.c_str(), 0700) != 0 && errno != EEXIST) {
+    SetError(error_message,
+             Describe(errno, "Failed to create the schedule directory", path));
+    return false;
+  }
+  return true;
 }
 
 // 全部写入或明确失败。EINTR 重试；短写继续写。
@@ -286,33 +318,55 @@ bool ValidateScheduleConfig(const ScheduleConfig& config,
   return BuildScheduleFilter(config, &filter, error_message);
 }
 
-bool ValidateScheduleForEnable(const ScheduleConfig& config,
-                               std::string* error_message) {
-  if (!ValidateScheduleConfig(config, error_message)) return false;
-  if (config.source_path.empty()) {
-    SetError(error_message,
-             "Schedule source directory must be set before enabling");
+namespace {
+
+// 一个"必须已经存在、必须是真实目录、且不能是软链接"的路径。
+//
+// 两条路径（源目录、仓库）用的是同一段判断，报错文案只换主语：绝不写两遍，
+// 免得某一天只修好了其中一份。
+bool RequireRealDirectory(const std::string& path, const char* what,
+                          std::string* error_message) {
+  if (path.empty()) {
+    SetError(error_message, std::string(what) + " must be set before enabling");
     return false;
   }
   struct stat status;
-  if (::lstat(config.source_path.c_str(), &status) != 0) {
-    SetError(error_message,
-             Describe(errno, "Schedule source directory is not usable",
-                      config.source_path));
+  if (::lstat(path.c_str(), &status) != 0) {
+    SetError(error_message, Describe(errno, what, path));
     return false;
   }
   if (S_ISLNK(status.st_mode)) {
     SetError(error_message,
-             "Schedule source directory must not be a symbolic link: " +
-                 config.source_path);
+             std::string(what) + " must not be a symbolic link: " + path);
     return false;
   }
   if (!S_ISDIR(status.st_mode)) {
-    SetError(error_message,
-             "Schedule source path is not a directory: " + config.source_path);
+    SetError(error_message, std::string(what) + " is not a directory: " + path);
     return false;
   }
   return true;
+}
+
+}  // namespace
+
+bool ValidateScheduleForEnable(const ScheduleConfig& config,
+                               const std::string& repository_path,
+                               std::string* error_message) {
+  if (!ValidateScheduleConfig(config, error_message)) return false;
+
+  // 仓库先查：仓库没配好时，"源目录也不对"不是用户现在最需要看到的信息。
+  if (repository_path.empty()) {
+    SetError(error_message,
+             "No backup repository is configured. Set one before enabling the "
+             "scheduled backup");
+    return false;
+  }
+  if (!RequireRealDirectory(repository_path, "The backup repository",
+                            error_message)) {
+    return false;
+  }
+  return RequireRealDirectory(config.source_path, "Schedule source directory",
+                              error_message);
 }
 
 const char* ScheduleRunResultKey(ScheduleRunResult result) {
@@ -542,6 +596,18 @@ std::string SerializeScheduleDocument(const ScheduleDocument& document) {
   AppendNumberField(&out, "last_manifest_entry_count",
                     document.state.last_manifest_entry_count, false);
 
+  // baseline 三件套总是写出来（空串也写）。读侧把它们当成可选字段，
+  // 所以旧版本写出的、没有这三行的 schedule.json 仍然读得进来。
+  AppendIndent(&out, 2);
+  AppendStringField(&out, "baseline_snapshot_file_name",
+                    document.state.baseline.snapshot_file_name, false);
+  AppendIndent(&out, 2);
+  AppendStringField(&out, "baseline_repository_identity",
+                    document.state.baseline.repository_identity, false);
+  AppendIndent(&out, 2);
+  AppendStringField(&out, "baseline_source_path",
+                    document.state.baseline.source_path, false);
+
   AppendIndent(&out, 2);
   out += "\"managed_snapshots\": [";
   if (document.state.managed_snapshots.empty()) {
@@ -593,6 +659,13 @@ const std::vector<const char*> kConfigFields = {
 const std::vector<const char*> kStateFields = {
     "next_run_time_sec", "last_success_time_sec", "last_manifest_entry_count",
     "managed_snapshots", "history"};
+// baseline 是在 review-fix 这一轮追加的。上一版写出的 schedule.json 没有这
+// 三个字段，它必须仍然读得进来（缺 baseline = 不知道 manifest 属于哪份快照
+// = 下一轮重建基线快照，语义上恰好就是安全的那个默认）。但"不在这两个列表
+// 里的 key"照样报 unknown，"kStateFields 里少一个"照样报 missing。
+const std::vector<const char*> kStateOptionalFields = {
+    "baseline_snapshot_file_name", "baseline_repository_identity",
+    "baseline_source_path"};
 const std::vector<const char*> kSnapshotFields = {
     "file_name", "created_time_sec", "added",       "removed",
     "modified",  "metadata_changed", "entry_count", "archive_size",
@@ -607,6 +680,20 @@ bool BadField(const std::string& what, const char* key,
   SetError(error_message, "Invalid schedule store: " + what + ": field '" +
                               key + "' " + detail);
   return false;
+}
+
+// 可选字符串字段：完全不出现就保持默认（空串），出现了就必须是合法字符串。
+// 只有 kStateOptionalFields 里的字段会走这里。
+bool RequireOptionalString(const JsonValue& object, const char* key,
+                           const std::string& what, std::string* out,
+                           std::string* error_message) {
+  if (object.Find(key) == nullptr) return true;
+  if (!RequireString(object, key, what, out, error_message)) return false;
+  if (!IsBoundedString(*out, kMaxScheduleStringBytes)) {
+    return BadField(what, key, "is unusable (too long or contains a NUL byte)",
+                    error_message);
+  }
+  return true;
 }
 
 bool ParseChangeFields(const JsonValue& object, const std::string& what,
@@ -871,7 +958,8 @@ bool ParseState(const JsonValue& root, ScheduleState* state,
   if (!RequireObject(root.Find("state"), "state", &object, error_message)) {
     return false;
   }
-  if (!RequireExactFields(*object, kStateFields, "state", error_message)) {
+  if (!RequireExactFields(*object, kStateFields, kStateOptionalFields, "state",
+                          error_message)) {
     return false;
   }
   if (!RequireInt64(*object, "next_run_time_sec", "state",
@@ -885,6 +973,29 @@ bool ParseState(const JsonValue& root, ScheduleState* state,
   if (!RequireUint64(*object, "last_manifest_entry_count", "state",
                      kMaxManifestEntries, &state->last_manifest_entry_count,
                      error_message)) {
+    return false;
+  }
+
+  // baseline 三件套：全部可选，缺失就是空串（= 没有记录过 baseline）。
+  // file_name 存在时必须是合法的单组件归档名——它是从仓库里 Resolve 出来的
+  // 依据，绝不允许出现带 '/' 或 ".." 的东西。
+  if (!RequireOptionalString(*object, "baseline_snapshot_file_name", "state",
+                             &state->baseline.snapshot_file_name,
+                             error_message)) {
+    return false;
+  }
+  if (!state->baseline.snapshot_file_name.empty() &&
+      !IsSingleComponentArchiveName(state->baseline.snapshot_file_name)) {
+    return BadField("state", "baseline_snapshot_file_name",
+                    "is not a plain .bak file name", error_message);
+  }
+  if (!RequireOptionalString(*object, "baseline_repository_identity", "state",
+                             &state->baseline.repository_identity,
+                             error_message)) {
+    return false;
+  }
+  if (!RequireOptionalString(*object, "baseline_source_path", "state",
+                             &state->baseline.source_path, error_message)) {
     return false;
   }
 
@@ -1048,6 +1159,32 @@ bool ScheduleStore::Save(const ScheduleDocument& document,
                    record.file_name + "'");
       return false;
     }
+  }
+  // baseline 指向的也必须是一个合法的单组件归档名。空串是合法的：那表示
+  // "还没有 baseline"，不是错误。
+  if (!document.state.baseline.snapshot_file_name.empty() &&
+      !IsSingleComponentArchiveName(
+          document.state.baseline.snapshot_file_name)) {
+    SetError(error_message,
+             "Cannot save schedule: the baseline snapshot has an invalid "
+             "file name: '" +
+                 document.state.baseline.snapshot_file_name + "'");
+    return false;
+  }
+  if (!IsBoundedString(document.state.baseline.repository_identity,
+                       kMaxScheduleStringBytes) ||
+      !IsBoundedString(document.state.baseline.source_path,
+                       kMaxScheduleStringBytes)) {
+    SetError(error_message,
+             "Cannot save schedule: the baseline record holds an unusable "
+             "path (too long or contains a NUL byte)");
+    return false;
+  }
+
+  // 父目录不存在就先建出来：首次运行、或者应用配置目录被清空过时，
+  // "保存计划"不该因为路径还不存在而失败。
+  if (!MakeDirectories(ParentDirectoryOf(schedule_file_path_), error_message)) {
+    return false;
   }
   return WriteFileAtomically(
       schedule_file_path_, SerializeScheduleDocument(document), error_message);

@@ -323,6 +323,14 @@ bool RequireObject(const JsonValue* value, const std::string& what,
 bool RequireExactFields(const JsonValue& object,
                         const std::vector<const char*>& fields,
                         const std::string& what, std::string* error_message) {
+  return RequireExactFields(object, fields, std::vector<const char*>(), what,
+                            error_message);
+}
+
+bool RequireExactFields(const JsonValue& object,
+                        const std::vector<const char*>& fields,
+                        const std::vector<const char*>& optional,
+                        const std::string& what, std::string* error_message) {
   if (!object.is_object()) {
     return Reject(what, "must be an object", error_message);
   }
@@ -338,6 +346,14 @@ bool RequireExactFields(const JsonValue& object,
       if (member.first == field) {
         known = true;
         break;
+      }
+    }
+    if (!known) {
+      for (const char* field : optional) {
+        if (member.first == field) {
+          known = true;
+          break;
+        }
       }
     }
     if (!known) {

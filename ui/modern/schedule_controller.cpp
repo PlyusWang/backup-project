@@ -68,6 +68,10 @@ ScheduleController::ScheduleController(QString schedule_file_path,
   if (backup_controller != nullptr) {
     connect(backup_controller, &BackupController::busyChanged, this,
             &ScheduleController::OnBackupBusyChanged);
+    // 仓库可以在运行期被改掉（设置页 / CLI）。不订阅它，scheduler 就会一直
+    // 拿启动时读到的那个仓库继续写——静默地把备份写进旧位置。
+    connect(backup_controller, &BackupController::repositoryPathChanged, this,
+            &ScheduleController::OnRepositoryPathChanged);
   }
 }
 
@@ -169,6 +173,18 @@ void ScheduleController::Tick() {
 
 void ScheduleController::OnBackupBusyChanged() { DrainPending(); }
 
+void ScheduleController::OnRepositoryPathChanged() {
+  // 只重读配置：下一次 Submit 会把当时的 repository_path_ 拷进后台任务，
+  // 所以新值天然只影响之后的提交，不会影响已经在跑的那一轮。
+  const QString previous = repository_path_;
+  LoadFromDisk();
+  ApplyRunnerLock();
+  if (repository_path_ != previous) {
+    // 换了仓库：积压的那一次到期检查必须落到新仓库上。
+    DrainPending();
+  }
+}
+
 void ScheduleController::Submit(bool force) {
   if (busy_) {
     // 忙碌期间来的多个到期事件 coalesce 成一次，绝不排无限队列。
@@ -238,6 +254,7 @@ ScheduleOutcome ScheduleController::RunEvaluation(const QString& store_path,
   outcome.succeeded = true;
   outcome.ran = true;
   outcome.first_snapshot = result.first_snapshot;
+  outcome.baseline_reset = result.baseline_reset;
   outcome.status_key = QString::fromLatin1(
       backupproject::ScheduleEvaluationStatusKey(result.status));
   outcome.status_text = QString::fromUtf8(
@@ -297,9 +314,17 @@ void ScheduleController::OnEvaluationFinished() {
                  : QStringLiteral(" 原因：") + outcome.diagnostic));
   } else if (outcome.created) {
     SetStatus(
-        kSuccess, QStringLiteral("已创建新的完整快照"),
+        kSuccess,
+        outcome.baseline_reset ? QStringLiteral("已重建基线快照")
+                               : QStringLiteral("已创建新的完整快照"),
         (outcome.first_snapshot
              ? QStringLiteral("首次快照：") +
+                   ChangeText(outcome.added, outcome.removed, outcome.modified,
+                              outcome.metadata_changed)
+         : outcome.baseline_reset
+             ? QStringLiteral("原来那份基线快照已经不在仓库里（被删除、"
+                              "换了仓库或换了源目录），因此重新建立了一份"
+                              "完整快照：") +
                    ChangeText(outcome.added, outcome.removed, outcome.modified,
                               outcome.metadata_changed)
              : QStringLiteral("变化：") +
@@ -390,21 +415,22 @@ bool ScheduleController::saveConfig(bool enabled, const QString& source_path,
               QString::fromStdString(error));
     return false;
   }
-  if (config.enabled) {
-    if (repository_path_.isEmpty()) {
-      SetStatus(kError, QStringLiteral("还没有配置备份仓库"),
-                QStringLiteral("请先在设置页选择备份仓库，再启用定时备份。"));
-      return false;
-    }
-    if (!backupproject::ValidateScheduleForEnable(config, &error)) {
-      SetStatus(kError, QStringLiteral("无法启用定时备份"),
-                QString::fromStdString(error));
-      return false;
-    }
+  if (config.enabled && !backupproject::ValidateScheduleForEnable(
+                            config, repository_path_.toStdString(), &error)) {
+    // 与 backupctl schedule enable 调的是同一个函数：源目录、仓库、"能不能
+    // 启用"这三件事只有一份判断，不会一边松一边紧。
+    SetStatus(kError, QStringLiteral("无法启用定时备份"),
+              QString::fromStdString(error));
+    return false;
   }
 
   backupproject::ScheduleDocument next = document_;
   next.config = config;
+  // 首次启用：下一次运行排在一个完整周期之后，而不是下一个 tick 就开跑。
+  // 已经启用时这个函数是 no-op —— 保存配置不该把时间表往后推。
+  backupproject::ApplyScheduleEnableTransition(
+      &next, document_.config.enabled,
+      static_cast<std::int64_t>(std::time(nullptr)));
   if (!store_.Save(next, &error)) {
     SetStatus(kError, QStringLiteral("计划保存失败"),
               QString::fromStdString(error));

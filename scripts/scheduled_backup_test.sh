@@ -448,6 +448,13 @@ else
   expect_grep "E.06 GUI 写的 include 规则 CLI 读得到" "Include rules:  ext:txt"
   expect_grep "E.07 GUI 写的 exclude 规则 CLI 读得到" "Exclude rules:  path:**/build/**"
 
+  # GUI 自检跑在自己的 QTemporaryDir 里，进程一退出那个仓库就不存在了；而它
+  # 留下的这份计划是 enabled 的，任何修改都会先过一遍"仍然真的能跑"的完整校验
+  # （review-fix 新加的那条）。所以先把仓库重新指到一个真实存在的目录：
+  # 这一步失败本身就是那条新约束在起作用的证据。
+  expect_exit "E.07b 重新指向一个真实存在的仓库" 0 \
+    "$BACKUPCTL" --config-file "$CROSS_CONFIG" config repository set "$CROSS/repo"
+
   # CLI -> GUI：CLI 写一份不同的计划，GUI 用自己的控制器读回来。
   expect_exit "E.08 CLI 写一份新计划" 0 \
     "$BACKUPCTL" --config-file "$CROSS_CONFIG" --schedule-file "$CROSS_STORE" schedule set \

@@ -93,6 +93,25 @@ struct BackupRecord {
   std::string diagnostic;
 };
 
+// 仓库的稳定 identity：用来回答"这两个仓库路径是不是同一个仓库"。
+//
+// 为什么不能直接比较用户写下的字符串："/repo"、"/repo/"、以及经过软链接的
+// "/mnt/data/repo" 可能指向同一个目录，也可能不是——字符串比较给出的答案
+// 与文件系统给的答案不一致，会让"同一份 manifest 属于哪个仓库"这件事失去意义。
+//
+// 取值规则（确定、可复现）：
+//   * 空路径 -> 空串；
+//   * 先去掉尾部 '/'（"/" 本身除外）；
+//   * 路径存在时返回 realpath() 的规范化结果；
+//   * 路径不存在时返回去掉尾部 '/' 的原字符串——**不做任何猜测**，
+//     也绝不因此把 identity 变成空串（那会让"仓库暂时不可用"看起来像
+//     "仓库换了"）。
+//
+// 刻意不读 inode / 设备号：仓库目录可以被删掉再建出来，那时 inode 变了但
+// 它仍然是用户心里的"同一个仓库"；反过来 device 号在容器与 bind mount 下
+// 也不稳定。路径 identity 是这里能给出的最诚实的答案。
+std::string RepositoryIdentity(const std::string& repository_path);
+
 class BackupCatalog {
  public:
   BackupCatalog() = default;

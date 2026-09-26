@@ -75,6 +75,17 @@ bool RequireExactFields(const JsonValue& object,
                         const std::vector<const char*>& fields,
                         const std::string& what, std::string* error_message);
 
+// 同上，但额外允许 optional 里的字段：它们可以出现，也可以完全不出现，
+// 出现时由调用方自己解析。
+//
+// 存在的唯一理由：新版本往一个已经发布的 schema 里追加字段时，旧文件必须
+// 仍然读得进来。它**不是**"放宽未知字段"——不在 fields ∪ optional 里的 key
+// 照样报 unknown，fields 里少一个照样报 missing。
+bool RequireExactFields(const JsonValue& object,
+                        const std::vector<const char*>& fields,
+                        const std::vector<const char*>& optional,
+                        const std::string& what, std::string* error_message);
+
 bool RequireObject(const JsonValue* value, const std::string& what,
                    const JsonValue** out, std::string* error_message);
 bool RequireArray(const JsonValue& object, const char* key,

@@ -66,6 +66,13 @@ struct ScheduleEvaluationResult {
   // 被删/损坏），因此产出的是一份"首次完整快照"，而不是"相对上一版的变化"。
   bool first_snapshot = false;
 
+  // true 表示"以前确实记过 baseline，但它已经不可信了"——对应快照被用户删掉、
+  // 仓库被换成了另一个、源目录被换掉、或者该快照不再归本 scheduler 管理。
+  //
+  // 这一轮和 first_snapshot 的结果完全一样：产出一份**完整基线快照**并重建
+  // baseline 记录，绝不因为"manifest 恰好相同"而 skip。
+  bool baseline_reset = false;
+
   ChangeSummary changes;
 
   // 只有真的产出归档时非空（单组件文件名）。
@@ -83,6 +90,50 @@ struct ScheduleEvaluationResult {
 // next_run = now + interval。整秒运算，溢出被夹到 INT64_MAX。
 std::int64_t ScheduleNextRunTime(std::int64_t now_sec,
                                  std::uint32_t interval_minutes);
+
+// disabled -> enabled 这一次转换应该怎么处理时间表。
+//
+// 语义（GUI 与 CLI 完全一致，两边都只调用这一个函数）：
+//   * 只有"启用"这一侧才动 next_run；停用不重置，方便下次启用重新算。
+//   * 已经启用时是 no-op —— show / load / set 都不许顺手把时间表推后，
+//     否则用户每改一次配置，下一次运行就被推迟一整个周期。
+//   * 首次启用把 next_run 推成 now + interval：用户刚勾上"启用"，下一秒就
+//     看到一次备份跑起来是反直觉的。想立刻跑有明确的入口（GUI 的"立即检查
+//     并运行"、CLI 的 schedule run），不需要靠 next_run = 0 的副作用。
+void ApplyScheduleEnableTransition(ScheduleDocument* document, bool was_enabled,
+                                   std::int64_t now_sec);
+
+// schedule-manifest.dat 里那份源清单到底能不能用。
+//
+// 这是本 PR 最重要的一条不变式：**manifest 只有在能证明它属于当前仓库里一份
+// 真实存在的、仍然归本 scheduler 管理的快照时才有意义**。单独一份 manifest
+// 只说明"上次扫描到的源状态"，它证明不了仓库里还有与它对应的那份备份。
+enum class ScheduleBaselineStatus {
+  // 从来没记录过 baseline（首次运行、或者旧版本的 schedule.json）。
+  kMissing,
+  // 记录的仓库与当前仓库不是同一个。
+  kRepositoryChanged,
+  // 记录的源目录与当前计划源目录不是同一个。
+  kSourceChanged,
+  // 记录的那份快照已经不在 managed 名单里：用户手工删了、或者被别的进程删了。
+  kNotManaged,
+  // 记录的那份快照在 managed 名单里，但在仓库里已经解析不出来了
+  // （文件被外部删掉、被替换成软链接、名字不再合法……）。
+  kSnapshotGone,
+  kValid,
+};
+
+const char* ScheduleBaselineStatusKey(ScheduleBaselineStatus status);
+std::string ScheduleBaselineStatusText(ScheduleBaselineStatus status);
+
+// 判定 baseline 是否仍然可用。document 必须是**已经 reconcile 过**的文档
+// （即 managed 名单已经剔除掉仓库里不存在的记录），否则 kNotManaged 与
+// kSnapshotGone 的分工就失去意义。
+//
+// 顺序是刻意的：先做三个纯字符串比较（免费），再做任何文件系统动作。
+ScheduleBaselineStatus EvaluateScheduleBaseline(
+    const ScheduleDocument& document, const std::string& repository_path,
+    std::string* error_message);
 
 // 是否到点。
 //
@@ -108,6 +159,17 @@ class ScheduledBackupService {
   // store 必须活得比本对象久；repository_path 是备份仓库的显式路径
   // （不从配置里猜）。
   ScheduledBackupService(std::string repository_path, ScheduleStore* store);
+
+  // 换仓库。给长运行的调用方用（backupctl schedule watch、任何常驻 runner）：
+  // 它们在每一轮真正评估之前重新从共享 ConfigManager 读一次当前仓库，
+  // 然后喂进来。
+  //
+  // 为什么必须有这个入口：进程启动时读一次仓库、之后整个生命周期都用它，
+  // 会在用户改了 config 之后继续往**旧仓库**写备份——那是静默的数据错位，
+  // 比一次明确的失败糟得多。仓库换了之后，baseline 的仓库 identity 对不上，
+  // 于是下一轮会老老实实重建一份完整基线快照。
+  void SetRepositoryPath(std::string repository_path);
+  const std::string& repository_path() const { return repository_path_; }
 
   // 完整走一轮评估，**先判断是否到点**。now_sec 由调用方注入。
   //
