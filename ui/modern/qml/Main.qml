@@ -153,21 +153,30 @@ ApplicationWindow {
                         checked: root.currentPage === 1
                         onClicked: root.currentPage = 1
                     }
+                    // 定时备份是一个独立的业务页面，不是备份页上的一个开关：
+                    // 它有自己的源目录、周期、保留策略与运行历史。
+                    NavItem {
+                        Layout.fillWidth: true
+                        text: "自动备份"
+                        iconName: "clock"
+                        checked: root.currentPage === 2
+                        onClicked: root.currentPage = 2
+                    }
                     // 恢复不再是独立页面：它是"备份管理"里的一个动作，
                     // 与课程设计里的"备份 / 管理备份数据 / 备份设置"结构一致。
                     NavItem {
                         Layout.fillWidth: true
                         text: "备份管理"
                         iconName: "folder"
-                        checked: root.currentPage === 2
-                        onClicked: root.currentPage = 2
+                        checked: root.currentPage === 3
+                        onClicked: root.currentPage = 3
                     }
                     NavItem {
                         Layout.fillWidth: true
                         text: "设置"
                         iconName: "settings"
-                        checked: root.currentPage === 3
-                        onClicked: root.currentPage = 3
+                        checked: root.currentPage === 4
+                        onClicked: root.currentPage = 4
                     }
 
                     Item { Layout.fillHeight: true }
@@ -182,7 +191,7 @@ ApplicationWindow {
                 }
             }
 
-            // 页面区：四页叠在同一位置，切换时当前页淡入。
+            // 页面区：五页叠在同一位置，切换时当前页淡入。
             StackLayout {
                 id: pageStack
                 Layout.fillWidth: true
@@ -199,17 +208,22 @@ ApplicationWindow {
                     opacity: root.currentPage === 1 ? 1 : 0
                     Behavior on opacity { NumberAnimation { duration: 150; easing.type: Easing.OutCubic } }
                     // 页面自己不改 root.currentPage，只发意图，跳转由窗口决定。
-                    onOpenSettings: root.currentPage = 3
+                    onOpenSettings: root.currentPage = 4
+                }
+
+                SchedulePage {
+                    opacity: root.currentPage === 2 ? 1 : 0
+                    Behavior on opacity { NumberAnimation { duration: 150; easing.type: Easing.OutCubic } }
                 }
 
                 BackupManagementPage {
-                    opacity: root.currentPage === 2 ? 1 : 0
+                    opacity: root.currentPage === 3 ? 1 : 0
                     Behavior on opacity { NumberAnimation { duration: 150; easing.type: Easing.OutCubic } }
-                    onOpenSettings: root.currentPage = 3
+                    onOpenSettings: root.currentPage = 4
                 }
 
                 SettingsPage {
-                    opacity: root.currentPage === 3 ? 1 : 0
+                    opacity: root.currentPage === 4 ? 1 : 0
                     Behavior on opacity { NumberAnimation { duration: 150; easing.type: Easing.OutCubic } }
                 }
             }

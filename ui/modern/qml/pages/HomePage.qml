@@ -98,6 +98,37 @@ Item {
                     AppButton {
                         text: "打开备份管理"
                         variant: "primary"
+                        onClicked: page.navigateTo(3)
+                    }
+                }
+            }
+
+            AppCard {
+                Layout.fillWidth: true
+                Layout.preferredHeight: 196
+
+                ColumnLayout {
+                    anchors.fill: parent
+                    spacing: 10
+
+                    AppIcon { name: "clock"; size: 22; color: theme.accent }
+                    Text {
+                        text: "自动备份"
+                        font.pixelSize: 20
+                        font.weight: Font.DemiBold
+                        color: theme.textPrimary
+                    }
+                    Text {
+                        text: "定时触发 + 完整快照：只有真的发生变化才建立新副本"
+                        font.pixelSize: 16
+                        color: theme.textSecondary
+                        Layout.fillWidth: true
+                        wrapMode: Text.WordWrap
+                    }
+                    Item { Layout.fillHeight: true }
+                    AppButton {
+                        text: "打开自动备份"
+                        variant: "primary"
                         onClicked: page.navigateTo(2)
                     }
                 }
