@@ -180,25 +180,33 @@ Item {
                     text: "开始备份"
                     variant: "primary"
                     // busy 时禁用：整个程序只有一个控制器，天然保证同一时刻只有一个操作。
-                    // 密码不合法（为空或两次不一致）时同样不给点：校验规则只有这两条，
-                    // 具体判定在面板里（passwordAcceptable），这一页不重复实现一遍。
-                    enabled: !controller.busy && panel.passwordAcceptable
+                    // 密码为空或两次不一致时不再直接把按钮禁用 —— 那样用户根本没有
+                    // "再点一次提交、然后才看到错误"的机会。校验改成点击时请求：
+                    // 面板先亮出错误，合法才真的调用控制器。
+                    // 规则仍然只有那两条，判定也仍然只写在面板里。
+                    enabled: !controller.busy
                     // 三个算法一律传冻结的字符串键；密码与确认密码原样交给控制器，
                     // 界面不在这里做任何加工（不加盐、不截断、不拼进任何路径）。
                     //
-                    // 只有控制器真的收下了这次任务（返回 true —— 此时 Start() 已经把
-                    // OperationRequest 的值拷贝交给 QtConcurrent）才清空两个密码框。
-                    // 同步校验失败时（没选源目录、没配仓库、两次不一致、未知 key）
-                    // 必须把用户已经打好的密码留着，让他改完继续提交，而不是重打一遍。
-                    // 这里也不动 encryptionKey：选中的仍然是 AES，下一次加密备份照常
-                    // 需要重新输入密码。
+                    // 顺序是刻意的：先请求校验 -> 不合法就 return（完全不碰控制器，
+                    // 错误提示由面板自己显示）-> 合法才提交。只有控制器真的收下了
+                    // 这次任务（返回 true —— 此时 Start() 已经把 OperationRequest
+                    // 的值拷贝交给 QtConcurrent）才清空两个密码框并收起提示。
+                    // 控制器同步失败时（没选源目录、没配仓库、未知 key）密码保留，
+                    // 用户改完可以直接再点一次；这里也不动 encryptionKey。
                     onClicked: {
+                        panel.requestPasswordValidation()
+
+                        if (!panel.passwordAcceptable)
+                            return
+
                         const started = controller.startBackupWithOptions(
                             panel.packKey,
                             panel.compressionKey,
                             panel.encryptionKey,
                             panel.password,
                             panel.confirmPassword)
+
                         if (started)
                             panel.clearPasswords()
                     }

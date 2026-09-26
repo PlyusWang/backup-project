@@ -224,7 +224,9 @@ Rectangle {
         objectName: "restorePasswordDialog"
         anchors.centerIn: parent
         modal: true
-        padding: 0
+        // 自定义 Dialog 默认没有内容边距，标题 / 正文 / 输入框 / 按钮会贴着边框。
+        // 统一给 18，与 AppCard 的内边距同一个量级；background 的圆角与描边不动。
+        padding: 18
 
         // 关闭路径不止“取消”一种，所以清空挂在 onClosed 上，
         // 保证任何一种关法都不会把输入留在界面上。
@@ -306,7 +308,8 @@ Rectangle {
         objectName: "deleteConfirmDialog"
         anchors.centerIn: parent
         modal: true
-        padding: 0
+        // 同 restorePasswordDialog：这是同一套自定义 Dialog 样式，边距保持一致。
+        padding: 18
 
         background: Rectangle {
             color: theme.surfaceElevated
