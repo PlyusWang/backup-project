@@ -172,6 +172,13 @@ Item {
                     formatVersion: Number(modelData["formatVersion"] || 0)
                     entryCountText: String(modelData["entryCount"] || 0)
                     diagnosticText: String(modelData["diagnostic"] || "")
+                    // v2 才有的 pipeline 元数据：缺字段一律按 legacy 处理，
+                    // 卡片因此不会显示任何算法名（也不会显示 v2 的三个文案）。
+                    hasPipelineMethods: Boolean(modelData["hasPipelineMethods"])
+                    packMethodText: String(modelData["packMethodText"] || "")
+                    compressionMethodText: String(modelData["compressionMethodText"] || "")
+                    encryptionMethodText: String(modelData["encryptionMethodText"] || "")
+                    passwordRequired: Boolean(modelData["passwordRequired"])
                     busy: controller.busy || controller.catalogBusy
                 }
             }
