@@ -27,8 +27,16 @@ Item {
     property string encryptionKey: "none"
 
     // 密码只在加密时才有意义；直接暴露输入框自己的 text，界面里不留第二份副本。
+    // 这两条是 readonly 绑定，不是 property alias：清 passwordField.text
+    // 就等于清掉对外暴露的 password / confirmPassword。
     readonly property string password: passwordField.text
     readonly property string confirmPassword: confirmField.text
+
+    // "当前输入合不合法"与"该不该把错误显示出来"是两件事，所以分开：
+    // validationMessage 一直实时算，这个开关只在用户真的点过一次"开始备份"之后才置真。
+    // 于是刚选上 AES、还没输入时不会先红一片；而成功提交后 clearPasswords()
+    // 会把它复位，红色提示随之消失 —— 那一次的密码是程序主动清的，不是用户输错了。
+    property bool passwordValidationRequested: false
 
     // 显示名与键分开放：下拉里给人看的是显示名，交给 C++ 的始终是键。
     readonly property var packLabels: ["MyPack", "USTAR", "Fast USTAR"]
@@ -93,18 +101,34 @@ Item {
     readonly property bool passwordAcceptable: !panel.passwordControlsVisible
                                                || panel.validationMessage.length === 0
 
-    // 切回"不加密"时立刻清掉两次输入：留着上一次的密码没有用处，
-    // 还会让"这一次备份到底有没有用密码"变得含糊。
-    // 清的是输入框本身 —— password / confirmPassword 就是它 text 的别名，
+    // 清的是输入框本身 —— password / confirmPassword 是它 text 的 readonly 绑定，
     // 所以不存在"清了一处、另一处还留着"的可能。
+    //
+    // 顺带把"已请求过校验"复位：清空是成功提交之后的动作，不是用户输错了，
+    // 复位后那行红色提示立刻消失，而不是跳成"密码不能为空"。
     function clearPasswords() {
         passwordField.text = ""
         confirmField.text = ""
+        panel.passwordValidationRequested = false
+    }
+
+    // 用户按下"开始备份"时才请求校验。单独给一个函数而不是让 BackupPage 直接写属性，
+    // 是为了让"什么算一次提交尝试"只有面板自己知道。
+    function requestPasswordValidation() {
+        panel.passwordValidationRequested = true
     }
 
     onEncryptionKeyChanged: {
-        if (panel.encryptionKey === "none")
+        if (panel.encryptionKey === "none") {
+            // 切回"不加密"：留着上一次的密码没有用处，还会让
+            // "这一次备份到底有没有用密码"变得含糊。
             panel.clearPasswords()
+        } else {
+            // 切到（或切换到另一种）加密方式时只复位"已尝试提交"，
+            // 不清已经输入的密码 —— 清不清密码是既有行为，本轮不扩大语义。
+            // 重点是别把上一次的红色错误继承过来。
+            panel.passwordValidationRequested = false
+        }
     }
 
     implicitHeight: card.implicitHeight
@@ -311,12 +335,15 @@ Item {
                         enabled: !controller.busy
                     }
 
-                    // 校验是实时的：密码框下面永远显示"当前这一次输入能不能提交"，
-                    // 而不是等用户点了开始备份才报错。
+                    // 提示只在"用户真的点过一次开始备份"之后才出现：刚选上 AES 还没输入时
+                    // 不该先报错，成功提交清空密码之后也不该立刻跳成"密码不能为空"。
+                    // 一旦请求过校验，文案仍然实时跟随 validationMessage 更新，
+                    // 用户边改边看到它从"不能为空"变成"两次不一致"再消失。
                     Text {
                         objectName: "passwordValidationText"
                         Layout.fillWidth: true
-                        visible: text.length > 0
+                        visible: panel.passwordValidationRequested
+                                 && panel.validationMessage.length > 0
                         text: panel.validationMessage
                         font.pixelSize: 15
                         color: theme.error

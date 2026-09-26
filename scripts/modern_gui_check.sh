@@ -960,14 +960,16 @@ expect_count_re "$QML_DIR/pages/BackupPage.qml" 'panel\.clearPasswords\(\)' 1 \
   "备份页调用 panel.clearPasswords()"
 expect_count_re "$QML_DIR/components/BackupOptionsPanel.qml" 'function clearPasswords\(\)' 1 \
   "面板提供 clearPasswords()"
-# 光有函数还不够：它必须真的把两个输入框都清掉。password / confirmPassword 是这两个
-# TextField 的 text 别名，所以清 text 就等于清掉对外暴露的那两个属性。
+# 光有函数还不够：它必须真的把两个输入框都清掉，并且在清空的同时复位"已请求过校验"，
+# 否则成功提交之后那行"密码不能为空"会立刻跳出来，看起来像刚输错。
+# password / confirmPassword 是这两个 TextField 的 text 的 readonly 绑定
+# （不是 property alias），所以清 text 就等于清掉对外暴露的那两个属性。
 SQUASHED_PANEL="$(tr -d '\n' < "$QML_DIR/components/BackupOptionsPanel.qml" | tr -s ' ')"
 if printf '%s' "$SQUASHED_PANEL" \
-    | grep -qE 'function clearPasswords\(\) \{ passwordField\.text = "" confirmField\.text = "" \}'; then
-  record_pass "clearPasswords() 同时清空 passwordField 与 confirmField"
+    | grep -qE 'function clearPasswords\(\) \{ passwordField\.text = "" confirmField\.text = "" panel\.passwordValidationRequested = false \}'; then
+  record_pass "clearPasswords() 清空两个输入框并复位 passwordValidationRequested"
 else
-  record_fail "clearPasswords() 没有同时清空两个输入框"
+  record_fail "clearPasswords() 没有同时清空两个输入框并复位校验请求状态"
 fi
 
 # 被禁用的措辞。只认代码行：注释里写"这里绝不写校验通过"正是这些规则的用意，
@@ -1197,6 +1199,101 @@ for repo_page in "$BACKUP_PAGE" "$MGMT_PAGE"; do
     record_pass "$(basename "$repo_page") 没有绕过设置页直接保存仓库"
   fi
 done
+
+echo "[modern-gui] 14) 密码校验时机与自定义 Dialog 内边距"
+
+PANEL_QML="$QML_DIR/components/BackupOptionsPanel.qml"
+BACKUP_PAGE_QML="$QML_DIR/pages/BackupPage.qml"
+SQUASHED_PANEL_V2="$(tr -d '\n' < "$PANEL_QML" | tr -s ' ')"
+SQUASHED_PAGE_V2="$(tr -d '\n' < "$BACKUP_PAGE_QML" | tr -s ' ')"
+
+# --- 密码校验从"纯实时"改成"提交时请求" ---
+expect_count_re "$PANEL_QML" 'property bool passwordValidationRequested: false' 1 \
+  "面板声明 passwordValidationRequested，默认 false"
+expect_count_re "$PANEL_QML" 'function requestPasswordValidation\(\)' 1 \
+  "面板提供 requestPasswordValidation()"
+if printf '%s' "$SQUASHED_PANEL_V2" \
+    | grep -qE 'function requestPasswordValidation\(\) \{ panel\.passwordValidationRequested = true \}'; then
+  record_pass "requestPasswordValidation() 会把 passwordValidationRequested 置真"
+else
+  record_fail "requestPasswordValidation() 没有把 passwordValidationRequested 置真"
+fi
+# 提示的显示条件必须同时看"请求过校验"和"当前文案非空"。只跟 validationMessage
+# 走就是本轮修掉的旧行为：密码被程序清空后立刻报"密码不能为空"。
+if printf '%s' "$SQUASHED_PANEL_V2" \
+    | grep -qE 'objectName: "passwordValidationText" .*visible: panel\.passwordValidationRequested && panel\.validationMessage\.length > 0'; then
+  record_pass "校验提示的 visible 同时依赖 passwordValidationRequested 与非空 validationMessage"
+else
+  record_fail "校验提示的 visible 条件不对（可能又变回只跟着 validationMessage 实时显示）"
+fi
+# 切换加密算法必须复位"已尝试提交"，否则刚点过 AES 又切到 DES 会继承上一次的红字。
+# 这一段先按行切出来再分别看两个分支：两个分支里都写了说明注释，直接把整段折叠成
+# 一行再写一条大正则会卡在注释文本上 —— 注释是代码的一部分，不是可以忽略的噪音。
+ENCRYPTION_HANDLER="$(awk '
+  /^    onEncryptionKeyChanged: \{/ { inside = 1 }
+  inside { print }
+  inside && /^    \}$/ { exit }
+' "$PANEL_QML" | tr -d '\n' | tr -s ' ')"
+NONE_BRANCH="$(printf '%s' "$ENCRYPTION_HANDLER" | sed 's/.*encryptionKey === "none") {//')"
+ELSE_BRANCH="$(printf '%s' "$ENCRYPTION_HANDLER" | sed 's/.*} else {//')"
+# 三个条件缺一不可：确实有 else 分支、none 分支清空、else 分支复位。
+# 少了第一条，sed 匹配不上时会原样返回整段，后面的 grep 就会变成"全文里存在"，
+# 那正好把"没有 else 分支"这种情况放过去。
+if printf '%s' "$ENCRYPTION_HANDLER" | grep -qF -- '} else {' \
+   && printf '%s' "$NONE_BRANCH" | grep -qF -- 'panel.clearPasswords()' \
+   && printf '%s' "$ELSE_BRANCH" | grep -qF -- 'panel.passwordValidationRequested = false'; then
+  record_pass "切换加密算法会复位 passwordValidationRequested，切到 none 时清空密码"
+else
+  record_fail "切换加密算法没有正确复位 / 清空（缺少 else 分支，或两个分支内容不对）"
+fi
+
+# --- 备份页提交顺序 ---
+assert_button "$BACKUP_PAGE_QML" startBackupButton \
+  "开始备份按钮只在 busy 时禁用（密码不合法不再直接禁用按钮）" \
+  'enabled: !controller.busy' \
+  'onClicked: {'
+
+START_BACKUP_BLOCK="$(button_block "$BACKUP_PAGE_QML" startBackupButton)"
+if printf '%s\n' "$START_BACKUP_BLOCK" | grep -qF -- 'enabled: !controller.busy && panel.passwordAcceptable'; then
+  record_fail "开始备份按钮仍被 passwordAcceptable 直接禁用（用户没有机会触发校验）"
+else
+  record_pass "开始备份按钮不再由 passwordAcceptable 直接禁用"
+fi
+if printf '%s' "$SQUASHED_PAGE_V2" \
+    | grep -qE 'onClicked: \{ panel\.requestPasswordValidation\(\) if \(!panel\.passwordAcceptable\) return const started = controller\.startBackupWithOptions\([^)]*\) if \(started\) panel\.clearPasswords\(\) \}'; then
+  record_pass "提交顺序正确：先请求校验 -> 不合法就 return（不碰控制器）-> 合法才提交 -> 成功才清空"
+else
+  record_fail "提交顺序不对（可能先调用了控制器，或清空时机被改）"
+fi
+
+# --- 自定义 Dialog 的内容边距 ---
+# 按 objectName 定位到各自 Dialog 之后的第一个 padding，而不是数全文的 "padding: 18"
+# 总量：后者在新增一个 Dialog 或改别处内边距时会给出误导性的结果。
+check_dialog_padding() {
+  local file="$1"
+  local name="$2"
+  local got
+  got="$(awk -v want="objectName: \"$name\"" '
+    index($0, want) { found = 1; next }
+    found && /padding:/ {
+      line = $0
+      sub(/^[[:space:]]*/, "", line)
+      print line
+      exit
+    }
+  ' "$file")"
+  if [[ -z "$got" ]]; then
+    record_fail "$(basename "$file") 的 $name 找不到 padding"
+  elif [[ "$got" == "padding: 18" ]]; then
+    record_pass "$(basename "$file") 的 $name 有 18 的内容边距"
+  else
+    record_fail "$(basename "$file") 的 $name 边距不是 18（实际：$got）"
+  fi
+}
+
+check_dialog_padding "$QML_DIR/components/BackupRecordCard.qml" restorePasswordDialog
+check_dialog_padding "$QML_DIR/components/BackupRecordCard.qml" deleteConfirmDialog
+check_dialog_padding "$QML_DIR/Main.qml" busyCloseDialog
 
 echo "[modern-gui] 通过 $PASS_COUNT 项，失败 $FAIL_COUNT 项"
 echo "[modern-gui] 日志: $LOG_FILE"

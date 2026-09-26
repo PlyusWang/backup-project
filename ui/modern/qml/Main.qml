@@ -253,7 +253,9 @@ ApplicationWindow {
         objectName: "busyCloseDialog"
         anchors.centerIn: parent
         modal: true
-        padding: 0
+        // 同 restorePasswordDialog / deleteDialog：一套自定义 Dialog 样式，
+        // 不应该只有其中一个有内容边距。
+        padding: 18
 
         background: Rectangle {
             color: theme.surfaceElevated
