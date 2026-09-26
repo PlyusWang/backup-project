@@ -14,8 +14,10 @@
 // 不碰真实 HOME。
 
 #include "archive.h"
+#include "archive_pipeline.h"
 #include "backup_catalog.h"
 #include "backup_engine.h"
+#include "container_format.h"
 
 #include <dirent.h>
 #include <fcntl.h>
@@ -240,6 +242,52 @@ bool MakeArchive(const std::string& source_dir, const std::string& archive_path,
     *error_message = message;
   }
   return false;
+}
+
+// ---- v2 流水线字段用的小工具 ----
+
+// 用真实 BackupEngine + BackupOptions 造一个 v2 container：测试面对的是产品
+// 代码自己写出的 160 字节外层 header，而不是测试拼的字节。
+bool MakePipelineArchive(const std::string& source_dir,
+                         const std::string& archive_path,
+                         const bp::BackupOptions& options,
+                         std::string* error_message) {
+  bp::BackupEngine engine;
+  std::string message;
+  if (engine.Backup(source_dir, archive_path, bp::Filter(), options,
+                    &message)) {
+    return true;
+  }
+  if (error_message != nullptr) {
+    *error_message = message;
+  }
+  return false;
+}
+
+// v2 用例的源目录：比 MakeSampleSource 多一个几 KB 的文件，让压缩层真的有
+// 内容可压（空流与极小流的边界另有 archive_pipeline 测试覆盖）。
+std::string MakePipelineSource(const std::string& dir) {
+  const std::string source = dir + "/source";
+  if (!MakeDir(source)) {
+    return std::string();
+  }
+  WriteFile(source + "/a.txt", "alpha\n");
+  WriteFile(source + "/repeat.txt", std::string(4096, 'x') + "\n");
+  return source;
+}
+
+// 四个字段一起断言：认得、有流水线、三种算法、恢复要不要密码。
+void ExpectPipelineMethods(const bp::BackupRecord& record,
+                           bp::PackMethod pack_method,
+                           bp::CompressionMethod compression_method,
+                           bp::EncryptionMethod encryption_method,
+                           bool password_required) {
+  EXPECT_TRUE(record.recognized_archive);
+  EXPECT_TRUE(record.has_pipeline_methods);
+  EXPECT_EQ(record.pack_method, pack_method);
+  EXPECT_EQ(record.compression_method, compression_method);
+  EXPECT_EQ(record.encryption_method, encryption_method);
+  EXPECT_EQ(record.password_required, password_required);
 }
 
 // 全局 header 的字段偏移，与 docs/format/archive_v0.1.md 的偏移表一致。
@@ -903,6 +951,181 @@ TEST(CatalogList, ClearsRecordsWhenItFails) {
   records.resize(3);
   std::string error;
   EXPECT_FALSE(catalog.List(dir + "/nope", &records, &error));
+  EXPECT_TRUE(records.empty());
+}
+
+// ============================================================
+// BackupCatalog::List：v2 流水线字段
+// ============================================================
+//
+// 界面要能在不知道密码的前提下说清每个备份用了哪三种算法、恢复要不要密码。
+// 这四个字段读的是 v2 container 的 160 字节外层 header，属于"声明"：归档是否
+// 完整、能不能恢复仍然由恢复路径判断，列表不做这个承诺。
+
+TEST(CatalogListPipelineMethods, ReportsLegacyV01WithoutPipeline) {
+  const std::string dir = CaseDir("catalog_methods_legacy");
+  const std::string repository = dir + "/repo";
+  const std::string source = MakeSampleSource(dir);
+  bp::BackupCatalog catalog;
+  std::string error;
+  EXPECT_TRUE(catalog.EnsureRepository(repository, &error));
+  // 不传 BackupOptions：走的就是 legacy v0.1 写入路径。
+  EXPECT_TRUE(MakeArchive(source, repository + "/legacy.bak", &error));
+
+  std::vector<bp::BackupRecord> records;
+  error.clear();
+  EXPECT_TRUE(catalog.List(repository, &records, &error));
+  EXPECT_TRUE(error.empty());
+  EXPECT_EQ(records.size(), static_cast<std::size_t>(1));
+  if (records.size() == 1) {
+    EXPECT_TRUE(records[0].recognized_archive);
+    EXPECT_EQ(records[0].format_version, bp::archive_v01::kFormatVersion);
+    EXPECT_FALSE(records[0].has_pipeline_methods);
+    EXPECT_FALSE(records[0].password_required);
+    // v0.1 没有流水线：三个算法字段保持默认值。
+    EXPECT_EQ(records[0].pack_method, bp::PackMethod::kMyPack);
+    EXPECT_EQ(records[0].compression_method, bp::CompressionMethod::kNone);
+    EXPECT_EQ(records[0].encryption_method, bp::EncryptionMethod::kNone);
+  }
+}
+
+TEST(CatalogListPipelineMethods, ReportsV2MyPackWithoutCompression) {
+  const std::string dir = CaseDir("catalog_methods_mypack");
+  const std::string repository = dir + "/repo";
+  const std::string source = MakePipelineSource(dir);
+  bp::BackupCatalog catalog;
+  std::string error;
+  EXPECT_TRUE(catalog.EnsureRepository(repository, &error));
+
+  bp::BackupOptions options;
+  options.pack_method = bp::PackMethod::kMyPack;
+  options.compression_method = bp::CompressionMethod::kNone;
+  options.encryption_method = bp::EncryptionMethod::kNone;
+  EXPECT_TRUE(
+      MakePipelineArchive(source, repository + "/plain.bak", options, &error));
+
+  std::vector<bp::BackupRecord> records;
+  error.clear();
+  EXPECT_TRUE(catalog.List(repository, &records, &error));
+  EXPECT_TRUE(error.empty());
+  EXPECT_EQ(records.size(), static_cast<std::size_t>(1));
+  if (records.size() == 1) {
+    // format_version 来自外层 container header，与 v0.1 的 1 区分开。
+    EXPECT_EQ(records[0].format_version,
+              static_cast<std::uint16_t>(bp::container_v2::kVersion));
+    EXPECT_TRUE(records[0].entry_count > 0);
+    EXPECT_TRUE(records[0].diagnostic.empty());
+    ExpectPipelineMethods(records[0], bp::PackMethod::kMyPack,
+                          bp::CompressionMethod::kNone,
+                          bp::EncryptionMethod::kNone,
+                          /*password_required=*/false);
+  }
+}
+
+TEST(CatalogListPipelineMethods, ReportsV2UstarWithHuffman) {
+  const std::string dir = CaseDir("catalog_methods_ustar");
+  const std::string repository = dir + "/repo";
+  const std::string source = MakePipelineSource(dir);
+  bp::BackupCatalog catalog;
+  std::string error;
+  EXPECT_TRUE(catalog.EnsureRepository(repository, &error));
+
+  bp::BackupOptions options;
+  options.pack_method = bp::PackMethod::kUstar;
+  options.compression_method = bp::CompressionMethod::kHuffman;
+  options.encryption_method = bp::EncryptionMethod::kNone;
+  EXPECT_TRUE(MakePipelineArchive(source, repository + "/huffman.bak", options,
+                                  &error));
+
+  std::vector<bp::BackupRecord> records;
+  error.clear();
+  EXPECT_TRUE(catalog.List(repository, &records, &error));
+  EXPECT_TRUE(error.empty());
+  EXPECT_EQ(records.size(), static_cast<std::size_t>(1));
+  if (records.size() == 1) {
+    ExpectPipelineMethods(records[0], bp::PackMethod::kUstar,
+                          bp::CompressionMethod::kHuffman,
+                          bp::EncryptionMethod::kNone,
+                          /*password_required=*/false);
+  }
+}
+
+TEST(CatalogListPipelineMethods, ReportsV2FastUstarWithLzssAndAes) {
+  const std::string dir = CaseDir("catalog_methods_aes");
+  const std::string repository = dir + "/repo";
+  const std::string source = MakePipelineSource(dir);
+  bp::BackupCatalog catalog;
+  std::string error;
+  EXPECT_TRUE(catalog.EnsureRepository(repository, &error));
+
+  bp::BackupOptions options;
+  options.pack_method = bp::PackMethod::kFastUstar;
+  options.compression_method = bp::CompressionMethod::kLzssHuffman;
+  options.encryption_method = bp::EncryptionMethod::kAes256CtrHmacSha256;
+  options.password = "catalog pipeline password";
+  EXPECT_TRUE(
+      MakePipelineArchive(source, repository + "/secret.bak", options, &error));
+
+  // 列目录全程没有给过密码：需要密码这件事本身就是从外层 header 读出来的。
+  std::vector<bp::BackupRecord> records;
+  error.clear();
+  EXPECT_TRUE(catalog.List(repository, &records, &error));
+  EXPECT_TRUE(error.empty());
+  EXPECT_EQ(records.size(), static_cast<std::size_t>(1));
+  if (records.size() == 1) {
+    ExpectPipelineMethods(records[0], bp::PackMethod::kFastUstar,
+                          bp::CompressionMethod::kLzssHuffman,
+                          bp::EncryptionMethod::kAes256CtrHmacSha256,
+                          /*password_required=*/true);
+  }
+}
+
+// 认不出来的 .bak 依旧：留在列表里、recognized=false、diagnostic 非空、删得掉。
+TEST(CatalogListPipelineMethods, KeepsBadArchivesListedAndDeletable) {
+  const std::string dir = CaseDir("catalog_methods_bad");
+  const std::string repository = dir + "/repo";
+  const std::string source = MakeSampleSource(dir);
+  bp::BackupCatalog catalog;
+  std::string error;
+  EXPECT_TRUE(catalog.EnsureRepository(repository, &error));
+
+  // ① 完全不是归档。
+  EXPECT_TRUE(WriteFile(repository + "/garbage.bak",
+                        "this file is definitely not a backup archive."));
+  // ② magic 是 BKPARCH 但全局 header 被截断：DetectKind 只看前 8 字节，
+  //    所以 IdentifyArchiveFile 会说"这是 legacy"，而 InspectHeader 读不出来。
+  //    这种文件必须仍然是 recognized=false + 非空 diagnostic。
+  const std::string good = dir + "/good.bak";
+  EXPECT_TRUE(MakeArchive(source, good, &error));
+  EXPECT_TRUE(TruncateTo(good, repository + "/headless.bak", 16));
+
+  std::vector<bp::BackupRecord> records;
+  error.clear();
+  EXPECT_TRUE(catalog.List(repository, &records, &error));
+  EXPECT_TRUE(error.empty());
+  EXPECT_EQ(records.size(), static_cast<std::size_t>(2));
+  for (const bp::BackupRecord& record : records) {
+    EXPECT_FALSE(record.recognized_archive);
+    EXPECT_FALSE(record.diagnostic.empty());
+    // 认不出来就没有流水线可报，也不该顺手说"需要密码"。
+    EXPECT_FALSE(record.has_pipeline_methods);
+    EXPECT_FALSE(record.password_required);
+  }
+
+  // 坏归档照样能删：列表里看得见，也清得掉。
+  error.clear();
+  EXPECT_TRUE(catalog.Delete(repository, "garbage.bak", &error));
+  EXPECT_TRUE(error.empty());
+  EXPECT_FALSE(FileExists(repository + "/garbage.bak"));
+
+  error.clear();
+  EXPECT_TRUE(catalog.Delete(repository, "headless.bak", &error));
+  EXPECT_TRUE(error.empty());
+  EXPECT_FALSE(FileExists(repository + "/headless.bak"));
+
+  records.clear();
+  error.clear();
+  EXPECT_TRUE(catalog.List(repository, &records, &error));
   EXPECT_TRUE(records.empty());
 }
 
