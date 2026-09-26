@@ -45,6 +45,42 @@ void AppendHistoryEntry(ScheduleState* state,
   }
 }
 
+// 用一份**已经列好的**仓库记录来裁剪 managed 名单。
+//
+// 单独抽出来是因为 EvaluateInternal 已经为了"仓库到底能不能读"先 List 过一次，
+// 再调一次 ReconcileManagedSnapshots 就是第二次目录扫描 + 第二次逐个归档
+// InspectHeader —— 那是纯浪费，而且两次结果之间还有竞态。
+void ReconcileAgainstRecords(const std::vector<BackupRecord>& records,
+                             ScheduleDocument* document) {
+  if (document == nullptr) return;
+  if (document->state.managed_snapshots.empty()) return;
+
+  std::unordered_set<std::string> present;
+  present.reserve(records.size());
+  for (const BackupRecord& record : records) present.insert(record.file_name);
+
+  std::vector<ScheduledSnapshotRecord> kept;
+  kept.reserve(document->state.managed_snapshots.size());
+  for (const ScheduledSnapshotRecord& record :
+       document->state.managed_snapshots) {
+    if (present.find(record.file_name) != present.end()) {
+      kept.push_back(record);
+    }
+  }
+  document->state.managed_snapshots = std::move(kept);
+}
+
+// baseline 记录的那份快照还在不在 managed 名单里。
+bool BaselineIsManaged(const ScheduleDocument& document) {
+  const std::string& file_name = document.state.baseline.snapshot_file_name;
+  if (file_name.empty()) return false;
+  for (const ScheduledSnapshotRecord& record :
+       document.state.managed_snapshots) {
+    if (record.file_name == file_name) return true;
+  }
+  return false;
+}
+
 // 最旧的 managed snapshot 下标。时间相同再按 file_name 升序，
 // 保证"删哪一个"是确定的，不依赖容器里的偶然顺序。
 std::size_t OldestManagedIndex(
@@ -126,9 +162,110 @@ ScheduleEvaluationStatus StatusForRetention(bool retention_ok) {
                       : ScheduleEvaluationStatus::kCreatedWithRetentionWarning;
 }
 
+const char* ScheduleBaselineStatusKey(ScheduleBaselineStatus status) {
+  switch (status) {
+    case ScheduleBaselineStatus::kMissing:
+      return "missing";
+    case ScheduleBaselineStatus::kRepositoryChanged:
+      return "repository_changed";
+    case ScheduleBaselineStatus::kSourceChanged:
+      return "source_changed";
+    case ScheduleBaselineStatus::kNotManaged:
+      return "not_managed";
+    case ScheduleBaselineStatus::kSnapshotGone:
+      return "snapshot_gone";
+    case ScheduleBaselineStatus::kValid:
+      return "valid";
+  }
+  return "missing";
+}
+
+std::string ScheduleBaselineStatusText(ScheduleBaselineStatus status) {
+  switch (status) {
+    case ScheduleBaselineStatus::kMissing:
+      return "No baseline snapshot has been recorded yet";
+    case ScheduleBaselineStatus::kRepositoryChanged:
+      return "The recorded baseline belongs to a different repository";
+    case ScheduleBaselineStatus::kSourceChanged:
+      return "The recorded baseline belongs to a different source directory";
+    case ScheduleBaselineStatus::kNotManaged:
+      return "The baseline snapshot is no longer a managed scheduled snapshot";
+    case ScheduleBaselineStatus::kSnapshotGone:
+      return "The baseline snapshot can no longer be resolved in the "
+             "repository";
+    case ScheduleBaselineStatus::kValid:
+      return "The baseline snapshot is present in this repository";
+  }
+  return "No baseline snapshot has been recorded yet";
+}
+
+ScheduleBaselineStatus EvaluateScheduleBaseline(
+    const ScheduleDocument& document, const std::string& repository_path,
+    std::string* error_message) {
+  if (error_message != nullptr) error_message->clear();
+
+  const ScheduleBaseline& baseline = document.state.baseline;
+  if (baseline.snapshot_file_name.empty()) {
+    SetError(error_message,
+             ScheduleBaselineStatusText(ScheduleBaselineStatus::kMissing));
+    return ScheduleBaselineStatus::kMissing;
+  }
+
+  // 三个纯字符串比较先做完，任何文件系统动作都排在后面。
+  const std::string identity = RepositoryIdentity(repository_path);
+  if (baseline.repository_identity != identity) {
+    SetError(error_message, ScheduleBaselineStatusText(
+                                ScheduleBaselineStatus::kRepositoryChanged) +
+                                ": recorded '" + baseline.repository_identity +
+                                "', current '" + identity + "'");
+    return ScheduleBaselineStatus::kRepositoryChanged;
+  }
+  if (baseline.source_path != document.config.source_path) {
+    SetError(
+        error_message,
+        ScheduleBaselineStatusText(ScheduleBaselineStatus::kSourceChanged) +
+            ": recorded '" + baseline.source_path + "', current '" +
+            document.config.source_path + "'");
+    return ScheduleBaselineStatus::kSourceChanged;
+  }
+  if (!BaselineIsManaged(document)) {
+    SetError(error_message,
+             ScheduleBaselineStatusText(ScheduleBaselineStatus::kNotManaged) +
+                 ": '" + baseline.snapshot_file_name + "'");
+    return ScheduleBaselineStatus::kNotManaged;
+  }
+
+  // 名字必须在**当前**仓库里能被安全解析成真实文件。这一步同时覆盖
+  // "文件被外部删掉"和"名字被改成越界的东西"两种情况。
+  BackupCatalog catalog;
+  std::string archive_path;
+  std::string resolve_error;
+  if (!catalog.Resolve(repository_path, baseline.snapshot_file_name,
+                       &archive_path, &resolve_error)) {
+    SetError(error_message,
+             ScheduleBaselineStatusText(ScheduleBaselineStatus::kSnapshotGone) +
+                 ": '" + baseline.snapshot_file_name + "': " + resolve_error);
+    return ScheduleBaselineStatus::kSnapshotGone;
+  }
+  return ScheduleBaselineStatus::kValid;
+}
+
+void ApplyScheduleEnableTransition(ScheduleDocument* document, bool was_enabled,
+                                   std::int64_t now_sec) {
+  if (document == nullptr) return;
+  if (!document->config.enabled) return;  // 停用不动时间表
+  if (was_enabled) return;                // 已经启用：不重置
+  document->state.next_run_time_sec =
+      ScheduleNextRunTime(now_sec, document->config.interval_minutes);
+}
+
 ScheduledBackupService::ScheduledBackupService(std::string repository_path,
                                                ScheduleStore* store)
     : repository_path_(std::move(repository_path)), store_(store) {}
+
+void ScheduledBackupService::SetRepositoryPath(std::string repository_path) {
+  repository_path_ = std::move(repository_path);
+}
 
 void ScheduledBackupService::ReconcileManagedSnapshots(
     const std::string& repository_path, ScheduleDocument* document) {
@@ -142,20 +279,7 @@ void ScheduledBackupService::ReconcileManagedSnapshots(
   // 把"读不到"当成"不存在"会把 ownership 名单清空，那些旧快照就再也不会
   // 被 retention 回收了。
   if (!catalog.List(repository_path, &records, &error)) return;
-
-  std::unordered_set<std::string> present;
-  present.reserve(records.size());
-  for (const BackupRecord& record : records) present.insert(record.file_name);
-
-  std::vector<ScheduledSnapshotRecord> kept;
-  kept.reserve(document->state.managed_snapshots.size());
-  for (const ScheduledSnapshotRecord& record :
-       document->state.managed_snapshots) {
-    if (present.find(record.file_name) != present.end()) {
-      kept.push_back(record);
-    }
-  }
-  document->state.managed_snapshots = std::move(kept);
+  ReconcileAgainstRecords(records, document);
 }
 
 bool ScheduledBackupService::RunRetention(ScheduleDocument* document,
@@ -196,6 +320,17 @@ bool ScheduledBackupService::RunRetention(ScheduleDocument* document,
         document->state.managed_snapshots.begin() +
         static_cast<std::ptrdiff_t>(oldest));
     if (deleted != nullptr) *deleted += 1;
+  }
+
+  // 不变式：retention 结束后，baseline 记录必须仍然指向一份存在的快照。
+  //
+  // 正常路径下永远碰不到——淘汰的是最旧的，baseline 是刚创建的那份最新的。
+  // 但 retain_count 被调小、或者 state 曾经被手工改过时是有可能的。真发生了
+  // 就在这里把记录清掉：下一轮 Evaluate 会因为 kMissing 重建一份完整基线
+  // 快照，而不是拿着一个指向空气的 baseline 继续判 skip。
+  if (!document->state.baseline.snapshot_file_name.empty() &&
+      !BaselineIsManaged(*document)) {
+    document->state.baseline = ScheduleBaseline{};
   }
   return true;
 }
@@ -240,10 +375,6 @@ bool ScheduledBackupService::EvaluateInternal(std::int64_t now_sec, bool force,
     return false;
   }
 
-  // 自愈发生在所有判断之前：用户手动删掉的快照，从 managed 名单里消失。
-  // history 里"曾经创建过"的记录保留——history 不是当前文件列表。
-  ReconcileManagedSnapshots(repository_path_, &document);
-
   const std::uint32_t interval = document.config.interval_minutes;
   result->next_run_time_sec = document.state.next_run_time_sec;
 
@@ -279,6 +410,27 @@ bool ScheduledBackupService::EvaluateInternal(std::int64_t now_sec, bool force,
     return true;
   };
 
+  // ---- 自愈 + 仓库可用性 ----
+  //
+  // 两件事共用这一次 List：
+  //   1. 用户手动删掉的快照从 managed 名单里消失（history 保留——它不是当前
+  //      文件列表）；
+  //   2. 判断"仓库到底能不能读"。这一点在修 baseline 之前不重要，现在很关键：
+  //      如果只是仓库没挂载，Resolve 一定会失败，而把"读不到"当成"baseline
+  //      失效"会让程序在一个空的挂载点里新建一份备份。所以有 baseline 记录
+  //      却读不出仓库时，直接失败、什么都不写。
+  BackupCatalog catalog;
+  std::vector<BackupRecord> listed;
+  std::string list_error;
+  if (catalog.List(repository_path_, &listed, &list_error)) {
+    ReconcileAgainstRecords(listed, &document);
+  } else if (!document.state.baseline.snapshot_file_name.empty()) {
+    return finish_failed(
+        "The backup repository could not be listed, so the recorded baseline "
+        "was kept and nothing was written: " +
+        list_error);
+  }
+
   // 配置本身必须合法。合法化发生在 set / enable 时，所以走到这里还能不合法
   // 基本只有"有人手改了 schedule.json"。此时不写盘——写了也存不回去。
   std::string config_error;
@@ -303,27 +455,58 @@ bool ScheduledBackupService::EvaluateInternal(std::int64_t now_sec, bool force,
     return finish_failed(manifest_error);
   }
 
-  // ---- 与上一份成功 manifest 比较 ----
+  // ---- 能不能拿"上一份 manifest"当基线？----
+  //
+  // 两份材料缺一不可：
+  //   * state 里记着 baseline 快照，而且它**现在仍然真实存在于当前仓库里、
+  //     仍然归本 scheduler 管理**（EvaluateScheduleBaseline）；
+  //   * 那份 manifest 文件本身还读得出来。
+  //
+  // 只有两份都在，才能说"manifest 相同 == 源没变 == 可以跳过"。少了任何一份，
+  // manifest 相同都只能说明"上次扫描时源长这样"，证明不了仓库里有对应的备份。
+  std::string baseline_error;
+  const ScheduleBaselineStatus baseline_status =
+      EvaluateScheduleBaseline(document, repository_path_, &baseline_error);
+
   std::vector<ManifestEntry> previous;
+  // manifest_error 复用上面扫描用的那个：两处报错都只在一轮之内用一次。
   const ScheduleStore::ManifestLoadStatus manifest_status =
       store_->LoadManifest(&previous, &manifest_error);
-  if (manifest_status == ScheduleStore::ManifestLoadStatus::kLoaded) {
+
+  std::string baseline_reason;
+  bool baseline_usable = false;
+  if (baseline_status != ScheduleBaselineStatus::kValid) {
+    baseline_reason = ScheduleBaselineStatusText(baseline_status);
+    if (!baseline_error.empty()) baseline_reason += " (" + baseline_error + ")";
+  } else if (manifest_status == ScheduleStore::ManifestLoadStatus::kError) {
+    baseline_reason = "The previous source manifest could not be read (" +
+                      manifest_error + ")";
+  } else if (manifest_status == ScheduleStore::ManifestLoadStatus::kMissing) {
+    baseline_reason = "The previous source manifest file is gone";
+  } else {
+    baseline_usable = true;
+  }
+
+  if (baseline_usable) {
     std::string diff_error;
     if (!DiffManifests(previous, current, &result->changes, nullptr,
                        &diff_error)) {
       return finish_failed(diff_error);
     }
   } else {
-    // 没有上一份可比对的基线：首次快照。manifest 坏了也走这条路——
-    // 多建一份完整备份，绝不漏变化。
-    result->first_snapshot = true;
+    // 没有可信基线：这一轮产出一份**完整基线快照**。
+    // 多建一份完整备份，绝不漏变化——这正是本 PR 的核心语义。
+    const bool had_baseline =
+        !document.state.baseline.snapshot_file_name.empty();
+    result->first_snapshot = !had_baseline;
+    result->baseline_reset = had_baseline;
     result->changes = ChangeSummary{};
     result->changes.added = current.size();
-    if (manifest_status == ScheduleStore::ManifestLoadStatus::kError) {
+    if (had_baseline) {
       result->diagnostic =
-          "The previous source manifest could not be read, so this run was "
-          "treated as the first snapshot: " +
-          manifest_error;
+          "The recorded baseline is no longer usable, so this run created a "
+          "new baseline snapshot. Reason: " +
+          baseline_reason + ". ";
     }
   }
 
@@ -355,8 +538,7 @@ bool ScheduledBackupService::EvaluateInternal(std::int64_t now_sec, bool force,
     return true;
   }
 
-  // ---- 有变化：创建一份完整独立的 v2 快照 ----
-  BackupCatalog catalog;
+  // ---- 有变化（或基线失效）：创建一份完整独立的 v2 快照 ----
   std::string work_error;
   if (!catalog.EnsureRepository(repository_path_, &work_error)) {
     return finish_failed(work_error);
@@ -406,6 +588,13 @@ bool ScheduledBackupService::EvaluateInternal(std::int64_t now_sec, bool force,
   document.state.last_manifest_entry_count = current.size();
   document.state.next_run_time_sec = ScheduleNextRunTime(now_sec, interval);
   result->next_run_time_sec = document.state.next_run_time_sec;
+
+  // ★ 这个 manifest 从此属于**这一份**快照。三者一起写下去，下一轮才有资格
+  //   用"manifest 相同"来判定"源没变"。
+  document.state.baseline.snapshot_file_name = file_name;
+  document.state.baseline.repository_identity =
+      RepositoryIdentity(repository_path_);
+  document.state.baseline.source_path = document.config.source_path;
 
   // ★ 崩溃一致性的顺序（§36）：archive 已发布 -> manifest -> state -> retention
   //   -> history -> state。

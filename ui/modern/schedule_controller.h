@@ -49,6 +49,9 @@ struct ScheduleOutcome {
   bool created = false;
   bool retention_warning = false;
   bool first_snapshot = false;
+  // 以前记过 baseline，但它已经不可信了（快照被删 / 换了仓库 / 换了源）。
+  // 与 first_snapshot 一样会产出一份完整快照，只是原因不同，界面要说清楚。
+  bool baseline_reset = false;
   bool due = true;
 
   QString status_key;
@@ -155,6 +158,9 @@ class ScheduleController : public QObject {
   Q_INVOKABLE void reload();
 
   // 保存计划配置。校验失败时返回 false 并把原因写进状态条，绝不落盘半份配置。
+  //
+  // 启用前的校验调用的是共享核心的 ValidateScheduleForEnable（CLI 用的是同一
+  // 个函数），并带上当前仓库；首次启用还会把 next_run 推成一个完整周期之后。
   Q_INVOKABLE bool saveConfig(bool enabled, const QString& source_path,
                               int interval_minutes, int retain_count,
                               const QString& pack_key,
@@ -203,6 +209,8 @@ class ScheduleController : public QObject {
   void DrainPending();
   void OnEvaluationFinished();
   void OnBackupBusyChanged();
+  // 仓库在设置页被改掉之后，本控制器必须立刻跟上：下一次评估用的是新仓库。
+  void OnRepositoryPathChanged();
   void SetStatus(const QString& kind, const QString& title,
                  const QString& message);
   void SetBusy(bool busy);

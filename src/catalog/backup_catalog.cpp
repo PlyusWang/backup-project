@@ -17,6 +17,8 @@
 
 #include <dirent.h>
 #include <fcntl.h>
+#include <limits.h>
+#include <stdlib.h>
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <unistd.h>
@@ -254,6 +256,16 @@ std::string SourceBaseName(const std::string& source_directory) {
 }
 
 }  // namespace
+
+std::string RepositoryIdentity(const std::string& repository_path) {
+  if (repository_path.empty()) return std::string();
+  const std::string normalized = StripTrailingSlashes(repository_path);
+  char resolved[PATH_MAX];
+  if (::realpath(normalized.c_str(), resolved) != nullptr) {
+    return std::string(resolved);
+  }
+  return normalized;
+}
 
 bool BackupCatalog::EnsureRepository(const std::string& repository,
                                      std::string* error_message) const {

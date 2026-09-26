@@ -93,9 +93,20 @@ bool BuildScheduleFilter(const ScheduleConfig& config, Filter* filter,
 bool ValidateScheduleConfig(const ScheduleConfig& config,
                             std::string* error_message);
 
-// 启用前的完整校验：结构校验 + source_path
-// 非空、存在、是真实目录（不是软链接）。
+// 启用前的完整校验。这是 GUI 与 CLI **共用**的那一份，两边都不许自己再写
+// 一套"能不能启用"的判断：
+//
+//   * 结构校验（trigger / strategy 支持矩阵、区间、加密边界、规则语法）；
+//   * source_path 非空、存在、是真实目录（不是软链接）；
+//   * repository_path 非空、存在、是真实目录（不是软链接）。
+//
+// repository_path 由调用方从 ConfigManager 读出来显式传入——这一层不猜配置
+// 位置。仓库必须是**已经存在**的真实目录：GUI 的 saveRepositoryPath 与 CLI 的
+// config repository set 都会先 EnsureRepository，所以正常流程下它一定存在；
+// 反过来，"配置里写了一个根本不存在、也不该由备份去创建的路径"必须在这里
+// 被拦住，而不是等第一次定时备份真的往那里写东西。
 bool ValidateScheduleForEnable(const ScheduleConfig& config,
+                               const std::string& repository_path,
                                std::string* error_message);
 
 // 一个由本 scheduler 自己创建、并且仍然归它管理的快照。
@@ -144,11 +155,41 @@ struct ScheduleHistoryEntry {
   std::string diagnostic;
 };
 
+// baseline：schedule-manifest.dat 里那份源清单**属于哪一个真实快照**。
+//
+// 为什么必须有这三个字段：manifest 单独存在时只说明"上一次扫描到的源状态"，
+// 它没有证明仓库里仍然存在一份与它对应的完整快照。两种情况下这个区别是致命的：
+//
+//   * 用户删掉了最新的那份快照 —— manifest 仍然与当前源相同，于是"无变化"
+//     被误判成可以跳过，而仓库里实际只剩下一份更旧的快照；
+//   * 用户把仓库换成了另一个（全新的）目录 —— manifest 仍然相同，于是新仓库
+//     一个可用的 baseline 都没有，却照样被判成"无变化"。
+//
+// 所以 baseline 的每一轮判断都是：先证明"这份 manifest 对应的快照仍然真实、
+// 安全地存在于**当前**仓库里、仍然归本 scheduler 管理"，再谈"源有没有变化"。
+// 证明不了就当没有 baseline —— 多建一份完整快照，绝不漏变化。
+//
+// 三个字段各自钉住一个维度：
+//   * file_name   哪一份快照（仍然只存单组件名字，绝不存绝对路径）；
+//   * repository  哪一个仓库（稳定 identity，不是文件名猜测）；
+//   * source_path 哪一个源目录（换了源、恰好 manifest 相似时不能误用旧基线）。
+struct ScheduleBaseline {
+  // 单组件 .bak 文件名。空 = 没有记录过 baseline。
+  std::string snapshot_file_name;
+  // 该快照所在仓库的 identity，见 RepositoryIdentity()。
+  std::string repository_identity;
+  // 该快照对应的源目录路径（原样保存，不做规范化）。
+  std::string source_path;
+};
+
 struct ScheduleState {
   // 下一次应该运行的时间（Unix epoch 秒）。0 表示"还没算过"。
   std::int64_t next_run_time_sec = 0;
   std::int64_t last_success_time_sec = 0;
   std::uint64_t last_manifest_entry_count = 0;
+
+  // 当前 last successful manifest 对应的真实快照。
+  ScheduleBaseline baseline;
 
   // 只有 scheduler 自己创建的快照才会出现在这里。用户手动备份、GUI 手动备份
   // 永远不进这个列表，所以自动淘汰不可能删到它们。

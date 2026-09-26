@@ -1655,12 +1655,14 @@ int RunScheduleShow(backup_modern::ScheduleController* schedule) {
 // backupproject::ScheduleStore 原样读回来逐项比对 —— 这正是
 // "GUI 与 CLI 读同一份 store、同一套 schema"在单元层面的证据。
 
-int CountArchives(const QString& repository) {
+QStringList ArchiveNames(const QString& repository) {
   QDir directory(repository);
-  return directory
-      .entryList(QStringList() << QStringLiteral("*.bak"), QDir::Files,
-                 QDir::Name)
-      .size();
+  return directory.entryList(QStringList() << QStringLiteral("*.bak"),
+                             QDir::Files, QDir::Name);
+}
+
+int CountArchives(const QString& repository) {
+  return ArchiveNames(repository).size();
 }
 
 QVariantMap LastHistory(const backup_modern::ScheduleController& schedule) {
@@ -1670,6 +1672,7 @@ QVariantMap LastHistory(const backup_modern::ScheduleController& schedule) {
 }
 
 int RunScheduleTest(backup_modern::ScheduleController* schedule,
+                    backup_modern::BackupController* backup_controller,
                     const QString& config_path) {
   CheckRun run;
   run.prefix = "[schedule]";
@@ -1875,6 +1878,93 @@ int RunScheduleTest(backup_modern::ScheduleController* schedule,
             QStringLiteral("SCH-35 CLI 与 GUI 的 schedule.json 严格同路径"),
             QString::fromStdString(backupproject::DefaultScheduleFilePath()));
 
+  // 10) review-fix：仓库在运行期被改掉之后，下一次评估必须写到新仓库去。
+  //
+  // 这一段只能在这里测：它依赖 BackupController::repositoryPathChanged 这个
+  // 真实信号，而不是"重新构造一个控制器"。
+  {
+    const QString repository_b = temp.path() + QStringLiteral("/repository-b");
+    QDir().mkpath(repository_b);
+    run.Check(CountArchives(repository) == 1,
+              QStringLiteral("SCH-40 切换前旧仓库里有一份快照"),
+              QString::number(CountArchives(repository)));
+
+    run.Check(backup_controller->saveRepositoryPath(repository_b),
+              QStringLiteral("SCH-41 设置页把仓库改成 B"));
+    // ScheduleController 订阅了 repositoryPathChanged，QML 一行都不用改。
+    run.Check(schedule->repositoryPath() == repository_b,
+              QStringLiteral("SCH-42 计划控制器立刻跟上了新仓库"),
+              schedule->repositoryPath());
+
+    schedule->runNow();
+    schedule->waitForIdle(180000);
+    run.Check(CountArchives(repository_b) == 1,
+              QStringLiteral("SCH-43 新快照出现在 B 仓库"),
+              QString::number(CountArchives(repository_b)));
+    run.Check(CountArchives(repository) == 1,
+              QStringLiteral("SCH-44 A 仓库没有被写入"),
+              QString::number(CountArchives(repository)));
+
+    // 切回来：跨前端比对用的 config.json 必须还是原来那个仓库。
+    run.Check(backup_controller->saveRepositoryPath(repository),
+              QStringLiteral("SCH-45 仓库切回 A"));
+  }
+
+  // 11) review-fix：首次启用把下一次运行排在一个完整周期之后。
+  //
+  // 必须走一次真正的 disabled -> enabled，否则 ApplyScheduleEnableTransition
+  // 按设计就是 no-op（保存配置不该把时间表往后推）。
+  {
+    run.Check(schedule->saveConfig(
+                  false, source, 30, 7, QStringLiteral("ustar"),
+                  QStringLiteral("huffman"), QStringList(), QStringList()),
+              QStringLiteral("SCH-46 先停用并改成 30 分钟周期"));
+    const qint64 before = QDateTime::currentSecsSinceEpoch();
+    run.Check(schedule->setEnabled(true), QStringLiteral("SCH-47 重新启用"));
+
+    backupproject::ScheduleStore store(schedule->storePath().toStdString());
+    backupproject::ScheduleDocument document;
+    std::string error;
+    const bool loaded = store.Load(&document, &error) ==
+                        backupproject::ScheduleLoadStatus::kLoaded;
+    run.Check(loaded, QStringLiteral("SCH-48 直接读回 store"),
+              QString::fromStdString(error));
+    const qint64 delta =
+        loaded ? document.state.next_run_time_sec - before : -1;
+    run.Check(delta >= 1795 && delta <= 1810,
+              QStringLiteral("SCH-49 启用后 next run 正好是一个完整周期之后"),
+              QString::number(delta));
+  }
+
+  // 12) review-fix：baseline 被删掉之后必须重建，而不是因为 manifest 相同就
+  // skip。
+  {
+    const QStringList names = ArchiveNames(repository);
+    run.Check(names.size() == 1, QStringLiteral("SCH-50 仓库里有一份 baseline"),
+              QString::number(names.size()));
+    if (names.size() == 1) {
+      run.Check(QFile::remove(repository + QStringLiteral("/") + names.front()),
+                QStringLiteral("SCH-51 手工删掉 baseline 快照"));
+      schedule->runNow();
+      schedule->waitForIdle(180000);
+      run.Check(CountArchives(repository) == 1,
+                QStringLiteral("SCH-52 下一轮重建了一份快照"),
+                QString::number(CountArchives(repository)));
+      run.Check(schedule->lastSucceeded(),
+                QStringLiteral("SCH-53 重建这一轮是成功的"));
+    }
+  }
+
+  // 收尾：把跨前端比对用的那套配置写回去（interval=5 / retain=7 / ustar +
+  // huffman + 两条规则）。modern_gui_check.sh 会拿 backupctl schedule show
+  // 逐项比对，所以这里必须与 SCH-36 完全一致。
+  run.Check(
+      schedule->saveConfig(true, source, 5, 7, QStringLiteral("ustar"),
+                           QStringLiteral("huffman"),
+                           QStringList() << QStringLiteral("ext:txt"),
+                           QStringList() << QStringLiteral("path:**/build/**")),
+      QStringLiteral("SCH-54 恢复跨前端比对用的配置"));
+
   const int total = run.passed + run.failed;
   std::printf("[schedule] %s %d/%d\n", run.failed == 0 ? "PASS" : "FAIL",
               run.passed, total);
@@ -2010,7 +2100,7 @@ int main(int argc, char* argv[]) {
   // 自检模式刻意不自动启动 runner：自检要自己控制每一步（从空 store 开始、
   // 手动触发评估），自动 tick 会和它抢同一份状态。
   if (schedule_test) {
-    return RunScheduleTest(&schedule_controller, config_file_path);
+    return RunScheduleTest(&schedule_controller, &controller, config_file_path);
   }
   if (schedule_show) {
     return RunScheduleShow(&schedule_controller);

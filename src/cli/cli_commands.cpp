@@ -168,6 +168,8 @@ bool LoadScheduleDocument(const CliContext& context, ScheduleDocument* document,
   return true;
 }
 
+std::int64_t NowSeconds() { return static_cast<std::int64_t>(::time(nullptr)); }
+
 bool SaveScheduleDocument(const CliContext& context,
                           const ScheduleDocument& document,
                           std::string* error_message) {
@@ -201,9 +203,17 @@ void PrintCliUsage(const std::string& program_name, std::ostream& output) {
       << " restore <backup_file> <destination_directory>\n"
       << "  " << program_name
       << " schedule show | set | enable | disable | run | history | watch\n"
+      << "    schedule set takes --source --interval-minutes --retain --pack\n"
+      << "      --compression --encryption none --include --exclude, plus\n"
+      << "      --clear-filters (drop the stored rules first, then add the "
+         "ones\n"
+      << "      given on this command line).\n"
       << "    schedule run evaluates right now, ignoring the due time; a run "
          "with no changes is still skipped, so it never becomes a forced "
          "backup.\n"
+      << "    schedule enable requires a configured repository and a real "
+         "source\n"
+      << "      directory; the first run is scheduled one full interval away.\n"
       << "  " << program_name << " repository list | delete <file_name>\n"
       << "  " << program_name << " config repository show | set <path>\n"
       << "\n"
@@ -420,6 +430,12 @@ void PrintEvaluation(const ScheduleEvaluationResult& result,
     std::cout
         << "  note:      first snapshot (there was no previous manifest)\n";
   }
+  if (result.baseline_reset) {
+    // 与 first_snapshot 分开报告：用户需要知道"这一轮为什么又建了一份"，
+    // 而不是把它当成一次普通的变化。
+    std::cout << "  note:      baseline reset (the recorded baseline no longer "
+                 "matches a live snapshot)\n";
+  }
   if (result.retention_deleted > 0 || result.retention_failed > 0) {
     std::cout << "  retention: removed " << result.retention_deleted
               << ", failed " << result.retention_failed << "\n";
@@ -513,6 +529,11 @@ int ScheduleSet(const CliContext& context,
     return kCliExitOperationFailed;
   }
   ScheduleConfig config = document.config;
+  // 这一次命令行上给的规则先收在这里，等选项全部解析完再决定怎么合并：
+  // 这样 --clear-filters 写在 --include 的前面还是后面，结果都一样。
+  std::vector<std::string> include_rules;
+  std::vector<std::string> exclude_rules;
+  bool clear_filters = false;
 
   for (std::size_t index = 0; index < arguments.size(); ++index) {
     const std::string option = arguments[index];
@@ -582,37 +603,62 @@ int ScheduleSet(const CliContext& context,
       config.encryption_method = method;
       continue;
     }
-    if (option == "--include") {
+    if (option == "--include" || option == "--exclude") {
       if (!TakeValue(arguments, &index, option, &value, &error)) {
         return UsageError(context, error);
       }
-      if (config.include_rules.size() + config.exclude_rules.size() >=
-          kMaxScheduleRules) {
+      if (include_rules.size() + exclude_rules.size() >= kMaxScheduleRules) {
         return UsageError(context, "too many filter rules (limit " +
                                        std::to_string(kMaxScheduleRules) + ")");
       }
-      config.include_rules.push_back(value);
+      if (option == "--include") {
+        include_rules.push_back(value);
+      } else {
+        exclude_rules.push_back(value);
+      }
       continue;
     }
-    if (option == "--exclude") {
-      if (!TakeValue(arguments, &index, option, &value, &error)) {
-        return UsageError(context, error);
-      }
-      if (config.include_rules.size() + config.exclude_rules.size() >=
-          kMaxScheduleRules) {
-        return UsageError(context, "too many filter rules (limit " +
-                                       std::to_string(kMaxScheduleRules) + ")");
-      }
-      config.exclude_rules.push_back(value);
+    if (option == "--clear-filters") {
+      clear_filters = true;
       continue;
     }
     return UsageError(context, "unknown option '" + option + "'");
+  }
+
+  // --clear-filters：先把**存下来的**规则整批丢掉，再把这次命令行上给的规则
+  // 放进去。之前 CLI 只能不断 append，GUI 里删掉的规则在 CLI 侧永远清不掉。
+  if (clear_filters) {
+    config.include_rules.clear();
+    config.exclude_rules.clear();
+  }
+  config.include_rules.insert(config.include_rules.end(), include_rules.begin(),
+                              include_rules.end());
+  config.exclude_rules.insert(config.exclude_rules.end(), exclude_rules.begin(),
+                              exclude_rules.end());
+  if (config.include_rules.size() + config.exclude_rules.size() >
+      kMaxScheduleRules) {
+    return UsageError(context, "too many filter rules (limit " +
+                                   std::to_string(kMaxScheduleRules) + ")");
   }
 
   // 规则语法在这里就用真实的 Filter 校验一遍：配置里存的规则与命令行的规则
   // 走的是同一套解析，写不进去的规则也读不出来。
   if (!ValidateScheduleConfig(config, &error)) {
     return UsageError(context, error);
+  }
+
+  if (config.enabled) {
+    // 已经启用的计划：**任何**一次修改之后都必须仍然"真的能跑"。
+    // 否则用户会得到一份 enabled 但一跑就失败的配置，而失败要等到下一次
+    // 定时触发才会暴露出来。校验不过就一个字节都不写，旧配置原样保留。
+    std::string repository;
+    if (!LoadRepositoryPath(context, &repository, &error) ||
+        !ValidateScheduleForEnable(config, repository, &error)) {
+      PrintError(error +
+                 " The scheduled backup is still enabled, so the stored "
+                 "configuration was left unchanged.");
+      return kCliExitOperationFailed;
+    }
   }
 
   document.config = config;
@@ -633,11 +679,24 @@ int ScheduleToggle(const CliContext& context, bool enabled) {
     PrintError(error);
     return kCliExitOperationFailed;
   }
+  const bool was_enabled = document.config.enabled;
   document.config.enabled = enabled;
-  if (enabled && !ValidateScheduleForEnable(document.config, &error)) {
-    // enable 之前必须完整校验：源目录不存在、没配源、规则非法，一律不许启用。
-    PrintError(error);
-    return kCliExitOperationFailed;
+  if (enabled) {
+    std::string repository;
+    if (!LoadRepositoryPath(context, &repository, &error)) {
+      // 没配仓库就"启用"是假启用：页面/命令会说 enabled，第一次到点却直接失败。
+      PrintError(error);
+      return kCliExitOperationFailed;
+    }
+    // enable 之前必须完整校验：源目录不存在、没配源、规则非法、仓库不可用，
+    // 一律不许启用。用的是 GUI 调用的同一个函数。
+    if (!ValidateScheduleForEnable(document.config, repository, &error)) {
+      PrintError(error);
+      return kCliExitOperationFailed;
+    }
+    // 首次启用把下一次运行排在一个完整周期之后：勾上"启用"下一秒就开跑是
+    // 反直觉的，想立刻跑有明确入口（schedule run）。
+    ApplyScheduleEnableTransition(&document, was_enabled, NowSeconds());
   }
   if (!SaveScheduleDocument(context, document, &error)) {
     PrintError(error);
@@ -674,7 +733,7 @@ int ScheduleRun(const CliContext& context) {
 
   ScheduledBackupService service(repository, &store);
   ScheduleEvaluationResult result;
-  const std::int64_t now = static_cast<std::int64_t>(::time(nullptr));
+  const std::int64_t now = NowSeconds();
   // "立即检查并运行"：跳过"还没到点"，但仍然做真实的变化检测。
   if (!service.EvaluateNow(now, &result, &error)) {
     PrintError(error);
@@ -750,8 +809,22 @@ int ScheduleWatch(const CliContext& context) {
 
   ScheduledBackupService service(repository, &store);
   while (g_watch_stop == 0) {
+    // 每一轮真正评估**之前**重新读一次当前仓库。
+    //
+    // 长运行进程绝不能把仓库缓存一整个生命周期：另一个 CLI 或 GUI 执行
+    // "config repository set B" 之后，这一轮必须写到 B 去，而不是继续往启动
+    // 时那份配置里的旧仓库写。重读的代价只是一次小文件读取，而且只发生在
+    // 真正要评估之前，不是每秒轮询。
+    std::string current_repository;
+    if (!LoadRepositoryPath(context, &current_repository, &error)) {
+      PrintError(error);
+      lock.Release();
+      return kCliExitOperationFailed;
+    }
+    service.SetRepositoryPath(current_repository);
+
     ScheduleEvaluationResult result;
-    const std::int64_t now = static_cast<std::int64_t>(::time(nullptr));
+    const std::int64_t now = NowSeconds();
     if (!service.Evaluate(now, &result, &error)) {
       PrintError(error);
       return kCliExitOperationFailed;
