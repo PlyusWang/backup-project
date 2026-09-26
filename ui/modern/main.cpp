@@ -31,8 +31,10 @@
 #include <QVariantList>
 #include <QVariantMap>
 #include <cstdio>
+#include <cstring>
 
 #include "app_theme.h"
+#include "archive_pipeline.h"
 #include "backup_controller.h"
 #include "filter_rule_model.h"
 
@@ -198,10 +200,34 @@ int RunSelfTest(backup_modern::BackupController* controller,
   return 0;
 }
 
+// v2 容器 header 的整数字段一律 little-endian（偏移表见
+// docs/format/archive_v2_container.md）。按字节拼出来，而不是把内存里的字节
+// 直接当成主机整数：后者只在特定字节序的机器上才是对的。
+unsigned ReadLeU16(const QByteArray& data, int offset) {
+  return static_cast<unsigned>(static_cast<unsigned char>(data.at(offset))) |
+         (static_cast<unsigned>(static_cast<unsigned char>(data.at(offset + 1)))
+          << 8);
+}
+
+unsigned long long ReadLeU64(const QByteArray& data, int offset) {
+  unsigned long long value = 0;
+  for (int index = 7; index >= 0; --index) {
+    value = (value << 8) | static_cast<unsigned char>(data.at(offset + index));
+  }
+  return value;
+}
+
 // --repository-test：repository-driven 的产品链路端到端验证。
 // 它走 ConfigManager + BackupCatalog + BackupController + BackupEngine，
 // 不使用任何 direct archive 捷径：文件名由 Catalog 自动生成，恢复只传 file
 // name。
+//
+// 除了"每一步都成功"，它还断言产物本身的格式：正常备份必须落成 v2 容器
+// （BKPCNT2\0 + MyPack + 不压缩 + 不加密），因为界面展示的 uid / gid /
+// symlink / FIFO 只有 v2 装得下。断言全部对着文件字节做，不看"备份成功"这句话。
+//
+// 环境变量 BACKUP_MODERN_KEEP_ARTIFACT（可选）指向一个路径：设了就把产物复制
+// 一份到那里，供检查脚本在产物被删除之前自己读字节。不设时行为一字不变。
 //
 // 每一步失败都把真实 diagnostic 打到 stderr 并以非 0 退出，
 // 所以脚本可以只信退出码，也可以从 stderr 看到核心的原文原因。
@@ -250,15 +276,131 @@ int RunRepositoryTest(backup_modern::BackupController* controller,
         qPrintable(record.value(QStringLiteral("diagnostic")).toString()));
     return 1;
   }
+  // 正常备份的产物是 v2 容器，所以列表里这一条必须认出 v2 并且数得出条目。
+  // recognizedArchive 只说明"全局 header 可读"，formatVersion 与 entryCount
+  // 才是"这是 v2、里面确实有条目"这两个事实。
+  const int record_format_version =
+      record.value(QStringLiteral("formatVersion")).toInt();
+  const unsigned long long record_entry_count =
+      record.value(QStringLiteral("entryCount")).toULongLong();
+  const bool record_recognized =
+      record.value(QStringLiteral("recognizedArchive")).toBool();
+  if (record_format_version != 2 || record_entry_count == 0) {
+    std::fprintf(stderr,
+                 "catalog 记录不是 v2 容器: formatVersion=%d entryCount=%llu\n",
+                 record_format_version, record_entry_count);
+    return 1;
+  }
   const QString file_name = record.value(QStringLiteral("fileName")).toString();
   std::printf("catalog list ok\n");
   std::printf(
-      "record: fileName=%s size=%s mtime=%s entryCount=%llu\n",
+      "record: fileName=%s size=%s mtime=%s recognizedArchive=%s "
+      "formatVersion=%d entryCount=%llu\n",
       qPrintable(file_name),
       qPrintable(record.value(QStringLiteral("sizeText")).toString()),
       qPrintable(record.value(QStringLiteral("modifiedTimeText")).toString()),
-      static_cast<unsigned long long>(
-          record.value(QStringLiteral("entryCount")).toULongLong()));
+      record_recognized ? "true" : "false", record_format_version,
+      record_entry_count);
+
+  // 3.5 产物字节：界面展示 uid / gid / user / group / symlink / FIFO，筛选预览
+  // 也会说某个 special entry“进入归档” —— 这些承诺只有在产物真的是 v2 容器时
+  // 才成立。这里直接读文件，而不是相信上一步的成功返回值。
+  const QString archive_path = QDir(repository).filePath(file_name);
+  QFile archive(archive_path);
+  if (!archive.open(QIODevice::ReadOnly)) {
+    std::fprintf(stderr, "无法读取备份产物: %s\n", qPrintable(archive_path));
+    return 1;
+  }
+  const QByteArray container_header = archive.read(160);
+  archive.close();
+
+  // 期望的 magic 逐字节比较，不走字符串：它的第 8 个字节就是 NUL。
+  const char kContainerMagic[8] = {'B', 'K', 'P', 'C', 'N', 'T', '2', '\0'};
+  if (container_header.size() < 160 ||
+      std::memcmp(container_header.constData(), kContainerMagic, 8) != 0) {
+    std::fprintf(stderr,
+                 "备份产物不是 v2 容器（前 8 字节不是 BKPCNT2\\0）: %s\n",
+                 qPrintable(archive_path));
+    return 1;
+  }
+  const unsigned container_version = ReadLeU16(container_header, 8);
+  const unsigned container_header_size = ReadLeU16(container_header, 10);
+  const unsigned pack_id = static_cast<unsigned char>(container_header.at(12));
+  const unsigned compression_id =
+      static_cast<unsigned char>(container_header.at(13));
+  const unsigned encryption_id =
+      static_cast<unsigned char>(container_header.at(14));
+  const unsigned long long container_entry_count =
+      ReadLeU64(container_header, 16);
+  // MyPack = 0 / None = 0 / None = 0（见 include/pack_stream.h 与
+  // include/container_format.h）。算法 id 与 entry_count 同时要和 catalog 记录
+  // 对得上：两条独立路径给出同一个结论才算数。
+  if (container_version != 2 || container_header_size != 160 || pack_id != 0 ||
+      compression_id != 0 || encryption_id != 0 ||
+      container_entry_count != record_entry_count) {
+    std::fprintf(stderr,
+                 "产物外层 header 不是 MyPack/None/None v2: version=%u "
+                 "headerSize=%u pack=%u compression=%u encryption=%u "
+                 "entryCount=%llu（catalog 记录 %llu）\n",
+                 container_version, container_header_size, pack_id,
+                 compression_id, encryption_id, container_entry_count,
+                 record_entry_count);
+    return 1;
+  }
+
+  backupproject::ArchiveFileInfo archive_info;
+  std::string identify_error;
+  if (!backupproject::IdentifyArchiveFile(archive_path.toStdString(),
+                                          &archive_info, &identify_error)) {
+    std::fprintf(stderr, "IdentifyArchiveFile 失败: %s\n",
+                 identify_error.c_str());
+    return 1;
+  }
+  if (archive_info.kind != backupproject::ArchiveFileInfo::Kind::kContainerV2 ||
+      archive_info.format_version != 2 ||
+      archive_info.pack_method != backupproject::PackMethod::kMyPack ||
+      archive_info.compression_method !=
+          backupproject::CompressionMethod::kNone ||
+      archive_info.encryption_method !=
+          backupproject::EncryptionMethod::kNone ||
+      archive_info.entry_count != container_entry_count) {
+    std::fprintf(stderr,
+                 "IdentifyArchiveFile 的结论与 v2 MyPack/None/None 不符\n");
+    return 1;
+  }
+
+  // magic 文本同样取自刚读到的字节（去掉结尾的 NUL 再打印），不是字面量：
+  // 检查脚本会拿下面两行断言产物格式，打印出来的必须是文件里真实的东西。
+  QByteArray magic_text = container_header.left(8);
+  while (magic_text.endsWith('\0')) {
+    magic_text.chop(1);
+  }
+  std::printf(
+      "artifact: magic=%s version=%u headerSize=%u packMethod=%u "
+      "compressionMethod=%u encryptionMethod=%u entryCount=%llu\n",
+      magic_text.constData(), container_version, container_header_size, pack_id,
+      compression_id, encryption_id, container_entry_count);
+  std::printf(
+      "identify: kind=container-v2 formatVersion=%u packMethod=%s "
+      "compressionMethod=%s encryptionMethod=%s entryCount=%llu\n",
+      static_cast<unsigned>(archive_info.format_version),
+      backupproject::PackMethodName(archive_info.pack_method),
+      backupproject::CompressionMethodName(archive_info.compression_method),
+      backupproject::EncryptionMethodName(archive_info.encryption_method),
+      static_cast<unsigned long long>(archive_info.entry_count));
+
+  // 产物马上就会被第 5 步删掉，脚本要自己读字节就得先留一份。没有设这个环境
+  // 变量时不复制、不留痕，产品行为一字不变。
+  const QByteArray keep_path = qgetenv("BACKUP_MODERN_KEEP_ARTIFACT");
+  if (!keep_path.isEmpty()) {
+    const QString keep = QString::fromLocal8Bit(keep_path);
+    QFile::remove(keep);
+    if (!QFile::copy(archive_path, keep)) {
+      std::fprintf(stderr, "产物副本写入失败: %s\n", qPrintable(keep));
+      return 1;
+    }
+    std::printf("artifact copy: %s\n", qPrintable(keep));
+  }
 
   // 4. 从管理页发起恢复：QML 只传 file name，解析交给 Catalog::Resolve
   if (!controller->startManagedRestore(file_name, destination) ||

@@ -3,7 +3,7 @@
 // 基础筛选规则的解析与匹配。设计上只有三件事：
 //
 //   1. 解析：把 "exclude path:**/build/**" 这样的文本变成若干子句；
-//   2. 匹配：glob / 扩展名列表 / 数值范围 / 日期范围；
+//   2. 匹配：glob / 扩展名列表 / 数值范围 / 属主 / 日期范围；
 //   3. 决策：exclude 优先，存在 include 时普通文件必须命中至少一条。
 //
 // 刻意不做的事：布尔表达式、regex、内容搜索、后代统计——它们都记在
@@ -23,6 +23,8 @@ namespace backupproject {
 
 namespace {
 
+// mtime:Ndays 里的"N 天"是 N x 24 小时（一段时长），不是 N 个日历日；
+// 日历日的边界一律交给 mktime 归一化，见 LocalDayStart / LocalDayEnd。
 constexpr std::int64_t kSecondsPerDay = 24 * 60 * 60;
 constexpr std::uint64_t kMaxDaysBack = 36500;  // 约 100 年，防止离谱输入
 
@@ -219,10 +221,30 @@ bool ParseSizeLiteral(const std::string& text, std::uint64_t* out,
   return true;
 }
 
+// ---- uid / gid ----------------------------------------------------------
+
+// uid:/gid: 的数值：先按 uint64 解析（顺带查溢出），再卡到 uint32 上界。
+// 99999999999 这类超范围输入必须明确报错，而不是截断成一个"看起来能跑"的数。
+bool ParseIdNumber(const std::string& field, const std::string& text,
+                   std::uint32_t* out, std::string* error_message) {
+  std::uint64_t value = 0;
+  if (!ParseUnsigned(text, &value) || value > UINT32_MAX) {
+    SetError(error_message,
+             "Invalid filter rule: " + field +
+                 " value out of range (0..4294967295): " + field + ":" + text);
+    return false;
+  }
+  *out = static_cast<std::uint32_t>(value);
+  return true;
+}
+
 // ---- mtime --------------------------------------------------------------
 
-// 本地时区某一天的 00:00:00。day_offset 用来取"前一天 / 后一天"，
-// 交给 mktime 归一化，这样夏令时切换也不会算错。
+// 本地时区某一天的 00:00:00。day_offset 是相对 (year, month, day) 的自然日
+// 偏移（可以为负），跨月 / 跨年 / 跨 DST 全部交给 mktime 归一化，不自己算日期。
+//
+// 只有 day_offset == 0 时才校验"日期本身合法"：带偏移的日期本来就允许落到
+// 相邻的月份或年份，归一化是预期行为而不是错误。
 bool LocalDayStart(int year, int month, int day, int day_offset,
                    std::int64_t* out) {
   struct tm parts;
@@ -243,7 +265,21 @@ bool LocalDayStart(int year, int month, int day, int day_offset,
   return true;
 }
 
-bool ParseDate(const std::string& text, std::int64_t* out) {
+// 某一天的最后一秒 = 下一天 00:00:00 - 1。不能写成 start + 86400 - 1：
+// DST 切换那天只有 23 或 25 小时，写死 86400 会让窗口端点落进相邻的日历日。
+bool LocalDayEnd(int year, int month, int day, std::int64_t* out) {
+  std::int64_t next_start = 0;
+  if (!LocalDayStart(year, month, day, 1, &next_start)) {
+    return false;
+  }
+  *out = next_start - 1;
+  return true;
+}
+
+// YYYY-MM-DD -> 本地日历日。年月日一并回给调用方：窗口上界要用它们算
+// "这一天的最后一秒"（见 LocalDayEnd），只回一个时间戳是算不出来的。
+bool ParseDate(const std::string& text, int* year, int* month, int* day,
+               std::int64_t* out) {
   if (text.size() != 10 || text[4] != '-' || text[7] != '-') {
     return false;
   }
@@ -253,13 +289,20 @@ bool ParseDate(const std::string& text, std::int64_t* out) {
       return false;
     }
   }
-  const int year = std::atoi(text.substr(0, 4).c_str());
-  const int month = std::atoi(text.substr(5, 2).c_str());
-  const int day = std::atoi(text.substr(8, 2).c_str());
-  if (month < 1 || month > 12 || day < 1 || day > 31) {
+  const int parsed_year = std::atoi(text.substr(0, 4).c_str());
+  const int parsed_month = std::atoi(text.substr(5, 2).c_str());
+  const int parsed_day = std::atoi(text.substr(8, 2).c_str());
+  if (parsed_month < 1 || parsed_month > 12 || parsed_day < 1 ||
+      parsed_day > 31) {
     return false;
   }
-  return LocalDayStart(year, month, day, 0, out);
+  if (!LocalDayStart(parsed_year, parsed_month, parsed_day, 0, out)) {
+    return false;
+  }
+  *year = parsed_year;
+  *month = parsed_month;
+  *day = parsed_day;
+  return true;
 }
 
 // mtime 取值换算成闭区间 [low, high]。kLastDays 只记天数，匹配时再拿
@@ -268,18 +311,26 @@ bool ParseMtimeValue(const std::string& value, int* kind, std::int64_t* low,
                      std::int64_t* high, std::int64_t* days_back,
                      std::string* error_message) {
   if (value == "today" || value == "yesterday") {
+    const bool is_today = value == "today";
     const std::time_t now = std::time(nullptr);
     struct tm local;
     localtime_r(&now, &local);
+    const int year = local.tm_year + 1900;
+    const int month = local.tm_mon + 1;
+    const int day = local.tm_mday;
+    // today     = [今天 00:00, 明天 00:00 - 1]
+    // yesterday = [昨天 00:00, 今天 00:00 - 1]
+    // 上界一律写成"下一天的开始减一秒"，DST 那天才会自动变成 23 / 25 小时。
     std::int64_t start = 0;
-    if (!LocalDayStart(local.tm_year + 1900, local.tm_mon + 1, local.tm_mday,
-                       value == "today" ? 0 : -1, &start)) {
+    std::int64_t next_start = 0;
+    if (!LocalDayStart(year, month, day, is_today ? 0 : -1, &start) ||
+        !LocalDayStart(year, month, day, is_today ? 1 : 0, &next_start)) {
       SetError(error_message, "Invalid filter rule: bad mtime value " + value);
       return false;
     }
     *kind = 0;  // kDay
     *low = start;
-    *high = start + kSecondsPerDay - 1;
+    *high = next_start - 1;
     return true;
   }
   if (value.size() > 4 && value.compare(value.size() - 4, 4, "days") == 0) {
@@ -298,10 +349,19 @@ bool ParseMtimeValue(const std::string& value, int* kind, std::int64_t* low,
   }
   const std::size_t range = value.find("..");
   if (range != std::string::npos) {
+    int start_year = 0;
+    int start_month = 0;
+    int start_day = 0;
+    int end_year = 0;
+    int end_month = 0;
+    int end_day = 0;
     std::int64_t start = 0;
     std::int64_t end = 0;
-    if (!ParseDate(value.substr(0, range), &start) ||
-        !ParseDate(value.substr(range + 2), &end)) {
+    if (!ParseDate(value.substr(0, range), &start_year, &start_month,
+                   &start_day, &start) ||
+        !ParseDate(value.substr(range + 2), &end_year, &end_month, &end_day,
+                   &end) ||
+        !LocalDayEnd(end_year, end_month, end_day, &end)) {
       SetError(error_message,
                "Invalid filter rule: invalid mtime range " + value);
       return false;
@@ -313,18 +373,23 @@ bool ParseMtimeValue(const std::string& value, int* kind, std::int64_t* low,
     }
     *kind = 1;  // kDayRange
     *low = start;
-    *high = end + kSecondsPerDay - 1;
+    *high = end;  // 结束日的最后一秒 = 次日 00:00 - 1
     return true;
   }
+  int year = 0;
+  int month = 0;
+  int day = 0;
   std::int64_t start = 0;
-  if (!ParseDate(value, &start)) {
+  std::int64_t end = 0;
+  if (!ParseDate(value, &year, &month, &day, &start) ||
+      !LocalDayEnd(year, month, day, &end)) {
     SetError(error_message,
              "Invalid filter rule: invalid mtime value " + value);
     return false;
   }
   *kind = 0;  // kDay
   *low = start;
-  *high = start + kSecondsPerDay - 1;
+  *high = end;
   return true;
 }
 
@@ -333,7 +398,8 @@ bool ParseMtimeValue(const std::string& value, int* kind, std::int64_t* low,
 bool IsKnownField(const std::string& field) {
   return field == "name" || field == "path" || field == "stem" ||
          field == "ext" || field == "type" || field == "size" ||
-         field == "mtime";
+         field == "mtime" || field == "uid" || field == "gid" ||
+         field == "user" || field == "group";
 }
 
 // 只在"空白后面紧跟已知字段名 + 冒号"处切分，这样 name:my file.txt 里的
@@ -409,6 +475,25 @@ bool ParseClause(const std::string& text, std::string* field_out,
 
 bool Filter::ClauseMatches(const Clause& clause,
                            const FilterEntry& entry) const {
+  // size / uid / gid 共用同一套数值比较；闭区间两端都算命中。
+  const auto numeric_match = [](std::uint64_t value, Clause::Compare compare,
+                                std::uint64_t low, std::uint64_t high) {
+    switch (compare) {
+      case Clause::Compare::kLess:
+        return value < low;
+      case Clause::Compare::kLessEqual:
+        return value <= low;
+      case Clause::Compare::kGreater:
+        return value > low;
+      case Clause::Compare::kGreaterEqual:
+        return value >= low;
+      case Clause::Compare::kEqual:
+        return value == low;
+      case Clause::Compare::kRange:
+        return value >= low && value <= high;
+    }
+    return false;
+  };
   switch (clause.field) {
     case Clause::Field::kName:
       return GlobMatch(clause.pattern, entry.name);
@@ -428,28 +513,62 @@ bool Filter::ClauseMatches(const Clause& clause,
       }
       return false;
     }
-    case Clause::Field::kType:
-      return entry.is_directory == clause.wants_directory;
-    case Clause::Field::kSize:
-      // 目录没有"文件大小"的语义，size 规则一律不命中目录。
+    case Clause::Field::kType: {
+      // type:file 只表示普通文件。它曾经等价于 !is_directory，于是 symlink /
+      // FIFO / 字符设备 / 块设备 / socket 统统被"普通文件"命中——而界面上那个
+      // 下拉框写的正是"普通文件"，DSL 里也早有 type:symlink 等独立取值。
+      // 旧调用方不受影响：EntryType 的默认值就是 kRegularFile，只填
+      // is_directory=false 的条目照旧被当成普通文件。
+      // 边界：扫描层为硬链接去重生成的 kHardLink 条目不是源目录里的类型，
+      // 因此不命中 type:file（它的 size 也被清零，见下面的 size 分支）。
+      if (clause.type_kind == Clause::TypeKind::kFile) {
+        return !entry.is_directory && entry.type == EntryType::kRegularFile;
+      }
+      // type:folder 仍然只看 is_directory：旧调用方没有 type 可填。
+      if (clause.type_kind == Clause::TypeKind::kFolder) {
+        return entry.is_directory;
+      }
       if (entry.is_directory) {
         return false;
       }
-      switch (clause.compare) {
-        case Clause::Compare::kLess:
-          return entry.size < clause.size_low;
-        case Clause::Compare::kLessEqual:
-          return entry.size <= clause.size_low;
-        case Clause::Compare::kGreater:
-          return entry.size > clause.size_low;
-        case Clause::Compare::kGreaterEqual:
-          return entry.size >= clause.size_low;
-        case Clause::Compare::kRange:
-          // 闭区间：两端都算命中。
-          return entry.size >= clause.size_low &&
-                 entry.size <= clause.size_high;
+      switch (clause.type_kind) {
+        case Clause::TypeKind::kSymlink:
+          return entry.type == EntryType::kSymlink;
+        case Clause::TypeKind::kFifo:
+          return entry.type == EntryType::kFifo;
+        case Clause::TypeKind::kCharDevice:
+          return entry.type == EntryType::kCharDevice;
+        case Clause::TypeKind::kBlockDevice:
+          return entry.type == EntryType::kBlockDevice;
+        case Clause::TypeKind::kSocket:
+          return entry.type == EntryType::kSocket;
+        case Clause::TypeKind::kFile:
+        case Clause::TypeKind::kFolder:
+          return false;  // 上面已经处理，这里只为穷尽枚举
       }
       return false;
+    }
+    case Clause::Field::kSize:
+      // size 只对普通文件有意义：扫描层把目录与 symlink / FIFO / 设备 /
+      // socket 的 size 一律置 0，若照旧参与比较，用户写 exclude size:<=1KB
+      // 会把它们全部误伤——而写 size: 时想的显然是文件内容的长度。
+      if (!entry.is_directory && entry.type == EntryType::kRegularFile) {
+        return numeric_match(entry.size, clause.compare, clause.size_low,
+                             clause.size_high);
+      }
+      return false;
+    case Clause::Field::kUid:
+      return numeric_match(entry.uid, clause.compare, clause.uid_low,
+                           clause.uid_high);
+    case Clause::Field::kGid:
+      return numeric_match(entry.gid, clause.compare, clause.gid_low,
+                           clause.gid_high);
+    case Clause::Field::kUser:
+      // 精确匹配、大小写敏感。user_name 为空（解析失败）时不匹配：既不报错
+      // 也不崩，更不会把"读不出名字"当成"匹配所有用户"。
+      return !entry.user_name.empty() && entry.user_name == clause.user_name;
+    case Clause::Field::kGroup:
+      return !entry.group_name.empty() && entry.group_name == clause.group_name;
     case Clause::Field::kMtime: {
       if (clause.time_kind == Clause::TimeKind::kLastDays) {
         const std::int64_t now = static_cast<std::int64_t>(std::time(nullptr));
@@ -544,6 +663,56 @@ bool Filter::AddRule(FilterAction action, const std::string& text,
     SetError(error_message, "Invalid filter rule: empty rule");
     return false;
   }
+  // uid:/gid: 共用的解析：裸数字表示"等于"，另支持 < <= > >= 与 a..b 闭区间。
+  // 写成 AddRule 内的 lambda，是为了能直接写出私有的 Clause::Compare 类型。
+  const auto parse_id = [](const std::string& field, const std::string& value,
+                           Clause::Compare* compare, std::uint32_t* low,
+                           std::uint32_t* high,
+                           std::string* error_message) -> bool {
+    const std::size_t range = value.find("..");
+    if (range != std::string::npos) {
+      std::uint32_t start = 0;
+      std::uint32_t end = 0;
+      if (!ParseIdNumber(field, value.substr(0, range), &start,
+                         error_message) ||
+          !ParseIdNumber(field, value.substr(range + 2), &end, error_message)) {
+        return false;
+      }
+      if (end < start) {
+        SetError(error_message, "Invalid filter rule: " + field +
+                                    " range is reversed: " + field + ":" +
+                                    value);
+        return false;
+      }
+      *compare = Clause::Compare::kRange;
+      *low = start;
+      *high = end;
+      return true;
+    }
+    Clause::Compare kind = Clause::Compare::kEqual;
+    std::string rest = value;
+    if (value.compare(0, 2, "<=") == 0) {
+      kind = Clause::Compare::kLessEqual;
+      rest = value.substr(2);
+    } else if (value.compare(0, 2, ">=") == 0) {
+      kind = Clause::Compare::kGreaterEqual;
+      rest = value.substr(2);
+    } else if (value[0] == '<') {
+      kind = Clause::Compare::kLess;
+      rest = value.substr(1);
+    } else if (value[0] == '>') {
+      kind = Clause::Compare::kGreater;
+      rest = value.substr(1);
+    }
+    std::uint32_t bound = 0;
+    if (!ParseIdNumber(field, rest, &bound, error_message)) {
+      return false;
+    }
+    *compare = kind;
+    *low = bound;
+    *high = bound;
+    return true;
+  };
   std::string clause_error;
   const std::vector<std::string> clause_texts =
       SplitClauses(text, &clause_error);
@@ -592,12 +761,24 @@ bool Filter::AddRule(FilterAction action, const std::string& text,
     } else if (field == "type") {
       clause.field = Clause::Field::kType;
       if (value == "file") {
-        clause.wants_directory = false;
+        clause.type_kind = Clause::TypeKind::kFile;
       } else if (value == "folder") {
-        clause.wants_directory = true;
+        clause.type_kind = Clause::TypeKind::kFolder;
+      } else if (value == "symlink") {
+        clause.type_kind = Clause::TypeKind::kSymlink;
+      } else if (value == "fifo") {
+        clause.type_kind = Clause::TypeKind::kFifo;
+      } else if (value == "char") {
+        clause.type_kind = Clause::TypeKind::kCharDevice;
+      } else if (value == "block") {
+        clause.type_kind = Clause::TypeKind::kBlockDevice;
+      } else if (value == "socket") {
+        clause.type_kind = Clause::TypeKind::kSocket;
       } else {
-        SetError(error_message, "Invalid filter rule: unknown type '" + value +
-                                    "' (expected file or folder)");
+        SetError(error_message,
+                 "Invalid filter rule: unknown type '" + value +
+                     "' (expected file, folder, symlink, fifo, char, block "
+                     "or socket)");
         ok = false;
       }
     } else if (field == "size") {
@@ -652,7 +833,32 @@ bool Filter::AddRule(FilterAction action, const std::string& text,
           }
         }
       }
-    } else {
+    } else if (field == "uid" || field == "gid") {
+      clause.field =
+          (field == "uid") ? Clause::Field::kUid : Clause::Field::kGid;
+      Clause::Compare compare = Clause::Compare::kEqual;
+      std::uint32_t low = 0;
+      std::uint32_t high = 0;
+      if (!parse_id(field, value, &compare, &low, &high, error_message)) {
+        ok = false;
+      } else if (field == "uid") {
+        clause.compare = compare;
+        clause.uid_low = low;
+        clause.uid_high = high;
+      } else {
+        clause.compare = compare;
+        clause.gid_low = low;
+        clause.gid_high = high;
+      }
+    } else if (field == "user" || field == "group") {
+      clause.field =
+          (field == "user") ? Clause::Field::kUser : Clause::Field::kGroup;
+      if (field == "user") {
+        clause.user_name = value;
+      } else {
+        clause.group_name = value;
+      }
+    } else if (field == "mtime") {
       clause.field = Clause::Field::kMtime;
       int kind = 0;
       std::int64_t low = 0;
@@ -666,6 +872,11 @@ bool Filter::AddRule(FilterAction action, const std::string& text,
         clause.time_high = high;
         clause.days_back = days;
       }
+    } else {
+      // IsKnownField 已经过滤过一次，这里只是穷尽分支，正常不可达。
+      SetError(error_message,
+               "Invalid filter rule: unknown field '" + field + "'");
+      ok = false;
     }
     if (!ok) {
       return false;
