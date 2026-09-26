@@ -58,6 +58,16 @@ bp::ManifestEntry MakeEntry(const std::string& path, bp::EntryType type) {
   return entry;
 }
 
+// 一份完整的 manifest 归属。三个字段都不是随便填的：repository_identity 与
+// source_path 用真实路径，snapshot_file_name 用合法的单组件 .bak 名字。
+bp::ManifestBinding MakeBinding(const std::string& snapshot_file_name) {
+  bp::ManifestBinding binding;
+  binding.snapshot_file_name = snapshot_file_name;
+  binding.repository_identity = "/home/u/repo";
+  binding.source_path = "/home/u/src";
+  return binding;
+}
+
 void CheckSummary(const std::string& label, const bp::ChangeSummary& actual,
                   std::uint64_t added, std::uint64_t removed,
                   std::uint64_t modified, std::uint64_t metadata_changed) {
@@ -308,11 +318,18 @@ void TestManifestFromTree() {
                       "MAN-08 hardlink degree counts the followers",
                       std::to_string(leader_degree));
 
-  // 序列化往返。
-  const std::string text = bp::SerializeManifest(entries);
+  // 序列化往返。带上一份完整的 binding：生产路径写出的就是 version 2。
+  const bp::ManifestBinding binding = MakeBinding("src-1.bak");
+  const std::string text = bp::SerializeManifest(entries, binding);
   std::vector<bp::ManifestEntry> parsed;
-  test_support::Check(bp::ParseManifest(text, &parsed, &error),
+  bp::ManifestBinding parsed_binding;
+  test_support::Check(bp::ParseManifest(text, &parsed, &parsed_binding, &error),
                       "MAN-09 manifest round-trips", error);
+  test_support::Check(parsed_binding.snapshot_file_name == "src-1.bak" &&
+                          parsed_binding.repository_identity ==
+                              binding.repository_identity &&
+                          parsed_binding.source_path == binding.source_path,
+                      "MAN-09b the round trip keeps the baseline binding");
   test_support::Check(parsed.size() == entries.size(),
                       "MAN-10 round-trip keeps the count");
   bool identical = parsed.size() == entries.size();
@@ -341,8 +358,9 @@ void TestManifestFromTree() {
   weird.push_back(newline);
   weird.push_back(backslash);
   std::vector<bp::ManifestEntry> weird_parsed;
-  test_support::Check(bp::ParseManifest(bp::SerializeManifest(weird),
-                                        &weird_parsed, &error) &&
+  bp::ManifestBinding weird_binding;
+  test_support::Check(bp::ParseManifest(bp::SerializeManifest(weird, binding),
+                                        &weird_parsed, &weird_binding, &error) &&
                           weird_parsed.size() == 3 &&
                           weird_parsed[0].archive_path == "a\tb" &&
                           weird_parsed[1].archive_path == "c\nd" &&
@@ -355,35 +373,48 @@ void TestManifestRejectsBadInput() {
   std::string error;
   std::vector<bp::ManifestEntry> entries;
 
-  test_support::Check(!bp::ParseManifest("", &entries, &error),
+  bp::ManifestBinding binding;
+  test_support::Check(!bp::ParseManifest("", &entries, &binding, &error),
                       "MAN-20 empty manifest is rejected", error);
-  test_support::Check(!bp::ParseManifest("NOTAMANIFEST\n", &entries, &error),
-                      "MAN-21 wrong header is rejected", error);
-  test_support::Check(!bp::ParseManifest("BPMANIFEST1 2\n", &entries, &error),
-                      "MAN-22 missing entries are rejected", error);
   test_support::Check(
-      !bp::ParseManifest("BPMANIFEST1 1\n2\t1\t1\t1\t644\t0\t0\t0\t0\t0\t.\n",
-                         &entries, &error),
+      !bp::ParseManifest("NOTAMANIFEST\n", &entries, &binding, &error),
+      "MAN-21 wrong header is rejected", error);
+  test_support::Check(
+      !bp::ParseManifest("BPMANIFEST1 2\n", &entries, &binding, &error),
+      "MAN-22 missing entries are rejected", error);
+  test_support::Check(
+      !bp::ParseManifest(
+          "BPMANIFEST1 1\n2\t1\t1\t1\t644\t0\t0\t0\t0\t0\t.\n", &entries,
+          &binding, &error),
       "MAN-23 a wrong field count is rejected", error);
   test_support::Check(
-      !bp::ParseManifest("BPMANIFEST1 1\n8\t0\t0\t0\t644\t0\t0\t0\t0\t0\t.\t\n",
-                         &entries, &error),
+      !bp::ParseManifest(
+          "BPMANIFEST1 1\n8\t0\t0\t0\t644\t0\t0\t0\t0\t0\t.\t\n", &entries,
+          &binding, &error),
       "MAN-24 the never-written socket type is rejected", error);
   test_support::Check(
-      !bp::ParseManifest("BPMANIFEST1 0\n2\t0\t0\t0\t644\t0\t0\t0\t0\t0\ta\t\n",
-                         &entries, &error),
+      !bp::ParseManifest(
+          "BPMANIFEST1 0\n2\t0\t0\t0\t644\t0\t0\t0\t0\t0\ta\t\n", &entries,
+          &binding, &error),
       "MAN-25 trailing data after the declared count is rejected", error);
   test_support::Check(
       !bp::ParseManifest(
-          "BPMANIFEST1 1\n2\t5\t0\t0\t644\t0\t0\t0\t0\t0\t/x\t\n", &entries,
-          &error),
+          "BPMANIFEST1 1\n2\t5\t0\t0\t644\t0\t0\t0\t0\t0\t/x\t\n",
+          &entries, &binding, &error),
       "MAN-26 an absolute archive path is rejected", error);
   test_support::Check(
       !bp::ParseManifest(
           "BPMANIFEST1 2\n2\t0\t0\t0\t644\t0\t0\t0\t0\t0\ta\t\n"
           "2\t0\t0\t0\t644\t0\t0\t0\t0\t0\ta\t\n",
-          &entries, &error),
+          &entries, &binding, &error),
       "MAN-27 a duplicate path is rejected", error);
+  // 空 manifest 是**合法**的 v1（0 条），但它没有 binding。
+  test_support::Check(bp::ParseManifest(bp::SerializeManifestV1({}), &entries,
+                                        &binding, &error) &&
+                          entries.empty() && binding.empty(),
+                      "MAN-28 a version 1 manifest still parses, without a "
+                      "binding",
+                      error);
 }
 
 // ---- D. 变化检测 ----

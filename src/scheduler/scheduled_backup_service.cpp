@@ -457,21 +457,30 @@ bool ScheduledBackupService::EvaluateInternal(std::int64_t now_sec, bool force,
 
   // ---- 能不能拿"上一份 manifest"当基线？----
   //
-  // 两份材料缺一不可：
+  // 三份材料缺一不可：
   //   * state 里记着 baseline 快照，而且它**现在仍然真实存在于当前仓库里、
   //     仍然归本 scheduler 管理**（EvaluateScheduleBaseline）；
-  //   * 那份 manifest 文件本身还读得出来。
+  //   * 那份 manifest 文件本身还读得出来；
+  //   * **manifest 自己声明的归属与 state 记录的 baseline 完全一致**。
   //
-  // 只有两份都在，才能说"manifest 相同 == 源没变 == 可以跳过"。少了任何一份，
-  // manifest 相同都只能说明"上次扫描时源长这样"，证明不了仓库里有对应的备份。
+  // 第三条是这条不变式的最后一环，也是最容易被忽略的一环。"baseline 存在"与
+  // "manifest 与当前源相同"这两条各自成立，并不蕴含"那份 baseline 装的就是
+  // 当前源"。反例正是崩溃留下的中间状态：archive 与 manifest 都已经换成了新的
+  // （M2 / S2），state 却还没来得及保存（仍然是 S1）。下一轮 S1 依然存在且
+  // managed，manifest 也依然等于当前源，于是错误地跳过一轮——而仓库里根本没有
+  // 任何一份快照装得下 M2。三个文件无法原子一起提交，所以必须让 manifest 带着
+  // 自己的归属，靠"这一对是否配套"来判定，而不是靠"两边分别看起来都还行"。
+  //
+  // 配套不上一律按"没有可信基线"处理：重建一份完整快照。多建一份，绝不错误跳过。
   std::string baseline_error;
   const ScheduleBaselineStatus baseline_status =
       EvaluateScheduleBaseline(document, repository_path_, &baseline_error);
 
   std::vector<ManifestEntry> previous;
+  ManifestBinding manifest_binding;
   // manifest_error 复用上面扫描用的那个：两处报错都只在一轮之内用一次。
   const ScheduleStore::ManifestLoadStatus manifest_status =
-      store_->LoadManifest(&previous, &manifest_error);
+      store_->LoadManifest(&previous, &manifest_binding, &manifest_error);
 
   std::string baseline_reason;
   bool baseline_usable = false;
@@ -483,6 +492,17 @@ bool ScheduledBackupService::EvaluateInternal(std::int64_t now_sec, bool force,
                       manifest_error + ")";
   } else if (manifest_status == ScheduleStore::ManifestLoadStatus::kMissing) {
     baseline_reason = "The previous source manifest file is gone";
+  } else if (manifest_binding.empty()) {
+    // version 1 的 manifest：没有归属信息。绝不猜它属于 state 里那份 baseline。
+    baseline_reason =
+        "The previous source manifest was written by an older version and does "
+        "not record which snapshot it belongs to";
+  } else if (!SameBaselineBinding(document.state.baseline, manifest_binding)) {
+    baseline_reason =
+        "The previous source manifest belongs to a different snapshot than the "
+        "recorded baseline (manifest belongs to '" +
+        manifest_binding.snapshot_file_name + "', the recorded baseline is '" +
+        document.state.baseline.snapshot_file_name + "')";
   } else {
     baseline_usable = true;
   }
@@ -602,8 +622,11 @@ bool ScheduledBackupService::EvaluateInternal(std::int64_t now_sec, bool force,
   //   如果在这里崩：archive 已经是一个完整可恢复的 .bak，而 state 里还没有
   //   它。它最多变成一个"没人认领的普通备份"，下次 List 照样列得出来、
   //   恢复得了、删得掉。state 永远不会让 archive 的正确性依赖它。
+  // manifest 写下去时带着**与 state 完全相同**的归属。两份文件因此各自
+  // 自描述，任何"只写成功了一半"的中间状态都会在下一轮被识别成不配套。
+  const ManifestBinding binding = BindingOf(document.state.baseline);
   std::string persist_error;
-  if (!store_->SaveManifest(current, &persist_error)) {
+  if (!store_->SaveManifest(current, binding, &persist_error)) {
     result->diagnostic +=
         "The snapshot was created, but the source manifest could not be saved "
         "(the next run will be treated as a first snapshot): " +

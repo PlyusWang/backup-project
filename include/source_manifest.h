@@ -116,28 +116,87 @@ bool DiffManifests(const std::vector<ManifestEntry>& previous,
                    std::vector<std::string>* changed_paths,
                    std::string* error_message);
 
+// ---- 这份 manifest 属于哪一份真实快照 ----
+//
+// 单独一份 manifest 只说明"上一次扫描到的源长这样"，它**证明不了**仓库里还有
+// 一份与它对应的完整快照。三个字段各自钉住一个维度：
+//
+//   * snapshot_file_name  哪一份快照（单组件 .bak 名字，绝不存绝对路径）；
+//   * repository_identity 哪一个仓库（稳定 identity，不是文件名猜测）；
+//   * source_path         哪一个源目录（换了源、恰好 manifest
+//   相似时不能误用）。
+//
+// 为什么必须写进文件本身，而不是只留在 schedule.json 里：archive / manifest /
+// schedule.json
+// 是三个独立文件，各自原子替换，**没有任何时刻能让三个一起提交**。
+// 于是"manifest 与 state 说的不是同一份快照"这种中间状态一定会出现——只要进程
+// 崩在两次写盘之间就会留下它。把归属写进 manifest 之后，下一轮只要发现
+// manifest 自己声明的归属与 state 记录的 baseline
+// 不一致，就能判定这一对不可信，
+// 老老实实重建一份完整快照。多建一份，绝不错误跳过。
+//
+// 反过来说：只比对"源有没有变化"是不够的。崩在 SaveManifest 与 Save(state)
+// 之间时，state 里还是旧的 baseline S1，manifest 却已经是新源状态 M2，而 S1
+// 依然真实存在于仓库里——"baseline 存在"+"current == manifest" 两条同时成立，
+// 于是错误地跳过一轮，而仓库里根本没有任何一份快照装得下 M2。
+struct ManifestBinding {
+  std::string snapshot_file_name;
+  std::string repository_identity;
+  std::string source_path;
+
+  // 三个字段全空 = 这份 manifest 没有归属信息（version 1 格式）。
+  // 调用方**不得**把它当成可信基线。
+  bool empty() const {
+    return snapshot_file_name.empty() && repository_identity.empty() &&
+           source_path.empty();
+  }
+};
+
 // ---- 序列化 ----
 //
 // 行式文本，不是 JSON：manifest 可能有几十万条，塞进 schedule.json 会让每次
-// 读写都在解析一个巨大的对象。格式如下（字段间是 TAB，首行是版本头）：
+// 读写都在解析一个巨大的对象。
 //
-//   BPMANIFEST1 <entry_count>\n
+// 当前写出格式是 version 2，头行在版本与条数之外多带三个转义字段，也就是上面
+// 那层归属（TAB 分隔）：
+//
+//   BPMANIFEST2 <entry_count>\t<escaped baseline snapshot file name>
+//     \t<escaped baseline repository identity>\t<escaped baseline source
+//     path>\n
 //   <type_id>\t<size>\t<mtime_sec>\t<mtime_nsec>\t<mode>\t<uid>\t<gid>
 //     \t<dev_major>\t<dev_minor>\t<hardlink_degree>
 //     \t<escaped archive_path>\t<escaped link_target>\n
 //
-// 转义只作用于两个字符串字段：反斜杠、TAB、换行、回车。
+// version 1（BPMANIFEST1 <entry_count>\n ...）仍然**读得出来**，但解析结果里
+// binding 是空的，也就是"不可信基线"。升级语义因此是单向安全的：v1 用户升级后
+// 最多多建一份完整快照，绝不会因此漏掉一次变化。
+//
+// 转义只作用于字符串字段：反斜杠、TAB、换行、回车。
 // 解析严格：头必须完全匹配、条数必须与正文一致、不接受多余字节、每个数字都
 // 做范围检查——manifest 是机器写的，出现偏差就是状态坏了，必须报错而不是尽力猜。
 
 inline constexpr std::size_t kMaxManifestBytes = 64u * 1024u * 1024u;
 inline constexpr std::size_t kMaxManifestEntries = 2000000u;
 inline constexpr std::size_t kMaxManifestLineBytes = 64u * 1024u;
+// binding 三个字段各自的长度上界。它与 kMaxScheduleStringBytes 取同一个量级：
+// 这里存的是路径与文件名，没有理由更长。
+inline constexpr std::size_t kMaxManifestBindingBytes = 4096u;
 
-std::string SerializeManifest(const std::vector<ManifestEntry>& entries);
+// 写出 version 2。binding 必须完整（三个字段非空、名字是合法的单组件名、
+// 长度有限、不含 NUL），否则返回空串——宁可什么都不写，也不写一份归属不明的
+// manifest 出去，那恰好是本次修复要消灭的状态。
+std::string SerializeManifest(const std::vector<ManifestEntry>& entries,
+                              const ManifestBinding& binding);
 
+// 写出 version 1（没有 binding）。存在的理由只有一个：兼容性与迁移测试需要
+// 造出一份"旧版本留下的 manifest"。**生产路径一律用上面那个带 binding
+// 的版本。**
+std::string SerializeManifestV1(const std::vector<ManifestEntry>& entries);
+
+// binding 非空且合法时填进 *binding；读到的是 version 1 时 *binding 留空。
+// 调用方据此区分"可信归属"与"旧格式，必须重建基线"。
 bool ParseManifest(const std::string& text, std::vector<ManifestEntry>* entries,
-                   std::string* error_message);
+                   ManifestBinding* binding, std::string* error_message);
 
 }  // namespace backupproject
 
