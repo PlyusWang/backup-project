@@ -81,6 +81,18 @@ Item {
                         }
                     }
 
+                    // 配好仓库不等于不能再改：配置还在、目录被删掉，或者单纯想换个位置，
+                    // 都会走到这里。换仓库统一在设置页完成，这一页只发跳转意图，
+                    // 所以"无法读取备份仓库"时用户也能直接过去处理。
+                    AppButton {
+                        objectName: "changeRepositoryButton"
+                        visible: controller.repositoryConfigured
+                        text: "更改仓库"
+                        iconName: "settings"
+                        enabled: !controller.busy
+                        onClicked: page.openSettings()
+                    }
+
                     AppButton {
                         objectName: "refreshBackupsButton"
                         visible: controller.repositoryConfigured
@@ -91,6 +103,7 @@ Item {
                     }
 
                     AppButton {
+                        objectName: "goToSettingsButton"
                         visible: !controller.repositoryConfigured
                         text: "前往设置"
                         iconName: "settings"

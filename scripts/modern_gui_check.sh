@@ -341,9 +341,10 @@ for page in BackupPage BackupManagementPage SettingsPage; do
   expect_count_re "$RESOURCE_FILE" "qml/pages/${page}\.qml" 1 "resources.qrc 收录 $page.qml"
 done
 
-# 备份页：源目录输入框 + 浏览 + 开始备份 = 3 处绑定 !controller.busy。
+# 备份页：源目录输入框 + 浏览 + 更改仓库 + 开始备份 = 4 处绑定 !controller.busy。
 # 计数式断言同时防"漏绑 busy"和"复制粘贴出多余按钮"。
-expect_count "$QML_DIR/pages/BackupPage.qml" "enabled: !controller.busy" 3 \
+# "更改仓库"属于这一组：任务期间不给跳走，与管理页的"刷新"用同一条禁用规则。
+expect_count "$QML_DIR/pages/BackupPage.qml" "enabled: !controller.busy" 4 \
   "备份页忙碌时禁用输入与按钮"
 # 设置页：仓库输入框 + 浏览目录 + 保存设置 = 3 处。
 expect_count "$QML_DIR/pages/SettingsPage.qml" "enabled: !controller.busy" 3 \
@@ -1094,6 +1095,108 @@ if grep -qE '^/tests/output/' "$ROOT_DIR/.gitignore"; then
 else
   record_fail "tests/output/ 不再被 .gitignore 覆盖，截图有被提交的风险"
 fi
+
+echo "[modern-gui] 13) 仓库设置入口（configured 状态下也能直接改仓库）"
+
+# 人工验收发现的缺口：仓库配好之后，备份页与管理页都只剩"当前路径"这一行，
+# 没有回到设置页改仓库的入口 —— 而"配置还在、目录已经被删掉"恰恰是最需要它的时候。
+# 两个页面本来就都有 openSettings() 信号、Main.qml 也已经连到设置页，
+# 所以这里断言的是"按钮真的接在那个信号上"，而不是又造一套跳转机制。
+
+# 从一个 objectName 处取到该 AppButton 块的结尾，再在块内逐项断言。
+# 对整块写一条大正则太脆：缩进或换行一调就误报；块内断言则只在字段真的
+# 被删掉或改坏时才失败。
+button_block() {
+  local file="$1"
+  local name="$2"
+  awk -v want="objectName: \"$name\"" '
+    index($0, want) { inside = 1 }
+    inside { print }
+    inside && /^[[:space:]]*}[[:space:]]*$/ { exit }
+  ' "$file"
+}
+
+assert_button() {
+  local file="$1"
+  local name="$2"
+  local label="$3"
+  shift 3
+  local block
+  block="$(button_block "$file" "$name")"
+  if [[ -z "$block" ]]; then
+    record_fail "$label（$(basename "$file") 里找不到 objectName: $name 的按钮）"
+    return 0
+  fi
+  local missing=""
+  local needle
+  for needle in "$@"; do
+    printf '%s\n' "$block" | grep -qF -- "$needle" || missing="$missing [$needle]"
+  done
+  if [[ -z "$missing" ]]; then
+    record_pass "$label"
+  else
+    record_fail "$label（缺少：$missing）"
+  fi
+}
+
+BACKUP_PAGE="$QML_DIR/pages/BackupPage.qml"
+MGMT_PAGE="$QML_DIR/pages/BackupManagementPage.qml"
+
+# 没有信号就谈不上接线，所以先把两个信号本身钉住。
+expect_count_re "$BACKUP_PAGE" '^    signal openSettings\(\)$' 1 \
+  "备份页声明 openSettings 信号"
+expect_count_re "$MGMT_PAGE" '^    signal openSettings\(\)$' 1 \
+  "备份管理页声明 openSettings 信号"
+
+assert_button "$BACKUP_PAGE" changeRepositoryButton \
+  "备份页 configured 状态提供「更改仓库」并接到 page.openSettings()" \
+  'text: "更改仓库"' \
+  'visible: controller.repositoryConfigured' \
+  'iconName: "settings"' \
+  'onClicked: page.openSettings()'
+
+assert_button "$BACKUP_PAGE" goToSettingsButton \
+  "备份页 unconfigured 状态仍是「前往设置」" \
+  'text: "前往设置"' \
+  'visible: !controller.repositoryConfigured' \
+  'onClicked: page.openSettings()'
+
+assert_button "$MGMT_PAGE" changeRepositoryButton \
+  "管理页 configured 状态提供「更改仓库」并接到 page.openSettings()" \
+  'text: "更改仓库"' \
+  'visible: controller.repositoryConfigured' \
+  'iconName: "settings"' \
+  'onClicked: page.openSettings()'
+
+assert_button "$MGMT_PAGE" refreshBackupsButton \
+  "管理页「刷新」仍在，语义未变" \
+  'text: "刷新"' \
+  'iconName: "refresh"' \
+  'onClicked: controller.refreshBackups()'
+
+assert_button "$MGMT_PAGE" goToSettingsButton \
+  "管理页 unconfigured 状态只留「前往设置」" \
+  'text: "前往设置"' \
+  'visible: !controller.repositoryConfigured'
+
+# 「更改仓库」的可见性只能挂在 repositoryConfigured 上。人工验收遇到的正是
+# "配置还在、目录已被删"（catalogError 非空、记录为 0）：那种情况下这个入口
+# 恰恰最该出现，所以它绝不能顺带依赖 catalogError 或 backupRecords。
+if printf '%s\n' "$(button_block "$MGMT_PAGE" changeRepositoryButton)" \
+    | grep -qF -- 'visible: controller.repositoryConfigured'; then
+  record_pass "管理页「更改仓库」只看 repositoryConfigured，catalogError 场景下依然可进入设置"
+else
+  record_fail "管理页「更改仓库」的可见性被别的条件影响，catalogError 场景可能进不去设置"
+fi
+
+# 换仓库这件事只能发生在设置页：这两个页面都不许自己落盘。
+for repo_page in "$BACKUP_PAGE" "$MGMT_PAGE"; do
+  if grep -q 'saveRepositoryPath' "$repo_page"; then
+    record_fail "$(basename "$repo_page") 直接调用了 saveRepositoryPath()，绕过了设置页"
+  else
+    record_pass "$(basename "$repo_page") 没有绕过设置页直接保存仓库"
+  fi
+done
 
 echo "[modern-gui] 通过 $PASS_COUNT 项，失败 $FAIL_COUNT 项"
 echo "[modern-gui] 日志: $LOG_FILE"
