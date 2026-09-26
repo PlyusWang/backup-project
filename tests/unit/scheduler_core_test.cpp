@@ -205,6 +205,27 @@ void TestSimpleJson() {
                                                &error) &&
                             error.find("missing required field") != std::string::npos,
                         "JSON-22 missing field is rejected", error);
+    // 可选字段：只有 optional 列表里的 key 才被额外放行。它是"新版本往已发布
+    // 的 schema 里追加字段"的唯一通道，不是"放宽未知字段"。
+    test_support::Check(
+        bp::RequireExactFields(value, {"a"}, {"b"}, "demo", &error),
+        "JSON-22b a declared optional field is accepted", error);
+    test_support::Check(
+        bp::RequireExactFields(value, {"a", "b"}, {"c"}, "demo", &error),
+        "JSON-22c an absent optional field is accepted", error);
+    test_support::Check(!bp::RequireExactFields(value, {"a"}, {"c"}, "demo",
+                                                &error) &&
+                            error.find("unknown field") != std::string::npos,
+                        "JSON-22d a field outside fields+optional is still "
+                        "rejected",
+                        error);
+    test_support::Check(!bp::RequireExactFields(value, {"a", "b", "c"}, {"b"},
+                                                "demo", &error) &&
+                            error.find("missing required field") !=
+                                std::string::npos,
+                        "JSON-22e optional does not excuse a missing required "
+                        "field",
+                        error);
     std::uint32_t number = 0;
     test_support::Check(bp::RequireUint32(value, "a", "demo", 0, 10, &number,
                                           &error) &&

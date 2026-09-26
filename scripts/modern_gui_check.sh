@@ -1476,6 +1476,49 @@ for pattern in "Interval:       5 minute(s)" \
   fi
 done
 
+# GUI 保存的筛选规则，CLI 必须逐字读得到。
+for pattern in "Include rules:  ext:txt" \
+               "Exclude rules:  path:**/build/**"; do
+  if grep -qF -- "$pattern" "$TEST_STATE_DIR/schedule-show.txt"; then
+    record_pass "跨前端一致（筛选规则）：$pattern"
+  else
+    record_fail "跨前端不一致（筛选规则）：$pattern"
+  fi
+done
+
+# GUI 能删规则，CLI 也必须能：--clear-filters 之后两边看到的都是空。
+#
+# 注意：GUI 自检跑在 QTemporaryDir 里，进程一退出那个仓库就没了；而这一份计划
+# 是 enabled 的，任何修改都会先过一遍"仍然真的能跑"的完整校验，所以这里先把
+# 仓库重新指到一个真实存在的目录。这本身就是那条新约束在起作用。
+mkdir -p "$TEST_STATE_DIR/cleared-repo" "$TEST_STATE_DIR/cleared-src"
+set +e
+./build/backupctl --config-file "$SCHEDULE_CONFIG" config repository set \
+  "$TEST_STATE_DIR/cleared-repo" > "$TEST_STATE_DIR/schedule-repo.txt" 2>&1
+repo_status=$?
+./build/backupctl --config-file "$SCHEDULE_CONFIG" --schedule-file "$SCHEDULE_STORE" \
+  schedule set --clear-filters --source "$TEST_STATE_DIR/cleared-src" \
+  > "$TEST_STATE_DIR/schedule-clear.txt" 2>&1
+clear_status=$?
+./build/backupctl --config-file "$SCHEDULE_CONFIG" --schedule-file "$SCHEDULE_STORE" \
+  schedule show > "$TEST_STATE_DIR/schedule-show-cleared.txt" 2>&1
+set -e
+
+if [[ "$repo_status" -eq 0 && "$clear_status" -eq 0 ]]; then
+  record_pass "backupctl schedule set --clear-filters 退出码 0"
+else
+  record_fail "backupctl schedule set --clear-filters 退出码 $clear_status（repository set 退出码 $repo_status）"
+fi
+for pattern in "Include rules:  (none)" \
+               "Exclude rules:  (none)" \
+               "Interval:       5 minute(s)"; do
+  if grep -qF -- "$pattern" "$TEST_STATE_DIR/schedule-show-cleared.txt"; then
+    record_pass "CLI 清空规则后仍然读到：$pattern"
+  else
+    record_fail "CLI 清空规则后读不到：$pattern"
+  fi
+done
+
 echo "[modern-gui] 通过 $PASS_COUNT 项，失败 $FAIL_COUNT 项"
 echo "[modern-gui] 日志: $LOG_FILE"
 if [[ "$FAIL_COUNT" -eq 0 ]]; then

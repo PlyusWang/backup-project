@@ -122,6 +122,39 @@ std::string JoinNames(const std::vector<std::string>& names) {
   return joined;
 }
 
+// 指定仓库、并且明确跳过"到没到点"的一轮评估。baseline 的测试关心的是
+// "这一轮该不该建快照"，不是时间表，所以默认走 EvaluateNow。
+bool EvaluateAt(const Env& env, const std::string& repository, bool force,
+                std::int64_t now, bp::ScheduleEvaluationResult* result,
+                std::string* error) {
+  bp::ScheduleStore store(env.schedule_file);
+  bp::ScheduledBackupService service(repository, &store);
+  return force ? service.EvaluateNow(now, result, error)
+               : service.Evaluate(now, result, error);
+}
+
+void ExpectNow(const std::string& label, const Env& env,
+               const std::string& repository, std::int64_t now,
+               bp::ScheduleEvaluationStatus expected,
+               bp::ScheduleEvaluationResult* result) {
+  std::string error;
+  if (!EvaluateAt(env, repository, /*force=*/true, now, result, &error)) {
+    test_support::Check(false, label, error);
+    return;
+  }
+  test_support::Check(
+      result->status == expected, label,
+      std::string("status=") + bp::ScheduleEvaluationStatusKey(result->status) +
+          " diagnostic=" + result->diagnostic);
+}
+
+// 把文本里的第一处 from 换成 to。只用于"手工改坏 schedule.json"这种用例。
+void ReplaceOnce(std::string* text, const std::string& from,
+                 const std::string& to) {
+  const std::size_t at = text->find(from);
+  if (at != std::string::npos) text->replace(at, from.size(), to);
+}
+
 // 跑一轮并断言状态。失败时把诊断一起打出来，免得只能看到"失败"两个字。
 void ExpectStatus(const std::string& label, const Env& env, std::int64_t now,
                   bp::ScheduleEvaluationStatus expected,
@@ -843,6 +876,594 @@ void TestStability() {
   }
 }
 
+
+// ---- I. 支持矩阵与启用时刻 ----
+
+void TestModeMatrix() {
+  test_support::Section("I. the backup mode support matrix");
+
+  struct ModeCase {
+    bp::BackupTrigger trigger;
+    bp::BackupStrategy strategy;
+    bool supported;
+    const char* label;
+  };
+  const ModeCase cases[] = {
+      {bp::BackupTrigger::kManual, bp::BackupStrategy::kFull, true, "manual-full"},
+      {bp::BackupTrigger::kManual, bp::BackupStrategy::kIncremental, false,
+       "manual-incremental"},
+      {bp::BackupTrigger::kScheduled, bp::BackupStrategy::kFull, true,
+       "scheduled-full"},
+      {bp::BackupTrigger::kScheduled, bp::BackupStrategy::kIncremental, false,
+       "scheduled-incremental"},
+      {bp::BackupTrigger::kRealtime, bp::BackupStrategy::kFull, false,
+       "realtime-full"},
+      {bp::BackupTrigger::kRealtime, bp::BackupStrategy::kIncremental, false,
+       "realtime-incremental"},
+  };
+
+  // 3 x 2 真值表逐格钉死。只判断 trigger 的写法会在这里被抓住 ——
+  // Manual + Incremental 曾经被误判成 supported，那正好是"选了增量却按全量跑"
+  // 这类静默降级的入口。
+  for (const ModeCase& item : cases) {
+    const std::string label = std::string("MODE-") + item.label;
+    test_support::Check(
+        bp::IsSupportedBackupMode(item.trigger, item.strategy) == item.supported,
+        label + " IsSupportedBackupMode(" + bp::BackupTriggerKey(item.trigger) +
+            " + " + bp::BackupStrategyKey(item.strategy) + ")",
+        item.supported ? "" : bp::UnsupportedBackupModeReason(item.trigger,
+                                                             item.strategy));
+  }
+
+  // 配置层必须真的用那张表，而不是自己再判断一遍。
+  for (const ModeCase& item : cases) {
+    bp::ScheduleConfig config;
+    config.source_path = "/tmp";
+    config.trigger = item.trigger;
+    config.strategy = item.strategy;
+    std::string error;
+    test_support::Check(bp::ValidateScheduleConfig(config, &error) ==
+                            item.supported,
+                        std::string("MODE-") + item.label +
+                            " in ValidateScheduleConfig",
+                        error);
+  }
+
+  // 不支持时必须有能直接显示的原文，GUI / CLI 不各自拼句子。
+  test_support::Check(
+      bp::UnsupportedBackupModeReason(bp::BackupTrigger::kManual,
+                                      bp::BackupStrategy::kIncremental)
+              .find("Manual + Incremental") != std::string::npos,
+      "MODE-07 the refusal names the exact combination");
+}
+
+void TestEnableTransition() {
+  test_support::Section("I2. enabling moves the next run one interval ahead");
+
+  bp::ScheduleDocument document;
+  document.config.enabled = false;
+  document.config.interval_minutes = 60;
+  document.state.next_run_time_sec = 0;
+
+  bp::ApplyScheduleEnableTransition(&document, false, 1000);
+  test_support::Check(document.state.next_run_time_sec == 0,
+                      "ENABLE-01 a disabled schedule keeps its next run",
+                      std::to_string(document.state.next_run_time_sec));
+
+  // disabled -> enabled，t=1000，interval=60 分钟 -> 4600。
+  document.config.enabled = true;
+  bp::ApplyScheduleEnableTransition(&document, false, 1000);
+  test_support::Check(document.state.next_run_time_sec == 4600,
+                      "ENABLE-02 the first enable schedules one interval ahead",
+                      std::to_string(document.state.next_run_time_sec));
+  test_support::Check(
+      !bp::IsScheduleDue(1001, document.state.next_run_time_sec, 60),
+      "ENABLE-03 the very next tick is not due");
+  test_support::Check(bp::IsScheduleDue(4600, document.state.next_run_time_sec, 60),
+                      "ENABLE-04 the run becomes due exactly one interval later");
+
+  // 已经启用：show / load / set 走的都是这条路，绝不能把时间表往后推。
+  bp::ApplyScheduleEnableTransition(&document, true, 9000);
+  test_support::Check(document.state.next_run_time_sec == 4600,
+                      "ENABLE-05 an already-enabled schedule keeps its next run",
+                      std::to_string(document.state.next_run_time_sec));
+
+  // 停用不动时间表，再启用才重算。
+  document.config.enabled = false;
+  bp::ApplyScheduleEnableTransition(&document, true, 9000);
+  test_support::Check(document.state.next_run_time_sec == 4600,
+                      "ENABLE-06 disabling leaves the next run alone",
+                      std::to_string(document.state.next_run_time_sec));
+  document.config.enabled = true;
+  bp::ApplyScheduleEnableTransition(&document, false, 9000);
+  test_support::Check(document.state.next_run_time_sec == 12600,
+                      "ENABLE-07 re-enabling recomputes the next run",
+                      std::to_string(document.state.next_run_time_sec));
+}
+
+void TestEnabledScheduleDoesNotRunImmediately() {
+  test_support::Section("I3. an enabled schedule waits for its first interval");
+
+  const Env env = MakeEnv("enable-timing", 3);
+  Write(env.source + "/a.txt", "alpha");
+
+  // 模拟 enable 那一刻：把 next_run 推成一个周期之后。
+  bp::ScheduleStore store(env.schedule_file);
+  bp::ScheduleDocument document;
+  std::string error;
+  test_support::Check(store.Load(&document, &error) == bp::ScheduleLoadStatus::kLoaded,
+                      "ENABLE-10 the store loads", error);
+  bp::ApplyScheduleEnableTransition(&document, /*was_enabled=*/false, 1000);
+  test_support::Check(store.Save(document, &error), "ENABLE-11 the store saves", error);
+
+  bp::ScheduleEvaluationResult result;
+  ExpectStatus("ENABLE-12 the automatic path is not due yet", env, 1001,
+               bp::ScheduleEvaluationStatus::kNotDue, &result);
+  test_support::Check(RepoArchives(env.repository).empty(),
+                      "ENABLE-13 nothing was written before the interval elapsed",
+                      JoinNames(RepoArchives(env.repository)));
+
+  // "立即检查并运行"仍然立刻做真实的变化检测。
+  ExpectNow("ENABLE-14 run-now still evaluates immediately", env, env.repository,
+            1002, bp::ScheduleEvaluationStatus::kCreatedSnapshot, &result);
+
+  // 到点之后自动路径才动；源没变，所以它照样是 skip 而不是"补一份备份"。
+  ExpectStatus("ENABLE-15 the automatic path fires once due", env, 4600,
+               bp::ScheduleEvaluationStatus::kSkippedNoChanges, &result);
+  test_support::Check(RepoArchives(env.repository).size() == 1,
+                      "ENABLE-16 the due run did not add a second snapshot",
+                      JoinNames(RepoArchives(env.repository)));
+}
+
+// ---- J. manifest 与真实 baseline 快照的绑定 ----
+
+void TestBaselineBinding() {
+  test_support::Section("J. the manifest is bound to a live baseline snapshot");
+
+  // T1：S1 -> 变化 -> S2 -> 手工删掉 S2 -> 源不变 -> 必须建 S3。
+  {
+    const Env env = MakeEnv("baseline-delete-newest", 12);
+    Write(env.source + "/a.txt", "one");
+    bp::ScheduleEvaluationResult result;
+    ExpectStatus("BASE-01 S1 is created", env, 1000,
+                 bp::ScheduleEvaluationStatus::kCreatedSnapshot, &result);
+    const std::string s1 = result.archive_file_name;
+
+    Write(env.source + "/b.txt", "two");
+    ExpectStatus("BASE-02 S2 is created after a change", env, 2000,
+                 bp::ScheduleEvaluationStatus::kCreatedSnapshot, &result);
+    const std::string s2 = result.archive_file_name;
+    test_support::Check(!s1.empty() && !s2.empty() && s1 != s2,
+                        "BASE-03 the two snapshots have different names");
+
+    // state 必须明确记下"这份 manifest 属于 S2"。
+    bp::ScheduleDocument document = LoadDocument(env);
+    test_support::Check(document.state.baseline.snapshot_file_name == s2,
+                        "BASE-04 the baseline names S2",
+                        document.state.baseline.snapshot_file_name);
+    test_support::Check(document.state.baseline.source_path == env.source,
+                        "BASE-05 the baseline records its source directory",
+                        document.state.baseline.source_path);
+    test_support::Check(!document.state.baseline.repository_identity.empty(),
+                        "BASE-06 the baseline records a repository identity",
+                        document.state.baseline.repository_identity);
+
+    // 用户手工删掉最新的 S2，源从此不再变化。
+    bp::BackupCatalog catalog;
+    std::string error;
+    test_support::Check(catalog.Delete(env.repository, s2, &error),
+                        "BASE-07 the newest snapshot is deleted by hand", error);
+
+    ExpectNow("BASE-08 deleting the baseline forces a new full snapshot", env,
+              env.repository, 3000, bp::ScheduleEvaluationStatus::kCreatedSnapshot,
+              &result);
+    test_support::Check(result.baseline_reset,
+                        "BASE-09 the run is reported as a baseline reset",
+                        result.diagnostic);
+    test_support::Check(!result.first_snapshot,
+                        "BASE-10 it is not reported as a first snapshot");
+    const std::string s3 = result.archive_file_name;
+    test_support::Check(s3 != s1 && s3 != s2 && !s3.empty(),
+                        "BASE-11 a third snapshot was created", s3);
+
+    // S3 必须等于当前源：a.txt 与 b.txt 都在。
+    bp::BackupEngine engine;
+    const std::string restored = env.root + "/restored-s3";
+    test_support::Check(engine.Restore(env.repository + "/" + s3, restored, &error),
+                        "BASE-12 S3 restores", error);
+    test_support::Check(test_support::Exists(restored + "/a.txt") &&
+                            test_support::Exists(restored + "/b.txt"),
+                        "BASE-13 S3 holds the current source, not the old one");
+    test_support::Check(RepoArchives(env.repository).size() == 2,
+                        "BASE-14 the repository holds S1 and S3",
+                        JoinNames(RepoArchives(env.repository)));
+
+    // 再跑一轮：S3 是 baseline，源没变 -> skip。
+    ExpectNow("BASE-15 the next run skips again", env, env.repository, 4000,
+              bp::ScheduleEvaluationStatus::kSkippedNoChanges, &result);
+  }
+
+  // T2：换仓库。源没变，但新仓库里一个 baseline 都没有。
+  {
+    const Env env = MakeEnv("baseline-repo-switch", 12);
+    Write(env.source + "/a.txt", "alpha");
+    bp::ScheduleEvaluationResult result;
+    ExpectStatus("BASE-20 repository A gets a baseline", env, 1000,
+                 bp::ScheduleEvaluationStatus::kCreatedSnapshot, &result);
+    test_support::Check(RepoArchives(env.repository).size() == 1,
+                        "BASE-21 repository A holds one snapshot");
+
+    const std::string repository_b = env.root + "/repository-b";
+    test_support::Check(test_support::Mkdir(repository_b, 0755),
+                        "BASE-22 repository B exists and is empty");
+
+    ExpectNow("BASE-23 switching repositories creates a baseline in B", env,
+              repository_b, 2000, bp::ScheduleEvaluationStatus::kCreatedSnapshot,
+              &result);
+    test_support::Check(result.baseline_reset,
+                        "BASE-24 the repository switch is a baseline reset",
+                        result.diagnostic);
+    const std::vector<std::string> in_b = RepoArchives(repository_b);
+    test_support::Check(in_b.size() == 1, "BASE-25 repository B now holds exactly "
+                                          "one snapshot",
+                        JoinNames(in_b));
+    test_support::Check(result.archive_file_name == in_b[0],
+                        "BASE-26 the new snapshot lives in repository B");
+    test_support::Check(RepoArchives(env.repository).size() == 1,
+                        "BASE-27 repository A was not touched",
+                        JoinNames(RepoArchives(env.repository)));
+
+    // 记下来的 identity 也必须跟着换成 B。
+    const bp::ScheduleDocument document = LoadDocument(env);
+    test_support::Check(document.state.baseline.repository_identity ==
+                            bp::RepositoryIdentity(repository_b),
+                        "BASE-28 the baseline now names repository B",
+                        document.state.baseline.repository_identity);
+  }
+
+  // T3：baseline 文件被外部删掉（managed 名单里还留着它）。
+  {
+    const Env env = MakeEnv("baseline-external-removal", 12);
+    Write(env.source + "/a.txt", "alpha");
+    bp::ScheduleEvaluationResult result;
+    ExpectStatus("BASE-30 a baseline is created", env, 1000,
+                 bp::ScheduleEvaluationStatus::kCreatedSnapshot, &result);
+    const std::string baseline = result.archive_file_name;
+
+    // 绕过 BackupCatalog 直接 unlink：文件名安全边界管的是"能不能删"，
+    // 管不了"别人绕过它去删"。这一条测的是被绕过之后能不能自愈。
+    test_support::Check(::unlink((env.repository + "/" + baseline).c_str()) == 0,
+                        "BASE-31 the baseline file disappears behind our back");
+
+    ExpectNow("BASE-32 the next evaluation replaces the missing baseline", env,
+              env.repository, 2000, bp::ScheduleEvaluationStatus::kCreatedSnapshot,
+              &result);
+    test_support::Check(result.baseline_reset,
+                        "BASE-33 it is reported as a baseline reset",
+                        result.diagnostic);
+    test_support::Check(RepoArchives(env.repository).size() == 1,
+                        "BASE-34 exactly one snapshot exists again",
+                        JoinNames(RepoArchives(env.repository)));
+  }
+
+  // T4：删掉的是**旧的、非 baseline** 的那一份 -> baseline 仍然有效 -> 照样 skip。
+  {
+    const Env env = MakeEnv("baseline-keep-old", 12);
+    Write(env.source + "/a.txt", "one");
+    bp::ScheduleEvaluationResult result;
+    ExpectStatus("BASE-40 S1 is created", env, 1000,
+                 bp::ScheduleEvaluationStatus::kCreatedSnapshot, &result);
+    const std::string s1 = result.archive_file_name;
+    Write(env.source + "/b.txt", "two");
+    ExpectStatus("BASE-41 S2 is created", env, 2000,
+                 bp::ScheduleEvaluationStatus::kCreatedSnapshot, &result);
+    const std::string s2 = result.archive_file_name;
+
+    bp::BackupCatalog catalog;
+    std::string error;
+    test_support::Check(catalog.Delete(env.repository, s1, &error),
+                        "BASE-42 the old snapshot is deleted", error);
+
+    ExpectNow("BASE-43 deleting a non-baseline snapshot still skips", env,
+              env.repository, 3000, bp::ScheduleEvaluationStatus::kSkippedNoChanges,
+              &result);
+    test_support::Check(!result.baseline_reset && !result.first_snapshot,
+                        "BASE-44 the baseline was not reset");
+    const std::vector<std::string> left = RepoArchives(env.repository);
+    test_support::Check(left.size() == 1 && left[0] == s2,
+                        "BASE-45 only the baseline is left", JoinNames(left));
+  }
+
+  // 换源目录：两棵树的 manifest 一模一样，"比较 manifest"分辨不出来，
+  // 只有 baseline 里记的 source_path 能。
+  {
+    const Env env = MakeEnv("baseline-source-switch", 12);
+    Write(env.source + "/a.txt", "alpha");
+    bp::ScheduleEvaluationResult result;
+    ExpectStatus("BASE-50 a baseline is created", env, 1000,
+                 bp::ScheduleEvaluationStatus::kCreatedSnapshot, &result);
+
+    const std::string other = env.root + "/other-source";
+    test_support::Check(test_support::Mkdir(other, 0755), "BASE-51 the other source exists");
+    Write(other + "/a.txt", "alpha");
+    bp::ScheduleConfig config = LoadConfig(env);
+    config.source_path = other;
+    SaveConfig(env, config);
+
+    ExpectNow("BASE-52 switching the source rebuilds the baseline", env,
+              env.repository, 2000, bp::ScheduleEvaluationStatus::kCreatedSnapshot,
+              &result);
+    test_support::Check(result.baseline_reset,
+                        "BASE-53 the source switch is a baseline reset",
+                        result.diagnostic);
+    test_support::Check(RepoArchives(env.repository).size() == 2,
+                        "BASE-54 a second snapshot exists",
+                        JoinNames(RepoArchives(env.repository)));
+  }
+}
+
+void TestBaselineAgainstAnUnreadableRepository() {
+  test_support::Section("J2. an unreadable repository never resets the baseline");
+
+  const Env env = MakeEnv("baseline-repo-gone", 12);
+  Write(env.source + "/a.txt", "alpha");
+  bp::ScheduleEvaluationResult result;
+  ExpectStatus("BASE-60 a baseline is created", env, 1000,
+               bp::ScheduleEvaluationStatus::kCreatedSnapshot, &result);
+
+  // 仓库整个不见了（没挂载 / 被搬走）。这正是 ReconcileManagedSnapshots
+  // 刻意"什么都不做"的那种情况，现在多了一层：有 baseline 记录时直接失败，
+  // 绝不在一个空的挂载点里新建一份备份。
+  const std::string moved = env.root + "/repository-moved-away";
+  test_support::Check(::rename(env.repository.c_str(), moved.c_str()) == 0,
+                      "BASE-61 the repository is moved away");
+
+  std::string error;
+  bp::ScheduleEvaluationResult failing;
+  const bool ok = EvaluateAt(env, env.repository, /*force=*/true, 2000, &failing,
+                             &error);
+  test_support::Check(ok && failing.status == bp::ScheduleEvaluationStatus::kFailed,
+                      "BASE-62 an unreadable repository fails the run",
+                      ok ? failing.diagnostic : error);
+  test_support::Check(!test_support::Exists(env.repository),
+                      "BASE-63 nothing was created at the missing path");
+  const bp::ScheduleDocument document = LoadDocument(env);
+  test_support::Check(!document.state.baseline.snapshot_file_name.empty(),
+                      "BASE-64 the baseline record was kept",
+                      document.state.baseline.snapshot_file_name);
+  test_support::Check(document.state.managed_snapshots.size() == 1,
+                      "BASE-65 the managed list was not emptied",
+                      std::to_string(document.state.managed_snapshots.size()));
+
+  // 仓库搬回来之后一切照旧：源没变 -> 照样 skip。
+  test_support::Check(::rename(moved.c_str(), env.repository.c_str()) == 0,
+                      "BASE-66 the repository is restored");
+  ExpectNow("BASE-67 the restored repository skips again", env, env.repository,
+            3000, bp::ScheduleEvaluationStatus::kSkippedNoChanges, &result);
+}
+
+void TestRetentionKeepsTheBaselineInvariant() {
+  test_support::Section("J3. retention never leaves a dangling baseline");
+
+  const Env env = MakeEnv("retention-baseline", 12);
+  Write(env.source + "/a.txt", "alpha");
+  bp::ScheduleEvaluationResult result;
+  ExpectStatus("BASE-70 a baseline is created", env, 1000,
+               bp::ScheduleEvaluationStatus::kCreatedSnapshot, &result);
+  const std::string baseline = result.archive_file_name;
+
+  // 手工构造"baseline 恰好是最旧的那一份、而且超额"的 state。
+  // 正常路径碰不到（淘汰的是最旧的，baseline 是最新的），但 retain_count 被
+  // 调小、或者 state 被手工改过时是可能的，invariant 必须在那儿也成立。
+  std::string bytes;
+  test_support::Check(test_support::ReadFile(env.repository + "/" + baseline, &bytes),
+                      "BASE-71 the baseline archive is readable");
+  const std::string newer = "zzz_newer_copy.bak";
+  test_support::Check(Write(env.repository + "/" + newer, bytes),
+                      "BASE-72 a second archive is planted");
+
+  bp::ScheduleDocument document = LoadDocument(env);
+  document.state.managed_snapshots.clear();
+  bp::ScheduledSnapshotRecord oldest;
+  oldest.file_name = baseline;
+  oldest.created_time_sec = 1000;
+  document.state.managed_snapshots.push_back(oldest);
+  bp::ScheduledSnapshotRecord latest = oldest;
+  latest.file_name = newer;
+  latest.created_time_sec = 2000;
+  document.state.managed_snapshots.push_back(latest);
+  document.config.retain_count = 1;
+
+  bp::ScheduleStore store(env.schedule_file);
+  std::string error;
+  test_support::Check(store.Save(document, &error),
+                      "BASE-73 the abnormal state saves", error);
+
+  bp::ScheduledBackupService service(env.repository, &store);
+  std::uint64_t deleted = 0;
+  std::uint64_t failed = 0;
+  test_support::Check(service.RunRetention(&document, &deleted, &failed, &error),
+                      "BASE-74 retention runs", error);
+  test_support::Check(deleted == 1 && failed == 0,
+                      "BASE-75 exactly one snapshot was removed",
+                      std::to_string(deleted) + "/" + std::to_string(failed));
+  test_support::Check(document.state.baseline.snapshot_file_name.empty(),
+                      "BASE-76 retention clears a baseline it removed",
+                      document.state.baseline.snapshot_file_name);
+  test_support::Check(store.Save(document, &error),
+                      "BASE-77 the cleared state saves", error);
+
+  // 下一轮必须重建，而不是拿着一个指向空气的 baseline 继续 skip。
+  ExpectNow("BASE-78 the next run rebuilds a snapshot", env, env.repository, 3000,
+            bp::ScheduleEvaluationStatus::kCreatedSnapshot, &result);
+  test_support::Check(!result.changes.empty() || result.first_snapshot ||
+                          result.baseline_reset,
+                      "BASE-79 the rebuild is accounted for",
+                      result.diagnostic);
+}
+
+void TestUnsupportedModeIsNeverRunAsFull() {
+  test_support::Section("J4. manual + incremental is refused, never run as full");
+
+  const Env env = MakeEnv("unsupported-mode", 12);
+  Write(env.source + "/a.txt", "alpha");
+
+  // 手工把 store 改成 trigger=manual / strategy=incremental —— 这是"选了增量"
+  // 最直接的表达。它必须明确失败，绝不能被当成全量悄悄跑掉。
+  std::string text;
+  test_support::Check(test_support::ReadFile(env.schedule_file, &text),
+                      "MODE-20 the store is readable");
+  ReplaceOnce(&text, "\"trigger\": \"scheduled\"", "\"trigger\": \"manual\"");
+  ReplaceOnce(&text, "\"strategy\": \"full\"", "\"strategy\": \"incremental\"");
+  test_support::Check(text.find("\"incremental\"") != std::string::npos,
+                      "MODE-21 the strategy really says incremental");
+  test_support::Check(test_support::WriteFile(env.schedule_file, text, 0600),
+                      "MODE-22 the store is rewritten by hand");
+
+  std::string error;
+  bp::ScheduleEvaluationResult result;
+  test_support::Check(EvaluateAt(env, env.repository, /*force=*/true, 1000, &result,
+                                 &error),
+                      "MODE-23 the evaluation itself completes", error);
+  test_support::Check(result.status == bp::ScheduleEvaluationStatus::kFailed,
+                      "MODE-24 manual + incremental is refused at run time",
+                      std::string(bp::ScheduleEvaluationStatusKey(result.status)) +
+                          " " + result.diagnostic);
+  test_support::Check(result.diagnostic.find("Unsupported backup mode") !=
+                          std::string::npos,
+                      "MODE-25 the refusal names the mode", result.diagnostic);
+  test_support::Check(RepoArchives(env.repository).empty(),
+                      "MODE-26 no full backup was silently created",
+                      JoinNames(RepoArchives(env.repository)));
+}
+
+// ---- K. store 的父目录与旧文件兼容 ----
+
+void TestStoreParentDirectoryAndLegacyFiles() {
+  test_support::Section("K. store parent directories and legacy documents");
+
+  // 全新的深层路径：父目录一个都不存在。
+  {
+    const std::string root = test_support::FreshDir("store-parent");
+    const std::string deep = root + "/a/b/c/schedule.json";
+    bp::ScheduleStore store(deep);
+    bp::ScheduleDocument document;
+    document.config.enabled = false;
+    document.config.source_path = root;
+    std::string error;
+    test_support::Check(store.Save(document, &error),
+                        "STORE-01 save creates the missing parent directories",
+                        error);
+    test_support::Check(test_support::Exists(deep), "STORE-02 the file exists");
+
+    struct stat info;
+    const bool stat_ok = test_support::StatOf(deep, &info);
+    test_support::Check(stat_ok && (info.st_mode & 07777) == 0600,
+                        "STORE-03 the schedule file is still 0600",
+                        stat_ok ? test_support::Octal(info.st_mode & 07777)
+                                : std::string("stat failed"));
+
+    bp::ScheduleDocument reloaded;
+    test_support::Check(store.Load(&reloaded, &error) == bp::ScheduleLoadStatus::kLoaded,
+                        "STORE-04 the file loads back", error);
+    test_support::Check(reloaded.config.source_path == root,
+                        "STORE-05 the round trip keeps the source path");
+  }
+
+  // 父目录存在但不是目录 -> 明确报错，不静默成功。
+  {
+    const std::string root = test_support::FreshDir("store-parent-file");
+    const std::string blocker = root + "/blocker";
+    Write(blocker, "not a directory");
+    bp::ScheduleStore store(blocker + "/schedule.json");
+    bp::ScheduleDocument document;
+    std::string error;
+    test_support::Check(!store.Save(document, &error),
+                        "STORE-06 a non-directory parent is refused");
+    test_support::Check(!error.empty(), "STORE-07 the refusal explains itself", error);
+  }
+
+  // baseline 的序列化往返。
+  {
+    const std::string root = test_support::FreshDir("store-baseline");
+    const std::string path = root + "/schedule.json";
+    bp::ScheduleStore store(path);
+    bp::ScheduleDocument document;
+    document.config.source_path = root;
+    document.state.baseline.snapshot_file_name = "source_20260926_120000.bak";
+    document.state.baseline.repository_identity = "/tmp/repo";
+    document.state.baseline.source_path = root;
+    std::string error;
+    test_support::Check(store.Save(document, &error), "STORE-10 the baseline saves", error);
+    bp::ScheduleDocument reloaded;
+    test_support::Check(store.Load(&reloaded, &error) == bp::ScheduleLoadStatus::kLoaded,
+                        "STORE-11 the baseline reloads", error);
+    test_support::Check(
+        reloaded.state.baseline.snapshot_file_name ==
+                "source_20260926_120000.bak" &&
+            reloaded.state.baseline.repository_identity == "/tmp/repo" &&
+            reloaded.state.baseline.source_path == root,
+        "STORE-12 every baseline field round-trips");
+
+    // 非法 baseline 文件名必须在保存时就被拦住。
+    bp::ScheduleDocument bad = reloaded;
+    bad.state.baseline.snapshot_file_name = "../escape.bak";
+    test_support::Check(!store.Save(bad, &error),
+                        "STORE-13 a traversing baseline name is refused");
+  }
+
+  // 旧版本写出的 schedule.json：没有那三个 baseline 字段，必须仍然读得进来。
+  {
+    const std::string root = test_support::FreshDir("store-legacy");
+    const std::string path = root + "/schedule.json";
+    const std::string legacy =
+        "{\n"
+        "  \"version\": 1,\n"
+        "  \"config\": {\n"
+        "    \"enabled\": false,\n"
+        "    \"trigger\": \"scheduled\",\n"
+        "    \"strategy\": \"full\",\n"
+        "    \"source_path\": \"" + root + "\",\n"
+        "    \"interval_minutes\": 60,\n"
+        "    \"retain_count\": 12,\n"
+        "    \"pack\": \"mypack\",\n"
+        "    \"compression\": \"none\",\n"
+        "    \"encryption\": \"none\",\n"
+        "    \"include_rules\": [],\n"
+        "    \"exclude_rules\": []\n"
+        "  },\n"
+        "  \"state\": {\n"
+        "    \"next_run_time_sec\": 0,\n"
+        "    \"last_success_time_sec\": 0,\n"
+        "    \"last_manifest_entry_count\": 0,\n"
+        "    \"managed_snapshots\": [],\n"
+        "    \"history\": []\n"
+        "  }\n"
+        "}\n";
+    test_support::Check(test_support::WriteFile(path, legacy, 0600),
+                        "STORE-20 the legacy document is written");
+    bp::ScheduleStore store(path);
+    bp::ScheduleDocument document;
+    std::string error;
+    test_support::Check(store.Load(&document, &error) == bp::ScheduleLoadStatus::kLoaded,
+                        "STORE-21 a document without baseline fields still loads",
+                        error);
+    test_support::Check(document.state.baseline.snapshot_file_name.empty() &&
+                            document.state.baseline.repository_identity.empty(),
+                        "STORE-22 the missing baseline degrades to 'unknown'");
+
+    // 但"不认识的字段"照样拒绝：可选列表不是放松未知字段。
+    std::string tampered = legacy;
+    ReplaceOnce(&tampered, "\"history\": []",
+                "\"history\": [], \"baseline_bogus\": \"x\"");
+    test_support::Check(test_support::WriteFile(path, tampered, 0600),
+                        "STORE-23 the tampered document is written");
+    test_support::Check(store.Load(&document, &error) == bp::ScheduleLoadStatus::kError &&
+                            error.find("unknown field") != std::string::npos,
+                        "STORE-24 an unknown state field is still rejected", error);
+  }
+}
+
 }  // namespace
 
 int main() {
@@ -855,6 +1476,14 @@ int main() {
   TestRetention();
   TestPipelineMatrix();
   TestEncryptionBoundaryAndLock();
+  TestModeMatrix();
+  TestEnableTransition();
+  TestEnabledScheduleDoesNotRunImmediately();
+  TestBaselineBinding();
+  TestBaselineAgainstAnUnreadableRepository();
+  TestRetentionKeepsTheBaselineInvariant();
+  TestUnsupportedModeIsNeverRunAsFull();
+  TestStoreParentDirectoryAndLegacyFiles();
   TestStability();
   test_support::RemoveTree(test_support::TempRoot());
   return test_support::Finish("scheduled backup");
