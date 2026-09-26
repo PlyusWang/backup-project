@@ -129,7 +129,22 @@ Item {
                         wrapMode: Text.WordWrap
                     }
 
+                    // 仓库配好之后同样要留一个修改入口：上面就是当前路径，
+                    // 但"换仓库"统一发生在设置页 —— 这一页不直接编辑 repositoryPath，
+                    // 也不复制 SettingsPage 的保存逻辑，否则同一套校验会有两份实现。
                     AppButton {
+                        objectName: "changeRepositoryButton"
+                        visible: controller.repositoryConfigured
+                        text: "更改仓库"
+                        iconName: "settings"
+                        // 任务运行期间不给跳走，与"刷新"保持同一条禁用规则，
+                        // 用户在"正在备份"时看到的两页状态是一致的。
+                        enabled: !controller.busy
+                        onClicked: page.openSettings()
+                    }
+
+                    AppButton {
+                        objectName: "goToSettingsButton"
                         visible: !controller.repositoryConfigured
                         text: "前往设置"
                         iconName: "settings"
