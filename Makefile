@@ -17,6 +17,17 @@ CORE_SOURCES := src/core/archive_entry.cpp src/core/archive_pipeline.cpp \
                 src/crypto/des.cpp src/crypto/hmac.cpp src/crypto/pbkdf2.cpp \
                 src/crypto/random.cpp src/crypto/sha256.cpp \
                 src/filter/filter.cpp src/filter/filter_rule_builder.cpp
+
+
+# PR #17：定时备份 + 变化检测 + retention 的共享核心。
+# 这些源文件都是 Qt 无关的纯 C++17，CLI 与 Modern GUI 共用同一份，
+# 所以它们属于 CORE_SOURCES，而不是某个前端的目标。
+CORE_SOURCES += src/core/backup_mode.cpp \
+                src/core/backup_option_keys.cpp \
+                src/core/simple_json.cpp \
+                src/platform/app_paths.cpp \
+                src/scheduler/source_manifest.cpp
+
 FILESYSTEM_SOURCES := src/filesystem/file_system.cpp
 SOURCES := $(APP_SOURCES) $(CORE_SOURCES) $(FILESYSTEM_SOURCES)
 OBJECTS := $(patsubst %.cpp,$(BUILD_DIR)/%.o,$(SOURCES))
