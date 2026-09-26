@@ -9,6 +9,8 @@
 #   D. CLI schedule 子命令的真实语义（无变化 skip、有变化建快照、retention）
 #   D2. review-fix 回归：enable 校验、启用时刻、clear-filters、baseline 绑定
 #   D3. 崩溃一致性：archive / manifest / schedule.json 的中间状态（C0-C8）
+#   D4. 多进程：真实的两个 watch / watch 与 run 互斥 / SIGTERM 释放锁
+#   D5. 故障注入：坏 store、只读目录、仓库与源临时不可用、软链接
 #   E. 跨前端：GUI 写的计划 CLI 读得到，CLI 写的计划 GUI 读得到
 #   F. 计划快照是完整独立备份：单独拷出来也必须能恢复
 #
@@ -719,6 +721,211 @@ else
 fi
 cc_place state-S2.json other-src.dat
 cc_case "D3.24" "manifest 声明的是别的源，绝不能 skip" "success_created" "D3.25"
+
+# ============================================================
+echo "[schedule-test] D4. 多进程：真实的两个 runner 抢同一把锁"
+# ============================================================
+#
+# 这一区开的是**真进程**，不是 flock 替身：两个 backupctl schedule watch
+# 跑同一份 schedule store。GUI 的 ScheduleController 用的是同一个 SchedulerLock、
+# 同一个 lock_file_path，所以"另一个 runner 持锁"这件事在这里被证明一次就够了。
+#
+# 锁的真相在 flock 上，锁文件里的 pid 提示只是给人看的——所以这里用 pid 判断
+# "谁拿着锁"，而不是"锁文件存在"。
+
+PL="$TEST_ROOT/process-lock"
+rm -rf "$PL"
+mkdir -p "$PL/src" "$PL/repo"
+printf 'lock\n' > "$PL/src/a.txt"
+PL_CONFIG="$PL/config.json"
+PL_STORE="$PL/schedule.json"
+
+"$BACKUPCTL" --config-file "$PL_CONFIG" config repository set "$PL/repo" >/dev/null 2>&1
+"$BACKUPCTL" --config-file "$PL_CONFIG" --schedule-file "$PL_STORE" schedule set \
+  --source "$PL/src" --interval-minutes 5 --retain 3 >/dev/null 2>&1
+"$BACKUPCTL" --config-file "$PL_CONFIG" --schedule-file "$PL_STORE" schedule enable >/dev/null 2>&1
+rm -f "$PL_STORE.lock"
+
+"$BACKUPCTL" --config-file "$PL_CONFIG" --schedule-file "$PL_STORE" schedule watch \
+  >"$PL/watch1.log" 2>&1 &
+PL_WATCH1=$!
+PL_HOLD1=0
+for _ in $(seq 1 60); do
+  if grep -q "^pid=$PL_WATCH1 " "$PL_STORE.lock" 2>/dev/null; then PL_HOLD1=1; break; fi
+  sleep 0.1
+done
+if [ "$PL_HOLD1" = "1" ]; then
+  record_pass "D4.01 第一个 watch 真的持有锁（锁文件里的 pid 就是它）"
+else
+  record_fail "D4.01 第一个 watch 真的持有锁（锁文件里的 pid 就是它）" "锁文件里没有 pid=$PL_WATCH1"
+fi
+
+expect_exit "D4.02 第二个 watch 明确失败" 1 \
+  "$BACKUPCTL" --config-file "$PL_CONFIG" --schedule-file "$PL_STORE" schedule watch
+expect_grep "D4.03 报错说明锁已被另一进程持有" "already held by another process"
+
+PL_BEFORE="$(ls -1 "$PL/repo" | wc -l)"
+expect_exit "D4.04 watch 持锁时 schedule run 明确失败" 1 \
+  "$BACKUPCTL" --config-file "$PL_CONFIG" --schedule-file "$PL_STORE" schedule run
+expect_grep "D4.05 schedule run 的报错同样是锁" "already held by another process"
+PL_AFTER="$(ls -1 "$PL/repo" | wc -l)"
+if [ "$PL_BEFORE" = "$PL_AFTER" ]; then
+  record_pass "D4.06 被拒绝的那一轮没有并发创建任何快照"
+else
+  record_fail "D4.06 被拒绝的那一轮没有并发创建任何快照" "$PL_BEFORE -> $PL_AFTER"
+fi
+
+# SIGTERM：flock 随进程退出自动释放——这正是选 flock 而不是 pidfile 的理由。
+kill -TERM "$PL_WATCH1" 2>/dev/null
+for _ in $(seq 1 100); do kill -0 "$PL_WATCH1" 2>/dev/null || break; sleep 0.1; done
+if kill -0 "$PL_WATCH1" 2>/dev/null; then
+  record_fail "D4.07 SIGTERM 之后 watch 退出" "进程仍然存活"
+  kill -KILL "$PL_WATCH1" 2>/dev/null
+else
+  record_pass "D4.07 SIGTERM 之后 watch 正常退出"
+fi
+wait "$PL_WATCH1" 2>/dev/null
+
+expect_exit "D4.08 锁随进程退出自动释放：schedule run 又能跑了" 0 \
+  "$BACKUPCTL" --config-file "$PL_CONFIG" --schedule-file "$PL_STORE" schedule run
+
+"$BACKUPCTL" --config-file "$PL_CONFIG" --schedule-file "$PL_STORE" schedule watch \
+  >"$PL/watch2.log" 2>&1 &
+PL_WATCH2=$!
+PL_HOLD2=0
+for _ in $(seq 1 60); do
+  if grep -q "^pid=$PL_WATCH2 " "$PL_STORE.lock" 2>/dev/null; then PL_HOLD2=1; break; fi
+  sleep 0.1
+done
+if [ "$PL_HOLD2" = "1" ]; then
+  record_pass "D4.09 释放之后第二个 watch 能拿到锁"
+else
+  record_fail "D4.09 释放之后第二个 watch 能拿到锁" "锁文件里没有 pid=$PL_WATCH2"
+fi
+kill -TERM "$PL_WATCH2" 2>/dev/null
+for _ in $(seq 1 100); do kill -0 "$PL_WATCH2" 2>/dev/null || break; sleep 0.1; done
+kill -KILL "$PL_WATCH2" 2>/dev/null
+wait "$PL_WATCH2" 2>/dev/null
+
+# ============================================================
+echo "[schedule-test] D5. 故障注入：坏文件 / 写不进去 / 仓库与源临时不可用"
+# ============================================================
+#
+# 全部是**非 root 也能真实制造**的故障。共同的不变式只有一条：
+# 出错时绝不静默前进——宁可下一轮多建一份完整快照，也绝不把一次失败
+# 当成"没有变化"。
+
+FI="$TEST_ROOT/fault-injection"
+rm -rf "$FI"
+mkdir -p "$FI/src" "$FI/repo" "$FI/state"
+printf 'one\n' > "$FI/src/a.txt"
+FI_CONFIG="$FI/config.json"
+FI_STORE="$FI/state/schedule.json"
+FI_MANIFEST="$FI/state/schedule-manifest.dat"
+
+"$BACKUPCTL" --config-file "$FI_CONFIG" config repository set "$FI/repo" >/dev/null 2>&1
+"$BACKUPCTL" --config-file "$FI_CONFIG" --schedule-file "$FI_STORE" schedule set \
+  --source "$FI/src" --interval-minutes 1 --retain 10 >/dev/null 2>&1
+"$BACKUPCTL" --config-file "$FI_CONFIG" --schedule-file "$FI_STORE" schedule enable >/dev/null 2>&1
+"$BACKUPCTL" --config-file "$FI_CONFIG" --schedule-file "$FI_STORE" schedule run >/dev/null 2>&1
+
+# ---- A. schedule.json 本身坏掉 ----
+cp "$FI_STORE" "$FI/full-state.json"
+head -c 20 "$FI/full-state.json" > "$FI/truncated-state.json"
+expect_exit "D5.01 截断的 schedule.json 被明确拒绝" 1 \
+  "$BACKUPCTL" --config-file "$FI_CONFIG" --schedule-file "$FI/truncated-state.json" schedule show
+: > "$FI/empty-state.json"
+expect_exit "D5.02 空的 schedule.json 被明确拒绝" 1 \
+  "$BACKUPCTL" --config-file "$FI_CONFIG" --schedule-file "$FI/empty-state.json" schedule show
+printf 'not json at all\n' > "$FI/garbage-state.json"
+expect_exit "D5.03 非 JSON 的 schedule.json 被明确拒绝" 1 \
+  "$BACKUPCTL" --config-file "$FI_CONFIG" --schedule-file "$FI/garbage-state.json" schedule show
+# 坏文件绝不能被当成"没配过"而静默回退到默认配置：run 同样必须明确失败，
+# 而不是拿一份空配置去跑一轮。
+FI_ARCHIVES_BAD="$(ls -1 "$FI/repo" | wc -l)"
+expect_exit "D5.04 坏 store 上 schedule run 也明确失败" 1   "$BACKUPCTL" --config-file "$FI_CONFIG" --schedule-file "$FI/garbage-state.json" schedule run
+if [ "$FI_ARCHIVES_BAD" = "$(ls -1 "$FI/repo" | wc -l)" ]; then
+  record_pass "D5.04b 坏 store 没有偷偷产生任何快照"
+else
+  record_fail "D5.04b 坏 store 没有偷偷产生任何快照" "仓库里的数量变了"
+fi
+
+# ---- B. 写不进去：目录只读 ----
+FI_MANIFEST_BEFORE="$(md5sum "$FI_MANIFEST" | cut -d' ' -f1)"
+printf 'two\n' > "$FI/src/b.txt"
+chmod 0500 "$FI/state"
+"$BACKUPCTL" --config-file "$FI_CONFIG" --schedule-file "$FI_STORE" schedule run >"$OUT" 2>&1
+FI_STATUS=$?
+chmod 0700 "$FI/state"
+if [ "$FI_STATUS" = "0" ]; then
+  record_pass "D5.05 归档已发布之后，state 写不进去只降级成诊断（退出 0）"
+else
+  record_fail "D5.05 归档已发布之后，state 写不进去只降级成诊断（退出 0）" "exit=$FI_STATUS: $(first_line)"
+fi
+expect_grep "D5.06 诊断说明 state 没能保存" "could not be saved"
+FI_MANIFEST_AFTER="$(md5sum "$FI_MANIFEST" | cut -d' ' -f1)"
+if [ "$FI_MANIFEST_BEFORE" = "$FI_MANIFEST_AFTER" ]; then
+  record_pass "D5.07 只读目录下 manifest 也没有被写坏（原子替换没留半个文件）"
+else
+  record_fail "D5.07 只读目录下 manifest 也没有被写坏（原子替换没留半个文件）" "字节变了"
+fi
+expect_exit "D5.08 恢复可写之后下一轮仍然不漏变化" 0 \
+  "$BACKUPCTL" --config-file "$FI_CONFIG" --schedule-file "$FI_STORE" schedule run
+expect_grep "D5.09 报告的是新建了一份完整快照，而不是 skip" "Created a new full snapshot"
+
+# ---- C. 仓库临时不可用 ----
+FI_LAST_BEFORE="$("$BACKUPCTL" --config-file "$FI_CONFIG" --schedule-file "$FI_STORE" schedule show 2>/dev/null | sed -n 's/^Last success:   //p')"
+FI_MANAGED_BEFORE="$("$BACKUPCTL" --config-file "$FI_CONFIG" --schedule-file "$FI_STORE" schedule show 2>/dev/null | sed -n 's/^Managed:        //p')"
+FI_ARCHIVES_BEFORE="$(ls -1 "$FI/repo" | wc -l)"
+mv "$FI/repo" "$FI/repo-moved"
+expect_exit "D5.10 仓库被移走时运行必须失败（不能当成一个空仓库）" 1 \
+  "$BACKUPCTL" --config-file "$FI_CONFIG" --schedule-file "$FI_STORE" schedule run
+expect_grep "D5.11 报错说明 baseline 被原样保留、什么都没写" "baseline was kept and nothing was written"
+mv "$FI/repo-moved" "$FI/repo"
+FI_LAST_AFTER="$("$BACKUPCTL" --config-file "$FI_CONFIG" --schedule-file "$FI_STORE" schedule show 2>/dev/null | sed -n 's/^Last success:   //p')"
+FI_MANAGED_AFTER="$("$BACKUPCTL" --config-file "$FI_CONFIG" --schedule-file "$FI_STORE" schedule show 2>/dev/null | sed -n 's/^Managed:        //p')"
+if [ "$FI_LAST_BEFORE" = "$FI_LAST_AFTER" ]; then
+  record_pass "D5.12 失败没有推进 last success"
+else
+  record_fail "D5.12 失败没有推进 last success" "$FI_LAST_BEFORE -> $FI_LAST_AFTER"
+fi
+if [ "$FI_MANAGED_BEFORE" = "$FI_MANAGED_AFTER" ]; then
+  record_pass "D5.13 失败没有清空 managed 名单"
+else
+  record_fail "D5.13 失败没有清空 managed 名单" "$FI_MANAGED_BEFORE -> $FI_MANAGED_AFTER"
+fi
+expect_exit "D5.14 仓库回来了、源没变，必须 skip（ownership 没有被错误清空）" 0 \
+  "$BACKUPCTL" --config-file "$FI_CONFIG" --schedule-file "$FI_STORE" schedule run
+expect_grep "D5.15 确实是一次 skip，而不是又建了一份" "Skipped: the source has not changed"
+FI_ARCHIVES_AFTER="$(ls -1 "$FI/repo" | wc -l)"
+if [ "$FI_ARCHIVES_BEFORE" = "$FI_ARCHIVES_AFTER" ]; then
+  record_pass "D5.16 整个停摆期间仓库里的快照数量没有变化"
+else
+  record_fail "D5.16 整个停摆期间仓库里的快照数量没有变化" "$FI_ARCHIVES_BEFORE -> $FI_ARCHIVES_AFTER"
+fi
+
+# ---- D. 源目录临时不可用 ----
+mv "$FI/src" "$FI/src-moved"
+expect_exit "D5.17 源目录被移走时运行必须失败" 1 \
+  "$BACKUPCTL" --config-file "$FI_CONFIG" --schedule-file "$FI_STORE" schedule run
+expect_grep "D5.18 报错点名源目录" "$FI/src"
+mv "$FI/src-moved" "$FI/src"
+expect_exit "D5.19 源回来之后内容没变，必须 skip（state 没有错误前进）" 0 \
+  "$BACKUPCTL" --config-file "$FI_CONFIG" --schedule-file "$FI_STORE" schedule run
+expect_grep "D5.20 确实是一次 skip" "Skipped: the source has not changed"
+
+# ---- E. 软链接：仓库与源都必须被拒绝 ----
+ln -s "$FI/repo" "$FI/repo-link"
+expect_exit "D5.21 软链接仓库被拒绝" 1 \
+  "$BACKUPCTL" --config-file "$FI_CONFIG" config repository set "$FI/repo-link"
+expect_grep "D5.22 报错说明仓库不能是软链接" "must not be a symbolic link"
+ln -s "$FI/src" "$FI/src-link"
+expect_exit "D5.23 软链接源目录被拒绝" 1 \
+  "$BACKUPCTL" --config-file "$FI_CONFIG" --schedule-file "$FI_STORE" schedule set \
+  --source "$FI/src-link"
+expect_grep "D5.24 报错说明源目录不能是软链接" "symbolic link"
+"$BACKUPCTL" --config-file "$FI_CONFIG" --schedule-file "$FI_STORE" schedule show >"$OUT" 2>&1
+expect_grep "D5.25 被拒绝之后旧源目录原样保留" "$FI/src"
 
 # ============================================================
 echo "[schedule-test] E. 跨前端：GUI 与 CLI 共用同一份 store"
