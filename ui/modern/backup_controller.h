@@ -139,6 +139,8 @@ class BackupController : public QObject {
   Q_INVOKABLE void refreshBackups();
   // 自动命名的备份：源目录 + 已配置的 repository，文件名由 BackupCatalog 生成，
   // 界面不再要求用户填写归档完整路径。
+  // 产物是 v2 container（MyPack + 不压缩 + 不加密）：界面展示的 uid / gid /
+  // symlink / FIFO 只有 v2 装得下，v0.1 会把它们丢掉或者直接失败。
   Q_INVOKABLE bool startBackup();
   // 从仓库里恢复一个备份。QML 只传 file name，解析成真实路径由 Catalog 负责。
   Q_INVOKABLE bool startManagedRestore(const QString& file_name,
@@ -152,7 +154,8 @@ class BackupController : public QObject {
   // ---- 仅供 main.cpp 自测调用，刻意不是 Q_INVOKABLE ----
   // 它们精确测试 controller → engine 的 direct archive 路径，复用同一个
   // Start() / RunOperation()，不是第二套 BackupEngine 调用逻辑。
-  // direct backup 仍然使用当前 include / exclude 筛选规则。
+  // direct backup 仍然使用当前 include / exclude 筛选规则，并且固定产 legacy
+  // v0.1：它是旧格式的回归入口，产品路径已经不再走它。
   bool startDirectBackupForTest(const QString& source,
                                 const QString& archive_file);
   bool startDirectRestoreForTest(const QString& archive_file,
@@ -184,8 +187,24 @@ class BackupController : public QObject {
   // 所以用枚举区分，共用同一份 Start() 与 RunOperation()。
   enum class Kind { kBackup, kRestore };
 
+  // 备份产物的格式。刻意只留在控制器内部：没有 Q_PROPERTY、没有 Q_INVOKABLE，
+  // QML 既看不见也传不进来 —— 界面上"开始备份"只有一条路，不存在"用哪种格式
+  // 备份"这个用户选项。
+  //
+  //   kModernV2  —— 仓库驱动的正常备份（startBackup）。界面已经展示
+  //                 uid / gid / user / group / symlink / FIFO，筛选预览也会说
+  //                 某个 special entry"进入归档"，产物就必须真的装得下这些；
+  //                 v0.1 装不下，只有 v2 container 可以。
+  //   kLegacyV01 —— 仅供 startDirectBackupForTest 使用的显式 legacy 路径。
+  //                 它保留 v0.1 产物，让旧格式始终有一条被真实执行的回归入口。
+  enum class BackupFlavor { kLegacyV01, kModernV2 };
+
   // 后台函数：static，运行在别的线程上，只碰值类型和核心对象。
-  static OperationOutcome RunOperation(Kind kind, const QString& first_path,
+  //
+  // flavor 只被 kBackup 分支读取：恢复没有"产物格式"这一说，归档是什么格式由
+  // 它自己的 magic 决定（BackupEngine::Restore 按 magic 分流）。
+  static OperationOutcome RunOperation(Kind kind, BackupFlavor flavor,
+                                       const QString& first_path,
                                        const QString& second_path,
                                        const Filter& filter);
   // 后台扫描：线程内自建 BackupCatalog，不与 GUI 线程共享任何对象。
@@ -193,8 +212,9 @@ class BackupController : public QObject {
 
   // file_name 只用于任务结束后的状态提示（备份是自动生成的名字，
   // 恢复是用户选的那个名字）；它不是输入状态，也不参与核心调用。
-  bool Start(Kind kind, const QString& first_path, const QString& second_path,
-             const QString& file_name, const Filter& filter);
+  bool Start(Kind kind, BackupFlavor flavor, const QString& first_path,
+             const QString& second_path, const QString& file_name,
+             const Filter& filter);
 
   // 把界面收集的规则编成 Filter；失败时 error_message 里是原因。
   bool BuildFilter(Filter* filter, std::string* error_message) const;

@@ -12,12 +12,18 @@
 #   4. 几条 grep 断言：资源清单、忙时禁用、拒绝假进度、拒绝网络栈，
 #      以及 repository-driven 架构约束（四页结构、没有 standalone 恢复页、
 #      QML 不出现 archive 完整路径、不自己拼 repository 路径）。
-#   5. --self-test 真跑一次 direct archive 打包 + 解包，再用 diff -r 比对目录树。
+#   5. --self-test 真跑一次 direct archive 打包 + 解包，再用 diff -r 比对目录树；
+#      顺带断言这条 direct 测试路径的产物仍是 legacy v0.1
+#      （BKPARCH\0 / version 1）——旧格式的回归入口没有被一起切到 v2。
 #   6. --path-test：本地路径与 URL 互转（中文、空格、#、%）不丢字符。
 #   7. --close-guard-test：任务进行中关窗被拦下，结束后可以正常退出。
 #   8. 文件筛选在 GUI 路径上生效。
 #   9. --repository-test：ConfigManager + BackupCatalog + BackupController +
-#      BackupEngine 的真实产品链路（保存仓库 / 自动命名备份 / 列表 / 恢复 / 删除）。
+#      BackupEngine 的真实产品链路（保存仓库 / 自动命名备份 / 列表 / 恢复 / 删除），
+#      并直接读产物字节断言正常备份落成 v2 容器（BKPCNT2\0 / version 2 /
+#      MyPack / 不压缩 / 不加密），catalog 记录 format_version=2、entry_count>0；
+#      源目录含 symlink 与 FIFO 时，恢复后仍必须是 S_ISLNK（target 一致）与
+#      S_ISFIFO。
 #  10. 损坏 .bak 场景下管理页仍能正常渲染。
 #
 # 所有 GUI 调用都带 --config-file 指向临时目录，并且导出临时 XDG_CONFIG_HOME：
@@ -450,6 +456,17 @@ if [[ -f "$WORK_DIR/backup.bak" && ! -d "$WORK_DIR/backup.bak" ]]; then
 else
   record_fail "备份产物不是普通文件"
 fi
+# direct 入口（startDirectBackupForTest）必须继续产 legacy v0.1：
+# magic = BKPARCH\0、version = 1。它与仓库驱动的正常备份是两条明确的格式路径，
+# 这条断言把"旧格式没有被顺手一起切到 v2"钉死（CLI 默认也仍然走这条路）。
+# 直接读产物字节，不看任何一方的自述。
+selftest_magic="$(head -c 8 "$WORK_DIR/backup.bak" | tr -d '\000')"
+selftest_version="$(od -An -j8 -N2 -tu2 "$WORK_DIR/backup.bak" | tr -d ' ')"
+if [[ "$selftest_magic" == "BKPARCH" && "$selftest_version" == "1" ]]; then
+  record_pass "direct 测试路径的产物仍是 legacy v0.1（BKPARCH\\0 + version 1）"
+else
+  record_fail "direct 测试路径的产物不是 legacy v0.1（magic=[$selftest_magic] version=[$selftest_version]）"
+fi
 # 自测自己说 ok 还不够，必须真的逐文件比对一遍目录树，
 # 确认恢复出来的东西与原始目录一致。
 if diff -r "$WORK_DIR/source" "$WORK_DIR/restore" >> "$LOG_FILE" 2>&1; then
@@ -523,6 +540,104 @@ expect_count_re "$ROOT_DIR/ui/desktop/operation_page.cpp" "AddFilterRule" 3 \
 expect_count_re "$ROOT_DIR/ui/desktop/operation_page.cpp" "CollectFilterRules" 3 \
   "Classic GUI 把规则收集后交给核心"
 
+# 元数据字段（uid / gid / user / group）与 type 的 7 个取值：表单与模型两层都要
+# 真的有接线，否则界面上能看到字段名，规则却永远生成不出来。下面只查"这一项
+# 存在且成对"，具体实现细节不钉死，避免把重构变成改断言。
+if grep -q -- '"uid", "gid", "user", "group"' "$QML_DIR/components/FilterEditorPanel.qml"; then
+  record_pass "筛选编辑器字段下拉含 uid / gid / user / group"
+else
+  record_fail "筛选编辑器字段下拉缺 uid / gid / user / group"
+fi
+if grep -q -- '"symlink", "fifo", "char",' "$QML_DIR/components/FilterEditorPanel.qml"; then
+  record_pass "type 下拉含 symlink / fifo / char / block / socket"
+else
+  record_fail "type 下拉缺新的 type 取值"
+fi
+if grep -q -- '"eq", "lt", "le", "gt", "ge", "range"' "$QML_DIR/components/FilterEditorPanel.qml"; then
+  record_pass "uid / gid 比较运算符含 eq / lt / le / gt / ge / range"
+else
+  record_fail "uid / gid 比较运算符缺项"
+fi
+if grep -q -- '"uid_high": panel.formUidHighText' "$QML_DIR/components/FilterEditorPanel.qml"; then
+  record_pass "表单把 uid / gid 的上下界一起交给模型"
+else
+  record_fail "表单没有提交 uid / gid 的区间上界"
+fi
+# 模型侧：四个新字段都必须真的映射成 FilterClauseDraft 的成员。
+for rule_field in kUid kGid kUser kGroup kMtime; do
+  if grep -qE "RuleField::${rule_field}\b" "$ROOT_DIR/ui/modern/filter_rule_model.cpp"; then
+    record_pass "模型处理 RuleField::${rule_field}"
+  else
+    record_fail "模型没有处理 RuleField::${rule_field}"
+  fi
+done
+# 字段分发必须有 default 兜底：以后再添 RuleField，也不会静默落进已有分支。
+if grep -qE '^[[:space:]]*default:$' "$ROOT_DIR/ui/modern/filter_rule_model.cpp"; then
+  record_pass "表单字段分发有 default 兜底"
+else
+  record_fail "表单字段分发没有 default 兜底"
+fi
+# 预览必须继续复用真实 Filter，并且用 lstat（不跟随软链接）。
+if grep -qF 'filter.ShouldIncludeFile(' "$ROOT_DIR/ui/modern/filter_rule_model.cpp" \
+   && grep -qF 'filter.ShouldPruneDirectory(' "$ROOT_DIR/ui/modern/filter_rule_model.cpp" \
+   && grep -qF 'filter.ShouldSkipSpecialEntry(' "$ROOT_DIR/ui/modern/filter_rule_model.cpp"; then
+  record_pass "预览沿用真实 Filter 的三条判定（include / 剪枝 / 特殊文件）"
+else
+  record_fail "预览没有走真实 Filter 判定"
+fi
+if grep -qF '::lstat(' "$ROOT_DIR/ui/modern/filter_rule_model.cpp"; then
+  record_pass "预览用 lstat 取元数据（不跟随软链接）"
+else
+  record_fail "预览没有用 lstat"
+fi
+# 预览要能把各类条目分开说清楚，并且点出 socket 的后果。
+for tag in '符号链接' 'FIFO' '字符设备' '块设备' 'socket（不支持归档）'; do
+  if grep -qF "QStringLiteral(\"${tag}\")" "$ROOT_DIR/ui/modern/filter_rule_model.cpp"; then
+    record_pass "预览能标注 ${tag}"
+  else
+    record_fail "预览缺 ${tag} 标注"
+  fi
+done
+if grep -qF '不支持的 socket（会导致备份失败）' "$ROOT_DIR/ui/modern/filter_rule_model.cpp" \
+   && grep -qF '被规则排除' "$ROOT_DIR/ui/modern/filter_rule_model.cpp"; then
+  record_pass "预览区分被规则排除与不支持的 socket"
+else
+  record_fail "预览缺排除 / socket 提示"
+fi
+
+# mtime 的 5 种形态：字段下拉、类型键、天数与两个日期都要真的接到模型上。
+if grep -q -- '"uid", "gid", "user", "group", "mtime"' "$QML_DIR/components/FilterEditorPanel.qml"; then
+  record_pass "筛选编辑器字段下拉含 mtime"
+else
+  record_fail "筛选编辑器字段下拉缺 mtime"
+fi
+if grep -q -- '"today", "yesterday", "last_days", "day",' "$QML_DIR/components/FilterEditorPanel.qml"; then
+  record_pass "mtime 类型下拉含 today / yesterday / last_days / day / day_range"
+else
+  record_fail "mtime 类型下拉缺项"
+fi
+if grep -q -- '"mtime_kind": panel.formMtimeKind' "$QML_DIR/components/FilterEditorPanel.qml" \
+   && grep -q -- '"days_back": panel.formDaysBackText' "$QML_DIR/components/FilterEditorPanel.qml" \
+   && grep -q -- '"date_low": panel.formDateLow' "$QML_DIR/components/FilterEditorPanel.qml" \
+   && grep -q -- '"date_high": panel.formDateHigh' "$QML_DIR/components/FilterEditorPanel.qml"; then
+  record_pass "表单把 mtime 类型 / 天数 / 两个日期一起交给模型"
+else
+  record_fail "表单没有提交 mtime 的完整取值"
+fi
+# 5 种形态在模型里都要有落点；日期合法性由 builder / 真实 Filter 裁决。
+for mtime_kind in kToday kYesterday kLastDays kDay kDayRange; do
+  if grep -qF "RuleMtimeKind::${mtime_kind}" "$ROOT_DIR/ui/modern/filter_rule_model.cpp"; then
+    record_pass "模型处理 mtime 形态 ${mtime_kind}"
+  else
+    record_fail "模型没有处理 mtime 形态 ${mtime_kind}"
+  fi
+done
+if grep -qF 'mtime 还没有表单控件' "$ROOT_DIR/ui/modern/filter_rule_model.cpp"; then
+  record_fail "模型里还留着 mtime 无控件的兜底错误"
+else
+  record_pass "模型里没有 mtime 无控件的兜底错误"
+fi
+
 FILTER_DIR="$WORK_DIR/filter-src"
 mkdir -p "$FILTER_DIR/build"
 printf 'cpp\n' > "$FILTER_DIR/a.cpp"
@@ -571,25 +686,81 @@ REPO_SRC="$REPO_WORK/source"
 REPO_DIR="$REPO_WORK/repository"
 REPO_DEST="$REPO_WORK/restored"
 REPO_CFG="$REPO_WORK/product-config.json"
+REPO_LOG="${TEST_STATE_DIR}/repo-test.log"
+# 产物会在 --repository-test 的最后一步被删掉，脚本要自己读它的字节，
+# 就得让程序在删除之前留一份副本（BACKUP_MODERN_KEEP_ARTIFACT 是纯测试旁路）。
+REPO_KEPT="$REPO_WORK/kept-artifact.bak"
 mkdir -p "$REPO_SRC/sub" "$REPO_SRC/emptydir"
 printf 'plain\n' > "$REPO_SRC/plain.txt"
 printf '中文内容\n' > "$REPO_SRC/中文文件.txt"
 printf 'space name\n' > "$REPO_SRC/with space.txt"
 : > "$REPO_SRC/empty.txt"
 printf 'nested\n' > "$REPO_SRC/sub/nested.txt"
+# 界面展示 uid / gid / symlink / FIFO，产物就必须真的装得下它们：
+# 源目录里放上软链接（指向文件与指向目录各一条）和一条 FIFO，
+# 恢复后逐个查文件类型与 link target。
+ln -s plain.txt "$REPO_SRC/symlink.txt"
+ln -s sub "$REPO_SRC/dirlink"
+mkfifo "$REPO_SRC/pipe"
 
 set +e
-QT_QPA_PLATFORM=offscreen QSG_RHI_BACKEND=software timeout 180 \
+BACKUP_MODERN_KEEP_ARTIFACT="$REPO_KEPT" \
+  QT_QPA_PLATFORM=offscreen QSG_RHI_BACKEND=software timeout 180 \
   ./build/backup-gui-modern --repository-test "$REPO_SRC" "$REPO_DIR" "$REPO_DEST" \
-  --config-file "$REPO_CFG" > "${TEST_STATE_DIR}/repo-test.log" 2>&1
+  --config-file "$REPO_CFG" > "$REPO_LOG" 2>&1
 repo_status=$?
 set -e
-sed 's/^/[modern-gui]     /' "${TEST_STATE_DIR}/repo-test.log"
-cat "${TEST_STATE_DIR}/repo-test.log" >> "$LOG_FILE"
+sed 's/^/[modern-gui]     /' "$REPO_LOG"
+cat "$REPO_LOG" >> "$LOG_FILE"
 if [[ "$repo_status" -eq 0 ]]; then
   record_pass "--repository-test 全链路通过（保存仓库 / 自动命名备份 / 列表 / 恢复 / 删除）"
 else
   record_fail "--repository-test 退出码 $repo_status"
+fi
+
+# 9.1 产物本身：magic / version / header size / 三个算法 id / entry_count 全部
+# 从字节上读一遍。断言的是文件内容，不是程序的"成功"自述。
+if [[ -f "$REPO_KEPT" ]]; then
+  repo_magic="$(head -c 8 "$REPO_KEPT" | tr -d '\000')"
+  repo_version="$(od -An -j8 -N2 -tu2 "$REPO_KEPT" | tr -d ' ')"
+  repo_header_size="$(od -An -j10 -N2 -tu2 "$REPO_KEPT" | tr -d ' ')"
+  read -r repo_pack repo_comp repo_enc \
+    <<<"$(od -An -j12 -N3 -tu1 "$REPO_KEPT" | tr -s ' ' | sed 's/^ //')" || true
+  repo_entries="$(od -An -j16 -N8 -tu8 "$REPO_KEPT" | tr -d ' ')"
+  repo_entries_dec=$((10#${repo_entries:-0}))
+  if [[ "$repo_magic" == "BKPCNT2" && "$repo_version" == "2" \
+        && "$repo_header_size" == "160" ]]; then
+    record_pass "正常备份产物是 v2 容器（magic=BKPCNT2\\0 / version=2 / headerSize=160）"
+  else
+    record_fail "正常备份产物不是 v2 容器（magic=[$repo_magic] version=[$repo_version] headerSize=[$repo_header_size]）"
+  fi
+  if [[ "$repo_pack" == "0" && "$repo_comp" == "0" && "$repo_enc" == "0" ]]; then
+    record_pass "外层 header 是 MyPack + 不压缩 + 不加密（三个算法 id 全为 0）"
+  else
+    record_fail "外层 header 的算法 id 不是 0/0/0（pack=[$repo_pack] compression=[$repo_comp] encryption=[$repo_enc]）"
+  fi
+  if [[ "$repo_entries_dec" -gt 0 ]]; then
+    record_pass "外层 header 的 entry_count=$repo_entries_dec > 0"
+  else
+    record_fail "外层 header 的 entry_count 不是正数（得到 [$repo_entries]）"
+  fi
+else
+  record_fail "正常备份产物的副本缺失：$REPO_KEPT"
+fi
+
+# 9.2 同一份产物的结论必须和 C++ 侧 IdentifyArchiveFile、catalog 的 record 一致：
+# 脚本按偏移读字节、核心解析 header，两条独立路径给出同一个答案才算数。
+if grep -qE '^identify: kind=container-v2 formatVersion=2 packMethod=mypack compressionMethod=none encryptionMethod=none entryCount=[1-9][0-9]*$' "$REPO_LOG"; then
+  record_pass "IdentifyArchiveFile 复核为 v2 / MyPack / None / None"
+else
+  record_fail "IdentifyArchiveFile 的结论不是 v2 / MyPack / None / None"
+  grep -n '^identify:' "$REPO_LOG" | sed 's/^/      /'
+fi
+if grep -qE '^record: .*recognizedArchive=true formatVersion=2 entryCount=[1-9][0-9]*$' "$REPO_LOG"; then
+  record_pass "BackupCatalog 认得它（recognized_archive=true，entry_count > 0）"
+else
+  record_fail "BackupCatalog 没有把它认成 v2 容器"
+  grep -n '^record:' "$REPO_LOG" | sed 's/^/      /'
 fi
 
 # 配置文件必须真的产生，并且产生在我们指定的那个路径上 ——
@@ -600,11 +771,35 @@ else
   record_fail "配置文件没有产生：$REPO_CFG"
 fi
 
-# 恢复结果必须与源目录逐字节一致（含中文名、空格名、空文件、空目录、子目录）。
-if diff -r "$REPO_SRC" "$REPO_DEST" >> "$LOG_FILE" 2>&1; then
-  record_pass "diff -r 源目录与恢复目录完全一致"
+# 9.3 恢复出来的类型必须原样回来：软链接还是软链接、link target 一字不差、
+# FIFO 还是 FIFO。这几条不能只靠 diff —— 不加 --no-dereference 的话 diff 会
+# 跟着软链接去比目标内容，"链接被恢复成普通文件"这种退化恰好查不出来。
+if [[ -L "$REPO_DEST/symlink.txt" \
+      && "$(readlink "$REPO_DEST/symlink.txt")" == "plain.txt" ]]; then
+  record_pass "恢复后 symlink.txt 仍是符号链接且 target 一致（plain.txt）"
 else
-  record_fail "diff -r 源目录与恢复目录有差异"
+  record_fail "恢复后 symlink.txt 不是指向 plain.txt 的符号链接"
+fi
+if [[ -L "$REPO_DEST/dirlink" \
+      && "$(readlink "$REPO_DEST/dirlink")" == "sub" ]]; then
+  record_pass "恢复后 dirlink 仍是指向目录的符号链接"
+else
+  record_fail "恢复后 dirlink 不是指向 sub 的符号链接"
+fi
+# FIFO 用普通用户就能建，所以这一条不需要"环境不允许就跳过"的借口。
+if [[ -p "$REPO_DEST/pipe" ]]; then
+  record_pass "恢复后 pipe 仍是 FIFO（S_ISFIFO）"
+else
+  record_fail "恢复后 pipe 不是 FIFO"
+fi
+
+# 恢复结果必须与源目录逐字节一致（含中文名、空格名、空文件、空目录、子目录）。
+# --no-dereference：软链接按链接本身比较，target 不同即判差异。
+# FIFO 用 --exclude 排掉：diff 无法比较 FIFO，它的类型已由上面的 test -p 断言。
+if diff -r --no-dereference --exclude=pipe "$REPO_SRC" "$REPO_DEST" >> "$LOG_FILE" 2>&1; then
+  record_pass "diff -r --no-dereference 源目录与恢复目录完全一致"
+else
+  record_fail "diff -r --no-dereference 源目录与恢复目录有差异"
 fi
 
 # 自动命名的产物：名字必须由核心按 <source-base>_YYYYMMDD_HHMMSS.bak 生成，

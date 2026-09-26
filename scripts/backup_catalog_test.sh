@@ -62,15 +62,23 @@ else
   fi
 fi
 
-# 顺序：先编译各自的 .o（产品核心在前、测试在后），最后链接，库放最后。
-g++ -std=c++17 -Wall -Wextra -Wpedantic -g -Iinclude -c src/archive/archive.cpp -o "$OUT_DIR/bpcat_archive.o" >> "$LOG" 2>&1
-g++ -std=c++17 -Wall -Wextra -Wpedantic -g -Iinclude -c src/catalog/backup_catalog.cpp -o "$OUT_DIR/bpcat_catalog.o" >> "$LOG" 2>&1
-g++ -std=c++17 -Wall -Wextra -Wpedantic -g -Iinclude -c src/core/backup_engine.cpp -o "$OUT_DIR/bpcat_engine.o" >> "$LOG" 2>&1
-g++ -std=c++17 -Wall -Wextra -Wpedantic -g -Iinclude -c src/filesystem/file_system.cpp -o "$OUT_DIR/bpcat_filesystem.o" >> "$LOG" 2>&1
-g++ -std=c++17 -Wall -Wextra -Wpedantic -g -Iinclude -c src/filter/filter.cpp -o "$OUT_DIR/bpcat_filter.o" >> "$LOG" 2>&1
+# 产品核心的编译单元直接从 src/ 取，而不是在脚本里写死一份清单：
+# 写死的话，每加一个模块都得回来改这里，而漏改的表现是"链接期一堆
+# undefined reference"——那种失败看起来像代码坏了，其实是脚本过期了。
+CORE_SOURCES="$(find src -name '*.cpp' | sort)"
+CORE_OBJECTS=""
+for source in $CORE_SOURCES; do
+  object="$OUT_DIR/bpcat_$(echo "$source" | tr '/' '_').o"
+  if ! g++ -std=c++17 -Wall -Wextra -Wpedantic -g -Iinclude -c "$source" -o "$object" >> "$LOG" 2>&1; then
+    echo "[catalog] 编译失败: $source，日志：$LOG"
+    tail -25 "$LOG"
+    exit 1
+  fi
+  CORE_OBJECTS="$CORE_OBJECTS $object"
+done
 g++ -std=c++17 -Wall -Wextra -Wpedantic -g $GTEST_FORCE $GTEST_CFLAGS -Iinclude -c tests/unit/backup_catalog_test.cpp -o "$OUT_DIR/bpcat_test.o" >> "$LOG" 2>&1
-echo "[catalog] 链接: bpcat_test.o bpcat_catalog.o bpcat_archive.o bpcat_engine.o bpcat_filesystem.o bpcat_filter.o"
-g++ "$OUT_DIR/bpcat_test.o" "$OUT_DIR/bpcat_catalog.o" "$OUT_DIR/bpcat_archive.o" "$OUT_DIR/bpcat_engine.o" "$OUT_DIR/bpcat_filesystem.o" "$OUT_DIR/bpcat_filter.o" -o "$BIN" $GTEST_LIBS >> "$LOG" 2>&1
+echo "[catalog] 链接: bpcat_test.o + $(echo $CORE_SOURCES | wc -w) 个核心编译单元"
+g++ "$OUT_DIR/bpcat_test.o" $CORE_OBJECTS -o "$BIN" $GTEST_LIBS >> "$LOG" 2>&1
 BUILD_CODE=$?
 if [ $BUILD_CODE -ne 0 ]; then
   echo "[catalog] 编译失败（exit=$BUILD_CODE），日志：$LOG"

@@ -40,8 +40,11 @@
 #include <string>
 #include <vector>
 
+#include "archive_entry.h"
+#include "container_format.h"
 #include "file_system.h"
 #include "filter.h"
+#include "user_directory.h"
 
 namespace backupproject {
 
@@ -555,9 +558,41 @@ bool WriteFilePayload(ArchiveOutput* output, const std::string& disk_path,
   return true;
 }
 
+// st_mode -> FilterEntry::type。
+//
+// legacy 写入器自己只需要区分"目录 / 普通文件 / 其它"，但 Filter 的规则要看
+// 得更细：type:symlink 这类取值靠它区分，size: 规则也要靠它判断"这个 size
+// 是不是文件内容的长度"。所以这里按 lstat 的类型位完整映射，而不是只填
+// is_directory 让调用方去猜。
+EntryType FilterEntryType(mode_t mode) {
+  switch (mode & S_IFMT) {
+    case S_IFDIR:
+      return EntryType::kDirectory;
+    case S_IFREG:
+      return EntryType::kRegularFile;
+    case S_IFLNK:
+      return EntryType::kSymlink;
+    case S_IFIFO:
+      return EntryType::kFifo;
+    case S_IFCHR:
+      return EntryType::kCharDevice;
+    case S_IFBLK:
+      return EntryType::kBlockDevice;
+    case S_IFSOCK:
+      return EntryType::kSocket;
+    default:
+      break;
+  }
+  // S_IFMT 在 Linux 上只有上面这 7 个取值，走到这里说明遇到了未知类型。
+  // 兜底取 kSocket 而不是 kRegularFile：归类成普通文件会让 size: / type:file
+  // 规则按"文件内容"去判它，可能让一个本该失败的备份变成静默跳过。
+  return EntryType::kSocket;
+}
+
 bool WriteDirectoryTree(ArchiveOutput* output,
                         const std::string& disk_directory,
                         const std::string& archive_path, const Filter* filter,
+                        UserDirectoryCache* user_names,
                         std::uint64_t* entry_count, std::string* error_message);
 
 // 写一个普通文件 entry：header + path + 原始 payload。
@@ -579,6 +614,7 @@ bool WriteRegularFileEntry(ArchiveOutput* output, const std::string& disk_path,
 bool WriteDirectoryTree(ArchiveOutput* output,
                         const std::string& disk_directory,
                         const std::string& archive_path, const Filter* filter,
+                        UserDirectoryCache* user_names,
                         std::uint64_t* entry_count,
                         std::string* error_message) {
   struct stat info;
@@ -640,15 +676,31 @@ bool WriteDirectoryTree(ArchiveOutput* output,
       return false;
     }
     // Filter 只看这些元数据，不读文件内容。
+    //
+    // 每个字段都必须来自这次 lstat：只填 is_directory / size / mtime 的话，
+    // type 会退回默认的 kRegularFile、uid / gid 会退回 0，于是 exclude
+    // type:symlink 命不中、exclude size:<=1KB 反而把 symlink 当 0 字节文件
+    // 误伤，uid: / user: / group: 规则则一律按 root 判——这些规则的语义在
+    // legacy 路径上必须和 v2 pipeline 一致，差别只在归档里写什么（v0.1 不写
+    // 属主），不在"哪些条目进归档"。
     FilterEntry filter_entry;
     filter_entry.archive_path = child_archive;
     filter_entry.name = name;
     filter_entry.is_directory = S_ISDIR(child_info.st_mode) != 0;
+    filter_entry.type = FilterEntryType(child_info.st_mode);
+    // 只有普通文件的 st_size 是内容长度：symlink 的 st_size 是目标字符串
+    // 长度，FIFO / 设备 / socket 的 st_size 没有意义，一律填 0。
     filter_entry.size = S_ISREG(child_info.st_mode)
                             ? static_cast<std::uint64_t>(child_info.st_size)
                             : 0;
     filter_entry.mtime_sec =
         static_cast<std::int64_t>(child_info.st_mtim.tv_sec);
+    filter_entry.uid = static_cast<std::uint32_t>(child_info.st_uid);
+    filter_entry.gid = static_cast<std::uint32_t>(child_info.st_gid);
+    // uid/gid -> 名字走整棵树共用的一份缓存：几千个条目通常只有几个 uid，
+    // NSS 查询次数因此降到"不同 uid 数"。
+    filter_entry.user_name = user_names->UserName(filter_entry.uid);
+    filter_entry.group_name = user_names->GroupName(filter_entry.gid);
 
     if (S_ISDIR(child_info.st_mode)) {
       // 命中 exclude 的目录整棵剪掉：不再递归，子树里的特殊文件也不再检查。
@@ -656,7 +708,7 @@ bool WriteDirectoryTree(ArchiveOutput* output,
         continue;
       }
       if (!WriteDirectoryTree(output, child_disk, child_archive, filter,
-                              entry_count, error_message)) {
+                              user_names, entry_count, error_message)) {
         return false;
       }
     } else if (S_ISREG(child_info.st_mode)) {
@@ -1155,10 +1207,14 @@ bool ArchiveWriter::Write(const std::string& source_directory,
   bool ok = WriteGlobalHeader(&output, error_message);
   std::uint64_t entry_count = 0;
   if (ok) {
+    // uid/gid -> 名字的缓存由整棵树的递归共用：它的生命周期覆盖这次 Write 的
+    // 全部条目，所以同一个 uid 只会查一次 NSS。放在这里而不是文件级静态
+    // 对象，是为了每次打包都从一份新缓存开始，不会把上一次的结果带过来。
+    UserDirectoryCache user_names;
     // 第一条永远是 "."：源目录本身的 mode / mtime 也进归档。
     // 源目录根条目 "." 永远保留：即使规则把内容全过滤掉，归档仍然是一个
     // 合法归档（只有根目录），恢复出来就是空目录。
-    ok = WriteDirectoryTree(&output, source_directory, ".", filter,
+    ok = WriteDirectoryTree(&output, source_directory, ".", filter, &user_names,
                             &entry_count, error_message);
   }
   if (ok) {
@@ -1339,6 +1395,27 @@ bool ArchiveReader::InspectHeader(const std::string& archive_file,
   }
   // 只读 fd 的 close 失败不会丢数据，交给 RAII 关闭即可。
   ScopedFd archive_fd(fd);
+
+  // v2 容器（BKPCNT2）不是 v0.1 格式，但同样是本项目的 .bak：备份列表必须
+  // 认得出它，否则用户会看到"备份还在，但列表不认识了"。
+  //
+  // 分流只看 magic，两条路径各自调用自己那份 header 解码实现；这里不复制
+  // 任何字段解析逻辑。
+  unsigned char magic[container_v2::kMagicSize];
+  if (ReadAt(archive_fd.get(), magic, sizeof(magic), 0) ==
+          static_cast<ssize_t>(sizeof(magic)) &&
+      LooksLikeContainer(magic, sizeof(magic))) {
+    ContainerHeader container;
+    std::string detail;
+    if (!InspectContainerFile(archive_file, &container, &detail)) {
+      SetError(error_message, detail);
+      return false;
+    }
+    summary->format_version = container_v2::kVersion;
+    summary->flags = container.flags;
+    summary->entry_count = container.entry_count;
+    return true;
+  }
 
   // 只读全局 header 这一块。读完就返回，所以"坏在后面的归档"在这里依然会被
   // 认出来——这正是本方法要暴露的边界，也是它不能替代 preflight 的原因。

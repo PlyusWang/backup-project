@@ -47,9 +47,43 @@ Item {
     property string formUnit: "KB"
     property string formSizeLowText: "1"
     property string formSizeHighText: "10"
+    // uid / gid 的表单值按文本收集：解析与取值范围由 C++ 侧统一裁决，
+    // QML 侧的 parseInt 会把超范围的值悄悄变成另一个数。
+    property string formUidCompare: "eq"
+    property string formUidText: "0"
+    property string formUidHighText: "0"
+    property string formGidCompare: "eq"
+    property string formGidText: "0"
+    property string formGidHighText: "0"
+    property string formUser: ""
+    property string formGroup: ""
+    // mtime 的表单值：日期原样透传，格式与区间方向由 C++ 侧（builder + 真实
+    // Filter）裁决，QML 不做日期解析，也不判合法性。
+    property string formMtimeKind: "today"
+    property string formDaysBackText: "7"
+    property string formDateLow: ""
+    property string formDateHigh: ""
     property string formError: ""
 
     readonly property bool wide: width >= 760
+
+    // type 下拉：显示名给用户看，键原样进表单，映射成 RuleTypeValue 由 C++ 侧
+    // 负责（界面不拼 DSL，也不判断规则合法性）。
+    readonly property var typeLabels: ["普通文件", "目录", "符号链接", "FIFO",
+                                       "字符设备", "块设备", "socket"]
+    readonly property var typeKeys: ["file", "folder", "symlink", "fifo", "char",
+                                     "block", "socket"]
+    // uid / gid 的比较运算符：键与 C++ 侧的表单约定一致（eq/lt/le/gt/ge/range）。
+    readonly property var idCompareLabels: ["等于", "小于", "小于等于", "大于",
+                                            "大于等于", "区间"]
+    readonly property var idCompareKeys: ["eq", "lt", "le", "gt", "ge", "range"]
+    // mtime 类型下拉：同样把显示名与表单词分开。
+    readonly property var mtimeLabels: ["今天", "昨天", "最近 N 天", "指定日期",
+                                        "日期区间"]
+    readonly property var mtimeKeys: ["today", "yesterday", "last_days", "day",
+                                      "day_range"]
+    // uid 与 gid 共用同一组控件，这里给出当前字段正在用的运算符。
+    readonly property string idCompare: panel.formField === "uid" ? panel.formUidCompare : panel.formGidCompare
 
     function syncFromModel() {
         if (!ruleModel)
@@ -77,7 +111,19 @@ Item {
             "compare": panel.formCompare,
             "unit": panel.formUnit,
             "sizeLow": panel.sizeLowValue(),
-            "sizeHigh": panel.sizeHighValue()
+            "sizeHigh": panel.sizeHighValue(),
+            "uid_compare": panel.formUidCompare,
+            "uid": panel.formUidText,
+            "uid_high": panel.formUidHighText,
+            "gid_compare": panel.formGidCompare,
+            "gid": panel.formGidText,
+            "gid_high": panel.formGidHighText,
+            "user": panel.formUser,
+            "group": panel.formGroup,
+            "mtime_kind": panel.formMtimeKind,
+            "days_back": panel.formDaysBackText,
+            "date_low": panel.formDateLow,
+            "date_high": panel.formDateHigh
         }
     }
 
@@ -122,6 +168,18 @@ Item {
         panel.formUnit = "KB"
         panel.formSizeLowText = "1"
         panel.formSizeHighText = "10"
+        panel.formUidCompare = "eq"
+        panel.formUidText = "0"
+        panel.formUidHighText = "0"
+        panel.formGidCompare = "eq"
+        panel.formGidText = "0"
+        panel.formGidHighText = "0"
+        panel.formUser = ""
+        panel.formGroup = ""
+        panel.formMtimeKind = "today"
+        panel.formDaysBackText = "7"
+        panel.formDateLow = ""
+        panel.formDateHigh = ""
         if (ruleModel)
             panel.ruleModel.clearError()
         panel.refreshFormError()
@@ -343,7 +401,9 @@ Item {
 
                         AppComboBox {
                             Layout.preferredWidth: 120
-                            model: ["ext", "name", "path", "stem", "type", "size"]
+                            // 字段名就是 C++ 侧的表单键，不翻译：翻译只发生在
+                            // 需要给人看的 type / 运算符下拉里。
+                            model: ["ext", "name", "path", "stem", "type", "size", "uid", "gid", "user", "group", "mtime"]
                             currentIndex: Math.max(0, model.indexOf(panel.formField))
                             onActivated: {
                                 panel.formField = currentText
@@ -375,11 +435,11 @@ Item {
 
                         AppComboBox {
                             visible: panel.formField === "type"
-                            Layout.preferredWidth: 120
-                            model: ["file", "folder"]
-                            currentIndex: panel.formType === "folder" ? 1 : 0
+                            Layout.preferredWidth: 140
+                            model: panel.typeLabels
+                            currentIndex: Math.max(0, panel.typeKeys.indexOf(panel.formType))
                             onActivated: {
-                                panel.formType = currentText
+                                panel.formType = panel.typeKeys[currentIndex]
                                 panel.refreshFormError()
                             }
                         }
@@ -425,6 +485,106 @@ Item {
                                 panel.refreshFormError()
                             }
                         }
+
+                        AppComboBox {
+                            visible: panel.formField === "uid" || panel.formField === "gid"
+                            Layout.preferredWidth: 110
+                            model: panel.idCompareLabels
+                            currentIndex: Math.max(0, panel.idCompareKeys.indexOf(panel.idCompare))
+                            onActivated: {
+                                if (panel.formField === "uid")
+                                    panel.formUidCompare = panel.idCompareKeys[currentIndex]
+                                else
+                                    panel.formGidCompare = panel.idCompareKeys[currentIndex]
+                                panel.refreshFormError()
+                            }
+                        }
+
+                        AppTextField {
+                            visible: panel.formField === "uid" || panel.formField === "gid"
+                            Layout.preferredWidth: 110
+                            placeholderText: panel.formField === "uid" ? "uid，如 1000" : "gid，如 100"
+                            text: panel.formField === "uid" ? panel.formUidText : panel.formGidText
+                            onTextEdited: {
+                                if (panel.formField === "uid")
+                                    panel.formUidText = text
+                                else
+                                    panel.formGidText = text
+                                panel.refreshFormError()
+                            }
+                        }
+
+                        AppTextField {
+                            visible: (panel.formField === "uid" || panel.formField === "gid") && panel.idCompare === "range"
+                            Layout.preferredWidth: 110
+                            placeholderText: "区间上界"
+                            text: panel.formField === "uid" ? panel.formUidHighText : panel.formGidHighText
+                            onTextEdited: {
+                                if (panel.formField === "uid")
+                                    panel.formUidHighText = text
+                                else
+                                    panel.formGidHighText = text
+                                panel.refreshFormError()
+                            }
+                        }
+
+                        AppTextField {
+                            Layout.fillWidth: true
+                            visible: panel.formField === "user" || panel.formField === "group"
+                            placeholderText: panel.formField === "user" ? "用户名，精确匹配，如 alice" : "用户组名，精确匹配，如 staff"
+                            text: panel.formField === "user" ? panel.formUser : panel.formGroup
+                            onTextEdited: {
+                                if (panel.formField === "user")
+                                    panel.formUser = text
+                                else
+                                    panel.formGroup = text
+                                panel.refreshFormError()
+                            }
+                        }
+
+                        AppComboBox {
+                            visible: panel.formField === "mtime"
+                            Layout.preferredWidth: 130
+                            model: panel.mtimeLabels
+                            currentIndex: Math.max(0, panel.mtimeKeys.indexOf(panel.formMtimeKind))
+                            onActivated: {
+                                panel.formMtimeKind = panel.mtimeKeys[currentIndex]
+                                panel.refreshFormError()
+                            }
+                        }
+
+                        AppTextField {
+                            visible: panel.formField === "mtime" && panel.formMtimeKind === "last_days"
+                            Layout.preferredWidth: 110
+                            placeholderText: "天数，如 7"
+                            text: panel.formDaysBackText
+                            onTextEdited: {
+                                panel.formDaysBackText = text
+                                panel.refreshFormError()
+                            }
+                        }
+
+                        AppTextField {
+                            visible: panel.formField === "mtime" && (panel.formMtimeKind === "day" || panel.formMtimeKind === "day_range")
+                            Layout.preferredWidth: 140
+                            placeholderText: "YYYY-MM-DD"
+                            text: panel.formDateLow
+                            onTextEdited: {
+                                panel.formDateLow = text
+                                panel.refreshFormError()
+                            }
+                        }
+
+                        AppTextField {
+                            visible: panel.formField === "mtime" && panel.formMtimeKind === "day_range"
+                            Layout.preferredWidth: 140
+                            placeholderText: "结束日期 YYYY-MM-DD"
+                            text: panel.formDateHigh
+                            onTextEdited: {
+                                panel.formDateHigh = text
+                                panel.refreshFormError()
+                            }
+                        }
                     }
 
                     Text {
@@ -467,7 +627,15 @@ Item {
                         wrapMode: Text.WordWrap
                         font.pixelSize: 15
                         color: theme.textSecondary
-                        text: "通配符：* 匹配任意字符但不跨 /，? 匹配一个字符，** 可以跨 /。"
+                        text: {
+                            if (panel.formField === "uid" || panel.formField === "gid")
+                                return "uid / gid 填十进制数字，0 是合法值（root）；区间是闭区间，两端都算命中。"
+                            if (panel.formField === "user" || panel.formField === "group")
+                                return "user / group 精确匹配、大小写敏感，不支持通配符。"
+                            if (panel.formField === "mtime")
+                                return "日期格式 YYYY-MM-DD，区间两端都算命中；最近 N 天按 N × 24 小时计算。"
+                            return "通配符：* 匹配任意字符但不跨 /，? 匹配一个字符，** 可以跨 /。"
+                        }
                     }
                 }
 

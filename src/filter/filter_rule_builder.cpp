@@ -36,8 +36,52 @@ const char* CompareOperator(RuleSizeCompare compare) {
       return ">=";
     case RuleSizeCompare::kRange:
       return "..";
+    case RuleSizeCompare::kEqual:
+      return "=";
   }
   return "";
+}
+
+// type 下拉 -> DSL 取值，必须与核心的 type: 解析表逐字一致。
+const char* TypeDslName(RuleTypeValue type) {
+  switch (type) {
+    case RuleTypeValue::kFile:
+      return "file";
+    case RuleTypeValue::kFolder:
+      return "folder";
+    case RuleTypeValue::kSymlink:
+      return "symlink";
+    case RuleTypeValue::kFifo:
+      return "fifo";
+    case RuleTypeValue::kCharDevice:
+      return "char";
+    case RuleTypeValue::kBlockDevice:
+      return "block";
+    case RuleTypeValue::kSocket:
+      return "socket";
+  }
+  return "file";
+}
+
+// type 下拉 -> 摘要里的中文名。
+const char* TypeDisplayName(RuleTypeValue type) {
+  switch (type) {
+    case RuleTypeValue::kFile:
+      return "普通文件";
+    case RuleTypeValue::kFolder:
+      return "目录";
+    case RuleTypeValue::kSymlink:
+      return "符号链接";
+    case RuleTypeValue::kFifo:
+      return "命名管道";
+    case RuleTypeValue::kCharDevice:
+      return "字符设备";
+    case RuleTypeValue::kBlockDevice:
+      return "块设备";
+    case RuleTypeValue::kSocket:
+      return "套接字";
+  }
+  return "未知类型";
 }
 
 bool IsDigits(const std::string& text) {
@@ -97,6 +141,33 @@ std::string FormatBytes(std::uint64_t value) {
   return std::string(buffer);
 }
 
+// uid:/gid: 的 DSL 片段。kEqual 写成裸数字（uid:1000），这点与 size 的
+// "必须带运算符"不同；range 与其余运算符和 size 同形。
+std::string IdClauseText(const char* field, std::uint32_t low,
+                         std::uint32_t high, RuleSizeCompare compare) {
+  const std::string prefix = std::string(field) + ":";
+  if (compare == RuleSizeCompare::kRange) {
+    return prefix + FormatBytes(low) + ".." + FormatBytes(high);
+  }
+  if (compare == RuleSizeCompare::kEqual) {
+    return prefix + FormatBytes(low);
+  }
+  return prefix + CompareOperator(compare) + FormatBytes(low);
+}
+
+// uid / gid 的中文摘要，例如 "属主 uid = 1000"。
+std::string IdSummary(const std::string& label, std::uint32_t low,
+                      std::uint32_t high, RuleSizeCompare compare) {
+  if (compare == RuleSizeCompare::kRange) {
+    return label + " 在 " + FormatBytes(low) + " 到 " + FormatBytes(high) +
+           " 之间";
+  }
+  if (compare == RuleSizeCompare::kEqual) {
+    return label + " = " + FormatBytes(low);
+  }
+  return label + " " + CompareOperator(compare) + " " + FormatBytes(low);
+}
+
 }  // namespace
 
 const char* RuleFieldName(RuleField field) {
@@ -115,6 +186,14 @@ const char* RuleFieldName(RuleField field) {
       return "size";
     case RuleField::kMtime:
       return "mtime";
+    case RuleField::kUid:
+      return "uid";
+    case RuleField::kGid:
+      return "gid";
+    case RuleField::kUser:
+      return "user";
+    case RuleField::kGroup:
+      return "group";
   }
   return "?";
 }
@@ -175,6 +254,26 @@ bool ValidateClause(const FilterClauseDraft& clause,
         return true;
       }
       return true;
+    case RuleField::kUid:
+    case RuleField::kGid: {
+      const bool is_uid = clause.field == RuleField::kUid;
+      const RuleSizeCompare compare =
+          is_uid ? clause.uid_compare : clause.gid_compare;
+      const std::uint32_t low = is_uid ? clause.uid : clause.gid;
+      const std::uint32_t high = is_uid ? clause.uid_high : clause.gid_high;
+      // 0 是合法 uid / gid（root），这里不把 0 当作"没填"。
+      if (compare == RuleSizeCompare::kRange && high < low) {
+        return fail(std::string(RuleFieldName(clause.field)) +
+                    " 区间的上界不能小于下界");
+      }
+      return true;
+    }
+    case RuleField::kUser:
+      if (clause.user.empty()) return fail("user 不能为空");
+      return true;
+    case RuleField::kGroup:
+      if (clause.group.empty()) return fail("group 不能为空");
+      return true;
   }
   return fail("未知字段");
 }
@@ -199,17 +298,19 @@ bool ToDsl(const FilterClauseDraft& clause, std::string* dsl,
       break;
     }
     case RuleField::kType:
-      text =
-          clause.type == RuleTypeValue::kFolder ? "type:folder" : "type:file";
+      text = std::string("type:") + TypeDslName(clause.type);
       break;
     case RuleField::kSize: {
       const char* suffix = UnitSuffix(clause.unit);
+      const std::string low = FormatBytes(clause.size_low) + suffix;
       if (clause.compare == RuleSizeCompare::kRange) {
-        text = "size:" + FormatBytes(clause.size_low) + suffix + ".." +
-               FormatBytes(clause.size_high) + suffix;
+        text = "size:" + low + ".." + FormatBytes(clause.size_high) + suffix;
+      } else if (clause.compare == RuleSizeCompare::kEqual) {
+        // size 没有"等于"运算符：用 a..a 表达同一语义，生成的 DSL
+        // 仍被核心接受。
+        text = "size:" + low + ".." + low;
       } else {
-        text = std::string("size:") + CompareOperator(clause.compare) +
-               FormatBytes(clause.size_low) + suffix;
+        text = std::string("size:") + CompareOperator(clause.compare) + low;
       }
       break;
     }
@@ -231,6 +332,20 @@ bool ToDsl(const FilterClauseDraft& clause, std::string* dsl,
           text = "mtime:" + clause.date_low + ".." + clause.date_high;
           break;
       }
+      break;
+    case RuleField::kUid:
+      text =
+          IdClauseText("uid", clause.uid, clause.uid_high, clause.uid_compare);
+      break;
+    case RuleField::kGid:
+      text =
+          IdClauseText("gid", clause.gid, clause.gid_high, clause.gid_compare);
+      break;
+    case RuleField::kUser:
+      text = "user:" + clause.user;
+      break;
+    case RuleField::kGroup:
+      text = "group:" + clause.group;
       break;
   }
   if (dsl != nullptr) *dsl = text;
@@ -279,7 +394,7 @@ std::string SummarizeClause(const FilterClauseDraft& clause) {
       return "扩展名为 " + JoinWith(cleaned, " 或 ") + " 的文件";
     }
     case RuleField::kType:
-      return clause.type == RuleTypeValue::kFolder ? "仅目录" : "仅普通文件";
+      return "类型 = " + std::string(TypeDisplayName(clause.type));
     case RuleField::kSize: {
       const std::string low =
           FormatBytes(clause.size_low) + " " + UnitSuffix(clause.unit);
@@ -303,6 +418,16 @@ std::string SummarizeClause(const FilterClauseDraft& clause) {
           return "修改日期在 " + clause.date_low + " 至 " + clause.date_high;
       }
       break;
+    case RuleField::kUid:
+      return IdSummary("属主 uid", clause.uid, clause.uid_high,
+                       clause.uid_compare);
+    case RuleField::kGid:
+      return IdSummary("属组 gid", clause.gid, clause.gid_high,
+                       clause.gid_compare);
+    case RuleField::kUser:
+      return "用户 user = " + clause.user;
+    case RuleField::kGroup:
+      return "用户组 group = " + clause.group;
   }
   return "未知条件";
 }
