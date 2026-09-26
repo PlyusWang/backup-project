@@ -7,6 +7,7 @@
 #   B. CLI pipeline parity：legacy 仍然是 v0.1，出现 pipeline 选项才走 v2
 #   C. 密码只从 TTY 读：真实 PTY 集成测试（备份问两次、恢复问一次）
 #   D. CLI schedule 子命令的真实语义（无变化 skip、有变化建快照、retention）
+#   D2. review-fix 回归：enable 校验、启用时刻、clear-filters、baseline 绑定
 #   E. 跨前端：GUI 写的计划 CLI 读得到，CLI 写的计划 GUI 读得到
 #   F. 计划快照是完整独立备份：单独拷出来也必须能恢复
 #
@@ -412,6 +413,150 @@ if command -v flock >/dev/null 2>&1; then
   wait "$LOCK_PID" 2>/dev/null || true
 else
   echo "  SKIP  D.36/D.37 flock 不可用"
+fi
+
+# ============================================================
+echo "[schedule-test] D2. review-fix：enable 校验 / clear-filters / baseline"
+# ============================================================
+#
+# 这一区对应 GPT 源码 review 提出的问题：
+#   * enable 之前必须真的配好仓库（CLI 与 GUI 用同一个校验）；
+#   * 已经启用的计划，任何一次修改之后都必须仍然"真的能跑"；
+#   * 首次启用把下一次运行排在一个完整周期之后；
+#   * manifest 必须绑定到仓库里真实存在的 baseline 快照，删掉它就必须重建；
+#   * --clear-filters 让 CLI 也能清空规则（之前只能不断 append）。
+
+FIX="$TEST_ROOT/fix"
+mkdir -p "$FIX/src" "$FIX/repo-a" "$FIX/repo-b"
+printf 'fix\n' > "$FIX/src/a.txt"
+FIX_CONFIG="$FIX/config.json"
+FIX_STORE="$FIX/schedule.json"
+
+# ---- 没配仓库时不许"启用" ----
+expect_exit "D2.01 未配仓库也能先写好计划（未启用）" 0 \
+  "$BACKUPCTL" --config-file "$FIX_CONFIG" --schedule-file "$FIX_STORE" schedule set \
+  --source "$FIX/src" --interval-minutes 60
+expect_exit "D2.02 没有仓库时 schedule enable 必须失败" 1 \
+  "$BACKUPCTL" --config-file "$FIX_CONFIG" --schedule-file "$FIX_STORE" schedule enable
+expect_grep "D2.03 报错点名仓库没配" "No backup repository is configured"
+"$BACKUPCTL" --config-file "$FIX_CONFIG" --schedule-file "$FIX_STORE" schedule show >"$OUT" 2>&1
+expect_grep "D2.04 enable 失败之后仍然是未启用" "Enabled:        no"
+
+# ---- 配好仓库后启用；下一次运行必须在一个周期之后 ----
+expect_exit "D2.05 config repository set" 0 \
+  "$BACKUPCTL" --config-file "$FIX_CONFIG" config repository set "$FIX/repo-a"
+ENABLED_AT="$(date +%s)"
+expect_exit "D2.06 schedule enable" 0 \
+  "$BACKUPCTL" --config-file "$FIX_CONFIG" --schedule-file "$FIX_STORE" schedule enable
+NEXT_RUN="$(sed -n 's/.*"next_run_time_sec": \(-\{0,1\}[0-9]*\).*/\1/p' "$FIX_STORE" | head -1)"
+DELTA=$(( NEXT_RUN - ENABLED_AT ))
+if [ "$DELTA" -ge 3595 ] && [ "$DELTA" -le 3610 ]; then
+  record_pass "D2.07 首次启用把下一次运行排在一个周期之后（delta=$DELTA 秒）"
+else
+  record_fail "D2.07 首次启用把下一次运行排在一个周期之后" "delta=$DELTA 秒"
+fi
+
+# ---- 已启用时改坏 source：拒绝，且旧配置原样保留 ----
+expect_exit "D2.08 已启用时非法 source 被拒绝" 1 \
+  "$BACKUPCTL" --config-file "$FIX_CONFIG" --schedule-file "$FIX_STORE" schedule set \
+  --source /does/not/exist
+expect_grep "D2.09 报错说明源目录不可用" "Schedule source directory"
+"$BACKUPCTL" --config-file "$FIX_CONFIG" --schedule-file "$FIX_STORE" schedule show >"$OUT" 2>&1
+expect_grep "D2.10 被拒绝后旧 source 原样保留" "$FIX/src"
+expect_grep "D2.11 被拒绝后仍然启用" "Enabled:        yes"
+
+# ---- 已启用 + 仓库缺失：任何修改都必须被拒绝 ----
+expect_exit "D2.12 已启用但仓库缺失时 schedule set 被拒绝" 1 \
+  "$BACKUPCTL" --config-file "$FIX/no-config.json" --schedule-file "$FIX_STORE" schedule set \
+  --interval-minutes 30
+expect_grep "D2.13 报错点名仓库没配" "No backup repository is configured"
+"$BACKUPCTL" --config-file "$FIX_CONFIG" --schedule-file "$FIX_STORE" schedule show >"$OUT" 2>&1
+expect_grep "D2.14 被拒绝后旧周期原样保留" "Interval:       60 minute(s)"
+
+# ---- --clear-filters ----
+"$BACKUPCTL" --config-file "$FIX_CONFIG" --schedule-file "$FIX_STORE" schedule set \
+  --include 'ext:cpp' --exclude 'path:**/build/**' >/dev/null 2>&1
+"$BACKUPCTL" --config-file "$FIX_CONFIG" --schedule-file "$FIX_STORE" schedule show >"$OUT" 2>&1
+expect_grep "D2.15 规则先追加进来" "Include rules:  ext:cpp"
+expect_grep "D2.16 exclude 也追加进来了" "Exclude rules:  path:**/build/**"
+
+expect_exit "D2.17 --clear-filters + 新规则" 0 \
+  "$BACKUPCTL" --config-file "$FIX_CONFIG" --schedule-file "$FIX_STORE" schedule set \
+  --clear-filters --include 'ext:txt;md'
+"$BACKUPCTL" --config-file "$FIX_CONFIG" --schedule-file "$FIX_STORE" schedule show >"$OUT" 2>&1
+expect_grep "D2.18 clear 之后 include 只剩新的" "Include rules:  ext:txt;md"
+expect_grep "D2.19 clear 之后 exclude 被清空" "Exclude rules:  (none)"
+
+expect_exit "D2.20 --include 写在 --clear-filters 之前也一样" 0 \
+  "$BACKUPCTL" --config-file "$FIX_CONFIG" --schedule-file "$FIX_STORE" schedule set \
+  --include 'ext:cpp' --clear-filters --include 'ext:txt'
+"$BACKUPCTL" --config-file "$FIX_CONFIG" --schedule-file "$FIX_STORE" schedule show >"$OUT" 2>&1
+expect_grep "D2.21 顺序无关：两条新规则都在" "Include rules:  ext:cpp, ext:txt"
+
+expect_exit "D2.22 只给 --clear-filters" 0 \
+  "$BACKUPCTL" --config-file "$FIX_CONFIG" --schedule-file "$FIX_STORE" schedule set \
+  --clear-filters
+"$BACKUPCTL" --config-file "$FIX_CONFIG" --schedule-file "$FIX_STORE" schedule show >"$OUT" 2>&1
+expect_grep "D2.23 规则被清空" "Include rules:  (none)"
+
+# ---- baseline：删掉最新快照之后必须重建，而不是 skip ----
+expect_exit "D2.24 建立 baseline" 0 \
+  "$BACKUPCTL" --config-file "$FIX_CONFIG" --schedule-file "$FIX_STORE" schedule run
+expect_grep "D2.25 建立的是完整快照" "Created a new full snapshot"
+FIX_BAK="$(ls -t "$FIX/repo-a" | head -1)"
+expect_exit "D2.26 源没变时照样 skip" 0 \
+  "$BACKUPCTL" --config-file "$FIX_CONFIG" --schedule-file "$FIX_STORE" schedule run
+expect_grep "D2.27 无变化跳过" "Skipped: the source has not changed"
+
+rm -f "$FIX/repo-a/$FIX_BAK"
+expect_exit "D2.28 手工删掉 baseline 之后再跑一轮" 0 \
+  "$BACKUPCTL" --config-file "$FIX_CONFIG" --schedule-file "$FIX_STORE" schedule run
+expect_grep "D2.29 明确报告基线被重建" "baseline reset"
+expect_grep "D2.30 建立的是新的完整快照" "Created a new full snapshot"
+FIX_COUNT_A="$(ls "$FIX/repo-a" | wc -l)"
+if [ "$FIX_COUNT_A" = "1" ]; then
+  record_pass "D2.31 仓库里又恰好只剩一份快照"
+else
+  record_fail "D2.31 仓库里又恰好只剩一份快照" "实际 $FIX_COUNT_A 份"
+fi
+
+expect_exit "D2.32 重建之后源没变，继续 skip" 0 \
+  "$BACKUPCTL" --config-file "$FIX_CONFIG" --schedule-file "$FIX_STORE" schedule run
+expect_grep "D2.33 新的 baseline 生效" "Skipped: the source has not changed"
+
+# ---- 换仓库：新仓库必须拿到一份 baseline ----
+expect_exit "D2.34 换到另一个仓库" 0 \
+  "$BACKUPCTL" --config-file "$FIX_CONFIG" config repository set "$FIX/repo-b"
+expect_exit "D2.35 换仓库后立即检查并运行" 0 \
+  "$BACKUPCTL" --config-file "$FIX_CONFIG" --schedule-file "$FIX_STORE" schedule run
+expect_grep "D2.36 新仓库拿到的是基线快照" "baseline reset"
+FIX_COUNT_B="$(ls "$FIX/repo-b" | wc -l)"
+if [ "$FIX_COUNT_B" = "1" ]; then
+  record_pass "D2.37 新仓库里有且只有一份快照"
+else
+  record_fail "D2.37 新仓库里有且只有一份快照" "实际 $FIX_COUNT_B 份"
+fi
+FIX_COUNT_A2="$(ls "$FIX/repo-a" | wc -l)"
+if [ "$FIX_COUNT_A2" = "1" ]; then
+  record_pass "D2.38 旧仓库没有被写入"
+else
+  record_fail "D2.38 旧仓库没有被写入" "实际 $FIX_COUNT_A2 份"
+fi
+
+# ---- 手工构造 manual + incremental：必须明确失败，绝不偷偷按全量跑 ----
+FIX_BAD="$FIX/bad-schedule.json"
+sed -e 's/"trigger": "scheduled"/"trigger": "manual"/' \
+    -e 's/"strategy": "full"/"strategy": "incremental"/' \
+    "$FIX_STORE" > "$FIX_BAD"
+expect_exit "D2.39 手改出来的 manual + incremental 在运行期被拒绝" 1 \
+  "$BACKUPCTL" --config-file "$FIX_CONFIG" --schedule-file "$FIX_BAD" schedule run
+expect_grep "D2.40 拒绝原因点名组合" "Unsupported backup mode: Manual + Incremental"
+FIX_BAK_BEFORE="$(ls "$FIX/repo-b" | wc -l)"
+FIX_BAK_AFTER="$(ls "$FIX/repo-b" | wc -l)"
+if [ "$FIX_BAK_BEFORE" = "$FIX_BAK_AFTER" ]; then
+  record_pass "D2.41 没有偷偷生成全量备份"
+else
+  record_fail "D2.41 没有偷偷生成全量备份" "$FIX_BAK_BEFORE -> $FIX_BAK_AFTER"
 fi
 
 # ============================================================
