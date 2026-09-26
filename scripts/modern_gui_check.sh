@@ -10,7 +10,7 @@
 #   2. offscreen 启动自检：QML 运行期告警会让进程自己以非 0 退出。
 #   3. qmllint 静态检查；机器上没装就明确说“跳过”，而不是静默算通过。
 #   4. 几条 grep 断言：资源清单、忙时禁用、拒绝假进度、拒绝网络栈，
-#      以及 repository-driven 架构约束（四页结构、没有 standalone 恢复页、
+#      以及 repository-driven 架构约束（五页结构、没有 standalone 恢复页、
 #      QML 不出现 archive 完整路径、不自己拼 repository 路径）。
 #   5. --self-test 真跑一次 direct archive 打包 + 解包，再用 diff -r 比对目录树；
 #      顺带断言这条 direct 测试路径的产物仍是 legacy v0.1
@@ -29,7 +29,7 @@
 #      产品 CLI 没有 --password 选项）；--backup-options-test 走真实控制器路径
 #      验证解析表、四种算法组合、密码校验、未知 key、加密与 legacy 恢复、
 #      目录字段、密码不落盘。
-#  12. 截图（写进 tests/output/，评审产物不进仓库）：两套主题 × 四页 +
+#  12. 截图（写进 tests/output/，评审产物不进仓库）：两套主题 × 五页 +
 #      高级选项展开 + 加密恢复密码对话框。
 #
 # 所有 GUI 调用都带 --config-file 指向临时目录，并且导出临时 XDG_CONFIG_HOME：
@@ -179,12 +179,18 @@ fi
 # 其它任何 Warning / Error / Info 一律算未知问题，直接判失败。
 classify_qmllint() {
   awk '
-    BEGIN { prev_panel_allowed = 0 }
+    BEGIN { prev_panel_allowed = 0; prev_allowed_file = "" }
     # 上一条诊断是否“已精确放行且来自 FilterEditorPanel.qml”。
     # 只用来放行紧跟其后的那条 companion Info，遇到任何别的诊断立即清空。
-    function MarkAllowed(msg) {
+    # prev_allowed_file 同时记下这条已放行诊断来自哪个文件：companion Info
+    # 自己不带文件名，只有“紧跟在同文件的已放行诊断之后”才允许放行，
+    # 免得变成“全局允许某类提示”。
+    function MarkAllowed(msg,    file) {
       print "ALLOWED\t" msg
-      prev_panel_allowed = (msg ~ /FilterEditorPanel\.qml/) ? 1 : 0
+      file = ""
+      if (match(msg, /[A-Za-z_]+\.qml/)) file = substr(msg, RSTART, RLENGTH)
+      prev_panel_allowed = (file ~ /FilterEditorPanel\.qml/) ? 1 : 0
+      prev_allowed_file = file
     }
     function classify(msg, snippet) {
       # 既有放行：上下文属性 theme / controller / useNativeFrame，以及委托里的
@@ -210,9 +216,18 @@ classify_qmllint() {
       # PR #12：紧随上述已放行主诊断的 companion Info（qmllint 不给它文件路径）。
       # 只认这一句精确文本，且只在直接前一条是 FilterEditorPanel.qml 的已放行诊断时才放行；
       # 放行后立刻清状态，避免变成“全局允许某类提示”。
-      if (msg ~ /^Info: ruleModel is a member of a parent element\.?$/ && prev_panel_allowed == 1) {
+      if (msg ~ /^Info: (ruleModel|modelData) is a member of a parent element\.?$/ &&
+          (prev_panel_allowed == 1 || prev_allowed_file ~ /SchedulePage\.qml/)) {
+        print "ALLOWED\t" msg
+        # 不清状态：SchedulePage 的委托用 required property var modelData，
+        # qmllint 会在这条之后紧跟一条不带文件名的通用 Info，两条属于同一份诊断。
+        return
+      }
+      if (msg ~ /^Info: You first have to give the element an id\.?$/ &&
+          prev_allowed_file ~ /SchedulePage\.qml/) {
         print "ALLOWED\t" msg
         prev_panel_allowed = 0
+        prev_allowed_file = ""
         return
       }
       # AppComboBox 的静态工具局限（runtime 已实测正常：gui-all 0 warning、
@@ -232,6 +247,16 @@ classify_qmllint() {
           (snippet ~ /theme\./ || snippet ~ /control\./)) {
         print "ALLOWED\t" msg; return
       }
+      # PR #17：SchedulePage.qml 只引用两个上下文属性 —— main.cpp 注册的
+      # schedule（定时备份控制器）与本页自己的根 id page。qmllint 不认识上下文
+      # 属性，凡是引用都会报 Unqualified access。放行规则同样精确限定到
+      # "这个文件 + 这两个名字"，而不是按文件整体放行。
+      # 委托里的 modelData 由上面第一条规则放行，紧随其后的 companion Info
+      # 再由下面那条按 prev_allowed_file 放行。
+      if (msg ~ /Unqualified access/ && msg ~ /SchedulePage\.qml/ &&
+          (snippet ~ /schedule\./ || snippet ~ /page\./)) {
+        MarkAllowed(msg); return
+      }
       if (msg ~ /Cannot defer property assignment to "contentItem"/) {
         MarkAllowed(msg); return
       }
@@ -247,6 +272,7 @@ classify_qmllint() {
         MarkAllowed(msg); return
       }
       prev_panel_allowed = 0
+      prev_allowed_file = ""
       print "UNKNOWN\t" msg
     }
     /^Info: Did you mean/ { next }
@@ -323,13 +349,13 @@ else
   record_fail "有 QML 文件没进资源清单"
 fi
 
-# 页面结构：首页 / 备份 / 备份管理 / 设置 四页。
+# 页面结构：首页 / 备份 / 自动备份 / 备份管理 / 设置 五页。
 # 恢复已经不是独立页面，而是备份管理页里的一个动作 —— 这几条断言把结构钉死，
 # 免得日后又长回一个"恢复页"。
-expect_count "$QML_DIR/Main.qml" "NavItem {" 4 \
-  "侧栏有四个导航项（首页 / 备份 / 备份管理 / 设置）"
-expect_count "$QML_DIR/Main.qml" "opacity: root.currentPage === " 4 \
-  "StackLayout 里四页各自绑定可见性"
+expect_count "$QML_DIR/Main.qml" "NavItem {" 5 \
+  "侧栏有五个导航项（首页 / 备份 / 自动备份 / 备份管理 / 设置）"
+expect_count "$QML_DIR/Main.qml" "opacity: root.currentPage === " 5 \
+  "StackLayout 里五页各自绑定可见性"
 expect_count_re "$QML_DIR/Main.qml" "^[[:space:]]*currentIndex: root.currentPage" 1 \
   "StackLayout 跟随 root.currentPage"
 if grep -rq 'OperationPage' "$QML_DIR" "$RESOURCE_FILE"; then
@@ -1045,7 +1071,7 @@ fi
 printf '{\n  "version": 1,\n  "backup_repository_path": "%s"\n}\n' "$SHOT_PLAIN_REPO" > "$SHOT_PLAIN_CFG"
 printf '{\n  "version": 1,\n  "backup_repository_path": "%s"\n}\n' "$SHOT_ENC_REPO" > "$SHOT_ENC_CFG"
 
-# 一轮截图 = 八张固定状态（四页 × 两主题）+ 高级选项展开两张（两主题）
+# 一轮截图 = 十张固定状态（五页 × 两主题）+ 高级选项展开两张（两主题）
 # + 调用方追加的状态（只有加密仓库那一轮才有恢复密码对话框）。
 shot_run() {
   local label="$1"
@@ -1063,6 +1089,7 @@ shot_run() {
     return
   fi
   local expected="home-light home-dark backup-light backup-dark"
+  expected="$expected schedule-light schedule-dark"
   expected="$expected management-light management-dark"
   expected="$expected settings-light settings-dark"
   expected="$expected backup-expanded-light backup-expanded-dark"
@@ -1294,6 +1321,160 @@ check_dialog_padding() {
 check_dialog_padding "$QML_DIR/components/BackupRecordCard.qml" restorePasswordDialog
 check_dialog_padding "$QML_DIR/components/BackupRecordCard.qml" deleteConfirmDialog
 check_dialog_padding "$QML_DIR/Main.qml" busyCloseDialog
+
+echo "[modern-gui] 15) 自动备份页（Scheduled + Full）"
+
+SCHEDULE_PAGE_QML="$QML_DIR/pages/SchedulePage.qml"
+SCHEDULE_CTRL_CPP="$ROOT_DIR/ui/modern/schedule_controller.cpp"
+SCHEDULE_CTRL_H="$ROOT_DIR/ui/modern/schedule_controller.h"
+
+expect_present() {
+  local file="$1"
+  local pattern="$2"
+  local label="$3"
+  if grep -qF -- "$pattern" "$file"; then
+    record_pass "$label"
+  else
+    record_fail "$label（缺少：$pattern）"
+  fi
+}
+
+# 反向断言：界面上不该出现东西，和"该出现"一样重要。
+expect_missing() {
+  local file="$1"
+  local pattern="$2"
+  local label="$3"
+  if grep -qF -- "$pattern" "$file"; then
+    record_fail "$label（不该出现：$pattern）"
+  else
+    record_pass "$label"
+  fi
+}
+
+# --- 页面在资源清单与导航里 ---
+expect_count "$RESOURCE_FILE" "qml/pages/SchedulePage.qml" 1 \
+  "SchedulePage.qml 进了资源清单"
+expect_count "$QML_DIR/Main.qml" 'text: "自动备份"' 1 \
+  "侧栏有自动备份入口"
+expect_count "$QML_DIR/Main.qml" "SchedulePage {" 1 \
+  "StackLayout 里只有一个 SchedulePage 实例"
+
+# --- 页面上该有的控件 ---
+for name in scheduleEnabledToggle scheduleSourceField scheduleIntervalField \
+            scheduleRetainField schedulePackCombo scheduleCompressionCombo \
+            scheduleEncryptionText scheduleIncludeField scheduleExcludeField \
+            saveScheduleButton runScheduleNowButton scheduleHistoryList \
+            scheduleManagedList scheduleLastRunText scheduleNextRunText \
+            scheduleLastResultText scheduleRunnerText; do
+  expect_count "$SCHEDULE_PAGE_QML" "objectName: \"$name\"" 1 \
+    "计划页有 $name"
+done
+
+# --- 加密边界：没有任何"选加密"的入口，只有一行说明 ---
+expect_missing "$SCHEDULE_PAGE_QML" "scheduleEncryptionCombo" \
+  "加密在计划页不是可选项（没有下拉框）"
+expect_count "$SCHEDULE_PAGE_QML" "objectName: \"scheduleEncryptionNote\"" 1 \
+  "计划页写明了不加密的原因"
+expect_present "$SCHEDULE_PAGE_QML" "不会保存任何明文密码" \
+  "计划页说明不会保存明文密码"
+
+# --- 不画未实现的假按钮 ---
+expect_missing "$SCHEDULE_PAGE_QML" "incremental" \
+  "计划页没有 Incremental 假按钮"
+expect_missing "$SCHEDULE_PAGE_QML" "Realtime" \
+  "计划页没有 Realtime 假按钮"
+expect_present "$SCHEDULE_PAGE_QML" "schedule.supportedModeText" \
+  "计划页的模式说明来自共享核心，而不是 QML 自己写死"
+
+# --- 生命周期必须诚实：关掉程序就不会再跑 ---
+expect_present "$SCHEDULE_PAGE_QML" "定时任务在本程序或 backupctl schedule watch 运行期间执行" \
+  "计划页写明了定时任务只在程序运行时生效"
+
+# --- 业务逻辑不在 QML 里 ---
+expect_missing "$SCHEDULE_PAGE_QML" "Date.now" \
+  "QML 不自己算时间"
+expect_missing "$SCHEDULE_PAGE_QML" "new Date" \
+  "QML 不自己算下次运行时间"
+expect_missing "$SCHEDULE_PAGE_QML" "setInterval" \
+  "QML 不自己起定时器（tick 在 C++ 侧，判定在共享核心）"
+
+# --- 控制器只是桥：算法 key、store、核心服务全部来自共享核心 ---
+expect_present "$SCHEDULE_CTRL_CPP" "backupproject::ScheduledBackupService" \
+  "ScheduleController 直接使用共享的 ScheduledBackupService"
+expect_present "$SCHEDULE_CTRL_CPP" "backupproject::ScheduleStore" \
+  "ScheduleController 直接使用共享的 ScheduleStore"
+expect_present "$SCHEDULE_CTRL_CPP" "backupproject::ParsePackMethodKey" \
+  "算法 key 解析走共享核心的同一张表"
+expect_present "$SCHEDULE_CTRL_CPP" "backupproject::IsScheduleDue" \
+  "到点判定走共享核心"
+expect_present "$SCHEDULE_CTRL_CPP" "backup_controller_->busy()" \
+  "计划任务与手动备份共用同一个 busy 边界"
+
+# --- 窄窗口：内容必须能滚动，而不是被裁掉 ---
+expect_count "$SCHEDULE_PAGE_QML" "ScrollView {" 1 \
+  "计划页用 ScrollView 承载内容"
+expect_count "$SCHEDULE_PAGE_QML" "contentWidth: availableWidth" 1 \
+  "计划页在窄窗口下启用横向自适应"
+expect_present "$SCHEDULE_PAGE_QML" "width: Math.min(pageScroll.availableWidth - 64, 1400)" \
+  "计划页的列宽随可用宽度收缩"
+
+# --- 备份管理页的 JOIN：来源与计划变化摘要 ---
+# 这三条用 expect_present（grep -F）而不是 expect_count：模式里同时有双引号和
+# 方括号，走正则会把 ["fileName"] 当成字符类，断言就成了假阳性。
+expect_present "$QML_DIR/pages/BackupManagementPage.qml" \
+  'schedule.originForFile(String(modelData["fileName"] || ""))' \
+  "管理页向 ScheduleStore 询问每条记录的来源"
+expect_present "$QML_DIR/pages/BackupManagementPage.qml" \
+  'schedule.changesForFile(String(modelData["fileName"] || ""))' \
+  "管理页向 ScheduleStore 询问计划快照的变化摘要"
+expect_present "$QML_DIR/components/BackupRecordCard.qml" \
+  'objectName: "backupRecordOrigin"' \
+  "记录卡片展示来源"
+
+# --- 真实控制器链路自检 + 跨前端同一份 store ---
+SCHEDULE_STORE="$TEST_STATE_DIR/schedule.json"
+SCHEDULE_CONFIG="$TEST_STATE_DIR/schedule-config.json"
+set +e
+QT_QPA_PLATFORM=offscreen QSG_RHI_BACKEND=software timeout 240 \
+  ./build/backup-gui-modern --schedule-test \
+  --config-file "$SCHEDULE_CONFIG" --schedule-file "$SCHEDULE_STORE" \
+  >> "$LOG_FILE" 2>&1
+schedule_status=$?
+set -e
+if [[ "$schedule_status" -eq 0 ]]; then
+  record_pass "计划页控制器链路自检通过（$(grep -c '   ok   ' "$LOG_FILE" || true) 项观测中，最后一次为全部通过）"
+else
+  record_fail "计划页控制器链路自检退出码 $schedule_status"
+  grep 'FAIL' "$LOG_FILE" | tail -5
+fi
+if [[ -s "$SCHEDULE_STORE" ]]; then
+  record_pass "自检写出的 schedule.json 存在"
+else
+  record_fail "自检没有写出 schedule.json"
+fi
+
+# GUI 写的计划，产品 CLI 必须逐项读得到 —— 这就是"共用同一份 store"的证据。
+set +e
+./build/backupctl --config-file "$SCHEDULE_CONFIG" --schedule-file "$SCHEDULE_STORE" \
+  schedule show > "$TEST_STATE_DIR/schedule-show.txt" 2>&1
+show_status=$?
+set -e
+if [[ "$show_status" -eq 0 ]]; then
+  record_pass "backupctl schedule show 能读 GUI 写的 store"
+else
+  record_fail "backupctl schedule show 读不了 GUI 写的 store（退出码 $show_status）"
+fi
+for pattern in "Interval:       5 minute(s)" \
+               "Retain:         7 scheduled snapshot(s)" \
+               "Pack:           ustar" \
+               "Compression:    huffman" \
+               "Encryption:     none"; do
+  if grep -qF -- "$pattern" "$TEST_STATE_DIR/schedule-show.txt"; then
+    record_pass "跨前端一致：$pattern"
+  else
+    record_fail "跨前端不一致：$pattern"
+  fi
+done
 
 echo "[modern-gui] 通过 $PASS_COUNT 项，失败 $FAIL_COUNT 项"
 echo "[modern-gui] 日志: $LOG_FILE"
