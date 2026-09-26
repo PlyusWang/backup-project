@@ -26,7 +26,10 @@ CORE_SOURCES += src/core/backup_mode.cpp \
                 src/core/backup_option_keys.cpp \
                 src/core/simple_json.cpp \
                 src/platform/app_paths.cpp \
-                src/scheduler/source_manifest.cpp
+                src/scheduler/source_manifest.cpp \
+                src/scheduler/schedule_store.cpp \
+                src/scheduler/scheduled_backup_service.cpp \
+                src/scheduler/scheduler_lock.cpp
 
 FILESYSTEM_SOURCES := src/filesystem/file_system.cpp
 SOURCES := $(APP_SOURCES) $(CORE_SOURCES) $(FILESYSTEM_SOURCES)
