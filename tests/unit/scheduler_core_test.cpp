@@ -417,6 +417,158 @@ void TestManifestRejectsBadInput() {
                       error);
 }
 
+// 手工拼一个 v2 头行。字段之间是 TAB，头行以换行结束。
+std::string V2Header(const std::string& count, const std::string& snapshot,
+                     const std::string& repository, const std::string& source) {
+  return "BPMANIFEST2 " + count + "\t" + snapshot + "\t" + repository + "\t" +
+         source + "\n";
+}
+
+void TestManifestBindingFormat() {
+  test_support::Section("C2. manifest version 2 carries the baseline binding");
+  std::string error;
+  std::vector<bp::ManifestEntry> entries;
+  bp::ManifestBinding binding;
+
+  // ---- 写出：归属不完整就什么都不写 ----
+  test_support::Check(bp::SerializeManifest({}, bp::ManifestBinding()).empty(),
+                      "MAN-30 an empty binding cannot be serialized");
+  bp::ManifestBinding no_repository = MakeBinding("src-1.bak");
+  no_repository.repository_identity.clear();
+  test_support::Check(bp::SerializeManifest({}, no_repository).empty(),
+                      "MAN-31 a binding without a repository is refused");
+  bp::ManifestBinding no_source = MakeBinding("src-1.bak");
+  no_source.source_path.clear();
+  test_support::Check(bp::SerializeManifest({}, no_source).empty(),
+                      "MAN-32 a binding without a source is refused");
+  // 快照名必须是单组件："带路径分隔符"与"."/".." 都不是合法的归档名。
+  test_support::Check(
+      bp::SerializeManifest({}, MakeBinding("sub/dir.bak")).empty(),
+      "MAN-33 a snapshot name with a slash is refused");
+  test_support::Check(bp::SerializeManifest({}, MakeBinding("..")).empty(),
+                      "MAN-34 a dot-dot snapshot name is refused");
+
+  // ---- 读入：头行结构必须严格 ----
+  const std::string good = V2Header("0", "src-1.bak", "/home/u/repo", "/home/u/src");
+  test_support::Check(bp::ParseManifest(good, &entries, &binding, &error) &&
+                          entries.empty() &&
+                          binding.snapshot_file_name == "src-1.bak",
+                      "MAN-35 a well-formed version 2 header parses", error);
+  test_support::Check(
+      !bp::ParseManifest("BPMANIFEST2 0\tsrc-1.bak\t/home/u/repo\n", &entries,
+                         &binding, &error),
+      "MAN-36 a three-field version 2 header is rejected", error);
+  test_support::Check(
+      !bp::ParseManifest("BPMANIFEST2 0\tsrc-1.bak\t/home/u/repo\t/home/u/"
+                         "src\textra\n",
+                         &entries, &binding, &error),
+      "MAN-37 a five-field version 2 header is rejected", error);
+  test_support::Check(
+      !bp::ParseManifest(V2Header("0", "", "/home/u/repo", "/home/u/src"),
+                         &entries, &binding, &error),
+      "MAN-38 an empty snapshot name is rejected", error);
+  test_support::Check(
+      !bp::ParseManifest(V2Header("0", "sub/dir.bak", "/home/u/repo", "/home/u/src"),
+                         &entries, &binding, &error),
+      "MAN-39 a snapshot name with a slash is rejected", error);
+  test_support::Check(
+      !bp::ParseManifest(V2Header("0", "src-1.bak", "", "/home/u/src"), &entries,
+                         &binding, &error),
+      "MAN-40 an empty repository identity is rejected", error);
+  test_support::Check(
+      !bp::ParseManifest(
+          V2Header("0", "src-1.bak", "/home/u/repo", "/home/u/src") + "stray\n",
+          &entries, &binding, &error),
+      "MAN-41 trailing data is still rejected in version 2", error);
+  test_support::Check(
+      !bp::ParseManifest(
+          V2Header("0", std::string(5000, 'x'), "/home/u/repo", "/home/u/src"),
+          &entries, &binding, &error),
+      "MAN-42 an over-long binding field is rejected", error);
+
+  // ---- 转义：binding 的字符串字段与条目字段走同一套转义 ----
+  {
+    bp::ManifestBinding odd = MakeBinding("src-1.bak");
+    odd.repository_identity = "/home/u/back\\slash";
+    odd.source_path = "/home/u/with\ttab";
+    const std::string text = bp::SerializeManifest({}, odd);
+    std::size_t tabs = 0;
+    for (std::size_t index = 0; index < text.find('\n'); ++index) {
+      if (text[index] == '\t') ++tabs;
+    }
+    test_support::Check(tabs == 3,
+                        "MAN-43 the header keeps exactly three field separators",
+                        std::to_string(tabs));
+    bp::ManifestBinding back;
+    test_support::Check(bp::ParseManifest(text, &entries, &back, &error) &&
+                            back.snapshot_file_name == odd.snapshot_file_name &&
+                            back.repository_identity == odd.repository_identity &&
+                            back.source_path == odd.source_path,
+                        "MAN-44 binding escaping survives a round trip", error);
+  }
+
+  // ---- v1 / v2 的条目正文完全一样，只有头行不同 ----
+  {
+    const std::vector<bp::ManifestEntry> sample = {
+        MakeEntry(".", bp::EntryType::kDirectory),
+        MakeEntry("a.txt", bp::EntryType::kRegularFile),
+    };
+    const std::string v1 = bp::SerializeManifestV1(sample);
+    const std::string v2 = bp::SerializeManifest(sample, MakeBinding("src-1.bak"));
+    test_support::Check(v1.compare(0, 11, "BPMANIFEST1") == 0 &&
+                            v2.compare(0, 11, "BPMANIFEST2") == 0,
+                        "MAN-45 the two writers emit different version headers");
+    test_support::Check(v1.substr(v1.find('\n')) == v2.substr(v2.find('\n')),
+                        "MAN-46 the entry bodies are byte-identical");
+    // 同一份正文，一个带归属一个不带：这正是升级路径要区分的那件事。
+    bp::ManifestBinding from_v1;
+    bp::ManifestBinding from_v2;
+    test_support::Check(
+        bp::ParseManifest(v1, &entries, &from_v1, &error) && from_v1.empty(),
+        "MAN-47 a version 1 manifest parses with no binding", error);
+    test_support::Check(
+        bp::ParseManifest(v2, &entries, &from_v2, &error) && !from_v2.empty(),
+        "MAN-48 a version 2 manifest parses with its binding", error);
+  }
+}
+
+void TestBaselineBindingComparison() {
+  test_support::Section("C3. the manifest binding must match the state baseline");
+  const bp::ScheduleBaseline baseline = bp::BaselineOf(MakeBinding("src-1.bak"));
+
+  test_support::Check(bp::SameBaselineBinding(baseline, MakeBinding("src-1.bak")),
+                      "MAN-50 an identical binding matches");
+  // 旧格式没有归属信息，一律不可信——这里绝不猜。
+  test_support::Check(!bp::SameBaselineBinding(baseline, bp::ManifestBinding()),
+                      "MAN-51 a version 1 manifest never matches");
+  test_support::Check(!bp::SameBaselineBinding(bp::ScheduleBaseline{},
+                                               MakeBinding("src-1.bak")),
+                      "MAN-52 a missing baseline never matches");
+
+  bp::ManifestBinding other_snapshot = MakeBinding("src-1.bak");
+  other_snapshot.snapshot_file_name = "src-2.bak";
+  test_support::Check(!bp::SameBaselineBinding(baseline, other_snapshot),
+                      "MAN-53 a different snapshot name does not match");
+  bp::ManifestBinding other_repository = MakeBinding("src-1.bak");
+  other_repository.repository_identity = "/home/u/other-repo";
+  test_support::Check(!bp::SameBaselineBinding(baseline, other_repository),
+                      "MAN-54 a different repository does not match");
+  bp::ManifestBinding other_source = MakeBinding("src-1.bak");
+  other_source.source_path = "/home/u/other-src";
+  test_support::Check(!bp::SameBaselineBinding(baseline, other_source),
+                      "MAN-55 a different source does not match");
+
+  // 转换必须是双向无损的：两边字段一一对应，漏一个就会让上面每条判断失效。
+  const bp::ScheduleBaseline round_trip =
+      bp::BaselineOf(bp::BindingOf(baseline));
+  test_support::Check(round_trip.snapshot_file_name ==
+                              baseline.snapshot_file_name &&
+                          round_trip.repository_identity ==
+                              baseline.repository_identity &&
+                          round_trip.source_path == baseline.source_path,
+                      "MAN-56 baseline and binding convert losslessly");
+}
+
 // ---- D. 变化检测 ----
 
 void TestChangeDetection() {
@@ -631,6 +783,8 @@ int main() {
   TestSimpleJson();
   TestManifestFromTree();
   TestManifestRejectsBadInput();
+  TestManifestBindingFormat();
+  TestBaselineBindingComparison();
   TestChangeDetection();
   TestChangeDetectionFromTrees();
   test_support::RemoveTree(test_support::TempRoot());

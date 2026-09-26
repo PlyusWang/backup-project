@@ -8,6 +8,7 @@
 #   C. 密码只从 TTY 读：真实 PTY 集成测试（备份问两次、恢复问一次）
 #   D. CLI schedule 子命令的真实语义（无变化 skip、有变化建快照、retention）
 #   D2. review-fix 回归：enable 校验、启用时刻、clear-filters、baseline 绑定
+#   D3. 崩溃一致性：archive / manifest / schedule.json 的中间状态（C0-C8）
 #   E. 跨前端：GUI 写的计划 CLI 读得到，CLI 写的计划 GUI 读得到
 #   F. 计划快照是完整独立备份：单独拷出来也必须能恢复
 #
@@ -560,6 +561,166 @@ else
 fi
 
 # ============================================================
+echo "[schedule-test] D3. 崩溃一致性：manifest 必须写明它属于哪一份快照"
+# ============================================================
+#
+# archive / manifest / schedule.json 是三个独立文件，各自原子替换，**没有任何
+# 时刻能让三个一起提交**。所以"崩在两次写盘之间"留下的中间状态不是假想，
+# 而是必然会出现的真实磁盘状态。D3 把每一种都摆出来，钉住同一条不变式：
+#
+#   只有 manifest 自己声明的归属与 state 记录的 baseline 完全一致，
+#   才允许由 "manifest == current" 推出"可以跳过"。
+#
+# 任何一环对不上都必须重建一份完整基线快照：多建一份是安全的代价，
+# 错误跳过是一个补不回来的数据缺口。
+#
+# 素材全部由真实运行产生，场景只做搬运与就地篡改——不手写字节。
+
+CC="$TEST_ROOT/crash-cut"
+rm -rf "$CC"
+mkdir -p "$CC/src" "$CC/repo"
+printf 'v1\n' > "$CC/src/file.txt"
+printf 'keep\n' > "$CC/src/keep.log"
+CC_CONFIG="$CC/config.json"
+CC_STORE="$CC/schedule.json"
+CC_MANIFEST="$CC/schedule-manifest.dat"
+CC_TAB=$'\t'
+
+"$BACKUPCTL" --config-file "$CC_CONFIG" config repository set "$CC/repo" >/dev/null 2>&1
+"$BACKUPCTL" --config-file "$CC_CONFIG" --schedule-file "$CC_STORE" schedule set \
+  --source "$CC/src" --interval-minutes 1 --retain 10 >/dev/null 2>&1
+"$BACKUPCTL" --config-file "$CC_CONFIG" --schedule-file "$CC_STORE" schedule enable >/dev/null 2>&1
+"$BACKUPCTL" --config-file "$CC_CONFIG" --schedule-file "$CC_STORE" schedule run >/dev/null 2>&1
+CC_S1="$(ls -1 "$CC/repo")"
+cp "$CC_STORE" "$CC/state-S1.json"
+cp "$CC_MANIFEST" "$CC/manifest-S1.dat"
+sleep 1
+printf 'v2\n' > "$CC/src/file.txt"
+"$BACKUPCTL" --config-file "$CC_CONFIG" --schedule-file "$CC_STORE" schedule run >/dev/null 2>&1
+CC_S2="$(ls -1 "$CC/repo" | grep -v -x "$CC_S1")"
+cp "$CC_STORE" "$CC/state-S2.json"
+cp "$CC_MANIFEST" "$CC/manifest-S2.dat"
+
+if [ -n "$CC_S1" ] && [ -n "$CC_S2" ] && [ "$CC_S1" != "$CC_S2" ]; then
+  record_pass "D3.00 两轮真实运行拿到两份不同的快照"
+else
+  record_fail "D3.00 两轮真实运行拿到两份不同的快照" "S1=$CC_S1 S2=$CC_S2"
+fi
+
+# cc_place <state 素材|-> <manifest 素材|->：把磁盘摆成某个中间状态。
+cc_place() {
+  case "$1" in -) rm -f "$CC_STORE" ;; *) cp "$CC/$1" "$CC_STORE" ;; esac
+  case "$2" in -) rm -f "$CC_MANIFEST" ;; *) cp "$CC/$2" "$CC_MANIFEST" ;; esac
+}
+
+# cc_case <编号> <说明> <期望结果 key> [恢复检查编号]
+# 跑一轮真实 CLI 评估，从 history 读回结果；只要这一轮真的新建了快照，
+# 就把它**单独拷出来**恢复，与当前源逐字节比较。
+cc_case() {
+  local id="$1" label="$2" expect="$3" recovery_id="${4:-}"
+  local result new
+  ls -1 "$CC/repo" | sort > "$CC/before.txt"
+  "$BACKUPCTL" --config-file "$CC_CONFIG" --schedule-file "$CC_STORE" schedule run >"$OUT" 2>&1
+  result="$("$BACKUPCTL" --config-file "$CC_CONFIG" --schedule-file "$CC_STORE" schedule history 2>/dev/null |
+            awk 'NR>1 && NF>1 {k=$3} END{print k}')"
+  ls -1 "$CC/repo" | sort > "$CC/after.txt"
+  new="$(comm -13 "$CC/before.txt" "$CC/after.txt" | head -1)"
+  if [ "$result" = "$expect" ]; then
+    record_pass "$id $label（$result）"
+  else
+    record_fail "$id $label" "期望 $expect，实际 $result: $(first_line)"
+  fi
+  if [ -n "$recovery_id" ] && [ -n "$new" ]; then
+    rm -rf "$CC/restored"
+    if "$BACKUPCTL" restore "$CC/repo/$new" "$CC/restored" >/dev/null 2>&1 &&
+       diff -r "$CC/src" "$CC/restored" >/dev/null 2>&1; then
+      record_pass "$recovery_id 新建的 $new 单独恢复 == 当前源"
+    else
+      record_fail "$recovery_id 新建的 $new 单独恢复 == 当前源" "恢复结果与源不一致"
+    fi
+  fi
+}
+
+# ---- C0：正常配对。这是唯一允许 skip 的形状 ----
+cc_place state-S2.json manifest-S2.dat
+cc_case "D3.01" "正常配对、源没变，必须 skip" "skipped_no_changes"
+
+# ---- C1：真实 bug。崩在 SaveManifest 与 Save(state) 之间 ----
+# state 还停在 S1，manifest 却已经是 S2 的（内容 = M2），两份归档都在。
+# S1 依然存在、依然 managed，manifest 也依然等于当前源——只比这两条就会
+# 错误地跳过一轮，而仓库里根本没有任何一份快照装得下 M2。
+cc_place state-S1.json manifest-S2.dat
+cc_case "D3.02" "旧 state + 新 manifest 绝不能 skip" "success_created" "D3.03"
+expect_grep "D3.04 明确报告基线被重建" "baseline reset"
+CC_COUNT="$(ls -1 "$CC/repo" | wc -l)"
+if [ "$CC_COUNT" = "3" ]; then
+  record_pass "D3.05 仓库里现在是三份快照（S1、S2、重建的那一份）"
+else
+  record_fail "D3.05 仓库里现在是三份快照（S1、S2、重建的那一份）" "实际 $CC_COUNT 份"
+fi
+# 重建之后必须收敛：源没再变，下一轮回到正常的 skip。
+cc_case "D3.06" "重建之后源没变，下一轮回到 skip" "skipped_no_changes"
+
+# ---- C2：崩在另一次写盘之间——state 前进了，manifest 还停在旧的 ----
+cc_place state-S2.json manifest-S1.dat
+cc_case "D3.07" "新 state + 旧 manifest 绝不能 skip" "success_created" "D3.08"
+
+# ---- C3：manifest 整个不见了 ----
+cc_place state-S2.json -
+cc_case "D3.09" "manifest 不见了，必须重建完整基线" "success_created" "D3.10"
+
+# ---- C4：manifest 被截断（真实的"写到一半掉电"形状）----
+head -c 64 "$CC/manifest-S2.dat" > "$CC/truncated.dat"
+cc_place state-S2.json truncated.dat
+cc_case "D3.11" "manifest 被截断，必须重建完整基线" "success_created" "D3.12"
+
+# ---- C5：旧版本留下的 v1 manifest：读得出来，但没有归属信息 ----
+{
+  printf 'BPMANIFEST1 %s\n' "$(sed -n '1s/^BPMANIFEST2 \([0-9]*\).*/\1/p' "$CC/manifest-S2.dat")"
+  tail -n +2 "$CC/manifest-S2.dat"
+} > "$CC/v1.dat"
+if head -n 1 "$CC/v1.dat" | grep -q '^BPMANIFEST1 '; then
+  record_pass "D3.13 造出了一份真正的 v1 manifest（条目正文不变、没有 binding）"
+else
+  record_fail "D3.13 造出了一份真正的 v1 manifest（条目正文不变、没有 binding）" "$(head -n 1 "$CC/v1.dat")"
+fi
+cc_place state-S2.json v1.dat
+cc_case "D3.14" "v1 manifest 绝不是可信基线" "success_created" "D3.15"
+expect_grep "D3.16 诊断点明 manifest 来自旧版本" "older version"
+if head -n 1 "$CC_MANIFEST" | grep -q '^BPMANIFEST2 '; then
+  record_pass "D3.17 重建出来的 manifest 是 version 2（升级不会永远重建下去）"
+else
+  record_fail "D3.17 重建出来的 manifest 是 version 2（升级不会永远重建下去）" "$(head -n 1 "$CC_MANIFEST")"
+fi
+
+# ---- C6：state 与 manifest 都指向 S2，但 S2 的归档已经被外部删掉 ----
+cc_place state-S2.json manifest-S2.dat
+rm -f "$CC/repo/$CC_S2"
+cc_case "D3.18" "baseline 归档不见了，必须重建完整基线" "success_created" "D3.19"
+
+# ---- C7：manifest 自己声明的仓库与 state 不一致 ----
+sed "1s|${CC_TAB}${CC}/repo${CC_TAB}|${CC_TAB}/tmp/other-repository${CC_TAB}|" \
+  "$CC/manifest-S2.dat" > "$CC/other-repo.dat"
+if cmp -s "$CC/manifest-S2.dat" "$CC/other-repo.dat"; then
+  record_fail "D3.20 篡改 manifest 的仓库字段确实生效了" "字节没有变化"
+else
+  record_pass "D3.20 篡改 manifest 的仓库字段确实生效了"
+fi
+cc_place state-S2.json other-repo.dat
+cc_case "D3.21" "manifest 声明的是别的仓库，绝不能 skip" "success_created" "D3.22"
+
+# ---- C8：manifest 自己声明的源与 state 不一致（源是头行最后一个字段）----
+sed "1s|${CC_TAB}${CC}/src\$|${CC_TAB}/tmp/other-source|" \
+  "$CC/manifest-S2.dat" > "$CC/other-src.dat"
+if cmp -s "$CC/manifest-S2.dat" "$CC/other-src.dat"; then
+  record_fail "D3.23 篡改 manifest 的源字段确实生效了" "字节没有变化"
+else
+  record_pass "D3.23 篡改 manifest 的源字段确实生效了"
+fi
+cc_place state-S2.json other-src.dat
+cc_case "D3.24" "manifest 声明的是别的源，绝不能 skip" "success_created" "D3.25"
+
+# ============================================================
 echo "[schedule-test] E. 跨前端：GUI 与 CLI 共用同一份 store"
 # ============================================================
 
@@ -615,7 +776,8 @@ else
   expect_grep "E.15 GUI 报告的加密始终是 none" "encryption=none"
 
   # 两边对同一份 store 的"不会漂移"是结构性的：只有一份 parser。
-  if [ "$(grep -c 'BPMANIFEST1' "$ROOT_DIR/src/scheduler/source_manifest.cpp")" -ge 1 ] &&
+  if [ "$(grep -c 'BPMANIFEST2' "$ROOT_DIR/src/scheduler/source_manifest.cpp")" -ge 1 ] &&
+     [ "$(grep -c 'BPMANIFEST1' "$ROOT_DIR/src/scheduler/source_manifest.cpp")" -ge 1 ] &&
      [ "$(grep -rl 'schedule_store.h' "$ROOT_DIR/src" "$ROOT_DIR/app" "$ROOT_DIR/ui" | wc -l)" -ge 3 ]; then
     record_pass "E.16 只有一份 schedule store 实现被三个前端共用"
   else
