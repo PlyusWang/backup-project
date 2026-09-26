@@ -182,6 +182,22 @@ struct ScheduleBaseline {
   std::string source_path;
 };
 
+// ScheduleBaseline <-> ManifestBinding：两边字段一一对应，但刻意是两个类型。
+//
+// ScheduleBaseline 是**运行状态**里记的归属（"我以为上一份 manifest 属于谁"）；
+// ManifestBinding 是 **manifest 文件自己声明**的归属（"这份清单属于谁"）。
+// 崩溃一致性靠的就是这两者必须对上：只有它们完全一致，才能相信
+// "manifest 与当前源相同"等价于"仓库里那份 baseline 快照装的就是当前源"。
+ManifestBinding BindingOf(const ScheduleBaseline& baseline);
+ScheduleBaseline BaselineOf(const ManifestBinding& binding);
+
+// manifest 自己声明的归属与 state 记录的 baseline 是不是**同一对**。
+//
+// 空 binding（version 1 格式）一律返回 false：旧格式没有这层信息，不能猜。
+// 任何一个字段不同也返回 false——包括"快照名字相同但仓库/源不同"这种。
+bool SameBaselineBinding(const ScheduleBaseline& baseline,
+                         const ManifestBinding& binding);
+
 struct ScheduleState {
   // 下一次应该运行的时间（Unix epoch 秒）。0 表示"还没算过"。
   std::int64_t next_run_time_sec = 0;
@@ -235,9 +251,18 @@ class ScheduleStore {
   // 按同一语义处理，但调用方应当把 error_message 记进诊断里，不要假装无事发生。
   enum class ManifestLoadStatus { kLoaded, kMissing, kError };
 
+  // binding 是 manifest **自己声明**的归属。读到 version 1 文件时它留空，
+  // 表示"这份 manifest 不知道自己属于谁"——调用方不得把它当成可信基线。
+  //
+  // 解析成功但 binding 不合法（快照名不是合法的单组件 .bak 名字、字段超长、
+  // 含 NUL）算 kError：这是坏文件，不是旧文件。
   ManifestLoadStatus LoadManifest(std::vector<ManifestEntry>* entries,
+                                  ManifestBinding* binding,
                                   std::string* error_message) const;
+
+  // binding 必须完整合法，否则拒绝写入——绝不落一份归属不明的 manifest。
   bool SaveManifest(const std::vector<ManifestEntry>& entries,
+                    const ManifestBinding& binding,
                     std::string* error_message) const;
   bool RemoveManifest(std::string* error_message) const;
 

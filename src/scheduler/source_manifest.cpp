@@ -156,6 +156,92 @@ bool LessByArchivePath(const ManifestEntry& left, const ManifestEntry& right) {
   return left.archive_path < right.archive_path;
 }
 
+// binding 里那份快照名字的**结构**检查：必须是一个单组件文件名——不带路径
+// 分隔符、不是 "." / ".."、不含 NUL。".bak 后缀"这条更具体的归档命名规则属于
+// BackupCatalog / ScheduleStore 那一层，由 ScheduleStore::LoadManifest 再校验
+// 一次；两层各守自己的规则，谁也不替谁放宽。
+bool IsPlainSingleComponentName(const std::string& name) {
+  if (name.empty()) return false;
+  if (name == "." || name == "..") return false;
+  if (name.find('/') != std::string::npos) return false;
+  if (name.find('\\') != std::string::npos) return false;
+  if (name.find('\0') != std::string::npos) return false;
+  return true;
+}
+
+bool IsValidManifestBinding(const ManifestBinding& binding,
+                            std::string* error_message) {
+  if (binding.snapshot_file_name.empty()) {
+    SetError(error_message,
+             "Invalid source manifest: the baseline snapshot file name is "
+             "empty");
+    return false;
+  }
+  if (binding.repository_identity.empty()) {
+    SetError(error_message,
+             "Invalid source manifest: the baseline repository identity is "
+             "empty");
+    return false;
+  }
+  if (binding.source_path.empty()) {
+    SetError(error_message,
+             "Invalid source manifest: the baseline source path is empty");
+    return false;
+  }
+  if (binding.snapshot_file_name.size() > kMaxManifestBindingBytes ||
+      binding.repository_identity.size() > kMaxManifestBindingBytes ||
+      binding.source_path.size() > kMaxManifestBindingBytes) {
+    SetError(error_message,
+             "Invalid source manifest: a baseline binding field is too long");
+    return false;
+  }
+  if (binding.repository_identity.find('\0') != std::string::npos ||
+      binding.source_path.find('\0') != std::string::npos) {
+    SetError(error_message,
+             "Invalid source manifest: a baseline binding field contains a NUL "
+             "byte");
+    return false;
+  }
+  if (!IsPlainSingleComponentName(binding.snapshot_file_name)) {
+    SetError(error_message,
+             "Invalid source manifest: the baseline snapshot file name is not "
+             "a single path component");
+    return false;
+  }
+  return true;
+}
+
+// 条目正文。v1 与 v2 的正文格式完全一样，只有头行不同。
+void AppendManifestEntries(const std::vector<ManifestEntry>& entries,
+                           std::string* out) {
+  for (const ManifestEntry& entry : entries) {
+    *out += std::to_string(static_cast<unsigned>(entry.type));
+    *out += '\t';
+    *out += std::to_string(entry.size);
+    *out += '\t';
+    *out += std::to_string(entry.mtime_sec);
+    *out += '\t';
+    *out += std::to_string(entry.mtime_nsec);
+    *out += '\t';
+    *out += std::to_string(entry.mode);
+    *out += '\t';
+    *out += std::to_string(entry.uid);
+    *out += '\t';
+    *out += std::to_string(entry.gid);
+    *out += '\t';
+    *out += std::to_string(entry.dev_major);
+    *out += '\t';
+    *out += std::to_string(entry.dev_minor);
+    *out += '\t';
+    *out += std::to_string(entry.hardlink_degree);
+    *out += '\t';
+    *out += EscapeField(entry.archive_path);
+    *out += '\t';
+    *out += EscapeField(entry.link_target);
+    *out += '\n';
+  }
+}
+
 }  // namespace
 
 std::uint64_t ChangeSummaryTotal(const ChangeSummary& summary) {
@@ -327,47 +413,48 @@ bool DiffManifests(const std::vector<ManifestEntry>& previous,
   return true;
 }
 
-std::string SerializeManifest(const std::vector<ManifestEntry>& entries) {
+std::string SerializeManifest(const std::vector<ManifestEntry>& entries,
+                              const ManifestBinding& binding) {
+  // 归属不完整就什么都不写。调用方必须在写盘前拿到一个明确的失败，
+  // 而不是一份"看起来正常、其实不知道属于谁"的 manifest。
+  std::string binding_error;
+  if (!IsValidManifestBinding(binding, &binding_error)) return std::string();
+
+  std::string out;
+  out += "BPMANIFEST2 ";
+  out += std::to_string(entries.size());
+  out += '\t';
+  out += EscapeField(binding.snapshot_file_name);
+  out += '\t';
+  out += EscapeField(binding.repository_identity);
+  out += '\t';
+  out += EscapeField(binding.source_path);
+  out += '\n';
+  AppendManifestEntries(entries, &out);
+  return out;
+}
+
+std::string SerializeManifestV1(const std::vector<ManifestEntry>& entries) {
   std::string out;
   out += "BPMANIFEST1 ";
   out += std::to_string(entries.size());
   out += '\n';
-  for (const ManifestEntry& entry : entries) {
-    out += std::to_string(static_cast<unsigned>(entry.type));
-    out += '\t';
-    out += std::to_string(entry.size);
-    out += '\t';
-    out += std::to_string(entry.mtime_sec);
-    out += '\t';
-    out += std::to_string(entry.mtime_nsec);
-    out += '\t';
-    out += std::to_string(entry.mode);
-    out += '\t';
-    out += std::to_string(entry.uid);
-    out += '\t';
-    out += std::to_string(entry.gid);
-    out += '\t';
-    out += std::to_string(entry.dev_major);
-    out += '\t';
-    out += std::to_string(entry.dev_minor);
-    out += '\t';
-    out += std::to_string(entry.hardlink_degree);
-    out += '\t';
-    out += EscapeField(entry.archive_path);
-    out += '\t';
-    out += EscapeField(entry.link_target);
-    out += '\n';
-  }
+  AppendManifestEntries(entries, &out);
   return out;
 }
 
 bool ParseManifest(const std::string& text, std::vector<ManifestEntry>* entries,
-                   std::string* error_message) {
+                   ManifestBinding* binding, std::string* error_message) {
   if (entries == nullptr) {
     SetError(error_message, "Manifest output must not be null");
     return false;
   }
+  if (binding == nullptr) {
+    SetError(error_message, "Manifest binding output must not be null");
+    return false;
+  }
   entries->clear();
+  *binding = ManifestBinding{};
 
   if (text.size() > kMaxManifestBytes) {
     SetError(error_message, "Source manifest is too large: " +
@@ -375,8 +462,20 @@ bool ParseManifest(const std::string& text, std::vector<ManifestEntry>* entries,
     return false;
   }
 
-  const std::string header = "BPMANIFEST1 ";
-  if (text.compare(0, std::min(header.size(), text.size()), header) != 0) {
+  // 两个版本头都要认。v1 只是"读得出来"——它的 binding 会留空，调用方据此
+  // 判定这是不可信基线，走重建。升级语义因此是单向安全的。
+  const std::string header_v2 = "BPMANIFEST2 ";
+  const std::string header_v1 = "BPMANIFEST1 ";
+  bool is_version_2 = false;
+  std::size_t header_size = 0;
+  if (text.compare(0, std::min(header_v2.size(), text.size()), header_v2) ==
+      0) {
+    is_version_2 = true;
+    header_size = header_v2.size();
+  } else if (text.compare(0, std::min(header_v1.size(), text.size()),
+                          header_v1) == 0) {
+    header_size = header_v1.size();
+  } else {
     SetError(error_message,
              "Invalid source manifest: missing or wrong version header");
     return false;
@@ -386,14 +485,50 @@ bool ParseManifest(const std::string& text, std::vector<ManifestEntry>* entries,
     SetError(error_message, "Invalid source manifest: truncated header");
     return false;
   }
-  const std::string count_text =
-      text.substr(header.size(), first_newline - header.size());
-  std::uint64_t declared_count = 0;
-  if (!ParseUnsigned(count_text, &declared_count) ||
-      declared_count > kMaxManifestEntries) {
+  const std::string header_rest =
+      text.substr(header_size, first_newline - header_size);
+  if (header_rest.size() > kMaxManifestLineBytes) {
     SetError(error_message,
-             "Invalid source manifest: bad entry count '" + count_text + "'");
+             "Invalid source manifest: the header line is too long");
     return false;
+  }
+
+  std::uint64_t declared_count = 0;
+  if (is_version_2) {
+    // 头行结构固定：<count>\t<snapshot>\t<repository>\t<source>，正好四个
+    // 字段。少一个、多一个、多一个 TAB 都算坏文件——manifest 是机器写的，
+    // 不规范的字节只能说明状态坏了。
+    std::vector<std::string> header_fields;
+    if (!SplitFields(header_rest, &header_fields) ||
+        header_fields.size() != 4) {
+      SetError(error_message,
+               "Invalid source manifest: a version 2 header must have exactly "
+               "four fields");
+      return false;
+    }
+    if (!ParseUnsigned(header_fields[0], &declared_count) ||
+        declared_count > kMaxManifestEntries) {
+      SetError(error_message, "Invalid source manifest: bad entry count '" +
+                                  header_fields[0] + "'");
+      return false;
+    }
+    ManifestBinding parsed_binding;
+    if (!UnescapeField(header_fields[1], &parsed_binding.snapshot_file_name) ||
+        !UnescapeField(header_fields[2], &parsed_binding.repository_identity) ||
+        !UnescapeField(header_fields[3], &parsed_binding.source_path)) {
+      SetError(error_message,
+               "Invalid source manifest: bad baseline binding escape");
+      return false;
+    }
+    if (!IsValidManifestBinding(parsed_binding, error_message)) return false;
+    *binding = std::move(parsed_binding);
+  } else {
+    if (!ParseUnsigned(header_rest, &declared_count) ||
+        declared_count > kMaxManifestEntries) {
+      SetError(error_message, "Invalid source manifest: bad entry count '" +
+                                  header_rest + "'");
+      return false;
+    }
   }
 
   entries->reserve(static_cast<std::size_t>(declared_count));

@@ -1190,14 +1190,47 @@ bool ScheduleStore::Save(const ScheduleDocument& document,
       schedule_file_path_, SerializeScheduleDocument(document), error_message);
 }
 
+ManifestBinding BindingOf(const ScheduleBaseline& baseline) {
+  ManifestBinding binding;
+  binding.snapshot_file_name = baseline.snapshot_file_name;
+  binding.repository_identity = baseline.repository_identity;
+  binding.source_path = baseline.source_path;
+  return binding;
+}
+
+ScheduleBaseline BaselineOf(const ManifestBinding& binding) {
+  ScheduleBaseline baseline;
+  baseline.snapshot_file_name = binding.snapshot_file_name;
+  baseline.repository_identity = binding.repository_identity;
+  baseline.source_path = binding.source_path;
+  return baseline;
+}
+
+bool SameBaselineBinding(const ScheduleBaseline& baseline,
+                         const ManifestBinding& binding) {
+  // version 1 的 manifest 没有归属信息。空 binding 与空 baseline 都是
+  // "不知道属于谁"，一律判为不一致——这里绝不猜。
+  if (binding.empty()) return false;
+  if (baseline.snapshot_file_name.empty()) return false;
+  return baseline.snapshot_file_name == binding.snapshot_file_name &&
+         baseline.repository_identity == binding.repository_identity &&
+         baseline.source_path == binding.source_path;
+}
+
 ScheduleStore::ManifestLoadStatus ScheduleStore::LoadManifest(
-    std::vector<ManifestEntry>* entries, std::string* error_message) const {
+    std::vector<ManifestEntry>* entries, ManifestBinding* binding,
+    std::string* error_message) const {
   if (error_message != nullptr) error_message->clear();
   if (entries == nullptr) {
     SetError(error_message, "Manifest output must not be null");
     return ManifestLoadStatus::kError;
   }
+  if (binding == nullptr) {
+    SetError(error_message, "Manifest binding output must not be null");
+    return ManifestLoadStatus::kError;
+  }
   entries->clear();
+  *binding = ManifestBinding{};
   if (schedule_file_path_.empty()) {
     SetError(error_message,
              "Cannot load source manifest: schedule file path is empty");
@@ -1211,13 +1244,27 @@ ScheduleStore::ManifestLoadStatus ScheduleStore::LoadManifest(
     return ManifestLoadStatus::kError;
   }
   if (missing) return ManifestLoadStatus::kMissing;
-  if (!ParseManifest(text, entries, error_message)) {
+  if (!ParseManifest(text, entries, binding, error_message)) {
+    return ManifestLoadStatus::kError;
+  }
+  // 第二层校验：binding 里那份快照名还必须是一个**本仓库能管理的归档名**。
+  // 结构检查（单组件、无 NUL、有界）在 ParseManifest 里已经做过一次，
+  // 这里补上归档命名规则这一条——两份 manifest 规则各自守自己的边界，
+  // 谁也不替谁放宽。
+  if (!binding->empty() &&
+      !IsSingleComponentArchiveName(binding->snapshot_file_name)) {
+    SetError(
+        error_message,
+        "Invalid source manifest: the baseline snapshot file name is not a "
+        "manageable archive name: '" +
+            binding->snapshot_file_name + "'");
     return ManifestLoadStatus::kError;
   }
   return ManifestLoadStatus::kLoaded;
 }
 
 bool ScheduleStore::SaveManifest(const std::vector<ManifestEntry>& entries,
+                                 const ManifestBinding& binding,
                                  std::string* error_message) const {
   if (error_message != nullptr) error_message->clear();
   if (schedule_file_path_.empty()) {
@@ -1231,7 +1278,29 @@ bool ScheduleStore::SaveManifest(const std::vector<ManifestEntry>& entries,
                  " entries exceeds the bound");
     return false;
   }
-  const std::string text = SerializeManifest(entries);
+  // 归属必须完整，而且必须是一个 Catalog 认得出来的归档名。
+  if (!IsSingleComponentArchiveName(binding.snapshot_file_name)) {
+    SetError(error_message,
+             "Cannot save source manifest: the baseline snapshot file name is "
+             "not a manageable archive name: '" +
+                 binding.snapshot_file_name + "'");
+    return false;
+  }
+  if (!IsBoundedString(binding.repository_identity, kMaxScheduleStringBytes) ||
+      !IsBoundedString(binding.source_path, kMaxScheduleStringBytes) ||
+      binding.repository_identity.empty() || binding.source_path.empty()) {
+    SetError(error_message,
+             "Cannot save source manifest: the baseline binding holds an "
+             "unusable repository or source path");
+    return false;
+  }
+
+  const std::string text = SerializeManifest(entries, binding);
+  if (text.empty()) {
+    SetError(error_message,
+             "Cannot save source manifest: the baseline binding is incomplete");
+    return false;
+  }
   if (text.size() > kMaxManifestBytes) {
     SetError(error_message,
              "Cannot save source manifest: " + std::to_string(text.size()) +
