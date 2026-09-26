@@ -51,6 +51,7 @@ Linux 环境下的数据备份与恢复软件课程项目。
 - `docs/02_architecture.md`：系统设计
 - `docs/03_testing.md`：软件测试
 - `docs/04_release_and_demo.md`：发布与演示
+- `docs/backlog/backup_mode_roadmap.md`：备份触发方式 × 备份策略的后续开发路线
 
 ## 开发环境
 
