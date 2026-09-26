@@ -146,6 +146,15 @@ Item {
                 Layout.topMargin: 4
             }
 
+            // 高级选项（打包格式 / 压缩 / 加密 + 密码）：默认收起。
+            // 默认取值（mypack + 不压缩 + 不加密）与之前完全一致，
+            // 不展开就不会碰到新选项，默认产物也不会因为这一块而改变。
+            BackupOptionsPanel {
+                id: panel
+                Layout.fillWidth: true
+                Layout.topMargin: 4
+            }
+
             RowLayout {
                 Layout.fillWidth: true
                 Layout.topMargin: 14
@@ -156,8 +165,12 @@ Item {
                     text: "开始备份"
                     variant: "primary"
                     // busy 时禁用：整个程序只有一个控制器，天然保证同一时刻只有一个操作。
-                    enabled: !controller.busy
-                    onClicked: controller.startBackup()
+                    // 密码不合法（为空或两次不一致）时同样不给点：校验规则只有这两条，
+                    // 具体判定在面板里（passwordAcceptable），这一页不重复实现一遍。
+                    enabled: !controller.busy && panel.passwordAcceptable
+                    // 三个算法一律传冻结的字符串键；密码与确认密码原样交给控制器，
+                    // 界面不在这里做任何加工（不加盐、不截断、不拼进任何路径）。
+                    onClicked: controller.startBackupWithOptions(panel.packKey, panel.compressionKey, panel.encryptionKey, panel.password, panel.confirmPassword)
                 }
 
                 // 不确定进度条：核心没有百分比回调，这里只表达“在跑”。
