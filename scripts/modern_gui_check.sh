@@ -942,6 +942,33 @@ expect_count_re "$QML_DIR/components/BackupRecordCard.qml" \
   'controller\.startManagedRestoreWithPassword\(' 1 \
   "加密恢复调用 controller.startManagedRestoreWithPassword()"
 
+# 密码生命周期：产品提交路径必须在 Start() 接受任务之后才清空密码框。
+# 只断言"面板里存在 clearPasswords() 函数"是挡不住问题的 —— 本轮修掉的洞正是
+# "函数存在，但按钮压根没调用它"。所以这两条要一起看：
+#   1) 结构断言：返回值被存进 started，且 clearPasswords() 只在 started 为真时调用；
+#   2) 计数断言：这个调用在备份页里恰好一次，多出来的无保护调用会被抓住。
+# QML 折行会把这个 if 拆成三行，正则跨不了行，所以先把文件压成一行再匹配整段结构。
+SQUASHED_BACKUP_PAGE="$(tr -d '\n' < "$QML_DIR/pages/BackupPage.qml" | tr -s ' ')"
+if printf '%s' "$SQUASHED_BACKUP_PAGE" \
+    | grep -qE 'const started = controller\.startBackupWithOptions\([^)]*\) if \(started\) panel\.clearPasswords\(\)'; then
+  record_pass "备份页检查 startBackupWithOptions() 的返回值，且只有成功才 panel.clearPasswords()"
+else
+  record_fail "备份页没有把 startBackupWithOptions() 的返回值与 clearPasswords() 关联（同步校验失败时会误清密码）"
+fi
+expect_count_re "$QML_DIR/pages/BackupPage.qml" 'panel\.clearPasswords\(\)' 1 \
+  "备份页调用 panel.clearPasswords()"
+expect_count_re "$QML_DIR/components/BackupOptionsPanel.qml" 'function clearPasswords\(\)' 1 \
+  "面板提供 clearPasswords()"
+# 光有函数还不够：它必须真的把两个输入框都清掉。password / confirmPassword 是这两个
+# TextField 的 text 别名，所以清 text 就等于清掉对外暴露的那两个属性。
+SQUASHED_PANEL="$(tr -d '\n' < "$QML_DIR/components/BackupOptionsPanel.qml" | tr -s ' ')"
+if printf '%s' "$SQUASHED_PANEL" \
+    | grep -qE 'function clearPasswords\(\) \{ passwordField\.text = "" confirmField\.text = "" \}'; then
+  record_pass "clearPasswords() 同时清空 passwordField 与 confirmField"
+else
+  record_fail "clearPasswords() 没有同时清空两个输入框"
+fi
+
 # 被禁用的措辞。只认代码行：注释里写"这里绝不写校验通过"正是这些规则的用意，
 # 把解释性注释也算成违规，只会逼着人删掉解释。
 forbidden_hits="$(grep -rnE '军用级|不可破解|绝对安全|生产级安全|校验通过|HMAC verified|归档健康|密码正确|记住密码' "$QML_DIR" \

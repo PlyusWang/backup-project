@@ -170,7 +170,23 @@ Item {
                     enabled: !controller.busy && panel.passwordAcceptable
                     // 三个算法一律传冻结的字符串键；密码与确认密码原样交给控制器，
                     // 界面不在这里做任何加工（不加盐、不截断、不拼进任何路径）。
-                    onClicked: controller.startBackupWithOptions(panel.packKey, panel.compressionKey, panel.encryptionKey, panel.password, panel.confirmPassword)
+                    //
+                    // 只有控制器真的收下了这次任务（返回 true —— 此时 Start() 已经把
+                    // OperationRequest 的值拷贝交给 QtConcurrent）才清空两个密码框。
+                    // 同步校验失败时（没选源目录、没配仓库、两次不一致、未知 key）
+                    // 必须把用户已经打好的密码留着，让他改完继续提交，而不是重打一遍。
+                    // 这里也不动 encryptionKey：选中的仍然是 AES，下一次加密备份照常
+                    // 需要重新输入密码。
+                    onClicked: {
+                        const started = controller.startBackupWithOptions(
+                            panel.packKey,
+                            panel.compressionKey,
+                            panel.encryptionKey,
+                            panel.password,
+                            panel.confirmPassword)
+                        if (started)
+                            panel.clearPasswords()
+                    }
                 }
 
                 // 不确定进度条：核心没有百分比回调，这里只表达“在跑”。
