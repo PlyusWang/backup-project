@@ -11,10 +11,12 @@
 // 环境变量或 QSettings 读取任何东西。这一层因此可以独立测试，也与并行的配置
 // 模块完全解耦。
 //
-// 与归档格式的边界：Catalog 只调用 ArchiveReader::InspectHeader 读全局 header，
-// 不解析 entry、不读 payload，也不要求归档格式为列表做任何升级。因此列表里能
-// 显示的额外信息只有归档文件自己的大小与 mtime——那是文件系统属性，不是格式
-// 字段，所以不需要动 archive v0.1。
+// 与归档格式的边界：Catalog 只读归档头，不解析 entry、不读 payload，也从不要求
+// 密码。识别格式用 IdentifyArchiveFile：按 magic 区分 legacy v0.1 与 v2
+// container，并从 v2 的 160 字节外层 header 读出 pack / compression /
+// encryption 三个算法 id；legacy 归档的全局 header 仍然由
+// ArchiveReader::InspectHeader 读。归档文件的大小与 mtime 是文件系统属性，
+// 不是格式字段，所以 archive v0.1 不需要为列表做任何升级。
 //
 // 一条贯穿全文件的规则：本类不跟随软链接。仓库根自己、以及仓库里的每一项，
 // 都用 lstat 判断，软链接既不会出现在列表里，也不会被解析、被删除。
@@ -42,6 +44,9 @@
 #include <string>
 #include <vector>
 
+#include "container_format.h"
+#include "pack_stream.h"
+
 namespace backupproject {
 
 // 仓库里的一个备份候选。
@@ -60,11 +65,29 @@ struct BackupRecord {
   // 归档文件自身的 mtime（秒）。
   std::int64_t modified_time_sec = 0;
 
-  // 全局 header 是否被当前实现认识。注意这只说明 header 可读，
-  // 既不保证归档内容完整，也不保证恢复得出来；完整校验始终在 Extract 里。
+  // header（legacy v0.1 的全局 header，或 v2 的 160 字节外层 container
+  // header）是否被当前实现认识。注意这只说明 header 可读，既不保证归档内容
+  // 完整，也不保证恢复得出来；完整校验始终在恢复路径里。
   bool recognized_archive = false;
   std::uint16_t format_version = 0;
   std::uint64_t entry_count = 0;
+
+  // 下面四个字段描述归档"声明"的流水线。它们来自 v2 container 的 160 字节外层
+  // header，读它不需要密码，也从来不是完整校验：header 完好只说明写入那一刻用
+  // 了这些算法，归档是否完整、能不能恢复仍然由恢复路径判断。
+  //
+  // has_pipeline_methods 为 false 表示这不是 v2 container；legacy v0.1 没有
+  // 流水线概念，此时另外三个字段保持默认值，没有任何含义。
+  bool has_pipeline_methods = false;
+  // 打包方式（MyPack / USTAR / FastUSTAR）。
+  PackMethod pack_method = PackMethod::kMyPack;
+  // 压缩方式。
+  CompressionMethod compression_method = CompressionMethod::kNone;
+  // 加密方式；不是 kNone 就意味着恢复需要密码。
+  EncryptionMethod encryption_method = EncryptionMethod::kNone;
+  // 恢复是否需要密码：等价于"v2 container 且 encryption_method != kNone"。
+  // 单独留一个字段，界面层就不必自己拼这条判断。
+  bool password_required = false;
 
   // recognized_archive 为 false 时的原因；为 true 时为空。
   std::string diagnostic;
