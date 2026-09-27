@@ -103,9 +103,9 @@ void TestSimpleJson() {
     test_support::Check(bp::ParseJson(kValidJson, &value, &error),
                         "JSON-01 valid document parses", error);
     const bp::JsonValue* version = value.Find("version");
-    test_support::Check(version != nullptr && version->is_number() &&
-                            version->number == 1,
-                        "JSON-02 integer field");
+    test_support::Check(
+        version != nullptr && version->is_number() && version->number == 1,
+        "JSON-02 integer field");
     const bp::JsonValue* name = value.Find("name");
     test_support::Check(name != nullptr && name->is_string() &&
                             name->text == std::string("hello\tworld"),
@@ -120,40 +120,46 @@ void TestSimpleJson() {
                             nested->Find("inner") != nullptr,
                         "JSON-05 nested object");
     const bp::JsonValue* nothing = value.Find("nothing");
-    test_support::Check(nothing != nullptr && nothing->kind == bp::JsonValue::Kind::kNull,
-                        "JSON-06 null literal");
+    test_support::Check(
+        nothing != nullptr && nothing->kind == bp::JsonValue::Kind::kNull,
+        "JSON-06 null literal");
     test_support::Check(value.Find("missing") == nullptr,
                         "JSON-07 missing key returns nullptr");
   }
 
   {
     bp::JsonValue value;
-    test_support::Check(!bp::ParseJson(R"JSON({"a": 1, "a": 2})JSON", &value, &error) &&
-                            error.find("duplicate") != std::string::npos,
-                        "JSON-08 duplicate key is rejected", error);
+    test_support::Check(
+        !bp::ParseJson(R"JSON({"a": 1, "a": 2})JSON", &value, &error) &&
+            error.find("duplicate") != std::string::npos,
+        "JSON-08 duplicate key is rejected", error);
   }
   {
     bp::JsonValue value;
-    test_support::Check(!bp::ParseJson(R"JSON({"a": "\u0041"})JSON", &value, &error) &&
-                            error.find("unsupported JSON escape") != std::string::npos,
-                        "JSON-09 unicode escape is rejected", error);
+    test_support::Check(
+        !bp::ParseJson(R"JSON({"a": "\u0041"})JSON", &value, &error) &&
+            error.find("unsupported JSON escape") != std::string::npos,
+        "JSON-09 unicode escape is rejected", error);
   }
   // \u 只认写侧真正会产出的那一格：\u00XX 且 XX 落在 C0 控制区。
   {
     bp::JsonValue value;
-    test_support::Check(bp::ParseJson(R"JSON({"a": "\u0001"})JSON", &value, &error),
-                        "JSON-09b the escape the writer emits parses", error);
+    test_support::Check(
+        bp::ParseJson(R"JSON({"a": "\u0001"})JSON", &value, &error),
+        "JSON-09b the escape the writer emits parses", error);
     test_support::Check(
         !bp::ParseJson(R"JSON({"a": "\u00ff"})JSON", &value, &error) &&
             error.find("unsupported JSON escape") != std::string::npos,
         "JSON-09c a non-control \\u escape is still rejected", error);
-    test_support::Check(!bp::ParseJson(R"JSON({"a": "\u1234"})JSON", &value, &error),
-                        "JSON-09d a surrogate-range \\u escape is still rejected",
-                        error);
-    test_support::Check(!bp::ParseJson(R"JSON({"a": "\u0"})JSON", &value, &error),
-                        "JSON-09e a truncated \\u escape is rejected", error);
-    test_support::Check(!bp::ParseJson(R"JSON({"a": "\u00zz"})JSON", &value, &error),
-                        "JSON-09f a non-hex \\u escape is rejected", error);
+    test_support::Check(
+        !bp::ParseJson(R"JSON({"a": "\u1234"})JSON", &value, &error),
+        "JSON-09d a surrogate-range \\u escape is still rejected", error);
+    test_support::Check(
+        !bp::ParseJson(R"JSON({"a": "\u0"})JSON", &value, &error),
+        "JSON-09e a truncated \\u escape is rejected", error);
+    test_support::Check(
+        !bp::ParseJson(R"JSON({"a": "\u00zz"})JSON", &value, &error),
+        "JSON-09f a non-hex \\u escape is rejected", error);
   }
   // 写出去的东西必须全都读得回来。这条不变式此前是断的：写侧把
   // 0x00-0x07 / 0x0B / 0x0E-0x1F 写成 \u00XX，读侧却拒绝一切 \uXXXX，
@@ -183,15 +189,17 @@ void TestSimpleJson() {
         }
       }
     }
-    test_support::Check(all_round_trip,
-                        "JSON-09g every C0 control byte survives write then parse",
-                        first_failure);
+    test_support::Check(
+        all_round_trip,
+        "JSON-09g every C0 control byte survives write then parse",
+        first_failure);
   }
   {
     bp::JsonValue value;
-    test_support::Check(!bp::ParseJson(R"JSON({"a": 1} trailing)JSON", &value, &error) &&
-                            error.find("unexpected data") != std::string::npos,
-                        "JSON-10 trailing data is rejected", error);
+    test_support::Check(
+        !bp::ParseJson(R"JSON({"a": 1} trailing)JSON", &value, &error) &&
+            error.find("unexpected data") != std::string::npos,
+        "JSON-10 trailing data is rejected", error);
   }
   {
     bp::JsonValue value;
@@ -200,9 +208,10 @@ void TestSimpleJson() {
   }
   {
     bp::JsonValue value;
-    test_support::Check(!bp::ParseJson(R"JSON({"a": 1.5})JSON", &value, &error) &&
-                            error.find("only integers") != std::string::npos,
-                        "JSON-12 fraction is rejected", error);
+    test_support::Check(
+        !bp::ParseJson(R"JSON({"a": 1.5})JSON", &value, &error) &&
+            error.find("only integers") != std::string::npos,
+        "JSON-12 fraction is rejected", error);
   }
   {
     bp::JsonValue value;
@@ -218,9 +227,10 @@ void TestSimpleJson() {
   }
   {
     bp::JsonValue value;
-    test_support::Check(!bp::ParseJson(R"JSON({"a": 007})JSON", &value, &error) &&
-                            error.find("leading zeros") != std::string::npos,
-                        "JSON-15 leading zeros are rejected", error);
+    test_support::Check(
+        !bp::ParseJson(R"JSON({"a": 007})JSON", &value, &error) &&
+            error.find("leading zeros") != std::string::npos,
+        "JSON-15 leading zeros are rejected", error);
   }
   {
     // 32 层嵌套超过 kMaxJsonDepth。
@@ -228,21 +238,23 @@ void TestSimpleJson() {
     for (int index = 0; index < 32; ++index) deep += "[";
     for (int index = 0; index < 32; ++index) deep += "]";
     bp::JsonValue value;
-    test_support::Check(!bp::ParseJson(deep, &value, &error) &&
-                            error.find("nesting is too deep") != std::string::npos,
-                        "JSON-16 deep nesting is rejected", error);
+    test_support::Check(
+        !bp::ParseJson(deep, &value, &error) &&
+            error.find("nesting is too deep") != std::string::npos,
+        "JSON-16 deep nesting is rejected", error);
   }
   {
     bp::JsonValue value;
-    test_support::Check(!bp::ParseJson(R"JSON({"a": "unterminated})JSON", &value,
-                                       &error) &&
-                            error.find("unterminated") != std::string::npos,
-                        "JSON-17 unterminated string is rejected", error);
+    test_support::Check(
+        !bp::ParseJson(R"JSON({"a": "unterminated})JSON", &value, &error) &&
+            error.find("unterminated") != std::string::npos,
+        "JSON-17 unterminated string is rejected", error);
   }
   {
     bp::JsonValue value;
-    test_support::Check(!bp::ParseJson(R"JSON({"a": 1 "b": 2})JSON", &value, &error),
-                        "JSON-18 missing comma is rejected", error);
+    test_support::Check(
+        !bp::ParseJson(R"JSON({"a": 1 "b": 2})JSON", &value, &error),
+        "JSON-18 missing comma is rejected", error);
   }
   {
     const std::string big(bp::kMaxJsonBytes + 1, 'x');
@@ -256,15 +268,16 @@ void TestSimpleJson() {
   {
     bp::JsonValue value;
     bp::ParseJson(R"JSON({"a": 1, "b": "x"})JSON", &value, &error);
-    test_support::Check(bp::RequireExactFields(value, {"a", "b"}, "demo", &error),
-                        "JSON-20 exact fields accepted", error);
+    test_support::Check(
+        bp::RequireExactFields(value, {"a", "b"}, "demo", &error),
+        "JSON-20 exact fields accepted", error);
     test_support::Check(!bp::RequireExactFields(value, {"a"}, "demo", &error) &&
                             error.find("unknown field") != std::string::npos,
                         "JSON-21 unknown field is rejected", error);
-    test_support::Check(!bp::RequireExactFields(value, {"a", "b", "c"}, "demo",
-                                               &error) &&
-                            error.find("missing required field") != std::string::npos,
-                        "JSON-22 missing field is rejected", error);
+    test_support::Check(
+        !bp::RequireExactFields(value, {"a", "b", "c"}, "demo", &error) &&
+            error.find("missing required field") != std::string::npos,
+        "JSON-22 missing field is rejected", error);
     // 可选字段：只有 optional 列表里的 key 才被额外放行。它是"新版本往已发布
     // 的 schema 里追加字段"的唯一通道，不是"放宽未知字段"。
     test_support::Check(
@@ -273,28 +286,28 @@ void TestSimpleJson() {
     test_support::Check(
         bp::RequireExactFields(value, {"a", "b"}, {"c"}, "demo", &error),
         "JSON-22c an absent optional field is accepted", error);
-    test_support::Check(!bp::RequireExactFields(value, {"a"}, {"c"}, "demo",
-                                                &error) &&
-                            error.find("unknown field") != std::string::npos,
-                        "JSON-22d a field outside fields+optional is still "
-                        "rejected",
-                        error);
-    test_support::Check(!bp::RequireExactFields(value, {"a", "b", "c"}, {"b"},
-                                                "demo", &error) &&
-                            error.find("missing required field") !=
-                                std::string::npos,
-                        "JSON-22e optional does not excuse a missing required "
-                        "field",
-                        error);
+    test_support::Check(
+        !bp::RequireExactFields(value, {"a"}, {"c"}, "demo", &error) &&
+            error.find("unknown field") != std::string::npos,
+        "JSON-22d a field outside fields+optional is still "
+        "rejected",
+        error);
+    test_support::Check(
+        !bp::RequireExactFields(value, {"a", "b", "c"}, {"b"}, "demo",
+                                &error) &&
+            error.find("missing required field") != std::string::npos,
+        "JSON-22e optional does not excuse a missing required "
+        "field",
+        error);
     std::uint32_t number = 0;
-    test_support::Check(bp::RequireUint32(value, "a", "demo", 0, 10, &number,
-                                          &error) &&
-                            number == 1,
-                        "JSON-23 uint32 in range", error);
-    test_support::Check(!bp::RequireUint32(value, "a", "demo", 5, 10, &number,
-                                           &error) &&
-                            error.find("out of range") != std::string::npos,
-                        "JSON-24 uint32 out of range is rejected", error);
+    test_support::Check(
+        bp::RequireUint32(value, "a", "demo", 0, 10, &number, &error) &&
+            number == 1,
+        "JSON-23 uint32 in range", error);
+    test_support::Check(
+        !bp::RequireUint32(value, "a", "demo", 5, 10, &number, &error) &&
+            error.find("out of range") != std::string::npos,
+        "JSON-24 uint32 out of range is rejected", error);
     std::string text;
     test_support::Check(!bp::RequireString(value, "a", "demo", &text, &error) &&
                             error.find("must be a string") != std::string::npos,
@@ -332,8 +345,9 @@ void TestManifestFromTree() {
 
   std::vector<bp::ManifestEntry> entries;
   std::string error;
-  test_support::Check(bp::BuildSourceManifest(source, nullptr, &entries, &error),
-                      "MAN-01 manifest builds", error);
+  test_support::Check(
+      bp::BuildSourceManifest(source, nullptr, &entries, &error),
+      "MAN-01 manifest builds", error);
   test_support::Check(entries.size() == 8,
                       "MAN-02 entry count matches the archive set",
                       std::to_string(entries.size()));
@@ -375,11 +389,11 @@ void TestManifestFromTree() {
   bp::ManifestBinding parsed_binding;
   test_support::Check(bp::ParseManifest(text, &parsed, &parsed_binding, &error),
                       "MAN-09 manifest round-trips", error);
-  test_support::Check(parsed_binding.snapshot_file_name == "src-1.bak" &&
-                          parsed_binding.repository_identity ==
-                              binding.repository_identity &&
-                          parsed_binding.source_path == binding.source_path,
-                      "MAN-09b the round trip keeps the baseline binding");
+  test_support::Check(
+      parsed_binding.snapshot_file_name == "src-1.bak" &&
+          parsed_binding.repository_identity == binding.repository_identity &&
+          parsed_binding.source_path == binding.source_path,
+      "MAN-09b the round trip keeps the baseline binding");
   test_support::Check(parsed.size() == entries.size(),
                       "MAN-10 round-trip keeps the count");
   bool identical = parsed.size() == entries.size();
@@ -409,13 +423,13 @@ void TestManifestFromTree() {
   weird.push_back(backslash);
   std::vector<bp::ManifestEntry> weird_parsed;
   bp::ManifestBinding weird_binding;
-  test_support::Check(bp::ParseManifest(bp::SerializeManifest(weird, binding),
-                                        &weird_parsed, &weird_binding, &error) &&
-                          weird_parsed.size() == 3 &&
-                          weird_parsed[0].archive_path == "a\tb" &&
-                          weird_parsed[1].archive_path == "c\nd" &&
-                          weird_parsed[2].archive_path == "e\\f",
-                      "MAN-12 field escaping survives a round trip", error);
+  test_support::Check(
+      bp::ParseManifest(bp::SerializeManifest(weird, binding), &weird_parsed,
+                        &weird_binding, &error) &&
+          weird_parsed.size() == 3 && weird_parsed[0].archive_path == "a\tb" &&
+          weird_parsed[1].archive_path == "c\nd" &&
+          weird_parsed[2].archive_path == "e\\f",
+      "MAN-12 field escaping survives a round trip", error);
 }
 
 void TestManifestRejectsBadInput() {
@@ -433,30 +447,26 @@ void TestManifestRejectsBadInput() {
       !bp::ParseManifest("BPMANIFEST1 2\n", &entries, &binding, &error),
       "MAN-22 missing entries are rejected", error);
   test_support::Check(
-      !bp::ParseManifest(
-          "BPMANIFEST1 1\n2\t1\t1\t1\t644\t0\t0\t0\t0\t0\t.\n", &entries,
-          &binding, &error),
+      !bp::ParseManifest("BPMANIFEST1 1\n2\t1\t1\t1\t644\t0\t0\t0\t0\t0\t.\n",
+                         &entries, &binding, &error),
       "MAN-23 a wrong field count is rejected", error);
   test_support::Check(
-      !bp::ParseManifest(
-          "BPMANIFEST1 1\n8\t0\t0\t0\t644\t0\t0\t0\t0\t0\t.\t\n", &entries,
-          &binding, &error),
+      !bp::ParseManifest("BPMANIFEST1 1\n8\t0\t0\t0\t644\t0\t0\t0\t0\t0\t.\t\n",
+                         &entries, &binding, &error),
       "MAN-24 the never-written socket type is rejected", error);
   test_support::Check(
-      !bp::ParseManifest(
-          "BPMANIFEST1 0\n2\t0\t0\t0\t644\t0\t0\t0\t0\t0\ta\t\n", &entries,
-          &binding, &error),
+      !bp::ParseManifest("BPMANIFEST1 0\n2\t0\t0\t0\t644\t0\t0\t0\t0\t0\ta\t\n",
+                         &entries, &binding, &error),
       "MAN-25 trailing data after the declared count is rejected", error);
   test_support::Check(
       !bp::ParseManifest(
-          "BPMANIFEST1 1\n2\t5\t0\t0\t644\t0\t0\t0\t0\t0\t/x\t\n",
-          &entries, &binding, &error),
+          "BPMANIFEST1 1\n2\t5\t0\t0\t644\t0\t0\t0\t0\t0\t/x\t\n", &entries,
+          &binding, &error),
       "MAN-26 an absolute archive path is rejected", error);
   test_support::Check(
-      !bp::ParseManifest(
-          "BPMANIFEST1 2\n2\t0\t0\t0\t644\t0\t0\t0\t0\t0\ta\t\n"
-          "2\t0\t0\t0\t644\t0\t0\t0\t0\t0\ta\t\n",
-          &entries, &binding, &error),
+      !bp::ParseManifest("BPMANIFEST1 2\n2\t0\t0\t0\t644\t0\t0\t0\t0\t0\ta\t\n"
+                         "2\t0\t0\t0\t644\t0\t0\t0\t0\t0\ta\t\n",
+                         &entries, &binding, &error),
       "MAN-27 a duplicate path is rejected", error);
   // 空 manifest 是**合法**的 v1（0 条），但它没有 binding。
   test_support::Check(bp::ParseManifest(bp::SerializeManifestV1({}), &entries,
@@ -499,7 +509,8 @@ void TestManifestBindingFormat() {
                       "MAN-34 a dot-dot snapshot name is refused");
 
   // ---- 读入：头行结构必须严格 ----
-  const std::string good = V2Header("0", "src-1.bak", "/home/u/repo", "/home/u/src");
+  const std::string good =
+      V2Header("0", "src-1.bak", "/home/u/repo", "/home/u/src");
   test_support::Check(bp::ParseManifest(good, &entries, &binding, &error) &&
                           entries.empty() &&
                           binding.snapshot_file_name == "src-1.bak",
@@ -518,12 +529,13 @@ void TestManifestBindingFormat() {
                          &entries, &binding, &error),
       "MAN-38 an empty snapshot name is rejected", error);
   test_support::Check(
-      !bp::ParseManifest(V2Header("0", "sub/dir.bak", "/home/u/repo", "/home/u/src"),
-                         &entries, &binding, &error),
+      !bp::ParseManifest(
+          V2Header("0", "sub/dir.bak", "/home/u/repo", "/home/u/src"), &entries,
+          &binding, &error),
       "MAN-39 a snapshot name with a slash is rejected", error);
   test_support::Check(
-      !bp::ParseManifest(V2Header("0", "src-1.bak", "", "/home/u/src"), &entries,
-                         &binding, &error),
+      !bp::ParseManifest(V2Header("0", "src-1.bak", "", "/home/u/src"),
+                         &entries, &binding, &error),
       "MAN-40 an empty repository identity is rejected", error);
   test_support::Check(
       !bp::ParseManifest(
@@ -546,15 +558,16 @@ void TestManifestBindingFormat() {
     for (std::size_t index = 0; index < text.find('\n'); ++index) {
       if (text[index] == '\t') ++tabs;
     }
-    test_support::Check(tabs == 3,
-                        "MAN-43 the header keeps exactly three field separators",
-                        std::to_string(tabs));
+    test_support::Check(
+        tabs == 3, "MAN-43 the header keeps exactly three field separators",
+        std::to_string(tabs));
     bp::ManifestBinding back;
-    test_support::Check(bp::ParseManifest(text, &entries, &back, &error) &&
-                            back.snapshot_file_name == odd.snapshot_file_name &&
-                            back.repository_identity == odd.repository_identity &&
-                            back.source_path == odd.source_path,
-                        "MAN-44 binding escaping survives a round trip", error);
+    test_support::Check(
+        bp::ParseManifest(text, &entries, &back, &error) &&
+            back.snapshot_file_name == odd.snapshot_file_name &&
+            back.repository_identity == odd.repository_identity &&
+            back.source_path == odd.source_path,
+        "MAN-44 binding escaping survives a round trip", error);
   }
 
   // ---- v1 / v2 的条目正文完全一样，只有头行不同 ----
@@ -564,10 +577,12 @@ void TestManifestBindingFormat() {
         MakeEntry("a.txt", bp::EntryType::kRegularFile),
     };
     const std::string v1 = bp::SerializeManifestV1(sample);
-    const std::string v2 = bp::SerializeManifest(sample, MakeBinding("src-1.bak"));
-    test_support::Check(v1.compare(0, 11, "BPMANIFEST1") == 0 &&
-                            v2.compare(0, 11, "BPMANIFEST2") == 0,
-                        "MAN-45 the two writers emit different version headers");
+    const std::string v2 =
+        bp::SerializeManifest(sample, MakeBinding("src-1.bak"));
+    test_support::Check(
+        v1.compare(0, 11, "BPMANIFEST1") == 0 &&
+            v2.compare(0, 11, "BPMANIFEST2") == 0,
+        "MAN-45 the two writers emit different version headers");
     test_support::Check(v1.substr(v1.find('\n')) == v2.substr(v2.find('\n')),
                         "MAN-46 the entry bodies are byte-identical");
     // 同一份正文，一个带归属一个不带：这正是升级路径要区分的那件事。
@@ -583,11 +598,14 @@ void TestManifestBindingFormat() {
 }
 
 void TestBaselineBindingComparison() {
-  test_support::Section("C3. the manifest binding must match the state baseline");
-  const bp::ScheduleBaseline baseline = bp::BaselineOf(MakeBinding("src-1.bak"));
+  test_support::Section(
+      "C3. the manifest binding must match the state baseline");
+  const bp::ScheduleBaseline baseline =
+      bp::BaselineOf(MakeBinding("src-1.bak"));
 
-  test_support::Check(bp::SameBaselineBinding(baseline, MakeBinding("src-1.bak")),
-                      "MAN-50 an identical binding matches");
+  test_support::Check(
+      bp::SameBaselineBinding(baseline, MakeBinding("src-1.bak")),
+      "MAN-50 an identical binding matches");
   // 旧格式没有归属信息，一律不可信——这里绝不猜。
   test_support::Check(!bp::SameBaselineBinding(baseline, bp::ManifestBinding()),
                       "MAN-51 a version 1 manifest never matches");
@@ -611,12 +629,11 @@ void TestBaselineBindingComparison() {
   // 转换必须是双向无损的：两边字段一一对应，漏一个就会让上面每条判断失效。
   const bp::ScheduleBaseline round_trip =
       bp::BaselineOf(bp::BindingOf(baseline));
-  test_support::Check(round_trip.snapshot_file_name ==
-                              baseline.snapshot_file_name &&
-                          round_trip.repository_identity ==
-                              baseline.repository_identity &&
-                          round_trip.source_path == baseline.source_path,
-                      "MAN-56 baseline and binding convert losslessly");
+  test_support::Check(
+      round_trip.snapshot_file_name == baseline.snapshot_file_name &&
+          round_trip.repository_identity == baseline.repository_identity &&
+          round_trip.source_path == baseline.source_path,
+      "MAN-56 baseline and binding convert losslessly");
 }
 
 // ---- D. 变化检测 ----
@@ -666,29 +683,29 @@ void TestChangeDetection() {
     std::vector<bp::ManifestEntry> current = base;
     current[1].mtime_nsec += 1;
     DiffOf(base, current, &summary);
-    CheckSummary("DIFF-06 mtime nanosecond change is modified", summary, 0, 0, 1,
-                 0);
+    CheckSummary("DIFF-06 mtime nanosecond change is modified", summary, 0, 0,
+                 1, 0);
   }
   {
     std::vector<bp::ManifestEntry> current = base;
     current[1].mode = 0600;
     DiffOf(base, current, &summary);
-    CheckSummary("DIFF-07 mode-only change is metadata_changed", summary, 0, 0, 0,
-                 1);
+    CheckSummary("DIFF-07 mode-only change is metadata_changed", summary, 0, 0,
+                 0, 1);
   }
   {
     std::vector<bp::ManifestEntry> current = base;
     current[1].uid = 4242;
     DiffOf(base, current, &summary);
-    CheckSummary("DIFF-08 uid-only change is metadata_changed", summary, 0, 0, 0,
-                 1);
+    CheckSummary("DIFF-08 uid-only change is metadata_changed", summary, 0, 0,
+                 0, 1);
   }
   {
     std::vector<bp::ManifestEntry> current = base;
     current[1].gid = 4243;
     DiffOf(base, current, &summary);
-    CheckSummary("DIFF-09 gid-only change is metadata_changed", summary, 0, 0, 0,
-                 1);
+    CheckSummary("DIFF-09 gid-only change is metadata_changed", summary, 0, 0,
+                 0, 1);
   }
   {
     std::vector<bp::ManifestEntry> current = base;
@@ -723,8 +740,8 @@ void TestChangeDetection() {
     std::vector<bp::ManifestEntry> current = base;
     current[0].mtime_sec += 1;
     DiffOf(base, current, &summary);
-    CheckSummary("DIFF-13 directory mtime is a documented blind spot", summary, 0,
-                 0, 0, 0);
+    CheckSummary("DIFF-13 directory mtime is a documented blind spot", summary,
+                 0, 0, 0, 0);
   }
   {
     std::vector<bp::ManifestEntry> previous = {
@@ -733,8 +750,8 @@ void TestChangeDetection() {
     current[0].dev_major = 1;
     current[0].dev_minor = 3;
     DiffOf(previous, current, &summary);
-    CheckSummary("DIFF-14 char device major/minor change is modified", summary, 0,
-                 0, 1, 0);
+    CheckSummary("DIFF-14 char device major/minor change is modified", summary,
+                 0, 0, 1, 0);
 
     std::vector<bp::ManifestEntry> block = {
         MakeEntry("disk", bp::EntryType::kBlockDevice)};
@@ -751,8 +768,8 @@ void TestChangeDetection() {
     std::vector<bp::ManifestEntry> current = previous;
     current[1].hardlink_degree = 2;
     DiffOf(previous, current, &summary);
-    CheckSummary("DIFF-16 hardlink degree change is metadata_changed", summary, 0,
-                 0, 0, 1);
+    CheckSummary("DIFF-16 hardlink degree change is metadata_changed", summary,
+                 0, 0, 0, 1);
   }
   {
     // hardlink 条目只比较 link_target：同一 inode 的 mtime 由 leader 负责。
@@ -786,8 +803,9 @@ void TestChangeDetectionFromTrees() {
 
   bp::Filter filter;
   std::string error;
-  test_support::Check(filter.AddRule(bp::FilterAction::kExclude, "ext:log", &error),
-                      "EXCL-01 exclude rule is accepted", error);
+  test_support::Check(
+      filter.AddRule(bp::FilterAction::kExclude, "ext:log", &error),
+      "EXCL-01 exclude rule is accepted", error);
 
   std::vector<bp::ManifestEntry> before;
   test_support::Check(bp::BuildSourceManifest(source, &filter, &before, &error),
@@ -801,8 +819,8 @@ void TestChangeDetectionFromTrees() {
       "EXCL-03 filtered manifest rebuilds", error);
   bp::ChangeSummary summary;
   DiffOf(before, after_excluded, &summary);
-  CheckSummary("EXCL-04 an excluded file change does not change the set", summary,
-               0, 0, 0, 0);
+  CheckSummary("EXCL-04 an excluded file change does not change the set",
+               summary, 0, 0, 0, 0);
 
   // 没有被排除的文件发生变化则必须被看见。
   Write(source + "/keep.txt", "keep changed");
@@ -822,10 +840,9 @@ void TestChangeDetectionFromTrees() {
       bp::BuildSourceManifest(source, &filter, &after_new_excluded, &error),
       "EXCL-07 filtered manifest rebuilds with a new excluded file", error);
   DiffOf(after_included, after_new_excluded, &summary);
-  CheckSummary("EXCL-08 a new excluded file does not change the set", summary, 0,
-               0, 0, 0);
+  CheckSummary("EXCL-08 a new excluded file does not change the set", summary,
+               0, 0, 0, 0);
 }
-
 
 // ---- 目录 mtime 合同 ------------------------------------------------------
 //
@@ -851,8 +868,8 @@ void TestDirectoryMtimeContract() {
     current[0].mtime_sec += 7;
     current[0].mtime_nsec = 12345;
     DiffOf(base, current, &summary);
-    CheckSummary("DIR-01 directory mtime only does not trigger", summary, 0, 0, 0,
-                 0);
+    CheckSummary("DIR-01 directory mtime only does not trigger", summary, 0, 0,
+                 0, 0);
   }
 
   // 2) 目录的 mode / uid / gid 是会影响 restore 结果的 metadata -> 触发。
@@ -891,9 +908,10 @@ void TestDirectoryMtimeContract() {
     current.erase(current.begin() + 1);
     current[0].mtime_sec += 3;
     DiffOf(base, current, &summary);
-    CheckSummary("DIR-06 a removed child is removed, the parent mtime is not "
-                 "counted",
-                 summary, 0, 1, 0, 0);
+    CheckSummary(
+        "DIR-06 a removed child is removed, the parent mtime is not "
+        "counted",
+        summary, 0, 1, 0, 0);
   }
   {
     // 改名 = 一条 added + 一条 removed（manifest 按路径排好序，没有 inode 身份
@@ -911,7 +929,8 @@ void TestDirectoryMtimeContract() {
 }
 
 // 真实文件系统上的同一条合同：只 touch 目录不触发；被 filter 排除的子项增删
-// 也不触发；被包含的子项增删触发。不 sleep：全部靠显式改 mtime 与重建 manifest。
+// 也不触发；被包含的子项增删触发。不 sleep：全部靠显式改 mtime 与重建
+// manifest。
 void TestDirectoryMtimeContractOnRealTree() {
   test_support::Section("DIFF-DIR-FS. the same contract on a real tree");
 
@@ -937,12 +956,13 @@ void TestDirectoryMtimeContractOnRealTree() {
   test_support::Check(test_support::SetTimes(source, 1600000000, 0),
                       "DIR-10 the source directory is touched");
   std::vector<bp::ManifestEntry> touched;
-  test_support::Check(bp::BuildSourceManifest(source, &filter, &touched, &error),
-                      "DIR-11 the manifest rebuilds after the touch", error);
+  test_support::Check(
+      bp::BuildSourceManifest(source, &filter, &touched, &error),
+      "DIR-11 the manifest rebuilds after the touch", error);
   bp::ChangeSummary summary;
   DiffOf(before, touched, &summary);
-  CheckSummary("DIR-12 touching a directory alone never triggers", summary, 0, 0,
-               0, 0);
+  CheckSummary("DIR-12 touching a directory alone never triggers", summary, 0,
+               0, 0, 0);
 
   // 被排除的子项增删：父目录 mtime 一定会变，但集合没变。
   Write(build + "/another.o", "object two");
@@ -951,7 +971,8 @@ void TestDirectoryMtimeContractOnRealTree() {
       bp::BuildSourceManifest(source, &filter, &excluded_added, &error),
       "DIR-13 the manifest rebuilds after an excluded child is added", error);
   DiffOf(touched, excluded_added, &summary);
-  CheckSummary("DIR-14 an excluded child add never triggers", summary, 0, 0, 0, 0);
+  CheckSummary("DIR-14 an excluded child add never triggers", summary, 0, 0, 0,
+               0);
 
   std::string ignored;
   test_support::Check(::unlink((build + "/another.o").c_str()) == 0,
@@ -971,13 +992,89 @@ void TestDirectoryMtimeContractOnRealTree() {
       bp::BuildSourceManifest(source, &filter, &included_added, &error),
       "DIR-18 the manifest rebuilds after an included child is added", error);
   DiffOf(excluded_removed, included_added, &summary);
-  test_support::Check(summary.added == 1 && summary.removed == 0 &&
-                          summary.modified == 0 && summary.metadata_changed == 0,
-                      "DIR-19 an included child add triggers exactly once",
-                      std::to_string(summary.added) + "/" +
-                          std::to_string(summary.removed) + "/" +
-                          std::to_string(summary.modified) + "/" +
-                          std::to_string(summary.metadata_changed));
+  test_support::Check(
+      summary.added == 1 && summary.removed == 0 && summary.modified == 0 &&
+          summary.metadata_changed == 0,
+      "DIR-19 an included child add triggers exactly once",
+      std::to_string(summary.added) + "/" + std::to_string(summary.removed) +
+          "/" + std::to_string(summary.modified) + "/" +
+          std::to_string(summary.metadata_changed));
+}
+
+// ---- 数字选项解析合同 ------------------------------------------------------
+//
+// CLI 的 --interval-minutes/--retain 与 GUI 文本框走的是同一个
+// ParseBoundedScheduleNumber。这张 case table 是"两个前端结论必须一致"的
+// 唯一判据，GUI 侧的 --schedule-test 会把同一张表再喂一遍并逐项比对。
+void TestNumberParserContract() {
+  test_support::Section("NUM. shared number parser contract");
+
+  struct Case {
+    const char* text;
+    bool accepted;
+    std::uint32_t value;
+  };
+  const Case cases[] = {
+      {"5", true, 5},
+      {"60", true, 60},
+      // 前后空白由共享 parser 自己处理：CLI 送 argv 原文、GUI 送文本框原文，
+      // 两边都不预处理，所以不可能一边接受一边拒绝。
+      {" 5 ", true, 5},
+      {"\t5\t", true, 5},
+      {"\n60\r", true, 60},
+      {"007", true, 7},
+      // 空与纯空白
+      {"", false, 0},
+      {"   ", false, 0},
+      {"\t", false, 0},
+      // 非纯数字
+      {"5x", false, 0},
+      {"x5", false, 0},
+      {"-1", false, 0},
+      {"+5", false, 0},
+      {"1.0", false, 0},
+      {"5 5", false, 0},
+      {"0x10", false, 0},
+      // 溢出：边解析边夹，不做回绕
+      {"99999999999999999999", false, 0},
+      {"18446744073709551616", false, 0},
+      // 范围
+      {"0", false, 0},
+      {"525601", false, 0},
+  };
+  for (const Case& item : cases) {
+    std::uint32_t value = 0;
+    std::string error;
+    const bool ok = bp::ParseBoundedScheduleNumber(
+        item.text, 1, 525600, "--interval-minutes", &value, &error);
+    test_support::Check(ok == item.accepted,
+                        std::string("NUM-01 [") + item.text +
+                            "] accepted=" + (item.accepted ? "yes" : "no"),
+                        error);
+    if (item.accepted) {
+      test_support::Check(
+          ok && value == item.value,
+          std::string("NUM-02 [") + item.text + "] parsed value",
+          std::to_string(value));
+    } else {
+      test_support::Check(
+          !ok && !error.empty(),
+          std::string("NUM-03 [") + item.text + "] rejection explains itself");
+    }
+  }
+
+  // 同一个函数、同一个上界，用于 retain：范围不同、规则相同。
+  {
+    std::uint32_t value = 0;
+    std::string error;
+    test_support::Check(bp::ParseBoundedScheduleNumber(
+                            " 12 ", 1, 1000, "--retain", &value, &error) &&
+                            value == 12,
+                        "NUM-04 the retain range uses the same parser", error);
+    test_support::Check(!bp::ParseBoundedScheduleNumber(
+                            "1001", 1, 1000, "--retain", &value, &error),
+                        "NUM-05 retain above the maximum is refused", error);
+  }
 }
 
 }  // namespace
@@ -993,6 +1090,7 @@ int main() {
   TestChangeDetectionFromTrees();
   TestDirectoryMtimeContract();
   TestDirectoryMtimeContractOnRealTree();
+  TestNumberParserContract();
   test_support::RemoveTree(test_support::TempRoot());
   return test_support::Finish("scheduler core");
 }

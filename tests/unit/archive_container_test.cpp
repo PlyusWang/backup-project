@@ -59,8 +59,8 @@ bool CopyAndMutate(const std::string& source, const std::string& target,
   if (offset >= bytes.size()) {
     return false;
   }
-  bytes[offset] = static_cast<char>(static_cast<unsigned char>(bytes[offset]) ^
-                                    mask);
+  bytes[offset] =
+      static_cast<char>(static_cast<unsigned char>(bytes[offset]) ^ mask);
   return WriteAll(target, bytes);
 }
 
@@ -92,8 +92,7 @@ bool CopyAndTruncate(const std::string& source, const std::string& target,
 }
 
 // 一次"必须失败，且失败后 destination 不存在"的恢复。
-void ExpectRestoreRejected(const std::string& label,
-                           const std::string& archive,
+void ExpectRestoreRejected(const std::string& label, const std::string& archive,
                            const std::string& destination,
                            const std::string& password) {
   BackupEngine engine;
@@ -161,12 +160,13 @@ void RunHeaderValidation(const std::string& workdir) {
       continue;
     }
     for (const Case& item : header_cases) {
-      const std::string mutated =
-          workdir + "/hdr-" + std::to_string(item.offset) + "-" +
-          std::to_string(item.value) + ".bak";
+      const std::string mutated = workdir + "/hdr-" +
+                                  std::to_string(item.offset) + "-" +
+                                  std::to_string(item.value) + ".bak";
       test_support::RemoveTree(mutated);
       if (!CopyAndSet(archive, mutated, item.offset, item.value)) {
-        test_support::Check(false, std::string("mutation setup: ") + item.label);
+        test_support::Check(false,
+                            std::string("mutation setup: ") + item.label);
         continue;
       }
       ExpectRestoreRejected(item.label, mutated, mutated + ".out", "");
@@ -248,8 +248,7 @@ void RunTruncation(const std::string& workdir) {
   test_support::Check(ReadAll(archive, &bytes), "read the container back");
   const std::size_t size = bytes.size();
 
-  const std::size_t keeps[] = {0, 8, 100, 159, 160, 161, size / 2,
-                               size - 1};
+  const std::size_t keeps[] = {0, 8, 100, 159, 160, 161, size / 2, size - 1};
   for (const std::size_t keep : keeps) {
     const std::string truncated =
         workdir + "/trunc-" + std::to_string(keep) + ".bak";
@@ -264,8 +263,8 @@ void RunTruncation(const std::string& workdir) {
   const std::string appended = workdir + "/trunc-append.bak";
   test_support::RemoveTree(appended);
   WriteAll(appended, bytes + "X");
-  ExpectRestoreRejected("trailing byte appended", appended,
-                        appended + ".out", kPassword);
+  ExpectRestoreRejected("trailing byte appended", appended, appended + ".out",
+                        kPassword);
 
   const std::string zero_appended = workdir + "/trunc-zero-append.bak";
   test_support::RemoveTree(zero_appended);
@@ -283,8 +282,9 @@ void RunTamper(const std::string& workdir) {
   const std::string source = workdir + "/tamper-source";
   BuildSource(source);
 
-  for (const EncryptionMethod method : {EncryptionMethod::kDesCbcHmacSha256,
-                                        EncryptionMethod::kAes256CtrHmacSha256}) {
+  for (const EncryptionMethod method :
+       {EncryptionMethod::kDesCbcHmacSha256,
+        EncryptionMethod::kAes256CtrHmacSha256}) {
     const bool des = method == EncryptionMethod::kDesCbcHmacSha256;
     const char* tag = des ? "DES" : "AES";
     BackupOptions options;
@@ -302,8 +302,9 @@ void RunTamper(const std::string& workdir) {
     // 密码绝对不能出现在归档里。
     std::string bytes;
     if (ReadAll(archive, &bytes)) {
-      test_support::Check(bytes.find(kPassword) == std::string::npos,
-                          std::string(tag) + " archive stores no plaintext password");
+      test_support::Check(
+          bytes.find(kPassword) == std::string::npos,
+          std::string(tag) + " archive stores no plaintext password");
     }
 
     struct Spot {
@@ -324,7 +325,8 @@ void RunTamper(const std::string& workdir) {
                                   std::to_string(spot.offset) + ".bak";
       test_support::RemoveTree(mutated);
       if (!CopyAndMutate(archive, mutated, spot.offset, 0xFF)) {
-        test_support::Check(false, std::string(tag) + " mutation " + spot.label);
+        test_support::Check(false,
+                            std::string(tag) + " mutation " + spot.label);
         continue;
       }
       ExpectRestoreRejected(std::string(tag) + " " + spot.label + " tampered",
@@ -342,13 +344,13 @@ void RunTamper(const std::string& workdir) {
           engine.Restore(archive, destination, wrong, &report, &error);
       test_support::Check(!ok, std::string(tag) + " wrong password rejected",
                           error);
-      test_support::Check(error.find("Authentication failed") != std::string::npos,
-                          std::string(tag) +
-                              " wrong password fails on HMAC, not on padding",
-                          error);
-      test_support::Check(!test_support::Exists(destination),
-                          std::string(tag) +
-                              " wrong password leaves no destination");
+      test_support::Check(
+          error.find("Authentication failed") != std::string::npos,
+          std::string(tag) + " wrong password fails on HMAC, not on padding",
+          error);
+      test_support::Check(
+          !test_support::Exists(destination),
+          std::string(tag) + " wrong password leaves no destination");
     }
     // 空密码策略：既不能备份，也不能恢复。
     {
@@ -357,12 +359,12 @@ void RunTamper(const std::string& workdir) {
       const std::string empty_archive = workdir + "/tamper-empty.bak";
       test_support::RemoveTree(empty_archive);
       error.clear();
-      const bool ok = engine.Backup(source, empty_archive, Filter(), empty,
-                                    &error);
+      const bool ok =
+          engine.Backup(source, empty_archive, Filter(), empty, &error);
       test_support::Check(!ok, std::string(tag) + " empty password rejected");
-      test_support::Check(!test_support::Exists(empty_archive),
-                          std::string(tag) +
-                              " empty password leaves no archive");
+      test_support::Check(
+          !test_support::Exists(empty_archive),
+          std::string(tag) + " empty password leaves no archive");
       ExpectRestoreRejected(std::string(tag) + " empty password restore",
                             archive, workdir + "/tamper-empty-out", "");
     }
@@ -373,14 +375,13 @@ void RunTamper(const std::string& workdir) {
       good.password = kPassword;
       RestoreReport report;
       error.clear();
-      const bool ok = engine.Restore(archive, destination, good, &report, &error);
+      const bool ok =
+          engine.Restore(archive, destination, good, &report, &error);
       std::string detail;
-      test_support::Check(ok &&
-                              test_support::CompareTrees(source, destination,
-                                                         &detail),
-                          std::string(tag) +
-                              " untampered archive still restores correctly",
-                          error + detail);
+      test_support::Check(
+          ok && test_support::CompareTrees(source, destination, &detail),
+          std::string(tag) + " untampered archive still restores correctly",
+          error + detail);
     }
   }
 }
@@ -415,15 +416,17 @@ void RunDestinationAtomicity(const std::string& workdir) {
   const bool ok = engine.Restore(archive, busy, good, &report, &error);
   test_support::Check(!ok, "non-empty destination rejected", error);
   std::string existing;
-  test_support::Check(test_support::ReadFile(busy + "/existing.txt", &existing) &&
-                          existing == "do not touch\n",
-                      "existing destination content untouched");
+  test_support::Check(
+      test_support::ReadFile(busy + "/existing.txt", &existing) &&
+          existing == "do not touch\n",
+      "existing destination content untouched");
 
   // 目标是普通文件：拒绝。
   const std::string file_target = workdir + "/atomic-file";
   test_support::WriteFile(file_target, "i am a file\n", 0644);
   error.clear();
-  const bool file_ok = engine.Restore(archive, file_target, good, &report, &error);
+  const bool file_ok =
+      engine.Restore(archive, file_target, good, &report, &error);
   test_support::Check(!file_ok, "destination that is a file rejected", error);
 
   // 空目标目录：允许，并且必须被恢复出来的内容替换。
@@ -432,8 +435,9 @@ void RunDestinationAtomicity(const std::string& workdir) {
   error.clear();
   const bool empty_ok = engine.Restore(archive, empty, good, &report, &error);
   std::string detail;
-  test_support::Check(empty_ok && test_support::CompareTrees(source, empty, &detail),
-                      "empty destination is filled correctly", error + detail);
+  test_support::Check(
+      empty_ok && test_support::CompareTrees(source, empty, &detail),
+      "empty destination is filled correctly", error + detail);
 
   // 失败之后不能在目标旁边留下暂存目录。
   const std::string root = workdir;
@@ -446,7 +450,8 @@ void RunDestinationAtomicity(const std::string& workdir) {
       leftover = true;
     }
   }
-  test_support::Check(!leftover, "no temporary files left behind in the workdir");
+  test_support::Check(!leftover,
+                      "no temporary files left behind in the workdir");
 }
 
 // ---- 5) MyPack v2 格式边界 -------------------------------------------------
@@ -455,8 +460,8 @@ void WriteMyPackFixture(const std::string& path,
                         const std::vector<ArchiveEntry>& entries) {
   test_support::RemoveTree(path);
   std::string error;
-  const bool ok = backupproject::PackEntries(PackMethod::kMyPack, entries, path,
-                                             &error);
+  const bool ok =
+      backupproject::PackEntries(PackMethod::kMyPack, entries, path, &error);
   test_support::Check(ok, "MyPack v2 fixture written", error);
 }
 
@@ -520,8 +525,8 @@ void RunMyPackBoundaries(const std::string& workdir) {
       {"second entry type unknown", second_entry + 0, 0x7F},
   };
   for (const Spot& spot : spots) {
-    const std::string mutated = workdir + "/mypack-" +
-                                std::to_string(spot.offset) + ".pack";
+    const std::string mutated =
+        workdir + "/mypack-" + std::to_string(spot.offset) + ".pack";
     test_support::RemoveTree(mutated);
     if (!CopyAndMutate(archive, mutated, spot.offset, 0xFF)) {
       test_support::Check(false, std::string("mypack mutation ") + spot.label);
@@ -531,8 +536,8 @@ void RunMyPackBoundaries(const std::string& workdir) {
     std::string error;
     const bool opened = reader.Open(mutated, &error);
     const bool scanned = opened && reader.Scan(PackMethod::kMyPack, &error);
-    test_support::Check(!scanned, std::string("MyPack ") + spot.label +
-                                      " rejected", error);
+    test_support::Check(
+        !scanned, std::string("MyPack ") + spot.label + " rejected", error);
   }
 
   // 合法流仍然必须成功——否则上面的"拒绝"没有意义。
@@ -559,8 +564,8 @@ void RunMyPackBoundaries(const std::string& workdir) {
     test_support::Check(!scanned, "MyPack trailing bytes rejected", error);
   }
   // 截断。
-  for (const std::size_t keep : {std::size_t(10), std::size_t(40),
-                                 std::size_t(96), bytes.size() - 1}) {
+  for (const std::size_t keep :
+       {std::size_t(10), std::size_t(40), std::size_t(96), bytes.size() - 1}) {
     const std::string truncated =
         workdir + "/mypack-trunc-" + std::to_string(keep) + ".pack";
     test_support::RemoveTree(truncated);
@@ -569,10 +574,10 @@ void RunMyPackBoundaries(const std::string& workdir) {
     std::string error;
     const bool scanned = reader.Open(truncated, &error) &&
                          reader.Scan(PackMethod::kMyPack, &error);
-    test_support::Check(!scanned,
-                        "MyPack truncated to " + std::to_string(keep) +
-                            " bytes rejected",
-                        error);
+    test_support::Check(
+        !scanned,
+        "MyPack truncated to " + std::to_string(keep) + " bytes rejected",
+        error);
   }
   // 重复路径 / 父目录不是目录：直接喂一份手工条目表，写侧必须拦住。
   {
@@ -615,8 +620,8 @@ void RunMyPackBoundaries(const std::string& workdir) {
     if (backupproject::PackEntries(PackMethod::kMyPack, bad_target, path,
                                    &error)) {
       backupproject::PackedStreamReader reader;
-      const bool scanned = reader.Open(path, &error) &&
-                           reader.Scan(PackMethod::kMyPack, &error);
+      const bool scanned =
+          reader.Open(path, &error) && reader.Scan(PackMethod::kMyPack, &error);
       test_support::Check(!scanned, "hard link with a missing target rejected",
                           error);
     } else {
@@ -633,8 +638,8 @@ void RunMyPackBoundaries(const std::string& workdir) {
     const std::string path = workdir + "/mypack-traversal.pack";
     test_support::RemoveTree(path);
     std::string error;
-    const bool ok =
-        backupproject::PackEntries(PackMethod::kMyPack, traversal, path, &error);
+    const bool ok = backupproject::PackEntries(PackMethod::kMyPack, traversal,
+                                               path, &error);
     test_support::Check(!ok, std::string("path rejected: ") + bad, error);
   }
 }
@@ -663,28 +668,30 @@ void RunLegacyCompatibility(const std::string& workdir) {
   const bool pipeline_ok = backupproject::RunRestorePipeline(
       archive, pipeline_out, options, &report, &error);
   std::string detail;
-  test_support::Check(pipeline_ok && test_support::CompareTrees(source, pipeline_out, &detail),
-                      "v0.1 restore through the pipeline entry point",
-                      error + detail);
+  test_support::Check(
+      pipeline_ok && test_support::CompareTrees(source, pipeline_out, &detail),
+      "v0.1 restore through the pipeline entry point", error + detail);
   (void)password;
 
   // 2) 旧的 BackupEngine::Restore 仍然工作，而且能认出 v2 容器。
   const std::string engine_out = workdir + "/legacy-engine-out";
   BackupEngine engine;
   error.clear();
-  test_support::Check(engine.Restore(archive, engine_out, &error) &&
-                          test_support::CompareTrees(source, engine_out, &detail),
-                      "v0.1 restore through BackupEngine::Restore",
-                      error + detail);
+  test_support::Check(
+      engine.Restore(archive, engine_out, &error) &&
+          test_support::CompareTrees(source, engine_out, &detail),
+      "v0.1 restore through BackupEngine::Restore", error + detail);
 
   // 3) 格式识别。
   backupproject::ArchiveFileInfo info;
   error.clear();
-  const bool identified = backupproject::IdentifyArchiveFile(archive, &info, &error);
-  test_support::Check(identified &&
-                          info.kind == backupproject::ArchiveFileInfo::Kind::kLegacyV01 &&
-                          info.format_version == 1,
-                      "v0.1 identified as legacy", error);
+  const bool identified =
+      backupproject::IdentifyArchiveFile(archive, &info, &error);
+  test_support::Check(
+      identified &&
+          info.kind == backupproject::ArchiveFileInfo::Kind::kLegacyV01 &&
+          info.format_version == 1,
+      "v0.1 identified as legacy", error);
   test_support::Check(info.entry_count > 0, "v0.1 entry count reported");
 
   // 4) v2 容器识别 + 不需要密码就能读外层 header。
@@ -703,15 +710,16 @@ void RunLegacyCompatibility(const std::string& workdir) {
   error.clear();
   const bool v2_identified =
       backupproject::IdentifyArchiveFile(container, &info, &error);
-  test_support::Check(v2_identified &&
-                          info.kind == backupproject::ArchiveFileInfo::Kind::kContainerV2 &&
-                          info.format_version == 2,
-                      "v2 container identified", error);
-  test_support::Check(info.pack_method == PackMethod::kFastUstar &&
-                          info.compression_method == CompressionMethod::kLzssHuffman &&
-                          info.encryption_method ==
-                              EncryptionMethod::kAes256CtrHmacSha256,
-                      "v2 container reports its three algorithm ids");
+  test_support::Check(
+      v2_identified &&
+          info.kind == backupproject::ArchiveFileInfo::Kind::kContainerV2 &&
+          info.format_version == 2,
+      "v2 container identified", error);
+  test_support::Check(
+      info.pack_method == PackMethod::kFastUstar &&
+          info.compression_method == CompressionMethod::kLzssHuffman &&
+          info.encryption_method == EncryptionMethod::kAes256CtrHmacSha256,
+      "v2 container reports its three algorithm ids");
   test_support::Check(info.entry_count == 4,
                       "v2 container reports the entry count without a password",
                       std::to_string(info.entry_count));
@@ -723,17 +731,17 @@ void RunLegacyCompatibility(const std::string& workdir) {
   backupproject::ArchiveSummary summary;
   error.clear();
   const bool inspected = reader.InspectHeader(container, &summary, &error);
-  test_support::Check(inspected && summary.format_version == 2 &&
-                          summary.entry_count == 4,
-                      "ArchiveReader::InspectHeader recognizes v2", error);
+  test_support::Check(
+      inspected && summary.format_version == 2 && summary.entry_count == 4,
+      "ArchiveReader::InspectHeader recognizes v2", error);
 
   // 6) 覆盖保护：归档文件已存在时必须拒绝，且不改动原文件。
   std::string before;
   ReadAll(container, &before);
   error.clear();
   const bool overwrite = engine.Backup(source, container, Filter(), v2, &error);
-  test_support::Check(!overwrite, "backup refuses to overwrite an existing .bak",
-                      error);
+  test_support::Check(!overwrite,
+                      "backup refuses to overwrite an existing .bak", error);
   std::string after;
   ReadAll(container, &after);
   test_support::Check(before == after, "existing .bak left byte-identical");
@@ -774,15 +782,120 @@ void RunEmptyInputs(const std::string& workdir) {
     const bool restored =
         engine.Restore(archive, destination, restore_options, &report, &error);
     std::string detail;
-    test_support::Check(restored &&
-                            test_support::CompareTrees(source, destination, &detail),
-                        std::string("empty fixture round trip (") +
-                            backupproject::PackMethodName(pack) + ")",
-                        error + detail);
+    test_support::Check(
+        restored && test_support::CompareTrees(source, destination, &detail),
+        std::string("empty fixture round trip (") +
+            backupproject::PackMethodName(pack) + ")",
+        error + detail);
   }
 }
 
 }  // namespace
+
+// ---- 8) writer / reader 的单条流上界必须同一边界 ---------------------------
+//
+// 这一组不制造 4 TiB 文件：边界判断被抽成了纯函数 IsAllowedStreamSize，
+// reader 与 writer 调用的是同一个函数、同一个常量 kMaxStreamSize。
+// 只要两者共用它，"writer 写出一个自己 reader 随后拒绝的归档"就不可能发生。
+void RunStreamSizeBoundary(const std::string& workdir) {
+  test_support::Section("stream size boundary: writer == reader");
+  (void)workdir;
+
+  const std::uint64_t limit = backupproject::container_v2::kMaxStreamSize;
+  test_support::Check(limit == (1ull << 42),
+                      "BND-01 the shared limit is still 4 TiB",
+                      std::to_string(limit));
+  test_support::Check(backupproject::IsAllowedStreamSize(limit - 1),
+                      "BND-02 limit-1 is allowed");
+  test_support::Check(backupproject::IsAllowedStreamSize(limit),
+                      "BND-03 limit itself is allowed (inclusive)");
+  test_support::Check(!backupproject::IsAllowedStreamSize(limit + 1),
+                      "BND-04 limit+1 is refused");
+  test_support::Check(!backupproject::IsAllowedStreamSize(UINT64_MAX),
+                      "BND-05 UINT64_MAX is refused");
+  test_support::Check(backupproject::IsAllowedStreamSize(0),
+                      "BND-06 zero is allowed (empty stream)");
+
+  // DES 的 PKCS#7 补齐是唯一的加法：接近 UINT64_MAX 时必须饱和而不是回绕。
+  // 回绕成 0 会把一个"显然太大"的长度伪装成合法的小值。
+  test_support::Check(backupproject::DesPaddedSize(UINT64_MAX) == UINT64_MAX,
+                      "BND-07 padding saturates instead of wrapping",
+                      std::to_string(backupproject::DesPaddedSize(UINT64_MAX)));
+  test_support::Check(
+      backupproject::DesPaddedSize(UINT64_MAX - 7) == UINT64_MAX,
+      "BND-08 padding near the top saturates too");
+  test_support::Check(backupproject::DesPaddedSize(0) == 8,
+                      "BND-09 padding of an empty stream is one block");
+  test_support::Check(backupproject::DesPaddedSize(8) == 16,
+                      "BND-10 padding always adds 1..8 bytes");
+  test_support::Check(!backupproject::IsAllowedStreamSize(
+                          backupproject::DesPaddedSize(limit + 1)),
+                      "BND-11 a stream just over the limit stays refused after "
+                      "padding");
+
+  // writer 侧：真的把超限的 size 交给 EncodeContainerHeader，必须**拒绝**，
+  // 而不是写出一个 reader 随后拒收的 header。
+  {
+    ContainerHeader header;
+    header.pack_method = static_cast<std::uint8_t>(PackMethod::kMyPack);
+    header.compression_method =
+        static_cast<std::uint8_t>(CompressionMethod::kNone);
+    header.encryption_method =
+        static_cast<std::uint8_t>(EncryptionMethod::kNone);
+    header.flags = 0;
+    header.entry_count = 1;
+    header.packed_size = limit + 1;
+    header.compressed_size = limit + 1;
+    header.payload_size = limit + 1;
+    std::string encoded;
+    std::string error;
+    test_support::Check(
+        !backupproject::EncodeContainerHeader(header, &encoded, &error),
+        "BND-12 the writer refuses an over-limit stream", error);
+    test_support::Check(encoded.empty(),
+                        "BND-13 a refused header produces no bytes at all");
+    test_support::Check(
+        error.find("exceeds the format limit") != std::string::npos,
+        "BND-14 the writer's refusal names the limit", error);
+
+    header.packed_size = limit;
+    header.compressed_size = limit;
+    header.payload_size = limit;
+    encoded.clear();
+    error.clear();
+    test_support::Check(
+        backupproject::EncodeContainerHeader(header, &encoded, &error),
+        "BND-15 exactly at the limit the writer still encodes", error);
+    test_support::Check(
+        encoded.size() == backupproject::container_v2::kHeaderSize,
+        "BND-16 the encoded header is still 160 bytes",
+        std::to_string(encoded.size()));
+
+    // reader 侧用同一份字节：header 里的 size 是 4
+    // TiB（合法），所以它能解出来。
+    ContainerHeader decoded;
+    error.clear();
+    const bool decoded_ok = backupproject::DecodeContainerHeader(
+        reinterpret_cast<const unsigned char*>(encoded.data()), encoded.size(),
+        &decoded, &error);
+    test_support::Check(decoded_ok && decoded.packed_size == limit,
+                        "BND-17 the reader accepts the very same header",
+                        error);
+
+    // 把 packed_size 改成 limit+1（其余保持一致），reader 必须拒绝。
+    std::string tampered = encoded;
+    for (int byte = 0; byte < 8; ++byte) {
+      tampered[24 + byte] = static_cast<char>((limit + 1) >> (8 * byte) & 0xFF);
+    }
+    ContainerHeader rejected;
+    error.clear();
+    test_support::Check(
+        !backupproject::DecodeContainerHeader(
+            reinterpret_cast<const unsigned char*>(tampered.data()),
+            tampered.size(), &rejected, &error),
+        "BND-18 the reader refuses limit+1 in the same layout", error);
+  }
+}
 
 int main() {
   std::printf("archive container / malformed input test\n");
@@ -795,6 +908,7 @@ int main() {
   RunMyPackBoundaries(workdir);
   RunLegacyCompatibility(workdir);
   RunEmptyInputs(workdir);
+  RunStreamSizeBoundary(workdir);
 
   return test_support::Finish("archive-container");
 }

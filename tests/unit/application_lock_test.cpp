@@ -5,7 +5,8 @@
 // 为什么这些用例不能只靠 shell 里的多进程测试：
 //   * "锁路径是符号链接 / 目录 / FIFO 时必须 fail closed，而且绝不 truncate
 //     目标" 这件事要在**拿到答案的同时**检查受害者文件没被动过；
-//   * "锁文件可以被留下、但绝不能靠删文件来释放锁" 需要检查 inode 而不是 exit code；
+//   * "锁文件可以被留下、但绝不能靠删文件来释放锁" 需要检查 inode 而不是 exit
+//   code；
 //   * 抢不到锁的**原因**必须能被区分（kBusy vs kError），否则一个环境问题会被
 //     汇报成并发问题。
 //
@@ -79,8 +80,9 @@ int main() {
 
     bp::FileLock first;
     std::string error;
-    test_support::Check(first.Acquire(path, &error) == bp::FileLockStatus::kAcquired,
-                        "AL-01 空路径之外的新锁文件可以拿到", error);
+    test_support::Check(
+        first.Acquire(path, &error) == bp::FileLockStatus::kAcquired,
+        "AL-01 空路径之外的新锁文件可以拿到", error);
     test_support::Check(first.held(), "AL-02 拿到之后 held() 为真");
 
     std::uint32_t mode = 0;
@@ -91,8 +93,9 @@ int main() {
     // 同一个进程里第二次 open 是另一个 open file description，flock 照样互斥。
     bp::FileLock second;
     const std::string hint = first.ReadOwnerHint();
-    test_support::Check(second.Acquire(path, &error) == bp::FileLockStatus::kBusy,
-                        "AL-04 第二个持有者拿到的是 kBusy（不是 kError）", error);
+    test_support::Check(
+        second.Acquire(path, &error) == bp::FileLockStatus::kBusy,
+        "AL-04 第二个持有者拿到的是 kBusy（不是 kError）", error);
     test_support::Check(!second.held(), "AL-05 kBusy 之后不持有任何 fd");
     test_support::Check(
         Contains(hint, "pid=" + std::to_string(static_cast<long>(::getpid()))),
@@ -100,9 +103,9 @@ int main() {
 
     first.Release();
     test_support::Check(!first.held(), "AL-07 Release 之后不再持有");
-    test_support::Check(second.Acquire(path, &error) ==
-                            bp::FileLockStatus::kAcquired,
-                        "AL-08 释放之后第二个能拿到", error);
+    test_support::Check(
+        second.Acquire(path, &error) == bp::FileLockStatus::kAcquired,
+        "AL-08 释放之后第二个能拿到", error);
     second.Release();
     test_support::Check(test_support::Exists(path),
                         "AL-09 释放锁**不删除**锁文件（删文件会让双方各持一个 "
@@ -114,7 +117,8 @@ int main() {
   }
 
   // ---- 不安全的锁路径必须 fail closed ----
-  test_support::Section("AL 2. 锁路径不安全时 fail closed，且绝不 truncate 目标");
+  test_support::Section(
+      "AL 2. 锁路径不安全时 fail closed，且绝不 truncate 目标");
   {
     const std::string directory = LockDir();
     const std::string victim = directory + "/victim.txt";
@@ -125,28 +129,33 @@ int main() {
     test_support::CreateSymlink(victim, link);
     bp::FileLock lock;
     std::string error;
-    test_support::Check(lock.Acquire(link, &error) == bp::FileLockStatus::kError,
-                        "AL-11 锁路径是符号链接 -> kError", error);
+    test_support::Check(
+        lock.Acquire(link, &error) == bp::FileLockStatus::kError,
+        "AL-11 锁路径是符号链接 -> kError", error);
     test_support::Check(Contains(error, "symbolic link"),
                         "AL-12 报错明确说这是符号链接", error);
     std::string after;
     test_support::ReadFile(victim, &after);
     test_support::Check(after == content,
-                        "AL-13 被指向的文件一个字节都没被改（O_NOFOLLOW）", after);
+                        "AL-13 被指向的文件一个字节都没被改（O_NOFOLLOW）",
+                        after);
     std::uint32_t victim_mode = 0;
     test_support::Check(ModeOf(victim, &victim_mode) && victim_mode == 0644,
-                        "AL-14 受害者权限也没被改", test_support::Octal(victim_mode));
+                        "AL-14 受害者权限也没被改",
+                        test_support::Octal(victim_mode));
 
     const std::string subdir = directory + "/dir.lock";
     ::mkdir(subdir.c_str(), 0755);
-    test_support::Check(lock.Acquire(subdir, &error) == bp::FileLockStatus::kError,
-                        "AL-15 锁路径是目录 -> kError", error);
+    test_support::Check(
+        lock.Acquire(subdir, &error) == bp::FileLockStatus::kError,
+        "AL-15 锁路径是目录 -> kError", error);
 
     const std::string fifo = directory + "/fifo.lock";
     test_support::CreateFifo(fifo, 0600);
     // FIFO 用 O_RDWR 打开不会阻塞，所以这里不会挂住；关键是它必须被拒绝。
-    test_support::Check(lock.Acquire(fifo, &error) == bp::FileLockStatus::kError,
-                        "AL-16 锁路径是 FIFO -> kError（而不是挂住）", error);
+    test_support::Check(
+        lock.Acquire(fifo, &error) == bp::FileLockStatus::kError,
+        "AL-16 锁路径是 FIFO -> kError（而不是挂住）", error);
     test_support::Check(Contains(error, "FIFO"),
                         "AL-17 报错说清楚占名字的是 FIFO", error);
   }
@@ -165,7 +174,8 @@ int main() {
     test_support::Check(!second.Acquire(path, &error),
                         "AL-19 第二个 SchedulerLock 抢不到");
     test_support::Check(
-        Contains(error, "The scheduled backup is already held by another process"),
+        Contains(error,
+                 "The scheduled backup is already held by another process"),
         "AL-20 SchedulerLock 报的是计划任务被别人持有", error);
 
     bp::SchedulerLock empty;
@@ -175,24 +185,27 @@ int main() {
   }
 
   // ---- 全应用单实例锁 ----
-  test_support::Section("AL 4. ApplicationInstanceLock：整个产品只允许一个实例");
+  test_support::Section(
+      "AL 4. ApplicationInstanceLock：整个产品只允许一个实例");
   {
     const std::string directory = LockDir();
     const std::string path = directory + "/app.lock";
 
     bp::ApplicationInstanceLock first;
     std::string error;
-    test_support::Check(first.Acquire(path, &error) ==
-                            bp::ApplicationInstanceStatus::kAcquired,
-                        "AL-23 第一个实例拿到锁", error);
+    test_support::Check(
+        first.Acquire(path, &error) == bp::ApplicationInstanceStatus::kAcquired,
+        "AL-23 第一个实例拿到锁", error);
     test_support::Check(first.held(), "AL-24 held() 为真");
 
     bp::ApplicationInstanceLock second;
     test_support::Check(second.Acquire(path, &error) ==
                             bp::ApplicationInstanceStatus::kAlreadyRunning,
-                        "AL-25 第二个实例得到 kAlreadyRunning（不是 kError）", error);
+                        "AL-25 第二个实例得到 kAlreadyRunning（不是 kError）",
+                        error);
     test_support::Check(Contains(error, "only one GUI or CLI process"),
-                        "AL-26 报错把产品规则说白：只允许一个 GUI 或 CLI", error);
+                        "AL-26 报错把产品规则说白：只允许一个 GUI 或 CLI",
+                        error);
     test_support::Check(!second.held(), "AL-27 被拒绝的一方不持有 fd");
 
     first.Release();
@@ -201,59 +214,158 @@ int main() {
                         "AL-28 释放之后第二个实例能拿到", error);
     second.Release();
 
-    // 产品路径必须由 app_paths.h 解析出来，且与 repository / --config-file /
-    // --schedule-file 无关。这里验证它跟着配置根走，而不是跟着别的东西。
-    test_support::Section("AL 5. 默认锁路径与配置根同源");
-    const std::string xdg = LockDir() + "/xdg";
-    test_support::Mkdir(xdg, 0755);
+    test_support::Section("AL 5. 全局锁路径只依赖 UID");
+    // 产品锁不能依赖 HOME / XDG_CONFIG_HOME：依赖它，同一个用户换一个环境变量
+    // 就能开第二个实例。这里把解析函数摊开成 (uid, runtime_root, fallback_root)
+    // 三个显式参数，因此每一种分支都能被覆盖，不需要伪造 /run/user
+    // 或第二个用户。
+    const std::string root = LockDir();
+    const std::string runtime_root = root + "/run-user";
+    const std::string fallback_root = root + "/tmp";
+    test_support::Mkdir(runtime_root, 0755);
+    test_support::Mkdir(fallback_root, 0777);
+    const uid_t uid = ::getuid();
+    const std::string uid_text =
+        std::to_string(static_cast<unsigned long long>(uid));
+    const std::string runtime_dir = runtime_root + "/" + uid_text;
+    const std::string expected_fallback =
+        fallback_root + "/backup-project-" + uid_text + ".lock";
+
+    std::string resolved;
+    // 1) runtime 目录不存在 -> fallback
+    test_support::Check(
+        bp::ResolveApplicationLockPath(uid, runtime_root, fallback_root,
+                                       &resolved, &error) &&
+            resolved == expected_fallback,
+        "AL-29 runtime 目录不存在 -> UID 专属 fallback", resolved);
+
+    // 2) runtime 目录可用 -> 用它
+    test_support::Mkdir(runtime_dir, 0700);
+    test_support::Check(
+        bp::ResolveApplicationLockPath(uid, runtime_root, fallback_root,
+                                       &resolved, &error) &&
+            resolved == runtime_dir + "/backup-project.lock",
+        "AL-30 runtime 目录可用 -> 优先用它", resolved);
+
+    // 3) runtime 目录本身是符号链接 -> 不跟随，退 fallback
+    const std::string real_runtime_dir =
+        runtime_root + "/" + uid_text + ".real";
+    test_support::Check(
+        ::rename(runtime_dir.c_str(), real_runtime_dir.c_str()) == 0,
+        "AL-31a runtime 目录改名备好");
+    test_support::Check(
+        test_support::CreateSymlink(real_runtime_dir, runtime_dir),
+        "AL-31b 在 runtime 路径上放一个符号链接");
+    test_support::Check(
+        bp::ResolveApplicationLockPath(uid, runtime_root, fallback_root,
+                                       &resolved, &error) &&
+            resolved == expected_fallback,
+        "AL-31 runtime 目录是符号链接时不跟随 -> fallback", resolved);
+    test_support::Check(
+        ::unlink(runtime_dir.c_str()) == 0 &&
+            ::rename(real_runtime_dir.c_str(), runtime_dir.c_str()) == 0,
+        "AL-31c 还原成真目录");
+
+    // 4) runtime 目录存在但不是目录 -> fallback
+    const std::string not_a_dir = runtime_root + "/file-dir";
+    test_support::WriteFile(not_a_dir, "x", 0644);
+    {
+      // 用一个"UID 就是 file-dir 这个名字"的假 uid 来命中最直接：
+      // 直接把 runtime_root 指到那个普通文件的父目录并换一个 uid 文本即可。
+      // 这里改成让 runtime_dir 本身成为一个普通文件：
+      const std::string other_uid_text = "4242";
+      const std::string file_runtime = runtime_root + "/" + other_uid_text;
+      test_support::WriteFile(file_runtime, "not a dir", 0644);
+      test_support::Check(
+          bp::ResolveApplicationLockPath(4242, runtime_root, fallback_root,
+                                         &resolved, &error) &&
+              resolved == fallback_root + "/backup-project-4242.lock",
+          "AL-32 runtime 路径是普通文件 -> fallback", resolved);
+      test_support::Check(!test_support::Exists(resolved),
+                          "AL-33 解析本身仍然不创建任何文件");
+    }
+
+    // 5) runtime 目录属主不是这个 uid -> fallback
+    test_support::Check(
+        bp::ResolveApplicationLockPath(uid + 1, runtime_root, fallback_root,
+                                       &resolved, &error) &&
+            resolved ==
+                fallback_root + "/backup-project-" +
+                    std::to_string(static_cast<unsigned long long>(uid + 1)) +
+                    ".lock",
+        "AL-34 runtime 目录属主不是该 uid -> fallback", resolved);
+
+    // 6) runtime 目录不可写 -> fallback
+    test_support::Check(::chmod(runtime_dir.c_str(), 0500) == 0,
+                        "AL-35 runtime 目录改为只读");
+    test_support::Check(
+        bp::ResolveApplicationLockPath(uid, runtime_root, fallback_root,
+                                       &resolved, &error) &&
+            resolved == expected_fallback,
+        "AL-36 runtime 目录不可写 -> fallback", resolved);
+    (void)::chmod(runtime_dir.c_str(), 0700);
+
+    // 7) 产品默认函数不读 HOME /
+    // XDG_CONFIG_HOME：换环境变量必须得到同一个路径。
     {
       SavedEnvironment saved_xdg("XDG_CONFIG_HOME");
       SavedEnvironment saved_home("HOME");
-      ::setenv("XDG_CONFIG_HOME", xdg.c_str(), 1);
-      std::string resolved;
+      std::string first;
+      std::string second;
+      ::setenv("XDG_CONFIG_HOME", (root + "/xdg-a").c_str(), 1);
       test_support::Check(
-          bp::DefaultApplicationInstanceLockPath(&resolved, &error),
-          "AL-29 能解析出默认锁路径", error);
+          bp::DefaultApplicationInstanceLockPath(&first, &error),
+          "AL-37 能解析出默认锁路径", error);
+      ::setenv("XDG_CONFIG_HOME", (root + "/xdg-b").c_str(), 1);
+      ::setenv("HOME", (root + "/home-b").c_str(), 1);
       test_support::Check(
-          resolved == xdg + "/backup-project/backup-gui-modern/app.lock",
-          "AL-30 默认锁路径 = <AppConfigDirectory>/app.lock", resolved);
+          bp::DefaultApplicationInstanceLockPath(&second, &error),
+          "AL-38 换环境变量之后仍然能解析", error);
+      test_support::Check(!first.empty() && first == second,
+                          "AL-39 默认锁路径与 XDG_CONFIG_HOME / HOME 无关",
+                          first + " vs " + second);
+      test_support::Check(
+          first == "/run/user/" + uid_text + "/backup-project.lock" ||
+              first == "/tmp/backup-project-" + uid_text + ".lock",
+          "AL-40 默认锁路径是 runtime 目录或 UID 专属 fallback", first);
+      test_support::Check(first.find(uid_text) != std::string::npos,
+                          "AL-41 默认锁路径里带着当前 uid", first);
+    }
 
-      // 解析只算路径，不碰文件系统。
-      test_support::Check(!test_support::Exists(resolved),
-                          "AL-31 只解析路径：解析本身不创建任何文件");
+    // 8) 不安全路径必须报 kError，不能伪装成"已有实例"。
+    const std::string victim = root + "/victim2.txt";
+    test_support::WriteFile(victim, "keep", 0644);
+    const std::string link = root + "/link.lock";
+    test_support::CreateSymlink(victim, link);
+    bp::ApplicationInstanceLock unsafe;
+    test_support::Check(
+        unsafe.Acquire(link, &error) == bp::ApplicationInstanceStatus::kError,
+        "AL-42 锁路径是符号链接 -> kError，不是 kAlreadyRunning", error);
+    std::string after;
+    test_support::ReadFile(victim, &after);
+    test_support::Check(after == "keep", "AL-43 被指向的文件仍然没被动过",
+                        after);
 
-      // 父目录不存在时 Acquire 要按项目策略建出来（0700），而不是拒绝启动。
-      const std::string nested = xdg + "/deep/er/app.lock";
+    // 9) 自动建目录：fallback 根不存在时按 0700 建出来
+    {
+      const std::string deep_fallback = root + "/deep/tmp";
       bp::ApplicationInstanceLock deep;
-      test_support::Check(deep.Acquire(nested, &error) ==
-                              bp::ApplicationInstanceStatus::kAcquired,
-                          "AL-32 配置目录不存在时也能拿锁（会自动建 0700 目录）",
-                          error);
+      test_support::Check(
+          bp::ResolveApplicationLockPath(uid, root + "/no-such-run",
+                                         deep_fallback, &resolved, &error) &&
+              deep.Acquire(resolved, &error) ==
+                  bp::ApplicationInstanceStatus::kAcquired,
+          "AL-44 fallback 根不存在时也能拿锁（自动建 0700 目录）", error);
       std::uint32_t mode = 0;
-      test_support::Check(ModeOf(xdg + "/deep/er", &mode) && mode == 0700,
-                          "AL-33 自动建出来的目录是 0700",
+      test_support::Check(ModeOf(deep_fallback, &mode) && mode == 0700,
+                          "AL-45 自动建出来的 fallback 目录是 0700",
                           test_support::Octal(mode));
       deep.Release();
-
-      // 不安全路径必须报 kError，不能伪装成"已有实例"：那会把环境问题
-      // 说成并发问题，排障方向直接跑偏。
-      const std::string victim = xdg + "/victim2.txt";
-      test_support::WriteFile(victim, "keep", 0644);
-      const std::string link = xdg + "/link.lock";
-      test_support::CreateSymlink(victim, link);
-      bp::ApplicationInstanceLock unsafe;
-      test_support::Check(unsafe.Acquire(link, &error) ==
-                              bp::ApplicationInstanceStatus::kError,
-                          "AL-34 锁路径是符号链接 -> kError，不是 kAlreadyRunning",
-                          error);
-      std::string after;
-      test_support::ReadFile(victim, &after);
-      test_support::Check(after == "keep",
-                          "AL-35 被指向的文件仍然没被动过", after);
     }
-    test_support::Check(::getenv("XDG_CONFIG_HOME") == nullptr ||
-                            std::string(::getenv("XDG_CONFIG_HOME")) != xdg,
-                        "AL-36 测试结束后环境变量已还原");
+    test_support::Check(
+        ::getenv("XDG_CONFIG_HOME") == nullptr ||
+            std::string(::getenv("XDG_CONFIG_HOME")) != root + "/xdg-b",
+        "AL-46 测试结束后环境变量已还原");
   }
 
   // ---- 原子替换写入（ScheduleStore / ConfigManager 共用）----
@@ -262,32 +374,31 @@ int main() {
     const std::string directory = LockDir();
     const std::string path = directory + "/state.json";
     std::string error;
-    test_support::Check(
-        bp::WriteFileAtomicallyReplacing(path, "first", &error),
-        "AL-37 首次写入成功", error);
+    test_support::Check(bp::WriteFileAtomicallyReplacing(path, "first", &error),
+                        "AL-47 首次写入成功", error);
     std::string content;
     test_support::ReadFile(path, &content);
-    test_support::Check(content == "first", "AL-38 内容正确", content);
+    test_support::Check(content == "first", "AL-48 内容正确", content);
 
     test_support::Check(
         bp::WriteFileAtomicallyReplacing(path, "second", &error),
-        "AL-39 覆盖写入成功", error);
+        "AL-49 覆盖写入成功", error);
     test_support::ReadFile(path, &content);
-    test_support::Check(content == "second", "AL-40 覆盖之后是新的完整内容",
+    test_support::Check(content == "second", "AL-50 覆盖之后是新的完整内容",
                         content);
 
     std::uint32_t mode = 0;
     test_support::Check(ModeOf(path, &mode) && mode == 0600,
-                        "AL-41 目标权限是 0600", test_support::Octal(mode));
+                        "AL-51 目标权限是 0600", test_support::Octal(mode));
 
     // 临时文件必须被清理干净：目录里只剩目标文件本身。
-    const std::vector<std::string> entries = test_support::DirEntries(directory);
+    const std::vector<std::string> entries =
+        test_support::DirEntries(directory);
     bool leftovers = false;
     for (const std::string& name : entries) {
       if (name.find(".tmp-") != std::string::npos) leftovers = true;
     }
-    test_support::Check(!leftovers,
-                        "AL-42 成功之后没有留下任何临时文件");
+    test_support::Check(!leftovers, "AL-52 成功之后没有留下任何临时文件");
 
     // 目标是一个符号链接时，写入必须替换**链接本身**而不是跟随它写穿过去。
     // rename 天然满足这一点（它作用在目录项上），这里把它钉住。
@@ -297,22 +408,21 @@ int main() {
     test_support::CreateSymlink(victim, link);
     test_support::Check(
         bp::WriteFileAtomicallyReplacing(link, "replaced", &error),
-        "AL-43 目标名字上是符号链接时也能替换目录项", error);
+        "AL-53 目标名字上是符号链接时也能替换目录项", error);
     std::string victim_content;
     test_support::ReadFile(victim, &victim_content);
     test_support::Check(victim_content == "untouched",
-                        "AL-44 链接指向的文件没有被写穿", victim_content);
+                        "AL-54 链接指向的文件没有被写穿", victim_content);
     std::string link_content;
     test_support::ReadFile(link, &link_content);
     test_support::Check(link_content == "replaced",
-                        "AL-45 那个名字现在是一个装着新内容的普通文件",
+                        "AL-55 那个名字现在是一个装着新内容的普通文件",
                         link_content);
 
-    test_support::Check(
-        !bp::WriteFileAtomicallyReplacing("", "x", &error),
-        "AL-46 空路径明确失败");
+    test_support::Check(!bp::WriteFileAtomicallyReplacing("", "x", &error),
+                        "AL-56 空路径明确失败");
     test_support::Check(Contains(error, "path is empty"),
-                        "AL-47 空路径的报错说清楚原因", error);
+                        "AL-57 空路径的报错说清楚原因", error);
   }
 
   return test_support::Finish("application_lock_test");
