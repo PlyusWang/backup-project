@@ -439,8 +439,8 @@ else
 fi
 
 # 筛选编辑器：刷新、添加 Include、添加 Exclude、清空、上移、下移、删除、
-# 添加规则 = 8 处。仍然钉死数量，防止漏绑 busy 或复制粘贴出多余按钮。
-expect_count "$QML_DIR/components/FilterEditorPanel.qml" "enabled: !controller.busy" 5 \
+# 添加规则与高级规则 = 6 处。仍然钉死数量，防止漏绑 busy 或复制粘贴出多余按钮。
+expect_count "$QML_DIR/components/FilterEditorPanel.qml" "enabled: !controller.busy" 6 \
   "筛选编辑器忙碌时禁用输入与按钮"
 # 规则卡片上的三个动作按钮（上移 / 下移 / 删除）沿用各自的忙碌开关。
 expect_count "$QML_DIR/components/RuleCard.qml" "enabled: !card.busy" 3 \
