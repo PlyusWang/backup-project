@@ -72,6 +72,11 @@ ScheduleController::ScheduleController(QString schedule_file_path,
     // 拿启动时读到的那个仓库继续写——静默地把备份写进旧位置。
     connect(backup_controller, &BackupController::repositoryPathChanged, this,
             &ScheduleController::OnRepositoryPathChanged);
+    // 备份管理页删掉一份归档之后，计划快照名单必须立刻跟上。少了这条连接，
+    // "GUI 删了一个计划快照"与"CLI repository delete 同一个文件"的后果不同：
+    // 前者会让这个文件名在计划页里继续显示到下一轮定时评估为止。
+    connect(backup_controller, &BackupController::archiveDeleted, this,
+            &ScheduleController::OnArchiveDeleted);
   }
 }
 
@@ -107,6 +112,8 @@ void ScheduleController::LoadFromDisk() {
     // 坏配置只如实报告，不自动改写、不自动删除、不猜默认值。
     load_error_ = QString::fromStdString(error);
     document_ = backupproject::ScheduleDocument{};
+    // 文件读不懂 = 计划不能用：明确挂起，而不是显示成"未启用"。
+    SetConfigInvalid(true);
     emit configChanged();
     emit stateChanged();
     return;
@@ -118,6 +125,10 @@ void ScheduleController::LoadFromDisk() {
     document_ = std::move(document);
   }
   config_loaded_ = true;
+  // 文件本身读得懂，所以"读不懂"这条挂起理由不成立。配置**内容**是否合法
+  // 由 Evaluate 回答（见 OnEvaluationFinished）：它能看见 Filter、仓库与
+  // 无人值守加密边界，比这里的一次结构检查更完整。
+  SetConfigInvalid(false);
   emit configChanged();
   emit stateChanged();
 }
@@ -125,14 +136,18 @@ void ScheduleController::LoadFromDisk() {
 // ---- runner 锁 ----
 
 void ScheduleController::ApplyRunnerLock() {
-  const bool should_run = document_.config.enabled && config_loaded_;
+  const bool should_run =
+      document_.config.enabled && config_loaded_ && !config_invalid_;
 
   if (!should_run) {
     if (lock_.held()) {
       lock_.Release();
       tick_.stop();
-      SetRunnerMessage(QStringLiteral("当前未启用。"));
-    } else if (runner_message_.isEmpty()) {
+    }
+    // 挂起与"未启用"是两件事：前者是配置坏了，用户需要看到不同的说法。
+    if (config_invalid_) {
+      SetRunnerMessage(QStringLiteral("计划配置不合法，定时备份已挂起。"));
+    } else {
       SetRunnerMessage(QStringLiteral("当前未启用。"));
     }
     return;
@@ -157,6 +172,22 @@ void ScheduleController::ApplyRunnerLock() {
   if (!tick_.isActive()) tick_.start();
 }
 
+void ScheduleController::SetConfigInvalid(bool invalid) {
+  if (config_invalid_ == invalid) return;
+  config_invalid_ = invalid;
+  if (invalid) {
+    // 关键的一步：把 1 Hz 的 timer 停掉。只把状态标成"挂起"而让 timer 继续
+    // 跑，Tick 仍然每秒被调用一次——虽然会被上面的提前返回挡住，但"停掉
+    // timer"才是"不再周期性重试"这句话的直接实现。
+    tick_.stop();
+    // 挂起期间也不该占着 runner 锁：我们不会跑任何东西，占着它只会让
+    // "这份计划现在由谁在跑"得到一个假答案。锁随挂起释放，恢复时
+    // ApplyRunnerLock 会重新抢回来。
+    if (lock_.held()) lock_.Release();
+  }
+  emit suspendedChanged();
+}
+
 void ScheduleController::SetRunnerMessage(const QString& text) {
   if (runner_message_ == text) return;
   runner_message_ = text;
@@ -166,6 +197,9 @@ void ScheduleController::SetRunnerMessage(const QString& text) {
 // ---- tick ----
 
 void ScheduleController::Tick() {
+  // 挂起时 tick 已经被停掉，这里再挡一次：即使 timer 真的又响了一次，
+  // 也绝不会有第二次完整校验，更不会有第二次备份。
+  if (config_invalid_) return;
   if (!config_loaded_ || !document_.config.enabled) return;
   if (!lock_.held()) {
     // 锁可能只是**暂时**在别人手里：上一个持有者退出之后必须能重新抢回来。
@@ -198,6 +232,31 @@ void ScheduleController::OnRepositoryPathChanged() {
     // 换了仓库：积压的那一次到期检查必须落到新仓库上。
     DrainPending();
   }
+}
+
+void ScheduleController::OnArchiveDeleted(const QString& file_name) {
+  Q_UNUSED(file_name);
+  // 读不懂 / 已挂起时一概不动：document_ 不是一份可信的 state，reconcile 之后
+  // 保存也一定失败，写下去只会把一份坏配置覆盖成另一份坏配置。
+  if (!config_loaded_ || config_invalid_) return;
+
+  const std::size_t before = document_.state.managed_snapshots.size();
+  // 与 CLI 的 repository delete 调的是同一个函数、同一个仓库。
+  backupproject::ScheduledBackupService::ReconcileManagedSnapshots(
+      repository_path_.toStdString(), &document_);
+  if (document_.state.managed_snapshots.size() == before) {
+    // 删掉的不是计划快照：一个字节都不写。
+    return;
+  }
+  std::string error;
+  if (!store_.Save(document_, &error)) {
+    // 归档已经删掉了，这一步失败不能让"删除"这个动作看起来失败。如实提示，
+    // 下一轮定时评估会再 reconcile 一次。
+    SetStatus(kWarning, QStringLiteral("备份已删除，但计划状态没有更新"),
+              QString::fromStdString(error));
+    return;
+  }
+  emit stateChanged();
 }
 
 void ScheduleController::Submit(bool force) {
@@ -300,6 +359,11 @@ ScheduleOutcome ScheduleController::RunEvaluation(const QString& store_path,
     case backupproject::ScheduleEvaluationStatus::kFailed:
       outcome.succeeded = false;
       break;
+    case backupproject::ScheduleEvaluationStatus::kConfigInvalid:
+      // 配置不合法：这一轮什么都没写。控制器据此挂起，不再周期性地重试。
+      outcome.succeeded = false;
+      outcome.config_invalid = true;
+      break;
   }
   return outcome;
 }
@@ -312,6 +376,15 @@ void ScheduleController::OnEvaluationFinished() {
   if (!outcome.error_message.isEmpty()) {
     SetStatus(kError, QStringLiteral("计划任务无法运行"),
               outcome.error_message);
+  } else if (outcome.config_invalid) {
+    // 挂起不是"这一次失败"：磁盘上的配置不合法，我们既不修也不猜。
+    // 页面必须明确说清楚，并给出唯一的恢复入口。
+    SetStatus(
+        kError, QStringLiteral("计划配置不合法，定时备份已挂起"),
+        (outcome.diagnostic.isEmpty() ? outcome.status_text
+                                      : outcome.diagnostic) +
+            QStringLiteral(" 这一轮没有写入任何内容，也不会自动重试。"
+                           "请在本页修正后重新保存，保存成功即自动恢复。"));
   } else if (!outcome.due) {
     SetStatus(kIdle, QStringLiteral("还没到时间"),
               QStringLiteral("下一次运行时间未到，本轮不执行。"));
@@ -353,14 +426,26 @@ void ScheduleController::OnEvaluationFinished() {
   // 重新读盘：managed 列表、history、next run 都以磁盘上的状态为准，
   // 界面不自己维护第二份。
   LoadFromDisk();
-  ApplyRunnerLock();
+  if (outcome.config_invalid) {
+    // 顺序很重要：LoadFromDisk
+    // 会清掉"文件读不懂"那条挂起理由（文件确实读得懂），
+    // 所以评估级别的挂起必须在这之后重新立起来，而且**不再**调用
+    // ApplyRunnerLock —— 那会把刚停掉的 tick 又启动回来。
+    SetConfigInvalid(true);
+  } else {
+    ApplyRunnerLock();
+  }
   emit operationFinished(last_succeeded_);
-  DrainPending();
+  // 挂起期间积压的 pending 没有意义：配置不合法，补跑一次也只是再失败一次。
+  if (!config_invalid_) DrainPending();
 }
 
 // ---- 对外入口 ----
 
 void ScheduleController::start() {
+  // 显式（重新）启动是恢复挂起的入口之一：用户点了"重新载入"，就该老实
+  // 重新读一次盘。LoadFromDisk 会按文件的实际状态重新决定是否挂起。
+  SetConfigInvalid(false);
   LoadFromDisk();
   ApplyRunnerLock();
 }
@@ -387,6 +472,25 @@ bool ScheduleController::saveConfig(bool enabled, const QString& source_path,
                                     const QString& compression_key,
                                     const QStringList& include_rules,
                                     const QStringList& exclude_rules) {
+  // ---- 同一进程内的单写者规则 ----
+  //
+  // ScheduleStore 的写者有两个：本函数（GUI 线程）与后台评估线程
+  // （RunEvaluation -> ScheduledBackupService ->
+  // ScheduleStore::Save/SaveManifest）。 两者同时写就是并发的
+  // Load->Modify->Save：后台那一路刚 push 进去的 managed 记录与 history
+  // 会被这一路整体覆盖掉，归档从此脱离 retention 管理。
+  //
+  // 产品只允许一个进程，但进程内仍然有两个线程，所以这条规则必须由 C++ 保证，
+  // 而不是只靠 QML 把按钮置灰（那是界面礼貌，不是不变式）。评估在飞的时候
+  // 直接拒绝保存，用户等它结束再点。
+  if (busy_) {
+    SetStatus(
+        kWarning, QStringLiteral("计划任务正在运行"),
+        QStringLiteral(
+            "定时备份正在评估/写盘，此时保存会与它并发写入同一份计划状态。"
+            "请等这一轮结束后再保存。"));
+    return false;
+  }
   if (!config_loaded_) {
     SetStatus(kError, QStringLiteral("计划配置不可用"), load_error_);
     return false;
@@ -454,6 +558,8 @@ bool ScheduleController::saveConfig(bool enabled, const QString& source_path,
 
   document_ = next;
   emit configChanged();
+  // 保存成功 = 磁盘上现在有一份合法配置 = 挂起理由消失。这是唯一的自动恢复点。
+  SetConfigInvalid(false);
   ApplyRunnerLock();
   SetStatus(kSuccess, QStringLiteral("计划已保存"),
             config.enabled
@@ -509,6 +615,11 @@ QString ScheduleController::validateRule(const QString& action,
 }
 
 bool ScheduleController::runNow() {
+  if (config_invalid_) {
+    SetStatus(kError, QStringLiteral("计划配置不合法，定时备份已挂起"),
+              QStringLiteral("请先在本页修正并保存计划配置。"));
+    return false;
+  }
   if (!config_loaded_) {
     SetStatus(kError, QStringLiteral("计划配置不可用"), load_error_);
     return false;

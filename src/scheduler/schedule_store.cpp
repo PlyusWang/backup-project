@@ -17,6 +17,7 @@
 
 #include "backup_catalog.h"
 #include "backup_option_keys.h"
+#include "file_io.h"
 #include "simple_json.h"
 
 namespace backupproject {
@@ -35,6 +36,11 @@ bool ContainsNul(const std::string& value) {
   return value.find('\0') != std::string::npos;
 }
 
+// 本文件自己的父目录解析。"a" -> "."、"/a" -> "/"、"/" -> "/"。
+//
+// 刻意不共用 file_io.h 里那个同名函数：它在"没有 '/' 时返回空串"，语义与
+// 这里不同（空串会让 mkdir -p 走到当前目录之外的判断上）。真正共享的是
+// 原子的文件替换与目录创建入口，不是这个六行的字符串切分。
 std::string ParentDirectoryOf(const std::string& path) {
   const std::size_t slash = path.rfind('/');
   if (slash == std::string::npos) return std::string(".");
@@ -69,92 +75,6 @@ bool MakeDirectories(const std::string& path, std::string* error_message) {
     SetError(error_message,
              Describe(errno, "Failed to create the schedule directory", path));
     return false;
-  }
-  return true;
-}
-
-// 全部写入或明确失败。EINTR 重试；短写继续写。
-bool WriteAll(int fd, const std::string& data, const std::string& path,
-              std::string* error_message) {
-  std::size_t written = 0;
-  while (written < data.size()) {
-    const ssize_t result =
-        ::write(fd, data.data() + written, data.size() - written);
-    if (result < 0) {
-      if (errno == EINTR) continue;
-      SetError(error_message, Describe(errno, "Failed to write", path));
-      return false;
-    }
-    if (result == 0) {
-      SetError(error_message, "Failed to write " + path + ": short write");
-      return false;
-    }
-    written += static_cast<std::size_t>(result);
-  }
-  return true;
-}
-
-// 原子替换：写临时文件 -> fsync -> rename -> fsync 目录。
-//
-// 顺序不是可以随便调的：先 rename 再 fsync 的话，掉电后可能留下一个名字对、
-// 内容空的文件——那比"旧文件还在"糟得多。
-bool WriteFileAtomically(const std::string& path, const std::string& data,
-                         std::string* error_message) {
-  const std::string directory = ParentDirectoryOf(path);
-  const std::string temporary =
-      path + ".tmp-" + std::to_string(static_cast<long>(::getpid()));
-
-  // 权限 0600 直接在 open 的 mode 参数里给：先按 umask 建再 chmod 会留下一个
-  // "短暂地更宽松"的窗口。
-  const int fd =
-      ::open(temporary.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
-  if (fd < 0) {
-    SetError(error_message,
-             Describe(errno, "Failed to create temporary file", temporary));
-    return false;
-  }
-  if (!WriteAll(fd, data, temporary, error_message)) {
-    const int saved_errno = errno;
-    ::close(fd);
-    ::unlink(temporary.c_str());
-    errno = saved_errno;
-    return false;
-  }
-  if (::fsync(fd) != 0) {
-    const int saved_errno = errno;
-    ::close(fd);
-    ::unlink(temporary.c_str());
-    SetError(error_message,
-             Describe(saved_errno, "Failed to fsync", temporary));
-    return false;
-  }
-  if (::close(fd) != 0) {
-    const int saved_errno = errno;
-    ::unlink(temporary.c_str());
-    SetError(error_message,
-             Describe(saved_errno, "Failed to close", temporary));
-    return false;
-  }
-  if (::rename(temporary.c_str(), path.c_str()) != 0) {
-    const int saved_errno = errno;
-    ::unlink(temporary.c_str());
-    SetError(error_message, Describe(saved_errno, "Failed to replace", path));
-    return false;
-  }
-
-  // 目录 fsync 让 rename 本身落盘。少数文件系统不支持对目录 fsync
-  // （EINVAL / ENOTSUP），那不是错误；其它 errno 是真实 I/O 问题，如实报告。
-  const int directory_fd =
-      ::open(directory.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
-  if (directory_fd >= 0) {
-    if (::fsync(directory_fd) != 0 && errno != EINVAL && errno != ENOTSUP) {
-      const int saved_errno = errno;
-      ::close(directory_fd);
-      SetError(error_message,
-               Describe(saved_errno, "Failed to fsync directory", directory));
-      return false;
-    }
-    ::close(directory_fd);
   }
   return true;
 }
@@ -1186,7 +1106,10 @@ bool ScheduleStore::Save(const ScheduleDocument& document,
   if (!MakeDirectories(ParentDirectoryOf(schedule_file_path_), error_message)) {
     return false;
   }
-  return WriteFileAtomically(
+  // 原子替换的实现在 file_io.cpp：临时文件名由 mkstemp 生成（唯一 + O_EXCL），
+  // 因此既不会跟随别人预放的符号链接，也不会截断别人预放的文件。ConfigManager
+  // 用的是同一个函数——两份各自演化的临时文件写法迟早会有一份漏掉某条边界。
+  return WriteFileAtomicallyReplacing(
       schedule_file_path_, SerializeScheduleDocument(document), error_message);
 }
 
@@ -1307,7 +1230,8 @@ bool ScheduleStore::SaveManifest(const std::vector<ManifestEntry>& entries,
                  " bytes exceeds the bound");
     return false;
   }
-  return WriteFileAtomically(manifest_file_path(), text, error_message);
+  return WriteFileAtomicallyReplacing(manifest_file_path(), text,
+                                      error_message);
 }
 
 bool ScheduleStore::RemoveManifest(std::string* error_message) const {

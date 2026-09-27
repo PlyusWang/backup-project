@@ -58,6 +58,25 @@ bool TakeValue(const std::vector<std::string>& arguments, std::size_t* index,
   return true;
 }
 
+// 单值选项的重复检测。
+//
+// "--retain 1 --retain 2" 不是"后者覆盖前者"：用户对同一件事说了两遍，静默取
+// 一个会让真正想指定的那个被丢掉，而且脚本里的拼接错误会一路静默通过。
+//
+// 刻意不覆盖三类：
+//   * --include / --exclude 是真·可重复选项，重复是它的正常用法；
+//   * --clear-filters 是幂等的布尔开关，说两遍和不说一样，没有歧义；
+//   * 位置参数由各自的"参数个数"检查负责。
+bool MarkSingleOption(bool* seen, const std::string& option,
+                      std::string* error_message) {
+  if (*seen) {
+    *error_message = option + " was given more than once";
+    return false;
+  }
+  *seen = true;
+  return true;
+}
+
 bool ParseBoundedUint32(const std::string& text, std::uint32_t minimum,
                         std::uint32_t maximum, const std::string& option,
                         std::uint32_t* value, std::string* error_message) {
@@ -233,6 +252,22 @@ void PrintCliUsage(const std::string& program_name, std::ostream& output) {
       << "  --config-file <path>    Override the application config.json.\n"
       << "  --schedule-file <path>  Override the schedule store.\n"
       << "\n"
+      << "Every command consumes all of its arguments: an unexpected\n"
+      << "positional argument, an unknown option, a missing option value, a\n"
+      << "repeated single-value option and an out-of-range number are all\n"
+      << "usage errors. --include / --exclude may be repeated.\n"
+      << "\n"
+      << "Only one instance of this program may run at a time. The Modern GUI\n"
+      << "and this command share one application lock; when the other one is\n"
+      << "already running, every business command exits with code 3 and does\n"
+      << "not touch the configuration, the repository or the schedule.\n"
+      << "\n"
+      << "Exit codes:\n"
+      << "  0  success\n"
+      << "  1  operation failed\n"
+      << "  2  command line usage error\n"
+      << "  3  another backup-project instance is already running\n"
+      << "\n"
       << "Filter rules (see docs/filter_usage.md):\n"
       << "  name: / path: / stem: / ext: / type:file|folder / size: / mtime:\n"
       << "  wildcards: * (no '/'), ? (one char, no '/'), ** (may cross '/')\n"
@@ -259,6 +294,9 @@ int RunBackupCommand(const CliContext& context,
   BackupOptions options;
   bool has_pipeline_option = false;
   bool encryption_requested = false;
+  bool saw_pack = false;
+  bool saw_compression = false;
+  bool saw_encryption = false;
   std::string error_message;
 
   for (std::size_t index = 2; index < arguments.size(); ++index) {
@@ -277,6 +315,9 @@ int RunBackupCommand(const CliContext& context,
       continue;
     }
     if (option == "--pack") {
+      if (!MarkSingleOption(&saw_pack, option, &error_message)) {
+        return UsageError(context, error_message);
+      }
       if (!TakeValue(arguments, &index, option, &value, &error_message)) {
         return UsageError(context, error_message);
       }
@@ -289,6 +330,9 @@ int RunBackupCommand(const CliContext& context,
       continue;
     }
     if (option == "--compression") {
+      if (!MarkSingleOption(&saw_compression, option, &error_message)) {
+        return UsageError(context, error_message);
+      }
       if (!TakeValue(arguments, &index, option, &value, &error_message)) {
         return UsageError(context, error_message);
       }
@@ -301,6 +345,9 @@ int RunBackupCommand(const CliContext& context,
       continue;
     }
     if (option == "--encryption") {
+      if (!MarkSingleOption(&saw_encryption, option, &error_message)) {
+        return UsageError(context, error_message);
+      }
       if (!TakeValue(arguments, &index, option, &value, &error_message)) {
         return UsageError(context, error_message);
       }
@@ -534,11 +581,22 @@ int ScheduleSet(const CliContext& context,
   std::vector<std::string> include_rules;
   std::vector<std::string> exclude_rules;
   bool clear_filters = false;
+  // 单值选项各只能出现一次。--include / --exclude 是重复有意义的可重复选项，
+  // --clear-filters 是幂等开关，三者都不在这里。
+  bool saw_source = false;
+  bool saw_interval = false;
+  bool saw_retain = false;
+  bool saw_pack = false;
+  bool saw_compression = false;
+  bool saw_encryption = false;
 
   for (std::size_t index = 0; index < arguments.size(); ++index) {
     const std::string option = arguments[index];
     std::string value;
     if (option == "--source") {
+      if (!MarkSingleOption(&saw_source, option, &error)) {
+        return UsageError(context, error);
+      }
       if (!TakeValue(arguments, &index, option, &value, &error)) {
         return UsageError(context, error);
       }
@@ -546,6 +604,9 @@ int ScheduleSet(const CliContext& context,
       continue;
     }
     if (option == "--interval-minutes") {
+      if (!MarkSingleOption(&saw_interval, option, &error)) {
+        return UsageError(context, error);
+      }
       if (!TakeValue(arguments, &index, option, &value, &error)) {
         return UsageError(context, error);
       }
@@ -556,6 +617,9 @@ int ScheduleSet(const CliContext& context,
       continue;
     }
     if (option == "--retain") {
+      if (!MarkSingleOption(&saw_retain, option, &error)) {
+        return UsageError(context, error);
+      }
       if (!TakeValue(arguments, &index, option, &value, &error)) {
         return UsageError(context, error);
       }
@@ -566,6 +630,9 @@ int ScheduleSet(const CliContext& context,
       continue;
     }
     if (option == "--pack") {
+      if (!MarkSingleOption(&saw_pack, option, &error)) {
+        return UsageError(context, error);
+      }
       if (!TakeValue(arguments, &index, option, &value, &error)) {
         return UsageError(context, error);
       }
@@ -575,6 +642,9 @@ int ScheduleSet(const CliContext& context,
       continue;
     }
     if (option == "--compression") {
+      if (!MarkSingleOption(&saw_compression, option, &error)) {
+        return UsageError(context, error);
+      }
       if (!TakeValue(arguments, &index, option, &value, &error)) {
         return UsageError(context, error);
       }
@@ -585,6 +655,9 @@ int ScheduleSet(const CliContext& context,
       continue;
     }
     if (option == "--encryption") {
+      if (!MarkSingleOption(&saw_encryption, option, &error)) {
+        return UsageError(context, error);
+      }
       if (!TakeValue(arguments, &index, option, &value, &error)) {
         return UsageError(context, error);
       }
@@ -724,6 +797,26 @@ int ScheduleRun(const CliContext& context) {
     return kCliExitOperationFailed;
   }
 
+  // "立即运行"的前提是这份计划**确实被启用了**。以前这里会走到
+  // EvaluateNow -> kDisabled 然后退出 0：脚本会把"其实什么都没做"当成成功，
+  // 而 GUI 的 runNow() 在同样的情况下是明确的拒绝。同一件事两个前端给不同
+  // 结论，正是本轮要收掉的边界，所以判断放在这里、结论是失败。
+  {
+    ScheduleDocument document;
+    ScheduleLoadStatus status = ScheduleLoadStatus::kMissing;
+    if (!LoadScheduleDocument(context, &document, &status, &error)) {
+      PrintError(error);
+      return kCliExitOperationFailed;
+    }
+    if (!document.config.enabled) {
+      PrintError(
+          "The scheduled backup is disabled, so there is nothing to run now. "
+          "Enable it first: " +
+          context.program_name + " schedule enable");
+      return kCliExitOperationFailed;
+    }
+  }
+
   ScheduleStore store(context.schedule_file_path);
   SchedulerLock lock;
   if (!lock.Acquire(store.lock_file_path(), &error)) {
@@ -740,7 +833,10 @@ int ScheduleRun(const CliContext& context) {
     return kCliExitOperationFailed;
   }
   PrintEvaluation(result, now);
-  return result.status == ScheduleEvaluationStatus::kFailed
+  // 配置不合法（计划被挂起）与"这一轮失败"是两回事，但对命令的调用者来说
+  // 都是"这次运行没有成功"，所以退出码相同：非 0。
+  return (result.status == ScheduleEvaluationStatus::kFailed ||
+          result.status == ScheduleEvaluationStatus::kConfigInvalid)
              ? kCliExitOperationFailed
              : kCliExitSuccess;
 }
@@ -829,6 +925,20 @@ int ScheduleWatch(const CliContext& context) {
       PrintError(error);
       return kCliExitOperationFailed;
     }
+    if (result.status == ScheduleEvaluationStatus::kConfigInvalid) {
+      // 落盘配置不合法 == 计划已挂起。继续 watch 只会每 30 秒重做一遍同样的
+      // 完整校验，而且产品只允许一个进程——用户在 watch 运行期间根本没法去改
+      // 那份文件。明确退出，把控制权交回用户。
+      PrintEvaluation(result, now);
+      PrintError(
+          "The stored schedule configuration is not usable, so the scheduled "
+          "backup is suspended. Nothing was written. Fix it with "
+          "'" +
+          context.program_name +
+          " schedule set ...' and start watching again.");
+      lock.Release();
+      return kCliExitOperationFailed;
+    }
     if (result.status != ScheduleEvaluationStatus::kNotDue) {
       PrintEvaluation(result, now);
       std::cout.flush();
@@ -863,15 +973,30 @@ int RunScheduleCommand(const CliContext& context,
   const std::string subcommand = arguments[0];
   const std::vector<std::string> rest(arguments.begin() + 1, arguments.end());
 
+  const bool known = subcommand == "show" || subcommand == "set" ||
+                     subcommand == "enable" || subcommand == "disable" ||
+                     subcommand == "run" || subcommand == "history" ||
+                     subcommand == "watch";
+  if (!known) {
+    return UsageError(context,
+                      "unknown schedule subcommand '" + subcommand + "'");
+  }
+  // 每个子命令都必须**明确消费全部 argv**。除了 set（它自己解析 rest），
+  // 其余子命令都是零参数：'schedule show extra' 静默忽略 extra 会让脚本里
+  // 一个拼错的参数看起来完全成功，而用户以为自己换了一种运行方式。
+  if (subcommand != "set" && !rest.empty()) {
+    return UsageError(context, "'schedule " + subcommand +
+                                   "' does not take any argument, but got '" +
+                                   rest[0] + "'");
+  }
+
   if (subcommand == "show") return ScheduleShow(context);
   if (subcommand == "set") return ScheduleSet(context, rest);
   if (subcommand == "enable") return ScheduleToggle(context, true);
   if (subcommand == "disable") return ScheduleToggle(context, false);
   if (subcommand == "run") return ScheduleRun(context);
   if (subcommand == "history") return ScheduleHistory(context);
-  if (subcommand == "watch") return ScheduleWatch(context);
-  return UsageError(context,
-                    "unknown schedule subcommand '" + subcommand + "'");
+  return ScheduleWatch(context);
 }
 
 // ---- repository ----
@@ -980,11 +1105,25 @@ int RunRepositoryCommand(const CliContext& context,
   if (arguments.empty()) {
     return UsageError(context, "'repository' expects 'list' or 'delete'");
   }
-  if (arguments[0] == "list") return RepositoryList(context);
+  if (arguments[0] == "list") {
+    if (arguments.size() != 1) {
+      return UsageError(context,
+                        "'repository list' does not take any argument, but got "
+                        "'" +
+                            arguments[1] + "'");
+    }
+    return RepositoryList(context);
+  }
   if (arguments[0] == "delete") {
-    if (arguments.size() != 2) {
+    if (arguments.size() < 2) {
       return UsageError(context,
                         "'repository delete' expects exactly one <file_name>");
+    }
+    if (arguments.size() > 2) {
+      return UsageError(context,
+                        "'repository delete' expects exactly one <file_name>, "
+                        "but got " +
+                            std::to_string(arguments.size() - 1) + " of them");
     }
     return RepositoryDelete(context, arguments[1]);
   }
@@ -1050,14 +1189,31 @@ int ConfigRepositorySet(const CliContext& context, const std::string& path) {
 
 int RunConfigCommand(const CliContext& context,
                      const std::vector<std::string>& arguments) {
-  if (arguments.size() >= 2 && arguments[0] == "repository") {
-    if (arguments[1] == "show") return ConfigRepositoryShow(context);
+  if (arguments[0] == "repository" && arguments.size() >= 2) {
+    if (arguments[1] == "show") {
+      if (arguments.size() != 2) {
+        return UsageError(context,
+                          "'config repository show' does not take any "
+                          "argument, but got '" +
+                              arguments[2] + "'");
+      }
+      return ConfigRepositoryShow(context);
+    }
     if (arguments[1] == "set") {
-      if (arguments.size() != 3) {
+      if (arguments.size() < 3) {
         return UsageError(context, "'config repository set' expects <path>");
+      }
+      if (arguments.size() > 3) {
+        return UsageError(context,
+                          "'config repository set' expects exactly one <path>, "
+                          "but got " +
+                              std::to_string(arguments.size() - 2) +
+                              " of them");
       }
       return ConfigRepositorySet(context, arguments[2]);
     }
+    return UsageError(
+        context, "unknown config repository subcommand '" + arguments[1] + "'");
   }
   return UsageError(context,
                     "'config' expects 'repository show' or "

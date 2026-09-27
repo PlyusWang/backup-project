@@ -112,6 +112,8 @@ const char* ScheduleEvaluationStatusKey(ScheduleEvaluationStatus status) {
       return "created_with_retention_warning";
     case ScheduleEvaluationStatus::kFailed:
       return "failed";
+    case ScheduleEvaluationStatus::kConfigInvalid:
+      return "config_invalid";
   }
   return "failed";
 }
@@ -131,6 +133,8 @@ const char* ScheduleEvaluationStatusText(ScheduleEvaluationStatus status) {
              "removed";
     case ScheduleEvaluationStatus::kFailed:
       return "Scheduled backup failed";
+    case ScheduleEvaluationStatus::kConfigInvalid:
+      return "Invalid schedule configuration: the schedule is suspended";
   }
   return "Scheduled backup failed";
 }
@@ -432,17 +436,26 @@ bool ScheduledBackupService::EvaluateInternal(std::int64_t now_sec, bool force,
   }
 
   // 配置本身必须合法。合法化发生在 set / enable 时，所以走到这里还能不合法
-  // 基本只有"有人手改了 schedule.json"。此时不写盘——写了也存不回去。
+  // 基本只有"有人手改了 schedule.json"。
+  //
+  // 这两条是**挂起**，不是"这一次失败"：
+  //   * 一个字节都不写——写下去也存不回来（Save 会拒绝同一份非法配置），
+  //     而"静默把用户手改的文件改成我们能接受的样子"更不可以；
+  //   * 不推进 next_run、不记 history。kFailed 走的是 finish_failed，它会推进
+  //     next_run，那在这里是错的：next_run 只活在内存里，磁盘上的值没变，
+  //     下一轮读到旧值仍然"到点"，于是变成每秒一次的完整校验 + 一个新线程。
+  //   * 调用方（GUI / watch）收到 kConfigInvalid 后进入明确的挂起状态并停止
+  //     周期性重试，恢复只能靠用户显式保存一份合法配置。
   std::string config_error;
   if (!ValidateScheduleConfig(document.config, &config_error)) {
-    result->status = ScheduleEvaluationStatus::kFailed;
+    result->status = ScheduleEvaluationStatus::kConfigInvalid;
     result->diagnostic = config_error;
     return true;
   }
 
   Filter filter;
   if (!BuildScheduleFilter(document.config, &filter, &config_error)) {
-    result->status = ScheduleEvaluationStatus::kFailed;
+    result->status = ScheduleEvaluationStatus::kConfigInvalid;
     result->diagnostic = config_error;
     return true;
   }

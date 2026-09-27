@@ -254,9 +254,16 @@ class ScheduleStore {
 
   // 上一份成功快照的源清单。
   //
-  // kMissing 同时覆盖"从来没写过"和"文件被删掉了"两种情况——两者的处理方式
-  // 完全一样：没有可比对的基线，走首次快照语义。kError（文件在但坏了）也
-  // 按同一语义处理，但调用方应当把 error_message 记进诊断里，不要假装无事发生。
+  // kMissing 同时覆盖"从来没写过"和"文件被删掉了"两种情况：两者都意味着
+  // **没有可信基线**。kError（文件在但坏了）同样如此，但调用方应当把
+  // error_message 记进诊断里，不要假装无事发生。
+  //
+  // 注意"没有可信基线"的结果**不一定**叫"首次快照"：state 里记过 baseline 时，
+  // 这一轮会被报告成 **baseline reset**（重建基线快照），只有确实没记过
+  // baseline 才是 first
+  // snapshot。两者的产物相同（一份完整基线快照），原因不同，给用户看
+  // 的说明也必须不同——见 ScheduleEvaluationResult 的 first_snapshot /
+  // baseline_reset。
   enum class ManifestLoadStatus { kLoaded, kMissing, kError };
 
   // binding 是 manifest **自己声明**的归属。读到 version 1 文件时它留空，

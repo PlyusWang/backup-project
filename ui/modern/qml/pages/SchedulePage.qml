@@ -522,6 +522,19 @@ Item {
                         color: theme.error
                         wrapMode: Text.WordWrap
                     }
+
+                    // 挂起是**持续状态**，与状态栏里那一句瞬时提示不同：
+                    // 只要悬挂原因还在（落盘配置不合法），这行就一直亮着。
+                    Text {
+                        objectName: "scheduleSuspendedText"
+                        Layout.fillWidth: true
+                        visible: schedule.suspended
+                        text: "定时备份已挂起：落盘的计划配置不合法。程序不会自动修改它，"
+                              + "也不会自动重试；请修正后重新保存计划。"
+                        font.pixelSize: 15
+                        color: theme.error
+                        wrapMode: Text.WordWrap
+                    }
                 }
             }
 
