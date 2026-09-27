@@ -423,6 +423,86 @@ bool FindIncrementalBaseline(const std::string& repository_directory,
   return false;
 }
 
+bool SnapshotParentOf(const std::string& repository_directory,
+                      const std::string& snapshot_file_name,
+                      std::string* parent_file_name,
+                      std::string* error_message) {
+  if (parent_file_name == nullptr) {
+    SetError(error_message, "Parent output must not be null");
+    return false;
+  }
+  parent_file_name->clear();
+  if (!IsPlainSingleComponentName(snapshot_file_name)) {
+    SetError(error_message, "A snapshot file name must be a single component");
+    return false;
+  }
+  const std::string path = JoinPath(repository_directory, snapshot_file_name);
+  const SnapshotFileKind kind = ClassifySnapshotFile(path, error_message);
+  if (kind == SnapshotFileKind::kContainer) return true;
+  if (kind == SnapshotFileKind::kUnknown) return false;
+  DeltaEnvelope envelope;
+  if (!ReadDeltaEnvelope(path, &envelope, error_message)) return false;
+  *parent_file_name = envelope.parent_file_name;
+  return true;
+}
+
+bool PlanDependencyAwareRetention(
+    const std::string& repository_directory,
+    const std::vector<std::string>& candidates_oldest_first,
+    std::size_t retain_count, RetentionPlan* plan, std::string* error_message) {
+  if (plan == nullptr) {
+    SetError(error_message, "Retention plan output must not be null");
+    return false;
+  }
+  *plan = RetentionPlan{};
+
+  const std::size_t total = candidates_oldest_first.size();
+  // 可见集合 = 最近 retain_count 个（候选里最旧在前，所以取尾部）。
+  const std::size_t visible_count = retain_count < total ? retain_count : total;
+  const std::size_t visible_begin = total - visible_count;
+  for (std::size_t index = visible_begin; index < total; ++index) {
+    plan->keep_visible.push_back(candidates_oldest_first[index]);
+  }
+
+  // 依赖闭包：从可见集合出发，沿 parent 往上走，只认候选集合里的名字。
+  // visited 兼作环保护：坏链最多让某个名字被访问一次。
+  std::vector<std::string> keep = plan->keep_visible;
+  std::vector<std::string> visited = keep;
+  for (std::size_t cursor = 0; cursor < keep.size(); ++cursor) {
+    const std::string current = keep[cursor];
+    // depth 由 visited 的数量天然限制：候选集合有限，且每个只访问一次。
+    if (visited.size() > kMaxDeltaChainDepth * 64 &&
+        keep.size() > candidates_oldest_first.size()) {
+      SetError(error_message, "Retention dependency walk did not terminate");
+      return false;
+    }
+    std::string parent;
+    if (!SnapshotParentOf(repository_directory, current, &parent,
+                          error_message)) {
+      return false;
+    }
+    if (parent.empty()) continue;
+    if (std::find(candidates_oldest_first.begin(),
+                  candidates_oldest_first.end(),
+                  parent) == candidates_oldest_first.end()) {
+      // 祖先不归本计划管理：不动它，也不需要继续往上走。
+      continue;
+    }
+    if (std::find(visited.begin(), visited.end(), parent) != visited.end()) {
+      continue;
+    }
+    visited.push_back(parent);
+    keep.push_back(parent);
+    plan->keep_ancestors.push_back(parent);
+  }
+
+  for (const std::string& name : candidates_oldest_first) {
+    if (std::find(keep.begin(), keep.end(), name) != keep.end()) continue;
+    plan->remove.push_back(name);
+  }
+  return true;
+}
+
 bool RunIncrementalBackup(const std::string& source_directory,
                           const std::string& repository_directory,
                           const std::string& snapshot_file_name,

@@ -110,6 +110,42 @@ bool RunIncrementalBackup(const std::string& source_directory,
                           IncrementalOutcome* outcome,
                           std::string* error_message);
 
+// ---- 依赖感知的 retention ----
+//
+// Full 的 retention 可以放心删最旧的一份。有链之后不行：
+//
+//     F0 → Δ1 → Δ2 → Δ3        retain = 2
+//     删掉 F0 与 Δ1，留下 Δ2、Δ3  →  Δ2/Δ3 全部不可恢复
+//
+// 这是**数据丢失**，不是"少留一份快照"。所以删除集合必须先过依赖检查。
+//
+// 第一版采用"保留最近 N 个 restore point，但保住它们需要的祖先"（设计文档
+// 第 11 节的方案 B）：用户看到的仍然是"最近 N 个还原点"，而为了让这些点真的
+// 能恢复，链上必须的祖先即使不算可见点也留下来，并在诊断里说明是
+// dependency retained。
+struct RetentionPlan {
+  // 可见的 restore point（最近 retain_count 个）。
+  std::vector<std::string> keep_visible;
+  // 不在可见集合里、但被可见点依赖，因此必须保留的祖先。
+  std::vector<std::string> keep_ancestors;
+  // 可以删除的（最旧的在前）。调用方按这个顺序删。
+  std::vector<std::string> remove;
+};
+
+// candidates 按**最旧在前**给出（调用方原本的 retention 顺序）。
+// 只有 candidates 里的文件会被放进 remove —— 链上不属于本计划管理的祖先
+// （例如用户手工建的完整备份）一律不动，那是别人的东西。
+bool PlanDependencyAwareRetention(
+    const std::string& repository_directory,
+    const std::vector<std::string>& candidates_oldest_first,
+    std::size_t retain_count, RetentionPlan* plan, std::string* error_message);
+
+// 一份快照的父快照文件名；完整归档返回空串。读不出来时返回 false。
+bool SnapshotParentOf(const std::string& repository_directory,
+                      const std::string& snapshot_file_name,
+                      std::string* parent_file_name,
+                      std::string* error_message);
+
 // 从磁盘上的强 manifest 副文件读一份基线 manifest。
 bool LoadSnapshotManifest(const std::string& repository_directory,
                           const std::string& snapshot_file_name,

@@ -5,6 +5,7 @@
 #include <sys/stat.h>
 #include <sys/types.h>
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <string>
@@ -14,6 +15,7 @@
 
 #include "backup_catalog.h"
 #include "backup_engine.h"
+#include "incremental_backup.h"
 #include "source_manifest.h"
 
 namespace backupproject {
@@ -81,20 +83,11 @@ bool BaselineIsManaged(const ScheduleDocument& document) {
   return false;
 }
 
-// 最旧的 managed snapshot 下标。时间相同再按 file_name 升序，
-// 保证"删哪一个"是确定的，不依赖容器里的偶然顺序。
-std::size_t OldestManagedIndex(
-    const std::vector<ScheduledSnapshotRecord>& records) {
-  std::size_t oldest = 0;
-  for (std::size_t index = 1; index < records.size(); ++index) {
-    if (records[index].created_time_sec < records[oldest].created_time_sec ||
-        (records[index].created_time_sec == records[oldest].created_time_sec &&
-         records[index].file_name < records[oldest].file_name)) {
-      oldest = index;
-    }
-  }
-  return oldest;
-}
+// 注意：原来这里有一个 OldestManagedIndex()，retention 直接用它挑"最旧的一份"。
+// PR #18 之后"删哪一份"不再是一个局部决定——必须先算出依赖安全的删除集合
+// （见 PlanDependencyAwareRetention），所以那条"找最旧"的逻辑搬进了计划函数，
+// 排序规则（时间相同按 file_name）一字未变。这里刻意不再留一个没人用的副本：
+// 两处排序规则共存，早晚会有一处先改。
 
 }  // namespace
 
@@ -289,9 +282,11 @@ void ScheduledBackupService::ReconcileManagedSnapshots(
 bool ScheduledBackupService::RunRetention(ScheduleDocument* document,
                                           std::uint64_t* deleted,
                                           std::uint64_t* failed,
+                                          std::uint64_t* dependency_retained,
                                           std::string* error_message) const {
   if (deleted != nullptr) *deleted = 0;
   if (failed != nullptr) *failed = 0;
+  if (dependency_retained != nullptr) *dependency_retained = 0;
   if (error_message != nullptr) error_message->clear();
   if (document == nullptr) {
     SetError(error_message, "Schedule document must not be null");
@@ -300,9 +295,49 @@ bool ScheduledBackupService::RunRetention(ScheduleDocument* document,
 
   BackupCatalog catalog;
   const std::size_t retain = document->config.retain_count;
-  while (document->state.managed_snapshots.size() > retain) {
-    const std::size_t oldest =
-        OldestManagedIndex(document->state.managed_snapshots);
+
+  // PR #18：删除集合必须先过依赖检查。
+  //
+  // "删最旧的"对 Full 是安全的，对依赖链不是：删掉某个 delta 的祖先会让它
+  // 以及它所有后代都无法恢复，而列表上看起来只是"少了一份旧快照"。
+  // 计划函数只回答"哪些能删"，具体删除仍然只走 catalog.Delete。
+  std::vector<std::string> managed_oldest_first;
+  {
+    std::vector<ScheduledSnapshotRecord> ordered =
+        document->state.managed_snapshots;
+    std::sort(ordered.begin(), ordered.end(),
+              [](const ScheduledSnapshotRecord& left,
+                 const ScheduledSnapshotRecord& right) {
+                if (left.created_time_sec != right.created_time_sec) {
+                  return left.created_time_sec < right.created_time_sec;
+                }
+                return left.file_name < right.file_name;
+              });
+    for (const ScheduledSnapshotRecord& item : ordered) {
+      managed_oldest_first.push_back(item.file_name);
+    }
+  }
+  RetentionPlan plan;
+  std::string plan_error;
+  if (!PlanDependencyAwareRetention(repository_path_, managed_oldest_first,
+                                    retain, &plan, &plan_error)) {
+    SetError(error_message,
+             "Failed to plan a dependency-safe retention pass: " + plan_error);
+    return false;
+  }
+
+  for (const std::string& planned : plan.remove) {
+    // 计划给出"可以删"，这里再映射回 managed 列表的下标：
+    // 删除永远走同一条 catalog.Delete 路径，绝不自己拼路径。
+    std::size_t oldest = document->state.managed_snapshots.size();
+    for (std::size_t index = 0;
+         index < document->state.managed_snapshots.size(); ++index) {
+      if (document->state.managed_snapshots[index].file_name == planned) {
+        oldest = index;
+        break;
+      }
+    }
+    if (oldest == document->state.managed_snapshots.size()) continue;
     // 先拷出来：下面会 erase，引用立刻失效。
     const std::string file_name =
         document->state.managed_snapshots[oldest].file_name;
@@ -324,6 +359,13 @@ bool ScheduledBackupService::RunRetention(ScheduleDocument* document,
         document->state.managed_snapshots.begin() +
         static_cast<std::ptrdiff_t>(oldest));
     if (deleted != nullptr) *deleted += 1;
+  }
+  if (!plan.keep_ancestors.empty()) {
+    // 被依赖而保留下来的祖先如实记一笔：否则"为什么还留着这么旧的快照"
+    // 在日志和界面上都说不清。
+    if (dependency_retained != nullptr) {
+      *dependency_retained = plan.keep_ancestors.size();
+    }
   }
 
   // 不变式：retention 结束后，baseline 记录必须仍然指向一份存在的快照。
@@ -662,9 +704,11 @@ bool ScheduledBackupService::EvaluateInternal(std::int64_t now_sec, bool force,
   // 所以 retention 不可能删掉 baseline —— 这一点与改动前完全一致。
   std::uint64_t deleted = 0;
   std::uint64_t failed = 0;
+  std::uint64_t dependency_retained = 0;
   std::string retention_error;
-  const bool retention_ok =
-      RunRetention(&document, &deleted, &failed, &retention_error);
+  const bool retention_ok = RunRetention(
+      &document, &deleted, &failed, &dependency_retained, &retention_error);
+  result->retention_dependency_retained = dependency_retained;
   result->retention_deleted = deleted;
   result->retention_failed = failed;
   result->status = StatusForRetention(retention_ok);

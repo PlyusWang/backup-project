@@ -171,6 +171,7 @@ run_unit backup_preview_test
 run_unit incremental_manifest_test
 run_unit incremental_format_test
 run_unit incremental_restore_test
+run_unit incremental_retention_test
 
 # ============================================================
 echo "[schedule-test] B. CLI pipeline parity"

@@ -98,6 +98,10 @@ struct ScheduleEvaluationResult {
   std::int64_t next_run_time_sec = 0;
   std::uint64_t retention_deleted = 0;
   std::uint64_t retention_failed = 0;
+  // PR #18：因为被"要保留的 restore point"依赖而留下来、没有删掉的祖先数量。
+  // 这些不算可见的还原点，但少了它们链就断了，所以必须如实计数，
+  // 否则"为什么还留着这么旧的快照"在界面上说不清。
+  std::uint64_t retention_dependency_retained = 0;
 };
 
 // next_run = now + interval。整秒运算，溢出被夹到 INT64_MAX。
@@ -210,8 +214,10 @@ class ScheduledBackupService {
                    std::string* error_message);
 
   // 只做 retention。供测试与显式维护入口使用。
+  // dependency_retained 可以为空；非空时写回"因为被依赖而保留"的祖先数量。
   bool RunRetention(ScheduleDocument* document, std::uint64_t* deleted,
-                    std::uint64_t* failed, std::string* error_message) const;
+                    std::uint64_t* failed, std::uint64_t* dependency_retained,
+                    std::string* error_message) const;
 
   // 自愈：把已经不在仓库里的 managed record 摘掉。
   //
