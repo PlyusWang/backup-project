@@ -642,8 +642,13 @@ Item {
                 }
             }
 
+            // 计划页的状态来自 ScheduleController，只有这一页绑定它；pageScope
+            // 仍然写全，让"临时提示只属于产生它的页面"这条契约在四处保持一致。
             StatusBanner {
+                objectName: "scheduleStatusBanner"
                 Layout.fillWidth: true
+                pageScope: "schedule"
+                scope: "schedule"
                 kind: schedule.statusKind
                 title: schedule.statusTitle
                 message: schedule.statusMessage
