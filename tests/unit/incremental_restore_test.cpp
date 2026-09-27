@@ -463,5 +463,158 @@ int main() {
                         "INC-R T7 FIFO 的删除与新增都生效了");
   }
 
+  // ---- 任意 restore point：链中间那一份也要能恢复 ----
+  test_support::Section("INC-R 8. 六连链：任意一个 restore point 都能恢复");
+  {
+    const std::string work3 = test_support::FreshDir("inc-chain-six");
+    const std::string src3 = work3 + "/src";
+    const std::string repo3 = work3 + "/repo";
+    const std::string oracle3 = work3 + "/oracle";
+    test_support::Mkdir(src3, 0755);
+    test_support::Mkdir(repo3, 0755);
+    test_support::Mkdir(oracle3, 0755);
+
+    bp::Filter filter;
+    bp::BackupOptions options;
+    std::string error;
+    // 六个状态：每一次都只动一个文件，于是链是 F0 -> d1 -> ... -> d5。
+    std::vector<std::string> oracle_trees;
+    for (int step = 0; step < 6; ++step) {
+      test_support::WriteFile(
+          src3 + "/state.txt",
+          "state-" + std::to_string(step) + std::string(8, 'x'), 0644);
+      test_support::WriteFile(src3 + "/other.txt", "unchanged", 0644);
+      const std::string name = "snap" + std::to_string(step) + ".bak";
+      bp::IncrementalOutcome outcome;
+      test_support::Check(bp::RunIncrementalBackup(
+                              src3, repo3, name, repository_identity, filter,
+                              options, {}, {}, "", &outcome, &error),
+                          "INC-R T8 第 " + std::to_string(step) + " 步增量成功",
+                          error);
+      if (step == 0) {
+        test_support::Check(
+            outcome.kind == bp::IncrementalOutcome::Kind::kFullBaseline,
+            "INC-R T8 第一步是完整基线");
+      } else {
+        test_support::Check(
+            outcome.kind == bp::IncrementalOutcome::Kind::kDelta &&
+                outcome.parent_file_name ==
+                    "snap" + std::to_string(step - 1) + ".bak",
+            "INC-R T8 第 " + std::to_string(step) + " 步挂在上一份快照上",
+            outcome.parent_file_name);
+      }
+      std::string tree;
+      test_support::Check(
+          MakeOracle(src3, oracle3, "six" + std::to_string(step), filter, &tree,
+                     &error),
+          "INC-R T8 第 " + std::to_string(step) + " 步 oracle 成功", error);
+      oracle_trees.push_back(tree);
+    }
+
+    // 逐个 restore point 都恢复一遍：包括链中间的、以及最早的那一份。
+    for (int step = 0; step < 6; ++step) {
+      const std::string restored = work3 + "/restore-" + std::to_string(step);
+      bp::RestoreReport report;
+      const std::string name = "snap" + std::to_string(step) + ".bak";
+      const bool ok = bp::RestoreSnapshotChain(
+          repo3, name, restored, bp::RestoreOptions{}, &report, &error);
+      if (!ok) {
+        test_support::Check(false, "INC-R T8 恢复 " + name, error);
+        continue;
+      }
+      std::string detail;
+      test_support::Check(
+          test_support::CompareTrees(oracle_trees[step], restored, &detail),
+          "INC-R T8 restore point " + std::to_string(step) +
+              " 与同状态的完整备份逐节点一致",
+          detail);
+      std::string body;
+      test_support::Check(
+          test_support::ReadFile(restored + "/state.txt", &body) &&
+              body == "state-" + std::to_string(step) + std::string(8, 'x'),
+          "INC-R T8 restore point " + std::to_string(step) + " 的内容正确",
+          body);
+    }
+  }
+
+  // ---- 压缩 / 加密与增量正交 ----
+  test_support::Section(
+      "INC-R 9. delta 走同一条 pack/compression/encryption 流水线");
+  {
+    const std::string work4 = test_support::FreshDir("inc-chain-crypto");
+    const std::string src4 = work4 + "/src";
+    const std::string repo4 = work4 + "/repo";
+    const std::string oracle4 = work4 + "/oracle";
+    test_support::Mkdir(src4, 0755);
+    test_support::Mkdir(repo4, 0755);
+    test_support::Mkdir(oracle4, 0755);
+    // 内容要够大，压缩与加密才真的被走到（空 payload 什么也证明不了）。
+    std::string bulk;
+    for (int index = 0; index < 400; ++index) bulk += "compressible-payload-";
+    test_support::WriteFile(src4 + "/bulk.txt", bulk, 0644);
+    test_support::WriteFile(src4 + "/small.txt", "small", 0644);
+
+    bp::Filter filter;
+    bp::BackupOptions options;
+    options.compression_method = bp::CompressionMethod::kLzssHuffman;
+    options.encryption_method = bp::EncryptionMethod::kAes256CtrHmacSha256;
+    options.password = "correct horse battery staple";
+    std::string error;
+    bp::IncrementalOutcome outcome;
+    test_support::Check(
+        bp::RunIncrementalBackup(src4, repo4, "c0.bak", repository_identity,
+                                 filter, options, {}, {}, "", &outcome, &error),
+        "INC-R T9 加密压缩的完整基线成功", error);
+    test_support::Check(
+        outcome.kind == bp::IncrementalOutcome::Kind::kFullBaseline,
+        "INC-R T9 第一步是基线");
+
+    test_support::WriteFile(src4 + "/small.txt", "small-changed", 0644);
+    bp::IncrementalOutcome second;
+    test_support::Check(
+        bp::RunIncrementalBackup(src4, repo4, "c1.bak", repository_identity,
+                                 filter, options, {}, {}, "", &second, &error),
+        "INC-R T9 加密压缩的 delta 成功", error);
+    test_support::Check(second.kind == bp::IncrementalOutcome::Kind::kDelta,
+                        "INC-R T9 第二步是 delta");
+    // 信封是明文（catalog 需要免密码识别种类），但 payload 必须是密文：
+    // 明文内容不该出现在 delta 文件里。
+    std::string delta_bytes;
+    test_support::Check(test_support::ReadFile(repo4 + "/c1.bak", &delta_bytes),
+                        "INC-R T9 读入 delta 字节");
+    test_support::Check(
+        delta_bytes.find("small-changed") == std::string::npos &&
+            delta_bytes.find("compressible-payload") == std::string::npos,
+        "INC-R T9 判别：payload 里看不到明文内容（真的加密了）");
+
+    bp::RestoreOptions restore_options;
+    restore_options.password = options.password;
+    const std::string restored = work4 + "/restored";
+    bp::RestoreReport report;
+    test_support::Check(
+        bp::RestoreSnapshotChain(repo4, "c1.bak", restored, restore_options,
+                                 &report, &error),
+        "INC-R T9 带密码的依赖链恢复成功", error);
+    std::string tree;
+    test_support::Check(
+        MakeOracle(src4, oracle4, "crypto", filter, &tree, &error),
+        "INC-R T9 oracle 成功", error);
+    std::string detail;
+    test_support::Check(test_support::CompareTrees(tree, restored, &detail),
+                        "INC-R T9 加密压缩链恢复 == 完整恢复", detail);
+
+    // 密码错了必须失败，而且不能留下半个目标目录。
+    bp::RestoreOptions wrong;
+    wrong.password = "wrong password";
+    const std::string restored_wrong = work4 + "/restored-wrong";
+    bp::RestoreReport wrong_report;
+    test_support::Check(
+        !bp::RestoreSnapshotChain(repo4, "c1.bak", restored_wrong, wrong,
+                                  &wrong_report, &error),
+        "INC-R T9 判别：错误密码被拒绝");
+    test_support::Check(!test_support::Exists(restored_wrong),
+                        "INC-R T9 恢复失败时不留半个目标目录");
+  }
+
   return test_support::Finish("incremental_restore_test");
 }
