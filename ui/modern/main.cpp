@@ -1955,6 +1955,40 @@ int RunScheduleTest(backup_modern::ScheduleController* schedule,
     }
   }
 
+  // 13) GUI 独有的边界：手动备份正在写盘时，定时任务到点了。
+  //
+  // 这几条断言不依赖时间。三次 runNow() 都在主线程上连续调用，中间没有跑事件
+  // 循环；而 busy_ 只可能被主线程上的 OnWatcherFinished 清掉，所以第一次必然
+  // 已经把它置上，后两次必然走 coalesce 分支。仓库里的源自 SCH-52
+  // 之后没有变过， 所以这两次评估都是 skip，不会影响后面的收尾。
+  {
+    const int history_before = schedule->history().size();
+    schedule->runNow();
+    run.Check(schedule->libraryBusy(),
+              QStringLiteral("SCH-54 busy 期间第一次请求真的跑起来了"));
+    run.Check(!schedule->pending(),
+              QStringLiteral("SCH-55 第一次请求不留下 pending"));
+    schedule->runNow();
+    run.Check(schedule->pending(),
+              QStringLiteral("SCH-56 busy 期间第二次请求被合并成一次 pending"));
+    schedule->runNow();
+    run.Check(schedule->pending(),
+              QStringLiteral("SCH-57 再来一次仍然是同一个 pending，不排队"));
+
+    run.Check(schedule->waitForIdle(180000),
+              QStringLiteral("SCH-58 补跑结束之后控制器回到空闲"));
+    run.Check(!schedule->libraryBusy() && !schedule->pending(),
+              QStringLiteral("SCH-59 空闲之后 busy 与 pending 都清掉了"));
+    // 三次请求 = 两次评估（一次立即 + 一次合并后的补跑）。排队的话会是三次。
+    const int expected =
+        qMin(history_before + 2,
+             static_cast<int>(backupproject::kMaxHistoryEntries));
+    run.Check(schedule->history().size() == expected,
+              QStringLiteral("SCH-60 三次请求只产生两次评估"),
+              QString::number(history_before) + " -> " +
+                  QString::number(schedule->history().size()));
+  }
+
   // 收尾：把跨前端比对用的那套配置写回去（interval=5 / retain=7 / ustar +
   // huffman + 两条规则）。modern_gui_check.sh 会拿 backupctl schedule show
   // 逐项比对，所以这里必须与 SCH-36 完全一致。
@@ -1963,7 +1997,7 @@ int RunScheduleTest(backup_modern::ScheduleController* schedule,
                            QStringLiteral("huffman"),
                            QStringList() << QStringLiteral("ext:txt"),
                            QStringList() << QStringLiteral("path:**/build/**")),
-      QStringLiteral("SCH-54 恢复跨前端比对用的配置"));
+      QStringLiteral("SCH-61 恢复跨前端比对用的配置"));
 
   const int total = run.passed + run.failed;
   std::printf("[schedule] %s %d/%d\n", run.failed == 0 ? "PASS" : "FAIL",
