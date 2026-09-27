@@ -43,10 +43,16 @@ struct ModeEntry {
 };
 
 const ModeEntry kModeEntries[] = {
-    {BackupTrigger::kManual, BackupStrategy::kFull, true},
-    {BackupTrigger::kManual, BackupStrategy::kIncremental, false},
+    // PR #18：Manual + Incremental 现在是真的了 —— delta 格式、依赖链恢复、
+    // baseline/delta/no-change 决策都在共享核心里，CLI 与 GUI 走同一条路径。
+    {BackupTrigger::kManual, BackupStrategy::kIncremental, true},
     {BackupTrigger::kScheduled, BackupStrategy::kFull, true},
+    // Scheduled + Incremental 仍然 false：计划路径还不知道依赖链，
+    // 而现有的 retention 是"按时间删最旧"，用在一条链上会把祖先删掉、
+    // 让后代全部不可恢复。在 retention 变成 dependency-aware 之前，
+    // 这条组合必须继续被拒绝，而不是"先跑起来再说"。
     {BackupTrigger::kScheduled, BackupStrategy::kIncremental, false},
+    {BackupTrigger::kManual, BackupStrategy::kFull, true},
     {BackupTrigger::kRealtime, BackupStrategy::kFull, false},
     {BackupTrigger::kRealtime, BackupStrategy::kIncremental, false},
 };
@@ -122,7 +128,8 @@ std::string UnsupportedBackupModeReason(BackupTrigger trigger,
                                         BackupStrategy strategy) {
   return std::string("Unsupported backup mode: ") + BackupTriggerText(trigger) +
          " + " + BackupStrategyText(strategy) +
-         ". This version implements only Manual + Full and Scheduled + Full.";
+         ". This version implements Manual + Full, Manual + Incremental and "
+         "Scheduled + Full.";
 }
 
 }  // namespace backupproject
