@@ -34,6 +34,7 @@
 
 #include "backup_controller.h"
 #include "config_manager.h"
+#include "operation_gate.h"
 #include "schedule_store.h"
 #include "scheduled_backup_service.h"
 #include "scheduler_lock.h"
@@ -70,7 +71,8 @@ struct ScheduleOutcome {
   qlonglong next_run_sec = 0;
 };
 
-class ScheduleController : public QObject {
+class ScheduleController : public QObject,
+                           public BackupController::ArchiveDeletedObserver {
   Q_OBJECT
 
   // ---- 配置（可编辑）----
@@ -117,11 +119,20 @@ class ScheduleController : public QObject {
   // schedule_file_path 由 main.cpp 显式给出（正常启动来自 app_paths.h，
   // 与 backupctl 的默认位置严格同源；测试用 --schedule-file 覆盖）。
   // backup_controller 用来查询/等待手动操作的 busy 边界，可以为空。
+  // operation_gate 与 BackupController 用的是同一个对象：它保证"手动操作"
+  // 与"后台评估"不会同时改动持久状态。
   ScheduleController(QString schedule_file_path,
                      const QString& config_file_path,
                      BackupController* backup_controller,
-                     QObject* parent = nullptr);
+                     OperationGate* operation_gate, QObject* parent = nullptr);
   ~ScheduleController() override;
+
+  // BackupController::ArchiveDeletedObserver
+  //
+  // 由 BackupController::deleteBackup 在**持有 kManualDelete 闸门期间**同步
+  // 调用，所以这里绝不能再申请闸门、也不能启动后台任务：整个"删除 + 计划状态
+  // 同步"是一个操作，中间不允许别的 writer 插进来。
+  void OnArchiveDeleted(const QString& file_name) override;
 
   bool configLoaded() const { return config_loaded_; }
   QString loadError() const { return load_error_; }
@@ -249,9 +260,6 @@ class ScheduleController : public QObject {
   void OnBackupBusyChanged();
   // 仓库在设置页被改掉之后，本控制器必须立刻跟上：下一次评估用的是新仓库。
   void OnRepositoryPathChanged();
-  // 备份管理页删掉一份归档之后，让 managed 名单与仓库的实际内容保持一致。
-  // 与 CLI 的 repository delete 走同一个 ReconcileManagedSnapshots。
-  void OnArchiveDeleted(const QString& file_name);
   void SetStatus(const QString& kind, const QString& title,
                  const QString& message);
   // 挂起开关的唯一入口。挂起时停掉 tick：没有 timer 就没有周期性重校验。
@@ -275,6 +283,8 @@ class ScheduleController : public QObject {
   // 本进程是否是这一份计划任务的 active runner。抢不到锁时页面要如实说明。
   backupproject::SchedulerLock lock_;
   QString runner_message_;
+  // 与 BackupController 共用的闸门。可以为空（只有自检路径会这样用）。
+  OperationGate* operation_gate_ = nullptr;
 
   QTimer tick_;
   QFutureWatcher<ScheduleOutcome> watcher_;
