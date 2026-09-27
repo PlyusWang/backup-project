@@ -243,6 +243,15 @@ origin=manual      手动备份，永远不会被自动淘汰
 
 这个判断来自 ScheduleStore，**不来自文件名解析**：文件名永远不是 ownership 的真相来源。
 
+`repository delete` 删掉一份仍然登记在计划任务 managed 名单里的归档时，会立刻调用
+共享核心的 `ScheduledBackupService::ReconcileManagedSnapshots` 把那条过期记录摘掉，
+再保存 schedule state。
+
+**GUI 的备份管理页删同一个文件时走的是同一步**（Modern GUI 订阅
+`BackupController::archiveDeleted`，由 ScheduleController 执行同一份 reconcile）。
+两个前端在这件事上的后果完全一致：删完之后"计划快照"名单与 `backupctl schedule show`
+都不会再显示一个已经不在仓库里的文件名。
+
 ---
 
 ## 4. GUI
@@ -315,20 +324,55 @@ backupctl backup <source> <archive> --encryption aes-256-ctr-hmac-sha256
 默认布局（与 Modern GUI 严格同源，见 include/app_paths.h）：
 
 ~~~text
+$XDG_CONFIG_HOME/backup-project/backup-gui-modern/app.lock
 $XDG_CONFIG_HOME/backup-project/backup-gui-modern/config.json
 $XDG_CONFIG_HOME/backup-project/backup-gui-modern/schedule.json
 $XDG_CONFIG_HOME/backup-project/backup-gui-modern/schedule-manifest.dat
 $XDG_CONFIG_HOME/backup-project/backup-gui-modern/schedule.json.lock
 ~~~
 
-XDG_CONFIG_HOME 未设置或不是绝对路径时回退到 $HOME/.config。
+XDG_CONFIG_HOME 未设置或不是绝对路径时回退到 $HOME/.config。目录按 0700 创建。
 
 * schedule.json 是 versioned 的固定 schema，字段集合**完全相等**：
   少一个字段报 missing required field，多一个字段报 unknown field，
   重复 key 直接报错。坏配置只如实报告，绝不静默回退到默认值。
-* 保存是原子的：临时文件 → fsync → rename → 目录 fsync。
+* 保存是原子的：同目录唯一临时文件（`mkstemp`，`O_CREAT|O_EXCL`）→ 写入 → fsync →
+  close → rename → 目录 fsync。临时文件名每次不同，所以既不会跟随别人预放的符号链接，
+  也不会截断别人预放的文件，同一进程里两次并行保存也不会撞名。config.json 走的是
+  同一个函数。
 * 新建文件的权限固定 0600（不受 umask 影响）。
 * schedule.json 里**没有任何密码字段**。
+
+### 6.1 全应用单实例
+
+**整个产品同一时刻只允许一个进程。** GUI + GUI、GUI + CLI、CLI + CLI、CLI + GUI
+四种组合全部拒绝，而且是在进入任何业务逻辑之前就拒绝（不会先读一遍配置再发现
+"已经有另一个实例"）。
+
+* 锁是 `app.lock`，用 `flock(LOCK_EX | LOCK_NB)`：进程正常退出、崩溃、被 SIGKILL
+  都由内核自动释放。磁盘上留一个 stale 的锁文件**不会**把产品永久锁死，锁文件里的
+  pid 只是给人看的提示。
+* 锁路径只由配置根决定（`app_paths.h`），**与仓库、`--config-file`、
+  `--schedule-file` 全都无关**：换个参数启动不会绕过单实例。
+* 锁路径本身如果是符号链接、目录或 FIFO，一律 fail closed 并明确报错，绝不 truncate
+  目标文件。
+* 纯 `--help` 不抢锁：已经有实例在跑时，用户仍然看得到用法。
+
+退出码：
+
+~~~text
+0  成功
+1  操作失败
+2  命令行用法错误（未知命令/选项、缺少选项值、多余的位置参数、
+   重复的单值选项、越界数字、非法筛选规则）
+3  已经有另一个 backup-project 实例在跑
+~~~
+
+GUI 与 CLI 在"已经有另一个实例"这件事上给**同一个退出码 3**：这是同一条产品规则。
+
+每个命令都明确消费全部 argv：`backupctl schedule show extra` 是用法错误（exit 2），
+不会静默忽略 `extra`；`--retain 1 --retain 2` 也是用法错误，不会"后者覆盖前者"。
+`--include` / `--exclude` 是重复有意义的可重复选项，不受这条限制。
 
 ---
 
@@ -365,6 +409,34 @@ XDG_CONFIG_HOME 未设置或不是绝对路径时回退到 $HOME/.config。
 
 ---
 
+### 7.1 落盘配置不合法：明确的挂起状态
+
+"配置不合法"与"这一次运行失败"是两件事，后果也不同：
+
+~~~text
+运行失败（kFailed）
+  → 推进 next_run，记录 history，下一轮到点再试
+
+配置不合法（kConfigInvalid）
+  → 一个字节都不写（改也存不回去），next_run 原地不动，不记 history
+  → 调度器进入明确的"已挂起"状态：停止 1 Hz 的重试，不再备份
+~~~
+
+* 走到这一步基本只有一种可能：有人手工改了 `schedule.json`，改成了一个
+  JSON 读得懂、业务规则不认的配置（例如 `interval_minutes: 0`，或者
+  `encryption` 不是 `none`）。写入口自己不会产出这种文件：`schedule set` /
+  `enable` / GUI 保存都会先做同一套完整校验。
+* 程序**不会**自动修复、不会删除、不会把文件改成"我们能接受的样子"。
+* 恢复只有一条路：用户显式保存一份合法配置（GUI 的保存按钮 / `backupctl
+  schedule set`）。保存成功即自动恢复。
+* `backupctl schedule run` 遇到挂起配置返回非 0；`backupctl schedule watch`
+  打印原因后明确退出——产品只允许一个进程，watch 运行期间用户根本没法去改那份
+  文件，继续每 30 秒重试一遍没有任何意义。
+* `schedule show` 仍然能读：它如实显示 store 状态，不会因为配置不合法就
+  拒绝工作。GUI 的其它页面（手动备份 / 恢复 / 备份管理）完全不受影响。
+
+---
+
 ## 8. 已知盲区（诚实说明）
 
 * 变化检测是 **metadata-first**：只比较路径、类型、大小、mtime、mode、uid/gid、
@@ -374,9 +446,24 @@ XDG_CONFIG_HOME 未设置或不是绝对路径时回退到 $HOME/.config。
   > **同大小 + 同 mtime 的人为原地改写逃得过这一版变化检测。**
 
   这不是密码学意义上的完整性校验。
-* **目录的 mtime 不参与比较**。任何子项的新增/删除都会顺带改掉父目录的 mtime，
-  把它算成变化会让"新增一个被筛选规则排除的文件"也触发一次完整快照，
-  而实际备份集合一个字都没变。代价是"单独 touch 一个目录、内容不变"看不出来。
+* **目录自身的 mtime 不参与变化检测**，但目录 metadata 参与。最终语义只有一套
+  （没有所谓的 Strict Metadata 模式）：
+
+  ~~~text
+  仅目录 mtime 改变                    -> 不触发
+  目录 mode / uid / gid 改变            -> 触发（metadata_changed）
+  被包含的子项 新增 / 删除 / 改名        -> 触发（由子项 path diff 得出）
+  被排除的子项 内容变 / 新增 / 删除      -> 不触发
+  被排除子项导致父目录 mtime 改变        -> 仍然不触发
+  ~~~
+
+  理由：任何子项的新增/删除都会顺带改掉父目录的 mtime，把它算成变化会让
+  "新增一个被筛选规则排除的文件"也触发一次完整快照，而实际备份集合一个字都没变。
+  代价是"单独 touch 一个目录、内容不变"看不出来。
+
+  > **目录 mtime 仍然会被归档保存、也会被恢复。** 它只是不作为定时备份的触发条件。
+  > 这一条由 `scripts/test.sh` 的 META-08 / META-09 / META-10 与
+  > `tests/unit/scheduler_core_test.cpp` 的 DIR-01..DIR-19 两侧分别钉住。
 * 被筛选规则排除的文件发生变化**不会**触发新快照 —— 因为计划的备份集合没变。
 * 第一版只支持**一个**计划任务，没有多任务列表。
 
