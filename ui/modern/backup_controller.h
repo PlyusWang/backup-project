@@ -31,6 +31,7 @@
 #include "backup_catalog.h"
 #include "config_manager.h"
 #include "filter.h"
+#include "operation_gate.h"
 
 namespace backup_modern {
 
@@ -119,8 +120,26 @@ class BackupController : public QObject {
   // 配置文件路径由调用方显式给出（正常启动由 main.cpp 从
   // QStandardPaths::AppConfigLocation 算出，测试用 --config-file 覆盖）。
   // 控制器自己不猜 HOME、不用 QSettings、不碰 XDG —— 那些都不属于它。
+  // operation_gate：Modern GUI 进程内"同一时刻只有一个会改动持久状态的
+  // 业务操作"的共享闸门（见 operation_gate.h）。可以为空——只有自检路径会
+  // 这样用，正常启动一定给同一个对象。
   explicit BackupController(const QString& config_file_path,
+                            OperationGate* operation_gate,
                             QObject* parent = nullptr);
+
+  // 删除归档之后的计划状态同步。
+  //
+  // 由 ScheduleController 实现。**调用时闸门已经以 kManualDelete 被持有**，
+  // 实现方不得再申请闸门、也不得启动后台任务：它只是"删除"这个操作的最后一
+  // 步，必须在同一个持有期内完成，否则就回到"两个 writer"的老问题上。
+  class ArchiveDeletedObserver {
+   public:
+    virtual ~ArchiveDeletedObserver() = default;
+    virtual void OnArchiveDeleted(const QString& file_name) = 0;
+  };
+  void SetArchiveDeletedObserver(ArchiveDeletedObserver* observer) {
+    archive_deleted_observer_ = observer;
+  }
 
   bool busy() const { return busy_; }
   QString statusKind() const { return status_kind_; }
@@ -215,10 +234,6 @@ class BackupController : public QObject {
   void statusChanged();
   void sourcePathChanged();
   void repositoryPathChanged();
-  // 一份归档刚刚从仓库里删掉。ScheduleController 订阅它，好让 ScheduleStore 的
-  // managed 名单立刻跟上——CLI 的 repository delete 一直这么做，GUI 少了这一步
-  // 就成了"同一件事在两个前端上后果不同"。
-  void archiveDeleted(const QString& file_name);
   void backupRecordsChanged();
   void catalogStateChanged();
   // 规则列表变化（增删清空）时发一次。
@@ -313,6 +328,10 @@ class BackupController : public QObject {
   bool last_succeeded_ = false;
   // 任务结束时要区分是备份还是恢复，否则成功文案只能写成笼统的“操作完成”。
   Kind active_kind_ = Kind::kBackup;
+  // 闸门与"这次操作占的是哪一种 kind"：Start() 申请，后台任务结束的回调里释放。
+  OperationGate* operation_gate_ = nullptr;
+  OperationGate::Kind active_gate_kind_ = OperationGate::Kind::kNone;
+  ArchiveDeletedObserver* archive_deleted_observer_ = nullptr;
   // 本次操作对应的 file name，只用于状态提示；不构成新的 QML 输入状态。
   QString active_file_name_;
 

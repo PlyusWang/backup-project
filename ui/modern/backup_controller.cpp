@@ -221,8 +221,11 @@ QString EncryptionMethodText(backupproject::EncryptionMethod method) {
 }
 
 BackupController::BackupController(const QString& config_file_path,
+                                   OperationGate* operation_gate,
                                    QObject* parent)
-    : QObject(parent), config_manager_(config_file_path.toStdString()) {
+    : QObject(parent),
+      config_manager_(config_file_path.toStdString()),
+      operation_gate_(operation_gate) {
   // 两个 watcher 都以 this 为上下文：对象销毁时连接自动断开，后台任务即使还在
   // 跑也不会回调到已经释放的控制器上。
   connect(
@@ -231,6 +234,13 @@ BackupController::BackupController(const QString& config_file_path,
         const Kind kind = active_kind_;
         const QString file_name = active_file_name_;
         last_succeeded_ = outcome.succeeded;
+        // 先放开闸门再清 busy_：busyChanged 会触发 ScheduleController 的补跑，
+        // 那一步必须看到闸门已经空了，否则补跑又要排一次 pending。
+        if (operation_gate_ != nullptr &&
+            active_gate_kind_ != OperationGate::Kind::kNone) {
+          operation_gate_->Release(active_gate_kind_);
+          active_gate_kind_ = OperationGate::Kind::kNone;
+        }
         SetBusy(false);
         if (outcome.succeeded) {
           if (kind == Kind::kBackup) {
@@ -484,6 +494,14 @@ CatalogOutcome BackupController::RunCatalogList(const QString& repository) {
 // ---- 保存 repository 设置 ----
 
 bool BackupController::saveRepositoryPath(const QString& path) {
+  // 改仓库会写 config.json，并让之后所有备份落到另一个地方。它同样是一个
+  // "会改动持久状态"的业务操作，所以在评估在飞的时候必须被拒绝。
+  OperationGuard guard(operation_gate_, OperationGate::Kind::kRepositoryChange);
+  if (operation_gate_ != nullptr && !guard.acquired()) {
+    SetStatus(QString::fromLatin1(kError), QStringLiteral("无法保存"),
+              guard.reason());
+    return false;
+  }
   if (busy_) {
     SetStatus(QString::fromLatin1(kError), QStringLiteral("无法保存"),
               QStringLiteral("备份或恢复正在进行，请等它结束后再改设置。"));
@@ -757,6 +775,15 @@ bool BackupController::startManagedRestoreWithPassword(
 }
 
 bool BackupController::deleteBackup(const QString& file_name) {
+  // 删除会同时改两处持久状态：仓库里的文件与 ScheduleStore 的 managed 名单。
+  // 整个动作（含最后那步 reconcile）都在同一持有期内完成，所以后台评估不可能
+  // 在这中间写 store。
+  OperationGuard guard(operation_gate_, OperationGate::Kind::kManualDelete);
+  if (operation_gate_ != nullptr && !guard.acquired()) {
+    SetStatus(QString::fromLatin1(kError), QStringLiteral("无法删除"),
+              guard.reason());
+    return false;
+  }
   if (busy_) {
     SetStatus(QString::fromLatin1(kError), QStringLiteral("无法删除"),
               QStringLiteral("备份或恢复正在进行，请等它结束后再试。"));
@@ -793,7 +820,13 @@ bool BackupController::deleteBackup(const QString& file_name) {
   refreshBackups();
   // 删成功之后才通知：计划状态要跟着这份仓库的实际内容走，而不是跟着"用户点了
   // 删除"走。失败时什么都没变，也就不该有人去改 schedule。
-  emit archiveDeleted(file_name);
+  //
+  // 这一步是同步的、且在闸门持有期内完成——它取代了以前那个信号：信号是排队
+  // 投递的，投递到 ScheduleController 时"删除"这个操作可能已经结束，闸门也
+  // 已经放开，后台评估就有机会插进来。
+  if (archive_deleted_observer_ != nullptr) {
+    archive_deleted_observer_->OnArchiveDeleted(file_name);
+  }
   return true;
 }
 
@@ -842,6 +875,23 @@ bool BackupController::Start(const OperationRequest& request,
     // 禁用了按钮，但快捷键或程序化调用仍可能走到这里。
     return false;
   }
+  // 闸门是真正的不变式：定时备份评估在跑的时候，手动备份/恢复必须在这里被
+  // 拒绝，而不是靠按钮被置灰。请求的 kind 决定占哪一种。
+  const OperationGate::Kind gate_kind =
+      request.kind == Kind::kBackup ? OperationGate::Kind::kManualBackup
+                                    : OperationGate::Kind::kManualRestore;
+  if (operation_gate_ != nullptr) {
+    QString reason;
+    if (!operation_gate_->Acquire(gate_kind, &reason)) {
+      SetStatus(QString::fromLatin1(kError),
+                request.kind == Kind::kBackup ? QStringLiteral("无法开始备份")
+                                              : QStringLiteral("无法开始恢复"),
+                reason);
+      return false;
+    }
+  }
+  active_gate_kind_ =
+      operation_gate_ != nullptr ? gate_kind : OperationGate::Kind::kNone;
   active_kind_ = request.kind;
   active_file_name_ = file_name;
   SetBusy(true);

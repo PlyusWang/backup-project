@@ -53,6 +53,7 @@
 #include "backup_controller.h"
 #include "config_manager.h"
 #include "filter_rule_model.h"
+#include "operation_gate.h"
 #include "schedule_controller.h"
 #include "schedule_store.h"
 #include "scheduler_lock.h"
@@ -2419,6 +2420,212 @@ int RunScheduleTest(backup_modern::ScheduleController* schedule,
                   QString::number(schedule->retainCount()));
   }
 
+  // 20) 数字解析的 case table：GUI 与 CLI 必须逐项同结论。
+  //
+  // 上一组证明"GUI 不再用 parseInt"；这一组把**同一张表**再喂一遍，并且与
+  // 共享核心的 ParseBoundedScheduleNumber（CLI 走的就是它）逐项比对返回值。
+  {
+    struct NumberCase {
+      const char* text;
+      bool accepted;
+    };
+    const NumberCase cases[] = {
+        {"5", true},
+        {"60", true},
+        {" 5 ", true},
+        {"\t5\t", true},
+        {"\n60\r", true},
+        {"007", true},
+        {"", false},
+        {"   ", false},
+        {"\t", false},
+        {"5x", false},
+        {"x5", false},
+        {"-1", false},
+        {"+5", false},
+        {"1.0", false},
+        {"5 5", false},
+        {"0x10", false},
+        {"99999999999999999999", false},
+        {"18446744073709551616", false},
+        {"0", false},
+        {"525601", false},
+    };
+    const QString store_path = schedule->storePath();
+    auto read_bytes = [](const QString& path) {
+      QFile file(path);
+      if (!file.open(QIODevice::ReadOnly)) return QByteArray();
+      return file.readAll();
+    };
+    const QByteArray before = read_bytes(store_path);
+
+    for (const NumberCase& item : cases) {
+      std::uint32_t core_value = 0;
+      std::string core_error;
+      const bool core_ok = backupproject::ParseBoundedScheduleNumber(
+          item.text, backupproject::kMinIntervalMinutes,
+          backupproject::kMaxIntervalMinutes, "--interval-minutes", &core_value,
+          &core_error);
+      const bool gui_ok = schedule->saveConfigFromText(
+          true, source, QString::fromUtf8(item.text), QStringLiteral("7"),
+          QStringLiteral("ustar"), QStringLiteral("huffman"), QStringList(),
+          QStringList());
+      const QByteArray before_case = read_bytes(store_path);
+      run.Check(gui_ok == item.accepted && core_ok == item.accepted,
+                QStringLiteral("SCH-127 [%1] GUI 与共享 parser 同结论（%2）")
+                    .arg(QString::fromUtf8(item.text),
+                         item.accepted ? QStringLiteral("接受")
+                                       : QStringLiteral("拒绝")),
+                schedule->statusMessage());
+      if (!item.accepted) {
+        // 被拒绝的那一项一个字节都不许落盘。
+        run.Check(read_bytes(store_path) == before_case,
+                  QStringLiteral("SCH-128 [%1] 被拒绝的输入没有改动 store")
+                      .arg(QString::fromUtf8(item.text)));
+      }
+    }
+    (void)before;
+    // 收尾：把跨前端比对用的配置写回去（与 SCH-36 / SCH-67 / SCH-98 一致）。
+    run.Check(schedule->saveConfigFromText(
+                  true, source, QStringLiteral("5"), QStringLiteral("7"),
+                  QStringLiteral("ustar"), QStringLiteral("huffman"),
+                  QStringList() << QStringLiteral("ext:txt"),
+                  QStringList() << QStringLiteral("path:**/build/**")),
+              QStringLiteral("SCH-129 收尾：把跨前端比对用的配置写回去"),
+              schedule->statusMessage());
+    run.Check(schedule->intervalMinutes() == 5 && schedule->retainCount() == 7,
+              QStringLiteral("SCH-130 收尾配置是 interval=5 / retain=7"),
+              QString::number(schedule->intervalMinutes()) +
+                  QStringLiteral("/") +
+                  QString::number(schedule->retainCount()));
+  }
+
+  // 21) GUI 内部的操作串行化（M1-M7）。
+  //
+  // 产品规则：一个 Modern GUI 进程内，任何会改动 backup repository / schedule
+  // state / source backup state 的业务操作，同一时刻最多一个。QML 的按钮状态
+  // 只是界面礼貌；这一组断言全部直接调用 C++ API，证明后端自己会拒绝。
+  {
+    auto read_bytes = [](const QString& path) {
+      QFile file(path);
+      if (!file.open(QIODevice::ReadOnly)) return QByteArray();
+      return file.readAll();
+    };
+    const QString store_path = schedule->storePath();
+
+    backup_controller->setSourcePath(source);
+
+    // ---- M1：评估在飞 -> 手动备份被拒绝 ----
+    run.Check(schedule->runNow() && schedule->libraryBusy(),
+              QStringLiteral("M1.1 评估进入 busy"));
+    const int archives_before = CountArchives(repository);
+    const QByteArray store_before = read_bytes(store_path);
+    run.Check(!backup_controller->startBackup(),
+              QStringLiteral("M1.2 评估在飞时手动备份被 C++ 拒绝"),
+              backup_controller->statusMessage());
+    run.Check(backup_controller->statusMessage().contains(
+                  QStringLiteral("定时备份评估")),
+              QStringLiteral("M1.3 拒绝理由点名是谁在占着"),
+              backup_controller->statusMessage());
+    run.Check(CountArchives(repository) == archives_before,
+              QStringLiteral("M1.4 被拒绝的手动备份没有产生任何归档"));
+    run.Check(read_bytes(store_path) == store_before,
+              QStringLiteral("M1.5 被拒绝的手动备份没有改动 schedule store"));
+
+    // ---- M2：评估在飞 -> 受管恢复被拒绝 ----
+    const QString managed_name = ArchiveNames(repository).isEmpty()
+                                     ? QString()
+                                     : ArchiveNames(repository).first();
+    run.Check(!managed_name.isEmpty(),
+              QStringLiteral("M2.1 仓库里有一份可恢复的归档"));
+    const QString restore_dest = temp.path() + QStringLiteral("/gate-restore");
+    run.Check(
+        !backup_controller->startManagedRestore(managed_name, restore_dest),
+        QStringLiteral("M2.2 评估在飞时受管恢复被 C++ 拒绝"),
+        backup_controller->statusMessage());
+    run.Check(!backup_controller->busy(),
+              QStringLiteral("M2.3 被拒绝的恢复没有把控制器置成 busy"));
+
+    // ---- M3：评估在飞 -> 删除被拒绝，store 一个字节不变 ----
+    {
+      const QByteArray before = read_bytes(store_path);
+      run.Check(!backup_controller->deleteBackup(managed_name),
+                QStringLiteral("M3.1 评估在飞时删除被 C++ 拒绝"),
+                backup_controller->statusMessage());
+      run.Check(read_bytes(store_path) == before,
+                QStringLiteral("M3.2 被拒绝的删除没有改动 schedule store"));
+      run.Check(CountArchives(repository) == archives_before,
+                QStringLiteral("M3.3 被拒绝的删除没有动仓库"));
+    }
+
+    // ---- M4：评估在飞 -> 改仓库被拒绝 ----
+    {
+      const QByteArray before = read_bytes(config_path);
+      const QString other = temp.path() + QStringLiteral("/other-repo");
+      QDir().mkpath(other);
+      run.Check(!backup_controller->saveRepositoryPath(other),
+                QStringLiteral("M4.1 评估在飞时改仓库被 C++ 拒绝"),
+                backup_controller->statusMessage());
+      run.Check(read_bytes(config_path) == before,
+                QStringLiteral("M4.2 被拒绝的仓库修改没有写 config.json"));
+      run.Check(backup_controller->repositoryPath() == repository,
+                QStringLiteral("M4.3 内存里的仓库路径也没有被改"));
+    }
+
+    run.Check(schedule->waitForIdle(180000),
+              QStringLiteral("M4.4 评估结束，闸门放开"));
+
+    // ---- M5：手动备份忙 -> 多次到期合并成一次评估 ----
+    {
+      run.Check(backup_controller->startBackup() && backup_controller->busy(),
+                QStringLiteral("M5.1 手动备份开始"));
+      schedule->runNow();
+      run.Check(schedule->pending(),
+                QStringLiteral("M5.2 手动备份期间到期只留下一个 pending"));
+      schedule->runNow();
+      schedule->runNow();
+      run.Check(schedule->pending(),
+                QStringLiteral("M5.3 再来两次仍然是同一个 pending，不排队"));
+      run.Check(backup_controller->waitForIdle(600000),
+                QStringLiteral("M5.4 手动备份结束"));
+      run.Check(schedule->waitForIdle(180000),
+                QStringLiteral("M5.5 补跑的那一次评估结束"));
+      run.Check(!schedule->pending() && !schedule->libraryBusy(),
+                QStringLiteral("M5.6 补跑之后回到空闲"));
+    }
+
+    // ---- M6：手动恢复忙 -> 同样的合并语义 ----
+    {
+      const QString name = ArchiveNames(repository).isEmpty()
+                               ? QString()
+                               : ArchiveNames(repository).first();
+      const QString dest = temp.path() + QStringLiteral("/gate-restore-2");
+      QDir().mkpath(dest);
+      run.Check(
+          !name.isEmpty() && backup_controller->startManagedRestore(name, dest),
+          QStringLiteral("M6.1 手动恢复开始"));
+      schedule->runNow();
+      run.Check(schedule->pending(),
+                QStringLiteral("M6.2 手动恢复期间到期同样合并成 pending"));
+      run.Check(backup_controller->waitForIdle(600000),
+                QStringLiteral("M6.3 手动恢复结束"));
+      run.Check(schedule->waitForIdle(180000), QStringLiteral("M6.4 补跑结束"));
+    }
+
+    // ---- M7：评估结束之后手动操作立刻可用 ----
+    {
+      const int before = CountArchives(repository);
+      run.Check(backup_controller->startBackup(),
+                QStringLiteral("M7.1 闸门空闲时手动备份可以开始"),
+                backup_controller->statusMessage());
+      run.Check(backup_controller->waitForIdle(600000) &&
+                    backup_controller->lastSucceeded(),
+                QStringLiteral("M7.2 手动备份正常完成"));
+      run.Check(CountArchives(repository) == before + 1,
+                QStringLiteral("M7.3 仓库里多了一份手动备份"));
+    }
+  }
+
   const int total = run.passed + run.failed;
   std::printf("[schedule] %s %d/%d\n", run.failed == 0 ? "PASS" : "FAIL",
               run.passed, total);
@@ -2533,7 +2740,11 @@ int main(int argc, char* argv[]) {
   // 配置路径在这里定型：正常启动是 AppConfigLocation/config.json，
   // 自动测试用 --config-file 指到临时目录，绝不读写真实用户配置。
   const QString config_file_path = ResolveConfigFilePath(arguments);
-  backup_modern::BackupController controller(config_file_path);
+  // 一个进程内"同一时刻只有一个会改动持久状态的业务操作"的共享闸门。
+  // 两个控制器拿到的是同一个对象：手动备份/恢复/删除/改仓库与"后台评估 +
+  // 保存计划"互相排斥，由 C++ 保证，而不是靠 QML 把按钮置灰。
+  backup_modern::OperationGate operation_gate;
+  backup_modern::BackupController controller(config_file_path, &operation_gate);
   // 计划存储文件与配置走同一套默认位置策略（见 app_paths.h）：
   // backupctl schedule show 读到的就是这一份。
   const QString schedule_file_path = ResolveScheduleFilePath(arguments);
@@ -2544,7 +2755,10 @@ int main(int argc, char* argv[]) {
   // 在它**之后**析构。反过来（引擎先析构）会让析构期间的绑定重算拿到一个
   // 已经变成 null 的 schedule，冒出一屏 "Cannot read property of null"。
   backup_modern::ScheduleController schedule_controller(
-      schedule_file_path, config_file_path, &controller);
+      schedule_file_path, config_file_path, &controller, &operation_gate);
+  // 删除归档之后的计划状态同步走这条直接连接，而不是信号：BackupController
+  // 会在自己的删除闸门持有期内同步调用它，中间不给后台评估留窗口。
+  controller.SetArchiveDeletedObserver(&schedule_controller);
   backup_modern::FilterRuleModel filter_rule_model(&controller);
 
   QQmlApplicationEngine engine;

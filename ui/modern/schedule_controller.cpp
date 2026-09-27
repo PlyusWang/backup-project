@@ -49,12 +49,14 @@ QString ChangeText(qulonglong added, qulonglong removed, qulonglong modified,
 ScheduleController::ScheduleController(QString schedule_file_path,
                                        const QString& config_file_path,
                                        BackupController* backup_controller,
+                                       OperationGate* operation_gate,
                                        QObject* parent)
     : QObject(parent),
       schedule_file_path_(std::move(schedule_file_path)),
       backup_controller_(backup_controller),
       config_manager_(config_file_path.toStdString()),
-      store_(schedule_file_path_.toStdString()) {
+      store_(schedule_file_path_.toStdString()),
+      operation_gate_(operation_gate) {
   // tick 只有 1 秒粒度，而且只负责"醒来一次"。"到没到点"问的是共享核心的
   // IsScheduleDue —— QTimer 不参与任何业务判断。
   tick_.setInterval(1000);
@@ -72,11 +74,9 @@ ScheduleController::ScheduleController(QString schedule_file_path,
     // 拿启动时读到的那个仓库继续写——静默地把备份写进旧位置。
     connect(backup_controller, &BackupController::repositoryPathChanged, this,
             &ScheduleController::OnRepositoryPathChanged);
-    // 备份管理页删掉一份归档之后，计划快照名单必须立刻跟上。少了这条连接，
-    // "GUI 删了一个计划快照"与"CLI repository delete 同一个文件"的后果不同：
-    // 前者会让这个文件名在计划页里继续显示到下一轮定时评估为止。
-    connect(backup_controller, &BackupController::archiveDeleted, this,
-            &ScheduleController::OnArchiveDeleted);
+    // 备份管理页删掉一份归档之后的计划状态同步不走信号：那一步必须发生在
+    // BackupController 的删除闸门持有期内（见 OnArchiveDeleted 的声明）。
+    // 由 main.cpp 通过 SetArchiveDeletedObserver(this) 建立这条直接连接。
   }
 }
 
@@ -236,6 +236,9 @@ void ScheduleController::OnRepositoryPathChanged() {
 
 void ScheduleController::OnArchiveDeleted(const QString& file_name) {
   Q_UNUSED(file_name);
+  // 调用约定（见头文件与 operation_gate.h）：这一次调用发生在
+  // BackupController 持有 kManualDelete 闸门的**同一持有期内**，所以这里
+  // 不能再申请闸门，也不能启动后台任务——只做一次同步的 reconcile + 保存。
   // 读不懂 / 已挂起时一概不动：document_ 不是一份可信的 state，reconcile 之后
   // 保存也一定失败，写下去只会把一份坏配置覆盖成另一份坏配置。
   if (!config_loaded_ || config_invalid_) return;
@@ -294,10 +297,30 @@ void ScheduleController::Submit(bool force) {
     return;
   }
 
+  // 闸门是真正的不变式：手动备份/恢复/删除/改仓库正在进行时，这一轮评估
+  // 提交不出去，按"忙"处理（合并成一次 pending）。QML 的按钮状态不参与判断。
+  OperationGate::Kind acquired = OperationGate::Kind::kNone;
+  if (operation_gate_ != nullptr) {
+    QString reason;
+    if (!operation_gate_->Acquire(OperationGate::Kind::kScheduleEvaluation,
+                                  &reason)) {
+      if (!pending_) {
+        pending_ = true;
+        emit pendingChanged();
+      }
+      pending_force_ = pending_force_ || force;
+      return;
+    }
+    acquired = OperationGate::Kind::kScheduleEvaluation;
+  }
+
   const QString store_path = schedule_file_path_;
   const QString repository = repository_path_;
   last_succeeded_ = false;
   SetBusy(true);
+  // 启动后台任务失败不是这里的路径（QtConcurrent 不会失败），所以持有期就是
+  // 整个评估：OnEvaluationFinished 里释放。
+  (void)acquired;
   SetStatus(kRunning, QStringLiteral("计划任务运行中"),
             force ? QStringLiteral("正在立即检查并运行…")
                   : QStringLiteral("正在执行到期的定时备份…"));
@@ -371,6 +394,11 @@ ScheduleOutcome ScheduleController::RunEvaluation(const QString& store_path,
 void ScheduleController::OnEvaluationFinished() {
   const ScheduleOutcome outcome = watcher_.result();
   last_succeeded_ = outcome.succeeded;
+  // 先放开评估闸门：下面的 ApplyRunnerLock / DrainPending 都可能再次提交，
+  // 而 SetBusy(false) 会触发 BackupController 侧的补跑。
+  if (operation_gate_ != nullptr) {
+    operation_gate_->Release(OperationGate::Kind::kScheduleEvaluation);
+  }
   SetBusy(false);
 
   if (!outcome.error_message.isEmpty()) {
@@ -477,12 +505,11 @@ bool ScheduleController::saveConfigFromText(
   // 与 backupctl schedule set --interval-minutes / --retain 是同一个函数、
   // 同一套规则；界面不再做任何自己的"解析"。
   if (!backupproject::ParseBoundedScheduleNumber(
-          interval_text.trimmed().toStdString(),
-          backupproject::kMinIntervalMinutes,
+          interval_text.toStdString(), backupproject::kMinIntervalMinutes,
           backupproject::kMaxIntervalMinutes,
           QStringLiteral("周期（分钟）").toStdString(), &interval, &error) ||
       !backupproject::ParseBoundedScheduleNumber(
-          retain_text.trimmed().toStdString(), backupproject::kMinRetainCount,
+          retain_text.toStdString(), backupproject::kMinRetainCount,
           backupproject::kMaxRetainCount,
           QStringLiteral("保留数量").toStdString(), &retain, &error)) {
     SetStatus(kError, QStringLiteral("计划配置不合法"),
@@ -513,6 +540,14 @@ bool ScheduleController::saveConfig(bool enabled, const QString& source_path,
   // 产品只允许一个进程，但进程内仍然有两个线程，所以这条规则必须由 C++ 保证，
   // 而不是只靠 QML 把按钮置灰（那是界面礼貌，不是不变式）。评估在飞的时候
   // 直接拒绝保存，用户等它结束再点。
+  //
+  // busy_ 只看本控制器；闸门看的是整个 GUI：手动备份/恢复/删除/改仓库正在
+  // 进行时，保存计划同样必须被拒绝——那几步都会改动持久状态。
+  OperationGuard guard(operation_gate_, OperationGate::Kind::kScheduleConfig);
+  if (operation_gate_ != nullptr && !guard.acquired()) {
+    SetStatus(kWarning, QStringLiteral("另一个操作正在进行"), guard.reason());
+    return false;
+  }
   if (busy_) {
     SetStatus(
         kWarning, QStringLiteral("计划任务正在运行"),
