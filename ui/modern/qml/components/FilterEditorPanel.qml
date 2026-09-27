@@ -639,6 +639,77 @@ Item {
                     }
                 }
 
+
+                // ---------- 高级规则（完整 DSL）----------
+                //
+                // 可视化表单每条规则只填一个子条件；DSL 允许一条规则里写多个
+                // 条件（AND），而多个 --include 之间是 OR —— 两者并不等价。
+                // 这里让 Manual Backup 的筛选能力与 CLI 完全一致：文本原样交给
+                // 共享核心校验（validateDsl 走的就是 Filter::AddRule）。
+                ColumnLayout {
+                    Layout.fillWidth: true
+                    spacing: 6
+
+                    Text {
+                        Layout.fillWidth: true
+                        wrapMode: Text.WordWrap
+                        font.pixelSize: 16
+                        font.weight: Font.DemiBold
+                        color: theme.textSecondary
+                        text: "高级规则（一条规则写多个条件，用空格分隔，全部满足才命中）"
+                    }
+
+                    RowLayout {
+                        Layout.fillWidth: true
+                        spacing: 8
+
+                        AppComboBox {
+                            id: advancedAction
+                            Layout.preferredWidth: 110
+                            model: ["include", "exclude"]
+                        }
+
+                        AppTextField {
+                            id: advancedDsl
+                            objectName: "advancedFilterRuleField"
+                            Layout.fillWidth: true
+                            placeholderText: "如 name:*.txt size:<1MB"
+                            onTextEdited: advancedError.text = ""
+                        }
+
+                        AppButton {
+                            objectName: "addAdvancedFilterRuleButton"
+                            text: "添加高级规则"
+                            enabled: !controller.busy
+                            onClicked: {
+                                if (!ruleModel)
+                                    return
+                                if (advancedDsl.text.length === 0) {
+                                    advancedError.text = "请先填写规则"
+                                    return
+                                }
+                                if (ruleModel.addAdvancedRule(advancedAction.currentText,
+                                                              advancedDsl.text)) {
+                                    advancedError.text = ""
+                                    advancedDsl.text = ""
+                                } else {
+                                    advancedError.text = ruleModel.lastError
+                                }
+                            }
+                        }
+                    }
+
+                    Text {
+                        id: advancedError
+                        objectName: "advancedFilterRuleError"
+                        Layout.fillWidth: true
+                        wrapMode: Text.WordWrap
+                        font.pixelSize: 15
+                        color: theme.accent
+                        visible: text.length > 0
+                    }
+                }
+
                 Text {
                     Layout.fillWidth: true
                     wrapMode: Text.WordWrap
