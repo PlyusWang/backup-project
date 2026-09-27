@@ -589,6 +589,45 @@ bool FilterRuleModel::addRule(const QVariantMap& form) {
   return true;
 }
 
+bool FilterRuleModel::addAdvancedRule(const QString& action,
+                                      const QString& dsl) {
+  const bp::FilterAction filter_action = action == QStringLiteral("exclude")
+                                             ? bp::FilterAction::kExclude
+                                             : bp::FilterAction::kInclude;
+  const QString reason = validateDsl(action, dsl);
+  if (!reason.isEmpty()) {
+    SetError(reason);
+    return false;
+  }
+  bp::FilterRuleDraft draft;
+  draft.action = filter_action;
+  draft.raw_dsl = dsl.toStdString();
+  drafts_.push_back(draft);
+  SyncController();
+  RebuildRules();
+  clearError();
+  emit rulesChanged();
+  return true;
+}
+
+QString FilterRuleModel::validateDsl(const QString& action,
+                                     const QString& dsl) const {
+  const bp::FilterAction filter_action = action == QStringLiteral("exclude")
+                                             ? bp::FilterAction::kExclude
+                                             : bp::FilterAction::kInclude;
+  bp::FilterRuleDraft draft;
+  draft.action = filter_action;
+  draft.raw_dsl = dsl.toStdString();
+  std::string error;
+  if (!bp::ValidateRule(draft, &error)) return QString::fromStdString(error);
+  return QString();
+}
+
+bool FilterRuleModel::isAdvancedRule(int index) const {
+  if (index < 0 || index >= static_cast<int>(drafts_.size())) return false;
+  return !drafts_[static_cast<std::size_t>(index)].raw_dsl.empty();
+}
+
 void FilterRuleModel::removeRule(int index) {
   if (index < 0 || index >= static_cast<int>(drafts_.size())) return;
   drafts_.erase(drafts_.begin() + index);

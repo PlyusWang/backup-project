@@ -96,6 +96,18 @@ struct FilterClauseDraft {
 struct FilterRuleDraft {
   FilterAction action = FilterAction::kInclude;
   std::vector<FilterClauseDraft> clauses;
+
+  // 高级入口：整条规则的 DSL 原文。
+  //
+  // 非空时它就是这条规则的**唯一定义**：ToDsl / ValidateRule / Summarize /
+  // CliArguments 全部直接用它，不再看 clauses。
+  //
+  // 为什么需要它：可视化表单每次只构造一个 clause，而 DSL 允许一条 rule 里写
+  // 多个 condition（AND 语义，例如 "name:*.txt size:<1MB"）。多个 --include
+  // 之间是 OR，所以"表单只能填单条件"并不是等价的表达。产品要求 GUI 与 CLI
+  // 能力一致，因此这里必须留一个完整的 DSL 入口——校验依旧走同一个
+  // Filter::AddRule，GUI 不定义语法。
+  std::string raw_dsl;
 };
 
 const char* RuleFieldName(RuleField field);

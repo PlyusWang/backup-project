@@ -61,6 +61,20 @@ class FilterRuleModel : public QObject {
   Q_INVOKABLE QString validateForm(const QVariantMap& form) const;
 
   Q_INVOKABLE bool addRule(const QVariantMap& form);
+
+  // 高级入口：直接输入完整 DSL。
+  //
+  // 可视化表单每条规则只填一个子条件，而 DSL 允许一条规则里写多个条件
+  // （AND），多个 --include 之间却是 OR——所以"表单只能填单条件"并不等价。
+  // 这个入口让 Manual Backup 的筛选能力与 CLI 完全一致。
+  //
+  // 校验与保存走的是同一条路：Filter::AddRule（共享核心），GUI 不定义语法。
+  Q_INVOKABLE bool addAdvancedRule(const QString& action, const QString& dsl);
+  // 只校验，不改动规则列表：返回空串表示合法。
+  Q_INVOKABLE QString validateDsl(const QString& action,
+                                  const QString& dsl) const;
+  // 第 index 条规则是不是高级 DSL 规则（Rule Card 据此显示原文）。
+  Q_INVOKABLE bool isAdvancedRule(int index) const;
   Q_INVOKABLE void removeRule(int index);
   Q_INVOKABLE void moveRule(int index, int delta);
   Q_INVOKABLE void clearRules();
