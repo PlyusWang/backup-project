@@ -366,6 +366,152 @@ int main() {
         ::getenv("XDG_CONFIG_HOME") == nullptr ||
             std::string(::getenv("XDG_CONFIG_HOME")) != root + "/xdg-b",
         "AL-46 测试结束后环境变量已还原");
+
+    // ---- R1..R8：runtime 目录的安全性判定 ----
+    //
+    // 在目录里创建 / 解析 "backup-project.lock" 需要两件事：对目录**可写**
+    // （创建目录项）和**可进入 / 可搜索**（穿过目录访问它下面的名字）。
+    // 只查写权限会把 mode 0600 的目录判成可用，然后在真正 open 子路径时才
+    // EACCES —— 那时错误看起来像配置损坏，而不是"runtime 目录不可用，
+    // 该走 fallback 了"。这一组用例把两个位都钉住。
+    //
+    // 全部走 ResolveApplicationLockPath 这个 seam：uid 与两个根目录都是显式
+    // 参数，所以每一种 mode / owner / 节点类型都能被测到，不需要 sudo，
+    // 也不会去动真实的 /run/user/<uid>。
+    test_support::Section("AL 5b. runtime 目录判定：R1..R8");
+    const std::string r_root = root + "/r-run";
+    const std::string r_fallback = root + "/r-tmp";
+    test_support::Mkdir(r_root, 0755);
+    test_support::Mkdir(r_fallback, 0700);
+    const std::string r_dir = r_root + "/" + uid_text;
+    const std::string r_expected_fallback =
+        r_fallback + "/backup-project-" + uid_text + ".lock";
+
+    // R1：属主正确 + 0700 -> 可用
+    test_support::Mkdir(r_dir, 0700);
+    test_support::Check(
+        bp::ResolveApplicationLockPath(uid, r_root, r_fallback, &resolved,
+                                       &error) &&
+            resolved == r_dir + "/backup-project.lock",
+        "R1 属主是本人且 mode 0700 -> runtime 目录可用", resolved);
+
+    // R2：属主正确 + 0600（可写但**不可搜索**）-> 不可用
+    test_support::Check(::chmod(r_dir.c_str(), 0600) == 0,
+                        "R2 runtime 目录改为 0600");
+    test_support::Check(
+        bp::ResolveApplicationLockPath(uid, r_root, r_fallback, &resolved,
+                                       &error) &&
+            resolved == r_expected_fallback,
+        "R2 mode 0600（缺 S_IXUSR）-> 不可用，退 fallback", resolved);
+
+    // R3：属主正确 + 0500（可搜索但**不可写**）-> 不可用
+    test_support::Check(::chmod(r_dir.c_str(), 0500) == 0,
+                        "R3 runtime 目录改为 0500");
+    test_support::Check(
+        bp::ResolveApplicationLockPath(uid, r_root, r_fallback, &resolved,
+                                       &error) &&
+            resolved == r_expected_fallback,
+        "R3 mode 0500（缺 S_IWUSR）-> 不可用，退 fallback", resolved);
+    test_support::Check(::chmod(r_dir.c_str(), 0700) == 0,
+                        "R3b runtime 目录恢复 0700");
+
+    // R4：属主不是本人 + 0777 -> 仍然不可用（世界可写不等于可以用）
+    const std::string r_foreign = r_root + "/4242";
+    test_support::Mkdir(r_foreign, 0777);
+    test_support::Check(
+        bp::ResolveApplicationLockPath(4242, r_root, r_fallback, &resolved,
+                                       &error) &&
+            resolved == r_fallback + "/backup-project-4242.lock",
+        "R4 属主不是该 uid 时，0777 也不算可用 -> fallback", resolved);
+
+    // R5：节点不是目录 -> 不可用
+    const std::string r_file = r_root + "/5150";
+    test_support::WriteFile(r_file, "not a directory", 0644);
+    test_support::Check(
+        bp::ResolveApplicationLockPath(5150, r_root, r_fallback, &resolved,
+                                       &error) &&
+            resolved == r_fallback + "/backup-project-5150.lock",
+        "R5 runtime 路径是普通文件 -> fallback", resolved);
+
+    // R6：节点是符号链接 -> 不跟随，退 fallback
+    const std::string r_real = r_root + "/6000.real";
+    test_support::Mkdir(r_real, 0700);
+    test_support::Check(test_support::CreateSymlink(r_real, r_root + "/6000"),
+                        "R6 在 runtime 路径上放一个指向真目录的符号链接");
+    test_support::Check(
+        bp::ResolveApplicationLockPath(6000, r_root, r_fallback, &resolved,
+                                       &error) &&
+            resolved == r_fallback + "/backup-project-6000.lock",
+        "R6 runtime 路径是符号链接 -> 不跟随，退 fallback", resolved);
+
+    // R7：runtime 不可用时选出来的 fallback 必须真的在 fallback 根下，
+    // 不能是"看起来换了名字、其实还在 runtime 目录里"。
+    test_support::Check(::chmod(r_dir.c_str(), 0600) == 0,
+                        "R7 runtime 目录改为 0600");
+    test_support::Check(
+        bp::ResolveApplicationLockPath(uid, r_root, r_fallback, &resolved,
+                                       &error) &&
+            resolved == r_expected_fallback &&
+            resolved.rfind(r_root + "/", 0) != 0,
+        "R7 判定不可用时选出的路径确实落在 fallback 根下", resolved);
+    test_support::Check(::chmod(r_dir.c_str(), 0700) == 0,
+                        "R7b runtime 目录恢复 0700");
+
+    // R8：fallback 锁本身的安全属性不能因为"退到 fallback"而放松。
+    //   0600 / O_NOFOLLOW / flock 独占都在这里直接验；
+    //   "锁文件属主必须是本人"需要第二个 UID 才能造出来（见下面的 NOTE）。
+    {
+      test_support::Check(!test_support::Exists(r_expected_fallback),
+                          "R8a fallback 锁文件一开始不存在");
+      bp::ApplicationInstanceLock fallback_lock;
+      test_support::Check(
+          fallback_lock.Acquire(r_expected_fallback, &error) ==
+              bp::ApplicationInstanceStatus::kAcquired,
+          "R8b fallback 锁可以拿到", error);
+      std::uint32_t fallback_mode = 0;
+      test_support::Check(
+          ModeOf(r_expected_fallback, &fallback_mode) && fallback_mode == 0600,
+          "R8b fallback 锁文件是 0600", test_support::Octal(fallback_mode));
+
+      bp::ApplicationInstanceLock fallback_second;
+      test_support::Check(
+          fallback_second.Acquire(r_expected_fallback, &error) ==
+              bp::ApplicationInstanceStatus::kAlreadyRunning,
+          "R8c fallback 锁仍然是 flock 独占（第二个实例被拒）", error);
+      fallback_lock.Release();
+
+      // O_NOFOLLOW：目标名字上是符号链接时 kError，且被指向的文件一个字节
+      // 都不能被动过 —— "退到 fallback" 不是放松路径安全检查的理由。
+      const std::string r_victim = root + "/r-victim.txt";
+      test_support::WriteFile(r_victim, "do not touch", 0644);
+      const std::string r_link = r_fallback + "/backup-project-7777.lock";
+      test_support::Check(test_support::CreateSymlink(r_victim, r_link),
+                          "R8d 在 fallback 锁路径上放一个符号链接");
+      bp::ApplicationInstanceLock fallback_unsafe;
+      test_support::Check(
+          fallback_unsafe.Acquire(r_link, &error) ==
+              bp::ApplicationInstanceStatus::kError,
+          "R8d fallback 路径是符号链接 -> kError（不是 kAlreadyRunning）",
+          error);
+      std::string r_after;
+      test_support::ReadFile(r_victim, &r_after);
+      test_support::Check(r_after == "do not touch",
+                          "R8d 被指向的文件没有被 truncate 或被覆盖", r_after);
+
+      // R8e：同一个位置上如果是目录，同样 fail closed。
+      const std::string r_dir_lock = r_fallback + "/backup-project-8888.lock";
+      test_support::Mkdir(r_dir_lock, 0755);
+      bp::ApplicationInstanceLock fallback_dir;
+      test_support::Check(
+          fallback_dir.Acquire(r_dir_lock, &error) ==
+              bp::ApplicationInstanceStatus::kError,
+          "R8e fallback 路径是目录 -> kError", error);
+
+      test_support::Note(
+          "R8f 锁文件属主必须是本人（st_uid != geteuid() 一律 fail closed）"
+          "需要第二个 UID 才能构造，无法在无 sudo 的单元测试里造出那个文件；"
+          "该判定在 src/platform/file_lock.cpp 里，属于拒绝路径而不是接受路径。");
+    }
   }
 
   // ---- 原子替换写入（ScheduleStore / ConfigManager 共用）----
