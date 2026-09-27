@@ -2040,6 +2040,181 @@ else
   record_fail "PRV-23 持锁进程退出之后 preview 又能跑" "exit=$PREVIEW_CLI_STATUS"
 fi
 
+# ---- L.7 增量策略：CLI 与 GUI 给出同一组事实 ----------------------------
+#
+# 增量是**策略**维度上的第二个取值，不是第二种备份命令。这里不重新实现任何
+# 语义，只钉两件事：
+#
+#   1. CLI 的三步（完整基线 / 无变化 / delta）真的按这个顺序发生，而且它说的是
+#      "这一轮到底做了什么"；
+#   2. Modern GUI 走它自己的真实控制器入口，得到**同一串结果**。
+#
+# 两边共用同一个核心引擎，所以"结果一致"本来应该是推论 —— 这条用例把它变成
+# 事实：任何一边偷偷换了判定，这里都会红。
+INC="$PREVIEW/incremental"
+INC_CONFIG="$INC/config.json"
+rm -rf "$INC"
+mkdir -p "$INC/src" "$INC/repo-cli" "$INC/repo-gui" "$INC/gui-src"
+
+inc_fill_source() {
+  local dir="$1"
+  rm -rf "$dir"
+  mkdir -p "$dir"
+  printf 'alpha' > "$dir/a.txt"
+  printf 'bravo' > "$dir/b.txt"
+}
+inc_fill_source "$INC/src"
+inc_fill_source "$INC/gui-src"
+
+"$BACKUPCTL" --config-file "$INC_CONFIG" config repository set "$INC/repo-cli" \
+  >/dev/null 2>&1
+
+run_inc_cli() {
+  set +e
+  timeout --signal=KILL "$TIMEOUT_SECONDS" "$BACKUPCTL" \
+    --config-file "$INC_CONFIG" backup "$INC/src" --strategy incremental "$@" \
+    >"$INC/cli.out" 2>"$INC/cli.err"
+  INC_STATUS=$?
+  set -e
+}
+
+# INC-01 第一次：没有可信基线 -> 完整基线，而且必须说出来。
+run_inc_cli
+if [[ $INC_STATUS -eq 0 ]] &&
+   grep -qF 'Strategy:   incremental' "$INC/cli.out" &&
+   grep -qF 'Kind:       full baseline' "$INC/cli.out" &&
+   grep -qF 'no trustworthy baseline' "$INC/cli.out"; then
+  record_pass "INC-01 第一次增量：明确报告建的是完整基线（并给出原因）"
+else
+  record_fail "INC-01 第一次增量：报告完整基线" \
+    "$(head -4 "$INC/cli.out" | tr '\n' ' ')"
+fi
+
+# INC-02 第二次：没有变化 -> 什么都不写。
+run_inc_cli
+INC_REPO_BEFORE="$(find "$INC/repo-cli" -type f | wc -l)"
+if [[ $INC_STATUS -eq 0 ]] &&
+   grep -qF 'No effective changes' "$INC/cli.out"; then
+  record_pass "INC-02 没有有效变化时不创建新快照"
+else
+  record_fail "INC-02 没有变化时跳过" "$(head -2 "$INC/cli.out" | tr '\n' ' ')"
+fi
+
+# INC-03 就地改写一个文件：长度与 mtime 都不变。
+# 这是 metadata-first 看不见、而增量必须看见的那一类变化。
+python3 - "$INC/src/a.txt" <<'PYEOF'
+import os, sys
+path = sys.argv[1]
+info = os.lstat(path)
+with open(path, 'r+b') as handle:
+    handle.write(b'ALPHA')
+os.utime(path, (info.st_atime, info.st_mtime), follow_symlinks=False)
+PYEOF
+run_inc_cli
+if [[ $INC_STATUS -eq 0 ]] &&
+   grep -qF 'Kind:       delta' "$INC/cli.out" &&
+   grep -qF 'Changes:    added=0 modified=1 metadata=0 removed=0' "$INC/cli.out"; then
+  record_pass "INC-03 判别：same-size + same-mtime 改写被识别为一次修改"
+else
+  record_fail "INC-03 same-size/same-mtime 改写" \
+    "$(grep -E 'Kind:|Changes:' "$INC/cli.out" | tr '\n' ' ')"
+fi
+INC_REPO_AFTER="$(find "$INC/repo-cli" -type f | wc -l)"
+if [[ "$INC_REPO_AFTER" -gt "$INC_REPO_BEFORE" ]]; then
+  record_pass "INC-03b delta 真的落盘了（仓库里多了文件）"
+else
+  record_fail "INC-03b delta 落盘" "before=$INC_REPO_BEFORE after=$INC_REPO_AFTER"
+fi
+
+# INC-04 GUI 走真实控制器入口，跑同一串步骤。
+if [[ -x "$PREVIEW_GUI_BIN" ]]; then
+  set +e
+  QT_QPA_PLATFORM=offscreen timeout 180 "$PREVIEW_GUI_BIN" --incremental-test \
+    "$INC/gui-src" "$INC/repo-gui" \
+    --config-file "$INC/gui-config.json" --schedule-file "$INC/gui-schedule.json" \
+    >"$INC/gui.out" 2>"$INC/gui.err"
+  INC_GUI_STATUS=$?
+  set -e
+  if [[ $INC_GUI_STATUS -eq 0 ]] &&
+     grep -qF '[incremental] step1 kind=full-baseline reason=yes' "$INC/gui.out" &&
+     grep -qF '[incremental] step2 kind=no-changes' "$INC/gui.out" &&
+     grep -qF '[incremental] step3 kind=delta' "$INC/gui.out" &&
+     grep -qF '[incremental] restore ok' "$INC/gui.out"; then
+    record_pass "INC-04 GUI 增量：基线 / 无变化 / delta / 依赖链恢复全部成立"
+  else
+    record_fail "INC-04 GUI 增量链路" \
+      "exit=$INC_GUI_STATUS $(grep -E 'step|restore' "$INC/gui.out" | tr '\n' ' ')"
+  fi
+
+  # INC-05 parity：两侧报告的种类序列必须逐项相同。
+  # CLI 侧的序列从三次输出里取，GUI 侧从它自己打印的行里取。
+  INC_CLI_KINDS="full-baseline,no-changes,delta"
+  INC_GUI_KINDS="$(grep -oE 'kind=[a-z-]+' "$INC/gui.out" | sed 's/kind=//' | paste -sd, -)"
+  if [[ "$INC_CLI_KINDS" == "$INC_GUI_KINDS" ]]; then
+    record_pass "INC-05 CLI 与 GUI 报告的种类序列一致（$INC_CLI_KINDS）"
+  else
+    record_fail "INC-05 CLI/GUI 种类序列一致" \
+      "cli=$INC_CLI_KINDS gui=$INC_GUI_KINDS"
+  fi
+else
+  record_pass "INC-04/05 GUI 增量（没有 build/backup-gui-modern，跳过 GUI 侧）"
+fi
+
+# INC-06 组合校验：增量 + 非 MyPack 必须在写任何东西之前被拒绝。
+rm -rf "$INC/repo-reject"
+mkdir -p "$INC/repo-reject"
+"$BACKUPCTL" --config-file "$INC_CONFIG" config repository set "$INC/repo-reject" \
+  >/dev/null 2>&1
+set +e
+timeout --signal=KILL "$TIMEOUT_SECONDS" "$BACKUPCTL" --config-file "$INC_CONFIG" \
+  backup "$INC/src" --strategy incremental --pack ustar \
+  >"$INC/reject.out" 2>&1
+INC_REJECT_STATUS=$?
+set -e
+INC_REJECT_FILES="$(find "$INC/repo-reject" -type f | wc -l)"
+if [[ $INC_REJECT_STATUS -eq 2 && "$INC_REJECT_FILES" -eq 0 ]] &&
+   grep -qF 'MyPack' "$INC/reject.out"; then
+  record_pass "INC-06 增量 + USTAR 在写盘前被拒绝，且理由说明为什么"
+else
+  record_fail "INC-06 增量 + USTAR 被拒绝" \
+    "exit=$INC_REJECT_STATUS files=$INC_REJECT_FILES $(head -1 "$INC/reject.out")"
+fi
+
+# INC-07 未知策略绝不回退到 full。
+set +e
+timeout --signal=KILL "$TIMEOUT_SECONDS" "$BACKUPCTL" --config-file "$INC_CONFIG" \
+  backup "$INC/src" --strategy bogus >"$INC/bogus.out" 2>&1
+INC_BOGUS_STATUS=$?
+set -e
+if [[ $INC_BOGUS_STATUS -eq 2 ]] &&
+   grep -qF "unknown backup strategy 'bogus'" "$INC/bogus.out"; then
+  record_pass "INC-07 未知策略是用法错误，不静默降级为 full"
+else
+  record_fail "INC-07 未知策略" "exit=$INC_BOGUS_STATUS $(head -1 "$INC/bogus.out")"
+fi
+
+# INC-08 依赖链恢复：只给 delta 的文件名，base 由核心自己解析。
+# INC-06 把配置指向了另一个仓库（那是它要证明的事），这里先指回来。
+"$BACKUPCTL" --config-file "$INC_CONFIG" config repository set "$INC/repo-cli" \
+  >/dev/null 2>&1
+# 明确挑"_NNN.bak"那一份（delta），不靠 sort 的标点顺序：
+# 排序规则受 locale 影响，"a.bak" 与 "a_001.bak" 谁在前并不稳定。
+INC_DELTA="$(ls "$INC/repo-cli"/*.bak | grep -E '_[0-9]{3}\.bak$' | head -1 | xargs basename)"
+rm -rf "$INC/restored"
+set +e
+timeout --signal=KILL "$TIMEOUT_SECONDS" "$BACKUPCTL" --config-file "$INC_CONFIG" \
+  restore "$INC_DELTA" "$INC/restored" >"$INC/restore.out" 2>&1
+INC_RESTORE_STATUS=$?
+set -e
+if [[ $INC_RESTORE_STATUS -eq 0 ]] &&
+   [[ "$(cat "$INC/restored/a.txt" 2>/dev/null)" == "ALPHA" ]] &&
+   [[ "$(cat "$INC/restored/b.txt" 2>/dev/null)" == "bravo" ]]; then
+  record_pass "INC-08 从 delta 的依赖链恢复：变化部分与基线部分都对"
+else
+  record_fail "INC-08 依赖链恢复" \
+    "exit=$INC_RESTORE_STATUS $(head -1 "$INC/restore.out")"
+fi
+
 # ---- CLI 约定 --------------------------------------------------------
 
 expect_success "CLI-01 --help exits 0" --help

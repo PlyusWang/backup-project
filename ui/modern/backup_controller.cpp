@@ -646,6 +646,16 @@ bool BackupController::startBackupWithStrategy(
                   BackupTrigger::kManual, strategy)));
     return false;
   }
+  // 打包方式与策略的组合同样在启动任务之前判定，理由与 CLI 一致。
+  backupproject::PackMethod pack_method = backupproject::PackMethod::kMyPack;
+  if (ParsePackMethodKey(pack_key, &pack_method) &&
+      strategy == BackupStrategy::kIncremental &&
+      !backupproject::IsSupportedIncrementalPack(pack_method)) {
+    SetStatus(QString::fromLatin1(kError), QStringLiteral("无法备份"),
+              QString::fromStdString(
+                  backupproject::UnsupportedIncrementalPackReason()));
+    return false;
+  }
   return StartBackupWithStrategy(strategy, pack_key, compression_key,
                                  encryption_key, password, confirm_password);
 }
