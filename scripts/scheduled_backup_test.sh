@@ -26,6 +26,14 @@ GUI="$ROOT_DIR/build/backup-gui-modern"
 TEST_ROOT="$ROOT_DIR/testdata/schedule"
 OUT="$TEST_ROOT/last-output.txt"
 
+# 全应用单实例锁住在配置根里（<XDG_CONFIG_HOME>/backup-project/backup-gui-modern/
+# app.lock，见 app_paths.h）。把配置根指到测试私有目录有两个好处：
+#   * 测试不会去抢用户桌面上那把真实的锁，也不会被用户开着的 GUI 干扰；
+#   * 仍然真实验证"GUI 与 CLI 解析出同一个锁路径"这条约束——两边都只认这一个
+#     环境变量，谁也没有第二套算法。
+export XDG_CONFIG_HOME="$TEST_ROOT/xdg"
+mkdir -p "$XDG_CONFIG_HOME"
+
 PASS=0
 FAIL=0
 
@@ -131,6 +139,7 @@ run_unit() {
   fi
 }
 
+run_unit application_lock_test
 run_unit scheduler_core_test
 run_unit scheduled_backup_test
 run_unit terminal_secret_test
@@ -406,6 +415,11 @@ else
 fi
 
 # single-runner 锁：另一个进程持锁时，schedule run 必须明确失败。
+#
+# 先把计划重新启用：schedule run 现在会**先**拒绝"没启用"的计划（与 GUI 的
+# runNow 是同一个结论、同一个顺序），不启用的话这条用例测到的是那条规则，
+# 而不是锁。判断顺序本身也是 parity 的一部分。
+"$BACKUPCTL" --config-file "$CONFIG" --schedule-file "$STORE" schedule enable   >/dev/null 2>&1
 if command -v flock >/dev/null 2>&1; then
   flock -n "$STORE.lock" -c 'sleep 6' &
   LOCK_PID=$!
@@ -725,89 +739,179 @@ cc_place state-S2.json other-src.dat
 cc_case "D3.24" "manifest 声明的是别的源，绝不能 skip" "success_created" "D3.25"
 
 # ============================================================
-echo "[schedule-test] D4. 多进程：真实的两个 runner 抢同一把锁"
+echo "[schedule-test] D4. 全应用单实例：真实进程"
 # ============================================================
 #
-# 这一区开的是**真进程**，不是 flock 替身：两个 backupctl schedule watch
-# 跑同一份 schedule store。GUI 的 ScheduleController 用的是同一个 SchedulerLock、
-# 同一个 lock_file_path，所以"另一个 runner 持锁"这件事在这里被证明一次就够了。
+# 产品规则：整个产品同一时刻只允许**一个**进程。GUI+GUI / GUI+CLI /
+# CLI+CLI / CLI+GUI 四种组合全部拒绝，而且必须在进入任何业务逻辑之前拒绝
+# （不能出现第二个 controller，不能先读一遍配置再发现已经有实例）。
 #
-# 锁的真相在 flock 上，锁文件里的 pid 提示只是给人看的——所以这里用 pid 判断
-# "谁拿着锁"，而不是"锁文件存在"。
+# 锁路径只由配置根（app_paths.h）决定，与 repository、--config-file、
+# --schedule-file 全都没有关系——所以下面每个 CLI 都带自己的 --config-file，
+# 互相之间照样冲突。"换个参数就能绕过单实例"这条捷径是被堵死的。
+#
+# 判锁永远靠 flock，不是"锁文件存在"。SIGKILL 与"锁文件仍然留在磁盘上"
+# 两条用例专门钉住这一点。
 
-PL="$TEST_ROOT/process-lock"
-rm -rf "$PL"
-mkdir -p "$PL/src" "$PL/repo"
-printf 'lock\n' > "$PL/src/a.txt"
-PL_CONFIG="$PL/config.json"
-PL_STORE="$PL/schedule.json"
+SI="$TEST_ROOT/single-instance"
+rm -rf "$SI"
+mkdir -p "$SI/src" "$SI/repo"
+printf 'single\n' > "$SI/src/a.txt"
+SI_CONFIG="$SI/config.json"
+SI_STORE="$SI/schedule.json"
+SI_APP_LOCK="$XDG_CONFIG_HOME/backup-project/backup-gui-modern/app.lock"
 
-"$BACKUPCTL" --config-file "$PL_CONFIG" config repository set "$PL/repo" >/dev/null 2>&1
-"$BACKUPCTL" --config-file "$PL_CONFIG" --schedule-file "$PL_STORE" schedule set \
-  --source "$PL/src" --interval-minutes 5 --retain 3 >/dev/null 2>&1
-"$BACKUPCTL" --config-file "$PL_CONFIG" --schedule-file "$PL_STORE" schedule enable >/dev/null 2>&1
-rm -f "$PL_STORE.lock"
+"$BACKUPCTL" --config-file "$SI_CONFIG" config repository set "$SI/repo" >/dev/null 2>&1
+"$BACKUPCTL" --config-file "$SI_CONFIG" --schedule-file "$SI_STORE" schedule set \
+  --source "$SI/src" --interval-minutes 5 --retain 3 >/dev/null 2>&1
+"$BACKUPCTL" --config-file "$SI_CONFIG" --schedule-file "$SI_STORE" schedule enable >/dev/null 2>&1
 
-"$BACKUPCTL" --config-file "$PL_CONFIG" --schedule-file "$PL_STORE" schedule watch \
-  >"$PL/watch1.log" 2>&1 &
-PL_WATCH1=$!
-PL_HOLD1=0
-for _ in $(seq 1 60); do
-  if grep -q "^pid=$PL_WATCH1 " "$PL_STORE.lock" 2>/dev/null; then PL_HOLD1=1; break; fi
+"$BACKUPCTL" --config-file "$SI_CONFIG" --schedule-file "$SI_STORE" schedule watch \
+  >"$SI/watch.log" 2>&1 &
+SI_WATCH=$!
+SI_HOLD=0
+for _ in $(seq 1 100); do
+  if grep -q "^pid=$SI_WATCH " "$SI_APP_LOCK" 2>/dev/null; then SI_HOLD=1; break; fi
   sleep 0.1
 done
-if [ "$PL_HOLD1" = "1" ]; then
-  record_pass "D4.01 第一个 watch 真的持有锁（锁文件里的 pid 就是它）"
+if [ "$SI_HOLD" = "1" ]; then
+  record_pass "D4.01 运行中的 CLI 持有的是全应用锁（app.lock 里的 pid 就是它）"
 else
-  record_fail "D4.01 第一个 watch 真的持有锁（锁文件里的 pid 就是它）" "锁文件里没有 pid=$PL_WATCH1"
+  record_fail "D4.01 运行中的 CLI 持有的是全应用锁（app.lock 里的 pid 就是它）" \
+    "app.lock 里没有 pid=$SI_WATCH"
 fi
 
-expect_exit "D4.02 第二个 watch 明确失败" 1 \
-  "$BACKUPCTL" --config-file "$PL_CONFIG" --schedule-file "$PL_STORE" schedule watch
-expect_grep "D4.03 报错说明锁已被另一进程持有" "already held by another process"
+SI_ARCHIVES_BEFORE="$(ls -1 "$SI/repo" 2>/dev/null | wc -l)"
+SI_STORE_SUM_BEFORE="$(cksum "$SI_STORE" | cut -d' ' -f1)"
 
-PL_BEFORE="$(ls -1 "$PL/repo" | wc -l)"
-expect_exit "D4.04 watch 持锁时 schedule run 明确失败" 1 \
-  "$BACKUPCTL" --config-file "$PL_CONFIG" --schedule-file "$PL_STORE" schedule run
-expect_grep "D4.05 schedule run 的报错同样是锁" "already held by another process"
-PL_AFTER="$(ls -1 "$PL/repo" | wc -l)"
-if [ "$PL_BEFORE" = "$PL_AFTER" ]; then
-  record_pass "D4.06 被拒绝的那一轮没有并发创建任何快照"
+expect_exit "D4.02 第二个 CLI（watch）被拒绝" 3 \
+  "$BACKUPCTL" --config-file "$SI_CONFIG" --schedule-file "$SI_STORE" schedule watch
+expect_grep "D4.03 理由是产品规则：只允许一个 GUI 或 CLI" "only one GUI or CLI process"
+
+expect_exit "D4.04 schedule show 在业务逻辑之前就被拒绝" 3 \
+  "$BACKUPCTL" --config-file "$SI_CONFIG" --schedule-file "$SI_STORE" schedule show
+expect_exit "D4.05 repository list 同样被拒绝" 3 \
+  "$BACKUPCTL" --config-file "$SI_CONFIG" repository list
+expect_exit "D4.06 config repository show 同样被拒绝" 3 \
+  "$BACKUPCTL" --config-file "$SI_CONFIG" config repository show
+expect_exit "D4.07 连 config repository set 都被拒绝（不写任何持久状态）" 3 \
+  "$BACKUPCTL" --config-file "$SI/other.json" config repository set "$SI/repo"
+expect_absent "D4.08 被拒绝的那次 set 没有创建它的 config 文件" "$SI/other.json"
+expect_exit "D4.09 backup 也被拒绝" 3 \
+  "$BACKUPCTL" --config-file "$SI_CONFIG" backup "$SI/src" "$SI/other.bak"
+expect_absent "D4.10 被拒绝的 backup 没有留下任何归档" "$SI/other.bak"
+# 纯 --help 不进入业务状态，因此刻意不抢锁：已经有 GUI 在跑的时候，用户仍然
+# 应该看得到用法。
+expect_exit "D4.11 --help 不抢锁，有实例在跑时仍然可用" 0 "$BACKUPCTL" --help
+
+if [ "$(ls -1 "$SI/repo" 2>/dev/null | wc -l)" = "$SI_ARCHIVES_BEFORE" ] &&
+   [ "$(cksum "$SI_STORE" | cut -d' ' -f1)" = "$SI_STORE_SUM_BEFORE" ]; then
+  record_pass "D4.12 这一串拒绝既没建归档也没改 schedule 状态"
 else
-  record_fail "D4.06 被拒绝的那一轮没有并发创建任何快照" "$PL_BEFORE -> $PL_AFTER"
+  record_fail "D4.12 这一串拒绝既没建归档也没改 schedule 状态" "仓库或 store 变了"
+fi
+
+if [ -x "$GUI" ]; then
+  export QT_QPA_PLATFORM=offscreen
+  expect_exit "D4.13 GUI 在 CLI 持锁时拒绝启动" 3 \
+    "$GUI" --schedule-show --config-file "$SI_CONFIG" --schedule-file "$SI_STORE"
+  expect_grep "D4.14 GUI 报的是同一句单实例拒绝" "only one GUI or CLI process"
+else
+  echo "  SKIP  D4.13/D4.14：没有 build/backup-gui-modern"
 fi
 
 # SIGTERM：flock 随进程退出自动释放——这正是选 flock 而不是 pidfile 的理由。
-kill -TERM "$PL_WATCH1" 2>/dev/null
-for _ in $(seq 1 100); do kill -0 "$PL_WATCH1" 2>/dev/null || break; sleep 0.1; done
-if kill -0 "$PL_WATCH1" 2>/dev/null; then
-  record_fail "D4.07 SIGTERM 之后 watch 退出" "进程仍然存活"
-  kill -KILL "$PL_WATCH1" 2>/dev/null
+kill -TERM "$SI_WATCH" 2>/dev/null
+for _ in $(seq 1 100); do kill -0 "$SI_WATCH" 2>/dev/null || break; sleep 0.1; done
+if kill -0 "$SI_WATCH" 2>/dev/null; then
+  record_fail "D4.15 SIGTERM 之后 watch 退出" "进程仍然存活"
+  kill -KILL "$SI_WATCH" 2>/dev/null
 else
-  record_pass "D4.07 SIGTERM 之后 watch 正常退出"
+  record_pass "D4.15 SIGTERM 之后 watch 正常退出"
 fi
-wait "$PL_WATCH1" 2>/dev/null
+wait "$SI_WATCH" 2>/dev/null
 
-expect_exit "D4.08 锁随进程退出自动释放：schedule run 又能跑了" 0 \
-  "$BACKUPCTL" --config-file "$PL_CONFIG" --schedule-file "$PL_STORE" schedule run
+expect_exit "D4.16 SIGTERM 之后锁自动释放：schedule show 又能跑" 0 \
+  "$BACKUPCTL" --config-file "$SI_CONFIG" --schedule-file "$SI_STORE" schedule show
+expect_file "D4.17 锁文件仍然留在磁盘上（锁不靠删文件释放）" "$SI_APP_LOCK"
 
-"$BACKUPCTL" --config-file "$PL_CONFIG" --schedule-file "$PL_STORE" schedule watch \
-  >"$PL/watch2.log" 2>&1 &
-PL_WATCH2=$!
-PL_HOLD2=0
-for _ in $(seq 1 60); do
-  if grep -q "^pid=$PL_WATCH2 " "$PL_STORE.lock" 2>/dev/null; then PL_HOLD2=1; break; fi
+# SIGKILL：内核必须释放 flock。stale 的 pid 提示留在文件里也不许把产品锁死。
+"$BACKUPCTL" --config-file "$SI_CONFIG" --schedule-file "$SI_STORE" schedule watch \
+  >"$SI/watch2.log" 2>&1 &
+SI_WATCH2=$!
+for _ in $(seq 1 100); do
+  if grep -q "^pid=$SI_WATCH2 " "$SI_APP_LOCK" 2>/dev/null; then break; fi
   sleep 0.1
 done
-if [ "$PL_HOLD2" = "1" ]; then
-  record_pass "D4.09 释放之后第二个 watch 能拿到锁"
+kill -KILL "$SI_WATCH2" 2>/dev/null
+for _ in $(seq 1 100); do kill -0 "$SI_WATCH2" 2>/dev/null || break; sleep 0.1; done
+wait "$SI_WATCH2" 2>/dev/null
+expect_exit "D4.18 SIGKILL 之后内核释放 flock：schedule show 能跑" 0 \
+  "$BACKUPCTL" --config-file "$SI_CONFIG" --schedule-file "$SI_STORE" schedule show
+
+# CLI vs GUI / GUI vs GUI：GUI 用的必须是同一把锁、同一个路径。
+if [ -x "$GUI" ]; then
+  export QT_QPA_PLATFORM=offscreen
+  "$GUI" --config-file "$SI_CONFIG" --schedule-file "$SI_STORE" \
+    >"$SI/gui1.log" 2>&1 &
+  SI_GUI1=$!
+  SI_GUI_HOLD=0
+  for _ in $(seq 1 150); do
+    if grep -q "^pid=$SI_GUI1 " "$SI_APP_LOCK" 2>/dev/null; then SI_GUI_HOLD=1; break; fi
+    sleep 0.1
+  done
+  if [ "$SI_GUI_HOLD" = "1" ]; then
+    record_pass "D4.19 GUI 启动后持有同一把全应用锁"
+  else
+    record_fail "D4.19 GUI 启动后持有同一把全应用锁" "app.lock 里没有 pid=$SI_GUI1"
+  fi
+
+  expect_exit "D4.20 CLI vs GUI：GUI 在跑时 CLI 被拒绝" 3 \
+    "$BACKUPCTL" --config-file "$SI_CONFIG" --schedule-file "$SI_STORE" schedule show
+  expect_exit "D4.21 GUI vs GUI：第二个 GUI 被拒绝" 3 \
+    "$GUI" --config-file "$SI_CONFIG" --schedule-file "$SI_STORE"
+  expect_grep "D4.22 第二个 GUI 报的是同一句话" "only one GUI or CLI process"
+  expect_exit "D4.23 第二个 GUI 没有建出第二套 controller（退出码不是 0）" 3 \
+    "$GUI" --schedule-test --config-file "$SI_CONFIG" --schedule-file "$SI_STORE"
+
+  kill -TERM "$SI_GUI1" 2>/dev/null
+  for _ in $(seq 1 150); do kill -0 "$SI_GUI1" 2>/dev/null || break; sleep 0.1; done
+  kill -KILL "$SI_GUI1" 2>/dev/null
+  wait "$SI_GUI1" 2>/dev/null
+  expect_exit "D4.24 GUI 退出之后 CLI 立刻恢复" 0 \
+    "$BACKUPCTL" --config-file "$SI_CONFIG" --schedule-file "$SI_STORE" schedule show
 else
-  record_fail "D4.09 释放之后第二个 watch 能拿到锁" "锁文件里没有 pid=$PL_WATCH2"
+  echo "  SKIP  D4.19-D4.24：没有 build/backup-gui-modern"
 fi
-kill -TERM "$PL_WATCH2" 2>/dev/null
-for _ in $(seq 1 100); do kill -0 "$PL_WATCH2" 2>/dev/null || break; sleep 0.1; done
-kill -KILL "$PL_WATCH2" 2>/dev/null
-wait "$PL_WATCH2" 2>/dev/null
+
+# 恶意锁路径：符号链接 / 目录 / FIFO 一律 fail closed，而且绝不 truncate 目标。
+# 这三种都不是"已有实例"，必须是 exit 1 的错误，绝不能报成 exit 3 ——
+# 把环境问题说成并发问题会让排障方向直接跑偏。
+SI_VICTIM="$SI/victim.txt"
+printf 'do not touch\n' > "$SI_VICTIM"
+mv "$SI_APP_LOCK" "$SI_APP_LOCK.real"
+ln -s "$SI_VICTIM" "$SI_APP_LOCK"
+expect_exit "D4.25 锁路径是符号链接 -> 明确失败（exit 1，不是 3）" 1 \
+  "$BACKUPCTL" --config-file "$SI_CONFIG" --schedule-file "$SI_STORE" schedule show
+expect_grep "D4.26 报错说清楚它是符号链接" "symbolic link"
+expect_content "D4.27 被指向的文件一个字节都没变" "$SI_VICTIM" "do not touch"
+rm -f "$SI_APP_LOCK"
+mkdir "$SI_APP_LOCK"
+expect_exit "D4.28 锁路径是目录 -> 明确失败" 1 \
+  "$BACKUPCTL" --config-file "$SI_CONFIG" --schedule-file "$SI_STORE" schedule show
+rmdir "$SI_APP_LOCK"
+mkfifo "$SI_APP_LOCK"
+expect_exit "D4.29 锁路径是 FIFO -> 明确失败（而不是挂住）" 1 \
+  "$BACKUPCTL" --config-file "$SI_CONFIG" --schedule-file "$SI_STORE" schedule show
+expect_grep "D4.30 报错说清楚占名字的是 FIFO" "FIFO"
+rm -f "$SI_APP_LOCK"
+mv "$SI_APP_LOCK.real" "$SI_APP_LOCK"
+expect_exit "D4.31 恢复之后一切照旧" 0 \
+  "$BACKUPCTL" --config-file "$SI_CONFIG" --schedule-file "$SI_STORE" schedule show
+
+# SchedulerLock 不再是产品层的多进程协作机制，但它仍然是 scheduler 内部的
+# 不变量：它的行为由 tests/unit/application_lock_test.cpp 的 AL-18..AL-22
+# 直接覆盖（同一个进程里两把锁照样互斥），这里不再假装用两个 CLI 去验证它。
 
 # ============================================================
 echo "[schedule-test] D5. 故障注入：坏文件 / 写不进去 / 仓库与源临时不可用"
@@ -1022,6 +1126,209 @@ cp "$IND/repo/$OLDEST" "$IND/elsewhere/lone.bak"
 expect_exit "F.01 最旧的一份单独恢复成功" 0 \
   "$BACKUPCTL" restore "$IND/elsewhere/lone.bak" "$IND/restored"
 expect_content "F.02 恢复出的是那一轮的内容（不是 delta）" "$IND/restored/file.txt" "v1"
+
+# ============================================================
+echo "[schedule-test] I. 前端 parity 契约：同一份核心、同一套判断"
+# ============================================================
+#
+# E 区证明两个前端读的是**同一份 store**；I 区证明它们用的是**同一套判断**：
+#   * repository：一个前端写、另一个前端读；
+#   * 归档：GUI 创建、CLI 列出与删除（同一个 Catalog、同一套命名规则）；
+#   * 非法输入：两个前端都拒绝，而且拒绝的理由就是共享核心那一句话。
+#
+# 这里刻意不逐字比较两个前端的输出文本——措辞可以不同，业务判断不能不同。
+
+if [ ! -x "$GUI" ]; then
+  echo "  SKIP  I 区：没有 build/backup-gui-modern"
+else
+  export QT_QPA_PLATFORM=offscreen
+
+  PAR="$TEST_ROOT/parity"
+  rm -rf "$PAR"
+  mkdir -p "$PAR/src" "$PAR/repo-a" "$PAR/repo-b" "$PAR/restore"
+  printf 'parity\n' > "$PAR/src/a.txt"
+  PAR_CONFIG="$PAR/config.json"
+  PAR_STORE="$PAR/schedule.json"
+
+  # ---- repository：两个方向都要通 ----
+  "$BACKUPCTL" --config-file "$PAR_CONFIG" config repository set "$PAR/repo-a" \
+    >"$OUT" 2>&1
+  "$GUI" --schedule-show --config-file "$PAR_CONFIG" --schedule-file "$PAR_STORE" \
+    >"$OUT" 2>&1
+  expect_grep "I.01 CLI 设的仓库 GUI 读到同一个路径" "repository=$PAR/repo-a"
+
+  # --config-file / --schedule-file 必须一并给：不给就是让 GUI 去用默认位置，
+  # 那样比对的就不是同一份配置了（"测试自己写错隔离路径"是最容易骗过自己的
+  # 那类假通过）。
+  #
+  # 这个自检最后会把它自己的产物删掉（产品行为：测完就清理），所以先用
+  # BACKUP_MODERN_KEEP_ARTIFACT 留一份副本，好让 CLI 去恢复它。
+  PAR_KEEP="$PAR/gui-artifact.bak"
+  BACKUP_MODERN_KEEP_ARTIFACT="$PAR_KEEP" "$GUI" --repository-test \
+    "$PAR/src" "$PAR/repo-b" "$PAR/restore-gui" \
+    --config-file "$PAR_CONFIG" --schedule-file "$PAR_STORE" \
+    >"$PAR/gui-repo.log" 2>&1
+  if [ $? -eq 0 ]; then
+    record_pass "I.02 GUI 的仓库链路自检通过（保存 / 备份 / 列表 / 恢复 / 删除）"
+  else
+    record_fail "I.02 GUI 的仓库链路自检通过（保存 / 备份 / 列表 / 恢复 / 删除）" \
+      "$(tail -2 "$PAR/gui-repo.log" | tr '\n' ' ')"
+  fi
+  "$BACKUPCTL" --config-file "$PAR_CONFIG" config repository show >"$OUT" 2>&1
+  expect_grep "I.03 GUI 设的仓库 CLI 读到同一个路径" "Repository:  $PAR/repo-b"
+
+  # ---- 归档：GUI 产的 v2 容器，CLI 必须恢复得回来 ----
+  expect_file "I.04 GUI 的产物被留了下来（BACKUP_MODERN_KEEP_ARTIFACT）" "$PAR_KEEP"
+  expect_exit "I.05 CLI 能恢复 GUI 产的归档" 0 \
+    "$BACKUPCTL" restore "$PAR_KEEP" "$PAR/restore-cli"
+  PAR_RESTORED="$(find "$PAR/restore-cli" -name a.txt -type f 2>/dev/null | head -n 1)"
+  if [ -n "$PAR_RESTORED" ] && cmp -s "$PAR/src/a.txt" "$PAR_RESTORED"; then
+    record_pass "I.06 CLI 恢复出来的内容与源文件逐字节一致"
+  else
+    record_fail "I.06 CLI 恢复出来的内容与源文件逐字节一致" "找不到或不同: $PAR_RESTORED"
+  fi
+  # GUI 的自检把它的产物从共享仓库里删掉了，CLI 必须看到同一个结果。
+  "$BACKUPCTL" --config-file "$PAR_CONFIG" repository list >"$OUT" 2>&1
+  expect_grep "I.07 GUI 删掉的归档在 CLI 这边也确实没了" "Archives:   0"
+
+  # ---- 非法输入：两个前端拒绝的是同一件事，理由是同一句核心原文 ----
+  "$BACKUPCTL" --config-file "$PAR_CONFIG" --schedule-file "$PAR_STORE" schedule set \
+    --source "$PAR/src" --interval-minutes 5 --retain 3 >/dev/null 2>&1
+  "$BACKUPCTL" --config-file "$PAR_CONFIG" --schedule-file "$PAR_STORE" schedule enable \
+    >/dev/null 2>&1
+  expect_exit "I.09 启用状态下把源改成不存在的目录 -> 拒绝" 1 \
+    "$BACKUPCTL" --config-file "$PAR_CONFIG" --schedule-file "$PAR_STORE" schedule set \
+    --source "$PAR/does-not-exist"
+  expect_grep "I.10 理由是共享核心的原文（Schedule source directory）" \
+    "Schedule source directory"
+  expect_exit "I.11 非法周期在解析阶段就被拒绝（exit 2，不落盘）" 2 \
+    "$BACKUPCTL" --config-file "$PAR_CONFIG" --schedule-file "$PAR_STORE" schedule set \
+    --interval-minutes 0
+  expect_exit "I.12 未知打包方式 key 被拒绝（exit 2）" 2 \
+    "$BACKUPCTL" --config-file "$PAR_CONFIG" --schedule-file "$PAR_STORE" schedule set \
+    --pack tar
+  expect_exit "I.13 未知压缩方式 key 被拒绝（exit 2）" 2 \
+    "$BACKUPCTL" --config-file "$PAR_CONFIG" --schedule-file "$PAR_STORE" schedule set \
+    --compression zip
+  expect_exit "I.14 定时加密边界：aes 在 CLI 侧被拒绝（exit 2）" 2 \
+    "$BACKUPCTL" --config-file "$PAR_CONFIG" --schedule-file "$PAR_STORE" schedule set \
+    --encryption aes-256-ctr-hmac-sha256
+  expect_grep "I.15 拒绝理由与 GUI 挂起时用的是同一条核心规则" "none only"
+  expect_exit "I.16 非法筛选规则被拒绝（exit 2）" 2 \
+    "$BACKUPCTL" --config-file "$PAR_CONFIG" --schedule-file "$PAR_STORE" schedule set \
+    --include "type:bogus"
+
+  # ---- 结构性契约：共享规则只有一份实现 ----
+  # 这几条不是"风格检查"：key 表或校验函数一旦被复制成两份，就会在某个
+  # 边界上漂移，而漂移的表现是"GUI 能存、CLI 读不了"这种最难查的 bug。
+  PAR_SHARED=1
+  for symbol in ParsePackMethodKey ParseCompressionMethodKey \
+                ValidateScheduleConfig ValidateScheduleForEnable; do
+    if ! grep -q "$symbol" "$ROOT_DIR/ui/modern/schedule_controller.cpp" ||
+       ! grep -q "$symbol" "$ROOT_DIR/src/cli/cli_commands.cpp"; then
+      PAR_SHARED=0
+      record_fail "I.17 GUI 与 CLI 都调用共享核心的 $symbol" "有一侧没有引用它"
+    fi
+  done
+  if [ "$PAR_SHARED" = "1" ]; then
+    record_pass "I.17 GUI 与 CLI 调用的是同一批 key 表与校验函数（没有第二套判断）"
+  fi
+
+  # 加密边界在界面上只有一个取值：none。它不自己造一套"unsupported"判断，
+  # 而是把 none 交给共享的 ValidateScheduleConfig —— 那条规则因此在两个前端上
+  # 不可能给出不同的答案。
+  if grep -q "EncryptionMethod::kNone" \
+       "$ROOT_DIR/ui/modern/schedule_controller.cpp" &&
+     grep -q "ValidateScheduleConfig" \
+       "$ROOT_DIR/ui/modern/schedule_controller.cpp"; then
+    record_pass "I.18 界面只提供 none，边界判断交给共享 ValidateScheduleConfig"
+  else
+    record_fail "I.18 界面只提供 none，边界判断交给共享 ValidateScheduleConfig" \
+      "界面侧出现了自己的加密判断"
+  fi
+
+  if ! grep -rq "kMinIntervalMinutes" "$ROOT_DIR/ui/modern" &&
+     ! grep -rq "kMaxRetainCount" "$ROOT_DIR/ui/modern"; then
+    record_pass "I.19 界面侧没有复制边界常量（范围只在共享核心里定义）"
+  else
+    record_fail "I.19 界面侧没有复制边界常量（范围只在共享核心里定义）" \
+      "ui/modern 下出现了边界常量"
+  fi
+fi
+
+# ============================================================
+echo "[schedule-test] J. 错误语义：同一件事，两个前端给同一个业务结论"
+# ============================================================
+#
+# 要的是**含义相同**，不是措辞逐字相同。这一区把每条边界在 CLI 侧的结论钉住；
+# GUI 侧的对应断言在 --schedule-test 里：SCH-99..SCH-109（非法输入的拒绝理由
+# 逐字来自共享核心）与 SCH-74..SCH-86（配置不合法 -> 挂起）。
+#
+# 共同的三条要求：
+#   * Core 给出稳定原因（下面每条 assert 的都是核心原文里的关键词）；
+#   * 不允许一边 silent fallback（"没启用也照样跑一次"就是典型）；
+#   * 不允许一边自动修、一边 fail（挂起态既不修也不猜）。
+
+ERR="$TEST_ROOT/error-semantics"
+rm -rf "$ERR"
+mkdir -p "$ERR/src" "$ERR/repo" "$ERR/dest-nonempty"
+printf 'err\n' > "$ERR/src/a.txt"
+printf 'busy\n' > "$ERR/dest-nonempty/keep.txt"
+printf 'not-a-dir\n' > "$ERR/repo-file"
+ERR_CONFIG="$ERR/config.json"
+ERR_STORE="$ERR/schedule.json"
+"$BACKUPCTL" --config-file "$ERR_CONFIG" config repository set "$ERR/repo" \
+  >/dev/null 2>&1
+
+expect_exit "J.01 源路径不存在 -> 失败" 1 \
+  "$BACKUPCTL" backup "$ERR/missing" "$ERR/out.bak"
+expect_grep "J.02 原因是核心给出的稳定原因" "Source directory does not exist"
+expect_absent "J.03 失败没有留下半份归档" "$ERR/out.bak"
+
+expect_exit "J.04 仓库路径是普通文件 -> 失败" 1 \
+  "$BACKUPCTL" --config-file "$ERR_CONFIG" config repository set "$ERR/repo-file"
+expect_grep "J.05 原因是核心给出的稳定原因" "is not a directory"
+
+expect_exit "J.06 归档路径落在源目录里 -> 失败" 1 \
+  "$BACKUPCTL" backup "$ERR/src" "$ERR/src/inner.bak"
+expect_grep "J.07 原因说清楚是路径拓扑问题" "Destination is inside the source"
+expect_absent "J.08 被拒绝的归档没有落盘" "$ERR/src/inner.bak"
+
+expect_exit "J.09 未知选项 -> 用法错误" 2 \
+  "$BACKUPCTL" backup "$ERR/src" "$ERR/out.bak" --bogus
+expect_exit "J.10 非法筛选规则 -> 用法错误" 2 \
+  "$BACKUPCTL" backup "$ERR/src" "$ERR/out.bak" --include 'size:not-a-number'
+expect_absent "J.11 用法错误没有留下任何归档" "$ERR/out.bak"
+
+expect_exit "J.12 没有交互终端时加密备份明确失败" 1 \
+  "$BACKUPCTL" backup "$ERR/src" "$ERR/out.bak" --encryption aes-256-ctr-hmac-sha256
+expect_grep "J.13 原因说清楚是终端问题，且不会退回空密码" \
+  "interactive terminal is required"
+expect_absent "J.14 失败没有留下归档" "$ERR/out.bak"
+
+"$BACKUPCTL" --config-file "$ERR_CONFIG" --schedule-file "$ERR_STORE" schedule set \
+  --source "$ERR/src" --interval-minutes 5 --retain 3 >/dev/null 2>&1
+expect_exit "J.15 未启用时 schedule run 明确失败（不假装成功）" 1 \
+  "$BACKUPCTL" --config-file "$ERR_CONFIG" --schedule-file "$ERR_STORE" schedule run
+expect_grep "J.16 理由与 GUI 的 runNow 是同一个结论：没启用" "is disabled"
+if [ "$(ls -1 "$ERR/repo" 2>/dev/null | wc -l)" = "0" ]; then
+  record_pass "J.17 未启用时没有创建任何归档"
+else
+  record_fail "J.17 未启用时没有创建任何归档" "仓库里多出了文件"
+fi
+
+printf '{ not json' > "$ERR/broken.json"
+ERR_SUM_BEFORE="$(cksum "$ERR/broken.json" | cut -d' ' -f1)"
+expect_exit "J.18 store 读不懂时 schedule run 明确失败" 1 \
+  "$BACKUPCTL" --config-file "$ERR_CONFIG" --schedule-file "$ERR/broken.json" schedule run
+expect_grep "J.19 报的是解析器给出的原文" "Invalid JSON"
+expect_exit "J.20 store 读不懂时 schedule show 也明确失败" 1 \
+  "$BACKUPCTL" --config-file "$ERR_CONFIG" --schedule-file "$ERR/broken.json" schedule show
+if [ "$(cksum "$ERR/broken.json" | cut -d' ' -f1)" = "$ERR_SUM_BEFORE" ]; then
+  record_pass "J.21 坏 store 没有被静默改写、修复或删除"
+else
+  record_fail "J.21 坏 store 没有被静默改写、修复或删除" "文件内容变了"
+fi
 
 # ============================================================
 echo "[schedule-test] G. ASan + UBSan（可选，SANITIZE=1 时执行）"

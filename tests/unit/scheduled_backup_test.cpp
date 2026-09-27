@@ -1320,21 +1320,52 @@ void TestUnsupportedModeIsNeverRunAsFull() {
   test_support::Check(test_support::WriteFile(env.schedule_file, text, 0600),
                       "MODE-22 the store is rewritten by hand");
 
+  // 评估之前先把 state 抄下来：挂起必须是"一个字节都不写"，包括 next_run
+  // 与 history —— 否则 GUI 会每一轮都重新判定"到点了"，退化成每秒重试。
+  bp::ScheduleDocument before;
+  bp::ScheduleStore store(env.schedule_file);
   std::string error;
+  test_support::Check(store.Load(&before, &error) == bp::ScheduleLoadStatus::kLoaded,
+                      "MODE-23a the hand-edited store still parses", error);
+
   bp::ScheduleEvaluationResult result;
   test_support::Check(EvaluateAt(env, env.repository, /*force=*/true, 1000, &result,
                                  &error),
                       "MODE-23 the evaluation itself completes", error);
-  test_support::Check(result.status == bp::ScheduleEvaluationStatus::kFailed,
-                      "MODE-24 manual + incremental is refused at run time",
-                      std::string(bp::ScheduleEvaluationStatusKey(result.status)) +
-                          " " + result.diagnostic);
+  test_support::Check(
+      result.status == bp::ScheduleEvaluationStatus::kConfigInvalid,
+      "MODE-24 manual + incremental suspends the schedule (it is not just a "
+      "failed attempt)",
+      std::string(bp::ScheduleEvaluationStatusKey(result.status)) + " " +
+          result.diagnostic);
   test_support::Check(result.diagnostic.find("Unsupported backup mode") !=
                           std::string::npos,
                       "MODE-25 the refusal names the mode", result.diagnostic);
   test_support::Check(RepoArchives(env.repository).empty(),
                       "MODE-26 no full backup was silently created",
                       JoinNames(RepoArchives(env.repository)));
+
+  std::string after_text;
+  test_support::ReadFile(env.schedule_file, &after_text);
+  test_support::Check(after_text == text,
+                      "MODE-27 a suspended run leaves the store byte-for-byte "
+                      "untouched (no silent repair)");
+  bp::ScheduleDocument after;
+  test_support::Check(store.Load(&after, &error) == bp::ScheduleLoadStatus::kLoaded,
+                      "MODE-28 the store still reloads", error);
+  test_support::Check(
+      after.state.next_run_time_sec == before.state.next_run_time_sec,
+      "MODE-29 a suspended run does not advance next_run (otherwise the GUI "
+      "would retry every tick)",
+      std::to_string(before.state.next_run_time_sec) + " -> " +
+          std::to_string(after.state.next_run_time_sec));
+  test_support::Check(after.state.history.size() == before.state.history.size(),
+                      "MODE-30 a suspended run records no history entry",
+                      std::to_string(before.state.history.size()) + " -> " +
+                          std::to_string(after.state.history.size()));
+  test_support::Check(after.state.managed_snapshots.size() ==
+                          before.state.managed_snapshots.size(),
+                      "MODE-31 a suspended run does not touch the managed list");
 }
 
 // ---- K. store 的父目录与旧文件兼容 ----
