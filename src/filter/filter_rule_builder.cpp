@@ -6,6 +6,7 @@
 #include "filter_rule_builder.h"
 
 #include <cstdio>
+#include <utility>
 
 namespace backupproject {
 namespace {
@@ -451,6 +452,20 @@ std::string Summarize(const FilterRuleDraft& rule) {
   }
   if (rule.action == FilterAction::kInclude) return "包含：" + text;
   return "排除：" + text;
+}
+
+bool BuildFilterFromDrafts(const std::vector<FilterRuleDraft>& rules,
+                           Filter* filter, std::string* error_message) {
+  // 与 CliArguments 走同一套序列化：GUI 预览与 "复制为 CLI 参数" 不可能给出
+  // 不同的规则文本。
+  Filter built;
+  for (const FilterRuleDraft& rule : rules) {
+    std::string dsl;
+    if (!ToDsl(rule, &dsl, error_message)) return false;
+    if (!built.AddRule(rule.action, dsl, error_message)) return false;
+  }
+  if (filter != nullptr) *filter = std::move(built);
+  return true;
 }
 
 std::vector<std::string> CliArguments(

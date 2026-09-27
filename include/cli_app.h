@@ -47,6 +47,8 @@ int RunBackupCommand(const CliContext& context,
                      const std::vector<std::string>& arguments);
 int RunRestoreCommand(const CliContext& context,
                       const std::vector<std::string>& arguments);
+int RunPreviewCommand(const CliContext& context,
+                      const std::vector<std::string>& arguments);
 int RunScheduleCommand(const CliContext& context,
                        const std::vector<std::string>& arguments);
 int RunRepositoryCommand(const CliContext& context,

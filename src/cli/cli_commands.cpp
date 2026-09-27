@@ -23,6 +23,7 @@
 #include "backup_catalog.h"
 #include "backup_engine.h"
 #include "backup_option_keys.h"
+#include "backup_preview.h"
 #include "cli_app.h"
 #include "config_manager.h"
 #include "filter.h"
@@ -197,6 +198,20 @@ void PrintCliUsage(const std::string& program_name, std::ostream& output) {
       << "    The archive is written into the configured repository, with a "
          "name the\n"
       << "    program generates; there is no way to give it a path.\n"
+      << "  " << program_name
+      << " preview <source_directory> [--include <rule>]... [--exclude "
+         "<rule>]...\n"
+      << "    Read-only: lists the entries a backup with these filter rules "
+         "would\n"
+      << "    put into the archive. Creates no archive, needs no repository "
+         "and\n"
+      << "    writes no state. Same rules, same selection and the same "
+         "preview\n"
+      << "    window as the Manual Backup preview in the Modern GUI: at most "
+      << kPreviewEntryLimit << "\n"
+      << "    entries are examined, and that is reported when the source "
+         "tree is\n"
+      << "    larger.\n"
       << "  " << program_name
       << " restore <file_name> <destination_directory>\n"
       << "    <file_name> must be a single-component .bak name inside the "
@@ -395,6 +410,71 @@ int RunBackupCommand(const CliContext& context,
             << CompressionMethodKey(options.compression_method)
             << " encryption=" << EncryptionMethodKey(options.encryption_method)
             << '\n';
+  return kCliExitSuccess;
+}
+
+// ---- preview ----
+//
+// Manual Backup 的"填规则 -> 预览"这一步。它与 Modern GUI 走的是**同一个函数**
+// （backupproject::PreviewBackupSelection），所以两边给出的条目集合、排序与
+// 截断标志必然一致；真实 backup 用的又是同一个 Filter，于是
+// "GUI 预览 == CLI 预览 == 实际归档条目"是结构上的结论，不是约定。
+//
+// 它刻意**不需要仓库**：预览不写归档、不碰 repository / config / schedule /
+// history，也不创建任何临时文件。用户可以先把规则调好，再决定备份到哪。
+//
+// 只接受 --include / --exclude。--pack / --compression / --encryption 属于
+// "怎么写归档"，与"选哪些条目"无关：允许它们只会让人以为这条命令会执行备份。
+int RunPreviewCommand(const CliContext& context,
+                      const std::vector<std::string>& arguments) {
+  if (arguments.empty()) {
+    std::cerr << "Error: 'preview' expects <source_directory>.\n\n";
+    PrintCliUsage(context.program_name, std::cerr);
+    return kCliExitUsageError;
+  }
+  const std::string source_directory = arguments[0];
+
+  std::vector<FilterRuleDraft> rules;
+  std::string error_message;
+  for (std::size_t index = 1; index < arguments.size(); ++index) {
+    const std::string option = arguments[index];
+    std::string value;
+    if (option != "--include" && option != "--exclude") {
+      return UsageError(context, "unknown option '" + option + "'");
+    }
+    if (!TakeValue(arguments, &index, option, &value, &error_message)) {
+      return UsageError(context, error_message);
+    }
+    FilterRuleDraft rule;
+    rule.action =
+        option == "--include" ? FilterAction::kInclude : FilterAction::kExclude;
+    rule.raw_dsl = value;
+    // 语法裁决只有一处：ValidateRule 内部的 Filter::AddRule。预览既不会接受
+    // 备份会拒绝的规则，也不会拒绝备份会接受的规则。
+    if (!ValidateRule(rule, &error_message)) {
+      return UsageError(context, error_message);
+    }
+    rules.push_back(rule);
+  }
+
+  // 到这里为止没有碰过任何持久状态：解析失败(2) 一定发生在扫描之前。
+  const PreviewResult preview = PreviewBackupSelection(source_directory, rules);
+  if (!preview.error.empty()) {
+    PrintError(preview.error + ": " + source_directory);
+    return kCliExitOperationFailed;
+  }
+
+  std::cout << "Preview: " << preview.included_count << " matching item(s)\n";
+  if (preview.truncated) {
+    // 明确说出来，不静默截断：这一行告诉用户"下面的列表不是全部"。
+    std::cout << "Note: the source tree has more than " << kPreviewEntryLimit
+              << " entries; only the first " << kPreviewEntryLimit
+              << " were examined.\n";
+  }
+  for (const PreviewItem& item : preview.items) {
+    if (!item.included) continue;
+    std::cout << item.archive_path << '\n';
+  }
   return kCliExitSuccess;
 }
 
