@@ -246,6 +246,48 @@ class JsonParser {
         case 't':
           value->push_back('\t');
           break;
+        case 'u':
+          // 写侧对 C0 控制区里没有专用短转义的那些字节（0x00-0x07、0x0B、
+          // 0x0E-0x1F）只能写成 \u00XX —— JSON 不允许裸控制字节出现在字符串里，
+          // 而 \b \f \n \r \t 之外的控制字节没有短转义可用。
+          // 所以读侧必须认得**正是这一种**形式，否则就是"写得出去、读不回来"：
+          // ScheduleStore 会写出一份自己再也读不进来的 schedule.json，而且连
+          // "再 set 一次"都修不好（set 也要先读）。两端各自的理由互相以为对方
+          // 是另一种样子，这里把写侧真正会产出的那一格补上。
+          //
+          // 只认 \u00XX 且 XX < 0x20。其余 \uXXXX 一律继续拒绝：写侧只有这一条
+          // \u 路径，从不产生别的形式，UTF-16 代理对就更没有理由在这里猜。
+          if (position_ + 4 > input_.size()) {
+            return Fail("truncated \\u escape sequence");
+          }
+          {
+            const bool zeros =
+                input_[position_] == '0' && input_[position_ + 1] == '0';
+            int code = 0;
+            bool hex_ok = true;
+            for (int index = 0; index < 2; ++index) {
+              const char digit = input_[position_ + 2 + index];
+              int nibble = -1;
+              if (digit >= '0' && digit <= '9') {
+                nibble = digit - '0';
+              } else if (digit >= 'a' && digit <= 'f') {
+                nibble = digit - 'a' + 10;
+              } else if (digit >= 'A' && digit <= 'F') {
+                nibble = digit - 'A' + 10;
+              }
+              if (nibble < 0) {
+                hex_ok = false;
+                break;
+              }
+              code = code * 16 + nibble;
+            }
+            if (!zeros || !hex_ok || code >= 0x20) {
+              return Fail("unsupported JSON escape '\\u'");
+            }
+            position_ += 4;
+            value->push_back(static_cast<char>(code));
+          }
+          break;
         default:
           return Fail(std::string("unsupported JSON escape '\\") + escaped +
                       "'");

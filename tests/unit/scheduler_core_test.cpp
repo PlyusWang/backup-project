@@ -137,6 +137,55 @@ void TestSimpleJson() {
                             error.find("unsupported JSON escape") != std::string::npos,
                         "JSON-09 unicode escape is rejected", error);
   }
+  // \u 只认写侧真正会产出的那一格：\u00XX 且 XX 落在 C0 控制区。
+  {
+    bp::JsonValue value;
+    test_support::Check(bp::ParseJson(R"JSON({"a": "\u0001"})JSON", &value, &error),
+                        "JSON-09b the escape the writer emits parses", error);
+    test_support::Check(
+        !bp::ParseJson(R"JSON({"a": "\u00ff"})JSON", &value, &error) &&
+            error.find("unsupported JSON escape") != std::string::npos,
+        "JSON-09c a non-control \\u escape is still rejected", error);
+    test_support::Check(!bp::ParseJson(R"JSON({"a": "\u1234"})JSON", &value, &error),
+                        "JSON-09d a surrogate-range \\u escape is still rejected",
+                        error);
+    test_support::Check(!bp::ParseJson(R"JSON({"a": "\u0"})JSON", &value, &error),
+                        "JSON-09e a truncated \\u escape is rejected", error);
+    test_support::Check(!bp::ParseJson(R"JSON({"a": "\u00zz"})JSON", &value, &error),
+                        "JSON-09f a non-hex \\u escape is rejected", error);
+  }
+  // 写出去的东西必须全都读得回来。这条不变式此前是断的：写侧把
+  // 0x00-0x07 / 0x0B / 0x0E-0x1F 写成 \u00XX，读侧却拒绝一切 \uXXXX，
+  // 于是 ScheduleStore 能写出一份自己再也读不进来的 schedule.json，
+  // 而且连"再 set 一次"都修不好（set 也要先读）。
+  {
+    bool all_round_trip = true;
+    std::string first_failure;
+    for (int byte = 0; byte < 0x20; ++byte) {
+      const std::string raw(1, static_cast<char>(byte));
+      std::string encoded;
+      bp::WriteJsonString(&encoded, raw);
+      bp::JsonValue parsed;
+      std::string parse_error;
+      const bp::JsonValue* field = nullptr;
+      const bool ok =
+          bp::ParseJson("{\"k\": " + encoded + "}", &parsed, &parse_error) &&
+          (field = parsed.Find("k")) != nullptr && field->is_string() &&
+          field->text == raw;
+      if (!ok) {
+        all_round_trip = false;
+        if (first_failure.empty()) {
+          char hex[8];
+          std::snprintf(hex, sizeof(hex), "%02x", byte);
+          first_failure = std::string("byte 0x") + hex + " encoded as " +
+                          encoded + " : " + parse_error;
+        }
+      }
+    }
+    test_support::Check(all_round_trip,
+                        "JSON-09g every C0 control byte survives write then parse",
+                        first_failure);
+  }
   {
     bp::JsonValue value;
     test_support::Check(!bp::ParseJson(R"JSON({"a": 1} trailing)JSON", &value, &error) &&

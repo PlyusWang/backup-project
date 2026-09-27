@@ -54,6 +54,7 @@
 #include "filter_rule_model.h"
 #include "schedule_controller.h"
 #include "schedule_store.h"
+#include "scheduler_lock.h"
 
 namespace {
 
@@ -1989,6 +1990,50 @@ int RunScheduleTest(backup_modern::ScheduleController* schedule,
                   QString::number(schedule->history().size()));
   }
 
+  // 14) 抢不到 runner 锁之后必须能重新抢回来。
+  //
+  // 场景：另一个进程先拿着锁，本程序启用计划时抢不到；对方退出之后 tick 必须
+  // 把锁拿回来。少了这一步，"别的进程曾经跑过"会变成"本程序再也不跑这个计划"，
+  // 页面会一直显示"已被另一进程持有"。
+  //
+  // 持锁方用一个真实的 SchedulerLock 扮演 —— 与 CLI watch / GUI
+  // 用的是同一个类、 同一个锁文件。
+  {
+    const QString lock_path = schedule->storePath() + QStringLiteral(".lock");
+    run.Check(schedule->saveConfig(false, source, 5, 7, QStringLiteral("ustar"),
+                                   QStringLiteral("huffman"), QStringList(),
+                                   QStringList()),
+              QStringLiteral("SCH-61 先停用，控制器放开自己手上的锁"));
+    run.Check(!schedule->holdsRunnerLock(),
+              QStringLiteral("SCH-62 停用之后控制器不再持锁"));
+
+    backupproject::SchedulerLock other;
+    std::string other_error;
+    run.Check(other.Acquire(lock_path.toStdString(), &other_error),
+              QStringLiteral("SCH-63 另一个进程拿到锁"),
+              QString::fromStdString(other_error));
+
+    run.Check(schedule->saveConfig(true, source, 5, 7, QStringLiteral("ustar"),
+                                   QStringLiteral("huffman"), QStringList(),
+                                   QStringList()),
+              QStringLiteral("SCH-64 抢不到锁时仍然保存计划配置"));
+    run.Check(
+        !schedule->holdsRunnerLock() && !schedule->runnerMessage().isEmpty(),
+        QStringLiteral("SCH-65 抢不到锁时如实报告给用户"),
+        schedule->runnerMessage());
+
+    // 对方退出。tick 每秒重试一次，这里最多等 6 秒。
+    other.Release();
+    bool recovered = false;
+    for (int attempt = 0; attempt < 60 && !recovered; ++attempt) {
+      WaitForAnimation(100);
+      recovered = schedule->holdsRunnerLock();
+    }
+    run.Check(recovered,
+              QStringLiteral("SCH-66 对方退出之后 tick 把锁拿了回来"),
+              schedule->runnerMessage());
+  }
+
   // 收尾：把跨前端比对用的那套配置写回去（interval=5 / retain=7 / ustar +
   // huffman + 两条规则）。modern_gui_check.sh 会拿 backupctl schedule show
   // 逐项比对，所以这里必须与 SCH-36 完全一致。
@@ -1997,7 +2042,7 @@ int RunScheduleTest(backup_modern::ScheduleController* schedule,
                            QStringLiteral("huffman"),
                            QStringList() << QStringLiteral("ext:txt"),
                            QStringList() << QStringLiteral("path:**/build/**")),
-      QStringLiteral("SCH-61 恢复跨前端比对用的配置"));
+      QStringLiteral("SCH-67 恢复跨前端比对用的配置"));
 
   const int total = run.passed + run.failed;
   std::printf("[schedule] %s %d/%d\n", run.failed == 0 ? "PASS" : "FAIL",

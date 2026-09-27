@@ -131,11 +131,9 @@ void ScheduleController::ApplyRunnerLock() {
     if (lock_.held()) {
       lock_.Release();
       tick_.stop();
-      runner_message_ = QStringLiteral("当前未启用。");
-      emit runnerChanged();
+      SetRunnerMessage(QStringLiteral("当前未启用。"));
     } else if (runner_message_.isEmpty()) {
-      runner_message_ = QStringLiteral("当前未启用。");
-      emit runnerChanged();
+      SetRunnerMessage(QStringLiteral("当前未启用。"));
     }
     return;
   }
@@ -143,24 +141,41 @@ void ScheduleController::ApplyRunnerLock() {
   if (!lock_.held()) {
     std::string error;
     if (!lock_.Acquire(store_.lock_file_path(), &error)) {
-      // 另一个进程正在跑。不重复执行，页面如实显示。
-      tick_.stop();
-      runner_message_ = QString::fromStdString(error);
-      emit runnerChanged();
+      // 另一个进程正在跑：这一轮不执行，页面如实显示。
+      //
+      // 但 timer 必须继续跑下去。它此刻的角色变成"等锁释放"的轮询：Tick 每秒
+      // 试一次非阻塞 flock，对方退出之后立刻把锁拿回来。停掉 timer 就等于
+      // "别的进程跑过一次之后，本程序再也不跑这个计划了" —— 页面会一直显示
+      // "已被另一进程持有"，直到用户改配置或重启。
+      SetRunnerMessage(QString::fromStdString(error));
+      if (!tick_.isActive()) tick_.start();
       return;
     }
   }
-  runner_message_ = QStringLiteral("本程序正在运行该计划（锁：%1）")
-                        .arg(QString::fromStdString(store_.lock_file_path()));
-  emit runnerChanged();
+  SetRunnerMessage(QStringLiteral("本程序正在运行该计划（锁：%1）")
+                       .arg(QString::fromStdString(store_.lock_file_path())));
   if (!tick_.isActive()) tick_.start();
+}
+
+void ScheduleController::SetRunnerMessage(const QString& text) {
+  if (runner_message_ == text) return;
+  runner_message_ = text;
+  emit runnerChanged();
 }
 
 // ---- tick ----
 
 void ScheduleController::Tick() {
   if (!config_loaded_ || !document_.config.enabled) return;
-  if (!lock_.held()) return;
+  if (!lock_.held()) {
+    // 锁可能只是**暂时**在别人手里：上一个持有者退出之后必须能重新抢回来。
+    // 少了这一步，"另一个进程曾经跑过"会变成"本程序从此再也不跑这个计划" ——
+    // 页面会一直显示"已被另一进程持有"，直到用户改配置或重启。
+    // tick 本来就是 1 Hz，一次非阻塞 flock 的代价可以忽略；抢不到时
+    // SetRunnerMessage 不会重复发信号，页面也不会每秒重绘。
+    ApplyRunnerLock();
+    if (!lock_.held()) return;
+  }
 
   const std::int64_t now = static_cast<std::int64_t>(std::time(nullptr));
   // "到没到点"由共享核心回答，QML 与 CLI 用的是同一个函数。
