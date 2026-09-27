@@ -102,6 +102,9 @@ struct ScheduleEvaluationResult {
   // 这些不算可见的还原点，但少了它们链就断了，所以必须如实计数，
   // 否则"为什么还留着这么旧的快照"在界面上说不清。
   std::uint64_t retention_dependency_retained = 0;
+  // 读不出依赖关系、因此不敢删的快照数量（坏文件等）。它们同样计入上面那个
+  // "为什么没删"的答案，只是原因不同：不是"被依赖"，而是"证明不了安全"。
+  std::uint64_t retention_unreadable = 0;
 };
 
 // next_run = now + interval。整秒运算，溢出被夹到 INT64_MAX。
@@ -214,9 +217,11 @@ class ScheduledBackupService {
                    std::string* error_message);
 
   // 只做 retention。供测试与显式维护入口使用。
-  // dependency_retained 可以为空；非空时写回"因为被依赖而保留"的祖先数量。
+  // dependency_retained / unreadable 可以为空：前者写回"因为被依赖而保留"的
+  // 祖先数量，后者写回"读不出依赖因此不敢删"的数量。
   bool RunRetention(ScheduleDocument* document, std::uint64_t* deleted,
                     std::uint64_t* failed, std::uint64_t* dependency_retained,
+                    std::uint64_t* unreadable,
                     std::string* error_message) const;
 
   // 自愈：把已经不在仓库里的 managed record 摘掉。

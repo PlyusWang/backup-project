@@ -130,6 +130,12 @@ struct RetentionPlan {
   std::vector<std::string> keep_ancestors;
   // 可以删除的（最旧的在前）。调用方按这个顺序删。
   std::vector<std::string> remove;
+  // 读不出依赖关系的快照（坏文件、或者根本不是本产品的快照）。
+  //
+  // 它们一律**不删**：读不出依赖就证明不了"删它不会断链"，而删除是不可逆的。
+  // 但也不再往上走——连它自己都读不出来，它的祖先是谁无从得知。如实记下来，
+  // 让调用方报出去，而不是替用户猜一个删除集合。
+  std::vector<std::string> unreadable;
 };
 
 // candidates 按**最旧在前**给出（调用方原本的 retention 顺序）。

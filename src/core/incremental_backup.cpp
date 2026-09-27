@@ -470,16 +470,16 @@ bool PlanDependencyAwareRetention(
   std::vector<std::string> visited = keep;
   for (std::size_t cursor = 0; cursor < keep.size(); ++cursor) {
     const std::string current = keep[cursor];
-    // depth 由 visited 的数量天然限制：候选集合有限，且每个只访问一次。
-    if (visited.size() > kMaxDeltaChainDepth * 64 &&
-        keep.size() > candidates_oldest_first.size()) {
-      SetError(error_message, "Retention dependency walk did not terminate");
-      return false;
-    }
     std::string parent;
+    std::string read_error;
     if (!SnapshotParentOf(repository_directory, current, &parent,
-                          error_message)) {
-      return false;
+                          &read_error)) {
+      // 读不出这一份的依赖：保守地保留它（它本来就在 keep 里），
+      // 但不再往上走。整份计划不会因此失败 —— 只因为它读不出来就拒绝
+      // 淘汰**其它**无关的旧快照，会让仓库无上限增长，而那不是安全，
+      // 只是把问题推给下一轮。
+      plan->unreadable.push_back(current);
+      continue;
     }
     if (parent.empty()) continue;
     if (std::find(candidates_oldest_first.begin(),
