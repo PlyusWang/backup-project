@@ -134,6 +134,36 @@ class Walker {
     return false;
   }
 
+  // 一条 entry 已经确定**会进入归档**之后，才要求它的 archive path 满足完整
+  // grammar。
+  //
+  // 时机是这一轮修的东西：把完整 IsValidArchivePath 提到 Filter 之前，会让
+  // "本来会被规则排除、因此根本不会进归档"的条目也提前阻塞整次备份/预览——
+  // 那是新的语义，不是历史语义。历史 Backup 是"Filter 先决定它进不进，
+  // 进了才校验路径"。
+  //
+  // 调用的是 Backup 与读侧共用的那一个 IsValidArchivePath：长度、反斜杠、
+  // 盘符、绝对路径、结尾 '/'、空 component、"." / ".." component、NUL 全在
+  // 这一份 grammar 里。所以 Linux 允许、归档不允许的名字（a\b.txt）在预览与
+  // 备份里会得到同一个结论、同一句原文。
+  //
+  // is_first_entry 恒为 false：child 永远不是第一条；"."（source root）在
+  // Walk() 里用 (true, true) 单独校验。is_directory 传 lstat 得到的真实类型，
+  // 参数语义与 Backup 完全一致。
+  bool CheckIncludedArchivePath(const std::string& disk_path,
+                                const std::string& archive_path,
+                                const SourceEntryFacts& facts,
+                                SourceWalkFailure* failure) {
+    std::string path_error;
+    if (IsValidArchivePath(archive_path, false,
+                           facts.type == EntryType::kDirectory,
+                           kMaxArchivePathLength, &path_error)) {
+      return true;
+    }
+    return Fail(failure, SourceWalkFailureKind::kInvalidArchivePath, path_error,
+                disk_path, archive_path);
+  }
+
   // 交给消费者的那一次调用。消费者失败时把它的原文原样带出去。
   bool Visit(const std::string& disk_path, const std::string& archive_path,
              const SourceEntryFacts& facts, SourceEntryDecision decision,
@@ -235,6 +265,15 @@ class Walker {
       const std::string child_archive =
           (archive_path == ".") ? name : archive_path + "/" + name;
 
+      // 历史语义：路径长度是**遍历/构造**阶段的硬边界，在 lstat 与 Filter 之前
+      // 就已经判死。一个超长的 child path 即使后来会被规则排除，真实 Backup
+      // 历史上也会在这里失败——本轮不顺手改这条。
+      if (child_archive.size() > kMaxArchivePathLength) {
+        return Fail(failure, SourceWalkFailureKind::kInvalidArchivePath,
+                    "Archive path too long: " + child_archive, child_disk,
+                    child_archive);
+      }
+
       SourceEntryFacts facts;
       const int injected_child =
           InjectedErrno(faults_, SourceWalkSyscall::kLstat, child_disk);
@@ -261,24 +300,6 @@ class Walker {
       }
       FillNames(&facts);
 
-      // 归档路径的**完整语法**校验：这里调的就是 Backup 与读侧共用的那一个
-      // IsValidArchivePath，不是"再看看长度"。长度、反斜杠、盘符、绝对路径、
-      // 结尾 '/'、空 component、"." / ".." component、NUL 全在这一份 grammar
-      // 里。只查长度的后果是具体的：Linux 允许 a\b.txt 这种文件名，预览会
-      // 高高兴兴把它列出来，而真实备份随后报 Invalid archive path (backslash)
-      // ——"预览说能备份、备份必然失败"。
-      //
-      // is_first_entry 恒为 false：child 永远不是第一条；"."（source root）
-      // 在 Walk() 里用 (true, true) 单独校验。is_directory 传真实类型，这样
-      // 参数语义与 Backup 完全一致，不会因为"抽到 walker 之后顺手写死"而错。
-      std::string path_error;
-      if (!IsValidArchivePath(child_archive, false,
-                              facts.type == EntryType::kDirectory,
-                              kMaxArchivePathLength, &path_error)) {
-        return Fail(failure, SourceWalkFailureKind::kInvalidArchivePath,
-                    path_error, child_disk, child_archive);
-      }
-
       FilterEntry filter_entry;
       filter_entry.archive_path = child_archive;
       filter_entry.name = name;
@@ -303,6 +324,12 @@ class Walker {
           }
           continue;
         }
+        // 只有**真的会进归档**的条目才需要满足完整 archive grammar。被剪枝的
+        // 目录在上一行已经 continue，走不到这里。
+        if (!CheckIncludedArchivePath(child_disk, child_archive, facts,
+                                      failure)) {
+          return false;
+        }
         if (!WalkDirectory(child_disk, child_archive, failure)) {
           return false;
         }
@@ -320,6 +347,9 @@ class Walker {
           }
           continue;
         }
+        // **优先级刻意保持历史语义**：没有被排除的 socket 先报"这个类型不能
+        // 归档"，而不是先报它的文件名违反了 archive grammar。哪怕 socket 的
+        // 名字里带反斜杠，真实 Backup 历史上报的也是这一句。
         return Fail(failure, SourceWalkFailureKind::kSocket,
                     "Unsupported special type: socket: " + child_disk,
                     child_disk, child_archive);
@@ -334,6 +364,11 @@ class Walker {
           return false;
         }
         continue;
+      }
+      // 到这里这条 entry 已经确定要进归档了，现在才要求它满足完整 grammar。
+      if (!CheckIncludedArchivePath(child_disk, child_archive, facts,
+                                    failure)) {
+        return false;
       }
       if (!Visit(child_disk, child_archive, facts,
                  SourceEntryDecision::kIncluded, failure)) {

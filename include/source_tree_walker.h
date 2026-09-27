@@ -30,15 +30,35 @@
 //   * user / group 名字解析（失败留空，不报错）；
 //   * FilterEntry 构造，以及 ShouldPruneDirectory / ShouldIncludeFile /
 //     ShouldSkipSpecialEntry 的判定顺序；
-//   * **归档路径语法**（IsValidArchivePath：长度 / 反斜杠 / 盘符 / 绝对路径 /
-//     空 component / "." / ".." / NUL）——这一条尤其重要：只查长度会让预览把
-//     Linux 上合法、归档里非法的名字（例如 a\b.txt）报成"可以备份"，而真实
-//     备份随后必然失败；
+//   * **归档路径语法**（IsValidArchivePath：反斜杠 / 盘符 / 绝对路径 / 结尾
+//   '/'、
+//     空 component / "." / ".." / NUL）——但只在**这个条目真的会进入归档**时
+//     才校验。只查长度会让预览把 Linux 上合法、归档里非法的名字（a\b.txt）
+//     报成"可以备份"；而在 Filter 之前就校验全套 grammar，又会让"本来会被
+//     规则排除、根本不会进归档"的名字提前阻塞整次备份——两种都是错的；
 //   * 全部 fail-closed 失败语义（见下）。
 //
 // 各消费者自己保留（刻意不共享）：hardlink 编码、软链接目标读取、设备号、
 // (st_dev, st_ino) 快照、payload 读取、打包 / 压缩 / 加密，以及预览的窗口与
 // 展示方式。
+//
+// ---- 每个 child 的决策顺序（这就是合同）----
+//
+//   build archive-relative path
+//   -> 长度硬边界（kMaxArchivePathLength；历史语义：在 lstat 与 Filter 之前）
+//   -> lstat
+//   -> 构造 FilterEntry
+//   -> 目录：ShouldPruneDirectory 为真 -> 剪掉整棵子树，不做语法校验
+//                                    为假 -> IsValidArchivePath -> 递归
+//      特殊文件：ShouldSkipSpecialEntry 为真 -> 跳过，不做语法校验
+//                                          为假 -> "Unsupported special type:
+//                                                  socket"（**优先于**任何
+//                                                  路径语法错误）
+//      其余：ShouldIncludeFile 为真 -> IsValidArchivePath -> visitor
+//                              为假 -> 跳过，不做语法校验
+//
+// 一句话：**只有真正进入归档的条目才必须满足完整的 archive grammar**。
+// source root（"."）始终属于归档，所以它在 Walk() 里用 (true, true) 直接校验。
 //
 // ---- 失败语义：整次遍历失败，不产出半个结果 ----
 //
@@ -46,9 +66,8 @@
 //   * 源目录不存在 / 不是真目录 / lstat 失败（kSourceRoot）；
 //   * 某个条目 lstat 失败（kInspect）；
 //   * opendir / readdir 失败（kDirectoryRead）；
-//   * 某条归档路径没过
-//   IsValidArchivePath（kInvalidArchivePath）——长度、反斜杠、
-//     盘符、绝对路径、结尾 '/'、空 component、"." / ".." component、含 NUL；
+//   * 某条**会进入归档**的条目的路径没过 IsValidArchivePath
+//     （kInvalidArchivePath，含遍历阶段的长度硬边界）；
 //   * stat 给出的类型无法表示（kUnsupportedType）；
 //   * 出现**没有被明确排除**的 socket（kSocket）——socket 不是可恢复备份，
 //     静默跳过、跟随它、把它当普通文件复制，这三种做法都会让"备份成功"变成假话。
