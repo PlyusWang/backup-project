@@ -352,5 +352,116 @@ int main() {
         compressed_outcome.baseline_reason);
   }
 
+  // ---- 特殊文件与硬链接走真实的链 ----
+  test_support::Section(
+      "INC-R 7. hardlink / FIFO / 软链接 / 权限变更在链上同样正确");
+  {
+    const std::string work2 = test_support::FreshDir("inc-chain-special");
+    const std::string src2 = work2 + "/src";
+    const std::string repo2 = work2 + "/repo";
+    const std::string oracle2 = work2 + "/oracle";
+    test_support::Mkdir(src2, 0755);
+    test_support::Mkdir(repo2, 0755);
+    test_support::Mkdir(oracle2, 0755);
+
+    // 状态 1：一个硬链接对、一个 FIFO、一个软链接、一个子目录。
+    test_support::WriteFile(src2 + "/leader.txt", "shared-body", 0644);
+    test_support::Check(
+        test_support::CreateHardlink(src2 + "/leader.txt", src2 + "/peer.txt"),
+        "INC-R T7 建立硬链接对");
+    test_support::Check(test_support::CreateFifo(src2 + "/pipe", 0644),
+                        "INC-R T7 建立 FIFO");
+    test_support::CreateSymlink("leader.txt", src2 + "/link");
+    test_support::Mkdir(src2 + "/sub", 0755);
+    test_support::WriteFile(src2 + "/sub/deep.txt", "deep", 0640);
+
+    bp::Filter filter;
+    bp::BackupOptions options;
+    bp::IncrementalOutcome outcome;
+    std::string error;
+    test_support::Check(bp::RunIncrementalBackup(
+                            src2, repo2, SnapshotName(11), repository_identity,
+                            filter, options, {}, {}, "", &outcome, &error),
+                        "INC-R T7 特殊文件基线建立成功", error);
+    test_support::Check(
+        outcome.kind == bp::IncrementalOutcome::Kind::kFullBaseline,
+        "INC-R T7 第一次是完整基线");
+
+    // 状态
+    // 2：删掉一个硬链接、新增另一个；通过链接改内容（两个名字都要跟着变）；
+    // 改软链接目标；删 FIFO；加一个新 FIFO；改权限与属主可见位。
+    test_support::Check(::unlink((src2 + "/peer.txt").c_str()) == 0,
+                        "INC-R T7 删掉一个硬链接");
+    test_support::Check(
+        test_support::CreateHardlink(src2 + "/leader.txt", src2 + "/peer2.txt"),
+        "INC-R T7 新增一个指向同一 inode 的硬链接");
+    test_support::WriteFile(src2 + "/leader.txt", "rewritten-via-link", 0644);
+    test_support::Check(::unlink((src2 + "/link").c_str()) == 0,
+                        "INC-R T7 删掉旧软链接");
+    test_support::CreateSymlink("sub", src2 + "/link");
+    test_support::Check(::unlink((src2 + "/pipe").c_str()) == 0,
+                        "INC-R T7 删掉 FIFO");
+    test_support::Check(test_support::CreateFifo(src2 + "/pipe2", 0600),
+                        "INC-R T7 新增 FIFO");
+    test_support::Check(::chmod((src2 + "/sub/deep.txt").c_str(), 0604) == 0,
+                        "INC-R T7 改 deep.txt 的权限");
+
+    bp::IncrementalOutcome second;
+    test_support::Check(bp::RunIncrementalBackup(
+                            src2, repo2, SnapshotName(12), repository_identity,
+                            filter, options, {}, {}, "", &second, &error),
+                        "INC-R T7 特殊文件 delta 写出成功", error);
+    test_support::Check(second.kind == bp::IncrementalOutcome::Kind::kDelta,
+                        "INC-R T7 第二次是 delta");
+    // 至少要有：内容改写（两个链接名都算）、软链接目标变化、FIFO 增删里的一类。
+    test_support::Check(
+        second.summary.modified >= 2 && second.summary.added >= 1 &&
+            second.summary.removed >= 1,
+        "INC-R T7 变化分类覆盖修改 / 新增 / 删除",
+        "added=" + std::to_string(second.summary.added) +
+            " modified=" + std::to_string(second.summary.modified) +
+            " removed=" + std::to_string(second.summary.removed));
+
+    std::string oracle_tree;
+    test_support::Check(
+        MakeOracle(src2, oracle2, "special2", filter, &oracle_tree, &error),
+        "INC-R T7 oracle 完整备份成功", error);
+    const std::string restored2 = work2 + "/restore2";
+    bp::RestoreReport report2;
+    test_support::Check(
+        bp::RestoreSnapshotChain(repo2, SnapshotName(12), restored2,
+                                 bp::RestoreOptions{}, &report2, &error),
+        "INC-R T7 特殊文件链恢复成功", error);
+    std::string detail2;
+    // CompareTrees 会逐项比较类型、mode、mtime（秒+纳秒）、属主、内容、
+    // 软链接目标，并单独比较 hardlink 分组 —— 所以这一条断言同时覆盖了
+    // "硬链接拓扑在链上保持"与"FIFO / 软链接 / 权限都被正确应用"。
+    // 比的是 oracle 的**恢复结果**，不是 oracle 的仓库目录 —— 后者当然和一棵
+    // 源树长得不一样。（第一版就写错了这一行，CompareTrees 立刻用
+    // "mtime differs" 戳穿了它，这也说明它比的是真实文件系统事实。）
+    test_support::Check(
+        test_support::CompareTrees(oracle_tree, restored2, &detail2),
+        "INC-R T7 判别：特殊文件与硬链接的链恢复 == 完整恢复", detail2);
+
+    // 硬链接拓扑单独再钉一次：两个名字必须还是同一个 inode。
+    struct stat first_info;
+    struct stat second_info;
+    const bool same_inode =
+        test_support::StatOf(restored2 + "/leader.txt", &first_info) &&
+        test_support::StatOf(restored2 + "/peer2.txt", &second_info) &&
+        first_info.st_ino == second_info.st_ino &&
+        first_info.st_dev == second_info.st_dev;
+    test_support::Check(same_inode,
+                        "INC-R T7 恢复出来的两个名字仍然共享一个 inode");
+    std::string body;
+    test_support::Check(
+        test_support::ReadFile(restored2 + "/peer2.txt", &body) &&
+            body == "rewritten-via-link",
+        "INC-R T7 通过另一个链接改写的内容被正确恢复", body);
+    test_support::Check(!test_support::Exists(restored2 + "/pipe") &&
+                            test_support::Exists(restored2 + "/pipe2"),
+                        "INC-R T7 FIFO 的删除与新增都生效了");
+  }
+
   return test_support::Finish("incremental_restore_test");
 }
