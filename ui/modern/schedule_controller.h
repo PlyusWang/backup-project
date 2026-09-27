@@ -53,6 +53,9 @@ struct ScheduleOutcome {
   // 与 first_snapshot 一样会产出一份完整快照，只是原因不同，界面要说清楚。
   bool baseline_reset = false;
   bool due = true;
+  // 落盘配置不合法：这一轮什么都没写，而且调度器应当**挂起**，不再周期性
+  // 重试。与普通的 failed 分开：failed 下一轮还会照常再试，挂起不会。
+  bool config_invalid = false;
 
   QString status_key;
   QString status_text;
@@ -91,6 +94,9 @@ class ScheduleController : public QObject {
   // ---- 运行状态 ----
   Q_PROPERTY(bool libraryBusy READ libraryBusy NOTIFY busyChanged)
   Q_PROPERTY(bool pending READ pending NOTIFY pendingChanged)
+  // 定时备份是否因为"落盘配置不合法"而挂起。挂起期间：不评估、不写盘、
+  // 不重试；用户在页面上重新保存一份合法的计划即可自动恢复。
+  Q_PROPERTY(bool suspended READ suspended NOTIFY suspendedChanged)
   Q_PROPERTY(bool holdsRunnerLock READ holdsRunnerLock NOTIFY runnerChanged)
   Q_PROPERTY(QString runnerMessage READ runnerMessage NOTIFY runnerChanged)
   Q_PROPERTY(QString statusKind READ statusKind NOTIFY statusChanged)
@@ -135,6 +141,7 @@ class ScheduleController : public QObject {
 
   bool libraryBusy() const { return busy_; }
   bool pending() const { return pending_; }
+  bool suspended() const { return config_invalid_; }
   bool holdsRunnerLock() const { return lock_.held(); }
   QString runnerMessage() const { return runner_message_; }
   QString statusKind() const { return status_kind_; }
@@ -191,6 +198,18 @@ class ScheduleController : public QObject {
   // ---- 仅供 main.cpp 的自动化测试使用，刻意不是 Q_INVOKABLE ----
   bool waitForIdle(int timeout_ms);
   bool lastSucceeded() const { return last_succeeded_; }
+  // 控制器当前内存里的配置原样交出去。parity 测试要用它调用共享核心的
+  // ValidateScheduleForEnable，证明 GUI 拒绝启用时给的理由就是核心那句话，
+  // 而不是界面自己另写的一套判断。
+  backupproject::ScheduleConfig configForTest() const {
+    return document_.config;
+  }
+  // tick 是否还活着。挂起之后它必须是 false：没有 timer 就不可能再有
+  // "每秒重新校验一次"。
+  bool tickActiveForTest() const { return tick_.isActive(); }
+  // 直接跑一次 Tick，"假装 timer 又响了一次"。用来证明即使 tick 真的再响，
+  // 挂起状态下也不会有任何新提交——不需要靠 sleep 堆时间去等 1 Hz。
+  void pumpTickForTest() { Tick(); }
 
  signals:
   void configChanged();
@@ -198,6 +217,7 @@ class ScheduleController : public QObject {
   void statusChanged();
   void busyChanged();
   void pendingChanged();
+  void suspendedChanged();
   void runnerChanged();
   void operationFinished(bool succeeded);
 
@@ -214,8 +234,13 @@ class ScheduleController : public QObject {
   void OnBackupBusyChanged();
   // 仓库在设置页被改掉之后，本控制器必须立刻跟上：下一次评估用的是新仓库。
   void OnRepositoryPathChanged();
+  // 备份管理页删掉一份归档之后，让 managed 名单与仓库的实际内容保持一致。
+  // 与 CLI 的 repository delete 走同一个 ReconcileManagedSnapshots。
+  void OnArchiveDeleted(const QString& file_name);
   void SetStatus(const QString& kind, const QString& title,
                  const QString& message);
+  // 挂起开关的唯一入口。挂起时停掉 tick：没有 timer 就没有周期性重校验。
+  void SetConfigInvalid(bool invalid);
   void SetBusy(bool busy);
 
   static ScheduleOutcome RunEvaluation(const QString& store_path,
@@ -239,6 +264,8 @@ class ScheduleController : public QObject {
   QTimer tick_;
   QFutureWatcher<ScheduleOutcome> watcher_;
 
+  // 落盘配置不合法 -> 挂起。见 SetConfigInvalid。
+  bool config_invalid_ = false;
   bool busy_ = false;
   bool pending_ = false;
   // pending 那次是"立即运行"还是普通到期检查：两者都要在手动操作结束后补跑，

@@ -215,6 +215,10 @@ class BackupController : public QObject {
   void statusChanged();
   void sourcePathChanged();
   void repositoryPathChanged();
+  // 一份归档刚刚从仓库里删掉。ScheduleController 订阅它，好让 ScheduleStore 的
+  // managed 名单立刻跟上——CLI 的 repository delete 一直这么做，GUI 少了这一步
+  // 就成了"同一件事在两个前端上后果不同"。
+  void archiveDeleted(const QString& file_name);
   void backupRecordsChanged();
   void catalogStateChanged();
   // 规则列表变化（增删清空）时发一次。

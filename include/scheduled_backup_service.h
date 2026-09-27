@@ -54,6 +54,18 @@ enum class ScheduleEvaluationStatus {
   // "计划备份成功，但旧版本淘汰失败"不等于"备份失败"。
   kCreatedWithRetentionWarning,
   kFailed,
+  // 落盘的配置本身不合法（结构读得懂，但业务规则不认）。
+  //
+  // 与 kFailed 刻意分开，因为后果完全不同：
+  //   * kFailed 是"这一次运行失败了"，next_run 照常推进、history 照常记录，
+  //     下一轮到点再试；
+  //   * kConfigInvalid 是"这份计划已经被挂起"：**一个字节都不写**（改了也存
+  //     不回去），next_run 原地不动，也不记 history。调用方据此进入明确的
+  //     config-error 状态并停止周期性重试——否则 GUI 会每个 tick 都重做一遍
+  //     完整校验，永远停不下来。
+  // 恢复方式只有一条：用户显式保存一份合法的配置（GUI 的保存 / CLI 的
+  // schedule set）。产品禁止多进程，所以不存在"别的进程在背后修好了文件"。
+  kConfigInvalid,
 };
 
 const char* ScheduleEvaluationStatusKey(ScheduleEvaluationStatus status);
@@ -78,8 +90,9 @@ struct ScheduleEvaluationResult {
   // 只有真的产出归档时非空（单组件文件名）。
   std::string archive_file_name;
 
-  // 出错原因原文，或本轮的说明（例如"上一份 manifest
-  // 不可读，按首次快照处理"）。 绝不含密码。
+  // 出错原因原文，或本轮的说明。典型例子：这一轮重建了一份完整基线快照，
+  // 原因是记录的基线已经不可用（快照被删 / 换了仓库 / 换了源 / manifest
+  // 读不出来） —— 那叫 baseline reset，不叫"首次快照"。绝不含密码。
   std::string diagnostic;
 
   std::int64_t next_run_time_sec = 0;

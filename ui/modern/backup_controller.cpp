@@ -791,6 +791,9 @@ bool BackupController::deleteBackup(const QString& file_name) {
   SetStatus(QString::fromLatin1(kSuccess), QStringLiteral("备份已删除"),
             QStringLiteral("%1 已从备份仓库中移除。").arg(file_name));
   refreshBackups();
+  // 删成功之后才通知：计划状态要跟着这份仓库的实际内容走，而不是跟着"用户点了
+  // 删除"走。失败时什么都没变，也就不该有人去改 schedule。
+  emit archiveDeleted(file_name);
   return true;
 }
 

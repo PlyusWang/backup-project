@@ -13,6 +13,8 @@
 #include <system_error>
 #include <utility>
 
+#include "file_io.h"
+
 namespace backupproject {
 namespace {
 
@@ -296,46 +298,21 @@ bool ConfigManager::Save(const AppConfig& config,
     return false;
   }
 
-  const fs::path config_file(config_file_path_);
-  const fs::path parent = config_file.parent_path();
-  std::error_code error;
-  if (!parent.empty()) fs::create_directories(parent, error);
-  if (error) {
-    SetError(error_message,
-             Describe("Failed to create config directory", parent, error));
+  // 配置文件也是持久化的业务配置，边界与 ScheduleStore 完全一致：
+  //   * 目录 0700（新建时生效）；
+  //   * 同目录唯一临时文件 + O_CREAT|O_EXCL（mkstemp）：不跟随符号链接、
+  //     不截断别人预放的文件、同进程并行保存也不会撞名；
+  //   * 0600、fsync、rename、fsync 目录。
+  // 固定名字的 ".tmp" 会跟随符号链接并 truncate 目标——那正是这次要收掉的东西。
+  if (!EnsurePrivateDirectoryFor(config_file_path_, error_message)) {
     return false;
   }
 
-  const fs::path temporary = config_file.string() + ".tmp";
-  {
-    std::ofstream output(temporary, std::ios::binary | std::ios::trunc);
-    if (!output) {
-      SetError(error_message,
-               "Failed to open temporary config file: " + temporary.string());
-      return false;
-    }
-    output << "{\n  \"version\": 1,\n  \"backup_repository_path\": \""
-           << EscapeJsonString(config.backup_repository_path) << "\"\n}\n";
-    output.close();
-    if (!output) {
-      std::error_code cleanup_error;
-      fs::remove(temporary, cleanup_error);
-      SetError(error_message,
-               "Failed to write temporary config file: " + temporary.string());
-      return false;
-    }
-  }
-
-  fs::rename(temporary, config_file, error);
-  if (error) {
-    const std::error_code rename_error = error;
-    std::error_code cleanup_error;
-    fs::remove(temporary, cleanup_error);
-    SetError(error_message, Describe("Failed to replace config file",
-                                     config_file, rename_error));
-    return false;
-  }
-  return true;
+  std::ostringstream text;
+  text << "{\n  \"version\": 1,\n  \"backup_repository_path\": \""
+       << EscapeJsonString(config.backup_repository_path) << "\"\n}\n";
+  return WriteFileAtomicallyReplacing(config_file_path_, text.str(),
+                                      error_message);
 }
 
 const std::string& ConfigManager::config_file_path() const {
