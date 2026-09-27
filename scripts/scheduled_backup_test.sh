@@ -168,6 +168,7 @@ run_unit scheduler_core_test
 run_unit scheduled_backup_test
 run_unit terminal_secret_test
 run_unit backup_preview_test
+run_unit incremental_manifest_test
 
 # ============================================================
 echo "[schedule-test] B. CLI pipeline parity"
