@@ -14,15 +14,23 @@
 //   <dir>/schedule.json.lock     运行期 single-runner 锁（flock）
 //
 // 为什么不把 manifest 塞进 JSON：源树几万条时，每轮都要解析/序列化一个巨大的
-// JSON 对象；而且 state 每次保存都会连带重写它。拆开之后两个文件各自原子替换，
-// state 引用关系只有"上一份成功 manifest 就是这个固定路径"这一条，
-// 崩溃后自愈规则也简单：manifest 不见了/坏了 = 没有上一份快照 =
-// 走首次快照语义， 多建一份完整备份，绝不漏变化。
+// JSON 对象；而且 state 每次保存都会连带重写它。拆开之后两个文件各自原子替换。
+//
+// state 与 manifest 的引用关系**不是**靠"固定路径"隐含的：manifest 自己带着一份
+// binding（属于哪一份快照、哪个仓库、哪个源目录），只有它与 state 记的 baseline
+// 完全一致，才允许由"manifest 相同"推出"可以跳过"。因此文件不见了 / 坏了 /
+// 来自旧版本，结论都不是"没跑过"，而是"没有可信基线"——多建一份完整基线快照，
+// 绝不漏变化。
 //
 // 崩溃一致性（§36）的落点在这里：
 //   * Save() 永远是 temp + fsync + rename + 目录
-//   fsync，读者永远看不到半个文件；
-//   * archive 先发布、manifest 再落盘、state 最后落盘；
+//     fsync，读者永远看不到半个文件；
+//   * archive 先发布、manifest 再落盘、retention 再淘汰、state 最后落盘；
+//   * **写出去的 state 必须读得回来**：Save() 的结构上界与调用方真正会产出的
+//     长度必须一致。retention 因此排在第一次 Save 之前——名单刚 push 进新快照时
+//     是 retain + 1 条，而 retain_count 允许取到 kMaxRetainCount，先写后淘汰会
+//     在满额时要求写出一份自己都读不回来的 state（见
+//     ScheduledBackupService::EvaluateInternal）；
 //   * state 里只存单组件 file_name，绝不存绝对路径——真正的 resolve/delete
 //     继续走 BackupCatalog，路径安全边界不在这里开口子；
 //   * state 丢失也绝不影响 archive 的正确性：它最多让一份 .bak 变成"没人认领的

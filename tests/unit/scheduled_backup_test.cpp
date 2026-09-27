@@ -1787,6 +1787,107 @@ void TestCrashConsistency() {
   }
 }
 
+// ---- M. 满额名单：写出去的 state 必须读得回来 ----
+//
+// retain_count 允许取到 kMaxRetainCount，而创建路径会先把新快照 push 进名单、
+// 再淘汰。所以名单长度在淘汰之前是 retain + 1 条，而 ScheduleStore 只接受
+// kMaxRetainCount 条。若先落盘后淘汰，满额那一轮就会要求写出一份自己都读不回来
+// 的 state：Save 拒绝 -> 在写盘处提前返回 -> retention 永远轮不到 -> 下一轮再建
+// 一份。结果是仓库无上限增长，而且每一轮都报成功、退出码 0。
+
+void TestManagedListStaysWritableAtTheBound() {
+  test_support::Section("M. the managed list stays writable at the bound");
+
+  const Env env = MakeEnv("managed-bound", bp::kMaxRetainCount);
+  Write(env.source + "/a.txt", "one");
+
+  bp::ScheduleEvaluationResult result;
+  ExpectStatus("BOUND-01 the seed snapshot is created", env, 1000,
+               bp::ScheduleEvaluationStatus::kCreatedSnapshot, &result);
+  const std::string seed = result.archive_file_name;
+  test_support::Check(!seed.empty(), "BOUND-02 the seed snapshot has a name", seed);
+
+  std::string bytes;
+  test_support::Check(test_support::ReadFile(env.repository + "/" + seed, &bytes),
+                      "BOUND-03 the seed archive is readable");
+
+  // 把仓库填到文件上界：一共 kMaxRetainCount 份**真实**归档。产品连续跑满
+  // 这么多轮之后，磁盘上就是这个样子。
+  std::vector<std::string> names;
+  names.push_back(seed);
+  std::size_t fillers = 0;
+  for (std::size_t index = 1; index < bp::kMaxRetainCount; ++index) {
+    char name[64];
+    std::snprintf(name, sizeof(name), "filler_%04zu.bak", index);
+    if (Write(env.repository + "/" + name, bytes)) ++fillers;
+    names.push_back(name);
+  }
+  test_support::Check(fillers + 1 == bp::kMaxRetainCount,
+                      "BOUND-04 the repository holds a full managed list",
+                      std::to_string(fillers + 1) + "/" +
+                          std::to_string(bp::kMaxRetainCount));
+
+  // 用产品自己的 writer 写出一份满额 state：这不是伪造字节，而是产品跑满之后
+  // 的真实内容。它必须写得出去。
+  bp::ScheduleStore store(env.schedule_file);
+  bp::ScheduleDocument document = LoadDocument(env);
+  document.config.retain_count = bp::kMaxRetainCount;
+  document.state.managed_snapshots.clear();
+  for (const std::string& name : names) {
+    bp::ScheduledSnapshotRecord record;
+    record.file_name = name;
+    record.created_time_sec = 1000;
+    record.entry_count = 1;
+    record.archive_size = 1;
+    document.state.managed_snapshots.push_back(record);
+  }
+  document.state.baseline.snapshot_file_name = seed;
+  document.state.baseline.repository_identity =
+      bp::RepositoryIdentity(env.repository);
+  document.state.baseline.source_path = env.source;
+
+  std::string error;
+  test_support::Check(document.state.managed_snapshots.size() ==
+                          bp::kMaxRetainCount,
+                      "BOUND-05 the crafted list sits exactly at the bound");
+  test_support::Check(store.Save(document, &error),
+                      "BOUND-06 a full managed list still saves", error);
+
+  // 源变了：这一轮必须建快照、必须真的淘汰，而且 state 必须仍然读得回来。
+  Write(env.source + "/b.txt", "two");
+  const std::size_t before = RepoArchives(env.repository).size();
+  ExpectStatus("BOUND-10 a change at the bound still creates a snapshot", env,
+               2000, bp::ScheduleEvaluationStatus::kCreatedSnapshot, &result);
+  const std::size_t after = RepoArchives(env.repository).size();
+  test_support::Check(after == bp::kMaxRetainCount,
+                      "BOUND-11 retention really ran at the bound",
+                      std::to_string(before) + " -> " + std::to_string(after));
+
+  bp::ScheduleDocument reloaded;
+  const bp::ScheduleLoadStatus status = store.Load(&reloaded, &error);
+  test_support::Check(status == bp::ScheduleLoadStatus::kLoaded,
+                      "BOUND-12 the state written at the bound loads back", error);
+  test_support::Check(reloaded.state.managed_snapshots.size() <=
+                          bp::kMaxRetainCount,
+                      "BOUND-13 the persisted list never exceeds the bound",
+                      std::to_string(reloaded.state.managed_snapshots.size()));
+  bool recorded = false;
+  for (const bp::ScheduledSnapshotRecord& record :
+       reloaded.state.managed_snapshots) {
+    if (record.file_name == result.archive_file_name) recorded = true;
+  }
+  test_support::Check(recorded, "BOUND-14 the new snapshot was recorded",
+                      result.archive_file_name);
+
+  // 源没再变：下一轮必须 skip。卡死的话这里会再建一份，仓库继续长。
+  ExpectStatus("BOUND-15 the next run skips instead of wedging", env, 3000,
+               bp::ScheduleEvaluationStatus::kSkippedNoChanges, &result);
+  const std::size_t settled = RepoArchives(env.repository).size();
+  test_support::Check(settled == bp::kMaxRetainCount,
+                      "BOUND-16 the repository does not grow without bound",
+                      std::to_string(settled));
+}
+
 int main() {
   std::printf("scheduled backup test\n");
   TestTimeSemantics();
@@ -1806,6 +1907,7 @@ int main() {
   TestUnsupportedModeIsNeverRunAsFull();
   TestStoreParentDirectoryAndLegacyFiles();
   TestCrashConsistency();
+  TestManagedListStaysWritableAtTheBound();
   TestStability();
   test_support::RemoveTree(test_support::TempRoot());
   return test_support::Finish("scheduled backup");
