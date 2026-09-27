@@ -207,6 +207,9 @@ class ScheduleController : public QObject {
   void Tick();
   void Submit(bool force);
   void DrainPending();
+  // runner_message_ 的写入口：文本没变就不发信号。tick 会周期性地重试抢锁，
+  // 少了这一层，"抢不到"会变成每秒一次的 runnerChanged 抖动。
+  void SetRunnerMessage(const QString& text);
   void OnEvaluationFinished();
   void OnBackupBusyChanged();
   // 仓库在设置页被改掉之后，本控制器必须立刻跟上：下一次评估用的是新仓库。
