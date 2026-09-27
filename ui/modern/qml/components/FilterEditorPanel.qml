@@ -30,6 +30,8 @@ Item {
     property bool previewBusy: false
     property bool previewTruncated: false
     property int previewShown: 0
+    property int previewTotal: 0
+    property int previewIncluded: 0
     property int previewLimit: 300
     property string previewSource: ""
     property string summaryLine: ""
@@ -93,6 +95,8 @@ Item {
         panel.previewBusy = panel.ruleModel.previewBusy
         panel.previewTruncated = panel.ruleModel.previewTruncated
         panel.previewShown = panel.ruleModel.previewShown
+        panel.previewTotal = panel.ruleModel.previewTotal
+        panel.previewIncluded = panel.ruleModel.previewIncluded
         panel.previewLimit = panel.ruleModel.previewLimit
         panel.summaryLine = panel.ruleModel.summaryText
         panel.dslPreview = panel.ruleModel.dslText
@@ -269,7 +273,7 @@ Item {
                         if (panel.previewSource.length > 0 && panel.previewSource !== controller.sourcePath)
                             return "共 " + panel.previewShown + " 项（结果对应 " + panel.previewSource + "，源目录已改，请刷新）。"
                         if (panel.previewTruncated)
-                            return "仅预览前 " + panel.previewLimit + " 项（目录过大时只显示开头部分）。"
+                            return "共 " + panel.previewIncluded + " 项会进入归档，仅列出前 " + panel.previewLimit + " 项（整棵源目录树都会被检查）。"
                         return "共 " + panel.previewShown + " 项。"
                     }
                 }

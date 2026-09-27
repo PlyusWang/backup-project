@@ -207,11 +207,13 @@ void PrintCliUsage(const std::string& program_name, std::ostream& output) {
          "and\n"
       << "    writes no state. Same rules, same selection and the same "
          "preview\n"
-      << "    window as the Manual Backup preview in the Modern GUI: at most "
-      << kPreviewEntryLimit << "\n"
-      << "    entries are examined, and that is reported when the source "
-         "tree is\n"
-      << "    larger.\n"
+      << "    window as the Manual Backup preview in the Modern GUI. The "
+         "whole\n"
+      << "    source tree is always validated; at most " << kPreviewEntryLimit
+      << " entries\n"
+      << "    are listed, and truncation is reported. Exits 1 when the "
+         "selection\n"
+      << "    could not be backed up (for example an un-excluded socket).\n"
       << "  " << program_name
       << " restore <file_name> <destination_directory>\n"
       << "    <file_name> must be a single-component .bak name inside the "
@@ -460,16 +462,30 @@ int RunPreviewCommand(const CliContext& context,
   // 到这里为止没有碰过任何持久状态：解析失败(2) 一定发生在扫描之前。
   const PreviewResult preview = PreviewBackupSelection(source_directory, rules);
   if (!preview.error.empty()) {
-    PrintError(preview.error + ": " + source_directory);
+    // 消息就是共享核心（也就是真实 Backup）报出的那一句，一个字都不改：
+    // "源目录不可用"、"遍历失败"、"这份选择无法被成功备份"这三件事由结构化
+    // 的 error_kind 区分，判断不在这一层重做。
+    PrintError(preview.error);
+    if (preview.error_kind == PreviewErrorKind::kSelectionBlocked) {
+      // 这不是命令行用法错误（那是 2），而是"按当前规则备份必然失败"（1）。
+      std::cout << "Backup would fail unless this entry is excluded.\n";
+    }
     return kCliExitOperationFailed;
   }
 
+  // 计数是**整棵树**的，不是窗口里的：上面那一步已经完整验证过整棵源目录树，
+  // 所以"第 301 个条目是 socket"这种情况不会漏掉。
+  std::size_t shown = 0;
+  for (const PreviewItem& item : preview.items) {
+    if (item.included) ++shown;
+  }
   std::cout << "Preview: " << preview.included_count << " matching item(s)\n";
   if (preview.truncated) {
-    // 明确说出来，不静默截断：这一行告诉用户"下面的列表不是全部"。
-    std::cout << "Note: the source tree has more than " << kPreviewEntryLimit
+    // 明确说出来，不静默截断：窗口之外还有条目，而列表只到窗口为止。
+    std::cout << "Note: the source tree has " << preview.total_entries
               << " entries; only the first " << kPreviewEntryLimit
-              << " were examined.\n";
+              << " were examined, and " << shown
+              << " matching item(s) are listed below.\n";
   }
   for (const PreviewItem& item : preview.items) {
     if (!item.included) continue;
