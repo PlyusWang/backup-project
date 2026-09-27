@@ -217,6 +217,16 @@ bool BuildChangedEntries(const std::string& source_directory,
 
 }  // namespace
 
+bool IsSupportedIncrementalPack(PackMethod pack) {
+  return pack == PackMethod::kMyPack;
+}
+
+std::string UnsupportedIncrementalPackReason() {
+  return "Incremental backup currently supports the MyPack pack method only: "
+         "USTAR cannot express tombstones or parent dependencies, so an "
+         "incremental chain built on it could not be applied correctly.";
+}
+
 std::string SnapshotManifestFileName(const std::string& snapshot_file_name) {
   return snapshot_file_name + ".manifest";
 }

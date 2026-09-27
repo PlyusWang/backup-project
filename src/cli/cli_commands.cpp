@@ -433,6 +433,12 @@ int RunBackupCommand(const CliContext& context,
     PrintError(UnsupportedBackupModeReason(BackupTrigger::kManual, strategy));
     return kCliExitOperationFailed;
   }
+  // 打包方式与策略的组合也要在**写任何东西之前**拒绝：增量第一版只支持
+  // MyPack，等到第一次 delta 才失败会把用户留在一份"看起来可用"的基线上。
+  if (strategy == BackupStrategy::kIncremental &&
+      !IsSupportedIncrementalPack(options.pack_method)) {
+    return UsageError(context, UnsupportedIncrementalPackReason());
+  }
 
   const std::string file_name = BaseNameOf(archive_path);
   if (strategy == BackupStrategy::kIncremental) {

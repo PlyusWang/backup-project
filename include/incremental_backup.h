@@ -34,6 +34,15 @@
 
 namespace backupproject {
 
+// 增量第一版只支持 MyPack 打包方式：USTAR 表达不了 tombstone 与 parent
+// dependency，硬套只会产出"恢复语义对不上"的链。
+//
+// CLI 与 GUI 必须在**启动任务之前**用这一个判断拒绝，而不是等第一次 delta
+// 才失败——那时用户已经拿到一份看起来可用的基线，错误来得太晚了。
+// 两个前端问的是同一个函数，所以拒绝的理由不可能分叉。
+bool IsSupportedIncrementalPack(PackMethod pack);
+std::string UnsupportedIncrementalPackReason();
+
 // 仓库里某一份快照的 manifest 副文件名：<snapshot 文件名>.manifest。
 // catalog 只列 *.bak，所以它不会被当成一份快照。
 std::string SnapshotManifestFileName(const std::string& snapshot_file_name);
