@@ -25,6 +25,9 @@
 //   --close-guard-test                  验证任务进行中关窗会被拦下
 //   --gui-contract-test                 验证首页三张卡片的按钮几何，以及
 //                                       "临时提示只属于产生它的页面"这条契约
+//   --incremental-test <源> <仓库>      PR #18 GUI/CLI parity：走真实控制器
+//                                       入口跑 baseline / no-change / delta /
+//                                       依赖链恢复，按固定格式打印结果
 //   --native-frame                      退回系统原生标题栏（Wayland 兜底）
 //
 // 这些开关让没有显示器的环境也能验证界面：离屏平台插件把窗口真正建出来，
@@ -1310,6 +1313,129 @@ int RunGuiContractTest(QQuickWindow* window,
     for (const QString& failure : run.failures)
       std::printf("[gui-contract]   FAIL %s\n", qPrintable(failure));
   }
+  return run.failed == 0 ? 0 : 1;
+}
+
+// ---- --incremental-test <source> <repository> ----
+//
+// PR #18 的 GUI/CLI parity 自检。它走**真实的控制器入口**
+// （startBackupWithStrategy + 依赖链恢复），并把每一步的结果按固定格式打印：
+//
+//     step1 kind=full-baseline reason=<yes|no>
+//     step2 kind=no-changes
+//     step3 kind=delta changes=+A~M=C-R
+//     restore ok
+//
+// 脚本拿这几行与 backupctl 的输出对照。这不是"两边都调了同一个函数"，
+// 而是"命令行里看到的与界面上会发生的完全一致"。
+int RunIncrementalTest(backup_modern::BackupController* controller,
+                       const QString& source, const QString& repository) {
+  CheckRun run;
+  run.prefix = "[incremental]";
+
+  // 仓库必须先配置好：产品路径上它来自设置页。
+  if (!controller->saveRepositoryPath(repository)) {
+    std::fprintf(stderr, "[incremental] cannot configure the repository: %s\n",
+                 qPrintable(controller->statusMessage()));
+    return 1;
+  }
+  controller->setSourcePath(source);
+  controller->clearStatus();
+
+  const auto runOne = [&](const char* label, bool* ok) {
+    controller->clearStatus();
+    const bool started = controller->startBackupWithStrategy(
+        QStringLiteral("incremental"), QStringLiteral("mypack"),
+        QStringLiteral("none"), QStringLiteral("none"), QString(), QString());
+    const bool idle =
+        started && controller->waitForIdle(600000) && !controller->busy();
+    const bool succeeded = idle && controller->lastSucceeded();
+    *ok = succeeded;
+    run.Check(started && idle, QStringLiteral("%1 任务正常结束").arg(label),
+              controller->statusMessage());
+    return succeeded;
+  };
+
+  bool first_ok = false;
+  runOne("step1", &first_ok);
+  if (!first_ok) {
+    std::printf("[incremental] step1 kind=failed\n");
+    std::printf("[incremental] passed=%d failed=%d\n", run.passed, run.failed);
+    return 1;
+  }
+  // step1：没有基线时必须建完整基线，并且给出原因。
+  const QString first_title = controller->statusTitle();
+  const bool first_baseline = first_title.contains(QStringLiteral("完整基线"));
+  std::printf("[incremental] step1 kind=%s reason=%s\n",
+              first_baseline ? "full-baseline" : "UNEXPECTED",
+              first_baseline ? "yes" : "no");
+
+  bool second_ok = false;
+  runOne("step2", &second_ok);
+  const QString second_title = controller->statusTitle();
+  const bool second_no_changes =
+      second_title.contains(QStringLiteral("没有变化"));
+  std::printf("[incremental] step2 kind=%s\n",
+              second_no_changes ? "no-changes" : "UNEXPECTED");
+
+  // 改一个文件（内容变、长度不变）：增量必须看得见。
+  {
+    QFile file(source + QStringLiteral("/a.txt"));
+    if (file.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
+      file.write("ALPHA");
+      file.close();
+    }
+  }
+  controller->clearStatus();
+  bool third_ok = false;
+  runOne("step3", &third_ok);
+  const QString third_title = controller->statusTitle();
+  const bool third_delta = third_title.contains(QStringLiteral("增量完成"));
+  std::printf("[incremental] step3 kind=%s changes=%s\n",
+              third_delta ? "delta" : "UNEXPECTED",
+              qPrintable(controller->statusMessage()));
+
+  // 依赖链恢复：只用 delta 的文件名，控制器自己去解析 base 与中间层。
+  //
+  // 列表刷新是异步的（每次备份成功都会触发一次后台扫描），所以这里必须等它
+  // 稳定下来再读，否则拿到的是上一轮的结果 —— 测试会变成"看谁跑得快"。
+  run.Check(controller->waitForCatalogIdle(120000),
+            QStringLiteral("step4 仓库列表刷新结束"));
+  const QVariantList records = controller->backupRecords();
+  QString delta_name;
+  for (const QVariant& value : records) {
+    const QVariantMap record = value.toMap();
+    const QString name = record.value(QStringLiteral("fileName")).toString();
+    if (record.value(QStringLiteral("recordKind")).toString() ==
+        QStringLiteral("delta")) {
+      delta_name = name;
+      break;
+    }
+  }
+  run.Check(!delta_name.isEmpty(),
+            QStringLiteral("step4 列表里能认出 delta 快照"), delta_name);
+  if (!delta_name.isEmpty()) {
+    const QString destination =
+        source + QStringLiteral("-restored-") +
+        QString::number(QDateTime::currentSecsSinceEpoch());
+    const bool restored =
+        controller->startManagedRestore(delta_name, destination) &&
+        controller->waitForIdle(600000) && controller->lastSucceeded();
+    run.Check(restored, QStringLiteral("step4 依赖链恢复成功"),
+              controller->statusMessage());
+    QString content;
+    QFile restored_file(destination + QStringLiteral("/a.txt"));
+    if (restored_file.open(QIODevice::ReadOnly)) {
+      content = QString::fromUtf8(restored_file.readAll());
+      restored_file.close();
+    }
+    run.Check(content == QStringLiteral("ALPHA"),
+              QStringLiteral("step4 恢复出来的内容来自 delta"), content);
+    std::printf("[incremental] restore %s\n",
+                content == QStringLiteral("ALPHA") ? "ok" : "FAILED");
+  }
+
+  std::printf("[incremental] passed=%d failed=%d\n", run.passed, run.failed);
   return run.failed == 0 ? 0 : 1;
 }
 
@@ -3059,6 +3185,8 @@ int main(int argc, char* argv[]) {
       arguments.contains(QStringLiteral("--close-guard-test"));
   const bool gui_contract_test =
       arguments.contains(QStringLiteral("--gui-contract-test"));
+  const int incremental_test_index =
+      arguments.indexOf(QStringLiteral("--incremental-test"));
   const int screenshot_index =
       arguments.indexOf(QStringLiteral("--screenshot"));
   const int self_test_index = arguments.indexOf(QStringLiteral("--self-test"));
@@ -3222,6 +3350,17 @@ int main(int argc, char* argv[]) {
                              arguments.at(repository_test_index + 1),
                              arguments.at(repository_test_index + 2),
                              arguments.at(repository_test_index + 3));
+  }
+
+  if (incremental_test_index >= 0) {
+    if (incremental_test_index + 2 >= arguments.size()) {
+      std::fprintf(stderr,
+                   "--incremental-test needs <source> and <repository>\n");
+      return 2;
+    }
+    return RunIncrementalTest(&controller,
+                              arguments.at(incremental_test_index + 1),
+                              arguments.at(incremental_test_index + 2));
   }
 
   if (backup_options_test) {
