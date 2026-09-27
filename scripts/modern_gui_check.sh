@@ -619,17 +619,33 @@ else
   record_fail "表单字段分发没有 default 兜底"
 fi
 # 预览必须继续复用真实 Filter，并且用 lstat（不跟随软链接）。
-if grep -qF 'filter.ShouldIncludeFile(' "$ROOT_DIR/ui/modern/filter_rule_model.cpp" \
-   && grep -qF 'filter.ShouldPruneDirectory(' "$ROOT_DIR/ui/modern/filter_rule_model.cpp" \
-   && grep -qF 'filter.ShouldSkipSpecialEntry(' "$ROOT_DIR/ui/modern/filter_rule_model.cpp"; then
+#
+# PR #17 最后一轮之后，这段判定不再写在 Qt 层：它搬进了共享核心
+# src/core/backup_preview.cpp，GUI 与 CLI 预览调用的是同一个函数。所以断言也
+# 跟着挪到核心上，并额外钉住"GUI 层没有第二套匹配逻辑"。
+# 只看 UI 文件里有没有某个字符串，会把"实现位置"当成"正确性"。
+if grep -qF 'bp::PreviewBackupSelection(' "$ROOT_DIR/ui/modern/filter_rule_model.cpp"; then
+  record_pass "GUI 预览委托给共享核心 PreviewBackupSelection"
+else
+  record_fail "GUI 预览没有走共享核心"
+fi
+if grep -qF 'filter.ShouldIncludeFile(' "$ROOT_DIR/src/core/backup_preview.cpp" \
+   && grep -qF 'filter.ShouldPruneDirectory(' "$ROOT_DIR/src/core/backup_preview.cpp" \
+   && grep -qF 'filter.ShouldSkipSpecialEntry(' "$ROOT_DIR/src/core/backup_preview.cpp"; then
   record_pass "预览沿用真实 Filter 的三条判定（include / 剪枝 / 特殊文件）"
 else
   record_fail "预览没有走真实 Filter 判定"
 fi
-if grep -qF '::lstat(' "$ROOT_DIR/ui/modern/filter_rule_model.cpp"; then
+if grep -qF '::lstat(' "$ROOT_DIR/src/core/backup_preview.cpp"; then
   record_pass "预览用 lstat 取元数据（不跟随软链接）"
 else
   record_fail "预览没有用 lstat"
+fi
+if grep -qF 'filter.ShouldIncludeFile(' "$ROOT_DIR/ui/modern/filter_rule_model.cpp" \
+   || grep -qF 'filter.ShouldPruneDirectory(' "$ROOT_DIR/ui/modern/filter_rule_model.cpp"; then
+  record_fail "GUI 层又出现了自己的匹配逻辑"
+else
+  record_pass "GUI 层没有第二套匹配逻辑（判定只有共享核心那一份）"
 fi
 # 预览要能把各类条目分开说清楚，并且点出 socket 的后果。
 for tag in '符号链接' 'FIFO' '字符设备' '块设备' 'socket（不支持归档）'; do
