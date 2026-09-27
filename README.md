@@ -77,20 +77,27 @@ VMware Ubuntu
 ## Sprint 1：基础 CLI Backup / Restore（v0.1）
 
 ```bash
-make                      # 构建 build/backupctl 与 build/archive-cli
+make                      # 构建产品 CLI build/backupctl
 ./build/backupctl backup <source_directory>          # 写进配置好的备份仓库
+./build/backupctl preview <source_directory>         # 只读：先看看会选中哪些条目
 ./build/backupctl restore <file_name> <destination_directory>
 ```
 
 产品 CLI 与 Modern GUI 是**同一套业务模型**：归档落在配置好的仓库里、文件名由程序
 生成（`backupctl repository list` 可以列出），恢复只接受仓库内的单组件
 `.bak` 名字。想指定任意归档路径的能力只存在于测试夹具
-`build/archive-cli`（不是产品命令，见 `docs/basic_cli_usage.md`）。
+`build/archive-cli`（不是产品命令、也不在默认构建目标里，要
+`make test-fixtures` 才会构建，见 `docs/basic_cli_usage.md`）。
 
-打包时可以按需筛选哪些内容进入备份文件：
+打包时可以按需筛选哪些内容进入备份文件；`preview` 用同一组规则先列一遍，
+它不建归档、不需要仓库、也不改任何状态：
 
 ```bash
-./build/backupctl backup ./source ./backup.bak \
+./build/backupctl preview ./source \
+  --include 'ext:cpp;h;hpp' \
+  --exclude 'path:**/build/**'
+
+./build/backupctl backup ./source \
   --include 'ext:cpp;h;hpp' \
   --exclude 'path:**/build/**' \
   --exclude 'ext:tmp;log'

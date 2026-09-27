@@ -28,12 +28,19 @@ make
 make clean && make
 ```
 
-产物：`build/backupctl`
+产物：`build/backupctl`（产品 CLI）。
+
+测试夹具 `build/archive-cli` **不在默认构建目标里**，需要时显式构建：
+
+```bash
+make test-fixtures        # 产出 build/archive-cli
+```
 
 ## 4. CLI 用法
 
 ```bash
 ./build/backupctl config repository set <仓库目录>   # 先配置仓库
+./build/backupctl preview <source_directory> [--include R]... [--exclude R]...
 ./build/backupctl backup <source_directory> [--pack ...] [--compression ...] [--encryption ...] [--include R]... [--exclude R]...
 ./build/backupctl repository list                    # 列出仓库里的归档
 ./build/backupctl restore <file_name> <destination_directory>
@@ -53,11 +60,17 @@ make clean && make
   绝对路径与符号链接。
 * 历史遗留的 `BKPARCH`（Archive Format v0.1）归档仍然**读得回来**：
   只要它作为合法记录放在仓库里，`restore` 就能恢复它。
+* `preview` 是**只读**的：用同一组筛选规则列出"哪些条目会进归档"，不创建
+  归档、不需要仓库、不改 config / schedule / history。它与 Modern GUI 的
+  Manual Backup 预览调用同一个核心（`backupproject::PreviewBackupSelection`），
+  所以两边给出的条目集合、顺序与截断行为完全一致。预览一次最多检查 300 个
+  条目（与 GUI 同一个上限），超过时会在输出里明确写出来。
 
 ### 归档格式的测试夹具
 
 `build/archive-cli` 是**测试专用**的可执行文件，不是产品命令、不出现在
-`backupctl --help` 里、也不参与 GUI/CLI parity：
+`backupctl --help` 里、不在默认构建目标里（要 `make test-fixtures`）、
+也不参与 GUI/CLI parity：
 
 ```bash
 ./build/archive-cli backup <source_directory> <backup_file> [filter...] [pipeline...]
@@ -70,8 +83,11 @@ make clean && make
 ## 5. 完整示例
 
 ```bash
-./build/backupctl backup testdata/source backup.bak
-./build/backupctl restore backup.bak restored
+./build/backupctl config repository set ~/backups
+./build/backupctl preview testdata/source --include 'ext:txt'
+./build/backupctl backup testdata/source
+./build/backupctl repository list                    # 拿到程序生成的名字
+./build/backupctl restore <上面列出的 file_name> restored
 diff -r testdata/source restored   # 应无差异
 ```
 
@@ -89,14 +105,24 @@ diff -r testdata/source restored   # 应无差异
 | 0 | 成功 |
 | 1 | 操作失败（路径、文件类型、I/O 等） |
 | 2 | 命令行用法错误 |
+| 3 | 已经有另一个 backup-project 实例在跑（GUI 或 CLI） |
+
+**整个产品同一时刻只允许一个进程**：Modern GUI、`backupctl` 与历史遗留的
+Qt Widgets GUI 共用同一把按 Unix UID 定位的应用锁。已经有实例在跑时，任何
+业务命令（包括只读的 `preview`）都以 3 退出，并且在碰配置 / 仓库 / 计划之前
+就退出。`--help` 是唯一的例外：看用法不需要抢锁。
+
+`--config-file` / `--schedule-file` 可以覆盖配置与计划存储的位置，但**换不掉
+那把锁**——它只取决于 UID。
 
 ## 8. 测试与质量检查
 
 ```bash
 make test       # 端到端 round-trip + 错误路径测试
 ./scripts/lint.sh
-valgrind --leak-check=full --show-leak-kinds=all ./build/backupctl backup <src> <repo>
-valgrind --leak-check=full --show-leak-kinds=all ./build/backupctl restore <repo> <dest>
+valgrind --leak-check=full --show-leak-kinds=all ./build/backupctl preview <src>
+valgrind --leak-check=full --show-leak-kinds=all ./build/backupctl backup <src>
+valgrind --leak-check=full --show-leak-kinds=all ./build/backupctl restore <file_name> <dest>
 make sanitize   # ASan + UBSan 构建，产物 build-sanitize/backupctl
 ```
 
