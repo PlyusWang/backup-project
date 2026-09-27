@@ -20,17 +20,16 @@ set -uo pipefail
 
 ROOT_DIR="$(cd "$(dirname "$BASH_SOURCE")/.." && pwd)"
 BACKUPCTL="$ROOT_DIR/build/backupctl"
+ARCHIVE_CLI="$ROOT_DIR/build/archive-cli"
 GUI="$ROOT_DIR/build/backup-gui-modern"
 # 放在已被 .gitignore 覆盖的 testdata/ 下面：测试失败时留下的现场不会变成
 # "未跟踪文件"，也就不会有人手滑把它提交进去。
 TEST_ROOT="$ROOT_DIR/testdata/schedule"
 OUT="$TEST_ROOT/last-output.txt"
 
-# 全应用单实例锁住在配置根里（<XDG_CONFIG_HOME>/backup-project/backup-gui-modern/
-# app.lock，见 app_paths.h）。把配置根指到测试私有目录有两个好处：
-#   * 测试不会去抢用户桌面上那把真实的锁，也不会被用户开着的 GUI 干扰；
-#   * 仍然真实验证"GUI 与 CLI 解析出同一个锁路径"这条约束——两边都只认这一个
-#     环境变量，谁也没有第二套算法。
+# 全应用单实例锁现在只由 Unix UID 决定（/run/user/<uid>/backup-project.lock），
+# 与 XDG_CONFIG_HOME 无关：把配置根指到测试私有目录只是为了让 config.json /
+# schedule.json 不落到真实用户目录里；锁本身仍然是"GUI 与 CLI 共用同一把"。
 export XDG_CONFIG_HOME="$TEST_ROOT/xdg"
 mkdir -p "$XDG_CONFIG_HOME"
 
@@ -99,8 +98,8 @@ chmod -R u+rwX "$TEST_ROOT" 2>/dev/null || true
 rm -rf "$TEST_ROOT"
 mkdir -p "$TEST_ROOT"
 
-if [ ! -x "$BACKUPCTL" ]; then
-  echo "[schedule-test] backupctl is missing; building first..."
+if [ ! -x "$BACKUPCTL" ] || [ ! -x "$ARCHIVE_CLI" ]; then
+  echo "[schedule-test] backupctl/archive-cli is missing; building first..."
   make -C "$ROOT_DIR" >/dev/null || exit 1
 fi
 
@@ -154,44 +153,44 @@ printf 'hello\n' > "$CLI/src/a.txt"
 printf 'world\n' > "$CLI/src/b.log"
 
 expect_exit "B.01 legacy backup（无 pipeline 选项）" 0 \
-  "$BACKUPCTL" backup "$CLI/src" "$CLI/legacy.bak"
+  "$ARCHIVE_CLI" backup "$CLI/src" "$CLI/legacy.bak"
 expect_magic "B.02 legacy 产物是 v0.1（BKPARCH）" "$CLI/legacy.bak" "424b504152434800"
 expect_grep "B.03 legacy 输出说明走的是 v0.1" "legacy v0.1"
 
 expect_exit "B.04 pipeline 备份（ustar + huffman）" 0 \
-  "$BACKUPCTL" backup "$CLI/src" "$CLI/v2.bak" --pack ustar --compression huffman
+  "$ARCHIVE_CLI" backup "$CLI/src" "$CLI/v2.bak" --pack ustar --compression huffman
 expect_magic "B.05 pipeline 产物是 v2（BKPCNT2）" "$CLI/v2.bak" "424b50434e543200"
 expect_grep "B.06 pipeline 输出报告真实算法" "pack=ustar compression=huffman encryption=none"
 
 expect_exit "B.07 只给 --encryption none 也算 pipeline" 0 \
-  "$BACKUPCTL" backup "$CLI/src" "$CLI/none.bak" --encryption none
+  "$ARCHIVE_CLI" backup "$CLI/src" "$CLI/none.bak" --encryption none
 expect_magic "B.08 显式 none 走 v2" "$CLI/none.bak" "424b50434e543200"
 
 expect_exit "B.09 只给 --include 仍然走 legacy" 0 \
-  "$BACKUPCTL" backup "$CLI/src" "$CLI/filter.bak" --include 'ext:txt'
+  "$ARCHIVE_CLI" backup "$CLI/src" "$CLI/filter.bak" --include 'ext:txt'
 expect_magic "B.10 只有筛选规则时仍是 v0.1" "$CLI/filter.bak" "424b504152434800"
 
 expect_exit "B.11 未知打包方式是用法错误" 2 \
-  "$BACKUPCTL" backup "$CLI/src" "$CLI/bad.bak" --pack gzip
+  "$ARCHIVE_CLI" backup "$CLI/src" "$CLI/bad.bak" --pack gzip
 expect_grep "B.12 未知打包方式报错点名取值" "unknown pack method"
 
 expect_exit "B.13 未知选项是用法错误" 2 \
-  "$BACKUPCTL" backup "$CLI/src" "$CLI/bad2.bak" --from-filter 'ext:cpp'
+  "$ARCHIVE_CLI" backup "$CLI/src" "$CLI/bad2.bak" --from-filter 'ext:cpp'
 
-expect_exit "B.14 legacy 恢复" 0 "$BACKUPCTL" restore "$CLI/legacy.bak" "$CLI/out-legacy"
+expect_exit "B.14 legacy 恢复" 0 "$ARCHIVE_CLI" restore "$CLI/legacy.bak" "$CLI/out-legacy"
 expect_content "B.15 legacy 恢复内容正确" "$CLI/out-legacy/a.txt" "hello"
 
-expect_exit "B.16 v2 恢复" 0 "$BACKUPCTL" restore "$CLI/v2.bak" "$CLI/out-v2"
+expect_exit "B.16 v2 恢复" 0 "$ARCHIVE_CLI" restore "$CLI/v2.bak" "$CLI/out-v2"
 expect_content "B.17 v2 恢复内容正确" "$CLI/out-v2/a.txt" "hello"
 
 expect_exit "B.18 筛选后的备份只装匹配到的文件" 0 \
-  "$BACKUPCTL" backup "$CLI/src" "$CLI/filter2.bak" --include 'ext:txt'
-expect_exit "B.19 恢复筛选备份" 0 "$BACKUPCTL" restore "$CLI/filter2.bak" "$CLI/out-filter"
+  "$ARCHIVE_CLI" backup "$CLI/src" "$CLI/filter2.bak" --include 'ext:txt'
+expect_exit "B.19 恢复筛选备份" 0 "$ARCHIVE_CLI" restore "$CLI/filter2.bak" "$CLI/out-filter"
 expect_file "B.20 匹配到的文件在" "$CLI/out-filter/a.txt"
 expect_absent "B.21 被筛掉的文件不在" "$CLI/out-filter/b.log"
 
 expect_exit "B.22 不允许 --password（密码绝不进 argv）" 2 \
-  "$BACKUPCTL" backup "$CLI/src" "$CLI/pw.bak" --password secret
+  "$ARCHIVE_CLI" backup "$CLI/src" "$CLI/pw.bak" --password secret
 
 # ============================================================
 echo "[schedule-test] C. 密码只从 TTY 读（真实 PTY）"
@@ -279,26 +278,26 @@ mkdir -p "$CLI/secret-src"
 printf 'top secret payload\n' > "$CLI/secret-src/secret.txt"
 
 expect_exit "C.01 PTY 加密备份（密码问两次）" 0 \
-  python3 "$PTY_RUN" "$BACKUPCTL" "hunter2,hunter2" \
+  python3 "$PTY_RUN" "$ARCHIVE_CLI" "hunter2,hunter2" \
   backup "$CLI/secret-src" "$CLI/secret.bak" --encryption aes-256-ctr-hmac-sha256
 expect_file "C.02 加密归档已生成" "$CLI/secret.bak"
 expect_magic "C.03 加密归档是 v2 container" "$CLI/secret.bak" "424b50434e543200"
 
 expect_exit "C.04 两次密码不一致必须失败" 1 \
-  python3 "$PTY_RUN" "$BACKUPCTL" "one,two" \
+  python3 "$PTY_RUN" "$ARCHIVE_CLI" "one,two" \
   backup "$CLI/secret-src" "$CLI/mismatch.bak" --encryption aes-256-ctr-hmac-sha256
 expect_absent "C.05 密码不一致没有留下半成品" "$CLI/mismatch.bak"
 
 expect_exit "C.06 没有 TTY 时明确失败（不从管道读密码）" 1 \
-  env -u TERM sh -c "exec 0</dev/null; exec $BACKUPCTL backup '$CLI/secret-src' '$CLI/notty.bak' --encryption aes-256-ctr-hmac-sha256"
+  env -u TERM sh -c "exec 0</dev/null; exec $ARCHIVE_CLI backup '$CLI/secret-src' '$CLI/notty.bak' --encryption aes-256-ctr-hmac-sha256"
 expect_absent "C.07 无 TTY 时没有留下半成品" "$CLI/notty.bak"
 
 expect_exit "C.08 加密归档用正确密码恢复（问一次）" 0 \
-  python3 "$PTY_RUN" "$BACKUPCTL" "hunter2" restore "$CLI/secret.bak" "$CLI/out-secret"
+  python3 "$PTY_RUN" "$ARCHIVE_CLI" "hunter2" restore "$CLI/secret.bak" "$CLI/out-secret"
 expect_content "C.09 加密恢复内容逐字节一致" "$CLI/out-secret/secret.txt" "top secret payload"
 
 expect_exit "C.10 错误密码必须失败" 1 \
-  python3 "$PTY_RUN" "$BACKUPCTL" "wrong-password" restore "$CLI/secret.bak" "$CLI/out-wrong"
+  python3 "$PTY_RUN" "$ARCHIVE_CLI" "wrong-password" restore "$CLI/secret.bak" "$CLI/out-wrong"
 expect_absent "C.11 错误密码不会建出目标目录" "$CLI/out-wrong"
 
 # ============================================================
@@ -650,7 +649,7 @@ cc_case() {
   fi
   if [ -n "$recovery_id" ] && [ -n "$new" ]; then
     rm -rf "$CC/restored"
-    if "$BACKUPCTL" restore "$CC/repo/$new" "$CC/restored" >/dev/null 2>&1 &&
+    if "$BACKUPCTL" --config-file "$CC_CONFIG" restore "$new" "$CC/restored" >/dev/null 2>&1 &&
        diff -r "$CC/src" "$CC/restored" >/dev/null 2>&1; then
       record_pass "$recovery_id 新建的 $new 单独恢复 == 当前源"
     else
@@ -746,8 +745,8 @@ echo "[schedule-test] D4. 全应用单实例：真实进程"
 # CLI+CLI / CLI+GUI 四种组合全部拒绝，而且必须在进入任何业务逻辑之前拒绝
 # （不能出现第二个 controller，不能先读一遍配置再发现已经有实例）。
 #
-# 锁路径只由配置根（app_paths.h）决定，与 repository、--config-file、
-# --schedule-file 全都没有关系——所以下面每个 CLI 都带自己的 --config-file，
+# 锁路径只由 Unix UID 决定，与 repository、--config-file、--schedule-file、
+# XDG_CONFIG_HOME 全都没有关系——所以下面每个 CLI 都带自己的 --config-file，
 # 互相之间照样冲突。"换个参数就能绕过单实例"这条捷径是被堵死的。
 #
 # 判锁永远靠 flock，不是"锁文件存在"。SIGKILL 与"锁文件仍然留在磁盘上"
@@ -759,7 +758,12 @@ mkdir -p "$SI/src" "$SI/repo"
 printf 'single\n' > "$SI/src/a.txt"
 SI_CONFIG="$SI/config.json"
 SI_STORE="$SI/schedule.json"
-SI_APP_LOCK="$XDG_CONFIG_HOME/backup-project/backup-gui-modern/app.lock"
+# 全应用锁是 UID 专属的（/run/user/<uid>/backup-project.lock，运行目录不可用时
+# 退到 /tmp/backup-project-<uid>.lock），与 XDG_CONFIG_HOME 无关。
+APP_LOCK="/run/user/$(id -u)/backup-project.lock"
+if [ ! -d "/run/user/$(id -u)" ] || [ ! -w "/run/user/$(id -u)" ]; then
+  APP_LOCK="/tmp/backup-project-$(id -u).lock"
+fi
 
 "$BACKUPCTL" --config-file "$SI_CONFIG" config repository set "$SI/repo" >/dev/null 2>&1
 "$BACKUPCTL" --config-file "$SI_CONFIG" --schedule-file "$SI_STORE" schedule set \
@@ -771,7 +775,7 @@ SI_APP_LOCK="$XDG_CONFIG_HOME/backup-project/backup-gui-modern/app.lock"
 SI_WATCH=$!
 SI_HOLD=0
 for _ in $(seq 1 100); do
-  if grep -q "^pid=$SI_WATCH " "$SI_APP_LOCK" 2>/dev/null; then SI_HOLD=1; break; fi
+  if grep -q "^pid=$SI_WATCH " "$APP_LOCK" 2>/dev/null; then SI_HOLD=1; break; fi
   sleep 0.1
 done
 if [ "$SI_HOLD" = "1" ]; then
@@ -833,14 +837,14 @@ wait "$SI_WATCH" 2>/dev/null
 
 expect_exit "D4.16 SIGTERM 之后锁自动释放：schedule show 又能跑" 0 \
   "$BACKUPCTL" --config-file "$SI_CONFIG" --schedule-file "$SI_STORE" schedule show
-expect_file "D4.17 锁文件仍然留在磁盘上（锁不靠删文件释放）" "$SI_APP_LOCK"
+expect_file "D4.17 锁文件仍然留在磁盘上（锁不靠删文件释放）" "$APP_LOCK"
 
 # SIGKILL：内核必须释放 flock。stale 的 pid 提示留在文件里也不许把产品锁死。
 "$BACKUPCTL" --config-file "$SI_CONFIG" --schedule-file "$SI_STORE" schedule watch \
   >"$SI/watch2.log" 2>&1 &
 SI_WATCH2=$!
 for _ in $(seq 1 100); do
-  if grep -q "^pid=$SI_WATCH2 " "$SI_APP_LOCK" 2>/dev/null; then break; fi
+  if grep -q "^pid=$SI_WATCH2 " "$APP_LOCK" 2>/dev/null; then break; fi
   sleep 0.1
 done
 kill -KILL "$SI_WATCH2" 2>/dev/null
@@ -857,7 +861,7 @@ if [ -x "$GUI" ]; then
   SI_GUI1=$!
   SI_GUI_HOLD=0
   for _ in $(seq 1 150); do
-    if grep -q "^pid=$SI_GUI1 " "$SI_APP_LOCK" 2>/dev/null; then SI_GUI_HOLD=1; break; fi
+    if grep -q "^pid=$SI_GUI1 " "$APP_LOCK" 2>/dev/null; then SI_GUI_HOLD=1; break; fi
     sleep 0.1
   done
   if [ "$SI_GUI_HOLD" = "1" ]; then
@@ -889,23 +893,23 @@ fi
 # 把环境问题说成并发问题会让排障方向直接跑偏。
 SI_VICTIM="$SI/victim.txt"
 printf 'do not touch\n' > "$SI_VICTIM"
-mv "$SI_APP_LOCK" "$SI_APP_LOCK.real"
-ln -s "$SI_VICTIM" "$SI_APP_LOCK"
+mv "$APP_LOCK" "$APP_LOCK.real"
+ln -s "$SI_VICTIM" "$APP_LOCK"
 expect_exit "D4.25 锁路径是符号链接 -> 明确失败（exit 1，不是 3）" 1 \
   "$BACKUPCTL" --config-file "$SI_CONFIG" --schedule-file "$SI_STORE" schedule show
 expect_grep "D4.26 报错说清楚它是符号链接" "symbolic link"
 expect_content "D4.27 被指向的文件一个字节都没变" "$SI_VICTIM" "do not touch"
-rm -f "$SI_APP_LOCK"
-mkdir "$SI_APP_LOCK"
+rm -f "$APP_LOCK"
+mkdir "$APP_LOCK"
 expect_exit "D4.28 锁路径是目录 -> 明确失败" 1 \
   "$BACKUPCTL" --config-file "$SI_CONFIG" --schedule-file "$SI_STORE" schedule show
-rmdir "$SI_APP_LOCK"
-mkfifo "$SI_APP_LOCK"
+rmdir "$APP_LOCK"
+mkfifo "$APP_LOCK"
 expect_exit "D4.29 锁路径是 FIFO -> 明确失败（而不是挂住）" 1 \
   "$BACKUPCTL" --config-file "$SI_CONFIG" --schedule-file "$SI_STORE" schedule show
 expect_grep "D4.30 报错说清楚占名字的是 FIFO" "FIFO"
-rm -f "$SI_APP_LOCK"
-mv "$SI_APP_LOCK.real" "$SI_APP_LOCK"
+rm -f "$APP_LOCK"
+mv "$APP_LOCK.real" "$APP_LOCK"
 expect_exit "D4.31 恢复之后一切照旧" 0 \
   "$BACKUPCTL" --config-file "$SI_CONFIG" --schedule-file "$SI_STORE" schedule show
 
@@ -1124,7 +1128,7 @@ printf 'v3\n' > "$IND/src/file.txt"
 
 cp "$IND/repo/$OLDEST" "$IND/elsewhere/lone.bak"
 expect_exit "F.01 最旧的一份单独恢复成功" 0 \
-  "$BACKUPCTL" restore "$IND/elsewhere/lone.bak" "$IND/restored"
+  "$ARCHIVE_CLI" restore "$IND/elsewhere/lone.bak" "$IND/restored"
 expect_content "F.02 恢复出的是那一轮的内容（不是 delta）" "$IND/restored/file.txt" "v1"
 
 # ============================================================
@@ -1180,7 +1184,7 @@ else
   # ---- 归档：GUI 产的 v2 容器，CLI 必须恢复得回来 ----
   expect_file "I.04 GUI 的产物被留了下来（BACKUP_MODERN_KEEP_ARTIFACT）" "$PAR_KEEP"
   expect_exit "I.05 CLI 能恢复 GUI 产的归档" 0 \
-    "$BACKUPCTL" restore "$PAR_KEEP" "$PAR/restore-cli"
+    "$ARCHIVE_CLI" restore "$PAR_KEEP" "$PAR/restore-cli"
   PAR_RESTORED="$(find "$PAR/restore-cli" -name a.txt -type f 2>/dev/null | head -n 1)"
   if [ -n "$PAR_RESTORED" ] && cmp -s "$PAR/src/a.txt" "$PAR_RESTORED"; then
     record_pass "I.06 CLI 恢复出来的内容与源文件逐字节一致"
@@ -1285,7 +1289,7 @@ ERR_STORE="$ERR/schedule.json"
   >/dev/null 2>&1
 
 expect_exit "J.01 源路径不存在 -> 失败" 1 \
-  "$BACKUPCTL" backup "$ERR/missing" "$ERR/out.bak"
+  "$ARCHIVE_CLI" backup "$ERR/missing" "$ERR/out.bak"
 expect_grep "J.02 原因是核心给出的稳定原因" "Source directory does not exist"
 expect_absent "J.03 失败没有留下半份归档" "$ERR/out.bak"
 
@@ -1294,18 +1298,18 @@ expect_exit "J.04 仓库路径是普通文件 -> 失败" 1 \
 expect_grep "J.05 原因是核心给出的稳定原因" "is not a directory"
 
 expect_exit "J.06 归档路径落在源目录里 -> 失败" 1 \
-  "$BACKUPCTL" backup "$ERR/src" "$ERR/src/inner.bak"
+  "$ARCHIVE_CLI" backup "$ERR/src" "$ERR/src/inner.bak"
 expect_grep "J.07 原因说清楚是路径拓扑问题" "Destination is inside the source"
 expect_absent "J.08 被拒绝的归档没有落盘" "$ERR/src/inner.bak"
 
 expect_exit "J.09 未知选项 -> 用法错误" 2 \
-  "$BACKUPCTL" backup "$ERR/src" "$ERR/out.bak" --bogus
+  "$ARCHIVE_CLI" backup "$ERR/src" "$ERR/out.bak" --bogus
 expect_exit "J.10 非法筛选规则 -> 用法错误" 2 \
-  "$BACKUPCTL" backup "$ERR/src" "$ERR/out.bak" --include 'size:not-a-number'
+  "$ARCHIVE_CLI" backup "$ERR/src" "$ERR/out.bak" --include 'size:not-a-number'
 expect_absent "J.11 用法错误没有留下任何归档" "$ERR/out.bak"
 
 expect_exit "J.12 没有交互终端时加密备份明确失败" 1 \
-  "$BACKUPCTL" backup "$ERR/src" "$ERR/out.bak" --encryption aes-256-ctr-hmac-sha256
+  "$ARCHIVE_CLI" backup "$ERR/src" "$ERR/out.bak" --encryption aes-256-ctr-hmac-sha256
 expect_grep "J.13 原因说清楚是终端问题，且不会退回空密码" \
   "interactive terminal is required"
 expect_absent "J.14 失败没有留下归档" "$ERR/out.bak"
@@ -1332,6 +1336,208 @@ if [ "$(cksum "$ERR/broken.json" | cut -d' ' -f1)" = "$ERR_SUM_BEFORE" ]; then
   record_pass "J.21 坏 store 没有被静默改写、修复或删除"
 else
   record_fail "J.21 坏 store 没有被静默改写、修复或删除" "文件内容变了"
+fi
+
+# ============================================================
+echo "[schedule-test] K. 产品收口：全局单实例 / repository-driven CLI / 复合筛选"
+# ============================================================
+#
+# 三组合同，各自只证明一件事：
+#   G 全局单实例锁只依赖 Unix UID —— 换 XDG_CONFIG_HOME 也绕不过去；
+#   C product CLI 与 Modern GUI 是同一套 repository-driven 业务模型；
+#   F Manual Backup 的筛选能力（一条规则内多条件 AND）与 CLI 完全一致。
+
+ARCHIVE_CLI="$ROOT_DIR/build/archive-cli"
+
+# ---- G：同一个 UID、不同配置根，仍然互斥 ----
+KG="$TEST_ROOT/global-lock"
+rm -rf "$KG"; mkdir -p "$KG/a" "$KG/b" "$KG/src" "$KG/repo"
+printf 'g\n' > "$KG/src/a.txt"
+"$BACKUPCTL" --config-file "$KG/a/config.json" config repository set "$KG/repo" >/dev/null 2>&1
+"$BACKUPCTL" --config-file "$KG/b/config.json" config repository set "$KG/repo" >/dev/null 2>&1
+
+KG_APP_LOCK="/run/user/$(id -u)/backup-project.lock"
+[ -d "/run/user/$(id -u)" ] || KG_APP_LOCK="/tmp/backup-project-$(id -u).lock"
+
+# watch 必须带上自己的配置：不带的话它会因为"没有仓库"立刻退出，锁文件里那一行
+# pid 提示还在，于是 K.01 会变成"对着一个死进程"的假通过。
+# watch 需要一份**能跑**的计划：store 不存在时它会明确失败并退出（那是产品的
+# 正确行为），于是锁也就跟着放开了。所以这里先把计划配好。
+"$BACKUPCTL" --config-file "$KG/a/config.json" --schedule-file "$KG/a/schedule.json" \
+  schedule set --source "$KG/src" --interval-minutes 5 --retain 3 >/dev/null 2>&1
+XDG_CONFIG_HOME="$KG/a" "$BACKUPCTL" --config-file "$KG/a/config.json" \
+  --schedule-file "$KG/a/schedule.json" schedule watch >"$KG/watch.log" 2>&1 &
+KG_WATCH=$!
+KG_HOLD=0
+for _ in $(seq 1 100); do
+  if kill -0 "$KG_WATCH" 2>/dev/null &&
+     grep -q "^pid=$KG_WATCH " "$KG_APP_LOCK" 2>/dev/null; then KG_HOLD=1; break; fi
+  sleep 0.1
+done
+if [ "$KG_HOLD" = "1" ]; then
+  record_pass "K.01 锁落在 $KG_APP_LOCK（UID 专属，与配置根无关）且持有者活着"
+else
+  record_fail "K.01 锁落在 $KG_APP_LOCK 且持有者活着" \
+    "pid=$KG_WATCH alive=$(kill -0 "$KG_WATCH" 2>/dev/null && echo yes || echo no): $(head -1 "$KG/watch.log")"
+fi
+
+expect_exit "K.02 G1 不同 XDG_CONFIG_HOME 的第二个 CLI 仍然被拒绝" 3 \
+  env XDG_CONFIG_HOME="$KG/b" "$BACKUPCTL" --config-file "$KG/b/config.json" repository list
+expect_grep "K.03 理由是全应用单实例" "only one GUI or CLI process"
+
+if [ -x "$GUI" ]; then
+  export QT_QPA_PLATFORM=offscreen
+  expect_exit "K.04 G2 CLI 持锁时 GUI（另一配置根）被拒绝" 3 \
+    env XDG_CONFIG_HOME="$KG/b" "$GUI" --schedule-show \
+      --config-file "$KG/b/config.json" --schedule-file "$KG/b/schedule.json"
+  if [ -x "$ROOT_DIR/build/backup-gui" ]; then
+    expect_exit "K.05 G2b legacy desktop 也被同一把锁拒绝" 3 \
+      env XDG_CONFIG_HOME="$KG/b" timeout 20 "$ROOT_DIR/build/backup-gui" --smoke-test
+  else
+    echo "  SKIP  K.05：没有 build/backup-gui"
+  fi
+fi
+
+kill -TERM "$KG_WATCH" 2>/dev/null
+for _ in $(seq 1 100); do kill -0 "$KG_WATCH" 2>/dev/null || break; sleep 0.1; done
+wait "$KG_WATCH" 2>/dev/null
+
+if [ -x "$GUI" ] && [ -x "$ROOT_DIR/build/backup-gui" ]; then
+  export QT_QPA_PLATFORM=offscreen
+  XDG_CONFIG_HOME="$KG/a" "$GUI" --config-file "$KG/a/config.json" \
+    --schedule-file "$KG/a/schedule.json" >"$KG/gui1.log" 2>&1 &
+  KG_GUI=$!
+  for _ in $(seq 1 150); do
+    grep -q "^pid=$KG_GUI " "/run/user/$(id -u)/backup-project.lock" 2>/dev/null && break
+    sleep 0.1
+  done
+  expect_exit "K.06 G3 GUI+GUI（不同配置根）仍然互斥" 3 \
+    env XDG_CONFIG_HOME="$KG/b" "$GUI" --config-file "$KG/b/config.json" \
+      --schedule-file "$KG/b/schedule.json"
+  kill -TERM "$KG_GUI" 2>/dev/null
+  for _ in $(seq 1 150); do kill -0 "$KG_GUI" 2>/dev/null || break; sleep 0.1; done
+  kill -KILL "$KG_GUI" 2>/dev/null
+  wait "$KG_GUI" 2>/dev/null
+  expect_exit "K.07 GUI 退出之后锁自动释放（CLI 又能跑）" 0 \
+    env XDG_CONFIG_HOME="$KG/b" "$BACKUPCTL" --config-file "$KG/b/config.json" \
+      repository list
+fi
+
+# ---- C：product CLI 与 Modern GUI 同一套 repository-driven 模型 ----
+KC="$TEST_ROOT/cli-model"
+rm -rf "$KC"; mkdir -p "$KC/src" "$KC/repo-a" "$KC/repo-b" "$KC/dest"
+printf 'c\n' > "$KC/src/a.txt"
+"$BACKUPCTL" --config-file "$KC/config.json" config repository set "$KC/repo-a" >/dev/null 2>&1
+
+expect_exit "K.08 C1 CLI backup 写进配置好的仓库" 0 \
+  "$BACKUPCTL" --config-file "$KC/config.json" backup "$KC/src"
+KC_NAME="$(ls -1 "$KC/repo-a" | head -n 1)"
+if [ -n "$KC_NAME" ]; then
+  record_pass "K.09 C1 归档由程序命名并落在仓库里（$KC_NAME）"
+else
+  record_fail "K.09 C1 归档由程序命名并落在仓库里" "仓库是空的"
+fi
+"$BACKUPCTL" --config-file "$KC/config.json" repository list >"$OUT" 2>&1
+expect_grep "K.10 C1 归档被认成 v2 容器" "container-v2"
+expect_grep "K.11 C1 归档来源是 manual" "origin=manual"
+
+expect_exit "K.12 C2 换仓库之后 CLI backup 落到新仓库" 0 \
+  env "$BACKUPCTL" --config-file "$KC/config.json" config repository set "$KC/repo-b"
+expect_exit "K.13 C2 第二次 backup" 0 \
+  "$BACKUPCTL" --config-file "$KC/config.json" backup "$KC/src"
+if [ "$(ls -1 "$KC/repo-b" | wc -l)" = "1" ]; then
+  record_pass "K.14 C2 新仓库里有且只有一份"
+else
+  record_fail "K.14 C2 新仓库里有且只有一份" "实际 $(ls -1 "$KC/repo-b" | wc -l) 份"
+fi
+"$BACKUPCTL" --config-file "$KC/config.json" repository list >"$OUT" 2>&1
+expect_grep "K.15 C2 CLI repository list 看到它" "$(ls -1 "$KC/repo-b" | head -n 1)"
+
+expect_exit "K.16 C4 restore 只接受仓库内的单组件名字" 0 \
+  "$BACKUPCTL" --config-file "$KC/config.json" restore "$(ls -1 "$KC/repo-b" | head -n 1)" "$KC/dest"
+for bad in "../x.bak" "sub/x.bak" ".." "x" "a\\b.bak"; do
+  expect_exit "K.17 C4 拒绝非法名字 [$bad]" 1 \
+    "$BACKUPCTL" --config-file "$KC/config.json" restore "$bad" "$KC/dest2"
+done
+expect_exit "K.18 C4 拒绝绝对路径" 1 \
+  "$BACKUPCTL" --config-file "$KC/config.json" restore "$KC/repo-b/$KC_NAME" "$KC/dest3"
+
+expect_exit "K.19 C3 CLI backup 支持与 GUI 相同的 pipeline 选项" 0 \
+  "$BACKUPCTL" --config-file "$KC/config.json" backup "$KC/src" --pack ustar \
+  --compression huffman --include 'ext:txt'
+expect_exit "K.20 C3 未知 pack key 与 GUI 一样被拒绝" 2 \
+  "$BACKUPCTL" --config-file "$KC/config.json" backup "$KC/src" --pack tar
+
+# C5：legacy v0.1 归档仍然读得回来（reader compatibility 不因产品模型变化而丢）
+"$ARCHIVE_CLI" backup "$KC/src" "$KC/repo-b/legacy_fixture.bak" >/dev/null 2>&1
+expect_exit "K.21 C5 仓库里的 legacy v0.1 能被 product CLI 恢复" 0 \
+  "$BACKUPCTL" --config-file "$KC/config.json" restore "legacy_fixture.bak" "$KC/dest-legacy"
+expect_grep "K.22 C5 恢复命令成功" "Restore completed successfully"
+KC_RESTORED="$(find "$KC/dest-legacy" -name a.txt -type f 2>/dev/null | head -n 1)"
+if [ -n "$KC_RESTORED" ] && cmp -s "$KC/src/a.txt" "$KC_RESTORED"; then
+  record_pass "K.23 C5 legacy 归档恢复出来的内容逐字节一致"
+else
+  record_fail "K.23 C5 legacy 归档恢复出来的内容逐字节一致" "找不到或内容不同: $KC_RESTORED"
+fi
+
+# ---- F：Manual Backup 的复合筛选与 CLI 一致 ----
+KF="$TEST_ROOT/manual-filter"
+rm -rf "$KF"; mkdir -p "$KF/src"
+printf 'aaaaaaaaaa' > "$KF/src/big.txt"
+printf 'b' > "$KF/src/small.txt"
+printf 'cccc' > "$KF/src/other.md"
+"$ARCHIVE_CLI" backup "$KF/src" "$KF/cli.bak" --include 'name:*.txt size:<5' >/dev/null 2>&1
+"$ARCHIVE_CLI" restore "$KF/cli.bak" "$KF/cli" >/dev/null 2>&1
+KF_CLI="$(find "$KF/cli" -type f 2>/dev/null | sed 's|.*/||' | sort | tr '\n' ' ')"
+if [ -z "$KF_CLI" ]; then
+  record_fail "K.23 F1 CLI 复合规则命中一个文件" "恢复目录是空的"
+else
+  record_pass "K.23 F1 CLI 复合规则（AND）结果是 [$KF_CLI]"
+fi
+
+if [ -x "$GUI" ]; then
+  export QT_QPA_PLATFORM=offscreen
+  "$GUI" --self-test "$KF/src" "$KF/gui.bak" "$KF/gui" \
+    --include 'name:*.txt size:<5' >"$KF/gui.log" 2>&1
+  KF_GUI="$(find "$KF/gui" -type f 2>/dev/null | sed 's|.*/||' | sort | tr '\n' ' ')"
+  if [ "$KF_GUI" = "$KF_CLI" ] && [ -n "$KF_GUI" ]; then
+    record_pass "K.24 F1 GUI 与 CLI 用同一条复合规则得到同一结果"
+  else
+    record_fail "K.24 F1 GUI 与 CLI 用同一条复合规则得到同一结果" \
+      "GUI=[$KF_GUI] CLI=[$KF_CLI]"
+  fi
+
+  # F3：非法复合规则两边都拒绝，而且都不执行备份
+  "$GUI" --self-test "$KF/src" "$KF/bad.bak" "$KF/bad" \
+    --include 'size:not-a-number' >/dev/null 2>&1
+  KF_GUI_BAD=$?
+  "$ARCHIVE_CLI" backup "$KF/src" "$KF/bad-cli.bak" --include 'size:not-a-number' >/dev/null 2>&1
+  KF_CLI_BAD=$?
+  if [ "$KF_GUI_BAD" != "0" ] && [ "$KF_CLI_BAD" != "0" ]; then
+    record_pass "K.25 F3 非法规则：GUI 与 CLI 都拒绝（$KF_GUI_BAD / $KF_CLI_BAD）"
+  else
+    record_fail "K.25 F3 非法规则：GUI 与 CLI 都拒绝" "GUI=$KF_GUI_BAD CLI=$KF_CLI_BAD"
+  fi
+  expect_absent "K.26 F3 被拒绝的那一次没有留下归档" "$KF/bad.bak"
+  expect_absent "K.27 F3 被拒绝的那一次没有留下归档（CLI）" "$KF/bad-cli.bak"
+
+  # F4：include 与 exclude 的优先级在两边一致
+  # 故意选一个"include 命中两个、exclude 砍掉其中一个"的组合：结果必须非空，
+  # 否则"两边都是空的"也能让这条断言通过。
+  "$ARCHIVE_CLI" backup "$KF/src" "$KF/mix.bak" \
+    --include 'name:*.txt' --exclude 'name:big*' >/dev/null 2>&1
+  "$ARCHIVE_CLI" restore "$KF/mix.bak" "$KF/mix" >/dev/null 2>&1
+  KF_MIX="$(find "$KF/mix" -type f 2>/dev/null | sed 's|.*/||' | sort | tr '\n' ' ')"
+  "$GUI" --self-test "$KF/src" "$KF/mix-gui.bak" "$KF/mix-gui" \
+    --include 'name:*.txt' --exclude 'name:big*' >/dev/null 2>&1
+  KF_MIX_GUI="$(find "$KF/mix-gui" -type f 2>/dev/null | sed 's|.*/||' | sort | tr '\n' ' ')"
+  # 两边都必须给出**非空**且相同的结果：两个空结果相等说明不了任何事。
+  if [ -n "$KF_MIX" ] && [ "$KF_MIX" = "$KF_MIX_GUI" ]; then
+    record_pass "K.28 F4 include+exclude 优先级在两边一致（[$KF_MIX]）"
+  else
+    record_fail "K.28 F4 include+exclude 优先级在两边一致" \
+      "GUI=[$KF_MIX_GUI] CLI=[$KF_MIX]"
+  fi
 fi
 
 # ============================================================
