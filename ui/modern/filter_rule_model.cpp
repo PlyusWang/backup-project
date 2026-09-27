@@ -300,8 +300,12 @@ QString PreviewTypeLabel(bp::EntryType type) {
   return QStringLiteral("未知类型");
 }
 
-// 把共享核心给出的判定翻成界面文案。判定本身（included / 剪枝 / socket）全部
+// 把共享核心给出的判定翻成界面文案。判定本身（included / 剪枝 / 排除）全部
 // 来自 backupproject::PreviewBackupSelection，这里只负责措辞。
+//
+// 只有三种取值，因为遍历的判定就是三选一：没有被排除的 socket 不让遍历继续
+// 走下去（真实 Backup 也会在它上面失败），所以它不是某一行的标签，而是整次
+// 预览的失败原因——见 FilterRuleModel::ScanPreview 的错误分支。
 QString PreviewTag(const bp::PreviewItem& item) {
   switch (item.disposition) {
     case bp::PreviewDisposition::kDirectoryPruned:
@@ -310,8 +314,6 @@ QString PreviewTag(const bp::PreviewItem& item) {
       return item.is_directory
                  ? QStringLiteral("目录（保留结构）")
                  : PreviewTypeLabel(item.type) + QStringLiteral(" · 进入归档");
-    case bp::PreviewDisposition::kUnsupportedSocket:
-      return QStringLiteral("不支持的 socket（会导致备份失败）");
     case bp::PreviewDisposition::kExcludedByRule:
       break;
   }
@@ -336,11 +338,22 @@ FilterRuleModel::FilterRuleModel(BackupController* controller, QObject* parent)
       StartScan(next_source, next_drafts);
       return;
     }
+    last_error_kind_ = outcome.error_kind;
     if (!outcome.error.isEmpty()) {
       SetError(outcome.error);
+      // 失败时不留上一份成功的列表：那是一份**不再成立**的结果（源目录可能已经
+      // 变了、规则可能已经改了），把它摆在错误信息旁边只会让人以为"大部分还是
+      // 好的"。预览的答案就是那句错误。
+      preview_items_.clear();
+      preview_truncated_ = false;
+      preview_total_ = 0;
+      preview_included_ = 0;
+      preview_source_ = outcome.source_path;
     } else {
       preview_items_ = outcome.items;
       preview_truncated_ = outcome.truncated;
+      preview_total_ = outcome.total;
+      preview_included_ = outcome.included;
       preview_source_ = outcome.source_path;
     }
     emit previewChanged();
@@ -730,17 +743,23 @@ FilterRuleModel::PreviewOutcome FilterRuleModel::ScanPreview(
   const bp::PreviewResult result =
       bp::PreviewBackupSelection(source_path.toStdString(), drafts, window);
   if (!result.error.empty()) {
+    outcome.error_kind = result.error_kind;
     if (result.error_kind == bp::PreviewErrorKind::kSourceUnusable) {
       // 核心只报事实，中文措辞留在界面这一层。
       outcome.error = QStringLiteral("源目录不存在或不是目录：") + source_path;
     } else {
-      // 规则被核心拒绝时原样转述：这是语法裁决的原文，翻译只会让它和 CLI
-      // 说出来的话不一样。正常路径到不了这里（规则在进入列表前已经校验过）。
+      // 其余失败一律转述核心原文，一个字都不改：
+      //   * kRuleRejected / kScanFailed / kSelectionBlocked 的诊断来自共享
+      //     核心，翻译只会让它和 CLI、和真实 Backup 说出来的话不一样；
+      //   * kSelectionBlocked 的那句话就是"备份会怎么失败"，界面里最该原样
+      //     看到的就是它。
       outcome.error = QString::fromStdString(result.error);
     }
     return outcome;
   }
   outcome.truncated = result.truncated;
+  outcome.total = static_cast<int>(result.total_entries);
+  outcome.included = static_cast<int>(result.included_count);
   outcome.items.reserve(static_cast<int>(result.items.size()));
   for (const bp::PreviewItem& preview : result.items) {
     QVariantMap item;

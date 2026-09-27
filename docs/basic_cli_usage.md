@@ -63,8 +63,12 @@ make test-fixtures        # 产出 build/archive-cli
 * `preview` 是**只读**的：用同一组筛选规则列出"哪些条目会进归档"，不创建
   归档、不需要仓库、不改 config / schedule / history。它与 Modern GUI 的
   Manual Backup 预览调用同一个核心（`backupproject::PreviewBackupSelection`），
-  所以两边给出的条目集合、顺序与截断行为完全一致。预览一次最多检查 300 个
-  条目（与 GUI 同一个上限），超过时会在输出里明确写出来。
+  所以两边给出的条目集合、顺序、失败语义与截断行为完全一致。
+  预览会**完整验证整棵源目录树**（遍历与真实备份共用同一份实现：同样的
+  `lstat` / `opendir` / `readdir`、同样的 lexical DFS 顺序、同样的失败语义），
+  但最多**列出** 300 个条目；超出时会在输出里明确写出总数、窗口大小与实际列出
+  的数量。所以"第 301 个条目是 socket"这类情况不会被窗口掩盖：预览会直接报
+  `Backup would fail unless this entry is excluded.` 并以 1 退出。
 
 ### 归档格式的测试夹具
 

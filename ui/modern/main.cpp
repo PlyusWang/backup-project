@@ -374,6 +374,12 @@ int RunPreviewTest(backup_modern::FilterRuleModel* model, const QString& source,
   }
   if (!model->lastError().isEmpty()) {
     std::fprintf(stderr, "Error: %s\n", qPrintable(model->lastError()));
+    if (model->lastErrorKind() ==
+        backupproject::PreviewErrorKind::kSelectionBlocked) {
+      // 与 backupctl preview 逐字一致的第二行：这不是语法问题，而是"按当前
+      // 规则备份必然失败"，所以两边都用 exit 1 并说清该怎么办。
+      std::printf("Backup would fail unless this entry is excluded.\n");
+    }
     return 1;
   }
 
@@ -387,13 +393,16 @@ int RunPreviewTest(backup_modern::FilterRuleModel* model, const QString& source,
       included_paths << item.value(QStringLiteral("path")).toString();
     }
   }
-  std::printf("Preview: %d matching item(s)\n",
-              static_cast<int>(included_paths.size()));
+  // 计数取整棵树的数字（与 CLI 打印的是同一个字段），窗口信息取核心给出的
+  // total / truncated。列表本身只到窗口为止，所以两者在截断时可以不同——
+  // 下面的 Note 行负责把这件事说清楚。
+  std::printf("Preview: %d matching item(s)\n", model->previewIncluded());
   if (model->previewTruncated()) {
     std::printf(
-        "Note: the source tree has more than %d entries; only the "
-        "first %d were examined.\n",
-        model->previewLimit(), model->previewLimit());
+        "Note: the source tree has %d entries; only the first %d were "
+        "examined, and %d matching item(s) are listed below.\n",
+        model->previewTotal(), model->previewLimit(),
+        static_cast<int>(included_paths.size()));
   }
   for (const QString& path : included_paths) {
     std::printf("%s\n", qPrintable(path));

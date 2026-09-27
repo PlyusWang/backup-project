@@ -470,7 +470,7 @@ QML 表单
 - 左侧文件预览：**逐条调用真实 Filter 判定**（ShouldPruneDirectory /
   ShouldIncludeFile / ShouldSkipSpecialEntry），标注“进入归档 / 被规则排除 /
   目录被排除（整棵剪掉）/ 特殊文件（会导致备份失败）”。
-  预览在后台线程扫描（QtConcurrent），最多 300 项，超过会明说“仅预览前 300 项”，
+  预览在后台线程扫描（QtConcurrent），最多列出 300 项，超过会明说总数与窗口大小，
   不会因为目录过大卡死界面。
 - 右侧规则列表：每条规则显示动作、人类可读摘要与 DSL，可上移 / 下移 / 删除。
 - 编辑器底部显示人类可读摘要、只读 DSL 预览与“CLI 等价参数”。

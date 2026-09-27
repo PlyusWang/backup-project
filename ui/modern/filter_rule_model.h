@@ -20,6 +20,7 @@
 #include <vector>
 
 #include "backup_controller.h"
+#include "backup_preview.h"
 #include "filter_rule_builder.h"
 
 namespace backup_modern {
@@ -34,6 +35,11 @@ class FilterRuleModel : public QObject {
   Q_PROPERTY(bool previewBusy READ previewBusy NOTIFY previewChanged)
   Q_PROPERTY(bool previewTruncated READ previewTruncated NOTIFY previewChanged)
   Q_PROPERTY(int previewShown READ previewShown NOTIFY previewChanged)
+  // 整棵树里被检查过的条目总数（不受显示窗口限制）。共享核心会完整验证整棵
+  // 源目录树，所以这个数字是"预览到底看了多少"，不是"列表里有多少行"。
+  Q_PROPERTY(int previewTotal READ previewTotal NOTIFY previewChanged)
+  // 整棵树里会进入归档的条目数。同样是全量数字：truncated 为真时它比列表长。
+  Q_PROPERTY(int previewIncluded READ previewIncluded NOTIFY previewChanged)
   Q_PROPERTY(int previewLimit READ previewLimit CONSTANT)
   Q_PROPERTY(QString lastError READ lastError NOTIFY lastErrorChanged)
   // 当前展示的预览结果对应哪个源目录（界面据此提示“结果已过期”）。
@@ -50,7 +56,14 @@ class FilterRuleModel : public QObject {
   bool previewBusy() const { return preview_busy_; }
   bool previewTruncated() const { return preview_truncated_; }
   int previewShown() const { return static_cast<int>(preview_items_.size()); }
+  int previewTotal() const { return preview_total_; }
+  int previewIncluded() const { return preview_included_; }
   int previewLimit() const { return kPreviewLimit; }
+  // 上一次失败的类别。--preview-test 用它决定"要不要多打一行该怎么办"，
+  // 界面本身只用 lastError 的文案。
+  backupproject::PreviewErrorKind lastErrorKind() const {
+    return last_error_kind_;
+  }
   QString lastError() const { return last_error_; }
   QString previewSource() const { return preview_source_; }
 
@@ -94,7 +107,11 @@ class FilterRuleModel : public QObject {
   struct PreviewOutcome {
     QVariantList items;
     bool truncated = false;
+    int total = 0;     // 整棵树里被检查过的条目数
+    int included = 0;  // 整棵树里会进入归档的条目数
     QString error;
+    backupproject::PreviewErrorKind error_kind =
+        backupproject::PreviewErrorKind::kNone;
     QString source_path;  // 这份结果对应哪个源目录
   };
   static PreviewOutcome ScanPreview(
@@ -123,7 +140,11 @@ class FilterRuleModel : public QObject {
   QString pending_source_;
   std::vector<backupproject::FilterRuleDraft> pending_drafts_;
   QString preview_source_;
+  int preview_total_ = 0;
+  int preview_included_ = 0;
   QString last_error_;
+  backupproject::PreviewErrorKind last_error_kind_ =
+      backupproject::PreviewErrorKind::kNone;
   QFutureWatcher<PreviewOutcome> watcher_;
 };
 
