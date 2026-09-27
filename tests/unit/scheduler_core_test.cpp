@@ -17,6 +17,7 @@
 #include <sys/types.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <cstdint>
 #include <string>
 #include <vector>
@@ -825,6 +826,160 @@ void TestChangeDetectionFromTrees() {
                0, 0, 0);
 }
 
+
+// ---- 目录 mtime 合同 ------------------------------------------------------
+//
+// 这一组把"目录 mtime 只影响 restore、不影响 schedule 触发"这条最终产品语义
+// 逐项钉住：实现（source_manifest.cpp 的 DiffManifests）、测试、文档三者必须
+// 说同一件事。
+//
+// 为什么不加所谓的 Strict Metadata 模式：那样"同一份源目录"就有了两种触发
+// 定义，GUI 与 CLI、文档与代码都会各自漂移。产品只有这一套定义。
+void TestDirectoryMtimeContract() {
+  test_support::Section("DIFF-DIR. directory mtime contract");
+
+  const std::vector<bp::ManifestEntry> base = {
+      MakeEntry("dir", bp::EntryType::kDirectory),
+      MakeEntry("dir/keep.txt", bp::EntryType::kRegularFile),
+      MakeEntry("dir/sub", bp::EntryType::kDirectory),
+  };
+  bp::ChangeSummary summary;
+
+  // 1) 仅仅目录自身的 mtime 改变 -> 不触发。
+  {
+    std::vector<bp::ManifestEntry> current = base;
+    current[0].mtime_sec += 7;
+    current[0].mtime_nsec = 12345;
+    DiffOf(base, current, &summary);
+    CheckSummary("DIR-01 directory mtime only does not trigger", summary, 0, 0, 0,
+                 0);
+  }
+
+  // 2) 目录的 mode / uid / gid 是会影响 restore 结果的 metadata -> 触发。
+  {
+    std::vector<bp::ManifestEntry> current = base;
+    current[0].mode = 0700;
+    DiffOf(base, current, &summary);
+    CheckSummary("DIR-02 directory mode change triggers", summary, 0, 0, 0, 1);
+  }
+  {
+    std::vector<bp::ManifestEntry> current = base;
+    current[0].uid += 1;
+    DiffOf(base, current, &summary);
+    CheckSummary("DIR-03 directory uid change triggers", summary, 0, 0, 0, 1);
+  }
+  {
+    std::vector<bp::ManifestEntry> current = base;
+    current[0].gid += 1;
+    DiffOf(base, current, &summary);
+    CheckSummary("DIR-04 directory gid change triggers", summary, 0, 0, 0, 1);
+  }
+
+  // 3) 子项的新增 / 删除 / 改名由 path 本身的变化检测，与父目录无关。
+  {
+    std::vector<bp::ManifestEntry> current = base;
+    current.push_back(MakeEntry("dir/new.txt", bp::EntryType::kRegularFile));
+    // 真实的子项新增一定会顺带改掉父目录 mtime：这里一起改掉，验证"只算一次、
+    // 不算成 metadata_changed"。
+    current[0].mtime_sec += 3;
+    DiffOf(base, current, &summary);
+    CheckSummary("DIR-05 a new child is added, the parent mtime is not counted",
+                 summary, 1, 0, 0, 0);
+  }
+  {
+    std::vector<bp::ManifestEntry> current = base;
+    current.erase(current.begin() + 1);
+    current[0].mtime_sec += 3;
+    DiffOf(base, current, &summary);
+    CheckSummary("DIR-06 a removed child is removed, the parent mtime is not "
+                 "counted",
+                 summary, 0, 1, 0, 0);
+  }
+  {
+    // 改名 = 一条 added + 一条 removed（manifest 按路径排好序，没有 inode 身份
+    // 可用，也不假装有）。
+    std::vector<bp::ManifestEntry> current = base;
+    current[1].archive_path = "dir/renamed.txt";
+    std::sort(current.begin(), current.end(),
+              [](const bp::ManifestEntry& a, const bp::ManifestEntry& b) {
+                return a.archive_path < b.archive_path;
+              });
+    current[0].mtime_sec += 3;
+    DiffOf(base, current, &summary);
+    CheckSummary("DIR-07 a rename is add + remove", summary, 1, 1, 0, 0);
+  }
+}
+
+// 真实文件系统上的同一条合同：只 touch 目录不触发；被 filter 排除的子项增删
+// 也不触发；被包含的子项增删触发。不 sleep：全部靠显式改 mtime 与重建 manifest。
+void TestDirectoryMtimeContractOnRealTree() {
+  test_support::Section("DIFF-DIR-FS. the same contract on a real tree");
+
+  const std::string root = test_support::FreshDir("dir-contract");
+  const std::string source = root + "/src";
+  const std::string build = source + "/build";
+  test_support::Mkdir(source, 0755);
+  test_support::Mkdir(build, 0755);
+  Write(source + "/keep.txt", "keep");
+  Write(build + "/excluded.o", "object");
+
+  bp::Filter filter;
+  std::string error;
+  test_support::Check(
+      filter.AddRule(bp::FilterAction::kExclude, "path:**/build/**", &error),
+      "DIR-08 the exclude rule is accepted", error);
+
+  std::vector<bp::ManifestEntry> before;
+  test_support::Check(bp::BuildSourceManifest(source, &filter, &before, &error),
+                      "DIR-09 the filtered manifest builds", error);
+
+  // 只改源目录自己的 mtime：备份集合一个字都没变。
+  test_support::Check(test_support::SetTimes(source, 1600000000, 0),
+                      "DIR-10 the source directory is touched");
+  std::vector<bp::ManifestEntry> touched;
+  test_support::Check(bp::BuildSourceManifest(source, &filter, &touched, &error),
+                      "DIR-11 the manifest rebuilds after the touch", error);
+  bp::ChangeSummary summary;
+  DiffOf(before, touched, &summary);
+  CheckSummary("DIR-12 touching a directory alone never triggers", summary, 0, 0,
+               0, 0);
+
+  // 被排除的子项增删：父目录 mtime 一定会变，但集合没变。
+  Write(build + "/another.o", "object two");
+  std::vector<bp::ManifestEntry> excluded_added;
+  test_support::Check(
+      bp::BuildSourceManifest(source, &filter, &excluded_added, &error),
+      "DIR-13 the manifest rebuilds after an excluded child is added", error);
+  DiffOf(touched, excluded_added, &summary);
+  CheckSummary("DIR-14 an excluded child add never triggers", summary, 0, 0, 0, 0);
+
+  std::string ignored;
+  test_support::Check(::unlink((build + "/another.o").c_str()) == 0,
+                      "DIR-15 the excluded child is removed again", ignored);
+  std::vector<bp::ManifestEntry> excluded_removed;
+  test_support::Check(
+      bp::BuildSourceManifest(source, &filter, &excluded_removed, &error),
+      "DIR-16 the manifest rebuilds after an excluded child is removed", error);
+  DiffOf(excluded_added, excluded_removed, &summary);
+  CheckSummary("DIR-17 an excluded child removal never triggers", summary, 0, 0,
+               0, 0);
+
+  // 被包含的子项新增：必须触发。
+  Write(source + "/new.txt", "new");
+  std::vector<bp::ManifestEntry> included_added;
+  test_support::Check(
+      bp::BuildSourceManifest(source, &filter, &included_added, &error),
+      "DIR-18 the manifest rebuilds after an included child is added", error);
+  DiffOf(excluded_removed, included_added, &summary);
+  test_support::Check(summary.added == 1 && summary.removed == 0 &&
+                          summary.modified == 0 && summary.metadata_changed == 0,
+                      "DIR-19 an included child add triggers exactly once",
+                      std::to_string(summary.added) + "/" +
+                          std::to_string(summary.removed) + "/" +
+                          std::to_string(summary.modified) + "/" +
+                          std::to_string(summary.metadata_changed));
+}
+
 }  // namespace
 
 int main() {
@@ -836,6 +991,8 @@ int main() {
   TestBaselineBindingComparison();
   TestChangeDetection();
   TestChangeDetectionFromTrees();
+  TestDirectoryMtimeContract();
+  TestDirectoryMtimeContractOnRealTree();
   test_support::RemoveTree(test_support::TempRoot());
   return test_support::Finish("scheduler core");
 }
