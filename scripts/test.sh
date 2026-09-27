@@ -1481,14 +1481,34 @@ PBIG="$PREVIEW/big"
 mkdir -p "$PBIG"
 for index in $(seq 1 320); do printf 'x' > "$PBIG/f$index.dat"; done
 run_preview_cli "$PBIG"
-# 计数是**整棵树**的（320），列表是窗口里的（300）：两边都要说清楚。
+# 计数是**整棵树**的（320），列表是窗口里的（300）：两边都要说清楚，而且措辞
+# 必须准确——整棵树都验证过了，被限制的只是列出多少条。
 if [[ $PREVIEW_CLI_STATUS -eq 0 ]] &&
    grep -qF 'Preview: 320 matching item(s)' "$PREVIEW_CLI_OUT" &&
-   grep -qF 'the source tree has 320 entries; only the first 300 were examined, and 300 matching item(s) are listed below.' "$PREVIEW_CLI_OUT"; then
-  record_pass "PRV-19 P7 超过窗口：总数 320 / 列出 300，截断说清楚"
+   grep -qF 'Note: showing the first 300 of 320 matching item(s); the whole source tree was validated, 300 listed below.' "$PREVIEW_CLI_OUT"; then
+  record_pass "PRV-19 P7 超过窗口：整棵树已验证 / 只列出前 300，文案说清楚"
 else
   record_fail "PRV-19 P7 超过窗口：总数 / 列出数" \
     "$(head -n 2 "$PREVIEW_CLI_OUT" | tr '\n' ' ')"
+fi
+# 旧文案是错的：它说"只检查了前 300 条"，而实际上整棵树都被检查过。
+if grep -qF 'were examined' "$PREVIEW_CLI_OUT"; then
+  record_fail "PRV-19b 截断提示不再声称只检查了前 300 条" \
+    "$(grep -F 'were examined' "$PREVIEW_CLI_OUT" | head -n 1)"
+else
+  record_pass "PRV-19b 截断提示不再声称只检查了前 300 条"
+fi
+# GUI 打出来的那一行必须与 CLI 逐字一致（PRV-20 会 diff，这里额外钉住关键词）。
+# 先真的跑一次 GUI：不跑就会拿着上一条用例留下的输出做断言。
+if [[ -x "$PREVIEW_GUI_BIN" ]]; then
+  run_preview_gui "$PBIG"
+  if grep -qF 'the whole source tree was validated' "$PREVIEW_GUI_OUT" &&
+     ! grep -qF 'were examined' "$PREVIEW_GUI_OUT"; then
+    record_pass "PRV-19c GUI 的截断提示与 CLI 同义（validated / listed）"
+  else
+    record_fail "PRV-19c GUI 的截断提示与 CLI 同义" \
+      "$(grep -E 'Note:' "$PREVIEW_GUI_OUT" | head -n 1)"
+  fi
 fi
 expect_preview_parity_at "PRV-20 P7 截断契约在 GUI 与 CLI 上一致" "$PBIG"
 
@@ -1631,6 +1651,97 @@ if [[ -x "$PREVIEW_GUI_BIN" ]]; then
     record_fail "PRV-31b 同一个窗口外 socket 在 GUI 上也 blocked" \
       "gui=$PREVIEW_GUI_STATUS[$(head -n 1 "$PREVIEW_GUI_ERR")]"
   fi
+fi
+
+# ---- L.5b 归档路径 grammar：预览与备份必须用同一套判断 ----
+#
+# Linux 允许文件名里出现反斜杠，也允许 "C:note.txt" 这种形状；归档格式两者都
+# 不接受。共享 walker 现在在生成 archive-relative path 之后调用的是完整
+# IsValidArchivePath，所以这类名字必须在**同一层**就让预览失败，而不是等真实
+# 备份去报错。
+PG="$PREVIEW/grammar"
+rm -rf "$PG"
+mkdir -p "$PG/backslash" "$PG/drive" "$PG/legal"
+mkdir -p "$PG/backslash-dir/dir\name"
+
+printf 'x\n' > "$PG/backslash/a\b.txt"
+printf 'x\n' > "$PG/backslash-dir/dir\name/file.txt"
+printf 'x\n' > "$PG/drive/C:note.txt"
+printf 'x\n' > "$PG/legal/a_b.txt"
+printf 'x\n' > "$PG/legal/a-b.txt"
+printf 'x\n' > "$PG/legal/a.b.txt"
+printf 'x\n' > "$PG/legal/中文.txt"
+printf 'x\n' > "$PG/legal/space name.txt"
+
+# PTH-04：合法 Linux 文件名不能被新增的 grammar 检查误伤。预览必须成功、
+# 备份必须成功，而且两者看到的是同一批条目。
+expect_preview_parity_at "PRV-32 PTH-04 合法文件名：CLI == GUI" "$PG/legal"
+run_preview_cli "$PG/legal"
+PVL_LEGAL_STATUS=$PREVIEW_CLI_STATUS
+PG_REPO_BEFORE="$(find "$PREVIEW_REPO" -maxdepth 1 -name '*.bak' -printf '%f\n' | sort)"
+set +e
+timeout --signal=KILL "$TIMEOUT_SECONDS" "$BACKUPCTL" --config-file "$PREVIEW_CONFIG" \
+  backup "$PG/legal" >"$PG/legal-backup.log" 2>&1
+PVL_LEGAL_BACKUP=$?
+set -e
+if [[ $PVL_LEGAL_STATUS -eq 0 && $PVL_LEGAL_BACKUP -eq 0 ]] &&
+   grep -qF 'Preview: 5 matching item(s)' "$PREVIEW_CLI_OUT" &&
+   ! grep -qF 'Invalid archive path' "$PG/legal-backup.log"; then
+  record_pass "PRV-32b PTH-04 合法文件名：预览与备份都成功（5 项）"
+else
+  record_fail "PRV-32b PTH-04 合法文件名：预览与备份都成功" \
+    "preview=$PVL_LEGAL_STATUS backup=$PVL_LEGAL_BACKUP $(head -n 1 "$PG/legal-backup.log")"
+fi
+
+# 逐个非法形状：预览与真实备份必须一起失败，并且说同一句话。
+# $1 = 用例号/说明，$2 = 源目录，$3 = 期望在错误里出现的片段
+expect_grammar_rejected() {
+  local label="$1"
+  local source="$2"
+  run_preview_cli "$source"
+  local preview_status=$PREVIEW_CLI_STATUS
+  local preview_message
+  preview_message="$(head -n 1 "$PREVIEW_CLI_ERR")"
+  set +e
+  timeout --signal=KILL "$TIMEOUT_SECONDS" "$BACKUPCTL" --config-file "$PREVIEW_CONFIG" \
+    backup "$source" >"$PG/backup.log" 2>&1
+  local backup_status=$?
+  set -e
+  if [[ $preview_status -eq 1 && $backup_status -eq 1 ]] &&
+     grep -qF "Invalid archive path" "$PREVIEW_CLI_ERR" &&
+     grep -qF "Invalid archive path" "$PG/backup.log" &&
+     diff <(echo "$preview_message" | sed 's/^Error: //') \
+          <(head -n 1 "$PG/backup.log" | sed 's/^Error: //') >/dev/null; then
+    record_pass "$label：预览与备份同一句拒绝（$preview_message）"
+  else
+    record_fail "$label：预览与备份同一句拒绝" \
+      "preview=$preview_status[$preview_message] backup=$backup_status[$(head -n 1 "$PG/backup.log")]"
+  fi
+  if [[ -x "$PREVIEW_GUI_BIN" ]]; then
+    run_preview_gui "$source"
+    if [[ $PREVIEW_GUI_STATUS -eq 1 ]] &&
+       [[ "$(head -n 1 "$PREVIEW_GUI_ERR")" == "$preview_message" ]]; then
+      record_pass "$label：GUI 与 CLI 同一句"
+    else
+      record_fail "$label：GUI 与 CLI 同一句" \
+        "gui=[$(head -n 1 "$PREVIEW_GUI_ERR")] cli=[$preview_message]"
+    fi
+  fi
+}
+
+# 三次被拒绝的备份都不能留下新归档：快照要取在这三次之前。
+PG_REPO_BEFORE="$(find "$PREVIEW_REPO" -maxdepth 1 -name '*.bak' -printf '%f\n' | sort)"
+expect_grammar_rejected "PRV-33 PTH-01 文件名含反斜杠" "$PG/backslash"
+expect_grammar_rejected "PRV-34 PTH-02 目录名含反斜杠" "$PG/backslash-dir"
+expect_grammar_rejected "PRV-35 PTH-03 盘符风格文件名" "$PG/drive"
+
+# 拒绝之后不能留下半成品归档：用前后快照比较，不依赖时间戳。
+PG_REPO_AFTER="$(find "$PREVIEW_REPO" -maxdepth 1 -name '*.bak' -printf '%f\n' | sort)"
+if [[ "$PG_REPO_BEFORE" == "$PG_REPO_AFTER" ]]; then
+  record_pass "PRV-35b 被 grammar 拒绝的备份没有留下任何新归档"
+else
+  record_fail "PRV-35b 被 grammar 拒绝的备份没有留下任何新归档" \
+    "before=[$PG_REPO_BEFORE] after=[$PG_REPO_AFTER]"
 fi
 
 # L.6 单实例：preview 是产品命令，必须在进入扫描之前被同一把锁拒绝。

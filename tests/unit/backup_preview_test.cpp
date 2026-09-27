@@ -44,6 +44,7 @@
 #include <string>
 #include <vector>
 
+#include "archive_path.h"
 #include "backup_engine.h"
 #include "filter.h"
 #include "source_tree_walker.h"
@@ -700,7 +701,168 @@ int main() {
                         "PREV T10 失败时不返回窗口里的那 300 条");
   }
 
-  test_support::Section("PREV 8. 无法给出结果时必须明确失败");
+  test_support::Section("PREV 8. 归档路径 grammar（PTH-01..PTH-05）");
+  {
+    // Linux 允许文件名里出现反斜杠，也允许 "C:note.txt" 这种形状；归档格式
+    // 两者都不接受（见 include/archive_path.h）。共享 walker 现在在生成
+    // archive-relative path 之后调用的是**完整**的 IsValidArchivePath，所以这
+    // 类名字必须在同一层就让预览失败——否则预览会把它列出来，而真实备份随后
+    // 必然失败，正好违反"预览 == 备份"。
+    const std::string work = test_support::FreshDir("backup-preview-grammar");
+    const std::string backslash = std::string(1, '\\');
+
+    // 每个非法形状：先直接问 IsValidArchivePath（确认当前 grammar 的真实
+    // 结论，不猜），再要求预览与备份给出同一个结论、同一句原文。
+    struct GrammarCase {
+      std::string label;
+      std::string relative;  // 归档相对路径
+      bool is_directory;
+    };
+    const GrammarCase cases[] = {
+        {"PTH-01 文件名含反斜杠", std::string("a") + backslash + "b.txt",
+         false},
+        {"PTH-02 目录名含反斜杠", std::string("dir") + backslash + "name",
+         true},
+        {"PTH-03 盘符风格文件名", "C:note.txt", false},
+    };
+
+    int index = 0;
+    for (const GrammarCase& item : cases) {
+      const std::string label = item.label;
+      const std::string relative =
+          item.is_directory ? item.relative + "/file.txt" : item.relative;
+      ++index;
+      const std::string source = work + "/case-" + std::to_string(index);
+
+      // grammar 自己怎么说？用与 walker **相同**的参数（非首条、真实类型）。
+      //
+      // 目录这一条要特别说清楚：walker 在遍历到目录自己时就失败了（还没进入
+      // 它），所以它报的是"目录那一条"的原文。下面的 grammar 期望值因此取
+      // item.relative；同时另外确认更深的子路径本身也是非法的——否则
+      // "目录恰好合法、子文件非法"这种情况会被漏掉。
+      std::string grammar_error;
+      const bool grammar_ok =
+          bp::IsValidArchivePath(item.relative, false, item.is_directory,
+                                 bp::kMaxArchivePathLength, &grammar_error);
+      test_support::Check(!grammar_ok,
+                          "PREV " + label + " IsValidArchivePath 拒绝该路径",
+                          grammar_error);
+      if (item.is_directory) {
+        std::string deep_error;
+        const bool deep_ok = bp::IsValidArchivePath(
+            relative, false, false, bp::kMaxArchivePathLength, &deep_error);
+        test_support::Check(!deep_ok, "PREV " + label + " 子路径本身也是非法的",
+                            deep_error);
+      }
+
+      test_support::Check(test_support::Mkdir(source, 0755),
+                          "PREV " + label + " 建好源目录");
+      bool materialized = false;
+      if (item.is_directory) {
+        materialized =
+            test_support::Mkdir(source + "/" + item.relative, 0755) &&
+            test_support::WriteFile(source + "/" + item.relative + "/file.txt",
+                                    "x\n", 0644);
+      } else {
+        materialized =
+            test_support::WriteFile(source + "/" + item.relative, "x\n", 0644);
+      }
+      test_support::Check(materialized,
+                          "PREV " + label + " 该名字在 Linux 上真的建得出来");
+
+      const bp::PreviewResult preview = bp::PreviewBackupSelection(source, {});
+      std::vector<bp::ArchiveEntry> entries;
+      std::string scan_error;
+      const bool backup_ok =
+          bp::ScanSourceTree(source, nullptr, &entries, &scan_error);
+      test_support::Check(!preview.error.empty(),
+                          "PREV " + label + " 预览 fail closed", preview.error);
+      test_support::Check(!backup_ok, "PREV " + label + " 真实备份同样失败",
+                          scan_error);
+      test_support::Check(
+          !preview.error.empty() && preview.error == scan_error,
+          "PREV " + label + " 两边报出同一句原文",
+          "preview=[" + preview.error + "] backup=[" + scan_error + "]");
+      test_support::Check(
+          preview.error == grammar_error,
+          "PREV " + label + " 用的就是同一个 grammar 的原文",
+          "preview=[" + preview.error + "] grammar=[" + grammar_error + "]");
+      test_support::Check(preview.items.empty() && preview.included_count == 0,
+                          "PREV " + label + " 失败时不返回任何条目");
+    }
+
+    // PTH-04：合法名字不能被误伤。Linux 上完全正常的名字（含中文、空格、点、
+    // 连字符、下划线）必须全部通过，而且预览与真实备份看到的是同一批。
+    const std::string legal = work + "/legal";
+    test_support::Check(test_support::Mkdir(legal, 0755),
+                        "PREV PTH-04 建好合法名字的源目录");
+    const char* legal_names[] = {"a_b.txt",  "a-b.txt",        "a.b.txt",
+                                 "中文.txt", "space name.txt", "UPPER.TXT"};
+    const std::size_t legal_count =
+        sizeof(legal_names) / sizeof(legal_names[0]);
+    for (const char* name : legal_names) {
+      std::string grammar_error;
+      test_support::Check(
+          bp::IsValidArchivePath(name, false, false, bp::kMaxArchivePathLength,
+                                 &grammar_error),
+          std::string("PREV PTH-04 IsValidArchivePath 接受 ") + name,
+          grammar_error);
+      test_support::Check(
+          test_support::WriteFile(legal + "/" + name, "x\n", 0644),
+          std::string("PREV PTH-04 建好 ") + name);
+    }
+    const bp::PreviewResult legal_preview =
+        bp::PreviewBackupSelection(legal, {});
+    test_support::Check(legal_preview.error.empty() &&
+                            legal_preview.included_count == legal_count,
+                        "PREV PTH-04 合法名字全部通过预览",
+                        legal_preview.error + " count=" +
+                            std::to_string(legal_preview.included_count));
+    std::vector<bp::ArchiveEntry> legal_entries;
+    std::string legal_error;
+    test_support::Check(
+        bp::ScanSourceTree(legal, nullptr, &legal_entries, &legal_error),
+        "PREV PTH-04 合法名字全部通过真实备份扫描", legal_error);
+    test_support::Check(
+        IncludedInOrder(legal_preview) == ScanOrder(legal_entries),
+        "PREV PTH-04 两边给出的条目序列一致",
+        Join(IncludedInOrder(legal_preview)));
+
+    // PTH-05：source root 自己（"."）不能被新增的 grammar 检查搞坏：它是
+    // is_first_entry = true + is_directory = true 的那一条特例。
+    const std::string root_source = work + "/root-case";
+    test_support::Check(test_support::Mkdir(root_source, 0755),
+                        "PREV PTH-05 建好源目录");
+    test_support::Check(
+        test_support::WriteFile(root_source + "/only.txt", "x\n", 0644),
+        "PREV PTH-05 建好一个普通文件");
+    const bp::PreviewResult root_preview =
+        bp::PreviewBackupSelection(root_source, {});
+    std::vector<bp::ArchiveEntry> root_entries;
+    std::string root_error;
+    test_support::Check(
+        root_preview.error.empty() && root_preview.included_count == 1,
+        "PREV PTH-05 root 仍然是合法的第一条（预览）", root_preview.error);
+    test_support::Check(
+        bp::ScanSourceTree(root_source, nullptr, &root_entries, &root_error) &&
+            !root_entries.empty() && root_entries.front().archive_path == ".",
+        "PREV PTH-05 root 仍然是第一条 entry（备份）", root_error);
+    const std::string empty_root = work + "/empty-root";
+    test_support::Check(test_support::Mkdir(empty_root, 0755),
+                        "PREV PTH-05 建好空源目录");
+    const bp::PreviewResult empty_preview =
+        bp::PreviewBackupSelection(empty_root, {});
+    std::vector<bp::ArchiveEntry> empty_entries;
+    std::string empty_error;
+    test_support::Check(
+        empty_preview.error.empty() && empty_preview.included_count == 0 &&
+            bp::ScanSourceTree(empty_root, nullptr, &empty_entries,
+                               &empty_error) &&
+            empty_entries.size() == 1,
+        "PREV PTH-05 空目录：预览 0 项，备份只有 root 一条", empty_error);
+  }
+
+  test_support::Section("PREV 9. 无法给出结果时必须明确失败");
   {
     const std::string work = test_support::FreshDir("backup-preview-error");
     const std::string source = work + "/src";
@@ -757,7 +919,7 @@ int main() {
                         "PREV P6 空目录 -> 0 项且不是错误");
   }
 
-  test_support::Section("PREV 9. 路径语义");
+  test_support::Section("PREV 10. 路径语义");
   {
     const std::string work = test_support::FreshDir("backup-preview-paths");
     const std::string source = work + "/src";
