@@ -1315,10 +1315,12 @@ expect_preview_parity() {
 }
 
 # 预览 == 真实备份：用同一组规则备份到仓库，恢复，比较节点集合。
-expect_preview_matches_backup() {
+# $2 是源目录：grammar 用例各自有自己的树，不能都绑在 $PREVIEW_SRC 上。
+expect_preview_matches_backup_at() {
   local name="$1"
-  shift
-  run_preview_cli "$PREVIEW_SRC" "$@"
+  local source="$2"
+  shift 2
+  run_preview_cli "$source" "$@"
   if [[ $PREVIEW_CLI_STATUS -ne 0 ]]; then
     record_fail "$name" "preview exit=$PREVIEW_CLI_STATUS"
     return
@@ -1329,7 +1331,7 @@ expect_preview_matches_backup() {
     >"$PREVIEW/before.txt"
   set +e
   timeout --signal=KILL "$TIMEOUT_SECONDS" "$BACKUPCTL" \
-    --config-file "$PREVIEW_CONFIG" backup "$PREVIEW_SRC" "$@" \
+    --config-file "$PREVIEW_CONFIG" backup "$source" "$@" \
     >"$PREVIEW/backup.log" 2>&1
   local backup_status=$?
   set -e
@@ -1362,6 +1364,12 @@ expect_preview_matches_backup() {
   else
     record_fail "$name" "$(head -n 6 "$PREVIEW_DIFF" | tr '\n' ' ')"
   fi
+}
+
+expect_preview_matches_backup() {
+  local name="$1"
+  shift
+  expect_preview_matches_backup_at "$name" "$PREVIEW_SRC" "$@"
 }
 
 # P1 没有规则 / P2 单条件 / P3 一条规则内的 compound AND /
@@ -1743,6 +1751,113 @@ else
   record_fail "PRV-35b 被 grammar 拒绝的备份没有留下任何新归档" \
     "before=[$PG_REPO_BEFORE] after=[$PG_REPO_AFTER]"
 fi
+
+# ---- L.5c 完整 archive grammar 只在"真的会进归档"时才要求 ----
+#
+# 历史 Backup 的顺序是"Filter 先决定这条进不进归档，进了才校验路径"。所以一个
+# 会被规则排除的非法名字**不能**阻塞整次备份/预览——这正是 FILT-PATH-02/04/05b
+# 与 SOCK-PATH-02 要钉的东西。
+
+# PRV-36 被排除的反斜杠文件名：两边都成功，且它不在结果里。
+expect_preview_matches_backup_at "PRV-36 FILT-PATH-02 被排除的反斜杠文件名不阻塞" \
+  "$PG/backslash" --exclude 'ext:txt'
+run_preview_cli "$PG/backslash" --exclude 'ext:txt'
+if [[ $PREVIEW_CLI_STATUS -eq 0 ]] &&
+   ! preview_listed "$PREVIEW_CLI_OUT" | grep -q 'b.txt'; then
+  record_pass "PRV-36b 被排除的反斜杠文件不出现在预览结果里"
+else
+  record_fail "PRV-36b 被排除的反斜杠文件不出现在预览结果里" \
+    "$(head -n 3 "$PREVIEW_CLI_OUT" | tr '\n' ' ')"
+fi
+
+# PRV-37 被排除的反斜杠目录：整棵子树剪掉，两边都成功。
+expect_preview_matches_backup_at "PRV-37 FILT-PATH-04 被排除的反斜杠目录整棵剪掉" \
+  "$PG/backslash-dir" --exclude 'name:*name'
+run_preview_cli "$PG/backslash-dir" --exclude 'name:*name'
+if [[ $PREVIEW_CLI_STATUS -eq 0 ]] &&
+   ! preview_listed "$PREVIEW_CLI_OUT" | grep -q 'file.txt' &&
+   ! grep -qF 'Invalid archive path' "$PREVIEW_CLI_ERR"; then
+  record_pass "PRV-37b 整棵子树被剪掉且没有出现语法错误"
+else
+  record_fail "PRV-37b 整棵子树被剪掉且没有出现语法错误" \
+    "exit=$PREVIEW_CLI_STATUS $(head -n 1 "$PREVIEW_CLI_ERR")"
+fi
+
+# PRV-38 被排除的盘符风格文件名：两边都成功。
+expect_preview_matches_backup_at "PRV-38 FILT-PATH-05b 被排除的 C:note.txt 不阻塞" \
+  "$PG/drive" --exclude 'ext:txt'
+
+# PRV-39 socket 的错误优先级：名字里带反斜杠也一样。
+PSOCK="$PG/socket"
+rm -rf "$PSOCK"; mkdir -p "$PSOCK"
+printf 'x\n' > "$PSOCK/keep.txt"
+python3 -c "import socket,sys; s=socket.socket(socket.AF_UNIX); s.bind(sys.argv[1])" \
+  "$PSOCK/sock\bad"
+run_preview_cli "$PSOCK"
+PSOCK_PREVIEW=$PREVIEW_CLI_STATUS
+PSOCK_MESSAGE="$(head -n 1 "$PREVIEW_CLI_ERR")"
+set +e
+timeout --signal=KILL "$TIMEOUT_SECONDS" "$BACKUPCTL" --config-file "$PREVIEW_CONFIG" \
+  backup "$PSOCK" > "$PG/socket-backup.log" 2>&1
+PSOCK_BACKUP=$?
+set -e
+if [[ $PSOCK_PREVIEW -eq 1 && $PSOCK_BACKUP -eq 1 ]] &&
+   [[ "$PSOCK_MESSAGE" == *"Unsupported special type: socket"* ]] &&
+   [[ "$PSOCK_MESSAGE" != *"Invalid archive path"* ]] &&
+   grep -qF "Unsupported special type: socket" "$PG/socket-backup.log" &&
+   ! grep -qF "Invalid archive path" "$PG/socket-backup.log"; then
+  record_pass "PRV-39 SOCK-PATH-01 非法名 socket 仍然报 socket 不支持（优先级保持）"
+else
+  record_fail "PRV-39 SOCK-PATH-01 非法名 socket 的优先级" \
+    "preview=$PSOCK_PREVIEW[$PSOCK_MESSAGE] backup=$PSOCK_BACKUP"
+fi
+if [[ -x "$PREVIEW_GUI_BIN" ]]; then
+  run_preview_gui "$PSOCK"
+  if [[ $PREVIEW_GUI_STATUS -eq 1 ]] &&
+     [[ "$(head -n 1 "$PREVIEW_GUI_ERR")" == "$PSOCK_MESSAGE" ]]; then
+    record_pass "PRV-39b GUI 与 CLI 对非法名 socket 报同一句"
+  else
+    record_fail "PRV-39b GUI 与 CLI 对非法名 socket 报同一句" \
+      "gui=[$(head -n 1 "$PREVIEW_GUI_ERR")] cli=[$PSOCK_MESSAGE]"
+  fi
+fi
+
+# PRV-40 明确排除这个 socket：两边都成功，它不进入结果。
+expect_preview_matches_backup_at "PRV-40 SOCK-PATH-02 被排除的非法名 socket 不阻塞" \
+  "$PSOCK" --exclude 'name:sock*'
+
+# PRV-41 超长 child path：长度是遍历阶段的硬边界（历史语义），即使规则会把它
+# 排除，也照样失败。用 chdir + 相对路径构造，任何一次 syscall 都不超 PATH_MAX。
+PLONG="$PG/too-long/src"
+rm -rf "$PG/too-long"; mkdir -p "$PLONG"
+python3 - "$PLONG" <<'PYEOF'
+import os, sys
+src = sys.argv[1]
+os.chdir(src)
+component = 'd' * 190
+relative = 0
+while relative < 3900:
+    os.makedirs(component, exist_ok=True)
+    os.chdir(component)
+    relative += 1 + len(component)
+open('v' * 200, 'w').write('x')
+PYEOF
+run_preview_cli "$PLONG" --exclude 'name:vvv*'
+PLONG_STATUS=$PREVIEW_CLI_STATUS
+set +e
+timeout --signal=KILL "$TIMEOUT_SECONDS" "$BACKUPCTL" --config-file "$PREVIEW_CONFIG" \
+  backup "$PLONG" --exclude 'name:vvv*' > "$PG/toolong-backup.log" 2>&1
+PLONG_BACKUP=$?
+set -e
+if [[ $PLONG_STATUS -eq 1 && $PLONG_BACKUP -eq 1 ]] &&
+   grep -qF "Archive path too long" "$PREVIEW_CLI_ERR" &&
+   grep -qF "Archive path too long" "$PG/toolong-backup.log"; then
+  record_pass "PRV-41 超长 child path 即使被排除也照样失败（历史 early 语义）"
+else
+  record_fail "PRV-41 超长 child path 的历史 early 语义" \
+    "preview=$PLONG_STATUS[$(head -n 1 "$PREVIEW_CLI_ERR")] backup=$PLONG_BACKUP"
+fi
+rm -rf "$PG/too-long"
 
 # L.6 单实例：preview 是产品命令，必须在进入扫描之前被同一把锁拒绝。
 # "只读所以可以并发"不是这个产品的规则。
