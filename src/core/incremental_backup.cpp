@@ -610,6 +610,10 @@ bool RunIncrementalBackup(const std::string& source_directory,
             JoinPath(repository_directory,
                      SnapshotManifestFileName(snapshot_file_name)),
             text, error_message)) {
+      // 快照已经发布、但它的副文件写不出去：这份快照谁也不认识，留着只会
+      // 变成"看起来像备份、其实没有任何东西指向它"的孤儿。撤回它，
+      // 并且明确报告失败。
+      ::unlink(target.c_str());
       return false;
     }
     if (!WriteManifestFile(
@@ -618,6 +622,10 @@ bool RunIncrementalBackup(const std::string& source_directory,
             SerializeSnapshotIdentity(source_identity, filter_identity,
                                       strategy_identity),
             error_message)) {
+      ::unlink(target.c_str());
+      ::unlink(JoinPath(repository_directory,
+                        SnapshotManifestFileName(snapshot_file_name))
+                   .c_str());
       return false;
     }
     outcome->kind = IncrementalOutcome::Kind::kFullBaseline;
@@ -713,6 +721,8 @@ bool RunIncrementalBackup(const std::string& source_directory,
   binding.repository_identity = repository_identity;
   binding.source_path = source_directory;
   const std::string text = SerializeManifestV3(current, binding);
+  const std::string delta_path =
+      JoinPath(repository_directory, snapshot_file_name);
   if (text.empty() ||
       !WriteManifestFile(JoinPath(repository_directory,
                                   SnapshotManifestFileName(snapshot_file_name)),
@@ -720,6 +730,8 @@ bool RunIncrementalBackup(const std::string& source_directory,
     if (error_message != nullptr && error_message->empty()) {
       SetError(error_message, "Cannot serialize the delta manifest");
     }
+    // 与完整基线同样处理：不留下没人认识的孤儿快照。
+    ::unlink(delta_path.c_str());
     return false;
   }
   if (!WriteManifestFile(
@@ -728,6 +740,10 @@ bool RunIncrementalBackup(const std::string& source_directory,
           SerializeSnapshotIdentity(source_identity, filter_identity,
                                     strategy_identity),
           error_message)) {
+    ::unlink(delta_path.c_str());
+    ::unlink(JoinPath(repository_directory,
+                      SnapshotManifestFileName(snapshot_file_name))
+                 .c_str());
     return false;
   }
 
