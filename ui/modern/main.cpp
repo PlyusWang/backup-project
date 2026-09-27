@@ -13,6 +13,10 @@
 //   --schedule-test                     验证自动备份页的控制器链路：保存计划、
 //                                       立即运行、无变化跳过、变化建快照、
 //                                       retention、0600 权限、与 CLI 同源路径
+//   --preview-test <源> [--include R]... [--exclude R]...
+//                                       把 Manual Backup 的筛选预览按 CLI 的
+//                                       格式打出来，供脚本与
+//                                       `backupctl preview` 逐行对比
 //   --config-file <路径>                指定配置文件（测试隔离真实用户配置）
 //   --schedule-file <路径>              指定计划存储文件（测试隔离真实计划）
 //   --schedule-show                     把控制器读到的计划配置打成 key=value，
@@ -27,7 +31,9 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+#include <QCoreApplication>
 #include <QDir>
+#include <QElapsedTimer>
 #include <QEventLoop>
 #include <QFile>
 #include <QFileInfo>
@@ -312,6 +318,85 @@ int ApplyFilterArguments(backup_modern::BackupController* controller,
       return 1;
     }
     ++index;
+  }
+  return 0;
+}
+
+// ---- --preview-test ----
+//
+// 把 Manual Backup 的筛选预览按 **backupctl preview 的输出格式**打出来，
+// 好让检查脚本把两条命令的输出逐行 diff。
+//
+// 它走的是界面真正的入口：FilterRuleModel::addAdvancedRule（用户填高级规则的
+// 那条路）+ FilterRuleModel::requestPreview（"刷新预览"按钮）。所以它证明的是
+// "界面上看到的集合 == 命令行 preview 给出的集合"，而不是"某个内部函数恰好
+// 返回了同样的值"。
+//
+// 输出格式与 backupctl preview 一致（包含 truncated 时的 Note 行），
+// 因此脚本可以直接 diff；差异一定意味着两个前端真的不一致。
+int RunPreviewTest(backup_modern::FilterRuleModel* model, const QString& source,
+                   const QStringList& arguments) {
+  // 规则按命令行顺序进：一条规则内部的 compound AND 由 DSL 自己表达，
+  // 多条 --include 之间是 OR —— 与 CLI 完全同一套语义。
+  for (int index = 0; index < arguments.size(); ++index) {
+    const QString option = arguments.at(index);
+    if (option != QStringLiteral("--include") &&
+        option != QStringLiteral("--exclude")) {
+      continue;
+    }
+    if (index + 1 >= arguments.size()) {
+      std::fprintf(stderr, "Error: %s 需要一个规则参数\n", qPrintable(option));
+      return 2;
+    }
+    const QString action = option == QStringLiteral("--include")
+                               ? QStringLiteral("include")
+                               : QStringLiteral("exclude");
+    if (!model->addAdvancedRule(action, arguments.at(index + 1))) {
+      // 与 CLI 一样，这里报出的就是核心 Filter::AddRule 的原文，
+      // 前端不翻译、不包装。
+      std::fprintf(stderr, "Error: %s\n", qPrintable(model->lastError()));
+      return 2;
+    }
+    ++index;
+  }
+
+  model->requestPreview(source, QString());
+  // 扫描在后台线程跑：只有把事件循环转起来，QFutureWatcher 的 finished
+  // 回调才会派发。processEvents 带超时，所以这不是空转占死 CPU。
+  QElapsedTimer timer;
+  timer.start();
+  while (model->previewBusy() && timer.elapsed() < 60000) {
+    QCoreApplication::processEvents(QEventLoop::AllEvents, 20);
+  }
+  if (model->previewBusy()) {
+    std::fprintf(stderr, "preview 超时\n");
+    return 1;
+  }
+  if (!model->lastError().isEmpty()) {
+    std::fprintf(stderr, "Error: %s\n", qPrintable(model->lastError()));
+    return 1;
+  }
+
+  // 界面列表里既有"进归档"也有"被排除"的条目（各自带标签），CLI 只列前者；
+  // 这里按 included 投影成同一份集合再打印。
+  const QVariantList items = model->previewItems();
+  QStringList included_paths;
+  for (const QVariant& value : items) {
+    const QVariantMap item = value.toMap();
+    if (item.value(QStringLiteral("included")).toBool()) {
+      included_paths << item.value(QStringLiteral("path")).toString();
+    }
+  }
+  std::printf("Preview: %d matching item(s)\n",
+              static_cast<int>(included_paths.size()));
+  if (model->previewTruncated()) {
+    std::printf(
+        "Note: the source tree has more than %d entries; only the "
+        "first %d were examined.\n",
+        model->previewLimit(), model->previewLimit());
+  }
+  for (const QString& path : included_paths) {
+    std::printf("%s\n", qPrintable(path));
   }
   return 0;
 }
@@ -2681,6 +2766,8 @@ int main(int argc, char* argv[]) {
       arguments.contains(QStringLiteral("--schedule-test"));
   const bool schedule_show =
       arguments.contains(QStringLiteral("--schedule-show"));
+  const int preview_test_index =
+      arguments.indexOf(QStringLiteral("--preview-test"));
 
   // 需要参数的开关：参数没跟上就是用法错误，明确说清楚并以 2 退出，
   // 而不是悄悄退化成默认行为（那会让测试以为它隔离了配置，其实没有）。
@@ -2702,6 +2789,10 @@ int main(int argc, char* argv[]) {
   if (self_test_index >= 0 && self_test_index + 3 >= arguments.size()) {
     std::fprintf(stderr,
                  "--self-test 需要三个参数: <源目录> <备份文件> <恢复目录>\n");
+    return 2;
+  }
+  if (preview_test_index >= 0 && preview_test_index + 1 >= arguments.size()) {
+    std::fprintf(stderr, "--preview-test 需要一个源目录参数\n");
     return 2;
   }
 
@@ -2801,6 +2892,10 @@ int main(int argc, char* argv[]) {
   }
   if (schedule_show) {
     return RunScheduleShow(&schedule_controller);
+  }
+  if (preview_test_index >= 0) {
+    return RunPreviewTest(&filter_rule_model,
+                          arguments.at(preview_test_index + 1), arguments);
   }
   schedule_controller.start();
 
