@@ -87,7 +87,10 @@ class ApplicationInstanceLock {
 // 依次尝试：
 //   1. <runtime_root>/<uid>/backup-project.lock   例如
 //   /run/user/1000/backup-project.lock
-//      只在该目录存在、是真目录（不是符号链接）、属主是 uid、属主可写时使用；
+//      只在该目录存在、是真目录（不是符号链接）、属主是 uid、属主**可写**且
+//      属主**可进入/可搜索**（S_IWUSR 与 S_IXUSR 都必须有）时使用：
+//      在目录里创建并解析锁文件名，两个位缺一不可，只查写权限会让 mode 0600
+//      的目录一路走到 open 才失败；
 //   2. <fallback_root>/backup-project-<uid>.lock  例如
 //   /tmp/backup-project-1000.lock
 //      fallback 目录通常是 sticky 的 /tmp：别的用户可能抢先占住这个文件名，

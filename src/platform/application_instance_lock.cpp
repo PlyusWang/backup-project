@@ -28,10 +28,23 @@ std::string UidText(uid_t uid) {
 
 // per-user runtime 目录（通常是 /run/user/<uid>）能不能安全地放产品锁。
 //
-// 四条都要满足，任何一条不满足就退到 UID 专属的 fallback：
+// 每一条都要满足，任何一条不满足就退到 UID 专属的 fallback：
 //   * 存在，而且是**真目录**（lstat 先挡住符号链接，stat 再确认目录本身）；
 //   * 属主是当前 uid（别人的目录我们不能写，也不该往里面放东西）；
-//   * 属主可写（0700 的正常情况；只读挂载就退 fallback）。
+//   * 属主**可写**（S_IWUSR）：在目录里创建锁文件需要写权限；
+//   * 属主**可进入 / 可搜索**（S_IXUSR）：在目录里解析"backup-project.lock"
+//     这个名字需要 x 位 —— 目录的 x 位就是"能穿过它访问里面的条目"。
+//
+// 最后一条不是理论问题：mode 0600 的目录是合法存在的，只查 S_IWUSR 会把它判成
+// 可用，然后在真正 open 子路径时才 EACCES。那时错误已经不是"runtime 目录不可
+// 用"，而是一个看起来像配置损坏的 I/O 失败；正确的行为是在这里就判不可用、
+// 干净地退到 fallback。
+//
+// 判定刻意用 mode/owner 而不是 access(W_OK|X_OK)：
+//   * access() 走的是真实 uid/gid（还会被 ACL、只读挂载影响），而这条规则要的是
+//     "这个目录节点的 mode 与属主是否安全"，两者不是一回事；
+//   * access() 会跟随符号链接，而这里的 lstat 分支已经明确拒绝符号链接。
+// 换句话说，这里要的是安全属性，不是"现在能不能写进去"。
 bool IsUsableRuntimeDirectory(const std::string& path, uid_t uid) {
   struct stat link_status;
   if (::lstat(path.c_str(), &link_status) != 0) return false;
@@ -39,6 +52,7 @@ bool IsUsableRuntimeDirectory(const std::string& path, uid_t uid) {
   if (!S_ISDIR(link_status.st_mode)) return false;
   if (link_status.st_uid != uid) return false;
   if ((link_status.st_mode & S_IWUSR) == 0) return false;
+  if ((link_status.st_mode & S_IXUSR) == 0) return false;
 
   struct stat real_status;
   if (::stat(path.c_str(), &real_status) != 0) return false;
