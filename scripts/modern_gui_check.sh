@@ -386,10 +386,11 @@ expect_count "$QML_DIR/components/BackupRecordCard.qml" "card.busy" 4 \
   "备份记录卡片的恢复 / 删除 / 密码输入 / 密码确认受忙碌状态约束"
 
 # QML 与核心的分工：界面只调用控制器，不自己持有核心对象、不拼路径。
-# 备份页从 PR #16 起走带算法选项的入口；startBackup() 在控制器内部就是
-# 它的 mypack + none + none 等价形式，产品界面不再直接调用那个名字。
-expect_count_re "$QML_DIR/pages/BackupPage.qml" 'controller\.startBackupWithOptions\(' 1 \
-  "备份页调用 controller.startBackupWithOptions()"
+# 备份页从 PR #16 起走带算法选项的入口；PR #18 之后那个入口多带一个策略，
+# 名字也随之变成 startBackupWithStrategy()。startBackup() / startBackupWithOptions()
+# 在控制器内部仍然存在（旧调用方与自测用），但**产品页面**只走带策略的那一个。
+expect_count_re "$QML_DIR/pages/BackupPage.qml" 'controller\.startBackupWithStrategy\(' 1 \
+  "备份页调用 controller.startBackupWithStrategy()"
 # 反向也钉死：产品页不再直接调用不带选项的旧入口。0 次是硬要求 ——
 # 少了这一条，"两个入口都被调用"这种半迁移状态照样能通过。
 expect_count_re "$QML_DIR/pages/BackupPage.qml" 'controller\.startBackup\(\)' 0 \
@@ -603,7 +604,8 @@ expect_count_re "$QML_DIR/Main.qml" "dismissPageStatus" 3 \
 
 # PR #18：增量策略必须在两个前端都能选到，而且用的是同一个 key。
 # 备份页读 backupOptionsPanel 的策略；计划页读它自己的策略下拉。
-expect_count_re "$QML_DIR/components/BackupOptionsPanel.qml" "strategyKeys" 2 \
+# 面板里 strategyKeys 出现三次：声明、indexOf 反查、以及 currentIndex 选择。
+expect_count_re "$QML_DIR/components/BackupOptionsPanel.qml" "strategyKeys" 3 \
   "备份页提供备份策略选择"
 expect_count_re "$QML_DIR/pages/BackupPage.qml" "startBackupWithStrategy" 1 \
   "备份页把策略一起交给控制器"
@@ -1036,9 +1038,10 @@ if grep -qF '未经专业密码学审计' "$QML_DIR/components/BackupOptionsPane
 else
   record_fail "缺少密码学免责声明"
 fi
-# 收起时的一行摘要：三段算法名用「 · 」连接，正好两个分隔符。
-expect_count "$QML_DIR/components/BackupOptionsPanel.qml" '" · "' 2 \
-  "摘要用「 · 」连接三段算法名"
+# 收起时的一行摘要：四段（策略 / 打包 / 压缩 / 加密）用「 · 」连接，
+# 正好三个分隔符。策略排在最前是因为它回答"这次是什么"，另外三段是"怎么写"。
+expect_count "$QML_DIR/components/BackupOptionsPanel.qml" '" · "' 3 \
+  "摘要用「 · 」连接四段（策略 + 三段算法名）"
 expect_count_re "$QML_DIR/components/BackupOptionsPanel.qml" \
   'objectName:[[:space:]]*"backupOptionsSummary"' 1 "摘要文本有 objectName"
 
@@ -1067,8 +1070,8 @@ fi
 
 # 回调必须接在产品入口上：备份走带选项的入口，加密恢复走带密码的入口。
 expect_count_re "$QML_DIR/pages/BackupPage.qml" \
-  'controller\.startBackupWithOptions\(' 1 \
-  "备份页调用 controller.startBackupWithOptions()"
+  'controller\.startBackupWithStrategy\(' 1 \
+  "备份页调用 controller.startBackupWithStrategy()"
 expect_count_re "$QML_DIR/components/BackupRecordCard.qml" \
   'controller\.startManagedRestoreWithPassword\(' 1 \
   "加密恢复调用 controller.startManagedRestoreWithPassword()"
@@ -1081,10 +1084,10 @@ expect_count_re "$QML_DIR/components/BackupRecordCard.qml" \
 # QML 折行会把这个 if 拆成三行，正则跨不了行，所以先把文件压成一行再匹配整段结构。
 SQUASHED_BACKUP_PAGE="$(tr -d '\n' < "$QML_DIR/pages/BackupPage.qml" | tr -s ' ')"
 if printf '%s' "$SQUASHED_BACKUP_PAGE" \
-    | grep -qE 'const started = controller\.startBackupWithOptions\([^)]*\) if \(started\) panel\.clearPasswords\(\)'; then
-  record_pass "备份页检查 startBackupWithOptions() 的返回值，且只有成功才 panel.clearPasswords()"
+    | grep -qE 'const started = controller\.startBackupWithStrategy\([^)]*\) if \(started\) panel\.clearPasswords\(\)'; then
+  record_pass "备份页检查 startBackupWithStrategy() 的返回值，且只有成功才 panel.clearPasswords()"
 else
-  record_fail "备份页没有把 startBackupWithOptions() 的返回值与 clearPasswords() 关联（同步校验失败时会误清密码）"
+  record_fail "备份页没有把 startBackupWithStrategy() 的返回值与 clearPasswords() 关联（同步校验失败时会误清密码）"
 fi
 expect_count_re "$QML_DIR/pages/BackupPage.qml" 'panel\.clearPasswords\(\)' 1 \
   "备份页调用 panel.clearPasswords()"
@@ -1391,7 +1394,7 @@ else
   record_pass "开始备份按钮不再由 passwordAcceptable 直接禁用"
 fi
 if printf '%s' "$SQUASHED_PAGE_V2" \
-    | grep -qE 'onClicked: \{ panel\.requestPasswordValidation\(\) if \(!panel\.passwordAcceptable\) return const started = controller\.startBackupWithOptions\([^)]*\) if \(started\) panel\.clearPasswords\(\) \}'; then
+    | grep -qE 'onClicked: \{ panel\.requestPasswordValidation\(\) if \(!panel\.passwordAcceptable\) return .*const started = controller\.startBackupWithStrategy\([^)]*\) if \(started\) panel\.clearPasswords\(\) \}'; then
   record_pass "提交顺序正确：先请求校验 -> 不合法就 return（不碰控制器）-> 合法才提交 -> 成功才清空"
 else
   record_fail "提交顺序不对（可能先调用了控制器，或清空时机被改）"
@@ -1491,8 +1494,11 @@ expect_present "$SCHEDULE_PAGE_QML" "不会保存任何明文密码" \
   "计划页说明不会保存明文密码"
 
 # --- 不画未实现的假按钮 ---
-expect_missing "$SCHEDULE_PAGE_QML" "incremental" \
-  "计划页没有 Incremental 假按钮"
+#
+# PR #18 之前这里断言"计划页不许出现 incremental"；现在它是一条真实支持的路，
+# 所以改成断言"策略选择真的接在共享 key 上"，而 Realtime 仍然不许出现。
+expect_present "$SCHEDULE_PAGE_QML" "scheduleStrategyCombo" \
+  "计划页提供备份策略选择（incremental 现在是真实支持的路）"
 expect_missing "$SCHEDULE_PAGE_QML" "Realtime" \
   "计划页没有 Realtime 假按钮"
 expect_present "$SCHEDULE_PAGE_QML" "schedule.supportedModeText" \

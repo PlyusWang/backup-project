@@ -3150,6 +3150,19 @@ int RunScheduleTest(backup_modern::ScheduleController* schedule,
   // 保存 incremental 之后读回来还是 incremental，并且磁盘上那份 JSON 里写的
   // 就是共享 key。引擎行为本身由 CLI 侧的 INC-09/10/11 覆盖。
   {
+    // 这一段会改写 store，而套件后面还要拿**自检写出来的那份配置**去和 CLI 对
+    // 照（Interval / Retain / Pack / Compression / 规则）。所以先把当前配置记
+    // 下来，做完断言再原样存回去 —— 否则这一段的副作用会变成别人的失败。
+    const bool saved_enabled = schedule->enabled();
+    const QString saved_source = schedule->sourcePath();
+    const int saved_interval = schedule->intervalMinutes();
+    const int saved_retain = schedule->retainCount();
+    const QString saved_pack = schedule->packKey();
+    const QString saved_compression = schedule->compressionKey();
+    const QStringList saved_include = schedule->includeRules();
+    const QStringList saved_exclude = schedule->excludeRules();
+    const QString saved_strategy_key = schedule->strategyKey();
+
     const QString strategy_source =
         temp.filePath(QStringLiteral("strategy-src"));
     QDir().mkpath(strategy_source);
@@ -3178,10 +3191,10 @@ int RunScheduleTest(backup_modern::ScheduleController* schedule,
     run.Check(schedule->strategyKey() == QStringLiteral("incremental"),
               QStringLiteral("STR-05 被拒绝的保存没有改动已存配置"),
               schedule->strategyKey());
-    // 恢复到 full，别把这份状态留给后面的用例。
-    schedule->saveConfig(true, strategy_source, 60, 3, QStringLiteral("mypack"),
-                         QStringLiteral("none"), QStringList(), QStringList(),
-                         QStringLiteral("full"));
+    // 把这一段的副作用收回去：恢复成进来时的配置。
+    schedule->saveConfig(saved_enabled, saved_source, saved_interval,
+                         saved_retain, saved_pack, saved_compression,
+                         saved_include, saved_exclude, saved_strategy_key);
   }
 
   const int total = run.passed + run.failed;
