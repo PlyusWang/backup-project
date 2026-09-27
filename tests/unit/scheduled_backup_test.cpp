@@ -1888,6 +1888,78 @@ void TestManagedListStaysWritableAtTheBound() {
                       std::to_string(settled));
 }
 
+// ---- N. 只让 manifest 写失败：state 前进、manifest 停在旧的 ----
+//
+// 非 root 也能把这一对真实地拆开：在状态目录里放一个**目录**占住
+// schedule-manifest.dat 的位置。rename(tmp, target) 必然失败（EISDIR），
+// 而同一个目录里的 schedule.json 照常写得进去。
+//
+// 这正是"崩在 SaveManifest 与 Save(state) 之间"留下的形状，只不过是被
+// 真故障而不是被杀进程造出来的：archive 与 state 都已经换成新的，manifest
+// 还停在旧的那一份。
+
+void TestManifestOnlySaveFailure() {
+  test_support::Section("N. a manifest-only save failure still converges");
+
+  const Env env = MakeEnv("manifest-only", 12);
+  Write(env.source + "/a.txt", "one");
+  bp::ScheduleEvaluationResult result;
+  ExpectStatus("MAN2-01 the first snapshot is created", env, 1000,
+               bp::ScheduleEvaluationStatus::kCreatedSnapshot, &result);
+
+  bp::ScheduleStore store(env.schedule_file);
+  const std::string manifest = store.manifest_file_path();
+  std::string whole;
+  test_support::Check(test_support::ReadFile(manifest, &whole),
+                      "MAN2-02 the manifest is readable");
+  test_support::Check(whole.compare(0, 11, "BPMANIFEST2") == 0,
+                      "MAN2-03 the production manifest is version 2",
+                      whole.substr(0, 16));
+
+  // 占住 manifest 的写入位置。旧内容先留一份，稍后原样放回去 —— 一次失败的
+  // 原子替换本来就不会破坏旧文件。
+  test_support::Check(::unlink(manifest.c_str()) == 0,
+                      "MAN2-04 the manifest is moved aside");
+  test_support::Check(test_support::Mkdir(manifest, 0755),
+                      "MAN2-05 the manifest path is now a directory");
+
+  Write(env.source + "/b.txt", "two");
+  ExpectStatus("MAN2-06 the snapshot is still created", env, 2000,
+               bp::ScheduleEvaluationStatus::kCreatedSnapshot, &result);
+  test_support::Check(
+      result.diagnostic.find("source manifest could not be saved") !=
+          std::string::npos,
+      "MAN2-07 the diagnostic names the manifest", result.diagnostic);
+  test_support::Check(RepoArchives(env.repository).size() == 2,
+                      "MAN2-08 the archive itself was published",
+                      std::to_string(RepoArchives(env.repository).size()));
+
+  test_support::Check(::rmdir(manifest.c_str()) == 0,
+                      "MAN2-09 the placeholder is removed");
+  test_support::Check(Write(manifest, whole),
+                      "MAN2-10 the previous manifest content is back");
+
+  // state 已经前进到 S2，manifest 还属于 S1：这一对不配套，绝不能 skip。
+  const std::size_t before = RepoArchives(env.repository).size();
+  ExpectStatus("MAN2-11 an old manifest with a new state must not skip", env, 3000,
+               bp::ScheduleEvaluationStatus::kCreatedSnapshot, &result);
+  test_support::Check(result.baseline_reset,
+                      "MAN2-12 it is reported as a baseline reset",
+                      result.diagnostic);
+  test_support::Check(RepoArchives(env.repository).size() == before + 1,
+                      "MAN2-13 exactly one snapshot was added",
+                      std::to_string(before) + " -> " +
+                          std::to_string(RepoArchives(env.repository).size()));
+
+  // 收敛：manifest 现在是新的，源没再变，下一轮回到 skip。
+  ExpectStatus("MAN2-14 the next run skips again", env, 4000,
+               bp::ScheduleEvaluationStatus::kSkippedNoChanges, &result);
+  test_support::Check(
+      RepoArchives(env.repository).size() == before + 1,
+      "MAN2-15 the repository stopped growing",
+      std::to_string(RepoArchives(env.repository).size()));
+}
+
 int main() {
   std::printf("scheduled backup test\n");
   TestTimeSemantics();
@@ -1908,6 +1980,7 @@ int main() {
   TestStoreParentDirectoryAndLegacyFiles();
   TestCrashConsistency();
   TestManagedListStaysWritableAtTheBound();
+  TestManifestOnlySaveFailure();
   TestStability();
   test_support::RemoveTree(test_support::TempRoot());
   return test_support::Finish("scheduled backup");
