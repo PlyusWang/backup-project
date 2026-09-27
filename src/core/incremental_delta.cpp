@@ -20,6 +20,7 @@
 #include <vector>
 
 #include "container_format.h"
+#include "crypto.h"
 #include "source_digest.h"
 
 namespace backupproject {
@@ -463,6 +464,50 @@ bool ParseDeltaEnvelope(const std::string& text, DeltaEnvelope* envelope,
     return false;
   }
   return true;
+}
+
+bool FullSnapshotId(const std::string& container_file, std::string* id,
+                    std::string* error_message) {
+  if (id == nullptr) {
+    SetError(error_message, "Snapshot id output must not be null");
+    return false;
+  }
+  id->clear();
+  ContainerHeader header;
+  if (!InspectContainerFile(container_file, &header, error_message)) {
+    return false;
+  }
+  if (header.payload_sha256.size() != container_v2::kSha256Size) {
+    SetError(
+        error_message,
+        "Cannot derive a snapshot id: the container has no payload digest");
+    return false;
+  }
+  const std::string hex = crypto::ToHex(
+      reinterpret_cast<const unsigned char*>(header.payload_sha256.data()),
+      header.payload_sha256.size());
+  *id = ContentDigestOfBytes("BPFULL1\n" + hex);
+  return true;
+}
+
+bool SnapshotIdOfFile(const std::string& path, std::string* id,
+                      std::string* error_message) {
+  const SnapshotFileKind kind = ClassifySnapshotFile(path, error_message);
+  if (kind == SnapshotFileKind::kDelta) {
+    DeltaEnvelope envelope;
+    if (!ReadDeltaEnvelope(path, &envelope, error_message)) return false;
+    if (id == nullptr) {
+      SetError(error_message, "Snapshot id output must not be null");
+      return false;
+    }
+    *id = envelope.snapshot_id;
+    return true;
+  }
+  if (kind == SnapshotFileKind::kContainer) {
+    return FullSnapshotId(path, id, error_message);
+  }
+  SetError(error_message, "Unknown snapshot file: " + path);
+  return false;
 }
 
 bool LooksLikeDelta(const unsigned char* data, std::size_t size) {
