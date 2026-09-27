@@ -40,13 +40,37 @@ SOURCES := $(APP_SOURCES) $(CORE_SOURCES) $(FILESYSTEM_SOURCES)
 OBJECTS := $(patsubst %.cpp,$(BUILD_DIR)/%.o,$(SOURCES))
 DEPENDS := $(OBJECTS:.o=.d)
 
+# ---- 归档格式的测试夹具（不是产品命令）----
+#
+# 产品 CLI 与 Modern GUI 一样是 repository-driven：归档名由 BackupCatalog 在
+# 配置好的仓库里生成，调用方不能指定任意路径。但归档格式本身（v0.1 legacy /
+# v2 container）的端到端回归需要"写到指定路径、再从这个路径恢复"，所以那部分
+# 能力搬到了这个独立可执行文件里。
+#
+# 它必须在**默认构建目标**里：scripts/quality_test.sh 会先 make clean，然后
+# 只跑一次普通的 make；如果它不在 all 里，整个质量套件会在干净树上失败。
+# 它不出现在 backupctl --help 里，不参与 GUI/CLI parity，也不是用户功能。
+FIXTURE_TARGET := $(BUILD_DIR)/archive-cli
+FIXTURE_SOURCES := tests/tools/archive_cli.cpp
+FIXTURE_OBJECTS := $(patsubst %.cpp,$(BUILD_DIR)/%.o,$(FIXTURE_SOURCES))
+# CORE_OBJECTS 在下面才定义（GUI 那一段），这里显式算一份同样的集合：
+# 目标的前置条件在解析这条规则时就要展开，用后面的变量会拿到空值。
+FIXTURE_CORE_OBJECTS := $(patsubst %.cpp,$(BUILD_DIR)/%.o,$(CORE_SOURCES) $(FILESYSTEM_SOURCES))
+DEPENDS += $(FIXTURE_OBJECTS:.o=.d)
+
 .PHONY: all debug sanitize test gui gui-modern gui-all clean
 
-all: $(TARGET)
+all: $(TARGET) $(FIXTURE_TARGET)
 
 $(TARGET): $(OBJECTS)
 	@mkdir -p $(BUILD_DIR)
 	$(CXX) $(CXXFLAGS) $(OBJECTS) -o $(TARGET)
+
+# 与 backupctl 共享同一份 CORE_SOURCES：夹具调用的就是产品用的引擎与读写器，
+# 不存在"测试用另一套实现"。
+$(FIXTURE_TARGET): $(FIXTURE_OBJECTS) $(FIXTURE_CORE_OBJECTS)
+	@mkdir -p $(BUILD_DIR)
+	$(CXX) $(CXXFLAGS) $(FIXTURE_OBJECTS) $(CORE_OBJECTS) -o $@
 
 $(BUILD_DIR)/%.o: %.cpp
 	@mkdir -p $(dir $@)

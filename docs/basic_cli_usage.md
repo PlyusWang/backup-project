@@ -33,14 +33,39 @@ make clean && make
 ## 4. CLI 用法
 
 ```bash
-./build/backupctl backup <source_directory> <backup_file>
-./build/backupctl restore <backup_file> <destination_directory>
+./build/backupctl config repository set <仓库目录>   # 先配置仓库
+./build/backupctl backup <source_directory> [--pack ...] [--compression ...] [--encryption ...] [--include R]... [--exclude R]...
+./build/backupctl repository list                    # 列出仓库里的归档
+./build/backupctl restore <file_name> <destination_directory>
 ./build/backupctl --help
 ```
 
-备份产物是一个单独的归档文件（推荐扩展名 `.bak`），格式为
-Archive Format v0.1：全局 header + 逐条 entry header + 原样保存的文件正文。
-是打包不是压缩，详见 `docs/format/archive_v0.1.md`。
+产品 CLI 与 Modern GUI 使用**同一套业务模型**：
+
+* `backup` 把归档写进**配置好的备份仓库**，文件名由程序生成
+  （`<source-base>_YYYYMMDD_HHMMSS.bak`，冲突时追加 `_001`…）。
+  调用方不能指定归档路径——那是 GUI 也没有的能力，因为"备份写到哪就是哪"
+  不是这个产品的业务概念。
+* 产物始终是 v2 容器（`BKPCNT2`）：pack / compression / encryption 只是
+  选择怎么打包、压缩、加密，详见 `docs/format/archive_v2_container.md`。
+* `restore` 的 `<file_name>` 必须是仓库里的**单组件**名字
+  （`repository list` 给出的那个），拒绝 `/`、`\\`、`..`、
+  绝对路径与符号链接。
+* 历史遗留的 `BKPARCH`（Archive Format v0.1）归档仍然**读得回来**：
+  只要它作为合法记录放在仓库里，`restore` 就能恢复它。
+
+### 归档格式的测试夹具
+
+`build/archive-cli` 是**测试专用**的可执行文件，不是产品命令、不出现在
+`backupctl --help` 里、也不参与 GUI/CLI parity：
+
+```bash
+./build/archive-cli backup <source_directory> <backup_file> [filter...] [pipeline...]
+./build/archive-cli restore <backup_file> <destination_directory>
+```
+
+它让"把归档写到指定路径 / 从不存在的任意路径恢复"这类**格式回归**继续测得到
+真实的读写器与引擎（不给 pipeline 选项时产 legacy v0.1，给了就走 v2）。
 
 ## 5. 完整示例
 
