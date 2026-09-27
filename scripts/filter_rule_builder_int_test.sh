@@ -18,6 +18,7 @@ ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT_DIR"
 
 CTL="$ROOT_DIR/build/backupctl"
+ARCHIVE_CLI="$ROOT_DIR/build/archive-cli"
 BIN="$ROOT_DIR/tests/output/filter_rule_builder_test"
 OUT_DIR="$ROOT_DIR/tests/output/rule-builder-int"
 LOG="$OUT_DIR/last-output.txt"
@@ -37,9 +38,9 @@ absent() { [ -e "$1" ] && echo 0 || echo 1; }
 tree_manifest() { ( cd "$1" 2> /dev/null && find . -type f -print0 | sort -z | xargs -0 sha256sum 2> /dev/null ); }
 
 if [ ! -x "$BIN" ]; then bash "$ROOT_DIR/scripts/filter_rule_builder_test.sh" > /dev/null 2>&1; fi
-if [ ! -x "$CTL" ]; then make -C "$ROOT_DIR" > /dev/null 2>&1; fi
-if [ ! -x "$BIN" ] || [ ! -x "$CTL" ]; then
-  echo "[rb-int] 缺少测试二进制或 backupctl，无法继续" >&2
+if [ ! -x "$CTL" ] || [ ! -x "$ARCHIVE_CLI" ]; then make -C "$ROOT_DIR" > /dev/null 2>&1; fi
+if [ ! -x "$BIN" ] || [ ! -x "$CTL" ] || [ ! -x "$ARCHIVE_CLI" ]; then
+  echo "[rb-int] 缺少测试二进制 / backupctl / archive-cli，无法继续" >&2
   exit 1
 fi
 
@@ -59,8 +60,8 @@ run_with_builder() {
   rm -f "$arc"; rm -rf "$dst"
   set --
   while IFS= read -r line; do set -- "$@" "$line"; done < <("$BIN" --emit-args "$scenario")
-  if ! timeout "$TIMEOUT" "$CTL" backup "$OUT_DIR/src" "$arc" "$@" > "$LOG" 2>&1; then echo "backup-failed"; return; fi
-  if ! timeout "$TIMEOUT" "$CTL" restore "$arc" "$dst" > "$LOG" 2>&1; then echo "restore-failed"; return; fi
+  if ! timeout "$TIMEOUT" "$ARCHIVE_CLI" backup "$OUT_DIR/src" "$arc" "$@" > "$LOG" 2>&1; then echo "backup-failed"; return; fi
+  if ! timeout "$TIMEOUT" "$ARCHIVE_CLI" restore "$arc" "$dst" > "$LOG" 2>&1; then echo "restore-failed"; return; fi
   echo "$dst"
 }
 
@@ -68,8 +69,8 @@ run_with_literal() {
   local tag="$1"; shift
   local arc="$OUT_DIR/$tag.bak" dst="$OUT_DIR/$tag-dest"
   rm -f "$arc"; rm -rf "$dst"
-  if ! timeout "$TIMEOUT" "$CTL" backup "$OUT_DIR/src" "$arc" "$@" > "$LOG" 2>&1; then echo "backup-failed"; return; fi
-  if ! timeout "$TIMEOUT" "$CTL" restore "$arc" "$dst" > "$LOG" 2>&1; then echo "restore-failed"; return; fi
+  if ! timeout "$TIMEOUT" "$ARCHIVE_CLI" backup "$OUT_DIR/src" "$arc" "$@" > "$LOG" 2>&1; then echo "backup-failed"; return; fi
+  if ! timeout "$TIMEOUT" "$ARCHIVE_CLI" restore "$arc" "$dst" > "$LOG" 2>&1; then echo "restore-failed"; return; fi
   echo "$dst"
 }
 
@@ -128,7 +129,7 @@ if "$BIN" --emit-args invalid_empty_ext > /dev/null 2>&1; then
 else
   record_pass "非法草稿被前端拦下（builder 校验失败，不会提交到后端）"
 fi
-timeout "$TIMEOUT" "$CTL" backup "$OUT_DIR/src" "$BAD_ARC" --include "bogus:x" > "$LOG" 2>&1
+timeout "$TIMEOUT" "$ARCHIVE_CLI" backup "$OUT_DIR/src" "$BAD_ARC" --include "bogus:x" > "$LOG" 2>&1
 BAD_CODE=$?
 if [ $BAD_CODE -eq 2 ] && [ ! -e "$BAD_ARC" ]; then
   record_pass "后端兜底：绕过前端提交非法规则 exit 2 且不留 .bak"

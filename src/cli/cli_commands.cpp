@@ -104,6 +104,14 @@ std::string JoinRules(const std::vector<std::string>& rules) {
   return joined;
 }
 
+// 路径的最后一段。"a/b.bak" -> "b.bak"、"b.bak" -> "b.bak"。
+// 只用于把 Catalog 给出的路径缩成一个可读的文件名，不参与任何安全判断。
+std::string BaseNameOf(const std::string& path) {
+  const std::size_t slash = path.rfind('/');
+  if (slash == std::string::npos) return path;
+  return path.substr(slash + 1);
+}
+
 // ---- 共享核心的薄封装 ----
 
 bool LoadRepositoryPath(const CliContext& context, std::string* repository,
@@ -184,10 +192,16 @@ void PrintCliUsage(const std::string& program_name, std::ostream& output) {
   output
       << "Usage:\n"
       << "  " << program_name
-      << " backup <source_directory> <backup_file> [--include <rule>]... "
-         "[--exclude <rule>]...\n"
+      << " backup <source_directory> [--include <rule>]... [--exclude "
+         "<rule>]...\n"
+      << "    The archive is written into the configured repository, with a "
+         "name the\n"
+      << "    program generates; there is no way to give it a path.\n"
       << "  " << program_name
-      << " restore <backup_file> <destination_directory>\n"
+      << " restore <file_name> <destination_directory>\n"
+      << "    <file_name> must be a single-component .bak name inside the "
+         "configured\n"
+      << "    repository (see 'repository list').\n"
       << "  " << program_name
       << " schedule show | set | enable | disable | run | history | watch\n"
       << "    schedule set takes --source --interval-minutes --retain --pack\n"
@@ -204,9 +218,9 @@ void PrintCliUsage(const std::string& program_name, std::ostream& output) {
       << "  " << program_name << " repository list | delete <file_name>\n"
       << "  " << program_name << " config repository show | set <path>\n"
       << "\n"
-      << "Backup pipeline options (any of these switches the command to the "
-         "v2\n"
-      << "container; without them the legacy v0.1 archive format is used):\n"
+      << "Backup pipeline options (the product archive is always a v2 "
+         "container;\n"
+      << "these choose how it is packed, compressed and encrypted):\n"
       << "  --pack mypack|ustar|fast-ustar\n"
       << "  --compression none|huffman|lzss-huffman\n"
       << "  --encryption none|aes-256-ctr-hmac-sha256|des-cbc-hmac-sha256\n"
@@ -246,28 +260,31 @@ void PrintCliUsage(const std::string& program_name, std::ostream& output) {
 }
 
 // ---- backup ----
-
+//
+// 与 Modern GUI **完全同一套业务模型**：归档由 BackupCatalog 在**配置好的
+// 仓库**里命名（<source-base>_YYYYMMDD_HHMMSS.bak），调用方不能指定路径。
+//
+// 任意路径的 direct archive（以及它默认产出的 legacy v0.1）不是产品功能：
+// 那是归档格式的测试夹具（tests/tools/archive_cli.cpp）负责的事。产品 CLI
+// 与产品 GUI 都不再暴露"把备份写到哪就是哪"这个能力。
 int RunBackupCommand(const CliContext& context,
                      const std::vector<std::string>& arguments) {
-  if (arguments.size() < 2) {
-    std::cerr << "Error: 'backup' expects <source_directory> and "
-                 "<backup_file>.\n\n";
+  if (arguments.empty()) {
+    std::cerr << "Error: 'backup' expects <source_directory>.\n\n";
     PrintCliUsage(context.program_name, std::cerr);
     return kCliExitUsageError;
   }
   const std::string source_directory = arguments[0];
-  const std::string backup_file = arguments[1];
 
   Filter filter;
   BackupOptions options;
-  bool has_pipeline_option = false;
   bool encryption_requested = false;
   bool saw_pack = false;
   bool saw_compression = false;
   bool saw_encryption = false;
   std::string error_message;
 
-  for (std::size_t index = 2; index < arguments.size(); ++index) {
+  for (std::size_t index = 1; index < arguments.size(); ++index) {
     const std::string option = arguments[index];
     std::string value;
     if (option == "--include" || option == "--exclude") {
@@ -294,7 +311,6 @@ int RunBackupCommand(const CliContext& context,
                                        "' (expected mypack, ustar or "
                                        "fast-ustar)");
       }
-      has_pipeline_option = true;
       continue;
     }
     if (option == "--compression") {
@@ -309,7 +325,6 @@ int RunBackupCommand(const CliContext& context,
                                        "' (expected none, huffman or "
                                        "lzss-huffman)");
       }
-      has_pipeline_option = true;
       continue;
     }
     if (option == "--encryption") {
@@ -325,12 +340,18 @@ int RunBackupCommand(const CliContext& context,
                                        "aes-256-ctr-hmac-sha256 or "
                                        "des-cbc-hmac-sha256)");
       }
-      has_pipeline_option = true;
       encryption_requested =
           options.encryption_method != EncryptionMethod::kNone;
       continue;
     }
     return UsageError(context, "unknown option '" + option + "'");
+  }
+
+  // 仓库是业务模型的一部分：没有仓库就没有"产品备份"这回事。
+  std::string repository;
+  if (!LoadRepositoryPath(context, &repository, &error_message)) {
+    PrintError(error_message);
+    return kCliExitOperationFailed;
   }
 
   if (encryption_requested) {
@@ -343,56 +364,77 @@ int RunBackupCommand(const CliContext& context,
       return kCliExitOperationFailed;
     }
     options.password = secret;
-    // 用完之后立刻抹掉这一份副本；options.password 会在离开作用域时销毁。
     for (char& character : secret) character = '\0';
   }
 
-  BackupEngine engine;
-  const bool ok = has_pipeline_option
-                      ? engine.Backup(source_directory, backup_file, filter,
-                                      options, &error_message)
-                      : engine.Backup(source_directory, backup_file, filter,
-                                      &error_message);
-  if (!ok) {
+  BackupCatalog catalog;
+  if (!catalog.EnsureRepository(repository, &error_message)) {
     PrintError(error_message);
     return kCliExitOperationFailed;
   }
-  std::cout << "Backup completed successfully.\n";
-  if (has_pipeline_option) {
-    std::cout << "Pipeline: pack=" << PackMethodKey(options.pack_method)
-              << " compression="
-              << CompressionMethodKey(options.compression_method)
-              << " encryption="
-              << EncryptionMethodKey(options.encryption_method) << '\n';
-  } else {
-    std::cout
-        << "Archive format: legacy v0.1 (no pipeline options were given)\n";
+  // 命名规则完全属于 BackupCatalog：这里一行都没有复制那套规则。
+  std::string archive_path;
+  if (!catalog.BuildArchivePath(repository, source_directory, NowSeconds(),
+                                &archive_path, &error_message)) {
+    PrintError(error_message);
+    return kCliExitOperationFailed;
   }
+
+  BackupEngine engine;
+  if (!engine.Backup(source_directory, archive_path, filter, options,
+                     &error_message)) {
+    PrintError(error_message);
+    return kCliExitOperationFailed;
+  }
+  const std::string file_name = BaseNameOf(archive_path);
+  std::cout << "Backup completed successfully.\n";
+  std::cout << "Repository: " << repository << "\n";
+  std::cout << "Archive:    " << file_name << "\n";
+  std::cout << "Pipeline: pack=" << PackMethodKey(options.pack_method)
+            << " compression="
+            << CompressionMethodKey(options.compression_method)
+            << " encryption=" << EncryptionMethodKey(options.encryption_method)
+            << '\n';
   return kCliExitSuccess;
 }
 
 // ---- restore ----
-
+//
+// file_name 是仓库内的**单组件**名字，路径解析交给 BackupCatalog::Resolve：
+// 拒绝空串、"."、".."、含 '/' 或 '\\'、内嵌 NUL、不以 .bak 结尾，并且要求
+// 解析结果确实是仓库的直接子项、普通文件、非软链接。产品 CLI 不再接受任意
+// 绝对路径——那同样属于测试夹具。
 int RunRestoreCommand(const CliContext& context,
                       const std::vector<std::string>& arguments) {
   if (arguments.size() != 2) {
-    std::cerr << "Error: 'restore' expects <backup_file> and "
+    std::cerr << "Error: 'restore' expects <file_name> and "
                  "<destination_directory>.\n\n";
     PrintCliUsage(context.program_name, std::cerr);
     return kCliExitUsageError;
   }
-  const std::string backup_file = arguments[0];
+  const std::string file_name = arguments[0];
   const std::string destination_directory = arguments[1];
 
-  BackupEngine engine;
+  std::string repository;
   std::string error_message;
+  if (!LoadRepositoryPath(context, &repository, &error_message)) {
+    PrintError(error_message);
+    return kCliExitOperationFailed;
+  }
+  BackupCatalog catalog;
+  std::string archive_path;
+  if (!catalog.Resolve(repository, file_name, &archive_path, &error_message)) {
+    PrintError(error_message);
+    return kCliExitOperationFailed;
+  }
+
+  BackupEngine engine;
 
   // 只有归档自己说"我需要密码"时才去问。问的方式还是 /dev/tty；
-  // 识别失败时不在这里报错，交给真正的恢复路径给出更准确的诊断
-  // （文件不存在、magic 不对、被截断……）。
+  // 识别失败时不在这里报错，交给真正的恢复路径给出更准确的诊断。
   ArchiveFileInfo info;
   std::string identify_error;
-  if (IdentifyArchiveFile(backup_file, &info, &identify_error) &&
+  if (IdentifyArchiveFile(archive_path, &info, &identify_error) &&
       !info.password_hint.empty()) {
     std::string secret;
     if (!ReadSecretFromTerminal("Restore password: ", &secret,
@@ -403,12 +445,12 @@ int RunRestoreCommand(const CliContext& context,
     RestoreOptions options;
     options.password = secret;
     for (char& character : secret) character = '\0';
-    if (!engine.Restore(backup_file, destination_directory, options, nullptr,
+    if (!engine.Restore(archive_path, destination_directory, options, nullptr,
                         &error_message)) {
       PrintError(error_message);
       return kCliExitOperationFailed;
     }
-  } else if (!engine.Restore(backup_file, destination_directory,
+  } else if (!engine.Restore(archive_path, destination_directory,
                              &error_message)) {
     PrintError(error_message);
     return kCliExitOperationFailed;
@@ -416,7 +458,6 @@ int RunRestoreCommand(const CliContext& context,
   std::cout << "Restore completed successfully.\n";
   return kCliExitSuccess;
 }
-
 // ---- schedule ----
 
 namespace {
