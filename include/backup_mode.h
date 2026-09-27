@@ -7,15 +7,18 @@
 //   Trigger:  Manual / Scheduled / Realtime
 //   Strategy: Full / Incremental
 //
-// 本版本真正实现并对外承诺的只有两种：
+// 本版本真正实现并对外承诺的三种：
 //
-//   Manual    + Full   （PR #15 / #16 已有）
-//   Scheduled + Full   （本 PR）
+//   Manual    + Full           （PR #15 / #16）
+//   Scheduled + Full           （PR #17）
+//   Manual    + Incremental    （PR #18：delta 格式 + 依赖链恢复 + 共享引擎）
 //
-// 其余四种组合在本文件里只有 enum 取值，没有任何产品入口会接受它们。
-// 这是刻意的：先把维度留出来，避免将来把接口命名写死成
-// "FullScheduleOnlyForever"，同时又绝不写空壳假实现——产品入口一律显式拒绝，
-// 不做 silent fallback（"选了增量就偷偷按全量跑"是最危险的那种降级）。
+// Scheduled + Incremental 仍然被拒绝，理由写在真值表旁边：计划路径的 retention
+// 还是"按时间删最旧"，用在依赖链上会删掉祖先、让后代全部不可恢复。Realtime
+// 只在 enum 里存在，没有任何产品入口。
+//
+// 产品入口一律显式拒绝不支持的组合，不做 silent fallback
+// （"选了增量就偷偷按全量跑"是最危险的那种降级）。
 //
 // 本文件是纯 C++17：不依赖 Qt，CLI / GUI / scheduler core 都可以 include。
 
@@ -38,11 +41,11 @@ enum class BackupTrigger : std::uint8_t {
 
 // 备份策略。
 //
-// kIncremental 在这里只是"未来维度"的占位：本 PR 的 change detection 是
-// "有变化才生成完整独立快照"，不是增量存储，两者不能混为一谈。
+// kFull：每次都写出一份完整、自包含的归档。
+// kIncremental：第一次（或基线不可信时）写完整基线，之后写 delta，
+//   没有任何有效变化时什么都不写。恢复靠依赖链自动解析。
 enum class BackupStrategy : std::uint8_t {
   kFull = 0,
-  // 已定义、未实现。没有 delta 格式，没有 baseline 依赖链。
   kIncremental = 1,
 };
 
