@@ -682,6 +682,18 @@ if grep -qF '被规则排除' "$ROOT_DIR/ui/modern/filter_rule_model.cpp" \
 else
   record_fail "预览缺排除 / 剪枝提示"
 fi
+# 窗口的说明必须与实际语义一致：列出的是"前 300 个预览条目"，不是"前 300 条
+# 匹配项"；也不能说"整棵源目录树都会被检查"——被排除的目录不会递归进去，
+# 真实 Backup 也不递归。UI 只改文字，不改布局。
+if grep -qF '列表只显示前 ' "$QML_DIR/components/FilterEditorPanel.qml" \
+   && grep -qF '完整执行与备份一致的筛选遍历' \
+     "$QML_DIR/components/FilterEditorPanel.qml" \
+   && ! grep -qF '整棵源目录树都会被检查' \
+     "$QML_DIR/components/FilterEditorPanel.qml"; then
+  record_pass "预览窗口的说明与实际语义一致（前 N 个预览条目 / 与备份同一次遍历）"
+else
+  record_fail "预览窗口的说明与实际语义不一致"
+fi
 
 # mtime 的 5 种形态：字段下拉、类型键、天数与两个日期都要真的接到模型上。
 if grep -q -- '"uid", "gid", "user", "group", "mtime"' "$QML_DIR/components/FilterEditorPanel.qml"; then
