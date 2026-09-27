@@ -430,11 +430,14 @@ Item {
                             text: "保存计划"
                             variant: "primary"
                             enabled: !schedule.libraryBusy
-                            onClicked: schedule.saveConfig(
+                            // 周期与保留数量按**文本**交给 C++：QML 的 parseInt
+                            // 会把 "12abc" 悄悄变成 12，而 backupctl 会明确拒绝它。
+                            // 解析规则只有一份，在共享核心里。
+                            onClicked: schedule.saveConfigFromText(
                                 page.draftEnabled,
                                 page.draftSource,
-                                parseInt(page.draftInterval, 10),
-                                parseInt(page.draftRetain, 10),
+                                page.draftInterval,
+                                page.draftRetain,
                                 page.packKeys[page.draftPackIndex],
                                 page.compressionKeys[page.draftCompressionIndex],
                                 page.draftInclude,

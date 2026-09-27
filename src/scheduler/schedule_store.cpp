@@ -269,6 +269,45 @@ bool RequireRealDirectory(const std::string& path, const char* what,
 
 }  // namespace
 
+bool ParseBoundedScheduleNumber(const std::string& text, std::uint32_t minimum,
+                                std::uint32_t maximum,
+                                const std::string& option, std::uint32_t* value,
+                                std::string* error_message) {
+  if (value == nullptr) {
+    SetError(error_message, "Schedule number output must not be null");
+    return false;
+  }
+  if (text.empty()) {
+    SetError(error_message, option + " needs a number");
+    return false;
+  }
+  std::uint64_t result = 0;
+  for (const char character : text) {
+    if (character < '0' || character > '9') {
+      SetError(
+          error_message,
+          option + " expects a plain non-negative integer, got '" + text + "'");
+      return false;
+    }
+    result = result * 10u + static_cast<std::uint64_t>(character - '0');
+    // 边解析边夹：不能等累加到溢出之后再判范围。
+    if (result > maximum) {
+      SetError(error_message, option + " is out of range: " + text +
+                                  " (expected " + std::to_string(minimum) +
+                                  ".." + std::to_string(maximum) + ")");
+      return false;
+    }
+  }
+  if (result < minimum) {
+    SetError(error_message, option + " is out of range: " + text +
+                                " (expected " + std::to_string(minimum) + ".." +
+                                std::to_string(maximum) + ")");
+    return false;
+  }
+  *value = static_cast<std::uint32_t>(result);
+  return true;
+}
+
 bool ValidateScheduleForEnable(const ScheduleConfig& config,
                                const std::string& repository_path,
                                std::string* error_message) {

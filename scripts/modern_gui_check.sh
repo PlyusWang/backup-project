@@ -1370,6 +1370,14 @@ for name in scheduleEnabledToggle scheduleSourceField scheduleIntervalField \
     "计划页有 $name"
 done
 
+# --- 周期 / 保留数量的解析规则只有一份 ---
+# QML 的 parseInt("12abc") 是 12，而 backupctl 对同一个输入是明确拒绝。
+# 界面必须把文本原样交给共享核心，自己不做"解析"。
+expect_present "$SCHEDULE_PAGE_QML" "schedule.saveConfigFromText("   "计划页把周期与保留数量按文本交给共享核心解析"
+expect_missing "$SCHEDULE_PAGE_QML" "parseInt(page.draft"   "计划页不再用 QML 的 parseInt 截断周期 / 保留数量"
+expect_present "$ROOT_DIR/ui/modern/schedule_controller.cpp"   "ParseBoundedScheduleNumber"   "界面侧调用的是共享的 ParseBoundedScheduleNumber"
+expect_present "$ROOT_DIR/src/cli/cli_commands.cpp"   "ParseBoundedScheduleNumber"   "CLI 侧调用的是同一个 ParseBoundedScheduleNumber"
+
 # --- 加密边界：没有任何"选加密"的入口，只有一行说明 ---
 expect_missing "$SCHEDULE_PAGE_QML" "scheduleEncryptionCombo" \
   "加密在计划页不是可选项（没有下拉框）"

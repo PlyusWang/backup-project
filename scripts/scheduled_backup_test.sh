@@ -1247,12 +1247,16 @@ else
       "界面侧出现了自己的加密判断"
   fi
 
-  if ! grep -rq "kMinIntervalMinutes" "$ROOT_DIR/ui/modern" &&
-     ! grep -rq "kMaxRetainCount" "$ROOT_DIR/ui/modern"; then
-    record_pass "I.19 界面侧没有复制边界常量（范围只在共享核心里定义）"
+  # 界面侧可以**使用**共享的边界常量（把同一个范围交给同一个解析函数），
+  # 但不许自己再定义一份。判据因此是"有没有定义"，不是"有没有出现这个名字"。
+  if ! grep -rqE "constexpr[^;]*(kMinIntervalMinutes|kMaxIntervalMinutes|kMinRetainCount|kMaxRetainCount)" \
+        "$ROOT_DIR/ui/modern" &&
+     ! grep -rqE "#define[[:space:]]+(kMin|kMax)(Interval|Retain)" \
+        "$ROOT_DIR/ui/modern"; then
+    record_pass "I.19 界面侧没有自己定义范围常量（用的是共享核心那一份）"
   else
-    record_fail "I.19 界面侧没有复制边界常量（范围只在共享核心里定义）" \
-      "ui/modern 下出现了边界常量"
+    record_fail "I.19 界面侧没有自己定义范围常量（用的是共享核心那一份）" \
+      "ui/modern 下出现了边界常量定义"
   fi
 fi
 

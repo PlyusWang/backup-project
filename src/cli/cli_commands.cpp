@@ -77,38 +77,6 @@ bool MarkSingleOption(bool* seen, const std::string& option,
   return true;
 }
 
-bool ParseBoundedUint32(const std::string& text, std::uint32_t minimum,
-                        std::uint32_t maximum, const std::string& option,
-                        std::uint32_t* value, std::string* error_message) {
-  if (text.empty()) {
-    *error_message = option + " needs a number";
-    return false;
-  }
-  std::uint64_t result = 0;
-  for (const char character : text) {
-    if (character < '0' || character > '9') {
-      *error_message =
-          option + " expects a plain non-negative integer, got '" + text + "'";
-      return false;
-    }
-    result = result * 10u + static_cast<std::uint64_t>(character - '0');
-    if (result > maximum) {
-      *error_message = option + " is out of range: " + text + " (expected " +
-                       std::to_string(minimum) + ".." +
-                       std::to_string(maximum) + ")";
-      return false;
-    }
-  }
-  if (result < minimum) {
-    *error_message = option + " is out of range: " + text + " (expected " +
-                     std::to_string(minimum) + ".." + std::to_string(maximum) +
-                     ")";
-    return false;
-  }
-  *value = static_cast<std::uint32_t>(result);
-  return true;
-}
-
 std::string FormatLocalTime(std::int64_t seconds) {
   if (seconds <= 0) return std::string("never");
   const std::time_t value = static_cast<std::time_t>(seconds);
@@ -610,8 +578,9 @@ int ScheduleSet(const CliContext& context,
       if (!TakeValue(arguments, &index, option, &value, &error)) {
         return UsageError(context, error);
       }
-      if (!ParseBoundedUint32(value, kMinIntervalMinutes, kMaxIntervalMinutes,
-                              option, &config.interval_minutes, &error)) {
+      if (!ParseBoundedScheduleNumber(value, kMinIntervalMinutes,
+                                      kMaxIntervalMinutes, option,
+                                      &config.interval_minutes, &error)) {
         return UsageError(context, error);
       }
       continue;
@@ -623,8 +592,8 @@ int ScheduleSet(const CliContext& context,
       if (!TakeValue(arguments, &index, option, &value, &error)) {
         return UsageError(context, error);
       }
-      if (!ParseBoundedUint32(value, kMinRetainCount, kMaxRetainCount, option,
-                              &config.retain_count, &error)) {
+      if (!ParseBoundedScheduleNumber(value, kMinRetainCount, kMaxRetainCount,
+                                      option, &config.retain_count, &error)) {
         return UsageError(context, error);
       }
       continue;
