@@ -2358,6 +2358,67 @@ int RunScheduleTest(backup_modern::ScheduleController* schedule,
               QStringLiteral("SCH-119 收尾：重建一份计划快照"));
   }
 
+  // 19) 周期与保留数量的解析规则只有一份：界面不再用 parseInt 截断。
+  //
+  // QML 的 parseInt("12abc") 是 12，而 backupctl 对同一个输入是明确拒绝。
+  // 界面现在把**文本**交给共享核心的 ParseBoundedScheduleNumber，两边的结论
+  // 因此不可能分叉——这一组断言钉住的就是"GUI 不再自己解析"。
+  {
+    const QString store_path = schedule->storePath();
+    auto read_bytes = [](const QString& path) {
+      QFile file(path);
+      if (!file.open(QIODevice::ReadOnly)) return QByteArray();
+      return file.readAll();
+    };
+    const QByteArray before = read_bytes(store_path);
+
+    const QStringList bad{QStringLiteral("12abc"),
+                          QString(),
+                          QStringLiteral("-5"),
+                          QStringLiteral("5.5"),
+                          QStringLiteral("99999999999999"),
+                          QStringLiteral(" ")};
+    for (const QString& text : bad) {
+      run.Check(
+          !schedule->saveConfigFromText(
+              true, source, text, QStringLiteral("7"), QStringLiteral("ustar"),
+              QStringLiteral("huffman"), QStringList(), QStringList()),
+          QStringLiteral("SCH-120 非法周期文本 [%1] 被拒绝（不再截断成 12）")
+              .arg(text),
+          schedule->statusMessage());
+      run.Check(
+          !schedule->saveConfigFromText(
+              true, source, QStringLiteral("5"), text, QStringLiteral("ustar"),
+              QStringLiteral("huffman"), QStringList(), QStringList()),
+          QStringLiteral("SCH-121 非法保留数量文本 [%1] 被拒绝").arg(text),
+          schedule->statusMessage());
+    }
+    // 格式正确但越界：由共享核心的范围校验拒绝，界面只是转述。
+    run.Check(!schedule->saveConfigFromText(
+                  true, source, QStringLiteral("0"), QStringLiteral("7"),
+                  QStringLiteral("ustar"), QStringLiteral("huffman"),
+                  QStringList(), QStringList()),
+              QStringLiteral("SCH-122 周期 0 被共享核心的范围校验拒绝"));
+    run.Check(schedule->statusMessage().contains(QStringLiteral("525600")),
+              QStringLiteral("SCH-123 展示的是核心的范围说明"),
+              schedule->statusMessage());
+    run.Check(read_bytes(store_path) == before,
+              QStringLiteral("SCH-124 这一串被拒绝的输入一个字节都没落盘"));
+
+    run.Check(schedule->saveConfigFromText(
+                  true, source, QStringLiteral("5"), QStringLiteral("7"),
+                  QStringLiteral("ustar"), QStringLiteral("huffman"),
+                  QStringList() << QStringLiteral("ext:txt"),
+                  QStringList() << QStringLiteral("path:**/build/**")),
+              QStringLiteral("SCH-125 合法文本照旧接受"),
+              schedule->statusMessage());
+    run.Check(schedule->intervalMinutes() == 5 && schedule->retainCount() == 7,
+              QStringLiteral("SCH-126 接受之后的周期与保留数量正确"),
+              QString::number(schedule->intervalMinutes()) +
+                  QStringLiteral("/") +
+                  QString::number(schedule->retainCount()));
+  }
+
   const int total = run.passed + run.failed;
   std::printf("[schedule] %s %d/%d\n", run.failed == 0 ? "PASS" : "FAIL",
               run.passed, total);

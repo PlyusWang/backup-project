@@ -466,6 +466,36 @@ void ScheduleController::clearStatus() {
   emit statusChanged();
 }
 
+bool ScheduleController::saveConfigFromText(
+    bool enabled, const QString& source_path, const QString& interval_text,
+    const QString& retain_text, const QString& pack_key,
+    const QString& compression_key, const QStringList& include_rules,
+    const QStringList& exclude_rules) {
+  std::uint32_t interval = 0;
+  std::uint32_t retain = 0;
+  std::string error;
+  // 与 backupctl schedule set --interval-minutes / --retain 是同一个函数、
+  // 同一套规则；界面不再做任何自己的"解析"。
+  if (!backupproject::ParseBoundedScheduleNumber(
+          interval_text.trimmed().toStdString(),
+          backupproject::kMinIntervalMinutes,
+          backupproject::kMaxIntervalMinutes,
+          QStringLiteral("周期（分钟）").toStdString(), &interval, &error) ||
+      !backupproject::ParseBoundedScheduleNumber(
+          retain_text.trimmed().toStdString(), backupproject::kMinRetainCount,
+          backupproject::kMaxRetainCount,
+          QStringLiteral("保留数量").toStdString(), &retain, &error)) {
+    SetStatus(kError, QStringLiteral("计划配置不合法"),
+              QStringLiteral("周期与保留数量都必须是十进制整数，判断规则与 "
+                             "backupctl 完全一致。") +
+                  QStringLiteral(" ") + QString::fromStdString(error));
+    return false;
+  }
+  return saveConfig(enabled, source_path, static_cast<int>(interval),
+                    static_cast<int>(retain), pack_key, compression_key,
+                    include_rules, exclude_rules);
+}
+
 bool ScheduleController::saveConfig(bool enabled, const QString& source_path,
                                     int interval_minutes, int retain_count,
                                     const QString& pack_key,

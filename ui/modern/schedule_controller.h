@@ -168,6 +168,21 @@ class ScheduleController : public QObject {
   //
   // 启用前的校验调用的是共享核心的 ValidateScheduleForEnable（CLI 用的是同一
   // 个函数），并带上当前仓库；首次启用还会把 next_run 推成一个完整周期之后。
+  // QML 真正调用的入口：周期与保留数量在界面上是**文本框**，所以按文本传进来，
+  // 由共享核心的 ParseBoundedScheduleNumber 裁决。
+  //
+  // 为什么不在这里用 QML 的 parseInt：它会把 "12abc" 悄悄变成 12，而 backupctl
+  // 明确拒绝同一个输入。同一个输入两个前端给出不同结论，正是 parity 要收掉的
+  // 东西；顺带还避免了 "99999999999999" 转 int 的溢出。
+  Q_INVOKABLE bool saveConfigFromText(bool enabled, const QString& source_path,
+                                      const QString& interval_text,
+                                      const QString& retain_text,
+                                      const QString& pack_key,
+                                      const QString& compression_key,
+                                      const QStringList& include_rules,
+                                      const QStringList& exclude_rules);
+
+  // 已经解析好的整数入口：C++ 侧的自动化测试与 saveConfigFromText 用它。
   Q_INVOKABLE bool saveConfig(bool enabled, const QString& source_path,
                               int interval_minutes, int retain_count,
                               const QString& pack_key,

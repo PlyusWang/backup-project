@@ -101,6 +101,22 @@ bool BuildScheduleFilter(const ScheduleConfig& config, Filter* filter,
 bool ValidateScheduleConfig(const ScheduleConfig& config,
                             std::string* error_message);
 
+// 把一个"必须是非负十进制整数"的选项解析成 uint32，并按给定的取值范围检查。
+//
+// CLI 的 --interval-minutes / --retain 与 GUI 计划页的周期 / 保留数量文本框
+// 走的是**同一个**函数。以前 GUI 用 QML 的 parseInt，"12abc" 会被悄悄截断成
+// 12，而 CLI 明确拒绝——同一个输入两个前端给出不同结论，正是要收掉的那类漂移，
+// 所以解析规则只留这一份。
+//
+// 规则：
+//   * 只接受纯十进制数字：空串、正负号、空白、小数点、字母一律拒绝；
+//   * 解析过程防溢出：一旦超过 maximum 立刻失败，不做回绕；
+//   * option 只是错误信息里的名字（CLI 传选项名，界面传人能读的字段名）。
+bool ParseBoundedScheduleNumber(const std::string& text, std::uint32_t minimum,
+                                std::uint32_t maximum,
+                                const std::string& option, std::uint32_t* value,
+                                std::string* error_message);
+
 // 启用前的完整校验。这是 GUI 与 CLI **共用**的那一份，两边都不许自己再写
 // 一套"能不能启用"的判断：
 //
