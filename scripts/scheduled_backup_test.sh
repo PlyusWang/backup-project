@@ -98,9 +98,11 @@ chmod -R u+rwX "$TEST_ROOT" 2>/dev/null || true
 rm -rf "$TEST_ROOT"
 mkdir -p "$TEST_ROOT"
 
+# archive-cli 是测试夹具，不在默认产品构建里（见 Makefile）：脚本要自己
+# 显式构建它。
 if [ ! -x "$BACKUPCTL" ] || [ ! -x "$ARCHIVE_CLI" ]; then
   echo "[schedule-test] backupctl/archive-cli is missing; building first..."
-  make -C "$ROOT_DIR" >/dev/null || exit 1
+  make -C "$ROOT_DIR" all test-fixtures >/dev/null || exit 1
 fi
 
 # ============================================================
@@ -142,6 +144,7 @@ run_unit application_lock_test
 run_unit scheduler_core_test
 run_unit scheduled_backup_test
 run_unit terminal_secret_test
+run_unit backup_preview_test
 
 # ============================================================
 echo "[schedule-test] B. CLI pipeline parity"
@@ -1557,7 +1560,9 @@ if [ "$(printenv SANITIZE || true)" = "1" ]; then
   mkdir -p "$SAN_DIR"
   SAN_SOURCES="$(find "$ROOT_DIR/src" -name '*.cpp' | sort | tr '
 ' ' ')"
-  for name in scheduler_core_test scheduled_backup_test terminal_secret_test; do
+  # application_lock_test 覆盖本轮改过的 runtime 目录判定（S_IXUSR）与
+  # FileLock 的 fail-closed 路径，所以它也在 sanitizer 名单里。
+  for name in application_lock_test scheduler_core_test scheduled_backup_test terminal_secret_test backup_preview_test; do
     if g++ -std=c++17 -g -O1 -fsanitize=address,undefined         -fno-omit-frame-pointer -I"$ROOT_DIR/include" -I"$ROOT_DIR/tests/unit"         "$ROOT_DIR/tests/unit/$name.cpp" $SAN_SOURCES         -o "$SAN_DIR/$name" >"$SAN_DIR/$name-build.log" 2>&1; then
       record_pass "G.$name 在 ASan + UBSan 下编译通过"
     else
@@ -1574,6 +1579,45 @@ if [ "$(printenv SANITIZE || true)" = "1" ]; then
 ' ' ')"
     fi
   done
+
+  # CLI 解析本身不在任何单元测试二进制里：preview 的参数分流（合法规则 /
+  # 非法规则 / 源不存在）要经过 build-sanitize/backupctl 走一遍。
+  # 它由 make sanitize 产出；quality_test.sh 已经建过，这里通常是一次空跑。
+  if [ ! -x "$ROOT_DIR/build-sanitize/backupctl" ]; then
+    make -C "$ROOT_DIR" sanitize >/dev/null 2>&1 || true
+  fi
+  SAN_CTL="$ROOT_DIR/build-sanitize/backupctl"
+  if [ -x "$SAN_CTL" ]; then
+    SAN_PREVIEW="$SAN_DIR/preview-src"
+    rm -rf "$SAN_PREVIEW"
+    mkdir -p "$SAN_PREVIEW/sub"
+    printf 'x\n' > "$SAN_PREVIEW/a.txt"
+    printf 'y\n' > "$SAN_PREVIEW/b.md"
+    printf 'z\n' > "$SAN_PREVIEW/sub/c.txt"
+    san_preview() {
+      local label="$1"
+      local expected="$2"
+      shift 2
+      ASAN_OPTIONS=detect_leaks=1:abort_on_error=0 \
+        UBSAN_OPTIONS=print_stacktrace=1:halt_on_error=1 \
+        "$SAN_CTL" preview "$@" >"$SAN_DIR/preview.log" 2>&1
+      local status=$?
+      if [ "$status" = "$expected" ] &&
+         ! grep -qE 'AddressSanitizer|runtime error|LeakSanitizer' "$SAN_DIR/preview.log"; then
+        record_pass "G.$label 在 ASan + UBSan 下 0 报告（exit=$status）"
+      else
+        record_fail "G.$label 在 ASan + UBSan 下有报告" \
+          "exit=$status $(grep -m1 -E 'AddressSanitizer|runtime error|LeakSanitizer' "$SAN_DIR/preview.log" | tr '\n' ' ')"
+      fi
+    }
+    san_preview "preview 正常路径" 0 "$SAN_PREVIEW" --include 'ext:txt'
+    san_preview "preview 复合规则" 0 "$SAN_PREVIEW" \
+      --include 'name:*.txt size:<5' --exclude 'name:b*'
+    san_preview "preview 非法规则" 2 "$SAN_PREVIEW" --include 'nonsense:xx'
+    san_preview "preview 源不存在" 1 "$SAN_DIR/no-such-source"
+  else
+    echo "  SKIP  G.preview（没有 build-sanitize/backupctl）"
+  fi
 else
   echo "  SKIP  G 区（设置 SANITIZE=1 才会跑）"
 fi

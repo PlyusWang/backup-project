@@ -38,7 +38,9 @@ absent() { [ -e "$1" ] && echo 0 || echo 1; }
 tree_manifest() { ( cd "$1" 2> /dev/null && find . -type f -print0 | sort -z | xargs -0 sha256sum 2> /dev/null ); }
 
 if [ ! -x "$BIN" ]; then bash "$ROOT_DIR/scripts/filter_rule_builder_test.sh" > /dev/null 2>&1; fi
-if [ ! -x "$CTL" ] || [ ! -x "$ARCHIVE_CLI" ]; then make -C "$ROOT_DIR" > /dev/null 2>&1; fi
+if [ ! -x "$CTL" ] || [ ! -x "$ARCHIVE_CLI" ]; then
+  make -C "$ROOT_DIR" all test-fixtures > /dev/null 2>&1
+fi
 if [ ! -x "$BIN" ] || [ ! -x "$CTL" ] || [ ! -x "$ARCHIVE_CLI" ]; then
   echo "[rb-int] 缺少测试二进制 / backupctl / archive-cli，无法继续" >&2
   exit 1

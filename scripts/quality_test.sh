@@ -130,6 +130,12 @@ make -C "$ROOT_DIR" clean > "$BUILD_LOG" 2>&1
 rm -rf "$ROOT_DIR/build-sanitize"
 make -C "$ROOT_DIR" >> "$BUILD_LOG" 2>&1
 BUILD_CODE=$?
+# A1：普通的 make 是**产品构建**，不该产出测试夹具 archive-cli。
+# 这一位必须在 make test-fixtures 之前取，之后就没法分辨它是不是被顺手建出来的。
+if [[ -x "$ARCHIVE_CLI" ]]; then FIXTURE_LEAK=1; else FIXTURE_LEAK=0; fi
+# A2：夹具由测试自己显式构建（见 Makefile 的 test-fixtures）。
+make -C "$ROOT_DIR" test-fixtures >> "$BUILD_LOG" 2>&1
+FIXTURE_CODE=$?
 make -C "$ROOT_DIR" sanitize >> "$BUILD_LOG" 2>&1
 SAN_BUILD_CODE=$?
 BUILD_WARNINGS=$(grep -c "warning:" "$BUILD_LOG")
@@ -146,6 +152,22 @@ else
 fi
 if [[ -x "$BACKUPCTL" ]]; then pass "BLD-03 产物 build/backupctl 可执行"; else fail "BLD-03 产物 build/backupctl 可执行" "缺失"; fi
 if [[ -x "$SAN_BACKUPCTL" ]]; then pass "BLD-04 产物 build-sanitize/backupctl 可执行"; else fail "BLD-04 产物 build-sanitize/backupctl 可执行" "缺失"; fi
+# archive-cli 是测试夹具：默认 make 不该产出它，测试必须显式要。
+if [[ $FIXTURE_LEAK -eq 0 ]]; then
+  pass "BLD-05 默认 make 不产出测试夹具 build/archive-cli"
+else
+  fail "BLD-05 默认 make 不产出测试夹具 build/archive-cli" "它被默认目标建出来了"
+fi
+if [[ $FIXTURE_CODE -eq 0 && -x "$ARCHIVE_CLI" ]]; then
+  pass "BLD-06 make test-fixtures 显式产出 build/archive-cli"
+else
+  fail "BLD-06 make test-fixtures 显式产出 build/archive-cli" "exit=$FIXTURE_CODE"
+fi
+if [[ -x "$SAN_ARCHIVE_CLI" ]]; then
+  pass "BLD-07 make sanitize 顺带产出 build-sanitize/archive-cli"
+else
+  fail "BLD-07 make sanitize 顺带产出 build-sanitize/archive-cli" "缺失"
+fi
 
 # ======================================================================
 # 步骤 1：功能基线（scripts/test.sh）

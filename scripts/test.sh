@@ -49,9 +49,11 @@ STATUS=0
 
 echo "[test] backup/restore suite (archive v0.1)"
 
+# archive-cli 是测试夹具，不在默认产品构建里（见 Makefile）：测试要自己显式
+# 构建它，而不是指望 make all 顺手产出。
 if [[ ! -x "$BACKUPCTL" || ! -x "$ARCHIVE_CLI" ]]; then
   echo "[test] backupctl/archive-cli is missing; building first..."
-  make -C "$ROOT_DIR"
+  make -C "$ROOT_DIR" all test-fixtures
 fi
 
 record_pass() {
@@ -1212,6 +1214,330 @@ expect_same_sha256 "FIL-36 retained file is byte-identical after filtering" \
   "$FIL/src/a.cpp" "$FIL/f36.out/a.cpp"
 expect_path_absent "FIL-37 filtered file is absent from the restored tree" \
   "$FIL/f36.out/c.log"
+
+# ---- L. Manual Backup 的筛选预览 ------------------------------------
+#
+# 这一段证明的是**三方一致**，而不是"某个函数返回了预期的值"：
+#
+#   CLI 预览      backupctl preview
+#   GUI 预览      build/backup-gui-modern --preview-test（界面真正的入口）
+#   真实备份      用同一组规则 backup 之后，把归档恢复出来数实际存在的节点
+#
+# GUI 二进制不存在时只跑 CLI 那一半（它属于 gui-modern 目标）。
+
+echo "[test] L. 筛选预览（CLI == GUI == 真实备份）"
+
+PREVIEW="$TEST_ROOT/preview"
+PREVIEW_GUI_BIN="$ROOT_DIR/build/backup-gui-modern"
+PREVIEW_CLI_OUT="$PREVIEW/cli.out"
+PREVIEW_CLI_ERR="$PREVIEW/cli.err"
+PREVIEW_GUI_OUT="$PREVIEW/gui.out"
+PREVIEW_GUI_ERR="$PREVIEW/gui.err"
+PREVIEW_DIFF="$PREVIEW/diff.txt"
+PREVIEW_SRC="$PREVIEW/src"
+PREVIEW_REPO="$PREVIEW/repo"
+PREVIEW_CONFIG="$PREVIEW/config.json"
+mkdir -p "$PREVIEW_SRC/sub" "$PREVIEW_SRC/build" "$PREVIEW_SRC/cache" \
+  "$PREVIEW_SRC/empty_dir" "$PREVIEW_REPO"
+
+printf 'aaa\n' > "$PREVIEW_SRC/a.txt"
+printf 'bbbbb\n' > "$PREVIEW_SRC/b.txt"
+printf 'notes\n' > "$PREVIEW_SRC/notes.md"
+printf 'obj\n' > "$PREVIEW_SRC/build/obj.o"
+printf 'ccc\n' > "$PREVIEW_SRC/sub/c.txt"
+printf 'big\n' > "$PREVIEW_SRC/sub/big.txt"
+printf 'tmp\n' > "$PREVIEW_SRC/cache/tmp.dat"
+
+"$BACKUPCTL" --config-file "$PREVIEW_CONFIG" config repository set "$PREVIEW_REPO" \
+  >/dev/null 2>&1
+
+PREVIEW_CLI_STATUS=0
+PREVIEW_GUI_STATUS=0
+run_preview_cli() {
+  set +e
+  timeout --signal=KILL "$TIMEOUT_SECONDS" "$BACKUPCTL" preview "$@" \
+    >"$PREVIEW_CLI_OUT" 2>"$PREVIEW_CLI_ERR"
+  PREVIEW_CLI_STATUS=$?
+  set -e
+}
+run_preview_gui() {
+  set +e
+  QT_QPA_PLATFORM=offscreen timeout --signal=KILL 180 "$PREVIEW_GUI_BIN" \
+    --preview-test "$@" >"$PREVIEW_GUI_OUT" 2>"$PREVIEW_GUI_ERR"
+  PREVIEW_GUI_STATUS=$?
+  set -e
+}
+# 预览输出 = 头部 + （可能一行 Note） + 每个 included 条目的相对路径。
+# 比较前排序：两边都按扫描顺序输出，但"顺序也一致"不该是这条断言的负担。
+preview_listed() {
+  grep -v '^Preview: ' "$1" | grep -v '^Note: ' | sort
+}
+# 恢复出来的树里所有节点（含目录）的相对路径。
+tree_nodes() {
+  ( cd "$1" && find . -mindepth 1 -printf '%P\n' | sort )
+}
+
+# CLI 预览 == GUI 预览：两条命令的输出逐行 diff。
+# 这是最直接的一条证据 —— 它不是"都调了同一个函数"，而是"命令行里看到的和
+# 界面上看到的一模一样"。
+# $2 是源目录：P7 的截断用例要换一个大目录，其它用例都用 $PREVIEW_SRC。
+expect_preview_parity_at() {
+  local name="$1"
+  local source="$2"
+  shift 2
+  run_preview_cli "$source" "$@"
+  if [[ $PREVIEW_CLI_STATUS -ne 0 ]]; then
+    record_fail "$name" \
+      "backupctl preview exit=$PREVIEW_CLI_STATUS: $(head -n 1 "$PREVIEW_CLI_ERR")"
+    return
+  fi
+  if [[ ! -x "$PREVIEW_GUI_BIN" ]]; then
+    record_pass "$name（CLI；没有 build/backup-gui-modern，跳过 GUI 对比）"
+    return
+  fi
+  run_preview_gui "$source" "$@"
+  if [[ $PREVIEW_GUI_STATUS -ne 0 ]]; then
+    record_fail "$name" \
+      "GUI preview exit=$PREVIEW_GUI_STATUS: $(head -n 1 "$PREVIEW_GUI_ERR")"
+    return
+  fi
+  if diff -u "$PREVIEW_CLI_OUT" "$PREVIEW_GUI_OUT" >"$PREVIEW_DIFF" 2>&1; then
+    record_pass "$name"
+  else
+    record_fail "$name" "$(head -n 6 "$PREVIEW_DIFF" | tr '\n' ' ')"
+  fi
+}
+
+expect_preview_parity() {
+  local name="$1"
+  shift
+  expect_preview_parity_at "$name" "$PREVIEW_SRC" "$@"
+}
+
+# 预览 == 真实备份：用同一组规则备份到仓库，恢复，比较节点集合。
+expect_preview_matches_backup() {
+  local name="$1"
+  shift
+  run_preview_cli "$PREVIEW_SRC" "$@"
+  if [[ $PREVIEW_CLI_STATUS -ne 0 ]]; then
+    record_fail "$name" "preview exit=$PREVIEW_CLI_STATUS"
+    return
+  fi
+  # 快照用文件而不是变量：仓库开始时是空的，空字符串会变成一个空行，
+  # 让 comm 多出一行"新文件名"。
+  find "$PREVIEW_REPO" -maxdepth 1 -name '*.bak' -printf '%f\n' | sort \
+    >"$PREVIEW/before.txt"
+  set +e
+  timeout --signal=KILL "$TIMEOUT_SECONDS" "$BACKUPCTL" \
+    --config-file "$PREVIEW_CONFIG" backup "$PREVIEW_SRC" "$@" \
+    >"$PREVIEW/backup.log" 2>&1
+  local backup_status=$?
+  set -e
+  if [[ $backup_status -ne 0 ]]; then
+    record_fail "$name" "backup exit=$backup_status: $(head -n 1 "$PREVIEW/backup.log")"
+    return
+  fi
+  find "$PREVIEW_REPO" -maxdepth 1 -name '*.bak' -printf '%f\n' | sort \
+    >"$PREVIEW/after.txt"
+  local file_name
+  file_name="$(comm -13 "$PREVIEW/before.txt" "$PREVIEW/after.txt" | head -n 1)"
+  if [[ -z "$file_name" ]]; then
+    record_fail "$name" "仓库里没有新归档"
+    return
+  fi
+  rm -rf "$PREVIEW/restored"
+  set +e
+  timeout --signal=KILL "$TIMEOUT_SECONDS" "$BACKUPCTL" \
+    --config-file "$PREVIEW_CONFIG" restore "$file_name" "$PREVIEW/restored" \
+    >>"$PREVIEW/backup.log" 2>&1
+  local restore_status=$?
+  set -e
+  if [[ $restore_status -ne 0 ]]; then
+    record_fail "$name" "restore exit=$restore_status: $(tail -n 1 "$PREVIEW/backup.log")"
+    return
+  fi
+  if diff -u <(preview_listed "$PREVIEW_CLI_OUT") <(tree_nodes "$PREVIEW/restored") \
+    >"$PREVIEW_DIFF" 2>&1; then
+    record_pass "$name"
+  else
+    record_fail "$name" "$(head -n 6 "$PREVIEW_DIFF" | tr '\n' ' ')"
+  fi
+}
+
+# P1 没有规则 / P2 单条件 / P3 一条规则内的 compound AND /
+# P4 include+exclude（exclude 优先）/ P5 被排除的目录整棵剪掉
+expect_preview_parity "PRV-01 P1 无规则：CLI 预览 == GUI 预览"
+expect_preview_matches_backup "PRV-02 P1 无规则：CLI 预览 == 真实备份条目"
+expect_preview_parity "PRV-03 P2 单条件 include：CLI == GUI" --include 'ext:txt'
+expect_preview_matches_backup "PRV-04 P2 单条件 include：CLI == 真实备份" --include 'ext:txt'
+expect_preview_parity "PRV-05 P3 compound AND：CLI == GUI" --include 'name:*.txt size:<5'
+expect_preview_matches_backup "PRV-06 P3 compound AND：CLI == 真实备份" \
+  --include 'name:*.txt size:<5'
+expect_preview_parity "PRV-07 P4 include+exclude：CLI == GUI" \
+  --include 'name:*.txt' --exclude 'name:b*'
+expect_preview_matches_backup "PRV-08 P4 include+exclude：CLI == 真实备份" \
+  --include 'name:*.txt' --exclude 'name:b*'
+expect_preview_parity "PRV-09 P5 被排除目录：CLI == GUI" --exclude 'name:build'
+expect_preview_matches_backup "PRV-10 P5 被排除目录：CLI == 真实备份" --exclude 'name:build'
+
+# P5b：排除项必须**真的不在**结果里。前两条只证明两边一致，这一条证明一致的
+# 方向是对的 —— 否则"两边都错误地包含了 build/"也会通过。
+run_preview_cli "$PREVIEW_SRC" --exclude 'name:build'
+if [[ $PREVIEW_CLI_STATUS -eq 0 ]] &&
+   ! preview_listed "$PREVIEW_CLI_OUT" | grep -q '^build'; then
+  record_pass "PRV-11 P5b 被排除目录及其子树不出现在预览里"
+else
+  record_fail "PRV-11 P5b 被排除目录及其子树不出现在预览里" \
+    "$(head -n 3 "$PREVIEW_CLI_OUT" | tr '\n' ' ')"
+fi
+
+# 预览是只读的：不建归档、不改仓库、不改配置。
+PREVIEW_LOCK_REPO_BEFORE="$(ls -1 "$PREVIEW_REPO" | sort | tr '\n' ' ')"
+PREVIEW_CFG_SUM="$(cksum "$PREVIEW_CONFIG" | cut -d' ' -f1)"
+run_preview_cli "$PREVIEW_SRC" --include 'ext:txt'
+PREVIEW_LOCK_REPO_AFTER="$(ls -1 "$PREVIEW_REPO" | sort | tr '\n' ' ')"
+if [[ $PREVIEW_CLI_STATUS -eq 0 &&
+      "$PREVIEW_LOCK_REPO_BEFORE" == "$PREVIEW_LOCK_REPO_AFTER" &&
+      "$PREVIEW_CFG_SUM" == "$(cksum "$PREVIEW_CONFIG" | cut -d' ' -f1)" ]]; then
+  record_pass "PRV-12 预览不创建归档、不改仓库、不改配置"
+else
+  record_fail "PRV-12 预览不创建归档、不改仓库、不改配置" \
+    "repo=[$PREVIEW_LOCK_REPO_AFTER]"
+fi
+
+# 预览**不需要**仓库：--help 与文档都这么承诺。这一条与 PRV-12 是两件事 ——
+# 那条说"不修改仓库"，这条说"没有仓库也能跑"。
+NOREPO_DIR="$PREVIEW/no-repo"
+mkdir -p "$NOREPO_DIR"
+NOREPO_CONFIG="$NOREPO_DIR/config.json"
+run_preview_cli "$PREVIEW_SRC" --include 'ext:txt' --config-file "$NOREPO_CONFIG"
+if [[ $PREVIEW_CLI_STATUS -eq 0 ]] &&
+   ! grep -q 'No backup repository is configured' "$PREVIEW_CLI_ERR"; then
+  record_pass "PRV-24 预览不需要配置仓库（没有 config.json 也能预览）"
+else
+  record_fail "PRV-24 预览不需要配置仓库" \
+    "exit=$PREVIEW_CLI_STATUS $(head -n 1 "$PREVIEW_CLI_ERR")"
+fi
+# 空配置必须真的是"没有仓库"，否则 PRV-24 就是空转：同一个配置下 backup
+# 必须明确拒绝，理由正是"没有配置仓库"。
+set +e
+timeout --signal=KILL "$TIMEOUT_SECONDS" "$BACKUPCTL" --config-file "$NOREPO_CONFIG" \
+  backup "$PREVIEW_SRC" >"$PREVIEW/no-repo-backup.log" 2>&1
+NOREPO_BACKUP_STATUS=$?
+set -e
+if [[ $NOREPO_BACKUP_STATUS -eq 1 ]] &&
+   grep -q 'No backup repository is configured' "$PREVIEW/no-repo-backup.log"; then
+  record_pass "PRV-25 同一份空配置下 backup 仍然被拒绝（PRV-24 不是空转）"
+else
+  record_fail "PRV-25 同一份空配置下 backup 仍然被拒绝" \
+    "exit=$NOREPO_BACKUP_STATUS $(head -n 1 "$PREVIEW/no-repo-backup.log")"
+fi
+
+# P6：非法规则 = 用法错误（2），在扫描之前返回，且不产生任何归档。
+expect_failure "PRV-13 P6 非法 DSL 是用例错误（exit 2）" 2 "Invalid filter rule" \
+  preview "$PREVIEW_SRC" --include 'nonsense:xx'
+# 语法错误的三种形态都必须是 2，而不是"忽略掉继续跑"。
+run_preview_cli "$PREVIEW_SRC" --include
+if [[ $PREVIEW_CLI_STATUS -eq 2 ]]; then
+  record_pass "PRV-14 P6 --include 缺少规则值是用法错误（exit 2）"
+else
+  record_fail "PRV-14 P6 --include 缺少规则值是用法错误" "exit=$PREVIEW_CLI_STATUS"
+fi
+run_preview_cli "$PREVIEW_SRC" --pack ustar
+if [[ $PREVIEW_CLI_STATUS -eq 2 ]]; then
+  record_pass "PRV-15 preview 不接受 pipeline 选项（exit 2）"
+else
+  record_fail "PRV-15 preview 不接受 pipeline 选项" "exit=$PREVIEW_CLI_STATUS"
+fi
+run_preview_cli "$PREVIEW_SRC" extra-positional
+if [[ $PREVIEW_CLI_STATUS -eq 2 ]]; then
+  record_pass "PRV-16 preview 拒绝多余的位置参数（exit 2）"
+else
+  record_fail "PRV-16 preview 拒绝多余的位置参数" "exit=$PREVIEW_CLI_STATUS"
+fi
+
+# 业务失败（源目录不存在）仍然是 1，与其它子命令一致。
+expect_failure "PRV-17 源目录不存在是操作失败（exit 1）" 1 "not a directory" \
+  preview "$PREVIEW/nope"
+
+# P6b：非法规则在 GUI 与 CLI 得到**同一句**核心原文。
+if [[ -x "$PREVIEW_GUI_BIN" ]]; then
+  run_preview_cli "$PREVIEW_SRC" --include 'nonsense:xx'
+  run_preview_gui "$PREVIEW_SRC" --include 'nonsense:xx'
+  CLI_MESSAGE="$(head -n 1 "$PREVIEW_CLI_ERR")"
+  GUI_MESSAGE="$(head -n 1 "$PREVIEW_GUI_ERR")"
+  if [[ -n "$CLI_MESSAGE" && "$CLI_MESSAGE" == "$GUI_MESSAGE" ]]; then
+    record_pass "PRV-18 P6 GUI 与 CLI 报出同一句无效规则原文"
+  else
+    record_fail "PRV-18 P6 GUI 与 CLI 报出同一句无效规则原文" \
+      "cli=[$CLI_MESSAGE] gui=[$GUI_MESSAGE]"
+  fi
+fi
+
+# P7：超过预览窗口时 GUI 与 CLI 采用同一个截断契约（同一个 limit、同一行 Note）。
+PBIG="$PREVIEW/big"
+mkdir -p "$PBIG"
+for index in $(seq 1 320); do printf 'x' > "$PBIG/f$index.dat"; done
+run_preview_cli "$PBIG"
+if [[ $PREVIEW_CLI_STATUS -eq 0 ]] &&
+   grep -qF 'Preview: 300 matching item(s)' "$PREVIEW_CLI_OUT" &&
+   grep -qF 'more than 300 entries' "$PREVIEW_CLI_OUT"; then
+  record_pass "PRV-19 P7 超过窗口时 CLI 明确报出截断（300 / more than 300）"
+else
+  record_fail "PRV-19 P7 超过窗口时 CLI 明确报出截断" \
+    "$(head -n 2 "$PREVIEW_CLI_OUT" | tr '\n' ' ')"
+fi
+expect_preview_parity_at "PRV-20 P7 截断契约在 GUI 与 CLI 上一致" "$PBIG"
+
+# L.6 单实例：preview 是产品命令，必须在进入扫描之前被同一把锁拒绝。
+# "只读所以可以并发"不是这个产品的规则。
+PLOCK="$PREVIEW/lock"
+mkdir -p "$PLOCK/src" "$PLOCK/repo"
+printf 'w\n' > "$PLOCK/src/a.txt"
+"$BACKUPCTL" --config-file "$PLOCK/config.json" config repository set "$PLOCK/repo" \
+  >/dev/null 2>&1
+"$BACKUPCTL" --config-file "$PLOCK/config.json" --schedule-file "$PLOCK/schedule.json" \
+  schedule set --source "$PLOCK/src" --interval-minutes 5 --retain 2 >/dev/null 2>&1
+APP_LOCK="/run/user/$(id -u)/backup-project.lock"
+[ -d "/run/user/$(id -u)" ] || APP_LOCK="/tmp/backup-project-$(id -u).lock"
+"$BACKUPCTL" --config-file "$PLOCK/config.json" --schedule-file "$PLOCK/schedule.json" \
+  schedule watch >"$PLOCK/watch.log" 2>&1 &
+PLOCK_WATCH=$!
+PLOCK_HOLD=0
+for _ in $(seq 1 100); do
+  if kill -0 "$PLOCK_WATCH" 2>/dev/null &&
+     grep -q "^pid=$PLOCK_WATCH " "$APP_LOCK" 2>/dev/null; then
+    PLOCK_HOLD=1
+    break
+  fi
+  sleep 0.1
+done
+run_preview_cli "$PREVIEW_SRC" --include 'ext:txt'
+if [[ $PLOCK_HOLD -eq 1 && $PREVIEW_CLI_STATUS -eq 3 &&
+      ! -s "$PREVIEW_CLI_OUT" ]]; then
+  record_pass "PRV-21 单实例：CLI 持锁时 preview 退出 3 且不扫描（无输出）"
+else
+  record_fail "PRV-21 单实例：CLI 持锁时 preview 退出 3 且不扫描" \
+    "hold=$PLOCK_HOLD exit=$PREVIEW_CLI_STATUS out=$(wc -c < "$PREVIEW_CLI_OUT")"
+fi
+if [[ -x "$PREVIEW_GUI_BIN" ]]; then
+  run_preview_gui "$PREVIEW_SRC" --include 'ext:txt'
+  if [[ $PREVIEW_GUI_STATUS -eq 3 ]]; then
+    record_pass "PRV-22 单实例：同一个锁也拦住 GUI 的预览入口"
+  else
+    record_fail "PRV-22 单实例：同一个锁也拦住 GUI 的预览入口" \
+      "exit=$PREVIEW_GUI_STATUS $(head -n 1 "$PREVIEW_GUI_ERR")"
+  fi
+fi
+kill -TERM "$PLOCK_WATCH" 2>/dev/null || true
+for _ in $(seq 1 100); do kill -0 "$PLOCK_WATCH" 2>/dev/null || break; sleep 0.1; done
+wait "$PLOCK_WATCH" 2>/dev/null || true
+run_preview_cli "$PREVIEW_SRC" --include 'ext:txt'
+if [[ $PREVIEW_CLI_STATUS -eq 0 ]]; then
+  record_pass "PRV-23 持锁进程退出之后 preview 又能跑（锁由内核释放）"
+else
+  record_fail "PRV-23 持锁进程退出之后 preview 又能跑" "exit=$PREVIEW_CLI_STATUS"
+fi
 
 # ---- CLI 约定 --------------------------------------------------------
 
