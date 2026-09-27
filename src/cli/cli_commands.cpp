@@ -619,9 +619,6 @@ int RunRestoreCommand(const CliContext& context,
     return kCliExitOperationFailed;
   }
 
-  // 恢复走**依赖链**入口：目标是一份完整快照时行为与以前完全一致（内部就是
-  // 同一个恢复路径），是 delta 时自动把 base 与中间层一起应用。用户只需要选
-  // restore point，不需要手工逐个恢复。
   ArchiveFileInfo info;
   std::string identify_error;
   const bool wants_password =
@@ -640,10 +637,31 @@ int RunRestoreCommand(const CliContext& context,
     }
     options.password = secret;
   }
+
+  // 先按 magic 分类再选路径：
+  //
+  //   * v2 container / BKPINC1 delta —— 依赖链入口。目标是一份完整快照时
+  //     内部走的就是同一个恢复路径，行为与以前一致；是 delta 时自动把 base
+  //     与中间层一起应用，用户只需要选 restore point。
+  //   * 其它（legacy v0.1 等）—— 这些格式没有"链"的概念，走按 magic 分流的
+  //     既有入口。它们的行为与 PR #17 一字不变：产品 CLI 一直能恢复历史 v0.1
+  //     归档，这条能力不能因为新增了增量而消失。
+  const SnapshotFileKind snapshot_kind =
+      ClassifySnapshotFile(archive_path, nullptr);
+  bool restored = false;
   RestoreReport report;
-  const bool restored =
-      RestoreSnapshotChain(repository, file_name, destination_directory,
-                           options, &report, &error_message);
+  if (snapshot_kind == SnapshotFileKind::kUnknown) {
+    BackupEngine engine;
+    restored = wants_password
+                   ? engine.Restore(archive_path, destination_directory,
+                                    options, nullptr, &error_message)
+                   : engine.Restore(archive_path, destination_directory,
+                                    &error_message);
+  } else {
+    restored =
+        RestoreSnapshotChain(repository, file_name, destination_directory,
+                             options, &report, &error_message);
+  }
   for (char& character : secret) character = '\0';
   if (!restored) {
     PrintError(error_message);

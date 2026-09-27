@@ -1097,7 +1097,12 @@ OperationOutcome BackupController::RunOperation(OperationRequest request) {
           engine.Backup(first, second, request.filter, &error_message);
     }
   } else if (request.kind == Kind::kRestore &&
-             request.repository_directory.size() > 0) {
+             request.repository_directory.size() > 0 &&
+             // 只有 v2 container 与 BKPINC1 delta 才属于依赖链；legacy v0.1
+             // 等格式没有链的概念，继续走下面那条按 magic 分流的既有入口
+             // （产品一直能恢复历史 v0.1，这条能力不因为增量而消失）。
+             backupproject::ClassifySnapshotFile(first, nullptr) !=
+                 backupproject::SnapshotFileKind::kUnknown) {
     // PR #18：GUI 的恢复也走依赖链入口 —— 目标是一份完整快照时行为与以前
     // 完全一致，是 delta 时自动把 base 与中间层一起应用。
     backupproject::RestoreReport report;

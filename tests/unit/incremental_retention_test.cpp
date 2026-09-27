@@ -270,9 +270,13 @@ int main() {
     bp::RetentionPlan plan;
     const bool planned =
         bp::PlanDependencyAwareRetention(repo, candidates, 1, &plan, &error);
-    test_support::Check(!planned,
-                        "INC-RT T4 判别：读不出依赖就拒绝出计划，绝不猜着删",
-                        planned ? "(竟然成功了)" : error);
+    // 契约是"读不出依赖的**不删**，并如实记下来"，而不是"整份计划失败"：
+    // 只因为一份读不出来的快照就拒绝淘汰其它无关的旧快照，会让仓库无上限
+    // 增长——那不是安全，只是把问题推给下一轮。
+    test_support::Check(planned && Contains(plan.unreadable, "d1.bak"),
+                        "INC-RT T4 读不出依赖的快照被记进 unreadable", error);
+    test_support::Check(!Contains(plan.remove, "d1.bak"),
+                        "INC-RT T4 判别：证明不了安全的快照绝不进入删除集合");
   }
 
   return test_support::Finish("incremental_retention_test");

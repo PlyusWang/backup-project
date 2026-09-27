@@ -283,10 +283,12 @@ bool ScheduledBackupService::RunRetention(ScheduleDocument* document,
                                           std::uint64_t* deleted,
                                           std::uint64_t* failed,
                                           std::uint64_t* dependency_retained,
+                                          std::uint64_t* unreadable,
                                           std::string* error_message) const {
   if (deleted != nullptr) *deleted = 0;
   if (failed != nullptr) *failed = 0;
   if (dependency_retained != nullptr) *dependency_retained = 0;
+  if (unreadable != nullptr) *unreadable = 0;
   if (error_message != nullptr) error_message->clear();
   if (document == nullptr) {
     SetError(error_message, "Schedule document must not be null");
@@ -360,12 +362,13 @@ bool ScheduledBackupService::RunRetention(ScheduleDocument* document,
         static_cast<std::ptrdiff_t>(oldest));
     if (deleted != nullptr) *deleted += 1;
   }
-  if (!plan.keep_ancestors.empty()) {
-    // 被依赖而保留下来的祖先如实记一笔：否则"为什么还留着这么旧的快照"
-    // 在日志和界面上都说不清。
-    if (dependency_retained != nullptr) {
-      *dependency_retained = plan.keep_ancestors.size();
-    }
+  // 被依赖而保留下来的祖先、以及读不出依赖因此不敢删的快照，
+  // 都如实计数：否则"为什么还留着这么旧的快照"在日志和界面上都说不清。
+  if (dependency_retained != nullptr) {
+    *dependency_retained = plan.keep_ancestors.size();
+  }
+  if (unreadable != nullptr) {
+    *unreadable = plan.unreadable.size();
   }
 
   // 不变式：retention 结束后，baseline 记录必须仍然指向一份存在的快照。
@@ -778,10 +781,13 @@ bool ScheduledBackupService::EvaluateInternal(std::int64_t now_sec, bool force,
   std::uint64_t deleted = 0;
   std::uint64_t failed = 0;
   std::uint64_t dependency_retained = 0;
+  std::uint64_t retention_unreadable = 0;
   std::string retention_error;
-  const bool retention_ok = RunRetention(
-      &document, &deleted, &failed, &dependency_retained, &retention_error);
+  const bool retention_ok =
+      RunRetention(&document, &deleted, &failed, &dependency_retained,
+                   &retention_unreadable, &retention_error);
   result->retention_dependency_retained = dependency_retained;
+  result->retention_unreadable = retention_unreadable;
   result->retention_deleted = deleted;
   result->retention_failed = failed;
   result->status = StatusForRetention(retention_ok);
