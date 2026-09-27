@@ -616,8 +616,8 @@ bool ScheduledBackupService::EvaluateInternal(std::int64_t now_sec, bool force,
       RepositoryIdentity(repository_path_);
   document.state.baseline.source_path = document.config.source_path;
 
-  // ★ 崩溃一致性的顺序（§36）：archive 已发布 -> manifest -> state -> retention
-  //   -> history -> state。
+  // ★ 崩溃一致性的顺序（§36）：archive 已发布 -> manifest -> retention
+  //   -> state -> history -> state。
   //
   //   如果在这里崩：archive 已经是一个完整可恢复的 .bak，而 state 里还没有
   //   它。它最多变成一个"没人认领的普通备份"，下次 List 照样列得出来、
@@ -628,10 +628,37 @@ bool ScheduledBackupService::EvaluateInternal(std::int64_t now_sec, bool force,
   std::string persist_error;
   if (!store_->SaveManifest(current, binding, &persist_error)) {
     result->diagnostic +=
-        "The snapshot was created, but the source manifest could not be saved "
-        "(the next run will be treated as a first snapshot): " +
+        "The snapshot was created, but the source manifest could not be "
+        "saved: " +
         persist_error + " ";
   }
+
+  // ---- retention：只在**这次真的创建成功之后**执行 ----
+  //
+  // 它必须排在第一次 Save **之前**。这不是顺序偏好，而是"写出去的东西必须
+  // 读得回来"：上一段刚把这一份新快照 push 进名单，长度是 retain + 1，而
+  // ScheduleStore 只接受 kMaxRetainCount 条，retain_count 又允许取到
+  // kMaxRetainCount。于是"先 Save 再淘汰"在满额时会要求写出一份自己都读不
+  // 回来的 state：Save 拒绝，这一轮在写盘处提前返回，retention 永远轮不到，
+  // 下一轮再建一份……仓库无上限增长，而且每一轮都报成功、退出码 0。
+  //
+  // 先淘汰再落盘，落盘的那份长度就恒 <= retain_count <= 文件上界，
+  // "能写出去的都能读回来"由构造保证。
+  //
+  // 淘汰删的是最旧的那些，而 baseline 刚被设成**最新**的这一份，
+  // 所以 retention 不可能删掉 baseline —— 这一点与改动前完全一致。
+  std::uint64_t deleted = 0;
+  std::uint64_t failed = 0;
+  std::string retention_error;
+  const bool retention_ok =
+      RunRetention(&document, &deleted, &failed, &retention_error);
+  result->retention_deleted = deleted;
+  result->retention_failed = failed;
+  result->status = StatusForRetention(retention_ok);
+  if (!retention_ok) {
+    result->diagnostic += retention_error + " ";
+  }
+
   if (!store_->Save(document, &persist_error)) {
     result->diagnostic +=
         "The snapshot was created, but the schedule state could not be "
@@ -640,20 +667,6 @@ bool ScheduledBackupService::EvaluateInternal(std::int64_t now_sec, bool force,
     result->status = ScheduleEvaluationStatus::kCreatedSnapshot;
     return true;
   }
-
-  // ---- retention：只在**这次真的创建成功之后**执行 ----
-  std::uint64_t deleted = 0;
-  std::uint64_t failed = 0;
-  std::string retention_error;
-  const bool retention_ok =
-      RunRetention(&document, &deleted, &failed, &retention_error);
-  result->retention_deleted = deleted;
-  result->retention_failed = failed;
-  if (!retention_ok) {
-    result->diagnostic += retention_error + " ";
-  }
-
-  result->status = StatusForRetention(retention_ok);
 
   ScheduleHistoryEntry entry;
   entry.scheduled_at_sec = now_sec;
