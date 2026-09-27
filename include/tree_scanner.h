@@ -20,6 +20,7 @@
 
 #include "archive_entry.h"
 #include "filter.h"
+#include "source_tree_walker.h"
 
 namespace backupproject {
 
@@ -37,6 +38,17 @@ namespace backupproject {
 bool ScanSourceTree(const std::string& source_directory, const Filter* filter,
                     std::vector<ArchiveEntry>* entries,
                     std::string* error_message);
+
+// 同一件事，但允许注入 filesystem 失败。
+//
+// 只给测试用：生产调用方一律传 nullptr（也就是上面那个重载）。存在的理由是
+// "备份遇到 opendir/readdir/lstat 失败也必须 fail closed" 这条语义需要被测到，
+// 而权限类失败在 root / CAP_DAC_OVERRIDE 下造不出来——用 chmod 000 拼出来的
+// 用例会在那种环境里静默变成"通过"。见 source_tree_walker.h 里的
+// SourceWalkFaults：它只能把一次 syscall 变成失败，不能伪造文件系统内容。
+bool ScanSourceTree(const std::string& source_directory, const Filter* filter,
+                    std::vector<ArchiveEntry>* entries,
+                    std::string* error_message, const SourceWalkFaults* faults);
 
 }  // namespace backupproject
 

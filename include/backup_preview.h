@@ -41,16 +41,26 @@
 
 #include "archive_entry.h"
 #include "filter_rule_builder.h"
+#include "source_tree_walker.h"
 
 namespace backupproject {
 
-// 预览窗口的默认大小：一次最多检查 300 个条目。
+// 预览窗口的默认大小：最多**列出** 300 个条目。
+//
+// 注意窗口限制的是展示，不是检查：整棵源目录树都会被遍历与验证
+// （见 PreviewBackupSelection 的说明）。把一个 30 万文件的目录检查完是预览
+// 该付的代价——如果为了快就在第 300 项停下，第 301 项上的 socket 或权限错误
+// 就会被漏掉，"预览说可以备份"这句话也就不再成立。
 //
 // 这是 GUI 与 CLI 共用的常量，不是某一端的显示偏好：两边报出来的
 // truncated 必须来自同一个数。
 inline constexpr std::size_t kPreviewEntryLimit = 300;
 
 // 一个条目为什么进 / 不进归档。界面据此给出人话，CLI 只需要 included 这一位。
+//
+// 只有三种取值：遍历的判定就是三选一（见 SourceEntryDecision）。"没有被排除的
+// socket"不在这里——它不让遍历继续走下去，而是让整次遍历失败（真实 Backup 也
+// 是这么做的），所以它出现在 PreviewResult 的失败字段里，而不是某一行上。
 enum class PreviewDisposition {
   // 进入归档（普通文件 / 软链接 / FIFO / 设备命中 include；目录保留结构）。
   kIncluded,
@@ -58,9 +68,6 @@ enum class PreviewDisposition {
   kExcludedByRule,
   // 目录命中 exclude：整棵子树被剪掉，子树里的条目不会再出现在结果里。
   kDirectoryPruned,
-  // socket 且没有被显式排除。归档格式装不下 socket，真实备份会整次失败，
-  // 所以它既不算 included，也不是"被规则排除"——是第三种后果。
-  kUnsupportedSocket,
 };
 
 struct PreviewItem {
@@ -78,39 +85,74 @@ struct PreviewItem {
   PreviewDisposition disposition = PreviewDisposition::kExcludedByRule;
 };
 
-// 预览为什么没有结果。区分这两件事是有意义的：源目录不可用是用户路径写错了
-// （界面要给中文提示），规则被拒绝是核心的语法原文（界面原样转述，不翻译）。
+// 预览为什么没有结果。三类失败对应三种完全不同的处置：
+//
+//   kSourceUnusable    用户把源目录写错了（界面要给中文提示）；
+//   kRuleRejected      规则没能编译：核心 Filter::AddRule 的原文，原样转述；
+//   kSelectionBlocked  源目录与规则都没问题，但这份选择**无法被成功备份**
+//                      （目前只有"没有被明确排除的 socket"）。这不是语法错误，
+//                      所以 CLI 用 exit 1 而不是 2；
+//   kScanFailed        遍历本身失败（lstat / opendir / readdir / 路径过长 /
+//                      无法表示的类型）——与真实 Backup 完全同一套失败语义。
 enum class PreviewErrorKind {
   kNone,
-  // 源目录不存在 / 不是目录。
   kSourceUnusable,
-  // 规则没能编译成 Filter。error 里是核心 Filter::AddRule 的原文。
   kRuleRejected,
+  kSelectionBlocked,
+  kScanFailed,
 };
 
 struct PreviewResult {
-  // 按扫描顺序，最多 limit 条。included 为真的条目就是"会进入归档"的那些。
+  // **显示窗口**：遍历顺序里的前 limit 条（含被排除的条目，界面要逐条标注）。
+  // included 为真的条目就是"会进入归档"的那些。
   std::vector<PreviewItem> items;
-  // 源目录里还有没被检查的条目（达到 limit 就停）。
+  // 整棵树里被检查过的条目总数（不受窗口限制）。
+  std::size_t total_entries = 0;
+  // 整棵树里会进入归档的条目数。这是**全量**数字，不是窗口里的数字：
+  // 第 301 个条目也是 socket 时，预览必须报失败而不是"前 300 个看起来没问题"。
+  std::size_t included_count = 0;
+  // 还有条目没有进窗口（items 不是全部）。
   bool truncated = false;
-  // 非空表示这次预览根本没跑起来。此时 items 为空，调用方应当把 error 报给
+  // 非空表示这次预览没有给出结果。此时 items 为空，调用方应当把 error 报给
   // 用户，而不是显示"0 项"——"一项都没匹配"和"这次预览没跑成"是两件事。
   std::string error;
   PreviewErrorKind error_kind = PreviewErrorKind::kNone;
-  // items 里 included 为真的条数。GUI 显示全部条目并逐条标注，CLI 只列这些，
-  // 两边因此不需要各自数一遍。
-  std::size_t included_count = 0;
+  // 让这次预览失败的那个条目（归档相对路径 / 磁盘路径）。kSelectionBlocked
+  // 时它就是"必须先排除掉的条目"；其它失败时用来定位。
+  std::string blocking_archive_path;
+  std::string blocking_disk_path;
 };
 
 // 扫描 source_directory，按 rules 判定每个条目会不会进入归档。
 //
+// **遍历与真实 Backup 完全共用一份实现**（src/core/source_tree_walker.cpp）：
+// 同样的 source root 校验、同样的 lstat、同样的 opendir/readdir 与失败语义、
+// 同样的 lexical DFS 顺序、同样的路径长度校验、同样的剪枝与 socket 规则。
+// 所以"预览会选中这些"与"备份会写入这些"不可能因为遍历差异而分叉。
+//
+// 两件事分开，别混：
+//   * 整棵树都会被检查（否则第 301 个条目是 socket 时预览会撒谎）；
+//   * 只有前 limit 条会进 items（展示窗口）。
+//
 // 只读：不创建归档、不碰 repository / config / schedule / history，也不写任何
-// 临时文件。源目录不可读时返回 error，不抛异常。
+// 临时文件。失败时返回 error，不抛异常。
 //
 // limit 为 0 时按 kPreviewEntryLimit 处理（"没有窗口"不是一个有意义的请求）。
 PreviewResult PreviewBackupSelection(const std::string& source_directory,
                                      const std::vector<FilterRuleDraft>& rules,
                                      std::size_t limit = kPreviewEntryLimit);
+
+// 同一件事，但允许注入 filesystem 失败。
+//
+// 只给测试用：生产调用方一律用上面那个重载。存在的理由与
+// ScanSourceTree 的注入重载完全一样——"预览遇到 opendir/readdir/lstat 失败
+// 也必须 fail closed"这条语义要和真实 Backup **对着同一次注入**一起验证，
+// 而权限类失败在 root / CAP_DAC_OVERRIDE 下根本造不出来。注入点只能把一次
+// syscall 变成失败，不能伪造文件系统内容（见 SourceWalkFaults）。
+PreviewResult PreviewBackupSelection(const std::string& source_directory,
+                                     const std::vector<FilterRuleDraft>& rules,
+                                     std::size_t limit,
+                                     const SourceWalkFaults* faults);
 
 }  // namespace backupproject
 
