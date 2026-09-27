@@ -91,7 +91,7 @@ PreviewErrorKind ErrorKindOf(SourceWalkFailureKind kind) {
     case SourceWalkFailureKind::kNone:
     case SourceWalkFailureKind::kInspect:
     case SourceWalkFailureKind::kDirectoryRead:
-    case SourceWalkFailureKind::kPathTooLong:
+    case SourceWalkFailureKind::kInvalidArchivePath:
     case SourceWalkFailureKind::kUnsupportedType:
     case SourceWalkFailureKind::kConsumerFailed:
       break;

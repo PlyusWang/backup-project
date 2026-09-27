@@ -394,14 +394,15 @@ int RunPreviewTest(backup_modern::FilterRuleModel* model, const QString& source,
     }
   }
   // 计数取整棵树的数字（与 CLI 打印的是同一个字段），窗口信息取核心给出的
-  // total / truncated。列表本身只到窗口为止，所以两者在截断时可以不同——
-  // 下面的 Note 行负责把这件事说清楚。
+  // truncated。列表本身只到窗口为止，所以两者在截断时可以不同——下面的 Note
+  // 行负责说清楚，而且必须与 backupctl 的措辞逐字一致：整棵树都被验证过，
+  // 被限制的只是列出多少条。
   std::printf("Preview: %d matching item(s)\n", model->previewIncluded());
   if (model->previewTruncated()) {
     std::printf(
-        "Note: the source tree has %d entries; only the first %d were "
-        "examined, and %d matching item(s) are listed below.\n",
-        model->previewTotal(), model->previewLimit(),
+        "Note: showing the first %d of %d matching item(s); the whole source "
+        "tree was validated, %d listed below.\n",
+        model->previewLimit(), model->previewIncluded(),
         static_cast<int>(included_paths.size()));
   }
   for (const QString& path : included_paths) {

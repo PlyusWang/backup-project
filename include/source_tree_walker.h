@@ -30,6 +30,10 @@
 //   * user / group 名字解析（失败留空，不报错）；
 //   * FilterEntry 构造，以及 ShouldPruneDirectory / ShouldIncludeFile /
 //     ShouldSkipSpecialEntry 的判定顺序；
+//   * **归档路径语法**（IsValidArchivePath：长度 / 反斜杠 / 盘符 / 绝对路径 /
+//     空 component / "." / ".." / NUL）——这一条尤其重要：只查长度会让预览把
+//     Linux 上合法、归档里非法的名字（例如 a\b.txt）报成"可以备份"，而真实
+//     备份随后必然失败；
 //   * 全部 fail-closed 失败语义（见下）。
 //
 // 各消费者自己保留（刻意不共享）：hardlink 编码、软链接目标读取、设备号、
@@ -42,7 +46,9 @@
 //   * 源目录不存在 / 不是真目录 / lstat 失败（kSourceRoot）；
 //   * 某个条目 lstat 失败（kInspect）；
 //   * opendir / readdir 失败（kDirectoryRead）；
-//   * 某条归档路径超过 kMaxArchivePathLength（kPathTooLong）；
+//   * 某条归档路径没过
+//   IsValidArchivePath（kInvalidArchivePath）——长度、反斜杠、
+//     盘符、绝对路径、结尾 '/'、空 component、"." / ".." component、含 NUL；
 //   * stat 给出的类型无法表示（kUnsupportedType）；
 //   * 出现**没有被明确排除**的 socket（kSocket）——socket 不是可恢复备份，
 //     静默跳过、跟随它、把它当普通文件复制，这三种做法都会让"备份成功"变成假话。
@@ -107,8 +113,11 @@ enum class SourceWalkFailureKind {
   kInspect,
   // opendir / readdir 失败（例如权限不足、目录被删掉、I/O 错误）。
   kDirectoryRead,
-  // 归档路径超过 kMaxArchivePathLength。
-  kPathTooLong,
+  // 归档路径没过 IsValidArchivePath 的完整语法：太长、含反斜杠、Windows 盘符、
+  // 绝对路径、结尾 '/'、空 component、"." / ".." component、含 NUL。
+  // 这是**同一个** grammar：任何真实 Backup 最终无法接受的 archive path，
+  // 预览都在这里被判死。
+  kInvalidArchivePath,
   // stat 给出的类型无法表示。
   kUnsupportedType,
   // 没有被明确排除的 socket：真实 Backup 必然失败。
