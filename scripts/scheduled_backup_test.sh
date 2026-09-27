@@ -551,10 +551,12 @@ FIX_BAD="$FIX/bad-schedule.json"
 sed -e 's/"trigger": "scheduled"/"trigger": "manual"/' \
     -e 's/"strategy": "full"/"strategy": "incremental"/' \
     "$FIX_STORE" > "$FIX_BAD"
+# 计数必须在被观测的那一轮**之前**取：两边都在之后取的话，这个断言永远成立，
+# 也就永远测不出"偷偷按全量跑了一份"。
+FIX_BAK_BEFORE="$(ls "$FIX/repo-b" | wc -l)"
 expect_exit "D2.39 手改出来的 manual + incremental 在运行期被拒绝" 1 \
   "$BACKUPCTL" --config-file "$FIX_CONFIG" --schedule-file "$FIX_BAD" schedule run
 expect_grep "D2.40 拒绝原因点名组合" "Unsupported backup mode: Manual + Incremental"
-FIX_BAK_BEFORE="$(ls "$FIX/repo-b" | wc -l)"
 FIX_BAK_AFTER="$(ls "$FIX/repo-b" | wc -l)"
 if [ "$FIX_BAK_BEFORE" = "$FIX_BAK_AFTER" ]; then
   record_pass "D2.41 没有偷偷生成全量备份"
