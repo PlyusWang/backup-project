@@ -125,8 +125,7 @@ std::string SourceIdentityDigest(const std::string& source_path,
                                  const std::string& repository_identity);
 std::string FilterIdentityDigest(const std::vector<std::string>& include_rules,
                                  const std::vector<std::string>& exclude_rules);
-std::string StrategyIdentityDigest(PackMethod pack,
-                                   CompressionMethod compression,
+std::string StrategyIdentityDigest(PackMethod pack, CompressionMethod compression,
                                    EncryptionMethod encryption);
 
 // 规范化序列化 / 严格解析。解析要求每个键出现且只出现一次、数值范围合法、
@@ -146,9 +145,8 @@ std::string ComputeDeltaSnapshotId(const DeltaEnvelope& envelope);
 // 由调用方在共享校验里报同一句话。
 //
 // 条目表与备份流水线的约定完全一致：**第一条必须是源根目录**
-// （archive_path == "."，type == kDirectory）。delta 也要带上根目录的
-// metadata， 否则应用完 delta
-// 之后根目录自身的时间戳与权限就没有人负责了。表不满足这条
+// （archive_path == "."，type == kDirectory）。delta 也要带上根目录的 metadata，
+// 否则应用完 delta 之后根目录自身的时间戳与权限就没有人负责了。表不满足这条
 // 约定时明确失败，不替调用方伪造一条根记录。
 //
 // 原子发布：先在目标目录写唯一临时文件，fsync，再 rename；失败删掉半成品。
@@ -166,6 +164,22 @@ bool ExtractDeltaPayload(const std::string& delta_file,
                          const std::string& container_file,
                          std::string* error_message);
 
+// ---- 快照身份 ----
+//
+// delta 的 snapshot_id 是"信封内容的摘要"，自校验。完整快照没有信封，所以它的
+// 身份从容器自己的 payload 摘要派生：
+//
+//     FullSnapshotId = SHA-256("BPFULL1\n" + <container payload_sha256 hex>)
+//
+// 这样父绑定就不只是"文件名"：同名文件被换成另一份归档时，父身份立刻对不上。
+// 它不需要密码（容器 header 本来就是"未知密码也能读"的），也不改 v2 格式。
+bool FullSnapshotId(const std::string& container_file, std::string* id,
+                    std::string* error_message);
+
+// 任意快照文件（delta 或完整归档）的身份。kUnknown 时返回 false。
+bool SnapshotIdOfFile(const std::string& path, std::string* id,
+                      std::string* error_message);
+
 // 这段字节是不是以 BKPINC1 开头。
 bool LooksLikeDelta(const unsigned char* data, std::size_t size);
 
@@ -177,8 +191,7 @@ SnapshotFileKind ClassifySnapshotFile(const std::string& path,
 
 // 校验 payload：长度、SHA-256、内层 container 的 header 与 payload 自洽。
 // 不需要密码的部分都在这里；HMAC 认证仍然由容器自己的恢复路径负责。
-bool VerifyDeltaPayload(const std::string& delta_file,
-                        std::string* error_message);
+bool VerifyDeltaPayload(const std::string& delta_file, std::string* error_message);
 
 }  // namespace backupproject
 
