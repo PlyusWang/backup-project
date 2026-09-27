@@ -559,6 +559,48 @@ else
   record_fail "关闭守卫行为与预期不符"
 fi
 
+# 人工验收提出的两条 GUI 契约：
+#   * 首页三张卡片的按钮必须完整落在卡片内（固定 196 高度时底边距是 -7px，
+#     按钮压在下边框上）；
+#   * 临时提示属于产生它的页面：离开即消费，回来不自动复现，后台任务在别的
+#     页面结束时也不会把完成提示丢过去。
+# 运行期断言真实几何与真实绑定结果，不做截图比对。
+set +e
+QT_QPA_PLATFORM=offscreen QSG_RHI_BACKEND=software \
+  ./build/backup-gui-modern --gui-contract-test \
+  --config-file /tmp/modern-gui-contract.json \
+  --schedule-file /tmp/modern-gui-contract-schedule.json \
+  > /tmp/modern-gui-contract.log 2>&1
+contract_status=$?
+set -e
+sed 's/^/[modern-gui]     /' /tmp/modern-gui-contract.log
+cat /tmp/modern-gui-contract.log >> "$LOG_FILE"
+if [[ "$contract_status" -eq 0 ]]; then
+  record_pass "首页按钮几何与临时提示的页面归属都符合契约"
+else
+  record_fail "首页按钮几何或临时提示的页面归属不符合契约" \
+    "$(grep -m2 'FAIL' /tmp/modern-gui-contract.log | tr '\n' ' ')"
+fi
+
+# 上面那条是运行期证据，这里再静态钉住结构：scope 的过滤必须写在状态栏里
+# （而不是每页各写一份 if），四个业务页各自声明自己的 pageScope，消费动作只有
+# 一处（Main.qml 的页面切换处理）。
+expect_count_re "$QML_DIR/components/StatusBanner.qml" "property string pageScope" 1 \
+  "状态栏区分这条消息属于哪一页"
+expect_count_re "$QML_DIR/components/StatusBanner.qml" "scope === pageScope" 1 \
+  "状态栏按 scope 过滤，severity 与 scope 正交"
+expect_count_re "$QML_DIR/components/StatusBanner.qml" "readonly property bool showsMessage" 1 \
+  "状态栏把该不该显示暴露成一个可断言的位"
+for page_scope in 'backup:BackupPage' 'settings:SettingsPage' \
+                  'management:BackupManagementPage' 'home:HomePage'; do
+  scope_name="${page_scope%%:*}"
+  page_file="${page_scope#*:}"
+  expect_count_re "$QML_DIR/pages/${page_file}.qml" "pageScope: \"${scope_name}\"" 1 \
+    "${page_file} 的状态栏声明了自己的页面作用域"
+done
+expect_count_re "$QML_DIR/Main.qml" "dismissPageStatus" 3 \
+  "页面切换时消费离开页面的临时提示（只有一处实现）"
+
 echo "[modern-gui] 8) 文件筛选在 GUI 路径上生效"
 # 界面只负责收集规则文本，解析与匹配都在 C++ Filter 里：
 # 下面先做静态确认，再用 --self-test 走一遍真实控制器路径。
