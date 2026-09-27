@@ -25,11 +25,16 @@
 //
 // ---- 预览窗口 ----
 //
-// 扫描在收集到 limit 条**被检查过的条目**之后停止，并把 truncated 置位。
-// 这与 GUI 一直以来的行为一致（目录太大时只显示开头部分），也是 GUI 与 CLI
-// 共用的截断契约：同一个 limit、同一面窗口、同一个 truncated 标志。
-// 所以 truncated 的含义是"源目录里还有没被检查的条目"，而不是"匹配项超过
-// limit 条"——被检查过的条目里既有 included 也有 excluded，两者都占窗口。
+// 窗口限制的是**展示**，不是**遍历**：WalkSourceTree 会一直走到"完整实际
+// 备份遍历"的尽头（被规则剪枝的子树不递归，与真实备份完全一致），limit 只
+// 决定 items 里最多留下前多少条 preview entries，并把 truncated 置位。
+// 达到 limit 之后遍历并没有停下：第 301 项上的 socket / lstat 失败照样会让
+// 这次预览失败。
+// 所以 truncated 的含义是"遍历顺序里还有条目没有进窗口"，而不是"匹配项超过
+// limit 条"——进窗口的条目里既有 included 也有 excluded（目录被剪枝时还有
+// pruned），三者都占窗口。
+// 这也是 GUI 与 CLI 共用的截断契约：同一个 limit、同一面窗口、同一个
+// truncated。
 
 #ifndef BACKUP_PROJECT_INCLUDE_BACKUP_PREVIEW_H_
 #define BACKUP_PROJECT_INCLUDE_BACKUP_PREVIEW_H_
@@ -47,10 +52,10 @@ namespace backupproject {
 
 // 预览窗口的默认大小：最多**列出** 300 个条目。
 //
-// 注意窗口限制的是展示，不是检查：整棵源目录树都会被遍历与验证
-// （见 PreviewBackupSelection 的说明）。把一个 30 万文件的目录检查完是预览
-// 该付的代价——如果为了快就在第 300 项停下，第 301 项上的 socket 或权限错误
-// 就会被漏掉，"预览说可以备份"这句话也就不再成立。
+// 注意窗口限制的是展示，不是检查：遍历会走完与真实备份完全相同的那一次
+// source traversal（见 PreviewBackupSelection 的说明）。把一个 30 万文件的
+// 目录检查完是预览该付的代价——如果为了快就在第 300 项停下，第 301 项上的
+// socket 或权限错误就会被漏掉，"预览说可以备份"这句话也就不再成立。
 //
 // 这是 GUI 与 CLI 共用的常量，不是某一端的显示偏好：两边报出来的
 // truncated 必须来自同一个数。
@@ -103,13 +108,16 @@ enum class PreviewErrorKind {
 };
 
 struct PreviewResult {
-  // **显示窗口**：遍历顺序里的前 limit 条（含被排除的条目，界面要逐条标注）。
-  // included 为真的条目就是"会进入归档"的那些。
+  // **显示窗口**：遍历顺序里的前 limit 条 preview entries（含被排除的与目录
+  // 被剪枝的条目，界面要逐条标注）。遍历在窗口满了之后继续走，所以这里只有
+  // 开头一段。included 为真的条目就是"会进入归档"的那些。
   std::vector<PreviewItem> items;
-  // 整棵树里被检查过的条目总数（不受窗口限制）。
+  // 完整实际备份遍历里被检查过的条目总数（不受窗口限制）。
   std::size_t total_entries = 0;
-  // 整棵树里会进入归档的条目数。这是**全量**数字，不是窗口里的数字：
+  // 完整实际备份遍历里会进入归档的条目数。这是**全量**数字，不是窗口里的数字：
   // 第 301 个条目也是 socket 时，预览必须报失败而不是"前 300 个看起来没问题"。
+  // 它既不是 items.size()，也不是"窗口里有几条 included"——窗口里可能一条
+  // 匹配项都没有，而 included_count 仍然大于 0。
   std::size_t included_count = 0;
   // 还有条目没有进窗口（items 不是全部）。
   bool truncated = false;
@@ -131,8 +139,9 @@ struct PreviewResult {
 // 所以"预览会选中这些"与"备份会写入这些"不可能因为遍历差异而分叉。
 //
 // 两件事分开，别混：
-//   * 整棵树都会被检查（否则第 301 个条目是 socket 时预览会撒谎）；
-//   * 只有前 limit 条会进 items（展示窗口）。
+//   * 完整实际备份遍历都会被走完，limit 之后也一样（否则第 301 个条目是
+//     socket 时预览会撒谎）；
+//   * 只有前 limit 条 preview entries 会进 items（展示窗口）。
 //
 // 只读：不创建归档、不碰 repository / config / schedule / history，也不写任何
 // 临时文件。失败时返回 error，不抛异常。

@@ -208,9 +208,9 @@ void PrintCliUsage(const std::string& program_name, std::ostream& output) {
       << "    writes no state. Same rules, same selection and the same "
          "preview\n"
       << "    window as the Manual Backup preview in the Modern GUI. The "
-         "whole\n"
-      << "    source tree is always validated; at most " << kPreviewEntryLimit
-      << " entries\n"
+         "full\n"
+      << "    effective backup traversal is always validated; at most "
+      << kPreviewEntryLimit << " entries\n"
       << "    are listed, and truncation is reported. Exits 1 when the "
          "selection\n"
       << "    could not be backed up (for example an un-excluded socket).\n"
@@ -473,21 +473,27 @@ int RunPreviewCommand(const CliContext& context,
     return kCliExitOperationFailed;
   }
 
-  // 计数是**整棵树**的，不是窗口里的：上面那一步已经完整验证过整棵源目录树，
-  // 所以"第 301 个条目是 socket"这种情况不会漏掉。
-  std::size_t shown = 0;
+  // 三个数字必须分开说，混起来就说不准：
+  //   * included_count：完整实际备份遍历里的匹配数（全量，不是窗口里的）；
+  //   * kPreviewEntryLimit：展示窗口的大小，单位是 preview entries（含被排除的
+  //     与被剪枝的条目，遍历在窗口满了之后继续）；
+  //   * listed_matching_count：窗口里真正列出来的匹配项数。
+  // 旧的 Note 把前两个说成 "the first 300 of N matching item(s)"，等于宣称
+  // 窗口装的是匹配项——当匹配项都排在窗口之外时它直接自相矛盾。
+  std::size_t listed_matching_count = 0;
   for (const PreviewItem& item : preview.items) {
-    if (item.included) ++shown;
+    if (item.included) ++listed_matching_count;
   }
-  std::cout << "Preview: " << preview.included_count << " matching item(s)\n";
+  std::cout << "Preview: " << preview.included_count
+            << " matching item(s) in the effective backup selection.\n";
   if (preview.truncated) {
-    // 明确说出来，不静默截断。措辞必须准确：整棵源目录树**已经**被完整验证
-    // 过（这是预览敢说"备份会怎样"的前提），被限制的只是**列出**多少条。
-    // 写成 "only the first 300 were examined" 会把这件事说反。
-    std::cout << "Note: showing the first " << kPreviewEntryLimit << " of "
-              << preview.included_count
-              << " matching item(s); the whole source tree was validated, "
-              << shown << " listed below.\n";
+    // 明确说出来，不静默截断。术语用"effective backup traversal"而不是
+    // "the whole source tree"：被规则剪枝的子树不会递归，真实备份也一样。
+    std::cout << "Note: showing matches found within the first "
+              << kPreviewEntryLimit
+              << " preview entries; the complete effective backup traversal "
+                 "was validated, "
+              << listed_matching_count << " matching item(s) listed below.\n";
   }
   for (const PreviewItem& item : preview.items) {
     if (!item.included) continue;
