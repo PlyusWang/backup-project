@@ -125,7 +125,8 @@ std::string SourceIdentityDigest(const std::string& source_path,
                                  const std::string& repository_identity);
 std::string FilterIdentityDigest(const std::vector<std::string>& include_rules,
                                  const std::vector<std::string>& exclude_rules);
-std::string StrategyIdentityDigest(PackMethod pack, CompressionMethod compression,
+std::string StrategyIdentityDigest(PackMethod pack,
+                                   CompressionMethod compression,
                                    EncryptionMethod encryption);
 
 // 规范化序列化 / 严格解析。解析要求每个键出现且只出现一次、数值范围合法、
@@ -145,8 +146,9 @@ std::string ComputeDeltaSnapshotId(const DeltaEnvelope& envelope);
 // 由调用方在共享校验里报同一句话。
 //
 // 条目表与备份流水线的约定完全一致：**第一条必须是源根目录**
-// （archive_path == "."，type == kDirectory）。delta 也要带上根目录的 metadata，
-// 否则应用完 delta 之后根目录自身的时间戳与权限就没有人负责了。表不满足这条
+// （archive_path == "."，type == kDirectory）。delta 也要带上根目录的
+// metadata， 否则应用完 delta
+// 之后根目录自身的时间戳与权限就没有人负责了。表不满足这条
 // 约定时明确失败，不替调用方伪造一条根记录。
 //
 // 原子发布：先在目标目录写唯一临时文件，fsync，再 rename；失败删掉半成品。
@@ -191,7 +193,8 @@ SnapshotFileKind ClassifySnapshotFile(const std::string& path,
 
 // 校验 payload：长度、SHA-256、内层 container 的 header 与 payload 自洽。
 // 不需要密码的部分都在这里；HMAC 认证仍然由容器自己的恢复路径负责。
-bool VerifyDeltaPayload(const std::string& delta_file, std::string* error_message);
+bool VerifyDeltaPayload(const std::string& delta_file,
+                        std::string* error_message);
 
 }  // namespace backupproject
 
