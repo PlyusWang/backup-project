@@ -224,8 +224,10 @@ void PrintCliUsage(const std::string& program_name, std::ostream& output) {
       << "    repository (see 'repository list').\n"
       << "  " << program_name
       << " schedule show | set | enable | disable | run | history | watch\n"
-      << "    schedule set takes --source --interval-minutes --retain --pack\n"
-      << "      --compression --encryption none --include --exclude, plus\n"
+      << "    schedule set takes --source --interval-minutes --retain "
+         "--strategy\n"
+      << "      --pack --compression --encryption none --include --exclude, "
+         "plus\n"
       << "      --clear-filters (drop the stored rules first, then add the "
          "ones\n"
       << "      given on this command line).\n"
@@ -792,6 +794,7 @@ int ScheduleSet(const CliContext& context,
   bool saw_source = false;
   bool saw_interval = false;
   bool saw_retain = false;
+  bool saw_strategy = false;
   bool saw_pack = false;
   bool saw_compression = false;
   bool saw_encryption = false;
@@ -833,6 +836,22 @@ int ScheduleSet(const CliContext& context,
       if (!ParseBoundedScheduleNumber(value, kMinRetainCount, kMaxRetainCount,
                                       option, &config.retain_count, &error)) {
         return UsageError(context, error);
+      }
+      continue;
+    }
+    if (option == "--strategy") {
+      // PR #18：计划也支持增量策略。解析失败不回退：写进配置的必须正是用户
+      // 要的那一个，而"支不支持这个组合"由共享的 ValidateScheduleConfig
+      // （也就是 IsSupportedBackupMode 那张真值表）在后面统一回答。
+      if (!MarkSingleOption(&saw_strategy, option, &error)) {
+        return UsageError(context, error);
+      }
+      if (!TakeValue(arguments, &index, option, &value, &error)) {
+        return UsageError(context, error);
+      }
+      if (!ParseBackupStrategyKey(value, &config.strategy)) {
+        return UsageError(context, "unknown backup strategy '" + value +
+                                       "' (expected full or incremental)");
       }
       continue;
     }
@@ -948,6 +967,12 @@ int ScheduleSet(const CliContext& context,
   }
   std::cout << "Schedule updated. Enabled: " << (config.enabled ? "yes" : "no")
             << "\n";
+  std::cout << "Strategy: " << BackupStrategyKey(config.strategy) << "\n";
+  if (config.strategy == BackupStrategy::kIncremental &&
+      !IsSupportedIncrementalPack(config.pack_method)) {
+    // 增量只支持 MyPack：在配置这一层就说清楚，而不是等第一次 delta 才发现。
+    std::cout << "Note: " << UnsupportedIncrementalPackReason() << "\n";
+  }
   return kCliExitSuccess;
 }
 
