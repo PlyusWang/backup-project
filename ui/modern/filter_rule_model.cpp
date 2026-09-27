@@ -1,18 +1,15 @@
 // filter_rule_model.cpp
 #include "filter_rule_model.h"
 
-#include <sys/stat.h>
-
 #include <QDateTime>
 #include <QtConcurrent>
 #include <algorithm>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
-#include <filesystem>
 #include <string>
 
-#include "user_directory.h"
+#include "backup_preview.h"
 
 namespace backup_modern {
 namespace {
@@ -303,46 +300,24 @@ QString PreviewTypeLabel(bp::EntryType type) {
   return QStringLiteral("未知类型");
 }
 
-// lstat 的 st_mode -> EntryType，判定与 src/core/tree_scanner.cpp 的 FactsOf
-// 同一套：预览看到的类型必须和真实扫描一致。
-bool TypeFromStat(const struct stat& info, bp::EntryType* type) {
-  if (S_ISDIR(info.st_mode)) {
-    *type = bp::EntryType::kDirectory;
-  } else if (S_ISREG(info.st_mode)) {
-    *type = bp::EntryType::kRegularFile;
-  } else if (S_ISLNK(info.st_mode)) {
-    *type = bp::EntryType::kSymlink;
-  } else if (S_ISFIFO(info.st_mode)) {
-    *type = bp::EntryType::kFifo;
-  } else if (S_ISCHR(info.st_mode)) {
-    *type = bp::EntryType::kCharDevice;
-  } else if (S_ISBLK(info.st_mode)) {
-    *type = bp::EntryType::kBlockDevice;
-  } else if (S_ISSOCK(info.st_mode)) {
-    *type = bp::EntryType::kSocket;
-  } else {
-    return false;
-  }
-  return true;
-}
-
-// uid / gid -> 名字走共享实现（backupproject::UserDirectoryCache）：预览和
-// 真实扫描（tree_scanner.cpp）必须给出同一份元数据。各写一份时，group 用错
-// sysconf hint 这类问题会让 user: / group: 规则在预览里命中、真实备份却漏掉。
-// 解析失败留空，Filter 对空名字一律视为不匹配（见 include/filter.h）。
+// 把共享核心给出的判定翻成界面文案。判定本身（included / 剪枝 / 排除）全部
+// 来自 backupproject::PreviewBackupSelection，这里只负责措辞。
 //
-// 不直接把扫描交给 ScanSourceTree 的原因：那个入口遇到"没有被排除的 socket"会
-// 整次失败，而预览要做的恰恰是把这类条目列出来并提示后果。
-bp::Filter BuildFilterFromDrafts(
-    const std::vector<bp::FilterRuleDraft>& drafts) {
-  bp::Filter filter;
-  for (const bp::FilterRuleDraft& draft : drafts) {
-    std::string dsl;
-    if (!bp::ToDsl(draft, &dsl, nullptr)) continue;
-    std::string error;
-    filter.AddRule(draft.action, dsl, &error);
+// 只有三种取值，因为遍历的判定就是三选一：没有被排除的 socket 不让遍历继续
+// 走下去（真实 Backup 也会在它上面失败），所以它不是某一行的标签，而是整次
+// 预览的失败原因——见 FilterRuleModel::ScanPreview 的错误分支。
+QString PreviewTag(const bp::PreviewItem& item) {
+  switch (item.disposition) {
+    case bp::PreviewDisposition::kDirectoryPruned:
+      return QStringLiteral("目录被排除（整棵剪掉）");
+    case bp::PreviewDisposition::kIncluded:
+      return item.is_directory
+                 ? QStringLiteral("目录（保留结构）")
+                 : PreviewTypeLabel(item.type) + QStringLiteral(" · 进入归档");
+    case bp::PreviewDisposition::kExcludedByRule:
+      break;
   }
-  return filter;
+  return PreviewTypeLabel(item.type) + QStringLiteral(" · 被规则排除");
 }
 
 }  // namespace
@@ -363,11 +338,22 @@ FilterRuleModel::FilterRuleModel(BackupController* controller, QObject* parent)
       StartScan(next_source, next_drafts);
       return;
     }
+    last_error_kind_ = outcome.error_kind;
     if (!outcome.error.isEmpty()) {
       SetError(outcome.error);
+      // 失败时不留上一份成功的列表：那是一份**不再成立**的结果（源目录可能已经
+      // 变了、规则可能已经改了），把它摆在错误信息旁边只会让人以为"大部分还是
+      // 好的"。预览的答案就是那句错误。
+      preview_items_.clear();
+      preview_truncated_ = false;
+      preview_total_ = 0;
+      preview_included_ = 0;
+      preview_source_ = outcome.source_path;
     } else {
       preview_items_ = outcome.items;
       preview_truncated_ = outcome.truncated;
+      preview_total_ = outcome.total;
+      preview_included_ = outcome.included;
       preview_source_ = outcome.source_path;
     }
     emit previewChanged();
@@ -589,6 +575,45 @@ bool FilterRuleModel::addRule(const QVariantMap& form) {
   return true;
 }
 
+bool FilterRuleModel::addAdvancedRule(const QString& action,
+                                      const QString& dsl) {
+  const bp::FilterAction filter_action = action == QStringLiteral("exclude")
+                                             ? bp::FilterAction::kExclude
+                                             : bp::FilterAction::kInclude;
+  const QString reason = validateDsl(action, dsl);
+  if (!reason.isEmpty()) {
+    SetError(reason);
+    return false;
+  }
+  bp::FilterRuleDraft draft;
+  draft.action = filter_action;
+  draft.raw_dsl = dsl.toStdString();
+  drafts_.push_back(draft);
+  SyncController();
+  RebuildRules();
+  clearError();
+  emit rulesChanged();
+  return true;
+}
+
+QString FilterRuleModel::validateDsl(const QString& action,
+                                     const QString& dsl) const {
+  const bp::FilterAction filter_action = action == QStringLiteral("exclude")
+                                             ? bp::FilterAction::kExclude
+                                             : bp::FilterAction::kInclude;
+  bp::FilterRuleDraft draft;
+  draft.action = filter_action;
+  draft.raw_dsl = dsl.toStdString();
+  std::string error;
+  if (!bp::ValidateRule(draft, &error)) return QString::fromStdString(error);
+  return QString();
+}
+
+bool FilterRuleModel::isAdvancedRule(int index) const {
+  if (index < 0 || index >= static_cast<int>(drafts_.size())) return false;
+  return !drafts_[static_cast<std::size_t>(index)].raw_dsl.empty();
+}
+
 void FilterRuleModel::removeRule(int index) {
   if (index < 0 || index >= static_cast<int>(drafts_.size())) return;
   drafts_.erase(drafts_.begin() + index);
@@ -705,96 +730,54 @@ void FilterRuleModel::StartScan(
   }));
 }
 
+// 扫描本身在共享核心 backupproject::PreviewBackupSelection 里（CLI 预览用的是
+// 同一个函数），这里只把结果翻成 QML 能绑定的 QVariantMap。所以"GUI 预览与
+// CLI 预览看到不同的集合"在结构上不可能发生——两边是同一次调用。
 FilterRuleModel::PreviewOutcome FilterRuleModel::ScanPreview(
     const QString& source_path, const std::vector<bp::FilterRuleDraft>& drafts,
     int limit) {
-  namespace fs = std::filesystem;
   PreviewOutcome outcome;
   outcome.source_path = source_path;
-  const fs::path root(source_path.toStdString());
-  std::error_code ec;
-  if (!fs::is_directory(root, ec)) {
-    outcome.error = QStringLiteral("源目录不存在或不是目录：") + source_path;
+  const std::size_t window =
+      limit > 0 ? static_cast<std::size_t>(limit) : bp::kPreviewEntryLimit;
+  const bp::PreviewResult result =
+      bp::PreviewBackupSelection(source_path.toStdString(), drafts, window);
+  if (!result.error.empty()) {
+    outcome.error_kind = result.error_kind;
+    if (result.error_kind == bp::PreviewErrorKind::kSourceUnusable) {
+      // 核心只报事实，中文措辞留在界面这一层。
+      outcome.error = QStringLiteral("源目录不存在或不是目录：") + source_path;
+    } else {
+      // 其余失败一律转述核心原文，一个字都不改：
+      //   * kRuleRejected / kScanFailed / kSelectionBlocked 的诊断来自共享
+      //     核心，翻译只会让它和 CLI、和真实 Backup 说出来的话不一样；
+      //   * kSelectionBlocked 的那句话就是"备份会怎么失败"，界面里最该原样
+      //     看到的就是它。
+      outcome.error = QString::fromStdString(result.error);
+    }
     return outcome;
   }
-  const bp::Filter filter = BuildFilterFromDrafts(drafts);
-  bp::UserDirectoryCache names;
-  fs::recursive_directory_iterator it(
-      root, fs::directory_options::skip_permission_denied, ec);
-  const fs::recursive_directory_iterator end;
-  for (; it != end; it.increment(ec)) {
-    if (ec) break;
-    if (static_cast<int>(outcome.items.size()) >= limit) {
-      outcome.truncated = true;
-      break;
-    }
-    const fs::path& path = it->path();
-    // lstat：软链接不会被跟随，预览看到的就是条目自己；mtime / uid / gid 也都
-    // 取自链接本身，口径与真实扫描（tree_scanner）一致。
-    struct stat info;
-    if (::lstat(path.c_str(), &info) != 0) continue;
-    bp::EntryType type = bp::EntryType::kRegularFile;
-    if (!TypeFromStat(info, &type)) continue;
-
-    bp::FilterEntry fe;
-    fe.archive_path = path.lexically_relative(root).generic_string();
-    fe.name = path.filename().string();
-    fe.is_directory = type == bp::EntryType::kDirectory;
-    fe.type = type;
-    fe.mtime_sec = static_cast<std::int64_t>(info.st_mtim.tv_sec);
-    fe.uid = static_cast<std::uint32_t>(info.st_uid);
-    fe.gid = static_cast<std::uint32_t>(info.st_gid);
-    if (type == bp::EntryType::kRegularFile) {
-      fe.size = static_cast<std::uint64_t>(info.st_size);
-    }
-    // 与 tree_scanner 一致：所有类型（含软链接）都解析属主 / 属组名字。
-    // uid / gid 来自 lstat，属于链接自己，解析名字不 follow。
-    fe.user_name = names.UserName(fe.uid);
-    fe.group_name = names.GroupName(fe.gid);
-
-    // 归属判定全部问真实 Filter：GUI 里没有第二套匹配逻辑。
-    bool included = false;
-    QString tag;
-    if (type == bp::EntryType::kDirectory) {
-      if (filter.ShouldPruneDirectory(fe)) {
-        // 命中 exclude 的目录整棵剪掉：子树里的 socket 也不再是问题。
-        tag = QStringLiteral("目录被排除（整棵剪掉）");
-        it.disable_recursion_pending();
-      } else {
-        included = true;
-        tag = QStringLiteral("目录（保留结构）");
-      }
-    } else if (type == bp::EntryType::kSocket) {
-      // socket 不作为可恢复备份：只有明确写了 exclude 才会被跳过，
-      // 否则真实备份会整次失败（见 tree_scanner.h 的失败语义）。
-      if (filter.ShouldSkipSpecialEntry(fe)) {
-        tag = PreviewTypeLabel(type) + QStringLiteral(" · 被规则排除");
-      } else {
-        tag = QStringLiteral("不支持的 socket（会导致备份失败）");
-      }
-    } else {
-      // 普通文件与软链接 / FIFO / 设备走同一条 include/exclude 判定。
-      included = filter.ShouldIncludeFile(fe);
-      tag =
-          PreviewTypeLabel(type) + (included ? QStringLiteral(" · 进入归档")
-                                             : QStringLiteral(" · 被规则排除"));
-    }
-
+  outcome.truncated = result.truncated;
+  outcome.total = static_cast<int>(result.total_entries);
+  outcome.included = static_cast<int>(result.included_count);
+  outcome.items.reserve(static_cast<int>(result.items.size()));
+  for (const bp::PreviewItem& preview : result.items) {
     QVariantMap item;
     item.insert(QStringLiteral("path"),
-                QString::fromStdString(fe.archive_path));
-    item.insert(QStringLiteral("isDirectory"), fe.is_directory);
-    item.insert(QStringLiteral("size"), type == bp::EntryType::kRegularFile
-                                            ? FormatSize(fe.size)
-                                            : QString());
-    item.insert(
-        QStringLiteral("mtime"),
-        fe.mtime_sec > 0
-            ? QDateTime::fromSecsSinceEpoch(static_cast<qint64>(fe.mtime_sec))
-                  .toString(QStringLiteral("yyyy-MM-dd HH:mm"))
-            : QString());
-    item.insert(QStringLiteral("included"), included);
-    item.insert(QStringLiteral("tag"), tag);
+                QString::fromStdString(preview.archive_path));
+    item.insert(QStringLiteral("isDirectory"), preview.is_directory);
+    item.insert(QStringLiteral("size"),
+                preview.type == bp::EntryType::kRegularFile
+                    ? FormatSize(preview.size)
+                    : QString());
+    item.insert(QStringLiteral("mtime"),
+                preview.mtime_sec > 0
+                    ? QDateTime::fromSecsSinceEpoch(
+                          static_cast<qint64>(preview.mtime_sec))
+                          .toString(QStringLiteral("yyyy-MM-dd HH:mm"))
+                    : QString());
+    item.insert(QStringLiteral("included"), preview.included);
+    item.insert(QStringLiteral("tag"), PreviewTag(preview));
     outcome.items.push_back(item);
   }
   return outcome;

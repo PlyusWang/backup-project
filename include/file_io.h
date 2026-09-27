@@ -134,6 +134,38 @@ class FileSource {
 bool WriteFully(int fd, const void* data, std::size_t size,
                 std::string* error_message);
 
+// mkdir -p，目录权限固定 0700。
+//
+// 配置文件目录、计划存储目录、全应用锁目录里放的都是"这台机器上谁在备份什么"，
+// 没有理由让同机器上的其他用户列得出来。已有的目录不会被改权限（只在新建立
+// 时生效）——改别人的目录权限不是这个函数的职责。
+// 路径已存在且确实是目录时返回 true；存在但不是目录时明确失败。
+bool EnsurePrivateDirectory(const std::string& path,
+                            std::string* error_message);
+
+// "这个文件要落在这个目录里"：建出 file_path 的父目录（0700）。
+// 比先算父目录再调 EnsurePrivateDirectory 少一次语义选择的机会。
+bool EnsurePrivateDirectoryFor(const std::string& file_path,
+                               std::string* error_message);
+
+// 原子替换写入：同目录唯一临时文件 -> 写 -> fsync -> close -> rename ->
+// fsync(目录)。
+//
+// 给"整份配置 / 整份状态"这类小文件用：读者要么看到旧的完整内容，要么看到
+// 新的完整内容，绝不会看到半份。四条要求都是安全边界：
+//   * 临时文件由 mkstemp 生成：名字唯一且带 O_CREAT|O_EXCL，所以既不会跟随
+//     别人预放的符号链接，也不会截断别人预放的文件，同一进程里两次并行保存
+//     也不可能撞上同一个临时名；
+//   * 权限 0600（mkstemp 的默认），并显式补 FD_CLOEXEC；
+//   * 只有 rename 一步会替换目标，rename 之前目标文件一个字节都没动；
+//   * 失败时临时文件一定被清理，绝不留下半份 .tmp 垃圾。
+//
+// rename 之后会 fsync 父目录让目录项落盘；少数文件系统不支持对目录 fsync
+// （EINVAL / ENOTSUP），那不是错误。
+bool WriteFileAtomicallyReplacing(const std::string& path,
+                                  const std::string& data,
+                                  std::string* error_message);
+
 // 递归删除一棵树，不 follow 软链接（软链接本身被 unlink，不进去）。
 // 尽力而为：失败不报错，因为它的调用点都是失败清理路径。
 void RemoveTreeNoFollow(const std::string& path);

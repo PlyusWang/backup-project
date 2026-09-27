@@ -31,6 +31,7 @@
 #include "backup_catalog.h"
 #include "config_manager.h"
 #include "filter.h"
+#include "operation_gate.h"
 
 namespace backup_modern {
 
@@ -90,6 +91,12 @@ class BackupController : public QObject {
   Q_PROPERTY(QString statusKind READ statusKind NOTIFY statusChanged)
   Q_PROPERTY(QString statusTitle READ statusTitle NOTIFY statusChanged)
   Q_PROPERTY(QString statusMessage READ statusMessage NOTIFY statusChanged)
+  // 这条状态消息属于哪个页面。severity（statusKind）决定颜色与图标，scope 决定
+  // 它出现在哪一页 —— 两者正交：同一个 scope 下 error / warning / information /
+  // success
+  // 走完全相同的生命周期。空串表示**全局**消息（启动期失败、空闲基线），
+  // 每一页都可以显示它。
+  Q_PROPERTY(QString statusScope READ statusScope NOTIFY statusChanged)
   // 源目录双向绑定到界面输入框：手动输入会写回这里，
   // 点“浏览”选完目录也会写回这里，控制器只负责原样保存。
   Q_PROPERTY(QString sourcePath READ sourcePath WRITE setSourcePath NOTIFY
@@ -119,13 +126,32 @@ class BackupController : public QObject {
   // 配置文件路径由调用方显式给出（正常启动由 main.cpp 从
   // QStandardPaths::AppConfigLocation 算出，测试用 --config-file 覆盖）。
   // 控制器自己不猜 HOME、不用 QSettings、不碰 XDG —— 那些都不属于它。
+  // operation_gate：Modern GUI 进程内"同一时刻只有一个会改动持久状态的
+  // 业务操作"的共享闸门（见 operation_gate.h）。可以为空——只有自检路径会
+  // 这样用，正常启动一定给同一个对象。
   explicit BackupController(const QString& config_file_path,
+                            OperationGate* operation_gate,
                             QObject* parent = nullptr);
+
+  // 删除归档之后的计划状态同步。
+  //
+  // 由 ScheduleController 实现。**调用时闸门已经以 kManualDelete 被持有**，
+  // 实现方不得再申请闸门、也不得启动后台任务：它只是"删除"这个操作的最后一
+  // 步，必须在同一个持有期内完成，否则就回到"两个 writer"的老问题上。
+  class ArchiveDeletedObserver {
+   public:
+    virtual ~ArchiveDeletedObserver() = default;
+    virtual void OnArchiveDeleted(const QString& file_name) = 0;
+  };
+  void SetArchiveDeletedObserver(ArchiveDeletedObserver* observer) {
+    archive_deleted_observer_ = observer;
+  }
 
   bool busy() const { return busy_; }
   QString statusKind() const { return status_kind_; }
   QString statusTitle() const { return status_title_; }
   QString statusMessage() const { return status_message_; }
+  QString statusScope() const { return status_scope_; }
 
   QString sourcePath() const { return source_path_; }
   void setSourcePath(const QString& path);
@@ -190,6 +216,10 @@ class BackupController : public QObject {
   // 回到“空闲”文案：界面上一动输入就调用它，免得上一次的结果一直挂着；
   // 任务进行中不会被清掉。
   Q_INVOKABLE void clearStatus();
+  // 离开某个页面时把该页的临时提示消费掉：只有"确实属于这一页"的消息会失效，
+  // 回到该页不会自动复现旧提示；任务进行中不清（那属于全局运行状态，不是临时
+  // 提示），空 scope 也不清（全局消息本来就不属于任何一页）。
+  Q_INVOKABLE void dismissPageStatus(const QString& scope);
 
   // ---- 仅供 main.cpp 自测调用，刻意不是 Q_INVOKABLE ----
   // 它们精确测试 controller → engine 的 direct archive 路径，复用同一个
@@ -200,6 +230,12 @@ class BackupController : public QObject {
                                 const QString& archive_file);
   bool startDirectRestoreForTest(const QString& archive_file,
                                  const QString& destination);
+
+  // 只给 main.cpp 的 GUI 契约自检用：把一条状态按给定的 severity / scope 放
+  // 进去，用来证明"severity 与 scope 正交"——四种 severity 的显示位置与失效
+  // 时机必须完全一样。刻意不是 Q_INVOKABLE：产品路径里 QML 不能凭空造状态。
+  void setStatusForTest(const QString& kind, const QString& scope,
+                        const QString& title, const QString& message);
 
   // 下面两个只给命令行模式用：那里没有 QML 绑定，需要一个同步等待点，
   // 否则主函数不知道怎么算“跑完了”。返回值区分“真的跑完了”和“等超时了”，
@@ -309,12 +345,21 @@ class BackupController : public QObject {
   bool last_succeeded_ = false;
   // 任务结束时要区分是备份还是恢复，否则成功文案只能写成笼统的“操作完成”。
   Kind active_kind_ = Kind::kBackup;
+  // 闸门与"这次操作占的是哪一种 kind"：Start() 申请，后台任务结束的回调里释放。
+  OperationGate* operation_gate_ = nullptr;
+  OperationGate::Kind active_gate_kind_ = OperationGate::Kind::kNone;
+  ArchiveDeletedObserver* archive_deleted_observer_ = nullptr;
   // 本次操作对应的 file name，只用于状态提示；不构成新的 QML 输入状态。
   QString active_file_name_;
 
   QString status_kind_ = QStringLiteral("idle");
   QString status_title_ = QStringLiteral("等待操作");
   QString status_message_;
+  // 产生这条状态的操作属于哪个页面。各入口方法在调用 SetStatus 之前设置它；
+  // 后台任务结束时用 active_scope_ 还原，保证"备份完成/失败"仍然落回发起它的
+  // 那一页，而不是当前正在看的页面。
+  QString status_scope_;
+  QString active_scope_;
 
   // 两个 watcher 职责分开：数据操作一个，仓库列表一个。两者可以同时进行，
   // 互不覆盖对方的生命周期。

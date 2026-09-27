@@ -119,6 +119,20 @@ bool InspectContainerFile(const std::string& path, ContainerHeader* header,
 // 这段字节是不是以 BKPCNT2 magic 开头。
 bool LooksLikeContainer(const unsigned char* data, std::size_t size);
 
+// 单条流的长度是否落在格式允许的范围内。
+//
+// **writer 与 reader 共用这一个判断**：读侧拒收的归档，写侧就不该产出——
+// 否则 writer 能写出一个自己 reader 随后拒绝的 .bak，那和 JSON writer/reader
+// 不一致是同一类问题。抽成纯函数是为了能在不制造 4 TiB 文件的前提下测边界。
+bool IsAllowedStreamSize(std::uint64_t size);
+
+// PKCS#7 一定补 1..8 个字节，所以 DES-CBC 之后的长度是 8 的倍数且严格更大。
+//
+// plain_size 接近 UINT64_MAX 时 (n/8+1)*8 会回绕成 0——那会把一个"显然太大"
+// 的长度伪装成一个合法的小值，后面的上界检查就完全失去意义。所以这里饱和到
+// UINT64_MAX，让调用方的范围检查如实拒绝它。
+std::uint64_t DesPaddedSize(std::uint64_t plain_size);
+
 // HMAC 的输入是"归一化 header + 密文 payload"：归一化 = auth_tag[32] 全部当 0，
 // 其它字段（含 sizes、salt、iv、payload_sha256）全部参与。
 std::string NormalizedHeaderForMac(const ContainerHeader& header);

@@ -12,8 +12,10 @@
 #include <QString>
 #include <QStringList>
 #include <QTimer>
+#include <cstdio>
 #include <iostream>
 
+#include "application_instance_lock.h"
 #include "main_window.h"
 
 namespace {
@@ -64,6 +66,13 @@ int SaveScreenshots(backup_gui::MainWindow* window, const QString& directory) {
 
 }  // namespace
 
+// 这个 Qt Widgets 界面是**历史 / 回归用**的前端，不是受支持的产品界面：
+// 它没有 Modern GUI 的 repository / schedule / pipeline 选项能力，因此不参与
+// "Modern GUI 与 backupctl 功能一致"这条产品义务。
+//
+// 但它仍然会触碰同一批用户数据，所以**必须**和另外两个前端抢同一把全应用锁：
+// legacy desktop + Modern GUI / legacy desktop + backupctl /
+// legacy desktop + legacy desktop 都互斥。绕过单实例不是它作为历史组件的权利。
 int main(int argc, char* argv[]) {
   QApplication app(argc, argv);
   QApplication::setApplicationName("backup-gui");
@@ -73,6 +82,26 @@ int main(int argc, char* argv[]) {
   QApplication::setOrganizationName("backup-project");
 
   // 只解析两个开发期开关，其余参数保持 Qt 默认行为，不做额外解释。
+  // 在构造窗口（也就会读配置、读仓库列表）之前先抢全应用锁。
+  std::string application_lock_path;
+  std::string application_lock_error;
+  backupproject::ApplicationInstanceLock application_lock;
+  if (!backupproject::DefaultApplicationInstanceLockPath(
+          &application_lock_path, &application_lock_error)) {
+    std::fprintf(stderr, "%s\n", application_lock_error.c_str());
+    return 1;
+  }
+  const backupproject::ApplicationInstanceStatus application_lock_status =
+      application_lock.Acquire(application_lock_path, &application_lock_error);
+  if (application_lock_status !=
+      backupproject::ApplicationInstanceStatus::kAcquired) {
+    std::fprintf(stderr, "%s\n", application_lock_error.c_str());
+    return application_lock_status ==
+                   backupproject::ApplicationInstanceStatus::kAlreadyRunning
+               ? backupproject::kApplicationAlreadyRunningExitCode
+               : 1;
+  }
+
   const QStringList arguments = QApplication::arguments();
   const bool smoke_test = arguments.contains("--smoke-test");
   const int screenshot_index = arguments.indexOf("--screenshot");

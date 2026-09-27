@@ -30,8 +30,11 @@ if [ "${FILTER_SEMANTICS_SANITIZE:-0}" = "1" ]; then
   echo "[filter-semantics] ASan + UBSan 构建"
 fi
 
+# 遍历是共享的（src/core/source_tree_walker.cpp）：tree_scanner.cpp 现在只把
+# walker 的事实落成 ArchiveEntry，两者必须一起编进来。
 SOURCES="tests/unit/filter_semantics_test.cpp src/filter/filter.cpp \
-  src/core/user_directory.cpp src/core/tree_scanner.cpp src/core/archive_entry.cpp \
+  src/core/user_directory.cpp src/core/tree_scanner.cpp \
+  src/core/source_tree_walker.cpp src/core/archive_entry.cpp \
   src/archive/archive_path.cpp src/filesystem/file_system.cpp"
 
 echo "[filter-semantics] 编译：g++ -std=c++17 -Wall -Wextra -Wpedantic -Iinclude $EXTRA_FLAGS"

@@ -20,6 +20,22 @@ namespace backupproject {
 
 namespace {
 
+// 路径里最后一个 '/' 之前的部分。"a" -> "."、"/a" -> "/"、"/" -> "/"。
+//
+// 刻意**不**导出：项目里另一个模块的同名函数在"没有 '/' 时返回空串"，
+// 两种语义同时可见会让调用点悄悄选错一个。对外只提供按用途命名的入口
+// （EnsurePrivateDirectoryFor / WriteFileAtomicallyReplacing）。
+std::string ParentDirectoryOf(const std::string& path) {
+  const std::size_t slash = path.rfind('/');
+  if (slash == std::string::npos) {
+    return std::string(".");
+  }
+  if (slash == 0) {
+    return std::string("/");
+  }
+  return path.substr(0, slash);
+}
+
 void SetError(std::string* error_message, const std::string& text) {
   if (error_message != nullptr) {
     *error_message = text;
@@ -31,15 +47,10 @@ std::string Describe(int error_number, const std::string& action,
   return action + ": " + path + ": " + std::strerror(error_number);
 }
 
-std::string ParentDirectoryOf(const std::string& path) {
+std::string BaseNameOf(const std::string& path) {
   const std::size_t slash = path.rfind('/');
-  if (slash == std::string::npos) {
-    return std::string(".");
-  }
-  if (slash == 0) {
-    return std::string("/");
-  }
-  return path.substr(0, slash);
+  if (slash == std::string::npos) return path;
+  return path.substr(slash + 1);
 }
 
 // 目录项落盘不靠 fsync 文件本身，而靠 fsync 父目录。失败只当诊断：
@@ -569,6 +580,130 @@ bool CheckFreeSpace(const std::string& directory, std::uint64_t need_bytes,
                                 " bytes, available " +
                                 std::to_string(available));
     return false;
+  }
+  return true;
+}
+
+// ---- 目录与"整份文件原子替换" ----
+
+bool EnsurePrivateDirectory(const std::string& path,
+                            std::string* error_message) {
+  if (path.empty() || path == "." || path == "/") return true;
+
+  struct stat status;
+  if (::lstat(path.c_str(), &status) == 0) {
+    if (S_ISDIR(status.st_mode)) return true;
+    // 存在的同名东西不是目录（普通文件、符号链接……）。绝不试图删掉它再建：
+    // 那不是"创建目录"，那是破坏用户的数据。
+    SetError(error_message,
+             "Cannot create the directory: not a directory: " + path);
+    return false;
+  }
+  if (errno != ENOENT) {
+    SetError(error_message, Describe(errno, "Failed to inspect", path));
+    return false;
+  }
+
+  const std::string parent = ParentDirectoryOf(path);
+  // parent == path 只会在 path 不含 '/' 且不是 "." 时出现，那时 parent 是 "."
+  // 已经被上面拦掉了；这个判断是防御性的，避免任何输入造成无限递归。
+  if (parent != path && !EnsurePrivateDirectory(parent, error_message)) {
+    return false;
+  }
+  if (::mkdir(path.c_str(), 0700) != 0 && errno != EEXIST) {
+    SetError(error_message,
+             Describe(errno, "Failed to create the directory", path));
+    return false;
+  }
+  return true;
+}
+
+bool EnsurePrivateDirectoryFor(const std::string& file_path,
+                               std::string* error_message) {
+  if (file_path.empty()) {
+    SetError(error_message, "Output file path is empty.");
+    return false;
+  }
+  return EnsurePrivateDirectory(ParentDirectoryOf(file_path), error_message);
+}
+
+bool WriteFileAtomicallyReplacing(const std::string& path,
+                                  const std::string& data,
+                                  std::string* error_message) {
+  if (path.empty()) {
+    SetError(error_message, "Output file path is empty.");
+    return false;
+  }
+
+  const std::string directory = ParentDirectoryOf(path);
+  const std::string base = BaseNameOf(path);
+  // mkstemp 的模板必须以 XXXXXX 结尾。前缀截到 40 字节：NAME_MAX 是 255，
+  // 一个很长的目标名加上后缀会把模板撑到超长，而临时文件叫什么并不重要。
+  std::string prefix = base.size() > 40 ? base.substr(0, 40) : base;
+  if (prefix.empty()) prefix = "atomic";
+  const std::string pattern =
+      (directory.empty() ? std::string(".") : directory) + "/" + prefix +
+      ".tmp-XXXXXX";
+  std::vector<char> buffer(pattern.begin(), pattern.end());
+  buffer.push_back('\0');
+
+  // O_CREAT|O_EXCL 由 mkstemp 内部保证：名字已存在（哪怕是个符号链接）就直接
+  // 换一个候选名重试，所以这里既不会跟随链接，也不会截断别人预放的文件。
+  const int fd = ::mkstemp(buffer.data());
+  if (fd < 0) {
+    SetError(error_message,
+             Describe(errno, "Failed to create temporary file", pattern));
+    return false;
+  }
+  const std::string temporary(buffer.data());
+  // mkstemp 不带 O_CLOEXEC，显式补上：临时 fd 没有任何理由泄漏进子进程。
+  (void)::fcntl(fd, F_SETFD, FD_CLOEXEC);
+
+  if (!WriteFully(fd, data.data(), data.size(), error_message)) {
+    const std::string reason =
+        (error_message != nullptr ? *error_message
+                                  : std::string("write failed"));
+    ::close(fd);
+    ::unlink(temporary.c_str());
+    SetError(error_message, reason);
+    return false;
+  }
+  if (::fsync(fd) != 0) {
+    const int saved_errno = errno;
+    ::close(fd);
+    ::unlink(temporary.c_str());
+    SetError(error_message,
+             Describe(saved_errno, "Failed to fsync", temporary));
+    return false;
+  }
+  if (::close(fd) != 0) {
+    const int saved_errno = errno;
+    ::unlink(temporary.c_str());
+    SetError(error_message,
+             Describe(saved_errno, "Failed to close", temporary));
+    return false;
+  }
+  // 到这里为止目标文件还没被碰过：任何一步失败，磁盘上留下的都是旧的完整内容。
+  if (::rename(temporary.c_str(), path.c_str()) != 0) {
+    const int saved_errno = errno;
+    ::unlink(temporary.c_str());
+    SetError(error_message, Describe(saved_errno, "Failed to replace", path));
+    return false;
+  }
+
+  // 目录 fsync 让 rename 本身落盘。少数文件系统不支持对目录 fsync
+  // （EINVAL / ENOTSUP），那不是错误；其它 errno 是真实 I/O 问题，如实报告。
+  const int directory_fd =
+      ::open(directory.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+  if (directory_fd >= 0) {
+    if (::fsync(directory_fd) != 0 && errno != EINVAL && errno != ENOTSUP) {
+      const int saved_errno = errno;
+      ::close(directory_fd);
+      SetError(error_message,
+               Describe(saved_errno, "Failed to fsync directory", directory));
+      return false;
+    }
+    ::close(directory_fd);
   }
   return true;
 }

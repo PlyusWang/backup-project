@@ -91,6 +91,21 @@ Canvas {
             ctx.closePath()
             ctx.stroke()
             break
+        case "clock":
+            // 表盘 + 时针分针。"定时"的语义就在这两根针上：
+            // 画成"一个圆里加个点"在 16px 下认不出是什么。
+            ctx.beginPath()
+            ctx.arc(9, 9, 6.2, 0, Math.PI * 2)
+            ctx.stroke()
+            ctx.beginPath()
+            ctx.moveTo(9, 9)
+            ctx.lineTo(9, 4.9)
+            ctx.stroke()
+            ctx.beginPath()
+            ctx.moveTo(9, 9)
+            ctx.lineTo(12.3, 10.7)
+            ctx.stroke()
+            break
         case "sun":
             ctx.beginPath()
             ctx.arc(9, 9, 3.4, 0, Math.PI * 2)

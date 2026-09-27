@@ -111,10 +111,8 @@ bool IsEmptyDirectory(const std::string& path) {
   return empty;
 }
 
-// 尽力而为地删掉一棵树，用于失败时清理暂存目录。不 follow 软链接。
-std::uint64_t DesPaddedSize(std::uint64_t plain_size) {
-  return (plain_size / 8 + 1) * 8;
-}
+// PKCS#7 的补齐长度与上界判断都只有一份实现，在 container_format.cpp：
+// writer 用的是和 reader 完全相同的算术与常量。
 
 bool FileSizeOf(const std::string& path, std::uint64_t* size,
                 std::string* error_message) {

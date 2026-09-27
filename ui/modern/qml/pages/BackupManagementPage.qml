@@ -192,12 +192,19 @@ Item {
                     compressionMethodText: String(modelData["compressionMethodText"] || "")
                     encryptionMethodText: String(modelData["encryptionMethodText"] || "")
                     passwordRequired: Boolean(modelData["passwordRequired"])
+                    // 来源与计划变化摘要来自 ScheduleStore（不是文件名解析）：
+                    // 手动备份不会被自动淘汰，"这条是谁建的"必须一眼看得出来。
+                    originText: schedule.originForFile(String(modelData["fileName"] || ""))
+                    scheduledChangesText: schedule.changesForFile(String(modelData["fileName"] || ""))
                     busy: controller.busy || controller.catalogBusy
                 }
             }
 
             StatusBanner {
+                objectName: "managementStatusBanner"
                 Layout.fillWidth: true
+                pageScope: "management"
+                scope: controller.statusScope
                 kind: controller.statusKind
                 title: controller.statusTitle
                 message: controller.statusMessage
