@@ -37,6 +37,7 @@
 #include "archive_pipeline.h"
 #include "container_format.h"
 #include "file_system.h"
+#include "incremental_delta.h"
 
 namespace backupproject {
 
@@ -395,6 +396,54 @@ bool BackupCatalog::List(const std::string& repository,
     //
     // 先认格式：IdentifyArchiveFile 只看 magic，就能把 legacy v0.1 与 v2
     // container 分开，而且不需要密码就能读出 v2 的三个算法 id。
+    // PR #18：先按 magic 分出增量 delta。
+    //
+    // 顺序很重要：delta 既不是 legacy v0.1、也不是 v2 container，
+    // 直接走 IdentifyArchiveFile 会被归到"认不出来"，而它其实是一份**完好**的
+    // 快照。分类只读 magic，不做任何解密、不读 payload。
+    if (ClassifySnapshotFile(candidate, nullptr) == SnapshotFileKind::kDelta) {
+      record.incremental_delta = true;
+      record.has_pipeline_methods = false;
+      record.password_required = false;
+      DeltaEnvelope delta_envelope;
+      std::string envelope_error;
+      if (!ReadDeltaEnvelope(candidate, &delta_envelope, &envelope_error)) {
+        record.recognized_archive = false;
+        record.diagnostic = envelope_error.empty()
+                                ? "Unreadable incremental delta: " + candidate
+                                : envelope_error;
+      } else {
+        record.recognized_archive = true;
+        record.format_version =
+            static_cast<std::uint16_t>(delta_envelope.format_version);
+        record.parent_file_name = delta_envelope.parent_file_name;
+        // 依赖链能不能恢复：这里只确认父文件还在（廉价判断）。
+        // 身份是否真的对得上由恢复路径校验。
+        const std::string parent_path =
+            repository + "/" + delta_envelope.parent_file_name;
+        struct stat parent_info;
+        if (delta_envelope.parent_file_name.empty()) {
+          record.chain_restorable = false;
+          record.chain_diagnostic = "the delta names no parent snapshot";
+        } else if (::lstat(parent_path.c_str(), &parent_info) != 0 ||
+                   !S_ISREG(parent_info.st_mode)) {
+          record.chain_restorable = false;
+          record.chain_diagnostic =
+              "parent snapshot is missing: " + delta_envelope.parent_file_name;
+        } else {
+          record.chain_restorable = true;
+        }
+        // 变化计数放进 entry_count：列表本来就有这一列，用它显示"这份 delta
+        // 装了多少条变化"，不必再加一个只对这一种记录有意义的字段。
+        record.entry_count = delta_envelope.added + delta_envelope.modified +
+                             delta_envelope.metadata_changed;
+      }
+      // 注意：这个循环累加的是局部变量 found，最后由它整体赋给 *records。
+      // 直接往 *records 里塞会被最后那句 move 覆盖掉。
+      found.push_back(std::move(record));
+      continue;
+    }
+
     ArchiveFileInfo archive_info;
     std::string identify_error;
     if (!IdentifyArchiveFile(candidate, &archive_info, &identify_error)) {

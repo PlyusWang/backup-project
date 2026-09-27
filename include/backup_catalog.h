@@ -91,6 +91,22 @@ struct BackupRecord {
 
   // recognized_archive 为 false 时的原因；为 true 时为空。
   std::string diagnostic;
+
+  // ---- PR #18：快照种类与依赖链 ----
+  //
+  // 一份 delta 不是"坏归档"，它是另一种快照：有独立 magic，自己带着父身份。
+  // catalog 必须先按 magic 分类，否则一份完好的 delta 会被报成"认不出来"。
+  bool incremental_delta = false;
+  // delta 的父快照文件名（完整归档时为空）。
+  std::string parent_file_name;
+  // 这条依赖链现在能不能恢复。
+  //
+  // 这里刻意只做**廉价**判断（父文件存不存在）：列表可能要看上千条记录，
+  // 逐条把整条链读一遍代价太大。真正的身份校验在恢复路径里 —— 那里才是
+  // 必须正确、也真的会拒绝的地方。这一位只回答"看起来能不能恢复"。
+  bool chain_restorable = false;
+  // 不能恢复时的原因（parent 缺失等）。
+  std::string chain_diagnostic;
 };
 
 // 仓库的稳定 identity：用来回答"这两个仓库路径是不是同一个仓库"。
