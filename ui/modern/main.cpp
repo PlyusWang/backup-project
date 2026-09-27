@@ -393,17 +393,20 @@ int RunPreviewTest(backup_modern::FilterRuleModel* model, const QString& source,
       included_paths << item.value(QStringLiteral("path")).toString();
     }
   }
-  // 计数取整棵树的数字（与 CLI 打印的是同一个字段），窗口信息取核心给出的
-  // truncated。列表本身只到窗口为止，所以两者在截断时可以不同——下面的 Note
-  // 行负责说清楚，而且必须与 backupctl 的措辞逐字一致：整棵树都被验证过，
-  // 被限制的只是列出多少条。
-  std::printf("Preview: %d matching item(s)\n", model->previewIncluded());
+  // 计数取完整实际备份遍历的数字（与 CLI 打印的是同一个字段），窗口信息取核心
+  // 给出的 truncated。三个数字互不相同：全量匹配数、窗口大小（preview entries，
+  // 含被排除的条目）、窗口里真正列出来的匹配项数。所以在截断时不能说
+  // "the first 300 of N matching item(s)"——那是把窗口大小当成了匹配数。
+  // 下面的 Note 行必须与 backupctl 的措辞逐字一致。
+  std::printf(
+      "Preview: %d matching item(s) in the effective backup selection.\n",
+      model->previewIncluded());
   if (model->previewTruncated()) {
     std::printf(
-        "Note: showing the first %d of %d matching item(s); the whole source "
-        "tree was validated, %d listed below.\n",
-        model->previewLimit(), model->previewIncluded(),
-        static_cast<int>(included_paths.size()));
+        "Note: showing matches found within the first %d preview entries; the "
+        "complete effective backup traversal was validated, %d matching "
+        "item(s) listed below.\n",
+        model->previewLimit(), static_cast<int>(included_paths.size()));
   }
   for (const QString& path : included_paths) {
     std::printf("%s\n", qPrintable(path));

@@ -273,7 +273,7 @@ Item {
                         if (panel.previewSource.length > 0 && panel.previewSource !== controller.sourcePath)
                             return "共 " + panel.previewShown + " 项（结果对应 " + panel.previewSource + "，源目录已改，请刷新）。"
                         if (panel.previewTruncated)
-                            return "共 " + panel.previewIncluded + " 项会进入归档，仅列出前 " + panel.previewLimit + " 项（整棵源目录树都会被检查）。"
+                            return "共 " + panel.previewIncluded + " 项会进入归档；列表只显示前 " + panel.previewLimit + " 个预览条目（完整执行与备份一致的筛选遍历，被排除的目录不进入其子树）。"
                         return "共 " + panel.previewShown + " 项。"
                     }
                 }

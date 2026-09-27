@@ -35,10 +35,12 @@ class FilterRuleModel : public QObject {
   Q_PROPERTY(bool previewBusy READ previewBusy NOTIFY previewChanged)
   Q_PROPERTY(bool previewTruncated READ previewTruncated NOTIFY previewChanged)
   Q_PROPERTY(int previewShown READ previewShown NOTIFY previewChanged)
-  // 整棵树里被检查过的条目总数（不受显示窗口限制）。共享核心会完整验证整棵
-  // 源目录树，所以这个数字是"预览到底看了多少"，不是"列表里有多少行"。
+  // 完整实际备份遍历里被检查过的条目总数（不受显示窗口限制）。共享核心会走完
+  // 与真实备份完全相同的那次遍历，所以这个数字是"预览到底看了多少"，不是
+  // "列表里有多少行"。
   Q_PROPERTY(int previewTotal READ previewTotal NOTIFY previewChanged)
-  // 整棵树里会进入归档的条目数。同样是全量数字：truncated 为真时它比列表长。
+  // 完整实际备份遍历里会进入归档的条目数。同样是全量数字：truncated 为真时它比
+  // 列表长，而且它和"列表里有几条 included"是两回事。
   Q_PROPERTY(int previewIncluded READ previewIncluded NOTIFY previewChanged)
   Q_PROPERTY(int previewLimit READ previewLimit CONSTANT)
   Q_PROPERTY(QString lastError READ lastError NOTIFY lastErrorChanged)
@@ -107,8 +109,8 @@ class FilterRuleModel : public QObject {
   struct PreviewOutcome {
     QVariantList items;
     bool truncated = false;
-    int total = 0;     // 整棵树里被检查过的条目数
-    int included = 0;  // 整棵树里会进入归档的条目数
+    int total = 0;     // 完整实际备份遍历里被检查过的条目数
+    int included = 0;  // 完整实际备份遍历里会进入归档的条目数
     QString error;
     backupproject::PreviewErrorKind error_kind =
         backupproject::PreviewErrorKind::kNone;
