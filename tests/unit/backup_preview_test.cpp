@@ -704,10 +704,12 @@ int main() {
   test_support::Section("PREV 8. 归档路径 grammar（PTH-01..PTH-05）");
   {
     // Linux 允许文件名里出现反斜杠，也允许 "C:note.txt" 这种形状；归档格式
-    // 两者都不接受（见 include/archive_path.h）。共享 walker 现在在生成
-    // archive-relative path 之后调用的是**完整**的 IsValidArchivePath，所以这
-    // 类名字必须在同一层就让预览失败——否则预览会把它列出来，而真实备份随后
-    // 必然失败，正好违反"预览 == 备份"。
+    // 两者都不接受（见 include/archive_path.h）。这类名字只要**会进入归档**，
+    // 共享 walker 就会用完整的 IsValidArchivePath 判死——否则预览会把它列
+    // 出来，而真实备份随后必然失败，正好违反"预览 == 备份"。
+    //
+    // 下面这些用例都是"没有规则 -> 它确实会进归档"的情形；"被规则排除因此
+    // 不该阻塞"的情形在 PREV 9。
     const std::string work = test_support::FreshDir("backup-preview-grammar");
     const std::string backslash = std::string(1, '\\');
 
@@ -862,7 +864,281 @@ int main() {
         "PREV PTH-05 空目录：预览 0 项，备份只有 root 一条", empty_error);
   }
 
-  test_support::Section("PREV 9. 无法给出结果时必须明确失败");
+  test_support::Section(
+      "PREV 9. 只有真正进入归档的条目才需要满足 archive grammar");
+  {
+    // 这一节钉的是**时机**：完整 IsValidArchivePath 必须在 Filter 判定之后
+    // 才跑。历史 Backup 的顺序是"Filter 先决定这条进不进归档，进了才校验
+    // 路径"；把校验提到 Filter 之前会让"本来会被规则排除、根本不会进归档"的
+    // 名字提前阻塞整次备份——那是新语义，不是历史语义。
+    const std::string work = test_support::FreshDir("backup-preview-filtpath");
+    const std::string backslash = std::string(1, '\\');
+
+    // FILT-PATH-01 / 02：文件名含反斜杠。
+    const std::string file_source = work + "/file-src";
+    test_support::Mkdir(file_source, 0755);
+    const std::string bad_file = std::string("a") + backslash + "b.txt";
+    test_support::WriteFile(file_source + "/" + bad_file, "x\n", 0644);
+    test_support::WriteFile(file_source + "/good.txt", "y\n", 0644);
+    {
+      const bp::PreviewResult preview =
+          bp::PreviewBackupSelection(file_source, {});
+      std::vector<bp::ArchiveEntry> entries;
+      std::string scan_error;
+      const bool backup_ok =
+          bp::ScanSourceTree(file_source, nullptr, &entries, &scan_error);
+      test_support::Check(
+          !preview.error.empty() && !backup_ok && preview.error == scan_error &&
+              preview.error.find("backslash") != std::string::npos,
+          "PREV FILT-PATH-01 未排除的 a-b.txt（反斜杠）：两边同一句拒绝",
+          "preview=[" + preview.error + "] backup=[" + scan_error + "]");
+    }
+    {
+      // 明确排除 ext:txt -> 那个名字根本不会进归档，两边都必须成功。
+      const std::vector<bp::FilterRuleDraft> rules = {
+          Rule(bp::FilterAction::kExclude, "ext:txt")};
+      CheckPreviewMatchesBackup("FILT-PATH-02 被排除的反斜杠文件名不阻塞",
+                                file_source, work, rules, 21);
+      const bp::PreviewResult preview =
+          bp::PreviewBackupSelection(file_source, rules);
+      test_support::Check(
+          preview.error.empty() && preview.included_count == 0,
+          "PREV FILT-PATH-02 两边都没有把它算进结果",
+          preview.error + " count=" + std::to_string(preview.included_count));
+    }
+
+    // FILT-PATH-03 / 04：目录名含反斜杠。
+    const std::string dir_source = work + "/dir-src";
+    test_support::Mkdir(dir_source, 0755);
+    const std::string bad_dir = std::string("dir") + backslash + "bad";
+    test_support::Mkdir(dir_source + "/" + bad_dir, 0755);
+    test_support::WriteFile(dir_source + "/" + bad_dir + "/inside.txt", "x\n",
+                            0644);
+    test_support::WriteFile(dir_source + "/keep.txt", "y\n", 0644);
+    {
+      const bp::PreviewResult preview =
+          bp::PreviewBackupSelection(dir_source, {});
+      std::vector<bp::ArchiveEntry> entries;
+      std::string scan_error;
+      const bool backup_ok =
+          bp::ScanSourceTree(dir_source, nullptr, &entries, &scan_error);
+      test_support::Check(
+          !preview.error.empty() && !backup_ok && preview.error == scan_error &&
+              preview.error.find("backslash") != std::string::npos,
+          "PREV FILT-PATH-03 未排除的反斜杠目录：两边同一句拒绝",
+          "preview=[" + preview.error + "] backup=[" + scan_error + "]");
+    }
+    {
+      // 目录被明确排除 -> 整棵子树剪掉，不做语法校验，两边都成功。
+      const std::vector<bp::FilterRuleDraft> rules = {
+          Rule(bp::FilterAction::kExclude, "name:*bad")};
+      CheckPreviewMatchesBackup("FILT-PATH-04 被排除的反斜杠目录整棵剪掉",
+                                dir_source, work, rules, 22);
+      const bp::PreviewResult preview =
+          bp::PreviewBackupSelection(dir_source, rules);
+      // 注意：被剪枝的目录自己会留在 items 里（界面要显示"整棵剪掉"），所以
+      // 这里只要求**included 的**条目里没有它。
+      bool included_bad = false;
+      bool saw_pruned = false;
+      for (const bp::PreviewItem& item : preview.items) {
+        if (item.included &&
+            item.archive_path.find("bad") != std::string::npos) {
+          included_bad = true;
+        }
+        if (item.disposition == bp::PreviewDisposition::kDirectoryPruned) {
+          saw_pruned = true;
+        }
+      }
+      test_support::Check(
+          preview.error.empty() && !included_bad && saw_pruned &&
+              preview.included_count == 1,
+          "PREV FILT-PATH-04 只留下 keep.txt，两边都没有语法错误",
+          preview.error + " count=" + std::to_string(preview.included_count) +
+              " pruned=" + (saw_pruned ? "yes" : "no"));
+    }
+
+    // FILT-PATH-05：盘符风格文件名。
+    const std::string drive_source = work + "/drive-src";
+    test_support::Mkdir(drive_source, 0755);
+    test_support::WriteFile(drive_source + "/C:note.txt", "x\n", 0644);
+    test_support::WriteFile(drive_source + "/plain.txt", "y\n", 0644);
+    {
+      const bp::PreviewResult preview =
+          bp::PreviewBackupSelection(drive_source, {});
+      std::vector<bp::ArchiveEntry> entries;
+      std::string scan_error;
+      const bool backup_ok =
+          bp::ScanSourceTree(drive_source, nullptr, &entries, &scan_error);
+      test_support::Check(
+          !preview.error.empty() && !backup_ok && preview.error == scan_error &&
+              preview.error.find("drive letter") != std::string::npos,
+          "PREV FILT-PATH-05 未排除的 C:note.txt：两边同一句拒绝",
+          "preview=[" + preview.error + "] backup=[" + scan_error + "]");
+    }
+    {
+      const std::vector<bp::FilterRuleDraft> rules = {
+          Rule(bp::FilterAction::kExclude, "ext:txt")};
+      CheckPreviewMatchesBackup("FILT-PATH-05b 被排除的 C:note.txt 不阻塞",
+                                drive_source, work, rules, 23);
+    }
+
+    // FILT-PATH-06：合法名字照旧全部通过（不能因为这一轮改动被误伤）。
+    const std::string legal_source = work + "/legal-src";
+    test_support::Mkdir(legal_source, 0755);
+    const char* legal_names[] = {"a_b.txt", "a-b.txt", "中文.txt",
+                                 "space name.txt"};
+    for (const char* name : legal_names) {
+      test_support::WriteFile(legal_source + "/" + name, "x\n", 0644);
+    }
+    const bp::PreviewResult legal =
+        bp::PreviewBackupSelection(legal_source, {});
+    test_support::Check(
+        legal.error.empty() && legal.included_count == 4,
+        "PREV FILT-PATH-06 合法名字继续通过",
+        legal.error + " count=" + std::to_string(legal.included_count));
+  }
+
+  test_support::Section("PREV 10. Socket 的错误优先级（名字非法也一样）");
+  {
+    // 没有被排除的 socket 历史上报的是"这个类型不能归档"，而不是"这个文件名
+    // 违反了 archive grammar"。即使 socket 的名字里带反斜杠，优先级也不变。
+    const std::string work = test_support::FreshDir("backup-preview-sockpath");
+    const std::string source = work + "/src";
+    test_support::Mkdir(source, 0755);
+    test_support::WriteFile(source + "/keep.txt", "x\n", 0644);
+    const std::string socket_name = std::string("sock") + '\\' + "bad";
+    const int socket_fd =
+        test_support::CreateUnixSocket(source + "/" + socket_name);
+    if (socket_fd < 0) {
+      test_support::Note("PREV SOCK-PATH 无法创建 unix socket，跳过这一组");
+    } else {
+      const bp::PreviewResult preview = bp::PreviewBackupSelection(source, {});
+      std::vector<bp::ArchiveEntry> entries;
+      std::string scan_error;
+      const bool backup_ok =
+          bp::ScanSourceTree(source, nullptr, &entries, &scan_error);
+      test_support::Check(
+          !preview.error.empty() && !backup_ok && preview.error == scan_error,
+          "PREV SOCK-PATH-01 未排除的非法名 socket：两边同一句",
+          "preview=[" + preview.error + "] backup=[" + scan_error + "]");
+      test_support::Check(
+          preview.error.find("Unsupported special type: socket") !=
+              std::string::npos,
+          "PREV SOCK-PATH-01 报的是 socket 不支持，而不是路径语法",
+          preview.error);
+      test_support::Check(
+          preview.error.find("Invalid archive path") == std::string::npos,
+          "PREV SOCK-PATH-01 错误优先级保持历史语义（socket 优先）",
+          preview.error);
+      test_support::Check(
+          preview.error_kind == bp::PreviewErrorKind::kSelectionBlocked,
+          "PREV SOCK-PATH-01 error_kind 是 blocked");
+
+      // 明确排除 -> 跳过，两边成功。
+      const std::vector<bp::FilterRuleDraft> rules = {
+          Rule(bp::FilterAction::kExclude, "name:sock*")};
+      const bp::PreviewResult excluded =
+          bp::PreviewBackupSelection(source, rules);
+      test_support::Check(excluded.error.empty(),
+                          "PREV SOCK-PATH-02 明确排除之后不再阻塞",
+                          excluded.error);
+      CheckPreviewMatchesBackup("SOCK-PATH-02 被排除的 socket 不进入结果",
+                                source, work, rules, 24);
+      ::unlink((source + "/" + socket_name).c_str());
+      ::close(socket_fd);
+    }
+  }
+
+  test_support::Section("PREV 11. 超长 child path：历史 early 语义保留");
+  {
+    // 长度是**遍历阶段**的硬边界（历史 TreeScanner 在 lstat 与 Filter 之前就
+    // 检查），所以一个超长 child path 即使会被规则排除，也照样失败。
+    //
+    // 构造方式刻意不碰常量：用 chdir + 相对路径建一条很深的目录链，使最深处
+    // 那个文件的 **archive 相对路径** 超过 kMaxArchivePathLength，而它的父目录
+    // 磁盘路径仍然短于 PATH_MAX（因此 walker 真的能遍历到那里）。
+    const std::string work = test_support::FreshDir("backup-preview-pathlen");
+    const std::string source = work + "/src";
+    test_support::Mkdir(source, 0755);
+
+    char saved[4096];
+    const bool have_cwd = ::getcwd(saved, sizeof(saved)) != nullptr;
+    const std::string component(190, 'd');
+    const std::string child_name(200, 'v');
+    int depth = 0;
+    std::size_t relative_length = 0;
+    bool built = have_cwd && ::chdir(source.c_str()) == 0;
+    while (built && relative_length < 3900) {
+      if (::mkdir(component.c_str(), 0755) != 0) {
+        built = false;
+        break;
+      }
+      if (::chdir(component.c_str()) != 0) {
+        built = false;
+        break;
+      }
+      relative_length += 1 + component.size();
+      ++depth;
+    }
+    if (built) {
+      const int fd =
+          ::open(child_name.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
+      built = fd >= 0;
+      if (fd >= 0) ::close(fd);
+    }
+    test_support::Check(
+        built, "PREV PATH-LEN 深目录链构造成功（archive 相对路径超过上限）");
+    if (have_cwd && ::chdir(saved) != 0) built = false;
+    if (built) {
+      std::string deepest;
+      for (int index = 0; index < depth; ++index) {
+        deepest += "/" + component;
+      }
+      deepest += "/" + child_name;
+      test_support::Check(
+          deepest.size() - 1 > bp::kMaxArchivePathLength,
+          "PREV PATH-LEN 该 child 的 archive 相对路径确实超过上限",
+          std::to_string(deepest.size() - 1));
+
+      // 规则本来会把它排除掉——但历史语义是"长度在遍历阶段就判死"。
+      const std::vector<bp::FilterRuleDraft> excluding = {
+          Rule(bp::FilterAction::kExclude, "name:vvv*")};
+      const bp::PreviewResult preview =
+          bp::PreviewBackupSelection(source, excluding);
+      std::vector<bp::ArchiveEntry> entries;
+      std::string scan_error;
+      const bool backup_ok =
+          bp::ScanSourceTree(source, nullptr, &entries, &scan_error, nullptr);
+      test_support::Check(
+          !preview.error.empty() && !backup_ok && preview.error == scan_error,
+          "PREV PATH-LEN 被排除也照样失败（历史 early 语义），两边同一句",
+          "preview=[" + preview.error + "] backup=[" + scan_error + "]");
+      test_support::Check(
+          preview.error.find("Archive path too long") != std::string::npos,
+          "PREV PATH-LEN 报的是长度而不是别的", preview.error);
+    }
+    // 清理：下到最深处删掉文件，再逐层 chdir("..") 删目录，避免又一次构造
+    // 超长路径（也避免在 /tmp 里留下一棵删不掉的树）。
+    if (have_cwd) {
+      if (::chdir(source.c_str()) == 0) {
+        for (int index = 0; index < depth; ++index) {
+          if (::chdir(component.c_str()) != 0) break;
+        }
+        ::unlink(child_name.c_str());
+        for (int index = 0; index < depth; ++index) {
+          if (::chdir("..") != 0) break;
+          ::rmdir(component.c_str());
+        }
+      }
+      // 回不去就只能留在原地，但这条清理路径不该悄悄吞掉失败：把它做成
+      // 断言的一部分（-Wunused-result 也会盯着 chdir 的返回值）。
+      if (::chdir(saved) != 0) {
+        test_support::Note("PREV PATH-LEN 清理时无法回到原工作目录");
+      }
+    }
+  }
+
+  test_support::Section("PREV 12. 无法给出结果时必须明确失败");
   {
     const std::string work = test_support::FreshDir("backup-preview-error");
     const std::string source = work + "/src";
@@ -919,7 +1195,7 @@ int main() {
                         "PREV P6 空目录 -> 0 项且不是错误");
   }
 
-  test_support::Section("PREV 10. 路径语义");
+  test_support::Section("PREV 13. 路径语义");
   {
     const std::string work = test_support::FreshDir("backup-preview-paths");
     const std::string source = work + "/src";

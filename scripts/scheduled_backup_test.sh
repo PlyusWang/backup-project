@@ -105,6 +105,29 @@ if [ ! -x "$BACKUPCTL" ] || [ ! -x "$ARCHIVE_CLI" ]; then
   make -C "$ROOT_DIR" all test-fixtures >/dev/null || exit 1
 fi
 
+# 两个 GUI 也是本套件要用的 fixture。脚本不能假设"前一个 suite 恰好构建过
+# 它们"——quality_test.sh 的 make clean 会把 build/ 清掉，之后 D4 / E / I 区
+# 会因为找不到 modern GUI 而 SKIP、K.05..K.07 会因为找不到 legacy desktop GUI
+# 而 SKIP（最终回归里这是真的发生过的事）。所以这里按需自己构建：
+#
+#   build/backup-gui-modern  D4.13+ / E 区 / I 区的跨前端检查
+#   build/backup-gui         K.05..K.07 的 legacy desktop 单实例 / 共存检查
+#                            （regression-only 目标，但它拿的是同一把产品锁）
+LEGACY_GUI="$ROOT_DIR/build/backup-gui"
+if [ ! -x "$GUI" ]; then
+  echo "[schedule-test] build/backup-gui-modern is missing; building gui-modern..."
+  make -C "$ROOT_DIR" gui-modern >/dev/null 2>&1 || true
+fi
+if [ ! -x "$LEGACY_GUI" ]; then
+  echo "[schedule-test] build/backup-gui is missing; building gui (regression-only)..."
+  make -C "$ROOT_DIR" gui >/dev/null 2>&1 || true
+fi
+if [ -x "$LEGACY_GUI" ]; then
+  echo "[schedule-test] legacy desktop GUI fixture: build/backup-gui present"
+else
+  echo "[schedule-test] 警告：build/backup-gui 仍然缺失，K.05..K.07 会被 SKIP" >&2
+fi
+
 # ============================================================
 echo "[schedule-test] A. core unit tests"
 # ============================================================
@@ -1393,11 +1416,12 @@ if [ -x "$GUI" ]; then
   expect_exit "K.04 G2 CLI 持锁时 GUI（另一配置根）被拒绝" 3 \
     env XDG_CONFIG_HOME="$KG/b" "$GUI" --schedule-show \
       --config-file "$KG/b/config.json" --schedule-file "$KG/b/schedule.json"
-  if [ -x "$ROOT_DIR/build/backup-gui" ]; then
+  if [ -x "$LEGACY_GUI" ]; then
     expect_exit "K.05 G2b legacy desktop 也被同一把锁拒绝" 3 \
-      env XDG_CONFIG_HOME="$KG/b" timeout 20 "$ROOT_DIR/build/backup-gui" --smoke-test
+      env XDG_CONFIG_HOME="$KG/b" timeout 20 "$LEGACY_GUI" --smoke-test
   else
-    echo "  SKIP  K.05：没有 build/backup-gui"
+    record_fail "K.05 G2b legacy desktop 也被同一把锁拒绝" \
+      "build/backup-gui 缺失（脚本应当已经按需构建它）"
   fi
 fi
 
@@ -1405,7 +1429,7 @@ kill -TERM "$KG_WATCH" 2>/dev/null
 for _ in $(seq 1 100); do kill -0 "$KG_WATCH" 2>/dev/null || break; sleep 0.1; done
 wait "$KG_WATCH" 2>/dev/null
 
-if [ -x "$GUI" ] && [ -x "$ROOT_DIR/build/backup-gui" ]; then
+if [ -x "$GUI" ] && [ -x "$LEGACY_GUI" ]; then
   export QT_QPA_PLATFORM=offscreen
   XDG_CONFIG_HOME="$KG/a" "$GUI" --config-file "$KG/a/config.json" \
     --schedule-file "$KG/a/schedule.json" >"$KG/gui1.log" 2>&1 &
