@@ -157,13 +157,19 @@ CLI 必须支持重复添加规则，不要求用户把所有规则写成一个�
 建议形式：
 
 ```bash
-backupctl backup <source_directory> <backup_file> \
+backupctl preview <source_directory> \
+  --include 'ext:cpp;h;hpp' \
+  --exclude 'path:**/build/**'
+
+backupctl backup <source_directory> \
   --include 'ext:cpp;h;hpp' \
   --exclude 'path:**/build/**' \
   --exclude 'ext:tmp;log'
 ```
 
-`--include` 与 `--exclude` 都允许重复出现。
+`--include` 与 `--exclude` 都允许重复出现。`preview` 与 `backup` 接受**同一组**
+规则（含一条规则内的 compound AND），并且与 Modern GUI 的 Manual Backup
+预览共用同一个核心，所以三者的筛选结果必然一致。
 
 非法规则必须：
 
