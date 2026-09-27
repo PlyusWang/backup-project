@@ -20,6 +20,7 @@
 #include <vector>
 
 #include "backup_controller.h"
+#include "backup_preview.h"
 #include "filter_rule_builder.h"
 
 namespace backup_modern {
@@ -34,6 +35,13 @@ class FilterRuleModel : public QObject {
   Q_PROPERTY(bool previewBusy READ previewBusy NOTIFY previewChanged)
   Q_PROPERTY(bool previewTruncated READ previewTruncated NOTIFY previewChanged)
   Q_PROPERTY(int previewShown READ previewShown NOTIFY previewChanged)
+  // 完整实际备份遍历里被检查过的条目总数（不受显示窗口限制）。共享核心会走完
+  // 与真实备份完全相同的那次遍历，所以这个数字是"预览到底看了多少"，不是
+  // "列表里有多少行"。
+  Q_PROPERTY(int previewTotal READ previewTotal NOTIFY previewChanged)
+  // 完整实际备份遍历里会进入归档的条目数。同样是全量数字：truncated 为真时它比
+  // 列表长，而且它和"列表里有几条 included"是两回事。
+  Q_PROPERTY(int previewIncluded READ previewIncluded NOTIFY previewChanged)
   Q_PROPERTY(int previewLimit READ previewLimit CONSTANT)
   Q_PROPERTY(QString lastError READ lastError NOTIFY lastErrorChanged)
   // 当前展示的预览结果对应哪个源目录（界面据此提示“结果已过期”）。
@@ -50,7 +58,14 @@ class FilterRuleModel : public QObject {
   bool previewBusy() const { return preview_busy_; }
   bool previewTruncated() const { return preview_truncated_; }
   int previewShown() const { return static_cast<int>(preview_items_.size()); }
+  int previewTotal() const { return preview_total_; }
+  int previewIncluded() const { return preview_included_; }
   int previewLimit() const { return kPreviewLimit; }
+  // 上一次失败的类别。--preview-test 用它决定"要不要多打一行该怎么办"，
+  // 界面本身只用 lastError 的文案。
+  backupproject::PreviewErrorKind lastErrorKind() const {
+    return last_error_kind_;
+  }
   QString lastError() const { return last_error_; }
   QString previewSource() const { return preview_source_; }
 
@@ -61,6 +76,20 @@ class FilterRuleModel : public QObject {
   Q_INVOKABLE QString validateForm(const QVariantMap& form) const;
 
   Q_INVOKABLE bool addRule(const QVariantMap& form);
+
+  // 高级入口：直接输入完整 DSL。
+  //
+  // 可视化表单每条规则只填一个子条件，而 DSL 允许一条规则里写多个条件
+  // （AND），多个 --include 之间却是 OR——所以"表单只能填单条件"并不等价。
+  // 这个入口让 Manual Backup 的筛选能力与 CLI 完全一致。
+  //
+  // 校验与保存走的是同一条路：Filter::AddRule（共享核心），GUI 不定义语法。
+  Q_INVOKABLE bool addAdvancedRule(const QString& action, const QString& dsl);
+  // 只校验，不改动规则列表：返回空串表示合法。
+  Q_INVOKABLE QString validateDsl(const QString& action,
+                                  const QString& dsl) const;
+  // 第 index 条规则是不是高级 DSL 规则（Rule Card 据此显示原文）。
+  Q_INVOKABLE bool isAdvancedRule(int index) const;
   Q_INVOKABLE void removeRule(int index);
   Q_INVOKABLE void moveRule(int index, int delta);
   Q_INVOKABLE void clearRules();
@@ -80,7 +109,11 @@ class FilterRuleModel : public QObject {
   struct PreviewOutcome {
     QVariantList items;
     bool truncated = false;
+    int total = 0;     // 完整实际备份遍历里被检查过的条目数
+    int included = 0;  // 完整实际备份遍历里会进入归档的条目数
     QString error;
+    backupproject::PreviewErrorKind error_kind =
+        backupproject::PreviewErrorKind::kNone;
     QString source_path;  // 这份结果对应哪个源目录
   };
   static PreviewOutcome ScanPreview(
@@ -109,7 +142,11 @@ class FilterRuleModel : public QObject {
   QString pending_source_;
   std::vector<backupproject::FilterRuleDraft> pending_drafts_;
   QString preview_source_;
+  int preview_total_ = 0;
+  int preview_included_ = 0;
   QString last_error_;
+  backupproject::PreviewErrorKind last_error_kind_ =
+      backupproject::PreviewErrorKind::kNone;
   QFutureWatcher<PreviewOutcome> watcher_;
 };
 

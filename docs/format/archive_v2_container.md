@@ -307,10 +307,25 @@ HMAC 的输入是 `normalized header + ciphertext payload`，其中 normalized h
 名字由 `mkstemp` 生成（含 pid 与随机后缀），由 RAII 守卫保证**成功或失败都清理**。
 不使用固定的 `/tmp/foo.tmp`，也不把整条归档一次读进内存。
 
-内存边界要说清楚：pack 与 encrypt 全程流式（256 KiB 缓冲）；**压缩层例外**——
-HUF1 / LZH1 是"一个 header + 一条 bitstream"的格式，频次表必须看过全部输入才能确定，
-所以这一层需要 O(n) 内存，当前实现给它设了 1 GiB / 条流的明确上限，
-超过就报错而不是 OOM。
+内存边界要说清楚：pack、compress、encrypt 三段全程流式，峰值内存与归档大小无关。
+
+压缩层的**产品路径**（`HuffmanCompressStream` / `LzssHuffmanCompressStream` 与对应的
+decode）只用固定缓冲：256 KiB I/O 缓冲、256 个 uint64 的频次表；LZSS 再加
+32 KiB 窗口与 261 字节前瞻，中间的 token 流落在私有工作目录的临时文件里，不驻留内存。
+"一个 header + 一条 bitstream"只约束 wire format，不要求把整条流放进内存：频次表分两遍
+扫输入得到，第二遍边读边写比特；解码端按头部声明的长度逐块输出，任何"声明的长度"都只用
+于校验，不用来分配内存。（`HuffmanCompress` / `HuffmanDecompress` 这类字符串接口确实是
+O(n)，但它们只服务单元测试与已知向量，产品流水线不调用它们——见
+`src/core/archive_pipeline.cpp` 里对 `*Stream` 的调用。）
+
+因此这一层**没有**"每条流 1 GiB 上限"这种限制：合法的超大输入照常流式处理，能不能落盘
+只取决于磁盘空间（`tests/unit/stream_rlimit_test.cpp` 在 RLIMIT_AS 下压过大输入，
+`tests/unit/compression_stream_test.cpp` 覆盖畸形流）。
+
+真正存在的上界在容器层：读侧要求 `packed_size` / `compressed_size` / `payload_size`
+都不超过 4 TiB（`container_v2::kMaxStreamSize`），否则以
+`Container stream size is implausibly large` 拒绝。这个数字只是"uint64 字段显然不合理"
+的拦截，不是压缩层的配额。
 
 ## 9. 安全措辞与边界
 
@@ -341,6 +356,7 @@ HUF1 / LZH1 是"一个 header + 一条 bitstream"的格式，频次表必须看�
   需要纳秒精度时用 MyPack v2。
 - USTAR 的路径上限是 name 100 + prefix 155 = 255 字节（含 `/`）；
   更长的路径必须换 MyPack v2 或明确失败。
-- 压缩层需要 O(n) 内存（见第 8 节）。
+- 压缩层与 pack / encrypt 一样是流式实现：产品路径只用固定缓冲，峰值内存与归档大小
+  无关（见第 8 节）；O(n) 的字符串接口只用于单元测试与已知向量。
 - 同一输入在 `PackMethod::kUstar` 与 `kFastUstar` 下产出**逐字节相同**的归档；
   两个 id 只表达"用哪条 I/O 策略写"，恢复时走同一个 reader。

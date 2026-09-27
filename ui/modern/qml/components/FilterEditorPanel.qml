@@ -30,6 +30,8 @@ Item {
     property bool previewBusy: false
     property bool previewTruncated: false
     property int previewShown: 0
+    property int previewTotal: 0
+    property int previewIncluded: 0
     property int previewLimit: 300
     property string previewSource: ""
     property string summaryLine: ""
@@ -93,6 +95,8 @@ Item {
         panel.previewBusy = panel.ruleModel.previewBusy
         panel.previewTruncated = panel.ruleModel.previewTruncated
         panel.previewShown = panel.ruleModel.previewShown
+        panel.previewTotal = panel.ruleModel.previewTotal
+        panel.previewIncluded = panel.ruleModel.previewIncluded
         panel.previewLimit = panel.ruleModel.previewLimit
         panel.summaryLine = panel.ruleModel.summaryText
         panel.dslPreview = panel.ruleModel.dslText
@@ -269,7 +273,7 @@ Item {
                         if (panel.previewSource.length > 0 && panel.previewSource !== controller.sourcePath)
                             return "共 " + panel.previewShown + " 项（结果对应 " + panel.previewSource + "，源目录已改，请刷新）。"
                         if (panel.previewTruncated)
-                            return "仅预览前 " + panel.previewLimit + " 项（目录过大时只显示开头部分）。"
+                            return "共 " + panel.previewIncluded + " 项会进入归档；列表只显示前 " + panel.previewLimit + " 个预览条目（完整执行与备份一致的筛选遍历，被排除的目录不进入其子树）。"
                         return "共 " + panel.previewShown + " 项。"
                     }
                 }
@@ -636,6 +640,77 @@ Item {
                                 return "日期格式 YYYY-MM-DD，区间两端都算命中；最近 N 天按 N × 24 小时计算。"
                             return "通配符：* 匹配任意字符但不跨 /，? 匹配一个字符，** 可以跨 /。"
                         }
+                    }
+                }
+
+
+                // ---------- 高级规则（完整 DSL）----------
+                //
+                // 可视化表单每条规则只填一个子条件；DSL 允许一条规则里写多个
+                // 条件（AND），而多个 --include 之间是 OR —— 两者并不等价。
+                // 这里让 Manual Backup 的筛选能力与 CLI 完全一致：文本原样交给
+                // 共享核心校验（validateDsl 走的就是 Filter::AddRule）。
+                ColumnLayout {
+                    Layout.fillWidth: true
+                    spacing: 6
+
+                    Text {
+                        Layout.fillWidth: true
+                        wrapMode: Text.WordWrap
+                        font.pixelSize: 16
+                        font.weight: Font.DemiBold
+                        color: theme.textSecondary
+                        text: "高级规则（一条规则写多个条件，用空格分隔，全部满足才命中）"
+                    }
+
+                    RowLayout {
+                        Layout.fillWidth: true
+                        spacing: 8
+
+                        AppComboBox {
+                            id: advancedAction
+                            Layout.preferredWidth: 110
+                            model: ["include", "exclude"]
+                        }
+
+                        AppTextField {
+                            id: advancedDsl
+                            objectName: "advancedFilterRuleField"
+                            Layout.fillWidth: true
+                            placeholderText: "如 name:*.txt size:<1MB"
+                            onTextEdited: advancedError.text = ""
+                        }
+
+                        AppButton {
+                            objectName: "addAdvancedFilterRuleButton"
+                            text: "添加高级规则"
+                            enabled: !controller.busy
+                            onClicked: {
+                                if (!ruleModel)
+                                    return
+                                if (advancedDsl.text.length === 0) {
+                                    advancedError.text = "请先填写规则"
+                                    return
+                                }
+                                if (ruleModel.addAdvancedRule(advancedAction.currentText,
+                                                              advancedDsl.text)) {
+                                    advancedError.text = ""
+                                    advancedDsl.text = ""
+                                } else {
+                                    advancedError.text = ruleModel.lastError
+                                }
+                            }
+                        }
+                    }
+
+                    Text {
+                        id: advancedError
+                        objectName: "advancedFilterRuleError"
+                        Layout.fillWidth: true
+                        wrapMode: Text.WordWrap
+                        font.pixelSize: 15
+                        color: theme.accent
+                        visible: text.length > 0
                     }
                 }
 

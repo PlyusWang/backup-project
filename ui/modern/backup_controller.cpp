@@ -11,11 +11,14 @@
 #include <QFileInfo>
 #include <QTimer>
 #include <QtConcurrent/QtConcurrentRun>
+#include <cstddef>
+#include <cstring>
 #include <string>
 #include <utility>
 #include <vector>
 
 #include "backup_engine.h"
+#include "backup_option_keys.h"
 
 namespace backup_modern {
 
@@ -27,6 +30,13 @@ const char kIdle[] = "idle";
 const char kRunning[] = "running";
 const char kSuccess[] = "success";
 const char kError[] = "error";
+
+// 状态消息的归属页面，取值与 QML 里各页 StatusBanner 的 pageScope 一一对应。
+// 与 severity 正交：同一个 scope 下 idle / running / success / error 走完全
+// 相同的生命周期。空串表示全局（启动期失败、空闲基线），每一页都能显示。
+const char kScopeBackup[] = "backup";
+const char kScopeSettings[] = "settings";
+const char kScopeManagement[] = "management";
 
 // 文件大小的展示文本。格式化放在 C++ 这层，QML 不需要自己实现一套单位换算。
 QString FormatSize(std::uint64_t bytes) {
@@ -86,28 +96,33 @@ QVariantMap RecordToVariant(const backupproject::BackupRecord& record) {
   // 不代表归档完整，也不代表密码正确。
   item.insert(QStringLiteral("hasPipelineMethods"),
               record.has_pipeline_methods);
+  // 显式写 backup_modern::：核心里的同名函数会因为参数类型触发 ADL 一起进来，
+  // 不限定的话这里就是二义性调用。
   item.insert(QStringLiteral("packMethodKey"),
-              record.has_pipeline_methods ? PackMethodKey(record.pack_method)
-                                          : QString());
+              record.has_pipeline_methods
+                  ? backup_modern::PackMethodKey(record.pack_method)
+                  : QString());
   item.insert(QStringLiteral("packMethodText"),
-              record.has_pipeline_methods ? PackMethodText(record.pack_method)
-                                          : QString());
+              record.has_pipeline_methods
+                  ? backup_modern::PackMethodText(record.pack_method)
+                  : QString());
   item.insert(QStringLiteral("compressionMethodKey"),
-              record.has_pipeline_methods
-                  ? CompressionMethodKey(record.compression_method)
-                  : QString());
-  item.insert(QStringLiteral("compressionMethodText"),
-              record.has_pipeline_methods
-                  ? CompressionMethodText(record.compression_method)
-                  : QString());
+              record.has_pipeline_methods ? backup_modern::CompressionMethodKey(
+                                                record.compression_method)
+                                          : QString());
+  item.insert(
+      QStringLiteral("compressionMethodText"),
+      record.has_pipeline_methods
+          ? backup_modern::CompressionMethodText(record.compression_method)
+          : QString());
   item.insert(QStringLiteral("encryptionMethodKey"),
               record.has_pipeline_methods
-                  ? EncryptionMethodKey(record.encryption_method)
+                  ? backup_modern::EncryptionMethodKey(record.encryption_method)
                   : QString());
   item.insert(QStringLiteral("encryptionMethodText"),
-              record.has_pipeline_methods
-                  ? EncryptionMethodText(record.encryption_method)
-                  : QString());
+              record.has_pipeline_methods ? backup_modern::EncryptionMethodText(
+                                                record.encryption_method)
+                                          : QString());
   // 只表示"恢复这份归档需要密码"。列表阶段没有、也不该有密码。
   item.insert(QStringLiteral("passwordRequired"), record.password_required);
   return item;
@@ -123,150 +138,101 @@ QVariantList RecordsToVariantList(
   return list;
 }
 
-// GUI key 与核心 enum 的对应表。表驱动而不是 if 链：加一种算法时只改这一张表，
-// 解析、反查 key、展示文本三处就不会走散。
-struct PackKeyEntry {
+// ---- 展示文案表：只回答"界面上怎么叫" ----
+//
+// PR #16 时这三张表同时承担了"key <-> enum 映射"和"中文展示文案"两件事，
+// 于是 CLI 想用同一套 key 就只能再抄一遍。PR #17 把映射提取到 Qt 无关的
+// 共享核心 include/backup_option_keys.h：
+//
+//   CLI、ScheduleStore、Modern GUI 读的是同一张表。
+//
+// 所以这里剩下的只有本地化文案，一条 enum 取值都不再出现。加一种算法时，
+// 映射只在核心改一次，这一层最多补一行中文。
+struct DisplayLabel {
   const char* key;
-  backupproject::PackMethod method;
-  const char* text;
+  const char* label;
 };
 
-const PackKeyEntry kPackKeys[] = {
-    {"mypack", backupproject::PackMethod::kMyPack, "MyPack"},
-    {"ustar", backupproject::PackMethod::kUstar, "USTAR"},
-    {"fast-ustar", backupproject::PackMethod::kFastUstar, "Fast USTAR"},
+const DisplayLabel kCompressionLabels[] = {
+    {"none", "不压缩"},
+    {"huffman", "Huffman"},
+    {"lzss-huffman", "LZSS + Huffman"},
 };
 
-struct CompressionKeyEntry {
-  const char* key;
-  backupproject::CompressionMethod method;
-  const char* text;
+const DisplayLabel kEncryptionLabels[] = {
+    {"none", "不加密"},
+    {"des-cbc-hmac-sha256", "DES-CBC + HMAC-SHA256"},
+    {"aes-256-ctr-hmac-sha256", "AES-256-CTR + HMAC-SHA256"},
 };
 
-const CompressionKeyEntry kCompressionKeys[] = {
-    {"none", backupproject::CompressionMethod::kNone, "不压缩"},
-    {"huffman", backupproject::CompressionMethod::kHuffman, "Huffman"},
-    {"lzss-huffman", backupproject::CompressionMethod::kLzssHuffman,
-     "LZSS + Huffman"},
-};
-
-struct EncryptionKeyEntry {
-  const char* key;
-  backupproject::EncryptionMethod method;
-  const char* text;
-};
-
-const EncryptionKeyEntry kEncryptionKeys[] = {
-    {"none", backupproject::EncryptionMethod::kNone, "不加密"},
-    {"des-cbc-hmac-sha256", backupproject::EncryptionMethod::kDesCbcHmacSha256,
-     "DES-CBC + HMAC-SHA256"},
-    {"aes-256-ctr-hmac-sha256",
-     backupproject::EncryptionMethod::kAes256CtrHmacSha256,
-     "AES-256-CTR + HMAC-SHA256"},
-};
+QString LabelForKey(const DisplayLabel* table, std::size_t count,
+                    const char* key) {
+  for (std::size_t index = 0; index < count; ++index) {
+    if (std::strcmp(table[index].key, key) == 0) {
+      return QString::fromUtf8(table[index].label);
+    }
+  }
+  return QString();
+}
 
 }  // namespace
 
 // ---- GUI 稳定 key 与核心 enum 的唯一映射 ----
+//
+// 全部转发到共享核心。GUI 在这里不再拥有任何映射知识，只负责 QString 的
+// 编码转换；展示文案单独查上面那张本地化表。
 
 bool ParsePackMethodKey(const QString& key, backupproject::PackMethod* method) {
-  if (method == nullptr) {
-    return false;
-  }
-  for (const PackKeyEntry& entry : kPackKeys) {
-    if (key == QString::fromLatin1(entry.key)) {
-      *method = entry.method;
-      return true;
-    }
-  }
-  return false;
+  if (method == nullptr) return false;
+  return backupproject::ParsePackMethodKey(key.toStdString(), method);
 }
 
 QString PackMethodKey(backupproject::PackMethod method) {
-  for (const PackKeyEntry& entry : kPackKeys) {
-    if (entry.method == method) {
-      return QString::fromLatin1(entry.key);
-    }
-  }
-  return QString();
+  return QString::fromLatin1(backupproject::PackMethodKey(method));
 }
 
 QString PackMethodText(backupproject::PackMethod method) {
-  for (const PackKeyEntry& entry : kPackKeys) {
-    if (entry.method == method) {
-      return QString::fromUtf8(entry.text);
-    }
-  }
-  return QString();
+  return QString::fromUtf8(backupproject::PackMethodDisplayName(method));
 }
 
 bool ParseCompressionMethodKey(const QString& key,
                                backupproject::CompressionMethod* method) {
-  if (method == nullptr) {
-    return false;
-  }
-  for (const CompressionKeyEntry& entry : kCompressionKeys) {
-    if (key == QString::fromLatin1(entry.key)) {
-      *method = entry.method;
-      return true;
-    }
-  }
-  return false;
+  if (method == nullptr) return false;
+  return backupproject::ParseCompressionMethodKey(key.toStdString(), method);
 }
 
 QString CompressionMethodKey(backupproject::CompressionMethod method) {
-  for (const CompressionKeyEntry& entry : kCompressionKeys) {
-    if (entry.method == method) {
-      return QString::fromLatin1(entry.key);
-    }
-  }
-  return QString();
+  return QString::fromLatin1(backupproject::CompressionMethodKey(method));
 }
 
 QString CompressionMethodText(backupproject::CompressionMethod method) {
-  for (const CompressionKeyEntry& entry : kCompressionKeys) {
-    if (entry.method == method) {
-      return QString::fromUtf8(entry.text);
-    }
-  }
-  return QString();
+  return LabelForKey(kCompressionLabels,
+                     sizeof(kCompressionLabels) / sizeof(kCompressionLabels[0]),
+                     backupproject::CompressionMethodKey(method));
 }
 
 bool ParseEncryptionMethodKey(const QString& key,
                               backupproject::EncryptionMethod* method) {
-  if (method == nullptr) {
-    return false;
-  }
-  for (const EncryptionKeyEntry& entry : kEncryptionKeys) {
-    if (key == QString::fromLatin1(entry.key)) {
-      *method = entry.method;
-      return true;
-    }
-  }
-  return false;
+  if (method == nullptr) return false;
+  return backupproject::ParseEncryptionMethodKey(key.toStdString(), method);
 }
 
 QString EncryptionMethodKey(backupproject::EncryptionMethod method) {
-  for (const EncryptionKeyEntry& entry : kEncryptionKeys) {
-    if (entry.method == method) {
-      return QString::fromLatin1(entry.key);
-    }
-  }
-  return QString();
+  return QString::fromLatin1(backupproject::EncryptionMethodKey(method));
 }
 
 QString EncryptionMethodText(backupproject::EncryptionMethod method) {
-  for (const EncryptionKeyEntry& entry : kEncryptionKeys) {
-    if (entry.method == method) {
-      return QString::fromUtf8(entry.text);
-    }
-  }
-  return QString();
+  return LabelForKey(kEncryptionLabels,
+                     sizeof(kEncryptionLabels) / sizeof(kEncryptionLabels[0]),
+                     backupproject::EncryptionMethodKey(method));
 }
 
 BackupController::BackupController(const QString& config_file_path,
+                                   OperationGate* operation_gate,
                                    QObject* parent)
-    : QObject(parent), config_manager_(config_file_path.toStdString()) {
+    : QObject(parent),
+      config_manager_(config_file_path.toStdString()),
+      operation_gate_(operation_gate) {
   // 两个 watcher 都以 this 为上下文：对象销毁时连接自动断开，后台任务即使还在
   // 跑也不会回调到已经释放的控制器上。
   connect(
@@ -274,7 +240,17 @@ BackupController::BackupController(const QString& config_file_path,
         const OperationOutcome outcome = watcher_.result();
         const Kind kind = active_kind_;
         const QString file_name = active_file_name_;
+        // 完成提示沿用发起这次操作时记录的 scope：即使用户已经切到别的页面，
+        // 这条消息也只会在原来的页面上显示。
+        status_scope_ = active_scope_;
         last_succeeded_ = outcome.succeeded;
+        // 先放开闸门再清 busy_：busyChanged 会触发 ScheduleController 的补跑，
+        // 那一步必须看到闸门已经空了，否则补跑又要排一次 pending。
+        if (operation_gate_ != nullptr &&
+            active_gate_kind_ != OperationGate::Kind::kNone) {
+          operation_gate_->Release(active_gate_kind_);
+          active_gate_kind_ = OperationGate::Kind::kNone;
+        }
         SetBusy(false);
         if (outcome.succeeded) {
           if (kind == Kind::kBackup) {
@@ -368,6 +344,8 @@ QUrl BackupController::directoryDialogStartUrl(const QString& path) const {
 
 bool BackupController::addFilterRule(const QString& action,
                                      const QString& rule) {
+  // 规则编辑器只存在于备份页，所以它产生的提示也只属于备份页。
+  status_scope_ = QString::fromLatin1(kScopeBackup);
   FilterAction filter_action = FilterAction::kInclude;
   QStringList* target = nullptr;
   if (action == QStringLiteral("include")) {
@@ -444,6 +422,8 @@ bool BackupController::BuildFilter(Filter* filter,
 // ---- 启动时读配置 ----
 
 void BackupController::LoadConfig() {
+  // 启动期读配置失败是全局状态：那时还没有"当前页面"这回事。
+  status_scope_.clear();
   backupproject::AppConfig config;
   std::string error_message;
   switch (config_manager_.Load(&config, &error_message)) {
@@ -528,6 +508,16 @@ CatalogOutcome BackupController::RunCatalogList(const QString& repository) {
 // ---- 保存 repository 设置 ----
 
 bool BackupController::saveRepositoryPath(const QString& path) {
+  // 保存仓库是设置页的动作。
+  status_scope_ = QString::fromLatin1(kScopeSettings);
+  // 改仓库会写 config.json，并让之后所有备份落到另一个地方。它同样是一个
+  // "会改动持久状态"的业务操作，所以在评估在飞的时候必须被拒绝。
+  OperationGuard guard(operation_gate_, OperationGate::Kind::kRepositoryChange);
+  if (operation_gate_ != nullptr && !guard.acquired()) {
+    SetStatus(QString::fromLatin1(kError), QStringLiteral("无法保存"),
+              guard.reason());
+    return false;
+  }
   if (busy_) {
     SetStatus(QString::fromLatin1(kError), QStringLiteral("无法保存"),
               QStringLiteral("备份或恢复正在进行，请等它结束后再改设置。"));
@@ -591,6 +581,8 @@ bool BackupController::startBackupWithOptions(const QString& pack_key,
                                               const QString& encryption_key,
                                               const QString& password,
                                               const QString& confirm_password) {
+  // 备份页的动作：成功 / 失败 / 校验提示都只属于备份页。
+  status_scope_ = QString::fromLatin1(kScopeBackup);
   if (busy_) {
     return false;
   }
@@ -689,6 +681,8 @@ bool BackupController::startBackupWithOptions(const QString& pack_key,
 
 bool BackupController::startManagedRestore(const QString& file_name,
                                            const QString& destination_path) {
+  // 恢复是"备份管理"页里的动作。
+  status_scope_ = QString::fromLatin1(kScopeManagement);
   if (busy_) {
     return false;
   }
@@ -748,6 +742,8 @@ bool BackupController::startManagedRestore(const QString& file_name,
 bool BackupController::startManagedRestoreWithPassword(
     const QString& file_name, const QString& destination_path,
     const QString& password) {
+  // 与不带密码的那个入口同属"备份管理"页。
+  status_scope_ = QString::fromLatin1(kScopeManagement);
   if (busy_) {
     return false;
   }
@@ -801,6 +797,17 @@ bool BackupController::startManagedRestoreWithPassword(
 }
 
 bool BackupController::deleteBackup(const QString& file_name) {
+  // 删除也是"备份管理"页里的动作。
+  status_scope_ = QString::fromLatin1(kScopeManagement);
+  // 删除会同时改两处持久状态：仓库里的文件与 ScheduleStore 的 managed 名单。
+  // 整个动作（含最后那步 reconcile）都在同一持有期内完成，所以后台评估不可能
+  // 在这中间写 store。
+  OperationGuard guard(operation_gate_, OperationGate::Kind::kManualDelete);
+  if (operation_gate_ != nullptr && !guard.acquired()) {
+    SetStatus(QString::fromLatin1(kError), QStringLiteral("无法删除"),
+              guard.reason());
+    return false;
+  }
   if (busy_) {
     SetStatus(QString::fromLatin1(kError), QStringLiteral("无法删除"),
               QStringLiteral("备份或恢复正在进行，请等它结束后再试。"));
@@ -835,6 +842,15 @@ bool BackupController::deleteBackup(const QString& file_name) {
   SetStatus(QString::fromLatin1(kSuccess), QStringLiteral("备份已删除"),
             QStringLiteral("%1 已从备份仓库中移除。").arg(file_name));
   refreshBackups();
+  // 删成功之后才通知：计划状态要跟着这份仓库的实际内容走，而不是跟着"用户点了
+  // 删除"走。失败时什么都没变，也就不该有人去改 schedule。
+  //
+  // 这一步是同步的、且在闸门持有期内完成——它取代了以前那个信号：信号是排队
+  // 投递的，投递到 ScheduleController 时"删除"这个操作可能已经结束，闸门也
+  // 已经放开，后台评估就有机会插进来。
+  if (archive_deleted_observer_ != nullptr) {
+    archive_deleted_observer_->OnArchiveDeleted(file_name);
+  }
   return true;
 }
 
@@ -842,6 +858,8 @@ bool BackupController::deleteBackup(const QString& file_name) {
 
 bool BackupController::startDirectBackupForTest(const QString& source,
                                                 const QString& archive_file) {
+  // 自测入口没有页面，按它语义上对应的页面归属，免得留下上一次的 scope。
+  status_scope_ = QString::fromLatin1(kScopeBackup);
   Filter filter;
   std::string filter_error;
   if (!BuildFilter(&filter, &filter_error)) {
@@ -862,6 +880,7 @@ bool BackupController::startDirectBackupForTest(const QString& source,
 
 bool BackupController::startDirectRestoreForTest(const QString& archive_file,
                                                  const QString& destination) {
+  status_scope_ = QString::fromLatin1(kScopeManagement);
   // 恢复不需要筛选：归档里有什么就恢复什么，和 CLI 的语义一致。
   // 恢复也不看 flavor：格式由归档自己的 magic 决定。
   OperationRequest request;
@@ -883,9 +902,32 @@ bool BackupController::Start(const OperationRequest& request,
     // 禁用了按钮，但快捷键或程序化调用仍可能走到这里。
     return false;
   }
+  // 闸门是真正的不变式：定时备份评估在跑的时候，手动备份/恢复必须在这里被
+  // 拒绝，而不是靠按钮被置灰。请求的 kind 决定占哪一种。
+  const OperationGate::Kind gate_kind =
+      request.kind == Kind::kBackup ? OperationGate::Kind::kManualBackup
+                                    : OperationGate::Kind::kManualRestore;
+  if (operation_gate_ != nullptr) {
+    QString reason;
+    if (!operation_gate_->Acquire(gate_kind, &reason)) {
+      SetStatus(QString::fromLatin1(kError),
+                request.kind == Kind::kBackup ? QStringLiteral("无法开始备份")
+                                              : QStringLiteral("无法开始恢复"),
+                reason);
+      return false;
+    }
+  }
+  active_gate_kind_ =
+      operation_gate_ != nullptr ? gate_kind : OperationGate::Kind::kNone;
   active_kind_ = request.kind;
   active_file_name_ = file_name;
+  // 记住这次操作属于哪一页：完成提示要落回发起它的页面，而不是用户此刻
+  // 正在看的页面。
+  active_scope_ = status_scope_;
   SetBusy(true);
+  // "正在备份 / 正在恢复"是**全局运行状态**，不属于任何一页：切页不该把它清掉，
+  // 每一页都该看得到"现在有活在干"。归属页面只作用于结果提示。
+  status_scope_.clear();
   SetStatus(QString::fromLatin1(kRunning),
             request.kind == Kind::kBackup ? QStringLiteral("正在备份……")
                                           : QStringLiteral("正在恢复……"),
@@ -942,12 +984,37 @@ void BackupController::SetBusy(bool busy) {
   emit busyChanged();
 }
 
+void BackupController::setStatusForTest(const QString& kind,
+                                        const QString& scope,
+                                        const QString& title,
+                                        const QString& message) {
+  status_scope_ = scope;
+  SetStatus(kind, title, message);
+}
+
 void BackupController::SetStatus(const QString& kind, const QString& title,
                                  const QString& message) {
   status_kind_ = kind;
   status_title_ = title;
   status_message_ = message;
+  // 空闲基线是全局状态：它没有"属于哪一页"这一说，所以在这里归一化掉。
+  // 其余消息保留调用方设置的 scope，由 QML 按页面过滤。
+  if (kind == QString::fromLatin1(kIdle)) {
+    status_scope_.clear();
+  }
   emit statusChanged();
+}
+
+// 离开页面时的"消费"。busy 判定与 clearStatus() 完全一致：正在跑的操作属于
+// 全局运行状态，不因为切页就消失。
+void BackupController::dismissPageStatus(const QString& scope) {
+  if (busy_ || scope.isEmpty()) {
+    return;
+  }
+  if (status_scope_ != scope) {
+    return;
+  }
+  clearStatus();
 }
 
 // 用户一动输入就把上一次的结果提示收回去；任务进行中不清，

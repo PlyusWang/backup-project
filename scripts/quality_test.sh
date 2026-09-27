@@ -30,6 +30,8 @@ set -uo pipefail
 ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 BACKUPCTL="$ROOT_DIR/build/backupctl"
 SAN_BACKUPCTL="$ROOT_DIR/build-sanitize/backupctl"
+ARCHIVE_CLI="$ROOT_DIR/build/archive-cli"
+SAN_ARCHIVE_CLI="$ROOT_DIR/build-sanitize/archive-cli"
 WORK_DIR="$ROOT_DIR/testdata/quality"
 LOGDIR="/tmp/backup-project-quality"
 LOG="$LOGDIR/last-output.txt"
@@ -128,6 +130,12 @@ make -C "$ROOT_DIR" clean > "$BUILD_LOG" 2>&1
 rm -rf "$ROOT_DIR/build-sanitize"
 make -C "$ROOT_DIR" >> "$BUILD_LOG" 2>&1
 BUILD_CODE=$?
+# A1：普通的 make 是**产品构建**，不该产出测试夹具 archive-cli。
+# 这一位必须在 make test-fixtures 之前取，之后就没法分辨它是不是被顺手建出来的。
+if [[ -x "$ARCHIVE_CLI" ]]; then FIXTURE_LEAK=1; else FIXTURE_LEAK=0; fi
+# A2：夹具由测试自己显式构建（见 Makefile 的 test-fixtures）。
+make -C "$ROOT_DIR" test-fixtures >> "$BUILD_LOG" 2>&1
+FIXTURE_CODE=$?
 make -C "$ROOT_DIR" sanitize >> "$BUILD_LOG" 2>&1
 SAN_BUILD_CODE=$?
 BUILD_WARNINGS=$(grep -c "warning:" "$BUILD_LOG")
@@ -144,6 +152,22 @@ else
 fi
 if [[ -x "$BACKUPCTL" ]]; then pass "BLD-03 产物 build/backupctl 可执行"; else fail "BLD-03 产物 build/backupctl 可执行" "缺失"; fi
 if [[ -x "$SAN_BACKUPCTL" ]]; then pass "BLD-04 产物 build-sanitize/backupctl 可执行"; else fail "BLD-04 产物 build-sanitize/backupctl 可执行" "缺失"; fi
+# archive-cli 是测试夹具：默认 make 不该产出它，测试必须显式要。
+if [[ $FIXTURE_LEAK -eq 0 ]]; then
+  pass "BLD-05 默认 make 不产出测试夹具 build/archive-cli"
+else
+  fail "BLD-05 默认 make 不产出测试夹具 build/archive-cli" "它被默认目标建出来了"
+fi
+if [[ $FIXTURE_CODE -eq 0 && -x "$ARCHIVE_CLI" ]]; then
+  pass "BLD-06 make test-fixtures 显式产出 build/archive-cli"
+else
+  fail "BLD-06 make test-fixtures 显式产出 build/archive-cli" "exit=$FIXTURE_CODE"
+fi
+if [[ -x "$SAN_ARCHIVE_CLI" ]]; then
+  pass "BLD-07 make sanitize 顺带产出 build-sanitize/archive-cli"
+else
+  fail "BLD-07 make sanitize 顺带产出 build-sanitize/archive-cli" "缺失"
+fi
 
 # ======================================================================
 # 步骤 1：功能基线（scripts/test.sh）
@@ -204,7 +228,7 @@ SOURCE_FILES=$(find "$SRC_SMALL" -type f | wc -l)
 SOURCE_DIRS=$(find "$SRC_SMALL" -mindepth 1 -type d | wc -l)
 echo "  混合树: $SOURCE_FILES 个文件 / $SOURCE_DIRS 个目录；深树 51 层；大文件 4 MiB"
 
-if expect_ok "SETUP-01 生成参考归档" "$BACKUPCTL" backup "$SRC_SMALL" "$GOOD_ARCHIVE"; then :; fi
+if expect_ok "SETUP-01 生成参考归档" "$ARCHIVE_CLI" backup "$SRC_SMALL" "$GOOD_ARCHIVE"; then :; fi
 
 # ======================================================================
 # 维度 1：可用性
@@ -212,22 +236,22 @@ if expect_ok "SETUP-01 生成参考归档" "$BACKUPCTL" backup "$SRC_SMALL" "$GO
 echo
 echo "[quality] 维度 1/4 可用性 (usability)"
 expect_ok_msg "US-01 --help 退出 0 并给出用法" "Usage" "$BACKUPCTL" --help
-expect_ok_msg "US-02 --help 说明归档文件参数" "backup_file" "$BACKUPCTL" --help
+expect_ok_msg "US-02 --help 说明归档文件参数" "file_name" "$BACKUPCTL" --help
 expect_fail "US-03 无参数返回用法错误 2" 2 "Usage:" "$BACKUPCTL"
 expect_fail "US-04 未知子命令返回 2" 2 "" "$BACKUPCTL" frobnicate a b
 expect_fail "US-05 backup 缺参数返回 2" 2 "Usage:" "$BACKUPCTL" backup
 expect_fail "US-06 restore 缺参数返回 2" 2 "Usage:" "$BACKUPCTL" restore
 MISSING_SRC="$WORK_DIR/missing-source"
-expect_fail "US-07 源不存在时报错含源路径" 1 "$MISSING_SRC" "$BACKUPCTL" backup "$MISSING_SRC" "$WORK_DIR/us07.bak"
-expect_fail "US-08 归档不存在时报错说明原因" 1 "Backup file does not exist" "$BACKUPCTL" restore "$WORK_DIR/no-such.bak" "$WORK_DIR/us08-dest"
-invoke "$BACKUPCTL" backup "$SRC_SMALL" "$WORK_DIR/us09.bak"
+expect_fail "US-07 源不存在时报错含源路径" 1 "$MISSING_SRC" "$ARCHIVE_CLI" backup "$MISSING_SRC" "$WORK_DIR/us07.bak"
+expect_fail "US-08 归档不存在时报错说明原因" 1 "Backup file does not exist" "$ARCHIVE_CLI" restore "$WORK_DIR/no-such.bak" "$WORK_DIR/us08-dest"
+invoke "$ARCHIVE_CLI" backup "$SRC_SMALL" "$WORK_DIR/us09.bak"
 US09_CODE=$?
 if [[ $US09_CODE -eq 0 ]] && grep -qF "Backup completed successfully." "$LOG"; then
   pass "US-09 backup 成功时给出可读的成功反馈"
 else
   fail "US-09 backup 成功时给出可读的成功反馈" "exit=$US09_CODE 输出: $(head -1 "$LOG")"
 fi
-expect_ok_msg "US-10 restore 成功时给出可读的成功反馈" "Restore completed successfully." "$BACKUPCTL" restore "$WORK_DIR/us09.bak" "$WORK_DIR/us10-dest"
+expect_ok_msg "US-10 restore 成功时给出可读的成功反馈" "Restore completed successfully." "$ARCHIVE_CLI" restore "$WORK_DIR/us09.bak" "$WORK_DIR/us10-dest"
 
 # ======================================================================
 # 维度 2：鲁棒性
@@ -235,35 +259,35 @@ expect_ok_msg "US-10 restore 成功时给出可读的成功反馈" "Restore comp
 echo
 echo "[quality] 维度 2/4 鲁棒性 (robustness)"
 rm -rf "$WORK_DIR/rb01-dest"
-expect_ok "RB-01 只含空目录的树可备份" "$BACKUPCTL" backup "$SRC_EMPTY" "$WORK_DIR/rb01.bak"
-expect_ok "RB-01b 只含空目录的树可恢复" "$BACKUPCTL" restore "$WORK_DIR/rb01.bak" "$WORK_DIR/rb01-dest"
+expect_ok "RB-01 只含空目录的树可备份" "$ARCHIVE_CLI" backup "$SRC_EMPTY" "$WORK_DIR/rb01.bak"
+expect_ok "RB-01b 只含空目录的树可恢复" "$ARCHIVE_CLI" restore "$WORK_DIR/rb01.bak" "$WORK_DIR/rb01-dest"
 check_consistency "RB-01c 空目录骨架往返一致" "$SRC_EMPTY" "$WORK_DIR/rb01-dest"
 
 rm -rf "$WORK_DIR/rb02-dest"
-expect_ok "RB-02 50 层深目录可备份" "$BACKUPCTL" backup "$SRC_DEEP" "$WORK_DIR/rb02.bak"
-expect_ok "RB-02b 50 层深目录可恢复" "$BACKUPCTL" restore "$WORK_DIR/rb02.bak" "$WORK_DIR/rb02-dest"
+expect_ok "RB-02 50 层深目录可备份" "$ARCHIVE_CLI" backup "$SRC_DEEP" "$WORK_DIR/rb02.bak"
+expect_ok "RB-02b 50 层深目录可恢复" "$ARCHIVE_CLI" restore "$WORK_DIR/rb02.bak" "$WORK_DIR/rb02-dest"
 check_consistency "RB-02c 深目录往返一致" "$SRC_DEEP" "$WORK_DIR/rb02-dest"
 
 rm -rf "$WORK_DIR/rb03-dest"
-expect_ok "RB-03 混合树（空文件/单字节/中文/空格/#%/二进制/0640）可备份" "$BACKUPCTL" backup "$SRC_SMALL" "$WORK_DIR/rb03.bak"
-expect_ok "RB-03b 混合树可恢复" "$BACKUPCTL" restore "$WORK_DIR/rb03.bak" "$WORK_DIR/rb03-dest"
+expect_ok "RB-03 混合树（空文件/单字节/中文/空格/#%/二进制/0640）可备份" "$ARCHIVE_CLI" backup "$SRC_SMALL" "$WORK_DIR/rb03.bak"
+expect_ok "RB-03b 混合树可恢复" "$ARCHIVE_CLI" restore "$WORK_DIR/rb03.bak" "$WORK_DIR/rb03-dest"
 check_consistency "RB-03c 混合树往返一致" "$SRC_SMALL" "$WORK_DIR/rb03-dest"
 
 rm -rf "$WORK_DIR/rb04-src" "$WORK_DIR/rb04-dest"
 mkdir -p "$WORK_DIR/rb04-src"
 cp "$WORK_DIR/big.bin" "$WORK_DIR/rb04-src/big.bin"
-expect_ok "RB-04 4 MiB 随机二进制可备份" "$BACKUPCTL" backup "$WORK_DIR/rb04-src" "$WORK_DIR/rb04.bak"
-expect_ok "RB-04b 4 MiB 随机二进制可恢复" "$BACKUPCTL" restore "$WORK_DIR/rb04.bak" "$WORK_DIR/rb04-dest"
+expect_ok "RB-04 4 MiB 随机二进制可备份" "$ARCHIVE_CLI" backup "$WORK_DIR/rb04-src" "$WORK_DIR/rb04.bak"
+expect_ok "RB-04b 4 MiB 随机二进制可恢复" "$ARCHIVE_CLI" restore "$WORK_DIR/rb04.bak" "$WORK_DIR/rb04-dest"
 if cmp -s "$WORK_DIR/big.bin" "$WORK_DIR/rb04-dest/big.bin"; then
   pass "RB-04c 大文件字节级一致（cmp）"
 else
   fail "RB-04c 大文件字节级一致（cmp）" "内容不同"
 fi
 
-expect_fail "RB-05 源目录不存在返回 1" 1 "$MISSING_SRC" "$BACKUPCTL" backup "$MISSING_SRC" "$WORK_DIR/rb05.bak"
-expect_fail "RB-06 源是普通文件返回 1" 1 "" "$BACKUPCTL" backup "$WORK_DIR/big.bin" "$WORK_DIR/rb06.bak"
+expect_fail "RB-05 源目录不存在返回 1" 1 "$MISSING_SRC" "$ARCHIVE_CLI" backup "$MISSING_SRC" "$WORK_DIR/rb05.bak"
+expect_fail "RB-06 源是普通文件返回 1" 1 "" "$ARCHIVE_CLI" backup "$WORK_DIR/big.bin" "$WORK_DIR/rb06.bak"
 rm -rf "$WORK_DIR/missing-parent"
-expect_ok "RB-07 归档父目录不存在时自动补建" "$BACKUPCTL" backup "$SRC_SMALL" "$WORK_DIR/missing-parent/deep/rb07.bak"
+expect_ok "RB-07 归档父目录不存在时自动补建" "$ARCHIVE_CLI" backup "$SRC_SMALL" "$WORK_DIR/missing-parent/deep/rb07.bak"
 if [[ -f "$WORK_DIR/missing-parent/deep/rb07.bak" ]]; then
   pass "RB-07b 自动补建的归档文件确实生成"
 else
@@ -272,7 +296,7 @@ fi
 
 printf 'sentinel-content\n' > "$WORK_DIR/rb08.bak"
 RB08_BEFORE=$(sha256sum "$WORK_DIR/rb08.bak" | cut -d' ' -f1)
-expect_fail "RB-08 归档已存在时拒绝覆盖" 1 "" "$BACKUPCTL" backup "$SRC_SMALL" "$WORK_DIR/rb08.bak"
+expect_fail "RB-08 归档已存在时拒绝覆盖" 1 "" "$ARCHIVE_CLI" backup "$SRC_SMALL" "$WORK_DIR/rb08.bak"
 RB08_AFTER=$(sha256sum "$WORK_DIR/rb08.bak" | cut -d' ' -f1)
 if [[ "$RB08_BEFORE" == "$RB08_AFTER" ]]; then
   pass "RB-09 拒绝覆盖后原归档字节未变（sha256 相同）"
@@ -282,7 +306,7 @@ fi
 
 mkdir -p "$WORK_DIR/rb10-dest"
 printf 'keep-me\n' > "$WORK_DIR/rb10-dest/keep.txt"
-expect_fail "RB-10 restore 拒绝非空目标" 1 "" "$BACKUPCTL" restore "$GOOD_ARCHIVE" "$WORK_DIR/rb10-dest"
+expect_fail "RB-10 restore 拒绝非空目标" 1 "" "$ARCHIVE_CLI" restore "$GOOD_ARCHIVE" "$WORK_DIR/rb10-dest"
 if [[ -f "$WORK_DIR/rb10-dest/keep.txt" ]] && [[ "$(cat "$WORK_DIR/rb10-dest/keep.txt")" == "keep-me" ]]; then
   pass "RB-11 拒绝后原有内容未被破坏"
 else
@@ -293,7 +317,7 @@ rm -rf "$SRC_FIFO"
 mkdir -p "$SRC_FIFO"
 mkfifo "$SRC_FIFO/pipe" 2> /dev/null || true
 rm -f "$WORK_DIR/rb12.bak"
-expect_fail "RB-12 FIFO 让整次备份失败" 1 "" "$BACKUPCTL" backup "$SRC_FIFO" "$WORK_DIR/rb12.bak"
+expect_fail "RB-12 FIFO 让整次备份失败" 1 "" "$ARCHIVE_CLI" backup "$SRC_FIFO" "$WORK_DIR/rb12.bak"
 if [[ ! -e "$WORK_DIR/rb12.bak" ]]; then
   pass "RB-13 失败时不留下半成品归档"
 else
@@ -301,18 +325,18 @@ else
 fi
 
 : > "$WORK_DIR/rb14.bak"
-expect_fail "RB-14 0 字节归档被拒绝" 1 "" "$BACKUPCTL" restore "$WORK_DIR/rb14.bak" "$WORK_DIR/rb14-dest"
+expect_fail "RB-14 0 字节归档被拒绝" 1 "" "$ARCHIVE_CLI" restore "$WORK_DIR/rb14.bak" "$WORK_DIR/rb14-dest"
 
 head -c 200 "$GOOD_ARCHIVE" > "$WORK_DIR/rb15.bak"
-expect_fail "RB-15 截断归档被拒绝" 1 "" "$BACKUPCTL" restore "$WORK_DIR/rb15.bak" "$WORK_DIR/rb15-dest"
+expect_fail "RB-15 截断归档被拒绝" 1 "" "$ARCHIVE_CLI" restore "$WORK_DIR/rb15.bak" "$WORK_DIR/rb15-dest"
 
 cp "$GOOD_ARCHIVE" "$WORK_DIR/rb16.bak"
 printf 'X' | dd of="$WORK_DIR/rb16.bak" bs=1 seek=0 conv=notrunc status=none
-expect_fail "RB-16 破坏 magic 的归档被拒绝" 1 "" "$BACKUPCTL" restore "$WORK_DIR/rb16.bak" "$WORK_DIR/rb16-dest"
+expect_fail "RB-16 破坏 magic 的归档被拒绝" 1 "" "$ARCHIVE_CLI" restore "$WORK_DIR/rb16.bak" "$WORK_DIR/rb16-dest"
 
 cp "$GOOD_ARCHIVE" "$WORK_DIR/rb17.bak"
 printf '\377\377\000\000' | dd of="$WORK_DIR/rb17.bak" bs=1 seek=16 conv=notrunc status=none
-expect_fail "RB-17 篡改 entry_count 的归档被拒绝" 1 "" "$BACKUPCTL" restore "$WORK_DIR/rb17.bak" "$WORK_DIR/rb17-dest"
+expect_fail "RB-17 篡改 entry_count 的归档被拒绝" 1 "" "$ARCHIVE_CLI" restore "$WORK_DIR/rb17.bak" "$WORK_DIR/rb17-dest"
 
 build_traversal_archive() {
   local out="$1"
@@ -322,7 +346,7 @@ build_traversal_archive() {
   rm -f "$base" "$out"
   mkdir -p "$src/d"
   printf 'boom\n' > "$src/d/aaaaaaaa.txt"
-  invoke "$BACKUPCTL" backup "$src" "$base"
+  invoke "$ARCHIVE_CLI" backup "$src" "$base"
   if [[ $? -ne 0 ]]; then return 1; fi
   cp "$base" "$out"
   local off
@@ -335,7 +359,7 @@ build_traversal_archive() {
 rm -f "$WORK_DIR/pwned00.txt"
 if build_traversal_archive "$WORK_DIR/rb18.bak"; then
   rm -rf "$WORK_DIR/rb18-dest"
-  expect_fail "RB-18 归档中 ../ 路径被拒绝" 1 "" "$BACKUPCTL" restore "$WORK_DIR/rb18.bak" "$WORK_DIR/rb18-dest"
+  expect_fail "RB-18 归档中 ../ 路径被拒绝" 1 "" "$ARCHIVE_CLI" restore "$WORK_DIR/rb18.bak" "$WORK_DIR/rb18-dest"
   if [[ ! -e "$WORK_DIR/pwned00.txt" ]]; then
     pass "RB-19 路径穿越未逃逸出目标目录"
   else
@@ -356,7 +380,7 @@ while [[ $FUZZ_I -le $FUZZ_ROUNDS ]]; do
   FUZZ_OFF=$((RANDOM % FUZZ_SIZE))
   dd if=/dev/urandom of="$WORK_DIR/fuzz.bak" bs=1 seek="$FUZZ_OFF" count=1 conv=notrunc status=none
   rm -rf "$WORK_DIR/fuzz-dest"
-  invoke "$BACKUPCTL" restore "$WORK_DIR/fuzz.bak" "$WORK_DIR/fuzz-dest"
+  invoke "$ARCHIVE_CLI" restore "$WORK_DIR/fuzz.bak" "$WORK_DIR/fuzz-dest"
   FUZZ_CODE=$?
   if [[ $FUZZ_CODE -eq 124 ]]; then FUZZ_HANG=$((FUZZ_HANG + 1)); fi
   if [[ $FUZZ_CODE -ge 128 ]]; then FUZZ_CRASH=$((FUZZ_CRASH + 1)); fi
@@ -381,13 +405,13 @@ while [[ $STAB_I -le $ROUNDS ]]; do
   rm -f "$STAB_ARC"
   rm -rf "$STAB_DST"
   STAB_START=$(date +%s%N)
-  invoke "$BACKUPCTL" backup "$SRC_SMALL" "$STAB_ARC"
+  invoke "$ARCHIVE_CLI" backup "$SRC_SMALL" "$STAB_ARC"
   STAB_CODE=$?
   STAB_OK=1
   STAB_WHY="ok"
   if [[ $STAB_CODE -ne 0 ]]; then STAB_OK=0; STAB_WHY="backup exit=$STAB_CODE"; fi
   if [[ $STAB_OK -eq 1 ]]; then
-    invoke "$BACKUPCTL" restore "$STAB_ARC" "$STAB_DST"
+    invoke "$ARCHIVE_CLI" restore "$STAB_ARC" "$STAB_DST"
     STAB_CODE=$?
     if [[ $STAB_CODE -ne 0 ]]; then STAB_OK=0; STAB_WHY="restore exit=$STAB_CODE"; fi
   fi
@@ -431,14 +455,14 @@ san_run() {
   pass "$desc"
 }
 
-if [[ ! -x "$SAN_BACKUPCTL" ]]; then
-  fail "SN-00 sanitizer 产物可用" "build-sanitize/backupctl 缺失，维度 4 无法执行"
+if [[ ! -x "$SAN_ARCHIVE_CLI" ]]; then
+  fail "SN-00 sanitizer 产物可用" "build-sanitize/archive-cli 缺失，维度 4 无法执行"
 else
   SAN_RUNS=$((SAN_RUNS + 1))
   rm -rf "$WORK_DIR/sn01-dest"
-  timeout --signal=KILL "$TIMEOUT_SECONDS" "$SAN_BACKUPCTL" backup "$SRC_SMALL" "$WORK_DIR/sn01.bak" > "$SAN_LOG" 2>&1
+  timeout --signal=KILL "$TIMEOUT_SECONDS" "$SAN_ARCHIVE_CLI" backup "$SRC_SMALL" "$WORK_DIR/sn01.bak" > "$SAN_LOG" 2>&1
   SAN_CODE=$?
-  timeout --signal=KILL "$TIMEOUT_SECONDS" "$SAN_BACKUPCTL" restore "$WORK_DIR/sn01.bak" "$WORK_DIR/sn01-dest" >> "$SAN_LOG" 2>&1
+  timeout --signal=KILL "$TIMEOUT_SECONDS" "$SAN_ARCHIVE_CLI" restore "$WORK_DIR/sn01.bak" "$WORK_DIR/sn01-dest" >> "$SAN_LOG" 2>&1
   SAN_CODE2=$?
   SAN_RUNS=$((SAN_RUNS + 1))
   if grep -qE 'AddressSanitizer|LeakSanitizer|runtime error:|SUMMARY: ' "$SAN_LOG"; then
@@ -451,23 +475,23 @@ else
   fi
 
   rm -rf "$WORK_DIR/sn02-dest"
-  san_run "SN-02 sanitizer 下空目录树往返" 0 "$SAN_BACKUPCTL" backup "$SRC_EMPTY" "$WORK_DIR/sn02.bak"
-  san_run "SN-02b sanitizer 下空目录树恢复" 0 "$SAN_BACKUPCTL" restore "$WORK_DIR/sn02.bak" "$WORK_DIR/sn02-dest"
+  san_run "SN-02 sanitizer 下空目录树往返" 0 "$SAN_ARCHIVE_CLI" backup "$SRC_EMPTY" "$WORK_DIR/sn02.bak"
+  san_run "SN-02b sanitizer 下空目录树恢复" 0 "$SAN_ARCHIVE_CLI" restore "$WORK_DIR/sn02.bak" "$WORK_DIR/sn02-dest"
   rm -rf "$WORK_DIR/sn03-dest"
-  san_run "SN-03 sanitizer 下 50 层深目录往返（备份）" 0 "$SAN_BACKUPCTL" backup "$SRC_DEEP" "$WORK_DIR/sn03.bak"
-  san_run "SN-03b sanitizer 下 50 层深目录往返（恢复）" 0 "$SAN_BACKUPCTL" restore "$WORK_DIR/sn03.bak" "$WORK_DIR/sn03-dest"
+  san_run "SN-03 sanitizer 下 50 层深目录往返（备份）" 0 "$SAN_ARCHIVE_CLI" backup "$SRC_DEEP" "$WORK_DIR/sn03.bak"
+  san_run "SN-03b sanitizer 下 50 层深目录往返（恢复）" 0 "$SAN_ARCHIVE_CLI" restore "$WORK_DIR/sn03.bak" "$WORK_DIR/sn03-dest"
   rm -rf "$WORK_DIR/sn04-dest"
-  san_run "SN-04 sanitizer 下 4 MiB 文件备份" 0 "$SAN_BACKUPCTL" backup "$WORK_DIR/rb04-src" "$WORK_DIR/sn04.bak"
-  san_run "SN-04b sanitizer 下 4 MiB 文件恢复" 0 "$SAN_BACKUPCTL" restore "$WORK_DIR/sn04.bak" "$WORK_DIR/sn04-dest"
+  san_run "SN-04 sanitizer 下 4 MiB 文件备份" 0 "$SAN_ARCHIVE_CLI" backup "$WORK_DIR/rb04-src" "$WORK_DIR/sn04.bak"
+  san_run "SN-04b sanitizer 下 4 MiB 文件恢复" 0 "$SAN_ARCHIVE_CLI" restore "$WORK_DIR/sn04.bak" "$WORK_DIR/sn04-dest"
   san_run "SN-05 sanitizer 下 --help" 0 "$SAN_BACKUPCTL" --help
-  san_run "SN-06 sanitizer 下源不存在报错" 1 "$SAN_BACKUPCTL" backup "$MISSING_SRC" "$WORK_DIR/sn06.bak"
-  san_run "SN-07 sanitizer 下截断归档被拒" 1 "$SAN_BACKUPCTL" restore "$WORK_DIR/rb15.bak" "$WORK_DIR/sn07-dest"
-  san_run "SN-08 sanitizer 下 magic 破坏被拒" 1 "$SAN_BACKUPCTL" restore "$WORK_DIR/rb16.bak" "$WORK_DIR/sn08-dest"
-  san_run "SN-09 sanitizer 下 entry_count 篡改被拒" 1 "$SAN_BACKUPCTL" restore "$WORK_DIR/rb17.bak" "$WORK_DIR/sn09-dest"
-  san_run "SN-10 sanitizer 下路径穿越被拒" 1 "$SAN_BACKUPCTL" restore "$WORK_DIR/rb18.bak" "$WORK_DIR/sn10-dest"
-  san_run "SN-11 sanitizer 下 FIFO 备份失败" 1 "$SAN_BACKUPCTL" backup "$SRC_FIFO" "$WORK_DIR/sn11.bak"
-  san_run "SN-12 sanitizer 下非空目标被拒" 1 "$SAN_BACKUPCTL" restore "$GOOD_ARCHIVE" "$WORK_DIR/rb10-dest"
-  san_run "SN-13 sanitizer 下 0 字节归档被拒" 1 "$SAN_BACKUPCTL" restore "$WORK_DIR/rb14.bak" "$WORK_DIR/sn13-dest"
+  san_run "SN-06 sanitizer 下源不存在报错" 1 "$SAN_ARCHIVE_CLI" backup "$MISSING_SRC" "$WORK_DIR/sn06.bak"
+  san_run "SN-07 sanitizer 下截断归档被拒" 1 "$SAN_ARCHIVE_CLI" restore "$WORK_DIR/rb15.bak" "$WORK_DIR/sn07-dest"
+  san_run "SN-08 sanitizer 下 magic 破坏被拒" 1 "$SAN_ARCHIVE_CLI" restore "$WORK_DIR/rb16.bak" "$WORK_DIR/sn08-dest"
+  san_run "SN-09 sanitizer 下 entry_count 篡改被拒" 1 "$SAN_ARCHIVE_CLI" restore "$WORK_DIR/rb17.bak" "$WORK_DIR/sn09-dest"
+  san_run "SN-10 sanitizer 下路径穿越被拒" 1 "$SAN_ARCHIVE_CLI" restore "$WORK_DIR/rb18.bak" "$WORK_DIR/sn10-dest"
+  san_run "SN-11 sanitizer 下 FIFO 备份失败" 1 "$SAN_ARCHIVE_CLI" backup "$SRC_FIFO" "$WORK_DIR/sn11.bak"
+  san_run "SN-12 sanitizer 下非空目标被拒" 1 "$SAN_ARCHIVE_CLI" restore "$GOOD_ARCHIVE" "$WORK_DIR/rb10-dest"
+  san_run "SN-13 sanitizer 下 0 字节归档被拒" 1 "$SAN_ARCHIVE_CLI" restore "$WORK_DIR/rb14.bak" "$WORK_DIR/sn13-dest"
 
   SANFUZZ_CRASH=0
   SANFUZZ_REPORT=0
@@ -479,7 +503,7 @@ else
     dd if=/dev/urandom of="$WORK_DIR/sanfuzz.bak" bs=1 seek="$SANFUZZ_OFF" count=1 conv=notrunc status=none
     rm -rf "$WORK_DIR/sanfuzz-dest"
     SAN_RUNS=$((SAN_RUNS + 1))
-    timeout --signal=KILL "$TIMEOUT_SECONDS" "$SAN_BACKUPCTL" restore "$WORK_DIR/sanfuzz.bak" "$WORK_DIR/sanfuzz-dest" > "$SAN_LOG" 2>&1
+    timeout --signal=KILL "$TIMEOUT_SECONDS" "$SAN_ARCHIVE_CLI" restore "$WORK_DIR/sanfuzz.bak" "$WORK_DIR/sanfuzz-dest" > "$SAN_LOG" 2>&1
     SANFUZZ_CODE=$?
     if [[ $SANFUZZ_CODE -eq 124 || $SANFUZZ_CODE -ge 128 ]]; then SANFUZZ_CRASH=$((SANFUZZ_CRASH + 1)); fi
     if grep -qE 'AddressSanitizer|LeakSanitizer|runtime error:|SUMMARY: ' "$SAN_LOG"; then

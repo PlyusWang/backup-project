@@ -10,9 +10,21 @@
 //                                       repository-driven 产品链路端到端验证
 //   --backup-options-test               验证算法选项 / 密码校验 / 加密恢复 /
 //                                       目录字段 / 密码不落盘（真实控制器路径）
+//   --schedule-test                     验证自动备份页的控制器链路：保存计划、
+//                                       立即运行、无变化跳过、变化建快照、
+//                                       retention、0600 权限、与 CLI 同源路径
+//   --preview-test <源> [--include R]... [--exclude R]...
+//                                       把 Manual Backup 的筛选预览按 CLI 的
+//                                       格式打出来，供脚本与
+//                                       `backupctl preview` 逐行对比
 //   --config-file <路径>                指定配置文件（测试隔离真实用户配置）
+//   --schedule-file <路径>              指定计划存储文件（测试隔离真实计划）
+//   --schedule-show                     把控制器读到的计划配置打成 key=value，
+//                                       用来证明 GUI 与 CLI 读的是同一份 store
 //   --path-test                         验证本地路径与 URL 互转不丢字符
 //   --close-guard-test                  验证任务进行中关窗会被拦下
+//   --gui-contract-test                 验证首页三张卡片的按钮几何，以及
+//                                       "临时提示只属于产生它的页面"这条契约
 //   --native-frame                      退回系统原生标题栏（Wayland 兜底）
 //
 // 这些开关让没有显示器的环境也能验证界面：离屏平台插件把窗口真正建出来，
@@ -21,11 +33,14 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+#include <QCoreApplication>
 #include <QDir>
+#include <QElapsedTimer>
 #include <QEventLoop>
 #include <QFile>
 #include <QFileInfo>
 #include <QGuiApplication>
+#include <QPointF>
 #include <QQmlApplicationEngine>
 #include <QQmlContext>
 #include <QQuickItem>
@@ -37,17 +52,26 @@
 #include <QTimer>
 #include <QVariantList>
 #include <QVariantMap>
+#include <algorithm>
+#include <cmath>
 #include <cstdio>
 #include <cstring>
 
+#include "app_paths.h"
 #include "app_theme.h"
+#include "application_instance_lock.h"
 #include "archive_pipeline.h"
 #include "backup_controller.h"
+#include "config_manager.h"
 #include "filter_rule_model.h"
+#include "operation_gate.h"
+#include "schedule_controller.h"
+#include "schedule_store.h"
+#include "scheduler_lock.h"
 
 namespace {
 
-const int kPageCount = 4;
+const int kPageCount = 5;
 int g_qml_warnings = 0;
 
 // QML 的运行期问题（binding loop、类型错误、模块缺失……）都以 Qt warning 发出。
@@ -101,12 +125,19 @@ QString ResolveConfigFilePath(const QStringList& arguments) {
   if (index >= 0 && index + 1 < arguments.size()) {
     return arguments.at(index + 1);
   }
-  const QString directory =
-      QStandardPaths::writableLocation(QStandardPaths::AppConfigLocation);
-  if (directory.isEmpty()) {
-    return QString();
+  // 默认位置与 backupctl 严格同源：两边走的都是 app_paths.h 里那一份实现。
+  // 这样"GUI 保存的计划 CLI 读不到"在结构上就不可能发生，
+  // 而不是靠两处各自记得写对同一个字符串。
+  return QString::fromStdString(backupproject::DefaultConfigFilePath());
+}
+
+// 计划存储文件：默认位置同样来自 app_paths.h，--schedule-file 只用于测试隔离。
+QString ResolveScheduleFilePath(const QStringList& arguments) {
+  const int index = arguments.indexOf(QStringLiteral("--schedule-file"));
+  if (index >= 0 && index + 1 < arguments.size()) {
+    return arguments.at(index + 1);
   }
-  return QDir(directory).filePath(QStringLiteral("config.json"));
+  return QString::fromStdString(backupproject::DefaultScheduleFilePath());
 }
 
 // 在可视项树里按 objectName 找一个 QQuickItem。
@@ -146,7 +177,7 @@ void ScrollBackupPage(QQuickWindow* window, int content_y) {
   }
 }
 
-// --screenshot：四个页面 × 两套主题各抓一张 PNG，另外补两种状态：
+// --screenshot：五个页面 × 两套主题各抓一张 PNG，另外补两种状态：
 // 高级选项展开、加密归档的恢复密码对话框。
 // 抓帧走窗口自己的 grabWindow()，和用户看到的是同一条渲染路径，
 // 不是另画一份示意图。
@@ -187,8 +218,10 @@ int CaptureScreenshots(QQuickWindow* window, backup_modern::AppTheme* theme,
     return true;
   };
 
-  const char* page_names[kPageCount] = {"home", "backup", "management",
-                                        "settings"};
+  // 顺序必须与 Main.qml 的 StackLayout 一致：首页 / 备份 / 自动备份 /
+  // 备份管理 / 设置。
+  const char* page_names[kPageCount] = {"home", "backup", "schedule",
+                                        "management", "settings"};
   for (int dark = 0; dark < 2; ++dark) {
     theme->setDark(dark == 1);
     for (int page = 0; page < kPageCount; ++page) {
@@ -290,6 +323,98 @@ int ApplyFilterArguments(backup_modern::BackupController* controller,
       return 1;
     }
     ++index;
+  }
+  return 0;
+}
+
+// ---- --preview-test ----
+//
+// 把 Manual Backup 的筛选预览按 **backupctl preview 的输出格式**打出来，
+// 好让检查脚本把两条命令的输出逐行 diff。
+//
+// 它走的是界面真正的入口：FilterRuleModel::addAdvancedRule（用户填高级规则的
+// 那条路）+ FilterRuleModel::requestPreview（"刷新预览"按钮）。所以它证明的是
+// "界面上看到的集合 == 命令行 preview 给出的集合"，而不是"某个内部函数恰好
+// 返回了同样的值"。
+//
+// 输出格式与 backupctl preview 一致（包含 truncated 时的 Note 行），
+// 因此脚本可以直接 diff；差异一定意味着两个前端真的不一致。
+int RunPreviewTest(backup_modern::FilterRuleModel* model, const QString& source,
+                   const QStringList& arguments) {
+  // 规则按命令行顺序进：一条规则内部的 compound AND 由 DSL 自己表达，
+  // 多条 --include 之间是 OR —— 与 CLI 完全同一套语义。
+  for (int index = 0; index < arguments.size(); ++index) {
+    const QString option = arguments.at(index);
+    if (option != QStringLiteral("--include") &&
+        option != QStringLiteral("--exclude")) {
+      continue;
+    }
+    if (index + 1 >= arguments.size()) {
+      std::fprintf(stderr, "Error: %s 需要一个规则参数\n", qPrintable(option));
+      return 2;
+    }
+    const QString action = option == QStringLiteral("--include")
+                               ? QStringLiteral("include")
+                               : QStringLiteral("exclude");
+    if (!model->addAdvancedRule(action, arguments.at(index + 1))) {
+      // 与 CLI 一样，这里报出的就是核心 Filter::AddRule 的原文，
+      // 前端不翻译、不包装。
+      std::fprintf(stderr, "Error: %s\n", qPrintable(model->lastError()));
+      return 2;
+    }
+    ++index;
+  }
+
+  model->requestPreview(source, QString());
+  // 扫描在后台线程跑：只有把事件循环转起来，QFutureWatcher 的 finished
+  // 回调才会派发。processEvents 带超时，所以这不是空转占死 CPU。
+  QElapsedTimer timer;
+  timer.start();
+  while (model->previewBusy() && timer.elapsed() < 60000) {
+    QCoreApplication::processEvents(QEventLoop::AllEvents, 20);
+  }
+  if (model->previewBusy()) {
+    std::fprintf(stderr, "preview 超时\n");
+    return 1;
+  }
+  if (!model->lastError().isEmpty()) {
+    std::fprintf(stderr, "Error: %s\n", qPrintable(model->lastError()));
+    if (model->lastErrorKind() ==
+        backupproject::PreviewErrorKind::kSelectionBlocked) {
+      // 与 backupctl preview 逐字一致的第二行：这不是语法问题，而是"按当前
+      // 规则备份必然失败"，所以两边都用 exit 1 并说清该怎么办。
+      std::printf("Backup would fail unless this entry is excluded.\n");
+    }
+    return 1;
+  }
+
+  // 界面列表里既有"进归档"也有"被排除"的条目（各自带标签），CLI 只列前者；
+  // 这里按 included 投影成同一份集合再打印。
+  const QVariantList items = model->previewItems();
+  QStringList included_paths;
+  for (const QVariant& value : items) {
+    const QVariantMap item = value.toMap();
+    if (item.value(QStringLiteral("included")).toBool()) {
+      included_paths << item.value(QStringLiteral("path")).toString();
+    }
+  }
+  // 计数取完整实际备份遍历的数字（与 CLI 打印的是同一个字段），窗口信息取核心
+  // 给出的 truncated。三个数字互不相同：全量匹配数、窗口大小（preview entries，
+  // 含被排除的条目）、窗口里真正列出来的匹配项数。所以在截断时不能说
+  // "the first 300 of N matching item(s)"——那是把窗口大小当成了匹配数。
+  // 下面的 Note 行必须与 backupctl 的措辞逐字一致。
+  std::printf(
+      "Preview: %d matching item(s) in the effective backup selection.\n",
+      model->previewIncluded());
+  if (model->previewTruncated()) {
+    std::printf(
+        "Note: showing matches found within the first %d preview entries; the "
+        "complete effective backup traversal was validated, %d matching "
+        "item(s) listed below.\n",
+        model->previewLimit(), static_cast<int>(included_paths.size()));
+  }
+  for (const QString& path : included_paths) {
+    std::printf("%s\n", qPrintable(path));
   }
   return 0;
 }
@@ -701,6 +826,8 @@ const backupproject::EncryptionMethod kUntouchedEncryptionMethod =
 // 断言计数。所有检查只累加、不提前返回：中途退出会让后面的检查永远不执行，
 // 一次运行就只能看到一个失败。
 struct CheckRun {
+  // 输出前缀。默认值保持 PR #16 的既有输出不变，定时备份自检会换成 [schedule]。
+  const char* prefix = "[backup-options]";
   int passed = 0;
   int failed = 0;
   QStringList failures;
@@ -708,7 +835,7 @@ struct CheckRun {
   void Check(bool ok, const QString& label, const QString& detail = QString()) {
     if (ok) {
       ++passed;
-      std::printf("[backup-options]   ok   %s\n", qPrintable(label));
+      std::printf("%s   ok   %s\n", prefix, qPrintable(label));
       return;
     }
     ++failed;
@@ -716,7 +843,7 @@ struct CheckRun {
                              ? label
                              : QStringLiteral("%1（%2）").arg(label, detail);
     failures.append(text);
-    std::printf("[backup-options]   FAIL %s\n", qPrintable(text));
+    std::printf("%s   FAIL %s\n", prefix, qPrintable(text));
   }
 
   // 目录字段断言。fileName 一起写进标签：记录有七八条，失败时必须一眼看出
@@ -898,6 +1025,294 @@ QString FlattenRecord(const QVariantMap& record) {
 //
 // 返回值只区分"全部通过(0)"与"有失败(非 0)"；失败项逐条打印，
 // 并且保留 QTemporaryDir 供人工进去看产物。
+// ---- --gui-contract-test ----
+//
+// 人工验收发现的两类 GUI 契约。断言的是 QML 的真实几何与真实绑定结果：
+// 不截图、不做像素比对，也不匹配文案本身。
+//
+// HOME-01..04 首页三张卡片的按钮必须完整落在卡片内（并且有正的底边距），三张
+//             卡片的按钮对齐；正常窗口与窗口最小尺寸都要成立。
+// MSG-01..05  某个页面产生的临时提示只在该页面显示；离开页面即被消费，回到该页
+//             不会自动复现；后台任务在别的页面结束时也不会把提示丢过去。
+//
+// banner 读的是它自己的 showsMessage（"这一页该不该显示这条消息"），不是
+// visible：Qt Quick 的 Item.visible 读出来就是**有效可见性**，StackLayout 里
+// 非当前页整体不可见，用 visible 永远测不出"这一页会不会显示这条消息"。
+int RunGuiContractTest(QQuickWindow* window,
+                       backup_modern::BackupController* controller) {
+  CheckRun run;
+  run.prefix = "[gui-contract]";
+
+  // 页面顺序必须与 Main.qml 的 StackLayout 一致。
+  const char* kBannerNames[5] = {
+      "homeStatusBanner", "backupStatusBanner", "scheduleStatusBanner",
+      "managementStatusBanner", "settingsStatusBanner"};
+
+  const auto goToPage = [window](int page) {
+    window->setProperty("currentPage", page);
+    // 切换之后要让绑定与布局都算完：这里等的是"事件循环转一圈 + 布局"，
+    // 不是某个动画时长。
+    WaitForAnimation(60);
+  };
+  const auto banner = [window, &kBannerNames](int page) -> QObject* {
+    return window->findChild<QObject*>(QString::fromLatin1(kBannerNames[page]));
+  };
+  const auto bannerTitle = [&banner](int page) {
+    QObject* item = banner(page);
+    return item == nullptr ? QStringLiteral("<missing>")
+                           : item->property("title").toString();
+  };
+  // 这一页会不会显示这条提示（与它此刻是不是当前页无关）。
+  const auto pageShows = [&banner](int page, const QString& title) {
+    QObject* item = banner(page);
+    return item != nullptr && item->property("showsMessage").toBool() &&
+           item->property("title").toString() == title;
+  };
+  const auto itemByName = [window](const char* name) -> QQuickItem* {
+    return window->findChild<QQuickItem*>(QString::fromLatin1(name));
+  };
+
+  // ---- HOME：三个按钮必须完整在卡片里 ----
+  const auto checkHomeCards = [&](int width, int height, const QString& label) {
+    window->setWidth(width);
+    window->setHeight(height);
+    goToPage(0);
+
+    qreal minimum_margin = -1.0;
+    qreal baseline = -1.0;
+    bool all_inside = true;
+    bool aligned = true;
+    QString detail;
+
+    for (int index = 0; index < 3; ++index) {
+      const QQuickItem* card = itemByName(index == 0   ? "homeCard0"
+                                          : index == 1 ? "homeCard1"
+                                                       : "homeCard2");
+      const QQuickItem* button = itemByName(index == 0   ? "homeAction0"
+                                            : index == 1 ? "homeAction1"
+                                                         : "homeAction2");
+      if (card == nullptr || button == nullptr) {
+        run.Check(false, QStringLiteral("%1 找得到卡片与按钮").arg(label),
+                  QStringLiteral("card=%1 button=%2")
+                      .arg(card != nullptr)
+                      .arg(button != nullptr));
+        return;
+      }
+      const QPointF top_left = button->mapToItem(card, QPointF(0, 0));
+      const qreal margin = card->height() - (top_left.y() + button->height());
+      // 左、右、上三条边也要在卡片内：只验下边界会漏掉横向越界。
+      const bool inside = top_left.x() >= 0.0 && top_left.y() >= 0.0 &&
+                          top_left.x() + button->width() <= card->width();
+      all_inside = all_inside && inside;
+      if (!inside) detail += QStringLiteral("按钮 %1 越界 ").arg(index);
+      minimum_margin =
+          minimum_margin < 0.0 ? margin : std::min(minimum_margin, margin);
+
+      const qreal window_y =
+          button->mapToItem(window->contentItem(), QPointF(0, 0)).y();
+      if (baseline < 0.0)
+        baseline = window_y;
+      else if (std::abs(window_y - baseline) > 1.0)
+        aligned = false;
+    }
+
+    // HOME-01：三个按钮都在卡片内，且底边距统一为正。
+    run.Check(all_inside && minimum_margin >= 12.0,
+              QStringLiteral("%1 HOME-01 按钮完整落在卡片内且底边距 >= 12px")
+                  .arg(label),
+              QStringLiteral("最小底边距=%1 全部在卡片内=%2")
+                  .arg(minimum_margin)
+                  .arg(all_inside));
+    // HOME-02：三张卡片的按钮对齐（同一 baseline，容差 1px）。
+    run.Check(aligned,
+              QStringLiteral("%1 HOME-02 三个按钮对齐（容差 1px）").arg(label),
+              detail);
+    // HOME-03：按钮不能压住卡片下边框，也不能超出卡片。
+    run.Check(minimum_margin > 0.0,
+              QStringLiteral("%1 HOME-03 卡片下边框没有被按钮压住").arg(label),
+              QStringLiteral("最小底边距=%1").arg(minimum_margin));
+    // HOME-04：卡片本身也必须在页面内（窄窗口下不能溢出到窗口外）。
+    const QQuickItem* row_card = itemByName("homeCard0");
+    const qreal card_bottom =
+        row_card
+            ->mapToItem(window->contentItem(), QPointF(0, row_card->height()))
+            .y();
+    const bool card_visible_in_window =
+        card_bottom <= static_cast<qreal>(height);
+    run.Check(
+        card_visible_in_window,
+        QStringLiteral("%1 HOME-04 卡片没有溢出窗口").arg(label),
+        QStringLiteral("卡片底部=%1 窗口高=%2").arg(card_bottom).arg(height));
+  };
+
+  checkHomeCards(1180, 760, QStringLiteral("正常窗口 1180x760"));
+  checkHomeCards(960, 620, QStringLiteral("最小窗口 960x620"));
+
+  // ---- MSG：临时提示只属于产生它的页面 ----
+  QTemporaryDir temp;
+  if (!temp.isValid()) {
+    std::fprintf(stderr, "[gui-contract] 无法创建临时目录\n");
+    return 1;
+  }
+
+  // MSG-01：备份页的输入校验错误不得跑到别的页面，回来后也不自动复现。
+  controller->setSourcePath(QString());
+  goToPage(1);
+  const bool started = controller->startBackupWithOptions(
+      QStringLiteral("mypack"), QStringLiteral("none"), QStringLiteral("none"),
+      QString(), QString());
+  run.Check(!started && controller->statusKind() == QStringLiteral("error"),
+            QStringLiteral("MSG-01 空源目录触发错误提示"),
+            controller->statusTitle() + QStringLiteral("/") +
+                controller->statusMessage());
+  run.Check(controller->statusScope() == QStringLiteral("backup"),
+            QStringLiteral("MSG-01 这条错误属于备份页"),
+            controller->statusScope());
+  run.Check(pageShows(1, controller->statusTitle()),
+            QStringLiteral("MSG-01 备份页显示它"));
+  run.Check(
+      !pageShows(4, controller->statusTitle()) &&
+          !pageShows(3, controller->statusTitle()) &&
+          !pageShows(2, controller->statusTitle()) &&
+          !pageShows(0, controller->statusTitle()),
+      QStringLiteral("MSG-01 设置 / 管理 / 自动备份 / 首页都不显示它"),
+      QStringLiteral("settings=[%1] management=[%2] schedule=[%3] home=[%4]")
+          .arg(bannerTitle(4), bannerTitle(3), bannerTitle(2), bannerTitle(0)));
+  const QString backup_error_title = controller->statusTitle();
+
+  goToPage(4);
+  run.Check(!pageShows(4, backup_error_title) &&
+                !pageShows(3, backup_error_title) &&
+                !pageShows(2, backup_error_title) &&
+                !pageShows(0, backup_error_title),
+            QStringLiteral("MSG-01 切到设置之后这条错误不再出现在任何页面"),
+            QStringLiteral("settings=[%1]").arg(bannerTitle(4)));
+  run.Check(controller->statusKind() == QStringLiteral("idle"),
+            QStringLiteral("MSG-01 离开备份页即消费掉这条错误"),
+            controller->statusKind());
+
+  goToPage(1);
+  run.Check(!pageShows(1, backup_error_title),
+            QStringLiteral("MSG-01 回到备份页不会自动复现旧错误"),
+            bannerTitle(1));
+
+  // MSG-02：设置页的成功提示同样只属于设置页，离开即消费。
+  const QString repository = temp.filePath(QStringLiteral("repo"));
+  goToPage(4);
+  const bool saved = controller->saveRepositoryPath(repository);
+  run.Check(saved && controller->statusKind() == QStringLiteral("success") &&
+                controller->statusScope() == QStringLiteral("settings"),
+            QStringLiteral("MSG-02 设置页保存成功"),
+            controller->statusTitle() + QStringLiteral("/") +
+                controller->statusScope());
+  const QString settings_title = controller->statusTitle();
+  run.Check(pageShows(4, settings_title),
+            QStringLiteral("MSG-02 设置页显示它"));
+  run.Check(
+      !pageShows(1, settings_title) && !pageShows(3, settings_title) &&
+          !pageShows(2, settings_title) && !pageShows(0, settings_title),
+      QStringLiteral("MSG-02 备份 / 管理 / 自动备份 / 首页都不显示它"),
+      QStringLiteral("backup=[%1] management=[%2] schedule=[%3] home=[%4]")
+          .arg(bannerTitle(1), bannerTitle(3), bannerTitle(2), bannerTitle(0)));
+  goToPage(1);
+  run.Check(controller->statusKind() == QStringLiteral("idle") &&
+                !pageShows(4, settings_title),
+            QStringLiteral("MSG-02 离开设置页即消费掉这条成功提示"),
+            controller->statusKind());
+  goToPage(4);
+  run.Check(!pageShows(4, settings_title),
+            QStringLiteral("MSG-02 回到设置页不会自动复现旧提示"),
+            bannerTitle(4));
+
+  // MSG-03：severity 与 scope 正交 —— 四种 severity 的位置与失效时机完全一样。
+  const char* kSeverities[4] = {"error", "warning", "info", "success"};
+  for (const char* severity : kSeverities) {
+    const QString kind = QString::fromLatin1(severity);
+    const QString title = QStringLiteral("severity-测试-%1").arg(kind);
+    goToPage(3);
+    controller->setStatusForTest(kind, QStringLiteral("management"), title,
+                                 QStringLiteral("detail"));
+    const bool shown_on_own_page = pageShows(3, title);
+    const bool hidden_elsewhere = !pageShows(1, title) &&
+                                  !pageShows(4, title) &&
+                                  !pageShows(2, title) && !pageShows(0, title);
+    goToPage(1);
+    const bool consumed = controller->statusKind() == QStringLiteral("idle");
+    run.Check(shown_on_own_page && hidden_elsewhere && consumed,
+              QStringLiteral("MSG-03 severity=%1 遵循同一条 scope/lifetime")
+                  .arg(kind),
+              QStringLiteral("本页显示=%1 其它页不显示=%2 离开即消费=%3")
+                  .arg(shown_on_own_page)
+                  .arg(hidden_elsewhere)
+                  .arg(consumed));
+  }
+
+  // MSG-04：后台任务在别的页面结束时，完成提示不能丢到那个页面上；
+  //         但任务本身必须照常完成。
+  const QString source = temp.filePath(QStringLiteral("source"));
+  QDir().mkpath(source);
+  for (int i = 0; i < 40; ++i) {
+    QFile file(QStringLiteral("%1/file-%2.bin").arg(source).arg(i));
+    if (file.open(QIODevice::WriteOnly)) file.write(QByteArray(2048, 'x'));
+  }
+  controller->setSourcePath(source);
+  goToPage(1);
+  const bool backup_started = controller->startBackupWithOptions(
+      QStringLiteral("mypack"), QStringLiteral("none"), QStringLiteral("none"),
+      QString(), QString());
+  run.Check(backup_started && controller->busy(),
+            QStringLiteral("MSG-04 备份真的启动了"));
+  // 切页就在**同一个事件循环回合内**完成：完成回调还没有机会派发，busy 一定
+  // 还是 true，所以这条断言不取决于任务跑得多快（与 --close-guard-test 用的是
+  // 同一条推理）。这里刻意不调用 goToPage()，它会让事件循环转一圈。
+  window->setProperty("currentPage", 4);
+  run.Check(
+      controller->busy() &&
+          controller->statusKind() == QStringLiteral("running") &&
+          !pageShows(4, QStringLiteral("备份完成")) &&
+          !pageShows(3, QStringLiteral("备份完成")),
+      QStringLiteral("MSG-04 运行中切页：运行状态不被切页清掉，也没有完成提示"),
+      controller->statusKind() + QStringLiteral("/") + bannerTitle(4));
+  run.Check(controller->waitForIdle(120000) && !controller->busy(),
+            QStringLiteral("MSG-04 切页之后任务照常完成"));
+  run.Check(controller->lastSucceeded() &&
+                controller->statusKind() == QStringLiteral("success") &&
+                controller->statusScope() == QStringLiteral("backup"),
+            QStringLiteral("MSG-04 完成提示仍然属于发起它的备份页"),
+            controller->statusTitle() + QStringLiteral("/") +
+                controller->statusScope());
+  run.Check(
+      pageShows(1, controller->statusTitle()) &&
+          !pageShows(4, controller->statusTitle()) &&
+          !pageShows(3, controller->statusTitle()) &&
+          !pageShows(2, controller->statusTitle()) &&
+          !pageShows(0, controller->statusTitle()),
+      QStringLiteral("MSG-04 完成提示只回到备份页，没有出现在当前页或其它页"),
+      QStringLiteral(
+          "backup=[%1] settings=[%2] management=[%3] schedule=[%4] home=[%5]")
+          .arg(bannerTitle(1), bannerTitle(4), bannerTitle(3), bannerTitle(2),
+               bannerTitle(0)));
+
+  // MSG-05：消费之后，重新触发同样的问题必须重新显示 —— 不能变成"清一次就
+  //         永远不显示"。
+  controller->setSourcePath(QString());
+  goToPage(1);
+  const bool started_again = controller->startBackupWithOptions(
+      QStringLiteral("mypack"), QStringLiteral("none"), QStringLiteral("none"),
+      QString(), QString());
+  run.Check(!started_again && pageShows(1, controller->statusTitle()) &&
+                controller->statusKind() == QStringLiteral("error"),
+            QStringLiteral("MSG-05 再次触发同一个错误仍然正常显示"),
+            bannerTitle(1) + QStringLiteral("/") + controller->statusKind());
+
+  std::printf("[gui-contract] passed=%d failed=%d\n", run.passed, run.failed);
+  if (run.failed != 0) {
+    for (const QString& failure : run.failures)
+      std::printf("[gui-contract]   FAIL %s\n", qPrintable(failure));
+  }
+  return run.failed == 0 ? 0 : 1;
+}
+
 int RunBackupOptionsTest(backup_modern::BackupController* controller,
                          const QString& config_file_path) {
   CheckRun run;
@@ -1592,14 +2007,1042 @@ int RunBackupOptionsTest(backup_modern::BackupController* controller,
   return 1;
 }
 
+// ---- --schedule-show：把控制器看到的计划配置打成 key=value ----
+//
+// 存在的理由只有一个：证明 GUI 与 CLI 读的是**同一份** store。
+// 脚本先让 backupctl 写、再让 GUI 读（或反过来），两边逐项比对；
+// 没有这个开关，"共享 store"就只能靠读代码相信。
+int RunScheduleShow(backup_modern::ScheduleController* schedule) {
+  schedule->reload();
+  std::printf("enabled=%d\n", schedule->enabled() ? 1 : 0);
+  std::printf("trigger=%s\n", qPrintable(schedule->triggerKey()));
+  std::printf("strategy=%s\n", qPrintable(schedule->strategyKey()));
+  std::printf("source=%s\n", qPrintable(schedule->sourcePath()));
+  std::printf("interval=%d\n", schedule->intervalMinutes());
+  std::printf("retain=%d\n", schedule->retainCount());
+  std::printf("pack=%s\n", qPrintable(schedule->packKey()));
+  std::printf("compression=%s\n", qPrintable(schedule->compressionKey()));
+  std::printf("encryption=%s\n", qPrintable(schedule->encryptionKey()));
+  for (const QString& rule : schedule->includeRules()) {
+    std::printf("include=%s\n", qPrintable(rule));
+  }
+  for (const QString& rule : schedule->excludeRules()) {
+    std::printf("exclude=%s\n", qPrintable(rule));
+  }
+  std::printf("repository=%s\n", qPrintable(schedule->repositoryPath()));
+  std::printf("managed=%d\n",
+              static_cast<int>(schedule->managedSnapshots().size()));
+  std::printf("history=%d\n", static_cast<int>(schedule->history().size()));
+  std::printf("store=%s\n", qPrintable(schedule->storePath()));
+  if (!schedule->loadError().isEmpty()) {
+    std::printf("load_error=%s\n", qPrintable(schedule->loadError()));
+  }
+  return 0;
+}
+
+// ---- --schedule-test：自动备份页的控制器链路自检 ----
+//
+// 全程跑在临时目录里：临时 config.json、临时 schedule.json、临时仓库与源目录。
+// 绝不读写用户真实的计划配置。
+//
+// 它刻意不 mock 核心：控制器写进 store 的东西，紧接着用
+// backupproject::ScheduleStore 原样读回来逐项比对 —— 这正是
+// "GUI 与 CLI 读同一份 store、同一套 schema"在单元层面的证据。
+
+QStringList ArchiveNames(const QString& repository) {
+  QDir directory(repository);
+  return directory.entryList(QStringList() << QStringLiteral("*.bak"),
+                             QDir::Files, QDir::Name);
+}
+
+int CountArchives(const QString& repository) {
+  return ArchiveNames(repository).size();
+}
+
+QVariantMap LastHistory(const backup_modern::ScheduleController& schedule) {
+  const QVariantList history = schedule.history();
+  if (history.isEmpty()) return QVariantMap();
+  return history.last().toMap();
+}
+
+int RunScheduleTest(backup_modern::ScheduleController* schedule,
+                    backup_modern::BackupController* backup_controller,
+                    const QString& config_path) {
+  CheckRun run;
+  run.prefix = "[schedule]";
+
+  QTemporaryDir temp;
+  if (!temp.isValid()) {
+    std::fprintf(stderr, "[schedule] 无法创建临时目录\n");
+    return 1;
+  }
+  // 从一份干净的 store 开始：自检要断言"默认值"，残留的旧计划会让它
+  // 测的不是默认状态。这里删的是 --schedule-file 指到的文件（测试隔离目录），
+  // 正常启动不会走到这条路径。
+  QFile::remove(schedule->storePath());
+
+  const QString source = temp.path() + QStringLiteral("/source");
+  const QString repository = temp.path() + QStringLiteral("/repository");
+  QDir().mkpath(source);
+  QDir().mkpath(repository);
+  if (!WriteTestFile(source + QStringLiteral("/a.txt"), "alpha")) {
+    std::fprintf(stderr, "[schedule] 无法准备源文件\n");
+    return 1;
+  }
+
+  // 1) 临时 config.json：把仓库指到临时目录。
+  {
+    backupproject::ConfigManager manager(config_path.toStdString());
+    backupproject::AppConfig config;
+    config.backup_repository_path = repository.toStdString();
+    std::string error;
+    run.Check(manager.Save(config, &error),
+              QStringLiteral("SCH-01 临时 config.json 写入成功"),
+              QString::fromStdString(error));
+  }
+
+  schedule->reload();
+
+  run.Check(!schedule->enabled(), QStringLiteral("SCH-02 默认未启用"));
+  run.Check(schedule->intervalMinutes() == 60,
+            QStringLiteral("SCH-03 默认周期 60 分钟"),
+            QString::number(schedule->intervalMinutes()));
+  run.Check(schedule->retainCount() == 12,
+            QStringLiteral("SCH-04 默认保留 12 个"),
+            QString::number(schedule->retainCount()));
+  run.Check(schedule->packKey() == QStringLiteral("mypack") &&
+                schedule->compressionKey() == QStringLiteral("none") &&
+                schedule->encryptionKey() == QStringLiteral("none"),
+            QStringLiteral("SCH-05 默认 MyPack + 不压缩 + 不加密"));
+  run.Check(schedule->repositoryPath() == repository,
+            QStringLiteral("SCH-06 控制器读到了临时仓库"),
+            schedule->repositoryPath());
+  run.Check(schedule->supportedModeText().contains(
+                QStringLiteral("定时触发 + 完整快照")),
+            QStringLiteral("SCH-07 页面说明只承诺已实现的模式"));
+
+  // 2) 保存一份真实计划。
+  run.Check(schedule->saveConfig(true, source, 1, 3, QStringLiteral("ustar"),
+                                 QStringLiteral("huffman"), QStringList(),
+                                 QStringList()),
+            QStringLiteral("SCH-08 保存计划成功"));
+
+  const QString store_file = schedule->storePath();
+  run.Check(QFile::exists(store_file),
+            QStringLiteral("SCH-09 schedule.json 已落盘"), store_file);
+  struct stat store_info;
+  const bool stat_ok =
+      ::stat(store_file.toLocal8Bit().constData(), &store_info) == 0;
+  run.Check(stat_ok && (store_info.st_mode & 07777) == 0600,
+            QStringLiteral("SCH-10 schedule.json 权限是 0600"),
+            stat_ok ? QString::number(store_info.st_mode & 07777, 8)
+                    : QStringLiteral("stat 失败"));
+
+  // 3) 用共享核心原样读回来 —— GUI 存的东西必须是共享 schema。
+  {
+    backupproject::ScheduleStore store(store_file.toStdString());
+    backupproject::ScheduleDocument document;
+    std::string error;
+    const bool loaded = store.Load(&document, &error) ==
+                        backupproject::ScheduleLoadStatus::kLoaded;
+    run.Check(loaded, QStringLiteral("SCH-11 核心能读回 schedule.json"),
+              QString::fromStdString(error));
+    run.Check(document.config.interval_minutes == 1 &&
+                  document.config.retain_count == 3,
+              QStringLiteral("SCH-12 周期与保留数量逐项一致"));
+    run.Check(
+        document.config.pack_method == backupproject::PackMethod::kUstar &&
+            document.config.compression_method ==
+                backupproject::CompressionMethod::kHuffman,
+        QStringLiteral("SCH-13 pack / compression 逐项一致"));
+    run.Check(document.config.encryption_method ==
+                  backupproject::EncryptionMethod::kNone,
+              QStringLiteral("SCH-14 schedule.json 里没有加密"));
+    run.Check(document.config.source_path == source.toStdString(),
+              QStringLiteral("SCH-15 源目录逐项一致"));
+    run.Check(
+        document.config.trigger == backupproject::BackupTrigger::kScheduled &&
+            document.config.strategy == backupproject::BackupStrategy::kFull,
+        QStringLiteral("SCH-16 trigger / strategy 是 scheduled + full"));
+  }
+
+  // 4) 立即检查并运行：首次快照。
+  run.Check(schedule->runNow(), QStringLiteral("SCH-17 立即运行被接受"));
+  schedule->waitForIdle(180000);
+  run.Check(schedule->lastSucceeded(), QStringLiteral("SCH-18 首次运行成功"));
+  run.Check(schedule->managedSnapshots().size() == 1,
+            QStringLiteral("SCH-19 产生了一个计划快照"),
+            QString::number(schedule->managedSnapshots().size()));
+  run.Check(CountArchives(repository) == 1,
+            QStringLiteral("SCH-20 仓库里恰好一个归档"),
+            QString::number(CountArchives(repository)));
+  run.Check(
+      LastHistory(*schedule).value(QStringLiteral("resultKey")).toString() ==
+          QStringLiteral("success_created"),
+      QStringLiteral("SCH-21 历史记录为 success_created"),
+      LastHistory(*schedule).value(QStringLiteral("resultKey")).toString());
+
+  // 5) 再运行一次：没有变化必须跳过，不产生新归档。
+  schedule->runNow();
+  schedule->waitForIdle(180000);
+  run.Check(schedule->managedSnapshots().size() == 1,
+            QStringLiteral("SCH-22 无变化时没有新增快照"));
+  run.Check(CountArchives(repository) == 1,
+            QStringLiteral("SCH-23 无变化时没有新增归档"),
+            QString::number(CountArchives(repository)));
+  run.Check(
+      LastHistory(*schedule).value(QStringLiteral("resultKey")).toString() ==
+          QStringLiteral("skipped_no_changes"),
+      QStringLiteral("SCH-24 历史记录为 skipped_no_changes"),
+      LastHistory(*schedule).value(QStringLiteral("resultKey")).toString());
+
+  // 6) 新增文件：建立新快照，变化摘要里 added = 1。
+  if (!WriteTestFile(source + QStringLiteral("/b.txt"), "beta")) {
+    run.Check(false, QStringLiteral("SCH-25 新增源文件"));
+  }
+  schedule->runNow();
+  schedule->waitForIdle(180000);
+  run.Check(schedule->managedSnapshots().size() == 2,
+            QStringLiteral("SCH-25 变化后建立了新快照"),
+            QString::number(schedule->managedSnapshots().size()));
+  run.Check(
+      LastHistory(*schedule)
+          .value(QStringLiteral("changesText"))
+          .toString()
+          .startsWith(QStringLiteral("+1")),
+      QStringLiteral("SCH-26 变化摘要显示 +1 新增"),
+      LastHistory(*schedule).value(QStringLiteral("changesText")).toString());
+
+  // 7) retention：retain=1 之后只留最新一份。
+  run.Check(schedule->saveConfig(true, source, 1, 1, QStringLiteral("mypack"),
+                                 QStringLiteral("none"), QStringList(),
+                                 QStringList()),
+            QStringLiteral("SCH-27 保留数量改为 1"));
+  if (!WriteTestFile(source + QStringLiteral("/c.txt"), "gamma")) {
+    run.Check(false, QStringLiteral("SCH-28 再新增一个源文件"));
+  }
+  schedule->runNow();
+  schedule->waitForIdle(180000);
+  run.Check(schedule->managedSnapshots().size() == 1,
+            QStringLiteral("SCH-28 retention 后只剩一个计划快照"),
+            QString::number(schedule->managedSnapshots().size()));
+  run.Check(CountArchives(repository) == 1,
+            QStringLiteral("SCH-29 仓库里也只剩一个归档"),
+            QString::number(CountArchives(repository)));
+
+  // 8) 规则校验走的是真实 Filter；非法规则不许进配置。
+  run.Check(
+      !schedule
+           ->validateRule(QStringLiteral("include"), QStringLiteral("bogus:x"))
+           .isEmpty(),
+      QStringLiteral("SCH-30 非法规则被 Filter 拒绝"));
+  run.Check(
+      schedule
+          ->validateRule(QStringLiteral("include"), QStringLiteral("ext:cpp"))
+          .isEmpty(),
+      QStringLiteral("SCH-31 合法规则被 Filter 接受"));
+  run.Check(!schedule->saveConfig(true, source, 0, 1, QStringLiteral("mypack"),
+                                  QStringLiteral("none"), QStringList(),
+                                  QStringList()),
+            QStringLiteral("SCH-32 非法周期被拒绝"));
+  run.Check(!schedule->saveConfig(true, source, 1, 1, QStringLiteral("gzip"),
+                                  QStringLiteral("none"), QStringList(),
+                                  QStringList()),
+            QStringLiteral("SCH-33 未知打包方式被拒绝"));
+
+  // 8b) 最后留下一份"有代表性"的配置（retain=7 / interval=5 / ustar +
+  // huffman）， 供跨前端脚本用 backupctl schedule show 逐项比对 —— GUI
+  // 写的，CLI 必须读得一模一样。
+  run.Check(
+      schedule->saveConfig(true, source, 5, 7, QStringLiteral("ustar"),
+                           QStringLiteral("huffman"),
+                           QStringList() << QStringLiteral("ext:txt"),
+                           QStringList() << QStringLiteral("path:**/build/**")),
+      QStringLiteral("SCH-36 留下跨前端比对用的配置"));
+
+  // 9) 与 CLI 同源：默认路径必须与 QStandardPaths 算出来的完全一致。
+  const QString qsp =
+      QStandardPaths::writableLocation(QStandardPaths::AppConfigLocation);
+  run.Check(QString::fromStdString(backupproject::DefaultConfigFilePath()) ==
+                QDir(qsp).filePath(QStringLiteral("config.json")),
+            QStringLiteral("SCH-34 CLI 与 GUI 的 config.json 严格同路径"),
+            QString::fromStdString(backupproject::DefaultConfigFilePath()));
+  run.Check(QString::fromStdString(backupproject::DefaultScheduleFilePath()) ==
+                QDir(qsp).filePath(QStringLiteral("schedule.json")),
+            QStringLiteral("SCH-35 CLI 与 GUI 的 schedule.json 严格同路径"),
+            QString::fromStdString(backupproject::DefaultScheduleFilePath()));
+
+  // 10) review-fix：仓库在运行期被改掉之后，下一次评估必须写到新仓库去。
+  //
+  // 这一段只能在这里测：它依赖 BackupController::repositoryPathChanged 这个
+  // 真实信号，而不是"重新构造一个控制器"。
+  {
+    const QString repository_b = temp.path() + QStringLiteral("/repository-b");
+    QDir().mkpath(repository_b);
+    run.Check(CountArchives(repository) == 1,
+              QStringLiteral("SCH-40 切换前旧仓库里有一份快照"),
+              QString::number(CountArchives(repository)));
+
+    run.Check(backup_controller->saveRepositoryPath(repository_b),
+              QStringLiteral("SCH-41 设置页把仓库改成 B"));
+    // ScheduleController 订阅了 repositoryPathChanged，QML 一行都不用改。
+    run.Check(schedule->repositoryPath() == repository_b,
+              QStringLiteral("SCH-42 计划控制器立刻跟上了新仓库"),
+              schedule->repositoryPath());
+
+    schedule->runNow();
+    schedule->waitForIdle(180000);
+    run.Check(CountArchives(repository_b) == 1,
+              QStringLiteral("SCH-43 新快照出现在 B 仓库"),
+              QString::number(CountArchives(repository_b)));
+    run.Check(CountArchives(repository) == 1,
+              QStringLiteral("SCH-44 A 仓库没有被写入"),
+              QString::number(CountArchives(repository)));
+
+    // 切回来：跨前端比对用的 config.json 必须还是原来那个仓库。
+    run.Check(backup_controller->saveRepositoryPath(repository),
+              QStringLiteral("SCH-45 仓库切回 A"));
+  }
+
+  // 11) review-fix：首次启用把下一次运行排在一个完整周期之后。
+  //
+  // 必须走一次真正的 disabled -> enabled，否则 ApplyScheduleEnableTransition
+  // 按设计就是 no-op（保存配置不该把时间表往后推）。
+  {
+    run.Check(schedule->saveConfig(
+                  false, source, 30, 7, QStringLiteral("ustar"),
+                  QStringLiteral("huffman"), QStringList(), QStringList()),
+              QStringLiteral("SCH-46 先停用并改成 30 分钟周期"));
+    const qint64 before = QDateTime::currentSecsSinceEpoch();
+    run.Check(schedule->setEnabled(true), QStringLiteral("SCH-47 重新启用"));
+
+    backupproject::ScheduleStore store(schedule->storePath().toStdString());
+    backupproject::ScheduleDocument document;
+    std::string error;
+    const bool loaded = store.Load(&document, &error) ==
+                        backupproject::ScheduleLoadStatus::kLoaded;
+    run.Check(loaded, QStringLiteral("SCH-48 直接读回 store"),
+              QString::fromStdString(error));
+    const qint64 delta =
+        loaded ? document.state.next_run_time_sec - before : -1;
+    run.Check(delta >= 1795 && delta <= 1810,
+              QStringLiteral("SCH-49 启用后 next run 正好是一个完整周期之后"),
+              QString::number(delta));
+  }
+
+  // 12) review-fix：baseline 被删掉之后必须重建，而不是因为 manifest 相同就
+  // skip。
+  {
+    const QStringList names = ArchiveNames(repository);
+    run.Check(names.size() == 1, QStringLiteral("SCH-50 仓库里有一份 baseline"),
+              QString::number(names.size()));
+    if (names.size() == 1) {
+      run.Check(QFile::remove(repository + QStringLiteral("/") + names.front()),
+                QStringLiteral("SCH-51 手工删掉 baseline 快照"));
+      schedule->runNow();
+      schedule->waitForIdle(180000);
+      run.Check(CountArchives(repository) == 1,
+                QStringLiteral("SCH-52 下一轮重建了一份快照"),
+                QString::number(CountArchives(repository)));
+      run.Check(schedule->lastSucceeded(),
+                QStringLiteral("SCH-53 重建这一轮是成功的"));
+    }
+  }
+
+  // 13) GUI 独有的边界：手动备份正在写盘时，定时任务到点了。
+  //
+  // 这几条断言不依赖时间。三次 runNow() 都在主线程上连续调用，中间没有跑事件
+  // 循环；而 busy_ 只可能被主线程上的 OnWatcherFinished 清掉，所以第一次必然
+  // 已经把它置上，后两次必然走 coalesce 分支。仓库里的源自 SCH-52
+  // 之后没有变过， 所以这两次评估都是 skip，不会影响后面的收尾。
+  {
+    const int history_before = schedule->history().size();
+    schedule->runNow();
+    run.Check(schedule->libraryBusy(),
+              QStringLiteral("SCH-54 busy 期间第一次请求真的跑起来了"));
+    run.Check(!schedule->pending(),
+              QStringLiteral("SCH-55 第一次请求不留下 pending"));
+    schedule->runNow();
+    run.Check(schedule->pending(),
+              QStringLiteral("SCH-56 busy 期间第二次请求被合并成一次 pending"));
+    schedule->runNow();
+    run.Check(schedule->pending(),
+              QStringLiteral("SCH-57 再来一次仍然是同一个 pending，不排队"));
+
+    run.Check(schedule->waitForIdle(180000),
+              QStringLiteral("SCH-58 补跑结束之后控制器回到空闲"));
+    run.Check(!schedule->libraryBusy() && !schedule->pending(),
+              QStringLiteral("SCH-59 空闲之后 busy 与 pending 都清掉了"));
+    // 三次请求 = 两次评估（一次立即 + 一次合并后的补跑）。排队的话会是三次。
+    const int expected =
+        qMin(history_before + 2,
+             static_cast<int>(backupproject::kMaxHistoryEntries));
+    run.Check(schedule->history().size() == expected,
+              QStringLiteral("SCH-60 三次请求只产生两次评估"),
+              QString::number(history_before) + " -> " +
+                  QString::number(schedule->history().size()));
+  }
+
+  // 14) 抢不到 runner 锁之后必须能重新抢回来。
+  //
+  // 场景：另一个进程先拿着锁，本程序启用计划时抢不到；对方退出之后 tick 必须
+  // 把锁拿回来。少了这一步，"别的进程曾经跑过"会变成"本程序再也不跑这个计划"，
+  // 页面会一直显示"已被另一进程持有"。
+  //
+  // 持锁方用一个真实的 SchedulerLock 扮演 —— 与 CLI watch / GUI
+  // 用的是同一个类、 同一个锁文件。
+  {
+    const QString lock_path = schedule->storePath() + QStringLiteral(".lock");
+    run.Check(schedule->saveConfig(false, source, 5, 7, QStringLiteral("ustar"),
+                                   QStringLiteral("huffman"), QStringList(),
+                                   QStringList()),
+              QStringLiteral("SCH-61 先停用，控制器放开自己手上的锁"));
+    run.Check(!schedule->holdsRunnerLock(),
+              QStringLiteral("SCH-62 停用之后控制器不再持锁"));
+
+    backupproject::SchedulerLock other;
+    std::string other_error;
+    run.Check(other.Acquire(lock_path.toStdString(), &other_error),
+              QStringLiteral("SCH-63 另一个进程拿到锁"),
+              QString::fromStdString(other_error));
+
+    run.Check(schedule->saveConfig(true, source, 5, 7, QStringLiteral("ustar"),
+                                   QStringLiteral("huffman"), QStringList(),
+                                   QStringList()),
+              QStringLiteral("SCH-64 抢不到锁时仍然保存计划配置"));
+    run.Check(
+        !schedule->holdsRunnerLock() && !schedule->runnerMessage().isEmpty(),
+        QStringLiteral("SCH-65 抢不到锁时如实报告给用户"),
+        schedule->runnerMessage());
+
+    // 对方退出。tick 每秒重试一次，这里最多等 6 秒。
+    other.Release();
+    bool recovered = false;
+    for (int attempt = 0; attempt < 60 && !recovered; ++attempt) {
+      WaitForAnimation(100);
+      recovered = schedule->holdsRunnerLock();
+    }
+    run.Check(recovered,
+              QStringLiteral("SCH-66 对方退出之后 tick 把锁拿了回来"),
+              schedule->runnerMessage());
+  }
+
+  // 收尾：把跨前端比对用的那套配置写回去（interval=5 / retain=7 / ustar +
+  // huffman + 两条规则）。modern_gui_check.sh 会拿 backupctl schedule show
+  // 逐项比对，所以这里必须与 SCH-36 完全一致。
+  run.Check(
+      schedule->saveConfig(true, source, 5, 7, QStringLiteral("ustar"),
+                           QStringLiteral("huffman"),
+                           QStringList() << QStringLiteral("ext:txt"),
+                           QStringList() << QStringLiteral("path:**/build/**")),
+      QStringLiteral("SCH-67 恢复跨前端比对用的配置"));
+
+  // 15) 落盘配置不合法 -> 明确挂起，而且**不再**周期性重试。
+  //
+  // 场景：有人手工把 schedule.json 改成一个"JSON 读得懂、业务规则不认"的配置。
+  // 产品禁止多进程，所以不存在"另一个进程在背后把它修好了"；挂起期间唯一的
+  // 恢复入口就是用户显式保存一份合法配置。
+  //
+  // 这一组断言全部不依赖时间：tick 被停掉之后**没有 timer**，再手动"敲"几次
+  // tick 也不会有新提交，所以不需要靠 sleep 堆时间去看"是不是每秒跑一次"。
+  {
+    auto read_bytes = [](const QString& path) {
+      QFile file(path);
+      if (!file.open(QIODevice::ReadOnly)) return QByteArray();
+      return file.readAll();
+    };
+    auto write_bytes = [](const QString& path, const QByteArray& data) {
+      QFile file(path);
+      if (!file.open(QIODevice::WriteOnly | QIODevice::Truncate)) return false;
+      const bool ok = file.write(data) == data.size();
+      file.close();
+      return ok;
+    };
+
+    const QString store_path = schedule->storePath();
+    const QByteArray original = read_bytes(store_path);
+    QByteArray invalid = original;
+    // 无人值守加密是**解析得通、业务规则拒绝**的那一类：枚举值合法，
+    // 但定时任务没有安全的密钥来源，ValidateScheduleConfig 必须拒绝它。
+    invalid.replace("\"encryption\": \"none\"",
+                    "\"encryption\": \"aes-256-ctr-hmac-sha256\"");
+    run.Check(!original.isEmpty() && invalid != original,
+              QStringLiteral("SCH-68 构造出一份业务上不合法的配置"));
+    run.Check(write_bytes(store_path, invalid),
+              QStringLiteral("SCH-69 把它写到磁盘上（模拟手工编辑）"));
+    const QByteArray broken_bytes = read_bytes(store_path);
+
+    // 文件本身读得懂，所以"读不懂"这条挂起理由不成立；合不合法由评估回答。
+    schedule->start();
+    run.Check(!schedule->suspended(),
+              QStringLiteral("SCH-70 文件读得懂时不挂起（合法性由评估回答）"));
+    run.Check(schedule->tickActiveForTest(),
+              QStringLiteral("SCH-71 此时 tick 还在跑"));
+
+    const int history_before = schedule->history().size();
+    const int archives_before = CountArchives(repository);
+
+    run.Check(
+        schedule->runNow(),
+        QStringLiteral("SCH-72 立即运行被接受（评估自己会发现配置不合法）"));
+    run.Check(schedule->waitForIdle(180000), QStringLiteral("SCH-73 评估结束"));
+    run.Check(schedule->suspended(),
+              QStringLiteral("SCH-74 评估判定配置不合法 -> 挂起"));
+    run.Check(
+        !schedule->tickActiveForTest(),
+        QStringLiteral("SCH-75 挂起之后 1 Hz tick 被停掉（不会每秒重新校验）"));
+    run.Check(!schedule->holdsRunnerLock(),
+              QStringLiteral("SCH-76 挂起期间不占着 runner 锁"));
+    run.Check(schedule->history().size() == history_before,
+              QStringLiteral("SCH-77 挂起这一轮不写 history"),
+              QString::number(history_before) + " -> " +
+                  QString::number(schedule->history().size()));
+    run.Check(CountArchives(repository) == archives_before,
+              QStringLiteral("SCH-78 挂起之后仓库里没有多出任何归档"));
+    run.Check(read_bytes(store_path) == broken_bytes,
+              QStringLiteral("SCH-79 没有静默改写这份不合法的配置"));
+    run.Check((schedule->statusTitle() + schedule->statusMessage())
+                  .contains(QStringLiteral("挂起")),
+              QStringLiteral("SCH-80 页面明确显示已挂起"),
+              schedule->statusTitle() + QStringLiteral(" / ") +
+                  schedule->statusMessage());
+
+    // 再"响"几次 tick：既不能有新评估，也不能有每秒一次的 signal 风暴。
+    int status_signals = 0;
+    int suspended_signals = 0;
+    QObject::connect(schedule,
+                     &backup_modern::ScheduleController::statusChanged,
+                     [&status_signals]() { ++status_signals; });
+    QObject::connect(schedule,
+                     &backup_modern::ScheduleController::suspendedChanged,
+                     [&suspended_signals]() { ++suspended_signals; });
+    const QString status_before = schedule->statusTitle() +
+                                  QStringLiteral("|") +
+                                  schedule->statusMessage();
+    for (int tick = 0; tick < 5; ++tick) {
+      schedule->pumpTickForTest();
+    }
+    WaitForAnimation(60);
+    run.Check(schedule->history().size() == history_before,
+              QStringLiteral("SCH-81 再响 5 次 tick 也没有产生新评估"));
+    run.Check(status_signals == 0 && suspended_signals == 0,
+              QStringLiteral("SCH-82 诊断稳定：没有每秒一次的 signal 风暴"),
+              QStringLiteral("status=") + QString::number(status_signals) +
+                  QStringLiteral(" suspended=") +
+                  QString::number(suspended_signals));
+    run.Check(status_before == schedule->statusTitle() + QStringLiteral("|") +
+                                   schedule->statusMessage(),
+              QStringLiteral("SCH-83 诊断文本一个字符都没变"));
+    run.Check(schedule->suspended(), QStringLiteral("SCH-84 仍然是挂起状态"));
+
+    // 唯一的恢复入口：显式保存一份合法配置。这里同时把收尾需要的
+    // 跨前端配置写回去（与 SCH-36 / SCH-67 完全一致）。
+    run.Check(schedule->saveConfig(true, source, 5, 7, QStringLiteral("ustar"),
+                                   QStringLiteral("huffman"),
+                                   QStringList() << QStringLiteral("ext:txt"),
+                                   QStringList()
+                                       << QStringLiteral("path:**/build/**")),
+              QStringLiteral("SCH-85 保存一份合法配置"));
+    run.Check(!schedule->suspended(),
+              QStringLiteral("SCH-86 保存成功之后挂起自动解除"));
+    run.Check(schedule->tickActiveForTest(),
+              QStringLiteral("SCH-87 tick 重新开始跑"));
+    run.Check(schedule->holdsRunnerLock(),
+              QStringLiteral("SCH-88 runner 锁也拿了回来"));
+    run.Check(schedule->runNow() && schedule->waitForIdle(180000) &&
+                  schedule->lastSucceeded(),
+              QStringLiteral("SCH-89 恢复之后计划真的又能跑了"));
+    run.Check(!schedule->suspended(),
+              QStringLiteral("SCH-90 成功跑完一轮之后仍然没有挂起"));
+  }
+
+  // 16) 同一进程内的单写者：评估在飞的时候不允许保存。
+  //
+  // ScheduleStore 的写者有两个：GUI 线程（saveConfig）与后台评估线程
+  // （RunEvaluation -> ScheduledBackupService -> Save/SaveManifest）。两者并发
+  // 就是并发的 Load->Modify->Save，后台刚 push 进去的 managed 记录与 history
+  // 会被覆盖掉。QML 把按钮置灰只是界面礼貌，真正的不变式必须在这里。
+  {
+    const QString store_path = schedule->storePath();
+    auto read_bytes = [](const QString& path) {
+      QFile file(path);
+      if (!file.open(QIODevice::ReadOnly)) return QByteArray();
+      return file.readAll();
+    };
+
+    run.Check(schedule->runNow(),
+              QStringLiteral("SCH-91 再立即运行一次，让评估进入 busy"));
+    run.Check(schedule->libraryBusy(), QStringLiteral("SCH-92 评估确实在飞"));
+    const QByteArray before = read_bytes(store_path);
+    run.Check(!schedule->saveConfig(
+                  true, source, 9, 4, QStringLiteral("fast-ustar"),
+                  QStringLiteral("lzss-huffman"), QStringList(), QStringList()),
+              QStringLiteral("SCH-93 busy 期间保存被明确拒绝"));
+    run.Check(schedule->statusMessage().contains(QStringLiteral("正在")),
+              QStringLiteral("SCH-94 拒绝的理由告诉用户等这一轮结束"),
+              schedule->statusMessage());
+    run.Check(read_bytes(store_path) == before,
+              QStringLiteral("SCH-95 被拒绝的保存没有改动 store 一个字节"));
+    run.Check(schedule->intervalMinutes() == 5 && schedule->retainCount() == 7,
+              QStringLiteral("SCH-96 内存里的计划也没有被改"),
+              QString::number(schedule->intervalMinutes()) +
+                  QStringLiteral("/") +
+                  QString::number(schedule->retainCount()));
+    run.Check(schedule->waitForIdle(180000), QStringLiteral("SCH-97 评估结束"));
+    run.Check(
+        schedule->saveConfig(true, source, 5, 7, QStringLiteral("ustar"),
+                             QStringLiteral("huffman"),
+                             QStringList() << QStringLiteral("ext:txt"),
+                             QStringList()
+                                 << QStringLiteral("path:**/build/**")),
+        QStringLiteral("SCH-98 空闲之后保存成功（收尾配置与 SCH-67 一致）"));
+  }
+
+  // 17) 前端 parity 契约：GUI 对非法输入问的是**共享核心**，不是自己的一套。
+  //
+  // 判据不是"两边措辞一样"，而是"GUI 显示的原因逐字来自核心函数"。同一批
+  // 非法输入在 CLI 那边由 scripts/scheduled_backup_test.sh 的 I 区验证退出码。
+  {
+    // 三条都必须是**共享 Filter 真的拒绝**的规则：不以"假设它非法"为前提，
+    // 而是把核心的返回值当作唯一判据（下面 core_ok 为真就直接算失败）。
+    const QStringList bad_rules{QStringLiteral("size:not-a-number"),
+                                QStringLiteral("type:bogus"),
+                                QStringLiteral("bogus:x")};
+    for (const QString& rule : bad_rules) {
+      const QString gui_error =
+          schedule->validateRule(QStringLiteral("include"), rule);
+      backupproject::Filter filter;
+      std::string core_error;
+      const bool core_ok = filter.AddRule(backupproject::FilterAction::kInclude,
+                                          rule.toStdString(), &core_error);
+      run.Check(!core_ok && !gui_error.isEmpty() &&
+                    gui_error == QString::fromStdString(core_error),
+                QStringLiteral("SCH-99 非法规则 [%1] 的原因逐字来自共享 Filter")
+                    .arg(rule),
+                gui_error);
+    }
+    const QString good_rule = QStringLiteral("ext:txt;md");
+    run.Check(schedule->validateRule(QStringLiteral("include"), good_rule)
+                      .isEmpty() &&
+                  backupproject::Filter().AddRule(
+                      backupproject::FilterAction::kInclude,
+                      good_rule.toStdString(), nullptr),
+              QStringLiteral("SCH-100 合法规则两边都接受"));
+
+    const QString store_path = schedule->storePath();
+    QFile store_file(store_path);
+    store_file.open(QIODevice::ReadOnly);
+    const QByteArray before = store_file.readAll();
+    store_file.close();
+
+    run.Check(!schedule->saveConfig(true, source, 0, 7, QStringLiteral("ustar"),
+                                    QStringLiteral("huffman"), QStringList(),
+                                    QStringList()),
+              QStringLiteral("SCH-101 GUI 拒绝越界周期"));
+    run.Check(schedule->statusMessage().contains(QStringLiteral("1")) &&
+                  schedule->statusMessage().contains(QStringLiteral("525600")),
+              QStringLiteral("SCH-102 展示的是共享核心的范围说明"),
+              schedule->statusMessage());
+    run.Check(!schedule->saveConfig(true, source, 5, 7, QStringLiteral("tar"),
+                                    QStringLiteral("huffman"), QStringList(),
+                                    QStringList()),
+              QStringLiteral("SCH-103 GUI 拒绝未知打包方式 key"));
+    run.Check(!schedule->saveConfig(true, source, 5, 7, QStringLiteral("ustar"),
+                                    QStringLiteral("zip"), QStringList(),
+                                    QStringList()),
+              QStringLiteral("SCH-104 GUI 拒绝未知压缩方式 key"));
+    run.Check(!schedule->saveConfig(
+                  true, source, 5, 7, QStringLiteral("ustar"),
+                  QStringLiteral("huffman"),
+                  QStringList() << QStringLiteral("type:bogus"), QStringList()),
+              QStringLiteral("SCH-105 GUI 拒绝含非法规则的保存"));
+
+    const QString missing_source =
+        temp.path() + QStringLiteral("/does-not-exist");
+    const bool accepted = schedule->saveConfig(
+        true, missing_source, 5, 7, QStringLiteral("ustar"),
+        QStringLiteral("huffman"), QStringList(), QStringList());
+    // 与 GUI 内部构造的那份配置逐字段一致：saveConfig 只在**成功**时才写回
+    // document_，所以直接拿 configForTest() 比就比错了对象。
+    backupproject::ScheduleConfig probe = schedule->configForTest();
+    probe.enabled = true;
+    probe.source_path = missing_source.toStdString();
+    std::string core_error;
+    const bool core_accepts = backupproject::ValidateScheduleForEnable(
+        probe, repository.toStdString(), &core_error);
+    run.Check(!accepted && !core_accepts,
+              QStringLiteral("SCH-106 源目录不存在时 GUI 与核心都拒绝启用"),
+              schedule->statusMessage());
+    run.Check(
+        schedule->statusMessage().contains(QString::fromStdString(core_error)),
+        QStringLiteral("SCH-107 拒绝理由就是 ValidateScheduleForEnable 的原话"),
+        QString::fromStdString(core_error));
+
+    QFile after_file(store_path);
+    after_file.open(QIODevice::ReadOnly);
+    const QByteArray after = after_file.readAll();
+    after_file.close();
+    run.Check(before == after,
+              QStringLiteral("SCH-108 这一串被拒绝的保存一个字节都没落盘"));
+    run.Check(schedule->intervalMinutes() == 5 &&
+                  schedule->retainCount() == 7 &&
+                  schedule->sourcePath() == source,
+              QStringLiteral("SCH-109 内存里的计划仍然是上一份合法配置"));
+  }
+
+  // 18) 备份管理页删除计划快照之后，ScheduleStore 必须立刻跟上。
+  //
+  // 这是 CLI 的 repository delete 一直有、GUI 以前没有的一步。少了它，同一个
+  // 删除动作在两个前端上的后果不同：GUI 删完之后计划页还会继续显示一个已经
+  // 不在仓库里的文件名，直到下一轮定时评估顺手 reconcile 掉。
+  {
+    run.Check(
+        WriteTestFile(source + QStringLiteral("/deleted-later.txt"), "delta"),
+        QStringLiteral("SCH-110 先给源目录制造一次变化"));
+    run.Check(schedule->runNow() && schedule->waitForIdle(180000) &&
+                  schedule->lastSucceeded(),
+              QStringLiteral("SCH-111 建立一份新的计划快照"));
+
+    const QVariantList managed = schedule->managedSnapshots();
+    run.Check(!managed.isEmpty(), QStringLiteral("SCH-112 计划快照名单非空"));
+    const QString victim =
+        managed.last().toMap().value(QStringLiteral("fileName")).toString();
+    run.Check(!victim.isEmpty(), QStringLiteral("SCH-113 取到要删除的归档名"),
+              victim);
+
+    // QML 的删除按钮走的就是这一条。
+    run.Check(backup_controller->deleteBackup(victim),
+              QStringLiteral("SCH-114 备份管理页删除成功"),
+              backup_controller->statusMessage());
+    run.Check(backup_controller->waitForCatalogIdle(600000),
+              QStringLiteral("SCH-115 列表刷新结束"));
+
+    bool still_listed = false;
+    for (const QVariant& item : schedule->managedSnapshots()) {
+      if (item.toMap().value(QStringLiteral("fileName")).toString() == victim) {
+        still_listed = true;
+      }
+    }
+    run.Check(!still_listed,
+              QStringLiteral("SCH-116 删除之后计划快照列表立刻不再包含它"),
+              victim);
+
+    backupproject::ScheduleStore store(schedule->storePath().toStdString());
+    backupproject::ScheduleDocument document;
+    std::string store_error;
+    run.Check(store.Load(&document, &store_error) ==
+                  backupproject::ScheduleLoadStatus::kLoaded,
+              QStringLiteral("SCH-117 能直接读回 schedule.json"),
+              QString::fromStdString(store_error));
+    bool on_disk = false;
+    for (const backupproject::ScheduledSnapshotRecord& record :
+         document.state.managed_snapshots) {
+      if (QString::fromStdString(record.file_name) == victim) on_disk = true;
+    }
+    run.Check(!on_disk,
+              QStringLiteral("SCH-118 schedule.json 里的 managed 名单也立刻跟上"
+                             "（与 CLI 的 repository delete 完全一致）"),
+              victim);
+
+    // 收尾：把删掉的那份变化重新变成一份快照，让 store 回到有基线的稳定状态。
+    run.Check(schedule->runNow() && schedule->waitForIdle(180000) &&
+                  schedule->lastSucceeded(),
+              QStringLiteral("SCH-119 收尾：重建一份计划快照"));
+  }
+
+  // 19) 周期与保留数量的解析规则只有一份：界面不再用 parseInt 截断。
+  //
+  // QML 的 parseInt("12abc") 是 12，而 backupctl 对同一个输入是明确拒绝。
+  // 界面现在把**文本**交给共享核心的 ParseBoundedScheduleNumber，两边的结论
+  // 因此不可能分叉——这一组断言钉住的就是"GUI 不再自己解析"。
+  {
+    const QString store_path = schedule->storePath();
+    auto read_bytes = [](const QString& path) {
+      QFile file(path);
+      if (!file.open(QIODevice::ReadOnly)) return QByteArray();
+      return file.readAll();
+    };
+    const QByteArray before = read_bytes(store_path);
+
+    const QStringList bad{QStringLiteral("12abc"),
+                          QString(),
+                          QStringLiteral("-5"),
+                          QStringLiteral("5.5"),
+                          QStringLiteral("99999999999999"),
+                          QStringLiteral(" ")};
+    for (const QString& text : bad) {
+      run.Check(
+          !schedule->saveConfigFromText(
+              true, source, text, QStringLiteral("7"), QStringLiteral("ustar"),
+              QStringLiteral("huffman"), QStringList(), QStringList()),
+          QStringLiteral("SCH-120 非法周期文本 [%1] 被拒绝（不再截断成 12）")
+              .arg(text),
+          schedule->statusMessage());
+      run.Check(
+          !schedule->saveConfigFromText(
+              true, source, QStringLiteral("5"), text, QStringLiteral("ustar"),
+              QStringLiteral("huffman"), QStringList(), QStringList()),
+          QStringLiteral("SCH-121 非法保留数量文本 [%1] 被拒绝").arg(text),
+          schedule->statusMessage());
+    }
+    // 格式正确但越界：由共享核心的范围校验拒绝，界面只是转述。
+    run.Check(!schedule->saveConfigFromText(
+                  true, source, QStringLiteral("0"), QStringLiteral("7"),
+                  QStringLiteral("ustar"), QStringLiteral("huffman"),
+                  QStringList(), QStringList()),
+              QStringLiteral("SCH-122 周期 0 被共享核心的范围校验拒绝"));
+    run.Check(schedule->statusMessage().contains(QStringLiteral("525600")),
+              QStringLiteral("SCH-123 展示的是核心的范围说明"),
+              schedule->statusMessage());
+    run.Check(read_bytes(store_path) == before,
+              QStringLiteral("SCH-124 这一串被拒绝的输入一个字节都没落盘"));
+
+    run.Check(schedule->saveConfigFromText(
+                  true, source, QStringLiteral("5"), QStringLiteral("7"),
+                  QStringLiteral("ustar"), QStringLiteral("huffman"),
+                  QStringList() << QStringLiteral("ext:txt"),
+                  QStringList() << QStringLiteral("path:**/build/**")),
+              QStringLiteral("SCH-125 合法文本照旧接受"),
+              schedule->statusMessage());
+    run.Check(schedule->intervalMinutes() == 5 && schedule->retainCount() == 7,
+              QStringLiteral("SCH-126 接受之后的周期与保留数量正确"),
+              QString::number(schedule->intervalMinutes()) +
+                  QStringLiteral("/") +
+                  QString::number(schedule->retainCount()));
+  }
+
+  // 20) 数字解析的 case table：GUI 与 CLI 必须逐项同结论。
+  //
+  // 上一组证明"GUI 不再用 parseInt"；这一组把**同一张表**再喂一遍，并且与
+  // 共享核心的 ParseBoundedScheduleNumber（CLI 走的就是它）逐项比对返回值。
+  {
+    struct NumberCase {
+      const char* text;
+      bool accepted;
+    };
+    const NumberCase cases[] = {
+        {"5", true},
+        {"60", true},
+        {" 5 ", true},
+        {"\t5\t", true},
+        {"\n60\r", true},
+        {"007", true},
+        {"", false},
+        {"   ", false},
+        {"\t", false},
+        {"5x", false},
+        {"x5", false},
+        {"-1", false},
+        {"+5", false},
+        {"1.0", false},
+        {"5 5", false},
+        {"0x10", false},
+        {"99999999999999999999", false},
+        {"18446744073709551616", false},
+        {"0", false},
+        {"525601", false},
+    };
+    const QString store_path = schedule->storePath();
+    auto read_bytes = [](const QString& path) {
+      QFile file(path);
+      if (!file.open(QIODevice::ReadOnly)) return QByteArray();
+      return file.readAll();
+    };
+    const QByteArray before = read_bytes(store_path);
+
+    for (const NumberCase& item : cases) {
+      std::uint32_t core_value = 0;
+      std::string core_error;
+      const bool core_ok = backupproject::ParseBoundedScheduleNumber(
+          item.text, backupproject::kMinIntervalMinutes,
+          backupproject::kMaxIntervalMinutes, "--interval-minutes", &core_value,
+          &core_error);
+      const bool gui_ok = schedule->saveConfigFromText(
+          true, source, QString::fromUtf8(item.text), QStringLiteral("7"),
+          QStringLiteral("ustar"), QStringLiteral("huffman"), QStringList(),
+          QStringList());
+      const QByteArray before_case = read_bytes(store_path);
+      run.Check(gui_ok == item.accepted && core_ok == item.accepted,
+                QStringLiteral("SCH-127 [%1] GUI 与共享 parser 同结论（%2）")
+                    .arg(QString::fromUtf8(item.text),
+                         item.accepted ? QStringLiteral("接受")
+                                       : QStringLiteral("拒绝")),
+                schedule->statusMessage());
+      if (!item.accepted) {
+        // 被拒绝的那一项一个字节都不许落盘。
+        run.Check(read_bytes(store_path) == before_case,
+                  QStringLiteral("SCH-128 [%1] 被拒绝的输入没有改动 store")
+                      .arg(QString::fromUtf8(item.text)));
+      }
+    }
+    (void)before;
+    // 收尾：把跨前端比对用的配置写回去（与 SCH-36 / SCH-67 / SCH-98 一致）。
+    run.Check(schedule->saveConfigFromText(
+                  true, source, QStringLiteral("5"), QStringLiteral("7"),
+                  QStringLiteral("ustar"), QStringLiteral("huffman"),
+                  QStringList() << QStringLiteral("ext:txt"),
+                  QStringList() << QStringLiteral("path:**/build/**")),
+              QStringLiteral("SCH-129 收尾：把跨前端比对用的配置写回去"),
+              schedule->statusMessage());
+    run.Check(schedule->intervalMinutes() == 5 && schedule->retainCount() == 7,
+              QStringLiteral("SCH-130 收尾配置是 interval=5 / retain=7"),
+              QString::number(schedule->intervalMinutes()) +
+                  QStringLiteral("/") +
+                  QString::number(schedule->retainCount()));
+  }
+
+  // 21) GUI 内部的操作串行化（M1-M7）。
+  //
+  // 产品规则：一个 Modern GUI 进程内，任何会改动 backup repository / schedule
+  // state / source backup state 的业务操作，同一时刻最多一个。QML 的按钮状态
+  // 只是界面礼貌；这一组断言全部直接调用 C++ API，证明后端自己会拒绝。
+  {
+    auto read_bytes = [](const QString& path) {
+      QFile file(path);
+      if (!file.open(QIODevice::ReadOnly)) return QByteArray();
+      return file.readAll();
+    };
+    const QString store_path = schedule->storePath();
+
+    backup_controller->setSourcePath(source);
+
+    // ---- M1：评估在飞 -> 手动备份被拒绝 ----
+    run.Check(schedule->runNow() && schedule->libraryBusy(),
+              QStringLiteral("M1.1 评估进入 busy"));
+    const int archives_before = CountArchives(repository);
+    const QByteArray store_before = read_bytes(store_path);
+    run.Check(!backup_controller->startBackup(),
+              QStringLiteral("M1.2 评估在飞时手动备份被 C++ 拒绝"),
+              backup_controller->statusMessage());
+    run.Check(backup_controller->statusMessage().contains(
+                  QStringLiteral("定时备份评估")),
+              QStringLiteral("M1.3 拒绝理由点名是谁在占着"),
+              backup_controller->statusMessage());
+    run.Check(CountArchives(repository) == archives_before,
+              QStringLiteral("M1.4 被拒绝的手动备份没有产生任何归档"));
+    run.Check(read_bytes(store_path) == store_before,
+              QStringLiteral("M1.5 被拒绝的手动备份没有改动 schedule store"));
+
+    // ---- M2：评估在飞 -> 受管恢复被拒绝 ----
+    const QString managed_name = ArchiveNames(repository).isEmpty()
+                                     ? QString()
+                                     : ArchiveNames(repository).first();
+    run.Check(!managed_name.isEmpty(),
+              QStringLiteral("M2.1 仓库里有一份可恢复的归档"));
+    const QString restore_dest = temp.path() + QStringLiteral("/gate-restore");
+    run.Check(
+        !backup_controller->startManagedRestore(managed_name, restore_dest),
+        QStringLiteral("M2.2 评估在飞时受管恢复被 C++ 拒绝"),
+        backup_controller->statusMessage());
+    run.Check(!backup_controller->busy(),
+              QStringLiteral("M2.3 被拒绝的恢复没有把控制器置成 busy"));
+
+    // ---- M3：评估在飞 -> 删除被拒绝，store 一个字节不变 ----
+    {
+      const QByteArray before = read_bytes(store_path);
+      run.Check(!backup_controller->deleteBackup(managed_name),
+                QStringLiteral("M3.1 评估在飞时删除被 C++ 拒绝"),
+                backup_controller->statusMessage());
+      run.Check(read_bytes(store_path) == before,
+                QStringLiteral("M3.2 被拒绝的删除没有改动 schedule store"));
+      run.Check(CountArchives(repository) == archives_before,
+                QStringLiteral("M3.3 被拒绝的删除没有动仓库"));
+    }
+
+    // ---- M4：评估在飞 -> 改仓库被拒绝 ----
+    {
+      const QByteArray before = read_bytes(config_path);
+      const QString other = temp.path() + QStringLiteral("/other-repo");
+      QDir().mkpath(other);
+      run.Check(!backup_controller->saveRepositoryPath(other),
+                QStringLiteral("M4.1 评估在飞时改仓库被 C++ 拒绝"),
+                backup_controller->statusMessage());
+      run.Check(read_bytes(config_path) == before,
+                QStringLiteral("M4.2 被拒绝的仓库修改没有写 config.json"));
+      run.Check(backup_controller->repositoryPath() == repository,
+                QStringLiteral("M4.3 内存里的仓库路径也没有被改"));
+    }
+
+    run.Check(schedule->waitForIdle(180000),
+              QStringLiteral("M4.4 评估结束，闸门放开"));
+
+    // ---- M5：手动备份忙 -> 多次到期合并成一次评估 ----
+    {
+      run.Check(backup_controller->startBackup() && backup_controller->busy(),
+                QStringLiteral("M5.1 手动备份开始"));
+      schedule->runNow();
+      run.Check(schedule->pending(),
+                QStringLiteral("M5.2 手动备份期间到期只留下一个 pending"));
+      schedule->runNow();
+      schedule->runNow();
+      run.Check(schedule->pending(),
+                QStringLiteral("M5.3 再来两次仍然是同一个 pending，不排队"));
+      run.Check(backup_controller->waitForIdle(600000),
+                QStringLiteral("M5.4 手动备份结束"));
+      run.Check(schedule->waitForIdle(180000),
+                QStringLiteral("M5.5 补跑的那一次评估结束"));
+      run.Check(!schedule->pending() && !schedule->libraryBusy(),
+                QStringLiteral("M5.6 补跑之后回到空闲"));
+    }
+
+    // ---- M6：手动恢复忙 -> 同样的合并语义 ----
+    {
+      const QString name = ArchiveNames(repository).isEmpty()
+                               ? QString()
+                               : ArchiveNames(repository).first();
+      const QString dest = temp.path() + QStringLiteral("/gate-restore-2");
+      QDir().mkpath(dest);
+      run.Check(
+          !name.isEmpty() && backup_controller->startManagedRestore(name, dest),
+          QStringLiteral("M6.1 手动恢复开始"));
+      schedule->runNow();
+      run.Check(schedule->pending(),
+                QStringLiteral("M6.2 手动恢复期间到期同样合并成 pending"));
+      run.Check(backup_controller->waitForIdle(600000),
+                QStringLiteral("M6.3 手动恢复结束"));
+      run.Check(schedule->waitForIdle(180000), QStringLiteral("M6.4 补跑结束"));
+    }
+
+    // ---- M7：评估结束之后手动操作立刻可用 ----
+    {
+      const int before = CountArchives(repository);
+      run.Check(backup_controller->startBackup(),
+                QStringLiteral("M7.1 闸门空闲时手动备份可以开始"),
+                backup_controller->statusMessage());
+      run.Check(backup_controller->waitForIdle(600000) &&
+                    backup_controller->lastSucceeded(),
+                QStringLiteral("M7.2 手动备份正常完成"));
+      run.Check(CountArchives(repository) == before + 1,
+                QStringLiteral("M7.3 仓库里多了一份手动备份"));
+    }
+  }
+
+  const int total = run.passed + run.failed;
+  std::printf("[schedule] %s %d/%d\n", run.failed == 0 ? "PASS" : "FAIL",
+              run.passed, total);
+  if (run.failed != 0) {
+    for (const QString& failure : run.failures) {
+      std::fprintf(stderr, "[schedule]   失败: %s\n", qPrintable(failure));
+    }
+    temp.setAutoRemove(false);
+    std::printf("[schedule] 临时目录保留: %s\n", qPrintable(temp.path()));
+    return 1;
+  }
+  return 0;
+}
+
 }  // namespace
 
 int main(int argc, char* argv[]) {
   QGuiApplication app(argc, argv);
   // 这两个名字同时决定 QSettings 与 QStandardPaths 的落盘位置，
   // 所以必须在读主题、解析配置文件路径之前设置好。
-  QCoreApplication::setApplicationName("backup-gui-modern");
-  QCoreApplication::setOrganizationName("backup-project");
+  // 名字来自共享的 app_paths.h：CLI 侧的默认路径就是按这两个常量算出来的，
+  // 写死字符串会让"GUI 与 CLI 严格同路径"这条约束只靠约定维持。
+  QCoreApplication::setApplicationName(
+      QString::fromLatin1(backupproject::kAppApplicationName));
+  QCoreApplication::setOrganizationName(
+      QString::fromLatin1(backupproject::kAppOrganizationName));
   // 固定用 Basic 风格：不跟随发行版的 GTK/GNOME 主题，
   // 否则同一份 QML 在不同 Linux 上会长得完全不一样。
   // 样式名必须和 QML 里 import 的 QtQuick.Controls.Basic 对得上。
@@ -1614,6 +3057,8 @@ int main(int argc, char* argv[]) {
   const bool path_test = arguments.contains(QStringLiteral("--path-test"));
   const bool close_guard_test =
       arguments.contains(QStringLiteral("--close-guard-test"));
+  const bool gui_contract_test =
+      arguments.contains(QStringLiteral("--gui-contract-test"));
   const int screenshot_index =
       arguments.indexOf(QStringLiteral("--screenshot"));
   const int self_test_index = arguments.indexOf(QStringLiteral("--self-test"));
@@ -1621,13 +3066,25 @@ int main(int argc, char* argv[]) {
       arguments.indexOf(QStringLiteral("--repository-test"));
   const int config_file_index =
       arguments.indexOf(QStringLiteral("--config-file"));
+  const int schedule_file_index =
+      arguments.indexOf(QStringLiteral("--schedule-file"));
   const bool backup_options_test =
       arguments.contains(QStringLiteral("--backup-options-test"));
+  const bool schedule_test =
+      arguments.contains(QStringLiteral("--schedule-test"));
+  const bool schedule_show =
+      arguments.contains(QStringLiteral("--schedule-show"));
+  const int preview_test_index =
+      arguments.indexOf(QStringLiteral("--preview-test"));
 
   // 需要参数的开关：参数没跟上就是用法错误，明确说清楚并以 2 退出，
   // 而不是悄悄退化成默认行为（那会让测试以为它隔离了配置，其实没有）。
   if (config_file_index >= 0 && config_file_index + 1 >= arguments.size()) {
     std::fprintf(stderr, "--config-file 需要一个配置文件路径参数\n");
+    return 2;
+  }
+  if (schedule_file_index >= 0 && schedule_file_index + 1 >= arguments.size()) {
+    std::fprintf(stderr, "--schedule-file 需要一个计划存储文件路径参数\n");
     return 2;
   }
   if (repository_test_index >= 0 &&
@@ -1642,6 +3099,39 @@ int main(int argc, char* argv[]) {
                  "--self-test 需要三个参数: <源目录> <备份文件> <恢复目录>\n");
     return 2;
   }
+  if (preview_test_index >= 0 && preview_test_index + 1 >= arguments.size()) {
+    std::fprintf(stderr, "--preview-test 需要一个源目录参数\n");
+    return 2;
+  }
+
+  // ---- 全应用单实例 ----
+  //
+  // 位置是硬要求：必须在构造任何 controller / 读任何持久状态之前。
+  // AppTheme 的构造函数会读 QSettings，BackupController 会读 config.json，
+  // ScheduleController 会读 schedule.json —— "先读一遍再发现已经有另一个
+  // 实例"等于并发访问已经发生，那把锁也就白拿了。
+  //
+  // 锁路径与 backupctl 走同一个函数（app_paths.h），所以 GUI 与 CLI 的默认
+  // 位置不可能漂移；产品只允许一个 GUI 或一个 CLI。
+  std::string application_lock_path;
+  std::string application_lock_error;
+  backupproject::ApplicationInstanceLock application_lock;
+  if (!backupproject::DefaultApplicationInstanceLockPath(
+          &application_lock_path, &application_lock_error)) {
+    std::fprintf(stderr, "%s\n", application_lock_error.c_str());
+    return 1;
+  }
+  const backupproject::ApplicationInstanceStatus application_lock_status =
+      application_lock.Acquire(application_lock_path, &application_lock_error);
+  if (application_lock_status !=
+      backupproject::ApplicationInstanceStatus::kAcquired) {
+    // 第二个 GUI：明确说清楚，然后退出。绝不建第二套 controller。
+    std::fprintf(stderr, "%s\n", application_lock_error.c_str());
+    return application_lock_status ==
+                   backupproject::ApplicationInstanceStatus::kAlreadyRunning
+               ? backupproject::kApplicationAlreadyRunningExitCode
+               : 1;
+  }
 
   qInstallMessageHandler(MessageHandler);
 
@@ -1649,17 +3139,37 @@ int main(int argc, char* argv[]) {
   // 配置路径在这里定型：正常启动是 AppConfigLocation/config.json，
   // 自动测试用 --config-file 指到临时目录，绝不读写真实用户配置。
   const QString config_file_path = ResolveConfigFilePath(arguments);
-  backup_modern::BackupController controller(config_file_path);
+  // 一个进程内"同一时刻只有一个会改动持久状态的业务操作"的共享闸门。
+  // 两个控制器拿到的是同一个对象：手动备份/恢复/删除/改仓库与"后台评估 +
+  // 保存计划"互相排斥，由 C++ 保证，而不是靠 QML 把按钮置灰。
+  backup_modern::OperationGate operation_gate;
+  backup_modern::BackupController controller(config_file_path, &operation_gate);
+  // 计划存储文件与配置走同一套默认位置策略（见 app_paths.h）：
+  // backupctl schedule show 读到的就是这一份。
+  const QString schedule_file_path = ResolveScheduleFilePath(arguments);
+  // 定时备份的桥。它自己不做任何业务判断，全部转发给共享核心；
+  // 同时订阅 controller.busy，保证手动备份与计划备份不会同时写盘。
+  //
+  // 声明顺序不是随意的：QObject 上下文属性必须在 QML 引擎**之前**构造、
+  // 在它**之后**析构。反过来（引擎先析构）会让析构期间的绑定重算拿到一个
+  // 已经变成 null 的 schedule，冒出一屏 "Cannot read property of null"。
+  backup_modern::ScheduleController schedule_controller(
+      schedule_file_path, config_file_path, &controller, &operation_gate);
+  // 删除归档之后的计划状态同步走这条直接连接，而不是信号：BackupController
+  // 会在自己的删除闸门持有期内同步调用它，中间不给后台评估留窗口。
+  controller.SetArchiveDeletedObserver(&schedule_controller);
+  backup_modern::FilterRuleModel filter_rule_model(&controller);
 
   QQmlApplicationEngine engine;
   // 用上下文属性而不是注册 QML 类型：QML 侧直接写 theme.accent /
   // controller.busy， 不需要任何 import 声明，也就不会碰到模块路径问题。
   engine.rootContext()->setContextProperty(QStringLiteral("theme"), &theme);
-  backup_modern::FilterRuleModel filter_rule_model(&controller);
   engine.rootContext()->setContextProperty(QStringLiteral("controller"),
                                            &controller);
   engine.rootContext()->setContextProperty(QStringLiteral("filterRuleModel"),
                                            &filter_rule_model);
+  engine.rootContext()->setContextProperty(QStringLiteral("schedule"),
+                                           &schedule_controller);
   // 窗口用不用系统边框由 C++ 决定、QML 只读：窗口标志必须在窗口创建时定下来，
   // 之后再改会出现“已经画了一帧才换边框”的闪动。
   engine.rootContext()->setContextProperty(QStringLiteral("useNativeFrame"),
@@ -1679,6 +3189,23 @@ int main(int argc, char* argv[]) {
   // 已经建好的窗口，提前返回会让这两条路径测的不是真实情况。
   window->show();
   WaitForAnimation(200);
+
+  // 页面建好之后再启动计划：此时 QML 已经绑好了 schedule 的属性，
+  // 第一步读盘的结果能直接反映到界面上。
+  //
+  // 自检模式刻意不自动启动 runner：自检要自己控制每一步（从空 store 开始、
+  // 手动触发评估），自动 tick 会和它抢同一份状态。
+  if (schedule_test) {
+    return RunScheduleTest(&schedule_controller, &controller, config_file_path);
+  }
+  if (schedule_show) {
+    return RunScheduleShow(&schedule_controller);
+  }
+  if (preview_test_index >= 0) {
+    return RunPreviewTest(&filter_rule_model,
+                          arguments.at(preview_test_index + 1), arguments);
+  }
+  schedule_controller.start();
 
   if (self_test_index >= 0) {
     const int filter_status = ApplyFilterArguments(&controller, arguments);
@@ -1722,18 +3249,40 @@ int main(int argc, char* argv[]) {
     return RunCloseGuardTest(window, &controller);
   }
 
+  if (gui_contract_test) {
+    return RunGuiContractTest(window, &controller);
+  }
+
   if (smoke_test) {
-    // 四个页面都要真的被实例化并切换一次，两套主题也都要切到。
-    // 只把 kPageCount 改成 4 而不真正切页，等于根本没有验证新页面。
+    // 五个页面都要真的被实例化并切换一次，两套主题也都要切到。
+    // 只把 kPageCount 加一而不真正切页，等于根本没有验证新页面。
     for (int page = 0; page < kPageCount; ++page) {
       QTimer::singleShot(120 + page * 90, &app, [window, page]() {
         window->setProperty("currentPage", page);
       });
     }
     const int after_pages = 120 + kPageCount * 90;
-    QTimer::singleShot(after_pages, &app, [&theme]() { theme.toggle(); });
-    QTimer::singleShot(after_pages + 120, &app, [&theme]() { theme.toggle(); });
-    QTimer::singleShot(after_pages + 260, &app, &QCoreApplication::quit);
+
+    // 再把窗口缩到最小尺寸走一遍：窄窗口下的裁切、绑定循环、隐式高度为 0
+    // 都会以 QML 运行期警告的形式暴露出来，而 --smoke-test 把警告算成失败。
+    QTimer::singleShot(after_pages, &app, [window]() {
+      window->setWidth(960);
+      window->setHeight(620);
+    });
+    for (int page = 0; page < kPageCount; ++page) {
+      QTimer::singleShot(after_pages + 80 + page * 70, &app, [window, page]() {
+        window->setProperty("currentPage", page);
+      });
+    }
+    const int after_narrow = after_pages + 80 + kPageCount * 70;
+    QTimer::singleShot(after_narrow, &app, [window]() {
+      window->setWidth(1180);
+      window->setHeight(760);
+    });
+    QTimer::singleShot(after_narrow + 80, &app, [&theme]() { theme.toggle(); });
+    QTimer::singleShot(after_narrow + 220, &app,
+                       [&theme]() { theme.toggle(); });
+    QTimer::singleShot(after_narrow + 360, &app, &QCoreApplication::quit);
   }
 
   const int exit_code = app.exec();

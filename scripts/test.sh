@@ -34,6 +34,7 @@ set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "$BASH_SOURCE")/.." && pwd)"
 BACKUPCTL="$ROOT_DIR/build/backupctl"
+ARCHIVE_CLI="$ROOT_DIR/build/archive-cli"
 TEST_ROOT="$ROOT_DIR/testdata"
 SOURCE="$TEST_ROOT/source"
 ARCHIVE="$TEST_ROOT/backup.bak"
@@ -48,9 +49,11 @@ STATUS=0
 
 echo "[test] backup/restore suite (archive v0.1)"
 
-if [[ ! -x "$BACKUPCTL" ]]; then
-  echo "[test] backupctl is missing; building first..."
-  make -C "$ROOT_DIR"
+# archive-cli 是测试夹具，不在默认产品构建里（见 Makefile）：测试要自己显式
+# 构建它，而不是指望 make all 顺手产出。
+if [[ ! -x "$BACKUPCTL" || ! -x "$ARCHIVE_CLI" ]]; then
+  echo "[test] backupctl/archive-cli is missing; building first..."
+  make -C "$ROOT_DIR" all test-fixtures
 fi
 
 record_pass() {
@@ -66,11 +69,24 @@ record_fail() {
 # 用 timeout --signal=KILL：归档解析如果陷入死循环，SIGTERM 未必能叫停，
 # 直接 KILL 才能保证测试不会挂在这里。超时按 124 处理，算失败。
 #
-# 带硬超时地运行 backupctl：合并后的输出写进 OUT_FILE，
+# 带硬超时地运行 CLI：合并后的输出写进 OUT_FILE，
 # 退出码留在 STATUS（124 表示超时被杀）。
 run_backupctl() {
+  local binary="$BACKUPCTL"
+
+  # legacy 直连路径的 backup / restore（带 <backup_file> 参数的那种）由测试夹具
+  # archive-cli 执行，argv 与旧 backupctl 一字不差。裸的 backup / restore 没有
+  # 任何直接路径，它们是产品 CLI 的参数数量契约（对应 quality_test.sh 的
+  # US-05/US-06），其余子命令同样留在产品 CLI 上。
+  case "${1-}" in
+    backup|restore)
+      if [[ $# -gt 1 ]]; then
+        binary="$ARCHIVE_CLI"
+      fi
+      ;;
+  esac
   set +e
-  timeout --signal=KILL "$TIMEOUT_SECONDS" "$BACKUPCTL" "$@" >"$OUT_FILE" 2>&1
+  timeout --signal=KILL "$TIMEOUT_SECONDS" "$binary" "$@" >"$OUT_FILE" 2>&1
   STATUS=$?
   set -e
   if [[ $STATUS -eq 124 || $STATUS -eq 137 ]]; then
@@ -345,7 +361,7 @@ expect_failure "ER-12 archive parent path is a regular file" 1 \
 expect_failure "ER-13 destination cannot be created (parent is a file)" 1 \
   "blocker" restore "$ARCHIVE" "$TEST_ROOT/blocker/dest"
 
-expect_failure "ER-14 usage error returns 2" 2 "Usage:" backup "$SOURCE"
+expect_failure "ER-14 usage error returns 2" 2 "Usage" backup "$SOURCE"
 expect_failure "ER-15 unknown command returns 2" 2 "unknown command" \
   frobnicate a b
 
@@ -1199,11 +1215,836 @@ expect_same_sha256 "FIL-36 retained file is byte-identical after filtering" \
 expect_path_absent "FIL-37 filtered file is absent from the restored tree" \
   "$FIL/f36.out/c.log"
 
+# ---- L. Manual Backup 的筛选预览 ------------------------------------
+#
+# 这一段证明的是**三方一致**，而不是"某个函数返回了预期的值"：
+#
+#   CLI 预览      backupctl preview
+#   GUI 预览      build/backup-gui-modern --preview-test（界面真正的入口）
+#   真实备份      用同一组规则 backup 之后，把归档恢复出来数实际存在的节点
+#
+# GUI 二进制不存在时只跑 CLI 那一半（它属于 gui-modern 目标）。
+
+echo "[test] L. 筛选预览（CLI == GUI == 真实备份）"
+
+PREVIEW="$TEST_ROOT/preview"
+PREVIEW_GUI_BIN="$ROOT_DIR/build/backup-gui-modern"
+PREVIEW_CLI_OUT="$PREVIEW/cli.out"
+PREVIEW_CLI_ERR="$PREVIEW/cli.err"
+PREVIEW_GUI_OUT="$PREVIEW/gui.out"
+PREVIEW_GUI_ERR="$PREVIEW/gui.err"
+PREVIEW_DIFF="$PREVIEW/diff.txt"
+PREVIEW_SRC="$PREVIEW/src"
+PREVIEW_REPO="$PREVIEW/repo"
+PREVIEW_CONFIG="$PREVIEW/config.json"
+mkdir -p "$PREVIEW_SRC/sub" "$PREVIEW_SRC/build" "$PREVIEW_SRC/cache" \
+  "$PREVIEW_SRC/empty_dir" "$PREVIEW_REPO"
+
+printf 'aaa\n' > "$PREVIEW_SRC/a.txt"
+printf 'bbbbb\n' > "$PREVIEW_SRC/b.txt"
+printf 'notes\n' > "$PREVIEW_SRC/notes.md"
+printf 'obj\n' > "$PREVIEW_SRC/build/obj.o"
+printf 'ccc\n' > "$PREVIEW_SRC/sub/c.txt"
+printf 'big\n' > "$PREVIEW_SRC/sub/big.txt"
+printf 'tmp\n' > "$PREVIEW_SRC/cache/tmp.dat"
+
+"$BACKUPCTL" --config-file "$PREVIEW_CONFIG" config repository set "$PREVIEW_REPO" \
+  >/dev/null 2>&1
+
+PREVIEW_CLI_STATUS=0
+PREVIEW_GUI_STATUS=0
+run_preview_cli() {
+  set +e
+  timeout --signal=KILL "$TIMEOUT_SECONDS" "$BACKUPCTL" preview "$@" \
+    >"$PREVIEW_CLI_OUT" 2>"$PREVIEW_CLI_ERR"
+  PREVIEW_CLI_STATUS=$?
+  set -e
+}
+run_preview_gui() {
+  set +e
+  QT_QPA_PLATFORM=offscreen timeout --signal=KILL 180 "$PREVIEW_GUI_BIN" \
+    --preview-test "$@" >"$PREVIEW_GUI_OUT" 2>"$PREVIEW_GUI_ERR"
+  PREVIEW_GUI_STATUS=$?
+  set -e
+}
+# 预览输出 = 头部 + （可能一行 Note） + 每个 included 条目的相对路径。
+# 比较前排序：两边都按扫描顺序输出，但"顺序也一致"不该是这条断言的负担。
+preview_listed() {
+  grep -v '^Preview: ' "$1" | grep -v '^Note: ' | sort
+}
+# 恢复出来的树里所有节点（含目录）的相对路径。
+tree_nodes() {
+  ( cd "$1" && find . -mindepth 1 -printf '%P\n' | sort )
+}
+
+# CLI 预览 == GUI 预览：两条命令的输出逐行 diff。
+# 这是最直接的一条证据 —— 它不是"都调了同一个函数"，而是"命令行里看到的和
+# 界面上看到的一模一样"。
+# $2 是源目录：P7 的截断用例要换一个大目录，其它用例都用 $PREVIEW_SRC。
+expect_preview_parity_at() {
+  local name="$1"
+  local source="$2"
+  shift 2
+  run_preview_cli "$source" "$@"
+  if [[ $PREVIEW_CLI_STATUS -ne 0 ]]; then
+    record_fail "$name" \
+      "backupctl preview exit=$PREVIEW_CLI_STATUS: $(head -n 1 "$PREVIEW_CLI_ERR")"
+    return
+  fi
+  if [[ ! -x "$PREVIEW_GUI_BIN" ]]; then
+    record_pass "$name（CLI；没有 build/backup-gui-modern，跳过 GUI 对比）"
+    return
+  fi
+  run_preview_gui "$source" "$@"
+  if [[ $PREVIEW_GUI_STATUS -ne 0 ]]; then
+    record_fail "$name" \
+      "GUI preview exit=$PREVIEW_GUI_STATUS: $(head -n 1 "$PREVIEW_GUI_ERR")"
+    return
+  fi
+  if diff -u "$PREVIEW_CLI_OUT" "$PREVIEW_GUI_OUT" >"$PREVIEW_DIFF" 2>&1; then
+    record_pass "$name"
+  else
+    record_fail "$name" "$(head -n 6 "$PREVIEW_DIFF" | tr '\n' ' ')"
+  fi
+}
+
+expect_preview_parity() {
+  local name="$1"
+  shift
+  expect_preview_parity_at "$name" "$PREVIEW_SRC" "$@"
+}
+
+# 预览 == 真实备份：用同一组规则备份到仓库，恢复，比较节点集合。
+# $2 是源目录：grammar 用例各自有自己的树，不能都绑在 $PREVIEW_SRC 上。
+expect_preview_matches_backup_at() {
+  local name="$1"
+  local source="$2"
+  shift 2
+  run_preview_cli "$source" "$@"
+  if [[ $PREVIEW_CLI_STATUS -ne 0 ]]; then
+    record_fail "$name" "preview exit=$PREVIEW_CLI_STATUS"
+    return
+  fi
+  # 快照用文件而不是变量：仓库开始时是空的，空字符串会变成一个空行，
+  # 让 comm 多出一行"新文件名"。
+  find "$PREVIEW_REPO" -maxdepth 1 -name '*.bak' -printf '%f\n' | sort \
+    >"$PREVIEW/before.txt"
+  set +e
+  timeout --signal=KILL "$TIMEOUT_SECONDS" "$BACKUPCTL" \
+    --config-file "$PREVIEW_CONFIG" backup "$source" "$@" \
+    >"$PREVIEW/backup.log" 2>&1
+  local backup_status=$?
+  set -e
+  if [[ $backup_status -ne 0 ]]; then
+    record_fail "$name" "backup exit=$backup_status: $(head -n 1 "$PREVIEW/backup.log")"
+    return
+  fi
+  find "$PREVIEW_REPO" -maxdepth 1 -name '*.bak' -printf '%f\n' | sort \
+    >"$PREVIEW/after.txt"
+  local file_name
+  file_name="$(comm -13 "$PREVIEW/before.txt" "$PREVIEW/after.txt" | head -n 1)"
+  if [[ -z "$file_name" ]]; then
+    record_fail "$name" "仓库里没有新归档"
+    return
+  fi
+  rm -rf "$PREVIEW/restored"
+  set +e
+  timeout --signal=KILL "$TIMEOUT_SECONDS" "$BACKUPCTL" \
+    --config-file "$PREVIEW_CONFIG" restore "$file_name" "$PREVIEW/restored" \
+    >>"$PREVIEW/backup.log" 2>&1
+  local restore_status=$?
+  set -e
+  if [[ $restore_status -ne 0 ]]; then
+    record_fail "$name" "restore exit=$restore_status: $(tail -n 1 "$PREVIEW/backup.log")"
+    return
+  fi
+  if diff -u <(preview_listed "$PREVIEW_CLI_OUT") <(tree_nodes "$PREVIEW/restored") \
+    >"$PREVIEW_DIFF" 2>&1; then
+    record_pass "$name"
+  else
+    record_fail "$name" "$(head -n 6 "$PREVIEW_DIFF" | tr '\n' ' ')"
+  fi
+}
+
+expect_preview_matches_backup() {
+  local name="$1"
+  shift
+  expect_preview_matches_backup_at "$name" "$PREVIEW_SRC" "$@"
+}
+
+# P1 没有规则 / P2 单条件 / P3 一条规则内的 compound AND /
+# P4 include+exclude（exclude 优先）/ P5 被排除的目录整棵剪掉
+expect_preview_parity "PRV-01 P1 无规则：CLI 预览 == GUI 预览"
+expect_preview_matches_backup "PRV-02 P1 无规则：CLI 预览 == 真实备份条目"
+expect_preview_parity "PRV-03 P2 单条件 include：CLI == GUI" --include 'ext:txt'
+expect_preview_matches_backup "PRV-04 P2 单条件 include：CLI == 真实备份" --include 'ext:txt'
+expect_preview_parity "PRV-05 P3 compound AND：CLI == GUI" --include 'name:*.txt size:<5'
+expect_preview_matches_backup "PRV-06 P3 compound AND：CLI == 真实备份" \
+  --include 'name:*.txt size:<5'
+expect_preview_parity "PRV-07 P4 include+exclude：CLI == GUI" \
+  --include 'name:*.txt' --exclude 'name:b*'
+expect_preview_matches_backup "PRV-08 P4 include+exclude：CLI == 真实备份" \
+  --include 'name:*.txt' --exclude 'name:b*'
+expect_preview_parity "PRV-09 P5 被排除目录：CLI == GUI" --exclude 'name:build'
+expect_preview_matches_backup "PRV-10 P5 被排除目录：CLI == 真实备份" --exclude 'name:build'
+
+# P5b：排除项必须**真的不在**结果里。前两条只证明两边一致，这一条证明一致的
+# 方向是对的 —— 否则"两边都错误地包含了 build/"也会通过。
+run_preview_cli "$PREVIEW_SRC" --exclude 'name:build'
+if [[ $PREVIEW_CLI_STATUS -eq 0 ]] &&
+   ! preview_listed "$PREVIEW_CLI_OUT" | grep -q '^build'; then
+  record_pass "PRV-11 P5b 被排除目录及其子树不出现在预览里"
+else
+  record_fail "PRV-11 P5b 被排除目录及其子树不出现在预览里" \
+    "$(head -n 3 "$PREVIEW_CLI_OUT" | tr '\n' ' ')"
+fi
+
+# 预览是只读的：不建归档、不改仓库、不改配置。
+PREVIEW_LOCK_REPO_BEFORE="$(ls -1 "$PREVIEW_REPO" | sort | tr '\n' ' ')"
+PREVIEW_CFG_SUM="$(cksum "$PREVIEW_CONFIG" | cut -d' ' -f1)"
+run_preview_cli "$PREVIEW_SRC" --include 'ext:txt'
+PREVIEW_LOCK_REPO_AFTER="$(ls -1 "$PREVIEW_REPO" | sort | tr '\n' ' ')"
+if [[ $PREVIEW_CLI_STATUS -eq 0 &&
+      "$PREVIEW_LOCK_REPO_BEFORE" == "$PREVIEW_LOCK_REPO_AFTER" &&
+      "$PREVIEW_CFG_SUM" == "$(cksum "$PREVIEW_CONFIG" | cut -d' ' -f1)" ]]; then
+  record_pass "PRV-12 预览不创建归档、不改仓库、不改配置"
+else
+  record_fail "PRV-12 预览不创建归档、不改仓库、不改配置" \
+    "repo=[$PREVIEW_LOCK_REPO_AFTER]"
+fi
+
+# 预览**不需要**仓库：--help 与文档都这么承诺。这一条与 PRV-12 是两件事 ——
+# 那条说"不修改仓库"，这条说"没有仓库也能跑"。
+NOREPO_DIR="$PREVIEW/no-repo"
+mkdir -p "$NOREPO_DIR"
+NOREPO_CONFIG="$NOREPO_DIR/config.json"
+run_preview_cli "$PREVIEW_SRC" --include 'ext:txt' --config-file "$NOREPO_CONFIG"
+if [[ $PREVIEW_CLI_STATUS -eq 0 ]] &&
+   ! grep -q 'No backup repository is configured' "$PREVIEW_CLI_ERR"; then
+  record_pass "PRV-24 预览不需要配置仓库（没有 config.json 也能预览）"
+else
+  record_fail "PRV-24 预览不需要配置仓库" \
+    "exit=$PREVIEW_CLI_STATUS $(head -n 1 "$PREVIEW_CLI_ERR")"
+fi
+# 空配置必须真的是"没有仓库"，否则 PRV-24 就是空转：同一个配置下 backup
+# 必须明确拒绝，理由正是"没有配置仓库"。
+set +e
+timeout --signal=KILL "$TIMEOUT_SECONDS" "$BACKUPCTL" --config-file "$NOREPO_CONFIG" \
+  backup "$PREVIEW_SRC" >"$PREVIEW/no-repo-backup.log" 2>&1
+NOREPO_BACKUP_STATUS=$?
+set -e
+if [[ $NOREPO_BACKUP_STATUS -eq 1 ]] &&
+   grep -q 'No backup repository is configured' "$PREVIEW/no-repo-backup.log"; then
+  record_pass "PRV-25 同一份空配置下 backup 仍然被拒绝（PRV-24 不是空转）"
+else
+  record_fail "PRV-25 同一份空配置下 backup 仍然被拒绝" \
+    "exit=$NOREPO_BACKUP_STATUS $(head -n 1 "$PREVIEW/no-repo-backup.log")"
+fi
+
+# P6：非法规则 = 用法错误（2），在扫描之前返回，且不产生任何归档。
+expect_failure "PRV-13 P6 非法 DSL 是用例错误（exit 2）" 2 "Invalid filter rule" \
+  preview "$PREVIEW_SRC" --include 'nonsense:xx'
+# 语法错误的三种形态都必须是 2，而不是"忽略掉继续跑"。
+run_preview_cli "$PREVIEW_SRC" --include
+if [[ $PREVIEW_CLI_STATUS -eq 2 ]]; then
+  record_pass "PRV-14 P6 --include 缺少规则值是用法错误（exit 2）"
+else
+  record_fail "PRV-14 P6 --include 缺少规则值是用法错误" "exit=$PREVIEW_CLI_STATUS"
+fi
+run_preview_cli "$PREVIEW_SRC" --pack ustar
+if [[ $PREVIEW_CLI_STATUS -eq 2 ]]; then
+  record_pass "PRV-15 preview 不接受 pipeline 选项（exit 2）"
+else
+  record_fail "PRV-15 preview 不接受 pipeline 选项" "exit=$PREVIEW_CLI_STATUS"
+fi
+run_preview_cli "$PREVIEW_SRC" extra-positional
+if [[ $PREVIEW_CLI_STATUS -eq 2 ]]; then
+  record_pass "PRV-16 preview 拒绝多余的位置参数（exit 2）"
+else
+  record_fail "PRV-16 preview 拒绝多余的位置参数" "exit=$PREVIEW_CLI_STATUS"
+fi
+
+# 业务失败（源目录不存在）仍然是 1，与其它子命令一致。
+# 消息与真实 Backup 逐字一致（同一个 walker 的同一句原文），不再是 CLI 自己
+# 拼的一句话。
+expect_failure "PRV-17 源目录不存在是操作失败（exit 1）" 1 \
+  "Failed to inspect source directory" preview "$PREVIEW/nope"
+
+# P6b：非法规则在 GUI 与 CLI 得到**同一句**核心原文。
+if [[ -x "$PREVIEW_GUI_BIN" ]]; then
+  run_preview_cli "$PREVIEW_SRC" --include 'nonsense:xx'
+  run_preview_gui "$PREVIEW_SRC" --include 'nonsense:xx'
+  CLI_MESSAGE="$(head -n 1 "$PREVIEW_CLI_ERR")"
+  GUI_MESSAGE="$(head -n 1 "$PREVIEW_GUI_ERR")"
+  if [[ -n "$CLI_MESSAGE" && "$CLI_MESSAGE" == "$GUI_MESSAGE" ]]; then
+    record_pass "PRV-18 P6 GUI 与 CLI 报出同一句无效规则原文"
+  else
+    record_fail "PRV-18 P6 GUI 与 CLI 报出同一句无效规则原文" \
+      "cli=[$CLI_MESSAGE] gui=[$GUI_MESSAGE]"
+  fi
+fi
+
+# P7：超过预览窗口时 GUI 与 CLI 采用同一个截断契约（同一个 limit、同一行 Note）。
+PBIG="$PREVIEW/big"
+mkdir -p "$PBIG"
+for index in $(seq 1 320); do printf 'x' > "$PBIG/f$index.dat"; done
+run_preview_cli "$PBIG"
+# 计数是**完整实际备份遍历**的（320），窗口是前 300 个 preview entries：三个
+# 数字必须分开说——总数、窗口大小、窗口里列出来的匹配数。窗口大小不是匹配数，
+# 被剪枝的子树也不会被说成"检查过整棵源目录树"。
+if [[ $PREVIEW_CLI_STATUS -eq 0 ]] &&
+   grep -qF 'Preview: 320 matching item(s) in the effective backup selection.' "$PREVIEW_CLI_OUT" &&
+   grep -qF 'Note: showing matches found within the first 300 preview entries; the complete effective backup traversal was validated, 300 matching item(s) listed below.' "$PREVIEW_CLI_OUT"; then
+  record_pass "PRV-19 P7 超过窗口：总数 / 窗口大小 / 列出数三个数字分开说清楚"
+else
+  record_fail "PRV-19 P7 超过窗口：总数 / 列出数" \
+    "$(head -n 2 "$PREVIEW_CLI_OUT" | tr '\n' ' ')"
+fi
+# 旧文案是错的（下面两句都不许再出现）：它说"只检查了前 300 条"，而实际上整棵树都被检查过。
+if grep -qF 'first 300 of' "$PREVIEW_CLI_OUT" ||
+   grep -qF 'were examined' "$PREVIEW_CLI_OUT"; then
+  record_fail "PRV-19b 截断提示不再把窗口大小说成匹配数、也不再声称只检查了 300 条" \
+    "$(grep -E 'first 300 of|were examined' "$PREVIEW_CLI_OUT" | head -n 1)"
+else
+  record_pass "PRV-19b 截断提示不再把窗口大小说成匹配数、也不再声称只检查了 300 条"
+fi
+# GUI 打出来的那一行必须与 CLI 逐字一致（PRV-20 会 diff，这里额外钉住关键词）。
+# 先真的跑一次 GUI：不跑就会拿着上一条用例留下的输出做断言。
+if [[ -x "$PREVIEW_GUI_BIN" ]]; then
+  run_preview_gui "$PBIG"
+  if grep -qF 'the complete effective backup traversal was validated' "$PREVIEW_GUI_OUT" &&
+     grep -qF 'within the first 300 preview entries' "$PREVIEW_GUI_OUT" &&
+     ! grep -qF 'first 300 of' "$PREVIEW_GUI_OUT" &&
+     ! grep -qF 'were examined' "$PREVIEW_GUI_OUT"; then
+    record_pass "PRV-19c GUI 的截断提示与 CLI 同义（traversal / preview entries）"
+  else
+    record_fail "PRV-19c GUI 的截断提示与 CLI 同义" \
+      "$(grep -E 'Note:' "$PREVIEW_GUI_OUT" | head -n 1)"
+  fi
+fi
+expect_preview_parity_at "PRV-20 P7 截断契约在 GUI 与 CLI 上一致" "$PBIG"
+
+# ---- L.4c 窗口大小 != 匹配数：三个数字必须分开报 ----
+#
+# 窗口 = 遍历顺序里的前 300 个 preview entries（included / excluded / pruned 都
+# 占位）；included_count = 完整实际备份遍历里的匹配数；窗口里列出来的匹配项数
+# 又是第三个数字。下面两个形状让这三个数字互不相等。
+#
+# 窗口装不下时 preview_listed 与整棵恢复树本来就不同（这正是窗口的定义），
+# 所以这里不比列表，只比"预览第一行报的匹配总数"与"真实备份真的产出多少条目"。
+# $1 = 用例名，$2 = 源目录，$3 = 期望条目数，其余 = 规则
+expect_preview_total_matches_backup() {
+  local name="$1"
+  local source="$2"
+  local expected="$3"
+  shift 3
+  run_preview_cli "$source" "$@"
+  if [[ $PREVIEW_CLI_STATUS -ne 0 ]]; then
+    record_fail "$name" "preview exit=$PREVIEW_CLI_STATUS"
+    return
+  fi
+  find "$PREVIEW_REPO" -maxdepth 1 -name '*.bak' -printf '%f\n' | sort \
+    >"$PREVIEW/before.txt"
+  set +e
+  timeout --signal=KILL "$TIMEOUT_SECONDS" "$BACKUPCTL" \
+    --config-file "$PREVIEW_CONFIG" backup "$source" "$@" \
+    >"$PREVIEW/total-backup.log" 2>&1
+  local backup_status=$?
+  set -e
+  if [[ $backup_status -ne 0 ]]; then
+    record_fail "$name" \
+      "backup exit=$backup_status: $(head -n 1 "$PREVIEW/total-backup.log")"
+    return
+  fi
+  find "$PREVIEW_REPO" -maxdepth 1 -name '*.bak' -printf '%f\n' | sort \
+    >"$PREVIEW/after.txt"
+  local file_name
+  file_name="$(comm -13 "$PREVIEW/before.txt" "$PREVIEW/after.txt" | head -n 1)"
+  if [[ -z "$file_name" ]]; then
+    record_fail "$name" "仓库里没有新归档"
+    return
+  fi
+  rm -rf "$PREVIEW/restored-total"
+  set +e
+  timeout --signal=KILL "$TIMEOUT_SECONDS" "$BACKUPCTL" \
+    --config-file "$PREVIEW_CONFIG" restore "$file_name" "$PREVIEW/restored-total" \
+    >>"$PREVIEW/total-backup.log" 2>&1
+  local restore_status=$?
+  set -e
+  if [[ $restore_status -ne 0 ]]; then
+    record_fail "$name" "restore exit=$restore_status"
+    return
+  fi
+  local nodes
+  nodes="$(tree_nodes "$PREVIEW/restored-total" | wc -l)"
+  if [[ "$nodes" -eq "$expected" ]] &&
+     grep -qF "Preview: $expected matching item(s) in the effective backup selection." \
+       "$PREVIEW_CLI_OUT"; then
+    record_pass "$name"
+  else
+    record_fail "$name" \
+      "backup nodes=$nodes expected=$expected: $(head -n 1 "$PREVIEW_CLI_OUT")"
+  fi
+}
+
+# 形状 1：前 300 条按名字全部被 exclude，真正会进归档的 10 条排在窗口之外。
+#   included_count = 10；窗口 = 300 个 preview entries；窗口里的 matching = 0。
+# 旧文案在这里会打印 "showing the first 300 of 10 matching item(s)"：既把窗口
+# 大小说成了匹配数，又和"301 项之后仍在继续验证"的事实打架。
+PWEX="$PREVIEW/window-excluded"
+rm -rf "$PWEX"
+mkdir -p "$PWEX"
+for index in $(seq 1 300); do printf 'x' > "$PWEX/aaa$(printf '%03d' "$index").dat"; done
+for index in $(seq 1 10); do printf 'x' > "$PWEX/zzz$(printf '%02d' "$index").dat"; done
+run_preview_cli "$PWEX" --exclude 'name:aaa*'
+if [[ $PREVIEW_CLI_STATUS -eq 0 ]] &&
+   grep -qF 'Preview: 10 matching item(s) in the effective backup selection.' "$PREVIEW_CLI_OUT" &&
+   grep -qF 'within the first 300 preview entries' "$PREVIEW_CLI_OUT" &&
+   grep -qF '0 matching item(s) listed below.' "$PREVIEW_CLI_OUT" &&
+   ! grep -qF 'first 300 of 10 matching item(s)' "$PREVIEW_CLI_OUT" &&
+   ! grep -qF 'were examined' "$PREVIEW_CLI_OUT"; then
+  record_pass "PRV-42 300 条被排除 + 10 条 included：总数 10 / 窗口 300 / 列出 0"
+else
+  record_fail "PRV-42 300 excluded + 10 included 的文案" \
+    "$(head -n 2 "$PREVIEW_CLI_OUT" | tr '\n' ' ')"
+fi
+# 窗口里一条匹配项都没有：结果列表必须是空的（excluded 不冒充匹配项）。
+if [[ -z "$(preview_listed "$PREVIEW_CLI_OUT")" ]]; then
+  record_pass "PRV-42b 窗口里 0 条 matching：列出的路径也是空的"
+else
+  record_fail "PRV-42b 窗口里 0 条 matching：列出的路径也是空的" \
+    "$(preview_listed "$PREVIEW_CLI_OUT" | head -n 3 | tr '\n' ' ')"
+fi
+# 但真实备份确实产出 10 条：预览报的 10 是"完整遍历"的数字，窗口不影响它。
+expect_preview_total_matches_backup \
+  "PRV-42c 窗口里 0 条 matching，总数 10 == 真实备份的 10 条" "$PWEX" 10 \
+  --exclude 'name:aaa*'
+expect_preview_parity_at "PRV-42d 同一个形状：GUI 与 CLI 逐字一致" "$PWEX" \
+  --exclude 'name:aaa*'
+
+# 形状 2：前 250 条 included + 50 条 excluded + 末尾 20 条 included。
+#   included_count = 270；窗口 = 300 个 preview entries；窗口里的 matching = 250。
+# 三个数字互不相等，任何"用其中一个冒充另一个"的文案都会露馅。
+PWMX="$PREVIEW/window-mixed"
+rm -rf "$PWMX"
+mkdir -p "$PWMX"
+for index in $(seq 1 250); do printf 'x' > "$PWMX/aaa$(printf '%03d' "$index").dat"; done
+for index in $(seq 1 50); do printf 'x' > "$PWMX/mmm$(printf '%03d' "$index").dat"; done
+for index in $(seq 1 20); do printf 'x' > "$PWMX/zzz$(printf '%02d' "$index").dat"; done
+run_preview_cli "$PWMX" --exclude 'name:mmm*'
+PVL_MIXED_LISTED="$(preview_listed "$PREVIEW_CLI_OUT")"
+if [[ $PREVIEW_CLI_STATUS -eq 0 ]] &&
+   grep -qF 'Preview: 270 matching item(s) in the effective backup selection.' "$PREVIEW_CLI_OUT" &&
+   grep -qF 'within the first 300 preview entries' "$PREVIEW_CLI_OUT" &&
+   grep -qF '250 matching item(s) listed below.' "$PREVIEW_CLI_OUT" &&
+   [[ "$(printf '%s\n' "$PVL_MIXED_LISTED" | wc -l)" -eq 250 ]] &&
+   [[ "$(printf '%s\n' "$PVL_MIXED_LISTED" | head -n 1)" == "aaa001.dat" ]] &&
+   [[ "$(printf '%s\n' "$PVL_MIXED_LISTED" | tail -n 1)" == "aaa250.dat" ]]; then
+  record_pass "PRV-43 混合窗口：总数 270 / 窗口 300 / 列出 250（三个数字互不相等）"
+else
+  record_fail "PRV-43 混合窗口的三个数字" \
+    "$(head -n 2 "$PREVIEW_CLI_OUT" | tr '\n' ' ') listed=$(printf '%s\n' "$PVL_MIXED_LISTED" | wc -l)"
+fi
+expect_preview_parity_at "PRV-43b 混合窗口：GUI 与 CLI 逐字一致" "$PWMX" \
+  --exclude 'name:mmm*'
+expect_preview_total_matches_backup \
+  "PRV-43c 混合窗口：总数 270 == 真实备份的 270 条" "$PWMX" 270 \
+  --exclude 'name:mmm*'
+
+# ---- L.5 源目录语义 / socket / 顺序：预览与备份必须是同一个结论 ----
+
+# 预览与真实 Backup 共用同一份遍历（source_tree_walker），所以下面每一条都是
+# "同一个问题问两次"：一次问 preview，一次问 backup，答案必须一样。
+PVSEM="$PREVIEW/semantics"
+rm -rf "$PVSEM"
+mkdir -p "$PVSEM/real-src" "$PVSEM/sock-src/sub" "$PVSEM/order-src"
+printf 'a\n' > "$PVSEM/real-src/a.txt"
+printf 'a\n' > "$PVSEM/sock-src/a.txt"
+printf 'b\n' > "$PVSEM/sock-src/sub/b.txt"
+ln -s "$PVSEM/real-src" "$PVSEM/link-src"
+python3 -c "import socket,sys; s=socket.socket(socket.AF_UNIX); s.bind(sys.argv[1])" \
+  "$PVSEM/sock-src/sub/sock"
+"$BACKUPCTL" --config-file "$PREVIEW_CONFIG" config repository set "$PREVIEW_REPO" \
+  >/dev/null 2>&1
+
+# PRV-26 源目录是 symlink-to-directory：预览拒绝，理由与备份一致。
+run_preview_cli "$PVSEM/link-src"
+PVL_LINK_STATUS=$PREVIEW_CLI_STATUS
+PVL_LINK_MESSAGE="$(head -n 1 "$PREVIEW_CLI_ERR")"
+set +e
+"$BACKUPCTL" --config-file "$PREVIEW_CONFIG" backup "$PVSEM/link-src" \
+  >"$PVSEM/link-backup.log" 2>&1
+PVL_LINK_BACKUP=$?
+set -e
+if [[ $PVL_LINK_STATUS -eq 1 && $PVL_LINK_BACKUP -eq 1 ]] &&
+   grep -qF "Source is not a directory" "$PVSEM/link-backup.log" &&
+   [[ "$PVL_LINK_MESSAGE" == *"Source is not a directory"* ]]; then
+  record_pass "PRV-26 symlink 源目录：预览与备份都拒绝且同一句原文"
+else
+  record_fail "PRV-26 symlink 源目录：预览与备份都拒绝" \
+    "preview=$PVL_LINK_STATUS[$PVL_LINK_MESSAGE] backup=$PVL_LINK_BACKUP"
+fi
+
+# PRV-27 没有被排除的 socket：预览必须 blocked（exit 1 + 说清后果），
+# 真实备份必须失败，两边第一行是同一句核心原文。
+run_preview_cli "$PVSEM/sock-src"
+PVL_SOCK_STATUS=$PREVIEW_CLI_STATUS
+PVL_SOCK_MESSAGE="$(head -n 1 "$PREVIEW_CLI_ERR")"
+set +e
+"$BACKUPCTL" --config-file "$PREVIEW_CONFIG" backup "$PVSEM/sock-src" \
+  >"$PVSEM/sock-backup.log" 2>&1
+PVL_SOCK_BACKUP=$?
+set -e
+if [[ $PVL_SOCK_STATUS -eq 1 && $PVL_SOCK_BACKUP -eq 1 ]] &&
+   grep -qF "Unsupported special type: socket" "$PVSEM/sock-backup.log" &&
+   [[ "$PVL_SOCK_MESSAGE" == *"Unsupported special type: socket"* ]] &&
+   grep -qF "Backup would fail unless this entry is excluded." "$PREVIEW_CLI_OUT"; then
+  record_pass "PRV-27 未排除的 socket：预览 exit 1 且说明备份会失败"
+else
+  record_fail "PRV-27 未排除的 socket：预览 exit 1" \
+    "preview=$PVL_SOCK_STATUS[$PVL_SOCK_MESSAGE] backup=$PVL_SOCK_BACKUP"
+fi
+
+if [[ -x "$PREVIEW_GUI_BIN" ]]; then
+  run_preview_gui "$PVSEM/sock-src"
+  if [[ $PREVIEW_GUI_STATUS -eq 1 ]] &&
+     [[ "$(head -n 1 "$PREVIEW_GUI_ERR")" == "$PVL_SOCK_MESSAGE" ]] &&
+     grep -qF "Backup would fail unless this entry is excluded." "$PREVIEW_GUI_OUT"; then
+    record_pass "PRV-28 未排除的 socket：GUI 与 CLI 同一句、同一个 exit"
+  else
+    record_fail "PRV-28 未排除的 socket：GUI 与 CLI 一致" \
+      "gui=$PREVIEW_GUI_STATUS[$(head -n 1 "$PREVIEW_GUI_ERR")] cli=[$PVL_SOCK_MESSAGE]"
+  fi
+fi
+
+# PRV-29 明确排除 socket：预览成功、备份成功、结果里没有 socket。
+expect_preview_parity "PRV-29 排除 socket：CLI == GUI" --exclude 'name:sock'
+expect_preview_matches_backup "PRV-29b 排除 socket：CLI 预览 == 真实备份" \
+  --exclude 'name:sock'
+run_preview_cli "$PVSEM/sock-src" --exclude 'name:sock'
+if [[ $PREVIEW_CLI_STATUS -eq 0 ]] &&
+   ! preview_listed "$PREVIEW_CLI_OUT" | grep -q 'sock'; then
+  record_pass "PRV-29c 被排除的 socket 不出现在预览结果里"
+else
+  record_fail "PRV-29c 被排除的 socket 不出现在预览结果里" \
+    "$(head -n 3 "$PREVIEW_CLI_OUT" | tr '\n' ' ')"
+fi
+
+# PRV-30 顺序：创建顺序故意与 lexical 顺序相反，逐行比较**不排序**的输出。
+POUT="$PVSEM/order-src"
+for name in zulu.txt mike.txt alpha.txt yankee.txt bravo.txt; do
+  printf 'x\n' > "$POUT/$name"
+done
+mkdir -p "$POUT/nested" "$POUT/alpha-dir"
+printf 'x\n' > "$POUT/nested/inner.txt"
+printf 'x\n' > "$POUT/alpha-dir/deep.txt"
+cat > "$PVSEM/expected-order.txt" <<'PEOF'
+Preview: 9 matching item(s) in the effective backup selection.
+alpha-dir
+alpha-dir/deep.txt
+alpha.txt
+bravo.txt
+mike.txt
+nested
+nested/inner.txt
+yankee.txt
+zulu.txt
+PEOF
+run_preview_cli "$POUT"
+if [[ $PREVIEW_CLI_STATUS -eq 0 ]] &&
+   diff -u "$PVSEM/expected-order.txt" "$PREVIEW_CLI_OUT" > "$PVSEM/order.diff" 2>&1; then
+  record_pass "PRV-30 遍历顺序是每层 lexical 的 DFS 先序（逐行比较，未排序）"
+else
+  record_fail "PRV-30 遍历顺序是每层 lexical 的 DFS 先序" \
+    "$(head -n 6 "$PVSEM/order.diff" | tr '\n' ' ')"
+fi
+expect_preview_parity_at "PRV-30b GUI 与 CLI 的顺序逐行一致（未排序）" "$POUT"
+
+# PRV-31 第 301 个条目是 socket：300 项的窗口不能把它掩盖掉。
+PWIN="$PVSEM/window-src"
+mkdir -p "$PWIN"
+for index in $(seq 1 300); do printf 'x' > "$PWIN/f$(printf '%03d' "$index").dat"; done
+python3 -c "import socket,sys; s=socket.socket(socket.AF_UNIX); s.bind(sys.argv[1])" \
+  "$PWIN/zzz-socket"
+run_preview_cli "$PWIN"
+PVL_WIN_STATUS=$PREVIEW_CLI_STATUS
+set +e
+"$BACKUPCTL" --config-file "$PREVIEW_CONFIG" backup "$PWIN" \
+  >"$PVSEM/window-backup.log" 2>&1
+PVL_WIN_BACKUP=$?
+set -e
+if [[ $PVL_WIN_STATUS -eq 1 && $PVL_WIN_BACKUP -eq 1 ]] &&
+   grep -qF "zzz-socket" "$PREVIEW_CLI_ERR" &&
+   grep -qF "zzz-socket" "$PVSEM/window-backup.log"; then
+  record_pass "PRV-31 第 301 条的 socket 不被 300 项窗口掩盖"
+else
+  record_fail "PRV-31 第 301 条的 socket 不被窗口掩盖" \
+    "preview=$PVL_WIN_STATUS[$(head -n 1 "$PREVIEW_CLI_ERR")] backup=$PVL_WIN_BACKUP"
+fi
+if [[ -x "$PREVIEW_GUI_BIN" ]]; then
+  run_preview_gui "$PWIN"
+  if [[ $PREVIEW_GUI_STATUS -eq 1 ]] &&
+     [[ "$(head -n 1 "$PREVIEW_GUI_ERR")" == "$(head -n 1 "$PREVIEW_CLI_ERR")" ]]; then
+    record_pass "PRV-31b 同一个窗口外 socket 在 GUI 上也 blocked"
+  else
+    record_fail "PRV-31b 同一个窗口外 socket 在 GUI 上也 blocked" \
+      "gui=$PREVIEW_GUI_STATUS[$(head -n 1 "$PREVIEW_GUI_ERR")]"
+  fi
+fi
+
+# ---- L.5b 归档路径 grammar：预览与备份必须用同一套判断 ----
+#
+# Linux 允许文件名里出现反斜杠，也允许 "C:note.txt" 这种形状；归档格式两者都
+# 不接受。共享 walker 现在在生成 archive-relative path 之后调用的是完整
+# IsValidArchivePath，所以这类名字必须在**同一层**就让预览失败，而不是等真实
+# 备份去报错。
+PG="$PREVIEW/grammar"
+rm -rf "$PG"
+mkdir -p "$PG/backslash" "$PG/drive" "$PG/legal"
+mkdir -p "$PG/backslash-dir/dir\name"
+
+printf 'x\n' > "$PG/backslash/a\b.txt"
+printf 'x\n' > "$PG/backslash-dir/dir\name/file.txt"
+printf 'x\n' > "$PG/drive/C:note.txt"
+printf 'x\n' > "$PG/legal/a_b.txt"
+printf 'x\n' > "$PG/legal/a-b.txt"
+printf 'x\n' > "$PG/legal/a.b.txt"
+printf 'x\n' > "$PG/legal/中文.txt"
+printf 'x\n' > "$PG/legal/space name.txt"
+
+# PTH-04：合法 Linux 文件名不能被新增的 grammar 检查误伤。预览必须成功、
+# 备份必须成功，而且两者看到的是同一批条目。
+expect_preview_parity_at "PRV-32 PTH-04 合法文件名：CLI == GUI" "$PG/legal"
+run_preview_cli "$PG/legal"
+PVL_LEGAL_STATUS=$PREVIEW_CLI_STATUS
+PG_REPO_BEFORE="$(find "$PREVIEW_REPO" -maxdepth 1 -name '*.bak' -printf '%f\n' | sort)"
+set +e
+timeout --signal=KILL "$TIMEOUT_SECONDS" "$BACKUPCTL" --config-file "$PREVIEW_CONFIG" \
+  backup "$PG/legal" >"$PG/legal-backup.log" 2>&1
+PVL_LEGAL_BACKUP=$?
+set -e
+if [[ $PVL_LEGAL_STATUS -eq 0 && $PVL_LEGAL_BACKUP -eq 0 ]] &&
+   grep -qF 'Preview: 5 matching item(s)' "$PREVIEW_CLI_OUT" &&
+   ! grep -qF 'Invalid archive path' "$PG/legal-backup.log"; then
+  record_pass "PRV-32b PTH-04 合法文件名：预览与备份都成功（5 项）"
+else
+  record_fail "PRV-32b PTH-04 合法文件名：预览与备份都成功" \
+    "preview=$PVL_LEGAL_STATUS backup=$PVL_LEGAL_BACKUP $(head -n 1 "$PG/legal-backup.log")"
+fi
+
+# 逐个非法形状：预览与真实备份必须一起失败，并且说同一句话。
+# $1 = 用例号/说明，$2 = 源目录，$3 = 期望在错误里出现的片段
+expect_grammar_rejected() {
+  local label="$1"
+  local source="$2"
+  run_preview_cli "$source"
+  local preview_status=$PREVIEW_CLI_STATUS
+  local preview_message
+  preview_message="$(head -n 1 "$PREVIEW_CLI_ERR")"
+  set +e
+  timeout --signal=KILL "$TIMEOUT_SECONDS" "$BACKUPCTL" --config-file "$PREVIEW_CONFIG" \
+    backup "$source" >"$PG/backup.log" 2>&1
+  local backup_status=$?
+  set -e
+  if [[ $preview_status -eq 1 && $backup_status -eq 1 ]] &&
+     grep -qF "Invalid archive path" "$PREVIEW_CLI_ERR" &&
+     grep -qF "Invalid archive path" "$PG/backup.log" &&
+     diff <(echo "$preview_message" | sed 's/^Error: //') \
+          <(head -n 1 "$PG/backup.log" | sed 's/^Error: //') >/dev/null; then
+    record_pass "$label：预览与备份同一句拒绝（$preview_message）"
+  else
+    record_fail "$label：预览与备份同一句拒绝" \
+      "preview=$preview_status[$preview_message] backup=$backup_status[$(head -n 1 "$PG/backup.log")]"
+  fi
+  if [[ -x "$PREVIEW_GUI_BIN" ]]; then
+    run_preview_gui "$source"
+    if [[ $PREVIEW_GUI_STATUS -eq 1 ]] &&
+       [[ "$(head -n 1 "$PREVIEW_GUI_ERR")" == "$preview_message" ]]; then
+      record_pass "$label：GUI 与 CLI 同一句"
+    else
+      record_fail "$label：GUI 与 CLI 同一句" \
+        "gui=[$(head -n 1 "$PREVIEW_GUI_ERR")] cli=[$preview_message]"
+    fi
+  fi
+}
+
+# 三次被拒绝的备份都不能留下新归档：快照要取在这三次之前。
+PG_REPO_BEFORE="$(find "$PREVIEW_REPO" -maxdepth 1 -name '*.bak' -printf '%f\n' | sort)"
+expect_grammar_rejected "PRV-33 PTH-01 文件名含反斜杠" "$PG/backslash"
+expect_grammar_rejected "PRV-34 PTH-02 目录名含反斜杠" "$PG/backslash-dir"
+expect_grammar_rejected "PRV-35 PTH-03 盘符风格文件名" "$PG/drive"
+
+# 拒绝之后不能留下半成品归档：用前后快照比较，不依赖时间戳。
+PG_REPO_AFTER="$(find "$PREVIEW_REPO" -maxdepth 1 -name '*.bak' -printf '%f\n' | sort)"
+if [[ "$PG_REPO_BEFORE" == "$PG_REPO_AFTER" ]]; then
+  record_pass "PRV-35b 被 grammar 拒绝的备份没有留下任何新归档"
+else
+  record_fail "PRV-35b 被 grammar 拒绝的备份没有留下任何新归档" \
+    "before=[$PG_REPO_BEFORE] after=[$PG_REPO_AFTER]"
+fi
+
+# ---- L.5c 完整 archive grammar 只在"真的会进归档"时才要求 ----
+#
+# 历史 Backup 的顺序是"Filter 先决定这条进不进归档，进了才校验路径"。所以一个
+# 会被规则排除的非法名字**不能**阻塞整次备份/预览——这正是 FILT-PATH-02/04/05b
+# 与 SOCK-PATH-02 要钉的东西。
+
+# PRV-36 被排除的反斜杠文件名：两边都成功，且它不在结果里。
+expect_preview_matches_backup_at "PRV-36 FILT-PATH-02 被排除的反斜杠文件名不阻塞" \
+  "$PG/backslash" --exclude 'ext:txt'
+run_preview_cli "$PG/backslash" --exclude 'ext:txt'
+if [[ $PREVIEW_CLI_STATUS -eq 0 ]] &&
+   ! preview_listed "$PREVIEW_CLI_OUT" | grep -q 'b.txt'; then
+  record_pass "PRV-36b 被排除的反斜杠文件不出现在预览结果里"
+else
+  record_fail "PRV-36b 被排除的反斜杠文件不出现在预览结果里" \
+    "$(head -n 3 "$PREVIEW_CLI_OUT" | tr '\n' ' ')"
+fi
+
+# PRV-37 被排除的反斜杠目录：整棵子树剪掉，两边都成功。
+expect_preview_matches_backup_at "PRV-37 FILT-PATH-04 被排除的反斜杠目录整棵剪掉" \
+  "$PG/backslash-dir" --exclude 'name:*name'
+run_preview_cli "$PG/backslash-dir" --exclude 'name:*name'
+if [[ $PREVIEW_CLI_STATUS -eq 0 ]] &&
+   ! preview_listed "$PREVIEW_CLI_OUT" | grep -q 'file.txt' &&
+   ! grep -qF 'Invalid archive path' "$PREVIEW_CLI_ERR"; then
+  record_pass "PRV-37b 整棵子树被剪掉且没有出现语法错误"
+else
+  record_fail "PRV-37b 整棵子树被剪掉且没有出现语法错误" \
+    "exit=$PREVIEW_CLI_STATUS $(head -n 1 "$PREVIEW_CLI_ERR")"
+fi
+
+# PRV-38 被排除的盘符风格文件名：两边都成功。
+expect_preview_matches_backup_at "PRV-38 FILT-PATH-05b 被排除的 C:note.txt 不阻塞" \
+  "$PG/drive" --exclude 'ext:txt'
+
+# PRV-39 socket 的错误优先级：名字里带反斜杠也一样。
+PSOCK="$PG/socket"
+rm -rf "$PSOCK"; mkdir -p "$PSOCK"
+printf 'x\n' > "$PSOCK/keep.txt"
+python3 -c "import socket,sys; s=socket.socket(socket.AF_UNIX); s.bind(sys.argv[1])" \
+  "$PSOCK/sock\bad"
+run_preview_cli "$PSOCK"
+PSOCK_PREVIEW=$PREVIEW_CLI_STATUS
+PSOCK_MESSAGE="$(head -n 1 "$PREVIEW_CLI_ERR")"
+set +e
+timeout --signal=KILL "$TIMEOUT_SECONDS" "$BACKUPCTL" --config-file "$PREVIEW_CONFIG" \
+  backup "$PSOCK" > "$PG/socket-backup.log" 2>&1
+PSOCK_BACKUP=$?
+set -e
+if [[ $PSOCK_PREVIEW -eq 1 && $PSOCK_BACKUP -eq 1 ]] &&
+   [[ "$PSOCK_MESSAGE" == *"Unsupported special type: socket"* ]] &&
+   [[ "$PSOCK_MESSAGE" != *"Invalid archive path"* ]] &&
+   grep -qF "Unsupported special type: socket" "$PG/socket-backup.log" &&
+   ! grep -qF "Invalid archive path" "$PG/socket-backup.log"; then
+  record_pass "PRV-39 SOCK-PATH-01 非法名 socket 仍然报 socket 不支持（优先级保持）"
+else
+  record_fail "PRV-39 SOCK-PATH-01 非法名 socket 的优先级" \
+    "preview=$PSOCK_PREVIEW[$PSOCK_MESSAGE] backup=$PSOCK_BACKUP"
+fi
+if [[ -x "$PREVIEW_GUI_BIN" ]]; then
+  run_preview_gui "$PSOCK"
+  if [[ $PREVIEW_GUI_STATUS -eq 1 ]] &&
+     [[ "$(head -n 1 "$PREVIEW_GUI_ERR")" == "$PSOCK_MESSAGE" ]]; then
+    record_pass "PRV-39b GUI 与 CLI 对非法名 socket 报同一句"
+  else
+    record_fail "PRV-39b GUI 与 CLI 对非法名 socket 报同一句" \
+      "gui=[$(head -n 1 "$PREVIEW_GUI_ERR")] cli=[$PSOCK_MESSAGE]"
+  fi
+fi
+
+# PRV-40 明确排除这个 socket：两边都成功，它不进入结果。
+expect_preview_matches_backup_at "PRV-40 SOCK-PATH-02 被排除的非法名 socket 不阻塞" \
+  "$PSOCK" --exclude 'name:sock*'
+
+# PRV-41 超长 child path：长度是遍历阶段的硬边界（历史语义），即使规则会把它
+# 排除，也照样失败。用 chdir + 相对路径构造，任何一次 syscall 都不超 PATH_MAX。
+PLONG="$PG/too-long/src"
+rm -rf "$PG/too-long"; mkdir -p "$PLONG"
+python3 - "$PLONG" <<'PYEOF'
+import os, sys
+src = sys.argv[1]
+os.chdir(src)
+component = 'd' * 190
+relative = 0
+while relative < 3900:
+    os.makedirs(component, exist_ok=True)
+    os.chdir(component)
+    relative += 1 + len(component)
+open('v' * 200, 'w').write('x')
+PYEOF
+run_preview_cli "$PLONG" --exclude 'name:vvv*'
+PLONG_STATUS=$PREVIEW_CLI_STATUS
+set +e
+timeout --signal=KILL "$TIMEOUT_SECONDS" "$BACKUPCTL" --config-file "$PREVIEW_CONFIG" \
+  backup "$PLONG" --exclude 'name:vvv*' > "$PG/toolong-backup.log" 2>&1
+PLONG_BACKUP=$?
+set -e
+if [[ $PLONG_STATUS -eq 1 && $PLONG_BACKUP -eq 1 ]] &&
+   grep -qF "Archive path too long" "$PREVIEW_CLI_ERR" &&
+   grep -qF "Archive path too long" "$PG/toolong-backup.log"; then
+  record_pass "PRV-41 超长 child path 即使被排除也照样失败（历史 early 语义）"
+else
+  record_fail "PRV-41 超长 child path 的历史 early 语义" \
+    "preview=$PLONG_STATUS[$(head -n 1 "$PREVIEW_CLI_ERR")] backup=$PLONG_BACKUP"
+fi
+rm -rf "$PG/too-long"
+
+# L.6 单实例：preview 是产品命令，必须在进入扫描之前被同一把锁拒绝。
+# "只读所以可以并发"不是这个产品的规则。
+PLOCK="$PREVIEW/lock"
+mkdir -p "$PLOCK/src" "$PLOCK/repo"
+printf 'w\n' > "$PLOCK/src/a.txt"
+"$BACKUPCTL" --config-file "$PLOCK/config.json" config repository set "$PLOCK/repo" \
+  >/dev/null 2>&1
+"$BACKUPCTL" --config-file "$PLOCK/config.json" --schedule-file "$PLOCK/schedule.json" \
+  schedule set --source "$PLOCK/src" --interval-minutes 5 --retain 2 >/dev/null 2>&1
+APP_LOCK="/run/user/$(id -u)/backup-project.lock"
+[ -d "/run/user/$(id -u)" ] || APP_LOCK="/tmp/backup-project-$(id -u).lock"
+"$BACKUPCTL" --config-file "$PLOCK/config.json" --schedule-file "$PLOCK/schedule.json" \
+  schedule watch >"$PLOCK/watch.log" 2>&1 &
+PLOCK_WATCH=$!
+PLOCK_HOLD=0
+for _ in $(seq 1 100); do
+  if kill -0 "$PLOCK_WATCH" 2>/dev/null &&
+     grep -q "^pid=$PLOCK_WATCH " "$APP_LOCK" 2>/dev/null; then
+    PLOCK_HOLD=1
+    break
+  fi
+  sleep 0.1
+done
+run_preview_cli "$PREVIEW_SRC" --include 'ext:txt'
+if [[ $PLOCK_HOLD -eq 1 && $PREVIEW_CLI_STATUS -eq 3 &&
+      ! -s "$PREVIEW_CLI_OUT" ]]; then
+  record_pass "PRV-21 单实例：CLI 持锁时 preview 退出 3 且不扫描（无输出）"
+else
+  record_fail "PRV-21 单实例：CLI 持锁时 preview 退出 3 且不扫描" \
+    "hold=$PLOCK_HOLD exit=$PREVIEW_CLI_STATUS out=$(wc -c < "$PREVIEW_CLI_OUT")"
+fi
+if [[ -x "$PREVIEW_GUI_BIN" ]]; then
+  run_preview_gui "$PREVIEW_SRC" --include 'ext:txt'
+  if [[ $PREVIEW_GUI_STATUS -eq 3 ]]; then
+    record_pass "PRV-22 单实例：同一个锁也拦住 GUI 的预览入口"
+  else
+    record_fail "PRV-22 单实例：同一个锁也拦住 GUI 的预览入口" \
+      "exit=$PREVIEW_GUI_STATUS $(head -n 1 "$PREVIEW_GUI_ERR")"
+  fi
+fi
+kill -TERM "$PLOCK_WATCH" 2>/dev/null || true
+for _ in $(seq 1 100); do kill -0 "$PLOCK_WATCH" 2>/dev/null || break; sleep 0.1; done
+wait "$PLOCK_WATCH" 2>/dev/null || true
+run_preview_cli "$PREVIEW_SRC" --include 'ext:txt'
+if [[ $PREVIEW_CLI_STATUS -eq 0 ]]; then
+  record_pass "PRV-23 持锁进程退出之后 preview 又能跑（锁由内核释放）"
+else
+  record_fail "PRV-23 持锁进程退出之后 preview 又能跑" "exit=$PREVIEW_CLI_STATUS"
+fi
+
 # ---- CLI 约定 --------------------------------------------------------
 
 expect_success "CLI-01 --help exits 0" --help
 run_backupctl --help
-if grep -qF "backup_file" "$OUT_FILE"; then
+if grep -qF "file_name" "$OUT_FILE"; then
   record_pass "CLI-02 help text uses the archive file wording"
 else
   record_fail "CLI-02 help text uses the archive file wording" "not found"

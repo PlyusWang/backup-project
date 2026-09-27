@@ -6,6 +6,7 @@
 #include "filter_rule_builder.h"
 
 #include <cstdio>
+#include <utility>
 
 namespace backupproject {
 namespace {
@@ -354,6 +355,11 @@ bool ToDsl(const FilterClauseDraft& clause, std::string* dsl,
 
 bool ToDsl(const FilterRuleDraft& rule, std::string* dsl,
            std::string* error_message) {
+  // 高级入口优先：raw_dsl 就是这条规则的完整定义。
+  if (!rule.raw_dsl.empty()) {
+    if (dsl != nullptr) *dsl = rule.raw_dsl;
+    return true;
+  }
   if (rule.clauses.empty()) {
     if (error_message != nullptr) *error_message = "规则至少需要一个子条件";
     return false;
@@ -433,6 +439,12 @@ std::string SummarizeClause(const FilterClauseDraft& clause) {
 }
 
 std::string Summarize(const FilterRuleDraft& rule) {
+  if (!rule.raw_dsl.empty()) {
+    // 高级规则原样展示：界面不该假装自己读懂了用户写的 DSL。
+    if (rule.action == FilterAction::kInclude)
+      return "包含（高级）：" + rule.raw_dsl;
+    return "排除（高级）：" + rule.raw_dsl;
+  }
   std::string text;
   for (std::size_t i = 0; i < rule.clauses.size(); ++i) {
     if (i != 0) text += "，且";
@@ -440,6 +452,20 @@ std::string Summarize(const FilterRuleDraft& rule) {
   }
   if (rule.action == FilterAction::kInclude) return "包含：" + text;
   return "排除：" + text;
+}
+
+bool BuildFilterFromDrafts(const std::vector<FilterRuleDraft>& rules,
+                           Filter* filter, std::string* error_message) {
+  // 与 CliArguments 走同一套序列化：GUI 预览与 "复制为 CLI 参数" 不可能给出
+  // 不同的规则文本。
+  Filter built;
+  for (const FilterRuleDraft& rule : rules) {
+    std::string dsl;
+    if (!ToDsl(rule, &dsl, error_message)) return false;
+    if (!built.AddRule(rule.action, dsl, error_message)) return false;
+  }
+  if (filter != nullptr) *filter = std::move(built);
+  return true;
 }
 
 std::vector<std::string> CliArguments(

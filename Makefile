@@ -7,8 +7,10 @@ TARGET := $(BUILD_DIR)/backupctl
 
 APP_SOURCES := app/backupctl.cpp
 CORE_SOURCES := src/core/archive_entry.cpp src/core/archive_pipeline.cpp \
-                src/core/backup_engine.cpp src/core/file_io.cpp \
-                src/core/tree_scanner.cpp src/core/user_directory.cpp src/archive/archive.cpp \
+                src/core/backup_engine.cpp src/core/backup_preview.cpp \
+                src/core/file_io.cpp \
+                src/core/tree_scanner.cpp src/core/source_tree_walker.cpp \
+                src/core/user_directory.cpp src/archive/archive.cpp \
                 src/archive/archive_path.cpp src/archive/container_format.cpp \
                 src/archive/mypack_v2.cpp src/archive/pack_stream.cpp \
                 src/archive/ustar.cpp src/catalog/backup_catalog.cpp \
@@ -17,18 +19,69 @@ CORE_SOURCES := src/core/archive_entry.cpp src/core/archive_pipeline.cpp \
                 src/crypto/des.cpp src/crypto/hmac.cpp src/crypto/pbkdf2.cpp \
                 src/crypto/random.cpp src/crypto/sha256.cpp \
                 src/filter/filter.cpp src/filter/filter_rule_builder.cpp
+
+
+# PR #17：定时备份 + 变化检测 + retention 的共享核心。
+# 这些源文件都是 Qt 无关的纯 C++17，CLI 与 Modern GUI 共用同一份，
+# 所以它们属于 CORE_SOURCES，而不是某个前端的目标。
+CORE_SOURCES += src/core/backup_mode.cpp \
+                src/core/backup_option_keys.cpp \
+                src/core/simple_json.cpp \
+                src/platform/app_paths.cpp \
+                src/platform/file_lock.cpp \
+                src/platform/application_instance_lock.cpp \
+                src/scheduler/source_manifest.cpp \
+                src/scheduler/schedule_store.cpp \
+                src/scheduler/scheduled_backup_service.cpp \
+                src/scheduler/scheduler_lock.cpp \
+                src/cli/terminal_secret.cpp \
+                src/cli/cli_commands.cpp
+
 FILESYSTEM_SOURCES := src/filesystem/file_system.cpp
 SOURCES := $(APP_SOURCES) $(CORE_SOURCES) $(FILESYSTEM_SOURCES)
 OBJECTS := $(patsubst %.cpp,$(BUILD_DIR)/%.o,$(SOURCES))
 DEPENDS := $(OBJECTS:.o=.d)
 
-.PHONY: all debug sanitize test gui gui-modern gui-all clean
+# ---- 归档格式的测试夹具（不是产品命令）----
+#
+# 产品 CLI 与 Modern GUI 一样是 repository-driven：归档名由 BackupCatalog 在
+# 配置好的仓库里生成，调用方不能指定任意路径。但归档格式本身（v0.1 legacy /
+# v2 container）的端到端回归需要"写到指定路径、再从这个路径恢复"，所以那部分
+# 能力搬到了这个独立可执行文件里。
+#
+# 它**不在默认构建目标里**：普通的 make / make all / make gui-all 是产品构建，
+# 不该产出一个用户看不懂、也不该去用的可执行文件。需要它的测试自己显式构建：
+#
+#   make test-fixtures                     # 普通构建目录
+#   make sanitize                          # 顺带构建 build-sanitize 的那一份
+#
+# 它不出现在 backupctl --help 里，不参与 GUI/CLI parity，也不是用户功能，
+# 也不拿产品单实例锁（它不是产品前端）。
+FIXTURE_TARGET := $(BUILD_DIR)/archive-cli
+FIXTURE_SOURCES := tests/tools/archive_cli.cpp
+FIXTURE_OBJECTS := $(patsubst %.cpp,$(BUILD_DIR)/%.o,$(FIXTURE_SOURCES))
+# CORE_OBJECTS 在下面才定义（GUI 那一段），这里显式算一份同样的集合：
+# 目标的前置条件在解析这条规则时就要展开，用后面的变量会拿到空值。
+FIXTURE_CORE_OBJECTS := $(patsubst %.cpp,$(BUILD_DIR)/%.o,$(CORE_SOURCES) $(FILESYSTEM_SOURCES))
+DEPENDS += $(FIXTURE_OBJECTS:.o=.d)
 
+.PHONY: all debug sanitize test test-fixtures gui gui-modern gui-all clean
+
+# 产品构建：只有产品前端。archive-cli 是测试夹具，见上面的说明。
 all: $(TARGET)
 
 $(TARGET): $(OBJECTS)
 	@mkdir -p $(BUILD_DIR)
 	$(CXX) $(CXXFLAGS) $(OBJECTS) -o $(TARGET)
+
+# 显式构建测试夹具。测试脚本用它，产品构建不用它。
+test-fixtures: $(FIXTURE_TARGET)
+
+# 与 backupctl 共享同一份 CORE_SOURCES：夹具调用的就是产品用的引擎与读写器，
+# 不存在"测试用另一套实现"。
+$(FIXTURE_TARGET): $(FIXTURE_OBJECTS) $(FIXTURE_CORE_OBJECTS)
+	@mkdir -p $(BUILD_DIR)
+	$(CXX) $(CXXFLAGS) $(FIXTURE_OBJECTS) $(CORE_OBJECTS) -o $@
 
 $(BUILD_DIR)/%.o: %.cpp
 	@mkdir -p $(dir $@)
@@ -40,8 +93,10 @@ debug:
 	@$(MAKE) BUILD_DIR=build-debug CXXFLAGS="$(CXXFLAGS) -g" all
 
 # AddressSanitizer + UndefinedBehaviorSanitizer build.
+# sanitize 是测试用的构建，所以顺带把测试夹具也建出来（脚本里的 sanitizer
+# 维度要跑它）。产品构建（all）里没有这一条。
 sanitize:
-	@$(MAKE) BUILD_DIR=build-sanitize CXXFLAGS="$(CXXFLAGS) -g -O1 -fsanitize=address,undefined -fno-omit-frame-pointer" all
+	@$(MAKE) BUILD_DIR=build-sanitize CXXFLAGS="$(CXXFLAGS) -g -O1 -fsanitize=address,undefined -fno-omit-frame-pointer" all test-fixtures
 
 test: all
 	@bash scripts/test.sh

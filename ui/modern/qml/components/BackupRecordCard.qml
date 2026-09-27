@@ -49,6 +49,10 @@ Rectangle {
     required property string encryptionMethodText
     // 加密备份恢复时需要密码。它只决定交互：恢复能不能成由核心裁决。
     required property bool passwordRequired
+    // 来源（手动备份 / 定时备份）与计划快照的变化摘要。
+    // 两者都来自 ScheduleStore，QML 不解析文件名也不自己推断。
+    required property string originText
+    required property string scheduledChangesText
     property bool busy: false
 
     // 卡片本地的加密恢复状态。两者都在密码对话框关闭时清空。
@@ -136,6 +140,17 @@ Rectangle {
             text: card.hasPipelineMethods ? card.packMethodText + " · " + card.compressionMethodText + " · " + card.encryptionMethodText : ""
             font.pixelSize: 15
             color: theme.textPrimary
+            wrapMode: Text.WordWrap
+        }
+
+        // 来源 + 计划变化摘要。变化摘要只有 managed 的计划快照才有，
+        // 手动备份这一栏是空的 —— 不显示"0 新增 0 修改"这种没有意义的噪声。
+        Text {
+            objectName: "backupRecordOrigin"
+            Layout.fillWidth: true
+            text: card.originText + (card.scheduledChangesText !== "" ? "  ·  " + card.scheduledChangesText : "")
+            font.pixelSize: 15
+            color: theme.textSecondary
             wrapMode: Text.WordWrap
         }
 

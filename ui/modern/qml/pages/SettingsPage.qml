@@ -142,7 +142,10 @@ Item {
             }
 
             StatusBanner {
+                objectName: "settingsStatusBanner"
                 Layout.fillWidth: true
+                pageScope: "settings"
+                scope: controller.statusScope
                 kind: controller.statusKind
                 title: controller.statusTitle
                 message: controller.statusMessage
