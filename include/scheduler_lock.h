@@ -8,17 +8,20 @@
 //   同时另一个终端在跑 backupctl schedule watch
 //
 // 这两个进程都觉得自己该跑，结果就是同一时刻两份备份在写同一个仓库。
-// 本 PR 不要求做完整的分布式锁，但也不能对多进程边界完全无感，所以：
 //
-//   * schedule store 本身是 atomic write（ScheduleStore 负责）；
-//   * scheduler 每次运行前先抢这把 flock；
-//   * 抢不到的一方明确显示"计划任务已由另一进程持有"，而不是也去备份一遍。
+// **产品层的多进程问题已经不由这把锁负责了**：整个产品只允许一个进程
+// （见 application_instance_lock.h），GUI 与 backupctl 在进入任何业务逻辑之前
+// 就已经互相排斥。这把锁因此退化成 scheduler 内部的 defense in depth：
 //
-// 刻意不做的事：
-//   * 不做 pidfile 清理协议、不做超时踢锁——flock 随进程退出（甚至崩溃）自动
-//     释放，这正是选它而不是选"写一个 pid 文件"的原因；
-//   * 不把锁文件内容当成真相。里面的 pid/时间只是给人看的提示，
-//     权限判断永远来自 flock 本身。
+//   * 它守的是"同一个进程里如果将来出现第二个 runner，也不会并发写仓库"；
+//   * 单元测试仍然直接用它来验证"抢不到锁就不跑"，那是它的真实语义；
+//   * 跨进程的 schedule watch vs schedule watch 现在**首先**被
+//     ApplicationInstanceLock 拒绝，看到的是"已有另一个实例"，不是这条消息。
+//
+// 锁顺序固定：ApplicationInstanceLock -> SchedulerLock。
+//
+// 锁机制（flock / O_NOFOLLOW / fstat 普通文件）统一实现在 file_lock.h，
+// 这里只负责 scheduler 自己的措辞与"谁在跑"的含义。
 //
 // 本文件是纯 C++17 + POSIX：不依赖 Qt。
 
@@ -26,6 +29,8 @@
 #define BACKUP_PROJECT_INCLUDE_SCHEDULER_LOCK_H_
 
 #include <string>
+
+#include "file_lock.h"
 
 namespace backupproject {
 
@@ -42,16 +47,15 @@ class SchedulerLock {
   // 但两种情况的返回值都是 false——调用方看 error_message 区分。
   bool Acquire(const std::string& lock_file_path, std::string* error_message);
 
-  bool held() const { return fd_ >= 0; }
+  bool held() const { return lock_.held(); }
 
   // 锁文件里的提示文本（"pid=… started_at=…"）。仅供展示。
-  std::string ReadOwnerHint() const;
+  std::string ReadOwnerHint() const { return lock_.ReadOwnerHint(); }
 
-  void Release();
+  void Release() { lock_.Release(); }
 
  private:
-  int fd_ = -1;
-  std::string lock_file_path_;
+  FileLock lock_;
 };
 
 }  // namespace backupproject
