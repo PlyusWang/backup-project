@@ -32,6 +32,13 @@ std::string Describe(int error_number, const std::string& action,
   return action + ": " + path + ": " + std::strerror(error_number);
 }
 
+// ASCII 空白。刻意不用 std::isspace：它受 locale 影响，而"数字选项"的解析
+// 规则必须是全局一致的。
+bool IsAsciiSpace(char character) {
+  return character == ' ' || character == '\t' || character == '\n' ||
+         character == '\r' || character == '\f' || character == '\v';
+}
+
 bool ContainsNul(const std::string& value) {
   return value.find('\0') != std::string::npos;
 }
@@ -277,12 +284,20 @@ bool ParseBoundedScheduleNumber(const std::string& text, std::uint32_t minimum,
     SetError(error_message, "Schedule number output must not be null");
     return false;
   }
-  if (text.empty()) {
+  // 前后空白由**这里**统一处理：CLI 把 argv 原样送进来，GUI
+  // 把文本框原样送进来， 两边都不做预处理。少了这一条，" 5 " 会在 GUI
+  // 被接受、被 CLI 拒绝—— 同一个输入两个前端给不同结论，正是要收掉的那类漂移。
+  std::size_t begin = 0;
+  std::size_t end = text.size();
+  while (begin < end && IsAsciiSpace(text[begin])) ++begin;
+  while (end > begin && IsAsciiSpace(text[end - 1])) --end;
+  const std::string trimmed = text.substr(begin, end - begin);
+  if (trimmed.empty()) {
     SetError(error_message, option + " needs a number");
     return false;
   }
   std::uint64_t result = 0;
-  for (const char character : text) {
+  for (const char character : trimmed) {
     if (character < '0' || character > '9') {
       SetError(
           error_message,

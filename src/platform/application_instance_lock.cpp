@@ -4,9 +4,12 @@
 
 #include "application_instance_lock.h"
 
+#include <sys/stat.h>
+#include <sys/types.h>
+#include <unistd.h>
+
 #include <string>
 
-#include "app_paths.h"
 #include "file_io.h"
 
 namespace backupproject {
@@ -16,8 +19,33 @@ void SetError(std::string* error_message, const std::string& text) {
   if (error_message != nullptr) *error_message = text;
 }
 
-// 锁文件名。固定一个常量，GUI 与 CLI 共用一个字面量。
-constexpr const char* kApplicationLockFileName = "app.lock";
+// 锁文件名。固定一个常量，两个前端共用一个字面量。
+constexpr const char* kApplicationLockFileName = "backup-project.lock";
+
+std::string UidText(uid_t uid) {
+  return std::to_string(static_cast<unsigned long long>(uid));
+}
+
+// per-user runtime 目录（通常是 /run/user/<uid>）能不能安全地放产品锁。
+//
+// 四条都要满足，任何一条不满足就退到 UID 专属的 fallback：
+//   * 存在，而且是**真目录**（lstat 先挡住符号链接，stat 再确认目录本身）；
+//   * 属主是当前 uid（别人的目录我们不能写，也不该往里面放东西）；
+//   * 属主可写（0700 的正常情况；只读挂载就退 fallback）。
+bool IsUsableRuntimeDirectory(const std::string& path, uid_t uid) {
+  struct stat link_status;
+  if (::lstat(path.c_str(), &link_status) != 0) return false;
+  if (S_ISLNK(link_status.st_mode)) return false;
+  if (!S_ISDIR(link_status.st_mode)) return false;
+  if (link_status.st_uid != uid) return false;
+  if ((link_status.st_mode & S_IWUSR) == 0) return false;
+
+  struct stat real_status;
+  if (::stat(path.c_str(), &real_status) != 0) return false;
+  if (!S_ISDIR(real_status.st_mode)) return false;
+  if (real_status.st_uid != uid) return false;
+  return true;
+}
 
 }  // namespace
 
@@ -60,18 +88,42 @@ ApplicationInstanceStatus ApplicationInstanceLock::Acquire(
   return ApplicationInstanceStatus::kError;
 }
 
-bool DefaultApplicationInstanceLockPath(std::string* path,
-                                        std::string* error_message) {
+bool ResolveApplicationLockPath(uid_t uid, const std::string& runtime_root,
+                                const std::string& fallback_root,
+                                std::string* path, std::string* error_message) {
   if (path == nullptr) {
     SetError(error_message, "Application lock path output must not be null");
     return false;
   }
   path->clear();
-  // AppConfigFilePath 会拒绝含 '/' 的文件名，也保证 GUI / CLI 同源。
-  if (!AppConfigFilePath(kApplicationLockFileName, path, error_message)) {
+  if (runtime_root.empty() || fallback_root.empty()) {
+    SetError(error_message, "Application lock roots must not be empty");
     return false;
   }
+
+  const std::string runtime_dir = runtime_root + "/" + UidText(uid);
+  if (IsUsableRuntimeDirectory(runtime_dir, uid)) {
+    *path = runtime_dir + "/" + kApplicationLockFileName;
+    return true;
+  }
+
+  // fallback：UID 专属文件名，放在 sticky 的 fallback 根目录下。
+  //
+  // 这里**不**用 mkstemp 那种随机名：锁必须有一个所有进程都能算出来的固定
+  // 位置，否则两个进程各锁各的。安全性由两件事保证：
+  //   * FileLock 打开时 O_NOFOLLOW + fstat 普通文件；
+  //   * 打开之后属主必须等于 geteuid()——别的用户抢先占住这个名字时直接
+  //     fail closed，既不跟随也不覆盖。
+  if (!EnsurePrivateDirectory(fallback_root, error_message)) return false;
+  *path = fallback_root + "/backup-project-" + UidText(uid) + ".lock";
   return true;
+}
+
+bool DefaultApplicationInstanceLockPath(std::string* path,
+                                        std::string* error_message) {
+  // 只认 uid：不读 HOME、不读 XDG_CONFIG_HOME、不看仓库与任何命令行参数。
+  return ResolveApplicationLockPath(::getuid(), "/run/user", "/tmp", path,
+                                    error_message);
 }
 
 }  // namespace backupproject

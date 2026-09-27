@@ -90,6 +90,20 @@ FileLockStatus FileLock::Acquire(const std::string& lock_file_path,
                                 FileTypeText(status) + ": " + lock_file_path);
     return FileLockStatus::kError;
   }
+  // 属主必须是本人。产品锁可能落在 sticky 的 /tmp 那类目录里：别的用户完全
+  // 可以先创建同名文件。那时正确的行为是 fail closed——绝不去 flock 一个
+  // 别人控制的 inode（对方可以随时删掉它让锁失效），更不会去覆盖它。
+  if (status.st_uid != ::geteuid()) {
+    ::close(fd);
+    SetError(
+        error_message,
+        "Refusing to use the lock file because it is owned by uid " +
+            std::to_string(static_cast<unsigned long long>(status.st_uid)) +
+            " instead of this user (uid " +
+            std::to_string(static_cast<unsigned long long>(::geteuid())) +
+            "): " + lock_file_path);
+    return FileLockStatus::kError;
+  }
 
   // LOCK_NB 是刻意的：等待会把 GUI 的事件循环或 watch 的 tick 卡住，
   // 而"另一个进程正在跑"本来就是需要如实报告的一种正常状态。

@@ -40,12 +40,16 @@ bool IsZeroField(const unsigned char* block, std::size_t offset,
   return true;
 }
 
-// PKCS#7 一定补 1..8 个字节，所以 DES-CBC 之后的长度是 8 的倍数且严格更大。
-std::uint64_t DesPaddedSize(std::uint64_t plain_size) {
-  return (plain_size / 8 + 1) * 8;
+}  // namespace
+
+bool IsAllowedStreamSize(std::uint64_t size) {
+  return size <= container_v2::kMaxStreamSize;
 }
 
-}  // namespace
+std::uint64_t DesPaddedSize(std::uint64_t plain_size) {
+  if (plain_size > UINT64_MAX - 8) return UINT64_MAX;
+  return (plain_size / 8 + 1) * 8;
+}
 
 const char* CompressionMethodName(CompressionMethod method) {
   switch (method) {
@@ -121,6 +125,24 @@ bool EncodeContainerHeader(const ContainerHeader& header, std::string* out,
       header.auth_tag.size() > container_v2::kAuthTagSize ||
       header.payload_sha256.size() > container_v2::kSha256Size) {
     SetError(error_message, "Internal error: container header field too long");
+    return false;
+  }
+  // 写侧也必须守同一条边界：读侧会拒收任何一个 size 超过 kMaxStreamSize 的
+  // 容器，所以写侧就不能把它产出来。少了这一步，writer 能写出一个自己
+  // reader 随后拒绝的 .bak —— 用户会拿到一份"备份成功但恢复不了"的归档。
+  //
+  // 这一步发生在打开任何输出文件**之前**（调用方先去 workspace 里写），
+  // 所以失败时不会有半成品 final archive，也不会有任何 state/catalog 变更。
+  if (!IsAllowedStreamSize(header.packed_size) ||
+      !IsAllowedStreamSize(header.compressed_size) ||
+      !IsAllowedStreamSize(header.payload_size)) {
+    SetError(error_message,
+             "Refusing to write a container whose stream exceeds the format "
+             "limit of " +
+                 std::to_string(container_v2::kMaxStreamSize) +
+                 " bytes (packed=" + std::to_string(header.packed_size) +
+                 ", compressed=" + std::to_string(header.compressed_size) +
+                 ", payload=" + std::to_string(header.payload_size) + ")");
     return false;
   }
   out->clear();
@@ -309,9 +331,9 @@ bool DecodeContainerHeader(const unsigned char* block, std::size_t size,
   }
 
   // ---- 三个 size 字段的关系 ----
-  if (decoded.packed_size > container_v2::kMaxStreamSize ||
-      decoded.compressed_size > container_v2::kMaxStreamSize ||
-      decoded.payload_size > container_v2::kMaxStreamSize) {
+  if (!IsAllowedStreamSize(decoded.packed_size) ||
+      !IsAllowedStreamSize(decoded.compressed_size) ||
+      !IsAllowedStreamSize(decoded.payload_size)) {
     SetError(error_message, "Container stream size is implausibly large");
     return false;
   }

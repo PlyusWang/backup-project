@@ -30,6 +30,8 @@
 #ifndef BACKUP_PROJECT_INCLUDE_APPLICATION_INSTANCE_LOCK_H_
 #define BACKUP_PROJECT_INCLUDE_APPLICATION_INSTANCE_LOCK_H_
 
+#include <sys/types.h>
+
 #include <string>
 
 #include "file_lock.h"
@@ -74,11 +76,30 @@ class ApplicationInstanceLock {
   FileLock lock_;
 };
 
-// 产品默认的全局实例锁路径：<AppConfigDirectory>/app.lock。
+// 产品全局实例锁的路径解析。
 //
-// AppConfigDirectory 由 app_paths.h 解析（XDG_CONFIG_HOME / HOME），GUI 与
-// CLI 用的是同一个函数，所以两边算出来的锁路径不可能不一样。
-// 解析不出来（HOME 与 XDG_CONFIG_HOME 都不可用）时返回 false。
+// 只依赖**当前 Unix UID + 固定产品身份**，不依赖任何可变的环境或参数：
+//
+//   * HOME / XDG_CONFIG_HOME —— 依赖它，同一个用户换一个环境变量就能开第二个
+//     实例，那就不叫"整个产品只允许一个进程"了；
+//   * repository / --config-file / --schedule-file / cwd —— 同理。
+//
+// 依次尝试：
+//   1. <runtime_root>/<uid>/backup-project.lock   例如
+//   /run/user/1000/backup-project.lock
+//      只在该目录存在、是真目录（不是符号链接）、属主是 uid、属主可写时使用；
+//   2. <fallback_root>/backup-project-<uid>.lock  例如
+//   /tmp/backup-project-1000.lock
+//      fallback 目录通常是 sticky 的 /tmp：别的用户可能抢先占住这个文件名，
+//      这种情况由 FileLock 的"属主必须是本人"检查 fail closed，绝不跟随/覆盖。
+//
+// uid 与两个根目录都是显式参数，所以这条决策可以被单元测试完整覆盖，
+// 不需要伪造 /run/user 或第二个用户。
+bool ResolveApplicationLockPath(uid_t uid, const std::string& runtime_root,
+                                const std::string& fallback_root,
+                                std::string* path, std::string* error_message);
+
+// 产品默认：ResolveApplicationLockPath(getuid(), "/run/user", "/tmp")。
 bool DefaultApplicationInstanceLockPath(std::string* path,
                                         std::string* error_message);
 
