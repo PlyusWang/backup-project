@@ -31,6 +31,13 @@ const char kRunning[] = "running";
 const char kSuccess[] = "success";
 const char kError[] = "error";
 
+// 状态消息的归属页面，取值与 QML 里各页 StatusBanner 的 pageScope 一一对应。
+// 与 severity 正交：同一个 scope 下 idle / running / success / error 走完全
+// 相同的生命周期。空串表示全局（启动期失败、空闲基线），每一页都能显示。
+const char kScopeBackup[] = "backup";
+const char kScopeSettings[] = "settings";
+const char kScopeManagement[] = "management";
+
 // 文件大小的展示文本。格式化放在 C++ 这层，QML 不需要自己实现一套单位换算。
 QString FormatSize(std::uint64_t bytes) {
   constexpr double kKilo = 1024.0;
@@ -233,6 +240,9 @@ BackupController::BackupController(const QString& config_file_path,
         const OperationOutcome outcome = watcher_.result();
         const Kind kind = active_kind_;
         const QString file_name = active_file_name_;
+        // 完成提示沿用发起这次操作时记录的 scope：即使用户已经切到别的页面，
+        // 这条消息也只会在原来的页面上显示。
+        status_scope_ = active_scope_;
         last_succeeded_ = outcome.succeeded;
         // 先放开闸门再清 busy_：busyChanged 会触发 ScheduleController 的补跑，
         // 那一步必须看到闸门已经空了，否则补跑又要排一次 pending。
@@ -334,6 +344,8 @@ QUrl BackupController::directoryDialogStartUrl(const QString& path) const {
 
 bool BackupController::addFilterRule(const QString& action,
                                      const QString& rule) {
+  // 规则编辑器只存在于备份页，所以它产生的提示也只属于备份页。
+  status_scope_ = QString::fromLatin1(kScopeBackup);
   FilterAction filter_action = FilterAction::kInclude;
   QStringList* target = nullptr;
   if (action == QStringLiteral("include")) {
@@ -410,6 +422,8 @@ bool BackupController::BuildFilter(Filter* filter,
 // ---- 启动时读配置 ----
 
 void BackupController::LoadConfig() {
+  // 启动期读配置失败是全局状态：那时还没有"当前页面"这回事。
+  status_scope_.clear();
   backupproject::AppConfig config;
   std::string error_message;
   switch (config_manager_.Load(&config, &error_message)) {
@@ -494,6 +508,8 @@ CatalogOutcome BackupController::RunCatalogList(const QString& repository) {
 // ---- 保存 repository 设置 ----
 
 bool BackupController::saveRepositoryPath(const QString& path) {
+  // 保存仓库是设置页的动作。
+  status_scope_ = QString::fromLatin1(kScopeSettings);
   // 改仓库会写 config.json，并让之后所有备份落到另一个地方。它同样是一个
   // "会改动持久状态"的业务操作，所以在评估在飞的时候必须被拒绝。
   OperationGuard guard(operation_gate_, OperationGate::Kind::kRepositoryChange);
@@ -565,6 +581,8 @@ bool BackupController::startBackupWithOptions(const QString& pack_key,
                                               const QString& encryption_key,
                                               const QString& password,
                                               const QString& confirm_password) {
+  // 备份页的动作：成功 / 失败 / 校验提示都只属于备份页。
+  status_scope_ = QString::fromLatin1(kScopeBackup);
   if (busy_) {
     return false;
   }
@@ -663,6 +681,8 @@ bool BackupController::startBackupWithOptions(const QString& pack_key,
 
 bool BackupController::startManagedRestore(const QString& file_name,
                                            const QString& destination_path) {
+  // 恢复是"备份管理"页里的动作。
+  status_scope_ = QString::fromLatin1(kScopeManagement);
   if (busy_) {
     return false;
   }
@@ -722,6 +742,8 @@ bool BackupController::startManagedRestore(const QString& file_name,
 bool BackupController::startManagedRestoreWithPassword(
     const QString& file_name, const QString& destination_path,
     const QString& password) {
+  // 与不带密码的那个入口同属"备份管理"页。
+  status_scope_ = QString::fromLatin1(kScopeManagement);
   if (busy_) {
     return false;
   }
@@ -775,6 +797,8 @@ bool BackupController::startManagedRestoreWithPassword(
 }
 
 bool BackupController::deleteBackup(const QString& file_name) {
+  // 删除也是"备份管理"页里的动作。
+  status_scope_ = QString::fromLatin1(kScopeManagement);
   // 删除会同时改两处持久状态：仓库里的文件与 ScheduleStore 的 managed 名单。
   // 整个动作（含最后那步 reconcile）都在同一持有期内完成，所以后台评估不可能
   // 在这中间写 store。
@@ -834,6 +858,8 @@ bool BackupController::deleteBackup(const QString& file_name) {
 
 bool BackupController::startDirectBackupForTest(const QString& source,
                                                 const QString& archive_file) {
+  // 自测入口没有页面，按它语义上对应的页面归属，免得留下上一次的 scope。
+  status_scope_ = QString::fromLatin1(kScopeBackup);
   Filter filter;
   std::string filter_error;
   if (!BuildFilter(&filter, &filter_error)) {
@@ -854,6 +880,7 @@ bool BackupController::startDirectBackupForTest(const QString& source,
 
 bool BackupController::startDirectRestoreForTest(const QString& archive_file,
                                                  const QString& destination) {
+  status_scope_ = QString::fromLatin1(kScopeManagement);
   // 恢复不需要筛选：归档里有什么就恢复什么，和 CLI 的语义一致。
   // 恢复也不看 flavor：格式由归档自己的 magic 决定。
   OperationRequest request;
@@ -894,7 +921,13 @@ bool BackupController::Start(const OperationRequest& request,
       operation_gate_ != nullptr ? gate_kind : OperationGate::Kind::kNone;
   active_kind_ = request.kind;
   active_file_name_ = file_name;
+  // 记住这次操作属于哪一页：完成提示要落回发起它的页面，而不是用户此刻
+  // 正在看的页面。
+  active_scope_ = status_scope_;
   SetBusy(true);
+  // "正在备份 / 正在恢复"是**全局运行状态**，不属于任何一页：切页不该把它清掉，
+  // 每一页都该看得到"现在有活在干"。归属页面只作用于结果提示。
+  status_scope_.clear();
   SetStatus(QString::fromLatin1(kRunning),
             request.kind == Kind::kBackup ? QStringLiteral("正在备份……")
                                           : QStringLiteral("正在恢复……"),
@@ -951,12 +984,37 @@ void BackupController::SetBusy(bool busy) {
   emit busyChanged();
 }
 
+void BackupController::setStatusForTest(const QString& kind,
+                                        const QString& scope,
+                                        const QString& title,
+                                        const QString& message) {
+  status_scope_ = scope;
+  SetStatus(kind, title, message);
+}
+
 void BackupController::SetStatus(const QString& kind, const QString& title,
                                  const QString& message) {
   status_kind_ = kind;
   status_title_ = title;
   status_message_ = message;
+  // 空闲基线是全局状态：它没有"属于哪一页"这一说，所以在这里归一化掉。
+  // 其余消息保留调用方设置的 scope，由 QML 按页面过滤。
+  if (kind == QString::fromLatin1(kIdle)) {
+    status_scope_.clear();
+  }
   emit statusChanged();
+}
+
+// 离开页面时的"消费"。busy 判定与 clearStatus() 完全一致：正在跑的操作属于
+// 全局运行状态，不因为切页就消失。
+void BackupController::dismissPageStatus(const QString& scope) {
+  if (busy_ || scope.isEmpty()) {
+    return;
+  }
+  if (status_scope_ != scope) {
+    return;
+  }
+  clearStatus();
 }
 
 // 用户一动输入就把上一次的结果提示收回去；任务进行中不清，
