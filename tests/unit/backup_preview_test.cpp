@@ -16,8 +16,9 @@
 //   * 集合与顺序：预览的 included 序列 == 真实备份扫描 / 归档的序列；
 //   * 失败语义：源目录不可用、opendir / readdir / lstat 失败、路径过长、
 //     未被排除的 socket —— 两边必须给出同一句原文；
-//   * 窗口：只展示前 300 条，但整棵树都被检查过（第 301 条的 socket 与
-//     第 301 条的 lstat 失败都不能被窗口掩盖）；
+//   * 窗口：最多展示前 300 个 preview entries，但整次实际备份遍历都会走完
+//     （第 301 条的 socket 与第 301 条的 lstat 失败都不能被窗口掩盖），而且
+//     窗口大小、完整遍历的匹配数、窗口里列出的匹配数三者必须分得清；
 //   * 不能有第二套实现：预览层里没有自己的遍历（由 modern_gui_check.sh 的
 //     静态断言与这里的"顺序逐项相等"共同保证）。
 //
@@ -644,6 +645,144 @@ int main() {
         "PREV T8c 条目数正好等于窗口时不算 truncated",
         std::to_string(exact.items.size()) +
             " truncated=" + (exact.truncated ? "true" : "false"));
+  }
+
+  test_support::Section(
+      "PREV 6b. 窗口大小 != 匹配数：前 300 条全被排除，匹配的 10 条在窗口之外");
+  {
+    // 这条用例是给"presentation 层怎么报数"准备的判据：
+    //   * items          = 遍历顺序里的前 300 个 preview entries（这里全是被
+    //                      规则排除的）；
+    //   * included_count =
+    //   完整实际备份遍历里的匹配数（10，且全部排在窗口之外）。
+    // 所以"窗口里有几条 included"既不是 items.size()，也不是 included_count。
+    // 旧文案把这两个数字混成 "showing the first 300 of 10 matching item(s)"，
+    // 在这个形状下直接自相矛盾——它宣称窗口里的 300 条就是那 10 条匹配项。
+    const std::string work = test_support::FreshDir("backup-preview-counts");
+    const std::string source = work + "/src";
+    test_support::Mkdir(source, 0755);
+    // lexical 顺序：aaa*** 在前（被排除），zzz** 在后（进归档）。
+    for (int index = 0; index < 300; ++index) {
+      char name[64];
+      std::snprintf(name, sizeof(name), "aaa%03d.dat", index);
+      test_support::WriteFile(source + "/" + name, "x", 0644);
+    }
+    for (int index = 0; index < 10; ++index) {
+      char name[64];
+      std::snprintf(name, sizeof(name), "zzz%02d.dat", index);
+      test_support::WriteFile(source + "/" + name, "x", 0644);
+    }
+    const std::vector<bp::FilterRuleDraft> rules = {
+        Rule(bp::FilterAction::kExclude, "name:aaa*")};
+
+    const bp::PreviewResult preview = bp::PreviewBackupSelection(source, rules);
+    test_support::Check(preview.error.empty(), "PREV T22 预览成功",
+                        preview.error);
+    test_support::Check(
+        preview.total_entries == 310 && preview.included_count == 10,
+        "PREV T22 included_count 是完整遍历的 10（不是窗口里的）",
+        std::to_string(preview.included_count) + "/" +
+            std::to_string(preview.total_entries));
+    test_support::Check(
+        preview.items.size() == bp::kPreviewEntryLimit && preview.truncated,
+        "PREV T22 窗口仍是前 300 个 preview entries，truncated 为真",
+        std::to_string(preview.items.size()));
+    std::size_t listed_matching = 0;
+    for (const bp::PreviewItem& item : preview.items) {
+      if (item.included) ++listed_matching;
+    }
+    test_support::Check(
+        listed_matching == 0,
+        "PREV T22 窗口里列出来的 matching 是 0（10 条全在窗口之外）",
+        std::to_string(listed_matching));
+    test_support::Check(
+        !preview.items.empty() && preview.items.front().disposition ==
+                                      bp::PreviewDisposition::kExcludedByRule,
+        "PREV T22 窗口里的条目确实是被规则排除的那些");
+
+    // 窗口里看不见那 10 条，但 included_count 必须仍然等于真实备份扫到的条目
+    // 数——"报出来的总数"与"列出多少条"是两件事。
+    std::string filter_error;
+    const bp::Filter filter = CompileOrDie(rules, &filter_error);
+    std::vector<bp::ArchiveEntry> entries;
+    std::string scan_error;
+    test_support::Check(
+        bp::ScanSourceTree(source, &filter, &entries, &scan_error),
+        "PREV T22 真实备份扫描成功", scan_error);
+    const std::size_t backup_entries = ScanOrder(entries).size();
+    test_support::Check(
+        backup_entries == preview.included_count,
+        "PREV T22 included_count == 真实备份扫到的条目数（窗口里看不见也一样）",
+        std::to_string(backup_entries) + "/" +
+            std::to_string(preview.included_count));
+  }
+
+  test_support::Section(
+      "PREV 6c. 混合窗口：前 250 条 included + 50 条 excluded + 末尾 20 条 "
+      "included");
+  {
+    // included_count（270）> 窗口里的 matching（250）> 窗口里……都不是 300：
+    // 三个数字互不相等，任何"用其中一个冒充另一个"的文案都会在这里露馅。
+    const std::string work = test_support::FreshDir("backup-preview-mixed");
+    const std::string source = work + "/src";
+    test_support::Mkdir(source, 0755);
+    for (int index = 0; index < 250; ++index) {
+      char name[64];
+      std::snprintf(name, sizeof(name), "aaa%03d.dat", index);
+      test_support::WriteFile(source + "/" + name, "x", 0644);
+    }
+    for (int index = 0; index < 50; ++index) {
+      char name[64];
+      std::snprintf(name, sizeof(name), "mmm%03d.dat", index);
+      test_support::WriteFile(source + "/" + name, "x", 0644);
+    }
+    for (int index = 0; index < 20; ++index) {
+      char name[64];
+      std::snprintf(name, sizeof(name), "zzz%02d.dat", index);
+      test_support::WriteFile(source + "/" + name, "x", 0644);
+    }
+    const std::vector<bp::FilterRuleDraft> rules = {
+        Rule(bp::FilterAction::kExclude, "name:mmm*")};
+
+    const bp::PreviewResult preview = bp::PreviewBackupSelection(source, rules);
+    test_support::Check(preview.error.empty(), "PREV T23 预览成功",
+                        preview.error);
+    test_support::Check(
+        preview.total_entries == 320 && preview.included_count == 270,
+        "PREV T23 included_count 是完整遍历的 270",
+        std::to_string(preview.included_count) + "/" +
+            std::to_string(preview.total_entries));
+    test_support::Check(
+        preview.items.size() == bp::kPreviewEntryLimit && preview.truncated,
+        "PREV T23 窗口是 300 个 preview entries",
+        std::to_string(preview.items.size()));
+    std::size_t listed_matching = 0;
+    for (const bp::PreviewItem& item : preview.items) {
+      if (item.included) ++listed_matching;
+    }
+    test_support::Check(
+        listed_matching == 250,
+        "PREV T23 窗口里的 matching 是 250（不是 300，也不是 270）",
+        std::to_string(listed_matching));
+
+    // 窗口里的 250 条必须逐项等于真实备份列表的前 250 条：窗口只是"截断"，
+    // 不是"挑出一部分"。
+    std::string filter_error;
+    const bp::Filter filter = CompileOrDie(rules, &filter_error);
+    std::vector<bp::ArchiveEntry> entries;
+    std::string scan_error;
+    test_support::Check(
+        bp::ScanSourceTree(source, &filter, &entries, &scan_error),
+        "PREV T23 真实备份扫描成功", scan_error);
+    const std::vector<std::string> scan_order = ScanOrder(entries);
+    const std::vector<std::string> preview_order = IncludedInOrder(preview);
+    test_support::Check(
+        scan_order.size() == 270 && preview_order.size() == 250 &&
+            std::equal(preview_order.begin(), preview_order.end(),
+                       scan_order.begin()),
+        "PREV T23 窗口里的 250 条 == 真实备份列表的前 250 条（逐项，未排序）",
+        std::to_string(preview_order.size()) + "/" +
+            std::to_string(scan_order.size()));
   }
 
   test_support::Section("PREV 7. 窗口之外的问题不能被掩盖（T9 / T10）");

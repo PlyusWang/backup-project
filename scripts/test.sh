@@ -1489,36 +1489,167 @@ PBIG="$PREVIEW/big"
 mkdir -p "$PBIG"
 for index in $(seq 1 320); do printf 'x' > "$PBIG/f$index.dat"; done
 run_preview_cli "$PBIG"
-# 计数是**整棵树**的（320），列表是窗口里的（300）：两边都要说清楚，而且措辞
-# 必须准确——整棵树都验证过了，被限制的只是列出多少条。
+# 计数是**完整实际备份遍历**的（320），窗口是前 300 个 preview entries：三个
+# 数字必须分开说——总数、窗口大小、窗口里列出来的匹配数。窗口大小不是匹配数，
+# 被剪枝的子树也不会被说成"检查过整棵源目录树"。
 if [[ $PREVIEW_CLI_STATUS -eq 0 ]] &&
-   grep -qF 'Preview: 320 matching item(s)' "$PREVIEW_CLI_OUT" &&
-   grep -qF 'Note: showing the first 300 of 320 matching item(s); the whole source tree was validated, 300 listed below.' "$PREVIEW_CLI_OUT"; then
-  record_pass "PRV-19 P7 超过窗口：整棵树已验证 / 只列出前 300，文案说清楚"
+   grep -qF 'Preview: 320 matching item(s) in the effective backup selection.' "$PREVIEW_CLI_OUT" &&
+   grep -qF 'Note: showing matches found within the first 300 preview entries; the complete effective backup traversal was validated, 300 matching item(s) listed below.' "$PREVIEW_CLI_OUT"; then
+  record_pass "PRV-19 P7 超过窗口：总数 / 窗口大小 / 列出数三个数字分开说清楚"
 else
   record_fail "PRV-19 P7 超过窗口：总数 / 列出数" \
     "$(head -n 2 "$PREVIEW_CLI_OUT" | tr '\n' ' ')"
 fi
-# 旧文案是错的：它说"只检查了前 300 条"，而实际上整棵树都被检查过。
-if grep -qF 'were examined' "$PREVIEW_CLI_OUT"; then
-  record_fail "PRV-19b 截断提示不再声称只检查了前 300 条" \
-    "$(grep -F 'were examined' "$PREVIEW_CLI_OUT" | head -n 1)"
+# 旧文案是错的（下面两句都不许再出现）：它说"只检查了前 300 条"，而实际上整棵树都被检查过。
+if grep -qF 'first 300 of' "$PREVIEW_CLI_OUT" ||
+   grep -qF 'were examined' "$PREVIEW_CLI_OUT"; then
+  record_fail "PRV-19b 截断提示不再把窗口大小说成匹配数、也不再声称只检查了 300 条" \
+    "$(grep -E 'first 300 of|were examined' "$PREVIEW_CLI_OUT" | head -n 1)"
 else
-  record_pass "PRV-19b 截断提示不再声称只检查了前 300 条"
+  record_pass "PRV-19b 截断提示不再把窗口大小说成匹配数、也不再声称只检查了 300 条"
 fi
 # GUI 打出来的那一行必须与 CLI 逐字一致（PRV-20 会 diff，这里额外钉住关键词）。
 # 先真的跑一次 GUI：不跑就会拿着上一条用例留下的输出做断言。
 if [[ -x "$PREVIEW_GUI_BIN" ]]; then
   run_preview_gui "$PBIG"
-  if grep -qF 'the whole source tree was validated' "$PREVIEW_GUI_OUT" &&
+  if grep -qF 'the complete effective backup traversal was validated' "$PREVIEW_GUI_OUT" &&
+     grep -qF 'within the first 300 preview entries' "$PREVIEW_GUI_OUT" &&
+     ! grep -qF 'first 300 of' "$PREVIEW_GUI_OUT" &&
      ! grep -qF 'were examined' "$PREVIEW_GUI_OUT"; then
-    record_pass "PRV-19c GUI 的截断提示与 CLI 同义（validated / listed）"
+    record_pass "PRV-19c GUI 的截断提示与 CLI 同义（traversal / preview entries）"
   else
     record_fail "PRV-19c GUI 的截断提示与 CLI 同义" \
       "$(grep -E 'Note:' "$PREVIEW_GUI_OUT" | head -n 1)"
   fi
 fi
 expect_preview_parity_at "PRV-20 P7 截断契约在 GUI 与 CLI 上一致" "$PBIG"
+
+# ---- L.4c 窗口大小 != 匹配数：三个数字必须分开报 ----
+#
+# 窗口 = 遍历顺序里的前 300 个 preview entries（included / excluded / pruned 都
+# 占位）；included_count = 完整实际备份遍历里的匹配数；窗口里列出来的匹配项数
+# 又是第三个数字。下面两个形状让这三个数字互不相等。
+#
+# 窗口装不下时 preview_listed 与整棵恢复树本来就不同（这正是窗口的定义），
+# 所以这里不比列表，只比"预览第一行报的匹配总数"与"真实备份真的产出多少条目"。
+# $1 = 用例名，$2 = 源目录，$3 = 期望条目数，其余 = 规则
+expect_preview_total_matches_backup() {
+  local name="$1"
+  local source="$2"
+  local expected="$3"
+  shift 3
+  run_preview_cli "$source" "$@"
+  if [[ $PREVIEW_CLI_STATUS -ne 0 ]]; then
+    record_fail "$name" "preview exit=$PREVIEW_CLI_STATUS"
+    return
+  fi
+  find "$PREVIEW_REPO" -maxdepth 1 -name '*.bak' -printf '%f\n' | sort \
+    >"$PREVIEW/before.txt"
+  set +e
+  timeout --signal=KILL "$TIMEOUT_SECONDS" "$BACKUPCTL" \
+    --config-file "$PREVIEW_CONFIG" backup "$source" "$@" \
+    >"$PREVIEW/total-backup.log" 2>&1
+  local backup_status=$?
+  set -e
+  if [[ $backup_status -ne 0 ]]; then
+    record_fail "$name" \
+      "backup exit=$backup_status: $(head -n 1 "$PREVIEW/total-backup.log")"
+    return
+  fi
+  find "$PREVIEW_REPO" -maxdepth 1 -name '*.bak' -printf '%f\n' | sort \
+    >"$PREVIEW/after.txt"
+  local file_name
+  file_name="$(comm -13 "$PREVIEW/before.txt" "$PREVIEW/after.txt" | head -n 1)"
+  if [[ -z "$file_name" ]]; then
+    record_fail "$name" "仓库里没有新归档"
+    return
+  fi
+  rm -rf "$PREVIEW/restored-total"
+  set +e
+  timeout --signal=KILL "$TIMEOUT_SECONDS" "$BACKUPCTL" \
+    --config-file "$PREVIEW_CONFIG" restore "$file_name" "$PREVIEW/restored-total" \
+    >>"$PREVIEW/total-backup.log" 2>&1
+  local restore_status=$?
+  set -e
+  if [[ $restore_status -ne 0 ]]; then
+    record_fail "$name" "restore exit=$restore_status"
+    return
+  fi
+  local nodes
+  nodes="$(tree_nodes "$PREVIEW/restored-total" | wc -l)"
+  if [[ "$nodes" -eq "$expected" ]] &&
+     grep -qF "Preview: $expected matching item(s) in the effective backup selection." \
+       "$PREVIEW_CLI_OUT"; then
+    record_pass "$name"
+  else
+    record_fail "$name" \
+      "backup nodes=$nodes expected=$expected: $(head -n 1 "$PREVIEW_CLI_OUT")"
+  fi
+}
+
+# 形状 1：前 300 条按名字全部被 exclude，真正会进归档的 10 条排在窗口之外。
+#   included_count = 10；窗口 = 300 个 preview entries；窗口里的 matching = 0。
+# 旧文案在这里会打印 "showing the first 300 of 10 matching item(s)"：既把窗口
+# 大小说成了匹配数，又和"301 项之后仍在继续验证"的事实打架。
+PWEX="$PREVIEW/window-excluded"
+rm -rf "$PWEX"
+mkdir -p "$PWEX"
+for index in $(seq 1 300); do printf 'x' > "$PWEX/aaa$(printf '%03d' "$index").dat"; done
+for index in $(seq 1 10); do printf 'x' > "$PWEX/zzz$(printf '%02d' "$index").dat"; done
+run_preview_cli "$PWEX" --exclude 'name:aaa*'
+if [[ $PREVIEW_CLI_STATUS -eq 0 ]] &&
+   grep -qF 'Preview: 10 matching item(s) in the effective backup selection.' "$PREVIEW_CLI_OUT" &&
+   grep -qF 'within the first 300 preview entries' "$PREVIEW_CLI_OUT" &&
+   grep -qF '0 matching item(s) listed below.' "$PREVIEW_CLI_OUT" &&
+   ! grep -qF 'first 300 of 10 matching item(s)' "$PREVIEW_CLI_OUT" &&
+   ! grep -qF 'were examined' "$PREVIEW_CLI_OUT"; then
+  record_pass "PRV-42 300 条被排除 + 10 条 included：总数 10 / 窗口 300 / 列出 0"
+else
+  record_fail "PRV-42 300 excluded + 10 included 的文案" \
+    "$(head -n 2 "$PREVIEW_CLI_OUT" | tr '\n' ' ')"
+fi
+# 窗口里一条匹配项都没有：结果列表必须是空的（excluded 不冒充匹配项）。
+if [[ -z "$(preview_listed "$PREVIEW_CLI_OUT")" ]]; then
+  record_pass "PRV-42b 窗口里 0 条 matching：列出的路径也是空的"
+else
+  record_fail "PRV-42b 窗口里 0 条 matching：列出的路径也是空的" \
+    "$(preview_listed "$PREVIEW_CLI_OUT" | head -n 3 | tr '\n' ' ')"
+fi
+# 但真实备份确实产出 10 条：预览报的 10 是"完整遍历"的数字，窗口不影响它。
+expect_preview_total_matches_backup \
+  "PRV-42c 窗口里 0 条 matching，总数 10 == 真实备份的 10 条" "$PWEX" 10 \
+  --exclude 'name:aaa*'
+expect_preview_parity_at "PRV-42d 同一个形状：GUI 与 CLI 逐字一致" "$PWEX" \
+  --exclude 'name:aaa*'
+
+# 形状 2：前 250 条 included + 50 条 excluded + 末尾 20 条 included。
+#   included_count = 270；窗口 = 300 个 preview entries；窗口里的 matching = 250。
+# 三个数字互不相等，任何"用其中一个冒充另一个"的文案都会露馅。
+PWMX="$PREVIEW/window-mixed"
+rm -rf "$PWMX"
+mkdir -p "$PWMX"
+for index in $(seq 1 250); do printf 'x' > "$PWMX/aaa$(printf '%03d' "$index").dat"; done
+for index in $(seq 1 50); do printf 'x' > "$PWMX/mmm$(printf '%03d' "$index").dat"; done
+for index in $(seq 1 20); do printf 'x' > "$PWMX/zzz$(printf '%02d' "$index").dat"; done
+run_preview_cli "$PWMX" --exclude 'name:mmm*'
+PVL_MIXED_LISTED="$(preview_listed "$PREVIEW_CLI_OUT")"
+if [[ $PREVIEW_CLI_STATUS -eq 0 ]] &&
+   grep -qF 'Preview: 270 matching item(s) in the effective backup selection.' "$PREVIEW_CLI_OUT" &&
+   grep -qF 'within the first 300 preview entries' "$PREVIEW_CLI_OUT" &&
+   grep -qF '250 matching item(s) listed below.' "$PREVIEW_CLI_OUT" &&
+   [[ "$(printf '%s\n' "$PVL_MIXED_LISTED" | wc -l)" -eq 250 ]] &&
+   [[ "$(printf '%s\n' "$PVL_MIXED_LISTED" | head -n 1)" == "aaa001.dat" ]] &&
+   [[ "$(printf '%s\n' "$PVL_MIXED_LISTED" | tail -n 1)" == "aaa250.dat" ]]; then
+  record_pass "PRV-43 混合窗口：总数 270 / 窗口 300 / 列出 250（三个数字互不相等）"
+else
+  record_fail "PRV-43 混合窗口的三个数字" \
+    "$(head -n 2 "$PREVIEW_CLI_OUT" | tr '\n' ' ') listed=$(printf '%s\n' "$PVL_MIXED_LISTED" | wc -l)"
+fi
+expect_preview_parity_at "PRV-43b 混合窗口：GUI 与 CLI 逐字一致" "$PWMX" \
+  --exclude 'name:mmm*'
+expect_preview_total_matches_backup \
+  "PRV-43c 混合窗口：总数 270 == 真实备份的 270 条" "$PWMX" 270 \
+  --exclude 'name:mmm*'
 
 # ---- L.5 源目录语义 / socket / 顺序：预览与备份必须是同一个结论 ----
 
@@ -1608,7 +1739,7 @@ mkdir -p "$POUT/nested" "$POUT/alpha-dir"
 printf 'x\n' > "$POUT/nested/inner.txt"
 printf 'x\n' > "$POUT/alpha-dir/deep.txt"
 cat > "$PVSEM/expected-order.txt" <<'PEOF'
-Preview: 9 matching item(s)
+Preview: 9 matching item(s) in the effective backup selection.
 alpha-dir
 alpha-dir/deep.txt
 alpha.txt
