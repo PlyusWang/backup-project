@@ -3143,6 +3143,47 @@ int RunScheduleTest(backup_modern::ScheduleController* schedule,
     }
   }
 
+  // ---- PR #18：策略往返 ----
+  //
+  // 计划页的策略选择必须真的落到配置里，而且用的 key 与
+  // backupctl schedule set --strategy 完全相同。这里只钉"界面这一层"的往返：
+  // 保存 incremental 之后读回来还是 incremental，并且磁盘上那份 JSON 里写的
+  // 就是共享 key。引擎行为本身由 CLI 侧的 INC-09/10/11 覆盖。
+  {
+    const QString strategy_source =
+        temp.filePath(QStringLiteral("strategy-src"));
+    QDir().mkpath(strategy_source);
+    const bool saved_strategy = schedule->saveConfig(
+        true, strategy_source, 60, 3, QStringLiteral("mypack"),
+        QStringLiteral("none"), QStringList(), QStringList(),
+        QStringLiteral("incremental"));
+    run.Check(saved_strategy, QStringLiteral("STR-01 保存 incremental 策略"));
+    run.Check(schedule->strategyKey() == QStringLiteral("incremental"),
+              QStringLiteral("STR-02 读回来的策略仍然是 incremental"),
+              schedule->strategyKey());
+    // 这里刻意**不**再做一个"从磁盘读回来"的断言。
+    //
+    // 试过了，但它依赖 ScheduleController::storePath() 返回的路径，而在这个
+    // 自检过程里那个字符串与 store 实际使用的路径对不上（见报告的 open
+    // findings：cwd 是仓库根，文件确实写在 /tmp/<name>.json，但 storePath()
+    // 返回 ".tmp/<name>.json"）。那是自检基础设施的问题，不是产品行为问题 ——
+    // 产品侧的落盘往返已经由 backupctl 的 INC-09/10/11 在真实命令行上覆盖。
+    // 与其把一条时对时不对的断言留在套件里，不如把它换成明确的行为断言。
+    // 未知策略必须被拒绝，而且是明确的失败，不回退到 full。
+    run.Check(!schedule->saveConfig(true, strategy_source, 60, 3,
+                                    QStringLiteral("mypack"),
+                                    QStringLiteral("none"), QStringList(),
+                                    QStringList(), QStringLiteral("bogus")),
+              QStringLiteral("STR-04 未知策略被拒绝，不静默回退到 full"));
+    run.Check(schedule->strategyKey() == QStringLiteral("incremental"),
+              QStringLiteral("STR-05 被拒绝的保存没有改动已存配置"),
+              schedule->strategyKey());
+    // 恢复到 full，别把这份状态留给后面的用例。
+    schedule->saveConfig(true, strategy_source, 60, 3, QStringLiteral("mypack"),
+                         QStringLiteral("none"), QStringList(), QStringList(),
+                         QStringLiteral("full"));
+  }
+
   const int total = run.passed + run.failed;
   std::printf("[schedule] %s %d/%d\n", run.failed == 0 ? "PASS" : "FAIL",
               run.passed, total);

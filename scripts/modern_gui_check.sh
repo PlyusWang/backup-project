@@ -601,6 +601,19 @@ done
 expect_count_re "$QML_DIR/Main.qml" "dismissPageStatus" 3 \
   "页面切换时消费离开页面的临时提示（只有一处实现）"
 
+# PR #18：增量策略必须在两个前端都能选到，而且用的是同一个 key。
+# 备份页读 backupOptionsPanel 的策略；计划页读它自己的策略下拉。
+expect_count_re "$QML_DIR/components/BackupOptionsPanel.qml" "strategyKeys" 2 \
+  "备份页提供备份策略选择"
+expect_count_re "$QML_DIR/pages/BackupPage.qml" "startBackupWithStrategy" 1 \
+  "备份页把策略一起交给控制器"
+expect_count_re "$QML_DIR/pages/SchedulePage.qml" "scheduleStrategyCombo" 1 \
+  "计划页提供备份策略选择"
+expect_count_re "$QML_DIR/pages/SchedulePage.qml" "strategyKeys\[page.draftStrategyIndex\]" 1 \
+  "计划页把策略一起交给控制器"
+expect_count_re "$ROOT_DIR/ui/modern/schedule_controller.cpp" "ParseBackupStrategyKey" 1 \
+  "计划控制器用共享的 key 解析，不自己判断策略"
+
 echo "[modern-gui] 8) 文件筛选在 GUI 路径上生效"
 # 界面只负责收集规则文本，解析与匹配都在 C++ Filter 里：
 # 下面先做静态确认，再用 --self-test 走一遍真实控制器路径。

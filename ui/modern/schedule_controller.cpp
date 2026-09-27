@@ -498,7 +498,7 @@ bool ScheduleController::saveConfigFromText(
     bool enabled, const QString& source_path, const QString& interval_text,
     const QString& retain_text, const QString& pack_key,
     const QString& compression_key, const QStringList& include_rules,
-    const QStringList& exclude_rules) {
+    const QStringList& exclude_rules, const QString& strategy_key) {
   std::uint32_t interval = 0;
   std::uint32_t retain = 0;
   std::string error;
@@ -520,7 +520,7 @@ bool ScheduleController::saveConfigFromText(
   }
   return saveConfig(enabled, source_path, static_cast<int>(interval),
                     static_cast<int>(retain), pack_key, compression_key,
-                    include_rules, exclude_rules);
+                    include_rules, exclude_rules, strategy_key);
 }
 
 bool ScheduleController::saveConfig(bool enabled, const QString& source_path,
@@ -528,7 +528,8 @@ bool ScheduleController::saveConfig(bool enabled, const QString& source_path,
                                     const QString& pack_key,
                                     const QString& compression_key,
                                     const QStringList& include_rules,
-                                    const QStringList& exclude_rules) {
+                                    const QStringList& exclude_rules,
+                                    const QString& strategy_key) {
   // ---- 同一进程内的单写者规则 ----
   //
   // ScheduleStore 的写者有两个：本函数（GUI 线程）与后台评估线程
@@ -569,6 +570,13 @@ bool ScheduleController::saveConfig(bool enabled, const QString& source_path,
   config.retain_count =
       retain_count < 0 ? 0 : static_cast<std::uint32_t>(retain_count);
 
+  // 策略同样是共享核心的 key：与 backupctl schedule set --strategy 逐字一致。
+  // 解析失败不回退到 full —— 用户明确选了增量，就必须拿到增量或明确的错误。
+  if (!backupproject::ParseBackupStrategyKey(strategy_key.toStdString(),
+                                             &config.strategy)) {
+    SetStatus(kError, QStringLiteral("未知的备份策略"), strategy_key);
+    return false;
+  }
   // 算法 key 的解析用的是共享核心那张表，与 CLI 完全一致。
   if (!backupproject::ParsePackMethodKey(pack_key.toStdString(),
                                          &config.pack_method)) {
