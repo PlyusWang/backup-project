@@ -1457,8 +1457,10 @@ else
 fi
 
 # 业务失败（源目录不存在）仍然是 1，与其它子命令一致。
-expect_failure "PRV-17 源目录不存在是操作失败（exit 1）" 1 "not a directory" \
-  preview "$PREVIEW/nope"
+# 消息与真实 Backup 逐字一致（同一个 walker 的同一句原文），不再是 CLI 自己
+# 拼的一句话。
+expect_failure "PRV-17 源目录不存在是操作失败（exit 1）" 1 \
+  "Failed to inspect source directory" preview "$PREVIEW/nope"
 
 # P6b：非法规则在 GUI 与 CLI 得到**同一句**核心原文。
 if [[ -x "$PREVIEW_GUI_BIN" ]]; then
@@ -1479,15 +1481,157 @@ PBIG="$PREVIEW/big"
 mkdir -p "$PBIG"
 for index in $(seq 1 320); do printf 'x' > "$PBIG/f$index.dat"; done
 run_preview_cli "$PBIG"
+# 计数是**整棵树**的（320），列表是窗口里的（300）：两边都要说清楚。
 if [[ $PREVIEW_CLI_STATUS -eq 0 ]] &&
-   grep -qF 'Preview: 300 matching item(s)' "$PREVIEW_CLI_OUT" &&
-   grep -qF 'more than 300 entries' "$PREVIEW_CLI_OUT"; then
-  record_pass "PRV-19 P7 超过窗口时 CLI 明确报出截断（300 / more than 300）"
+   grep -qF 'Preview: 320 matching item(s)' "$PREVIEW_CLI_OUT" &&
+   grep -qF 'the source tree has 320 entries; only the first 300 were examined, and 300 matching item(s) are listed below.' "$PREVIEW_CLI_OUT"; then
+  record_pass "PRV-19 P7 超过窗口：总数 320 / 列出 300，截断说清楚"
 else
-  record_fail "PRV-19 P7 超过窗口时 CLI 明确报出截断" \
+  record_fail "PRV-19 P7 超过窗口：总数 / 列出数" \
     "$(head -n 2 "$PREVIEW_CLI_OUT" | tr '\n' ' ')"
 fi
 expect_preview_parity_at "PRV-20 P7 截断契约在 GUI 与 CLI 上一致" "$PBIG"
+
+# ---- L.5 源目录语义 / socket / 顺序：预览与备份必须是同一个结论 ----
+
+# 预览与真实 Backup 共用同一份遍历（source_tree_walker），所以下面每一条都是
+# "同一个问题问两次"：一次问 preview，一次问 backup，答案必须一样。
+PVSEM="$PREVIEW/semantics"
+rm -rf "$PVSEM"
+mkdir -p "$PVSEM/real-src" "$PVSEM/sock-src/sub" "$PVSEM/order-src"
+printf 'a\n' > "$PVSEM/real-src/a.txt"
+printf 'a\n' > "$PVSEM/sock-src/a.txt"
+printf 'b\n' > "$PVSEM/sock-src/sub/b.txt"
+ln -s "$PVSEM/real-src" "$PVSEM/link-src"
+python3 -c "import socket,sys; s=socket.socket(socket.AF_UNIX); s.bind(sys.argv[1])" \
+  "$PVSEM/sock-src/sub/sock"
+"$BACKUPCTL" --config-file "$PREVIEW_CONFIG" config repository set "$PREVIEW_REPO" \
+  >/dev/null 2>&1
+
+# PRV-26 源目录是 symlink-to-directory：预览拒绝，理由与备份一致。
+run_preview_cli "$PVSEM/link-src"
+PVL_LINK_STATUS=$PREVIEW_CLI_STATUS
+PVL_LINK_MESSAGE="$(head -n 1 "$PREVIEW_CLI_ERR")"
+set +e
+"$BACKUPCTL" --config-file "$PREVIEW_CONFIG" backup "$PVSEM/link-src" \
+  >"$PVSEM/link-backup.log" 2>&1
+PVL_LINK_BACKUP=$?
+set -e
+if [[ $PVL_LINK_STATUS -eq 1 && $PVL_LINK_BACKUP -eq 1 ]] &&
+   grep -qF "Source is not a directory" "$PVSEM/link-backup.log" &&
+   [[ "$PVL_LINK_MESSAGE" == *"Source is not a directory"* ]]; then
+  record_pass "PRV-26 symlink 源目录：预览与备份都拒绝且同一句原文"
+else
+  record_fail "PRV-26 symlink 源目录：预览与备份都拒绝" \
+    "preview=$PVL_LINK_STATUS[$PVL_LINK_MESSAGE] backup=$PVL_LINK_BACKUP"
+fi
+
+# PRV-27 没有被排除的 socket：预览必须 blocked（exit 1 + 说清后果），
+# 真实备份必须失败，两边第一行是同一句核心原文。
+run_preview_cli "$PVSEM/sock-src"
+PVL_SOCK_STATUS=$PREVIEW_CLI_STATUS
+PVL_SOCK_MESSAGE="$(head -n 1 "$PREVIEW_CLI_ERR")"
+set +e
+"$BACKUPCTL" --config-file "$PREVIEW_CONFIG" backup "$PVSEM/sock-src" \
+  >"$PVSEM/sock-backup.log" 2>&1
+PVL_SOCK_BACKUP=$?
+set -e
+if [[ $PVL_SOCK_STATUS -eq 1 && $PVL_SOCK_BACKUP -eq 1 ]] &&
+   grep -qF "Unsupported special type: socket" "$PVSEM/sock-backup.log" &&
+   [[ "$PVL_SOCK_MESSAGE" == *"Unsupported special type: socket"* ]] &&
+   grep -qF "Backup would fail unless this entry is excluded." "$PREVIEW_CLI_OUT"; then
+  record_pass "PRV-27 未排除的 socket：预览 exit 1 且说明备份会失败"
+else
+  record_fail "PRV-27 未排除的 socket：预览 exit 1" \
+    "preview=$PVL_SOCK_STATUS[$PVL_SOCK_MESSAGE] backup=$PVL_SOCK_BACKUP"
+fi
+
+if [[ -x "$PREVIEW_GUI_BIN" ]]; then
+  run_preview_gui "$PVSEM/sock-src"
+  if [[ $PREVIEW_GUI_STATUS -eq 1 ]] &&
+     [[ "$(head -n 1 "$PREVIEW_GUI_ERR")" == "$PVL_SOCK_MESSAGE" ]] &&
+     grep -qF "Backup would fail unless this entry is excluded." "$PREVIEW_GUI_OUT"; then
+    record_pass "PRV-28 未排除的 socket：GUI 与 CLI 同一句、同一个 exit"
+  else
+    record_fail "PRV-28 未排除的 socket：GUI 与 CLI 一致" \
+      "gui=$PREVIEW_GUI_STATUS[$(head -n 1 "$PREVIEW_GUI_ERR")] cli=[$PVL_SOCK_MESSAGE]"
+  fi
+fi
+
+# PRV-29 明确排除 socket：预览成功、备份成功、结果里没有 socket。
+expect_preview_parity "PRV-29 排除 socket：CLI == GUI" --exclude 'name:sock'
+expect_preview_matches_backup "PRV-29b 排除 socket：CLI 预览 == 真实备份" \
+  --exclude 'name:sock'
+run_preview_cli "$PVSEM/sock-src" --exclude 'name:sock'
+if [[ $PREVIEW_CLI_STATUS -eq 0 ]] &&
+   ! preview_listed "$PREVIEW_CLI_OUT" | grep -q 'sock'; then
+  record_pass "PRV-29c 被排除的 socket 不出现在预览结果里"
+else
+  record_fail "PRV-29c 被排除的 socket 不出现在预览结果里" \
+    "$(head -n 3 "$PREVIEW_CLI_OUT" | tr '\n' ' ')"
+fi
+
+# PRV-30 顺序：创建顺序故意与 lexical 顺序相反，逐行比较**不排序**的输出。
+POUT="$PVSEM/order-src"
+for name in zulu.txt mike.txt alpha.txt yankee.txt bravo.txt; do
+  printf 'x\n' > "$POUT/$name"
+done
+mkdir -p "$POUT/nested" "$POUT/alpha-dir"
+printf 'x\n' > "$POUT/nested/inner.txt"
+printf 'x\n' > "$POUT/alpha-dir/deep.txt"
+cat > "$PVSEM/expected-order.txt" <<'PEOF'
+Preview: 9 matching item(s)
+alpha-dir
+alpha-dir/deep.txt
+alpha.txt
+bravo.txt
+mike.txt
+nested
+nested/inner.txt
+yankee.txt
+zulu.txt
+PEOF
+run_preview_cli "$POUT"
+if [[ $PREVIEW_CLI_STATUS -eq 0 ]] &&
+   diff -u "$PVSEM/expected-order.txt" "$PREVIEW_CLI_OUT" > "$PVSEM/order.diff" 2>&1; then
+  record_pass "PRV-30 遍历顺序是每层 lexical 的 DFS 先序（逐行比较，未排序）"
+else
+  record_fail "PRV-30 遍历顺序是每层 lexical 的 DFS 先序" \
+    "$(head -n 6 "$PVSEM/order.diff" | tr '\n' ' ')"
+fi
+expect_preview_parity_at "PRV-30b GUI 与 CLI 的顺序逐行一致（未排序）" "$POUT"
+
+# PRV-31 第 301 个条目是 socket：300 项的窗口不能把它掩盖掉。
+PWIN="$PVSEM/window-src"
+mkdir -p "$PWIN"
+for index in $(seq 1 300); do printf 'x' > "$PWIN/f$(printf '%03d' "$index").dat"; done
+python3 -c "import socket,sys; s=socket.socket(socket.AF_UNIX); s.bind(sys.argv[1])" \
+  "$PWIN/zzz-socket"
+run_preview_cli "$PWIN"
+PVL_WIN_STATUS=$PREVIEW_CLI_STATUS
+set +e
+"$BACKUPCTL" --config-file "$PREVIEW_CONFIG" backup "$PWIN" \
+  >"$PVSEM/window-backup.log" 2>&1
+PVL_WIN_BACKUP=$?
+set -e
+if [[ $PVL_WIN_STATUS -eq 1 && $PVL_WIN_BACKUP -eq 1 ]] &&
+   grep -qF "zzz-socket" "$PREVIEW_CLI_ERR" &&
+   grep -qF "zzz-socket" "$PVSEM/window-backup.log"; then
+  record_pass "PRV-31 第 301 条的 socket 不被 300 项窗口掩盖"
+else
+  record_fail "PRV-31 第 301 条的 socket 不被窗口掩盖" \
+    "preview=$PVL_WIN_STATUS[$(head -n 1 "$PREVIEW_CLI_ERR")] backup=$PVL_WIN_BACKUP"
+fi
+if [[ -x "$PREVIEW_GUI_BIN" ]]; then
+  run_preview_gui "$PWIN"
+  if [[ $PREVIEW_GUI_STATUS -eq 1 ]] &&
+     [[ "$(head -n 1 "$PREVIEW_GUI_ERR")" == "$(head -n 1 "$PREVIEW_CLI_ERR")" ]]; then
+    record_pass "PRV-31b 同一个窗口外 socket 在 GUI 上也 blocked"
+  else
+    record_fail "PRV-31b 同一个窗口外 socket 在 GUI 上也 blocked" \
+      "gui=$PREVIEW_GUI_STATUS[$(head -n 1 "$PREVIEW_GUI_ERR")]"
+  fi
+fi
 
 # L.6 单实例：preview 是产品命令，必须在进入扫描之前被同一把锁拒绝。
 # "只读所以可以并发"不是这个产品的规则。
