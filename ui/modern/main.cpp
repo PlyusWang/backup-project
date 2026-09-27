@@ -23,6 +23,8 @@
 //                                       用来证明 GUI 与 CLI 读的是同一份 store
 //   --path-test                         验证本地路径与 URL 互转不丢字符
 //   --close-guard-test                  验证任务进行中关窗会被拦下
+//   --gui-contract-test                 验证首页三张卡片的按钮几何，以及
+//                                       "临时提示只属于产生它的页面"这条契约
 //   --native-frame                      退回系统原生标题栏（Wayland 兜底）
 //
 // 这些开关让没有显示器的环境也能验证界面：离屏平台插件把窗口真正建出来，
@@ -38,6 +40,7 @@
 #include <QFile>
 #include <QFileInfo>
 #include <QGuiApplication>
+#include <QPointF>
 #include <QQmlApplicationEngine>
 #include <QQmlContext>
 #include <QQuickItem>
@@ -49,6 +52,8 @@
 #include <QTimer>
 #include <QVariantList>
 #include <QVariantMap>
+#include <algorithm>
+#include <cmath>
 #include <cstdio>
 #include <cstring>
 
@@ -1020,6 +1025,294 @@ QString FlattenRecord(const QVariantMap& record) {
 //
 // 返回值只区分"全部通过(0)"与"有失败(非 0)"；失败项逐条打印，
 // 并且保留 QTemporaryDir 供人工进去看产物。
+// ---- --gui-contract-test ----
+//
+// 人工验收发现的两类 GUI 契约。断言的是 QML 的真实几何与真实绑定结果：
+// 不截图、不做像素比对，也不匹配文案本身。
+//
+// HOME-01..04 首页三张卡片的按钮必须完整落在卡片内（并且有正的底边距），三张
+//             卡片的按钮对齐；正常窗口与窗口最小尺寸都要成立。
+// MSG-01..05  某个页面产生的临时提示只在该页面显示；离开页面即被消费，回到该页
+//             不会自动复现；后台任务在别的页面结束时也不会把提示丢过去。
+//
+// banner 读的是它自己的 showsMessage（"这一页该不该显示这条消息"），不是
+// visible：Qt Quick 的 Item.visible 读出来就是**有效可见性**，StackLayout 里
+// 非当前页整体不可见，用 visible 永远测不出"这一页会不会显示这条消息"。
+int RunGuiContractTest(QQuickWindow* window,
+                       backup_modern::BackupController* controller) {
+  CheckRun run;
+  run.prefix = "[gui-contract]";
+
+  // 页面顺序必须与 Main.qml 的 StackLayout 一致。
+  const char* kBannerNames[5] = {
+      "homeStatusBanner", "backupStatusBanner", "scheduleStatusBanner",
+      "managementStatusBanner", "settingsStatusBanner"};
+
+  const auto goToPage = [window](int page) {
+    window->setProperty("currentPage", page);
+    // 切换之后要让绑定与布局都算完：这里等的是"事件循环转一圈 + 布局"，
+    // 不是某个动画时长。
+    WaitForAnimation(60);
+  };
+  const auto banner = [window, &kBannerNames](int page) -> QObject* {
+    return window->findChild<QObject*>(QString::fromLatin1(kBannerNames[page]));
+  };
+  const auto bannerTitle = [&banner](int page) {
+    QObject* item = banner(page);
+    return item == nullptr ? QStringLiteral("<missing>")
+                           : item->property("title").toString();
+  };
+  // 这一页会不会显示这条提示（与它此刻是不是当前页无关）。
+  const auto pageShows = [&banner](int page, const QString& title) {
+    QObject* item = banner(page);
+    return item != nullptr && item->property("showsMessage").toBool() &&
+           item->property("title").toString() == title;
+  };
+  const auto itemByName = [window](const char* name) -> QQuickItem* {
+    return window->findChild<QQuickItem*>(QString::fromLatin1(name));
+  };
+
+  // ---- HOME：三个按钮必须完整在卡片里 ----
+  const auto checkHomeCards = [&](int width, int height, const QString& label) {
+    window->setWidth(width);
+    window->setHeight(height);
+    goToPage(0);
+
+    qreal minimum_margin = -1.0;
+    qreal baseline = -1.0;
+    bool all_inside = true;
+    bool aligned = true;
+    QString detail;
+
+    for (int index = 0; index < 3; ++index) {
+      const QQuickItem* card = itemByName(index == 0   ? "homeCard0"
+                                          : index == 1 ? "homeCard1"
+                                                       : "homeCard2");
+      const QQuickItem* button = itemByName(index == 0   ? "homeAction0"
+                                            : index == 1 ? "homeAction1"
+                                                         : "homeAction2");
+      if (card == nullptr || button == nullptr) {
+        run.Check(false, QStringLiteral("%1 找得到卡片与按钮").arg(label),
+                  QStringLiteral("card=%1 button=%2")
+                      .arg(card != nullptr)
+                      .arg(button != nullptr));
+        return;
+      }
+      const QPointF top_left = button->mapToItem(card, QPointF(0, 0));
+      const qreal margin = card->height() - (top_left.y() + button->height());
+      // 左、右、上三条边也要在卡片内：只验下边界会漏掉横向越界。
+      const bool inside = top_left.x() >= 0.0 && top_left.y() >= 0.0 &&
+                          top_left.x() + button->width() <= card->width();
+      all_inside = all_inside && inside;
+      if (!inside) detail += QStringLiteral("按钮 %1 越界 ").arg(index);
+      minimum_margin =
+          minimum_margin < 0.0 ? margin : std::min(minimum_margin, margin);
+
+      const qreal window_y =
+          button->mapToItem(window->contentItem(), QPointF(0, 0)).y();
+      if (baseline < 0.0)
+        baseline = window_y;
+      else if (std::abs(window_y - baseline) > 1.0)
+        aligned = false;
+    }
+
+    // HOME-01：三个按钮都在卡片内，且底边距统一为正。
+    run.Check(all_inside && minimum_margin >= 12.0,
+              QStringLiteral("%1 HOME-01 按钮完整落在卡片内且底边距 >= 12px")
+                  .arg(label),
+              QStringLiteral("最小底边距=%1 全部在卡片内=%2")
+                  .arg(minimum_margin)
+                  .arg(all_inside));
+    // HOME-02：三张卡片的按钮对齐（同一 baseline，容差 1px）。
+    run.Check(aligned,
+              QStringLiteral("%1 HOME-02 三个按钮对齐（容差 1px）").arg(label),
+              detail);
+    // HOME-03：按钮不能压住卡片下边框，也不能超出卡片。
+    run.Check(minimum_margin > 0.0,
+              QStringLiteral("%1 HOME-03 卡片下边框没有被按钮压住").arg(label),
+              QStringLiteral("最小底边距=%1").arg(minimum_margin));
+    // HOME-04：卡片本身也必须在页面内（窄窗口下不能溢出到窗口外）。
+    const QQuickItem* row_card = itemByName("homeCard0");
+    const qreal card_bottom =
+        row_card
+            ->mapToItem(window->contentItem(), QPointF(0, row_card->height()))
+            .y();
+    const bool card_visible_in_window =
+        card_bottom <= static_cast<qreal>(height);
+    run.Check(
+        card_visible_in_window,
+        QStringLiteral("%1 HOME-04 卡片没有溢出窗口").arg(label),
+        QStringLiteral("卡片底部=%1 窗口高=%2").arg(card_bottom).arg(height));
+  };
+
+  checkHomeCards(1180, 760, QStringLiteral("正常窗口 1180x760"));
+  checkHomeCards(960, 620, QStringLiteral("最小窗口 960x620"));
+
+  // ---- MSG：临时提示只属于产生它的页面 ----
+  QTemporaryDir temp;
+  if (!temp.isValid()) {
+    std::fprintf(stderr, "[gui-contract] 无法创建临时目录\n");
+    return 1;
+  }
+
+  // MSG-01：备份页的输入校验错误不得跑到别的页面，回来后也不自动复现。
+  controller->setSourcePath(QString());
+  goToPage(1);
+  const bool started = controller->startBackupWithOptions(
+      QStringLiteral("mypack"), QStringLiteral("none"), QStringLiteral("none"),
+      QString(), QString());
+  run.Check(!started && controller->statusKind() == QStringLiteral("error"),
+            QStringLiteral("MSG-01 空源目录触发错误提示"),
+            controller->statusTitle() + QStringLiteral("/") +
+                controller->statusMessage());
+  run.Check(controller->statusScope() == QStringLiteral("backup"),
+            QStringLiteral("MSG-01 这条错误属于备份页"),
+            controller->statusScope());
+  run.Check(pageShows(1, controller->statusTitle()),
+            QStringLiteral("MSG-01 备份页显示它"));
+  run.Check(
+      !pageShows(4, controller->statusTitle()) &&
+          !pageShows(3, controller->statusTitle()) &&
+          !pageShows(2, controller->statusTitle()) &&
+          !pageShows(0, controller->statusTitle()),
+      QStringLiteral("MSG-01 设置 / 管理 / 自动备份 / 首页都不显示它"),
+      QStringLiteral("settings=[%1] management=[%2] schedule=[%3] home=[%4]")
+          .arg(bannerTitle(4), bannerTitle(3), bannerTitle(2), bannerTitle(0)));
+  const QString backup_error_title = controller->statusTitle();
+
+  goToPage(4);
+  run.Check(!pageShows(4, backup_error_title) &&
+                !pageShows(3, backup_error_title) &&
+                !pageShows(2, backup_error_title) &&
+                !pageShows(0, backup_error_title),
+            QStringLiteral("MSG-01 切到设置之后这条错误不再出现在任何页面"),
+            QStringLiteral("settings=[%1]").arg(bannerTitle(4)));
+  run.Check(controller->statusKind() == QStringLiteral("idle"),
+            QStringLiteral("MSG-01 离开备份页即消费掉这条错误"),
+            controller->statusKind());
+
+  goToPage(1);
+  run.Check(!pageShows(1, backup_error_title),
+            QStringLiteral("MSG-01 回到备份页不会自动复现旧错误"),
+            bannerTitle(1));
+
+  // MSG-02：设置页的成功提示同样只属于设置页，离开即消费。
+  const QString repository = temp.filePath(QStringLiteral("repo"));
+  goToPage(4);
+  const bool saved = controller->saveRepositoryPath(repository);
+  run.Check(saved && controller->statusKind() == QStringLiteral("success") &&
+                controller->statusScope() == QStringLiteral("settings"),
+            QStringLiteral("MSG-02 设置页保存成功"),
+            controller->statusTitle() + QStringLiteral("/") +
+                controller->statusScope());
+  const QString settings_title = controller->statusTitle();
+  run.Check(pageShows(4, settings_title),
+            QStringLiteral("MSG-02 设置页显示它"));
+  run.Check(
+      !pageShows(1, settings_title) && !pageShows(3, settings_title) &&
+          !pageShows(2, settings_title) && !pageShows(0, settings_title),
+      QStringLiteral("MSG-02 备份 / 管理 / 自动备份 / 首页都不显示它"),
+      QStringLiteral("backup=[%1] management=[%2] schedule=[%3] home=[%4]")
+          .arg(bannerTitle(1), bannerTitle(3), bannerTitle(2), bannerTitle(0)));
+  goToPage(1);
+  run.Check(controller->statusKind() == QStringLiteral("idle") &&
+                !pageShows(4, settings_title),
+            QStringLiteral("MSG-02 离开设置页即消费掉这条成功提示"),
+            controller->statusKind());
+  goToPage(4);
+  run.Check(!pageShows(4, settings_title),
+            QStringLiteral("MSG-02 回到设置页不会自动复现旧提示"),
+            bannerTitle(4));
+
+  // MSG-03：severity 与 scope 正交 —— 四种 severity 的位置与失效时机完全一样。
+  const char* kSeverities[4] = {"error", "warning", "info", "success"};
+  for (const char* severity : kSeverities) {
+    const QString kind = QString::fromLatin1(severity);
+    const QString title = QStringLiteral("severity-测试-%1").arg(kind);
+    goToPage(3);
+    controller->setStatusForTest(kind, QStringLiteral("management"), title,
+                                 QStringLiteral("detail"));
+    const bool shown_on_own_page = pageShows(3, title);
+    const bool hidden_elsewhere = !pageShows(1, title) &&
+                                  !pageShows(4, title) &&
+                                  !pageShows(2, title) && !pageShows(0, title);
+    goToPage(1);
+    const bool consumed = controller->statusKind() == QStringLiteral("idle");
+    run.Check(shown_on_own_page && hidden_elsewhere && consumed,
+              QStringLiteral("MSG-03 severity=%1 遵循同一条 scope/lifetime")
+                  .arg(kind),
+              QStringLiteral("本页显示=%1 其它页不显示=%2 离开即消费=%3")
+                  .arg(shown_on_own_page)
+                  .arg(hidden_elsewhere)
+                  .arg(consumed));
+  }
+
+  // MSG-04：后台任务在别的页面结束时，完成提示不能丢到那个页面上；
+  //         但任务本身必须照常完成。
+  const QString source = temp.filePath(QStringLiteral("source"));
+  QDir().mkpath(source);
+  for (int i = 0; i < 40; ++i) {
+    QFile file(QStringLiteral("%1/file-%2.bin").arg(source).arg(i));
+    if (file.open(QIODevice::WriteOnly)) file.write(QByteArray(2048, 'x'));
+  }
+  controller->setSourcePath(source);
+  goToPage(1);
+  const bool backup_started = controller->startBackupWithOptions(
+      QStringLiteral("mypack"), QStringLiteral("none"), QStringLiteral("none"),
+      QString(), QString());
+  run.Check(backup_started && controller->busy(),
+            QStringLiteral("MSG-04 备份真的启动了"));
+  // 切页就在**同一个事件循环回合内**完成：完成回调还没有机会派发，busy 一定
+  // 还是 true，所以这条断言不取决于任务跑得多快（与 --close-guard-test 用的是
+  // 同一条推理）。这里刻意不调用 goToPage()，它会让事件循环转一圈。
+  window->setProperty("currentPage", 4);
+  run.Check(
+      controller->busy() &&
+          controller->statusKind() == QStringLiteral("running") &&
+          !pageShows(4, QStringLiteral("备份完成")) &&
+          !pageShows(3, QStringLiteral("备份完成")),
+      QStringLiteral("MSG-04 运行中切页：运行状态不被切页清掉，也没有完成提示"),
+      controller->statusKind() + QStringLiteral("/") + bannerTitle(4));
+  run.Check(controller->waitForIdle(120000) && !controller->busy(),
+            QStringLiteral("MSG-04 切页之后任务照常完成"));
+  run.Check(controller->lastSucceeded() &&
+                controller->statusKind() == QStringLiteral("success") &&
+                controller->statusScope() == QStringLiteral("backup"),
+            QStringLiteral("MSG-04 完成提示仍然属于发起它的备份页"),
+            controller->statusTitle() + QStringLiteral("/") +
+                controller->statusScope());
+  run.Check(
+      pageShows(1, controller->statusTitle()) &&
+          !pageShows(4, controller->statusTitle()) &&
+          !pageShows(3, controller->statusTitle()) &&
+          !pageShows(2, controller->statusTitle()) &&
+          !pageShows(0, controller->statusTitle()),
+      QStringLiteral("MSG-04 完成提示只回到备份页，没有出现在当前页或其它页"),
+      QStringLiteral(
+          "backup=[%1] settings=[%2] management=[%3] schedule=[%4] home=[%5]")
+          .arg(bannerTitle(1), bannerTitle(4), bannerTitle(3), bannerTitle(2),
+               bannerTitle(0)));
+
+  // MSG-05：消费之后，重新触发同样的问题必须重新显示 —— 不能变成"清一次就
+  //         永远不显示"。
+  controller->setSourcePath(QString());
+  goToPage(1);
+  const bool started_again = controller->startBackupWithOptions(
+      QStringLiteral("mypack"), QStringLiteral("none"), QStringLiteral("none"),
+      QString(), QString());
+  run.Check(!started_again && pageShows(1, controller->statusTitle()) &&
+                controller->statusKind() == QStringLiteral("error"),
+            QStringLiteral("MSG-05 再次触发同一个错误仍然正常显示"),
+            bannerTitle(1) + QStringLiteral("/") + controller->statusKind());
+
+  std::printf("[gui-contract] passed=%d failed=%d\n", run.passed, run.failed);
+  if (run.failed != 0) {
+    for (const QString& failure : run.failures)
+      std::printf("[gui-contract]   FAIL %s\n", qPrintable(failure));
+  }
+  return run.failed == 0 ? 0 : 1;
+}
+
 int RunBackupOptionsTest(backup_modern::BackupController* controller,
                          const QString& config_file_path) {
   CheckRun run;
@@ -2764,6 +3057,8 @@ int main(int argc, char* argv[]) {
   const bool path_test = arguments.contains(QStringLiteral("--path-test"));
   const bool close_guard_test =
       arguments.contains(QStringLiteral("--close-guard-test"));
+  const bool gui_contract_test =
+      arguments.contains(QStringLiteral("--gui-contract-test"));
   const int screenshot_index =
       arguments.indexOf(QStringLiteral("--screenshot"));
   const int self_test_index = arguments.indexOf(QStringLiteral("--self-test"));
@@ -2952,6 +3247,10 @@ int main(int argc, char* argv[]) {
 
   if (close_guard_test) {
     return RunCloseGuardTest(window, &controller);
+  }
+
+  if (gui_contract_test) {
+    return RunGuiContractTest(window, &controller);
   }
 
   if (smoke_test) {
