@@ -113,7 +113,7 @@ class Walker {
     std::string root_path_error;
     if (!IsValidArchivePath(".", true, true, kMaxArchivePathLength,
                             &root_path_error)) {
-      return Fail(failure, SourceWalkFailureKind::kConsumerFailed,
+      return Fail(failure, SourceWalkFailureKind::kInvalidArchivePath,
                   root_path_error, source_directory, ".");
     }
     // source root 永远保留：即使规则把内容全过滤掉，扫描结果仍然是一棵合法
@@ -234,11 +234,6 @@ class Walker {
       const std::string child_disk = FileSystem::JoinPath(disk_directory, name);
       const std::string child_archive =
           (archive_path == ".") ? name : archive_path + "/" + name;
-      if (child_archive.size() > kMaxArchivePathLength) {
-        return Fail(failure, SourceWalkFailureKind::kPathTooLong,
-                    "Archive path too long: " + child_archive, child_disk,
-                    child_archive);
-      }
 
       SourceEntryFacts facts;
       const int injected_child =
@@ -265,6 +260,24 @@ class Walker {
             child_disk, child_archive);
       }
       FillNames(&facts);
+
+      // 归档路径的**完整语法**校验：这里调的就是 Backup 与读侧共用的那一个
+      // IsValidArchivePath，不是"再看看长度"。长度、反斜杠、盘符、绝对路径、
+      // 结尾 '/'、空 component、"." / ".." component、NUL 全在这一份 grammar
+      // 里。只查长度的后果是具体的：Linux 允许 a\b.txt 这种文件名，预览会
+      // 高高兴兴把它列出来，而真实备份随后报 Invalid archive path (backslash)
+      // ——"预览说能备份、备份必然失败"。
+      //
+      // is_first_entry 恒为 false：child 永远不是第一条；"."（source root）
+      // 在 Walk() 里用 (true, true) 单独校验。is_directory 传真实类型，这样
+      // 参数语义与 Backup 完全一致，不会因为"抽到 walker 之后顺手写死"而错。
+      std::string path_error;
+      if (!IsValidArchivePath(child_archive, false,
+                              facts.type == EntryType::kDirectory,
+                              kMaxArchivePathLength, &path_error)) {
+        return Fail(failure, SourceWalkFailureKind::kInvalidArchivePath,
+                    path_error, child_disk, child_archive);
+      }
 
       FilterEntry filter_entry;
       filter_entry.archive_path = child_archive;

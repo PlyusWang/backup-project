@@ -481,11 +481,13 @@ int RunPreviewCommand(const CliContext& context,
   }
   std::cout << "Preview: " << preview.included_count << " matching item(s)\n";
   if (preview.truncated) {
-    // 明确说出来，不静默截断：窗口之外还有条目，而列表只到窗口为止。
-    std::cout << "Note: the source tree has " << preview.total_entries
-              << " entries; only the first " << kPreviewEntryLimit
-              << " were examined, and " << shown
-              << " matching item(s) are listed below.\n";
+    // 明确说出来，不静默截断。措辞必须准确：整棵源目录树**已经**被完整验证
+    // 过（这是预览敢说"备份会怎样"的前提），被限制的只是**列出**多少条。
+    // 写成 "only the first 300 were examined" 会把这件事说反。
+    std::cout << "Note: showing the first " << kPreviewEntryLimit << " of "
+              << preview.included_count
+              << " matching item(s); the whole source tree was validated, "
+              << shown << " listed below.\n";
   }
   for (const PreviewItem& item : preview.items) {
     if (!item.included) continue;
