@@ -562,13 +562,82 @@ bool ScheduledBackupService::EvaluateInternal(std::int64_t now_sec, bool force,
     baseline_usable = true;
   }
 
-  if (baseline_usable) {
+  // ---- PR #18：增量策略的结论由共享增量引擎给出 ----
+  //
+  // 这里刻意**不**用 metadata-first 的比较来决定增量要不要写：内容身份必须
+  // 是真实摘要，否则 same-size + same-mtime 的改写会被漏掉，而漏掉的那一次
+  // 变化会成为所有后代的错误祖先。
+  //
+  // 引擎可能已经写好了一份快照（完整基线或 delta），也可能什么都没写；
+  // 两种结果都被翻译成下面那条**共用的**尾巴所期待的几个变量，
+  // 所以登记 / baseline 绑定 / manifest / retention / state / history 的
+  // 语义在三种路径上完全一致。
+  const bool incremental_mode =
+      document.config.strategy == BackupStrategy::kIncremental;
+  bool snapshot_already_written = false;
+  std::string incremental_snapshot_path;
+
+  if (incremental_mode) {
+    std::string work_error;
+    if (!catalog.EnsureRepository(repository_path_, &work_error)) {
+      return finish_failed(work_error);
+    }
+    // 命名规则仍然只属于 BackupCatalog。这里只是**预留**一个名字：
+    // 引擎若判定"没有变化"，这个名字不会被用到（BuildArchivePath 不创建文件）。
+    std::string candidate_path;
+    if (!catalog.BuildArchivePath(repository_path_, document.config.source_path,
+                                  now_sec, &candidate_path, &work_error)) {
+      return finish_failed(work_error);
+    }
+
+    BackupOptions incremental_options;
+    incremental_options.pack_method = document.config.pack_method;
+    incremental_options.compression_method = document.config.compression_method;
+    // 无人值守计划不接受加密：配置层已经拒过一次，这里不再提供入口。
+    incremental_options.encryption_method = EncryptionMethod::kNone;
+
+    IncrementalOutcome outcome;
+    if (!RunIncrementalBackup(
+            document.config.source_path, repository_path_,
+            BaseNameOf(candidate_path), RepositoryIdentity(repository_path_),
+            filter, incremental_options, document.config.include_rules,
+            document.config.exclude_rules, std::string(), &outcome,
+            &work_error)) {
+      return finish_failed(work_error);
+    }
+
+    result->changes = outcome.summary;
+    const bool had_baseline =
+        !document.state.baseline.snapshot_file_name.empty();
+    if (outcome.kind == IncrementalOutcome::Kind::kNoChanges) {
+      // 什么都没写：下面的 skip 分支会因为 changes 为空而接管，
+      // 连"不更新 manifest、不建空文件"这些细节都走同一条代码。
+    } else {
+      snapshot_already_written = true;
+      incremental_snapshot_path =
+          repository_path_ + "/" + outcome.snapshot_file_name;
+      result->archive_file_name = outcome.snapshot_file_name;
+      if (outcome.kind == IncrementalOutcome::Kind::kFullBaseline) {
+        result->first_snapshot = !had_baseline;
+        result->baseline_reset = had_baseline;
+        result->diagnostic +=
+            "Requested strategy = incremental, but this run created a full "
+            "baseline snapshot. Reason: " +
+            outcome.baseline_reason + ". ";
+      } else {
+        result->diagnostic +=
+            "Incremental delta on top of '" + outcome.parent_file_name + "'. ";
+      }
+    }
+  }
+
+  if (!incremental_mode && baseline_usable) {
     std::string diff_error;
     if (!DiffManifests(previous, current, &result->changes, nullptr,
                        &diff_error)) {
       return finish_failed(diff_error);
     }
-  } else {
+  } else if (!incremental_mode) {
     // 没有可信基线：这一轮产出一份**完整基线快照**。
     // 多建一份完整备份，绝不漏变化——这正是本 PR 的核心语义。
     const bool had_baseline =
@@ -619,12 +688,6 @@ bool ScheduledBackupService::EvaluateInternal(std::int64_t now_sec, bool force,
     return finish_failed(work_error);
   }
 
-  std::string archive_path;
-  if (!catalog.BuildArchivePath(repository_path_, document.config.source_path,
-                                now_sec, &archive_path, &work_error)) {
-    return finish_failed(work_error);
-  }
-
   BackupOptions options;
   options.pack_method = document.config.pack_method;
   options.compression_method = document.config.compression_method;
@@ -632,10 +695,20 @@ bool ScheduledBackupService::EvaluateInternal(std::int64_t now_sec, bool force,
   // 没有任何密码参数能从这条路径进来。
   options.encryption_method = EncryptionMethod::kNone;
 
-  BackupEngine engine;
-  if (!engine.Backup(document.config.source_path, archive_path, filter, options,
-                     &work_error)) {
-    return finish_failed(work_error);
+  std::string archive_path;
+  if (snapshot_already_written) {
+    // 增量引擎已经把它写好了（并且写好了它的 manifest / identity 副文件）。
+    archive_path = incremental_snapshot_path;
+  } else {
+    if (!catalog.BuildArchivePath(repository_path_, document.config.source_path,
+                                  now_sec, &archive_path, &work_error)) {
+      return finish_failed(work_error);
+    }
+    BackupEngine engine;
+    if (!engine.Backup(document.config.source_path, archive_path, filter,
+                       options, &work_error)) {
+      return finish_failed(work_error);
+    }
   }
 
   // 归档已经成功发布。从这一刻起，这一轮就是"成功"——后面的登记、淘汰、

@@ -2215,6 +2215,95 @@ else
     "exit=$INC_RESTORE_STATUS $(head -1 "$INC/restore.out")"
 fi
 
+# ---- L.8 计划 + 增量：同一个引擎，dependency-aware retention ----------------
+#
+# 这一节钉的是"计划路径没有自己的一套增量"：它把决策交给同一个共享引擎，
+# 于是 metadata-first 看不见的改写在这里同样看得见；而 retention 变成
+# dependency-aware 之后，把 retain 调小也不会为了"删最旧"而删断一条链。
+SCHED_INC="$PREVIEW/sched-incremental"
+SCHED_INC_CFG="$SCHED_INC/config.json"
+SCHED_INC_STORE="$SCHED_INC/schedule.json"
+rm -rf "$SCHED_INC"
+mkdir -p "$SCHED_INC/src" "$SCHED_INC/repo" "$SCHED_INC/home"
+printf 'alpha' > "$SCHED_INC/src/a.txt"
+printf 'bravo' > "$SCHED_INC/src/b.txt"
+"$BACKUPCTL" --config-file "$SCHED_INC_CFG" --schedule-file "$SCHED_INC_STORE" \
+  config repository set "$SCHED_INC/repo" >/dev/null 2>&1
+
+run_sched_inc() {
+  set +e
+  timeout --signal=KILL "$TIMEOUT_SECONDS" "$BACKUPCTL" --config-file "$SCHED_INC_CFG" \
+    --schedule-file "$SCHED_INC_STORE" schedule "$@" >"$SCHED_INC/out" 2>&1
+  SCHED_INC_STATUS=$?
+  set -e
+}
+
+# INC-09 计划配置接受 --strategy，并且真的按增量跑。
+run_sched_inc set --source "$SCHED_INC/src" --interval-minutes 60 --retain 3 \
+  --strategy incremental
+if [[ $SCHED_INC_STATUS -eq 0 ]] &&
+   grep -qF 'Strategy: incremental' "$SCHED_INC/out"; then
+  record_pass "INC-09 计划支持 --strategy incremental"
+else
+  record_fail "INC-09 计划 --strategy" "$(head -2 "$SCHED_INC/out" | tr '\n' ' ')"
+fi
+run_sched_inc enable
+run_sched_inc run
+if grep -qF 'full baseline snapshot' "$SCHED_INC/out"; then
+  record_pass "INC-09b 计划增量第一轮：如实报告建的是完整基线"
+else
+  record_fail "INC-09b 计划增量第一轮" "$(head -3 "$SCHED_INC/out" | tr '\n' ' ')"
+fi
+run_sched_inc run
+if grep -qiE 'skipped|not changed' "$SCHED_INC/out"; then
+  record_pass "INC-09c 计划增量第二轮：没有变化就跳过"
+else
+  record_fail "INC-09c 计划增量第二轮" "$(head -3 "$SCHED_INC/out" | tr '\n' ' ')"
+fi
+
+# INC-10 判别：same-size + same-mtime 的改写，计划路径也必须看得见。
+python3 - "$SCHED_INC/src/a.txt" <<'PYEOF'
+import os, sys
+path = sys.argv[1]
+info = os.lstat(path)
+with open(path, 'r+b') as handle:
+    handle.write(b'ALPHA')
+os.utime(path, (info.st_atime, info.st_mtime), follow_symlinks=False)
+PYEOF
+run_sched_inc run
+if grep -qF 'Incremental delta on top of' "$SCHED_INC/out"; then
+  record_pass "INC-10 判别：计划路径也识别 same-size/same-mtime 的改写（写出 delta）"
+else
+  record_fail "INC-10 计划路径识别改写" "$(head -3 "$SCHED_INC/out" | tr '\n' ' ')"
+fi
+
+# INC-11 retention 不能删断链：把 retain 调成 1 再跑一轮，链上的祖先必须还在。
+run_sched_inc set --retain 1
+printf 'charlie' > "$SCHED_INC/src/c.txt"
+run_sched_inc run
+SCHED_INC_BACKUPS="$(ls "$SCHED_INC/repo"/*.bak 2>/dev/null | wc -l)"
+if [[ "$SCHED_INC_BACKUPS" -ge 3 ]]; then
+  record_pass "INC-11 retain=1 也不会删掉链上必需的祖先（当前 $SCHED_INC_BACKUPS 份）"
+else
+  record_fail "INC-11 retention 保住了祖先" "backups=$SCHED_INC_BACKUPS"
+fi
+# 保住还不够：那条链必须真的还能恢复。
+SCHED_INC_DELTA="$(ls "$SCHED_INC/repo"/*_001.bak 2>/dev/null | head -1 | xargs -r basename)"
+rm -rf "$SCHED_INC/restored"
+set +e
+timeout --signal=KILL "$TIMEOUT_SECONDS" "$BACKUPCTL" --config-file "$SCHED_INC_CFG" \
+  --schedule-file "$SCHED_INC_STORE" restore "$SCHED_INC_DELTA" "$SCHED_INC/restored" \
+  >"$SCHED_INC/restore.out" 2>&1
+SCHED_INC_RESTORE=$?
+set -e
+if [[ $SCHED_INC_RESTORE -eq 0 ]] &&
+   [[ "$(cat "$SCHED_INC/restored/a.txt" 2>/dev/null)" == "ALPHA" ]]; then
+  record_pass "INC-11b 经过 retention 之后，链仍然恢复得出正确内容"
+else
+  record_fail "INC-11b retention 之后链可恢复" \
+    "exit=$SCHED_INC_RESTORE $(head -1 "$SCHED_INC/restore.out")"
+fi
+
 # ---- CLI 约定 --------------------------------------------------------
 
 expect_success "CLI-01 --help exits 0" --help

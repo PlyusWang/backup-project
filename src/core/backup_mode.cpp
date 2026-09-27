@@ -47,11 +47,12 @@ const ModeEntry kModeEntries[] = {
     // baseline/delta/no-change 决策都在共享核心里，CLI 与 GUI 走同一条路径。
     {BackupTrigger::kManual, BackupStrategy::kIncremental, true},
     {BackupTrigger::kScheduled, BackupStrategy::kFull, true},
-    // Scheduled + Incremental 仍然 false：计划路径还不知道依赖链，
-    // 而现有的 retention 是"按时间删最旧"，用在一条链上会把祖先删掉、
-    // 让后代全部不可恢复。在 retention 变成 dependency-aware 之前，
-    // 这条组合必须继续被拒绝，而不是"先跑起来再说"。
-    {BackupTrigger::kScheduled, BackupStrategy::kIncremental, false},
+    // PR #18：Scheduled + Incremental 现在也是真的了。它成立的前提有两件事，
+    // 缺一不可，而且都已经落地：
+    //   * 计划路径把增量决策交给共享引擎（内容身份，而不是 metadata-first）；
+    //   * retention 变成 dependency-aware，不会为了"删最旧"而删掉某个 delta
+    //     的祖先。
+    {BackupTrigger::kScheduled, BackupStrategy::kIncremental, true},
     {BackupTrigger::kManual, BackupStrategy::kFull, true},
     {BackupTrigger::kRealtime, BackupStrategy::kFull, false},
     {BackupTrigger::kRealtime, BackupStrategy::kIncremental, false},
@@ -128,8 +129,8 @@ std::string UnsupportedBackupModeReason(BackupTrigger trigger,
                                         BackupStrategy strategy) {
   return std::string("Unsupported backup mode: ") + BackupTriggerText(trigger) +
          " + " + BackupStrategyText(strategy) +
-         ". This version implements Manual + Full, Manual + Incremental and "
-         "Scheduled + Full.";
+         ". This version implements Manual + Full, Manual + Incremental, "
+         "Scheduled + Full and Scheduled + Incremental.";
 }
 
 }  // namespace backupproject

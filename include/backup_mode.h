@@ -12,10 +12,10 @@
 //   Manual    + Full           （PR #15 / #16）
 //   Scheduled + Full           （PR #17）
 //   Manual    + Incremental    （PR #18：delta 格式 + 依赖链恢复 + 共享引擎）
+//   Scheduled + Incremental    （PR #18：计划路径委托同一个引擎，
+//                               且 retention 已经是 dependency-aware）
 //
-// Scheduled + Incremental 仍然被拒绝，理由写在真值表旁边：计划路径的 retention
-// 还是"按时间删最旧"，用在依赖链上会删掉祖先、让后代全部不可恢复。Realtime
-// 只在 enum 里存在，没有任何产品入口。
+// Realtime 只在 enum 里存在，没有任何产品入口。
 //
 // 产品入口一律显式拒绝不支持的组合，不做 silent fallback
 // （"选了增量就偷偷按全量跑"是最危险的那种降级）。
