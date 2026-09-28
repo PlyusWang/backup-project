@@ -633,6 +633,85 @@ bool BackupCatalog::Resolve(const std::string& repository,
                                error_message);
 }
 
+namespace {
+
+// 测试接缝（默认 nullptr）：见 backup_catalog.h 的声明。
+bool (*g_unlink_failure_hook)(const char*) = nullptr;
+
+// 把"这一批要删的名字"排成 descendants-first（叶子在前）。
+//
+// 只依据依赖图：对每个名字读一次它声明的父（信封自证，所以"边"这个形状本身
+// 是可信的），而且只在**这批名字内部**连边。于是：
+//   * 在这批里没有子节点的先出队；
+//   * 任何一个父亲一定排在它所有后代之后；
+//   * 集合内部出现环 -> 拒绝整批（环本来就没有合法顺序，更不能靠猜）。
+//
+// 只排顺序，不做信任判断：一份坏掉的 .bak 仍然必须删得掉（它没有可解析的父，
+// 因此不连任何边）。
+bool DeletionOrderByDependencies(const std::string& repository,
+                                 const std::vector<std::string>& file_names,
+                                 std::vector<std::size_t>* order,
+                                 std::string* error_message) {
+  if (order == nullptr) {
+    SetError(error_message, "Deletion order output must not be null");
+    return false;
+  }
+  order->clear();
+  const std::size_t count = file_names.size();
+  std::vector<std::vector<std::size_t>> children(count);
+  for (std::size_t index = 0; index < count; ++index) {
+    std::string parent;
+    std::string read_error;
+    if (!SnapshotParentOf(repository, file_names[index], &parent,
+                          &read_error)) {
+      continue;  // 读不出来就不连边：它不是任何人的父亲
+    }
+    if (parent.empty()) continue;
+    for (std::size_t other = 0; other < count; ++other) {
+      if (file_names[other] == parent) {
+        children[other].push_back(index);
+        break;
+      }
+    }
+  }
+
+  std::vector<bool> emitted(count, false);
+  std::size_t remaining = count;
+  bool progressed = true;
+  while (remaining > 0 && progressed) {
+    progressed = false;
+    for (std::size_t index = 0; index < count; ++index) {
+      if (emitted[index]) continue;
+      bool has_live_child = false;
+      for (const std::size_t child : children[index]) {
+        if (!emitted[child]) {
+          has_live_child = true;
+          break;
+        }
+      }
+      if (has_live_child) continue;
+      order->push_back(index);
+      emitted[index] = true;
+      --remaining;
+      progressed = true;
+    }
+  }
+  if (remaining != 0) {
+    SetError(error_message,
+             "Cannot order this deletion set: the dependency graph inside it "
+             "contains a cycle");
+    return false;
+  }
+  return true;
+}
+
+}  // namespace
+
+void SetBackupCatalogUnlinkFailureHookForTesting(
+    bool (*hook)(const char* path)) {
+  g_unlink_failure_hook = hook;
+}
+
 bool BackupCatalog::Delete(const std::string& repository,
                            const std::string& file_name,
                            std::string* error_message) const {
@@ -697,10 +776,32 @@ bool BackupCatalog::DeleteSnapshots(
     }
   }
 
-  // ---- 第二遍：真的删。----
-  for (std::size_t index = 0; index < file_names.size(); ++index) {
+  // ---- 第二遍：按依赖顺序（descendants-first）真的删 ----
+  //
+  // 顺序不是风格问题：如果先删祖先、删到一半崩掉，剩下的后代就指向一个不存在
+  // 的父快照——那是 retention 自己制造 broken chain。叶子先删则任何中断点上
+  // "还存在的子节点，其父亲也还存在"。
+  //
+  // 排序只依据依赖图（child -> parent 的边），**不靠 created_time 猜**：
+  // 时间戳只能说明"谁先写出来"，说明不了谁依赖谁。
+  std::vector<std::size_t> order;
+  if (!DeletionOrderByDependencies(repository, file_names, &order,
+                                   error_message)) {
+    return false;
+  }
+
+  for (const std::size_t index : order) {
     const std::string& file_name = file_names[index];
     const std::string& archive_path = archive_paths[index];
+
+    // 测试接缝：让某一次 unlink 被人为判成失败，用来验证"删到一半停住"之后
+    // 剩下的链仍然自洽。默认没有钩子，产品路径不受影响。
+    if (g_unlink_failure_hook != nullptr &&
+        g_unlink_failure_hook(archive_path.c_str())) {
+      SetError(error_message,
+               "Injected unlink failure for backup file: " + archive_path);
+      return false;
+    }
 
     // 不要求 InspectHeader 成功：坏掉的备份仍然是普通 .bak 文件，必须删得掉，
     // 否则损坏的存档会永远留在列表里。

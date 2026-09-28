@@ -243,12 +243,24 @@ class BackupCatalog {
   // deleted_file_names 可以为空：非空时按实际删除成功的顺序填入文件名。
   // 单个 unlink 失败会立刻停止（后面的文件保持原样），所以调用方必须靠它——
   // 而不是靠"返回值为真"——来决定哪些记录可以从状态里去掉。
+  //
+  // 真正 unlink 的顺序是 **descendants-first**（叶子在前），由集合内部的依赖图
+  // 决定，不看 created_time：先删祖先、删到一半崩掉会留下"指向不存在父节点"的
+  // 后代，那是自己制造 broken chain。集合内部成环则整批拒绝。
   bool DeleteSnapshots(const std::string& repository,
                        const std::vector<std::string>& file_names,
                        std::vector<std::string>* deleted_file_names,
                        std::vector<std::string>* diagnostics,
                        std::string* error_message) const;
 };
+
+// ---- 测试接缝 ----
+//
+// 让某一条 unlink 在"即将执行"时被人为判成失败：用来验证"删到一半停住"之后
+// 剩下的链仍然自洽（还存在的子节点，其父亲也还存在）。默认 nullptr，产品的
+// 任何路径都不会设置它。
+void SetBackupCatalogUnlinkFailureHookForTesting(
+    bool (*hook)(const char* archive_path));
 
 }  // namespace backupproject
 
