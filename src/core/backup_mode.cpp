@@ -5,6 +5,8 @@
 
 #include "backup_mode.h"
 
+#include "incremental_backup.h"
+
 namespace backupproject {
 namespace {
 
@@ -131,6 +133,52 @@ std::string UnsupportedBackupModeReason(BackupTrigger trigger,
          " + " + BackupStrategyText(strategy) +
          ". This version implements Manual + Full, Manual + Incremental, "
          "Scheduled + Full and Scheduled + Incremental.";
+}
+
+bool IsSupportedBackupOptionCombination(
+    const BackupOptionCombination& combination) {
+  if (!IsSupportedBackupMode(combination.trigger, combination.strategy)) {
+    return false;
+  }
+  if (combination.strategy == BackupStrategy::kIncremental &&
+      !IsSupportedIncrementalPack(combination.pack_method)) {
+    return false;
+  }
+  // 计划路径从来没有"口令"这个东西：无人值守的加密需要安全的密钥来源，
+  // 本版本一律拒绝（与 ValidateScheduleConfig 逐字一致的那句话）。
+  if (combination.trigger == BackupTrigger::kScheduled &&
+      combination.encryption_method != EncryptionMethod::kNone) {
+    return false;
+  }
+  if (combination.strategy == BackupStrategy::kIncremental &&
+      !IsSupportedIncrementalEncryption(combination.encryption_method)) {
+    return false;
+  }
+  return true;
+}
+
+std::string UnsupportedBackupOptionCombinationReason(
+    const BackupOptionCombination& combination) {
+  if (!IsSupportedBackupMode(combination.trigger, combination.strategy)) {
+    return UnsupportedBackupModeReason(combination.trigger,
+                                       combination.strategy);
+  }
+  if (combination.strategy == BackupStrategy::kIncremental &&
+      !IsSupportedIncrementalPack(combination.pack_method)) {
+    return UnsupportedIncrementalPackReason();
+  }
+  if (combination.trigger == BackupTrigger::kScheduled &&
+      combination.encryption_method != EncryptionMethod::kNone) {
+    return std::string(
+        "Unattended scheduled encryption is not supported: "
+        "定时无人值守加密需要安全的密钥来源；当前版本不会持久化明文密码。");
+  }
+  if (combination.strategy == BackupStrategy::kIncremental &&
+      !IsSupportedIncrementalEncryption(combination.encryption_method)) {
+    return UnsupportedIncrementalEncryptionReason();
+  }
+  // 走到这里说明组合是支持的；返回空串而不是编一句"不支持"。
+  return std::string();
 }
 
 }  // namespace backupproject

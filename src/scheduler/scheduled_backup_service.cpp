@@ -328,39 +328,81 @@ bool ScheduledBackupService::RunRetention(ScheduleDocument* document,
     return false;
   }
 
+  // 计划里的名字必须是"本计划管理的快照"，否则不删（别人的东西不动）。
+  std::vector<std::string> to_remove;
   for (const std::string& planned : plan.remove) {
-    // 计划给出"可以删"，这里再映射回 managed 列表的下标：
-    // 删除永远走同一条 catalog.Delete 路径，绝不自己拼路径。
-    std::size_t oldest = document->state.managed_snapshots.size();
-    for (std::size_t index = 0;
-         index < document->state.managed_snapshots.size(); ++index) {
-      if (document->state.managed_snapshots[index].file_name == planned) {
-        oldest = index;
+    for (const ScheduledSnapshotRecord& item :
+         document->state.managed_snapshots) {
+      if (item.file_name == planned) {
+        to_remove.push_back(planned);
         break;
       }
     }
-    if (oldest == document->state.managed_snapshots.size()) continue;
-    // 先拷出来：下面会 erase，引用立刻失效。
-    const std::string file_name =
-        document->state.managed_snapshots[oldest].file_name;
+  }
 
+  if (!to_remove.empty()) {
+    std::vector<std::string> removed;
+    std::vector<std::string> diagnostics;
     std::string delete_error;
     // 删除永远走 BackupCatalog：它是唯一实现"file_name 必须是仓库直接子项、
-    // 必须是普通文件、不是软链接"这条路径安全边界的地方。
+    // 必须是普通文件、不是软链接"这条路径安全边界的地方，也是唯一实现
+    // "还有后代活着就不许删"的地方。
     // 绝不写成 std::filesystem::remove(repository + "/" + file_name)。
-    if (!catalog.Delete(repository_path_, file_name, &delete_error)) {
-      if (failed != nullptr) *failed += 1;
+    //
+    // 整批一起交进去是刻意的：retention 的删除集合是**整条链一起**，
+    // 而"删祖先"单独看必须被拒绝。集合级的规则正好同时表达这两件事。
+    const bool all_removed = catalog.DeleteSnapshots(
+        repository_path_, to_remove, &removed, &diagnostics, &delete_error);
+
+    // 只有**真的删掉了**的记录才从 managed 列表里去掉：单个 unlink 失败时
+    // 剩下的记录留在名单里，下一轮再试。
+    for (const std::string& file_name : removed) {
+      for (std::size_t index = 0;
+           index < document->state.managed_snapshots.size(); ++index) {
+        if (document->state.managed_snapshots[index].file_name != file_name) {
+          continue;
+        }
+        document->state.managed_snapshots.erase(
+            document->state.managed_snapshots.begin() +
+            static_cast<std::ptrdiff_t>(index));
+        break;
+      }
+    }
+    if (deleted != nullptr) {
+      *deleted += static_cast<std::uint64_t>(removed.size());
+    }
+    if (failed != nullptr) {
+      *failed += static_cast<std::uint64_t>(diagnostics.size());
+    }
+    if (!all_removed) {
+      if (failed != nullptr && removed.empty()) {
+        *failed += static_cast<std::uint64_t>(to_remove.size());
+      }
       SetError(error_message,
-               "Failed to remove the oldest scheduled snapshot '" + file_name +
-                   "': " + delete_error);
-      // 删不掉的记录保留在 managed 列表里，下一轮再试。
-      // 新快照已经成功，绝不能因为淘汰失败就把它当成整体失败。
+               "Failed to remove the oldest scheduled snapshots: " +
+                   delete_error);
       return false;
     }
-    document->state.managed_snapshots.erase(
-        document->state.managed_snapshots.begin() +
-        static_cast<std::ptrdiff_t>(oldest));
-    if (deleted != nullptr) *deleted += 1;
+  }
+
+  // 副文件生命周期：catalog 会带走每一份被删快照自己的副文件，但仓库里
+  // 历史遗留的孤儿副文件（.bak 早就不在了）只能在这里显式清一次。
+  // 清理失败如实计数，不静默。
+  {
+    std::vector<std::string> removed_sidecars;
+    std::vector<std::string> sidecar_diagnostics;
+    std::string cleanup_error;
+    if (!CleanOrphanSidecars(repository_path_, &removed_sidecars,
+                             &sidecar_diagnostics, &cleanup_error)) {
+      if (failed != nullptr) *failed += 1;
+      SetError(error_message,
+               "Failed to clean up orphan snapshot sidecars: " +
+                   cleanup_error);
+      return false;
+    }
+    if (failed != nullptr) {
+      *failed += static_cast<std::uint64_t>(sidecar_diagnostics.size());
+    }
   }
   // 被依赖而保留下来的祖先、以及读不出依赖因此不敢删的快照，
   // 都如实计数：否则"为什么还留着这么旧的快照"在日志和界面上都说不清。
