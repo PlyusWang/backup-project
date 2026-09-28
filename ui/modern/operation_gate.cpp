@@ -22,6 +22,10 @@ const char* OperationGate::KindName(Kind kind) {
       return "保存计划配置";
     case Kind::kScheduleEvaluation:
       return "定时备份评估";
+    case Kind::kRealtimeConfig:
+      return "保存实时配置";
+    case Kind::kRealtimeEvaluation:
+      return "实时备份评估";
   }
   return "未知操作";
 }

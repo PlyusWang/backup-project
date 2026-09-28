@@ -21,6 +21,10 @@
 //   --schedule-file <路径>              指定计划存储文件（测试隔离真实计划）
 //   --schedule-show                     把控制器读到的计划配置打成 key=value，
 //                                       用来证明 GUI 与 CLI 读的是同一份 store
+//   --realtime-test                     验证实时备份页的控制器链路：写配置并
+//                                       逐字段读回、attach watcher、resync 触发
+//                                       快照、文件事件触发快照、列出实时快照
+//   --realtime-file <路径> 指定实时存储文件（测试隔离真实实时配置）
 //   --path-test                         验证本地路径与 URL 互转不丢字符
 //   --close-guard-test                  验证任务进行中关窗会被拦下
 //   --gui-contract-test                 验证首页三张卡片的按钮几何，以及
@@ -68,13 +72,14 @@
 #include "config_manager.h"
 #include "filter_rule_model.h"
 #include "operation_gate.h"
+#include "realtime_controller.h"
 #include "schedule_controller.h"
 #include "schedule_store.h"
 #include "scheduler_lock.h"
 
 namespace {
 
-const int kPageCount = 5;
+const int kPageCount = 6;
 int g_qml_warnings = 0;
 
 // QML 的运行期问题（binding loop、类型错误、模块缺失……）都以 Qt warning 发出。
@@ -141,6 +146,16 @@ QString ResolveScheduleFilePath(const QStringList& arguments) {
     return arguments.at(index + 1);
   }
   return QString::fromStdString(backupproject::DefaultScheduleFilePath());
+}
+
+// 实时备份存储文件：默认位置同样来自 app_paths.h（backupctl realtime 读的就是
+// 这一份），--realtime-file 只用于测试隔离。
+QString ResolveRealtimeFilePath(const QStringList& arguments) {
+  const int index = arguments.indexOf(QStringLiteral("--realtime-file"));
+  if (index >= 0 && index + 1 < arguments.size()) {
+    return arguments.at(index + 1);
+  }
+  return QString::fromStdString(backupproject::DefaultRealtimeFilePath());
 }
 
 // 在可视项树里按 objectName 找一个 QQuickItem。
@@ -222,9 +237,9 @@ int CaptureScreenshots(QQuickWindow* window, backup_modern::AppTheme* theme,
   };
 
   // 顺序必须与 Main.qml 的 StackLayout 一致：首页 / 备份 / 自动备份 /
-  // 备份管理 / 设置。
-  const char* page_names[kPageCount] = {"home", "backup", "schedule",
-                                        "management", "settings"};
+  // 备份管理 / 设置 / 实时备份。
+  const char* page_names[kPageCount] = {"home",       "backup",   "schedule",
+                                        "management", "settings", "realtime"};
   for (int dark = 0; dark < 2; ++dark) {
     theme->setDark(dark == 1);
     for (int page = 0; page < kPageCount; ++page) {
@@ -2166,6 +2181,278 @@ int RunScheduleShow(backup_modern::ScheduleController* schedule) {
   return 0;
 }
 
+// ---- --realtime-test：实时备份页的控制器链路自检 ----
+//
+// 全程跑在临时目录里：临时 config.json、临时 realtime.json、临时仓库与源目录。
+// 绝不读写用户真实的实时配置，也不碰冻结的 Demo 目录。
+//
+// 它刻意不 mock 核心：控制器写进 store 的东西，紧接着用
+// backupproject::RealtimeStore 原样读回来逐项比对 —— 这正是
+// "GUI 与 CLI 读同一份 store、同一套 schema"在单元层面的证据。
+
+// 等到"最近一次产出的归档名"变成 previous 之外的值。
+// 用事件循环等，不用 sleep 堆时间：inotify 事件、debounce 定时器、后台任务
+// 都在这个循环里跑。
+bool WaitUntilNewSnapshot(backup_modern::RealtimeController* realtime,
+                          const QString& previous, int timeout_ms) {
+  QEventLoop loop;
+  QTimer poll;
+  poll.setInterval(10);
+  QObject::connect(&poll, &QTimer::timeout, &loop,
+                   [realtime, previous, &loop]() {
+                     if (!realtime->libraryBusy() && !realtime->pending() &&
+                         !realtime->lastSnapshotName().isEmpty() &&
+                         realtime->lastSnapshotName() != previous) {
+                       loop.quit();
+                     }
+                   });
+  QTimer guard;
+  guard.setSingleShot(true);
+  QObject::connect(&guard, &QTimer::timeout, &loop, &QEventLoop::quit);
+  poll.start();
+  guard.start(timeout_ms);
+  loop.exec();
+  return !realtime->lastSnapshotName().isEmpty() &&
+         realtime->lastSnapshotName() != previous;
+}
+
+int RunRealtimeTest(backup_modern::RealtimeController* realtime,
+                    backup_modern::OperationGate* gate,
+                    const QString& config_path) {
+  CheckRun run;
+  run.prefix = "[realtime]";
+
+  QTemporaryDir temp;
+  if (!temp.isValid()) {
+    std::fprintf(stderr, "[realtime] 无法创建临时目录\n");
+    return 1;
+  }
+  // 从一份干净的 store 开始：自检要断言"默认值"，残留的旧配置会让它测的不是
+  // 默认状态。这里删的是 --realtime-file 指到的文件（测试隔离目录）。
+  QFile::remove(realtime->storePath());
+
+  const QString source = temp.path() + QStringLiteral("/source");
+  const QString repository = temp.path() + QStringLiteral("/repository");
+  QDir().mkpath(source);
+  QDir().mkpath(repository);
+  if (!WriteTestFile(source + QStringLiteral("/a.txt"), "alpha")) {
+    std::fprintf(stderr, "[realtime] 无法准备源文件\n");
+    return 1;
+  }
+
+  // 1) 临时 config.json：把仓库指到临时目录。
+  {
+    backupproject::ConfigManager manager(config_path.toStdString());
+    backupproject::AppConfig config;
+    config.backup_repository_path = repository.toStdString();
+    std::string error;
+    run.Check(manager.Save(config, &error),
+              QStringLiteral("RT-01 临时 config.json 写入成功"),
+              QString::fromStdString(error));
+  }
+
+  realtime->reload();
+
+  run.Check(!realtime->enabled(), QStringLiteral("RT-02 默认未启用"));
+  run.Check(realtime->debounceMs() == 500,
+            QStringLiteral("RT-03 默认 debounce 500 ms"),
+            QString::number(realtime->debounceMs()));
+  run.Check(realtime->maxWaitMs() == 5000,
+            QStringLiteral("RT-04 默认 max wait 5000 ms"),
+            QString::number(realtime->maxWaitMs()));
+  run.Check(realtime->retainCount() == 12,
+            QStringLiteral("RT-05 默认保留 12 份"),
+            QString::number(realtime->retainCount()));
+  run.Check(realtime->triggerKey() == QStringLiteral("realtime"),
+            QStringLiteral("RT-06 trigger 固定为 realtime"),
+            realtime->triggerKey());
+  run.Check(realtime->repositoryPath() == repository,
+            QStringLiteral("RT-07 控制器读到了临时仓库"),
+            realtime->repositoryPath());
+  run.Check(realtime->encryptionKey() == QStringLiteral("none"),
+            QStringLiteral("RT-08 加密固定 none"), realtime->encryptionKey());
+
+  // 2) 写一份临时 realtime.json：strategy=full，逐字段读回。
+  run.Check(realtime->saveConfig(/*enabled=*/false, source, 200, 2000, 3,
+                                 QStringLiteral("mypack"),
+                                 QStringLiteral("none"), QStringList(),
+                                 QStringList(), QStringLiteral("full")),
+            QStringLiteral("RT-09 保存实时配置（full）成功"));
+
+  const QString store_file = realtime->storePath();
+  run.Check(QFile::exists(store_file),
+            QStringLiteral("RT-10 realtime.json 已落盘"), store_file);
+  struct stat store_info;
+  const bool stat_ok =
+      ::stat(store_file.toLocal8Bit().constData(), &store_info) == 0;
+  run.Check(stat_ok && (store_info.st_mode & 07777) == 0600,
+            QStringLiteral("RT-11 realtime.json 权限是 0600"),
+            stat_ok ? QString::number(store_info.st_mode & 07777, 8)
+                    : QStringLiteral("stat 失败"));
+
+  // 用共享核心原样读回来 —— GUI 存的东西必须是共享 schema。
+  {
+    backupproject::RealtimeStore store(store_file.toStdString());
+    backupproject::RealtimeConfig stored;
+    std::string error;
+    const backupproject::RealtimeLoadStatus status =
+        store.Load(&stored, &error);
+    run.Check(status == backupproject::RealtimeLoadStatus::kLoaded,
+              QStringLiteral("RT-12 realtime.json 能被共享核心读回"),
+              QString::fromStdString(error));
+    run.Check(stored.source_path == source.toStdString(),
+              QStringLiteral("RT-13 源目录逐字一致"),
+              QString::fromStdString(stored.source_path));
+    run.Check(stored.debounce_ms == 200 && stored.max_wait_ms == 2000 &&
+                  stored.retain_count == 3,
+              QStringLiteral("RT-14 debounce / max_wait / retain 逐字段一致"),
+              QStringLiteral("%1/%2/%3")
+                  .arg(stored.debounce_ms)
+                  .arg(stored.max_wait_ms)
+                  .arg(stored.retain_count));
+    run.Check(stored.strategy == backupproject::BackupStrategy::kFull,
+              QStringLiteral("RT-15 strategy=full"));
+    run.Check(stored.trigger == backupproject::BackupTrigger::kRealtime,
+              QStringLiteral("RT-16 trigger=realtime"));
+    run.Check(
+        stored.encryption_method == backupproject::EncryptionMethod::kNone,
+        QStringLiteral("RT-17 加密固定 none"));
+    run.Check(!stored.enabled, QStringLiteral("RT-18 enabled 与保存时一致"));
+    run.Check(stored.version == backupproject::kRealtimeConfigVersion,
+              QStringLiteral("RT-19 version 是共享 schema 的当前版本"));
+  }
+  std::printf(
+      "[realtime] config strategy=%s debounce=%d max_wait=%d retain=%d\n",
+      qPrintable(realtime->strategyKey()), realtime->debounceMs(),
+      realtime->maxWaitMs(), realtime->retainCount());
+
+  // 3) 切到 incremental 再读回核对。
+  run.Check(realtime->saveConfig(false, source, 200, 2000, 3,
+                                 QStringLiteral("mypack"),
+                                 QStringLiteral("none"), QStringList(),
+                                 QStringList(), QStringLiteral("incremental")),
+            QStringLiteral("RT-20 保存实时配置（incremental）成功"));
+  {
+    backupproject::RealtimeStore store(store_file.toStdString());
+    backupproject::RealtimeConfig stored;
+    std::string error;
+    const bool loaded = store.Load(&stored, &error) ==
+                        backupproject::RealtimeLoadStatus::kLoaded;
+    run.Check(loaded && stored.strategy ==
+                            backupproject::BackupStrategy::kIncremental,
+              QStringLiteral("RT-21 读回来是 strategy=incremental"),
+              QString::fromStdString(error));
+  }
+  std::printf(
+      "[realtime] config strategy=%s debounce=%d max_wait=%d retain=%d\n",
+      qPrintable(realtime->strategyKey()), realtime->debounceMs(),
+      realtime->maxWaitMs(), realtime->retainCount());
+
+  // 切回 full：下面两次触发断言的都是"完整快照"这条真实产品路径。
+  run.Check(realtime->saveConfig(false, source, 200, 2000, 3,
+                                 QStringLiteral("mypack"),
+                                 QStringLiteral("none"), QStringList(),
+                                 QStringList(), QStringLiteral("full")),
+            QStringLiteral("RT-22 切回 strategy=full 成功"));
+
+  // 4) 启用 -> attach watcher -> 合成一次 resync -> 等第一份快照。
+  run.Check(realtime->setEnabled(true),
+            QStringLiteral("RT-23 启用实时备份成功"));
+  run.Check(realtime->watching() && realtime->watchCount() > 0,
+            QStringLiteral("RT-24 watcher 已建立"),
+            QString::number(realtime->watchCount()));
+  std::printf("[realtime] attach watches=%d\n", realtime->watchCount());
+  run.Check(realtime->waitForIdle(60000),
+            QStringLiteral("RT-25 重新同步触发的第一份快照完成"));
+  run.Check(realtime->lastOutcomeKind() == QStringLiteral("full-snapshot"),
+            QStringLiteral("RT-26 第一次触发产出完整快照"),
+            realtime->lastOutcomeKind());
+  const QString first = realtime->lastSnapshotName();
+  run.Check(!first.isEmpty(), QStringLiteral("RT-27 第一次触发有归档名"));
+  std::printf("[realtime] step1 kind=%s name=%s\n",
+              qPrintable(realtime->lastOutcomeKind()), qPrintable(first));
+
+  // 5) 制造一次文件写入 -> 等 debounce -> 等第二份快照。
+  run.Check(WriteTestFile(source + QStringLiteral("/b.txt"), "beta"),
+            QStringLiteral("RT-28 在源目录里写入新文件"));
+  run.Check(WaitUntilNewSnapshot(realtime, first, 60000),
+            QStringLiteral("RT-29 事件触发的第二份快照完成"));
+  run.Check(realtime->lastOutcomeKind() == QStringLiteral("full-snapshot"),
+            QStringLiteral("RT-30 第二次触发产出完整快照"),
+            realtime->lastOutcomeKind());
+  const QString second = realtime->lastSnapshotName();
+  run.Check(!second.isEmpty() && second != first,
+            QStringLiteral("RT-31 第二次触发产出了新的归档"), second);
+  std::printf("[realtime] step2 kind=%s name=%s\n",
+              qPrintable(realtime->lastOutcomeKind()), qPrintable(second));
+
+  std::printf("[realtime] history count=%d\n", realtime->snapshotCount());
+  run.Check(realtime->snapshotCount() >= 2,
+            QStringLiteral("RT-32 最近实时快照列表里至少有两份"),
+            QString::number(realtime->snapshotCount()));
+  run.Check(realtime->watchCount() > 0,
+            QStringLiteral("RT-33 两轮之间监听一直没断"));
+
+  // ---- 闸门被占时触发不丢：合并成一个 pending generation，释放后补一次 ----
+  //
+  // 这条路径在真实产品里很容易发生（手动备份 / 计划评估正在跑，同时源目录
+  // 又变了）。判别点有两个：闸门被占期间**不写任何东西**，而且几批事件只
+  // 合并成**一次**评估，不是每次事件都排一次队。
+  {
+    const int before_count = realtime->snapshotCount();
+    QString reason;
+    const bool held = gate->Acquire(
+        backup_modern::OperationGate::Kind::kManualBackup, &reason);
+    run.Check(held, QStringLiteral("RT-34 先占住闸门（模拟手动备份正在跑）"),
+              reason);
+
+    run.Check(WriteTestFile(source + QStringLiteral("/c.txt"), "gamma"),
+              QStringLiteral("RT-35 闸门被占期间改第一个文件"));
+    run.Check(WriteTestFile(source + QStringLiteral("/d.txt"), "delta"),
+              QStringLiteral("RT-36 闸门被占期间改第二个文件"));
+
+    auto wait_for_pending = [realtime](int timeout_ms) {
+      QEventLoop loop;
+      QTimer poll;
+      poll.setInterval(10);
+      QObject::connect(&poll, &QTimer::timeout, &loop, [realtime, &loop]() {
+        if (realtime->pending()) loop.quit();
+      });
+      QTimer guard;
+      guard.setSingleShot(true);
+      QObject::connect(&guard, &QTimer::timeout, &loop, &QEventLoop::quit);
+      poll.start();
+      guard.start(timeout_ms);
+      loop.exec();
+      return realtime->pending();
+    };
+    run.Check(wait_for_pending(10000),
+              QStringLiteral("RT-37 闸门被占时这一代被记住（pending）"));
+    run.Check(realtime->snapshotCount() == before_count,
+              QStringLiteral("RT-38 闸门被占期间一份快照都没写"),
+              QString::number(realtime->snapshotCount()));
+
+    gate->Release(backup_modern::OperationGate::Kind::kManualBackup);
+    run.Check(WaitUntilNewSnapshot(realtime, second, 60000),
+              QStringLiteral("RT-39 闸门释放后待办的那一代被补跑"));
+    run.Check(realtime->snapshotCount() == before_count + 1,
+              QStringLiteral("RT-40 判别：两批事件只合并成一次评估"),
+              QString::number(realtime->snapshotCount()));
+  }
+
+  realtime->stop();
+
+  std::printf("[realtime] 通过 %d 项，失败 %d 项\n", run.passed, run.failed);
+  if (run.failed != 0) {
+    for (const QString& failure : run.failures) {
+      std::printf("[realtime]   FAIL %s\n", qPrintable(failure));
+    }
+    return 1;
+  }
+  std::printf("[realtime] ok\n");
+  return 0;
+}
+
 // ---- --schedule-test：自动备份页的控制器链路自检 ----
 //
 // 全程跑在临时目录里：临时 config.json、临时 schedule.json、临时仓库与源目录。
@@ -3250,6 +3537,10 @@ int main(int argc, char* argv[]) {
       arguments.indexOf(QStringLiteral("--config-file"));
   const int schedule_file_index =
       arguments.indexOf(QStringLiteral("--schedule-file"));
+  const bool realtime_test =
+      arguments.contains(QStringLiteral("--realtime-test"));
+  const int realtime_file_index =
+      arguments.indexOf(QStringLiteral("--realtime-file"));
   const bool backup_options_test =
       arguments.contains(QStringLiteral("--backup-options-test"));
   const bool schedule_test =
@@ -3267,6 +3558,10 @@ int main(int argc, char* argv[]) {
   }
   if (schedule_file_index >= 0 && schedule_file_index + 1 >= arguments.size()) {
     std::fprintf(stderr, "--schedule-file 需要一个计划存储文件路径参数\n");
+    return 2;
+  }
+  if (realtime_file_index >= 0 && realtime_file_index + 1 >= arguments.size()) {
+    std::fprintf(stderr, "--realtime-file 需要一个实时存储文件路径参数\n");
     return 2;
   }
   if (repository_test_index >= 0 &&
@@ -3340,6 +3635,14 @@ int main(int argc, char* argv[]) {
   // 删除归档之后的计划状态同步走这条直接连接，而不是信号：BackupController
   // 会在自己的删除闸门持有期内同步调用它，中间不给后台评估留窗口。
   controller.SetArchiveDeletedObserver(&schedule_controller);
+  // 实时备份的桥。它与手动 / 计划共用同一个 operation_gate，共用同一个仓库，
+  // 也用同一份 realtime.json（backupctl realtime 读的就是这一份）。
+  // 它**不**自己取任何 application lock：GUI 主进程已经在启动时按 per-UID
+  // 持有了那把锁，flock 绑在 open file description 上，再取一次只会把自己
+  // 判成"另一个实例正在运行"。
+  const QString realtime_file_path = ResolveRealtimeFilePath(arguments);
+  backup_modern::RealtimeController realtime_controller(
+      realtime_file_path, config_file_path, &operation_gate);
   backup_modern::FilterRuleModel filter_rule_model(&controller);
 
   QQmlApplicationEngine engine;
@@ -3352,6 +3655,8 @@ int main(int argc, char* argv[]) {
                                            &filter_rule_model);
   engine.rootContext()->setContextProperty(QStringLiteral("schedule"),
                                            &schedule_controller);
+  engine.rootContext()->setContextProperty(QStringLiteral("realtime"),
+                                           &realtime_controller);
   // 窗口用不用系统边框由 C++ 决定、QML 只读：窗口标志必须在窗口创建时定下来，
   // 之后再改会出现“已经画了一帧才换边框”的闪动。
   engine.rootContext()->setContextProperty(QStringLiteral("useNativeFrame"),
@@ -3383,11 +3688,20 @@ int main(int argc, char* argv[]) {
   if (schedule_show) {
     return RunScheduleShow(&schedule_controller);
   }
+  // 实时自检与计划自检一样：自己控制每一步（从空 store 开始、手动启用、
+  // 手动等快照），所以不自动 start。
+  if (realtime_test) {
+    return RunRealtimeTest(&realtime_controller, &operation_gate,
+                            config_file_path);
+  }
   if (preview_test_index >= 0) {
     return RunPreviewTest(&filter_rule_model,
                           arguments.at(preview_test_index + 1), arguments);
   }
   schedule_controller.start();
+  // 实时备份：读同一份 realtime.json，enabled 时 attach + 合成 resync。
+  // 与计划一样，自检模式不会走到这里。
+  realtime_controller.start();
 
   if (self_test_index >= 0) {
     const int filter_status = ApplyFilterArguments(&controller, arguments);
@@ -3447,7 +3761,7 @@ int main(int argc, char* argv[]) {
   }
 
   if (smoke_test) {
-    // 五个页面都要真的被实例化并切换一次，两套主题也都要切到。
+    // 六个页面都要真的被实例化并切换一次，两套主题也都要切到。
     // 只把 kPageCount 加一而不真正切页，等于根本没有验证新页面。
     for (int page = 0; page < kPageCount; ++page) {
       QTimer::singleShot(120 + page * 90, &app, [window, page]() {

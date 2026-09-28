@@ -217,14 +217,16 @@ classify_qmllint() {
       # 只认这一句精确文本，且只在直接前一条是 FilterEditorPanel.qml 的已放行诊断时才放行；
       # 放行后立刻清状态，避免变成“全局允许某类提示”。
       if (msg ~ /^Info: (ruleModel|modelData) is a member of a parent element\.?$/ &&
-          (prev_panel_allowed == 1 || prev_allowed_file ~ /SchedulePage\.qml/)) {
+          (prev_panel_allowed == 1 || prev_allowed_file ~ /SchedulePage\.qml/ ||
+           prev_allowed_file ~ /RealtimePage\.qml/)) {
         print "ALLOWED\t" msg
         # 不清状态：SchedulePage 的委托用 required property var modelData，
         # qmllint 会在这条之后紧跟一条不带文件名的通用 Info，两条属于同一份诊断。
         return
       }
       if (msg ~ /^Info: You first have to give the element an id\.?$/ &&
-          prev_allowed_file ~ /SchedulePage\.qml/) {
+          (prev_allowed_file ~ /SchedulePage\.qml/ ||
+           prev_allowed_file ~ /RealtimePage\.qml/)) {
         print "ALLOWED\t" msg
         prev_panel_allowed = 0
         prev_allowed_file = ""
@@ -255,6 +257,13 @@ classify_qmllint() {
       # 再由下面那条按 prev_allowed_file 放行。
       if (msg ~ /Unqualified access/ && msg ~ /SchedulePage\.qml/ &&
           (snippet ~ /schedule\./ || snippet ~ /page\./)) {
+        MarkAllowed(msg); return
+      }
+      # PR #19：RealtimePage.qml 只引用两个上下文属性 —— main.cpp 注册的
+      # realtime（实时备份控制器）与本页自己的根 id page。放行规则同样精确限定到
+      # "这个文件 + 这两个名字"。
+      if (msg ~ /Unqualified access/ && msg ~ /RealtimePage\.qml/ &&
+          (snippet ~ /realtime\./ || snippet ~ /page\./)) {
         MarkAllowed(msg); return
       }
       if (msg ~ /Cannot defer property assignment to "contentItem"/) {
@@ -352,10 +361,11 @@ fi
 # 页面结构：首页 / 备份 / 自动备份 / 备份管理 / 设置 五页。
 # 恢复已经不是独立页面，而是备份管理页里的一个动作 —— 这几条断言把结构钉死，
 # 免得日后又长回一个"恢复页"。
-expect_count "$QML_DIR/Main.qml" "NavItem {" 5 \
-  "侧栏有五个导航项（首页 / 备份 / 自动备份 / 备份管理 / 设置）"
-expect_count "$QML_DIR/Main.qml" "opacity: root.currentPage === " 5 \
-  "StackLayout 里五页各自绑定可见性"
+# PR #19 之后是六页：首页 / 备份 / 自动备份 / 实时备份 / 备份管理 / 设置。
+expect_count "$QML_DIR/Main.qml" "NavItem {" 6 \
+  "侧栏有六个导航项（首页 / 备份 / 自动备份 / 实时备份 / 备份管理 / 设置）"
+expect_count "$QML_DIR/Main.qml" "opacity: root.currentPage === " 6 \
+  "StackLayout 里六页各自绑定可见性"
 expect_count_re "$QML_DIR/Main.qml" "^[[:space:]]*currentIndex: root.currentPage" 1 \
   "StackLayout 跟随 root.currentPage"
 if grep -rq 'OperationPage' "$QML_DIR" "$RESOURCE_FILE"; then
@@ -1636,6 +1646,166 @@ for pattern in "Include rules:  (none)" \
     record_fail "CLI 清空规则后读不到：$pattern"
   fi
 done
+
+echo "[modern-gui] 16) 实时备份页（Realtime Trigger）"
+
+REALTIME_PAGE_QML="$QML_DIR/pages/RealtimePage.qml"
+REALTIME_CTRL_CPP="$ROOT_DIR/ui/modern/realtime_controller.cpp"
+REALTIME_CTRL_H="$ROOT_DIR/ui/modern/realtime_controller.h"
+
+# --- 页面在资源清单与导航里 ---
+expect_count "$RESOURCE_FILE" "qml/pages/RealtimePage.qml" 1 \
+  "RealtimePage.qml 进了资源清单"
+expect_count "$QML_DIR/Main.qml" 'text: "实时备份"' 1 \
+  "侧栏有实时备份入口"
+expect_count "$QML_DIR/Main.qml" "RealtimePage {" 1 \
+  "StackLayout 里只有一个 RealtimePage 实例"
+expect_count "$QML_DIR/Main.qml" "realtime.clearStatus()" 1 \
+  "离开实时页时消费它自己的临时提示"
+
+# --- 页面上该有的控件 ---
+for name in realtimeEnabledToggle realtimeSourceField realtimeDebounceField \
+            realtimeMaxWaitField realtimeRetainField realtimeStrategyCombo \
+            realtimePackCombo realtimeCompressionCombo realtimeEncryptionCombo \
+            realtimeEncryptionText realtimeEncryptionNote realtimeIncludeField \
+            realtimeExcludeField saveRealtimeButton realtimePhaseText \
+            realtimeWatchCountText realtimePendingCountText realtimeOverflowText \
+            realtimeSnapshotList realtimeStatusBanner; do
+  expect_count "$REALTIME_PAGE_QML" "objectName: \"$name\"" 1 \
+    "实时页有 $name"
+done
+
+# --- 加密：只有 none，而且选择器是**置灰**的（不是藏起来） ---
+expect_present "$REALTIME_PAGE_QML" 'objectName: "realtimeEncryptionCombo"' \
+  "实时页有加密选择器"
+expect_present "$REALTIME_PAGE_QML" "enabled: false" \
+  "加密选择器是置灰的，不是隐藏的"
+expect_missing "$REALTIME_PAGE_QML" "aes-256-ctr-hmac-sha256" \
+  "实时页不提供任何加密算法选项"
+expect_present "$REALTIME_CTRL_CPP" "实时无人值守备份当前不保存密码，因此不启用加密。" \
+  "加密说明那句话只有一份来源（控制器），QML 不再写一遍"
+
+# --- Filter：复用既有规则编辑方式，解析仍然只在共享 Filter 里 ---
+expect_present "$REALTIME_PAGE_QML" "realtime.validateRule(" \
+  "实时页的规则即时反馈问的是控制器（背后是真实 Filter）"
+expect_present "$REALTIME_PAGE_QML" "realtime.saveConfigFromText(" \
+  "实时页把数字按文本交给共享核心解析"
+expect_missing "$REALTIME_PAGE_QML" "parseInt(page.draft" \
+  "实时页不用 QML 的 parseInt 截断 Debounce / Max wait / 保留数量"
+expect_missing "$REALTIME_PAGE_QML" "backupFilePath" \
+  "实时页没有归档完整路径这个概念"
+
+# --- 业务逻辑不在 QML 里：inotify / 核心服务 / retention / 仓库路径拼接 ---
+# 顶层注释里那句"它不直接调 inotify"是有意留下的说明，所以断言的是真实的
+# API 名字，而不是那个词本身。
+expect_missing "$REALTIME_PAGE_QML" "InotifyWatcher" \
+  "QML 不直接碰 inotify"
+expect_missing "$REALTIME_PAGE_QML" "RunRealtimeBackupOnce" \
+  "QML 不直接调核心服务"
+expect_missing "$REALTIME_PAGE_QML" "ListRealtimeSnapshots" \
+  "QML 不直接列实时快照"
+expect_missing "$REALTIME_PAGE_QML" "RunRealtimeRetention" \
+  "QML 不自己执行 retention"
+expect_present "$REALTIME_PAGE_QML" "realtime.repositoryPath" \
+  "实时页只显示控制器给的仓库路径"
+expect_missing "$REALTIME_PAGE_QML" 'repositoryPath + "/"' \
+  "实时页不自己拼 repository 路径"
+
+# --- 窄窗口：内容必须能滚动，而不是被裁掉 ---
+expect_count "$REALTIME_PAGE_QML" "ScrollView {" 1 \
+  "实时页用 ScrollView 承载内容"
+expect_count "$REALTIME_PAGE_QML" "contentWidth: availableWidth" 1 \
+  "实时页在窄窗口下启用横向自适应"
+expect_present "$REALTIME_PAGE_QML" "width: Math.min(pageScroll.availableWidth - 64, 1400)" \
+  "实时页的列宽随可用宽度收缩"
+
+# --- 控制器只是桥：配置 / 监听 / 合并 / 执行 / 历史全部来自共享核心 ---
+expect_present "$REALTIME_CTRL_H" "backupproject::RealtimeStore store_;" \
+  "RealtimeController 直接使用共享的 RealtimeStore"
+expect_present "$REALTIME_CTRL_H" "backupproject::InotifyWatcher watcher_;" \
+  "监听走共享核心的 InotifyWatcher"
+expect_present "$REALTIME_CTRL_CPP" "backupproject::RealtimeDebouncer" \
+  "合并窗口走共享核心的 RealtimeDebouncer"
+expect_present "$REALTIME_CTRL_CPP" "backupproject::RunRealtimeBackupOnce" \
+  "执行走共享核心的 RunRealtimeBackupOnce"
+expect_present "$REALTIME_CTRL_CPP" "backupproject::ListRealtimeSnapshots" \
+  "实时快照列表走共享核心的 ListRealtimeSnapshots"
+expect_present "$REALTIME_CTRL_CPP" "backupproject::ValidateRealtimeConfig" \
+  "结构校验走共享核心"
+expect_present "$REALTIME_CTRL_CPP" "backupproject::ValidateRealtimeForEnable" \
+  "启用前的完整校验走共享核心（backupctl realtime enable 用的是同一个函数）"
+expect_present "$REALTIME_CTRL_CPP" "backupproject::ParseBackupStrategyKey" \
+  "策略 key 解析走共享核心的同一张表"
+# --- 单实例锁与子进程：都**不许**出现 ---
+# GUI 主进程启动时已经按 per-UID 持有了 ApplicationInstanceLock，而 flock 绑在
+# open file description 上：同一进程第二次 open + LOCK_EX|LOCK_NB 会 EWOULDBLOCK，
+# 自己把自己判成"另一个实例正在运行"。核心服务自己不加锁，所以这里也不许有。
+expect_missing "$REALTIME_CTRL_CPP" "ApplicationInstanceLock" \
+  "RealtimeController 不重复申请应用单实例锁"
+expect_missing "$REALTIME_CTRL_CPP" "QProcess" \
+  "RealtimeController 不 spawn 子 backupproject 进程来做备份"
+
+# --- 闸门：进 worker 前必须拿到 kRealtimeEvaluation；保存配置走 kRealtimeConfig ---
+expect_present "$REALTIME_CTRL_CPP" "OperationGate::Kind::kRealtimeEvaluation" \
+  "后台实时评估先过闸门"
+expect_present "$REALTIME_CTRL_CPP" "OperationGate::Kind::kRealtimeConfig" \
+  "保存实时配置先过闸门"
+expect_present "$REALTIME_CTRL_CPP" "retry_timer_.setInterval(kGateRetryMs)" \
+  "抢不到闸门时用 150 ms 的轻量 retry timer，而不是 busy-spin"
+expect_present "$REALTIME_CTRL_H" "backupproject::RealtimeGeneration pending_generation_;" \
+  "抢不到闸门时只保留**一个** pending generation"
+expect_present "$ROOT_DIR/ui/modern/operation_gate.h" "kRealtimeEvaluation," \
+  "闸门里有实时评估这一格"
+expect_present "$ROOT_DIR/ui/modern/operation_gate.h" "kRealtimeConfig," \
+  "闸门里有保存实时配置这一格"
+expect_count "$ROOT_DIR/ui/modern/operation_gate.h" "kRealtime" 2 \
+  "闸门只加了实时相关的两格"
+
+# --- 真实控制器链路自检 + 隔离路径 ---
+REALTIME_STORE="$TEST_STATE_DIR/realtime.json"
+REALTIME_CONFIG="$TEST_STATE_DIR/realtime-config.json"
+REALTIME_LOG="$TEST_STATE_DIR/realtime-test.log"
+set +e
+QT_QPA_PLATFORM=offscreen QSG_RHI_BACKEND=software timeout 300 \
+  ./build/backup-gui-modern --realtime-test \
+  --config-file "$REALTIME_CONFIG" --realtime-file "$REALTIME_STORE" \
+  > "$REALTIME_LOG" 2>&1
+realtime_status=$?
+set -e
+cat "$REALTIME_LOG" >> "$LOG_FILE"
+if [[ "$realtime_status" -eq 0 ]]; then
+  record_pass "实时页控制器链路自检通过（$(grep -c '   ok   ' "$REALTIME_LOG" || true) 项观测全部通过）"
+else
+  record_fail "实时页控制器链路自检退出码 $realtime_status"
+  grep 'FAIL' "$REALTIME_LOG" | tail -5
+fi
+# 固定格式的输出行：脚本按行断言，不靠"程序自己说成功"。
+for pattern in "config strategy=full debounce=200 max_wait=2000 retain=3" \
+               "config strategy=incremental debounce=200 max_wait=2000 retain=3" \
+               "attach watches=" \
+               "step1 kind=full-snapshot name=" \
+               "step2 kind=full-snapshot name=" \
+               "history count=" \
+               "ok"; do
+  if grep -qF -- "[realtime] $pattern" "$REALTIME_LOG"; then
+    record_pass "实时自检输出：$pattern"
+  else
+    record_fail "实时自检缺少输出：$pattern"
+  fi
+done
+# 两次触发的归档名必须不同：只断言"有 name=" 会漏掉"第二份没有真的新建"。
+realtime_first="$(grep -oE '^\[realtime\] step1 kind=[^ ]+ name=.*$' "$REALTIME_LOG" | head -1 || true)"
+realtime_second="$(grep -oE '^\[realtime\] step2 kind=[^ ]+ name=.*$' "$REALTIME_LOG" | head -1 || true)"
+if [[ -n "$realtime_first" && -n "$realtime_second" && "$realtime_first" != "$realtime_second" ]]; then
+  record_pass "实时自检的两次触发产出了不同的归档"
+else
+  record_fail "实时自检的两次触发没有产出不同的归档"
+fi
+if [[ -s "$REALTIME_STORE" ]]; then
+  record_pass "自检写出的 realtime.json 存在"
+else
+  record_fail "自检没有写出 realtime.json"
+fi
 
 echo "[modern-gui] 通过 $PASS_COUNT 项，失败 $FAIL_COUNT 项"
 echo "[modern-gui] 日志: $LOG_FILE"
