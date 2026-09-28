@@ -188,6 +188,22 @@ bool BuildScheduleFilter(const ScheduleConfig& config, Filter* filter,
 
 bool ValidateScheduleConfig(const ScheduleConfig& config,
                             std::string* error_message) {
+  // 这份 store 的作用域：它只装 scheduled 触发。Realtime 有它自己的 store
+  // （realtime.json，见 PR #19）。
+  //
+  // 为什么这条判断必须存在：PR #19 之后共享矩阵里 Realtime × {Full,
+  // Incremental} 两格都是"支持"，只问矩阵的话，一份手改成
+  // "trigger": "realtime" 的 schedule.json 会被 schedule 路径当成合法配置
+  // 执行——那不是"换了个触发方式"，而是"这份文件根本不该被执行"。
+  // 所以作用域由 store 自己回答，矩阵继续回答"组合本身能不能跑"。
+  if (config.trigger != BackupTrigger::kScheduled) {
+    SetError(error_message,
+             std::string("This schedule store only holds the scheduled "
+                         "trigger, got '") +
+                 BackupTriggerText(config.trigger) +
+                 "'. Realtime backups use their own store (realtime.json).");
+    return false;
+  }
   // 组合校验只有一份实现：产品矩阵 + "增量只支持 MyPack" + "计划不接受加密"。
   // 这里不再自己写 if 链——"GUI 能存、CLI 读不了"就是这么来的。
   BackupOptionCombination combination;

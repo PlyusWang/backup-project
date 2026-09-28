@@ -6,7 +6,8 @@
 //
 //   * 选项组合的唯一答案来源（含"存得进去、跑起来才炸"的那两种组合）；
 //   * 不可信 delta 路径在**应用**那一刻的边界（软链接祖先 / final symlink）；
-//   * 父绑定三件事（名字、快照身份、manifest 摘要）与"换掉 .bak、留着旧副文件"；
+//   * 父绑定三件事（名字、快照身份、manifest 摘要）与"换掉
+//   .bak、留着旧副文件"；
 //   * hardlink group 只改内容时的整组扩张；
 //   * manifest 与真正写进 payload 的字节绑定（same-size + 原 mtime 的改写）；
 //   * 依赖感知的手工删除与副文件生命周期；
@@ -44,26 +45,23 @@ bool RunIncremental(const std::string& source, const std::string& repository,
                     bp::IncrementalOutcome* outcome, std::string* error) {
   bp::Filter filter;
   bp::BackupOptions options;
-  return bp::RunIncrementalBackup(source, repository, name,
-                                  bp::RepositoryIdentity(repository), filter,
-                                  options, std::vector<std::string>(),
-                                  std::vector<std::string>(), baseline, outcome,
-                                  error);
+  return bp::RunIncrementalBackup(
+      source, repository, name, bp::RepositoryIdentity(repository), filter,
+      options, std::vector<std::string>(), std::vector<std::string>(), baseline,
+      outcome, error);
 }
 
 // 指定选项的那一条（用来证明核心自己也会拒绝非法组合）。
 bool RunIncrementalWith(const std::string& source,
-                        const std::string& repository,
-                        const std::string& name,
+                        const std::string& repository, const std::string& name,
                         const std::string& baseline,
                         const bp::BackupOptions& options,
                         bp::IncrementalOutcome* outcome, std::string* error) {
   bp::Filter filter;
-  return bp::RunIncrementalBackup(source, repository, name,
-                                  bp::RepositoryIdentity(repository), filter,
-                                  options, std::vector<std::string>(),
-                                  std::vector<std::string>(), baseline, outcome,
-                                  error);
+  return bp::RunIncrementalBackup(
+      source, repository, name, bp::RepositoryIdentity(repository), filter,
+      options, std::vector<std::string>(), std::vector<std::string>(), baseline,
+      outcome, error);
 }
 
 // 用产品自己的完整备份路径造一份"外来归档"：替换攻击需要一份**合法但不同**
@@ -172,8 +170,7 @@ bool ChainedEnvelope(const std::string& repository, const std::string& source,
 bool WriteRootOnlyDelta(const std::string& repository,
                         const std::string& source,
                         const std::string& delta_name,
-                        const bp::DeltaEnvelope& envelope,
-                        std::string* error) {
+                        const bp::DeltaEnvelope& envelope, std::string* error) {
   std::vector<bp::ArchiveEntry> entries;
   entries.push_back(RootEntry(source));
   bp::BackupOptions options;
@@ -212,7 +209,8 @@ void MutateSourceHook(void* context) {
 
 int main() {
   // ---- C1：选项组合的唯一答案来源 ----
-  test_support::Section("INC-C 1. 选项组合（trigger x strategy x pack x encryption）");
+  test_support::Section(
+      "INC-C 1. 选项组合（trigger x strategy x pack x encryption）");
   {
     struct Case {
       bp::BackupTrigger trigger;
@@ -274,12 +272,22 @@ int main() {
          bp::PackMethod::kMyPack, bp::CompressionMethod::kNone,
          bp::EncryptionMethod::kAes256CtrHmacSha256, false,
          "Scheduled + Incremental + aes 被拒绝"},
+        // PR #19：Realtime 两格现在都是真实支持的组合（六格全开）。
+        // 但"支持"只到策略与 pack 这一层：加密边界依旧不放松。
         {bp::BackupTrigger::kRealtime, bp::BackupStrategy::kFull,
          bp::PackMethod::kMyPack, bp::CompressionMethod::kNone,
-         bp::EncryptionMethod::kNone, false, "Realtime + Full 被拒绝"},
+         bp::EncryptionMethod::kNone, true, "Realtime + Full 现在支持"},
         {bp::BackupTrigger::kRealtime, bp::BackupStrategy::kIncremental,
          bp::PackMethod::kMyPack, bp::CompressionMethod::kNone,
-         bp::EncryptionMethod::kNone, false, "Realtime + Incremental 被拒绝"},
+         bp::EncryptionMethod::kNone, true, "Realtime + Incremental 现在支持"},
+        {bp::BackupTrigger::kRealtime, bp::BackupStrategy::kFull,
+         bp::PackMethod::kMyPack, bp::CompressionMethod::kNone,
+         bp::EncryptionMethod::kAes256CtrHmacSha256, false,
+         "Realtime + aes 仍然被拒绝"},
+        {bp::BackupTrigger::kRealtime, bp::BackupStrategy::kIncremental,
+         bp::PackMethod::kUstar, bp::CompressionMethod::kNone,
+         bp::EncryptionMethod::kNone, false,
+         "Realtime + Incremental + ustar 仍然被拒绝"},
     };
     for (const Case& item : cases) {
       bp::BackupOptionCombination combination;
@@ -288,7 +296,8 @@ int main() {
       combination.pack_method = item.pack;
       combination.compression_method = item.compression;
       combination.encryption_method = item.encryption;
-      const bool supported = bp::IsSupportedBackupOptionCombination(combination);
+      const bool supported =
+          bp::IsSupportedBackupOptionCombination(combination);
       test_support::Check(supported == item.supported,
                           "INC-C OPT " + item.label);
       const std::string reason =
@@ -331,11 +340,12 @@ int main() {
     test_support::Check(!RunIncrementalWith(source, repository, "enc.bak", "",
                                             encrypted, &outcome, &error),
                         "INC-C CORE 增量 + 加密被核心拒绝");
-    test_support::Check(error.find("does not support encryption") !=
-                            std::string::npos,
-                        "INC-C CORE 拒绝理由说明信封未被认证", error);
-    test_support::Check(!test_support::Exists(SnapshotPath(repository, "enc.bak")),
-                        "INC-C CORE 拒绝后没有留下快照");
+    test_support::Check(
+        error.find("does not support encryption") != std::string::npos,
+        "INC-C CORE 拒绝理由说明信封未被认证", error);
+    test_support::Check(
+        !test_support::Exists(SnapshotPath(repository, "enc.bak")),
+        "INC-C CORE 拒绝后没有留下快照");
 
     error.clear();
     bp::BackupOptions ustar;
@@ -343,9 +353,9 @@ int main() {
     test_support::Check(!RunIncrementalWith(source, repository, "ustar.bak", "",
                                             ustar, &outcome, &error),
                         "INC-C CORE 增量 + USTAR 被核心拒绝");
-    test_support::Check(!test_support::Exists(
-                            SnapshotPath(repository, "ustar.bak")),
-                        "INC-C CORE 拒绝后没有留下 USTAR 快照");
+    test_support::Check(
+        !test_support::Exists(SnapshotPath(repository, "ustar.bak")),
+        "INC-C CORE 拒绝后没有留下 USTAR 快照");
   }
 
   // ---- C3：delta 路径在应用那一刻的边界 ----
@@ -363,32 +373,30 @@ int main() {
 
     bp::IncrementalOutcome outcome;
     std::string error;
-    test_support::Check(RunIncremental(source, repository, "base.bak", "",
-                                       &outcome, &error),
-                        "INC-C PATH 基线建立成功", error);
+    test_support::Check(
+        RunIncremental(source, repository, "base.bak", "", &outcome, &error),
+        "INC-C PATH 基线建立成功", error);
 
     // 合法的父绑定 + 一个穿越软链接祖先的 tombstone。
     bp::DeltaEnvelope envelope;
-    test_support::Check(ChainedEnvelope(repository, source, "base.bak",
-                                        &envelope, &error),
-                        "INC-C PATH 取到父身份", error);
+    test_support::Check(
+        ChainedEnvelope(repository, source, "base.bak", &envelope, &error),
+        "INC-C PATH 取到父身份", error);
     envelope.tombstones = {"link/victim"};
     envelope.removed = 1;
     error.clear();
-    test_support::Check(WriteRootOnlyDelta(repository, source, "evil.bak",
-                                           envelope, &error),
-                        "INC-C PATH 穿越型 tombstone 能写出来（它是坏数据）",
-                        error);
+    test_support::Check(
+        WriteRootOnlyDelta(repository, source, "evil.bak", envelope, &error),
+        "INC-C PATH 穿越型 tombstone 能写出来（它是坏数据）", error);
 
     bp::RestoreOptions restore_options;
     bp::RestoreReport report;
     const std::string destination = work + "/restored";
     error.clear();
-    test_support::Check(!bp::RestoreSnapshotChain(repository, "evil.bak",
-                                                  destination, restore_options,
-                                                  &report, &error),
-                        "INC-C PATH-07 恢复拒绝穿过软链接祖先的 tombstone",
-                        error);
+    test_support::Check(
+        !bp::RestoreSnapshotChain(repository, "evil.bak", destination,
+                                  restore_options, &report, &error),
+        "INC-C PATH-07 恢复拒绝穿过软链接祖先的 tombstone", error);
     test_support::Check(!test_support::Exists(destination),
                         "INC-C PATH-07 拒绝时不留下目标目录");
     std::string victim;
@@ -408,29 +416,28 @@ int main() {
 
     bp::IncrementalOutcome outcome;
     std::string error;
-    test_support::Check(RunIncremental(source, repository, "base.bak", "",
-                                       &outcome, &error),
-                        "INC-C PATH-08 基线建立成功", error);
+    test_support::Check(
+        RunIncremental(source, repository, "base.bak", "", &outcome, &error),
+        "INC-C PATH-08 基线建立成功", error);
     bp::DeltaEnvelope envelope;
-    test_support::Check(ChainedEnvelope(repository, source, "base.bak",
-                                        &envelope, &error),
-                        "INC-C PATH-08 取到父身份", error);
+    test_support::Check(
+        ChainedEnvelope(repository, source, "base.bak", &envelope, &error),
+        "INC-C PATH-08 取到父身份", error);
     envelope.tombstones = {"d/link.txt"};
     envelope.removed = 1;
     error.clear();
-    test_support::Check(WriteRootOnlyDelta(repository, source, "unlink.bak",
-                                           envelope, &error),
-                        "INC-C PATH-08 final symlink 的 tombstone 能写出来",
-                        error);
+    test_support::Check(
+        WriteRootOnlyDelta(repository, source, "unlink.bak", envelope, &error),
+        "INC-C PATH-08 final symlink 的 tombstone 能写出来", error);
 
     bp::RestoreOptions restore_options;
     bp::RestoreReport report;
     const std::string destination = work + "/restored";
     error.clear();
-    test_support::Check(bp::RestoreSnapshotChain(repository, "unlink.bak",
-                                                 destination, restore_options,
-                                                 &report, &error),
-                        "INC-C PATH-08 删除 final symlink 本身应当成功", error);
+    test_support::Check(
+        bp::RestoreSnapshotChain(repository, "unlink.bak", destination,
+                                 restore_options, &report, &error),
+        "INC-C PATH-08 删除 final symlink 本身应当成功", error);
     test_support::Check(!test_support::Exists(destination + "/d/link.txt"),
                         "INC-C PATH-08 软链接被删掉");
     std::string kept;
@@ -453,29 +460,30 @@ int main() {
 
     bp::IncrementalOutcome outcome;
     std::string error;
-    test_support::Check(RunIncremental(source, repository, "base.bak", "",
-                                       &outcome, &error),
-                        "INC-C PATH-09 基线建立成功", error);
+    test_support::Check(
+        RunIncremental(source, repository, "base.bak", "", &outcome, &error),
+        "INC-C PATH-09 基线建立成功", error);
     bp::DeltaEnvelope envelope;
-    test_support::Check(ChainedEnvelope(repository, source, "base.bak",
-                                        &envelope, &error),
-                        "INC-C PATH-09 取到父身份", error);
+    test_support::Check(
+        ChainedEnvelope(repository, source, "base.bak", &envelope, &error),
+        "INC-C PATH-09 取到父身份", error);
     envelope.tombstones = {"dir/sub/gone.txt"};
     envelope.removed = 1;
     error.clear();
-    test_support::Check(WriteRootOnlyDelta(repository, source, "nested.bak",
-                                           envelope, &error),
-                        "INC-C PATH-09 嵌套 tombstone 能写出来", error);
+    test_support::Check(
+        WriteRootOnlyDelta(repository, source, "nested.bak", envelope, &error),
+        "INC-C PATH-09 嵌套 tombstone 能写出来", error);
     bp::RestoreOptions restore_options;
     bp::RestoreReport report;
     const std::string destination = work + "/restored";
     error.clear();
-    test_support::Check(bp::RestoreSnapshotChain(repository, "nested.bak",
-                                                 destination, restore_options,
-                                                 &report, &error),
-                        "INC-C PATH-09 嵌套 tombstone 正常生效", error);
-    test_support::Check(!test_support::Exists(destination + "/dir/sub/gone.txt"),
-                        "INC-C PATH-09 被删的文件确实不在");
+    test_support::Check(
+        bp::RestoreSnapshotChain(repository, "nested.bak", destination,
+                                 restore_options, &report, &error),
+        "INC-C PATH-09 嵌套 tombstone 正常生效", error);
+    test_support::Check(
+        !test_support::Exists(destination + "/dir/sub/gone.txt"),
+        "INC-C PATH-09 被删的文件确实不在");
     test_support::Check(test_support::Exists(destination + "/dir/sub/keep.txt"),
                         "INC-C PATH-09 同目录的其它文件仍在");
   }
@@ -492,37 +500,38 @@ int main() {
 
     bp::IncrementalOutcome outcome;
     std::string error;
-    test_support::Check(RunIncremental(source, repository, "base.bak", "",
-                                       &outcome, &error),
-                        "INC-C BIND 基线建立成功", error);
+    test_support::Check(
+        RunIncremental(source, repository, "base.bak", "", &outcome, &error),
+        "INC-C BIND 基线建立成功", error);
 
     bp::DeltaEnvelope good;
-    test_support::Check(ChainedEnvelope(repository, source, "base.bak", &good,
-                                        &error),
-                        "INC-C BIND 取到父身份", error);
+    test_support::Check(
+        ChainedEnvelope(repository, source, "base.bak", &good, &error),
+        "INC-C BIND 取到父身份", error);
 
     // 正确的一条必须能解析（否则后面的拒绝就没有判别力）。
     error.clear();
-    test_support::Check(WriteRootOnlyDelta(repository, source, "ok.bak", good,
-                                           &error),
-                        "INC-C BIND 正确父绑定的 delta 能写出", error);
+    test_support::Check(
+        WriteRootOnlyDelta(repository, source, "ok.bak", good, &error),
+        "INC-C BIND 正确父绑定的 delta 能写出", error);
     bp::SnapshotChain chain;
     error.clear();
-    test_support::Check(bp::ResolveSnapshotChain(repository, "ok.bak", &chain,
-                                                 &error),
-                        "INC-C BIND 正确父绑定的链可以解析", error);
+    test_support::Check(
+        bp::ResolveSnapshotChain(repository, "ok.bak", &chain, &error),
+        "INC-C BIND 正确父绑定的链可以解析", error);
 
     // BIND-01：parent_snapshot_id 对、parent_manifest_digest 错。
     bp::DeltaEnvelope wrong_manifest = good;
-    wrong_manifest.parent_manifest_digest = bp::ContentDigestOfBytes("not-the-parent");
+    wrong_manifest.parent_manifest_digest =
+        bp::ContentDigestOfBytes("not-the-parent");
     error.clear();
-    test_support::Check(WriteRootOnlyDelta(repository, source, "bad-manifest.bak",
-                                           wrong_manifest, &error),
-                        "INC-C BIND-01 错摘要的 delta 能写出来（它是坏数据）",
-                        error);
+    test_support::Check(
+        WriteRootOnlyDelta(repository, source, "bad-manifest.bak",
+                           wrong_manifest, &error),
+        "INC-C BIND-01 错摘要的 delta 能写出来（它是坏数据）", error);
     error.clear();
-    test_support::Check(!bp::ResolveSnapshotChain(repository, "bad-manifest.bak",
-                                                  &chain, &error),
+    test_support::Check(!bp::ResolveSnapshotChain(
+                            repository, "bad-manifest.bak", &chain, &error),
                         "INC-C BIND-01 manifest 摘要不符 -> 拒绝", error);
     test_support::Check(error.find("manifest") != std::string::npos,
                         "INC-C BIND-01 拒绝理由点名 manifest 摘要", error);
@@ -531,14 +540,13 @@ int main() {
     bp::DeltaEnvelope wrong_id = good;
     wrong_id.parent_snapshot_id = bp::ContentDigestOfBytes("not-the-parent-id");
     error.clear();
-    test_support::Check(WriteRootOnlyDelta(repository, source, "bad-id.bak",
-                                           wrong_id, &error),
-                        "INC-C BIND-02 错身份的 delta 能写出来（它是坏数据）",
-                        error);
+    test_support::Check(
+        WriteRootOnlyDelta(repository, source, "bad-id.bak", wrong_id, &error),
+        "INC-C BIND-02 错身份的 delta 能写出来（它是坏数据）", error);
     error.clear();
-    test_support::Check(!bp::ResolveSnapshotChain(repository, "bad-id.bak",
-                                                  &chain, &error),
-                        "INC-C BIND-02 快照身份不符 -> 拒绝", error);
+    test_support::Check(
+        !bp::ResolveSnapshotChain(repository, "bad-id.bak", &chain, &error),
+        "INC-C BIND-02 快照身份不符 -> 拒绝", error);
     test_support::Check(error.find("identity") != std::string::npos,
                         "INC-C BIND-02 拒绝理由点名身份", error);
 
@@ -551,25 +559,26 @@ int main() {
     test_support::Check(MakeForeignArchive(other_source, foreign, &error),
                         "INC-C BIND-03 造出替换用的合法归档", error);
     std::string foreign_bytes;
-    test_support::Check(test_support::ReadFile(foreign, &foreign_bytes) &&
-                            test_support::WriteFile(
-                                SnapshotPath(repository, "base.bak"),
-                                foreign_bytes, 0640),
-                        "INC-C BIND-03 用另一份合法归档替换 base.bak");
+    test_support::Check(
+        test_support::ReadFile(foreign, &foreign_bytes) &&
+            test_support::WriteFile(SnapshotPath(repository, "base.bak"),
+                                    foreign_bytes, 0640),
+        "INC-C BIND-03 用另一份合法归档替换 base.bak");
     std::string reason;
     std::string baseline;
-    test_support::Check(!bp::FindIncrementalBaseline(
-                            repository, source, bp::RepositoryIdentity(repository),
-                            bp::FilterIdentityDigest({}, {}),
-                            bp::StrategyIdentityDigest(
-                                bp::PackMethod::kMyPack,
-                                bp::CompressionMethod::kNone,
-                                bp::EncryptionMethod::kNone),
-                            &baseline, &reason),
-                        "INC-C BIND-03 被替换的 .bak 不再被当作基线");
+    test_support::Check(
+        !bp::FindIncrementalBaseline(
+            repository, source, bp::RepositoryIdentity(repository),
+            bp::FilterIdentityDigest({}, {}),
+            bp::StrategyIdentityDigest(bp::PackMethod::kMyPack,
+                                       bp::CompressionMethod::kNone,
+                                       bp::EncryptionMethod::kNone),
+            &baseline, &reason),
+        "INC-C BIND-03 被替换的 .bak 不再被当作基线");
     test_support::Check(reason.find("replaced") != std::string::npos ||
                             reason.find("not trustworthy") != std::string::npos,
-                        "INC-C BIND-03 理由是「不信任」而不是「没有变化」", reason);
+                        "INC-C BIND-03 理由是「不信任」而不是「没有变化」",
+                        reason);
 
     // 源没有变，但基线不可信 -> 必须重建完整基线，而不是报 no-changes。
     bp::IncrementalOutcome replaced_outcome;
@@ -591,22 +600,23 @@ int main() {
     test_support::WriteFile(source + "/a.txt", "alpha", 0644);
     bp::IncrementalOutcome outcome;
     std::string error;
-    test_support::Check(RunIncremental(source, repository, "base.bak", "",
-                                       &outcome, &error),
-                        "INC-C BIND-04 基线建立成功", error);
+    test_support::Check(
+        RunIncremental(source, repository, "base.bak", "", &outcome, &error),
+        "INC-C BIND-04 基线建立成功", error);
     test_support::WriteFile(source + "/a.txt", "alpha2", 0644);
     error.clear();
-    test_support::Check(RunIncremental(source, repository, "d1.bak", "base.bak",
-                                       &outcome, &error) &&
-                            outcome.kind == bp::IncrementalOutcome::Kind::kDelta,
-                        "INC-C BIND-04 delta 建立成功", error);
+    test_support::Check(
+        RunIncremental(source, repository, "d1.bak", "base.bak", &outcome,
+                       &error) &&
+            outcome.kind == bp::IncrementalOutcome::Kind::kDelta,
+        "INC-C BIND-04 delta 建立成功", error);
     ::unlink(SnapshotPath(repository, "base.bak.manifest").c_str());
     ::unlink(SnapshotPath(repository, "base.bak.identity").c_str());
     bp::SnapshotChain chain;
     error.clear();
-    test_support::Check(!bp::ResolveSnapshotChain(repository, "d1.bak", &chain,
-                                                  &error),
-                        "INC-C BIND-04 父没有副文件 -> 链被拒绝", error);
+    test_support::Check(
+        !bp::ResolveSnapshotChain(repository, "d1.bak", &chain, &error),
+        "INC-C BIND-04 父没有副文件 -> 链被拒绝", error);
   }
 
   // ---- C5：hardlink group 只改内容 ----
@@ -624,35 +634,37 @@ int main() {
 
     bp::IncrementalOutcome outcome;
     std::string error;
-    test_support::Check(RunIncremental(source, repository, "base.bak", "",
-                                       &outcome, &error),
-                        "INC-C HL 基线建立成功", error);
+    test_support::Check(
+        RunIncremental(source, repository, "base.bak", "", &outcome, &error),
+        "INC-C HL 基线建立成功", error);
 
     // 只改共享 inode 的内容：链接关系一个字都没动。
     test_support::WriteFile(source + "/leader.txt", "BBBB", 0644);
     error.clear();
-    test_support::Check(RunIncremental(source, repository, "d1.bak", "base.bak",
-                                       &outcome, &error) &&
-                            outcome.kind == bp::IncrementalOutcome::Kind::kDelta,
-                        "INC-C HL 内容变化写成 delta", error);
+    test_support::Check(
+        RunIncremental(source, repository, "d1.bak", "base.bak", &outcome,
+                       &error) &&
+            outcome.kind == bp::IncrementalOutcome::Kind::kDelta,
+        "INC-C HL 内容变化写成 delta", error);
 
     bp::RestoreOptions restore_options;
     bp::RestoreReport report;
     const std::string destination = work + "/restored";
     error.clear();
-    test_support::Check(bp::RestoreSnapshotChain(repository, "d1.bak",
-                                                 destination, restore_options,
-                                                 &report, &error),
-                        "INC-C HL 恢复最新点成功", error);
+    test_support::Check(
+        bp::RestoreSnapshotChain(repository, "d1.bak", destination,
+                                 restore_options, &report, &error),
+        "INC-C HL 恢复最新点成功", error);
     std::string leader;
     std::string peer;
-    test_support::Check(test_support::ReadFile(destination + "/leader.txt",
-                                               &leader) &&
-                            leader == "BBBB",
-                        "INC-C HL leader 拿到新内容", leader);
-    test_support::Check(test_support::ReadFile(destination + "/peer.txt", &peer) &&
-                            peer == "BBBB",
-                        "INC-C HL 判别：peer 也拿到新内容（组没有被拆开）", peer);
+    test_support::Check(
+        test_support::ReadFile(destination + "/leader.txt", &leader) &&
+            leader == "BBBB",
+        "INC-C HL leader 拿到新内容", leader);
+    test_support::Check(
+        test_support::ReadFile(destination + "/peer.txt", &peer) &&
+            peer == "BBBB",
+        "INC-C HL 判别：peer 也拿到新内容（组没有被拆开）", peer);
     struct stat leader_info;
     struct stat peer_info;
     test_support::Check(
@@ -673,9 +685,9 @@ int main() {
     test_support::WriteFile(source + "/a.txt", "0000000000", 0644);
     bp::IncrementalOutcome outcome;
     std::string error;
-    test_support::Check(RunIncremental(source, repository, "base.bak", "",
-                                       &outcome, &error),
-                        "INC-C TOCTOU 基线建立成功", error);
+    test_support::Check(
+        RunIncremental(source, repository, "base.bak", "", &outcome, &error),
+        "INC-C TOCTOU 基线建立成功", error);
 
     // 先做一次**真实**的变化（这样才会走到"写 payload"那一步），
     // 再在 manifest 建好之后把它改成同样大小、同样 mtime 的第三个版本。
@@ -691,18 +703,17 @@ int main() {
 
     bp::SetIncrementalManifestBuiltHookForTesting(MutateSourceHook, &hook);
     error.clear();
-    const bool written =
-        RunIncremental(source, repository, "d1.bak", "base.bak", &outcome,
-                       &error);
+    const bool written = RunIncremental(source, repository, "d1.bak",
+                                        "base.bak", &outcome, &error);
     bp::SetIncrementalManifestBuiltHookForTesting(nullptr, nullptr);
     test_support::Check(hook.fired, "INC-C TOCTOU 测试接缝被调用");
-    test_support::Check(!written,
-                        "INC-C TOCTOU 判别：manifest 之后被改写 -> 整次失败",
-                        error);
+    test_support::Check(
+        !written, "INC-C TOCTOU 判别：manifest 之后被改写 -> 整次失败", error);
     test_support::Check(error.find("manifest digest") != std::string::npos,
                         "INC-C TOCTOU 拒绝理由点名内容摘要不符", error);
-    test_support::Check(!test_support::Exists(SnapshotPath(repository, "d1.bak")),
-                        "INC-C TOCTOU 失败时不发布快照");
+    test_support::Check(
+        !test_support::Exists(SnapshotPath(repository, "d1.bak")),
+        "INC-C TOCTOU 失败时不发布快照");
     test_support::Check(
         !test_support::Exists(SnapshotPath(repository, "d1.bak.manifest")) &&
             !test_support::Exists(SnapshotPath(repository, "d1.bak.identity")),
@@ -732,15 +743,16 @@ int main() {
     test_support::CreateSymlink("target-a", source + "/link");
     bp::IncrementalOutcome outcome;
     std::string error;
-    test_support::Check(RunIncremental(source, repository, "base.bak", "",
-                                       &outcome, &error),
-                        "INC-C TOCTOU-L 基线建立成功", error);
+    test_support::Check(
+        RunIncremental(source, repository, "base.bak", "", &outcome, &error),
+        "INC-C TOCTOU-L 基线建立成功", error);
 
     // 同样先做一次真实变化（target-a -> target-c），再在 manifest 之后把它
     // 换成第三个等长目标。
     ::unlink((source + "/link").c_str());
-    test_support::Check(test_support::CreateSymlink("target-c", source + "/link"),
-                        "INC-C TOCTOU-L 先做一次真实的目标变化");
+    test_support::Check(
+        test_support::CreateSymlink("target-c", source + "/link"),
+        "INC-C TOCTOU-L 先做一次真实的目标变化");
     MutationHook hook;
     hook.path = source + "/link";
     hook.content = "target-b";  // 与 "target-c" 等长
@@ -751,11 +763,11 @@ int main() {
                                         "base.bak", &outcome, &error);
     bp::SetIncrementalManifestBuiltHookForTesting(nullptr, nullptr);
     test_support::Check(hook.fired, "INC-C TOCTOU-L 测试接缝被调用");
-    test_support::Check(!written,
-                        "INC-C TOCTOU-L 判别：软链接目标被改写 -> 整次失败",
-                        error);
-    test_support::Check(!test_support::Exists(SnapshotPath(repository, "d1.bak")),
-                        "INC-C TOCTOU-L 失败时不发布快照");
+    test_support::Check(
+        !written, "INC-C TOCTOU-L 判别：软链接目标被改写 -> 整次失败", error);
+    test_support::Check(
+        !test_support::Exists(SnapshotPath(repository, "d1.bak")),
+        "INC-C TOCTOU-L 失败时不发布快照");
   }
 
   // ---- C7：依赖感知的手工删除 + 副文件生命周期 ----
@@ -769,28 +781,31 @@ int main() {
     test_support::WriteFile(source + "/a.txt", "one", 0644);
     bp::IncrementalOutcome outcome;
     std::string error;
-    test_support::Check(RunIncremental(source, repository, "f0.bak", "",
-                                       &outcome, &error),
-                        "INC-C DEL 基线 f0 建立成功", error);
+    test_support::Check(
+        RunIncremental(source, repository, "f0.bak", "", &outcome, &error),
+        "INC-C DEL 基线 f0 建立成功", error);
     test_support::WriteFile(source + "/a.txt", "two", 0644);
     error.clear();
-    test_support::Check(RunIncremental(source, repository, "d1.bak", "f0.bak",
-                                       &outcome, &error) &&
-                            outcome.kind == bp::IncrementalOutcome::Kind::kDelta,
-                        "INC-C DEL d1 建立成功", error);
+    test_support::Check(
+        RunIncremental(source, repository, "d1.bak", "f0.bak", &outcome,
+                       &error) &&
+            outcome.kind == bp::IncrementalOutcome::Kind::kDelta,
+        "INC-C DEL d1 建立成功", error);
     test_support::WriteFile(source + "/a.txt", "three", 0644);
     error.clear();
-    test_support::Check(RunIncremental(source, repository, "d2.bak", "d1.bak",
-                                       &outcome, &error) &&
-                            outcome.kind == bp::IncrementalOutcome::Kind::kDelta,
-                        "INC-C DEL d2 建立成功", error);
+    test_support::Check(
+        RunIncremental(source, repository, "d2.bak", "d1.bak", &outcome,
+                       &error) &&
+            outcome.kind == bp::IncrementalOutcome::Kind::kDelta,
+        "INC-C DEL d2 建立成功", error);
 
     bp::BackupCatalog catalog;
     error.clear();
     test_support::Check(!catalog.Delete(repository, "f0.bak", &error),
                         "INC-C DEL-01 删除有后代的基线被拒绝", error);
-    test_support::Check(test_support::Exists(SnapshotPath(repository, "f0.bak")),
-                        "INC-C DEL-01 拒绝时文件仍在");
+    test_support::Check(
+        test_support::Exists(SnapshotPath(repository, "f0.bak")),
+        "INC-C DEL-01 拒绝时文件仍在");
     error.clear();
     test_support::Check(!catalog.Delete(repository, "d1.bak", &error),
                         "INC-C DEL-02 删除中间节点被拒绝", error);
@@ -799,12 +814,14 @@ int main() {
                         "INC-C DEL-03 删除叶子成功", error);
     test_support::Check(
         !test_support::Exists(SnapshotPath(repository, "d2.bak")) &&
-            !test_support::Exists(SnapshotPath(repository, "d2.bak.manifest")) &&
+            !test_support::Exists(
+                SnapshotPath(repository, "d2.bak.manifest")) &&
             !test_support::Exists(SnapshotPath(repository, "d2.bak.identity")),
         "INC-C DEL-03 副文件跟随叶子一起被清理");
     error.clear();
     test_support::Check(catalog.Delete(repository, "d1.bak", &error),
-                        "INC-C DEL-04 叶子删掉之后中间节点变成叶子，可以删", error);
+                        "INC-C DEL-04 叶子删掉之后中间节点变成叶子，可以删",
+                        error);
     error.clear();
     test_support::Check(catalog.Delete(repository, "f0.bak", &error),
                         "INC-C DEL-05 链尾最后也能删掉", error);
@@ -819,17 +836,19 @@ int main() {
     test_support::Check(bp::FindOrphanSidecars(repository, &orphans, &error) &&
                             orphans.size() == 2,
                         "INC-C DEL-06 孤儿副文件被检测出来", error);
-    test_support::Check(test_support::Exists(repository + "/ghost.bak.manifest"),
-                        "INC-C DEL-06 检测本身不删除任何东西");
+    test_support::Check(
+        test_support::Exists(repository + "/ghost.bak.manifest"),
+        "INC-C DEL-06 检测本身不删除任何东西");
     std::vector<std::string> removed;
     std::vector<std::string> diagnostics;
     error.clear();
-    test_support::Check(bp::CleanOrphanSidecars(repository, &removed,
-                                                &diagnostics, &error) &&
-                            removed.size() == 2 && diagnostics.empty(),
-                        "INC-C DEL-07 显式清理删掉孤儿副文件", error);
-    test_support::Check(!test_support::Exists(repository + "/ghost.bak.manifest"),
-                        "INC-C DEL-07 孤儿副文件确实没了");
+    test_support::Check(
+        bp::CleanOrphanSidecars(repository, &removed, &diagnostics, &error) &&
+            removed.size() == 2 && diagnostics.empty(),
+        "INC-C DEL-07 显式清理删掉孤儿副文件", error);
+    test_support::Check(
+        !test_support::Exists(repository + "/ghost.bak.manifest"),
+        "INC-C DEL-07 孤儿副文件确实没了");
   }
 
   // ---- C8：深度上界（64 允许 / 65 拒绝）----
@@ -843,9 +862,9 @@ int main() {
     test_support::WriteFile(source + "/a.txt", "0", 0644);
     bp::IncrementalOutcome outcome;
     std::string error;
-    test_support::Check(RunIncremental(source, repository, "s000.bak", "",
-                                       &outcome, &error),
-                        "INC-C DEPTH 基线建立成功", error);
+    test_support::Check(
+        RunIncremental(source, repository, "s000.bak", "", &outcome, &error),
+        "INC-C DEPTH 基线建立成功", error);
     std::string previous = "s000.bak";
     std::size_t made = 0;
     for (int index = 1; index <= 64; ++index) {
@@ -858,9 +877,10 @@ int main() {
       if (!RunIncremental(source, repository, name, previous, &outcome,
                           &error) ||
           outcome.kind != bp::IncrementalOutcome::Kind::kDelta) {
-        test_support::Check(false, "INC-C DEPTH 第 " + std::to_string(index) +
-                                       " 个 delta 建立成功",
-                            error);
+        test_support::Check(
+            false,
+            "INC-C DEPTH 第 " + std::to_string(index) + " 个 delta 建立成功",
+            error);
         break;
       }
       previous = name;
@@ -869,18 +889,18 @@ int main() {
     test_support::Check(made == 64, "INC-C DEPTH 建出 64 个 delta 的链");
     std::size_t depth = 0;
     error.clear();
-    test_support::Check(bp::SnapshotDeltaDepth(repository, previous, &depth,
-                                               &error) &&
-                            depth == 64,
-                        "INC-C DEPTH 深度读数是 64", error);
+    test_support::Check(
+        bp::SnapshotDeltaDepth(repository, previous, &depth, &error) &&
+            depth == 64,
+        "INC-C DEPTH 深度读数是 64", error);
     bp::RestoreOptions restore_options;
     bp::RestoreReport report;
     const std::string destination = work + "/restored";
     error.clear();
-    test_support::Check(bp::RestoreSnapshotChain(repository, previous,
-                                                 destination, restore_options,
-                                                 &report, &error),
-                        "INC-C DEPTH 64 个 delta 的链可以恢复", error);
+    test_support::Check(
+        bp::RestoreSnapshotChain(repository, previous, destination,
+                                 restore_options, &report, &error),
+        "INC-C DEPTH 64 个 delta 的链可以恢复", error);
 
     // 写侧：再挂一个就会越界 -> 不产出不可恢复的快照，而是重建完整基线。
     test_support::WriteFile(source + "/a.txt", "65", 0644);
@@ -898,9 +918,9 @@ int main() {
     // 读侧：手工在 64 深的链上再挂一个 delta -> 解析阶段就必须拒绝。
     bp::DeltaEnvelope envelope;
     error.clear();
-    test_support::Check(ChainedEnvelope(repository, source, previous, &envelope,
-                                        &error),
-                        "INC-C DEPTH 取到最深处那一份的父身份", error);
+    test_support::Check(
+        ChainedEnvelope(repository, source, previous, &envelope, &error),
+        "INC-C DEPTH 取到最深处那一份的父身份", error);
     envelope.tombstones = {"a.txt"};
     envelope.removed = 1;
     error.clear();
@@ -909,13 +929,12 @@ int main() {
                         "INC-C DEPTH 65 深的链能拼出来（它是坏数据）", error);
     bp::SnapshotChain chain;
     error.clear();
-    test_support::Check(!bp::ResolveSnapshotChain(repository, "too-deep.bak",
-                                                  &chain, &error),
-                        "INC-C DEPTH 65 个 delta 的链在解析阶段被拒绝", error);
+    test_support::Check(
+        !bp::ResolveSnapshotChain(repository, "too-deep.bak", &chain, &error),
+        "INC-C DEPTH 65 个 delta 的链在解析阶段被拒绝", error);
     test_support::Check(error.find("deeper than") != std::string::npos,
                         "INC-C DEPTH 拒绝理由点名深度上界", error);
   }
-
 
   // ---- C9：读侧同样拒绝加密的 delta ----
   test_support::Section("INC-C 9. 加密的 delta：读侧也拒绝");
@@ -928,9 +947,9 @@ int main() {
     test_support::WriteFile(source + "/a.txt", "alpha", 0644);
     bp::IncrementalOutcome outcome;
     std::string error;
-    test_support::Check(RunIncremental(source, repository, "base.bak", "",
-                                       &outcome, &error),
-                        "INC-C ENC 基线建立成功", error);
+    test_support::Check(
+        RunIncremental(source, repository, "base.bak", "", &outcome, &error),
+        "INC-C ENC 基线建立成功", error);
 
     // 用产品自己的流水线造一份**加密**的内层 container：老版本会把这样的
     // payload 包进 BKPINC1 信封里，本轮起创建路径拒绝它。
@@ -945,20 +964,19 @@ int main() {
     encrypted_options.password = "correct horse battery staple";
     const std::string payload = work + "/payload.bak";
     error.clear();
-    test_support::Check(
-        bp::RunBackupPipelineFromEntries(entries, payload, encrypted_options,
-                                         &error),
-        "INC-C ENC 造出加密的内层 container", error);
+    test_support::Check(bp::RunBackupPipelineFromEntries(
+                            entries, payload, encrypted_options, &error),
+                        "INC-C ENC 造出加密的内层 container", error);
 
     bp::DeltaEnvelope envelope;
     error.clear();
-    test_support::Check(ChainedEnvelope(repository, source, "base.bak",
-                                        &envelope, &error),
-                        "INC-C ENC 取到父身份", error);
+    test_support::Check(
+        ChainedEnvelope(repository, source, "base.bak", &envelope, &error),
+        "INC-C ENC 取到父身份", error);
     error.clear();
-    test_support::Check(AssembleDelta(repository + "/encrypted.bak", envelope,
-                                      payload, &error),
-                        "INC-C ENC 拼出加密 delta（老版本的产物形状）", error);
+    test_support::Check(
+        AssembleDelta(repository + "/encrypted.bak", envelope, payload, &error),
+        "INC-C ENC 拼出加密 delta（老版本的产物形状）", error);
 
     bp::ContainerHeader header;
     error.clear();
@@ -974,17 +992,16 @@ int main() {
     bp::RestoreReport report;
     const std::string destination = work + "/restored";
     error.clear();
-    test_support::Check(!bp::RestoreSnapshotChain(repository, "encrypted.bak",
-                                                  destination, restore_options,
-                                                  &report, &error),
-                        "INC-C ENC 判别：加密 delta 不再被恢复路径接受", error);
-    test_support::Check(error.find("does not support encryption") !=
-                            std::string::npos,
-                        "INC-C ENC 拒绝理由说明信封未被认证", error);
+    test_support::Check(
+        !bp::RestoreSnapshotChain(repository, "encrypted.bak", destination,
+                                  restore_options, &report, &error),
+        "INC-C ENC 判别：加密 delta 不再被恢复路径接受", error);
+    test_support::Check(
+        error.find("does not support encryption") != std::string::npos,
+        "INC-C ENC 拒绝理由说明信封未被认证", error);
     test_support::Check(!test_support::Exists(destination),
                         "INC-C ENC 拒绝时不留下目标目录");
   }
-
 
   // ---- C10：身份必须来自"实际归档字节" ----
   test_support::Section("INC-C 10. actual archive bytes 验证");
@@ -997,15 +1014,16 @@ int main() {
     test_support::WriteFile(source + "/a.txt", "AAAA", 0644);
     bp::IncrementalOutcome outcome;
     std::string error;
-    test_support::Check(RunIncremental(source, repository, "base.bak", "",
-                                       &outcome, &error),
-                        "INC-C BYTES 基线建立成功", error);
+    test_support::Check(
+        RunIncremental(source, repository, "base.bak", "", &outcome, &error),
+        "INC-C BYTES 基线建立成功", error);
     test_support::WriteFile(source + "/a.txt", "BBBB", 0644);
     error.clear();
-    test_support::Check(RunIncremental(source, repository, "d1.bak", "base.bak",
-                                       &outcome, &error) &&
-                            outcome.kind == bp::IncrementalOutcome::Kind::kDelta,
-                        "INC-C BYTES 写出 d1", error);
+    test_support::Check(
+        RunIncremental(source, repository, "d1.bak", "base.bak", &outcome,
+                       &error) &&
+            outcome.kind == bp::IncrementalOutcome::Kind::kDelta,
+        "INC-C BYTES 写出 d1", error);
 
     // 造一份**同样长度、内容不同**的合法内层 container：同一棵树、同样的
     // 路径集合与内容长度，只把源文件的 mtime 挪一下（mtime 是定长字段）。
@@ -1013,9 +1031,10 @@ int main() {
     test_support::Check(test_support::StatOf(source + "/a.txt", &before),
                         "INC-C BYTES 取到 mtime");
     test_support::Check(
-        test_support::SetTimes(source + "/a.txt",
-                               static_cast<std::int64_t>(before.st_mtim.tv_sec) + 5,
-                               static_cast<std::uint32_t>(before.st_mtim.tv_nsec)),
+        test_support::SetTimes(
+            source + "/a.txt",
+            static_cast<std::int64_t>(before.st_mtim.tv_sec) + 5,
+            static_cast<std::uint32_t>(before.st_mtim.tv_nsec)),
         "INC-C BYTES 挪动 mtime");
     bp::Filter filter;
     std::vector<bp::ArchiveEntry> entries;
@@ -1025,33 +1044,33 @@ int main() {
     const std::string replacement = work + "/replacement.bak";
     bp::BackupOptions options;
     error.clear();
-    test_support::Check(bp::RunBackupPipelineFromEntries(entries, replacement,
-                                                         options, &error),
-                        "INC-C BYTES 造出替换用的合法 container", error);
+    test_support::Check(
+        bp::RunBackupPipelineFromEntries(entries, replacement, options, &error),
+        "INC-C BYTES 造出替换用的合法 container", error);
 
     std::string original;
     std::string payload;
-    test_support::Check(test_support::ReadFile(repository + "/d1.bak", &original) &&
-                            test_support::ReadFile(replacement, &payload),
-                        "INC-C BYTES 读入两份字节");
+    test_support::Check(
+        test_support::ReadFile(repository + "/d1.bak", &original) &&
+            test_support::ReadFile(replacement, &payload),
+        "INC-C BYTES 读入两份字节");
     test_support::Check(original.size() > payload.size(),
                         "INC-C BYTES 替换件不比整个 delta 长");
     const std::size_t offset = original.size() - payload.size();
     const std::string spliced = original.substr(0, offset) + payload;
     test_support::Check(spliced.size() == original.size(),
                         "INC-C BYTES-01 替换后文件长度不变（只换 payload）");
-    test_support::Check(test_support::WriteFile(repository + "/d1.bak", spliced,
-                                                0640),
-                        "INC-C BYTES-01 就地换掉 d1 的 payload（信封与副文件不动）");
+    test_support::Check(
+        test_support::WriteFile(repository + "/d1.bak", spliced, 0640),
+        "INC-C BYTES-01 就地换掉 d1 的 payload（信封与副文件不动）");
 
     // 声明身份照旧成立——这正是旧行为会把它当成可信身份的原因。
     std::string declared;
     error.clear();
-    test_support::Check(bp::SnapshotIdOfFile(repository + "/d1.bak", &declared,
-                                             &error) &&
-                            bp::IsContentDigest(declared),
-                        "INC-C BYTES-01 声明身份仍然读得出来（旧路径只信它）",
-                        error);
+    test_support::Check(
+        bp::SnapshotIdOfFile(repository + "/d1.bak", &declared, &error) &&
+            bp::IsContentDigest(declared),
+        "INC-C BYTES-01 声明身份仍然读得出来（旧路径只信它）", error);
     bp::SnapshotIdentity identity;
     error.clear();
     test_support::Check(!bp::LoadVerifiedSnapshotIdentity(
@@ -1080,10 +1099,10 @@ int main() {
     bp::RestoreReport report;
     const std::string destination = work + "/restored";
     error.clear();
-    test_support::Check(!bp::RestoreSnapshotChain(repository, "d1.bak",
-                                                  destination, restore_options,
-                                                  &report, &error),
-                        "INC-C BYTES-01 判别：恢复拒绝这份 delta", error);
+    test_support::Check(
+        !bp::RestoreSnapshotChain(repository, "d1.bak", destination,
+                                  restore_options, &report, &error),
+        "INC-C BYTES-01 判别：恢复拒绝这份 delta", error);
     test_support::Check(!test_support::Exists(destination),
                         "INC-C BYTES-01 拒绝时不留下目标目录");
 
@@ -1095,9 +1114,9 @@ int main() {
     test_support::Mkdir(bit_repo, 0755);
     test_support::WriteFile(bit_source + "/a.txt", "AAAA", 0644);
     error.clear();
-    test_support::Check(RunIncremental(bit_source, bit_repo, "base.bak", "",
-                                       &outcome, &error),
-                        "INC-C BYTES-02 基线建立成功", error);
+    test_support::Check(
+        RunIncremental(bit_source, bit_repo, "base.bak", "", &outcome, &error),
+        "INC-C BYTES-02 基线建立成功", error);
     test_support::WriteFile(bit_source + "/a.txt", "BBBB", 0644);
     error.clear();
     test_support::Check(RunIncremental(bit_source, bit_repo, "d1.bak",
@@ -1107,32 +1126,36 @@ int main() {
     test_support::Check(test_support::ReadFile(bit_repo + "/d1.bak", &bytes),
                         "INC-C BYTES-02 读入 d1");
     bytes[bytes.size() - 1] = static_cast<char>(bytes[bytes.size() - 1] ^ 0x01);
-    test_support::Check(test_support::WriteFile(bit_repo + "/d1.bak", bytes, 0640),
-                        "INC-C BYTES-02 翻转 payload 的最后一个 bit");
+    test_support::Check(
+        test_support::WriteFile(bit_repo + "/d1.bak", bytes, 0640),
+        "INC-C BYTES-02 翻转 payload 的最后一个 bit");
     error.clear();
     test_support::Check(!bp::LoadVerifiedSnapshotIdentity(
                             bit_repo, "d1.bak", &identity, nullptr, &error),
-                        "INC-C BYTES-02 判别：bit flip 之后身份验证失败", error);
+                        "INC-C BYTES-02 判别：bit flip 之后身份验证失败",
+                        error);
 
     // ID-BYTES-03：完整快照的 payload 被改，header 不变。
-    const std::string full_work = test_support::FreshDir("inc-closure-fullbyte");
+    const std::string full_work =
+        test_support::FreshDir("inc-closure-fullbyte");
     const std::string full_source = full_work + "/src";
     const std::string full_repo = full_work + "/repo";
     test_support::Mkdir(full_source, 0755);
     test_support::Mkdir(full_repo, 0755);
     test_support::WriteFile(full_source + "/a.txt", "AAAA", 0644);
     error.clear();
-    test_support::Check(RunIncremental(full_source, full_repo, "f0.bak", "",
-                                       &outcome, &error),
-                        "INC-C BYTES-03 写出完整快照", error);
+    test_support::Check(
+        RunIncremental(full_source, full_repo, "f0.bak", "", &outcome, &error),
+        "INC-C BYTES-03 写出完整快照", error);
     std::string full_declared;
     error.clear();
-    test_support::Check(bp::FullSnapshotId(full_repo + "/f0.bak", &full_declared,
-                                           &error),
-                        "INC-C BYTES-03 声明身份可读", error);
+    test_support::Check(
+        bp::FullSnapshotId(full_repo + "/f0.bak", &full_declared, &error),
+        "INC-C BYTES-03 声明身份可读", error);
     std::string full_bytes;
-    test_support::Check(test_support::ReadFile(full_repo + "/f0.bak", &full_bytes),
-                        "INC-C BYTES-03 读入完整快照");
+    test_support::Check(
+        test_support::ReadFile(full_repo + "/f0.bak", &full_bytes),
+        "INC-C BYTES-03 读入完整快照");
     full_bytes[full_bytes.size() - 1] =
         static_cast<char>(full_bytes[full_bytes.size() - 1] ^ 0x01);
     test_support::Check(
@@ -1143,7 +1166,8 @@ int main() {
     test_support::Check(
         bp::FullSnapshotId(full_repo + "/f0.bak", &still_declared, &error) &&
             still_declared == full_declared,
-        "INC-C BYTES-03 判别：声明身份没变（旧路径看不出 payload 被改）", error);
+        "INC-C BYTES-03 判别：声明身份没变（旧路径看不出 payload 被改）",
+        error);
     error.clear();
     test_support::Check(!bp::LoadVerifiedSnapshotIdentity(
                             full_repo, "f0.bak", &identity, nullptr, &error),
@@ -1174,11 +1198,11 @@ int main() {
             test_support::WriteFile(repository + "/report.identity",
                                     "user report", 0644),
         "INC-C SIDE-01 放入两个与项目无关的用户文件");
-    test_support::Check(
-        test_support::WriteFile(repository + "/ghost.bak.manifest", "x", 0640) &&
-            test_support::WriteFile(repository + "/ghost.bak.identity", "y",
-                                    0640),
-        "INC-C SIDE-01 放入两个真正的孤儿副文件");
+    test_support::Check(test_support::WriteFile(
+                            repository + "/ghost.bak.manifest", "x", 0640) &&
+                            test_support::WriteFile(
+                                repository + "/ghost.bak.identity", "y", 0640),
+                        "INC-C SIDE-01 放入两个真正的孤儿副文件");
     std::vector<std::string> orphans;
     std::string error;
     test_support::Check(bp::FindOrphanSidecars(repository, &orphans, &error) &&
@@ -1188,18 +1212,18 @@ int main() {
     std::vector<std::string> removed;
     std::vector<std::string> diagnostics;
     error.clear();
-    test_support::Check(bp::CleanOrphanSidecars(repository, &removed,
-                                                &diagnostics, &error) &&
-                            removed.size() == 2 && diagnostics.empty(),
-                        "INC-C SIDE-01 清理掉那两个孤儿", error);
-    test_support::Check(test_support::Exists(repository + "/notes.manifest") &&
-                            test_support::Exists(repository + "/report.identity"),
-                        "INC-C SIDE-01 判别：无关用户文件原样保留");
-    test_support::Check(!test_support::Exists(repository +
-                                              "/ghost.bak.manifest") &&
-                            !test_support::Exists(repository +
-                                                  "/ghost.bak.identity"),
-                        "INC-C SIDE-01 自己的孤儿副文件被清掉");
+    test_support::Check(
+        bp::CleanOrphanSidecars(repository, &removed, &diagnostics, &error) &&
+            removed.size() == 2 && diagnostics.empty(),
+        "INC-C SIDE-01 清理掉那两个孤儿", error);
+    test_support::Check(
+        test_support::Exists(repository + "/notes.manifest") &&
+            test_support::Exists(repository + "/report.identity"),
+        "INC-C SIDE-01 判别：无关用户文件原样保留");
+    test_support::Check(
+        !test_support::Exists(repository + "/ghost.bak.manifest") &&
+            !test_support::Exists(repository + "/ghost.bak.identity"),
+        "INC-C SIDE-01 自己的孤儿副文件被清掉");
   }
 
   // ---- C12：完整备份不做无意义的 payload 哈希 ----
@@ -1234,16 +1258,17 @@ int main() {
     // PERF-02：增量路径必须做（每个带期望摘要的普通文件各一次）。
     bp::IncrementalOutcome outcome;
     error.clear();
-    test_support::Check(RunIncremental(source, repository, "base.bak", "",
-                                       &outcome, &error),
-                        "INC-C PERF-02 增量基线成功", error);
+    test_support::Check(
+        RunIncremental(source, repository, "base.bak", "", &outcome, &error),
+        "INC-C PERF-02 增量基线成功", error);
     test_support::WriteFile(source + "/small.txt", "small-changed", 0644);
     bp::ResetMyPackDigestVerificationCountForTesting();
     error.clear();
-    test_support::Check(RunIncremental(source, repository, "d1.bak", "base.bak",
-                                       &outcome, &error) &&
-                            outcome.kind == bp::IncrementalOutcome::Kind::kDelta,
-                        "INC-C PERF-02 增量 delta 成功", error);
+    test_support::Check(
+        RunIncremental(source, repository, "d1.bak", "base.bak", &outcome,
+                       &error) &&
+            outcome.kind == bp::IncrementalOutcome::Kind::kDelta,
+        "INC-C PERF-02 增量 delta 成功", error);
     test_support::Check(
         bp::MyPackDigestVerificationCountForTesting() >= 1,
         "INC-C PERF-02 判别：增量路径照旧逐文件核对摘要",
