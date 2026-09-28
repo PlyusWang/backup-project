@@ -173,6 +173,9 @@ run_unit incremental_format_test
 run_unit incremental_restore_test
 run_unit incremental_retention_test
 run_unit incremental_crash_test
+# PR #18 closure：路径安全 / 父绑定 / hardlink / 选项矩阵 / 依赖删除 /
+# 副文件生命周期 / payload 绑定 / 深度上界。
+run_unit incremental_closure_test
 
 # ============================================================
 echo "[schedule-test] B. CLI pipeline parity"

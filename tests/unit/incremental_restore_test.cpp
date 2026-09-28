@@ -537,9 +537,9 @@ int main() {
     }
   }
 
-  // ---- 压缩 / 加密与增量正交 ----
+  // ---- 压缩与增量正交；加密与增量**不相容**（PR #18 closure 收紧的合同）----
   test_support::Section(
-      "INC-R 9. delta 走同一条 pack/compression/encryption 流水线");
+      "INC-R 9. 压缩照旧；增量 + 加密被明确拒绝，完整备份仍然支持加密");
   {
     const std::string work4 = test_support::FreshDir("inc-chain-crypto");
     const std::string src4 = work4 + "/src";
@@ -555,63 +555,91 @@ int main() {
     test_support::WriteFile(src4 + "/small.txt", "small", 0644);
 
     bp::Filter filter;
-    bp::BackupOptions options;
-    options.compression_method = bp::CompressionMethod::kLzssHuffman;
-    options.encryption_method = bp::EncryptionMethod::kAes256CtrHmacSha256;
-    options.password = "correct horse battery staple";
+    bp::BackupOptions encrypted;
+    encrypted.compression_method = bp::CompressionMethod::kLzssHuffman;
+    encrypted.encryption_method = bp::EncryptionMethod::kAes256CtrHmacSha256;
+    encrypted.password = "correct horse battery staple";
     std::string error;
     bp::IncrementalOutcome outcome;
+    // PR #18 v1 的合同：增量 + 加密 = 明确拒绝，而且是在**建任何东西之前**。
     test_support::Check(
-        bp::RunIncrementalBackup(src4, repo4, "c0.bak", repository_identity,
-                                 filter, options, {}, {}, "", &outcome, &error),
-        "INC-R T9 加密压缩的完整基线成功", error);
+        !bp::RunIncrementalBackup(src4, repo4, "c0.bak", repository_identity,
+                                  filter, encrypted, {}, {}, "", &outcome,
+                                  &error),
+        "INC-R T9 判别：增量 + 加密被拒绝（旧 HEAD 会接受）", error);
     test_support::Check(
-        outcome.kind == bp::IncrementalOutcome::Kind::kFullBaseline,
-        "INC-R T9 第一步是基线");
+        error.find("does not support encryption") != std::string::npos,
+        "INC-R T9 拒绝理由说明外层信封未被认证", error);
+    test_support::Check(!test_support::Exists(repo4 + "/c0.bak"),
+                        "INC-R T9 拒绝之后没有留下基线");
+    test_support::Check(
+        !test_support::Exists(repo4 + "/c0.bak.manifest") &&
+            !test_support::Exists(repo4 + "/c0.bak.identity"),
+        "INC-R T9 拒绝之后没有留下副文件");
 
+    // 同一组算法换成**压缩**（不加密）：仍然完全支持，而且链可以恢复。
+    bp::BackupOptions compressed;
+    compressed.compression_method = bp::CompressionMethod::kLzssHuffman;
+    error.clear();
+    bp::IncrementalOutcome first;
+    test_support::Check(
+        bp::RunIncrementalBackup(src4, repo4, "k0.bak", repository_identity,
+                                 filter, compressed, {}, {}, "", &first,
+                                 &error) &&
+            first.kind == bp::IncrementalOutcome::Kind::kFullBaseline,
+        "INC-R T9 压缩（不加密）的增量基线成功", error);
     test_support::WriteFile(src4 + "/small.txt", "small-changed", 0644);
+    error.clear();
     bp::IncrementalOutcome second;
     test_support::Check(
-        bp::RunIncrementalBackup(src4, repo4, "c1.bak", repository_identity,
-                                 filter, options, {}, {}, "", &second, &error),
-        "INC-R T9 加密压缩的 delta 成功", error);
-    test_support::Check(second.kind == bp::IncrementalOutcome::Kind::kDelta,
-                        "INC-R T9 第二步是 delta");
-    // 信封是明文（catalog 需要免密码识别种类），但 payload 必须是密文：
-    // 明文内容不该出现在 delta 文件里。
-    std::string delta_bytes;
-    test_support::Check(test_support::ReadFile(repo4 + "/c1.bak", &delta_bytes),
-                        "INC-R T9 读入 delta 字节");
-    test_support::Check(
-        delta_bytes.find("small-changed") == std::string::npos &&
-            delta_bytes.find("compressible-payload") == std::string::npos,
-        "INC-R T9 判别：payload 里看不到明文内容（真的加密了）");
-
-    bp::RestoreOptions restore_options;
-    restore_options.password = options.password;
+        bp::RunIncrementalBackup(src4, repo4, "k1.bak", repository_identity,
+                                 filter, compressed, {}, {}, "", &second,
+                                 &error) &&
+            second.kind == bp::IncrementalOutcome::Kind::kDelta,
+        "INC-R T9 压缩（不加密）的 delta 成功", error);
     const std::string restored = work4 + "/restored";
     bp::RestoreReport report;
-    test_support::Check(
-        bp::RestoreSnapshotChain(repo4, "c1.bak", restored, restore_options,
-                                 &report, &error),
-        "INC-R T9 带密码的依赖链恢复成功", error);
+    error.clear();
+    test_support::Check(bp::RestoreSnapshotChain(repo4, "k1.bak", restored,
+                                                 bp::RestoreOptions{}, &report,
+                                                 &error),
+                        "INC-R T9 压缩链恢复成功", error);
     std::string tree;
     test_support::Check(
         MakeOracle(src4, oracle4, "crypto", filter, &tree, &error),
         "INC-R T9 oracle 成功", error);
     std::string detail;
     test_support::Check(test_support::CompareTrees(tree, restored, &detail),
-                        "INC-R T9 加密压缩链恢复 == 完整恢复", detail);
+                        "INC-R T9 压缩链恢复 == 完整恢复", detail);
 
-    // 密码错了必须失败，而且不能留下半个目标目录。
+    // 加密本身没有被拿掉：完整备份 + 加密 + 压缩照旧可用，密码错了必须拒绝。
+    const std::string full_archive = work4 + "/full-encrypted.bak";
+    std::vector<bp::ArchiveEntry> entries;
+    error.clear();
+    test_support::Check(bp::ScanSourceTree(src4, &filter, &entries, &error) &&
+                            bp::RunBackupPipelineFromEntries(
+                                entries, full_archive, encrypted, &error),
+                        "INC-R T9 完整备份 + 加密 + 压缩仍然可用", error);
+    std::string bytes;
+    test_support::Check(test_support::ReadFile(full_archive, &bytes) &&
+                            bytes.find("small-changed") == std::string::npos,
+                        "INC-R T9 判别：完整备份的 payload 是密文");
+    const std::string full_restored = work4 + "/full-restored";
+    bp::RestoreOptions restore_options;
+    restore_options.password = encrypted.password;
+    bp::RestoreReport full_report;
+    error.clear();
+    test_support::Check(bp::RunRestorePipeline(full_archive, full_restored,
+                                               restore_options, &full_report,
+                                               &error),
+                        "INC-R T9 加密的完整备份带密码恢复成功", error);
     bp::RestoreOptions wrong;
     wrong.password = "wrong password";
     const std::string restored_wrong = work4 + "/restored-wrong";
     bp::RestoreReport wrong_report;
-    test_support::Check(
-        !bp::RestoreSnapshotChain(repo4, "c1.bak", restored_wrong, wrong,
-                                  &wrong_report, &error),
-        "INC-R T9 判别：错误密码被拒绝");
+    test_support::Check(!bp::RunRestorePipeline(full_archive, restored_wrong,
+                                                wrong, &wrong_report, &error),
+                        "INC-R T9 判别：错误密码被拒绝");
     test_support::Check(!test_support::Exists(restored_wrong),
                         "INC-R T9 恢复失败时不留半个目标目录");
   }

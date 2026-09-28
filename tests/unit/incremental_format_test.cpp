@@ -408,5 +408,128 @@ int main() {
                             " full=" + std::to_string(full_info.st_size));
   }
 
+
+  // ---- F7：不可信路径字段的边界（PR #18 closure）----
+  test_support::Section("INC-F 7. parent / tombstone：不可信字段一律 fail closed");
+  {
+    // PATH-01 / 02 / 03：parent_file_name 必须是"与 Catalog 管理的备份文件名
+    // 同一条边界"的单组件名字。它来自不可信信封，格式层就要判死。
+    const std::vector<std::string> bad_parents = {
+        "../../evil.bak",     // PATH-01 目录穿越
+        "../x",               // 上一级 + 没有扩展名
+        "a/b.bak",            // PATH-02 多组件
+        "a\\b.bak",           // PATH-02 反斜杠
+        ".", "..", "", "plain", "x.txt"};
+    for (const std::string& parent : bad_parents) {
+      bp::DeltaEnvelope envelope =
+          MakeEnvelope("base.bak", std::string(64, 'a'), std::string(64, 'b'));
+      envelope.parent_file_name = parent;
+      envelope.snapshot_id = bp::ComputeDeltaSnapshotId(envelope);
+      bp::DeltaEnvelope parsed;
+      std::string error;
+      test_support::Check(!bp::ParseDeltaEnvelope(
+                              bp::SerializeDeltaEnvelope(envelope), &parsed,
+                              &error),
+                          "INC-C PATH parent 被拒绝: '" + parent + "'");
+    }
+    // ".bak" 这种"只有扩展名"的名字 Catalog 也接受（它确实是合法的单组件
+    // 普通文件名），所以增量这一侧必须接受同一件事——边界一致比"看起来更严"
+    // 重要：两处不一致会出现"Catalog 认得、delta 读不了"的文件。
+    const std::vector<std::string> good_parents = {
+        "base.bak", "20260928_040000.bak", "中文 名字.bak", "a#b%.bak", ".bak"};
+    for (const std::string& parent : good_parents) {
+      bp::DeltaEnvelope envelope =
+          MakeEnvelope(parent, std::string(64, 'a'), std::string(64, 'b'));
+      bp::DeltaEnvelope parsed;
+      std::string error;
+      test_support::Check(bp::ParseDeltaEnvelope(
+                              bp::SerializeDeltaEnvelope(envelope), &parsed,
+                              &error) &&
+                              parsed.parent_file_name == parent,
+                          "INC-C PATH parent 被接受: '" + parent + "'", error);
+    }
+
+    // PATH-04 / 05 / 06：tombstone 是归档内相对路径，而且永远不能删源根。
+    const std::vector<std::string> bad_tombstones = {
+        "../victim",          // PATH-04 目录穿越
+        ".",                  // PATH-05 源根
+        "a/../../victim", "a/../b", "/abs/path", "a\\b", "a//b", "a/./b",
+        "C:/windows", "dir/", ""};
+    for (const std::string& tombstone : bad_tombstones) {
+      bp::DeltaEnvelope envelope =
+          MakeEnvelope("base.bak", std::string(64, 'a'), std::string(64, 'b'));
+      envelope.tombstones = {tombstone};
+      envelope.removed = 1;
+      envelope.snapshot_id = bp::ComputeDeltaSnapshotId(envelope);
+      bp::DeltaEnvelope parsed;
+      std::string error;
+      test_support::Check(!bp::ParseDeltaEnvelope(
+                              bp::SerializeDeltaEnvelope(envelope), &parsed,
+                              &error),
+                          "INC-C PATH tombstone 被拒绝: '" + tombstone +
+                              "'");
+    }
+    const std::vector<std::string> good_tombstones = {
+        "gone.txt", "dir/sub/file.txt", "中文 目录/文件.txt"};
+    for (const std::string& tombstone : good_tombstones) {
+      bp::DeltaEnvelope envelope =
+          MakeEnvelope("base.bak", std::string(64, 'a'), std::string(64, 'b'));
+      envelope.tombstones = {tombstone};
+      envelope.removed = 1;
+      bp::DeltaEnvelope parsed;
+      std::string error;
+      test_support::Check(bp::ParseDeltaEnvelope(
+                              bp::SerializeDeltaEnvelope(envelope), &parsed,
+                              &error) &&
+                              parsed.tombstones.size() == 1,
+                          "INC-C PATH tombstone 被接受: '" + tombstone + "'",
+                          error);
+    }
+
+    // 写侧与读侧过的是同一对校验：自己不产出自己随后拒绝的东西，
+    // 而且失败时不留任何文件。
+    bp::BackupOptions options;
+    std::vector<bp::ArchiveEntry> entries;
+    entries.push_back(RootEntry(source));
+    const std::string escaped = work + "/bad-parent.inc";
+    bp::DeltaEnvelope bad_parent = MakeEnvelope("../../evil.bak",
+                                                std::string(64, 'a'),
+                                                std::string(64, 'b'));
+    std::string error;
+    test_support::Check(!bp::WriteDeltaFile(escaped, bad_parent, entries,
+                                            options, &error),
+                        "INC-C PATH 写侧拒绝穿越型 parent");
+    test_support::Check(!test_support::Exists(escaped),
+                        "INC-C PATH 写侧拒绝时不留下文件");
+    const std::string bad_tomb = work + "/bad-tomb.inc";
+    bp::DeltaEnvelope bad_tombstone = MakeEnvelope("base.bak",
+                                                   std::string(64, 'a'),
+                                                   std::string(64, 'b'));
+    bad_tombstone.tombstones = {"../victim"};
+    bad_tombstone.removed = 1;
+    error.clear();
+    test_support::Check(!bp::WriteDeltaFile(bad_tomb, bad_tombstone, entries,
+                                            options, &error),
+                        "INC-C PATH 写侧拒绝穿越型 tombstone");
+    test_support::Check(!test_support::Exists(bad_tomb),
+                        "INC-C PATH 写侧拒绝时不留 tombstone 半成品");
+
+    // 抽出内层 container 的 header：不需要密码，也不需要解压。
+    const std::string good_delta = work + "/header.inc";
+    bp::DeltaEnvelope good = MakeEnvelope("base.bak", std::string(64, 'a'),
+                                          std::string(64, 'b'));
+    error.clear();
+    test_support::Check(bp::WriteDeltaFile(good_delta, good, entries, options,
+                                           &error),
+                        "INC-C PATH 正常 delta 可以写出", error);
+    bp::ContainerHeader header;
+    error.clear();
+    test_support::Check(bp::InspectDeltaPayloadHeader(good_delta, &header, &error),
+                        "INC-C PATH 内层 header 可读（无需密码）", error);
+    test_support::Check(
+        header.encryption_method ==
+            static_cast<std::uint8_t>(bp::EncryptionMethod::kNone),
+        "INC-C PATH 正常 delta 的内层容器未加密");
+  }
   return test_support::Finish("incremental_format_test");
 }
