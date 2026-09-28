@@ -109,6 +109,13 @@ bool IsSupportedBackupOptionCombination(
 std::string UnsupportedBackupOptionCombinationReason(
     const BackupOptionCombination& combination);
 
+// 自动触发（Scheduled / Realtime）为什么一律不加密。
+//
+// 这句话只能有一处来源：CLI 的拒绝理由与 GUI 的说明文案都读它，谁都不许
+// 复制一份字面量——两份文案迟早会有一份忘了改。
+// 非自动触发返回空串。
+std::string UnattendedEncryptionDisabledReason(BackupTrigger trigger);
+
 }  // namespace backupproject
 
 #endif  // BACKUP_PROJECT_INCLUDE_BACKUP_MODE_H_

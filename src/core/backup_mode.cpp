@@ -162,6 +162,17 @@ bool IsSupportedBackupOptionCombination(
   return true;
 }
 
+std::string UnattendedEncryptionDisabledReason(BackupTrigger trigger) {
+  if (trigger == BackupTrigger::kScheduled) {
+    return std::string(
+        "定时无人值守加密需要安全的密钥来源；当前版本不会持久化明文密码。");
+  }
+  if (trigger == BackupTrigger::kRealtime) {
+    return std::string("实时无人值守备份当前不保存密码，因此不启用加密。");
+  }
+  return std::string();
+}
+
 std::string UnsupportedBackupOptionCombinationReason(
     const BackupOptionCombination& combination) {
   if (!IsSupportedBackupMode(combination.trigger, combination.strategy)) {
@@ -172,17 +183,15 @@ std::string UnsupportedBackupOptionCombinationReason(
       !IsSupportedIncrementalPack(combination.pack_method)) {
     return UnsupportedIncrementalPackReason();
   }
-  if (combination.trigger == BackupTrigger::kScheduled &&
+  if ((combination.trigger == BackupTrigger::kScheduled ||
+       combination.trigger == BackupTrigger::kRealtime) &&
       combination.encryption_method != EncryptionMethod::kNone) {
-    return std::string(
-        "Unattended scheduled encryption is not supported: "
-        "定时无人值守加密需要安全的密钥来源；当前版本不会持久化明文密码。");
-  }
-  if (combination.trigger == BackupTrigger::kRealtime &&
-      combination.encryption_method != EncryptionMethod::kNone) {
-    return std::string(
-        "Unattended realtime encryption is not supported: "
-        "实时无人值守备份当前不保存密码，因此不启用加密。");
+    // 前缀说明"这是哪条边界"，句子本体来自唯一来源。
+    const std::string prefix =
+        combination.trigger == BackupTrigger::kScheduled
+            ? "Unattended scheduled encryption is not supported: "
+            : "Unattended realtime encryption is not supported: ";
+    return prefix + UnattendedEncryptionDisabledReason(combination.trigger);
   }
   if (combination.strategy == BackupStrategy::kIncremental &&
       !IsSupportedIncrementalEncryption(combination.encryption_method)) {

@@ -1186,7 +1186,10 @@ QString RealtimeController::supportedModeText() const {
 }
 
 QString RealtimeController::encryptionNote() const {
-  return QStringLiteral("实时无人值守备份当前不保存密码，因此不启用加密。");
+  // 唯一来源：核心那句"自动触发为什么不加密"。GUI 不复制一份字面量。
+  return QString::fromStdString(
+      backupproject::UnattendedEncryptionDisabledReason(
+          backupproject::BackupTrigger::kRealtime));
 }
 
 bool RealtimeController::watching() const { return watcher_.attached(); }

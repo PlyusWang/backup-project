@@ -24,6 +24,8 @@
 //   --realtime-test                     验证实时备份页的控制器链路：写配置并
 //                                       逐字段读回、attach watcher、resync 触发
 //                                       快照、文件事件触发快照、列出实时快照
+//   --realtime-show                     把控制器读到的实时配置打成 key=value，
+//                                       用来证明 GUI 与 CLI 读的是同一份 store
 //   --realtime-file <路径> 指定实时存储文件（测试隔离真实实时配置）
 //   --path-test                         验证本地路径与 URL 互转不丢字符
 //   --close-guard-test                  验证任务进行中关窗会被拦下
@@ -2181,6 +2183,40 @@ int RunScheduleShow(backup_modern::ScheduleController* schedule) {
   return 0;
 }
 
+// ---- --realtime-show：把 GUI 控制器读到的实时配置打成 key=value ----
+//
+// 与 --schedule-show 同构。它是 CLI ↔ GUI parity 的"GUI 侧读"证据：
+// backupctl realtime set 写下的字段，GUI 控制器必须逐项读到同样的值；
+// 反过来 GUI 保存出来的文件，backupctl realtime show 也必须读到同样的值。
+int RunRealtimeShow(backup_modern::RealtimeController* realtime) {
+  realtime->reload();
+  std::printf("enabled=%d\n", realtime->enabled() ? 1 : 0);
+  std::printf("trigger=%s\n", qPrintable(realtime->triggerKey()));
+  std::printf("strategy=%s\n", qPrintable(realtime->strategyKey()));
+  std::printf("source=%s\n", qPrintable(realtime->sourcePath()));
+  std::printf("debounce_ms=%d\n", realtime->debounceMs());
+  std::printf("max_wait_ms=%d\n", realtime->maxWaitMs());
+  std::printf("retain=%d\n", realtime->retainCount());
+  std::printf("pack=%s\n", qPrintable(realtime->packKey()));
+  std::printf("compression=%s\n", qPrintable(realtime->compressionKey()));
+  std::printf("encryption=%s\n", qPrintable(realtime->encryptionKey()));
+  for (const QString& rule : realtime->includeRules()) {
+    std::printf("include=%s\n", qPrintable(rule));
+  }
+  for (const QString& rule : realtime->excludeRules()) {
+    std::printf("exclude=%s\n", qPrintable(rule));
+  }
+  std::printf("repository=%s\n", qPrintable(realtime->repositoryPath()));
+  // 加密边界的那句话也必须来自同一处：GUI 与 CLI 显示的是同一个字符串。
+  std::printf("encryption_note=%s\n", qPrintable(realtime->encryptionNote()));
+  std::printf("snapshots=%d\n", realtime->snapshotCount());
+  std::printf("store=%s\n", qPrintable(realtime->storePath()));
+  if (!realtime->loadError().isEmpty()) {
+    std::printf("load_error=%s\n", qPrintable(realtime->loadError()));
+  }
+  return 0;
+}
+
 // ---- --realtime-test：实时备份页的控制器链路自检 ----
 //
 // 全程跑在临时目录里：临时 config.json、临时 realtime.json、临时仓库与源目录。
@@ -3547,6 +3583,8 @@ int main(int argc, char* argv[]) {
       arguments.contains(QStringLiteral("--schedule-test"));
   const bool schedule_show =
       arguments.contains(QStringLiteral("--schedule-show"));
+  const bool realtime_show =
+      arguments.contains(QStringLiteral("--realtime-show"));
   const int preview_test_index =
       arguments.indexOf(QStringLiteral("--preview-test"));
 
@@ -3690,9 +3728,12 @@ int main(int argc, char* argv[]) {
   }
   // 实时自检与计划自检一样：自己控制每一步（从空 store 开始、手动启用、
   // 手动等快照），所以不自动 start。
+  if (realtime_show) {
+    return RunRealtimeShow(&realtime_controller);
+  }
   if (realtime_test) {
     return RunRealtimeTest(&realtime_controller, &operation_gate,
-                            config_file_path);
+                           config_file_path);
   }
   if (preview_test_index >= 0) {
     return RunPreviewTest(&filter_rule_model,

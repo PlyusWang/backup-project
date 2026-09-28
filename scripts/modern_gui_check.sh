@@ -1682,8 +1682,11 @@ expect_present "$REALTIME_PAGE_QML" "enabled: false" \
   "加密选择器是置灰的，不是隐藏的"
 expect_missing "$REALTIME_PAGE_QML" "aes-256-ctr-hmac-sha256" \
   "实时页不提供任何加密算法选项"
-expect_present "$REALTIME_CTRL_CPP" "实时无人值守备份当前不保存密码，因此不启用加密。" \
-  "加密说明那句话只有一份来源（控制器），QML 不再写一遍"
+expect_present "$REALTIME_CTRL_CPP" "UnattendedEncryptionDisabledReason" \
+  "加密说明问的是核心那句唯一来源，控制器不复制字面量"
+expect_present "$ROOT_DIR/src/core/backup_mode.cpp" \
+  "实时无人值守备份当前不保存密码，因此不启用加密。" \
+  "那句话本身只有一处：backup_mode.cpp（CLI 与 GUI 都读它）"
 
 # --- Filter：复用既有规则编辑方式，解析仍然只在共享 Filter 里 ---
 expect_present "$REALTIME_PAGE_QML" "realtime.validateRule(" \
