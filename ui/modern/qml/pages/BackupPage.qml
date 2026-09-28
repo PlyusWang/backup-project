@@ -186,7 +186,7 @@ Item {
                     // 规则仍然只有那两条，判定也仍然只写在面板里。
                     // 增量 + 非 MyPack 是核心明确拒绝的组合：界面直接禁用，
                     // 并在策略说明里讲清原因，而不是让用户点了才看到失败。
-                    enabled: !controller.busy && panel.strategyPackCombinationAllowed
+                    enabled: !controller.busy && panel.strategyCombinationAllowed
                     // 三个算法一律传冻结的字符串键；密码与确认密码原样交给控制器，
                     // 界面不在这里做任何加工（不加盐、不截断、不拼进任何路径）。
                     //
