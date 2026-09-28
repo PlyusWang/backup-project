@@ -20,6 +20,7 @@
 #include "archive_pipeline.h"
 #include "backup_catalog.h"
 #include "backup_engine.h"
+#include "incremental_backup.h"
 #include "scheduled_backup_service.h"
 #include "scheduler_lock.h"
 #include "test_support.h"
@@ -610,7 +611,20 @@ void TestRetention() {
     bp::ScheduledSnapshotRecord newer;
     newer.file_name = "newer_20200102_000000.bak";
     newer.created_time_sec = 2;
-    Write(env.repository + "/" + newer.file_name, "placeholder");
+    // 保留点必须是一份**验证得过**的快照：retention 现在只信实际字节与副文件，
+    // 保留点读不透时会整轮不删（fail closed）。这里直接走产品路径写一份真的。
+    {
+      bp::Filter filter;
+      bp::BackupOptions options;
+      bp::IncrementalOutcome outcome;
+      test_support::Check(
+          bp::RunIncrementalBackup(
+              env.source, env.repository, newer.file_name,
+              bp::RepositoryIdentity(env.repository), filter, options,
+              std::vector<std::string>(), std::vector<std::string>(), "",
+              &outcome, &error),
+          "RET-29 the kept snapshot is a real, verifiable one", error);
+    }
     document.state.managed_snapshots.push_back(newer);
     test_support::Check(store.Save(document, &error),
                         "RET-30 the crafted document saves", error);
