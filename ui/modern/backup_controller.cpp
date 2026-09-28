@@ -19,6 +19,8 @@
 
 #include "backup_engine.h"
 #include "backup_option_keys.h"
+#include "incremental_backup.h"
+#include "incremental_restore.h"
 
 namespace backup_modern {
 
@@ -125,6 +127,18 @@ QVariantMap RecordToVariant(const backupproject::BackupRecord& record) {
                                           : QString());
   // 只表示"恢复这份归档需要密码"。列表阶段没有、也不该有密码。
   item.insert(QStringLiteral("passwordRequired"), record.password_required);
+  // PR #18：快照种类与依赖链状态。界面据此显示"完整 / 增量"、父快照，
+  // 以及在链断掉时如实说明"这份现在恢复不了"，而不是等用户点了才失败。
+  item.insert(QStringLiteral("recordKind"), record.incremental_delta
+                                                ? QStringLiteral("delta")
+                                                : QStringLiteral("full"));
+  item.insert(QStringLiteral("isDelta"), record.incremental_delta);
+  item.insert(QStringLiteral("parentFileName"),
+              QString::fromStdString(record.parent_file_name));
+  item.insert(QStringLiteral("chainRestorable"),
+              record.chain_restorable || !record.incremental_delta);
+  item.insert(QStringLiteral("chainDiagnostic"),
+              QString::fromStdString(record.chain_diagnostic));
   return item;
 }
 
@@ -253,7 +267,33 @@ BackupController::BackupController(const QString& config_file_path,
         }
         SetBusy(false);
         if (outcome.succeeded) {
-          if (kind == Kind::kBackup) {
+          if (kind == Kind::kBackup && outcome.incremental) {
+            // 增量策略必须说清"这一轮到底做了什么"：什么都没写、建了基线、
+            // 还是写了 delta。三种情况用户看到的话必须是不一样的。
+            if (outcome.no_changes) {
+              SetStatus(
+                  QString::fromLatin1(kSuccess), QStringLiteral("没有变化"),
+                  QStringLiteral("自上次快照以来没有有效变化，未创建新快照。"));
+            } else if (outcome.created_baseline) {
+              SetStatus(
+                  QString::fromLatin1(kSuccess),
+                  QStringLiteral("备份完成（完整基线）"),
+                  QStringLiteral("增量策略：本轮没有可信基线，已建立完整基线"
+                                 "快照。原因：%1")
+                      .arg(outcome.baseline_reason));
+              refreshBackups();
+            } else {
+              SetStatus(QString::fromLatin1(kSuccess),
+                        QStringLiteral("增量完成"),
+                        QStringLiteral("已保存为 %1；变化：+%2 ~%3 =%4 -%5")
+                            .arg(file_name)
+                            .arg(outcome.added)
+                            .arg(outcome.modified)
+                            .arg(outcome.metadata_changed)
+                            .arg(outcome.removed));
+              refreshBackups();
+            }
+          } else if (kind == Kind::kBackup) {
             SetStatus(QString::fromLatin1(kSuccess), QStringLiteral("备份完成"),
                       file_name.isEmpty()
                           ? QStringLiteral("备份文件已写入备份仓库。")
@@ -576,11 +616,71 @@ bool BackupController::startBackup() {
                                 QString(), QString());
 }
 
+// 旧入口 = full 策略。行为与 PR #17 完全一致。
 bool BackupController::startBackupWithOptions(const QString& pack_key,
                                               const QString& compression_key,
                                               const QString& encryption_key,
                                               const QString& password,
                                               const QString& confirm_password) {
+  return StartBackupWithStrategy(BackupStrategy::kFull, pack_key,
+                                 compression_key, encryption_key, password,
+                                 confirm_password);
+}
+
+bool BackupController::startBackupWithStrategy(
+    const QString& strategy_key, const QString& pack_key,
+    const QString& compression_key, const QString& encryption_key,
+    const QString& password, const QString& confirm_password) {
+  // 解析失败绝不回退到 full：用户明确选了增量，就必须拿到增量或明确报错。
+  BackupStrategy strategy = BackupStrategy::kFull;
+  status_scope_ = QString::fromLatin1(kScopeBackup);
+  if (!ParseBackupStrategyKey(strategy_key.toStdString(), &strategy)) {
+    SetStatus(QString::fromLatin1(kError), QStringLiteral("无法备份"),
+              QStringLiteral("未知备份策略：%1").arg(strategy_key));
+    return false;
+  }
+  // 支持矩阵与选项组合是唯一答案来源：界面能点到的组合与核心接受的组合
+  // 必须是同一个集合。这一条同时盖住 programmatic call——界面把某个选项置灰
+  // 只是提示，真正的边界在这里。
+  backupproject::PackMethod pack_method = backupproject::PackMethod::kMyPack;
+  backupproject::CompressionMethod compression_method =
+      backupproject::CompressionMethod::kNone;
+  backupproject::EncryptionMethod encryption_method =
+      backupproject::EncryptionMethod::kNone;
+  const bool pack_ok = ParsePackMethodKey(pack_key, &pack_method);
+  const bool compression_ok =
+      ParseCompressionMethodKey(compression_key, &compression_method);
+  const bool encryption_ok =
+      ParseEncryptionMethodKey(encryption_key, &encryption_method);
+  if (pack_ok && compression_ok && encryption_ok) {
+    backupproject::BackupOptionCombination combination;
+    combination.trigger = BackupTrigger::kManual;
+    combination.strategy = strategy;
+    combination.pack_method = pack_method;
+    combination.compression_method = compression_method;
+    combination.encryption_method = encryption_method;
+    if (!backupproject::IsSupportedBackupOptionCombination(combination)) {
+      SetStatus(QString::fromLatin1(kError), QStringLiteral("无法备份"),
+                QString::fromStdString(
+                    backupproject::UnsupportedBackupOptionCombinationReason(
+                        combination)));
+      return false;
+    }
+  } else if (!IsSupportedBackupMode(BackupTrigger::kManual, strategy)) {
+    // key 解析失败的详细报错由后面那条路径负责；这里只保证产品矩阵先被判掉。
+    SetStatus(QString::fromLatin1(kError), QStringLiteral("无法备份"),
+              QString::fromStdString(UnsupportedBackupModeReason(
+                  BackupTrigger::kManual, strategy)));
+    return false;
+  }
+  return StartBackupWithStrategy(strategy, pack_key, compression_key,
+                                 encryption_key, password, confirm_password);
+}
+
+bool BackupController::StartBackupWithStrategy(
+    BackupStrategy strategy, const QString& pack_key,
+    const QString& compression_key, const QString& encryption_key,
+    const QString& password, const QString& confirm_password) {
   // 备份页的动作：成功 / 失败 / 校验提示都只属于备份页。
   status_scope_ = QString::fromLatin1(kScopeBackup);
   if (busy_) {
@@ -675,6 +775,21 @@ bool BackupController::startBackupWithOptions(const QString& pack_key,
   request.second_path = archive;
   request.filter = filter;
   request.backup_options = options;
+  request.strategy = strategy;
+  if (strategy == BackupStrategy::kIncremental) {
+    // 增量在后台自己决定 baseline / delta / 不写，所以它需要仓库本身、
+    // 快照名与规则原文（规则是链 identity 的一部分）。
+    request.repository_directory = repository_path_;
+    request.repository_identity =
+        QString::fromStdString(backupproject::RepositoryIdentity(repository));
+    request.snapshot_file_name = QFileInfo(archive).fileName();
+    for (const QString& rule : include_rules_) {
+      request.include_rules.push_back(rule.toStdString());
+    }
+    for (const QString& rule : exclude_rules_) {
+      request.exclude_rules.push_back(rule.toStdString());
+    }
+  }
   // file name 只用于状态提示，来自 Catalog 生成的归档名，与密码无关。
   return Start(request, QFileInfo(archive).fileName());
 }
@@ -736,6 +851,10 @@ bool BackupController::startManagedRestore(const QString& file_name,
   request.kind = Kind::kRestore;
   request.first_path = QString::fromStdString(archive_path);
   request.second_path = destination_path;
+  // 依赖链恢复需要仓库与快照名：目标是完整快照时走的是同一条路径，
+  // 行为与以前完全一致；是 delta 时自动解析 base 与中间层。
+  request.repository_directory = repository_path_;
+  request.snapshot_file_name = file_name;
   return Start(request, file_name);
 }
 
@@ -785,6 +904,8 @@ bool BackupController::startManagedRestoreWithPassword(
   request.kind = Kind::kRestore;
   request.first_path = QString::fromStdString(archive_path);
   request.second_path = destination_path;
+  request.repository_directory = repository_path_;
+  request.snapshot_file_name = file_name;
   if (identified &&
       info.kind == backupproject::ArchiveFileInfo::Kind::kContainerV2 &&
       info.encryption_method != backupproject::EncryptionMethod::kNone) {
@@ -833,14 +954,21 @@ bool BackupController::deleteBackup(const QString& file_name) {
   // 否则它会在列表里永远留着。界面上那层确认对话框不是安全边界，
   // 文件名与目标类型的校验始终由 Catalog 自己完成。
   std::string error_message;
+  std::vector<std::string> diagnostics;
   if (!catalog_.Delete(repository_path_.toStdString(), file_name.toStdString(),
-                       &error_message)) {
+                       &diagnostics, &error_message)) {
     SetStatus(QString::fromLatin1(kError), QStringLiteral("删除失败"),
               QString::fromStdString(error_message));
     return false;
   }
+  QString message = QStringLiteral("%1 已从备份仓库中移除。").arg(file_name);
+  // 副文件清理失败不是"删除失败"，但要说出来：否则用户以为仓库干净了，
+  // 而 <name>.manifest / <name>.identity 还留在那里。
+  for (const std::string& note : diagnostics) {
+    message += QStringLiteral("\n") + QString::fromStdString(note);
+  }
   SetStatus(QString::fromLatin1(kSuccess), QStringLiteral("备份已删除"),
-            QStringLiteral("%1 已从备份仓库中移除。").arg(file_name));
+            message);
   refreshBackups();
   // 删成功之后才通知：计划状态要跟着这份仓库的实际内容走，而不是跟着"用户点了
   // 删除"走。失败时什么都没变，也就不该有人去改 schedule。
@@ -951,7 +1079,38 @@ OperationOutcome BackupController::RunOperation(OperationRequest request) {
   const std::string second = request.second_path.toStdString();
 
   OperationOutcome outcome;
-  if (request.kind == Kind::kBackup) {
+  if (request.kind == Kind::kBackup &&
+      request.strategy == BackupStrategy::kIncremental) {
+    // 增量：baseline / delta / 无变化三选一，由共享引擎决定。
+    // 界面只负责把结果如实说出来，不自己判断"这算不算成功"。
+    backupproject::IncrementalOutcome incremental;
+    const bool ok = backupproject::RunIncrementalBackup(
+        first, request.repository_directory.toStdString(),
+        request.snapshot_file_name.toStdString(),
+        request.repository_identity.toStdString(), request.filter,
+        request.backup_options, request.include_rules, request.exclude_rules,
+        std::string(), &incremental, &error_message);
+    outcome.succeeded = ok;
+    outcome.incremental = true;
+    if (ok) {
+      outcome.no_changes = incremental.kind ==
+                           backupproject::IncrementalOutcome::Kind::kNoChanges;
+      outcome.created_baseline =
+          incremental.kind ==
+          backupproject::IncrementalOutcome::Kind::kFullBaseline;
+      outcome.snapshot_kind =
+          outcome.no_changes
+              ? QStringLiteral("no changes")
+              : (outcome.created_baseline ? QStringLiteral("full baseline")
+                                          : QStringLiteral("delta"));
+      outcome.baseline_reason =
+          QString::fromStdString(incremental.baseline_reason);
+      outcome.added = incremental.summary.added;
+      outcome.modified = incremental.summary.modified;
+      outcome.metadata_changed = incremental.summary.metadata_changed;
+      outcome.removed = incremental.summary.removed;
+    }
+  } else if (request.kind == Kind::kBackup) {
     if (request.backup_flavor == BackupFlavor::kModernV2) {
       // 三项都由用户在界面上选择，这里不再写死任何一项。
       outcome.succeeded = engine.Backup(first, second, request.filter,
@@ -961,6 +1120,20 @@ OperationOutcome BackupController::RunOperation(OperationRequest request) {
       outcome.succeeded =
           engine.Backup(first, second, request.filter, &error_message);
     }
+  } else if (request.kind == Kind::kRestore &&
+             request.repository_directory.size() > 0 &&
+             // 只有 v2 container 与 BKPINC1 delta 才属于依赖链；legacy v0.1
+             // 等格式没有链的概念，继续走下面那条按 magic 分流的既有入口
+             // （产品一直能恢复历史 v0.1，这条能力不因为增量而消失）。
+             backupproject::ClassifySnapshotFile(first, nullptr) !=
+                 backupproject::SnapshotFileKind::kUnknown) {
+    // PR #18：GUI 的恢复也走依赖链入口 —— 目标是一份完整快照时行为与以前
+    // 完全一致，是 delta 时自动把 base 与中间层一起应用。
+    backupproject::RestoreReport report;
+    outcome.succeeded = backupproject::RestoreSnapshotChain(
+        request.repository_directory.toStdString(),
+        request.snapshot_file_name.toStdString(), second,
+        request.restore_options, &report, &error_message);
   } else if (request.restore_is_v2) {
     // 只有用户真的输入了恢复密码才会走这里。
     outcome.succeeded =

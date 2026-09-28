@@ -22,11 +22,14 @@
 #include "archive_pipeline.h"
 #include "backup_catalog.h"
 #include "backup_engine.h"
+#include "backup_mode.h"
 #include "backup_option_keys.h"
 #include "backup_preview.h"
 #include "cli_app.h"
 #include "config_manager.h"
 #include "filter.h"
+#include "incremental_backup.h"
+#include "incremental_restore.h"
 #include "schedule_store.h"
 #include "scheduled_backup_service.h"
 #include "scheduler_lock.h"
@@ -221,8 +224,10 @@ void PrintCliUsage(const std::string& program_name, std::ostream& output) {
       << "    repository (see 'repository list').\n"
       << "  " << program_name
       << " schedule show | set | enable | disable | run | history | watch\n"
-      << "    schedule set takes --source --interval-minutes --retain --pack\n"
-      << "      --compression --encryption none --include --exclude, plus\n"
+      << "    schedule set takes --source --interval-minutes --retain "
+         "--strategy\n"
+      << "      --pack --compression --encryption none --include --exclude, "
+         "plus\n"
       << "      --clear-filters (drop the stored rules first, then add the "
          "ones\n"
       << "      given on this command line).\n"
@@ -295,11 +300,18 @@ int RunBackupCommand(const CliContext& context,
 
   Filter filter;
   BackupOptions options;
+  // 策略默认 full：不写 --strategy 的既有用法行为一字不变。
+  BackupStrategy strategy = BackupStrategy::kFull;
   bool encryption_requested = false;
   bool saw_pack = false;
   bool saw_compression = false;
   bool saw_encryption = false;
+  bool saw_strategy = false;
   std::string error_message;
+  // 规则原文按 include / exclude 分开留着：它是增量链的 identity 之一
+  // （规则变了就必须重新建基线），所以不能只留下编好的 Filter。
+  std::vector<std::string> include_rules;
+  std::vector<std::string> exclude_rules;
 
   for (std::size_t index = 1; index < arguments.size(); ++index) {
     const std::string option = arguments[index];
@@ -313,6 +325,26 @@ int RunBackupCommand(const CliContext& context,
                                       : FilterAction::kExclude;
       if (!filter.AddRule(action, value, &error_message)) {
         return UsageError(context, error_message);
+      }
+      if (action == FilterAction::kInclude) {
+        include_rules.push_back(value);
+      } else {
+        exclude_rules.push_back(value);
+      }
+      continue;
+    }
+    if (option == "--strategy") {
+      if (!MarkSingleOption(&saw_strategy, option, &error_message)) {
+        return UsageError(context, error_message);
+      }
+      if (!TakeValue(arguments, &index, option, &value, &error_message)) {
+        return UsageError(context, error_message);
+      }
+      // 解析失败绝不回退到 full：用户明确说了 incremental，就必须拿到明确的
+      // 结果或明确的错误。
+      if (!ParseBackupStrategyKey(value, &strategy)) {
+        return UsageError(context, "unknown backup strategy '" + value +
+                                       "' (expected full or incremental)");
       }
       continue;
     }
@@ -397,16 +429,79 @@ int RunBackupCommand(const CliContext& context,
     return kCliExitOperationFailed;
   }
 
+  // 支持矩阵与选项组合是唯一答案来源，而且要在做任何写盘动作**之前**问它：
+  // "argv 收下了、校验再拒绝"这种半吊子状态最容易让人以为命令成功了。
+  // 组合校验只有一份实现（与 GUI backend、计划配置同源）。
+  BackupOptionCombination combination;
+  combination.trigger = BackupTrigger::kManual;
+  combination.strategy = strategy;
+  combination.pack_method = options.pack_method;
+  combination.compression_method = options.compression_method;
+  combination.encryption_method = options.encryption_method;
+  if (!IsSupportedBackupOptionCombination(combination)) {
+    const std::string reason =
+        UnsupportedBackupOptionCombinationReason(combination);
+    // 产品矩阵本身不支持（Realtime）是运行级拒绝；策略与算法的组合不成立
+    // 是用法错误——两者都是"什么都没写盘就失败"，但退出码不同。
+    if (!IsSupportedBackupMode(BackupTrigger::kManual, strategy)) {
+      PrintError(reason);
+      return kCliExitOperationFailed;
+    }
+    return UsageError(context, reason);
+  }
+
+  const std::string file_name = BaseNameOf(archive_path);
+  if (strategy == BackupStrategy::kIncremental) {
+    // 增量：baseline / delta / 无变化三选一，由共享引擎决定并如实报告。
+    IncrementalOutcome outcome;
+    if (!RunIncrementalBackup(source_directory, repository, file_name,
+                              RepositoryIdentity(repository), filter, options,
+                              include_rules, exclude_rules, "", &outcome,
+                              &error_message)) {
+      PrintError(error_message);
+      return kCliExitOperationFailed;
+    }
+    if (outcome.kind == IncrementalOutcome::Kind::kNoChanges) {
+      std::cout << "No effective changes since the last snapshot; nothing was "
+                   "written.\n";
+      std::cout << "Repository: " << repository << "\n";
+      std::cout << "Parent:     " << outcome.parent_file_name << "\n";
+      return kCliExitSuccess;
+    }
+    std::cout << "Backup completed successfully.\n";
+    std::cout << "Repository: " << repository << "\n";
+    std::cout << "Archive:    " << file_name << "\n";
+    std::cout << "Strategy:   " << BackupStrategyKey(strategy) << "\n";
+    if (outcome.kind == IncrementalOutcome::Kind::kFullBaseline) {
+      // 用户要的是增量，这一轮建的却是完整基线：必须说出来，还要说清为什么。
+      std::cout << "Kind:       full baseline (no trustworthy baseline: "
+                << outcome.baseline_reason << ")\n";
+    } else {
+      std::cout << "Kind:       delta\n";
+      std::cout << "Parent:     " << outcome.parent_file_name << "\n";
+      std::cout << "Changes:    added=" << outcome.summary.added
+                << " modified=" << outcome.summary.modified
+                << " metadata=" << outcome.summary.metadata_changed
+                << " removed=" << outcome.summary.removed << "\n";
+    }
+    std::cout << "Pipeline: pack=" << PackMethodKey(options.pack_method)
+              << " compression="
+              << CompressionMethodKey(options.compression_method)
+              << " encryption="
+              << EncryptionMethodKey(options.encryption_method) << '\n';
+    return kCliExitSuccess;
+  }
+
   BackupEngine engine;
   if (!engine.Backup(source_directory, archive_path, filter, options,
                      &error_message)) {
     PrintError(error_message);
     return kCliExitOperationFailed;
   }
-  const std::string file_name = BaseNameOf(archive_path);
   std::cout << "Backup completed successfully.\n";
   std::cout << "Repository: " << repository << "\n";
   std::cout << "Archive:    " << file_name << "\n";
+  std::cout << "Strategy:   " << BackupStrategyKey(strategy) << "\n";
   std::cout << "Pipeline: pack=" << PackMethodKey(options.pack_method)
             << " compression="
             << CompressionMethodKey(options.compression_method)
@@ -532,34 +627,60 @@ int RunRestoreCommand(const CliContext& context,
     return kCliExitOperationFailed;
   }
 
-  BackupEngine engine;
-
-  // 只有归档自己说"我需要密码"时才去问。问的方式还是 /dev/tty；
-  // 识别失败时不在这里报错，交给真正的恢复路径给出更准确的诊断。
   ArchiveFileInfo info;
   std::string identify_error;
-  if (IdentifyArchiveFile(archive_path, &info, &identify_error) &&
-      !info.password_hint.empty()) {
-    std::string secret;
+  const bool wants_password =
+      IdentifyArchiveFile(archive_path, &info, &identify_error) &&
+      !info.password_hint.empty();
+
+  RestoreOptions options;
+  std::string secret;
+  if (wants_password) {
+    // 只有归档自己说"我需要密码"时才去问。问的方式还是 /dev/tty；
+    // 识别失败时不在这里报错，交给真正的恢复路径给出更准确的诊断。
     if (!ReadSecretFromTerminal("Restore password: ", &secret,
                                 &error_message)) {
       PrintError(error_message);
       return kCliExitOperationFailed;
     }
-    RestoreOptions options;
     options.password = secret;
-    for (char& character : secret) character = '\0';
-    if (!engine.Restore(archive_path, destination_directory, options, nullptr,
-                        &error_message)) {
-      PrintError(error_message);
-      return kCliExitOperationFailed;
-    }
-  } else if (!engine.Restore(archive_path, destination_directory,
-                             &error_message)) {
+  }
+
+  // 先按 magic 分类再选路径：
+  //
+  //   * v2 container / BKPINC1 delta —— 依赖链入口。目标是一份完整快照时
+  //     内部走的就是同一个恢复路径，行为与以前一致；是 delta 时自动把 base
+  //     与中间层一起应用，用户只需要选 restore point。
+  //   * 其它（legacy v0.1 等）—— 这些格式没有"链"的概念，走按 magic 分流的
+  //     既有入口。它们的行为与 PR #17 一字不变：产品 CLI 一直能恢复历史 v0.1
+  //     归档，这条能力不能因为新增了增量而消失。
+  const SnapshotFileKind snapshot_kind =
+      ClassifySnapshotFile(archive_path, nullptr);
+  bool restored = false;
+  RestoreReport report;
+  if (snapshot_kind == SnapshotFileKind::kUnknown) {
+    BackupEngine engine;
+    restored = wants_password
+                   ? engine.Restore(archive_path, destination_directory,
+                                    options, nullptr, &error_message)
+                   : engine.Restore(archive_path, destination_directory,
+                                    &error_message);
+  } else {
+    restored =
+        RestoreSnapshotChain(repository, file_name, destination_directory,
+                             options, &report, &error_message);
+  }
+  for (char& character : secret) character = '\0';
+  if (!restored) {
     PrintError(error_message);
     return kCliExitOperationFailed;
   }
   std::cout << "Restore completed successfully.\n";
+  if (!report.notes.empty()) {
+    // 尽力而为的步骤（例如非 root 改不了属主）如实说出来，不假装完整。
+    std::cout << "Notes:      " << report.notes.size()
+              << " (ownership or metadata steps were skipped)\n";
+  }
   return kCliExitSuccess;
 }
 // ---- schedule ----
@@ -699,6 +820,7 @@ int ScheduleSet(const CliContext& context,
   bool saw_source = false;
   bool saw_interval = false;
   bool saw_retain = false;
+  bool saw_strategy = false;
   bool saw_pack = false;
   bool saw_compression = false;
   bool saw_encryption = false;
@@ -740,6 +862,22 @@ int ScheduleSet(const CliContext& context,
       if (!ParseBoundedScheduleNumber(value, kMinRetainCount, kMaxRetainCount,
                                       option, &config.retain_count, &error)) {
         return UsageError(context, error);
+      }
+      continue;
+    }
+    if (option == "--strategy") {
+      // PR #18：计划也支持增量策略。解析失败不回退：写进配置的必须正是用户
+      // 要的那一个，而"支不支持这个组合"由共享的 ValidateScheduleConfig
+      // （也就是 IsSupportedBackupMode 那张真值表）在后面统一回答。
+      if (!MarkSingleOption(&saw_strategy, option, &error)) {
+        return UsageError(context, error);
+      }
+      if (!TakeValue(arguments, &index, option, &value, &error)) {
+        return UsageError(context, error);
+      }
+      if (!ParseBackupStrategyKey(value, &config.strategy)) {
+        return UsageError(context, "unknown backup strategy '" + value +
+                                       "' (expected full or incremental)");
       }
       continue;
     }
@@ -855,6 +993,12 @@ int ScheduleSet(const CliContext& context,
   }
   std::cout << "Schedule updated. Enabled: " << (config.enabled ? "yes" : "no")
             << "\n";
+  std::cout << "Strategy: " << BackupStrategyKey(config.strategy) << "\n";
+  if (config.strategy == BackupStrategy::kIncremental &&
+      !IsSupportedIncrementalPack(config.pack_method)) {
+    // 增量只支持 MyPack：在配置这一层就说清楚，而不是等第一次 delta 才发现。
+    std::cout << "Note: " << UnsupportedIncrementalPackReason() << "\n";
+  }
   return kCliExitSuccess;
 }
 
@@ -1152,6 +1296,19 @@ int RepositoryList(const CliContext& context) {
 
   std::cout << "Repository: " << repository << "\n";
   std::cout << "Archives:   " << records.size() << "\n";
+  // 孤儿副文件只报告、不清理：列表是只读操作，破坏性动作必须由用户显式发起
+  // （或者由 retention 在明确的淘汰轮次里做）。
+  {
+    std::vector<std::string> orphans;
+    std::string orphan_error;
+    if (FindOrphanSidecars(repository, &orphans, &orphan_error)) {
+      for (const std::string& name : orphans) {
+        std::cout
+            << "Orphan sidecar: " << name
+            << "  (its snapshot file is gone; retention will remove it)\n";
+      }
+    }
+  }
   for (const BackupRecord& record : records) {
     bool managed = false;
     for (const ScheduledSnapshotRecord& snapshot :
@@ -1183,9 +1340,15 @@ int RepositoryDelete(const CliContext& context, const std::string& file_name) {
     return kCliExitOperationFailed;
   }
   BackupCatalog catalog;
+  std::vector<std::string> diagnostics;
   if (!catalog.Delete(repository, file_name, &error)) {
     PrintError(error);
     return kCliExitOperationFailed;
+  }
+  // 副文件清理失败不是"删除失败"，但绝不能静默：用户以为 .bak 没了就干净了，
+  // 而仓库里还留着它的 .manifest / .identity。
+  for (const std::string& note : diagnostics) {
+    std::cout << "Warning: " << note << "\n";
   }
 
   // §19 的 A 路径：删除成功后立刻让 ScheduleStore 忘掉这条 managed record。

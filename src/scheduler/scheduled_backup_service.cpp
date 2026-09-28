@@ -5,6 +5,7 @@
 #include <sys/stat.h>
 #include <sys/types.h>
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <string>
@@ -14,6 +15,7 @@
 
 #include "backup_catalog.h"
 #include "backup_engine.h"
+#include "incremental_backup.h"
 #include "source_manifest.h"
 
 namespace backupproject {
@@ -81,20 +83,11 @@ bool BaselineIsManaged(const ScheduleDocument& document) {
   return false;
 }
 
-// 最旧的 managed snapshot 下标。时间相同再按 file_name 升序，
-// 保证"删哪一个"是确定的，不依赖容器里的偶然顺序。
-std::size_t OldestManagedIndex(
-    const std::vector<ScheduledSnapshotRecord>& records) {
-  std::size_t oldest = 0;
-  for (std::size_t index = 1; index < records.size(); ++index) {
-    if (records[index].created_time_sec < records[oldest].created_time_sec ||
-        (records[index].created_time_sec == records[oldest].created_time_sec &&
-         records[index].file_name < records[oldest].file_name)) {
-      oldest = index;
-    }
-  }
-  return oldest;
-}
+// 注意：原来这里有一个 OldestManagedIndex()，retention 直接用它挑"最旧的一份"。
+// PR #18 之后"删哪一份"不再是一个局部决定——必须先算出依赖安全的删除集合
+// （见 PlanDependencyAwareRetention），所以那条"找最旧"的逻辑搬进了计划函数，
+// 排序规则（时间相同按 file_name）一字未变。这里刻意不再留一个没人用的副本：
+// 两处排序规则共存，早晚会有一处先改。
 
 }  // namespace
 
@@ -289,9 +282,13 @@ void ScheduledBackupService::ReconcileManagedSnapshots(
 bool ScheduledBackupService::RunRetention(ScheduleDocument* document,
                                           std::uint64_t* deleted,
                                           std::uint64_t* failed,
+                                          std::uint64_t* dependency_retained,
+                                          std::uint64_t* unreadable,
                                           std::string* error_message) const {
   if (deleted != nullptr) *deleted = 0;
   if (failed != nullptr) *failed = 0;
+  if (dependency_retained != nullptr) *dependency_retained = 0;
+  if (unreadable != nullptr) *unreadable = 0;
   if (error_message != nullptr) error_message->clear();
   if (document == nullptr) {
     SetError(error_message, "Schedule document must not be null");
@@ -300,30 +297,134 @@ bool ScheduledBackupService::RunRetention(ScheduleDocument* document,
 
   BackupCatalog catalog;
   const std::size_t retain = document->config.retain_count;
-  while (document->state.managed_snapshots.size() > retain) {
-    const std::size_t oldest =
-        OldestManagedIndex(document->state.managed_snapshots);
-    // 先拷出来：下面会 erase，引用立刻失效。
-    const std::string file_name =
-        document->state.managed_snapshots[oldest].file_name;
 
+  // PR #18：删除集合必须先过依赖检查。
+  //
+  // "删最旧的"对 Full 是安全的，对依赖链不是：删掉某个 delta 的祖先会让它
+  // 以及它所有后代都无法恢复，而列表上看起来只是"少了一份旧快照"。
+  // 计划函数只回答"哪些能删"，具体删除仍然只走 catalog.Delete。
+  std::vector<std::string> managed_oldest_first;
+  {
+    std::vector<ScheduledSnapshotRecord> ordered =
+        document->state.managed_snapshots;
+    std::sort(ordered.begin(), ordered.end(),
+              [](const ScheduledSnapshotRecord& left,
+                 const ScheduledSnapshotRecord& right) {
+                if (left.created_time_sec != right.created_time_sec) {
+                  return left.created_time_sec < right.created_time_sec;
+                }
+                return left.file_name < right.file_name;
+              });
+    for (const ScheduledSnapshotRecord& item : ordered) {
+      managed_oldest_first.push_back(item.file_name);
+    }
+  }
+  RetentionPlan plan;
+  std::string plan_error;
+  if (!PlanDependencyAwareRetention(repository_path_, managed_oldest_first,
+                                    retain, &plan, &plan_error)) {
+    SetError(error_message,
+             "Failed to plan a dependency-safe retention pass: " + plan_error);
+    return false;
+  }
+  if (plan.dependency_uncertain) {
+    // fail closed：依赖不确定 -> 这一轮什么都不删。
+    //
+    // 报成"带警告的成功"而不是硬失败：新快照已经建好、状态也自洽，只是没有
+    // 回收旧快照。但必须说出来——否则"为什么仓库一直在长"没有答案。
+    if (unreadable != nullptr) {
+      *unreadable = static_cast<std::uint64_t>(plan.unreadable.size());
+    }
+    SetError(
+        error_message,
+        "Retention removed nothing because a dependency chain could not be "
+        "verified: " +
+            plan.uncertainty_reason);
+    return false;
+  }
+
+  // 计划里的名字必须是"本计划管理的快照"，否则不删（别人的东西不动）。
+  std::vector<std::string> to_remove;
+  for (const std::string& planned : plan.remove) {
+    for (const ScheduledSnapshotRecord& item :
+         document->state.managed_snapshots) {
+      if (item.file_name == planned) {
+        to_remove.push_back(planned);
+        break;
+      }
+    }
+  }
+
+  if (!to_remove.empty()) {
+    std::vector<std::string> removed;
+    std::vector<std::string> diagnostics;
     std::string delete_error;
     // 删除永远走 BackupCatalog：它是唯一实现"file_name 必须是仓库直接子项、
-    // 必须是普通文件、不是软链接"这条路径安全边界的地方。
+    // 必须是普通文件、不是软链接"这条路径安全边界的地方，也是唯一实现
+    // "还有后代活着就不许删"的地方。
     // 绝不写成 std::filesystem::remove(repository + "/" + file_name)。
-    if (!catalog.Delete(repository_path_, file_name, &delete_error)) {
-      if (failed != nullptr) *failed += 1;
-      SetError(error_message,
-               "Failed to remove the oldest scheduled snapshot '" + file_name +
-                   "': " + delete_error);
-      // 删不掉的记录保留在 managed 列表里，下一轮再试。
-      // 新快照已经成功，绝不能因为淘汰失败就把它当成整体失败。
+    //
+    // 整批一起交进去是刻意的：retention 的删除集合是**整条链一起**，
+    // 而"删祖先"单独看必须被拒绝。集合级的规则正好同时表达这两件事。
+    const bool all_removed = catalog.DeleteSnapshots(
+        repository_path_, to_remove, &removed, &diagnostics, &delete_error);
+
+    // 只有**真的删掉了**的记录才从 managed 列表里去掉：单个 unlink 失败时
+    // 剩下的记录留在名单里，下一轮再试。
+    for (const std::string& file_name : removed) {
+      for (std::size_t index = 0;
+           index < document->state.managed_snapshots.size(); ++index) {
+        if (document->state.managed_snapshots[index].file_name != file_name) {
+          continue;
+        }
+        document->state.managed_snapshots.erase(
+            document->state.managed_snapshots.begin() +
+            static_cast<std::ptrdiff_t>(index));
+        break;
+      }
+    }
+    if (deleted != nullptr) {
+      *deleted += static_cast<std::uint64_t>(removed.size());
+    }
+    if (failed != nullptr) {
+      *failed += static_cast<std::uint64_t>(diagnostics.size());
+    }
+    if (!all_removed) {
+      if (failed != nullptr && removed.empty()) {
+        *failed += static_cast<std::uint64_t>(to_remove.size());
+      }
+      SetError(
+          error_message,
+          "Failed to remove the oldest scheduled snapshots: " + delete_error);
       return false;
     }
-    document->state.managed_snapshots.erase(
-        document->state.managed_snapshots.begin() +
-        static_cast<std::ptrdiff_t>(oldest));
-    if (deleted != nullptr) *deleted += 1;
+  }
+
+  // 副文件生命周期：catalog 会带走每一份被删快照自己的副文件，但仓库里
+  // 历史遗留的孤儿副文件（.bak 早就不在了）只能在这里显式清一次。
+  // 清理失败如实计数，不静默。
+  {
+    std::vector<std::string> removed_sidecars;
+    std::vector<std::string> sidecar_diagnostics;
+    std::string cleanup_error;
+    if (!CleanOrphanSidecars(repository_path_, &removed_sidecars,
+                             &sidecar_diagnostics, &cleanup_error)) {
+      if (failed != nullptr) *failed += 1;
+      SetError(error_message,
+               "Failed to clean up orphan snapshot sidecars: " + cleanup_error);
+      return false;
+    }
+    if (failed != nullptr) {
+      *failed += static_cast<std::uint64_t>(sidecar_diagnostics.size());
+    }
+  }
+  // 被依赖而保留下来的祖先、以及读不出依赖因此不敢删的快照，
+  // 都如实计数：否则"为什么还留着这么旧的快照"在日志和界面上都说不清。
+  if (dependency_retained != nullptr) {
+    *dependency_retained = plan.keep_ancestors.size();
+  }
+  if (unreadable != nullptr) {
+    *unreadable = plan.unreadable.size();
   }
 
   // 不变式：retention 结束后，baseline 记录必须仍然指向一份存在的快照。
@@ -520,13 +621,82 @@ bool ScheduledBackupService::EvaluateInternal(std::int64_t now_sec, bool force,
     baseline_usable = true;
   }
 
-  if (baseline_usable) {
+  // ---- PR #18：增量策略的结论由共享增量引擎给出 ----
+  //
+  // 这里刻意**不**用 metadata-first 的比较来决定增量要不要写：内容身份必须
+  // 是真实摘要，否则 same-size + same-mtime 的改写会被漏掉，而漏掉的那一次
+  // 变化会成为所有后代的错误祖先。
+  //
+  // 引擎可能已经写好了一份快照（完整基线或 delta），也可能什么都没写；
+  // 两种结果都被翻译成下面那条**共用的**尾巴所期待的几个变量，
+  // 所以登记 / baseline 绑定 / manifest / retention / state / history 的
+  // 语义在三种路径上完全一致。
+  const bool incremental_mode =
+      document.config.strategy == BackupStrategy::kIncremental;
+  bool snapshot_already_written = false;
+  std::string incremental_snapshot_path;
+
+  if (incremental_mode) {
+    std::string work_error;
+    if (!catalog.EnsureRepository(repository_path_, &work_error)) {
+      return finish_failed(work_error);
+    }
+    // 命名规则仍然只属于 BackupCatalog。这里只是**预留**一个名字：
+    // 引擎若判定"没有变化"，这个名字不会被用到（BuildArchivePath 不创建文件）。
+    std::string candidate_path;
+    if (!catalog.BuildArchivePath(repository_path_, document.config.source_path,
+                                  now_sec, &candidate_path, &work_error)) {
+      return finish_failed(work_error);
+    }
+
+    BackupOptions incremental_options;
+    incremental_options.pack_method = document.config.pack_method;
+    incremental_options.compression_method = document.config.compression_method;
+    // 无人值守计划不接受加密：配置层已经拒过一次，这里不再提供入口。
+    incremental_options.encryption_method = EncryptionMethod::kNone;
+
+    IncrementalOutcome outcome;
+    if (!RunIncrementalBackup(
+            document.config.source_path, repository_path_,
+            BaseNameOf(candidate_path), RepositoryIdentity(repository_path_),
+            filter, incremental_options, document.config.include_rules,
+            document.config.exclude_rules, std::string(), &outcome,
+            &work_error)) {
+      return finish_failed(work_error);
+    }
+
+    result->changes = outcome.summary;
+    const bool had_baseline =
+        !document.state.baseline.snapshot_file_name.empty();
+    if (outcome.kind == IncrementalOutcome::Kind::kNoChanges) {
+      // 什么都没写：下面的 skip 分支会因为 changes 为空而接管，
+      // 连"不更新 manifest、不建空文件"这些细节都走同一条代码。
+    } else {
+      snapshot_already_written = true;
+      incremental_snapshot_path =
+          repository_path_ + "/" + outcome.snapshot_file_name;
+      result->archive_file_name = outcome.snapshot_file_name;
+      if (outcome.kind == IncrementalOutcome::Kind::kFullBaseline) {
+        result->first_snapshot = !had_baseline;
+        result->baseline_reset = had_baseline;
+        result->diagnostic +=
+            "Requested strategy = incremental, but this run created a full "
+            "baseline snapshot. Reason: " +
+            outcome.baseline_reason + ". ";
+      } else {
+        result->diagnostic +=
+            "Incremental delta on top of '" + outcome.parent_file_name + "'. ";
+      }
+    }
+  }
+
+  if (!incremental_mode && baseline_usable) {
     std::string diff_error;
     if (!DiffManifests(previous, current, &result->changes, nullptr,
                        &diff_error)) {
       return finish_failed(diff_error);
     }
-  } else {
+  } else if (!incremental_mode) {
     // 没有可信基线：这一轮产出一份**完整基线快照**。
     // 多建一份完整备份，绝不漏变化——这正是本 PR 的核心语义。
     const bool had_baseline =
@@ -577,12 +747,6 @@ bool ScheduledBackupService::EvaluateInternal(std::int64_t now_sec, bool force,
     return finish_failed(work_error);
   }
 
-  std::string archive_path;
-  if (!catalog.BuildArchivePath(repository_path_, document.config.source_path,
-                                now_sec, &archive_path, &work_error)) {
-    return finish_failed(work_error);
-  }
-
   BackupOptions options;
   options.pack_method = document.config.pack_method;
   options.compression_method = document.config.compression_method;
@@ -590,10 +754,20 @@ bool ScheduledBackupService::EvaluateInternal(std::int64_t now_sec, bool force,
   // 没有任何密码参数能从这条路径进来。
   options.encryption_method = EncryptionMethod::kNone;
 
-  BackupEngine engine;
-  if (!engine.Backup(document.config.source_path, archive_path, filter, options,
-                     &work_error)) {
-    return finish_failed(work_error);
+  std::string archive_path;
+  if (snapshot_already_written) {
+    // 增量引擎已经把它写好了（并且写好了它的 manifest / identity 副文件）。
+    archive_path = incremental_snapshot_path;
+  } else {
+    if (!catalog.BuildArchivePath(repository_path_, document.config.source_path,
+                                  now_sec, &archive_path, &work_error)) {
+      return finish_failed(work_error);
+    }
+    BackupEngine engine;
+    if (!engine.Backup(document.config.source_path, archive_path, filter,
+                       options, &work_error)) {
+      return finish_failed(work_error);
+    }
   }
 
   // 归档已经成功发布。从这一刻起，这一轮就是"成功"——后面的登记、淘汰、
@@ -662,9 +836,14 @@ bool ScheduledBackupService::EvaluateInternal(std::int64_t now_sec, bool force,
   // 所以 retention 不可能删掉 baseline —— 这一点与改动前完全一致。
   std::uint64_t deleted = 0;
   std::uint64_t failed = 0;
+  std::uint64_t dependency_retained = 0;
+  std::uint64_t retention_unreadable = 0;
   std::string retention_error;
   const bool retention_ok =
-      RunRetention(&document, &deleted, &failed, &retention_error);
+      RunRetention(&document, &deleted, &failed, &dependency_retained,
+                   &retention_unreadable, &retention_error);
+  result->retention_dependency_retained = dependency_retained;
+  result->retention_unreadable = retention_unreadable;
   result->retention_deleted = deleted;
   result->retention_failed = failed;
   result->status = StatusForRetention(retention_ok);

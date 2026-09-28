@@ -85,6 +85,8 @@ class ScheduleController : public QObject,
   Q_PROPERTY(QString sourcePath READ sourcePath NOTIFY configChanged)
   Q_PROPERTY(int intervalMinutes READ intervalMinutes NOTIFY configChanged)
   Q_PROPERTY(int retainCount READ retainCount NOTIFY configChanged)
+  // PR #18：strategyKey 这一条 PR #17 就已经留好了，本轮只是让它真的能被
+  // 界面选择与保存（下面两个 saveConfig* 各多一个 strategy_key）。
   Q_PROPERTY(QString packKey READ packKey NOTIFY configChanged)
   Q_PROPERTY(QString compressionKey READ compressionKey NOTIFY configChanged)
   Q_PROPERTY(QString encryptionKey READ encryptionKey NOTIFY configChanged)
@@ -185,21 +187,21 @@ class ScheduleController : public QObject,
   // 为什么不在这里用 QML 的 parseInt：它会把 "12abc" 悄悄变成 12，而 backupctl
   // 明确拒绝同一个输入。同一个输入两个前端给出不同结论，正是 parity 要收掉的
   // 东西；顺带还避免了 "99999999999999" 转 int 的溢出。
-  Q_INVOKABLE bool saveConfigFromText(bool enabled, const QString& source_path,
-                                      const QString& interval_text,
-                                      const QString& retain_text,
-                                      const QString& pack_key,
-                                      const QString& compression_key,
-                                      const QStringList& include_rules,
-                                      const QStringList& exclude_rules);
+  // strategy_key 默认 "full"：不传的调用方（旧 QML、旧自测）行为一字不变，
+  // 传了的调用方拿到的是与 backupctl --strategy 完全相同的一个 key。
+  Q_INVOKABLE bool saveConfigFromText(
+      bool enabled, const QString& source_path, const QString& interval_text,
+      const QString& retain_text, const QString& pack_key,
+      const QString& compression_key, const QStringList& include_rules,
+      const QStringList& exclude_rules,
+      const QString& strategy_key = QStringLiteral("full"));
 
   // 已经解析好的整数入口：C++ 侧的自动化测试与 saveConfigFromText 用它。
-  Q_INVOKABLE bool saveConfig(bool enabled, const QString& source_path,
-                              int interval_minutes, int retain_count,
-                              const QString& pack_key,
-                              const QString& compression_key,
-                              const QStringList& include_rules,
-                              const QStringList& exclude_rules);
+  Q_INVOKABLE bool saveConfig(
+      bool enabled, const QString& source_path, int interval_minutes,
+      int retain_count, const QString& pack_key, const QString& compression_key,
+      const QStringList& include_rules, const QStringList& exclude_rules,
+      const QString& strategy_key = QStringLiteral("full"));
   // 只改 enabled。启用前会做完整校验。
   Q_INVOKABLE bool setEnabled(bool enabled);
   // 备份管理页的 JOIN：file_name -> 来源 / 计划变化摘要。

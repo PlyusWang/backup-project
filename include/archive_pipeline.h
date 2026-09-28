@@ -110,6 +110,23 @@ struct ArchiveFileInfo {
 bool IdentifyArchiveFile(const std::string& archive_file, ArchiveFileInfo* info,
                          std::string* error_message);
 
+// 只做"未知密码也能做"的那一半完整性校验：
+//
+//   * header 可解码（InspectContainerFile 的全部格式与语义规则）；
+//   * 文件长度必须正好是 160 + header.payload_size；
+//   * **磁盘上实际 payload 字节**的 SHA-256 必须等于 header 声明的
+//     payload_sha256。
+//
+// 加密容器的 HMAC 与解密不在这里——那需要密码，属于恢复路径。这一层回答的是
+// "磁盘上的内容是不是它自己声明的那些字节"。任何**信任判断**（把一份快照当作
+// baseline / parent / 恢复链成员）都必须先过它：只读 160 字节 header 拿一个
+// 声明值，证明不了 payload 还是当初写下的那一份。
+//
+// header 可以为空；非空时得到已经验证过的 header。
+bool VerifyContainerPayloadBytes(const std::string& container_file,
+                                 ContainerHeader* header,
+                                 std::string* error_message);
+
 }  // namespace backupproject
 
 #endif  // BACKUP_PROJECT_INCLUDE_ARCHIVE_PIPELINE_H_

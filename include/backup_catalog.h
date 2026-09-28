@@ -49,6 +49,18 @@
 
 namespace backupproject {
 
+// 归档文件名的规范扩展名，以及"这是不是一个受管理的备份文件名"。
+//
+// 这条规则只属于 Catalog：BuildArchivePath 生成它，Resolve / Delete 校验它。
+// 增量 delta 的 parent_file_name 也来自不可信归档、也必须满足同一条边界，
+// 所以这里公开出来给那条校验复用——同一套规则不可能在两处走散。
+inline constexpr const char kBackupFileExtension[] = ".bak";
+
+// 非空、单组件（不含 '/' 或 '\\'、不是 "." / ".."、不含 NUL）、以 .bak 结尾。
+// 只看字符串，不访问文件系统：真正的"必须是仓库的直接子项、普通文件、非软
+// 链接"由 Resolve 负责。
+bool IsManagedBackupFileName(const std::string& file_name);
+
 // 仓库里的一个备份候选。
 //
 // 一个 record 必然对应仓库的直接子项、普通文件、文件名以 .bak 结尾；但它不
@@ -91,6 +103,22 @@ struct BackupRecord {
 
   // recognized_archive 为 false 时的原因；为 true 时为空。
   std::string diagnostic;
+
+  // ---- PR #18：快照种类与依赖链 ----
+  //
+  // 一份 delta 不是"坏归档"，它是另一种快照：有独立 magic，自己带着父身份。
+  // catalog 必须先按 magic 分类，否则一份完好的 delta 会被报成"认不出来"。
+  bool incremental_delta = false;
+  // delta 的父快照文件名（完整归档时为空）。
+  std::string parent_file_name;
+  // 这条依赖链现在能不能恢复。
+  //
+  // 这里刻意只做**廉价**判断（父文件存不存在）：列表可能要看上千条记录，
+  // 逐条把整条链读一遍代价太大。真正的身份校验在恢复路径里 —— 那里才是
+  // 必须正确、也真的会拒绝的地方。这一位只回答"看起来能不能恢复"。
+  bool chain_restorable = false;
+  // 不能恢复时的原因（parent 缺失等）。
+  std::string chain_diagnostic;
 };
 
 // 仓库的稳定 identity：用来回答"这两个仓库路径是不是同一个仓库"。
@@ -191,9 +219,48 @@ class BackupCatalog {
   // 子项名）覆盖普通使用场景；它不构成对祖先路径符号链接替换或 check/use
   // 竞态的完整防护。更强的本地对抗边界可用 dirfd + openat/openat2/unlinkat
   // 实现，本版本未采用。
+  //
+  // PR #18 起，删除还是**依赖感知**的：任何还有可达后代（还活着、读得出来的
+  // 子快照）的快照都会被拒绝——删掉一个祖先等于让那些后代永远不可恢复，
+  // 那不是"少留一份"，是数据丢失。要一次删掉一整条已经计划好的链，用
+  // DeleteSnapshots。
+  //
+  // 删除成功之后，这份快照拥有的副文件（<name>.manifest / <name>.identity）
+  // 一起清理；清理失败会进 diagnostics（不静默）。
   bool Delete(const std::string& repository, const std::string& file_name,
               std::string* error_message) const;
+  bool Delete(const std::string& repository, const std::string& file_name,
+              std::vector<std::string>* diagnostics,
+              std::string* error_message) const;
+
+  // 删除一个**已经过依赖检查的集合**（retention 计划用这一条）。
+  //
+  // 规则：集合里任何一个名字的所有可达后代必须**也在集合里**，否则整次调用
+  // 一个文件都不删并返回失败。这条规则正好覆盖两种调用方：
+  //   * 手工删除（集合只有一个名字）= "只允许删叶子"；
+  //   * retention（集合是整份淘汰计划）= "同一条链一起删"。
+  // 先整体校验再逐个 unlink，所以不会出现"删到一半发现不该删"的中间状态。
+  // deleted_file_names 可以为空：非空时按实际删除成功的顺序填入文件名。
+  // 单个 unlink 失败会立刻停止（后面的文件保持原样），所以调用方必须靠它——
+  // 而不是靠"返回值为真"——来决定哪些记录可以从状态里去掉。
+  //
+  // 真正 unlink 的顺序是 **descendants-first**（叶子在前），由集合内部的依赖图
+  // 决定，不看 created_time：先删祖先、删到一半崩掉会留下"指向不存在父节点"的
+  // 后代，那是自己制造 broken chain。集合内部成环则整批拒绝。
+  bool DeleteSnapshots(const std::string& repository,
+                       const std::vector<std::string>& file_names,
+                       std::vector<std::string>* deleted_file_names,
+                       std::vector<std::string>* diagnostics,
+                       std::string* error_message) const;
 };
+
+// ---- 测试接缝 ----
+//
+// 让某一条 unlink 在"即将执行"时被人为判成失败：用来验证"删到一半停住"之后
+// 剩下的链仍然自洽（还存在的子节点，其父亲也还存在）。默认 nullptr，产品的
+// 任何路径都不会设置它。
+void SetBackupCatalogUnlinkFailureHookForTesting(
+    bool (*hook)(const char* archive_path));
 
 }  // namespace backupproject
 

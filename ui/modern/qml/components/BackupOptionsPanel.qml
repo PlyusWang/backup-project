@@ -22,6 +22,10 @@ Item {
     property bool expanded: false
 
     // 当前选择：冻结的字符串键，控制器拿到的永远是这几个键之一。
+    //
+    // 备份策略是**第二个维度**，不是第二种操作：它和打包 / 压缩 / 加密并列，
+    // 默认 full，所以不展开面板时产品行为与以前一字不差。
+    property string strategyKey: "full"
     property string packKey: "mypack"
     property string compressionKey: "none"
     property string encryptionKey: "none"
@@ -39,6 +43,8 @@ Item {
     property bool passwordValidationRequested: false
 
     // 显示名与键分开放：下拉里给人看的是显示名，交给 C++ 的始终是键。
+    readonly property var strategyLabels: ["完整备份", "增量备份"]
+    readonly property var strategyKeys: ["full", "incremental"]
     readonly property var packLabels: ["MyPack", "USTAR", "Fast USTAR"]
     readonly property var packKeys: ["mypack", "ustar", "fast-ustar"]
     readonly property var compressionLabels: ["不压缩", "Huffman", "LZSS + Huffman"]
@@ -52,14 +58,56 @@ Item {
                                            "aes-256-ctr-hmac-sha256",
                                            "des-cbc-hmac-sha256"]
 
+    readonly property int strategyIndex: Math.max(0, panel.strategyKeys.indexOf(panel.strategyKey))
     readonly property int packIndex: Math.max(0, panel.packKeys.indexOf(panel.packKey))
     readonly property int compressionIndex: Math.max(0, panel.compressionKeys.indexOf(panel.compressionKey))
     readonly property int encryptionIndex: Math.max(0, panel.encryptionKeys.indexOf(panel.encryptionKey))
 
     // 收起时的一行摘要：直接用当前选中项的显示名拼，和下拉里看到的完全一致。
-    readonly property string summaryText: panel.packLabels[panel.packIndex] + " · "
+    // 策略排在最前：它是"这次备份是什么"，另外三个是"怎么写"。
+    readonly property string summaryText: panel.strategyLabels[panel.strategyIndex] + " · "
+                                          + panel.packLabels[panel.packIndex] + " · "
                                           + panel.compressionLabels[panel.compressionIndex] + " · "
                                           + panel.encryptionLabels[panel.encryptionIndex]
+
+    // 增量策略的说明。刻意把两件容易被误解的事说清楚：
+    // 第一次会建完整基线，以及增量 v1 只支持 MyPack。
+    readonly property string strategyHelper: {
+        if (panel.strategyKey !== "incremental")
+            return "每次备份都生成一份完整、自包含的归档。"
+        return "第一次（或基线不可信时）建立完整基线，之后只写变化部分；"
+               + "没有变化就不创建新快照。恢复时自动按依赖链还原。"
+               + "增量目前只支持 MyPack 打包方式，且不支持加密。"
+    }
+
+    // 选了增量但打包方式不是 MyPack：界面直接说明，而不是等核心拒绝。
+    // 真正的判定仍然在核心（共享校验），这里只是即时反馈。
+    readonly property bool strategyPackCombinationAllowed:
+        panel.strategyKey !== "incremental" || panel.packKey === "mypack"
+
+    // 增量 v1 不支持加密：外层信封（父绑定 + 删除列表）不受内层 HMAC 覆盖。
+    // 界面上加密选项在增量下直接置灰，说明写在 strategyHelper 与这一行提示里。
+    readonly property bool strategyEncryptionCombinationAllowed:
+        panel.strategyKey !== "incremental" || panel.encryptionKey === "none"
+    readonly property bool strategyCombinationAllowed:
+        panel.strategyPackCombinationAllowed && panel.strategyEncryptionCombinationAllowed
+    readonly property string strategyEncryptionHelper:
+        panel.strategyKey === "incremental"
+            ? "增量 v1 不支持加密，加密方式已固定为 none。"
+            : ""
+
+    // 从加密切到增量时**不静默**改掉用户的选择：把加密复位成 none，并且
+    // 让上面那句提示出现。切回 full 时提示随之消失（加密并不自动恢复——
+    // 那会把"我什么时候选的加密"变成一个谜）。
+    property bool strategyResetEncryptionNotice: false
+    onStrategyKeyChanged: {
+        if (panel.strategyKey === "incremental" && panel.encryptionKey !== "none") {
+            panel.encryptionKey = "none"
+            panel.strategyResetEncryptionNotice = true
+        } else if (panel.strategyKey !== "incremental") {
+            panel.strategyResetEncryptionNotice = false
+        }
+    }
 
     // 每个算法的说明只在它被选中时显示。刻意不写"最快""压缩率最高"这类
     // 没有前提条件的断言：Fast USTAR 的差别在 I/O 实现，不是对所有文件都更快。
@@ -189,6 +237,38 @@ Item {
                     spacing: 6
 
                     Text {
+                        text: "备份策略"
+                        font.pixelSize: 16
+                        font.weight: Font.DemiBold
+                        color: theme.textSecondary
+                    }
+
+                    AppComboBox {
+                        objectName: "strategySelector"
+                        Layout.fillWidth: true
+                        Layout.maximumWidth: 420
+                        model: panel.strategyLabels
+                        currentIndex: panel.strategyIndex
+                        enabled: !controller.busy
+                        onActivated: panel.strategyKey = panel.strategyKeys[currentIndex]
+                    }
+
+                    Text {
+                        objectName: "strategyHelperText"
+                        Layout.fillWidth: true
+                        visible: text.length > 0
+                        text: panel.strategyHelper
+                        font.pixelSize: 15
+                        color: panel.strategyPackCombinationAllowed ? theme.textSecondary : theme.error
+                        wrapMode: Text.WordWrap
+                    }
+                }
+
+                ColumnLayout {
+                    Layout.fillWidth: true
+                    spacing: 6
+
+                    Text {
                         text: "打包格式"
                         font.pixelSize: 16
                         font.weight: Font.DemiBold
@@ -268,8 +348,24 @@ Item {
                         Layout.maximumWidth: 420
                         model: panel.encryptionLabels
                         currentIndex: panel.encryptionIndex
-                        enabled: !controller.busy
+                        // 增量 v1 不支持加密：选项直接置灰，而不是让用户选完才被拒绝。
+                        enabled: !controller.busy && panel.strategyKey !== "incremental"
                         onActivated: panel.encryptionKey = panel.encryptionKeys[currentIndex]
+                    }
+
+                    // 增量下的那一句原因（含"刚从加密切过来"的提示）。它不是
+                    // 安全断言，只是把核心的拒绝理由提前说出来。
+                    Text {
+                        objectName: "incrementalEncryptionNotice"
+                        Layout.fillWidth: true
+                        visible: panel.strategyKey === "incremental"
+                        text: panel.strategyResetEncryptionNotice
+                              ? "增量 v1 不支持加密，加密方式已复位为 none。"
+                              : panel.strategyEncryptionHelper
+                        font.pixelSize: 15
+                        color: panel.strategyEncryptionCombinationAllowed ? theme.textSecondary
+                                                                          : theme.error
+                        wrapMode: Text.WordWrap
                     }
 
                     // 只要选了加密，这段话就必须出现，且始终在密码输入框上方：

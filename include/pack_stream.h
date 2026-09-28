@@ -119,6 +119,14 @@ bool WriteMyPackV2(const std::vector<ArchiveEntry>& entries, FileSink* sink,
 bool ScanMyPackV2(const FileSource& source, std::vector<PackedEntry>* entries,
                   std::uint64_t* entry_count, std::string* error_message);
 
+// ---- 测试接缝 ----
+//
+// MyPack 写侧"真的做了内容摘要计算与比对"的 payload 次数。存在的唯一理由，是
+// 让"完整备份（没有期望摘要）不做无意义的全量 SHA-256"这条能被断言钉住，而不是
+// 靠 benchmark 猜。产品路径不读它。
+std::uint64_t MyPackDigestVerificationCountForTesting();
+void ResetMyPackDigestVerificationCountForTesting();
+
 }  // namespace backupproject
 
 #endif  // BACKUP_PROJECT_INCLUDE_PACK_STREAM_H_

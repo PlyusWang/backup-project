@@ -188,9 +188,17 @@ bool BuildScheduleFilter(const ScheduleConfig& config, Filter* filter,
 
 bool ValidateScheduleConfig(const ScheduleConfig& config,
                             std::string* error_message) {
-  if (!IsSupportedBackupMode(config.trigger, config.strategy)) {
+  // 组合校验只有一份实现：产品矩阵 + "增量只支持 MyPack" + "计划不接受加密"。
+  // 这里不再自己写 if 链——"GUI 能存、CLI 读不了"就是这么来的。
+  BackupOptionCombination combination;
+  combination.trigger = config.trigger;
+  combination.strategy = config.strategy;
+  combination.pack_method = config.pack_method;
+  combination.compression_method = config.compression_method;
+  combination.encryption_method = config.encryption_method;
+  if (!IsSupportedBackupOptionCombination(combination)) {
     SetError(error_message,
-             UnsupportedBackupModeReason(config.trigger, config.strategy));
+             UnsupportedBackupOptionCombinationReason(combination));
     return false;
   }
   if (config.interval_minutes < kMinIntervalMinutes ||
@@ -210,15 +218,8 @@ bool ValidateScheduleConfig(const ScheduleConfig& config,
                                 std::to_string(config.retain_count));
     return false;
   }
-  if (config.encryption_method != EncryptionMethod::kNone) {
-    // 无人值守的定时任务没有安全的持久密钥来源，所以本版本一律拒绝。
-    // 明确拒绝而不是"存下来但运行时报错"，也不是静默降级成不加密。
-    SetError(
-        error_message,
-        "Unattended scheduled encryption is not supported: "
-        "定时无人值守加密需要安全的密钥来源；当前版本不会持久化明文密码。");
-    return false;
-  }
+  // 加密边界（无人值守的计划没有安全的密钥来源）已经在上面那张共享表里
+  // 回答过了：这一句不是第二套判断，只是把"哪个字段违规"点出来。
   if (!IsBoundedString(config.source_path, kMaxScheduleStringBytes)) {
     SetError(error_message,
              "Schedule source path is not usable (too long or contains a NUL "

@@ -37,13 +37,17 @@
 #include "archive_pipeline.h"
 #include "container_format.h"
 #include "file_system.h"
+#include "incremental_backup.h"
+#include "incremental_delta.h"
 
 namespace backupproject {
 
 namespace {
 
 // 仓库里被视为"用户备份"的扩展名。大小写按 Linux 原义：.BAK 不算。
-constexpr const char kBackupExtension[] = ".bak";
+// 常量本体已经公开（backup_catalog.h 的 kBackupFileExtension），这里只是
+// 本文件内部的一个短别名，避免把每一处都写长。
+constexpr const char* kBackupExtension = kBackupFileExtension;
 constexpr std::size_t kBackupExtensionLength = 4;
 
 // 同名冲突时的序号上限：_001 … _999，固定三位十进制。
@@ -257,6 +261,14 @@ std::string SourceBaseName(const std::string& source_directory) {
 
 }  // namespace
 
+bool IsManagedBackupFileName(const std::string& file_name) {
+  if (file_name.empty() || file_name == "." || file_name == "..") return false;
+  if (file_name.find('/') != std::string::npos) return false;
+  if (file_name.find('\\') != std::string::npos) return false;
+  if (file_name.find('\0') != std::string::npos) return false;
+  return HasBackupExtension(file_name);
+}
+
 std::string RepositoryIdentity(const std::string& repository_path) {
   if (repository_path.empty()) return std::string();
   const std::string normalized = StripTrailingSlashes(repository_path);
@@ -395,6 +407,54 @@ bool BackupCatalog::List(const std::string& repository,
     //
     // 先认格式：IdentifyArchiveFile 只看 magic，就能把 legacy v0.1 与 v2
     // container 分开，而且不需要密码就能读出 v2 的三个算法 id。
+    // PR #18：先按 magic 分出增量 delta。
+    //
+    // 顺序很重要：delta 既不是 legacy v0.1、也不是 v2 container，
+    // 直接走 IdentifyArchiveFile 会被归到"认不出来"，而它其实是一份**完好**的
+    // 快照。分类只读 magic，不做任何解密、不读 payload。
+    if (ClassifySnapshotFile(candidate, nullptr) == SnapshotFileKind::kDelta) {
+      record.incremental_delta = true;
+      record.has_pipeline_methods = false;
+      record.password_required = false;
+      DeltaEnvelope delta_envelope;
+      std::string envelope_error;
+      if (!ReadDeltaEnvelope(candidate, &delta_envelope, &envelope_error)) {
+        record.recognized_archive = false;
+        record.diagnostic = envelope_error.empty()
+                                ? "Unreadable incremental delta: " + candidate
+                                : envelope_error;
+      } else {
+        record.recognized_archive = true;
+        record.format_version =
+            static_cast<std::uint16_t>(delta_envelope.format_version);
+        record.parent_file_name = delta_envelope.parent_file_name;
+        // 依赖链能不能恢复：这里只确认父文件还在（廉价判断）。
+        // 身份是否真的对得上由恢复路径校验。
+        const std::string parent_path =
+            repository + "/" + delta_envelope.parent_file_name;
+        struct stat parent_info;
+        if (delta_envelope.parent_file_name.empty()) {
+          record.chain_restorable = false;
+          record.chain_diagnostic = "the delta names no parent snapshot";
+        } else if (::lstat(parent_path.c_str(), &parent_info) != 0 ||
+                   !S_ISREG(parent_info.st_mode)) {
+          record.chain_restorable = false;
+          record.chain_diagnostic =
+              "parent snapshot is missing: " + delta_envelope.parent_file_name;
+        } else {
+          record.chain_restorable = true;
+        }
+        // 变化计数放进 entry_count：列表本来就有这一列，用它显示"这份 delta
+        // 装了多少条变化"，不必再加一个只对这一种记录有意义的字段。
+        record.entry_count = delta_envelope.added + delta_envelope.modified +
+                             delta_envelope.metadata_changed;
+      }
+      // 注意：这个循环累加的是局部变量 found，最后由它整体赋给 *records。
+      // 直接往 *records 里塞会被最后那句 move 覆盖掉。
+      found.push_back(std::move(record));
+      continue;
+    }
+
     ArchiveFileInfo archive_info;
     std::string identify_error;
     if (!IdentifyArchiveFile(candidate, &archive_info, &identify_error)) {
@@ -573,37 +633,219 @@ bool BackupCatalog::Resolve(const std::string& repository,
                                error_message);
 }
 
+namespace {
+
+// 测试接缝（默认 nullptr）：见 backup_catalog.h 的声明。
+bool (*g_unlink_failure_hook)(const char*) = nullptr;
+
+// 把"这一批要删的名字"排成 descendants-first（叶子在前）。
+//
+// 只依据依赖图：对每个名字读一次它声明的父（信封自证，所以"边"这个形状本身
+// 是可信的），而且只在**这批名字内部**连边。于是：
+//   * 在这批里没有子节点的先出队；
+//   * 任何一个父亲一定排在它所有后代之后；
+//   * 集合内部出现环 -> 拒绝整批（环本来就没有合法顺序，更不能靠猜）。
+//
+// 只排顺序，不做信任判断：一份坏掉的 .bak 仍然必须删得掉（它没有可解析的父，
+// 因此不连任何边）。
+bool DeletionOrderByDependencies(const std::string& repository,
+                                 const std::vector<std::string>& file_names,
+                                 std::vector<std::size_t>* order,
+                                 std::string* error_message) {
+  if (order == nullptr) {
+    SetError(error_message, "Deletion order output must not be null");
+    return false;
+  }
+  order->clear();
+  const std::size_t count = file_names.size();
+  std::vector<std::vector<std::size_t>> children(count);
+  for (std::size_t index = 0; index < count; ++index) {
+    std::string parent;
+    std::string read_error;
+    if (!SnapshotParentOf(repository, file_names[index], &parent,
+                          &read_error)) {
+      continue;  // 读不出来就不连边：它不是任何人的父亲
+    }
+    if (parent.empty()) continue;
+    for (std::size_t other = 0; other < count; ++other) {
+      if (file_names[other] == parent) {
+        children[other].push_back(index);
+        break;
+      }
+    }
+  }
+
+  std::vector<bool> emitted(count, false);
+  std::size_t remaining = count;
+  bool progressed = true;
+  while (remaining > 0 && progressed) {
+    progressed = false;
+    for (std::size_t index = 0; index < count; ++index) {
+      if (emitted[index]) continue;
+      bool has_live_child = false;
+      for (const std::size_t child : children[index]) {
+        if (!emitted[child]) {
+          has_live_child = true;
+          break;
+        }
+      }
+      if (has_live_child) continue;
+      order->push_back(index);
+      emitted[index] = true;
+      --remaining;
+      progressed = true;
+    }
+  }
+  if (remaining != 0) {
+    SetError(error_message,
+             "Cannot order this deletion set: the dependency graph inside it "
+             "contains a cycle");
+    return false;
+  }
+  return true;
+}
+
+}  // namespace
+
+void SetBackupCatalogUnlinkFailureHookForTesting(
+    bool (*hook)(const char* path)) {
+  g_unlink_failure_hook = hook;
+}
+
 bool BackupCatalog::Delete(const std::string& repository,
                            const std::string& file_name,
                            std::string* error_message) const {
+  return Delete(repository, file_name, nullptr, error_message);
+}
+
+bool BackupCatalog::Delete(const std::string& repository,
+                           const std::string& file_name,
+                           std::vector<std::string>* diagnostics,
+                           std::string* error_message) const {
+  return DeleteSnapshots(repository, {file_name}, nullptr, diagnostics,
+                         error_message);
+}
+
+bool BackupCatalog::DeleteSnapshots(
+    const std::string& repository, const std::vector<std::string>& file_names,
+    std::vector<std::string>* deleted_file_names,
+    std::vector<std::string>* diagnostics, std::string* error_message) const {
   if (error_message != nullptr) {
     error_message->clear();
   }
-
-  std::string archive_path;
-  if (!LocateDirectChildFile(repository, file_name,
-                             "Failed to inspect backup file", &archive_path,
-                             error_message)) {
+  if (deleted_file_names != nullptr) deleted_file_names->clear();
+  if (file_names.empty()) {
+    SetError(error_message, "No snapshot was named for deletion");
     return false;
   }
 
-  // 不要求 InspectHeader 成功：坏掉的备份仍然是普通 .bak 文件，必须删得掉，
-  // 否则损坏的存档会永远留在列表里。
+  // ---- 第一遍：整体校验。任何一条不成立就一个文件都不动。----
+  std::vector<std::string> archive_paths;
+  archive_paths.reserve(file_names.size());
+  for (const std::string& file_name : file_names) {
+    std::string archive_path;
+    if (!LocateDirectChildFile(repository, file_name,
+                               "Failed to inspect backup file", &archive_path,
+                               error_message)) {
+      return false;
+    }
+    if (std::find(archive_paths.begin(), archive_paths.end(), archive_path) !=
+        archive_paths.end()) {
+      SetError(error_message,
+               "Backup file was named twice for deletion: " + file_name);
+      return false;
+    }
+    archive_paths.push_back(archive_path);
+
+    // 依赖检查：还有后代活着、而且它不在这次要删的集合里 -> 拒绝。
+    std::vector<std::string> descendants;
+    if (!FindReachableDescendants(repository, file_name, &descendants,
+                                  error_message)) {
+      return false;
+    }
+    for (const std::string& child : descendants) {
+      if (std::find(file_names.begin(), file_names.end(), child) !=
+          file_names.end()) {
+        continue;
+      }
+      SetError(error_message,
+               "Cannot delete '" + file_name + "': the snapshot '" + child +
+                   "' is built on top of it and would become unrestorable. "
+                   "Delete the dependent snapshot(s) first.");
+      return false;
+    }
+  }
+
+  // ---- 第二遍：按依赖顺序（descendants-first）真的删 ----
   //
-  // 校验与 unlink 之间确实存在时间窗。LocateDirectChildFile 里那两条前提
-  // （仓库根不是软链接、最后一段是普通文件）只在"校验那一刻"成立：
-  //   * 仓库根若是软链接，POSIX 会跟随这个中间组件，真正被 unlink 的是链接
-  //     指向的那个目录里的文件。这一条只靠"最后一段不是软链接"挡不住，所以
-  //     必须单独验，本文件早期版本的注释漏了它；
-  //   * unlink 本身不跟随软链接（删的是链接本身，不是它指向的目标），也不会
-  //     删目录（会以 EISDIR 失败）。
-  // 因此在这个时间窗里把最后一段换成别的东西，最坏结果是仓库内少了一个软链接。
-  // 但校验之后文件系统若被并发改写（包括把某个祖先目录换成软链接），上面的
-  // 结论就不再成立——那属于 backup_catalog.h 顶部列出的、当前不提供防护的范围。
-  if (::unlink(archive_path.c_str()) != 0) {
-    SetError(error_message,
-             Describe(errno, "Failed to delete backup file", archive_path));
+  // 顺序不是风格问题：如果先删祖先、删到一半崩掉，剩下的后代就指向一个不存在
+  // 的父快照——那是 retention 自己制造 broken chain。叶子先删则任何中断点上
+  // "还存在的子节点，其父亲也还存在"。
+  //
+  // 排序只依据依赖图（child -> parent 的边），**不靠 created_time 猜**：
+  // 时间戳只能说明"谁先写出来"，说明不了谁依赖谁。
+  std::vector<std::size_t> order;
+  if (!DeletionOrderByDependencies(repository, file_names, &order,
+                                   error_message)) {
     return false;
+  }
+
+  for (const std::size_t index : order) {
+    const std::string& file_name = file_names[index];
+    const std::string& archive_path = archive_paths[index];
+
+    // 测试接缝：让某一次 unlink 被人为判成失败，用来验证"删到一半停住"之后
+    // 剩下的链仍然自洽。默认没有钩子，产品路径不受影响。
+    if (g_unlink_failure_hook != nullptr &&
+        g_unlink_failure_hook(archive_path.c_str())) {
+      SetError(error_message,
+               "Injected unlink failure for backup file: " + archive_path);
+      return false;
+    }
+
+    // 不要求 InspectHeader 成功：坏掉的备份仍然是普通 .bak 文件，必须删得掉，
+    // 否则损坏的存档会永远留在列表里。
+    //
+    // 校验与 unlink 之间确实存在时间窗。LocateDirectChildFile 里那两条前提
+    // （仓库根不是软链接、最后一段是普通文件）只在"校验那一刻"成立：
+    //   * 仓库根若是软链接，POSIX 会跟随这个中间组件，真正被 unlink 的是链接
+    //     指向的那个目录里的文件。这一条只靠"最后一段不是软链接"挡不住，所以
+    //     必须单独验，本文件早期版本的注释漏了它；
+    //   * unlink 本身不跟随软链接（删的是链接本身，不是它指向的目标），也不会
+    //     删目录（会以 EISDIR 失败）。
+    // 因此在这个时间窗里把最后一段换成别的东西，最坏结果是仓库内少了一个软链接。
+    // 但校验之后文件系统若被并发改写（包括把某个祖先目录换成软链接），上面的
+    // 结论就不再成立——那属于 backup_catalog.h
+    // 顶部列出的、当前不提供防护的范围。
+    if (::unlink(archive_path.c_str()) != 0) {
+      SetError(error_message,
+               Describe(errno, "Failed to delete backup file", archive_path));
+      return false;
+    }
+    if (deleted_file_names != nullptr) deleted_file_names->push_back(file_name);
+
+    // 副文件跟随快照一起走：只删 .bak 会让仓库里攒下一堆孤儿副文件，
+    // 而且下一次同名快照出现时它们会看起来"属于"新快照。失败不静默。
+    std::string normalized_repository;
+    std::string normalize_error;
+    if (!ValidateRepositoryDirectory(repository, &normalized_repository,
+                                     &normalize_error)) {
+      if (diagnostics != nullptr) {
+        diagnostics->push_back("Cannot clean up the sidecars of " + file_name +
+                               ": " + normalize_error);
+      }
+      continue;
+    }
+    for (const std::string& sidecar : SnapshotSidecarFileNames(file_name)) {
+      const std::string sidecar_path =
+          FileSystem::JoinPath(normalized_repository, sidecar);
+      if (::unlink(sidecar_path.c_str()) != 0 && errno != ENOENT) {
+        if (diagnostics != nullptr) {
+          diagnostics->push_back("Cannot remove the sidecar " + sidecar_path +
+                                 ": " + std::strerror(errno));
+        }
+      }
+    }
   }
   return true;
 }
