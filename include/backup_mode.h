@@ -28,6 +28,9 @@
 #include <cstdint>
 #include <string>
 
+#include "container_format.h"
+#include "pack_stream.h"
+
 namespace backupproject {
 
 // 触发方式。数值不写进任何归档格式，只用于持久化文本 key 与内存比较，
@@ -70,6 +73,41 @@ bool IsSupportedBackupMode(BackupTrigger trigger, BackupStrategy strategy);
 // 不支持时的完整说明。GUI / CLI 直接显示原文，不各自拼一句话。
 std::string UnsupportedBackupModeReason(BackupTrigger trigger,
                                         BackupStrategy strategy);
+
+// ---- 选项组合：trigger × strategy × pack × compression × encryption ----
+//
+// trigger × strategy 只回答"这个产品组合存在吗"。真正决定"这一组选项能不能
+// 跑"的还有三个算法维度：
+//
+//   * 增量第一版只支持 MyPack（USTAR 表达不了 tombstone 与 parent 依赖）；
+//   * 增量第一版不支持加密（外层信封不受内层 HMAC 覆盖）；
+//   * 计划路径不支持加密（无人值守没有安全的口令来源）。
+//
+// 少判一条的后果不是"少一个功能"，而是**先存进去、第二次运行才炸**：
+//
+//   schedule set --strategy incremental --pack ustar     （旧行为：接受）
+//     第一轮：建立完整 baseline（成功）
+//     第二轮：真的要做 delta 时失败
+//
+// 用户此时已经拿到一份看起来可用的基线，而错误来得太晚。所以这一组判断必须
+// 在**保存配置 / 启动任务之前**回答，而且四个入口（Manual CLI、Modern GUI
+// backend、ValidateScheduleConfig、ScheduledBackupService 的防御路径）问的是
+// 同一个函数。
+struct BackupOptionCombination {
+  BackupTrigger trigger = BackupTrigger::kManual;
+  BackupStrategy strategy = BackupStrategy::kFull;
+  PackMethod pack_method = PackMethod::kMyPack;
+  CompressionMethod compression_method = CompressionMethod::kNone;
+  EncryptionMethod encryption_method = EncryptionMethod::kNone;
+};
+
+bool IsSupportedBackupOptionCombination(
+    const BackupOptionCombination& combination);
+
+// 不支持时的完整说明：先报产品矩阵，再报打包方式，再报加密边界。
+// compression 目前对三种策略都没有额外限制。
+std::string UnsupportedBackupOptionCombinationReason(
+    const BackupOptionCombination& combination);
 
 }  // namespace backupproject
 
