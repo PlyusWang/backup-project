@@ -2,6 +2,9 @@
 
 #include "source_manifest.h"
 
+#include <sys/stat.h>
+#include <sys/types.h>
+
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
@@ -11,6 +14,7 @@
 #include <utility>
 #include <vector>
 
+#include "source_digest.h"
 #include "tree_scanner.h"
 
 namespace backupproject {
@@ -242,6 +246,72 @@ void AppendManifestEntries(const std::vector<ManifestEntry>& entries,
   }
 }
 
+// version 3 的条目行：v2 的 12 个字段之后追加内容摘要（第 13 个字段）。
+// 摘要本身是十六进制，转义只是让"字段"这个概念保持统一。
+void AppendManifestEntriesV3(const std::vector<ManifestEntry>& entries,
+                             std::string* out) {
+  for (const ManifestEntry& entry : entries) {
+    *out += std::to_string(static_cast<unsigned>(entry.type));
+    *out += '\t';
+    *out += std::to_string(entry.size);
+    *out += '\t';
+    *out += std::to_string(entry.mtime_sec);
+    *out += '\t';
+    *out += std::to_string(entry.mtime_nsec);
+    *out += '\t';
+    *out += std::to_string(entry.mode);
+    *out += '\t';
+    *out += std::to_string(entry.uid);
+    *out += '\t';
+    *out += std::to_string(entry.gid);
+    *out += '\t';
+    *out += std::to_string(entry.dev_major);
+    *out += '\t';
+    *out += std::to_string(entry.dev_minor);
+    *out += '\t';
+    *out += std::to_string(entry.hardlink_degree);
+    *out += '\t';
+    *out += EscapeField(entry.archive_path);
+    *out += '\t';
+    *out += EscapeField(entry.link_target);
+    *out += '\t';
+    *out += EscapeField(entry.content_digest);
+    *out += '\n';
+  }
+}
+
+// 把一次 ScanSourceTree 的结果映射成 manifest 条目。
+// source_path 一并带上：强化版要拿它去读正文算摘要。
+void ManifestFromScannedEntries(const std::vector<ArchiveEntry>& scanned,
+                                std::vector<ManifestEntry>* entries) {
+  std::unordered_map<std::string, std::uint32_t> hardlink_degree;
+  for (const ArchiveEntry& entry : scanned) {
+    if (entry.type != EntryType::kHardLink) continue;
+    ++hardlink_degree[entry.link_target];
+  }
+
+  entries->clear();
+  entries->reserve(scanned.size());
+  for (const ArchiveEntry& scanned_entry : scanned) {
+    ManifestEntry entry;
+    entry.archive_path = scanned_entry.archive_path;
+    entry.source_path = scanned_entry.source_path;
+    entry.type = scanned_entry.type;
+    entry.size = scanned_entry.size;
+    entry.mtime_sec = scanned_entry.mtime_sec;
+    entry.mtime_nsec = scanned_entry.mtime_nsec;
+    entry.mode = scanned_entry.mode;
+    entry.uid = scanned_entry.uid;
+    entry.gid = scanned_entry.gid;
+    entry.link_target = scanned_entry.link_target;
+    entry.dev_major = scanned_entry.dev_major;
+    entry.dev_minor = scanned_entry.dev_minor;
+    const auto found = hardlink_degree.find(entry.archive_path);
+    entry.hardlink_degree = found == hardlink_degree.end() ? 0u : found->second;
+    entries->push_back(std::move(entry));
+  }
+}
+
 }  // namespace
 
 std::uint64_t ChangeSummaryTotal(const ChangeSummary& summary) {
@@ -270,29 +340,79 @@ bool BuildSourceManifest(const std::string& source_directory,
     return false;
   }
 
-  std::unordered_map<std::string, std::uint32_t> hardlink_degree;
-  for (const ArchiveEntry& entry : scanned) {
-    if (entry.type != EntryType::kHardLink) continue;
-    ++hardlink_degree[entry.link_target];
+  ManifestFromScannedEntries(scanned, entries);
+  return true;
+}
+
+bool BuildStrongSourceManifest(const std::string& source_directory,
+                               const Filter* filter,
+                               std::vector<ManifestEntry>* entries,
+                               std::string* error_message) {
+  if (entries == nullptr) {
+    SetError(error_message, "Manifest output must not be null");
+    return false;
+  }
+  entries->clear();
+
+  std::vector<ArchiveEntry> scanned;
+  if (!ScanSourceTree(source_directory, filter, &scanned, error_message)) {
+    return false;
+  }
+  if (scanned.size() > kMaxManifestEntries) {
+    SetError(error_message, "Source manifest is too large: " +
+                                std::to_string(scanned.size()) + " entries");
+    return false;
+  }
+  ManifestFromScannedEntries(scanned, entries);
+
+  // 全量哈希。第一版不做任何 size+mtime 摘要缓存：缓存的失效判断本身就是
+  // correctness 问题，而"漏掉一次变化"在增量链上是会被后代继承的错误。
+  for (ManifestEntry& entry : *entries) {
+    if (entry.type == EntryType::kRegularFile) {
+      std::string digest;
+      if (!ContentDigestOfFile(entry.source_path, &digest, error_message)) {
+        return false;
+      }
+      entry.content_digest = std::move(digest);
+    } else if (entry.type == EntryType::kSymlink) {
+      // 软链接没有"正文"，它的内容就是目标字符串的字节。
+      entry.content_digest = ContentDigestOfBytes(entry.link_target);
+    }
   }
 
-  entries->reserve(scanned.size());
-  for (const ArchiveEntry& scanned_entry : scanned) {
-    ManifestEntry entry;
-    entry.archive_path = scanned_entry.archive_path;
-    entry.type = scanned_entry.type;
-    entry.size = scanned_entry.size;
-    entry.mtime_sec = scanned_entry.mtime_sec;
-    entry.mtime_nsec = scanned_entry.mtime_nsec;
-    entry.mode = scanned_entry.mode;
-    entry.uid = scanned_entry.uid;
-    entry.gid = scanned_entry.gid;
-    entry.link_target = scanned_entry.link_target;
-    entry.dev_major = scanned_entry.dev_major;
-    entry.dev_minor = scanned_entry.dev_minor;
-    const auto found = hardlink_degree.find(entry.archive_path);
-    entry.hardlink_degree = found == hardlink_degree.end() ? 0u : found->second;
-    entries->push_back(std::move(entry));
+  // 读正文期间源不许变。变了就整次失败：否则 manifest 会把"读到的内容"与
+  // "扫描时记下的元数据"拼成一个从未真实存在过的版本，而增量链会把它当成
+  // 一个可信的祖先。
+  for (const ManifestEntry& entry : *entries) {
+    if (entry.type != EntryType::kRegularFile) continue;
+    struct stat info;
+    if (::lstat(entry.source_path.c_str(), &info) != 0) {
+      SetError(error_message,
+               "Source entry disappeared while hashing: " + entry.source_path);
+      return false;
+    }
+    const std::uint64_t size = static_cast<std::uint64_t>(info.st_size);
+    const std::int64_t mtime_sec =
+        static_cast<std::int64_t>(info.st_mtim.tv_sec);
+    const std::uint32_t mtime_nsec =
+        static_cast<std::uint32_t>(info.st_mtim.tv_nsec);
+    if (!S_ISREG(info.st_mode) || size != entry.size ||
+        mtime_sec != entry.mtime_sec || mtime_nsec != entry.mtime_nsec) {
+      SetError(error_message,
+               "Source changed while hashing: " + entry.source_path);
+      return false;
+    }
+  }
+  return true;
+}
+
+bool HasContentDigests(const std::vector<ManifestEntry>& entries) {
+  for (const ManifestEntry& entry : entries) {
+    if (entry.type != EntryType::kRegularFile &&
+        entry.type != EntryType::kSymlink) {
+      continue;
+    }
+    if (!IsContentDigest(entry.content_digest)) return false;
   }
   return true;
 }
@@ -354,6 +474,15 @@ bool DiffManifests(const std::vector<ManifestEntry>& previous,
               old_entry.mtime_sec != new_entry.mtime_sec ||
               old_entry.mtime_nsec != new_entry.mtime_nsec) {
             is_modified = true;
+          } else if (!old_entry.content_digest.empty() ||
+                     !new_entry.content_digest.empty()) {
+            // 元数据一致时，内容身份才说话：same-size + same-mtime 的人为
+            // in-place rewrite 只有摘要看得出来。两边都有摘要时比摘要；
+            // 只有一边有（拿 v3 与 v2 比，例如刚升级完）时无法证明相等，
+            // 按变化处理——宁可多重一份完整快照，绝不错误跳过。
+            if (old_entry.content_digest != new_entry.content_digest) {
+              is_modified = true;
+            }
           }
           break;
         case EntryType::kSymlink:
@@ -434,6 +563,57 @@ std::string SerializeManifest(const std::vector<ManifestEntry>& entries,
   return out;
 }
 
+std::string SerializeManifestV3(const std::vector<ManifestEntry>& entries,
+                                const ManifestBinding& binding) {
+  std::string binding_error;
+  if (!IsValidManifestBinding(binding, &binding_error)) return std::string();
+
+  // 自称 v3 就必须带齐内容身份：普通文件与软链接缺摘要时什么都不写。
+  // 写出半份 v3 等于给了增量链一个看起来可用、实际无法校验的基线。
+  for (const ManifestEntry& entry : entries) {
+    if (entry.type != EntryType::kRegularFile &&
+        entry.type != EntryType::kSymlink) {
+      continue;
+    }
+    if (!IsContentDigest(entry.content_digest)) return std::string();
+  }
+
+  std::string out;
+  out += "BPMANIFEST3 ";
+  out += std::to_string(entries.size());
+  out += '\t';
+  out += EscapeField(binding.snapshot_file_name);
+  out += '\t';
+  out += EscapeField(binding.repository_identity);
+  out += '\t';
+  out += EscapeField(binding.source_path);
+  out += '\n';
+  AppendManifestEntriesV3(entries, &out);
+  return out;
+}
+
+std::string ManifestDigest(const std::vector<ManifestEntry>& entries) {
+  // 先按 archive_path 排序：摘要必须只取决于"源是什么样"，不取决于遍历
+  // 恰好以什么顺序产出条目。排序后的顺序就是规范顺序。
+  std::vector<const ManifestEntry*> ordered;
+  ordered.reserve(entries.size());
+  for (const ManifestEntry& entry : entries) ordered.push_back(&entry);
+  std::sort(ordered.begin(), ordered.end(),
+            [](const ManifestEntry* left, const ManifestEntry* right) {
+              return LessByArchivePath(*left, *right);
+            });
+  std::vector<ManifestEntry> canonical;
+  canonical.reserve(ordered.size());
+  for (const ManifestEntry* entry : ordered) canonical.push_back(*entry);
+
+  std::string text;
+  text += "BPMANIFEST3 ";
+  text += std::to_string(canonical.size());
+  text += '\n';
+  AppendManifestEntriesV3(canonical, &text);
+  return ContentDigestOfBytes(text);
+}
+
 std::string SerializeManifestV1(const std::vector<ManifestEntry>& entries) {
   std::string out;
   out += "BPMANIFEST1 ";
@@ -464,12 +644,20 @@ bool ParseManifest(const std::string& text, std::vector<ManifestEntry>* entries,
 
   // 两个版本头都要认。v1 只是"读得出来"——它的 binding 会留空，调用方据此
   // 判定这是不可信基线，走重建。升级语义因此是单向安全的。
+  const std::string header_v3 = "BPMANIFEST3 ";
   const std::string header_v2 = "BPMANIFEST2 ";
   const std::string header_v1 = "BPMANIFEST1 ";
+  // is_version_2 的含义是"头行带 binding"，v3 同样带，只是条目多一个字段。
   bool is_version_2 = false;
+  bool is_version_3 = false;
   std::size_t header_size = 0;
-  if (text.compare(0, std::min(header_v2.size(), text.size()), header_v2) ==
+  if (text.compare(0, std::min(header_v3.size(), text.size()), header_v3) ==
       0) {
+    is_version_3 = true;
+    is_version_2 = true;
+    header_size = header_v3.size();
+  } else if (text.compare(0, std::min(header_v2.size(), text.size()),
+                          header_v2) == 0) {
     is_version_2 = true;
     header_size = header_v2.size();
   } else if (text.compare(0, std::min(header_v1.size(), text.size()),
@@ -551,9 +739,11 @@ bool ParseManifest(const std::string& text, std::vector<ManifestEntry>* entries,
     }
 
     std::vector<std::string> fields;
-    if (!SplitFields(line, &fields) || fields.size() != 12) {
+    const std::size_t expected_fields = is_version_3 ? 13u : 12u;
+    if (!SplitFields(line, &fields) || fields.size() != expected_fields) {
       SetError(error_message,
-               "Invalid source manifest: an entry does not have 12 fields");
+               "Invalid source manifest: an entry does not have " +
+                   std::to_string(expected_fields) + " fields");
       return false;
     }
 
@@ -642,6 +832,29 @@ bool ParseManifest(const std::string& text, std::vector<ManifestEntry>* entries,
       SetError(error_message,
                "Invalid source manifest: bad link target escape");
       return false;
+    }
+    if (is_version_3) {
+      if (!UnescapeField(fields[12], &entry.content_digest)) {
+        SetError(error_message,
+                 "Invalid source manifest: bad content digest escape");
+        return false;
+      }
+      // v3 自称带内容身份，就必须真的带：普通文件与软链接缺摘要说明这份
+      // manifest 不能当增量基线；反过来，其它类型带摘要说明写入方不懂格式。
+      if (entry.type == EntryType::kRegularFile ||
+          entry.type == EntryType::kSymlink) {
+        if (!IsContentDigest(entry.content_digest)) {
+          SetError(error_message,
+                   "Invalid source manifest: a version 3 entry is missing its "
+                   "content digest");
+          return false;
+        }
+      } else if (!entry.content_digest.empty()) {
+        SetError(error_message,
+                 "Invalid source manifest: this entry type must not carry a "
+                 "content digest");
+        return false;
+      }
     }
     if (!seen_paths.insert(entry.archive_path).second) {
       SetError(error_message, "Invalid source manifest: duplicate path '" +

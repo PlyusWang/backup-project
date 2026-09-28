@@ -25,6 +25,8 @@ Item {
     property string draftSource: schedule.sourcePath
     property string draftInterval: String(schedule.intervalMinutes)
     property string draftRetain: String(schedule.retainCount)
+    // PR #18：策略是第二个维度。默认 full，与 backupctl schedule set 的默认一致。
+    property int draftStrategyIndex: 0
     property int draftPackIndex: 0
     property int draftCompressionIndex: 0
     property var draftInclude: []
@@ -32,6 +34,8 @@ Item {
     property string draftIncludeInput: ""
     property string draftExcludeInput: ""
 
+    readonly property var strategyKeys: ["full", "incremental"]
+    readonly property var strategyLabels: ["完整备份", "增量备份"]
     readonly property var packKeys: ["mypack", "ustar", "fast-ustar"]
     readonly property var packLabels: ["MyPack", "USTAR", "Fast USTAR"]
     readonly property var compressionKeys: ["none", "huffman", "lzss-huffman"]
@@ -44,6 +48,7 @@ Item {
         page.draftRetain = String(schedule.retainCount)
         page.draftInclude = schedule.includeRules
         page.draftExclude = schedule.excludeRules
+        page.draftStrategyIndex = Math.max(0, page.strategyKeys.indexOf(schedule.strategyKey))
         page.draftPackIndex = Math.max(0, page.packKeys.indexOf(schedule.packKey))
         page.draftCompressionIndex = Math.max(0, page.compressionKeys.indexOf(schedule.compressionKey))
     }
@@ -56,7 +61,8 @@ Item {
     // 也不需要为了一个信号多引一个模块。
     readonly property string savedSignature: [
         schedule.enabled, schedule.sourcePath, schedule.intervalMinutes,
-        schedule.retainCount, schedule.packKey, schedule.compressionKey,
+        schedule.retainCount, schedule.strategyKey,
+        schedule.packKey, schedule.compressionKey,
         schedule.includeRules.join(","), schedule.excludeRules.join(",")
     ].join("|")
     onSavedSignatureChanged: syncFromController()
@@ -231,6 +237,21 @@ Item {
                         Layout.fillWidth: true
                         Layout.topMargin: 6
                         spacing: 10
+
+                        Text {
+                            text: "策略"
+                            font.pixelSize: 16
+                            color: theme.textSecondary
+                        }
+                        AppComboBox {
+                            id: strategyBox
+                            objectName: "scheduleStrategyCombo"
+                            implicitWidth: 190
+                            enabled: !schedule.libraryBusy
+                            model: page.strategyLabels
+                            currentIndex: page.draftStrategyIndex
+                            onActivated: page.draftStrategyIndex = currentIndex
+                        }
 
                         Text {
                             text: "打包"
@@ -441,7 +462,8 @@ Item {
                                 page.packKeys[page.draftPackIndex],
                                 page.compressionKeys[page.draftCompressionIndex],
                                 page.draftInclude,
-                                page.draftExclude)
+                                page.draftExclude,
+                                page.strategyKeys[page.draftStrategyIndex])
                         }
 
                         AppButton {

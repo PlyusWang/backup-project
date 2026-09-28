@@ -29,6 +29,7 @@
 
 #include "archive_pipeline.h"
 #include "backup_catalog.h"
+#include "backup_mode.h"
 #include "config_manager.h"
 #include "filter.h"
 #include "operation_gate.h"
@@ -39,6 +40,9 @@ namespace backup_modern {
 // Filter / FilterAction，不必到处加限定名。
 using Filter = backupproject::Filter;
 using FilterAction = backupproject::FilterAction;
+// PR #18：策略与触发方式是 Qt 无关的共享核心类型，别名只为少写限定名。
+using BackupStrategy = backupproject::BackupStrategy;
+using BackupTrigger = backupproject::BackupTrigger;
 
 // ---- GUI 稳定 key 与核心 enum 的唯一映射 ----
 //
@@ -67,9 +71,24 @@ QString EncryptionMethodText(backupproject::EncryptionMethod method);
 // 错误原文不翻译、不截断：核心的报错里带着具体路径和原因，
 // 直接显示比在桥这层换成一句笼统提示有用得多。
 // 后台任务的返回值。只带“成功与否 + 核心原文错误”，不加工。
+//
+// 增量策略多带几个字段：它必须能说清“我这一轮到底做了什么”——
+// 建了完整基线（以及为什么）、写了 delta（变化了多少）、还是什么都没写。
+// CLI 与 GUI 用的是同一批字段，所以两边的说法不可能分叉。
 struct OperationOutcome {
   bool succeeded = false;
   QString error_message;
+
+  bool incremental = false;
+  bool no_changes = false;
+  bool created_baseline = false;
+  // "full baseline" / "delta"，直接来自核心 outcome。
+  QString snapshot_kind;
+  QString baseline_reason;
+  quint64 added = 0;
+  quint64 modified = 0;
+  quint64 metadata_changed = 0;
+  quint64 removed = 0;
 };
 
 // 仓库列表的后台结果。除数据本身外还带 repository_path：它让 GUI 线程能判断
@@ -202,6 +221,17 @@ class BackupController : public QObject {
                                           const QString& encryption_key,
                                           const QString& password,
                                           const QString& confirm_password);
+  // PR #18：带策略的入口。strategy_key 取 "full" / "incremental"。
+  // startBackupWithOptions 就是它加 "full"，旧调用方一字不改。
+  //
+  // 组合是否被支持只问共享核心的 IsSupportedBackupMode，界面不自己判断：
+  // 这样"界面收下了、核心再拒绝"这种半吊子状态不可能出现。
+  Q_INVOKABLE bool startBackupWithStrategy(const QString& strategy_key,
+                                           const QString& pack_key,
+                                           const QString& compression_key,
+                                           const QString& encryption_key,
+                                           const QString& password,
+                                           const QString& confirm_password);
   // 从仓库里恢复一个备份。QML 只传 file name，解析成真实路径由 Catalog 负责。
   // 加密的 v2 归档在这里会明确失败并提示需要恢复密码 —— 它不会拿空密码去试。
   Q_INVOKABLE bool startManagedRestore(const QString& file_name,
@@ -294,6 +324,18 @@ class BackupController : public QObject {
     // 路径会把它置 true；false 时走按 magic 分流的旧入口，legacy v0.1 与未加密
     // 的 v2 都靠它，行为与 PR #15 完全一致。
     bool restore_is_v2 = false;
+
+    // ---- PR #18：增量备份 ----
+    //
+    // 策略是备份的第二个维度，不是第二种操作：kind 仍然是 kBackup，
+    // 后台线程只是改走增量引擎。仓库、快照名与规则原文一起带过去，
+    // 因为增量链的 identity 需要它们（规则变了就必须重新建基线）。
+    BackupStrategy strategy = BackupStrategy::kFull;
+    QString repository_directory;
+    QString repository_identity;
+    QString snapshot_file_name;
+    std::vector<std::string> include_rules;
+    std::vector<std::string> exclude_rules;
   };
 
   // 后台函数：static，运行在别的线程上，只碰值类型和核心对象。
@@ -305,6 +347,12 @@ class BackupController : public QObject {
   // file_name 只用于任务结束后的状态提示（备份是自动生成的名字，
   // 恢复是用户选的那个名字）；它不是输入状态，也不参与核心调用。
   bool Start(const OperationRequest& request, const QString& file_name);
+  // 两个公开备份入口共用的实现：校验、编译规则、命名、交给后台线程。
+  bool StartBackupWithStrategy(BackupStrategy strategy, const QString& pack_key,
+                               const QString& compression_key,
+                               const QString& encryption_key,
+                               const QString& password,
+                               const QString& confirm_password);
 
   // 把界面收集的规则编成 Filter；失败时 error_message 里是原因。
   bool BuildFilter(Filter* filter, std::string* error_message) const;

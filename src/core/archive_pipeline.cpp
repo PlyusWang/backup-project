@@ -1266,6 +1266,65 @@ bool RunRestorePackedStream(const std::string& packed_file,
   return true;
 }
 
+// 实际的 payload 字节是不是它自己声明的那些：流式把 payload 区读一遍算
+// SHA-256。 与恢复路径的 AuthenticatePayload 用同一套"payload 从 160
+// 字节之后开始、长度 由 header.payload_size 决定"的布局规则，只是不做需要密码的
+// HMAC 那一半。
+bool VerifyContainerPayloadBytes(const std::string& container_file,
+                                 ContainerHeader* header,
+                                 std::string* error_message) {
+  ContainerHeader local;
+  if (!InspectContainerFile(container_file, &local, error_message)) {
+    return false;
+  }
+  if (local.payload_sha256.size() != container_v2::kSha256Size) {
+    SetError(error_message,
+             "Container header carries no payload digest: " + container_file);
+    return false;
+  }
+  FileSource source;
+  if (!source.Open(container_file, error_message)) {
+    return false;
+  }
+  const std::uint64_t expected_size =
+      static_cast<std::uint64_t>(container_v2::kHeaderSize) +
+      local.payload_size;
+  if (source.size() != expected_size) {
+    SetError(error_message,
+             "Container length does not match its header (declared " +
+                 std::to_string(expected_size) + " bytes, file has " +
+                 std::to_string(source.size()) + "): " + container_file);
+    return false;
+  }
+  crypto::Sha256 sha;
+  std::vector<unsigned char> buffer(kStreamBufferSize);
+  std::uint64_t offset = 0;
+  while (offset < local.payload_size) {
+    const std::uint64_t remaining = local.payload_size - offset;
+    const std::size_t want = static_cast<std::size_t>(
+        remaining < kStreamBufferSize ? remaining : kStreamBufferSize);
+    if (!source.ReadAt(container_v2::kHeaderSize + offset, buffer.data(), want,
+                       error_message)) {
+      return false;
+    }
+    sha.Update(buffer.data(), want);
+    offset += want;
+  }
+  unsigned char digest[crypto::kSha256DigestSize];
+  sha.Final(digest);
+  const std::string computed(reinterpret_cast<const char*>(digest),
+                             crypto::kSha256DigestSize);
+  if (!crypto::ConstantTimeEquals(computed, local.payload_sha256)) {
+    SetError(error_message,
+             "Payload checksum mismatch: the actual archive bytes do not match "
+             "the digest declared in the container header (" +
+                 container_file + ")");
+    return false;
+  }
+  if (header != nullptr) *header = local;
+  return true;
+}
+
 bool IdentifyArchiveFile(const std::string& archive_file, ArchiveFileInfo* info,
                          std::string* error_message) {
   if (info == nullptr) {

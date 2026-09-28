@@ -20,6 +20,7 @@
 #include "archive_pipeline.h"
 #include "backup_catalog.h"
 #include "backup_engine.h"
+#include "incremental_backup.h"
 #include "scheduled_backup_service.h"
 #include "scheduler_lock.h"
 #include "test_support.h"
@@ -108,7 +109,8 @@ std::vector<std::string> RepoArchives(const std::string& repository) {
   std::string error;
   std::vector<std::string> names;
   if (!catalog.List(repository, &records, &error)) return names;
-  for (const bp::BackupRecord& record : records) names.push_back(record.file_name);
+  for (const bp::BackupRecord& record : records)
+    names.push_back(record.file_name);
   std::sort(names.begin(), names.end());
   return names;
 }
@@ -142,10 +144,10 @@ void ExpectNow(const std::string& label, const Env& env,
     test_support::Check(false, label, error);
     return;
   }
-  test_support::Check(
-      result->status == expected, label,
-      std::string("status=") + bp::ScheduleEvaluationStatusKey(result->status) +
-          " diagnostic=" + result->diagnostic);
+  test_support::Check(result->status == expected, label,
+                      std::string("status=") +
+                          bp::ScheduleEvaluationStatusKey(result->status) +
+                          " diagnostic=" + result->diagnostic);
 }
 
 // 把文本里的第一处 from 换成 to。只用于"手工改坏 schedule.json"这种用例。
@@ -165,10 +167,10 @@ void ExpectStatus(const std::string& label, const Env& env, std::int64_t now,
     test_support::Check(false, label, error);
     return;
   }
-  test_support::Check(
-      result->status == expected, label,
-      std::string("status=") + bp::ScheduleEvaluationStatusKey(result->status) +
-          " diagnostic=" + result->diagnostic);
+  test_support::Check(result->status == expected, label,
+                      std::string("status=") +
+                          bp::ScheduleEvaluationStatusKey(result->status) +
+                          " diagnostic=" + result->diagnostic);
 }
 
 // ---- A. 时刻语义 ----
@@ -222,11 +224,17 @@ void TestTimeSemantics() {
   test_support::Check(!bp::ValidateScheduleConfig(config, &error),
                       "TIME-13 retain above the bound is rejected", error);
   config.retain_count = 12;
+  // PR #18：Scheduled + Incremental 现在是真实支持的组合，所以这里换成
+  // **仍然不受支持**的那一个（Realtime + Incremental）。这条用例要钉的
+  // 性质没有变：支持矩阵是唯一答案来源，没人实现的组合必须被明确拒绝，
+  // 而不是被当成 full 偷偷跑掉。
+  config.trigger = bp::BackupTrigger::kRealtime;
   config.strategy = bp::BackupStrategy::kIncremental;
-  test_support::Check(!bp::ValidateScheduleConfig(config, &error) &&
-                          error.find("Unsupported backup mode") != std::string::npos,
-                      "TIME-14 an unimplemented strategy is refused, not faked",
-                      error);
+  test_support::Check(
+      !bp::ValidateScheduleConfig(config, &error) &&
+          error.find("Unsupported backup mode") != std::string::npos,
+      "TIME-14 an unimplemented combination is refused, not faked", error);
+  config.trigger = bp::BackupTrigger::kScheduled;
   config.strategy = bp::BackupStrategy::kFull;
   config.trigger = bp::BackupTrigger::kRealtime;
   test_support::Check(!bp::ValidateScheduleConfig(config, &error),
@@ -253,11 +261,11 @@ void TestFirstRunAndSkip() {
                bp::ScheduleEvaluationStatus::kCreatedSnapshot, &result);
   test_support::Check(result.first_snapshot,
                       "RUN-02 the first run is marked as a first snapshot");
-  test_support::Check(result.changes.added == 3 && result.changes.removed == 0 &&
-                          result.changes.modified == 0 &&
-                          result.changes.metadata_changed == 0,
-                      "RUN-03 the first snapshot reports the whole set as added",
-                      std::to_string(result.changes.added));
+  test_support::Check(
+      result.changes.added == 3 && result.changes.removed == 0 &&
+          result.changes.modified == 0 && result.changes.metadata_changed == 0,
+      "RUN-03 the first snapshot reports the whole set as added",
+      std::to_string(result.changes.added));
   test_support::Check(!result.archive_file_name.empty(),
                       "RUN-04 the snapshot has a file name");
 
@@ -288,9 +296,10 @@ void TestFirstRunAndSkip() {
   ExpectStatus("RUN-11 a due run without changes is skipped", env, 1060,
                bp::ScheduleEvaluationStatus::kSkippedNoChanges, &skipped);
   const std::vector<std::string> after_skip = RepoArchives(env.repository);
-  test_support::Check(after_skip == after_first,
-                      "RUN-12 skipping creates no new archive and no pseudo-rotation",
-                      JoinNames(after_skip));
+  test_support::Check(
+      after_skip == after_first,
+      "RUN-12 skipping creates no new archive and no pseudo-rotation",
+      JoinNames(after_skip));
   document = LoadDocument(env);
   test_support::Check(document.state.history.size() == 2 &&
                           document.state.history[1].result ==
@@ -308,7 +317,8 @@ void TestFirstRunAndSkip() {
 // ---- B2. "立即检查并运行" ----
 
 void TestRunNowSemantics() {
-  test_support::Section("B2. run now ignores the due time but keeps change detection");
+  test_support::Section(
+      "B2. run now ignores the due time but keeps change detection");
   const Env env = MakeEnv("run-now", 12);
   Write(env.source + "/a.txt", "alpha");
 
@@ -319,35 +329,35 @@ void TestRunNowSemantics() {
 
   test_support::Check(service.EvaluateNow(1000, &result, &error),
                       "NOW-01 run now evaluates", error);
-  test_support::Check(result.status ==
-                          bp::ScheduleEvaluationStatus::kCreatedSnapshot,
-                      "NOW-02 run now creates the first snapshot",
-                      bp::ScheduleEvaluationStatusKey(result.status));
+  test_support::Check(
+      result.status == bp::ScheduleEvaluationStatus::kCreatedSnapshot,
+      "NOW-02 run now creates the first snapshot",
+      bp::ScheduleEvaluationStatusKey(result.status));
 
   // 还没到点，而且没有变化：run now 也必须是 skip，绝不能变成"强制备份"。
   test_support::Check(service.EvaluateNow(1010, &result, &error),
                       "NOW-03 run now evaluates again", error);
-  test_support::Check(result.status ==
-                          bp::ScheduleEvaluationStatus::kSkippedNoChanges,
-                      "NOW-04 run now without changes is still skipped",
-                      bp::ScheduleEvaluationStatusKey(result.status));
+  test_support::Check(
+      result.status == bp::ScheduleEvaluationStatus::kSkippedNoChanges,
+      "NOW-04 run now without changes is still skipped",
+      bp::ScheduleEvaluationStatusKey(result.status));
   test_support::Check(RepoArchives(env.repository).size() == 1,
                       "NOW-05 the skip produced no archive");
 
   // 同一个时刻的到期检查仍然会说"没到点"：force 只作用于 run now 这一条入口。
-  test_support::Check(service.Evaluate(1010, &result, &error) &&
-                          result.status ==
-                              bp::ScheduleEvaluationStatus::kNotDue,
-                      "NOW-06 the automatic path still respects the due time");
+  test_support::Check(
+      service.Evaluate(1010, &result, &error) &&
+          result.status == bp::ScheduleEvaluationStatus::kNotDue,
+      "NOW-06 the automatic path still respects the due time");
 
   Write(env.source + "/b.txt", "beta");
   test_support::Check(service.EvaluateNow(1020, &result, &error),
                       "NOW-07 run now evaluates after a change", error);
-  test_support::Check(result.status ==
-                              bp::ScheduleEvaluationStatus::kCreatedSnapshot &&
-                          result.changes.added == 1,
-                      "NOW-08 run now creates a snapshot when something changed",
-                      bp::ScheduleEvaluationStatusKey(result.status));
+  test_support::Check(
+      result.status == bp::ScheduleEvaluationStatus::kCreatedSnapshot &&
+          result.changes.added == 1,
+      "NOW-08 run now creates a snapshot when something changed",
+      bp::ScheduleEvaluationStatusKey(result.status));
 
   const bp::ScheduleDocument document = LoadDocument(env);
   test_support::Check(document.state.managed_snapshots.size() == 2,
@@ -371,12 +381,12 @@ void TestChangeKinds() {
   Write(env.source + "/b.txt", "beta");
   ExpectStatus("CHG-02 an added file creates a snapshot", env, 1060,
                bp::ScheduleEvaluationStatus::kCreatedSnapshot, &result);
-  test_support::Check(result.changes.added == 1 && result.changes.modified == 0 &&
-                          result.changes.removed == 0 &&
-                          result.changes.metadata_changed == 0,
-                      "CHG-03 added is exactly one",
-                      std::to_string(result.changes.added) + "/" +
-                          std::to_string(result.changes.metadata_changed));
+  test_support::Check(
+      result.changes.added == 1 && result.changes.modified == 0 &&
+          result.changes.removed == 0 && result.changes.metadata_changed == 0,
+      "CHG-03 added is exactly one",
+      std::to_string(result.changes.added) + "/" +
+          std::to_string(result.changes.metadata_changed));
 
   unlink((env.source + "/b.txt").c_str());
   ExpectStatus("CHG-04 a removed file creates a snapshot", env, 1120,
@@ -388,19 +398,19 @@ void TestChangeKinds() {
   Write(env.source + "/a.txt", "alpha changed");
   ExpectStatus("CHG-06 a content change creates a snapshot", env, 1180,
                bp::ScheduleEvaluationStatus::kCreatedSnapshot, &result);
-  test_support::Check(result.changes.modified == 1 &&
-                          result.changes.metadata_changed == 0,
-                      "CHG-07 a size change is modified",
-                      std::to_string(result.changes.modified));
+  test_support::Check(
+      result.changes.modified == 1 && result.changes.metadata_changed == 0,
+      "CHG-07 a size change is modified",
+      std::to_string(result.changes.modified));
 
   test_support::Check(chmod((env.source + "/a.txt").c_str(), 0600) == 0,
                       "CHG-08 chmod succeeds");
   ExpectStatus("CHG-09 a metadata-only change creates a snapshot", env, 1240,
                bp::ScheduleEvaluationStatus::kCreatedSnapshot, &result);
-  test_support::Check(result.changes.modified == 0 &&
-                          result.changes.metadata_changed >= 1,
-                      "CHG-10 a mode change is metadata_changed",
-                      std::to_string(result.changes.metadata_changed));
+  test_support::Check(
+      result.changes.modified == 0 && result.changes.metadata_changed >= 1,
+      "CHG-10 a mode change is metadata_changed",
+      std::to_string(result.changes.metadata_changed));
 
   // 不存在的源目录：明确失败，并且仍然推进 next run（不会每 tick 重试）。
   const bp::ScheduleConfig saved = LoadConfig(env);
@@ -409,9 +419,9 @@ void TestChangeKinds() {
   SaveConfig(env, broken);
   ExpectStatus("CHG-11 a missing source fails the run", env, 1300,
                bp::ScheduleEvaluationStatus::kFailed, &result);
-  test_support::Check(result.diagnostic.find("does-not-exist") != std::string::npos,
-                      "CHG-12 the failure names the missing path",
-                      result.diagnostic);
+  test_support::Check(
+      result.diagnostic.find("does-not-exist") != std::string::npos,
+      "CHG-12 the failure names the missing path", result.diagnostic);
   const bp::ScheduleDocument failed_document = LoadDocument(env);
   test_support::Check(failed_document.state.next_run_time_sec == 1360,
                       "CHG-13 a failed run still advances next run",
@@ -447,10 +457,12 @@ void TestSnapshotsAreIndependent() {
   const std::string elsewhere = env.root + "/elsewhere";
   test_support::Mkdir(elsewhere, 0755);
   std::string bytes;
-  test_support::Check(test_support::ReadFile(env.repository + "/" + oldest, &bytes),
-                      "IND-04 the oldest archive is readable");
+  test_support::Check(
+      test_support::ReadFile(env.repository + "/" + oldest, &bytes),
+      "IND-04 the oldest archive is readable");
   const std::string lone = elsewhere + "/lone_copy.bak";
-  test_support::Check(Write(lone, bytes), "IND-05 the oldest archive is copied out");
+  test_support::Check(Write(lone, bytes),
+                      "IND-05 the oldest archive is copied out");
 
   const std::string restored = env.root + "/restored-oldest";
   bp::BackupEngine engine;
@@ -458,24 +470,26 @@ void TestSnapshotsAreIndependent() {
   test_support::Check(engine.Restore(lone, restored, &error),
                       "IND-06 the oldest snapshot restores from a lone copy",
                       error);
-  test_support::Check(test_support::Exists(restored + "/one.txt") &&
-                          !test_support::Exists(restored + "/two.txt") &&
-                          !test_support::Exists(restored + "/three.txt"),
-                      "IND-07 the oldest snapshot holds exactly the state of its "
-                      "own time (not a delta)");
+  test_support::Check(
+      test_support::Exists(restored + "/one.txt") &&
+          !test_support::Exists(restored + "/two.txt") &&
+          !test_support::Exists(restored + "/three.txt"),
+      "IND-07 the oldest snapshot holds exactly the state of its "
+      "own time (not a delta)");
   std::string content;
   test_support::ReadFile(restored + "/one.txt", &content);
   test_support::Check(content == "first",
-                      "IND-08 the restored content matches that moment", content);
+                      "IND-08 the restored content matches that moment",
+                      content);
 
   // 最新的一份也必须能独立恢复。
   const std::vector<std::string> names = RepoArchives(env.repository);
   test_support::Check(names.size() == 3, "IND-09 three snapshots exist",
                       JoinNames(names));
   const std::string newest_dir = env.root + "/restored-newest";
-  test_support::Check(engine.Restore(env.repository + "/" + names.back(),
-                                     newest_dir, &error),
-                      "IND-10 the newest snapshot restores", error);
+  test_support::Check(
+      engine.Restore(env.repository + "/" + names.back(), newest_dir, &error),
+      "IND-10 the newest snapshot restores", error);
   test_support::Check(test_support::Exists(newest_dir + "/three.txt"),
                       "IND-11 the newest snapshot holds the latest state");
 }
@@ -509,21 +523,21 @@ void TestRetention() {
     test_support::Check(every_run_created,
                         "RET-01 thirteen changing runs each create a snapshot");
     const bp::ScheduleDocument document = LoadDocument(env);
-    test_support::Check(document.state.managed_snapshots.size() == 12,
-                        "RET-02 retain=12 keeps exactly twelve managed snapshots",
-                        std::to_string(document.state.managed_snapshots.size()));
+    test_support::Check(
+        document.state.managed_snapshots.size() == 12,
+        "RET-02 retain=12 keeps exactly twelve managed snapshots",
+        std::to_string(document.state.managed_snapshots.size()));
     const std::vector<std::string> names = RepoArchives(env.repository);
     test_support::Check(names.size() == 13,
                         "RET-03 the repository holds 12 scheduled + 1 manual",
                         JoinNames(names));
-    test_support::Check(std::find(names.begin(), names.end(), "manual_old.bak") !=
-                            names.end(),
-                        "RET-04 an old manual backup is never removed");
-    test_support::Check(!oldest_name.empty() &&
-                            std::find(names.begin(), names.end(), oldest_name) ==
-                                names.end(),
-                        "RET-05 the oldest scheduled snapshot was deleted",
-                        oldest_name);
+    test_support::Check(
+        std::find(names.begin(), names.end(), "manual_old.bak") != names.end(),
+        "RET-04 an old manual backup is never removed");
+    test_support::Check(
+        !oldest_name.empty() &&
+            std::find(names.begin(), names.end(), oldest_name) == names.end(),
+        "RET-05 the oldest scheduled snapshot was deleted", oldest_name);
     test_support::Check(document.state.history.size() == 13,
                         "RET-06 the history keeps every run",
                         std::to_string(document.state.history.size()));
@@ -541,9 +555,9 @@ void TestRetention() {
       }
       const bp::ScheduleDocument document = LoadDocument(env);
       if (document.state.managed_snapshots.size() != 1) {
-        test_support::Check(false, "RET-11 retain=1 keeps exactly one snapshot",
-                            std::to_string(
-                                document.state.managed_snapshots.size()));
+        test_support::Check(
+            false, "RET-11 retain=1 keeps exactly one snapshot",
+            std::to_string(document.state.managed_snapshots.size()));
         break;
       }
     }
@@ -570,10 +584,10 @@ void TestRetention() {
     ExpectStatus("RET-24 the next run reconciles without a catastrophic error",
                  env, 1120, bp::ScheduleEvaluationStatus::kSkippedNoChanges,
                  &result);
-    test_support::Check(LoadDocument(env).state.managed_snapshots.size() == 1,
-                        "RET-25 the stale managed record was removed",
-                        std::to_string(
-                            LoadDocument(env).state.managed_snapshots.size()));
+    test_support::Check(
+        LoadDocument(env).state.managed_snapshots.size() == 1,
+        "RET-25 the stale managed record was removed",
+        std::to_string(LoadDocument(env).state.managed_snapshots.size()));
   }
 
   {
@@ -597,7 +611,20 @@ void TestRetention() {
     bp::ScheduledSnapshotRecord newer;
     newer.file_name = "newer_20200102_000000.bak";
     newer.created_time_sec = 2;
-    Write(env.repository + "/" + newer.file_name, "placeholder");
+    // 保留点必须是一份**验证得过**的快照：retention 现在只信实际字节与副文件，
+    // 保留点读不透时会整轮不删（fail closed）。这里直接走产品路径写一份真的。
+    {
+      bp::Filter filter;
+      bp::BackupOptions options;
+      bp::IncrementalOutcome outcome;
+      test_support::Check(
+          bp::RunIncrementalBackup(
+              env.source, env.repository, newer.file_name,
+              bp::RepositoryIdentity(env.repository), filter, options,
+              std::vector<std::string>(), std::vector<std::string>(), "",
+              &outcome, &error),
+          "RET-29 the kept snapshot is a real, verifiable one", error);
+    }
     document.state.managed_snapshots.push_back(newer);
     test_support::Check(store.Save(document, &error),
                         "RET-30 the crafted document saves", error);
@@ -607,22 +634,28 @@ void TestRetention() {
     store.Load(&loaded, &error);
     std::uint64_t deleted = 0;
     std::uint64_t failed = 0;
+    // PR #18：多一个出参——因为被依赖而保留的祖先数量。
+    std::uint64_t dependency_retained = 0;
+    std::uint64_t unreadable = 0;
     std::string retention_error;
     test_support::Check(
-        !service.RunRetention(&loaded, &deleted, &failed, &retention_error),
+        !service.RunRetention(&loaded, &deleted, &failed, &dependency_retained,
+                              &unreadable, &retention_error),
         "RET-31 a deletion failure is reported");
     test_support::Check(deleted == 0 && failed == 1,
                         "RET-32 exactly one deletion failed",
                         std::to_string(deleted) + "/" + std::to_string(failed));
-    test_support::Check(loaded.state.managed_snapshots.size() == 2,
-                        "RET-33 the un-deletable record is kept for the next retry",
-                        std::to_string(loaded.state.managed_snapshots.size()));
+    test_support::Check(
+        loaded.state.managed_snapshots.size() == 2,
+        "RET-33 the un-deletable record is kept for the next retry",
+        std::to_string(loaded.state.managed_snapshots.size()));
     test_support::Check(retention_error.find(link_name) != std::string::npos,
                         "RET-34 the retention error names the archive",
                         retention_error);
-    test_support::Check(bp::StatusForRetention(true) ==
-                            bp::ScheduleEvaluationStatus::kCreatedSnapshot,
-                        "RET-35 a successful retention maps to created_snapshot");
+    test_support::Check(
+        bp::StatusForRetention(true) ==
+            bp::ScheduleEvaluationStatus::kCreatedSnapshot,
+        "RET-35 a successful retention maps to created_snapshot");
     test_support::Check(
         bp::StatusForRetention(false) ==
             bp::ScheduleEvaluationStatus::kCreatedWithRetentionWarning,
@@ -663,25 +696,28 @@ void TestPipelineMatrix() {
 
     Write(env.source + "/payload.txt", "payload for the matrix");
     bp::ScheduleEvaluationResult result;
-    ExpectStatus(std::string("MAT-01 ") + item.label + " creates a snapshot", env,
-                 1000, bp::ScheduleEvaluationStatus::kCreatedSnapshot, &result);
+    ExpectStatus(std::string("MAT-01 ") + item.label + " creates a snapshot",
+                 env, 1000, bp::ScheduleEvaluationStatus::kCreatedSnapshot,
+                 &result);
 
     const std::string archive = env.repository + "/" + result.archive_file_name;
     bp::ArchiveFileInfo info;
     std::string error;
-    test_support::Check(bp::IdentifyArchiveFile(archive, &info, &error) &&
-                            info.kind == bp::ArchiveFileInfo::Kind::kContainerV2 &&
-                            info.pack_method == item.pack &&
-                            info.compression_method == item.compression &&
-                            info.encryption_method == bp::EncryptionMethod::kNone,
-                        std::string("MAT-02 ") + item.label +
-                            " is a v2 container with those methods",
-                        error);
+    test_support::Check(
+        bp::IdentifyArchiveFile(archive, &info, &error) &&
+            info.kind == bp::ArchiveFileInfo::Kind::kContainerV2 &&
+            info.pack_method == item.pack &&
+            info.compression_method == item.compression &&
+            info.encryption_method == bp::EncryptionMethod::kNone,
+        std::string("MAT-02 ") + item.label +
+            " is a v2 container with those methods",
+        error);
 
     const std::string restored = env.root + "/restored";
     bp::BackupEngine engine;
     test_support::Check(engine.Restore(archive, restored, &error),
-                        std::string("MAT-03 ") + item.label + " restores", error);
+                        std::string("MAT-03 ") + item.label + " restores",
+                        error);
     std::string content;
     test_support::ReadFile(restored + "/payload.txt", &content);
     test_support::Check(content == "payload for the matrix",
@@ -702,11 +738,10 @@ void TestEncryptionBoundaryAndLock() {
   bp::ScheduleDocument document;
   document.config = config;
   std::string error;
-  test_support::Check(!store.Save(document, &error) &&
-                          error.find("定时无人值守加密需要安全的密钥来源") !=
-                              std::string::npos,
-                      "ENC-01 a schedule store refuses to persist encryption",
-                      error);
+  test_support::Check(
+      !store.Save(document, &error) &&
+          error.find("定时无人值守加密需要安全的密钥来源") != std::string::npos,
+      "ENC-01 a schedule store refuses to persist encryption", error);
 
   // 手写一份带 password 字段的 schedule.json 也不会被接受：解析层只认 schema，
   // 未知字段直接报错。这样"密码写进 schedule.json"这条路连门都没有。
@@ -728,10 +763,10 @@ void TestEncryptionBoundaryAndLock() {
                       "LOCK-03 the owner hint names a pid",
                       first.ReadOwnerHint());
   bp::SchedulerLock second;
-  test_support::Check(!second.Acquire(lock_path, &error) &&
-                          error.find("already held") != std::string::npos,
-                      "LOCK-04 a second runner is refused, not double-backed-up",
-                      error);
+  test_support::Check(
+      !second.Acquire(lock_path, &error) &&
+          error.find("already held") != std::string::npos,
+      "LOCK-04 a second runner is refused, not double-backed-up", error);
   test_support::Check(!second.held(), "LOCK-05 the refused lock holds nothing");
   first.Release();
   test_support::Check(!first.held(), "LOCK-06 release clears the ownership");
@@ -780,16 +815,18 @@ void TestStability() {
     }
     test_support::Check(ok, "STRESS-01 100 evaluations stay bounded", failure);
     std::sort(seen.begin(), seen.end());
-    test_support::Check(std::adjacent_find(seen.begin(), seen.end()) == seen.end(),
-                        "STRESS-02 no duplicate archive file name was produced",
-                        std::to_string(seen.size()));
+    test_support::Check(
+        std::adjacent_find(seen.begin(), seen.end()) == seen.end(),
+        "STRESS-02 no duplicate archive file name was produced",
+        std::to_string(seen.size()));
     test_support::Check(RepoArchives(env.repository).size() <= 3,
                         "STRESS-03 the repository never exceeds retain_count",
                         JoinNames(RepoArchives(env.repository)));
     const bp::ScheduleDocument document = LoadDocument(env);
-    test_support::Check(document.state.managed_snapshots.size() == 3,
-                        "STRESS-04 the managed list settled at retain_count",
-                        std::to_string(document.state.managed_snapshots.size()));
+    test_support::Check(
+        document.state.managed_snapshots.size() == 3,
+        "STRESS-04 the managed list settled at retain_count",
+        std::to_string(document.state.managed_snapshots.size()));
   }
 
   {
@@ -802,17 +839,20 @@ void TestStability() {
     std::vector<bp::ManifestEntry> first;
     std::vector<bp::ManifestEntry> second;
     std::string error;
-    test_support::Check(bp::BuildSourceManifest(env.source, &filter, &first, &error),
-                        "STRESS-10 a 1200-entry manifest builds", error);
+    test_support::Check(
+        bp::BuildSourceManifest(env.source, &filter, &first, &error),
+        "STRESS-10 a 1200-entry manifest builds", error);
     test_support::Check(first.size() >= 1200,
                         "STRESS-11 every entry is present",
                         std::to_string(first.size()));
-    test_support::Check(bp::BuildSourceManifest(env.source, &filter, &second, &error),
-                        "STRESS-12 the manifest rebuilds", error);
+    test_support::Check(
+        bp::BuildSourceManifest(env.source, &filter, &second, &error),
+        "STRESS-12 the manifest rebuilds", error);
     bp::ChangeSummary summary;
     const clock_t started = std::clock();
-    test_support::Check(bp::DiffManifests(first, second, &summary, nullptr, &error),
-                        "STRESS-13 diffing 1200 entries succeeds", error);
+    test_support::Check(
+        bp::DiffManifests(first, second, &summary, nullptr, &error),
+        "STRESS-13 diffing 1200 entries succeeds", error);
     const double seconds =
         static_cast<double>(std::clock() - started) / CLOCKS_PER_SEC;
     test_support::Check(summary.empty(),
@@ -866,16 +906,15 @@ void TestStability() {
       }
       document = reloaded;
     }
-    test_support::Check(ok, "STRESS-20 100 save/load cycles all reload", failure);
-    test_support::Check(document.state.history.size() ==
-                            bp::kMaxHistoryEntries,
+    test_support::Check(ok, "STRESS-20 100 save/load cycles all reload",
+                        failure);
+    test_support::Check(document.state.history.size() == bp::kMaxHistoryEntries,
                         "STRESS-21 the history stops at its bound",
                         std::to_string(document.state.history.size()));
     test_support::Check(document.state.history.size() <= bp::kMaxHistoryEntries,
                         "STRESS-22 the history respects its bound");
   }
 }
-
 
 // ---- I. 支持矩阵与启用时刻 ----
 
@@ -889,12 +928,16 @@ void TestModeMatrix() {
     const char* label;
   };
   const ModeCase cases[] = {
-      {bp::BackupTrigger::kManual, bp::BackupStrategy::kFull, true, "manual-full"},
-      {bp::BackupTrigger::kManual, bp::BackupStrategy::kIncremental, false,
+      {bp::BackupTrigger::kManual, bp::BackupStrategy::kFull, true,
+       "manual-full"},
+      // PR #18：两条增量组合都变成了真实支持的组合 —— 手动走共享增量引擎，
+      // 计划把决策委托给同一个引擎，且 retention 已经是 dependency-aware。
+      // 这张表仍然是唯一答案来源：把某一条改回 false 而不改实现，这里立刻红。
+      {bp::BackupTrigger::kManual, bp::BackupStrategy::kIncremental, true,
        "manual-incremental"},
       {bp::BackupTrigger::kScheduled, bp::BackupStrategy::kFull, true,
        "scheduled-full"},
-      {bp::BackupTrigger::kScheduled, bp::BackupStrategy::kIncremental, false,
+      {bp::BackupTrigger::kScheduled, bp::BackupStrategy::kIncremental, true,
        "scheduled-incremental"},
       {bp::BackupTrigger::kRealtime, bp::BackupStrategy::kFull, false,
        "realtime-full"},
@@ -903,16 +946,18 @@ void TestModeMatrix() {
   };
 
   // 3 x 2 真值表逐格钉死。只判断 trigger 的写法会在这里被抓住 ——
-  // Manual + Incremental 曾经被误判成 supported，那正好是"选了增量却按全量跑"
-  // 这类静默降级的入口。
+  // 把"没实现的策略"误判成 supported，正是"选了增量却按全量跑"这类静默降级的
+  // 入口；反过来把已实现的组合判成不支持，则会让功能存在却没人能用到。
   for (const ModeCase& item : cases) {
     const std::string label = std::string("MODE-") + item.label;
     test_support::Check(
-        bp::IsSupportedBackupMode(item.trigger, item.strategy) == item.supported,
+        bp::IsSupportedBackupMode(item.trigger, item.strategy) ==
+            item.supported,
         label + " IsSupportedBackupMode(" + bp::BackupTriggerKey(item.trigger) +
             " + " + bp::BackupStrategyKey(item.strategy) + ")",
-        item.supported ? "" : bp::UnsupportedBackupModeReason(item.trigger,
-                                                             item.strategy));
+        item.supported
+            ? ""
+            : bp::UnsupportedBackupModeReason(item.trigger, item.strategy));
   }
 
   // 配置层必须真的用那张表，而不是自己再判断一遍。
@@ -922,11 +967,10 @@ void TestModeMatrix() {
     config.trigger = item.trigger;
     config.strategy = item.strategy;
     std::string error;
-    test_support::Check(bp::ValidateScheduleConfig(config, &error) ==
-                            item.supported,
-                        std::string("MODE-") + item.label +
-                            " in ValidateScheduleConfig",
-                        error);
+    test_support::Check(
+        bp::ValidateScheduleConfig(config, &error) == item.supported,
+        std::string("MODE-") + item.label + " in ValidateScheduleConfig",
+        error);
   }
 
   // 不支持时必须有能直接显示的原文，GUI / CLI 不各自拼句子。
@@ -959,14 +1003,16 @@ void TestEnableTransition() {
   test_support::Check(
       !bp::IsScheduleDue(1001, document.state.next_run_time_sec, 60),
       "ENABLE-03 the very next tick is not due");
-  test_support::Check(bp::IsScheduleDue(4600, document.state.next_run_time_sec, 60),
-                      "ENABLE-04 the run becomes due exactly one interval later");
+  test_support::Check(
+      bp::IsScheduleDue(4600, document.state.next_run_time_sec, 60),
+      "ENABLE-04 the run becomes due exactly one interval later");
 
   // 已经启用：show / load / set 走的都是这条路，绝不能把时间表往后推。
   bp::ApplyScheduleEnableTransition(&document, true, 9000);
-  test_support::Check(document.state.next_run_time_sec == 4600,
-                      "ENABLE-05 an already-enabled schedule keeps its next run",
-                      std::to_string(document.state.next_run_time_sec));
+  test_support::Check(
+      document.state.next_run_time_sec == 4600,
+      "ENABLE-05 an already-enabled schedule keeps its next run",
+      std::to_string(document.state.next_run_time_sec));
 
   // 停用不动时间表，再启用才重算。
   document.config.enabled = false;
@@ -991,21 +1037,25 @@ void TestEnabledScheduleDoesNotRunImmediately() {
   bp::ScheduleStore store(env.schedule_file);
   bp::ScheduleDocument document;
   std::string error;
-  test_support::Check(store.Load(&document, &error) == bp::ScheduleLoadStatus::kLoaded,
-                      "ENABLE-10 the store loads", error);
+  test_support::Check(
+      store.Load(&document, &error) == bp::ScheduleLoadStatus::kLoaded,
+      "ENABLE-10 the store loads", error);
   bp::ApplyScheduleEnableTransition(&document, /*was_enabled=*/false, 1000);
-  test_support::Check(store.Save(document, &error), "ENABLE-11 the store saves", error);
+  test_support::Check(store.Save(document, &error), "ENABLE-11 the store saves",
+                      error);
 
   bp::ScheduleEvaluationResult result;
   ExpectStatus("ENABLE-12 the automatic path is not due yet", env, 1001,
                bp::ScheduleEvaluationStatus::kNotDue, &result);
-  test_support::Check(RepoArchives(env.repository).empty(),
-                      "ENABLE-13 nothing was written before the interval elapsed",
-                      JoinNames(RepoArchives(env.repository)));
+  test_support::Check(
+      RepoArchives(env.repository).empty(),
+      "ENABLE-13 nothing was written before the interval elapsed",
+      JoinNames(RepoArchives(env.repository)));
 
   // "立即检查并运行"仍然立刻做真实的变化检测。
-  ExpectNow("ENABLE-14 run-now still evaluates immediately", env, env.repository,
-            1002, bp::ScheduleEvaluationStatus::kCreatedSnapshot, &result);
+  ExpectNow("ENABLE-14 run-now still evaluates immediately", env,
+            env.repository, 1002,
+            bp::ScheduleEvaluationStatus::kCreatedSnapshot, &result);
 
   // 到点之后自动路径才动；源没变，所以它照样是 skip 而不是"补一份备份"。
   ExpectStatus("ENABLE-15 the automatic path fires once due", env, 4600,
@@ -1052,11 +1102,12 @@ void TestBaselineBinding() {
     bp::BackupCatalog catalog;
     std::string error;
     test_support::Check(catalog.Delete(env.repository, s2, &error),
-                        "BASE-07 the newest snapshot is deleted by hand", error);
+                        "BASE-07 the newest snapshot is deleted by hand",
+                        error);
 
     ExpectNow("BASE-08 deleting the baseline forces a new full snapshot", env,
-              env.repository, 3000, bp::ScheduleEvaluationStatus::kCreatedSnapshot,
-              &result);
+              env.repository, 3000,
+              bp::ScheduleEvaluationStatus::kCreatedSnapshot, &result);
     test_support::Check(result.baseline_reset,
                         "BASE-09 the run is reported as a baseline reset",
                         result.diagnostic);
@@ -1069,8 +1120,9 @@ void TestBaselineBinding() {
     // S3 必须等于当前源：a.txt 与 b.txt 都在。
     bp::BackupEngine engine;
     const std::string restored = env.root + "/restored-s3";
-    test_support::Check(engine.Restore(env.repository + "/" + s3, restored, &error),
-                        "BASE-12 S3 restores", error);
+    test_support::Check(
+        engine.Restore(env.repository + "/" + s3, restored, &error),
+        "BASE-12 S3 restores", error);
     test_support::Check(test_support::Exists(restored + "/a.txt") &&
                             test_support::Exists(restored + "/b.txt"),
                         "BASE-13 S3 holds the current source, not the old one");
@@ -1098,14 +1150,15 @@ void TestBaselineBinding() {
                         "BASE-22 repository B exists and is empty");
 
     ExpectNow("BASE-23 switching repositories creates a baseline in B", env,
-              repository_b, 2000, bp::ScheduleEvaluationStatus::kCreatedSnapshot,
-              &result);
+              repository_b, 2000,
+              bp::ScheduleEvaluationStatus::kCreatedSnapshot, &result);
     test_support::Check(result.baseline_reset,
                         "BASE-24 the repository switch is a baseline reset",
                         result.diagnostic);
     const std::vector<std::string> in_b = RepoArchives(repository_b);
-    test_support::Check(in_b.size() == 1, "BASE-25 repository B now holds exactly "
-                                          "one snapshot",
+    test_support::Check(in_b.size() == 1,
+                        "BASE-25 repository B now holds exactly "
+                        "one snapshot",
                         JoinNames(in_b));
     test_support::Check(result.archive_file_name == in_b[0],
                         "BASE-26 the new snapshot lives in repository B");
@@ -1132,12 +1185,13 @@ void TestBaselineBinding() {
 
     // 绕过 BackupCatalog 直接 unlink：文件名安全边界管的是"能不能删"，
     // 管不了"别人绕过它去删"。这一条测的是被绕过之后能不能自愈。
-    test_support::Check(::unlink((env.repository + "/" + baseline).c_str()) == 0,
-                        "BASE-31 the baseline file disappears behind our back");
+    test_support::Check(
+        ::unlink((env.repository + "/" + baseline).c_str()) == 0,
+        "BASE-31 the baseline file disappears behind our back");
 
     ExpectNow("BASE-32 the next evaluation replaces the missing baseline", env,
-              env.repository, 2000, bp::ScheduleEvaluationStatus::kCreatedSnapshot,
-              &result);
+              env.repository, 2000,
+              bp::ScheduleEvaluationStatus::kCreatedSnapshot, &result);
     test_support::Check(result.baseline_reset,
                         "BASE-33 it is reported as a baseline reset",
                         result.diagnostic);
@@ -1146,7 +1200,8 @@ void TestBaselineBinding() {
                         JoinNames(RepoArchives(env.repository)));
   }
 
-  // T4：删掉的是**旧的、非 baseline** 的那一份 -> baseline 仍然有效 -> 照样 skip。
+  // T4：删掉的是**旧的、非 baseline** 的那一份 -> baseline 仍然有效 -> 照样
+  // skip。
   {
     const Env env = MakeEnv("baseline-keep-old", 12);
     Write(env.source + "/a.txt", "one");
@@ -1165,8 +1220,8 @@ void TestBaselineBinding() {
                         "BASE-42 the old snapshot is deleted", error);
 
     ExpectNow("BASE-43 deleting a non-baseline snapshot still skips", env,
-              env.repository, 3000, bp::ScheduleEvaluationStatus::kSkippedNoChanges,
-              &result);
+              env.repository, 3000,
+              bp::ScheduleEvaluationStatus::kSkippedNoChanges, &result);
     test_support::Check(!result.baseline_reset && !result.first_snapshot,
                         "BASE-44 the baseline was not reset");
     const std::vector<std::string> left = RepoArchives(env.repository);
@@ -1184,15 +1239,16 @@ void TestBaselineBinding() {
                  bp::ScheduleEvaluationStatus::kCreatedSnapshot, &result);
 
     const std::string other = env.root + "/other-source";
-    test_support::Check(test_support::Mkdir(other, 0755), "BASE-51 the other source exists");
+    test_support::Check(test_support::Mkdir(other, 0755),
+                        "BASE-51 the other source exists");
     Write(other + "/a.txt", "alpha");
     bp::ScheduleConfig config = LoadConfig(env);
     config.source_path = other;
     SaveConfig(env, config);
 
     ExpectNow("BASE-52 switching the source rebuilds the baseline", env,
-              env.repository, 2000, bp::ScheduleEvaluationStatus::kCreatedSnapshot,
-              &result);
+              env.repository, 2000,
+              bp::ScheduleEvaluationStatus::kCreatedSnapshot, &result);
     test_support::Check(result.baseline_reset,
                         "BASE-53 the source switch is a baseline reset",
                         result.diagnostic);
@@ -1203,7 +1259,8 @@ void TestBaselineBinding() {
 }
 
 void TestBaselineAgainstAnUnreadableRepository() {
-  test_support::Section("J2. an unreadable repository never resets the baseline");
+  test_support::Section(
+      "J2. an unreadable repository never resets the baseline");
 
   const Env env = MakeEnv("baseline-repo-gone", 12);
   Write(env.source + "/a.txt", "alpha");
@@ -1220,11 +1277,12 @@ void TestBaselineAgainstAnUnreadableRepository() {
 
   std::string error;
   bp::ScheduleEvaluationResult failing;
-  const bool ok = EvaluateAt(env, env.repository, /*force=*/true, 2000, &failing,
-                             &error);
-  test_support::Check(ok && failing.status == bp::ScheduleEvaluationStatus::kFailed,
-                      "BASE-62 an unreadable repository fails the run",
-                      ok ? failing.diagnostic : error);
+  const bool ok =
+      EvaluateAt(env, env.repository, /*force=*/true, 2000, &failing, &error);
+  test_support::Check(
+      ok && failing.status == bp::ScheduleEvaluationStatus::kFailed,
+      "BASE-62 an unreadable repository fails the run",
+      ok ? failing.diagnostic : error);
   test_support::Check(!test_support::Exists(env.repository),
                       "BASE-63 nothing was created at the missing path");
   const bp::ScheduleDocument document = LoadDocument(env);
@@ -1256,8 +1314,9 @@ void TestRetentionKeepsTheBaselineInvariant() {
   // 正常路径碰不到（淘汰的是最旧的，baseline 是最新的），但 retain_count 被
   // 调小、或者 state 被手工改过时是可能的，invariant 必须在那儿也成立。
   std::string bytes;
-  test_support::Check(test_support::ReadFile(env.repository + "/" + baseline, &bytes),
-                      "BASE-71 the baseline archive is readable");
+  test_support::Check(
+      test_support::ReadFile(env.repository + "/" + baseline, &bytes),
+      "BASE-71 the baseline archive is readable");
   const std::string newer = "zzz_newer_copy.bak";
   test_support::Check(Write(env.repository + "/" + newer, bytes),
                       "BASE-72 a second archive is planted");
@@ -1282,8 +1341,13 @@ void TestRetentionKeepsTheBaselineInvariant() {
   bp::ScheduledBackupService service(env.repository, &store);
   std::uint64_t deleted = 0;
   std::uint64_t failed = 0;
-  test_support::Check(service.RunRetention(&document, &deleted, &failed, &error),
-                      "BASE-74 retention runs", error);
+  // PR #18：多一个出参——因为被依赖而保留的祖先数量。
+  std::uint64_t dependency_retained = 0;
+  std::uint64_t unreadable = 0;
+  test_support::Check(
+      service.RunRetention(&document, &deleted, &failed, &dependency_retained,
+                           &unreadable, &error),
+      "BASE-74 retention runs", error);
   test_support::Check(deleted == 1 && failed == 0,
                       "BASE-75 exactly one snapshot was removed",
                       std::to_string(deleted) + "/" + std::to_string(failed));
@@ -1294,26 +1358,30 @@ void TestRetentionKeepsTheBaselineInvariant() {
                       "BASE-77 the cleared state saves", error);
 
   // 下一轮必须重建，而不是拿着一个指向空气的 baseline 继续 skip。
-  ExpectNow("BASE-78 the next run rebuilds a snapshot", env, env.repository, 3000,
-            bp::ScheduleEvaluationStatus::kCreatedSnapshot, &result);
-  test_support::Check(!result.changes.empty() || result.first_snapshot ||
-                          result.baseline_reset,
-                      "BASE-79 the rebuild is accounted for",
-                      result.diagnostic);
+  ExpectNow("BASE-78 the next run rebuilds a snapshot", env, env.repository,
+            3000, bp::ScheduleEvaluationStatus::kCreatedSnapshot, &result);
+  test_support::Check(
+      !result.changes.empty() || result.first_snapshot || result.baseline_reset,
+      "BASE-79 the rebuild is accounted for", result.diagnostic);
 }
 
 void TestUnsupportedModeIsNeverRunAsFull() {
-  test_support::Section("J4. manual + incremental is refused, never run as full");
+  test_support::Section(
+      "J4. an unimplemented combination is refused, never run as full");
 
   const Env env = MakeEnv("unsupported-mode", 12);
   Write(env.source + "/a.txt", "alpha");
 
-  // 手工把 store 改成 trigger=manual / strategy=incremental —— 这是"选了增量"
-  // 最直接的表达。它必须明确失败，绝不能被当成全量悄悄跑掉。
+  // 手工把 store 改成 trigger=realtime / strategy=incremental —— 一个**仍然
+  // 没有人实现**的组合。它必须明确挂起，绝不能被当成全量悄悄跑掉。
+  //
+  // PR #18 之前这里用的是 manual + incremental；那一条现在是真实支持的组合
+  // （手动增量由共享引擎实现），所以这条用例换成真值表里仍然为 false 的那一格。
+  // 要钉的性质没有变：支持矩阵是唯一答案来源，手改 JSON 也绕不过去。
   std::string text;
   test_support::Check(test_support::ReadFile(env.schedule_file, &text),
                       "MODE-20 the store is readable");
-  ReplaceOnce(&text, "\"trigger\": \"scheduled\"", "\"trigger\": \"manual\"");
+  ReplaceOnce(&text, "\"trigger\": \"scheduled\"", "\"trigger\": \"realtime\"");
   ReplaceOnce(&text, "\"strategy\": \"full\"", "\"strategy\": \"incremental\"");
   test_support::Check(text.find("\"incremental\"") != std::string::npos,
                       "MODE-21 the strategy really says incremental");
@@ -1325,22 +1393,23 @@ void TestUnsupportedModeIsNeverRunAsFull() {
   bp::ScheduleDocument before;
   bp::ScheduleStore store(env.schedule_file);
   std::string error;
-  test_support::Check(store.Load(&before, &error) == bp::ScheduleLoadStatus::kLoaded,
-                      "MODE-23a the hand-edited store still parses", error);
+  test_support::Check(
+      store.Load(&before, &error) == bp::ScheduleLoadStatus::kLoaded,
+      "MODE-23a the hand-edited store still parses", error);
 
   bp::ScheduleEvaluationResult result;
-  test_support::Check(EvaluateAt(env, env.repository, /*force=*/true, 1000, &result,
-                                 &error),
-                      "MODE-23 the evaluation itself completes", error);
+  test_support::Check(
+      EvaluateAt(env, env.repository, /*force=*/true, 1000, &result, &error),
+      "MODE-23 the evaluation itself completes", error);
   test_support::Check(
       result.status == bp::ScheduleEvaluationStatus::kConfigInvalid,
-      "MODE-24 manual + incremental suspends the schedule (it is not just a "
+      "MODE-24 realtime + incremental suspends the schedule (it is not just a "
       "failed attempt)",
       std::string(bp::ScheduleEvaluationStatusKey(result.status)) + " " +
           result.diagnostic);
-  test_support::Check(result.diagnostic.find("Unsupported backup mode") !=
-                          std::string::npos,
-                      "MODE-25 the refusal names the mode", result.diagnostic);
+  test_support::Check(
+      result.diagnostic.find("Unsupported backup mode") != std::string::npos,
+      "MODE-25 the refusal names the mode", result.diagnostic);
   test_support::Check(RepoArchives(env.repository).empty(),
                       "MODE-26 no full backup was silently created",
                       JoinNames(RepoArchives(env.repository)));
@@ -1351,8 +1420,9 @@ void TestUnsupportedModeIsNeverRunAsFull() {
                       "MODE-27 a suspended run leaves the store byte-for-byte "
                       "untouched (no silent repair)");
   bp::ScheduleDocument after;
-  test_support::Check(store.Load(&after, &error) == bp::ScheduleLoadStatus::kLoaded,
-                      "MODE-28 the store still reloads", error);
+  test_support::Check(
+      store.Load(&after, &error) == bp::ScheduleLoadStatus::kLoaded,
+      "MODE-28 the store still reloads", error);
   test_support::Check(
       after.state.next_run_time_sec == before.state.next_run_time_sec,
       "MODE-29 a suspended run does not advance next_run (otherwise the GUI "
@@ -1363,9 +1433,10 @@ void TestUnsupportedModeIsNeverRunAsFull() {
                       "MODE-30 a suspended run records no history entry",
                       std::to_string(before.state.history.size()) + " -> " +
                           std::to_string(after.state.history.size()));
-  test_support::Check(after.state.managed_snapshots.size() ==
-                          before.state.managed_snapshots.size(),
-                      "MODE-31 a suspended run does not touch the managed list");
+  test_support::Check(
+      after.state.managed_snapshots.size() ==
+          before.state.managed_snapshots.size(),
+      "MODE-31 a suspended run does not touch the managed list");
 }
 
 // ---- K. store 的父目录与旧文件兼容 ----
@@ -1395,8 +1466,9 @@ void TestStoreParentDirectoryAndLegacyFiles() {
                                 : std::string("stat failed"));
 
     bp::ScheduleDocument reloaded;
-    test_support::Check(store.Load(&reloaded, &error) == bp::ScheduleLoadStatus::kLoaded,
-                        "STORE-04 the file loads back", error);
+    test_support::Check(
+        store.Load(&reloaded, &error) == bp::ScheduleLoadStatus::kLoaded,
+        "STORE-04 the file loads back", error);
     test_support::Check(reloaded.config.source_path == root,
                         "STORE-05 the round trip keeps the source path");
   }
@@ -1411,7 +1483,8 @@ void TestStoreParentDirectoryAndLegacyFiles() {
     std::string error;
     test_support::Check(!store.Save(document, &error),
                         "STORE-06 a non-directory parent is refused");
-    test_support::Check(!error.empty(), "STORE-07 the refusal explains itself", error);
+    test_support::Check(!error.empty(), "STORE-07 the refusal explains itself",
+                        error);
   }
 
   // baseline 的序列化往返。
@@ -1425,10 +1498,12 @@ void TestStoreParentDirectoryAndLegacyFiles() {
     document.state.baseline.repository_identity = "/tmp/repo";
     document.state.baseline.source_path = root;
     std::string error;
-    test_support::Check(store.Save(document, &error), "STORE-10 the baseline saves", error);
+    test_support::Check(store.Save(document, &error),
+                        "STORE-10 the baseline saves", error);
     bp::ScheduleDocument reloaded;
-    test_support::Check(store.Load(&reloaded, &error) == bp::ScheduleLoadStatus::kLoaded,
-                        "STORE-11 the baseline reloads", error);
+    test_support::Check(
+        store.Load(&reloaded, &error) == bp::ScheduleLoadStatus::kLoaded,
+        "STORE-11 the baseline reloads", error);
     test_support::Check(
         reloaded.state.baseline.snapshot_file_name ==
                 "source_20260926_120000.bak" &&
@@ -1454,7 +1529,9 @@ void TestStoreParentDirectoryAndLegacyFiles() {
         "    \"enabled\": false,\n"
         "    \"trigger\": \"scheduled\",\n"
         "    \"strategy\": \"full\",\n"
-        "    \"source_path\": \"" + root + "\",\n"
+        "    \"source_path\": \"" +
+        root +
+        "\",\n"
         "    \"interval_minutes\": 60,\n"
         "    \"retain_count\": 12,\n"
         "    \"pack\": \"mypack\",\n"
@@ -1476,9 +1553,9 @@ void TestStoreParentDirectoryAndLegacyFiles() {
     bp::ScheduleStore store(path);
     bp::ScheduleDocument document;
     std::string error;
-    test_support::Check(store.Load(&document, &error) == bp::ScheduleLoadStatus::kLoaded,
-                        "STORE-21 a document without baseline fields still loads",
-                        error);
+    test_support::Check(
+        store.Load(&document, &error) == bp::ScheduleLoadStatus::kLoaded,
+        "STORE-21 a document without baseline fields still loads", error);
     test_support::Check(document.state.baseline.snapshot_file_name.empty() &&
                             document.state.baseline.repository_identity.empty(),
                         "STORE-22 the missing baseline degrades to 'unknown'");
@@ -1489,9 +1566,10 @@ void TestStoreParentDirectoryAndLegacyFiles() {
                 "\"history\": [], \"baseline_bogus\": \"x\"");
     test_support::Check(test_support::WriteFile(path, tampered, 0600),
                         "STORE-23 the tampered document is written");
-    test_support::Check(store.Load(&document, &error) == bp::ScheduleLoadStatus::kError &&
-                            error.find("unknown field") != std::string::npos,
-                        "STORE-24 an unknown state field is still rejected", error);
+    test_support::Check(
+        store.Load(&document, &error) == bp::ScheduleLoadStatus::kError &&
+            error.find("unknown field") != std::string::npos,
+        "STORE-24 an unknown state field is still rejected", error);
   }
 }
 
@@ -1610,10 +1688,10 @@ bp::ScheduleEvaluationResult ExpectCut(const std::string& label, CrashCut* cut,
     test_support::Check(false, label, error);
     return result;
   }
-  test_support::Check(
-      result.status == expected, label,
-      std::string("status=") + bp::ScheduleEvaluationStatusKey(result.status) +
-          " diagnostic=" + result.diagnostic);
+  test_support::Check(result.status == expected, label,
+                      std::string("status=") +
+                          bp::ScheduleEvaluationStatusKey(result.status) +
+                          " diagnostic=" + result.diagnostic);
 
   const std::vector<std::string> after = RepoArchives(cut->env.repository);
   std::vector<std::string> created;
@@ -1630,7 +1708,8 @@ bp::ScheduleEvaluationResult ExpectCut(const std::string& label, CrashCut* cut,
     return result;
   }
   if (created.size() != 1) {
-    test_support::Check(false, label + ": exactly one new snapshot", JoinNames(created));
+    test_support::Check(false, label + ": exactly one new snapshot",
+                        JoinNames(created));
     return result;
   }
 
@@ -1645,8 +1724,9 @@ bp::ScheduleEvaluationResult ExpectCut(const std::string& label, CrashCut* cut,
                       label + ": the new snapshot restores from a lone copy",
                       restore_error);
   std::string detail;
-  test_support::Check(test_support::CompareTrees(cut->env.source, restored, &detail),
-                      label + ": the new snapshot equals the current source", detail);
+  test_support::Check(
+      test_support::CompareTrees(cut->env.source, restored, &detail),
+      label + ": the new snapshot equals the current source", detail);
   return result;
 }
 
@@ -1688,8 +1768,8 @@ void TestCrashConsistency() {
     // 重建之后必须收敛：源没再变，下一轮就是一次正常的 skip。
     PlaceState(cut, "S2");
     PlaceManifest(cut, "S2");
-    ExpectCut("CUT-C1e the rebuilt baseline makes the next run skip again", &cut,
-              bp::ScheduleEvaluationStatus::kSkippedNoChanges);
+    ExpectCut("CUT-C1e the rebuilt baseline makes the next run skip again",
+              &cut, bp::ScheduleEvaluationStatus::kSkippedNoChanges);
   }
 
   // C2 崩在另一次写盘之间：state 前进到了 S2，manifest 还停在 M1。
@@ -1713,23 +1793,24 @@ void TestCrashConsistency() {
     const bp::ScheduleEvaluationResult result =
         ExpectCut("CUT-C3 a missing manifest forces a full baseline", &cut,
                   bp::ScheduleEvaluationStatus::kCreatedSnapshot);
-    test_support::Check(result.baseline_reset, "CUT-C3b baseline reset reported",
-                        result.diagnostic);
+    test_support::Check(result.baseline_reset,
+                        "CUT-C3b baseline reset reported", result.diagnostic);
   }
 
   // C4 manifest 被截断：这是真实的"写到一半掉电"形状。
   {
     CrashCut cut = PrepareCrashCut("cut-c4");
     const std::string whole = MaterialBytes(cut, "S2");
-    test_support::Check(whole.size() > 64, "CUT-C4a the material is big enough");
+    test_support::Check(whole.size() > 64,
+                        "CUT-C4a the material is big enough");
     test_support::Check(Write(ManifestPath(cut.env), whole.substr(0, 64)),
                         "CUT-C4b the manifest is truncated");
     PlaceState(cut, "S2");
     const bp::ScheduleEvaluationResult result =
         ExpectCut("CUT-C4 a truncated manifest forces a full baseline", &cut,
                   bp::ScheduleEvaluationStatus::kCreatedSnapshot);
-    test_support::Check(result.baseline_reset, "CUT-C4c baseline reset reported",
-                        result.diagnostic);
+    test_support::Check(result.baseline_reset,
+                        "CUT-C4c baseline reset reported", result.diagnostic);
   }
 
   // C5 旧版本留下的 v1 manifest：读得出来，但它没有归属信息，不可信。
@@ -1745,7 +1826,8 @@ void TestCrashConsistency() {
     // "BPMANIFEST2 <count>\t..." -> "BPMANIFEST1 <count>\n<same entries>"
     const std::string version2 = "BPMANIFEST2";
     const std::string v1 =
-        "BPMANIFEST1" + whole.substr(version2.size(), first_tab - version2.size()) +
+        "BPMANIFEST1" +
+        whole.substr(version2.size(), first_tab - version2.size()) +
         whole.substr(first_newline);
     test_support::Check(Write(ManifestPath(cut.env), v1),
                         "CUT-C5b a version 1 manifest is written");
@@ -1753,8 +1835,8 @@ void TestCrashConsistency() {
     const bp::ScheduleEvaluationResult result =
         ExpectCut("CUT-C5 a legacy manifest is never a trusted baseline", &cut,
                   bp::ScheduleEvaluationStatus::kCreatedSnapshot);
-    test_support::Check(result.baseline_reset, "CUT-C5c baseline reset reported",
-                        result.diagnostic);
+    test_support::Check(result.baseline_reset,
+                        "CUT-C5c baseline reset reported", result.diagnostic);
     test_support::Check(
         result.diagnostic.find("older version") != std::string::npos,
         "CUT-C5d the diagnostic says the manifest is from an older version",
@@ -1793,8 +1875,8 @@ void TestCrashConsistency() {
     const bp::ScheduleEvaluationResult result =
         ExpectCut("CUT-C7 a manifest bound to another repository must not skip",
                   &cut, bp::ScheduleEvaluationStatus::kCreatedSnapshot);
-    test_support::Check(result.baseline_reset, "CUT-C7c baseline reset reported",
-                        result.diagnostic);
+    test_support::Check(result.baseline_reset,
+                        "CUT-C7c baseline reset reported", result.diagnostic);
   }
 
   // C8 manifest 自己声明的源不是当前源。源路径是头行最后一个字段，
@@ -1811,10 +1893,10 @@ void TestCrashConsistency() {
                         "CUT-C8b the source field is tampered with");
     PlaceState(cut, "S2");
     const bp::ScheduleEvaluationResult result =
-        ExpectCut("CUT-C8 a manifest bound to another source must not skip", &cut,
-                  bp::ScheduleEvaluationStatus::kCreatedSnapshot);
-    test_support::Check(result.baseline_reset, "CUT-C8c baseline reset reported",
-                        result.diagnostic);
+        ExpectCut("CUT-C8 a manifest bound to another source must not skip",
+                  &cut, bp::ScheduleEvaluationStatus::kCreatedSnapshot);
+    test_support::Check(result.baseline_reset,
+                        "CUT-C8c baseline reset reported", result.diagnostic);
   }
 }
 
@@ -1836,11 +1918,13 @@ void TestManagedListStaysWritableAtTheBound() {
   ExpectStatus("BOUND-01 the seed snapshot is created", env, 1000,
                bp::ScheduleEvaluationStatus::kCreatedSnapshot, &result);
   const std::string seed = result.archive_file_name;
-  test_support::Check(!seed.empty(), "BOUND-02 the seed snapshot has a name", seed);
+  test_support::Check(!seed.empty(), "BOUND-02 the seed snapshot has a name",
+                      seed);
 
   std::string bytes;
-  test_support::Check(test_support::ReadFile(env.repository + "/" + seed, &bytes),
-                      "BOUND-03 the seed archive is readable");
+  test_support::Check(
+      test_support::ReadFile(env.repository + "/" + seed, &bytes),
+      "BOUND-03 the seed archive is readable");
 
   // 把仓库填到文件上界：一共 kMaxRetainCount 份**真实**归档。产品连续跑满
   // 这么多轮之后，磁盘上就是这个样子。
@@ -1853,10 +1937,10 @@ void TestManagedListStaysWritableAtTheBound() {
     if (Write(env.repository + "/" + name, bytes)) ++fillers;
     names.push_back(name);
   }
-  test_support::Check(fillers + 1 == bp::kMaxRetainCount,
-                      "BOUND-04 the repository holds a full managed list",
-                      std::to_string(fillers + 1) + "/" +
-                          std::to_string(bp::kMaxRetainCount));
+  test_support::Check(
+      fillers + 1 == bp::kMaxRetainCount,
+      "BOUND-04 the repository holds a full managed list",
+      std::to_string(fillers + 1) + "/" + std::to_string(bp::kMaxRetainCount));
 
   // 用产品自己的 writer 写出一份满额 state：这不是伪造字节，而是产品跑满之后
   // 的真实内容。它必须写得出去。
@@ -1878,9 +1962,9 @@ void TestManagedListStaysWritableAtTheBound() {
   document.state.baseline.source_path = env.source;
 
   std::string error;
-  test_support::Check(document.state.managed_snapshots.size() ==
-                          bp::kMaxRetainCount,
-                      "BOUND-05 the crafted list sits exactly at the bound");
+  test_support::Check(
+      document.state.managed_snapshots.size() == bp::kMaxRetainCount,
+      "BOUND-05 the crafted list sits exactly at the bound");
   test_support::Check(store.Save(document, &error),
                       "BOUND-06 a full managed list still saves", error);
 
@@ -1897,11 +1981,12 @@ void TestManagedListStaysWritableAtTheBound() {
   bp::ScheduleDocument reloaded;
   const bp::ScheduleLoadStatus status = store.Load(&reloaded, &error);
   test_support::Check(status == bp::ScheduleLoadStatus::kLoaded,
-                      "BOUND-12 the state written at the bound loads back", error);
-  test_support::Check(reloaded.state.managed_snapshots.size() <=
-                          bp::kMaxRetainCount,
-                      "BOUND-13 the persisted list never exceeds the bound",
-                      std::to_string(reloaded.state.managed_snapshots.size()));
+                      "BOUND-12 the state written at the bound loads back",
+                      error);
+  test_support::Check(
+      reloaded.state.managed_snapshots.size() <= bp::kMaxRetainCount,
+      "BOUND-13 the persisted list never exceeds the bound",
+      std::to_string(reloaded.state.managed_snapshots.size()));
   bool recorded = false;
   for (const bp::ScheduledSnapshotRecord& record :
        reloaded.state.managed_snapshots) {
@@ -1972,8 +2057,8 @@ void TestManifestOnlySaveFailure() {
 
   // state 已经前进到 S2，manifest 还属于 S1：这一对不配套，绝不能 skip。
   const std::size_t before = RepoArchives(env.repository).size();
-  ExpectStatus("MAN2-11 an old manifest with a new state must not skip", env, 3000,
-               bp::ScheduleEvaluationStatus::kCreatedSnapshot, &result);
+  ExpectStatus("MAN2-11 an old manifest with a new state must not skip", env,
+               3000, bp::ScheduleEvaluationStatus::kCreatedSnapshot, &result);
   test_support::Check(result.baseline_reset,
                       "MAN2-12 it is reported as a baseline reset",
                       result.diagnostic);
@@ -1985,10 +2070,9 @@ void TestManifestOnlySaveFailure() {
   // 收敛：manifest 现在是新的，源没再变，下一轮回到 skip。
   ExpectStatus("MAN2-14 the next run skips again", env, 4000,
                bp::ScheduleEvaluationStatus::kSkippedNoChanges, &result);
-  test_support::Check(
-      RepoArchives(env.repository).size() == before + 1,
-      "MAN2-15 the repository stopped growing",
-      std::to_string(RepoArchives(env.repository).size()));
+  test_support::Check(RepoArchives(env.repository).size() == before + 1,
+                      "MAN2-15 the repository stopped growing",
+                      std::to_string(RepoArchives(env.repository).size()));
 }
 
 int main() {

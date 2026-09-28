@@ -61,6 +61,20 @@ struct ManifestEntry {
   // 新建/删除一个指向同一 inode 的硬链接时，leader 自己的其它字段一字未变，
   // 只有这个计数会动。
   std::uint32_t hardlink_degree = 0;
+
+  // ---- 内容身份（version 3 才写盘）----
+  //
+  // 普通文件：正文的 SHA-256。软链接：目标字节的 SHA-256。
+  // 其余类型为空：它们的身份由上面的字段唯一决定（类型 + 设备号 + hardlink
+  // 关系），再算一遍摘要只是重复。
+  //
+  // 空串的含义是"这一版没有内容摘要"（version 1 / 2 写出来的 manifest）。
+  // 调用方**不得**把空串当成"内容为空"，也不得把 v1/v2 当成增量基线。
+  std::string content_digest;
+
+  // 磁盘上的真实路径。**刻意不参与序列化**：它只用于生成摘要时读正文，
+  // 写进 manifest 等于把源目录的绝对路径留在磁盘上。
+  std::string source_path;
 };
 
 // 变化摘要。四个计数互斥，绝不重复计数：一条 path 只会落进其中一个桶。
@@ -110,6 +124,35 @@ bool BuildSourceManifest(const std::string& source_directory,
 // uid / gid 全部由 leader 那条记录负责，比较两次只会制造重复计数。
 //
 // changed_paths 可以为空；非空时按 archive_path 升序填入发生变化的路径。
+// ---- 强化版 manifest：增量备份的内容身份 ----
+//
+// 集合与 BuildSourceManifest 完全一致（同一个 ScanSourceTree、同一个 Filter、
+// 同一套 socket 规则），额外做两件事：
+//
+//   * 每个 included 普通文件读一遍正文算 SHA-256；
+//   * 每个软链接算目标字节的 SHA-256。
+//
+// 第一版刻意**全量哈希**：size+mtime 摘要缓存自己就是一个 correctness 问题
+// （失效判断写错就会漏掉真实变化），性能优化留到以后。
+//
+// 读数期间源发生改动（size / mtime 与扫描时不一致，或条目消失）会让整次构建
+// 失败：摘要必须描述一个真实存在过的状态，否则 manifest 会把"读到的内容"和
+// "记录的元数据"拼成一个从未存在过的版本。
+bool BuildStrongSourceManifest(const std::string& source_directory,
+                               const Filter* filter,
+                               std::vector<ManifestEntry>* entries,
+                               std::string* error_message);
+
+// 这份 manifest 是否带齐了内容身份：所有普通文件与软链接都有合法摘要。
+// 只有它为真时，这份 manifest 才可以当作增量链的基线。
+bool HasContentDigests(const std::vector<ManifestEntry>& entries);
+
+// manifest 自身的摘要（64 个小写十六进制）。覆盖"规范化的 v3 正文"：
+// 条目先按 archive_path 排序再序列化，所以同一个 source state 无论遍历细节
+// 如何，摘要都可复现。它不包含 binding——binding 说的是"这份 manifest 属于
+// 哪一份快照"，不是源的内容身份。
+std::string ManifestDigest(const std::vector<ManifestEntry>& entries);
+
 bool DiffManifests(const std::vector<ManifestEntry>& previous,
                    const std::vector<ManifestEntry>& current,
                    ChangeSummary* summary,
@@ -187,6 +230,16 @@ inline constexpr std::size_t kMaxManifestBindingBytes = 4096u;
 // manifest 出去，那恰好是本次修复要消灭的状态。
 std::string SerializeManifest(const std::vector<ManifestEntry>& entries,
                               const ManifestBinding& binding);
+
+// 写出 version 3：在 v2 的 12 个字段之后追加第 13 个字段——内容摘要。
+//
+//   BPMANIFEST3 <entry_count>\t<binding...>\n
+//   <12 个 v2 字段>\t<escaped content_digest>\n
+//
+// 普通文件与软链接必须带摘要，否则返回空串（宁可什么都不写，也不写一份
+// 自称 v3、却没有内容身份的 manifest 出去——那正是假增量的入口）。
+std::string SerializeManifestV3(const std::vector<ManifestEntry>& entries,
+                                const ManifestBinding& binding);
 
 // 写出 version 1（没有 binding）。存在的理由只有一个：兼容性与迁移测试需要
 // 造出一份"旧版本留下的 manifest"。**生产路径一律用上面那个带 binding

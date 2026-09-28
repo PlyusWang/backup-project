@@ -5,6 +5,8 @@
 
 #include "backup_mode.h"
 
+#include "incremental_backup.h"
+
 namespace backupproject {
 namespace {
 
@@ -43,10 +45,17 @@ struct ModeEntry {
 };
 
 const ModeEntry kModeEntries[] = {
-    {BackupTrigger::kManual, BackupStrategy::kFull, true},
-    {BackupTrigger::kManual, BackupStrategy::kIncremental, false},
+    // PR #18：Manual + Incremental 现在是真的了 —— delta 格式、依赖链恢复、
+    // baseline/delta/no-change 决策都在共享核心里，CLI 与 GUI 走同一条路径。
+    {BackupTrigger::kManual, BackupStrategy::kIncremental, true},
     {BackupTrigger::kScheduled, BackupStrategy::kFull, true},
-    {BackupTrigger::kScheduled, BackupStrategy::kIncremental, false},
+    // PR #18：Scheduled + Incremental 现在也是真的了。它成立的前提有两件事，
+    // 缺一不可，而且都已经落地：
+    //   * 计划路径把增量决策交给共享引擎（内容身份，而不是 metadata-first）；
+    //   * retention 变成 dependency-aware，不会为了"删最旧"而删掉某个 delta
+    //     的祖先。
+    {BackupTrigger::kScheduled, BackupStrategy::kIncremental, true},
+    {BackupTrigger::kManual, BackupStrategy::kFull, true},
     {BackupTrigger::kRealtime, BackupStrategy::kFull, false},
     {BackupTrigger::kRealtime, BackupStrategy::kIncremental, false},
 };
@@ -122,7 +131,54 @@ std::string UnsupportedBackupModeReason(BackupTrigger trigger,
                                         BackupStrategy strategy) {
   return std::string("Unsupported backup mode: ") + BackupTriggerText(trigger) +
          " + " + BackupStrategyText(strategy) +
-         ". This version implements only Manual + Full and Scheduled + Full.";
+         ". This version implements Manual + Full, Manual + Incremental, "
+         "Scheduled + Full and Scheduled + Incremental.";
+}
+
+bool IsSupportedBackupOptionCombination(
+    const BackupOptionCombination& combination) {
+  if (!IsSupportedBackupMode(combination.trigger, combination.strategy)) {
+    return false;
+  }
+  if (combination.strategy == BackupStrategy::kIncremental &&
+      !IsSupportedIncrementalPack(combination.pack_method)) {
+    return false;
+  }
+  // 计划路径从来没有"口令"这个东西：无人值守的加密需要安全的密钥来源，
+  // 本版本一律拒绝（与 ValidateScheduleConfig 逐字一致的那句话）。
+  if (combination.trigger == BackupTrigger::kScheduled &&
+      combination.encryption_method != EncryptionMethod::kNone) {
+    return false;
+  }
+  if (combination.strategy == BackupStrategy::kIncremental &&
+      !IsSupportedIncrementalEncryption(combination.encryption_method)) {
+    return false;
+  }
+  return true;
+}
+
+std::string UnsupportedBackupOptionCombinationReason(
+    const BackupOptionCombination& combination) {
+  if (!IsSupportedBackupMode(combination.trigger, combination.strategy)) {
+    return UnsupportedBackupModeReason(combination.trigger,
+                                       combination.strategy);
+  }
+  if (combination.strategy == BackupStrategy::kIncremental &&
+      !IsSupportedIncrementalPack(combination.pack_method)) {
+    return UnsupportedIncrementalPackReason();
+  }
+  if (combination.trigger == BackupTrigger::kScheduled &&
+      combination.encryption_method != EncryptionMethod::kNone) {
+    return std::string(
+        "Unattended scheduled encryption is not supported: "
+        "定时无人值守加密需要安全的密钥来源；当前版本不会持久化明文密码。");
+  }
+  if (combination.strategy == BackupStrategy::kIncremental &&
+      !IsSupportedIncrementalEncryption(combination.encryption_method)) {
+    return UnsupportedIncrementalEncryptionReason();
+  }
+  // 走到这里说明组合是支持的；返回空串而不是编一句"不支持"。
+  return std::string();
 }
 
 }  // namespace backupproject

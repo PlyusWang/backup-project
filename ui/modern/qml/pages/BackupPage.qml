@@ -184,7 +184,9 @@ Item {
                     // "再点一次提交、然后才看到错误"的机会。校验改成点击时请求：
                     // 面板先亮出错误，合法才真的调用控制器。
                     // 规则仍然只有那两条，判定也仍然只写在面板里。
-                    enabled: !controller.busy
+                    // 增量 + 非 MyPack 是核心明确拒绝的组合：界面直接禁用，
+                    // 并在策略说明里讲清原因，而不是让用户点了才看到失败。
+                    enabled: !controller.busy && panel.strategyCombinationAllowed
                     // 三个算法一律传冻结的字符串键；密码与确认密码原样交给控制器，
                     // 界面不在这里做任何加工（不加盐、不截断、不拼进任何路径）。
                     //
@@ -200,7 +202,10 @@ Item {
                         if (!panel.passwordAcceptable)
                             return
 
-                        const started = controller.startBackupWithOptions(
+                        // 策略与三个算法键一起交给控制器；组合是否被支持由共享
+                        // 核心的 IsSupportedBackupMode 判定，界面不自己放行。
+                        const started = controller.startBackupWithStrategy(
+                            panel.strategyKey,
                             panel.packKey,
                             panel.compressionKey,
                             panel.encryptionKey,

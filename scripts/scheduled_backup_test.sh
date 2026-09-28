@@ -168,6 +168,14 @@ run_unit scheduler_core_test
 run_unit scheduled_backup_test
 run_unit terminal_secret_test
 run_unit backup_preview_test
+run_unit incremental_manifest_test
+run_unit incremental_format_test
+run_unit incremental_restore_test
+run_unit incremental_retention_test
+run_unit incremental_crash_test
+# PR #18 closure：路径安全 / 父绑定 / hardlink / 选项矩阵 / 依赖删除 /
+# 副文件生命周期 / payload 绑定 / 深度上界。
+run_unit incremental_closure_test
 
 # ============================================================
 echo "[schedule-test] B. CLI pipeline parity"
@@ -585,17 +593,22 @@ else
   record_fail "D2.38 旧仓库没有被写入" "实际 $FIX_COUNT_A2 份"
 fi
 
-# ---- 手工构造 manual + incremental：必须明确失败，绝不偷偷按全量跑 ----
+# ---- 手工构造出不受支持的组合：必须明确失败，绝不偷偷按全量跑 ----
+#
+# PR #18 之后 Manual + Incremental 已经是真实支持的组合（由共享增量引擎实现），
+# 所以这里换成**仍然不受支持**的 Realtime + Incremental。这条用例要钉的性质
+# 没有变：支持矩阵是运行期的唯一答案来源，手改 JSON 塞进来的非法组合既不跑、
+# 也不生成任何快照。
 FIX_BAD="$FIX/bad-schedule.json"
-sed -e 's/"trigger": "scheduled"/"trigger": "manual"/' \
+sed -e 's/"trigger": "scheduled"/"trigger": "realtime"/' \
     -e 's/"strategy": "full"/"strategy": "incremental"/' \
     "$FIX_STORE" > "$FIX_BAD"
 # 计数必须在被观测的那一轮**之前**取：两边都在之后取的话，这个断言永远成立，
 # 也就永远测不出"偷偷按全量跑了一份"。
 FIX_BAK_BEFORE="$(ls "$FIX/repo-b" | wc -l)"
-expect_exit "D2.39 手改出来的 manual + incremental 在运行期被拒绝" 1 \
+expect_exit "D2.39 手改出来的 realtime + incremental 在运行期被拒绝" 1 \
   "$BACKUPCTL" --config-file "$FIX_CONFIG" --schedule-file "$FIX_BAD" schedule run
-expect_grep "D2.40 拒绝原因点名组合" "Unsupported backup mode: Manual + Incremental"
+expect_grep "D2.40 拒绝原因点名组合" "Unsupported backup mode: Realtime + Incremental"
 FIX_BAK_AFTER="$(ls "$FIX/repo-b" | wc -l)"
 if [ "$FIX_BAK_BEFORE" = "$FIX_BAK_AFTER" ]; then
   record_pass "D2.41 没有偷偷生成全量备份"
@@ -1586,7 +1599,10 @@ if [ "$(printenv SANITIZE || true)" = "1" ]; then
 ' ' ')"
   # application_lock_test 覆盖本轮改过的 runtime 目录判定（S_IXUSR）与
   # FileLock 的 fail-closed 路径，所以它也在 sanitizer 名单里。
-  for name in application_lock_test scheduler_core_test scheduled_backup_test terminal_secret_test backup_preview_test; do
+  #
+  # PR #18 closure 把增量五个套件也加进来：本轮改的正是 delta 解析与路径应用、
+  # 依赖链解析、manifest 与 payload 绑定、retention/delete、payload 哈希比对。
+  for name in application_lock_test scheduler_core_test scheduled_backup_test terminal_secret_test backup_preview_test incremental_manifest_test incremental_format_test incremental_restore_test incremental_retention_test incremental_crash_test incremental_closure_test; do
     if g++ -std=c++17 -g -O1 -fsanitize=address,undefined         -fno-omit-frame-pointer -I"$ROOT_DIR/include" -I"$ROOT_DIR/tests/unit"         "$ROOT_DIR/tests/unit/$name.cpp" $SAN_SOURCES         -o "$SAN_DIR/$name" >"$SAN_DIR/$name-build.log" 2>&1; then
       record_pass "G.$name 在 ASan + UBSan 下编译通过"
     else
