@@ -593,12 +593,12 @@ else
   record_fail "D2.38 旧仓库没有被写入" "实际 $FIX_COUNT_A2 份"
 fi
 
-# ---- 手工构造出不受支持的组合：必须明确失败，绝不偷偷按全量跑 ----
+# ---- 手工构造出这份 store 不该执行的东西：必须明确失败，绝不偷偷按全量跑 ----
 #
-# PR #18 之后 Manual + Incremental 已经是真实支持的组合（由共享增量引擎实现），
-# 所以这里换成**仍然不受支持**的 Realtime + Incremental。这条用例要钉的性质
-# 没有变：支持矩阵是运行期的唯一答案来源，手改 JSON 塞进来的非法组合既不跑、
-# 也不生成任何快照。
+# PR #19 之后 Realtime × {Full, Incremental} 两格都是真实支持的组合，所以
+# "矩阵不支持"这个例子没有了；换成**作用域**的例子：这份 store 只装 scheduled
+# 触发，手工把 trigger 改成 realtime（Realtime 有自己的 realtime.json）。
+# 这条用例要钉的性质没有变：手改 JSON 塞进来的东西既不跑、也不生成任何快照。
 FIX_BAD="$FIX/bad-schedule.json"
 sed -e 's/"trigger": "scheduled"/"trigger": "realtime"/' \
     -e 's/"strategy": "full"/"strategy": "incremental"/' \
@@ -606,9 +606,9 @@ sed -e 's/"trigger": "scheduled"/"trigger": "realtime"/' \
 # 计数必须在被观测的那一轮**之前**取：两边都在之后取的话，这个断言永远成立，
 # 也就永远测不出"偷偷按全量跑了一份"。
 FIX_BAK_BEFORE="$(ls "$FIX/repo-b" | wc -l)"
-expect_exit "D2.39 手改出来的 realtime + incremental 在运行期被拒绝" 1 \
+expect_exit "D2.39 手改出来的 realtime 触发在 schedule 路径被拒绝" 1 \
   "$BACKUPCTL" --config-file "$FIX_CONFIG" --schedule-file "$FIX_BAD" schedule run
-expect_grep "D2.40 拒绝原因点名组合" "Unsupported backup mode: Realtime + Incremental"
+expect_grep "D2.40 拒绝原因点名 store 作用域" "only holds the scheduled trigger"
 FIX_BAK_AFTER="$(ls "$FIX/repo-b" | wc -l)"
 if [ "$FIX_BAK_BEFORE" = "$FIX_BAK_AFTER" ]; then
   record_pass "D2.41 没有偷偷生成全量备份"

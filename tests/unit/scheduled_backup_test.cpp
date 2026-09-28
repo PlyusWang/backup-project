@@ -224,21 +224,25 @@ void TestTimeSemantics() {
   test_support::Check(!bp::ValidateScheduleConfig(config, &error),
                       "TIME-13 retain above the bound is rejected", error);
   config.retain_count = 12;
-  // PR #18：Scheduled + Incremental 现在是真实支持的组合，所以这里换成
-  // **仍然不受支持**的那一个（Realtime + Incremental）。这条用例要钉的
-  // 性质没有变：支持矩阵是唯一答案来源，没人实现的组合必须被明确拒绝，
-  // 而不是被当成 full 偷偷跑掉。
-  config.trigger = bp::BackupTrigger::kRealtime;
+  // PR #19：Realtime × {Full, Incremental} 两格现在都是真实支持的组合，六格
+  // 全开。这条用例要钉的性质没有变：**没人实现的组合必须被明确拒绝，而不是
+  // 被当成 full 偷偷跑掉**——只是例子换成了仍然不受支持的那一个
+  // （Incremental + USTAR：USTAR 表达不了 tombstone 与 parent 依赖）。
+  config.trigger = bp::BackupTrigger::kScheduled;
   config.strategy = bp::BackupStrategy::kIncremental;
+  config.pack_method = bp::PackMethod::kUstar;
   test_support::Check(
       !bp::ValidateScheduleConfig(config, &error) &&
-          error.find("Unsupported backup mode") != std::string::npos,
+          error.find("MyPack") != std::string::npos,
       "TIME-14 an unimplemented combination is refused, not faked", error);
-  config.trigger = bp::BackupTrigger::kScheduled;
-  config.strategy = bp::BackupStrategy::kFull;
+  config.pack_method = bp::PackMethod::kMyPack;
+  // 这一份 store 只属于 scheduled 触发：手工塞一个 realtime 进来不是
+  // "换了个触发方式"，而是这份文件根本不该被 schedule 路径执行。
   config.trigger = bp::BackupTrigger::kRealtime;
-  test_support::Check(!bp::ValidateScheduleConfig(config, &error),
-                      "TIME-15 an unimplemented trigger is refused", error);
+  test_support::Check(!bp::ValidateScheduleConfig(config, &error) &&
+                          error.find("realtime.json") != std::string::npos,
+                      "TIME-15 a trigger outside this store's scope is refused",
+                      error);
   config.trigger = bp::BackupTrigger::kScheduled;
   config.encryption_method = bp::EncryptionMethod::kAes256CtrHmacSha256;
   test_support::Check(
@@ -617,13 +621,13 @@ void TestRetention() {
       bp::Filter filter;
       bp::BackupOptions options;
       bp::IncrementalOutcome outcome;
-      test_support::Check(
-          bp::RunIncrementalBackup(
-              env.source, env.repository, newer.file_name,
-              bp::RepositoryIdentity(env.repository), filter, options,
-              std::vector<std::string>(), std::vector<std::string>(), "",
-              &outcome, &error),
-          "RET-29 the kept snapshot is a real, verifiable one", error);
+      test_support::Check(bp::RunIncrementalBackup(
+                              env.source, env.repository, newer.file_name,
+                              bp::RepositoryIdentity(env.repository), filter,
+                              options, std::vector<std::string>(),
+                              std::vector<std::string>(), "", &outcome, &error),
+                          "RET-29 the kept snapshot is a real, verifiable one",
+                          error);
     }
     document.state.managed_snapshots.push_back(newer);
     test_support::Check(store.Save(document, &error),
@@ -939,9 +943,11 @@ void TestModeMatrix() {
        "scheduled-full"},
       {bp::BackupTrigger::kScheduled, bp::BackupStrategy::kIncremental, true,
        "scheduled-incremental"},
-      {bp::BackupTrigger::kRealtime, bp::BackupStrategy::kFull, false,
+      // PR #19：实时触发的两格打开（watch + debounce + 共享引擎 + marker），
+      // 六格全开。把某一条改回 false 而不改实现，这里立刻红。
+      {bp::BackupTrigger::kRealtime, bp::BackupStrategy::kFull, true,
        "realtime-full"},
-      {bp::BackupTrigger::kRealtime, bp::BackupStrategy::kIncremental, false,
+      {bp::BackupTrigger::kRealtime, bp::BackupStrategy::kIncremental, true,
        "realtime-incremental"},
   };
 
@@ -960,17 +966,29 @@ void TestModeMatrix() {
             : bp::UnsupportedBackupModeReason(item.trigger, item.strategy));
   }
 
-  // 配置层必须真的用那张表，而不是自己再判断一遍。
+  // 配置层必须真的用那张表，而不是自己再判断一遍。这里其实要同时问两个不同的
+  // 问题，两个都要回答对：
+  //   * 矩阵：这个 trigger × strategy 产品实现了吗？
+  //   * store 作用域：这份 schedule.json 允许装它吗？（只装 scheduled 触发，
+  //     实时触发有它自己的 realtime.json）
+  // 只把矩阵答案抄一遍，会让一份手改成 realtime 的计划被 schedule 路径执行。
   for (const ModeCase& item : cases) {
     bp::ScheduleConfig config;
     config.source_path = "/tmp";
     config.trigger = item.trigger;
     config.strategy = item.strategy;
     std::string error;
+    const bool in_scope = item.trigger == bp::BackupTrigger::kScheduled;
     test_support::Check(
-        bp::ValidateScheduleConfig(config, &error) == item.supported,
+        bp::ValidateScheduleConfig(config, &error) ==
+            (item.supported && in_scope),
         std::string("MODE-") + item.label + " in ValidateScheduleConfig",
         error);
+    if (!in_scope) {
+      test_support::Check(
+          !error.empty() && error.find("realtime.json") != std::string::npos,
+          std::string("MODE-") + item.label + " 说明的是 store 作用域", error);
+    }
   }
 
   // 不支持时必须有能直接显示的原文，GUI / CLI 不各自拼句子。
@@ -1408,8 +1426,9 @@ void TestUnsupportedModeIsNeverRunAsFull() {
       std::string(bp::ScheduleEvaluationStatusKey(result.status)) + " " +
           result.diagnostic);
   test_support::Check(
-      result.diagnostic.find("Unsupported backup mode") != std::string::npos,
-      "MODE-25 the refusal names the mode", result.diagnostic);
+      result.diagnostic.find("realtime.json") != std::string::npos,
+      "MODE-25 the refusal names why this store cannot run it",
+      result.diagnostic);
   test_support::Check(RepoArchives(env.repository).empty(),
                       "MODE-26 no full backup was silently created",
                       JoinNames(RepoArchives(env.repository)));
