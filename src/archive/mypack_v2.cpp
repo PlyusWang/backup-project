@@ -35,6 +35,9 @@ namespace backupproject {
 
 namespace {
 
+// 测试接缝的计数器：只统计"真的做了内容摘要计算与比对"的 payload。
+std::uint64_t g_digest_verification_count = 0;
+
 void SetError(std::string* error_message, const std::string& text) {
   if (error_message != nullptr) {
     *error_message = text;
@@ -163,6 +166,9 @@ bool ValidateEntryForWriting(const ArchiveEntry& entry, bool is_first,
 // 读取**边写边算 SHA-256，写完与 manifest 记的摘要核对。加了这一层之后，
 // "manifest 建好之后、payload 读之前"把文件改成同样大小、再把 mtime 贴回去
 // 这种改写不再能悄悄溜过去——size/mtime 两层检查对它本来就是瞎的。
+//
+// 反过来：完整备份不带期望摘要，那时**一次哈希都不做**。给每条路径白算一遍
+// 全量 SHA-256 只是让 Full + MyPack 变慢，换不来任何判断。
 bool WriteRegularPayload(const std::string& disk_path,
                          const ArchiveEntry& entry, FileSink* sink,
                          std::string* error_message) {
@@ -173,6 +179,7 @@ bool WriteRegularPayload(const std::string& disk_path,
              Describe(errno, "Failed to open source file", disk_path));
     return false;
   }
+  const bool verify_digest = !entry.expected_content_digest.empty();
   crypto::Sha256 hasher;
   std::vector<unsigned char> buffer(64 * 1024);
   std::uint64_t copied = 0;
@@ -201,7 +208,9 @@ bool WriteRegularPayload(const std::string& disk_path,
       ok = false;
       break;
     }
-    hasher.Update(buffer.data(), static_cast<std::size_t>(got));
+    if (verify_digest) {
+      hasher.Update(buffer.data(), static_cast<std::size_t>(got));
+    }
     copied += static_cast<std::uint64_t>(got);
   }
   if (ok) {
@@ -223,7 +232,8 @@ bool WriteRegularPayload(const std::string& disk_path,
       }
     }
   }
-  if (ok && !entry.expected_content_digest.empty()) {
+  if (ok && verify_digest) {
+    ++g_digest_verification_count;
     unsigned char digest[crypto::kSha256DigestSize];
     hasher.Final(digest);
     const std::string actual = crypto::ToHex(digest, crypto::kSha256DigestSize);
@@ -474,6 +484,14 @@ bool DecodeEntryHeader(const unsigned char* block, const std::string& hint,
 }
 
 }  // namespace
+
+std::uint64_t MyPackDigestVerificationCountForTesting() {
+  return g_digest_verification_count;
+}
+
+void ResetMyPackDigestVerificationCountForTesting() {
+  g_digest_verification_count = 0;
+}
 
 bool WriteMyPackV2(const std::vector<ArchiveEntry>& entries, FileSink* sink,
                    std::string* error_message) {
