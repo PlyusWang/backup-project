@@ -18,7 +18,10 @@
 #include <string>
 #include <vector>
 
+#include "archive_path.h"
+#include "backup_catalog.h"
 #include "container_format.h"
+#include "incremental_backup.h"
 
 namespace backupproject {
 
@@ -36,14 +39,6 @@ std::string ErrnoText(int error_number) {
 
 void AddNote(RestoreReport* report, const std::string& note) {
   if (report != nullptr) report->notes.push_back(note);
-}
-
-bool IsPlainSingleComponentName(const std::string& name) {
-  if (name.empty() || name == "." || name == "..") return false;
-  if (name.find('/') != std::string::npos) return false;
-  if (name.find('\\') != std::string::npos) return false;
-  if (name.find('\0') != std::string::npos) return false;
-  return true;
 }
 
 std::string JoinPath(const std::string& directory, const std::string& name) {
@@ -418,18 +413,18 @@ bool ResolveSnapshotChain(const std::string& repository_directory,
     return false;
   }
   *chain = SnapshotChain{};
-  if (!IsPlainSingleComponentName(target_file_name)) {
-    SetError(error_message,
-             "A snapshot file name must be a single path component");
-    return false;
-  }
 
+  BackupCatalog catalog;
   std::vector<std::string> reversed_files;
   std::vector<std::string> reversed_names;
   std::vector<std::string> visited;
   std::string current = target_file_name;
   std::string expected_parent_id;
+  std::string expected_parent_manifest_digest;
 
+  // depth 的定义：目标自己是 0，每往上一跳加一。所以一条含 N 个 delta 的链，
+  // 链底的完整快照落在 depth = N 上；"depth > kMaxDeltaChainDepth" 意味着
+  // "64 个 delta 允许、65 个拒绝"，边界由测试钉死（INC-C BND-01/02）。
   for (std::size_t depth = 0;; ++depth) {
     if (depth > kMaxDeltaChainDepth) {
       SetError(error_message, "The snapshot chain is deeper than " +
@@ -444,30 +439,58 @@ bool ResolveSnapshotChain(const std::string& repository_directory,
     }
     visited.push_back(current);
 
-    const std::string path = JoinPath(repository_directory, current);
-    const SnapshotFileKind kind = ClassifySnapshotFile(path, error_message);
-    if (kind == SnapshotFileKind::kUnknown) {
-      if (error_message != nullptr && error_message->empty()) {
-        // 说清是"哪一个"以及"它是被当作谁的父亲在找"：链断掉时用户需要知道
-        // 缺的是哪一份，而不是一句笼统的失败。
-        SetError(error_message, expected_parent_id.empty()
-                                    ? "Unknown snapshot file: " + current
-                                    : "The parent snapshot is missing or "
-                                      "unreadable: " +
-                                          current);
-      }
+    // 每一跳都走 BackupCatalog::Resolve：单组件名字、仓库的直接子项、普通文件、
+    // 非软链接。parent_file_name 来自不可信信封，这里是它落地前的唯一入口——
+    // 名字合法**不等于**它是这个仓库里的一份快照。
+    std::string path;
+    if (!catalog.Resolve(repository_directory, current, &path, error_message)) {
+      const std::string reason =
+          error_message == nullptr ? std::string() : *error_message;
+      SetError(error_message,
+               expected_parent_id.empty()
+                   ? "The snapshot '" + current + "' cannot be used: " + reason
+                   : "The parent snapshot '" + current +
+                         "' is missing or unusable: " + reason);
       return false;
     }
 
-    // 父身份的核对：子节点记录的 parent_snapshot_id 必须等于父文件真实的身份。
+    SnapshotIdentity identity;
+    std::string identity_error;
+    if (!LoadSnapshotIdentity(repository_directory, current, &identity, nullptr,
+                              &identity_error)) {
+      SetError(error_message, identity_error.empty()
+                                  ? "Unknown snapshot file: " + current
+                                  : identity_error);
+      return false;
+    }
+    if (identity.kind == SnapshotFileKind::kUnknown) {
+      SetError(error_message, "Unknown snapshot file: " + current);
+      return false;
+    }
+
+    // 父绑定必须**三件事同时成立**：名字解析到这份文件、它的归档身份对得上、
+    // 它的 manifest 摘要也对得上。少一条都不是合法链。
     if (!expected_parent_id.empty()) {
-      std::string actual_id;
-      if (!SnapshotIdOfFile(path, &actual_id, error_message)) return false;
-      if (actual_id != expected_parent_id) {
+      if (!identity.sidecars_verified) {
+        SetError(error_message,
+                 "The parent snapshot '" + current +
+                     "' has no verified manifest/identity sidecar: " +
+                     identity.sidecar_diagnostic);
+        return false;
+      }
+      if (identity.snapshot_id != expected_parent_id) {
         SetError(error_message, "Snapshot '" + current +
                                     "' does not match the parent identity "
                                     "recorded by its child (the file was "
                                     "replaced or the chain is broken)");
+        return false;
+      }
+      if (identity.manifest_digest != expected_parent_manifest_digest) {
+        SetError(error_message,
+                 "Snapshot '" + current +
+                     "' does not match the parent manifest digest recorded "
+                     "by its child (the file was replaced or the chain is "
+                     "broken)");
         return false;
       }
     }
@@ -475,24 +498,36 @@ bool ResolveSnapshotChain(const std::string& repository_directory,
     reversed_files.push_back(path);
     reversed_names.push_back(current);
 
-    if (kind == SnapshotFileKind::kContainer) {
+    if (identity.kind == SnapshotFileKind::kContainer) {
       // 链的底必须真的是这份 delta 声明的 generation：否则这条链会被应用在
       // 一个不是它祖先的完整快照上，结果是一个从未存在过的目录树。
-      std::string base_id;
-      if (!FullSnapshotId(path, &base_id, error_message)) return false;
       if (!chain->base_generation_id.empty() &&
-          chain->base_generation_id != base_id) {
+          chain->base_generation_id != identity.snapshot_id) {
         SetError(error_message,
                  "The full snapshot at the bottom of this chain is not the "
                  "generation the deltas were built against");
         return false;
       }
-      chain->base_generation_id = base_id;
+      chain->base_generation_id = identity.snapshot_id;
       break;
     }
 
-    DeltaEnvelope envelope;
-    if (!ReadDeltaEnvelope(path, &envelope, error_message)) return false;
+    // 读侧与写侧是同一条加密合同：加密的 delta 一律不接受。它的明文外层信封
+    // （parent / tombstones）不受内层 HMAC 覆盖，接受它等于接受一组未经认证的
+    // 路径指令。旧版本写出来的这种 delta 因此也不再可恢复。
+    ContainerHeader payload_header;
+    std::string payload_error;
+    if (!InspectDeltaPayloadHeader(path, &payload_header, &payload_error)) {
+      SetError(error_message, payload_error);
+      return false;
+    }
+    if (payload_header.encryption_method !=
+        static_cast<std::uint8_t>(EncryptionMethod::kNone)) {
+      SetError(error_message, UnsupportedIncrementalEncryptionReason());
+      return false;
+    }
+
+    const DeltaEnvelope& envelope = identity.envelope;
     if (reversed_files.size() == 1) {
       chain->target_manifest_digest = envelope.current_manifest_digest;
       chain->base_generation_id = envelope.base_generation_id;
@@ -507,6 +542,7 @@ bool ResolveSnapshotChain(const std::string& repository_directory,
       return false;
     }
     expected_parent_id = envelope.parent_snapshot_id;
+    expected_parent_manifest_digest = envelope.parent_manifest_digest;
     current = envelope.parent_file_name;
   }
 
@@ -586,16 +622,23 @@ bool RestoreSnapshotChain(const std::string& repository_directory,
       }
       ::unlink(inner_container.c_str());
 
-      // 2a) tombstone：深的先删。
+      // 2a) tombstone：深的先删，而且**不允许穿过软链接祖先**。
       std::vector<std::string> tombstones = envelope.tombstones;
       SortDeepestFirst(&tombstones);
       for (const std::string& relative : tombstones) {
-        if (relative.empty() || relative == ".") {
-          SetError(error_message, "A tombstone may not remove the source root");
-          ok = false;
+        // 语法在解析信封时就验过了（IsValidDeltaTombstone）；这里再验一次是
+        // 纵深防御：应用路径不该假设"调用方一定先解析过"。
+        if (!IsValidDeltaTombstone(relative, error_message)) break;
+        std::string path;
+        bool exists = false;
+        if (!ResolveUnderRootNoSymlinkAncestors(staging, relative, &path,
+                                                &exists, error_message)) {
           break;
         }
-        const std::string path = JoinPath(staging, relative);
+        // 中间组件不存在 = 这条路径现在不存在，没有东西要删。
+        if (!exists) continue;
+        // final node 按 lstat 语义处理：软链接删链接本身（不碰目标），
+        // FIFO / 设备删节点，目录递归删（RemoveTree 全程 lstat，不 follow）。
         if (!RemoveTree(path)) {
           SetError(error_message, "Cannot apply a tombstone: " + path);
           break;

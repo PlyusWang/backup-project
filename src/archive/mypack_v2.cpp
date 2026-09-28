@@ -27,7 +27,9 @@
 
 #include "archive_path.h"
 #include "byte_order.h"
+#include "crypto.h"
 #include "pack_stream.h"
+#include "source_digest.h"
 
 namespace backupproject {
 
@@ -156,6 +158,11 @@ bool ValidateEntryForWriting(const ArchiveEntry& entry, bool is_first,
 // 与 v0.1 一样有两层保护，缺一层都会产出"看起来成功、其实内容对不上"的归档：
 // 读取循环以扫描时的 size 为准，读不满就是源文件被截短了；读满之后再 fstat
 // 一次，size 或 mtime 变了就失败。v2 不做快照，只是不假装成功。
+//
+// 第三层只在增量路径上生效（entry.expected_content_digest 非空）：**同一次
+// 读取**边写边算 SHA-256，写完与 manifest 记的摘要核对。加了这一层之后，
+// "manifest 建好之后、payload 读之前"把文件改成同样大小、再把 mtime 贴回去
+// 这种改写不再能悄悄溜过去——size/mtime 两层检查对它本来就是瞎的。
 bool WriteRegularPayload(const std::string& disk_path,
                          const ArchiveEntry& entry, FileSink* sink,
                          std::string* error_message) {
@@ -166,6 +173,7 @@ bool WriteRegularPayload(const std::string& disk_path,
              Describe(errno, "Failed to open source file", disk_path));
     return false;
   }
+  crypto::Sha256 hasher;
   std::vector<unsigned char> buffer(64 * 1024);
   std::uint64_t copied = 0;
   bool ok = true;
@@ -193,6 +201,7 @@ bool WriteRegularPayload(const std::string& disk_path,
       ok = false;
       break;
     }
+    hasher.Update(buffer.data(), static_cast<std::size_t>(got));
     copied += static_cast<std::uint64_t>(got);
   }
   if (ok) {
@@ -214,8 +223,63 @@ bool WriteRegularPayload(const std::string& disk_path,
       }
     }
   }
+  if (ok && !entry.expected_content_digest.empty()) {
+    unsigned char digest[crypto::kSha256DigestSize];
+    hasher.Final(digest);
+    const std::string actual =
+        crypto::ToHex(digest, crypto::kSha256DigestSize);
+    if (actual != entry.expected_content_digest) {
+      SetError(error_message,
+               "Source file content does not match the manifest digest "
+               "(the file changed between the manifest and the payload): " +
+                   disk_path);
+      ok = false;
+    }
+  }
   ::close(raw_fd);
   return ok;
+}
+
+// FIFO / 字符设备 / 块设备没有正文，身份只能靠"类型 + 设备号 + metadata"
+// 表达。强 manifest 与真正写 entry header 之间隔着一次 payload 构建，这里做
+// 最后一次 lstat 比对——只看 size/mtime 对这三种类型等于没看。
+bool VerifySpecialSourceUnchanged(const ArchiveEntry& entry,
+                                  std::string* error_message) {
+  struct stat info;
+  if (::lstat(entry.source_path.c_str(), &info) != 0) {
+    SetError(error_message,
+             Describe(errno, "Failed to re-inspect source entry",
+                      entry.source_path));
+    return false;
+  }
+  const bool type_ok =
+      (entry.type == EntryType::kFifo && S_ISFIFO(info.st_mode)) ||
+      (entry.type == EntryType::kCharDevice && S_ISCHR(info.st_mode)) ||
+      (entry.type == EntryType::kBlockDevice && S_ISBLK(info.st_mode));
+  if (!type_ok) {
+    SetError(error_message,
+             "Source entry changed type while packing: " + entry.source_path);
+    return false;
+  }
+  if ((info.st_mode & 07777) != entry.mode || info.st_uid != entry.uid ||
+      info.st_gid != entry.gid) {
+    SetError(error_message,
+             "Source entry metadata changed while packing: " +
+                 entry.source_path);
+    return false;
+  }
+  if (entry.type != EntryType::kFifo) {
+    if (DeviceMajor(static_cast<std::uint64_t>(info.st_rdev)) !=
+            entry.dev_major ||
+        DeviceMinor(static_cast<std::uint64_t>(info.st_rdev)) !=
+            entry.dev_minor) {
+      SetError(error_message,
+               "Source device numbers changed while packing: " +
+                   entry.source_path);
+      return false;
+    }
+  }
+  return true;
 }
 
 // ---- 读侧 -----------------------------------------------------------------
@@ -468,8 +532,47 @@ bool WriteMyPackV2(const std::vector<ArchiveEntry>& entries, FileSink* sink,
                      error_message)) {
       return false;
     }
+    // 软链接的目标也是内容：manifest 记的是目标字节的摘要。写进去的必须是
+    // **期望的那些字节**（entry.link_target 来自 manifest），同时再 readlink
+    // 一次核对源没变——只信"写的是期望值"而不看源，会把"manifest 之后有人
+    // 改过这个链接"变成一条静默的陈旧记录。readlink 不 follow，路径安全。
+    if (entry.type == EntryType::kSymlink &&
+        !entry.expected_content_digest.empty()) {
+      if (ContentDigestOfBytes(entry.link_target) !=
+          entry.expected_content_digest) {
+        SetError(error_message,
+                 "Symlink target does not match the manifest digest: " +
+                     entry.archive_path);
+        return false;
+      }
+      char link_buffer[mypack_v2::kMaxLinkLength + 1];
+      const ssize_t link_size = ::readlink(entry.source_path.c_str(),
+                                           link_buffer, sizeof(link_buffer) - 1);
+      if (link_size < 0) {
+        SetError(error_message,
+                 Describe(errno, "Failed to re-read source symlink",
+                          entry.source_path));
+        return false;
+      }
+      const std::string actual_target(link_buffer,
+                                      static_cast<std::size_t>(link_size));
+      if (actual_target != entry.link_target) {
+        SetError(error_message,
+                 "Symlink target changed between the manifest and the "
+                 "payload: " +
+                     entry.source_path);
+        return false;
+      }
+    }
     if (payload_size > 0 &&
         !WriteRegularPayload(entry.source_path, entry, sink, error_message)) {
+      return false;
+    }
+    if (entry.expect_source_unchanged &&
+        (entry.type == EntryType::kFifo ||
+         entry.type == EntryType::kCharDevice ||
+         entry.type == EntryType::kBlockDevice) &&
+        !VerifySpecialSourceUnchanged(entry, error_message)) {
       return false;
     }
   }

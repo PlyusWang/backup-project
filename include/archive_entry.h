@@ -93,6 +93,23 @@ struct ArchiveEntry {
   // 它为 0 表示扫描层没有提供，写侧就不做这项检查。
   std::uint64_t source_dev = 0;
   std::uint64_t source_ino = 0;
+
+  // ---- 增量流水线的内容绑定（不写进任何归档格式）----
+  //
+  // 强 manifest 已经算过每个普通文件的正文摘要、每个软链接的目标摘要。真正写
+  // payload 时会**再读一遍源**，两次之间源可能被改写——same-size + 原 mtime
+  // 的人为改写正好躲得过上面那套 size/mtime 检查。所以写侧把期望摘要带在
+  // 身上：写完 payload 立刻核对，不一致就整次失败，绝不发布一份
+  // "manifest 说的"和"payload 里装的"不是同一份内容的快照。
+  //
+  // 普通文件 = 正文摘要；软链接 = 目标字节摘要；其余类型为空。
+  // 空串的含义是"这一版没有期望值"（完整备份路径、测试直接构造的条目表）。
+  std::string expected_content_digest;
+
+  // 这条条目来自一次真实扫描。为真时，写侧会对**没有正文**的类型
+  // （FIFO / 字符设备 / 块设备）做最后一次 lstat 比对：它们的身份只能靠
+  // 类型 + 设备号 + metadata 表达，plan 与 payload 之间被改掉就必须失败。
+  bool expect_source_unchanged = false;
 };
 
 // Linux dev_t 的 major/minor 拆分（glibc 的编码不是简单的位移）。
