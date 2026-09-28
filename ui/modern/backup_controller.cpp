@@ -669,8 +669,8 @@ bool BackupController::startBackupWithStrategy(
   } else if (!IsSupportedBackupMode(BackupTrigger::kManual, strategy)) {
     // key 解析失败的详细报错由后面那条路径负责；这里只保证产品矩阵先被判掉。
     SetStatus(QString::fromLatin1(kError), QStringLiteral("无法备份"),
-              QString::fromStdString(
-                  UnsupportedBackupModeReason(BackupTrigger::kManual, strategy)));
+              QString::fromStdString(UnsupportedBackupModeReason(
+                  BackupTrigger::kManual, strategy)));
     return false;
   }
   return StartBackupWithStrategy(strategy, pack_key, compression_key,

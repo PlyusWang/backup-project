@@ -226,8 +226,7 @@ bool WriteRegularPayload(const std::string& disk_path,
   if (ok && !entry.expected_content_digest.empty()) {
     unsigned char digest[crypto::kSha256DigestSize];
     hasher.Final(digest);
-    const std::string actual =
-        crypto::ToHex(digest, crypto::kSha256DigestSize);
+    const std::string actual = crypto::ToHex(digest, crypto::kSha256DigestSize);
     if (actual != entry.expected_content_digest) {
       SetError(error_message,
                "Source file content does not match the manifest digest "
@@ -247,9 +246,8 @@ bool VerifySpecialSourceUnchanged(const ArchiveEntry& entry,
                                   std::string* error_message) {
   struct stat info;
   if (::lstat(entry.source_path.c_str(), &info) != 0) {
-    SetError(error_message,
-             Describe(errno, "Failed to re-inspect source entry",
-                      entry.source_path));
+    SetError(error_message, Describe(errno, "Failed to re-inspect source entry",
+                                     entry.source_path));
     return false;
   }
   const bool type_ok =
@@ -263,9 +261,8 @@ bool VerifySpecialSourceUnchanged(const ArchiveEntry& entry,
   }
   if ((info.st_mode & 07777) != entry.mode || info.st_uid != entry.uid ||
       info.st_gid != entry.gid) {
-    SetError(error_message,
-             "Source entry metadata changed while packing: " +
-                 entry.source_path);
+    SetError(error_message, "Source entry metadata changed while packing: " +
+                                entry.source_path);
     return false;
   }
   if (entry.type != EntryType::kFifo) {
@@ -273,9 +270,8 @@ bool VerifySpecialSourceUnchanged(const ArchiveEntry& entry,
             entry.dev_major ||
         DeviceMinor(static_cast<std::uint64_t>(info.st_rdev)) !=
             entry.dev_minor) {
-      SetError(error_message,
-               "Source device numbers changed while packing: " +
-                   entry.source_path);
+      SetError(error_message, "Source device numbers changed while packing: " +
+                                  entry.source_path);
       return false;
     }
   }
@@ -546,8 +542,8 @@ bool WriteMyPackV2(const std::vector<ArchiveEntry>& entries, FileSink* sink,
         return false;
       }
       char link_buffer[mypack_v2::kMaxLinkLength + 1];
-      const ssize_t link_size = ::readlink(entry.source_path.c_str(),
-                                           link_buffer, sizeof(link_buffer) - 1);
+      const ssize_t link_size = ::readlink(
+          entry.source_path.c_str(), link_buffer, sizeof(link_buffer) - 1);
       if (link_size < 0) {
         SetError(error_message,
                  Describe(errno, "Failed to re-read source symlink",

@@ -251,9 +251,9 @@ bool IsValidDeltaParentFileName(const std::string& name,
   }
   if (name.find('/') != std::string::npos ||
       name.find('\\') != std::string::npos) {
-    SetError(error_message,
-             "A delta parent file name must be a single path component: " +
-                 name);
+    SetError(
+        error_message,
+        "A delta parent file name must be a single path component: " + name);
     return false;
   }
   if (name.find('\0') != std::string::npos) {
@@ -272,7 +272,8 @@ bool IsValidDeltaParentFileName(const std::string& name,
   return true;
 }
 
-bool IsValidDeltaTombstone(const std::string& path, std::string* error_message) {
+bool IsValidDeltaTombstone(const std::string& path,
+                           std::string* error_message) {
   // 先复用归档路径的唯一语法实现：长度、绝对路径、空组件、"."/".." 组件、
   // 反斜杠、盘符、结尾 '/'、NUL 都在那里被拒。
   if (!IsValidArchivePath(path, /*is_first_entry=*/false,
@@ -281,7 +282,8 @@ bool IsValidDeltaTombstone(const std::string& path, std::string* error_message) 
     return false;
   }
   // "." 是源根本身：它不是"某一条被删掉的路径"，而是整棵树的身份。
-  // IsValidArchivePath 在 is_first_entry = false 时已经拒绝它，这里再明确说一句，
+  // IsValidArchivePath 在 is_first_entry = false
+  // 时已经拒绝它，这里再明确说一句，
   // 免得将来有人放宽那条规则时把根也一起放进来。
   if (path == ".") {
     SetError(error_message, "A tombstone may not remove the source root");
@@ -829,7 +831,8 @@ bool InspectDeltaPayloadHeader(const std::string& delta_file,
   }
   *header = ContainerHeader{};
   // 布局规则只有一份实现：先让 ReadDeltaEnvelope 把外层整个读一遍
-  // （magic / version / 长度自洽 / 信封自校验），这里再读 payload 的头 160 字节。
+  // （magic / version / 长度自洽 / 信封自校验），这里再读 payload 的头 160
+  // 字节。
   DeltaEnvelope envelope;
   if (!ReadDeltaEnvelope(delta_file, &envelope, error_message)) return false;
 

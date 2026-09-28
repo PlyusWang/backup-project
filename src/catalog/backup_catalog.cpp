@@ -647,11 +647,10 @@ bool BackupCatalog::Delete(const std::string& repository,
                          error_message);
 }
 
-bool BackupCatalog::DeleteSnapshots(const std::string& repository,
-                                    const std::vector<std::string>& file_names,
-                                    std::vector<std::string>* deleted_file_names,
-                                    std::vector<std::string>* diagnostics,
-                                    std::string* error_message) const {
+bool BackupCatalog::DeleteSnapshots(
+    const std::string& repository, const std::vector<std::string>& file_names,
+    std::vector<std::string>* deleted_file_names,
+    std::vector<std::string>* diagnostics, std::string* error_message) const {
   if (error_message != nullptr) {
     error_message->clear();
   }
@@ -715,7 +714,8 @@ bool BackupCatalog::DeleteSnapshots(const std::string& repository,
     //     删目录（会以 EISDIR 失败）。
     // 因此在这个时间窗里把最后一段换成别的东西，最坏结果是仓库内少了一个软链接。
     // 但校验之后文件系统若被并发改写（包括把某个祖先目录换成软链接），上面的
-    // 结论就不再成立——那属于 backup_catalog.h 顶部列出的、当前不提供防护的范围。
+    // 结论就不再成立——那属于 backup_catalog.h
+    // 顶部列出的、当前不提供防护的范围。
     if (::unlink(archive_path.c_str()) != 0) {
       SetError(error_message,
                Describe(errno, "Failed to delete backup file", archive_path));
@@ -730,9 +730,8 @@ bool BackupCatalog::DeleteSnapshots(const std::string& repository,
     if (!ValidateRepositoryDirectory(repository, &normalized_repository,
                                      &normalize_error)) {
       if (diagnostics != nullptr) {
-        diagnostics->push_back(
-            "Cannot clean up the sidecars of " + file_name + ": " +
-            normalize_error);
+        diagnostics->push_back("Cannot clean up the sidecars of " + file_name +
+                               ": " + normalize_error);
       }
       continue;
     }

@@ -262,11 +262,10 @@ void ExpandHardlinkGroups(const std::vector<ManifestEntry>& current,
                           std::vector<std::string>* changed_paths) {
   std::vector<std::string> expanded = *changed_paths;
   for (const std::string& path : *changed_paths) {
-    const bool present =
-        std::any_of(current.begin(), current.end(),
-                    [&path](const ManifestEntry& entry) {
-                      return entry.archive_path == path;
-                    });
+    const bool present = std::any_of(current.begin(), current.end(),
+                                     [&path](const ManifestEntry& entry) {
+                                       return entry.archive_path == path;
+                                     });
     if (!present) continue;
     for (const std::string& member : HardlinkGroupOf(current, path)) {
       const bool in_current =
@@ -296,22 +295,18 @@ std::string SerializeSnapshotIdentity(const std::string& snapshot_file_name,
 
 // 快照已经写出来之后，两个副文件必须一起成功；任何一个失败就把本轮写下的
 // 东西全部撤回。只撤自己刚创建的那些：这里不碰任何既有文件。
-bool PublishSnapshotSidecars(const std::string& repository_directory,
-                             const std::string& snapshot_file_name,
-                             const std::string& snapshot_path,
-                             const std::string& snapshot_id,
-                             const std::string& manifest_digest,
-                             const std::vector<ManifestEntry>& entries,
-                             const std::string& repository_identity,
-                             const std::string& source_directory,
-                             const std::string& source_identity,
-                             const std::string& filter_identity,
-                             const std::string& strategy_identity,
-                             std::string* error_message) {
-  const std::string manifest_path =
-      JoinPath(repository_directory, SnapshotManifestFileName(snapshot_file_name));
-  const std::string identity_path =
-      JoinPath(repository_directory, SnapshotIdentityFileName(snapshot_file_name));
+bool PublishSnapshotSidecars(
+    const std::string& repository_directory,
+    const std::string& snapshot_file_name, const std::string& snapshot_path,
+    const std::string& snapshot_id, const std::string& manifest_digest,
+    const std::vector<ManifestEntry>& entries,
+    const std::string& repository_identity, const std::string& source_directory,
+    const std::string& source_identity, const std::string& filter_identity,
+    const std::string& strategy_identity, std::string* error_message) {
+  const std::string manifest_path = JoinPath(
+      repository_directory, SnapshotManifestFileName(snapshot_file_name));
+  const std::string identity_path = JoinPath(
+      repository_directory, SnapshotIdentityFileName(snapshot_file_name));
 
   ManifestBinding binding;
   binding.snapshot_file_name = snapshot_file_name;
@@ -319,8 +314,7 @@ bool PublishSnapshotSidecars(const std::string& repository_directory,
   binding.source_path = source_directory;
   const std::string text = SerializeManifestV3(entries, binding);
   if (text.empty()) {
-    SetError(error_message,
-             "Cannot serialize the manifest for this snapshot");
+    SetError(error_message, "Cannot serialize the manifest for this snapshot");
     ::unlink(snapshot_path.c_str());
     return false;
   }
@@ -499,12 +493,12 @@ bool ParseSnapshotIdentity(const std::string& text,
   }
   *record = SnapshotIdentityRecord{};
   const bool is_v2 =
-      text.compare(0, std::min(std::string(kIdentityV2Header).size(),
-                               text.size()),
+      text.compare(0,
+                   std::min(std::string(kIdentityV2Header).size(), text.size()),
                    kIdentityV2Header) == 0;
   const bool is_v1 =
-      text.compare(0, std::min(std::string(kIdentityV1Header).size(),
-                               text.size()),
+      text.compare(0,
+                   std::min(std::string(kIdentityV1Header).size(), text.size()),
                    kIdentityV1Header) == 0;
   if (!is_v1 && !is_v2) {
     SetError(error_message, "Invalid snapshot identity: wrong header");
@@ -575,9 +569,9 @@ bool ParseSnapshotIdentity(const std::string& text,
         }
       }
       if (number != kIdentityVersion2) {
-        SetError(error_message,
-                 "Invalid snapshot identity: unsupported version '" + value +
-                     "'");
+        SetError(
+            error_message,
+            "Invalid snapshot identity: unsupported version '" + value + "'");
         return false;
       }
       continue;
@@ -713,7 +707,8 @@ bool LoadSnapshotIdentity(const std::string& repository_directory,
     }
     identity->parent_file_name = identity->envelope.parent_file_name;
     identity->parent_snapshot_id = identity->envelope.parent_snapshot_id;
-    identity->parent_manifest_digest = identity->envelope.parent_manifest_digest;
+    identity->parent_manifest_digest =
+        identity->envelope.parent_manifest_digest;
     identity->base_generation_id = identity->envelope.base_generation_id;
     identity->manifest_digest = identity->envelope.current_manifest_digest;
   }
@@ -899,8 +894,8 @@ bool SnapshotDeltaDepth(const std::string& repository_directory,
   std::string current = snapshot_file_name;
   while (true) {
     if (std::find(visited.begin(), visited.end(), current) != visited.end()) {
-      SetError(error_message, "Snapshot chain contains a cycle at '" + current +
-                                  "'");
+      SetError(error_message,
+               "Snapshot chain contains a cycle at '" + current + "'");
       return false;
     }
     visited.push_back(current);
@@ -1053,19 +1048,19 @@ bool RunIncrementalBackup(const std::string& source_directory,
     std::vector<ManifestEntry> loaded;
     const bool loaded_ok = LoadSnapshotIdentity(
         repository_directory, baseline, &identity, &loaded, &load_error);
-    bool usable = loaded_ok && identity.sidecars_verified &&
-                  identity.manifest_binding.repository_identity ==
-                      repository_identity &&
-                  identity.manifest_binding.source_path == source_directory &&
-                  identity.source_identity == source_identity &&
-                  identity.filter_identity == filter_identity &&
-                  identity.strategy_identity == strategy_identity;
+    bool usable =
+        loaded_ok && identity.sidecars_verified &&
+        identity.manifest_binding.repository_identity == repository_identity &&
+        identity.manifest_binding.source_path == source_directory &&
+        identity.source_identity == source_identity &&
+        identity.filter_identity == filter_identity &&
+        identity.strategy_identity == strategy_identity;
     if (usable && identity.kind == SnapshotFileKind::kUnknown) usable = false;
     if (!usable) {
-      reason = loaded_ok ? "the recorded baseline is no longer trustworthy (" +
-                               identity.sidecar_diagnostic + ")"
-                         : "the recorded baseline is not usable (" + load_error +
-                               ")";
+      reason = loaded_ok
+                   ? "the recorded baseline is no longer trustworthy (" +
+                         identity.sidecar_diagnostic + ")"
+                   : "the recorded baseline is not usable (" + load_error + ")";
       baseline.clear();
     } else {
       // 再挂一个 delta 会不会越过恢复侧的上界？会的话就不挂：与其产出
@@ -1113,11 +1108,11 @@ bool RunIncrementalBackup(const std::string& source_directory,
       ::unlink(target.c_str());
       return false;
     }
-    if (!PublishSnapshotSidecars(
-            repository_directory, snapshot_file_name, target, snapshot_id,
-            current_digest, current, repository_identity, source_directory,
-            source_identity, filter_identity, strategy_identity,
-            error_message)) {
+    if (!PublishSnapshotSidecars(repository_directory, snapshot_file_name,
+                                 target, snapshot_id, current_digest, current,
+                                 repository_identity, source_directory,
+                                 source_identity, filter_identity,
+                                 strategy_identity, error_message)) {
       return false;
     }
     outcome->kind = IncrementalOutcome::Kind::kFullBaseline;
@@ -1219,11 +1214,10 @@ bool RunIncrementalBackup(const std::string& source_directory,
     ::unlink(delta_path.c_str());
     return false;
   }
-  if (!PublishSnapshotSidecars(repository_directory, snapshot_file_name,
-                               delta_path, snapshot_id, current_digest, current,
-                               repository_identity, source_directory,
-                               source_identity, filter_identity,
-                               strategy_identity, error_message)) {
+  if (!PublishSnapshotSidecars(
+          repository_directory, snapshot_file_name, delta_path, snapshot_id,
+          current_digest, current, repository_identity, source_directory,
+          source_identity, filter_identity, strategy_identity, error_message)) {
     return false;
   }
 
@@ -1304,14 +1298,14 @@ bool SplitSidecarName(const std::string& name, std::string* base) {
   const std::size_t manifest_len = ::strlen(kManifestSuffix);
   const std::size_t identity_len = ::strlen(kIdentitySuffix);
   if (name.size() > manifest_len &&
-      name.compare(name.size() - manifest_len, manifest_len,
-                   kManifestSuffix) == 0) {
+      name.compare(name.size() - manifest_len, manifest_len, kManifestSuffix) ==
+          0) {
     *base = name.substr(0, name.size() - manifest_len);
     return true;
   }
   if (name.size() > identity_len &&
-      name.compare(name.size() - identity_len, identity_len,
-                   kIdentitySuffix) == 0) {
+      name.compare(name.size() - identity_len, identity_len, kIdentitySuffix) ==
+          0) {
     *base = name.substr(0, name.size() - identity_len);
     return true;
   }
@@ -1342,8 +1336,7 @@ bool FindOrphanSidecars(const std::string& repository_directory,
   DIR* raw = ::opendir(repository_directory.c_str());
   if (raw == nullptr) {
     SetError(error_message, "Cannot open the repository directory " +
-                                repository_directory + ": " +
-                                ErrnoText(errno));
+                                repository_directory + ": " + ErrnoText(errno));
     return false;
   }
   while (struct dirent* item = ::readdir(raw)) {

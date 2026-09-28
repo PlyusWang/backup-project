@@ -1303,8 +1303,9 @@ int RepositoryList(const CliContext& context) {
     std::string orphan_error;
     if (FindOrphanSidecars(repository, &orphans, &orphan_error)) {
       for (const std::string& name : orphans) {
-        std::cout << "Orphan sidecar: " << name
-                  << "  (its snapshot file is gone; retention will remove it)\n";
+        std::cout
+            << "Orphan sidecar: " << name
+            << "  (its snapshot file is gone; retention will remove it)\n";
       }
     }
   }
