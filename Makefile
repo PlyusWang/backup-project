@@ -41,7 +41,9 @@ CORE_SOURCES += src/core/backup_mode.cpp \
                 src/realtime/realtime_store.cpp \
                 src/realtime/realtime_watcher.cpp \
                 src/realtime/realtime_debouncer.cpp \
+                src/realtime/realtime_backup_service.cpp \
                 src/cli/terminal_secret.cpp \
+                src/cli/realtime_commands.cpp \
                 src/cli/cli_commands.cpp
 
 FILESYSTEM_SOURCES := src/filesystem/file_system.cpp

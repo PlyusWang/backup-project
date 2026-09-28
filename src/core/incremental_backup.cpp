@@ -1347,14 +1347,20 @@ bool FindReachableDescendants(const std::string& repository_directory,
 
 std::vector<std::string> SnapshotSidecarFileNames(
     const std::string& snapshot_file_name) {
+  // PR #19：realtime marker 也是这份快照拥有的 sidecar，删除时跟着走。
+  // 常量在这里写字面量而不是 include realtime_backup_service.h，是为了让
+  // incremental_backup 不反向依赖 realtime 模块；两边都只认 ".realtime"。
   return {SnapshotManifestFileName(snapshot_file_name),
-          SnapshotIdentityFileName(snapshot_file_name)};
+          SnapshotIdentityFileName(snapshot_file_name),
+          snapshot_file_name + ".realtime"};
 }
 
 namespace {
 
 constexpr const char* kManifestSuffix = ".manifest";
 constexpr const char* kIdentitySuffix = ".identity";
+// PR #19：realtime marker（BPREALTIME1）。只有 <managed .bak>.realtime 才算。
+constexpr const char* kRealtimeSuffix = ".realtime";
 
 // name 是不是**本项目的**一份快照的副文件名；是的话把主文件名写进 *base。
 //
@@ -1365,6 +1371,7 @@ constexpr const char* kIdentitySuffix = ".identity";
 bool SplitSidecarName(const std::string& name, std::string* base) {
   const std::size_t manifest_len = ::strlen(kManifestSuffix);
   const std::size_t identity_len = ::strlen(kIdentitySuffix);
+  const std::size_t realtime_len = ::strlen(kRealtimeSuffix);
   std::string candidate;
   if (name.size() > manifest_len &&
       name.compare(name.size() - manifest_len, manifest_len, kManifestSuffix) ==
@@ -1374,6 +1381,10 @@ bool SplitSidecarName(const std::string& name, std::string* base) {
              name.compare(name.size() - identity_len, identity_len,
                           kIdentitySuffix) == 0) {
     candidate = name.substr(0, name.size() - identity_len);
+  } else if (name.size() > realtime_len &&
+             name.compare(name.size() - realtime_len, realtime_len,
+                          kRealtimeSuffix) == 0) {
+    candidate = name.substr(0, name.size() - realtime_len);
   } else {
     return false;
   }
