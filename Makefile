@@ -38,6 +38,7 @@ CORE_SOURCES += src/core/backup_mode.cpp \
                 src/scheduler/schedule_store.cpp \
                 src/scheduler/scheduled_backup_service.cpp \
                 src/scheduler/scheduler_lock.cpp \
+                src/realtime/realtime_store.cpp \
                 src/cli/terminal_secret.cpp \
                 src/cli/cli_commands.cpp
 
