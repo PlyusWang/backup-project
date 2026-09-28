@@ -605,6 +605,106 @@ SnapshotFileKind ClassifySnapshotFile(const std::string& path,
   return SnapshotFileKind::kUnknown;
 }
 
+namespace {
+
+// BKPINC1 的 24 字节固定头：解析 + 全部长度层校验。多处以同一套规则读它，
+// 所以只有这一份实现（magic / version / header size / envelope 长度上界 /
+// payload 长度上界 / 文件长度必须正好等于三段之和）。
+struct DeltaLayout {
+  std::uint32_t envelope_len = 0;
+  std::uint64_t payload_len = 0;
+};
+
+bool ReadDeltaLayout(int fd, std::uint64_t file_size, DeltaLayout* layout,
+                     std::string* error_message) {
+  unsigned char header[kDeltaFixedHeaderSize] = {0};
+  std::size_t filled = 0;
+  while (filled < sizeof(header)) {
+    const ssize_t got = ::pread(fd, header + filled, sizeof(header) - filled,
+                                static_cast<off_t>(filled));
+    if (got < 0) {
+      if (errno == EINTR) continue;
+      SetError(error_message, "Cannot read delta header: " + ErrnoText(errno));
+      return false;
+    }
+    if (got == 0) break;
+    filled += static_cast<std::size_t>(got);
+  }
+  if (filled < sizeof(header)) {
+    SetError(error_message, "Invalid delta: the fixed header is truncated");
+    return false;
+  }
+  if (!LooksLikeDelta(header, sizeof(header))) {
+    SetError(error_message,
+             "Invalid delta: wrong magic (this file is not a BKPINC1 delta)");
+    return false;
+  }
+  const std::uint16_t version =
+      static_cast<std::uint16_t>(header[8] | (header[9] << 8));
+  const std::uint16_t fixed_size =
+      static_cast<std::uint16_t>(header[10] | (header[11] << 8));
+  if (version != kDeltaFormatVersion || fixed_size != kDeltaFixedHeaderSize) {
+    SetError(error_message,
+             "Invalid delta: unsupported format version or header size");
+    return false;
+  }
+  const std::uint32_t envelope_len =
+      static_cast<std::uint32_t>(header[12]) |
+      (static_cast<std::uint32_t>(header[13]) << 8) |
+      (static_cast<std::uint32_t>(header[14]) << 16) |
+      (static_cast<std::uint32_t>(header[15]) << 24);
+  std::uint64_t payload_len = 0;
+  for (int index = 0; index < 8; ++index) {
+    payload_len |= static_cast<std::uint64_t>(header[16 + index])
+                   << (8 * index);
+  }
+  if (envelope_len == 0 || envelope_len > kMaxDeltaEnvelopeBytes) {
+    SetError(error_message, "Invalid delta: implausible envelope length");
+    return false;
+  }
+  if (payload_len == 0 || !IsAllowedStreamSize(payload_len)) {
+    SetError(error_message, "Invalid delta: implausible payload length");
+    return false;
+  }
+  // 文件长度必须正好等于 header + envelope + payload：多一个字节都不接受。
+  const std::uint64_t expected =
+      static_cast<std::uint64_t>(kDeltaFixedHeaderSize) + envelope_len +
+      payload_len;
+  if (file_size != expected) {
+    SetError(error_message,
+             "Invalid delta: file size does not match the declared envelope "
+             "and payload lengths");
+    return false;
+  }
+  layout->envelope_len = envelope_len;
+  layout->payload_len = payload_len;
+  return true;
+}
+
+// 从 fd 的给定偏移读满一段字节（pread，不改文件偏移）。
+bool ReadExactlyAt(int fd, std::uint64_t offset, void* buffer, std::size_t size,
+                   std::string* error_message) {
+  unsigned char* cursor = static_cast<unsigned char*>(buffer);
+  std::size_t filled = 0;
+  while (filled < size) {
+    const ssize_t got = ::pread(fd, cursor + filled, size - filled,
+                                static_cast<off_t>(offset + filled));
+    if (got < 0) {
+      if (errno == EINTR) continue;
+      SetError(error_message, "Cannot read delta bytes: " + ErrnoText(errno));
+      return false;
+    }
+    if (got == 0) {
+      SetError(error_message, "Invalid delta: truncated while reading");
+      return false;
+    }
+    filled += static_cast<std::size_t>(got);
+  }
+  return true;
+}
+
+}  // namespace
+
 bool ReadDeltaEnvelope(const std::string& delta_file, DeltaEnvelope* envelope,
                        std::string* error_message) {
   if (envelope == nullptr) {
@@ -831,8 +931,7 @@ bool InspectDeltaPayloadHeader(const std::string& delta_file,
   }
   *header = ContainerHeader{};
   // 布局规则只有一份实现：先让 ReadDeltaEnvelope 把外层整个读一遍
-  // （magic / version / 长度自洽 / 信封自校验），这里再读 payload 的头 160
-  // 字节。
+  // （magic / version / 长度自洽 / 信封自校验），再用 ReadDeltaLayout 取偏移。
   DeltaEnvelope envelope;
   if (!ReadDeltaEnvelope(delta_file, &envelope, error_message)) return false;
 
@@ -842,58 +941,29 @@ bool InspectDeltaPayloadHeader(const std::string& delta_file,
              "Cannot open delta " + delta_file + ": " + ErrnoText(errno));
     return false;
   }
-  unsigned char fixed[kDeltaFixedHeaderSize] = {0};
-  std::size_t filled = 0;
-  while (filled < sizeof(fixed)) {
-    const ssize_t got = ::read(fd, fixed + filled, sizeof(fixed) - filled);
-    if (got < 0) {
-      if (errno == EINTR) continue;
-      const std::string text = ErrnoText(errno);
-      ::close(fd);
-      SetError(error_message, "Cannot read delta header: " + text);
-      return false;
-    }
-    if (got == 0) break;
-    filled += static_cast<std::size_t>(got);
-  }
-  if (filled != sizeof(fixed)) {
-    ::close(fd);
-    SetError(error_message, "Invalid delta: the fixed header is truncated");
-    return false;
-  }
-  const std::uint32_t envelope_len =
-      static_cast<std::uint32_t>(fixed[12]) |
-      (static_cast<std::uint32_t>(fixed[13]) << 8) |
-      (static_cast<std::uint32_t>(fixed[14]) << 16) |
-      (static_cast<std::uint32_t>(fixed[15]) << 24);
-  if (::lseek(fd, static_cast<off_t>(kDeltaFixedHeaderSize + envelope_len),
-              SEEK_SET) < 0) {
+  struct stat info;
+  if (::fstat(fd, &info) != 0) {
     const std::string text = ErrnoText(errno);
     ::close(fd);
-    SetError(error_message, "Cannot seek to the delta payload: " + text);
+    SetError(error_message, "Cannot stat delta: " + text);
+    return false;
+  }
+  DeltaLayout layout;
+  if (!ReadDeltaLayout(fd, static_cast<std::uint64_t>(info.st_size), &layout,
+                       error_message)) {
+    ::close(fd);
     return false;
   }
   unsigned char block[container_v2::kHeaderSize] = {0};
-  filled = 0;
-  while (filled < sizeof(block)) {
-    const ssize_t got = ::read(fd, block + filled, sizeof(block) - filled);
-    if (got < 0) {
-      if (errno == EINTR) continue;
-      const std::string text = ErrnoText(errno);
-      ::close(fd);
-      SetError(error_message, "Cannot read the delta payload header: " + text);
-      return false;
-    }
-    if (got == 0) break;
-    filled += static_cast<std::size_t>(got);
+  if (!ReadExactlyAt(fd,
+                     static_cast<std::uint64_t>(kDeltaFixedHeaderSize) +
+                         layout.envelope_len,
+                     block, sizeof(block), error_message)) {
+    ::close(fd);
+    return false;
   }
   if (::close(fd) != 0) {
     SetError(error_message, "Cannot close delta: " + ErrnoText(errno));
-    return false;
-  }
-  if (filled != sizeof(block)) {
-    SetError(error_message,
-             "Invalid delta: the inner container header is truncated");
     return false;
   }
   return DecodeContainerHeader(block, sizeof(block), header, error_message);
@@ -901,26 +971,111 @@ bool InspectDeltaPayloadHeader(const std::string& delta_file,
 
 bool VerifyDeltaPayload(const std::string& delta_file,
                         std::string* error_message) {
+  // 1) 信封：布局、字段边界、自身摘要（ReadDeltaEnvelope 内部全做）。
   DeltaEnvelope envelope;
   if (!ReadDeltaEnvelope(delta_file, &envelope, error_message)) return false;
 
-  std::vector<ArchiveEntry> ignored;
-  (void)ignored;
-
-  // payload 必须存在、长度一致、摘要一致。内层 container 自己的 header 与
-  // payload 一致性由 v2 的解码器负责，这里先把"外层说了什么就得到什么"验完。
-  const std::string temp = UniqueSiblingPath(delta_file, ".verify");
-  if (!ExtractDeltaPayload(delta_file, temp, error_message)) return false;
-  std::string digest;
-  if (!DigestOfFile(temp, &digest, error_message)) {
-    ::unlink(temp.c_str());
+  const int fd = ::open(delta_file.c_str(), O_RDONLY | O_CLOEXEC);
+  if (fd < 0) {
+    SetError(error_message,
+             "Cannot open delta " + delta_file + ": " + ErrnoText(errno));
     return false;
   }
-  ::unlink(temp.c_str());
-  if (digest != envelope.payload_sha256) {
-    SetError(error_message,
-             "Invalid delta: the payload digest does not match the envelope");
+  struct stat info;
+  if (::fstat(fd, &info) != 0) {
+    const std::string text = ErrnoText(errno);
+    ::close(fd);
+    SetError(error_message, "Cannot stat delta: " + text);
     return false;
+  }
+  DeltaLayout layout;
+  if (!ReadDeltaLayout(fd, static_cast<std::uint64_t>(info.st_size), &layout,
+                       error_message)) {
+    ::close(fd);
+    return false;
+  }
+
+  // 2) **实际 payload 字节**的 SHA-256 必须等于信封声明的 payload_sha256。
+  //    就地流式读，不落任何临时文件：这一步是"身份可信"的前提，不是可选装饰。
+  const std::uint64_t payload_offset =
+      static_cast<std::uint64_t>(kDeltaFixedHeaderSize) + layout.envelope_len;
+  crypto::Sha256 sha;
+  std::vector<unsigned char> buffer(64u * 1024u);
+  std::uint64_t offset = 0;
+  while (offset < layout.payload_len) {
+    const std::uint64_t remaining = layout.payload_len - offset;
+    const std::size_t want = static_cast<std::size_t>(
+        remaining < buffer.size() ? remaining : buffer.size());
+    const ssize_t got = ::pread(fd, buffer.data(), want,
+                                static_cast<off_t>(payload_offset + offset));
+    if (got < 0) {
+      if (errno == EINTR) continue;
+      const std::string text = ErrnoText(errno);
+      ::close(fd);
+      SetError(error_message, "Cannot read delta payload: " + text);
+      return false;
+    }
+    if (got == 0) {
+      ::close(fd);
+      SetError(error_message, "Invalid delta: the payload is truncated");
+      return false;
+    }
+    sha.Update(buffer.data(), static_cast<std::size_t>(got));
+    offset += static_cast<std::uint64_t>(got);
+  }
+  unsigned char digest[crypto::kSha256DigestSize];
+  sha.Final(digest);
+  const std::string actual = crypto::ToHex(digest, crypto::kSha256DigestSize);
+  if (actual != envelope.payload_sha256) {
+    ::close(fd);
+    SetError(error_message,
+             "Delta payload checksum mismatch: the actual payload bytes do not "
+             "match the digest declared in the envelope (" +
+                 delta_file + ")");
+    return false;
+  }
+
+  // 3) 内层 container 自己也要自洽：header 可解码，而且它的长度正好等于
+  //    这份 payload 的长度（payload 就是那个 container，一个字节都不多不少）。
+  unsigned char header_block[container_v2::kHeaderSize] = {0};
+  if (!ReadExactlyAt(fd, payload_offset, header_block, sizeof(header_block),
+                     error_message)) {
+    ::close(fd);
+    return false;
+  }
+  ContainerHeader header;
+  if (!DecodeContainerHeader(header_block, sizeof(header_block), &header,
+                             error_message)) {
+    ::close(fd);
+    return false;
+  }
+  if (static_cast<std::uint64_t>(container_v2::kHeaderSize) +
+          header.payload_size !=
+      layout.payload_len) {
+    ::close(fd);
+    SetError(error_message,
+             "Invalid delta: the inner container length does not match the "
+             "delta payload length");
+    return false;
+  }
+  if (::close(fd) != 0) {
+    SetError(error_message, "Cannot close delta: " + ErrnoText(errno));
+    return false;
+  }
+  return true;
+}
+
+bool VerifyFullSnapshotPayload(const std::string& container_file,
+                               std::string* payload_sha256_hex,
+                               std::string* error_message) {
+  ContainerHeader header;
+  if (!VerifyContainerPayloadBytes(container_file, &header, error_message)) {
+    return false;
+  }
+  if (payload_sha256_hex != nullptr) {
+    *payload_sha256_hex = crypto::ToHex(
+        reinterpret_cast<const unsigned char*>(header.payload_sha256.data()),
+        header.payload_sha256.size());
   }
   return true;
 }

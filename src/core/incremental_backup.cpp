@@ -669,11 +669,11 @@ bool ReadIdentityRecord(const std::string& repository_directory,
 
 }  // namespace
 
-bool LoadSnapshotIdentity(const std::string& repository_directory,
-                          const std::string& snapshot_file_name,
-                          SnapshotIdentity* identity,
-                          std::vector<ManifestEntry>* manifest_entries,
-                          std::string* error_message) {
+bool LoadVerifiedSnapshotIdentity(const std::string& repository_directory,
+                                  const std::string& snapshot_file_name,
+                                  SnapshotIdentity* identity,
+                                  std::vector<ManifestEntry>* manifest_entries,
+                                  std::string* error_message) {
   if (identity == nullptr) {
     SetError(error_message, "Snapshot identity output must not be null");
     return false;
@@ -698,6 +698,17 @@ bool LoadSnapshotIdentity(const std::string& repository_directory,
     }
     return false;
   }
+  // ---- 实际字节验证：身份只有在这一步之后才算成立 ----
+  //
+  // 只读 header / 只解析信封拿到的是**声明值**：把 payload 换掉（header 与信封
+  // 都不动）它照样成立，而"照样成立"正是 stale/broken 快照被当成可信身份的
+  // 来源。所以先证明磁盘上的实际 payload 字节与声明一致，再谈身份。
+  if (identity->kind == SnapshotFileKind::kDelta) {
+    if (!VerifyDeltaPayload(path, error_message)) return false;
+  } else if (!VerifyFullSnapshotPayload(path, &identity->payload_sha256,
+                                        error_message)) {
+    return false;
+  }
   if (!SnapshotIdOfFile(path, &identity->snapshot_id, error_message)) {
     return false;
   }
@@ -705,6 +716,8 @@ bool LoadSnapshotIdentity(const std::string& repository_directory,
     if (!ReadDeltaEnvelope(path, &identity->envelope, error_message)) {
       return false;
     }
+    // 上一步已经证明实际 payload 就是这个摘要。
+    identity->payload_sha256 = identity->envelope.payload_sha256;
     identity->parent_file_name = identity->envelope.parent_file_name;
     identity->parent_snapshot_id = identity->envelope.parent_snapshot_id;
     identity->parent_manifest_digest =
@@ -809,8 +822,8 @@ bool FindIncrementalBaseline(const std::string& repository_directory,
     // 副文件"能骗过去的路径。
     SnapshotIdentity identity;
     std::string load_error;
-    if (!LoadSnapshotIdentity(repository_directory, name, &identity, nullptr,
-                              &load_error)) {
+    if (!LoadVerifiedSnapshotIdentity(repository_directory, name, &identity,
+                                      nullptr, &load_error)) {
       continue;
     }
     if (!identity.sidecars_verified) {
@@ -932,36 +945,86 @@ bool PlanDependencyAwareRetention(
     plan->keep_visible.push_back(candidates_oldest_first[index]);
   }
 
-  // 依赖闭包：从可见集合出发，沿 parent 往上走，只认候选集合里的名字。
-  // visited 兼作环保护：坏链最多让某个名字被访问一次。
+  const auto is_candidate =
+      [&candidates_oldest_first](const std::string& name) {
+        return std::find(candidates_oldest_first.begin(),
+                         candidates_oldest_first.end(),
+                         name) != candidates_oldest_first.end();
+      };
+
+  // ---- 依赖闭包：从可见集合出发，沿 parent 往上走 ----
+  //
+  // 每一步都走 **LoadVerifiedSnapshotIdentity**（实际字节 +
+  // 副文件绑定都验过），
+  // 而不是"读得出来就算数"。只要有一个必须保留的点没法把依赖链完整走完——
+  // 自己坏了、payload 与声明不符、父缺失、父的绑定无效、成环——就进入
+  // fail-closed：remove 清空，这一轮什么都不淘汰。
+  //
+  // 理由：那种情况下"哪些更老的候选可能是它的祖先"没有答案，而删除不可逆。
+  // 宁可不回收，也不删掉一条恢复链的祖先。
   std::vector<std::string> keep = plan->keep_visible;
-  std::vector<std::string> visited = keep;
-  for (std::size_t cursor = 0; cursor < keep.size(); ++cursor) {
-    const std::string current = keep[cursor];
-    std::string parent;
-    std::string read_error;
-    if (!SnapshotParentOf(repository_directory, current, &parent,
-                          &read_error)) {
-      // 读不出这一份的依赖：保守地保留它（它本来就在 keep 里），
-      // 但不再往上走。整份计划不会因此失败 —— 只因为它读不出来就拒绝
-      // 淘汰**其它**无关的旧快照，会让仓库无上限增长，而那不是安全，
-      // 只是把问题推给下一轮。
+  std::vector<std::string> traversal = plan->keep_visible;
+  std::vector<std::string> visited = traversal;
+  std::map<std::string, std::string> parent_of;
+  bool uncertain = false;
+  for (std::size_t cursor = 0; cursor < traversal.size() && !uncertain;
+       ++cursor) {
+    const std::string current = traversal[cursor];
+    SnapshotIdentity identity;
+    std::string verify_error;
+    if (!LoadVerifiedSnapshotIdentity(repository_directory, current, &identity,
+                                      nullptr, &verify_error)) {
       plan->unreadable.push_back(current);
-      continue;
+      uncertain = true;
+      plan->uncertainty_reason =
+          "the dependency chain cannot be verified at '" + current +
+          "': " + verify_error;
+      break;
     }
-    if (parent.empty()) continue;
-    if (std::find(candidates_oldest_first.begin(),
-                  candidates_oldest_first.end(),
-                  parent) == candidates_oldest_first.end()) {
-      // 祖先不归本计划管理：不动它，也不需要继续往上走。
-      continue;
-    }
+    if (identity.parent_file_name.empty()) continue;  // 完整快照 = 链底
+    const std::string parent = identity.parent_file_name;
+    parent_of[current] = parent;
     if (std::find(visited.begin(), visited.end(), parent) != visited.end()) {
+      // 已经走过（菱形依赖）或者成环：环在下面的深度检查里被抓住。
       continue;
     }
     visited.push_back(parent);
-    keep.push_back(parent);
-    plan->keep_ancestors.push_back(parent);
+    traversal.push_back(parent);
+    if (is_candidate(parent) &&
+        std::find(keep.begin(), keep.end(), parent) == keep.end()) {
+      keep.push_back(parent);
+      plan->keep_ancestors.push_back(parent);
+    }
+  }
+
+  // 深度/成环检查：每一条走过的链都必须在 kMaxDeltaChainDepth 步内到达链底。
+  // 只靠 visited 去重会把环"走成一条有限的路"，那样祖先集合就是错的。
+  if (!uncertain) {
+    for (const std::string& start : traversal) {
+      std::string node = start;
+      std::size_t steps = 0;
+      while (true) {
+        const auto found = parent_of.find(node);
+        if (found == parent_of.end()) break;  // 走到没记过的一跳 = 到顶
+        if (found->second.empty()) break;     // 完整快照
+        if (++steps > kMaxDeltaChainDepth) {
+          uncertain = true;
+          plan->uncertainty_reason =
+              "the dependency chain through '" + start +
+              "' is longer than the supported depth or contains a cycle";
+          break;
+        }
+        node = found->second;
+      }
+      if (uncertain) break;
+    }
+  }
+
+  if (uncertain) {
+    // fail closed：remove 保持为空。
+    plan->dependency_uncertain = true;
+    plan->remove.clear();
+    return true;
   }
 
   for (const std::string& name : candidates_oldest_first) {
@@ -1046,7 +1109,7 @@ bool RunIncrementalBackup(const std::string& source_directory,
     SnapshotIdentity identity;
     std::string load_error;
     std::vector<ManifestEntry> loaded;
-    const bool loaded_ok = LoadSnapshotIdentity(
+    const bool loaded_ok = LoadVerifiedSnapshotIdentity(
         repository_directory, baseline, &identity, &loaded, &load_error);
     bool usable =
         loaded_ok && identity.sidecars_verified &&
@@ -1293,23 +1356,30 @@ namespace {
 constexpr const char* kManifestSuffix = ".manifest";
 constexpr const char* kIdentitySuffix = ".identity";
 
-// name 是不是某一份快照的副文件名；是的话把主文件名写进 *base。
+// name 是不是**本项目的**一份快照的副文件名；是的话把主文件名写进 *base。
+//
+// 只认后缀是不够的：那样 notes.manifest / report.identity 这种普通用户文件
+// 只要没有同名 base 就会被当成孤儿删掉——而仓库的边界是"只管自己的 backup
+// artifacts"。所以剥掉后缀之后，base 还必须过 BackupCatalog 的唯一命名规则
+// （单组件 + .bak 结尾）。
 bool SplitSidecarName(const std::string& name, std::string* base) {
   const std::size_t manifest_len = ::strlen(kManifestSuffix);
   const std::size_t identity_len = ::strlen(kIdentitySuffix);
+  std::string candidate;
   if (name.size() > manifest_len &&
       name.compare(name.size() - manifest_len, manifest_len, kManifestSuffix) ==
           0) {
-    *base = name.substr(0, name.size() - manifest_len);
-    return true;
+    candidate = name.substr(0, name.size() - manifest_len);
+  } else if (name.size() > identity_len &&
+             name.compare(name.size() - identity_len, identity_len,
+                          kIdentitySuffix) == 0) {
+    candidate = name.substr(0, name.size() - identity_len);
+  } else {
+    return false;
   }
-  if (name.size() > identity_len &&
-      name.compare(name.size() - identity_len, identity_len, kIdentitySuffix) ==
-          0) {
-    *base = name.substr(0, name.size() - identity_len);
-    return true;
-  }
-  return false;
+  if (!IsManagedBackupFileName(candidate)) return false;
+  *base = candidate;
+  return true;
 }
 
 // 主文件还在吗（直接子项、普通文件、非软链接）。
@@ -1339,7 +1409,23 @@ bool FindOrphanSidecars(const std::string& repository_directory,
                                 repository_directory + ": " + ErrnoText(errno));
     return false;
   }
-  while (struct dirent* item = ::readdir(raw)) {
+  while (true) {
+    // readdir 用 nullptr 同时表示"读完"和"出错"，只能靠 errno 区分：把读错误
+    // 当 EOF 会让一次扫描悄悄漏掉一部分副文件（甚至把该清理的当成不存在）。
+    errno = 0;
+    struct dirent* item = ::readdir(raw);
+    if (item == nullptr) {
+      if (errno != 0) {
+        const std::string text = ErrnoText(errno);
+        ::closedir(raw);
+        SetError(error_message,
+                 "Cannot read the repository directory while looking for "
+                 "orphan sidecars: " +
+                     text);
+        return false;
+      }
+      break;
+    }
     const std::string name = item->d_name;
     if (name == "." || name == "..") continue;
     std::string base;
