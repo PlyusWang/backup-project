@@ -378,9 +378,9 @@ bool ScheduledBackupService::RunRetention(ScheduleDocument* document,
       if (failed != nullptr && removed.empty()) {
         *failed += static_cast<std::uint64_t>(to_remove.size());
       }
-      SetError(error_message,
-               "Failed to remove the oldest scheduled snapshots: " +
-                   delete_error);
+      SetError(
+          error_message,
+          "Failed to remove the oldest scheduled snapshots: " + delete_error);
       return false;
     }
   }
@@ -396,8 +396,7 @@ bool ScheduledBackupService::RunRetention(ScheduleDocument* document,
                              &sidecar_diagnostics, &cleanup_error)) {
       if (failed != nullptr) *failed += 1;
       SetError(error_message,
-               "Failed to clean up orphan snapshot sidecars: " +
-                   cleanup_error);
+               "Failed to clean up orphan snapshot sidecars: " + cleanup_error);
       return false;
     }
     if (failed != nullptr) {

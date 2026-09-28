@@ -184,7 +184,8 @@ bool InspectDeltaPayloadHeader(const std::string& delta_file,
 //
 // parent_file_name：非空、单组件、不是 "." / ".."、不含 '/' 或 '\\' 或 NUL，
 //   且以 .bak 结尾——与 BackupCatalog 管理的备份文件名同一条边界。
-// tombstone：先复用 IsValidArchivePath，再额外拒绝 "."（源根永远不能被 tombstone
+// tombstone：先复用 IsValidArchivePath，再额外拒绝 "."（源根永远不能被
+// tombstone
 //   删掉）。绝对路径、'..' 组件、空组件、反斜杠、盘符、结尾 '/'、NUL 全部
 //   在 IsValidArchivePath 里就已经被拒。
 bool IsValidDeltaParentFileName(const std::string& name,

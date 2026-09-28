@@ -7,8 +7,8 @@
 #include <sys/stat.h>
 #include <sys/types.h>
 
-#include <cerrno>
 #include <cctype>
+#include <cerrno>
 #include <cstring>
 
 namespace backupproject {
@@ -253,9 +253,9 @@ bool ResolveUnderRootNoSymlinkAncestors(const std::string& root,
     // 中间组件必须是真实目录。软链接单独报一句：那正是这条检查存在的理由。
     if (!S_ISDIR(info.st_mode)) {
       if (S_ISLNK(info.st_mode)) {
-        SetError(error_message,
-                 "Refusing to follow a symlink inside the staging tree: " +
-                     current);
+        SetError(
+            error_message,
+            "Refusing to follow a symlink inside the staging tree: " + current);
       } else {
         SetError(error_message,
                  "A path component is not a directory: " + current);
