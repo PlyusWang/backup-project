@@ -115,6 +115,11 @@ struct IncrementalOutcome {
 // 全部来自文件本身与它自己的两个副文件，没有一处来自"调用方说的"。
 // 完整快照与 delta 都通过它：链上的每一跳都用同一个函数核对，不存在
 // "full 一套、delta 另一套"的分叉。
+//
+// "真实"的含义是**实际字节**：只有在磁盘上的 payload 字节被验证成与归档自己
+// 声明的摘要一致之后，这份身份才算成立。只读 header /
+// 只解析信封拿到的是声明值， 换掉 payload 之后它照样成立——那正是"stale/broken
+// 快照被当作可信身份"的来源。
 struct SnapshotIdentity {
   // 单组件文件名与解析出来的绝对路径。
   std::string snapshot_file_name;
@@ -123,6 +128,10 @@ struct SnapshotIdentity {
 
   // 归档内容的身份（完整快照由容器 payload 摘要派生；delta 是信封自校验摘要）。
   std::string snapshot_id;
+  // **实际** payload 字节的 SHA-256（十六进制）。完整快照来自"验证通过的
+  // 容器 payload"；delta 来自"验证通过的信封
+  // payload_sha256"（两者相等才成立）。
+  std::string payload_sha256;
   // 这份快照对应源树的 manifest 摘要。完整快照来自身份副文件；delta 还额外要求
   // 它与信封里的 current_manifest_digest 一致。
   std::string manifest_digest;
@@ -149,22 +158,36 @@ struct SnapshotIdentity {
   std::string sidecar_diagnostic;
 };
 
-// 读取一份快照的真实身份。
+// 读取一份快照的**已验证**身份：这是所有信任判断的唯一入口。
 //
-// 返回 false 只有一种情况：这个文件名不是仓库的直接子项、不是普通文件、
-// 或者归档本身读不出来（这时 error_message 是原因）。
-// 副文件缺失 / 版本旧 / 与磁盘事实对不上**不算**失败：返回 true，但
+//   baseline 发现 / 依赖链解析 / retention 计划 / 删除安全性
+//
+// 都只通过它拿身份，不再各走一套"只看声明"的 helper。
+//
+// 顺序是硬的：
+//   1.
+//   文件名必须是仓库的直接子项、普通文件、非符号链接（BackupCatalog::Resolve）；
+//   2. delta：ReadDeltaEnvelope（信封布局 + 字段边界 + 自摘要）
+//      → VerifyDeltaPayload（**实际 payload 字节**的 SHA-256
+//      必须等于信封声明值） → 才认 snapshot_id / payload_sha256；
+//      完整快照：VerifyFullSnapshotPayload（实际 payload 区 == header 声明值，
+//      且文件长度与 header 自洽）→ 才认身份；
+//   3. 两个副文件必须与磁盘事实逐项对上（sidecars_verified）。
+//
+// 返回 false 表示"这份文件不能作为可信身份使用"：字节对不上、归档读不出来、
+// 或者名字不是仓库的直接子项。此时 error_message 是原因。
+// 副文件缺失 / 版本旧 / 与磁盘事实对不上**不算**这种失败：返回 true，但
 // sidecars_verified = false，原因在 sidecar_diagnostic 里。调用方据此决定
 // "跳过这一份，去建新基线"还是"拒绝这条链"。
 //
 // manifest_entries 可以为空指针。非空时，只有在两个副文件都验证通过之后才会
 // 填入 manifest 条目——调用方拿到的条目与"已验证的归属"是同一份，不存在
 // "先读条目、再验归属"的中间窗口。
-bool LoadSnapshotIdentity(const std::string& repository_directory,
-                          const std::string& snapshot_file_name,
-                          SnapshotIdentity* identity,
-                          std::vector<ManifestEntry>* manifest_entries,
-                          std::string* error_message);
+bool LoadVerifiedSnapshotIdentity(const std::string& repository_directory,
+                                  const std::string& snapshot_file_name,
+                                  SnapshotIdentity* identity,
+                                  std::vector<ManifestEntry>* manifest_entries,
+                                  std::string* error_message);
 
 // 在仓库里找"当前可以当作基线的快照"：按文件名倒序找第一份两个副文件都在、
 // 都验证通过、身份又与给定值一致的快照。
@@ -262,9 +285,18 @@ struct RetentionPlan {
   // 读不出依赖关系的快照（坏文件、或者根本不是本产品的快照）。
   //
   // 它们一律**不删**：读不出依赖就证明不了"删它不会断链"，而删除是不可逆的。
-  // 但也不再往上走——连它自己都读不出来，它的祖先是谁无从得知。如实记下来，
-  // 让调用方报出去，而不是替用户猜一个删除集合。
+  // 如实记下来，让调用方报出去，而不是替用户猜一个删除集合。
   std::vector<std::string> unreadable;
+
+  // 依赖不确定性（本轮新增的 fail-closed 语义）。
+  //
+  // 只要**任何一个必须保留的点**的依赖链无法完整解析——它自己读不出来、父缺失、
+  // 父的绑定无效、payload 与声明不符、成环——"哪些更老的候选可能是它的祖先"
+  // 就没有答案。此时 remove 一定是空的：宁可这一轮什么都不淘汰，也不删掉一个
+  // 可能是某条恢复链祖先的快照。
+  bool dependency_uncertain = false;
+  // 为什么不确定（面向人的一句话，调用方原样报出去）。
+  std::string uncertainty_reason;
 };
 
 // candidates 按**最旧在前**给出（调用方原本的 retention 顺序）。
@@ -275,7 +307,12 @@ bool PlanDependencyAwareRetention(
     const std::vector<std::string>& candidates_oldest_first,
     std::size_t retain_count, RetentionPlan* plan, std::string* error_message);
 
-// 一份快照的父快照文件名；完整归档返回空串。读不出来时返回 false。
+// 一份快照的**声明**父快照文件名；完整归档返回空串。读不出来时返回 false。
+//
+// 只读信封（信封本身自带摘要，所以它至少是自洽的）。用途仅限"谁声称依赖谁"
+// 这类**图的形状**问题：删除安全性要知道某个候选有没有后代，只需要边，不需要
+// 那份快照的 payload 字节。任何"把这份文件当成 baseline / parent / 恢复链成员"
+// 的判断都不许用它，必须走 LoadVerifiedSnapshotIdentity。
 bool SnapshotParentOf(const std::string& repository_directory,
                       const std::string& snapshot_file_name,
                       std::string* parent_file_name,

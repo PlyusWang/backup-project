@@ -456,8 +456,8 @@ bool ResolveSnapshotChain(const std::string& repository_directory,
 
     SnapshotIdentity identity;
     std::string identity_error;
-    if (!LoadSnapshotIdentity(repository_directory, current, &identity, nullptr,
-                              &identity_error)) {
+    if (!LoadVerifiedSnapshotIdentity(repository_directory, current, &identity,
+                                      nullptr, &identity_error)) {
       SetError(error_message, identity_error.empty()
                                   ? "Unknown snapshot file: " + current
                                   : identity_error);

@@ -201,10 +201,15 @@ bool IsValidDeltaTombstone(const std::string& path, std::string* error_message);
 //
 // 这样父绑定就不只是"文件名"：同名文件被换成另一份归档时，父身份立刻对不上。
 // 它不需要密码（容器 header 本来就是"未知密码也能读"的），也不改 v2 格式。
+//
+// 注意它读的是 header 里的**声明值**：这是"廉价身份"，只适合展示与快速分类，
+// 不足以支撑信任判断。任何 baseline / parent / 恢复链成员的身份都必须走
+// LoadVerifiedSnapshotIdentity（先证明实际 payload 字节与声明一致）。
 bool FullSnapshotId(const std::string& container_file, std::string* id,
                     std::string* error_message);
 
-// 任意快照文件（delta 或完整归档）的身份。kUnknown 时返回 false。
+// 任意快照文件（delta 或完整归档）的**声明**身份。kUnknown 时返回 false。
+// 与 FullSnapshotId 同样的边界：展示用，信任判断不用它。
 bool SnapshotIdOfFile(const std::string& path, std::string* id,
                       std::string* error_message);
 
@@ -217,10 +222,22 @@ enum class SnapshotFileKind { kUnknown, kDelta, kContainer };
 SnapshotFileKind ClassifySnapshotFile(const std::string& path,
                                       std::string* error_message);
 
-// 校验 payload：长度、SHA-256、内层 container 的 header 与 payload 自洽。
-// 不需要密码的部分都在这里；HMAC 认证仍然由容器自己的恢复路径负责。
+// 校验 payload：布局、**实际 payload 字节的
+// SHA-256（就地流式，不落临时文件）**、 以及内层 container 的 header 与 payload
+// 长度自洽。不需要密码的部分都在这里； HMAC 认证仍然由容器自己的恢复路径负责。
 bool VerifyDeltaPayload(const std::string& delta_file,
                         std::string* error_message);
+
+// 验证一份**完整快照**的实际 payload 字节（复用 v2 容器自己的完整性规则：
+// header 可解码、文件长度 == 160 + payload_size、实际 payload 区的 SHA-256 ==
+// header 声明的 payload_sha256），成功时把那个摘要以十六进制带出来。
+//
+// 它是 "actual archive-byte identity" 在完整快照这一侧的唯一入口：
+// payload_sha256_hex 是**验证过的实际字节**的摘要，不是 header 里的声明值
+// （两者相等才算成功）。加密容器同样适用——这一层不需要密码，HMAC 仍归恢复路径。
+bool VerifyFullSnapshotPayload(const std::string& container_file,
+                               std::string* payload_sha256_hex,
+                               std::string* error_message);
 
 }  // namespace backupproject
 
