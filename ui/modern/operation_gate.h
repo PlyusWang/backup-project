@@ -46,6 +46,10 @@ class OperationGate {
     kScheduleConfig,
     // 后台评估：写归档 + manifest + schedule.json。
     kScheduleEvaluation,
+    // 保存 / 启停实时备份：写 realtime.json。
+    kRealtimeConfig,
+    // 后台实时触发评估：写归档 + .realtime marker + 淘汰旧实时快照。
+    kRealtimeEvaluation,
   };
 
   // 给人看的名字，用于状态栏里那句"XX 正在运行"。

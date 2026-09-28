@@ -56,6 +56,8 @@ ApplicationWindow {
             controller.dismissPageStatus("settings")
         else if (pageIndex === 2)
             schedule.clearStatus()
+        else if (pageIndex === 5)
+            realtime.clearStatus()
     }
 
     onCurrentPageChanged: {
@@ -184,6 +186,15 @@ ApplicationWindow {
                         checked: root.currentPage === 2
                         onClicked: root.currentPage = 2
                     }
+                    // 实时备份同样是独立页面：它有自己的源目录、合并窗口与
+                    // 实时快照列表，不是"备份"页上的一个开关。
+                    NavItem {
+                        Layout.fillWidth: true
+                        text: "实时备份"
+                        iconName: "refresh"
+                        checked: root.currentPage === 5
+                        onClicked: root.currentPage = 5
+                    }
                     // 恢复不再是独立页面：它是"备份管理"里的一个动作，
                     // 与课程设计里的"备份 / 管理备份数据 / 备份设置"结构一致。
                     NavItem {
@@ -246,6 +257,11 @@ ApplicationWindow {
 
                 SettingsPage {
                     opacity: root.currentPage === 4 ? 1 : 0
+                    Behavior on opacity { NumberAnimation { duration: 150; easing.type: Easing.OutCubic } }
+                }
+
+                RealtimePage {
+                    opacity: root.currentPage === 5 ? 1 : 0
                     Behavior on opacity { NumberAnimation { duration: 150; easing.type: Easing.OutCubic } }
                 }
             }
