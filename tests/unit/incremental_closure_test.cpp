@@ -141,8 +141,8 @@ bool ChainedEnvelope(const std::string& repository, const std::string& source,
                      const std::string& baseline_name,
                      bp::DeltaEnvelope* envelope, std::string* error) {
   bp::SnapshotIdentity parent;
-  if (!bp::LoadSnapshotIdentity(repository, baseline_name, &parent, nullptr,
-                                error)) {
+  if (!bp::LoadVerifiedSnapshotIdentity(repository, baseline_name, &parent,
+                                        nullptr, error)) {
     return false;
   }
   if (!parent.sidecars_verified) {
@@ -983,6 +983,271 @@ int main() {
                         "INC-C ENC 拒绝理由说明信封未被认证", error);
     test_support::Check(!test_support::Exists(destination),
                         "INC-C ENC 拒绝时不留下目标目录");
+  }
+
+
+  // ---- C10：身份必须来自"实际归档字节" ----
+  test_support::Section("INC-C 10. actual archive bytes 验证");
+  {
+    const std::string work = test_support::FreshDir("inc-closure-bytes");
+    const std::string source = work + "/src";
+    const std::string repository = work + "/repo";
+    test_support::Mkdir(source, 0755);
+    test_support::Mkdir(repository, 0755);
+    test_support::WriteFile(source + "/a.txt", "AAAA", 0644);
+    bp::IncrementalOutcome outcome;
+    std::string error;
+    test_support::Check(RunIncremental(source, repository, "base.bak", "",
+                                       &outcome, &error),
+                        "INC-C BYTES 基线建立成功", error);
+    test_support::WriteFile(source + "/a.txt", "BBBB", 0644);
+    error.clear();
+    test_support::Check(RunIncremental(source, repository, "d1.bak", "base.bak",
+                                       &outcome, &error) &&
+                            outcome.kind == bp::IncrementalOutcome::Kind::kDelta,
+                        "INC-C BYTES 写出 d1", error);
+
+    // 造一份**同样长度、内容不同**的合法内层 container：同一棵树、同样的
+    // 路径集合与内容长度，只把源文件的 mtime 挪一下（mtime 是定长字段）。
+    struct stat before;
+    test_support::Check(test_support::StatOf(source + "/a.txt", &before),
+                        "INC-C BYTES 取到 mtime");
+    test_support::Check(
+        test_support::SetTimes(source + "/a.txt",
+                               static_cast<std::int64_t>(before.st_mtim.tv_sec) + 5,
+                               static_cast<std::uint32_t>(before.st_mtim.tv_nsec)),
+        "INC-C BYTES 挪动 mtime");
+    bp::Filter filter;
+    std::vector<bp::ArchiveEntry> entries;
+    error.clear();
+    test_support::Check(bp::ScanSourceTree(source, &filter, &entries, &error),
+                        "INC-C BYTES 重新扫描", error);
+    const std::string replacement = work + "/replacement.bak";
+    bp::BackupOptions options;
+    error.clear();
+    test_support::Check(bp::RunBackupPipelineFromEntries(entries, replacement,
+                                                         options, &error),
+                        "INC-C BYTES 造出替换用的合法 container", error);
+
+    std::string original;
+    std::string payload;
+    test_support::Check(test_support::ReadFile(repository + "/d1.bak", &original) &&
+                            test_support::ReadFile(replacement, &payload),
+                        "INC-C BYTES 读入两份字节");
+    test_support::Check(original.size() > payload.size(),
+                        "INC-C BYTES 替换件不比整个 delta 长");
+    const std::size_t offset = original.size() - payload.size();
+    const std::string spliced = original.substr(0, offset) + payload;
+    test_support::Check(spliced.size() == original.size(),
+                        "INC-C BYTES-01 替换后文件长度不变（只换 payload）");
+    test_support::Check(test_support::WriteFile(repository + "/d1.bak", spliced,
+                                                0640),
+                        "INC-C BYTES-01 就地换掉 d1 的 payload（信封与副文件不动）");
+
+    // 声明身份照旧成立——这正是旧行为会把它当成可信身份的原因。
+    std::string declared;
+    error.clear();
+    test_support::Check(bp::SnapshotIdOfFile(repository + "/d1.bak", &declared,
+                                             &error) &&
+                            bp::IsContentDigest(declared),
+                        "INC-C BYTES-01 声明身份仍然读得出来（旧路径只信它）",
+                        error);
+    bp::SnapshotIdentity identity;
+    error.clear();
+    test_support::Check(!bp::LoadVerifiedSnapshotIdentity(
+                            repository, "d1.bak", &identity, nullptr, &error),
+                        "INC-C BYTES-01 判别：实际字节对不上 -> 身份验证失败",
+                        error);
+    test_support::Check(error.find("payload") != std::string::npos,
+                        "INC-C BYTES-01 拒绝理由点名 payload 摘要", error);
+
+    // baseline 发现与恢复都必须拒绝它。
+    std::string baseline;
+    std::string reason;
+    error.clear();
+    test_support::Check(
+        bp::FindIncrementalBaseline(
+            repository, source, bp::RepositoryIdentity(repository),
+            bp::FilterIdentityDigest({}, {}),
+            bp::StrategyIdentityDigest(bp::PackMethod::kMyPack,
+                                       bp::CompressionMethod::kNone,
+                                       bp::EncryptionMethod::kNone),
+            &baseline, &reason) &&
+            baseline == "base.bak",
+        "INC-C BYTES-01 判别：被换过 payload 的 delta 不会被当成基线",
+        baseline);
+    bp::RestoreOptions restore_options;
+    bp::RestoreReport report;
+    const std::string destination = work + "/restored";
+    error.clear();
+    test_support::Check(!bp::RestoreSnapshotChain(repository, "d1.bak",
+                                                  destination, restore_options,
+                                                  &report, &error),
+                        "INC-C BYTES-01 判别：恢复拒绝这份 delta", error);
+    test_support::Check(!test_support::Exists(destination),
+                        "INC-C BYTES-01 拒绝时不留下目标目录");
+
+    // ID-BYTES-02：payload 里翻一个 bit。
+    const std::string bit_work = test_support::FreshDir("inc-closure-bitflip");
+    const std::string bit_source = bit_work + "/src";
+    const std::string bit_repo = bit_work + "/repo";
+    test_support::Mkdir(bit_source, 0755);
+    test_support::Mkdir(bit_repo, 0755);
+    test_support::WriteFile(bit_source + "/a.txt", "AAAA", 0644);
+    error.clear();
+    test_support::Check(RunIncremental(bit_source, bit_repo, "base.bak", "",
+                                       &outcome, &error),
+                        "INC-C BYTES-02 基线建立成功", error);
+    test_support::WriteFile(bit_source + "/a.txt", "BBBB", 0644);
+    error.clear();
+    test_support::Check(RunIncremental(bit_source, bit_repo, "d1.bak",
+                                       "base.bak", &outcome, &error),
+                        "INC-C BYTES-02 写出 d1", error);
+    std::string bytes;
+    test_support::Check(test_support::ReadFile(bit_repo + "/d1.bak", &bytes),
+                        "INC-C BYTES-02 读入 d1");
+    bytes[bytes.size() - 1] = static_cast<char>(bytes[bytes.size() - 1] ^ 0x01);
+    test_support::Check(test_support::WriteFile(bit_repo + "/d1.bak", bytes, 0640),
+                        "INC-C BYTES-02 翻转 payload 的最后一个 bit");
+    error.clear();
+    test_support::Check(!bp::LoadVerifiedSnapshotIdentity(
+                            bit_repo, "d1.bak", &identity, nullptr, &error),
+                        "INC-C BYTES-02 判别：bit flip 之后身份验证失败", error);
+
+    // ID-BYTES-03：完整快照的 payload 被改，header 不变。
+    const std::string full_work = test_support::FreshDir("inc-closure-fullbyte");
+    const std::string full_source = full_work + "/src";
+    const std::string full_repo = full_work + "/repo";
+    test_support::Mkdir(full_source, 0755);
+    test_support::Mkdir(full_repo, 0755);
+    test_support::WriteFile(full_source + "/a.txt", "AAAA", 0644);
+    error.clear();
+    test_support::Check(RunIncremental(full_source, full_repo, "f0.bak", "",
+                                       &outcome, &error),
+                        "INC-C BYTES-03 写出完整快照", error);
+    std::string full_declared;
+    error.clear();
+    test_support::Check(bp::FullSnapshotId(full_repo + "/f0.bak", &full_declared,
+                                           &error),
+                        "INC-C BYTES-03 声明身份可读", error);
+    std::string full_bytes;
+    test_support::Check(test_support::ReadFile(full_repo + "/f0.bak", &full_bytes),
+                        "INC-C BYTES-03 读入完整快照");
+    full_bytes[full_bytes.size() - 1] =
+        static_cast<char>(full_bytes[full_bytes.size() - 1] ^ 0x01);
+    test_support::Check(
+        test_support::WriteFile(full_repo + "/f0.bak", full_bytes, 0640),
+        "INC-C BYTES-03 改掉 payload 的最后一个字节（header 不动）");
+    std::string still_declared;
+    error.clear();
+    test_support::Check(
+        bp::FullSnapshotId(full_repo + "/f0.bak", &still_declared, &error) &&
+            still_declared == full_declared,
+        "INC-C BYTES-03 判别：声明身份没变（旧路径看不出 payload 被改）", error);
+    error.clear();
+    test_support::Check(!bp::LoadVerifiedSnapshotIdentity(
+                            full_repo, "f0.bak", &identity, nullptr, &error),
+                        "INC-C BYTES-03 判别：实际字节验证失败", error);
+    std::string full_baseline;
+    std::string full_reason;
+    error.clear();
+    test_support::Check(
+        !bp::FindIncrementalBaseline(
+            full_repo, full_source, bp::RepositoryIdentity(full_repo),
+            bp::FilterIdentityDigest({}, {}),
+            bp::StrategyIdentityDigest(bp::PackMethod::kMyPack,
+                                       bp::CompressionMethod::kNone,
+                                       bp::EncryptionMethod::kNone),
+            &full_baseline, &full_reason),
+        "INC-C BYTES-03 判别：坏掉的完整快照不会被当成基线", full_reason);
+  }
+
+  // ---- C11：副文件归属 ----
+  test_support::Section("INC-C 11. 孤儿副文件清理只碰自己的文件");
+  {
+    const std::string work = test_support::FreshDir("inc-closure-sidecar");
+    const std::string repository = work + "/repo";
+    test_support::Mkdir(repository, 0755);
+    test_support::Check(
+        test_support::WriteFile(repository + "/notes.manifest", "user notes",
+                                0644) &&
+            test_support::WriteFile(repository + "/report.identity",
+                                    "user report", 0644),
+        "INC-C SIDE-01 放入两个与项目无关的用户文件");
+    test_support::Check(
+        test_support::WriteFile(repository + "/ghost.bak.manifest", "x", 0640) &&
+            test_support::WriteFile(repository + "/ghost.bak.identity", "y",
+                                    0640),
+        "INC-C SIDE-01 放入两个真正的孤儿副文件");
+    std::vector<std::string> orphans;
+    std::string error;
+    test_support::Check(bp::FindOrphanSidecars(repository, &orphans, &error) &&
+                            orphans.size() == 2,
+                        "INC-C SIDE-01 只认出 .bak 的副文件（2 个）",
+                        std::to_string(orphans.size()));
+    std::vector<std::string> removed;
+    std::vector<std::string> diagnostics;
+    error.clear();
+    test_support::Check(bp::CleanOrphanSidecars(repository, &removed,
+                                                &diagnostics, &error) &&
+                            removed.size() == 2 && diagnostics.empty(),
+                        "INC-C SIDE-01 清理掉那两个孤儿", error);
+    test_support::Check(test_support::Exists(repository + "/notes.manifest") &&
+                            test_support::Exists(repository + "/report.identity"),
+                        "INC-C SIDE-01 判别：无关用户文件原样保留");
+    test_support::Check(!test_support::Exists(repository +
+                                              "/ghost.bak.manifest") &&
+                            !test_support::Exists(repository +
+                                                  "/ghost.bak.identity"),
+                        "INC-C SIDE-01 自己的孤儿副文件被清掉");
+  }
+
+  // ---- C12：完整备份不做无意义的 payload 哈希 ----
+  test_support::Section("INC-C 12. Full + MyPack：没有期望摘要就不算摘要");
+  {
+    const std::string work = test_support::FreshDir("inc-closure-perf");
+    const std::string source = work + "/src";
+    const std::string repository = work + "/repo";
+    test_support::Mkdir(source, 0755);
+    test_support::Mkdir(repository, 0755);
+    std::string bulk;
+    for (int index = 0; index < 2000; ++index) bulk += "payload-line-";
+    test_support::WriteFile(source + "/bulk.txt", bulk, 0644);
+    test_support::WriteFile(source + "/small.txt", "small", 0644);
+
+    bp::Filter filter;
+    std::vector<bp::ArchiveEntry> entries;
+    std::string error;
+    test_support::Check(bp::ScanSourceTree(source, &filter, &entries, &error),
+                        "INC-C PERF 扫描源树", error);
+    bp::ResetMyPackDigestVerificationCountForTesting();
+    bp::BackupOptions options;
+    error.clear();
+    test_support::Check(bp::RunBackupPipelineFromEntries(
+                            entries, work + "/full.bak", options, &error),
+                        "INC-C PERF-01 完整备份成功", error);
+    test_support::Check(
+        bp::MyPackDigestVerificationCountForTesting() == 0,
+        "INC-C PERF-01 判别：Full + MyPack 一次 payload SHA-256 都没做",
+        std::to_string(bp::MyPackDigestVerificationCountForTesting()));
+
+    // PERF-02：增量路径必须做（每个带期望摘要的普通文件各一次）。
+    bp::IncrementalOutcome outcome;
+    error.clear();
+    test_support::Check(RunIncremental(source, repository, "base.bak", "",
+                                       &outcome, &error),
+                        "INC-C PERF-02 增量基线成功", error);
+    test_support::WriteFile(source + "/small.txt", "small-changed", 0644);
+    bp::ResetMyPackDigestVerificationCountForTesting();
+    error.clear();
+    test_support::Check(RunIncremental(source, repository, "d1.bak", "base.bak",
+                                       &outcome, &error) &&
+                            outcome.kind == bp::IncrementalOutcome::Kind::kDelta,
+                        "INC-C PERF-02 增量 delta 成功", error);
+    test_support::Check(
+        bp::MyPackDigestVerificationCountForTesting() >= 1,
+        "INC-C PERF-02 判别：增量路径照旧逐文件核对摘要",
+        std::to_string(bp::MyPackDigestVerificationCountForTesting()));
   }
 
   return test_support::Finish("incremental_closure_test");
