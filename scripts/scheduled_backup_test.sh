@@ -1599,7 +1599,10 @@ if [ "$(printenv SANITIZE || true)" = "1" ]; then
 ' ' ')"
   # application_lock_test 覆盖本轮改过的 runtime 目录判定（S_IXUSR）与
   # FileLock 的 fail-closed 路径，所以它也在 sanitizer 名单里。
-  for name in application_lock_test scheduler_core_test scheduled_backup_test terminal_secret_test backup_preview_test; do
+  #
+  # PR #18 closure 把增量五个套件也加进来：本轮改的正是 delta 解析与路径应用、
+  # 依赖链解析、manifest 与 payload 绑定、retention/delete、payload 哈希比对。
+  for name in application_lock_test scheduler_core_test scheduled_backup_test terminal_secret_test backup_preview_test incremental_manifest_test incremental_format_test incremental_restore_test incremental_retention_test incremental_crash_test incremental_closure_test; do
     if g++ -std=c++17 -g -O1 -fsanitize=address,undefined         -fno-omit-frame-pointer -I"$ROOT_DIR/include" -I"$ROOT_DIR/tests/unit"         "$ROOT_DIR/tests/unit/$name.cpp" $SAN_SOURCES         -o "$SAN_DIR/$name" >"$SAN_DIR/$name-build.log" 2>&1; then
       record_pass "G.$name 在 ASan + UBSan 下编译通过"
     else
