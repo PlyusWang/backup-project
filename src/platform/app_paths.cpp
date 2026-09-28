@@ -89,6 +89,15 @@ std::string DefaultConfigFilePath() {
   return path;
 }
 
+std::string DefaultRealtimeFilePath() {
+  std::string path;
+  std::string error;
+  if (!AppConfigFilePath(kAppRealtimeFileName, &path, &error)) {
+    return std::string();
+  }
+  return path;
+}
+
 std::string DefaultScheduleFilePath() {
   std::string path;
   std::string error;
