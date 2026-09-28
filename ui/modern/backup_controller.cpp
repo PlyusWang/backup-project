@@ -639,21 +639,38 @@ bool BackupController::startBackupWithStrategy(
               QStringLiteral("未知备份策略：%1").arg(strategy_key));
     return false;
   }
-  // 支持矩阵是唯一答案来源：界面能点到的组合与核心接受的组合必须是同一个集合。
-  if (!IsSupportedBackupMode(BackupTrigger::kManual, strategy)) {
-    SetStatus(QString::fromLatin1(kError), QStringLiteral("无法备份"),
-              QString::fromStdString(UnsupportedBackupModeReason(
-                  BackupTrigger::kManual, strategy)));
-    return false;
-  }
-  // 打包方式与策略的组合同样在启动任务之前判定，理由与 CLI 一致。
+  // 支持矩阵与选项组合是唯一答案来源：界面能点到的组合与核心接受的组合
+  // 必须是同一个集合。这一条同时盖住 programmatic call——界面把某个选项置灰
+  // 只是提示，真正的边界在这里。
   backupproject::PackMethod pack_method = backupproject::PackMethod::kMyPack;
-  if (ParsePackMethodKey(pack_key, &pack_method) &&
-      strategy == BackupStrategy::kIncremental &&
-      !backupproject::IsSupportedIncrementalPack(pack_method)) {
+  backupproject::CompressionMethod compression_method =
+      backupproject::CompressionMethod::kNone;
+  backupproject::EncryptionMethod encryption_method =
+      backupproject::EncryptionMethod::kNone;
+  const bool pack_ok = ParsePackMethodKey(pack_key, &pack_method);
+  const bool compression_ok =
+      ParseCompressionMethodKey(compression_key, &compression_method);
+  const bool encryption_ok =
+      ParseEncryptionMethodKey(encryption_key, &encryption_method);
+  if (pack_ok && compression_ok && encryption_ok) {
+    backupproject::BackupOptionCombination combination;
+    combination.trigger = BackupTrigger::kManual;
+    combination.strategy = strategy;
+    combination.pack_method = pack_method;
+    combination.compression_method = compression_method;
+    combination.encryption_method = encryption_method;
+    if (!backupproject::IsSupportedBackupOptionCombination(combination)) {
+      SetStatus(QString::fromLatin1(kError), QStringLiteral("无法备份"),
+                QString::fromStdString(
+                    backupproject::UnsupportedBackupOptionCombinationReason(
+                        combination)));
+      return false;
+    }
+  } else if (!IsSupportedBackupMode(BackupTrigger::kManual, strategy)) {
+    // key 解析失败的详细报错由后面那条路径负责；这里只保证产品矩阵先被判掉。
     SetStatus(QString::fromLatin1(kError), QStringLiteral("无法备份"),
               QString::fromStdString(
-                  backupproject::UnsupportedIncrementalPackReason()));
+                  UnsupportedBackupModeReason(BackupTrigger::kManual, strategy)));
     return false;
   }
   return StartBackupWithStrategy(strategy, pack_key, compression_key,
@@ -937,14 +954,21 @@ bool BackupController::deleteBackup(const QString& file_name) {
   // 否则它会在列表里永远留着。界面上那层确认对话框不是安全边界，
   // 文件名与目标类型的校验始终由 Catalog 自己完成。
   std::string error_message;
+  std::vector<std::string> diagnostics;
   if (!catalog_.Delete(repository_path_.toStdString(), file_name.toStdString(),
-                       &error_message)) {
+                       &diagnostics, &error_message)) {
     SetStatus(QString::fromLatin1(kError), QStringLiteral("删除失败"),
               QString::fromStdString(error_message));
     return false;
   }
+  QString message = QStringLiteral("%1 已从备份仓库中移除。").arg(file_name);
+  // 副文件清理失败不是"删除失败"，但要说出来：否则用户以为仓库干净了，
+  // 而 <name>.manifest / <name>.identity 还留在那里。
+  for (const std::string& note : diagnostics) {
+    message += QStringLiteral("\n") + QString::fromStdString(note);
+  }
   SetStatus(QString::fromLatin1(kSuccess), QStringLiteral("备份已删除"),
-            QStringLiteral("%1 已从备份仓库中移除。").arg(file_name));
+            message);
   refreshBackups();
   // 删成功之后才通知：计划状态要跟着这份仓库的实际内容走，而不是跟着"用户点了
   // 删除"走。失败时什么都没变，也就不该有人去改 schedule。
