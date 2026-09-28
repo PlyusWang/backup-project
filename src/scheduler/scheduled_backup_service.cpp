@@ -327,6 +327,21 @@ bool ScheduledBackupService::RunRetention(ScheduleDocument* document,
              "Failed to plan a dependency-safe retention pass: " + plan_error);
     return false;
   }
+  if (plan.dependency_uncertain) {
+    // fail closed：依赖不确定 -> 这一轮什么都不删。
+    //
+    // 报成"带警告的成功"而不是硬失败：新快照已经建好、状态也自洽，只是没有
+    // 回收旧快照。但必须说出来——否则"为什么仓库一直在长"没有答案。
+    if (unreadable != nullptr) {
+      *unreadable = static_cast<std::uint64_t>(plan.unreadable.size());
+    }
+    SetError(
+        error_message,
+        "Retention removed nothing because a dependency chain could not be "
+        "verified: " +
+            plan.uncertainty_reason);
+    return false;
+  }
 
   // 计划里的名字必须是"本计划管理的快照"，否则不删（别人的东西不动）。
   std::vector<std::string> to_remove;
