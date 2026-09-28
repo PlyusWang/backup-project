@@ -120,10 +120,10 @@ class RealtimeStore {
 
 // ---- Realtime job identity ----
 //
-// "这一套 realtime 配置"的稳定摘要：源 / 仓库 / 规则 / 策略 / pack / compression
-// / encryption / trigger。marker 记录它，retention 只淘汰与当前 job 相同的快照；
-// 换了源或换了算法之后，旧 realtime 快照继续显示为实时快照，但不再被新 job
-// 自动淘汰（用户仍可手工删除）。
+// "这一套 realtime 配置"的稳定摘要：源 / 仓库 / 规则 / 策略 / pack /
+// compression / encryption / trigger。marker 记录它，retention 只淘汰与当前 job
+// 相同的快照； 换了源或换了算法之后，旧 realtime
+// 快照继续显示为实时快照，但不再被新 job 自动淘汰（用户仍可手工删除）。
 std::string RealtimeJobIdentityDigest(const RealtimeConfig& config,
                                       const std::string& repository_identity,
                                       const std::string& source_path);
