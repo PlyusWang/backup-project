@@ -171,6 +171,9 @@ int main() {
       test_support::Check(
           first.kind == bp::RealtimeOutcome::Kind::kFullSnapshot,
           "INC-RTB T1 判别：Realtime+Full 建完整快照（不复制策略实现）");
+      test_support::Check(first.summary_text == "创建完整实时快照",
+                          "INC-RTB T1 面向用户的那句话 = 创建完整实时快照",
+                          first.summary_text);
       test_support::Check(first.marker_written && !first.marker_warning,
                           "INC-RTB T1 marker 写成");
       test_support::Check(!first.snapshot_file_name.empty(),
@@ -354,6 +357,9 @@ int main() {
       test_support::Check(
           baseline.kind == bp::RealtimeOutcome::Kind::kFullBaseline,
           "INC-RTB I1 判别：无基线时如实报告 full-baseline（不是 delta）");
+      test_support::Check(
+          baseline.summary_text == "实时增量策略建立了新的完整基线",
+          "INC-RTB I1 判别：基线不会被说成 delta", baseline.summary_text);
       bp::RealtimeMarker marker;
       std::string error;
       if (bp::LoadRealtimeMarker(repository, baseline.snapshot_file_name,
@@ -379,6 +385,9 @@ int main() {
                 "INC-RTB I2")) {
       test_support::Check(delta.kind == bp::RealtimeOutcome::Kind::kDelta,
                           "INC-RTB I2 判别：有变化时写 delta");
+      test_support::Check(delta.summary_text == "实时增量快照已创建",
+                          "INC-RTB I2 面向用户的那句话 = 实时增量快照已创建",
+                          delta.summary_text);
       test_support::Check(delta.changes.modified + delta.changes.added +
                                   delta.changes.removed >=
                               1,
@@ -412,6 +421,11 @@ int main() {
         test_support::Check(
             nothing.kind == bp::RealtimeOutcome::Kind::kNoChanges,
             "INC-RTB I3 判别：有效备份集合没变 -> no-changes");
+        test_support::Check(
+            nothing.summary_text ==
+                "检测到文件系统事件，但有效备份集合没有变化；未创建快照",
+            "INC-RTB I3 判别：no-changes 的文案不冒充「已创建快照」",
+            nothing.summary_text);
         test_support::Check(
             !nothing.marker_written && nothing.snapshot_file_name.empty(),
             "INC-RTB I3 no-changes 不写 marker、不写快照");

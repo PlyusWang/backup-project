@@ -342,12 +342,13 @@ int RunWatch(const RealtimeConfig& config, const std::string& repository,
       std::cout << " snapshot=" << outcome.snapshot_file_name;
     }
     std::cout << "\n";
+    // 面向用户的那句话直接来自共享核心：GUI 显示的是同一句，CLI 不另写一份。
+    if (!outcome.summary_text.empty()) {
+      std::cout << "[realtime] " << outcome.summary_text << "\n";
+    }
     if (!outcome.diagnostic.empty()) {
       std::cout << "[realtime] retention warning: " << outcome.diagnostic
                 << "\n";
-    }
-    if (outcome.kind == RealtimeOutcome::Kind::kNoChanges) {
-      std::cout << "[realtime] no effective change; no snapshot created\n";
     }
   }
 

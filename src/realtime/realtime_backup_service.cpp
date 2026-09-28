@@ -733,7 +733,8 @@ bool RunRealtimeBackupOnce(const RealtimeConfig& config,
       return false;
     }
     outcome->kind = RealtimeOutcome::Kind::kFullSnapshot;
-    outcome->summary_text = "Realtime full snapshot created";
+    // 面向用户的那句话只有一处：CLI 与 GUI 都显示它。
+    outcome->summary_text = "创建完整实时快照";
   } else {
     // Incremental：完全走 RunIncrementalBackup（baseline / delta / no-change
     // 三选一由它决定，这里一个字都不复制）。
@@ -756,18 +757,16 @@ bool RunRealtimeBackupOnce(const RealtimeConfig& config,
     switch (incremental.kind) {
       case IncrementalOutcome::Kind::kFullBaseline:
         outcome->kind = RealtimeOutcome::Kind::kFullBaseline;
-        outcome->summary_text =
-            "Realtime incremental strategy created a new full baseline";
+        outcome->summary_text = "实时增量策略建立了新的完整基线";
         break;
       case IncrementalOutcome::Kind::kDelta:
         outcome->kind = RealtimeOutcome::Kind::kDelta;
-        outcome->summary_text = "Realtime incremental snapshot created";
+        outcome->summary_text = "实时增量快照已创建";
         break;
       case IncrementalOutcome::Kind::kNoChanges:
         outcome->kind = RealtimeOutcome::Kind::kNoChanges;
         outcome->summary_text =
-            "Filesystem events were seen, but the effective backup set did not "
-            "change; no snapshot was created";
+            "检测到文件系统事件，但有效备份集合没有变化；未创建快照";
         return true;  // 什么都没写：marker 与 retention 都不需要
     }
     if (incremental.snapshot_file_name == snapshot_file_name) {
