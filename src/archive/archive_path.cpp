@@ -4,7 +4,12 @@
 
 #include "archive_path.h"
 
+#include <sys/stat.h>
+#include <sys/types.h>
+
+#include <cerrno>
 #include <cctype>
+#include <cstring>
 
 namespace backupproject {
 
@@ -14,6 +19,18 @@ void SetError(std::string* error_message, const std::string& text) {
   if (error_message != nullptr) {
     *error_message = text;
   }
+}
+
+std::string ErrnoText(int error_number) {
+  const char* text = ::strerror(error_number);
+  return text == nullptr ? std::string("errno ") + std::to_string(error_number)
+                         : std::string(text);
+}
+
+std::string JoinRoot(const std::string& root, const std::string& relative) {
+  if (root.empty()) return relative;
+  if (root.back() == '/') return root + relative;
+  return root + "/" + relative;
 }
 
 }  // namespace
@@ -155,6 +172,98 @@ bool ArchivePathRegistry::Finalize(std::string* error_message) const {
     }
   }
   return true;
+}
+
+bool ResolveUnderRootNoSymlinkAncestors(const std::string& root,
+                                        const std::string& relative_path,
+                                        std::string* resolved_path,
+                                        bool* exists,
+                                        std::string* error_message) {
+  if (resolved_path == nullptr || exists == nullptr) {
+    SetError(error_message,
+             "ResolveUnderRootNoSymlinkAncestors: outputs must not be null");
+    return false;
+  }
+  resolved_path->clear();
+  *exists = false;
+  if (root.empty()) {
+    SetError(error_message, "The resolution root must not be empty");
+    return false;
+  }
+  if (root.find('\0') != std::string::npos) {
+    SetError(error_message, "The resolution root contains a NUL byte");
+    return false;
+  }
+  // 语法先自己过一遍，不把"调用方已经校验过"当成前提：这个函数是最后一道闸，
+  // 它自己必须能独立成立。
+  if (relative_path.empty() || relative_path == ".") {
+    SetError(error_message,
+             "A tombstone must name a path below the staging root, not the "
+             "root itself");
+    return false;
+  }
+  if (relative_path.find('\0') != std::string::npos) {
+    SetError(error_message, "Invalid path (contains NUL byte)");
+    return false;
+  }
+  if (relative_path.front() == '/') {
+    SetError(error_message, "Invalid path (absolute): " + relative_path);
+    return false;
+  }
+  if (relative_path.back() == '/') {
+    SetError(error_message, "Invalid path (trailing slash): " + relative_path);
+    return false;
+  }
+  if (relative_path.find('\\') != std::string::npos) {
+    SetError(error_message, "Invalid path (backslash): " + relative_path);
+    return false;
+  }
+
+  std::string current = root;
+  std::size_t start = 0;
+  while (true) {
+    const std::size_t slash = relative_path.find('/', start);
+    const bool is_last = slash == std::string::npos;
+    const std::string component =
+        is_last ? relative_path.substr(start)
+                : relative_path.substr(start, slash - start);
+    if (component.empty() || component == "." || component == "..") {
+      SetError(error_message, "Invalid path component: " + relative_path);
+      return false;
+    }
+    current = current + "/" + component;
+
+    struct stat info;
+    if (::lstat(current.c_str(), &info) != 0) {
+      if (errno != ENOENT) {
+        SetError(error_message,
+                 "Cannot inspect " + current + ": " + ErrnoText(errno));
+        return false;
+      }
+      // 不存在就是"没有东西要处理"：调用方按 exists = false 处理。
+      *resolved_path = JoinRoot(root, relative_path);
+      *exists = false;
+      return true;
+    }
+    if (is_last) {
+      *resolved_path = JoinRoot(root, relative_path);
+      *exists = true;
+      return true;
+    }
+    // 中间组件必须是真实目录。软链接单独报一句：那正是这条检查存在的理由。
+    if (!S_ISDIR(info.st_mode)) {
+      if (S_ISLNK(info.st_mode)) {
+        SetError(error_message,
+                 "Refusing to follow a symlink inside the staging tree: " +
+                     current);
+      } else {
+        SetError(error_message,
+                 "A path component is not a directory: " + current);
+      }
+      return false;
+    }
+    start = slash + 1;
+  }
 }
 
 std::string JoinArchivePath(const std::string& destination,

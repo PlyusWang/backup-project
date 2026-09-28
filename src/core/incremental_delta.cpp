@@ -19,6 +19,8 @@
 #include <string>
 #include <vector>
 
+#include "archive_path.h"
+#include "backup_catalog.h"
 #include "container_format.h"
 #include "crypto.h"
 #include "source_digest.h"
@@ -235,6 +237,57 @@ std::string StrategyIdentityDigest(PackMethod pack,
   text += std::to_string(static_cast<unsigned>(compression)) + "\n";
   text += std::to_string(static_cast<unsigned>(encryption)) + "\n";
   return ContentDigestOfBytes(text);
+}
+
+bool IsValidDeltaParentFileName(const std::string& name,
+                                std::string* error_message) {
+  if (name.empty()) {
+    SetError(error_message, "A delta parent file name must not be empty");
+    return false;
+  }
+  if (name == "." || name == "..") {
+    SetError(error_message, "Invalid delta parent file name: " + name);
+    return false;
+  }
+  if (name.find('/') != std::string::npos ||
+      name.find('\\') != std::string::npos) {
+    SetError(error_message,
+             "A delta parent file name must be a single path component: " +
+                 name);
+    return false;
+  }
+  if (name.find('\0') != std::string::npos) {
+    SetError(error_message, "A delta parent file name contains a NUL byte");
+    return false;
+  }
+  // 扩展名规则与 Catalog 管理的备份文件名是同一条：这里复用它的判断，而不是
+  // 自己再写一遍 ".bak"。
+  if (!IsManagedBackupFileName(name)) {
+    SetError(error_message,
+             "A delta parent file name must be a managed snapshot name "
+             "(ending in .bak): " +
+                 name);
+    return false;
+  }
+  return true;
+}
+
+bool IsValidDeltaTombstone(const std::string& path, std::string* error_message) {
+  // 先复用归档路径的唯一语法实现：长度、绝对路径、空组件、"."/".." 组件、
+  // 反斜杠、盘符、结尾 '/'、NUL 都在那里被拒。
+  if (!IsValidArchivePath(path, /*is_first_entry=*/false,
+                          /*is_directory=*/false, kMaxArchivePathLength,
+                          error_message)) {
+    return false;
+  }
+  // "." 是源根本身：它不是"某一条被删掉的路径"，而是整棵树的身份。
+  // IsValidArchivePath 在 is_first_entry = false 时已经拒绝它，这里再明确说一句，
+  // 免得将来有人放宽那条规则时把根也一起放进来。
+  if (path == ".") {
+    SetError(error_message, "A tombstone may not remove the source root");
+    return false;
+  }
+  return true;
 }
 
 std::string SerializeDeltaEnvelope(const DeltaEnvelope& envelope) {
@@ -462,6 +515,15 @@ bool ParseDeltaEnvelope(const std::string& text, DeltaEnvelope* envelope,
     SetError(error_message,
              "Invalid delta envelope: the snapshot is its own parent");
     return false;
+  }
+  // 不可信字段的边界：这两个字段会被用在真实文件系统上，格式层就必须把它们
+  // 判死。放在这里而不是只放在应用路径，是因为每一个读者（Catalog 列表、
+  // 恢复、retention）都要先过这一关。
+  if (!IsValidDeltaParentFileName(envelope->parent_file_name, error_message)) {
+    return false;
+  }
+  for (const std::string& tombstone : envelope->tombstones) {
+    if (!IsValidDeltaTombstone(tombstone, error_message)) return false;
   }
   return true;
 }
@@ -758,6 +820,82 @@ bool ExtractDeltaPayload(const std::string& delta_file,
   return true;
 }
 
+bool InspectDeltaPayloadHeader(const std::string& delta_file,
+                               ContainerHeader* header,
+                               std::string* error_message) {
+  if (header == nullptr) {
+    SetError(error_message, "Container header output must not be null");
+    return false;
+  }
+  *header = ContainerHeader{};
+  // 布局规则只有一份实现：先让 ReadDeltaEnvelope 把外层整个读一遍
+  // （magic / version / 长度自洽 / 信封自校验），这里再读 payload 的头 160 字节。
+  DeltaEnvelope envelope;
+  if (!ReadDeltaEnvelope(delta_file, &envelope, error_message)) return false;
+
+  const int fd = ::open(delta_file.c_str(), O_RDONLY | O_CLOEXEC);
+  if (fd < 0) {
+    SetError(error_message,
+             "Cannot open delta " + delta_file + ": " + ErrnoText(errno));
+    return false;
+  }
+  unsigned char fixed[kDeltaFixedHeaderSize] = {0};
+  std::size_t filled = 0;
+  while (filled < sizeof(fixed)) {
+    const ssize_t got = ::read(fd, fixed + filled, sizeof(fixed) - filled);
+    if (got < 0) {
+      if (errno == EINTR) continue;
+      const std::string text = ErrnoText(errno);
+      ::close(fd);
+      SetError(error_message, "Cannot read delta header: " + text);
+      return false;
+    }
+    if (got == 0) break;
+    filled += static_cast<std::size_t>(got);
+  }
+  if (filled != sizeof(fixed)) {
+    ::close(fd);
+    SetError(error_message, "Invalid delta: the fixed header is truncated");
+    return false;
+  }
+  const std::uint32_t envelope_len =
+      static_cast<std::uint32_t>(fixed[12]) |
+      (static_cast<std::uint32_t>(fixed[13]) << 8) |
+      (static_cast<std::uint32_t>(fixed[14]) << 16) |
+      (static_cast<std::uint32_t>(fixed[15]) << 24);
+  if (::lseek(fd, static_cast<off_t>(kDeltaFixedHeaderSize + envelope_len),
+              SEEK_SET) < 0) {
+    const std::string text = ErrnoText(errno);
+    ::close(fd);
+    SetError(error_message, "Cannot seek to the delta payload: " + text);
+    return false;
+  }
+  unsigned char block[container_v2::kHeaderSize] = {0};
+  filled = 0;
+  while (filled < sizeof(block)) {
+    const ssize_t got = ::read(fd, block + filled, sizeof(block) - filled);
+    if (got < 0) {
+      if (errno == EINTR) continue;
+      const std::string text = ErrnoText(errno);
+      ::close(fd);
+      SetError(error_message, "Cannot read the delta payload header: " + text);
+      return false;
+    }
+    if (got == 0) break;
+    filled += static_cast<std::size_t>(got);
+  }
+  if (::close(fd) != 0) {
+    SetError(error_message, "Cannot close delta: " + ErrnoText(errno));
+    return false;
+  }
+  if (filled != sizeof(block)) {
+    SetError(error_message,
+             "Invalid delta: the inner container header is truncated");
+    return false;
+  }
+  return DecodeContainerHeader(block, sizeof(block), header, error_message);
+}
+
 bool VerifyDeltaPayload(const std::string& delta_file,
                         std::string* error_message) {
   DeltaEnvelope envelope;
@@ -805,6 +943,13 @@ bool WriteDeltaFile(const std::string& delta_file,
     SetError(error_message,
              "Delta envelope: removed count must equal the tombstone count");
     return false;
+  }
+  // 写侧过的是与读侧同一对校验：自己不产出自己随后拒绝的东西。
+  if (!IsValidDeltaParentFileName(envelope.parent_file_name, error_message)) {
+    return false;
+  }
+  for (const std::string& tombstone : envelope.tombstones) {
+    if (!IsValidDeltaTombstone(tombstone, error_message)) return false;
   }
   // payload 复用备份流水线，条目表的约定也就与备份完全一致：第一条是源根。
   // 不替调用方伪造一条根记录——根目录的 metadata 必须来自真实扫描。

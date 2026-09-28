@@ -166,6 +166,31 @@ bool ExtractDeltaPayload(const std::string& delta_file,
                          const std::string& container_file,
                          std::string* error_message);
 
+// 读内层 container 的 header：不需要密码、不抽取 payload、不触碰内容。
+//
+// 恢复路径用它确认"这份 delta 的 payload 没有被加密"。PR #18 v1 的合同是
+// Incremental + encryption 明确拒绝，创建路径由共享校验拦住；读侧要有同一条
+// 合同，因为旧版本写出来的加密 delta 的**明文外层信封**（parent / tombstones）
+// 并不受内层 HMAC 覆盖，接受它等于接受一组未经认证的路径指令。
+bool InspectDeltaPayloadHeader(const std::string& delta_file,
+                               ContainerHeader* header,
+                               std::string* error_message);
+
+// ---- 不可信信封字段的边界 ----
+//
+// parent_file_name 与 tombstones 都来自**不可信归档**：它们是字符串，却会被用在
+// 真实文件系统上。边界放在格式层，因为每一个读者（Catalog 列表、恢复、
+// retention）都要先解析信封；写侧过的也是同一对函数。
+//
+// parent_file_name：非空、单组件、不是 "." / ".."、不含 '/' 或 '\\' 或 NUL，
+//   且以 .bak 结尾——与 BackupCatalog 管理的备份文件名同一条边界。
+// tombstone：先复用 IsValidArchivePath，再额外拒绝 "."（源根永远不能被 tombstone
+//   删掉）。绝对路径、'..' 组件、空组件、反斜杠、盘符、结尾 '/'、NUL 全部
+//   在 IsValidArchivePath 里就已经被拒。
+bool IsValidDeltaParentFileName(const std::string& name,
+                                std::string* error_message);
+bool IsValidDeltaTombstone(const std::string& path, std::string* error_message);
+
 // ---- 快照身份 ----
 //
 // delta 的 snapshot_id 是"信封内容的摘要"，自校验。完整快照没有信封，所以它的

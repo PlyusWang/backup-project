@@ -429,17 +429,25 @@ int RunBackupCommand(const CliContext& context,
     return kCliExitOperationFailed;
   }
 
-  // 支持矩阵是唯一答案来源，而且要在做任何写盘动作**之前**问它：
+  // 支持矩阵与选项组合是唯一答案来源，而且要在做任何写盘动作**之前**问它：
   // "argv 收下了、校验再拒绝"这种半吊子状态最容易让人以为命令成功了。
-  if (!IsSupportedBackupMode(BackupTrigger::kManual, strategy)) {
-    PrintError(UnsupportedBackupModeReason(BackupTrigger::kManual, strategy));
-    return kCliExitOperationFailed;
-  }
-  // 打包方式与策略的组合也要在**写任何东西之前**拒绝：增量第一版只支持
-  // MyPack，等到第一次 delta 才失败会把用户留在一份"看起来可用"的基线上。
-  if (strategy == BackupStrategy::kIncremental &&
-      !IsSupportedIncrementalPack(options.pack_method)) {
-    return UsageError(context, UnsupportedIncrementalPackReason());
+  // 组合校验只有一份实现（与 GUI backend、计划配置同源）。
+  BackupOptionCombination combination;
+  combination.trigger = BackupTrigger::kManual;
+  combination.strategy = strategy;
+  combination.pack_method = options.pack_method;
+  combination.compression_method = options.compression_method;
+  combination.encryption_method = options.encryption_method;
+  if (!IsSupportedBackupOptionCombination(combination)) {
+    const std::string reason =
+        UnsupportedBackupOptionCombinationReason(combination);
+    // 产品矩阵本身不支持（Realtime）是运行级拒绝；策略与算法的组合不成立
+    // 是用法错误——两者都是"什么都没写盘就失败"，但退出码不同。
+    if (!IsSupportedBackupMode(BackupTrigger::kManual, strategy)) {
+      PrintError(reason);
+      return kCliExitOperationFailed;
+    }
+    return UsageError(context, reason);
   }
 
   const std::string file_name = BaseNameOf(archive_path);
@@ -1288,6 +1296,18 @@ int RepositoryList(const CliContext& context) {
 
   std::cout << "Repository: " << repository << "\n";
   std::cout << "Archives:   " << records.size() << "\n";
+  // 孤儿副文件只报告、不清理：列表是只读操作，破坏性动作必须由用户显式发起
+  // （或者由 retention 在明确的淘汰轮次里做）。
+  {
+    std::vector<std::string> orphans;
+    std::string orphan_error;
+    if (FindOrphanSidecars(repository, &orphans, &orphan_error)) {
+      for (const std::string& name : orphans) {
+        std::cout << "Orphan sidecar: " << name
+                  << "  (its snapshot file is gone; retention will remove it)\n";
+      }
+    }
+  }
   for (const BackupRecord& record : records) {
     bool managed = false;
     for (const ScheduledSnapshotRecord& snapshot :
@@ -1319,9 +1339,15 @@ int RepositoryDelete(const CliContext& context, const std::string& file_name) {
     return kCliExitOperationFailed;
   }
   BackupCatalog catalog;
+  std::vector<std::string> diagnostics;
   if (!catalog.Delete(repository, file_name, &error)) {
     PrintError(error);
     return kCliExitOperationFailed;
+  }
+  // 副文件清理失败不是"删除失败"，但绝不能静默：用户以为 .bak 没了就干净了，
+  // 而仓库里还留着它的 .manifest / .identity。
+  for (const std::string& note : diagnostics) {
+    std::cout << "Warning: " << note << "\n";
   }
 
   // §19 的 A 路径：删除成功后立刻让 ScheduleStore 忘掉这条 managed record。

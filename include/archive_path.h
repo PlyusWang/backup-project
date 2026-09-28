@@ -70,6 +70,28 @@ class ArchivePathRegistry {
 std::string JoinArchivePath(const std::string& destination,
                             const std::string& archive_path);
 
+// ---- 落盘解析：不能穿过软链接祖先 ----
+//
+// IsValidArchivePath 管的是"这段路径长什么样"，它挡不住"祖先组件本身是软链接"
+// 这种布局：staging/a -> /tmp/outside 时，字符串完全合法的 a/victim 会顺着链接
+// 删到 staging 外面去。凡是**来自归档的路径**要被用在真实文件系统上（增量 delta
+// 的 tombstone 就是这一类），都必须再过这一道。
+//
+// 语义（全部用 lstat，绝不 follow）：
+//   * root 与 relative 的语法先各自校验（空、绝对路径、反斜杠、"." / ".."
+//     组件、空组件、NUL 一律拒绝）；
+//   * 中间组件（最后一段之前的每一段）必须**真实存在且是目录**：软链接、
+//     普通文件、FIFO 等一律拒绝，并以 error_message 说明是哪一段；
+//   * 某个中间组件不存在时返回 true 且 *exists = false——"这条路径现在不存在"
+//     是调用方要处理的正常状态，不是错误；
+//   * 最后一段只做 lstat，不 follow：软链接就是软链接，是否删除由调用方按
+//     lstat 语义决定（删链接本身，不删它指向的东西）。
+bool ResolveUnderRootNoSymlinkAncestors(const std::string& root,
+                                        const std::string& relative_path,
+                                        std::string* resolved_path,
+                                        bool* exists,
+                                        std::string* error_message);
+
 }  // namespace backupproject
 
 #endif  // BACKUP_PROJECT_INCLUDE_ARCHIVE_PATH_H_
