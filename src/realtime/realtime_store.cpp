@@ -136,22 +136,20 @@ bool ValidateRealtimeConfig(const RealtimeConfig& config,
   }
   if (config.debounce_ms < kMinRealtimeDebounceMs ||
       config.debounce_ms > kMaxRealtimeDebounceMs) {
-    SetError(error_message, "Realtime debounce must be between " +
-                                std::to_string(kMinRealtimeDebounceMs) +
-                                " and " +
-                                std::to_string(kMaxRealtimeDebounceMs) +
-                                " ms, got " +
-                                std::to_string(config.debounce_ms));
+    SetError(error_message,
+             "Realtime debounce must be between " +
+                 std::to_string(kMinRealtimeDebounceMs) + " and " +
+                 std::to_string(kMaxRealtimeDebounceMs) + " ms, got " +
+                 std::to_string(config.debounce_ms));
     return false;
   }
   if (config.max_wait_ms < kMinRealtimeMaxWaitMs ||
       config.max_wait_ms > kMaxRealtimeMaxWaitMs) {
-    SetError(error_message, "Realtime max wait must be between " +
-                                std::to_string(kMinRealtimeMaxWaitMs) +
-                                " and " +
-                                std::to_string(kMaxRealtimeMaxWaitMs) +
-                                " ms, got " +
-                                std::to_string(config.max_wait_ms));
+    SetError(error_message,
+             "Realtime max wait must be between " +
+                 std::to_string(kMinRealtimeMaxWaitMs) + " and " +
+                 std::to_string(kMaxRealtimeMaxWaitMs) + " ms, got " +
+                 std::to_string(config.max_wait_ms));
     return false;
   }
   if (config.max_wait_ms < config.debounce_ms) {
@@ -165,8 +163,7 @@ bool ValidateRealtimeConfig(const RealtimeConfig& config,
                                 std::to_string(kMinRealtimeRetainCount) +
                                 " and " +
                                 std::to_string(kMaxRealtimeRetainCount) +
-                                ", got " +
-                                std::to_string(config.retain_count));
+                                ", got " + std::to_string(config.retain_count));
     return false;
   }
   if (config.include_rules.size() + config.exclude_rules.size() >
@@ -219,9 +216,8 @@ bool ValidateRealtimeForEnable(const RealtimeConfig& config,
     return false;
   }
   if (is_symlink) {
-    SetError(error_message,
-             "Realtime source must not be a symbolic link: " +
-                 config.source_path);
+    SetError(error_message, "Realtime source must not be a symbolic link: " +
+                                config.source_path);
     return false;
   }
   if (!is_directory) {
@@ -254,9 +250,10 @@ bool ValidateRealtimeForEnable(const RealtimeConfig& config,
     case RealtimePathOverlap::kNone:
       break;
     case RealtimePathOverlap::kEqual:
-      SetError(error_message,
-               "Realtime source and repository must not be the same directory: " +
-                   overlap_detail);
+      SetError(
+          error_message,
+          "Realtime source and repository must not be the same directory: " +
+              overlap_detail);
       return false;
     case RealtimePathOverlap::kRepositoryInsideSource:
       SetError(error_message,
@@ -331,12 +328,11 @@ bool ReadWholeFile(const std::string& path, std::string* text,
 }
 
 bool RealtimeRequireString(const JsonValue& object, const char* key,
-                   const std::string& what, std::string* value,
-                   std::string* error_message) {
+                           const std::string& what, std::string* value,
+                           std::string* error_message) {
   const JsonValue* field = object.Find(key);
   if (field == nullptr || !field->is_string()) {
-    SetError(error_message,
-             what + ": '" + key + "' must be a string");
+    SetError(error_message, what + ": '" + key + "' must be a string");
     return false;
   }
   if (!IsBoundedString(field->text)) {
@@ -348,8 +344,8 @@ bool RealtimeRequireString(const JsonValue& object, const char* key,
 }
 
 bool RealtimeRequireBool(const JsonValue& object, const char* key,
-                 const std::string& what, bool* value,
-                 std::string* error_message) {
+                         const std::string& what, bool* value,
+                         std::string* error_message) {
   const JsonValue* field = object.Find(key);
   if (field == nullptr || !field->is_bool()) {
     SetError(error_message, what + ": '" + key + "' must be a boolean");
@@ -360,8 +356,8 @@ bool RealtimeRequireBool(const JsonValue& object, const char* key,
 }
 
 bool RealtimeRequireUint(const JsonValue& object, const char* key,
-                 const std::string& what, std::uint32_t maximum,
-                 std::uint32_t* value, std::string* error_message) {
+                         const std::string& what, std::uint32_t maximum,
+                         std::uint32_t* value, std::string* error_message) {
   const JsonValue* field = object.Find(key);
   if (field == nullptr || !field->is_number()) {
     SetError(error_message, what + ": '" + key + "' must be an integer");
@@ -377,8 +373,9 @@ bool RealtimeRequireUint(const JsonValue& object, const char* key,
 }
 
 bool RealtimeRequireRuleList(const JsonValue& object, const char* key,
-                     const std::string& what, std::vector<std::string>* rules,
-                     std::string* error_message) {
+                             const std::string& what,
+                             std::vector<std::string>* rules,
+                             std::string* error_message) {
   const JsonValue* field = object.Find(key);
   if (field == nullptr || !field->is_array()) {
     SetError(error_message, what + ": '" + key + "' must be an array");
@@ -466,8 +463,8 @@ RealtimeLoadStatus RealtimeStore::Load(RealtimeConfig* config,
   struct stat info;
   if (::lstat(file_path_.c_str(), &info) != 0) {
     if (errno == ENOENT) return RealtimeLoadStatus::kMissing;
-    SetError(error_message, "Cannot inspect " + file_path_ + ": " +
-                                ErrnoText(errno));
+    SetError(error_message,
+             "Cannot inspect " + file_path_ + ": " + ErrnoText(errno));
     return RealtimeLoadStatus::kError;
   }
 
@@ -481,26 +478,29 @@ RealtimeLoadStatus RealtimeStore::Load(RealtimeConfig* config,
     SetError(error_message, "Invalid realtime config: " + json_error);
     return RealtimeLoadStatus::kError;
   }
-  if (!RequireExactFields(root,
-                          {"version", "enabled", "trigger", "source_path",
-                           "debounce_ms", "max_wait_ms", "retain_count",
-                           "strategy", "pack", "compression", "encryption",
-                           "include_rules", "exclude_rules"},
-                          "realtime config", error_message)) {
+  if (!RequireExactFields(
+          root,
+          {"version", "enabled", "trigger", "source_path", "debounce_ms",
+           "max_wait_ms", "retain_count", "strategy", "pack", "compression",
+           "encryption", "include_rules", "exclude_rules"},
+          "realtime config", error_message)) {
     return RealtimeLoadStatus::kError;
   }
 
   std::uint32_t number = 0;
   std::string text_value;
   const std::string what = "realtime config";
-  if (!RealtimeRequireUint(root, "version", what, 1000, &number, error_message)) {
+  if (!RealtimeRequireUint(root, "version", what, 1000, &number,
+                           error_message)) {
     return RealtimeLoadStatus::kError;
   }
   config->version = number;
-  if (!RealtimeRequireBool(root, "enabled", what, &config->enabled, error_message)) {
+  if (!RealtimeRequireBool(root, "enabled", what, &config->enabled,
+                           error_message)) {
     return RealtimeLoadStatus::kError;
   }
-  if (!RealtimeRequireString(root, "trigger", what, &text_value, error_message)) {
+  if (!RealtimeRequireString(root, "trigger", what, &text_value,
+                             error_message)) {
     return RealtimeLoadStatus::kError;
   }
   if (!ParseBackupTriggerKey(text_value, &config->trigger) ||
@@ -510,41 +510,43 @@ RealtimeLoadStatus RealtimeStore::Load(RealtimeConfig* config,
     return RealtimeLoadStatus::kError;
   }
   if (!RealtimeRequireString(root, "source_path", what, &config->source_path,
-                     error_message)) {
+                             error_message)) {
     return RealtimeLoadStatus::kError;
   }
   if (!RealtimeRequireUint(root, "debounce_ms", what, 60000000u, &number,
-                   error_message)) {
+                           error_message)) {
     return RealtimeLoadStatus::kError;
   }
   config->debounce_ms = number;
   if (!RealtimeRequireUint(root, "max_wait_ms", what, 60000000u, &number,
-                   error_message)) {
+                           error_message)) {
     return RealtimeLoadStatus::kError;
   }
   config->max_wait_ms = number;
   if (!RealtimeRequireUint(root, "retain_count", what, 1000000u, &number,
-                   error_message)) {
+                           error_message)) {
     return RealtimeLoadStatus::kError;
   }
   config->retain_count = number;
-  if (!RealtimeRequireString(root, "strategy", what, &text_value, error_message)) {
+  if (!RealtimeRequireString(root, "strategy", what, &text_value,
+                             error_message)) {
     return RealtimeLoadStatus::kError;
   }
   if (!ParseBackupStrategyKey(text_value, &config->strategy)) {
-    SetError(error_message, "realtime config: unknown strategy '" +
-                                text_value + "'");
+    SetError(error_message,
+             "realtime config: unknown strategy '" + text_value + "'");
     return RealtimeLoadStatus::kError;
   }
   if (!RealtimeRequireString(root, "pack", what, &text_value, error_message)) {
     return RealtimeLoadStatus::kError;
   }
   if (!ParsePackMethodKey(text_value, &config->pack_method)) {
-    SetError(error_message, "realtime config: unknown pack method '" +
-                                text_value + "'");
+    SetError(error_message,
+             "realtime config: unknown pack method '" + text_value + "'");
     return RealtimeLoadStatus::kError;
   }
-  if (!RealtimeRequireString(root, "compression", what, &text_value, error_message)) {
+  if (!RealtimeRequireString(root, "compression", what, &text_value,
+                             error_message)) {
     return RealtimeLoadStatus::kError;
   }
   if (!ParseCompressionMethodKey(text_value, &config->compression_method)) {
@@ -552,20 +554,21 @@ RealtimeLoadStatus RealtimeStore::Load(RealtimeConfig* config,
                                 text_value + "'");
     return RealtimeLoadStatus::kError;
   }
-  if (!RealtimeRequireString(root, "encryption", what, &text_value, error_message)) {
+  if (!RealtimeRequireString(root, "encryption", what, &text_value,
+                             error_message)) {
     return RealtimeLoadStatus::kError;
   }
   if (!ParseEncryptionMethodKey(text_value, &config->encryption_method)) {
-    SetError(error_message, "realtime config: unknown encryption method '" +
-                                text_value + "'");
+    SetError(error_message,
+             "realtime config: unknown encryption method '" + text_value + "'");
     return RealtimeLoadStatus::kError;
   }
-  if (!RealtimeRequireRuleList(root, "include_rules", what, &config->include_rules,
-                       error_message)) {
+  if (!RealtimeRequireRuleList(root, "include_rules", what,
+                               &config->include_rules, error_message)) {
     return RealtimeLoadStatus::kError;
   }
-  if (!RealtimeRequireRuleList(root, "exclude_rules", what, &config->exclude_rules,
-                       error_message)) {
+  if (!RealtimeRequireRuleList(root, "exclude_rules", what,
+                               &config->exclude_rules, error_message)) {
     return RealtimeLoadStatus::kError;
   }
   if (!ValidateRealtimeConfig(*config, error_message)) {
@@ -589,15 +592,13 @@ bool RealtimeStore::Save(const RealtimeConfig& config,
   out += ",\n";
   out += "    \"debounce_ms\": " + std::to_string(config.debounce_ms) + ",\n";
   out += "    \"max_wait_ms\": " + std::to_string(config.max_wait_ms) + ",\n";
-  out +=
-      "    \"retain_count\": " + std::to_string(config.retain_count) + ",\n";
+  out += "    \"retain_count\": " + std::to_string(config.retain_count) + ",\n";
   out += "    \"strategy\": \"" +
          std::string(BackupStrategyKey(config.strategy)) + "\",\n";
   out += "    \"pack\": \"" + std::string(PackMethodKey(config.pack_method)) +
          "\",\n";
   out += "    \"compression\": \"" +
-         std::string(CompressionMethodKey(config.compression_method)) +
-         "\",\n";
+         std::string(CompressionMethodKey(config.compression_method)) + "\",\n";
   out += "    \"encryption\": \"" +
          std::string(EncryptionMethodKey(config.encryption_method)) + "\",\n";
   AppendRules(&out, "include_rules", config.include_rules, false);
@@ -645,20 +646,19 @@ std::string RealtimeJobIdentityDigest(const RealtimeConfig& config,
                                       const std::string& source_path) {
   std::string canonical = "BPREALTIMEJOB1\n";
   canonical += "trigger=realtime\n";
-  canonical += "source=" +
-               SourceIdentityDigest(source_path, repository_identity) + "\n";
+  canonical +=
+      "source=" + SourceIdentityDigest(source_path, repository_identity) + "\n";
   canonical += "repository=" + repository_identity + "\n";
   canonical +=
-      "filter=" + FilterIdentityDigest(config.include_rules,
-                                       config.exclude_rules) +
+      "filter=" +
+      FilterIdentityDigest(config.include_rules, config.exclude_rules) + "\n";
+  canonical +=
+      "strategy=" + std::string(BackupStrategyKey(config.strategy)) + "\n";
+  canonical +=
+      "pipeline=" +
+      StrategyIdentityDigest(config.pack_method, config.compression_method,
+                             config.encryption_method) +
       "\n";
-  canonical += "strategy=" + std::string(BackupStrategyKey(config.strategy)) +
-               "\n";
-  canonical += "pipeline=" +
-               StrategyIdentityDigest(config.pack_method,
-                                      config.compression_method,
-                                      config.encryption_method) +
-               "\n";
   canonical += "include=" + KeyOfRuleList(config.include_rules) + "\n";
   canonical += "exclude=" + KeyOfRuleList(config.exclude_rules) + "\n";
   return ContentDigestOfBytes(canonical);

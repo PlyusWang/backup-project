@@ -68,10 +68,10 @@ void InotifyWatcher::ReleaseState() {
 
 void InotifyWatcher::Detach() { ReleaseState(); }
 
-bool InotifyWatcher::AddDirectory(
-    int fd, const std::string& path, bool is_root,
-    std::vector<WatchTarget>* watches,
-    std::unordered_map<int, std::size_t>* index, std::string* error_message) {
+bool InotifyWatcher::AddDirectory(int fd, const std::string& path, bool is_root,
+                                  std::vector<WatchTarget>* watches,
+                                  std::unordered_map<int, std::size_t>* index,
+                                  std::string* error_message) {
   // 结构事件之后的重建必须能容忍"目录在这一瞬间被删掉"：那不是错误，只是这
   // 一层没有东西可看。
   struct stat info;
@@ -81,7 +81,8 @@ bool InotifyWatcher::AddDirectory(
              "Cannot inspect directory " + path + ": " + ErrnoText(errno));
     return false;
   }
-  if (!S_ISDIR(info.st_mode)) return true;  // 软链接 / 普通文件：不 follow，跳过
+  if (!S_ISDIR(info.st_mode))
+    return true;  // 软链接 / 普通文件：不 follow，跳过
 
   if (injected_add_watch_errno_ != 0) {
     const int injected = injected_add_watch_errno_;
@@ -92,15 +93,14 @@ bool InotifyWatcher::AddDirectory(
     return false;
   }
 
-  const int wd = ::inotify_add_watch(fd, path.c_str(),
-                                     kWatchMask | kDirectoryFlags);
+  const int wd =
+      ::inotify_add_watch(fd, path.c_str(), kWatchMask | kDirectoryFlags);
   if (wd < 0) {
     SetError(error_message,
              "Cannot watch " + path + ": " + ErrnoText(errno) +
-                 (errno == ENOSPC
-                      ? " (inotify watch limit reached: check "
-                        "fs.inotify.max_user_watches)"
-                      : ""));
+                 (errno == ENOSPC ? " (inotify watch limit reached: check "
+                                    "fs.inotify.max_user_watches)"
+                                  : ""));
     return false;
   }
   WatchTarget target;
@@ -130,8 +130,7 @@ bool InotifyWatcher::AddDirectory(
       if (errno != 0) {
         const std::string text = ErrnoText(errno);
         ::closedir(directory);
-        SetError(error_message,
-                 "Cannot read directory " + path + ": " + text);
+        SetError(error_message, "Cannot read directory " + path + ": " + text);
         return false;
       }
       break;
@@ -157,7 +156,7 @@ bool InotifyWatcher::AddDirectory(
     const std::string child = JoinPath(path, name);
     struct stat child_info;
     if (::lstat(child.c_str(), &child_info) != 0) continue;  // 刚好被删掉
-    if (!S_ISDIR(child_info.st_mode)) continue;              // 软链接不 follow
+    if (!S_ISDIR(child_info.st_mode)) continue;  // 软链接不 follow
     if (!AddDirectory(fd, child, false, watches, index, error_message)) {
       return false;
     }
@@ -165,9 +164,10 @@ bool InotifyWatcher::AddDirectory(
   return true;
 }
 
-bool InotifyWatcher::BuildWatches(
-    int fd, const std::string& root, std::vector<WatchTarget>* watches,
-    std::unordered_map<int, std::size_t>* index, std::string* error_message) {
+bool InotifyWatcher::BuildWatches(int fd, const std::string& root,
+                                  std::vector<WatchTarget>* watches,
+                                  std::unordered_map<int, std::size_t>* index,
+                                  std::string* error_message) {
   root_wd_ = -1;
   return AddDirectory(fd, root, true, watches, index, error_message);
 }
@@ -197,8 +197,7 @@ bool InotifyWatcher::Attach(const std::string& root,
 
   const int fd = ::inotify_init1(IN_NONBLOCK | IN_CLOEXEC);
   if (fd < 0) {
-    SetError(error_message,
-             "inotify_init1 failed: " + ErrnoText(errno));
+    SetError(error_message, "inotify_init1 failed: " + ErrnoText(errno));
     return false;
   }
   std::vector<WatchTarget> watches;
@@ -323,9 +322,7 @@ bool InotifyWatcher::Drain(WatchBatch* batch, std::string* error_message) {
   return true;
 }
 
-void InotifyWatcher::InjectOverflowForTesting() {
-  injected_overflow_ = true;
-}
+void InotifyWatcher::InjectOverflowForTesting() { injected_overflow_ = true; }
 
 void InotifyWatcher::InjectAddWatchFailureForTesting(int error_number) {
   injected_add_watch_errno_ = error_number;
