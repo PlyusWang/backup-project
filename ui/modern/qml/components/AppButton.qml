@@ -26,20 +26,42 @@ AbstractButton {
         radius: 9
         // 主按钮用强调色，次级按钮用容器色，flat 完全透明——
         // 三者的层级差异靠背景而不是靠边框粗细来区分。
+        // 这里只留"常态底色"：hover / pressed 交给下面的固定色覆盖层，
+        // 因为 "transparent" 和不透明色之间做 ColorAnimation 会逐分量插值出
+        // "半透明黑"，浅色主题下鼠标划过就是那一闪的"黑一下"。
         color: {
             if (!control.enabled)
                 return control.primary ? theme.border : (control.flat ? "transparent" : theme.surface)
             if (control.primary)
-                return control.pressed ? theme.accentPressed : (control.hovered ? theme.accentHover : theme.accent)
-            if (control.flat)
-                return control.pressed ? control.pressedColor : (control.hovered ? control.hoverColor : "transparent")
-            return control.pressed ? control.pressedColor : (control.hovered ? control.hoverColor : theme.surface)
+                return theme.accent
+            return control.flat ? "transparent" : theme.surface
         }
         border.width: (control.primary || control.flat) ? 0 : 1
         border.color: theme.border
 
-        // 状态色变化时给一点点过渡，避免鼠标划过时颜色“跳”。
-        Behavior on color { ColorAnimation { duration: 110 } }
+        // hover 覆盖层：固定色 + 只动画 opacity，flat 从全透明淡入也不再经过黑色。
+        // 自带一圈与 background 同色同宽的边框：覆盖层画在 background 边框之上，
+        // 不补这一圈会把次级按钮的 1px 描边盖掉（深色主题下描边比底色亮，最明显）。
+        Rectangle {
+            anchors.fill: parent
+            radius: parent.radius
+            color: control.primary ? theme.accentHover : control.hoverColor
+            border.width: (control.primary || control.flat) ? 0 : 1
+            border.color: theme.border
+            opacity: control.enabled && control.hovered ? 1 : 0
+            Behavior on opacity { NumberAnimation { duration: 110 } }
+        }
+
+        // pressed 覆盖层：画在 hover 之上，保证 pressed 优先于 hover。
+        Rectangle {
+            anchors.fill: parent
+            radius: parent.radius
+            color: control.primary ? theme.accentPressed : control.pressedColor
+            border.width: (control.primary || control.flat) ? 0 : 1
+            border.color: theme.border
+            opacity: control.enabled && control.pressed ? 1 : 0
+            Behavior on opacity { NumberAnimation { duration: 110 } }
+        }
     }
 
     contentItem: Item {
