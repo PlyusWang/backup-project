@@ -1283,21 +1283,21 @@ QString FlattenRecord(const QVariantMap& record) {
 // 非当前页整体不可见，用 visible 永远测不出"这一页会不会显示这条消息"。
 // ---- --combo-hover-test ----
 //
-// 共享 AppComboBox 的 hover 残留回归。
+// 共享 AppComboBox 下拉行的状态回归（两轮人工验收都栽在这里）。
 //
-// 人工现场：鼠标移过下拉里的某一项之后，把它移开（甚至移出下拉菜单），那块灰底
-// 不消失；备份 / 自动备份 / 实时备份三页都能复现 —— 因为三页用的是同一个
-// components/AppComboBox.qml。
+// 第一轮：hover 底色绑到了 control.highlightedIndex（Qt 的常驻索引），
+//         下拉一打开"当前已选择项"就是灰的，鼠标移开也不会消失。
+// 第二轮：改成"键盘高亮 + accentSoft"之后仍然残留 —— 因为 highlightedIndex
+//         **不能证明高亮是键盘来的**：鼠标划过一行之后 Qt 也把它留在那一行上。
 //
-// 这个自检真的把指针移到某一行的中心，再移到下一行、再移出 popup，然后逐行读
-// 真实状态：
+// 所以这个自检的重点不是"hover 能不能清掉"（那一条第一轮就修好了），而是：
 //
-//   * 灰底只允许出现在"指针此刻真的在这一行上"的那一行；
-//   * 一行都不能因为 highlightedIndex（常驻的键盘导航索引）而变成灰的；
-//   * 已选择项靠勾号 + 强调色文字表示，不占底色；
-//   * 关掉再打开 popup，上一轮的 hover 不许留下任何痕迹。
+//   **构造出 highlightedIndex 仍然停在某一行、但指针已经离开的状态，
+//     并证明那一行没有任何底色。**
 //
-// 它断言的是运行期的真实属性（hovered / color），不是"文件里写了什么"。
+// 它真的把指针移到行上、再移走，也真的把导航键送进 popup 的按键处理器，
+// 逐行读运行期状态（hovered / highlightedIndex / currentIndex / 两个覆盖层的
+// opacity），不读源码文本。
 int RunComboHoverTest(QQuickWindow* window, backup_modern::AppTheme* theme) {
   CheckRun run;
   run.prefix = "[combo-hover]";
@@ -1309,14 +1309,12 @@ int RunComboHoverTest(QQuickWindow* window, backup_modern::AppTheme* theme) {
             QStringLiteral("hover=%1 keyboard=%2")
                 .arg(hover_color.name(), keyboard_color.name()));
 
-  // 页面与控件：备份页 → 共享规则编辑器 → “条件类型”。
-  // 先用真实按钮把表单展开（下拉只有在可见时才收得到 hover）。
+  // 备份页 → 共享规则编辑器 → “条件类型”（先用真实按钮把表单展开：
+  // hover 是"窗口里真的有这个点"才成立的）。
   window->setProperty("currentPage", 1);
   window->setWidth(1280);
   window->setHeight(1000);
   WaitForAnimation(150);
-  // 备份页很长，"条件类型"下拉在筛选编辑器里：先滚到它，再展开表单。
-  // hover 是"窗口里真的有这个点"才成立的，控件在裁剪区外就收不到指针。
   ScrollBackupPage(window, 700);
   WaitForAnimation(120);
   const auto clickByName = [window](const QString& name) -> bool {
@@ -1335,22 +1333,36 @@ int RunComboHoverTest(QQuickWindow* window, backup_modern::AppTheme* theme) {
     std::printf("[combo-hover] passed=%d failed=%d\n", run.passed, run.failed);
     return 1;
   }
-
   QObject* popup = combo->property("popup").value<QObject*>();
-  run.Check(popup != nullptr, QStringLiteral("下拉有 popup 对象"));
-  if (popup == nullptr) {
+  QQuickItem* popup_content =
+      popup == nullptr ? nullptr
+                       : popup->property("contentItem").value<QQuickItem*>();
+  run.Check(popup != nullptr && popup_content != nullptr,
+            QStringLiteral("下拉有 popup 与它的 contentItem"));
+  if (popup == nullptr || popup_content == nullptr) {
     std::printf("[combo-hover] passed=%d failed=%d\n", run.passed, run.failed);
     return 1;
   }
 
-  // 按行号收集当前 popup 里的行（delegate 只在 popup 打开时存在）。
-  struct Row {
-    int index = -1;
-    QQuickItem* item = nullptr;
-    QQuickItem* background = nullptr;
-  };
-  QQuickItem* popup_content =
-      popup->property("contentItem").value<QQuickItem*>();
+  // 复现人工验收截图：当前已选择项 = “路径”，残留灰框 = “文件类型”。
+  const QVariantList model = combo->property("model").toList();
+  QStringList labels;
+  for (const QVariant& item : model) {
+    labels << item.toString();
+  }
+  const int path_index = labels.indexOf(QStringLiteral("路径"));
+  const int type_index = labels.indexOf(QStringLiteral("文件类型"));
+  run.Check(path_index >= 0 && type_index >= 0,
+            QStringLiteral("条件类型下拉里能找到“路径”与“文件类型”"),
+            labels.join(QStringLiteral("/")));
+  if (path_index < 0 || type_index < 0) {
+    std::printf("[combo-hover] passed=%d failed=%d\n", run.passed, run.failed);
+    return 1;
+  }
+  combo->setProperty("currentIndex", path_index);
+  WaitForAnimation(100);
+
+  // ---- 运行期读数（全部取自真实的 QML 属性/覆盖层）----
   const auto collectRows = [popup_content]() {
     QList<QPair<int, QQuickItem*>> rows;
     std::function<void(QQuickItem*)> walk = [&](QQuickItem* item) {
@@ -1361,7 +1373,7 @@ int RunComboHoverTest(QQuickWindow* window, backup_modern::AppTheme* theme) {
         walk(kid);
       }
     };
-    if (popup_content != nullptr) walk(popup_content);
+    walk(popup_content);
     std::sort(
         rows.begin(), rows.end(),
         [](const QPair<int, QQuickItem*>& a, const QPair<int, QQuickItem*>& b) {
@@ -1369,205 +1381,246 @@ int RunComboHoverTest(QQuickWindow* window, backup_modern::AppTheme* theme) {
         });
     return rows;
   };
-  const auto backgroundOf = [](QQuickItem* row) -> QQuickItem* {
-    return row->findChild<QQuickItem*>(QStringLiteral("comboItemBackground"));
+  const auto layerOpacity = [](const QPair<int, QQuickItem*>& row,
+                               const char* name) -> qreal {
+    QQuickItem* layer =
+        row.second->findChild<QQuickItem*>(QString::fromLatin1(name));
+    return layer == nullptr ? -1.0 : layer->property("opacity").toReal();
   };
-  const auto colorOf = [](QQuickItem* background) -> QColor {
-    return background == nullptr
-               ? QColor()
-               : background->property("color").value<QColor>();
+  const auto hoverOpacity =
+      [&layerOpacity](const QPair<int, QQuickItem*>& row) {
+        return layerOpacity(row, "comboItemHoverLayer");
+      };
+  const auto keyboardOpacity =
+      [&layerOpacity](const QPair<int, QQuickItem*>& row) {
+        return layerOpacity(row, "comboItemKeyboardLayer");
+      };
+  // "这一行有没有底色"：两个覆盖层与底色本身，任何一个是可见的就算有。
+  const auto hasBackground = [&](const QPair<int, QQuickItem*>& row) -> bool {
+    const QColor base =
+        row.second
+            ->findChild<QQuickItem*>(QStringLiteral("comboItemBackground"))
+            ->property("color")
+            .value<QColor>();
+    return hoverOpacity(row) > 0.01 || keyboardOpacity(row) > 0.01 ||
+           base.alpha() > 0;
   };
   const auto describe = [&](const QList<QPair<int, QQuickItem*>>& rows) {
     QStringList parts;
     for (const auto& row : rows) {
-      const QColor color = colorOf(backgroundOf(row.second));
-      parts << QStringLiteral("%1[%2%3]")
+      parts << QStringLiteral("%1[h=%2 k=%3 hovered=%4 sel=%5]")
                    .arg(row.first)
-                   .arg(color.alpha() == 0 ? QStringLiteral("透明")
-                                           : color.name())
-                   .arg(row.second->property("hovered").toBool()
-                            ? QStringLiteral(" hover")
-                            : QString());
+                   .arg(hoverOpacity(row), 0, 'f', 0)
+                   .arg(keyboardOpacity(row), 0, 'f', 0)
+                   .arg(row.second->property("hovered").toBool() ? 1 : 0)
+                   .arg(row.second->property("isSelected").toBool() ? 1 : 0);
     }
     return parts.join(QStringLiteral(" "));
   };
+  const auto rowsWithBackground =
+      [&](const QList<QPair<int, QQuickItem*>>& rows) {
+        QStringList names;
+        for (const auto& row : rows) {
+          if (hasBackground(row)) names << QString::number(row.first);
+        }
+        return names;
+      };
+  const auto keyboardActive = [combo]() {
+    return combo->property("keyboardNavigationActive").toBool();
+  };
+  const QString marker = QStringLiteral("无底色=%1 键盘层 -1 说明覆盖层不存在");
   const auto movePointerTo = [window](const QPointF& pos,
                                       const QPointF& old_pos) {
     QHoverEvent hover(QEvent::HoverMove, pos, pos, old_pos);
     QCoreApplication::sendEvent(window, &hover);
   };
-  const auto centerOf = [window](QQuickItem* item) {
+  const auto centerOf = [](QQuickItem* item) {
     return item->mapToScene(QPointF(item->width() / 2.0, item->height() / 2.0));
   };
 
   QMetaObject::invokeMethod(popup, "open");
-  WaitForAnimation(260);
-
+  WaitForAnimation(280);
   QList<QPair<int, QQuickItem*>> rows = collectRows();
-  run.Check(
-      rows.size() >= 7, QStringLiteral("条件类型下拉展开了至少 7 行"),
-      QStringLiteral("实际 %1 行（combo 可见=%2，popup 可见=%3，位置=%4,%5）")
-          .arg(rows.size())
-          .arg(combo->isVisible())
-          .arg(popup->property("visible").toBool())
-          .arg(combo->mapToScene(QPointF(0, 0)).x())
-          .arg(combo->mapToScene(QPointF(0, 0)).y()));
-  if (rows.size() < 3) {
+  run.Check(rows.size() >= 7, QStringLiteral("条件类型下拉展开了至少 7 行"),
+            QStringLiteral("实际 %1 行").arg(rows.size()));
+  if (rows.size() < 7) {
     std::printf("[combo-hover] passed=%d failed=%d\n", run.passed, run.failed);
-    for (const QString& failure : run.failures)
-      std::printf("[combo-hover]   FAIL %s\n", qPrintable(failure));
     return 1;
   }
-
-  // ---- 1) 打开之后，没有任何一行是 hover 灰 ----
-  //
-  // 这一条就是那个 bug：改动前 control.highlightedIndex 在下拉打开时等于
-  // currentIndex，于是"当前已选择的项"从一开始就带着 hover 的那块灰。
-  {
-    QStringList stale;
+  const auto rowAt = [&rows](int index) -> QQuickItem* {
     for (const auto& row : rows) {
-      if (colorOf(backgroundOf(row.second)) == hover_color)
-        stale << QString::number(row.first);
+      if (row.first == index) return row.second;
     }
-    run.Check(stale.isEmpty(),
-              QStringLiteral("刚打开时没有任何一行带着 hover 灰底"),
-              QStringLiteral("仍然是灰的行：%1（%2）")
-                  .arg(stale.join(QStringLiteral(",")), describe(rows)));
-  }
-  run.Check(combo->property("highlightedIndex").toInt() ==
-                combo->property("currentIndex").toInt(),
-            QStringLiteral("Qt 确实把 highlightedIndex 设成了当前已选择项"),
+    return nullptr;
+  };
+
+  // ---- Case 1：打开 popup，指针不在任何地方 ----
+  // 期望：任何一行都没有底色；当前已选择项只有 check + 强调色文字。
+  run.Check(rowsWithBackground(rows).isEmpty() && !keyboardActive(),
+            QStringLiteral("Case 1 打开 popup 时没有任何一行带底色"),
+            QStringLiteral("带底色的行=%1 键盘模式=%2 | %3")
+                .arg(rowsWithBackground(rows).join(QStringLiteral(",")))
+                .arg(keyboardActive())
+                .arg(describe(rows)));
+  run.Check(combo->property("highlightedIndex").toInt() == path_index &&
+                combo->property("currentIndex").toInt() == path_index,
+            QStringLiteral("Case 1 Qt 把 highlightedIndex 设成了当前已选择项"),
             QStringLiteral("highlightedIndex=%1 currentIndex=%2")
                 .arg(combo->property("highlightedIndex").toInt())
                 .arg(combo->property("currentIndex").toInt()));
-
-  // ---- 2) 已选择项用勾号表示，不靠底色 ----
   {
-    QQuickItem* selected_row = nullptr;
-    for (const auto& row : rows) {
-      if (row.first == combo->property("currentIndex").toInt())
-        selected_row = row.second;
-    }
+    QQuickItem* selected_row = rowAt(path_index);
     QQuickItem* check = selected_row == nullptr
                             ? nullptr
                             : selected_row->findChild<QQuickItem*>(
                                   QStringLiteral("comboItemCheck"));
     run.Check(check != nullptr && check->property("visible").toBool() &&
-                  colorOf(backgroundOf(selected_row)) != hover_color,
-              QStringLiteral("已选择项用勾号标记，且没有 hover 灰底"));
+                  !hasBackground({path_index, selected_row}),
+              QStringLiteral("Case 1 已选择项（路径）只有勾号，没有底色"));
   }
 
-  // ---- 3) 指针移到第 2 行：只有它是灰的 ----
-  const int second_index = rows.at(1).first;
-  QPointF pointer = centerOf(rows.at(1).second);
-  movePointerTo(pointer, centerOf(rows.at(0).second));
-  WaitForAnimation(120);
-  rows = collectRows();
-  {
-    QStringList gray;
-    for (const auto& row : rows) {
-      if (colorOf(backgroundOf(row.second)) == hover_color)
-        gray << QString::number(row.first);
-    }
-    run.Check(gray == QStringList{QString::number(second_index)},
-              QStringLiteral("指针在第 %1 行时，只有这一行是 hover 灰")
-                  .arg(second_index),
-              QStringLiteral("灰的行=%1（%2）")
-                  .arg(gray.join(QStringLiteral(",")), describe(rows)));
-  }
-
-  // ---- 4) 指针移到下一行：上一行立刻不再是灰的 ----
-  const QPointF previous = pointer;
-  pointer = centerOf(rows.at(2).second);
-  movePointerTo(pointer, previous);
-  WaitForAnimation(120);
-  rows = collectRows();
-  {
-    QStringList gray;
-    for (const auto& row : rows) {
-      if (colorOf(backgroundOf(row.second)) == hover_color)
-        gray << QString::number(row.first);
-    }
-    run.Check(gray == QStringList{QString::number(rows.at(2).first)},
-              QStringLiteral("指针换到第 %1 行后，第 %2 行的灰立刻消失")
-                  .arg(rows.at(2).first)
-                  .arg(second_index),
-              QStringLiteral("灰的行=%1（%2）")
-                  .arg(gray.join(QStringLiteral(",")), describe(rows)));
-  }
-
-  // ---- 5) 指针移出 popup：一块灰都不许留下 ----
-  //
-  // 这正是用户看到的现象：移开之后那块灰还在。
-  movePointerTo(QPointF(4, 4), pointer);
+  // ---- Case 2：指针 hover “文件类型” ----
+  QPointF pointer = centerOf(rowAt(type_index));
+  movePointerTo(pointer, centerOf(rowAt(path_index)));
   WaitForAnimation(150);
   rows = collectRows();
   {
-    QStringList gray;
+    QStringList hover_rows;
     for (const auto& row : rows) {
-      if (colorOf(backgroundOf(row.second)) == hover_color)
-        gray << QString::number(row.first);
+      if (hoverOpacity(row) > 0.01) hover_rows << QString::number(row.first);
     }
-    run.Check(gray.isEmpty(),
-              QStringLiteral("指针移出下拉之后没有任何 hover 灰底残留"),
-              QStringLiteral("仍然灰的行=%1（%2）")
-                  .arg(gray.join(QStringLiteral(",")), describe(rows)));
+    run.Check(hover_rows == QStringList{QString::number(type_index)},
+              QStringLiteral("Case 2 只有“文件类型”这一行有 hover 底色"),
+              QStringLiteral("hover 行=%1 | %2")
+                  .arg(hover_rows.join(QStringLiteral(",")), describe(rows)));
   }
 
-  // ---- 6) 关掉再打开：上一轮的 hover 不许留下痕迹 ----
+  // ---- Case 3（本次最关键）：指针离开“文件类型”，但 highlightedIndex
+  // 留在它身上 ----
+  movePointerTo(QPointF(4, 4), pointer);
+  WaitForAnimation(200);
+  rows = collectRows();
+  const int retained = combo->property("highlightedIndex").toInt();
+  const bool type_hovered = rowAt(type_index)->property("hovered").toBool();
+  run.Check(!type_hovered,
+            QStringLiteral("Case 3 指针离开后 row.hovered 已经是 false"),
+            QStringLiteral("hovered=%1").arg(type_hovered));
+  run.Check(retained == type_index,
+            QStringLiteral(
+                "Case 3 highlightedIndex 仍然停在被划过的那一行（Qt 的行为）"),
+            QStringLiteral("highlightedIndex=%1 期望=%2")
+                .arg(retained)
+                .arg(type_index));
+  run.Check(!keyboardActive(),
+            QStringLiteral("Case 3 没有任何键盘导航，输入方式闸门是关的"));
+  run.Check(rowsWithBackground(rows).isEmpty(),
+            QStringLiteral(
+                "Case 3 highlightedIndex 留在那一行，但视觉上没有任何底色"),
+            QStringLiteral("带底色的行=%1 | %2")
+                    .arg(rowsWithBackground(rows).join(QStringLiteral(",")),
+                         describe(rows)) +
+                QStringLiteral(" | ") + marker.arg(0));
+
+  // ---- Case 4：指针移出整个 popup ----
+  run.Check(rowsWithBackground(rows).isEmpty(),
+            QStringLiteral("Case 4 指针在 popup 之外时没有任何底色"));
+
+  // ---- Case 5：关掉再打开，没有 stale ----
   QMetaObject::invokeMethod(popup, "close");
-  WaitForAnimation(220);
+  WaitForAnimation(240);
   QMetaObject::invokeMethod(popup, "open");
-  WaitForAnimation(260);
+  WaitForAnimation(280);
+  rows = collectRows();
+  run.Check(rowsWithBackground(rows).isEmpty() && !keyboardActive(),
+            QStringLiteral("Case 5 重新打开下拉没有 stale 底色"),
+            QStringLiteral("带底色的行=%1 | %2")
+                .arg(rowsWithBackground(rows).join(QStringLiteral(",")),
+                     describe(rows)));
+
+  // ---- Case 6：真实的 ↓ ----
+  //
+  // offscreen 窗口没有 active focus，把键发给窗口送不到 popup；所以先把键发给
+  // 当前焦点项（真实链路：焦点项在 delegate 上，事件沿父链上浮），不行再直接
+  // 发给 popup 的列表项（它才是 Keys 处理器的宿主）。两条路用的都是同一个真实
+  // 按键处理器与同一个状态机，只是投递点不同；哪一条生效会记在断言详情里。
+  const auto sendKey = [](QQuickItem* target, int key) {
+    if (target == nullptr) return false;
+    QKeyEvent press(QEvent::KeyPress, key, Qt::NoModifier);
+    QCoreApplication::sendEvent(target, &press);
+    QKeyEvent release(QEvent::KeyRelease, key, Qt::NoModifier);
+    QCoreApplication::sendEvent(target, &release);
+    return true;
+  };
+  QString delivery = QStringLiteral("none");
+  sendKey(window->activeFocusItem(), Qt::Key_Down);
+  WaitForAnimation(120);
+  if (keyboardActive()) {
+    delivery = QStringLiteral("activeFocusItem");
+  } else {
+    sendKey(popup_content, Qt::Key_Down);
+    WaitForAnimation(120);
+    if (keyboardActive()) delivery = QStringLiteral("popup contentItem");
+  }
+  run.Check(keyboardActive(),
+            QStringLiteral("Case 6 真实 ↓ 打开了键盘导航模式"),
+            QStringLiteral("投递点=%1 keyboardNavigationActive=%2")
+                .arg(delivery)
+                .arg(keyboardActive()));
   rows = collectRows();
   {
-    QStringList gray;
+    QStringList keyboard_rows;
     for (const auto& row : rows) {
-      if (colorOf(backgroundOf(row.second)) == hover_color)
-        gray << QString::number(row.first);
+      if (keyboardOpacity(row) > 0.01)
+        keyboard_rows << QString::number(row.first);
     }
-    run.Check(gray.isEmpty(), QStringLiteral("重新打开下拉没有 stale hover"),
-              QStringLiteral("仍然灰的行=%1（%2）")
-                  .arg(gray.join(QStringLiteral(",")), describe(rows)));
+    run.Check(keyboardActive() && !keyboard_rows.isEmpty(),
+              QStringLiteral("Case 6 键盘模式下有且只有键盘行被点亮"),
+              QStringLiteral("键盘行=%1 highlightedIndex=%2 | %3")
+                  .arg(keyboard_rows.join(QStringLiteral(",")))
+                  .arg(combo->property("highlightedIndex").toInt())
+                  .arg(describe(rows)));
+    run.Check(!keyboard_rows.contains(QString::number(path_index)),
+              QStringLiteral("Case 6 当前已选择项不会被键盘底色盖住"));
   }
 
-  // ---- 7) 那个曾经被当成 hover 用的索引，本身是只读的常驻状态 ----
-  //
-  // highlightedIndex 在 Qt 6.4 里没有 WRITE 访问器（setProperty 返回 false），
-  // 只能由 Qt 自己的键盘处理改动它；下拉一打开它就被设成当前已选择项。这正是
-  // 老实现的问题所在：界面上想"清掉"这块高亮也没有任何办法 —— 它压根不是鼠标
-  // 状态。所以它现在只用来表达"已选择 / 键盘位置"，一律不碰 hover 的那块灰。
-  //
-  // 键盘事件本身在 offscreen 窗口里送不到 popup（窗口没有 active focus），
-  // 所以这一节只断言上面这条**结构性事实**；键盘导航是否需要视觉反馈由
-  // scripts/modern_gui_check.sh 的结构断言 + 真实桌面人工验收覆盖。
+  // ---- Case 7：键盘之后鼠标一动，立刻切回 hover 模式 ----
+  rows = collectRows();
+  const QPointF keyboard_row_center = centerOf(rowAt(type_index));
+  movePointerTo(keyboard_row_center, QPointF(4, 4));
+  WaitForAnimation(180);
+  rows = collectRows();
   {
-    run.Check(
-        !combo->setProperty("highlightedIndex", 3) &&
-            combo->property("highlightedIndex").toInt() ==
-                combo->property("currentIndex").toInt(),
-        QStringLiteral(
-            "highlightedIndex 是只读的常驻索引，不是可以清掉的 hover 状态"),
-        QStringLiteral("setProperty 返回 false，读回 %1")
-            .arg(combo->property("highlightedIndex").toInt()));
-    rows = collectRows();
-    QStringList gray_rows;
+    QStringList keyboard_rows;
+    QStringList hover_rows;
     for (const auto& row : rows) {
-      if (colorOf(backgroundOf(row.second)) == hover_color)
-        gray_rows << QString::number(row.first);
+      if (keyboardOpacity(row) > 0.01)
+        keyboard_rows << QString::number(row.first);
+      if (hoverOpacity(row) > 0.01) hover_rows << QString::number(row.first);
     }
-    run.Check(gray_rows.isEmpty(),
-              QStringLiteral("这个常驻索引没有把任何一行画成 hover 灰"),
-              describe(rows));
+    run.Check(!keyboardActive() && keyboard_rows.isEmpty(),
+              QStringLiteral("Case 7 鼠标一动就退出键盘模式，键盘底色全部熄灭"),
+              QStringLiteral("键盘模式=%1 键盘行=%2")
+                  .arg(keyboardActive())
+                  .arg(keyboard_rows.join(QStringLiteral(","))));
+    run.Check(hover_rows == QStringList{QString::number(type_index)},
+              QStringLiteral("Case 7 hover 立刻接管，只跟指针"),
+              QStringLiteral("hover 行=%1 | %2")
+                  .arg(hover_rows.join(QStringLiteral(",")), describe(rows)));
   }
 
-  // ---- 8) 收尾：选择与表单都回到干净状态 ----
+  // ---- 收尾 ----
+  movePointerTo(QPointF(4, 4), keyboard_row_center);
+  WaitForAnimation(150);
+  rows = collectRows();
+  run.Check(rowsWithBackground(rows).isEmpty(),
+            QStringLiteral("收尾：指针再次离开后没有任何残留底色"));
   QMetaObject::invokeMethod(popup, "close");
-  WaitForAnimation(200);
-  run.Check(combo->property("currentIndex").toInt() >= 0,
-            QStringLiteral("清理 hover 的过程没有动坏 currentIndex"),
-            QStringLiteral("currentIndex=%1")
-                .arg(combo->property("currentIndex").toInt()));
+  WaitForAnimation(220);
+  run.Check(combo->property("currentIndex").toInt() == path_index,
+            QStringLiteral("整个过程没有动坏 currentIndex"),
+            QStringLiteral("currentIndex=%1 期望=%2")
+                .arg(combo->property("currentIndex").toInt())
+                .arg(path_index));
   clickByName(QStringLiteral("filterRuleCancelButton"));
   WaitForAnimation(80);
 
