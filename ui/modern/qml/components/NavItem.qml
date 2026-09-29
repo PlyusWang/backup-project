@@ -17,12 +17,29 @@ AbstractButton {
 
     background: Rectangle {
         radius: 7
-        color: {
-            if (control.checked)
-                return theme.accentSoft
-            return control.hovered ? theme.hover : "transparent"
+        // 底色不参与颜色动画：所有随交互变化的面都拆成"固定主题色 + 只动画
+        // opacity"的覆盖层。"transparent" 是 RGBA(0,0,0,0)，拿它和不透明色做
+        // ColorAnimation 会逐分量插值出"半透明黑"——浅色主题下就是鼠标划过 /
+        // 切换选中项时那一闪的"黑一下"。深色主题底色本就暗，所以几乎看不出。
+        color: "transparent"
+
+        // 选中底色。
+        Rectangle {
+            anchors.fill: parent
+            radius: parent.radius
+            color: theme.accentSoft
+            opacity: control.checked ? 1 : 0
+            Behavior on opacity { NumberAnimation { duration: 110 } }
         }
-        Behavior on color { ColorAnimation { duration: 110 } }
+
+        // hover 底色：选中态刻意不给 hover 反馈（与改动前一致）。
+        Rectangle {
+            anchors.fill: parent
+            radius: parent.radius
+            color: theme.hover
+            opacity: control.hovered && !control.checked ? 1 : 0
+            Behavior on opacity { NumberAnimation { duration: 110 } }
+        }
 
         // 选中指示条：靠边框实现，不需要自绘，也不会在切换时让文字位移。
         Rectangle {
