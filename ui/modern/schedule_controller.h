@@ -84,6 +84,10 @@ class ScheduleController : public QObject,
   Q_PROPERTY(QString strategyKey READ strategyKey NOTIFY configChanged)
   Q_PROPERTY(QString sourcePath READ sourcePath NOTIFY configChanged)
   Q_PROPERTY(int intervalMinutes READ intervalMinutes NOTIFY configChanged)
+  // 备份频率的显示形态：把 interval_minutes 拆成"值 + 单位"（60 -> 1 小时，
+  // 90 -> 90 分钟）。存储与核心仍然只有 interval_minutes 这一个字段。
+  Q_PROPERTY(QString frequencyValueText READ frequencyValueText NOTIFY configChanged)
+  Q_PROPERTY(QString frequencyUnitKey READ frequencyUnitKey NOTIFY configChanged)
   Q_PROPERTY(int retainCount READ retainCount NOTIFY configChanged)
   // PR #18：strategyKey 这一条 PR #17 就已经留好了，本轮只是让它真的能被
   // 界面选择与保存（下面两个 saveConfig* 各多一个 strategy_key）。
@@ -94,6 +98,9 @@ class ScheduleController : public QObject,
   Q_PROPERTY(QStringList excludeRules READ excludeRules NOTIFY configChanged)
   // 当前真实支持的模式。QML 只显示这一行，不做"未实现的按钮"。
   Q_PROPERTY(QString supportedModeText READ supportedModeText CONSTANT)
+  // 定时无人值守为什么不能加密。与实时页同一条来源：核心里那句唯一的话
+  // （UnattendedEncryptionDisabledReason），界面不复制一份字面量。
+  Q_PROPERTY(QString encryptionNote READ encryptionNote CONSTANT)
 
   // ---- 运行状态 ----
   Q_PROPERTY(bool libraryBusy READ libraryBusy NOTIFY busyChanged)
@@ -144,6 +151,8 @@ class ScheduleController : public QObject,
   QString strategyKey() const;
   QString sourcePath() const;
   int intervalMinutes() const;
+  QString frequencyValueText() const;
+  QString frequencyUnitKey() const;
   int retainCount() const;
   QString packKey() const;
   QString compressionKey() const;
@@ -151,6 +160,7 @@ class ScheduleController : public QObject,
   QStringList includeRules() const;
   QStringList excludeRules() const;
   QString supportedModeText() const;
+  QString encryptionNote() const;
 
   bool libraryBusy() const { return busy_; }
   bool pending() const { return pending_; }
@@ -195,6 +205,22 @@ class ScheduleController : public QObject,
       const QString& compression_key, const QStringList& include_rules,
       const QStringList& exclude_rules,
       const QString& strategy_key = QStringLiteral("full"));
+
+  // 界面上的"备份频率"入口：值 + 单位（每 1 小时）-> interval_minutes。
+  //
+  // 为什么不复用 saveConfigFromText：那个入口的第二个参数是"分钟数文本"，
+  // 而普通用户看到的从来不是分钟数。这里先把"值 × 单位"折成分钟，再交给
+  // 同一个 saveConfig——换算只有一份（schedule_frequency.h），保存路径也只有
+  // 一条，所以"每 2 小时"与 backupctl --interval-minutes 120 必然是同一件事。
+  Q_INVOKABLE bool saveConfigFromFrequencyText(
+      bool enabled, const QString& source_path, const QString& value_text,
+      const QString& unit_key, const QString& retain_text,
+      const QString& pack_key, const QString& compression_key,
+      const QStringList& include_rules, const QStringList& exclude_rules,
+      const QString& strategy_key = QStringLiteral("full"));
+
+  // 界面下拉要用的单位选项：[{key,label}]，顺序 = 分钟 / 小时 / 天 / 周。
+  Q_INVOKABLE QVariantList frequencyUnits() const;
 
   // 已经解析好的整数入口：C++ 侧的自动化测试与 saveConfigFromText 用它。
   Q_INVOKABLE bool saveConfig(

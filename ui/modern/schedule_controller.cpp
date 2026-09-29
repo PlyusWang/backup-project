@@ -2,16 +2,21 @@
 
 #include "schedule_controller.h"
 
+#include "schedule_frequency.h"
+
 #include <QDateTime>
 #include <QDir>
 #include <QEventLoop>
 #include <QFileInfo>
+#include <QVariantMap>
 #include <QtConcurrent/QtConcurrentRun>
+#include <cstdint>
 #include <ctime>
 #include <string>
 #include <utility>
 
 #include "backup_catalog.h"
+#include "backup_mode.h"
 #include "backup_option_keys.h"
 #include "filter.h"
 
@@ -494,6 +499,55 @@ void ScheduleController::clearStatus() {
   emit statusChanged();
 }
 
+QString ScheduleController::frequencyValueText() const {
+  std::string value;
+  std::string unit;
+  SplitFrequency(document_.config.interval_minutes, &value, &unit);
+  return QString::fromStdString(value);
+}
+
+QString ScheduleController::frequencyUnitKey() const {
+  std::string value;
+  std::string unit;
+  SplitFrequency(document_.config.interval_minutes, &value, &unit);
+  return QString::fromStdString(unit);
+}
+
+QVariantList ScheduleController::frequencyUnits() const {
+  QVariantList units;
+  for (int i = 0; i < FrequencyUnitCount(); ++i) {
+    const FrequencyUnit& unit = FrequencyUnitAt(i);
+    QVariantMap option;
+    option.insert(QStringLiteral("key"), QString::fromLatin1(unit.key));
+    option.insert(QStringLiteral("label"), QString::fromUtf8(unit.label));
+    units.push_back(option);
+  }
+  return units;
+}
+
+bool ScheduleController::saveConfigFromFrequencyText(
+    bool enabled, const QString& source_path, const QString& value_text,
+    const QString& unit_key, const QString& retain_text,
+    const QString& pack_key, const QString& compression_key,
+    const QStringList& include_rules, const QStringList& exclude_rules,
+    const QString& strategy_key) {
+  std::uint32_t interval = 0;
+  std::string error;
+  // 值 × 单位 -> 分钟。范围与溢出都在 schedule_frequency.cpp 里判，
+  // 数值文本本身仍然由共享核心的 ParseBoundedScheduleNumber 解析。
+  if (!ParseFrequency(value_text.toStdString(), unit_key.toStdString(),
+                      &interval, &error)) {
+    SetStatus(kError, QStringLiteral("备份频率不合法"),
+              QStringLiteral("备份频率必须是正整数，判断规则与 backupctl 完全一致。") +
+                  QStringLiteral(" ") + QString::fromStdString(error));
+    return false;
+  }
+  return saveConfigFromText(enabled, source_path,
+                            QString::number(interval), retain_text, pack_key,
+                            compression_key, include_rules, exclude_rules,
+                            strategy_key);
+}
+
 bool ScheduleController::saveConfigFromText(
     bool enabled, const QString& source_path, const QString& interval_text,
     const QString& retain_text, const QString& pack_key,
@@ -822,8 +876,17 @@ QStringList ScheduleController::excludeRules() const {
 }
 
 QString ScheduleController::supportedModeText() const {
+  // 面向用户的一句话能力说明。以前那句还写着"后续将扩展增量策略"，那是 PR #18
+  // 之前的实情；现在增量已经是计划路径上真实支持的一种方式，继续留着就是误导。
   return QStringLiteral(
-      "当前支持：定时触发 + 完整快照\n后续将扩展增量策略与实时触发。");
+      "当前支持：定时触发；备份方式可选完整备份或增量备份。");
+}
+
+QString ScheduleController::encryptionNote() const {
+  // 唯一来源：核心那句"无人值守为什么不加密"。GUI 不复制一份字面量。
+  return QString::fromStdString(
+      backupproject::UnattendedEncryptionDisabledReason(
+          backupproject::BackupTrigger::kScheduled));
 }
 
 QString ScheduleController::lastRunText() const {
