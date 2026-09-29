@@ -38,6 +38,10 @@
 //   --incremental-test <源> <仓库>      PR #18 GUI/CLI parity：走真实控制器
 //                                       入口跑 baseline / no-change / delta /
 //                                       依赖链恢复，按固定格式打印结果
+//   --filter-ux-test                    三页 parity：同一个普通表单输入
+//                                       （条件类型 + 取值）在备份页 / 自动备份页 /
+//                                       实时备份页生成同一条 DSL，非法输入三处
+//                                       得到同一句来自共享 builder 的原因
 //   --native-frame                      退回系统原生标题栏（Wayland 兜底）
 //
 // 这些开关让没有显示器的环境也能验证界面：离屏平台插件把窗口真正建出来，
@@ -1270,6 +1274,334 @@ QString FlattenRecord(const QVariantMap& record) {
 // banner 读的是它自己的 showsMessage（"这一页该不该显示这条消息"），不是
 // visible：Qt Quick 的 Item.visible 读出来就是**有效可见性**，StackLayout 里
 // 非当前页整体不可见，用 visible 永远测不出"这一页会不会显示这条消息"。
+// ---- --filter-ux-test ----
+//
+// 三个页面"同一个普通表单输入 -> 同一条 DSL"的 parity 自检。
+//
+// 这是 GUI Usability Closure 的核心断言：用户在备份页 / 自动备份页 / 实时备份页
+// 做**同一次操作**（选"文件扩展名"、填 txt;md），最终必须得到同一条规则文本
+// ext:txt;md，而且这条规则必须被真实的 Filter::AddRule 接受。
+//
+// 它走真实界面：切页、展开高级设置、点真实的按钮、往真实的输入框里打字，然后读
+// 真实的模型。不是"两边都调了同一个函数"，也不是 grep 文件。
+//
+// 同时钉住三件事：
+//   * 条件类型下拉显示的是中文（文件扩展名 / 路径 / 文件大小 / 文件类型 ...）；
+//   * 不同条件用不同控件（文件类型与比较方式只能是下拉，大小是
+//     比较方式 + 数值 + 单位，绝不是一个裸文本框）；
+//   * 非法输入在三处拿到**同一句**来自共享 builder 的原因。
+int RunFilterUxTest(QQuickWindow* window,
+                    backup_modern::FilterRuleModel* manual_model,
+                    backup_modern::FilterRuleModel* schedule_model,
+                    backup_modern::FilterRuleModel* realtime_model) {
+  CheckRun run;
+  run.prefix = "[filter-ux]";
+
+  const auto itemByName = [window](const QString& name) -> QQuickItem* {
+    return window->findChild<QQuickItem*>(name);
+  };
+  const auto goToPage = [window](int page) {
+    window->setProperty("currentPage", page);
+    WaitForAnimation(90);
+  };
+  // 点真实按钮：AppButton 是 AbstractButton，clicked 是它的信号。
+  const auto click = [](QQuickItem* item) -> bool {
+    if (item == nullptr) return false;
+    return QMetaObject::invokeMethod(item, "clicked");
+  };
+  // 下拉不能只改 currentIndex：onActivated 只由用户激活触发，所以要先把
+  // currentIndex 设成目标值，再发一次 activated(index)，与用户真的点了一下等价。
+  const auto choose = [](QQuickItem* combo, int index) -> bool {
+    if (combo == nullptr || index < 0) return false;
+    combo->setProperty("currentIndex", index);
+    return QMetaObject::invokeMethod(combo, "activated", Q_ARG(int, index));
+  };
+  // TextField 的 textEdited 在 QML 类型的元对象里是无参信号（实参由控件的
+  // text 属性承载），所以先把 text 设成目标值，再发一次 textEdited()。
+  const auto typeInto = [](QQuickItem* field, const QString& text) -> bool {
+    if (field == nullptr) return false;
+    field->setProperty("text", text);
+    return QMetaObject::invokeMethod(field, "textEdited");
+  };
+  // 输入框用 text，下拉框用 displayText —— 两种控件的"当前显示文本"不是同一个
+  // 属性，读错了会得到空串而不是失败。
+  const auto textOf = [](QQuickItem* item) -> QString {
+    if (item == nullptr) return QStringLiteral("<missing>");
+    const QVariant text = item->property("text");
+    if (text.isValid() && !text.toString().isEmpty()) return text.toString();
+    const QVariant display = item->property("displayText");
+    return display.isValid() ? display.toString() : QString();
+  };
+  // 断言"这个控件此刻可见吗"。不能用 QQuickItem::isVisible()：它要求窗口真的
+  // exposed，而自检跑在 offscreen 平台上；这里读的是控件自己那条 visible 绑定。
+  const auto shown = [](QQuickItem* item) -> bool {
+    return item != nullptr && item->property("visible").toBool();
+  };
+
+  struct PageCase {
+    const char* label;
+    int page;
+    QString prefix;
+    backup_modern::FilterRuleModel* model;
+    // 计划页 / 实时页的规则编辑器在默认折叠的「高级设置」里。
+    QString advanced_toggle;
+    QString advanced_section;
+  };
+  // 页面下标 = Main.qml 里 StackLayout 的顺序（0 首页 / 1 备份 / 2 自动备份 /
+  // 3 备份管理 / 4 设置 / 5 实时备份），不是侧栏导航的顺序。
+  const PageCase kCases[] = {
+      {"备份页", 1, QStringLiteral("filter"), manual_model, QString(),
+       QString()},
+      {"自动备份页", 2, QStringLiteral("schedule"), schedule_model,
+       QStringLiteral("scheduleAdvancedToggle"),
+       QStringLiteral("scheduleAdvancedSection")},
+      {"实时备份页", 5, QStringLiteral("realtime"), realtime_model,
+       QStringLiteral("realtimeAdvancedToggle"),
+       QStringLiteral("realtimeAdvancedSection")},
+  };
+
+  // 三处必须拿到**同一句**错误：它来自共享 builder，不是三份前端文案。
+  QStringList rejection_reasons;
+
+  for (const PageCase& page : kCases) {
+    // 中文标签必须走 fromUtf8：fromLatin1 会把 UTF-8 字节按 Latin-1 解释，
+    // 日志里的页名会变成一串乱码，脚本按名字断言就会假失败。
+    const QString label = QString::fromUtf8(page.label);
+    const auto named = [&page, &itemByName](const char* suffix) -> QQuickItem* {
+      return itemByName(page.prefix + QString::fromLatin1(suffix));
+    };
+
+    goToPage(page.page);
+
+    // ---- 默认折叠：高级设置（规则编辑器在它里面）----
+    if (!page.advanced_toggle.isEmpty()) {
+      QQuickItem* section = itemByName(page.advanced_section);
+      run.Check(section != nullptr && !shown(section),
+                QStringLiteral("%1 高级设置默认收起").arg(label),
+                QStringLiteral("section=%1").arg(section != nullptr));
+      click(itemByName(page.advanced_toggle));
+      WaitForAnimation(80);
+      run.Check(shown(section),
+                QStringLiteral("%1 展开之后高级设置可见").arg(label));
+    }
+
+    // ---- 新建规则的表单默认收起，点"添加包含规则"才出现 ----
+    QQuickItem* builder = named("RuleBuilderForm");
+    run.Check(builder != nullptr && !shown(builder),
+              QStringLiteral("%1 新建规则的表单默认收起").arg(label));
+    click(named("AddIncludeRuleButton"));
+    WaitForAnimation(80);
+    run.Check(shown(builder),
+              QStringLiteral("%1 点“添加包含规则”后表单展开（不是弹窗）").arg(label));
+
+    // ---- 条件类型下拉显示中文 ----
+    QQuickItem* field_combo = named("RuleFieldCombo");
+    run.Check(textOf(field_combo) == QStringLiteral("文件扩展名"),
+              QStringLiteral("%1 条件类型默认显示“文件扩展名”").arg(label),
+              textOf(field_combo));
+    const QVariantList field_options =
+        field_combo == nullptr ? QVariantList()
+                               : field_combo->property("model").toList();
+    QStringList field_labels;
+    for (const QVariant& option : field_options) {
+      field_labels << option.toString();
+    }
+    run.Check(field_labels.contains(QStringLiteral("文件类型")) &&
+                  field_labels.contains(QStringLiteral("文件大小")) &&
+                  field_labels.contains(QStringLiteral("路径")) &&
+                  !field_labels.contains(QStringLiteral("ext")),
+              QStringLiteral("%1 条件类型下拉全部是中文（没有裸字段名）").arg(label),
+              field_labels.join(QStringLiteral("/")));
+    run.Check(!shown(named("RuleTypeCombo")) &&
+                  !shown(named("RuleSizeCompareCombo")) &&
+                  named("RuleExtensionField") != nullptr,
+              QStringLiteral("%1 选“文件扩展名”时只出现扩展名输入框").arg(label));
+
+    // ---- 同一次普通操作：扩展名 -> txt;md ----
+    run.Check(typeInto(named("RuleExtensionField"), QStringLiteral("txt;md")),
+              QStringLiteral("%1 可以在扩展名输入框里输入").arg(label));
+    WaitForAnimation(60);
+    run.Check(textOf(named("RuleFormSummaryText"))
+                  .startsWith(QStringLiteral("将添加：")),
+              QStringLiteral("%1 实时显示这条规则的人话摘要").arg(label),
+              textOf(named("RuleFormSummaryText")));
+    run.Check(textOf(named("RuleFormErrorText")).isEmpty(),
+              QStringLiteral("%1 合法输入没有报错").arg(label),
+              textOf(named("RuleFormErrorText")));
+    run.Check(click(named("RuleSubmitButton")),
+              QStringLiteral("%1 “添加规则”可点").arg(label));
+    WaitForAnimation(80);
+    run.Check(page.model->rulesForAction(QStringLiteral("include")) ==
+                  QStringList{QStringLiteral("ext:txt;md")},
+              QStringLiteral("%1 生成 ext:txt;md（用户没有写过 ext:）").arg(label),
+              page.model->rulesForAction(QStringLiteral("include"))
+                  .join(QStringLiteral(",")));
+    run.Check(page.model->rulesForAction(QStringLiteral("exclude")).isEmpty(),
+              QStringLiteral("%1 这条规则落在包含一侧").arg(label));
+
+    // 规则卡片的数据：主行是人话，DSL 是次要信息。
+    const QVariantList rules = page.model->property("rules").toList();
+    if (!rules.isEmpty()) {
+      const QVariantMap first = rules.at(0).toMap();
+      run.Check(first.value(QStringLiteral("actionLabel")).toString() ==
+                        QStringLiteral("包含") &&
+                    first.value(QStringLiteral("conditionLabel")).toString() ==
+                        QStringLiteral("文件扩展名：txt、md"),
+                QStringLiteral("%1 规则主行是“包含 · 文件扩展名：txt、md”")
+                    .arg(label),
+                first.value(QStringLiteral("conditionLabel")).toString());
+      run.Check(first.value(QStringLiteral("dsl")).toString() ==
+                    QStringLiteral("ext:txt;md"),
+                QStringLiteral("%1 卡片的 DSL 字段与提交的一致").arg(label));
+    }
+
+    // ---- 路径：排除规则（同一个表单，换一个条件类型）----
+    click(named("AddExcludeRuleButton"));
+    WaitForAnimation(60);
+    choose(field_combo, field_labels.indexOf(QStringLiteral("路径")));
+    WaitForAnimation(60);
+    run.Check(shown(named("RulePatternField")) &&
+                  !shown(named("RuleExtensionField")),
+              QStringLiteral("%1 换“路径”之后出现的是路径输入框").arg(label));
+    typeInto(named("RulePatternField"), QStringLiteral("**/build/**"));
+    click(named("RuleSubmitButton"));
+    WaitForAnimation(80);
+    run.Check(page.model->rulesForAction(QStringLiteral("exclude")) ==
+                  QStringList{QStringLiteral("path:**/build/**")},
+              QStringLiteral("%1 生成 path:**/build/**").arg(label),
+              page.model->rulesForAction(QStringLiteral("exclude"))
+                  .join(QStringLiteral(",")));
+
+    // ---- 文件类型：只能是下拉 ----
+    click(named("AddIncludeRuleButton"));
+    WaitForAnimation(60);
+    choose(field_combo, field_labels.indexOf(QStringLiteral("文件类型")));
+    WaitForAnimation(60);
+    QQuickItem* type_combo = named("RuleTypeCombo");
+    run.Check(shown(type_combo),
+              QStringLiteral("%1 文件类型用的是下拉，不是文本框").arg(label));
+    choose(type_combo, 1);  // 目录
+    click(named("RuleSubmitButton"));
+    WaitForAnimation(80);
+    run.Check(page.model->rulesForAction(QStringLiteral("include"))
+                  .contains(QStringLiteral("type:folder")),
+              QStringLiteral("%1 选了“目录”就生成 type:folder").arg(label),
+              page.model->rulesForAction(QStringLiteral("include"))
+                  .join(QStringLiteral(",")));
+
+    // ---- 文件大小：比较方式 + 数值 + 单位 ----
+    click(named("AddIncludeRuleButton"));
+    WaitForAnimation(60);
+    choose(field_combo, field_labels.indexOf(QStringLiteral("文件大小")));
+    WaitForAnimation(60);
+    run.Check(shown(named("RuleSizeCompareCombo")) &&
+                  shown(named("RuleSizeValueField")) &&
+                  shown(named("RuleSizeUnitCombo")),
+              QStringLiteral("%1 文件大小是比较方式 + 数值 + 单位三个控件")
+                  .arg(label));
+    run.Check(textOf(named("RuleSizeCompareCombo")) == QStringLiteral("小于"),
+              QStringLiteral("%1 比较方式默认“小于”").arg(label),
+              textOf(named("RuleSizeCompareCombo")));
+    typeInto(named("RuleSizeValueField"), QStringLiteral("1"));
+    choose(named("RuleSizeUnitCombo"), 2);  // MB
+    click(named("RuleSubmitButton"));
+    WaitForAnimation(80);
+    run.Check(page.model->rulesForAction(QStringLiteral("include"))
+                  .contains(QStringLiteral("size:<1MB")),
+              QStringLiteral("%1 生成 size:<1MB（用户没有写过 size:）").arg(label),
+              page.model->rulesForAction(QStringLiteral("include"))
+                  .join(QStringLiteral(",")));
+
+    // ---- 非法输入：三处必须拿到同一句共享 builder 的原因 ----
+    click(named("AddIncludeRuleButton"));
+    WaitForAnimation(60);
+    choose(field_combo, field_labels.indexOf(QStringLiteral("文件大小")));
+    WaitForAnimation(60);
+    typeInto(named("RuleSizeValueField"), QStringLiteral("abc"));
+    WaitForAnimation(60);
+    const QString reason = textOf(named("RuleFormErrorText"));
+    rejection_reasons << reason;
+    run.Check(!reason.isEmpty() &&
+                  !named("RuleSubmitButton")->property("enabled").toBool(),
+              QStringLiteral("%1 非法的大小取值被拒绝，且“添加规则”不可点")
+                  .arg(label),
+              reason);
+    // 溢出：以前 QML 会先 parseInt("99999999999999999999")，等 C++ 拿到时它已经
+    // 变成一个浮点数了，谁都没机会拒绝。现在数值按文本解析，溢出是明确失败。
+    typeInto(named("RuleSizeValueField"),
+             QStringLiteral("99999999999999999999"));
+    WaitForAnimation(60);
+    const QString overflow_reason = textOf(named("RuleFormErrorText"));
+    run.Check(overflow_reason.contains(QStringLiteral("超出可表示范围")),
+              QStringLiteral("%1 超大数值被明确拒绝（不是静默截断）").arg(label),
+              overflow_reason);
+    click(named("RuleCancelButton"));
+    WaitForAnimation(60);
+
+    // ---- 高级 DSL：默认收起，展开后仍然可用 ----
+    QQuickItem* advanced_section = named("AdvancedRulesSection");
+    run.Check(advanced_section != nullptr && !shown(advanced_section),
+              QStringLiteral("%1 高级规则默认收起（普通用户看不到 DSL）")
+                  .arg(label));
+    click(named("AdvancedRulesToggle"));
+    WaitForAnimation(60);
+    run.Check(shown(advanced_section),
+              QStringLiteral("%1 高级规则展开后可见").arg(label));
+    typeInto(named("AdvancedRuleField"), QStringLiteral("size:<abc"));
+    click(named("AddAdvancedRuleButton"));
+    WaitForAnimation(80);
+    run.Check(!textOf(named("AdvancedRuleErrorText")).isEmpty(),
+              QStringLiteral("%1 高级 DSL 的非法输入被共享核心拒绝").arg(label),
+              textOf(named("AdvancedRuleErrorText")));
+    click(named("AdvancedRulesToggle"));
+    WaitForAnimation(60);
+  }
+
+  // ---- parity：三处最终拿到的是同一组规则文本 ----
+  const QStringList manual_include =
+      manual_model->rulesForAction(QStringLiteral("include"));
+  const QStringList schedule_include =
+      schedule_model->rulesForAction(QStringLiteral("include"));
+  const QStringList realtime_include =
+      realtime_model->rulesForAction(QStringLiteral("include"));
+  run.Check(manual_include == schedule_include &&
+                schedule_include == realtime_include,
+            QStringLiteral("PARITY-01 三处的包含规则逐字相同"),
+            QStringLiteral("manual=[%1] schedule=[%2] realtime=[%3]")
+                .arg(manual_include.join(QStringLiteral(" ")),
+                     schedule_include.join(QStringLiteral(" ")),
+                     realtime_include.join(QStringLiteral(" "))));
+  run.Check(manual_include ==
+                QStringList({QStringLiteral("ext:txt;md"),
+                             QStringLiteral("type:folder"),
+                             QStringLiteral("size:<1MB")}),
+            QStringLiteral("PARITY-02 普通表单输入生成的就是核心认可的 DSL"),
+            manual_include.join(QStringLiteral(" ")));
+  run.Check(manual_model->rulesForAction(QStringLiteral("exclude")) ==
+                schedule_model->rulesForAction(QStringLiteral("exclude")) &&
+                schedule_model->rulesForAction(QStringLiteral("exclude")) ==
+                    realtime_model->rulesForAction(QStringLiteral("exclude")),
+            QStringLiteral("PARITY-03 三处的排除规则逐字相同"));
+  run.Check(rejection_reasons.size() == 3 &&
+                rejection_reasons.at(0) == rejection_reasons.at(1) &&
+                rejection_reasons.at(1) == rejection_reasons.at(2) &&
+                !rejection_reasons.at(0).isEmpty(),
+            QStringLiteral("PARITY-04 非法输入在三处得到同一句原因（来自共享 builder）"),
+            rejection_reasons.join(QStringLiteral(" | ")));
+
+  // 收尾：三份模型都清空，后面的自检从干净状态开始。
+  manual_model->clearRules();
+  schedule_model->clearRules();
+  realtime_model->clearRules();
+
+  std::printf("[filter-ux] passed=%d failed=%d\n", run.passed, run.failed);
+  if (run.failed != 0) {
+    for (const QString& failure : run.failures)
+      std::printf("[filter-ux]   FAIL %s\n", qPrintable(failure));
+  }
+  return run.failed == 0 ? 0 : 1;
+}
+
 int RunGuiContractTest(QQuickWindow* window,
                        backup_modern::BackupController* controller) {
   CheckRun run;
@@ -4072,6 +4404,11 @@ int main(int argc, char* argv[]) {
       arguments.contains(QStringLiteral("--close-guard-test"));
   const bool gui_contract_test =
       arguments.contains(QStringLiteral("--gui-contract-test"));
+  // 三个页面"同一个普通表单输入 -> 同一条 DSL"的 parity 自检（见
+  // RunFilterUxTest）。它需要真实 QML 对象，所以和 gui-contract 一样在窗口
+  // 建好之后才分派，也属于自检模式（配置隔离照常生效）。
+  const bool filter_ux_test =
+      arguments.contains(QStringLiteral("--filter-ux-test"));
   const int incremental_test_index =
       arguments.indexOf(QStringLiteral("--incremental-test"));
   const int screenshot_index =
@@ -4176,7 +4513,8 @@ int main(int argc, char* argv[]) {
                                incremental_test_index >= 0 ||
                                screenshot_index >= 0 || self_test_index >= 0 ||
                                repository_test_index >= 0 || realtime_test ||
-                               backup_options_test || schedule_test;
+                               backup_options_test || schedule_test ||
+                               filter_ux_test;
   QString config_file_path = ResolveConfigFilePath(arguments);
   QString schedule_file_path = ResolveScheduleFilePath(arguments);
   QString realtime_file_path = ResolveRealtimeFilePath(arguments);
@@ -4235,7 +4573,15 @@ int main(int argc, char* argv[]) {
   // 换到 B，旧仓库不会再收到任何新快照（与 ScheduleController 同一种接法）。
   backup_modern::RealtimeController realtime_controller(
       realtime_file_path, config_file_path, &controller, &operation_gate);
+  // 三个页面的筛选规则编辑器共用同一个 presentation 组件，但每个页面有**自己**
+  // 的规则列表：备份页的模型直接挂在 BackupController 上（编辑即生效），计划页
+  // 与实时页是"草稿 + 保存"，所以它们的模型不带落点（构造参数为 nullptr），
+  // 只在本地生成 DSL 与摘要，保存时由页面把列表交给各自的控制器。
+  //
+  // 语法裁决仍然只有一条路：任一模型 -> FilterRuleBuilder -> Filter::AddRule。
   backup_modern::FilterRuleModel filter_rule_model(&controller);
+  backup_modern::FilterRuleModel schedule_filter_rule_model(nullptr);
+  backup_modern::FilterRuleModel realtime_filter_rule_model(nullptr);
 
   QQmlApplicationEngine engine;
   // 用上下文属性而不是注册 QML 类型：QML 侧直接写 theme.accent /
@@ -4245,6 +4591,10 @@ int main(int argc, char* argv[]) {
                                            &controller);
   engine.rootContext()->setContextProperty(QStringLiteral("filterRuleModel"),
                                            &filter_rule_model);
+  engine.rootContext()->setContextProperty(
+      QStringLiteral("scheduleFilterRuleModel"), &schedule_filter_rule_model);
+  engine.rootContext()->setContextProperty(
+      QStringLiteral("realtimeFilterRuleModel"), &realtime_filter_rule_model);
   engine.rootContext()->setContextProperty(QStringLiteral("schedule"),
                                            &schedule_controller);
   engine.rootContext()->setContextProperty(QStringLiteral("realtime"),
@@ -4355,6 +4705,12 @@ int main(int argc, char* argv[]) {
 
   if (gui_contract_test) {
     return RunGuiContractTest(window, &controller);
+  }
+
+  if (filter_ux_test) {
+    return RunFilterUxTest(window, &filter_rule_model,
+                           &schedule_filter_rule_model,
+                           &realtime_filter_rule_model);
   }
 
   if (smoke_test) {

@@ -37,10 +37,6 @@ Item {
     property int draftStrategyIndex: 0
     property int draftPackIndex: 0
     property int draftCompressionIndex: 0
-    property var draftInclude: []
-    property var draftExclude: []
-    property string draftIncludeInput: ""
-    property string draftExcludeInput: ""
 
     // 两个折叠区都默认收起，而且**不持久化**：折叠是这一屏的临时视图状态，
     // 不是配置；重新进入页面时回到"常用设置 + 运行状态优先"的默认样子。
@@ -50,14 +46,15 @@ Item {
     readonly property var strategyKeys: ["full", "incremental"]
     readonly property var strategyLabels: ["完整备份", "增量备份"]
     readonly property var packKeys: ["mypack", "ustar", "fast-ustar"]
-    readonly property var packLabels: ["MyPack", "USTAR", "Fast USTAR"]
+    readonly property var packLabels: ["MyPack（推荐）", "USTAR（兼容格式）", "Fast USTAR（兼容格式）"]
     readonly property var compressionKeys: ["none", "huffman", "lzss-huffman"]
     readonly property var compressionLabels: ["不压缩", "Huffman", "LZSS + Huffman"]
 
     // 备份方式的短解释：只解释当前选中的那一种，避免两个术语同时出现。
+    // 措辞与自动备份页逐字一致（人工验收：三个页面统一产品语言）。
     readonly property string strategyHelper: page.draftStrategyIndex === 1
-        ? "增量备份：首次建立完整基线，之后只保存变化。"
-        : "完整备份：每次创建一份可独立恢复的完整快照。"
+        ? "增量备份：首次建立完整基线，之后只保存变化，更节省空间。"
+        : "完整备份：每次生成一份可以独立恢复的完整备份。"
 
     // 草稿与已保存配置是否一致。只用来提示"这次改动还没生效"，
     // 不参与任何"能不能保存"的判断 —— 那个判断在共享核心里。
@@ -69,8 +66,7 @@ Item {
         || page.strategyKeys[page.draftStrategyIndex] !== realtime.strategyKey
         || page.packKeys[page.draftPackIndex] !== realtime.packKey
         || page.compressionKeys[page.draftCompressionIndex] !== realtime.compressionKey
-        || page.draftInclude.join("\n") !== realtime.includeRules.join("\n")
-        || page.draftExclude.join("\n") !== realtime.excludeRules.join("\n")
+        || ruleEditor.rulesSignature !== page.savedRulesSignature
 
     function syncFromController() {
         page.draftEnabled = realtime.enabled
@@ -78,12 +74,18 @@ Item {
         page.draftDebounce = String(realtime.debounceMs)
         page.draftMaxWait = String(realtime.maxWaitMs)
         page.draftRetain = String(realtime.retainCount)
-        page.draftInclude = realtime.includeRules
-        page.draftExclude = realtime.excludeRules
         page.draftStrategyIndex = Math.max(0, page.strategyKeys.indexOf(realtime.strategyKey))
         page.draftPackIndex = Math.max(0, page.packKeys.indexOf(realtime.packKey))
         page.draftCompressionIndex = Math.max(0, page.compressionKeys.indexOf(realtime.compressionKey))
+        // 落盘配置里的规则读进共享编辑器（校验仍然走共享 builder）。读不懂时
+        // 编辑器会显示共享核心给出的原因，这里不吞掉它。
+        ruleEditor.loadRules(realtime.includeRules, realtime.excludeRules)
     }
+
+    // 已保存配置里的规则文本，用作"改动尚未保存"的比较基准。分隔符与编辑器
+    // 的 rulesSignature 一致，两边是同一套拼接方式。
+    readonly property string savedRulesSignature: realtime.includeRules.join("\n")
+        + "\u0000" + realtime.excludeRules.join("\n")
 
     // 已保存配置的"指纹"：它一变就说明控制器那边的配置换了（保存成功，或者
     // 有人用 backupctl realtime set 改了同一份 store），草稿跟着重置。
@@ -363,8 +365,8 @@ Item {
                                 page.draftRetain,
                                 page.packKeys[page.draftPackIndex],
                                 page.compressionKeys[page.draftCompressionIndex],
-                                page.draftInclude,
-                                page.draftExclude,
+                                ruleEditor.includeRuleTexts,
+                                ruleEditor.excludeRuleTexts,
                                 page.strategyKeys[page.draftStrategyIndex])
                         }
 
@@ -423,8 +425,10 @@ Item {
                             Layout.fillWidth: true
                             spacing: 4
 
+                            // 主标签只用中文：英文术语（Debounce）退到「技术详情」
+                            // 与源码注释里，普通用户不需要看见它。
                             Text {
-                                text: "响应延迟（Debounce）"
+                                text: "响应延迟"
                                 font.pixelSize: 16
                                 color: theme.textSecondary
                             }
@@ -452,7 +456,7 @@ Item {
 
                             Text {
                                 Layout.fillWidth: true
-                                text: "文件停止变化多久后开始备份。默认 500 ms（可填 100–60000）。"
+                                text: "文件停止变化多久后开始备份。默认 500 毫秒。"
                                 font.pixelSize: 14
                                 color: theme.textSecondary
                                 wrapMode: Text.WordWrap
@@ -465,7 +469,7 @@ Item {
                             spacing: 4
 
                             Text {
-                                text: "最长等待（Max wait）"
+                                text: "最长等待"
                                 font.pixelSize: 16
                                 color: theme.textSecondary
                             }
@@ -493,7 +497,7 @@ Item {
 
                             Text {
                                 Layout.fillWidth: true
-                                text: "文件持续写入时，最多等待多久就创建一次检查点。默认 5000 ms（可填 500–300000）。"
+                                text: "文件持续写入时，最多等这么久就先备份一次。默认 5 秒。"
                                 font.pixelSize: 14
                                 color: theme.textSecondary
                                 wrapMode: Text.WordWrap
@@ -549,134 +553,19 @@ Item {
                         }
 
                         // ---- 筛选规则 ----
-                        Text {
-                            text: "筛选规则"
-                            font.pixelSize: 16
-                            font.weight: Font.DemiBold
-                            color: theme.textSecondary
-                        }
-
-                        Text {
+                        //
+                        // 以前这里是两个 raw DSL 输入框（"例如 ext:cpp;h" +
+                        // "添加包含规则"），普通用户被要求自己写语法。现在换成
+                        // 与备份页、自动备份页**同一个** FilterRuleEditor：
+                        // 选条件类型、填取值，DSL 由共享 builder 生成。
+                        FilterRuleEditor {
+                            id: ruleEditor
+                            ruleModel: realtimeFilterRuleModel
+                            objectPrefix: "realtime"
+                            busy: realtime.libraryBusy
+                            heading: "筛选规则"
+                            intro: "只有符合条件的文件会参与备份。如果同时命中包含和排除规则，以排除规则为准。"
                             Layout.fillWidth: true
-                            text: "只有符合条件的文件会被备份。规则由共享核心解析并校验，"
-                                  + "这里不做第二套解析。"
-                            font.pixelSize: 14
-                            color: theme.textSecondary
-                            wrapMode: Text.WordWrap
-                        }
-
-                        Repeater {
-                            model: page.draftInclude.length + page.draftExclude.length
-                            delegate: RowLayout {
-                                required property int index
-                                Layout.fillWidth: true
-                                spacing: 8
-                                readonly property bool isInclude: index < page.draftInclude.length
-                                readonly property string ruleText: isInclude
-                                    ? page.draftInclude[index]
-                                    : page.draftExclude[index - page.draftInclude.length]
-                                Text {
-                                    Layout.fillWidth: true
-                                    text: (parent.isInclude ? "包含  " : "排除  ") + parent.ruleText
-                                    font.pixelSize: 15
-                                    color: theme.textPrimary
-                                    elide: Text.ElideMiddle
-                                }
-                                AppButton {
-                                    text: "移除"
-                                    variant: "flat"
-                                    implicitWidth: 72
-                                    enabled: !realtime.libraryBusy
-                                    onClicked: {
-                                        if (parent.isInclude) {
-                                            const next = page.draftInclude.slice()
-                                            next.splice(index, 1)
-                                            page.draftInclude = next
-                                        } else {
-                                            const next = page.draftExclude.slice()
-                                            next.splice(index - page.draftInclude.length, 1)
-                                            page.draftExclude = next
-                                        }
-                                    }
-                                }
-                            }
-                        }
-
-                        RowLayout {
-                            Layout.fillWidth: true
-                            spacing: 8
-
-                            AppTextField {
-                                id: includeInput
-                                objectName: "realtimeIncludeField"
-                                visible: page.advancedExpanded
-                                Layout.fillWidth: true
-                                enabled: !realtime.libraryBusy
-                                placeholderText: "例如 ext:cpp;h"
-                                text: page.draftIncludeInput
-                                onTextEdited: page.draftIncludeInput = text
-                            }
-                            AppButton {
-                                objectName: "addRealtimeIncludeButton"
-                                text: "添加包含规则"
-                                enabled: !realtime.libraryBusy && page.draftIncludeInput !== ""
-                                onClicked: {
-                                    const error = realtime.validateRule("include", page.draftIncludeInput)
-                                    if (error !== "") {
-                                        invalidRuleText.text = error
-                                        return
-                                    }
-                                    invalidRuleText.text = ""
-                                    const next = page.draftInclude.slice()
-                                    next.push(page.draftIncludeInput)
-                                    page.draftInclude = next
-                                    page.draftIncludeInput = ""
-                                }
-                            }
-                        }
-
-                        RowLayout {
-                            Layout.fillWidth: true
-                            spacing: 8
-
-                            AppTextField {
-                                id: excludeInput
-                                objectName: "realtimeExcludeField"
-                                visible: page.advancedExpanded
-                                Layout.fillWidth: true
-                                enabled: !realtime.libraryBusy
-                                placeholderText: "例如 path:**/build/**"
-                                text: page.draftExcludeInput
-                                onTextEdited: page.draftExcludeInput = text
-                            }
-                            AppButton {
-                                objectName: "addRealtimeExcludeButton"
-                                text: "添加排除规则"
-                                enabled: !realtime.libraryBusy && page.draftExcludeInput !== ""
-                                onClicked: {
-                                    const error = realtime.validateRule("exclude", page.draftExcludeInput)
-                                    if (error !== "") {
-                                        invalidRuleText.text = error
-                                        return
-                                    }
-                                    invalidRuleText.text = ""
-                                    const next = page.draftExclude.slice()
-                                    next.push(page.draftExcludeInput)
-                                    page.draftExclude = next
-                                    page.draftExcludeInput = ""
-                                }
-                            }
-                        }
-
-                        Text {
-                            id: invalidRuleText
-                            objectName: "realtimeInvalidRuleText"
-                            Layout.fillWidth: true
-                            visible: text !== ""
-                            text: ""
-                            font.pixelSize: 15
-                            color: theme.error
-                            wrapMode: Text.WordWrap
                         }
 
                         // ---- 加密：一句弱提示，不再摆一个永远点不动的下拉框 ----
@@ -914,6 +803,18 @@ Item {
                             visible: page.technicalExpanded
                             Layout.fillWidth: true
                             text: realtime.lastEventText
+                            font.pixelSize: 14
+                            color: theme.textSecondary
+                            wrapMode: Text.WordWrap
+                        }
+
+                        // 英文术语只在这里出现一次：普通 UI 讲"响应延迟 / 最长等待"，
+                        // 需要对着文档或源码排查的人在这一层能拿到原名。
+                        Text {
+                            objectName: "realtimeDelayTermText"
+                            visible: page.technicalExpanded
+                            Layout.fillWidth: true
+                            text: "响应延迟对应 Debounce（debounce_ms），最长等待对应 Max wait（max_wait_ms）。"
                             font.pixelSize: 14
                             color: theme.textSecondary
                             wrapMode: Text.WordWrap
