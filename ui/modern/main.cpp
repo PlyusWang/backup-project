@@ -81,6 +81,7 @@
 #include "operation_gate.h"
 #include "realtime_controller.h"
 #include "schedule_controller.h"
+#include "schedule_frequency.h"
 #include "schedule_store.h"
 #include "scheduler_lock.h"
 
@@ -2899,6 +2900,13 @@ int RunScheduleTest(backup_modern::ScheduleController* schedule,
   CheckRun run;
   run.prefix = "[schedule]";
 
+  // 频率断言的人话单位名（内部 key -> 中文），只用于日志。
+  const auto unitLabel = [](const char* key) -> QString {
+    const backup_modern::FrequencyUnit* unit =
+        backup_modern::FindFrequencyUnit(key);
+    return QString::fromUtf8(unit == nullptr ? key : unit->label);
+  };
+
   QTemporaryDir temp;
   if (!temp.isValid()) {
     std::fprintf(stderr, "[schedule] 无法创建临时目录\n");
@@ -2945,9 +2953,132 @@ int RunScheduleTest(backup_modern::ScheduleController* schedule,
   run.Check(schedule->repositoryPath() == repository,
             QStringLiteral("SCH-06 控制器读到了临时仓库"),
             schedule->repositoryPath());
-  run.Check(schedule->supportedModeText().contains(
-                QStringLiteral("定时触发 + 完整快照")),
-            QStringLiteral("SCH-07 页面说明只承诺已实现的模式"));
+  // 这句能力说明改成面向用户的一句之后，断言也跟着改：它必须说的是当前真的
+  // 支持什么，而不是"以后会扩展什么"。
+  run.Check(schedule->supportedModeText().contains(QStringLiteral("定时触发")) &&
+                !schedule->supportedModeText().contains(
+                    QStringLiteral("后续将扩展")),
+            QStringLiteral("SCH-07 页面说明只承诺已实现的模式"),
+            schedule->supportedModeText());
+
+  // ---- 备份频率：值 + 单位 <-> interval_minutes ----
+  //
+  // 界面上是"每 1 小时"，核心与 backupctl 只认分钟。这一组断言把换算的两端都
+  // 钉住，尤其是"不能整除就回退分钟"和"乘法不许溢出"。
+  {
+    struct FrequencyCase {
+      const char* value;
+      const char* unit;
+      int expected;
+    };
+    const FrequencyCase kAccepted[] = {
+        {"1", "minutes", 1},   {"90", "minutes", 90}, {"1", "hours", 60},
+        {"2", "hours", 120},   {"1", "days", 1440},   {"2", "days", 2880},
+        {"1", "weeks", 10080}, {"365", "days", 525600},
+    };
+    for (const FrequencyCase& item : kAccepted) {
+      std::uint32_t minutes = 0;
+      std::string error;
+      const bool ok = backup_modern::ParseFrequency(
+          item.value, item.unit, &minutes, &error);
+      run.Check(ok && minutes == static_cast<std::uint32_t>(item.expected),
+                QStringLiteral("FREQ-01 每 %1 %2 -> %3 分钟")
+                    .arg(QString::fromLatin1(item.value), unitLabel(item.unit))
+                    .arg(item.expected),
+                ok ? QString::number(minutes) : QString::fromStdString(error));
+    }
+
+    // 加载：取最大的整除单位。10080 必须是"每 1 周"而不是"每 168 小时"，
+    // 90 必须老实回退成"每 90 分钟"，绝不显示"每 1.5 小时"。
+    struct SplitCase {
+      int minutes;
+      const char* value;
+      const char* unit;
+    };
+    const SplitCase kSplit[] = {
+        {60, "1", "hours"},   {120, "2", "hours"},  {1440, "1", "days"},
+        {2880, "2", "days"},  {10080, "1", "weeks"}, {90, "90", "minutes"},
+        {1, "1", "minutes"},  {525600, "365", "days"},
+    };
+    for (const SplitCase& item : kSplit) {
+      std::string value;
+      std::string unit;
+      backup_modern::SplitFrequency(static_cast<std::uint32_t>(item.minutes),
+                                    &value, &unit);
+      run.Check(value == item.value && unit == item.unit,
+                QStringLiteral("FREQ-02 %1 分钟 -> 每 %2 %3")
+                    .arg(item.minutes)
+                    .arg(QString::fromLatin1(item.value), unitLabel(item.unit)),
+                QStringLiteral("%1/%2").arg(QString::fromStdString(value),
+                                            QString::fromStdString(unit)));
+    }
+
+    // 0 / 负数 / 非数字 / 小数点 / 超最大值 / 乘法溢出 / 未知单位：全部拒绝。
+    struct RejectCase {
+      const char* value;
+      const char* unit;
+      const char* why;
+    };
+    const RejectCase kRejected[] = {
+        {"0", "minutes", "零"},
+        {"0", "hours", "零"},
+        {"-1", "hours", "负数"},
+        {"abc", "minutes", "非数字"},
+        {"1.5", "hours", "小数点"},
+        {"", "minutes", "空串"},
+        {"12abc", "minutes", "尾随字母"},
+        {"99999999999999999999", "minutes", "超出 uint32"},
+        {"525601", "minutes", "超出最大分钟数"},
+        {"1000", "weeks", "乘法会溢出上界"},
+        {"1", "lightyears", "未知单位"},
+    };
+    for (const RejectCase& item : kRejected) {
+      std::uint32_t minutes = 0;
+      std::string error;
+      const bool ok = backup_modern::ParseFrequency(
+          item.value, item.unit, &minutes, &error);
+      run.Check(!ok && !error.empty(),
+                QStringLiteral("FREQ-03 拒绝 每 %1 %2（%3）")
+                    .arg(QString::fromLatin1(item.value), unitLabel(item.unit),
+                         QString::fromUtf8(item.why)),
+                ok ? QStringLiteral("被接受了：%1").arg(minutes)
+                   : QStringLiteral("没有任何原因"));
+    }
+  }
+
+  // 控制器入口：界面走的就是这一条，返回值与回显都要对得上。
+  run.Check(schedule->saveConfigFromFrequencyText(
+                true, source, QStringLiteral("1"), QStringLiteral("hours"),
+                QStringLiteral("3"), QStringLiteral("mypack"),
+                QStringLiteral("none"), QStringList(), QStringList(),
+                QStringLiteral("full")) &&
+                schedule->intervalMinutes() == 60 &&
+                schedule->frequencyValueText() == QStringLiteral("1") &&
+                schedule->frequencyUnitKey() == QStringLiteral("hours"),
+            QStringLiteral("FREQ-04 控制器接受“每 1 小时”并回显一致"),
+            QStringLiteral("%1 %2 / %3 分钟")
+                .arg(schedule->frequencyValueText(),
+                     schedule->frequencyUnitKey())
+                .arg(schedule->intervalMinutes()));
+  run.Check(schedule->saveConfigFromFrequencyText(
+                true, source, QStringLiteral("90"),
+                QStringLiteral("minutes"), QStringLiteral("3"),
+                QStringLiteral("mypack"), QStringLiteral("none"),
+                QStringList(), QStringList(), QStringLiteral("full")) &&
+                schedule->intervalMinutes() == 90 &&
+                schedule->frequencyValueText() == QStringLiteral("90") &&
+                schedule->frequencyUnitKey() == QStringLiteral("minutes"),
+            QStringLiteral("FREQ-05 90 分钟不会被显示成 1.5 小时"));
+  run.Check(!schedule->saveConfigFromFrequencyText(
+                true, source, QStringLiteral("0"), QStringLiteral("minutes"),
+                QStringLiteral("3"), QStringLiteral("mypack"),
+                QStringLiteral("none"), QStringList(), QStringList(),
+                QStringLiteral("full")) &&
+                schedule->statusKind() == QStringLiteral("error"),
+            QStringLiteral("FREQ-06 控制器拒绝“每 0 分钟”并给出错误"),
+            schedule->statusTitle() + QStringLiteral("/") +
+                schedule->statusMessage());
+  schedule->clearStatus();
 
   // 2) 保存一份真实计划。
   run.Check(schedule->saveConfig(true, source, 1, 3, QStringLiteral("ustar"),
