@@ -592,8 +592,8 @@ QVariantMap FilterRuleModel::editorOptions() const {
   // ---- 条件类型 ----
   //
   // 顺序 = 普通用户的使用频率，不是 RuleField 的枚举顺序：先"按名字/扩展名挑
-  // 文件"，再"按大小/时间/属性挑"。user / group 排在最后：它们需要知道属主是谁，
-  // 日常用不到。
+  // 文件"，再"按大小/时间/属性挑"。user / group
+  // 排在最后：它们需要知道属主是谁， 日常用不到。
   //
   // 每一项都必须能真的生成 DSL 并被 Filter::AddRule 接受——这张表与
   // FilterRuleBuilder::RuleFieldLabel / RuleFieldHint 是同一份定义。
@@ -624,16 +624,15 @@ QVariantMap FilterRuleModel::editorOptions() const {
 
   // ---- type 的 7 个取值 ----
   const bp::RuleTypeValue kTypes[] = {
-      bp::RuleTypeValue::kFile,        bp::RuleTypeValue::kFolder,
-      bp::RuleTypeValue::kSymlink,     bp::RuleTypeValue::kFifo,
-      bp::RuleTypeValue::kCharDevice,  bp::RuleTypeValue::kBlockDevice,
+      bp::RuleTypeValue::kFile,       bp::RuleTypeValue::kFolder,
+      bp::RuleTypeValue::kSymlink,    bp::RuleTypeValue::kFifo,
+      bp::RuleTypeValue::kCharDevice, bp::RuleTypeValue::kBlockDevice,
       bp::RuleTypeValue::kSocket,
   };
   QVariantList types;
   for (const bp::RuleTypeValue type : kTypes) {
     QVariantMap option;
-    option.insert(QStringLiteral("key"),
-                  QString::fromLatin1(TypeText(type)));
+    option.insert(QStringLiteral("key"), QString::fromLatin1(TypeText(type)));
     option.insert(QStringLiteral("label"),
                   QString::fromUtf8(bp::TypeValueLabel(type)));
     types.push_back(option);
@@ -645,14 +644,15 @@ QVariantMap FilterRuleModel::editorOptions() const {
   // 区间放在最后。键就是表单键，也是 size 的 DSL 运算符（"等于"由 builder
   // 展开成 a..a，核心的 size 没有单独的 "="）。
   const bp::RuleSizeCompare kSizeCompares[] = {
-      bp::RuleSizeCompare::kLess,     bp::RuleSizeCompare::kLessEqual,
-      bp::RuleSizeCompare::kEqual,    bp::RuleSizeCompare::kGreaterEqual,
-      bp::RuleSizeCompare::kGreater,  bp::RuleSizeCompare::kRange,
+      bp::RuleSizeCompare::kLess,    bp::RuleSizeCompare::kLessEqual,
+      bp::RuleSizeCompare::kEqual,   bp::RuleSizeCompare::kGreaterEqual,
+      bp::RuleSizeCompare::kGreater, bp::RuleSizeCompare::kRange,
   };
   QVariantList size_compares;
   for (const bp::RuleSizeCompare compare : kSizeCompares) {
     QVariantMap option;
-    option.insert(QStringLiteral("key"), QString::fromLatin1(CompareText(compare)));
+    option.insert(QStringLiteral("key"),
+                  QString::fromLatin1(CompareText(compare)));
     option.insert(QStringLiteral("label"),
                   QString::fromUtf8(bp::SizeCompareLabel(compare)));
     size_compares.push_back(option);
@@ -682,7 +682,9 @@ QVariantMap FilterRuleModel::editorOptions() const {
 
   // ---- 大小单位（1024 进制，与 builder 的 RuleSizeUnit 一一对应）----
   const bp::RuleSizeUnit kUnits[] = {
-      bp::RuleSizeUnit::kByte, bp::RuleSizeUnit::kKilo, bp::RuleSizeUnit::kMega,
+      bp::RuleSizeUnit::kByte,
+      bp::RuleSizeUnit::kKilo,
+      bp::RuleSizeUnit::kMega,
       bp::RuleSizeUnit::kGiga,
   };
   QVariantList units;
@@ -731,8 +733,8 @@ bool FilterRuleModel::setRules(const QStringList& include_rules,
   // 先在**副本**上全部校验通过，再整体替换：半份新规则比旧规则更糟——
   // 用户看到的列表会既不是他保存的那份，也不是他刚填的那份。
   std::vector<bp::FilterRuleDraft> next;
-  next.reserve(static_cast<std::size_t>(include_rules.size() +
-                                        exclude_rules.size()));
+  next.reserve(
+      static_cast<std::size_t>(include_rules.size() + exclude_rules.size()));
   const auto append = [&next](const QStringList& rules,
                               bp::FilterAction action) -> QString {
     for (const QString& text : rules) {
@@ -927,9 +929,9 @@ void FilterRuleModel::RebuildRules() {
     bp::ToDsl(draft, &dsl, nullptr);
     QVariantMap item;
     const bool is_include = draft.action == bp::FilterAction::kInclude;
-    item.insert(QStringLiteral("action"),
-                is_include ? QStringLiteral("include")
-                           : QStringLiteral("exclude"));
+    item.insert(QStringLiteral("action"), is_include
+                                              ? QStringLiteral("include")
+                                              : QStringLiteral("exclude"));
     // 主行是给人看的人话："包含 · 文件扩展名：cpp、h"。动作名与条件名都来自
     // 共享 builder 的中文表，界面不再自己拼一套术语（也就不会出现"一处叫
     // Include、一处叫包含规则"）。

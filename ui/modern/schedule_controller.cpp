@@ -2,8 +2,6 @@
 
 #include "schedule_controller.h"
 
-#include "schedule_frequency.h"
-
 #include <QDateTime>
 #include <QDir>
 #include <QEventLoop>
@@ -19,6 +17,7 @@
 #include "backup_mode.h"
 #include "backup_option_keys.h"
 #include "filter.h"
+#include "schedule_frequency.h"
 
 namespace backup_modern {
 
@@ -538,14 +537,14 @@ bool ScheduleController::saveConfigFromFrequencyText(
   if (!ParseFrequency(value_text.toStdString(), unit_key.toStdString(),
                       &interval, &error)) {
     SetStatus(kError, QStringLiteral("备份频率不合法"),
-              QStringLiteral("备份频率必须是正整数，判断规则与 backupctl 完全一致。") +
+              QStringLiteral(
+                  "备份频率必须是正整数，判断规则与 backupctl 完全一致。") +
                   QStringLiteral(" ") + QString::fromStdString(error));
     return false;
   }
-  return saveConfigFromText(enabled, source_path,
-                            QString::number(interval), retain_text, pack_key,
-                            compression_key, include_rules, exclude_rules,
-                            strategy_key);
+  return saveConfigFromText(enabled, source_path, QString::number(interval),
+                            retain_text, pack_key, compression_key,
+                            include_rules, exclude_rules, strategy_key);
 }
 
 bool ScheduleController::saveConfigFromText(
@@ -878,8 +877,7 @@ QStringList ScheduleController::excludeRules() const {
 QString ScheduleController::supportedModeText() const {
   // 面向用户的一句话能力说明。以前那句还写着"后续将扩展增量策略"，那是 PR #18
   // 之前的实情；现在增量已经是计划路径上真实支持的一种方式，继续留着就是误导。
-  return QStringLiteral(
-      "当前支持：定时触发；备份方式可选完整备份或增量备份。");
+  return QStringLiteral("当前支持：定时触发；备份方式可选完整备份或增量备份。");
 }
 
 QString ScheduleController::encryptionNote() const {

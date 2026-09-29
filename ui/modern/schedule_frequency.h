@@ -23,8 +23,8 @@
 namespace backup_modern {
 
 struct FrequencyUnit {
-  const char* key;      // 表单键，QML 用它传递选择结果
-  const char* label;    // 中文单位名
+  const char* key;        // 表单键，QML 用它传递选择结果
+  const char* label;      // 中文单位名
   std::uint32_t minutes;  // 1 / 60 / 1440 / 10080
 };
 
@@ -44,7 +44,8 @@ const FrequencyUnit& LargestExactFrequencyUnit(std::uint32_t interval_minutes);
 //   * 折算后超过 kMaxIntervalMinutes；
 //   * 乘法会溢出的输入（在乘之前用最大值/单位分钟数夹住，不做回绕）。
 bool ParseFrequency(const std::string& value_text, const std::string& unit_key,
-                    std::uint32_t* interval_minutes, std::string* error_message);
+                    std::uint32_t* interval_minutes,
+                    std::string* error_message);
 
 // interval_minutes -> "值 + 单位"，用于把落盘配置回显到界面。
 // 10080 -> "1" + "weeks"；2880 -> "2" + "days"；120 -> "2" + "hours"；

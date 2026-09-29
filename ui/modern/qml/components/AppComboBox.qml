@@ -98,32 +98,93 @@ ComboBox {
         }
     }
 
-    // 每一行：行高、padding、hover、选中态都用主题色，字比默认大。
+    // 每一行：行高、padding 与**三种互不相同的状态**。
+    //
+    // 人工验收：鼠标移过某一项之后，把它移开（甚至移出下拉菜单）那块灰底不会
+    // 消失。根因是这里曾经把两个不同的概念混成了同一块灰色：
+    //
+    //   row.highlighted —— 绑到 control.highlightedIndex，这是 Qt 的**常驻**索引：
+    //                      下拉一打开就被设成当前已选择项（键盘导航的起点），
+    //                      ↑/↓ 移动它，它也不会因为鼠标离开而回到 -1。
+    //   row.hovered     —— 真正的"指针此刻在这一行上"。
+    //
+    // 两个分支返回同一个 theme.hover，于是"当前已选择的那一行"从下拉打开的那一
+    // 刻起就是灰的。用户先划过它、再移开鼠标，看到的自然是一块"移不掉"的灰——
+    // 那块灰根本不是鼠标点亮的，而是 highlightedIndex 一直在那儿。
+    //
+    // 现在三种状态各走各的通道，任何一个都不会借用另一个的表现：
+    //
+    //   鼠标 hover —— 只有指针真的停在这一行上才出现（row.hovered），指针一走
+    //                 立刻恢复透明。它是唯一使用 theme.hover 灰底的状态。
+    //   已选择项  —— 文字换成强调色 + 加粗，右侧一个勾号。不占任何底色，因此
+    //                 不可能被看成"残留的 hover"。
+    //   键盘导航  —— ↑/↓ 移开之后才点亮（row.keyboardHighlighted），用另一种
+    //                 颜色（accentSoft）。它和 hover 的灰在视觉上不是同一样东西。
     delegate: ItemDelegate {
         id: row
+
+        // headless 自检按这两个名字找行与它的底：--combo-hover-test 会真的把
+        // 指针移到某一行上，再移开，断言灰底严格跟着指针来去。
+        objectName: "comboItemRow"
         required property var modelData
         required property int index
 
         width: control.width - 12
         implicitHeight: 44
-        highlighted: control.highlightedIndex === index
+        // 显式打开 hover：默认值来自系统 style hint，headless 环境下不一定为真，
+        // 而这里的全部语义都建立在"指针真的在这一行上"。
+        hoverEnabled: true
 
-        contentItem: Text {
-            leftPadding: 10
-            text: row.modelData
-            font.pixelSize: 17
-            color: theme.textPrimary
-            verticalAlignment: Text.AlignVCenter
-            elide: Text.ElideRight
+        readonly property bool isSelected: control.currentIndex === index
+        // 键盘导航高亮：highlightedIndex 是常驻索引，所以只在它**不等于**当前已
+        // 选择项时才算"用户正在用键盘导航"。下拉刚打开时它等于 currentIndex，
+        // 那一行已经由"已选择"的样式表达了，不该再叠一层底色。
+        readonly property bool keyboardHighlighted: control.highlightedIndex === index
+                                                   && !row.isSelected
+        // ItemDelegate.highlighted 仍然是"键盘 / 焦点高亮"的语义，不能拿它当
+        // 鼠标 hover 用（Basic 样式会用它换文字色）。指针在的时候由 hover 说话。
+        highlighted: row.keyboardHighlighted && !row.hovered
+
+        contentItem: Item {
+            Text {
+                id: rowLabel
+                anchors.left: parent.left
+                anchors.right: parent.right
+                anchors.rightMargin: 26
+                anchors.verticalCenter: parent.verticalCenter
+                leftPadding: 10
+                text: row.modelData
+                font.pixelSize: 17
+                font.weight: row.isSelected ? Font.DemiBold : Font.Normal
+                color: row.isSelected ? theme.accent : theme.textPrimary
+                verticalAlignment: Text.AlignVCenter
+                elide: Text.ElideRight
+            }
+
+            // 已选择项的标记。它和 hover 的灰底是两条独立通道，"鼠标走了还留着
+            // 一块灰"在结构上不再可能发生。
+            Text {
+                objectName: "comboItemCheck"
+                anchors.right: parent.right
+                anchors.rightMargin: 12
+                anchors.verticalCenter: parent.verticalCenter
+                visible: row.isSelected
+                text: "✓"
+                font.pixelSize: 16
+                color: theme.accent
+            }
         }
 
         background: Rectangle {
+            objectName: "comboItemBackground"
             radius: 7
+            // 固定色之间直接切换，不做颜色动画：transparent 与不透明色之间插值会
+            // 逐分量经过"半透明黑"，浅色主题下就是上一轮已经修掉的那一闪。
             color: {
-                if (row.highlighted)
-                    return theme.hover
                 if (row.hovered)
                     return theme.hover
+                if (row.keyboardHighlighted)
+                    return theme.accentSoft
                 return "transparent"
             }
         }

@@ -2392,6 +2392,85 @@ expect_present "$SCHEDULE_PAGE_QML" "立即检查当前状态，并在需要时�
 expect_missing "$SCHEDULE_PAGE_QML" '"保存计划"' \
   "旧文案“保存计划”已经消失"
 
+echo "[modern-gui] 22) 共享 ComboBox 的 hover 残留（AppComboBox）"
+#
+# 人工现场：鼠标移过下拉里的某一项之后，把它移开（甚至移出下拉菜单），那块灰底
+# 不消失；备份 / 自动备份 / 实时备份三页都能复现 —— 三页用的是同一个
+# components/AppComboBox.qml，所以这是共享组件问题，不能逐页打补丁。
+#
+# 根因：delegate 把两个不同的概念混成了同一块灰色 ——
+#   row.highlighted（= control.highlightedIndex === index，Qt 的**常驻**索引，
+#                    下拉一打开就是当前已选择项，鼠标离开也不会回到 -1）
+#   row.hovered（指针此刻真的在这一行上）
+# 两个分支都返回 theme.hover，于是"当前已选择的那一行"从打开的那一刻起就是灰的。
+COMBO_QML="$QML_DIR/components/AppComboBox.qml"
+
+# --- 结构：hover 只能由"指针真的在这一行上"决定 ---
+expect_present "$COMBO_QML" "hoverEnabled: true" \
+  "下拉行显式打开 hover（默认值来自系统 style hint，headless 下不一定为真）"
+expect_present "$COMBO_QML" "if (row.hovered)" \
+  "hover 底色由 row.hovered 决定"
+expect_missing "$COMBO_QML" "if (row.highlighted)" \
+  "hover 底色不再由 highlighted（常驻索引）决定"
+expect_missing "$COMBO_QML" "highlighted: control.highlightedIndex === index" \
+  "delegate 不再把常驻索引直接当作高亮语义"
+expect_present "$COMBO_QML" "row.keyboardHighlighted" \
+  "键盘高亮是一个独立的派生状态"
+expect_present "$COMBO_QML" "theme.accentSoft" \
+  "键盘高亮用另一种颜色，和 hover 的灰不是同一块"
+expect_count "$COMBO_QML" "return theme.hover" 1 \
+  "全文件只有一处 hover 灰（就是 row.hovered 那一支）"
+
+# --- 已选择项：勾号 + 强调色文字，不占底色 ---
+expect_present "$COMBO_QML" 'objectName: "comboItemCheck"' \
+  "已选择项有独立的勾号标记"
+expect_present "$COMBO_QML" "row.isSelected ? Font.DemiBold : Font.Normal" \
+  "已选择项用字重区分"
+expect_present "$COMBO_QML" "row.isSelected ? theme.accent : theme.textPrimary" \
+  "已选择项用强调色文字区分"
+
+# --- 不重新引入颜色插值（浅色主题那一闪的根因）---
+expect_missing "$COMBO_QML" "Behavior on color" \
+  "下拉行不做颜色动画（固定色直接切换）"
+expect_present "$COMBO_QML" 'objectName: "comboItemBackground"' \
+  "行底有 objectName，运行期自检才能读到真实颜色"
+
+# --- 运行期：真的把指针移上去、移开、关掉重开 ---
+set +e
+QT_QPA_PLATFORM=offscreen QSG_RHI_BACKEND=software timeout 240 \
+  ./build/backup-gui-modern --combo-hover-test \
+  --config-file "$TEST_STATE_DIR/combo-config.json" \
+  --schedule-file "$TEST_STATE_DIR/combo-schedule.json" \
+  --realtime-file "$TEST_STATE_DIR/combo-realtime.json" \
+  > "$TEST_STATE_DIR/combo-hover.log" 2>&1
+combo_status=$?
+set -e
+cat "$TEST_STATE_DIR/combo-hover.log" >> "$LOG_FILE"
+if [[ "$combo_status" -eq 0 ]]; then
+  record_pass "共享下拉 hover 自检通过（$(grep -c '   ok   ' "$TEST_STATE_DIR/combo-hover.log" || true) 项观测全部通过）"
+else
+  record_fail "共享下拉 hover 自检退出码 $combo_status"
+  grep 'FAIL' "$TEST_STATE_DIR/combo-hover.log" | tail -8
+fi
+for pattern in "刚打开时没有任何一行带着 hover 灰底" \
+               "已选择项用勾号标记，且没有 hover 灰底" \
+               "指针在第 1 行时，只有这一行是 hover 灰" \
+               "指针换到第 2 行后，第 1 行的灰立刻消失" \
+               "指针移出下拉之后没有任何 hover 灰底残留" \
+               "重新打开下拉没有 stale hover" \
+               "highlightedIndex 是只读的常驻索引"; do
+  if grep -qF -- "$pattern" "$TEST_STATE_DIR/combo-hover.log"; then
+    record_pass "下拉 hover 自检：$pattern"
+  else
+    record_fail "下拉 hover 自检缺少：$pattern"
+  fi
+done
+if grep -qF "qml-warning" "$TEST_STATE_DIR/combo-hover.log"; then
+  record_fail "下拉 hover 自检期间出现了 QML 运行期告警"
+else
+  record_pass "下拉 hover 自检期间 0 QML 运行期告警"
+fi
+
 echo "[modern-gui] 通过 $PASS_COUNT 项，失败 $FAIL_COUNT 项"
 echo "[modern-gui] 日志: $LOG_FILE"
 if [[ "$FAIL_COUNT" -eq 0 ]]; then
