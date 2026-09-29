@@ -1283,21 +1283,17 @@ QString FlattenRecord(const QVariantMap& record) {
 // 非当前页整体不可见，用 visible 永远测不出"这一页会不会显示这条消息"。
 // ---- --combo-hover-test ----
 //
-// 共享 AppComboBox 下拉行的状态回归（两轮人工验收都栽在这里）。
+// 共享 AppComboBox 下拉行的状态回归（三轮人工验收都栽在同一个坑的不同形态上）。
 //
-// 第一轮：hover 底色绑到了 control.highlightedIndex（Qt 的常驻索引），
-//         下拉一打开"当前已选择项"就是灰的，鼠标移开也不会消失。
-// 第二轮：改成"键盘高亮 + accentSoft"之后仍然残留 —— 因为 highlightedIndex
-//         **不能证明高亮是键盘来的**：鼠标划过一行之后 Qt 也把它留在那一行上。
+//   第一轮：hover 底色绑到 control.highlightedIndex（常驻索引）
+//   第二轮：改成"键盘高亮 + highlightedIndex"，但 highlightedIndex 会被鼠标改脏
+//   第三轮：改成监听 Keys.onPressed，真实桌面上收不到事件（焦点在 ComboBox 上）
 //
-// 所以这个自检的重点不是"hover 能不能清掉"（那一条第一轮就修好了），而是：
+// 现在键盘模式由**Qt 导航的结果**推断：popup ListView 的 currentIndex 变了、
+// 而且当前没有指针活动 —— 不监听按键，也不接管任何键。
 //
-//   **构造出 highlightedIndex 仍然停在某一行、但指针已经离开的状态，
-//     并证明那一行没有任何底色。**
-//
-// 它真的把指针移到行上、再移走，也真的把导航键送进 popup 的按键处理器，
-// 逐行读运行期状态（hovered / highlightedIndex / currentIndex / 两个覆盖层的
-// opacity），不读源码文本。
+// 这个自检真的把指针移到行上、移走，也真的把 ↓ 送进真实焦点链，然后逐行读
+// 运行期状态（hovered / 覆盖层 opacity / currentIndex / 输入方式闸门）。
 int RunComboHoverTest(QQuickWindow* window, backup_modern::AppTheme* theme) {
   CheckRun run;
   run.prefix = "[combo-hover]";
@@ -1309,8 +1305,6 @@ int RunComboHoverTest(QQuickWindow* window, backup_modern::AppTheme* theme) {
             QStringLiteral("hover=%1 keyboard=%2")
                 .arg(hover_color.name(), keyboard_color.name()));
 
-  // 备份页 → 共享规则编辑器 → “条件类型”（先用真实按钮把表单展开：
-  // hover 是"窗口里真的有这个点"才成立的）。
   window->setProperty("currentPage", 1);
   window->setWidth(1280);
   window->setHeight(1000);
@@ -1334,17 +1328,17 @@ int RunComboHoverTest(QQuickWindow* window, backup_modern::AppTheme* theme) {
     return 1;
   }
   QObject* popup = combo->property("popup").value<QObject*>();
-  QQuickItem* popup_content =
-      popup == nullptr ? nullptr
-                       : popup->property("contentItem").value<QQuickItem*>();
-  run.Check(popup != nullptr && popup_content != nullptr,
+  QQuickItem* list = popup == nullptr
+                         ? nullptr
+                         : popup->property("contentItem").value<QQuickItem*>();
+  run.Check(popup != nullptr && list != nullptr,
             QStringLiteral("下拉有 popup 与它的 contentItem"));
-  if (popup == nullptr || popup_content == nullptr) {
+  if (popup == nullptr || list == nullptr) {
     std::printf("[combo-hover] passed=%d failed=%d\n", run.passed, run.failed);
     return 1;
   }
 
-  // 复现人工验收截图：当前已选择项 = “路径”，残留灰框 = “文件类型”。
+  // 复现人工验收截图：当前已选择项 = “路径”，鼠标划过“文件类型”。
   const QVariantList model = combo->property("model").toList();
   QStringList labels;
   for (const QVariant& item : model) {
@@ -1362,8 +1356,7 @@ int RunComboHoverTest(QQuickWindow* window, backup_modern::AppTheme* theme) {
   combo->setProperty("currentIndex", path_index);
   WaitForAnimation(100);
 
-  // ---- 运行期读数（全部取自真实的 QML 属性/覆盖层）----
-  const auto collectRows = [popup_content]() {
+  const auto collectRows = [list]() {
     QList<QPair<int, QQuickItem*>> rows;
     std::function<void(QQuickItem*)> walk = [&](QQuickItem* item) {
       if (item->objectName() == QLatin1String("comboItemRow"))
@@ -1373,7 +1366,7 @@ int RunComboHoverTest(QQuickWindow* window, backup_modern::AppTheme* theme) {
         walk(kid);
       }
     };
-    walk(popup_content);
+    walk(list);
     std::sort(
         rows.begin(), rows.end(),
         [](const QPair<int, QQuickItem*>& a, const QPair<int, QQuickItem*>& b) {
@@ -1395,7 +1388,6 @@ int RunComboHoverTest(QQuickWindow* window, backup_modern::AppTheme* theme) {
       [&layerOpacity](const QPair<int, QQuickItem*>& row) {
         return layerOpacity(row, "comboItemKeyboardLayer");
       };
-  // "这一行有没有底色"：两个覆盖层与底色本身，任何一个是可见的就算有。
   const auto hasBackground = [&](const QPair<int, QQuickItem*>& row) -> bool {
     const QColor base =
         row.second
@@ -1405,10 +1397,19 @@ int RunComboHoverTest(QQuickWindow* window, backup_modern::AppTheme* theme) {
     return hoverOpacity(row) > 0.01 || keyboardOpacity(row) > 0.01 ||
            base.alpha() > 0;
   };
+  const auto rowsWhere =
+      [&](const QList<QPair<int, QQuickItem*>>& rows,
+          const std::function<qreal(const QPair<int, QQuickItem*>&)>& opacity) {
+        QStringList names;
+        for (const auto& row : rows) {
+          if (opacity(row) > 0.01) names << QString::number(row.first);
+        }
+        return names;
+      };
   const auto describe = [&](const QList<QPair<int, QQuickItem*>>& rows) {
     QStringList parts;
     for (const auto& row : rows) {
-      parts << QStringLiteral("%1[h=%2 k=%3 hovered=%4 sel=%5]")
+      parts << QStringLiteral("%1[h=%2 k=%3 hv=%4 sel=%5]")
                    .arg(row.first)
                    .arg(hoverOpacity(row), 0, 'f', 0)
                    .arg(keyboardOpacity(row), 0, 'f', 0)
@@ -1417,18 +1418,18 @@ int RunComboHoverTest(QQuickWindow* window, backup_modern::AppTheme* theme) {
     }
     return parts.join(QStringLiteral(" "));
   };
-  const auto rowsWithBackground =
-      [&](const QList<QPair<int, QQuickItem*>>& rows) {
-        QStringList names;
-        for (const auto& row : rows) {
-          if (hasBackground(row)) names << QString::number(row.first);
-        }
-        return names;
-      };
+  const auto hoverRows = [&](const QList<QPair<int, QQuickItem*>>& rows) {
+    return rowsWhere(rows, hoverOpacity);
+  };
+  const auto keyboardRows = [&](const QList<QPair<int, QQuickItem*>>& rows) {
+    return rowsWhere(rows, keyboardOpacity);
+  };
   const auto keyboardActive = [combo]() {
     return combo->property("keyboardNavigationActive").toBool();
   };
-  const QString marker = QStringLiteral("无底色=%1 键盘层 -1 说明覆盖层不存在");
+  const auto listIndex = [list]() {
+    return list->property("currentIndex").toInt();
+  };
   const auto movePointerTo = [window](const QPointF& pos,
                                       const QPointF& old_pos) {
     QHoverEvent hover(QEvent::HoverMove, pos, pos, old_pos);
@@ -1437,9 +1438,15 @@ int RunComboHoverTest(QQuickWindow* window, backup_modern::AppTheme* theme) {
   const auto centerOf = [](QQuickItem* item) {
     return item->mapToScene(QPointF(item->width() / 2.0, item->height() / 2.0));
   };
+  const auto sendKey = [window](int key) {
+    QKeyEvent press(QEvent::KeyPress, key, Qt::NoModifier);
+    QCoreApplication::sendEvent(window, &press);
+    QKeyEvent release(QEvent::KeyRelease, key, Qt::NoModifier);
+    QCoreApplication::sendEvent(window, &release);
+  };
 
   QMetaObject::invokeMethod(popup, "open");
-  WaitForAnimation(280);
+  WaitForAnimation(320);
   QList<QPair<int, QQuickItem*>> rows = collectRows();
   run.Check(rows.size() >= 7, QStringLiteral("条件类型下拉展开了至少 7 行"),
             QStringLiteral("实际 %1 行").arg(rows.size()));
@@ -1454,19 +1461,21 @@ int RunComboHoverTest(QQuickWindow* window, backup_modern::AppTheme* theme) {
     return nullptr;
   };
 
-  // ---- Case 1：打开 popup，指针不在任何地方 ----
-  // 期望：任何一行都没有底色；当前已选择项只有 check + 强调色文字。
-  run.Check(rowsWithBackground(rows).isEmpty() && !keyboardActive(),
-            QStringLiteral("Case 1 打开 popup 时没有任何一行带底色"),
-            QStringLiteral("带底色的行=%1 键盘模式=%2 | %3")
-                .arg(rowsWithBackground(rows).join(QStringLiteral(",")))
-                .arg(keyboardActive())
-                .arg(describe(rows)));
-  run.Check(combo->property("highlightedIndex").toInt() == path_index &&
+  // ---- Mouse 1：打开 popup，指针不在任何地方，键盘模式必须是关的 ----
+  run.Check(
+      !keyboardActive() && hoverRows(rows).isEmpty() &&
+          keyboardRows(rows).isEmpty(),
+      QStringLiteral("Mouse 1 打开 popup：无 hover 底色、无键盘光标、模式关闭"),
+      QStringLiteral("hover 行=%1 键盘行=%2 模式=%3 | %4")
+          .arg(hoverRows(rows).join(QStringLiteral(",")),
+               keyboardRows(rows).join(QStringLiteral(",")))
+          .arg(keyboardActive())
+          .arg(describe(rows)));
+  run.Check(listIndex() == path_index &&
                 combo->property("currentIndex").toInt() == path_index,
-            QStringLiteral("Case 1 Qt 把 highlightedIndex 设成了当前已选择项"),
-            QStringLiteral("highlightedIndex=%1 currentIndex=%2")
-                .arg(combo->property("highlightedIndex").toInt())
+            QStringLiteral("Mouse 1 打开时键盘位置同步到当前已选择项"),
+            QStringLiteral("listCur=%1 currentIndex=%2")
+                .arg(listIndex())
                 .arg(combo->property("currentIndex").toInt()));
   {
     QQuickItem* selected_row = rowAt(path_index);
@@ -1476,151 +1485,203 @@ int RunComboHoverTest(QQuickWindow* window, backup_modern::AppTheme* theme) {
                                   QStringLiteral("comboItemCheck"));
     run.Check(check != nullptr && check->property("visible").toBool() &&
                   !hasBackground({path_index, selected_row}),
-              QStringLiteral("Case 1 已选择项（路径）只有勾号，没有底色"));
+              QStringLiteral("Mouse 1 已选择项（路径）只有勾号，没有底色"));
   }
 
-  // ---- Case 2：指针 hover “文件类型” ----
+  // ---- Mouse 2：指针 hover “文件类型” ----
   QPointF pointer = centerOf(rowAt(type_index));
   movePointerTo(pointer, centerOf(rowAt(path_index)));
   WaitForAnimation(150);
   rows = collectRows();
-  {
-    QStringList hover_rows;
-    for (const auto& row : rows) {
-      if (hoverOpacity(row) > 0.01) hover_rows << QString::number(row.first);
-    }
-    run.Check(hover_rows == QStringList{QString::number(type_index)},
-              QStringLiteral("Case 2 只有“文件类型”这一行有 hover 底色"),
-              QStringLiteral("hover 行=%1 | %2")
-                  .arg(hover_rows.join(QStringLiteral(",")), describe(rows)));
-  }
+  run.Check(hoverRows(rows) == QStringList{QString::number(type_index)} &&
+                keyboardRows(rows).isEmpty() && !keyboardActive(),
+            QStringLiteral(
+                "Mouse 2 只有“文件类型”有 hover 灰底，且没有误触发键盘模式"),
+            QStringLiteral("hover 行=%1 键盘行=%2 模式=%3 | %4")
+                .arg(hoverRows(rows).join(QStringLiteral(",")),
+                     keyboardRows(rows).join(QStringLiteral(",")))
+                .arg(keyboardActive())
+                .arg(describe(rows)));
 
-  // ---- Case 3（本次最关键）：指针离开“文件类型”，但 highlightedIndex
-  // 留在它身上 ----
+  // ---- Mouse 3：指针移出，但 highlightedIndex / listCur 都还停在那一行 ----
   movePointerTo(QPointF(4, 4), pointer);
-  WaitForAnimation(200);
+  WaitForAnimation(220);
   rows = collectRows();
-  const int retained = combo->property("highlightedIndex").toInt();
-  const bool type_hovered = rowAt(type_index)->property("hovered").toBool();
-  run.Check(!type_hovered,
-            QStringLiteral("Case 3 指针离开后 row.hovered 已经是 false"),
-            QStringLiteral("hovered=%1").arg(type_hovered));
-  run.Check(retained == type_index,
+  const int retained_hl = combo->property("highlightedIndex").toInt();
+  const int retained_list = listIndex();
+  run.Check(
+      !rowAt(type_index)->property("hovered").toBool() &&
+          retained_hl == type_index && retained_list == type_index,
+      QStringLiteral("Mouse 3 指针离开后索引仍停在被划过的那一行（Qt 的行为）"),
+      QStringLiteral("hovered=%1 highlightedIndex=%2 listCur=%3")
+          .arg(rowAt(type_index)->property("hovered").toBool())
+          .arg(retained_hl)
+          .arg(retained_list));
+  run.Check(!keyboardActive() && hoverRows(rows).isEmpty() &&
+                keyboardRows(rows).isEmpty(),
             QStringLiteral(
-                "Case 3 highlightedIndex 仍然停在被划过的那一行（Qt 的行为）"),
-            QStringLiteral("highlightedIndex=%1 期望=%2")
-                .arg(retained)
-                .arg(type_index));
-  run.Check(!keyboardActive(),
-            QStringLiteral("Case 3 没有任何键盘导航，输入方式闸门是关的"));
-  run.Check(rowsWithBackground(rows).isEmpty(),
-            QStringLiteral(
-                "Case 3 highlightedIndex 留在那一行，但视觉上没有任何底色"),
-            QStringLiteral("带底色的行=%1 | %2")
-                    .arg(rowsWithBackground(rows).join(QStringLiteral(",")),
-                         describe(rows)) +
-                QStringLiteral(" | ") + marker.arg(0));
+                "Mouse 3 索引留在那一行，但视觉上没有任何底色（人工验收截图）"),
+            QStringLiteral("hover 行=%1 键盘行=%2 模式=%3 | %4")
+                .arg(hoverRows(rows).join(QStringLiteral(",")),
+                     keyboardRows(rows).join(QStringLiteral(",")))
+                .arg(keyboardActive())
+                .arg(describe(rows)));
 
-  // ---- Case 4：指针移出整个 popup ----
-  run.Check(rowsWithBackground(rows).isEmpty(),
-            QStringLiteral("Case 4 指针在 popup 之外时没有任何底色"));
-
-  // ---- Case 5：关掉再打开，没有 stale ----
-  QMetaObject::invokeMethod(popup, "close");
-  WaitForAnimation(240);
-  QMetaObject::invokeMethod(popup, "open");
-  WaitForAnimation(280);
-  rows = collectRows();
-  run.Check(rowsWithBackground(rows).isEmpty() && !keyboardActive(),
-            QStringLiteral("Case 5 重新打开下拉没有 stale 底色"),
-            QStringLiteral("带底色的行=%1 | %2")
-                .arg(rowsWithBackground(rows).join(QStringLiteral(",")),
-                     describe(rows)));
-
-  // ---- Case 6：真实的 ↓ ----
-  //
-  // offscreen 窗口没有 active focus，把键发给窗口送不到 popup；所以先把键发给
-  // 当前焦点项（真实链路：焦点项在 delegate 上，事件沿父链上浮），不行再直接
-  // 发给 popup 的列表项（它才是 Keys 处理器的宿主）。两条路用的都是同一个真实
-  // 按键处理器与同一个状态机，只是投递点不同；哪一条生效会记在断言详情里。
-  const auto sendKey = [](QQuickItem* target, int key) {
-    if (target == nullptr) return false;
-    QKeyEvent press(QEvent::KeyPress, key, Qt::NoModifier);
-    QCoreApplication::sendEvent(target, &press);
-    QKeyEvent release(QEvent::KeyRelease, key, Qt::NoModifier);
-    QCoreApplication::sendEvent(target, &release);
-    return true;
-  };
-  QString delivery = QStringLiteral("none");
-  sendKey(window->activeFocusItem(), Qt::Key_Down);
-  WaitForAnimation(120);
-  if (keyboardActive()) {
-    delivery = QStringLiteral("activeFocusItem");
-  } else {
-    sendKey(popup_content, Qt::Key_Down);
-    WaitForAnimation(120);
-    if (keyboardActive()) delivery = QStringLiteral("popup contentItem");
-  }
-  run.Check(keyboardActive(),
-            QStringLiteral("Case 6 真实 ↓ 打开了键盘导航模式"),
-            QStringLiteral("投递点=%1 keyboardNavigationActive=%2")
-                .arg(delivery)
-                .arg(keyboardActive()));
-  rows = collectRows();
-  {
-    QStringList keyboard_rows;
-    for (const auto& row : rows) {
-      if (keyboardOpacity(row) > 0.01)
-        keyboard_rows << QString::number(row.first);
-    }
-    run.Check(keyboardActive() && !keyboard_rows.isEmpty(),
-              QStringLiteral("Case 6 键盘模式下有且只有键盘行被点亮"),
-              QStringLiteral("键盘行=%1 highlightedIndex=%2 | %3")
-                  .arg(keyboard_rows.join(QStringLiteral(",")))
-                  .arg(combo->property("highlightedIndex").toInt())
-                  .arg(describe(rows)));
-    run.Check(!keyboard_rows.contains(QString::number(path_index)),
-              QStringLiteral("Case 6 当前已选择项不会被键盘底色盖住"));
-  }
-
-  // ---- Case 7：键盘之后鼠标一动，立刻切回 hover 模式 ----
-  rows = collectRows();
-  const QPointF keyboard_row_center = centerOf(rowAt(type_index));
-  movePointerTo(keyboard_row_center, QPointF(4, 4));
-  WaitForAnimation(180);
-  rows = collectRows();
-  {
-    QStringList keyboard_rows;
-    QStringList hover_rows;
-    for (const auto& row : rows) {
-      if (keyboardOpacity(row) > 0.01)
-        keyboard_rows << QString::number(row.first);
-      if (hoverOpacity(row) > 0.01) hover_rows << QString::number(row.first);
-    }
-    run.Check(!keyboardActive() && keyboard_rows.isEmpty(),
-              QStringLiteral("Case 7 鼠标一动就退出键盘模式，键盘底色全部熄灭"),
-              QStringLiteral("键盘模式=%1 键盘行=%2")
-                  .arg(keyboardActive())
-                  .arg(keyboard_rows.join(QStringLiteral(","))));
-    run.Check(hover_rows == QStringList{QString::number(type_index)},
-              QStringLiteral("Case 7 hover 立刻接管，只跟指针"),
-              QStringLiteral("hover 行=%1 | %2")
-                  .arg(hover_rows.join(QStringLiteral(",")), describe(rows)));
-  }
-
-  // ---- 收尾 ----
-  movePointerTo(QPointF(4, 4), keyboard_row_center);
+  // ---- Mouse 4：重新进入，hover 立刻接管 ----
+  movePointerTo(centerOf(rowAt(type_index)), QPointF(4, 4));
   WaitForAnimation(150);
   rows = collectRows();
-  run.Check(rowsWithBackground(rows).isEmpty(),
-            QStringLiteral("收尾：指针再次离开后没有任何残留底色"));
-  QMetaObject::invokeMethod(popup, "close");
+  run.Check(hoverRows(rows) == QStringList{QString::number(type_index)},
+            QStringLiteral("Mouse 4 指针重新进入：hover 立刻接管"),
+            describe(rows));
+
+  // ---- Keyboard 1：真实焦点链上的 ↓ ----
+  //
+  // 真实桌面实测：点开下拉之后焦点在 ComboBox 上，按键送到窗口后由 ComboBox
+  // 处理， popup ListView 的 currentIndex 随之前移。这里复现同一条链路。
+  movePointerTo(QPointF(4, 4), centerOf(rowAt(type_index)));
+  WaitForAnimation(200);
+  combo->forceActiveFocus();
+  WaitForAnimation(150);
+  const int before_down = listIndex();
+  sendKey(Qt::Key_Down);
   WaitForAnimation(220);
-  run.Check(combo->property("currentIndex").toInt() == path_index,
-            QStringLiteral("整个过程没有动坏 currentIndex"),
-            QStringLiteral("currentIndex=%1 期望=%2")
+  rows = collectRows();
+  run.Check(
+      listIndex() == before_down + 1,
+      QStringLiteral("Keyboard 1 ↓ 让 popup 的 currentIndex 前移一项"),
+      QStringLiteral("listCur %1 -> %2").arg(before_down).arg(listIndex()));
+  run.Check(keyboardActive(),
+            QStringLiteral("Keyboard 1 ↓ 之后键盘模式打开（由导航结果推断）"),
+            QStringLiteral("模式=%1").arg(keyboardActive()));
+  run.Check(
+      keyboardRows(rows) == QStringList{QString::number(listIndex())},
+      QStringLiteral("Keyboard 1 键盘光标正好落在 Qt 移动到的那个 row 上"),
+      QStringLiteral("键盘行=%1 listCur=%2 | %3")
+          .arg(keyboardRows(rows).join(QStringLiteral(",")))
+          .arg(listIndex())
+          .arg(describe(rows)));
+
+  // ---- Keyboard 2：再 ↓ 一次，光标整体下移一行 ----
+  const int first_keyboard_row = listIndex();
+  sendKey(Qt::Key_Down);
+  WaitForAnimation(220);
+  rows = collectRows();
+  run.Check(listIndex() == first_keyboard_row + 1 &&
+                keyboardRows(rows) == QStringList{QString::number(listIndex())},
+            QStringLiteral("Keyboard 2 再 ↓：光标整体下移一行，上一行立刻熄灭"),
+            QStringLiteral("键盘行=%1 listCur=%2 | %3")
+                .arg(keyboardRows(rows).join(QStringLiteral(",")))
+                .arg(listIndex())
+                .arg(describe(rows)));
+
+  // ---- Keyboard 3：↑ 回上一行 ----
+  sendKey(Qt::Key_Up);
+  WaitForAnimation(220);
+  rows = collectRows();
+  run.Check(listIndex() == first_keyboard_row &&
+                keyboardRows(rows) == QStringList{QString::number(listIndex())},
+            QStringLiteral("Keyboard 3 ↑ 把光标移回上一行"),
+            QStringLiteral("键盘行=%1 listCur=%2")
+                .arg(keyboardRows(rows).join(QStringLiteral(",")))
+                .arg(listIndex()));
+
+  // ---- Keyboard 4：光标落在"已选择项"上时仍然看得见 ----
+  while (listIndex() > path_index) {
+    sendKey(Qt::Key_Up);
+    WaitForAnimation(180);
+  }
+  rows = collectRows();
+  {
+    QQuickItem* selected_row = rowAt(path_index);
+    QQuickItem* check = selected_row == nullptr
+                            ? nullptr
+                            : selected_row->findChild<QQuickItem*>(
+                                  QStringLiteral("comboItemCheck"));
+    run.Check(
+        listIndex() == path_index && keyboardActive() &&
+            keyboardOpacity({path_index, selected_row}) > 0.01 &&
+            check != nullptr && check->property("visible").toBool(),
+        QStringLiteral("Keyboard 4 键盘光标落在已选择项上：光标与勾号同时可见"),
+        QStringLiteral("listCur=%1 键盘层=%2 勾号=%3")
+            .arg(listIndex())
+            .arg(keyboardOpacity({path_index, selected_row}))
+            .arg(check != nullptr && check->property("visible").toBool()));
+  }
+
+  // ---- Mouse 5：键盘模式下移动鼠标 -> 键盘模式立刻退出 ----
+  const QPointF back_to_type = centerOf(rowAt(type_index));
+  movePointerTo(back_to_type, QPointF(4, 4));
+  WaitForAnimation(220);
+  rows = collectRows();
+  run.Check(!keyboardActive() && keyboardRows(rows).isEmpty() &&
+                hoverRows(rows) == QStringList{QString::number(type_index)},
+            QStringLiteral(
+                "Mouse 5 键盘模式下移动鼠标：键盘光标立即消失、hover 接管"),
+            QStringLiteral("hover 行=%1 键盘行=%2 模式=%3 | %4")
+                .arg(hoverRows(rows).join(QStringLiteral(",")),
+                     keyboardRows(rows).join(QStringLiteral(",")))
+                .arg(keyboardActive())
+                .arg(describe(rows)));
+
+  // ---- Mouse 6：指针再离开 -> 仍然什么都不留 ----
+  movePointerTo(QPointF(4, 4), back_to_type);
+  WaitForAnimation(200);
+  rows = collectRows();
+  run.Check(!keyboardActive() && hoverRows(rows).isEmpty() &&
+                keyboardRows(rows).isEmpty(),
+            QStringLiteral("Mouse 6 指针离开后没有任何底色残留"),
+            describe(rows));
+
+  // ---- Keyboard 5：Enter 采纳，Esc 不改选择 ----
+  combo->forceActiveFocus();
+  sendKey(Qt::Key_Down);
+  WaitForAnimation(200);
+  const int enter_target = listIndex();
+  sendKey(Qt::Key_Return);
+  WaitForAnimation(260);
+  run.Check(!popup->property("visible").toBool() &&
+                combo->property("currentIndex").toInt() == enter_target &&
+                !keyboardActive(),
+            QStringLiteral("Keyboard 5 Enter 采纳当前键盘行并关闭下拉"),
+            QStringLiteral("visible=%1 currentIndex=%2 期望=%3 模式=%4")
+                .arg(popup->property("visible").toBool())
                 .arg(combo->property("currentIndex").toInt())
-                .arg(path_index));
+                .arg(enter_target)
+                .arg(keyboardActive()));
+  const int selected_after_enter = combo->property("currentIndex").toInt();
+  QMetaObject::invokeMethod(popup, "open");
+  WaitForAnimation(300);
+  sendKey(Qt::Key_Down);
+  WaitForAnimation(200);
+  sendKey(Qt::Key_Escape);
+  WaitForAnimation(260);
+  run.Check(
+      !popup->property("visible").toBool() &&
+          combo->property("currentIndex").toInt() == selected_after_enter &&
+          !keyboardActive(),
+      QStringLiteral("Keyboard 6 Esc 关闭下拉且不改动已选择的值"),
+      QStringLiteral("visible=%1 currentIndex=%2 期望=%3")
+          .arg(popup->property("visible").toBool())
+          .arg(combo->property("currentIndex").toInt())
+          .arg(selected_after_enter));
+
+  // ---- 关掉再打开：没有 stale ----
+  QMetaObject::invokeMethod(popup, "open");
+  WaitForAnimation(320);
+  rows = collectRows();
+  run.Check(!keyboardActive() && keyboardRows(rows).isEmpty() &&
+                hoverRows(rows).isEmpty(),
+            QStringLiteral(
+                "Reopen 重新打开下拉：没有 stale 键盘光标、没有 stale 灰底"),
+            QStringLiteral("键盘行=%1 hover 行=%2 模式=%3 | %4")
+                .arg(keyboardRows(rows).join(QStringLiteral(",")),
+                     hoverRows(rows).join(QStringLiteral(",")))
+                .arg(keyboardActive())
+                .arg(describe(rows)));
+
+  QMetaObject::invokeMethod(popup, "close");
+  WaitForAnimation(200);
   clickByName(QStringLiteral("filterRuleCancelButton"));
   WaitForAnimation(80);
 
