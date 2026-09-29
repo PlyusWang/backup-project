@@ -85,6 +85,13 @@ class InotifyWatcher {
   void InjectAddWatchFailureForTesting(int error_number);
   // 让下一次目录枚举在指定深度失败。
   void InjectReaddirFailureForTesting(int error_number);
+  // 让下一次 Attach / Rebuild 在"root 预检已经通过、真正开始建立 watch 之前"
+  // 调用这个钩子。测试用它把 root 删掉 / 换成普通文件 / 换成软链接，精确命中
+  // precheck 与 AddDirectory 的第二次 lstat 之间的那个窗口——不是概率 race。
+  // 建立 watch 的**后置不变量**（root watch 存在、root_wd 有效、watch 数 >= 1）
+  // 与这个钩子无关：钩子只是把现实里真实存在的竞态做成可重复的。
+  void SetRootPrecheckHookForTesting(void (*hook)(void* context),
+                                     void* context);
 
  private:
   struct WatchTarget {
@@ -109,9 +116,17 @@ class InotifyWatcher {
   std::unordered_map<int, std::size_t> index_;
   int root_wd_ = -1;
 
+  // "root 真的被 watch 上了"的唯一判据。Attach / Rebuild 成功之后必须成立，
+  // 不成立就是失败——不能返回一个 watch_count == 0 的"健康"实例。
+  bool RootWatchBuilt(const std::vector<WatchTarget>& watches) const {
+    return root_wd_ >= 0 && !watches.empty();
+  }
+
   bool injected_overflow_ = false;
   int injected_add_watch_errno_ = 0;
   int injected_readdir_errno_ = 0;
+  void (*root_precheck_hook_)(void* context) = nullptr;
+  void* root_precheck_hook_context_ = nullptr;
 };
 
 }  // namespace backupproject
