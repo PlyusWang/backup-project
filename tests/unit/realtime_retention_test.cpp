@@ -403,9 +403,15 @@ int main() {
           realtime_child.retention_deleted == 0,
           "INC-RTR T4 判别：有活着的非 realtime 后代 -> 一份都不删",
           std::to_string(realtime_child.retention_deleted));
+      // F 之后这里不再是 uncertain：保留点的依赖链把那份基线保了下来，属于
+      // 健康的 dependency retention（"删除被拒绝"的证据在下面直接调
+      // DeleteSnapshots 的那一条）。
       test_support::Check(
-          realtime_child.retention_uncertain,
-          "INC-RTR T4 判别：删除被拒绝这件事被如实报成 uncertain");
+          !realtime_child.retention_uncertain &&
+              realtime_child.retention_kept_ancestors >= 1,
+          "INC-RTR T4 判别：跨 Trigger 的祖先被当成依赖保留，不再是 "
+          "uncertainty",
+          std::to_string(realtime_child.retention_kept_ancestors));
       test_support::Check(
           Exists(repository + "/" + realtime_baseline.snapshot_file_name) &&
               Exists(repository + "/" + manual_name),
@@ -576,6 +582,83 @@ int main() {
       test_support::Check(
           records.size() == 2 && unverified == 1,
           "INC-RTR T6 history 把孤儿 marker 如实标成 unverified");
+    }
+  }
+
+  // ============================================================
+  test_support::Section(
+      "INC-RTR 7. 健康链的 remove-empty 不是 uncertainty（F）");
+  // ============================================================
+  {
+    const std::string work =
+        test_support::FreshDir("realtime-retention-healthy");
+    const std::string source = work + "/src";
+    const std::string repository = work + "/repo";
+    test_support::Mkdir(source, 0755);
+    test_support::Mkdir(repository, 0755);
+    test_support::WriteFile(source + "/a.txt", "v0\n", 0644);
+
+    // 先用宽 retain 建一条健康的增量链 F0 -> D1 -> D2。
+    bp::RealtimeConfig config =
+        MakeConfig(source, bp::BackupStrategy::kIncremental, 12);
+    bp::RealtimeOutcome baseline;
+    RunOnce(config, repository, MakeEvents(1, 0, true), NextTime(), &baseline,
+            "INC-RTR F1");
+    test_support::WriteFile(source + "/a.txt", "v1\n", 0644);
+    bp::RealtimeOutcome delta1;
+    RunOnce(config, repository, MakeEvents(2, 1), NextTime(), &delta1,
+            "INC-RTR F1");
+    test_support::WriteFile(source + "/a.txt", "v2\n", 0644);
+    bp::RealtimeOutcome delta2;
+    RunOnce(config, repository, MakeEvents(3, 1), NextTime(), &delta2,
+            "INC-RTR F1");
+    test_support::Check(delta2.kind == bp::RealtimeOutcome::Kind::kDelta,
+                        "INC-RTR F1 准备：链上有两份 delta");
+
+    // 直接问 retention：retain=1，可见点是 D2，它依赖 D1 与 F0。
+    bp::RealtimeRetentionResult result;
+    std::string error;
+    test_support::Check(
+        bp::RunRealtimeRetention(repository, JobIdentityOf(config, repository),
+                                 1, &result, &error),
+        "INC-RTR F1 retention 可调用", error);
+    test_support::Check(
+        !result.uncertain,
+        "INC-RTR F1 判别：健康的 dependency retention 不是 uncertain",
+        result.reason);
+    test_support::Check(result.deleted == 0,
+                        "INC-RTR F1 判别：这一轮确实没有可删的东西",
+                        std::to_string(result.deleted));
+    test_support::Check(result.kept_visible == 1 && result.kept_ancestors >= 2,
+                        "INC-RTR F1 判别：可见点与祖先都按真实计数保留",
+                        std::to_string(result.kept_visible) + "/" +
+                            std::to_string(result.kept_ancestors));
+    test_support::Check(result.reason.empty(),
+                        "INC-RTR F1 判别：healthy 不给出 warning 理由",
+                        result.reason);
+
+    // 服务路径同样不能把这件事报成 warning。
+    config.retain_count = 1;
+    test_support::WriteFile(source + "/a.txt", "v3\n", 0644);
+    bp::RealtimeOutcome third;
+    if (RunOnce(config, repository, MakeEvents(4, 1), NextTime(), &third,
+                "INC-RTR F2")) {
+      test_support::Check(
+          !third.retention_uncertain,
+          "INC-RTR F2 判别：service 侧 retention_uncertain == false");
+      test_support::Check(
+          third.retention_deleted == 0 && third.retention_kept_ancestors >= 2,
+          "INC-RTR F2 判别：祖先保留计数真实，删除数为 0",
+          std::to_string(third.retention_deleted) + "/" +
+              std::to_string(third.retention_kept_ancestors));
+      test_support::Check(
+          third.diagnostic.find("retention warning") == std::string::npos,
+          "INC-RTR F2 判别：不产生 retention warning 文案", third.diagnostic);
+      test_support::Check(
+          Exists(repository + "/" + baseline.snapshot_file_name) &&
+              Exists(repository + "/" + delta1.snapshot_file_name) &&
+              Exists(repository + "/" + delta2.snapshot_file_name),
+          "INC-RTR F2 链仍然完整");
     }
   }
 

@@ -26,6 +26,7 @@
 
 #include "backup_mode.h"
 #include "container_format.h"
+#include "filter.h"
 #include "pack_stream.h"
 
 namespace backupproject {
@@ -89,6 +90,14 @@ RealtimePathOverlap ClassifyPathOverlap(const std::string& source_path,
 // 不访问文件系统，因此 disabled 状态下允许保存一个暂时不存在的 source。
 bool ValidateRealtimeConfig(const RealtimeConfig& config,
                             std::string* error_message);
+
+// 用共享 Filter 编译实时配置里的规则。
+//
+// 规则语法的唯一裁决者是 `Filter::AddRule`：CLI（set / enable）、GUI save、
+// RealtimeStore 读回来的配置校验、运行时防御路径，统统走这一个函数，
+// 因此错误逐字一致，也不会出现"先存进去、第一次触发才炸"。
+bool BuildRealtimeFilter(const RealtimeConfig& config, Filter* filter,
+                         std::string* error_message);
 
 // enable 前的完整校验：source 存在、是真实目录、root 不是软链接；repository
 // 已配置、可解析、不是软链接；两者不重叠。

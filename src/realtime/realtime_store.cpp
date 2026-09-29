@@ -118,6 +118,27 @@ RealtimePathOverlap ClassifyPathOverlap(const std::string& source_path,
   return RealtimePathOverlap::kNone;
 }
 
+bool BuildRealtimeFilter(const RealtimeConfig& config, Filter* filter,
+                         std::string* error_message) {
+  if (filter == nullptr) {
+    SetError(error_message, "Realtime filter output must not be null");
+    return false;
+  }
+  // 顺序与手动 / 计划一致：先 include 再 exclude；Filter 内部沿用它自己的
+  // 优先级规则（exclude 优先），这里不复制任何语义。
+  for (const std::string& rule : config.include_rules) {
+    if (!filter->AddRule(FilterAction::kInclude, rule, error_message)) {
+      return false;
+    }
+  }
+  for (const std::string& rule : config.exclude_rules) {
+    if (!filter->AddRule(FilterAction::kExclude, rule, error_message)) {
+      return false;
+    }
+  }
+  return true;
+}
+
 bool ValidateRealtimeConfig(const RealtimeConfig& config,
                             std::string* error_message) {
   if (config.version != kRealtimeConfigVersion) {
@@ -185,6 +206,13 @@ bool ValidateRealtimeConfig(const RealtimeConfig& config,
       return false;
     }
   }
+  // 规则必须真的编译一遍。只查长度与 NUL 的话，
+  // `realtime set --include nonsense:xx` 会保存成功、enable 成功，直到第一次
+  // 真正触发才在引擎里失败——那正是"先存进去、运行时才炸"。
+  // 语法裁决只有一处：Filter::AddRule（与 ValidateScheduleConfig
+  // 同一个编译器）。
+  Filter filter;
+  if (!BuildRealtimeFilter(config, &filter, error_message)) return false;
   // 策略 / 算法组合只有一份答案来源。Realtime 不需要自己的第二张表。
   BackupOptionCombination combination;
   combination.trigger = config.trigger;
@@ -397,32 +425,62 @@ bool RealtimeRequireRuleList(const JsonValue& object, const char* key,
   return true;
 }
 
+// JSON 字符串体（不含两端的引号）。
+//
+// 这是 RealtimeStore 写侧**唯一**的转义实现：source_path 与两个规则数组都用它。
+// 要求只有一条，但很硬：Save() 写出去的东西 Load() 必须读得回来。共享 parser
+// （simple_json.cpp）明确拒绝 raw < 0x20，所以：
+//
+//   * `" \\ \b \f \n \r \t` 用 JSON 标准简写；
+//   * 其余 C0（0x00..0x1F）用 parser 同样支持的 `\u00XX`；
+//   * 非控制字节原样写出（项目字符串是 UTF-8 bytes，不做 Unicode 编码器）。
+//
+// 之前 include/exclude 规则只处理了 \\ 与 \" 与 \n，一个带 \t / \r / \b / \f
+// 的合法规则会写出 parser 拒绝的 raw 控制字符 —— "写得出、读不回"。
+void AppendJsonStringBody(std::string* out, const std::string& value) {
+  static const char kHex[] = "0123456789abcdef";
+  for (const unsigned char character : value) {
+    switch (character) {
+      case '\\':
+        *out += "\\\\";
+        continue;
+      case '"':
+        *out += "\\\"";
+        continue;
+      case '\b':
+        *out += "\\b";
+        continue;
+      case '\f':
+        *out += "\\f";
+        continue;
+      case '\n':
+        *out += "\\n";
+        continue;
+      case '\r':
+        *out += "\\r";
+        continue;
+      case '\t':
+        *out += "\\t";
+        continue;
+      default:
+        break;
+    }
+    if (character < 0x20) {
+      *out += "\\u00";
+      out->push_back(kHex[(character >> 4) & 0x0F]);
+      out->push_back(kHex[character & 0x0F]);
+      continue;
+    }
+    out->push_back(static_cast<char>(character));
+  }
+}
+
 void AppendStringField(std::string* out, const char* key,
                        const std::string& value) {
   *out += "    \"";
   *out += key;
   *out += "\": \"";
-  for (const char character : value) {
-    switch (character) {
-      case '\\':
-        *out += "\\\\";
-        break;
-      case '"':
-        *out += "\\\"";
-        break;
-      case '\n':
-        *out += "\\n";
-        break;
-      case '\r':
-        *out += "\\r";
-        break;
-      case '\t':
-        *out += "\\t";
-        break;
-      default:
-        out->push_back(character);
-    }
-  }
+  AppendJsonStringBody(out, value);
   *out += "\"";
 }
 
@@ -434,14 +492,7 @@ void AppendRules(std::string* out, const char* key,
   for (std::size_t index = 0; index < rules.size(); ++index) {
     if (index > 0) *out += ", ";
     *out += "\"";
-    for (const char character : rules[index]) {
-      if (character == '\\' || character == '"') out->push_back('\\');
-      if (character == '\n') {
-        *out += "\\n";
-        continue;
-      }
-      out->push_back(character);
-    }
+    AppendJsonStringBody(out, rules[index]);
     *out += "\"";
   }
   *out += "]";

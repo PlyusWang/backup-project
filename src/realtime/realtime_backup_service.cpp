@@ -641,11 +641,20 @@ bool RunRealtimeRetention(const std::string& repository_directory,
   }
   result->kept_visible = plan.keep_visible.size();
   result->kept_ancestors = plan.keep_ancestors.size();
-  if (plan.dependency_uncertain || plan.remove.empty()) {
+  // 只有**真的不确定**才算 uncertain。
+  //
+  // 健康的增量链（例如 F0 -> D1 -> D2 -> D3、retain = 1）会出现
+  // remove 为空但并非不确定的状态：最新恢复点依赖全部祖先，所以这一轮没有
+  // 可删的东西。那是正常的 dependency retention，不是"依赖链读不出来"，
+  // 不能报成 warning 让用户以为哪里坏了。
+  if (plan.dependency_uncertain) {
     result->uncertain = true;
-    result->reason = plan.dependency_uncertain
-                         ? plan.uncertainty_reason
-                         : std::string("nothing to remove");
+    result->reason = plan.uncertainty_reason;
+    return true;
+  }
+  if (plan.remove.empty()) {
+    // success：deleted = 0，kept_visible / kept_ancestors 保持真实计数，无
+    // warning。
     return true;
   }
 
@@ -691,18 +700,13 @@ bool RunRealtimeBackupOnce(const RealtimeConfig& config,
   const std::string job_identity = RealtimeJobIdentityDigest(
       config, repository_identity, config.source_path);
 
+  // 规则编译只有一处实现（共享 Filter::AddRule，见 BuildRealtimeFilter）：
+  // ValidateRealtimeConfig 已经在保存 / 启用前编译过一遍，这里是运行时的防御
+  // 路径，用的是同一个函数，因此错误逐字一致。
   Filter filter;
-  for (const std::string& rule : config.include_rules) {
-    if (!filter.AddRule(FilterAction::kInclude, rule, error_message)) {
-      outcome->kind = RealtimeOutcome::Kind::kFailed;
-      return false;
-    }
-  }
-  for (const std::string& rule : config.exclude_rules) {
-    if (!filter.AddRule(FilterAction::kExclude, rule, error_message)) {
-      outcome->kind = RealtimeOutcome::Kind::kFailed;
-      return false;
-    }
+  if (!BuildRealtimeFilter(config, &filter, error_message)) {
+    outcome->kind = RealtimeOutcome::Kind::kFailed;
+    return false;
   }
 
   BackupCatalog catalog;
