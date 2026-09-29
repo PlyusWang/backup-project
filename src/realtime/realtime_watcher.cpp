@@ -37,6 +37,17 @@ std::string JoinPath(const std::string& directory, const std::string& name) {
   return directory + "/" + name;
 }
 
+// 出了竞态时要能说清"它现在是什么"：只报"不是目录"没法排查。
+const char* DirectoryTypeText(mode_t mode) {
+  if (S_ISLNK(mode)) return "a symbolic link";
+  if (S_ISREG(mode)) return "a regular file";
+  if (S_ISFIFO(mode)) return "a FIFO";
+  if (S_ISSOCK(mode)) return "a socket";
+  if (S_ISCHR(mode)) return "a character device";
+  if (S_ISBLK(mode)) return "a block device";
+  return "not a directory";
+}
+
 // 读事件用的缓冲：inotify 一次最多返回这么多字节。内核要求至少 sizeof(struct
 // inotify_event) + NAME_MAX + 1，64 KiB 足够一次读完一批常见事件。
 constexpr std::size_t kReadBufferBytes = 64u * 1024u;
@@ -72,17 +83,40 @@ bool InotifyWatcher::AddDirectory(int fd, const std::string& path, bool is_root,
                                   std::vector<WatchTarget>* watches,
                                   std::unordered_map<int, std::size_t>* index,
                                   std::string* error_message) {
-  // 结构事件之后的重建必须能容忍"目录在这一瞬间被删掉"：那不是错误，只是这
-  // 一层没有东西可看。
+  // child 目录：结构事件之后的重建必须能容忍"目录在这一瞬间被删掉"——那
+  // 不是错误，只是这一层没有东西可看。
+  //
+  // root 相反：Attach 的预检刚刚确认过它是真实目录，这里再看不到它（或者它
+  // 已经不是目录了）说明它在这两步之间被删掉 / 移走 / 换成了普通文件或软链接。
+  // 这种情况**必须硬失败**：如果按 child 那样 benign skip，BuildWatches 会返回
+  // 成功、Attach 会返回成功，而实例其实是 watch_count == 0 的空壳——之后 root
+  // 重建也不会有任何 watch 通知它，等于永久漏监听。
   struct stat info;
   if (::lstat(path.c_str(), &info) != 0) {
-    if (errno == ENOENT) return true;
-    SetError(error_message,
-             "Cannot inspect directory " + path + ": " + ErrnoText(errno));
+    const int saved_errno = errno;
+    if (is_root) {
+      SetError(error_message, "The watch root cannot be watched: " + path +
+                                  ": " + ErrnoText(saved_errno) +
+                                  (saved_errno == ENOENT
+                                       ? " (it disappeared after the initial "
+                                         "check)"
+                                       : ""));
+      return false;
+    }
+    if (saved_errno == ENOENT) return true;
+    SetError(error_message, "Cannot inspect directory " + path + ": " +
+                                ErrnoText(saved_errno));
     return false;
   }
-  if (!S_ISDIR(info.st_mode))
-    return true;  // 软链接 / 普通文件：不 follow，跳过
+  if (!S_ISDIR(info.st_mode)) {
+    if (!is_root) return true;  // 软链接 / 普通文件：不 follow，跳过
+    SetError(error_message,
+             "The watch root is no longer a directory: " + path + " (it is " +
+                 DirectoryTypeText(info.st_mode) +
+                 " now; the root must be a real directory and must not be a "
+                 "symbolic link)");
+    return false;
+  }
 
   if (injected_add_watch_errno_ != 0) {
     const int injected = injected_add_watch_errno_;
@@ -117,9 +151,17 @@ bool InotifyWatcher::AddDirectory(int fd, const std::string& path, bool is_root,
 
   DIR* directory = ::opendir(path.c_str());
   if (directory == nullptr) {
-    if (errno == ENOENT) return true;
+    const int saved_errno = errno;
+    if (is_root) {
+      // root 的 watch 已经加上、目录却打不开了：同样的"看着健康其实没有内容"
+      // 状态，一律硬失败。
+      SetError(error_message, "Cannot open the watch root " + path + ": " +
+                                  ErrnoText(saved_errno));
+      return false;
+    }
+    if (saved_errno == ENOENT) return true;
     SetError(error_message,
-             "Cannot open directory " + path + ": " + ErrnoText(errno));
+             "Cannot open directory " + path + ": " + ErrnoText(saved_errno));
     return false;
   }
   std::vector<std::string> children;
@@ -168,8 +210,19 @@ bool InotifyWatcher::BuildWatches(int fd, const std::string& root,
                                   std::vector<WatchTarget>* watches,
                                   std::unordered_map<int, std::size_t>* index,
                                   std::string* error_message) {
+  // 测试接缝：正好落在"root 预检已经通过"与"AddDirectory 的第二次 lstat"
+  // 之间。产品路径下这两个指针永远是 nullptr。
+  if (root_precheck_hook_ != nullptr) {
+    root_precheck_hook_(root_precheck_hook_context_);
+  }
   root_wd_ = -1;
   return AddDirectory(fd, root, true, watches, index, error_message);
+}
+
+void InotifyWatcher::SetRootPrecheckHookForTesting(void (*hook)(void* context),
+                                                   void* context) {
+  root_precheck_hook_ = hook;
+  root_precheck_hook_context_ = context;
 }
 
 bool InotifyWatcher::Attach(const std::string& root,
@@ -202,9 +255,25 @@ bool InotifyWatcher::Attach(const std::string& root,
   }
   std::vector<WatchTarget> watches;
   std::unordered_map<int, std::size_t> index;
+  // BuildWatches 会把 root_wd_ 清成 -1；失败时旧状态必须原样保留（包括旧
+  // root 的 wd —— 它是"源根丢了没有"的唯一判据）。
+  const int previous_root_wd = root_wd_;
   if (!BuildWatches(fd, root, &watches, &index, error_message)) {
     // 半成品必须清理：不留 fd，也不留任何 watch。
     ::close(fd);
+    root_wd_ = previous_root_wd;
+    return false;
+  }
+  // 后置不变量：不允许返回一个 root 根本没被 watch 上的"成功"实例。
+  // 只靠预检挡不住 precheck 与 AddDirectory 之间的那个窗口。
+  if (!RootWatchBuilt(watches)) {
+    SetError(error_message,
+             "The watch root has no inotify watch after a successful build: " +
+                 root +
+                 " (the root disappeared or changed type while it was being "
+                 "watched)");
+    ::close(fd);
+    root_wd_ = previous_root_wd;
     return false;
   }
   // 成功之后才替换旧状态（Attach 也可以用来换 root）。
@@ -238,6 +307,17 @@ bool InotifyWatcher::Rebuild(std::string* error_message) {
     ::close(fd);
     root_wd_ = previous_root_wd;
     return false;  // 旧 fd 原样保留：不允许出现"拆了旧的、新的没建起来"
+  }
+  if (!RootWatchBuilt(watches)) {
+    SetError(
+        error_message,
+        "The watch root has no inotify watch after a successful rebuild: " +
+            root_ +
+            " (the root disappeared or changed type while it was "
+            "being watched)");
+    ::close(fd);
+    root_wd_ = previous_root_wd;
+    return false;
   }
   if (fd_ >= 0) ::close(fd_);
   fd_ = fd;
