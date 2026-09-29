@@ -31,8 +31,13 @@ ApplicationWindow {
     // 核心没有取消能力，所以任务进行中一律不允许关窗，免得让用户以为
     // “关掉窗口 = 安全取消”。自绘的 ×、Alt+F4、系统菜单、窗口管理器走的
     // 都是这一个信号，所以守卫放在这里，而不是只放在那个按钮里。
+    //
+    // 三个 writer 缺一不可：手动备份 / 恢复落在 controller.busy，而计划评估与
+    // 实时触发都跑在 QtConcurrent 上，真正落盘的那一位是各自的 libraryBusy ——
+    // 只看 controller.busy 会漏掉"实时备份正在写归档时 Alt+F4 能关掉窗口"。
+    // 这是同一条全局不变式（持久状态操作进行中不得关窗），不是三种特例。
     onClosing: function (close) {
-        if (controller.busy) {
+        if (controller.busy || schedule.libraryBusy || realtime.libraryBusy) {
             close.accepted = false
             busyCloseDialog.open()
         }
@@ -328,7 +333,7 @@ ApplicationWindow {
 
             Text {
                 Layout.preferredWidth: 300
-                text: "备份或恢复尚未完成。为避免留下不完整结果，请等待当前操作结束后再退出。"
+                text: "备份、恢复或实时/定时备份尚未完成。为避免留下不完整结果，请等待当前操作结束后再退出。"
                 color: theme.textSecondary
                 font.pixelSize: 15
                 wrapMode: Text.WordWrap

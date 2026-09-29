@@ -16,6 +16,9 @@
 #include <string>
 #include <utility>
 
+// 只为订阅 BackupController::repositoryPathChanged 与拿到它的完整类型：
+// 仓库换掉之后，本控制器必须立刻跟上（见 OnRepositoryPathChanged）。
+#include "backup_controller.h"
 #include "backup_option_keys.h"
 #include "filter.h"
 
@@ -169,10 +172,12 @@ bool ParseRealtimeNumber(const QString& text, const QString& label,
 
 RealtimeController::RealtimeController(QString realtime_file_path,
                                        const QString& config_file_path,
+                                       BackupController* backup_controller,
                                        OperationGate* operation_gate,
                                        QObject* parent)
     : QObject(parent),
       realtime_file_path_(std::move(realtime_file_path)),
+      backup_controller_(backup_controller),
       config_manager_(config_file_path.toStdString()),
       store_(realtime_file_path_.toStdString()),
       operation_gate_(operation_gate) {
@@ -198,6 +203,15 @@ RealtimeController::RealtimeController(QString realtime_file_path,
           &RealtimeController::OnRunFinished);
   connect(&list_watcher_, &QFutureWatcher<RealtimeRunResult>::finished, this,
           &RealtimeController::OnListFinished);
+
+  // 仓库可以在运行期被改掉（设置页写 config.json）。不订阅它，控制器就会拿
+  // 启动时读到的那个仓库继续写 —— 静默地把新事件产生的快照放进旧位置，而且
+  // 新仓库与 source 的 overlap 再也不会被重新检查。订阅方式与
+  // ScheduleController 完全一致（同一个信号、同一种接法）。
+  if (backup_controller != nullptr) {
+    connect(backup_controller, &BackupController::repositoryPathChanged, this,
+            &RealtimeController::OnRepositoryPathChanged);
+  }
 }
 
 RealtimeController::~RealtimeController() {
@@ -459,6 +473,67 @@ void RealtimeController::OnRecoveryTimeout() {
   // 仍然起不来：继续每秒重试。这不是 busy-spin —— 一次重试是几次 stat /
   // realpath，而且只在降级期间发生。
   recovery_timer_.start(kRecoveryMs);
+}
+
+// ---- 仓库在运行期被改掉 ----
+
+// 调用约定（与 ScheduleController::OnRepositoryPathChanged 同源）：
+// BackupController 只在"改仓库**已经成功落盘**"之后同步发这个信号，而且是在它
+// 自己**持有 kRepositoryChange 闸门**的同一持有期内。因此这里有两件绝对不能做：
+//
+//   * 不能再 Acquire 任何闸门 —— 闸门不认"自己人"，再取一次必然失败，而在这里
+//     等它释放就是死等（改仓库的那条路径要等这个槽返回才会继续）；
+//   * 不需要等一个在飞的 realtime worker —— kRealtimeEvaluation 与
+//     kRepositoryChange 本来就互斥，能走到这里就说明 busy_ 一定是 false。
+//
+// 顺序同样是硬要求：先停掉当前 watcher（从这一刻起，这次切换之后的事件不可能
+// 再被算到旧仓库头上），再用**新**路径重新校验，合法才重新 attach + 合成
+// resync。 任何一条分支都不写 snapshot。
+void RealtimeController::OnRepositoryPathChanged() {
+  const QString previous = repository_path_;
+
+  StopWatching();
+  watch_degraded_ = false;
+  watch_degraded_reason_.clear();
+
+  if (!config_loaded_ || config_error_) {
+    // 配置本身读不出来时本来就不监听：只如实刷新仓库与列表，不做任何触发。
+    std::string error;
+    RefreshRepository(&error);
+    refreshSnapshots();
+    emit runtimeChanged();
+    return;
+  }
+
+  if (!config_.enabled) {
+    // 未启用：只刷新 repository / 快照列表。**绝不**因为一次仓库变化就无故
+    // 启动 watcher，也绝不写任何东西。
+    std::string error;
+    RefreshRepository(&error);
+    refreshSnapshots();
+    SetPhase(QString::fromLatin1(kPhaseDisabled),
+             QStringLiteral("实时备份未启用"));
+    emit runtimeChanged();
+    return;
+  }
+
+  // 已启用：TryStartWatching 走的正是这条路径 —— RefreshRepository（新路径）
+  // → ValidateRealtimeForEnable（重新检查 source == repo / repo 在 source 里 /
+  // source 在 repo 里三种重叠）→ attach + 合成一次 resync。
+  // 校验不过时它只把控制器置成 degraded 并给出共享核心那句原文，一个字节都不
+  // 写；BeginWatching 会排一次 1 秒重建重试，所以仓库改回合法值时会自动恢复。
+  BeginWatching();
+  refreshSnapshots();
+  emit runtimeChanged();
+
+  if (watcher_.attached() && repository_path_ != previous) {
+    // 换成功了：把"旧仓库不会再收到新快照"这条结论明确说出来，而不是让用户
+    // 从仓库路径悄悄变了去猜。
+    SetStatus(kSuccess, QStringLiteral("备份仓库已切换，实时监听已重建"),
+              QStringLiteral("之后的实时快照只会写进新仓库 %1，"
+                             "旧仓库不会再新增任何快照。")
+                  .arg(repository_path_));
+  }
 }
 
 // ---- 事件 ----
@@ -771,7 +846,10 @@ void RealtimeController::refreshSnapshots() {
 void RealtimeController::OnListFinished() {
   const RealtimeRunResult result = list_watcher_.result();
   list_busy_ = false;
-  if (result.listed) ApplySnapshots(result);
+  // 已经排了下一次列举（例如刚刚换了仓库）：这一份结果属于**上一个**仓库，
+  // 拿它刷新界面会让"新仓库的路径 + 旧仓库的列表"短暂同屏。直接等新仓库那次
+  // 回来即可 —— pending 的那次列举马上就会发出。
+  if (result.listed && !list_pending_) ApplySnapshots(result);
   if (list_pending_) {
     list_pending_ = false;
     refreshSnapshots();

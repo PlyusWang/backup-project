@@ -30,6 +30,24 @@
 // 保存配置的顺序是硬要求：先停 watcher → Acquire(kRealtimeConfig) → 严格校验 +
 // 原子保存 → 若 enabled 则重新 attach + 合成 resync。
 //
+// ---- 仓库 ----
+//
+// 仓库（config.json 里的 backup_repository_path）可以在**运行期**被改掉。
+// 控制器订阅 BackupController::repositoryPathChanged —— 与 ScheduleController
+// 订的是同一个信号、同一种接法 —— 并在"改仓库已经成功落盘之后"：
+//
+//   * 先停掉当前 watcher（从这一刻起，旧仓库不可能再被切换之后的事件写到）；
+//   * 重新读仓库路径，用共享核心的 ValidateRealtimeForEnable 重新校验
+//     （它会重新检查 source == repo / repo 在 source 里 / source 在 repo 里
+//     这三种重叠）；
+//   * 合法 → 重新 attach + 合成一次 resync（语义与 start() 完全一致）；
+//   * 不合法 → 一个字节都不写，只进入 degraded 状态并如实说明原因；enabled
+//     保持不变，仓库改回合法值后会自动恢复；
+//   * 未启用 → 只刷新仓库与快照列表，绝不无故启动 watcher。
+//
+// 这个槽由 BackupController 在**持有 kRepositoryChange 闸门期间**同步调用，
+// 所以它绝不能 Acquire 任何闸门（会与持有者自冲突）。
+//
 // 本文件只依赖 Qt 与共享核心，不含任何业务判定。
 
 #ifndef BACKUP_PROJECT_UI_MODERN_REALTIME_CONTROLLER_H_
@@ -57,6 +75,8 @@
 class QSocketNotifier;
 
 namespace backup_modern {
+
+class BackupController;
 
 // 一次后台任务的返回值。
 //
@@ -135,10 +155,14 @@ class RealtimeController : public QObject {
  public:
   // realtime_file_path 由 main.cpp 显式给出（正常启动来自 app_paths.h，与
   // backupctl 的默认位置严格同源；测试用 --realtime-file 覆盖）。
+  // backup_controller 用来订阅 BackupController::repositoryPathChanged：仓库
+  // 在运行期被改掉之后，本控制器必须立刻跟上（与 ScheduleController 同一种
+  // 接法）。可以为空，但产品路径上永远是同一个对象。
   // operation_gate 必须与 BackupController / ScheduleController
   // 用的是**同一个** 对象：它才是"同一时刻只有一个 writer"这条不变式的载体。
   RealtimeController(QString realtime_file_path,
                      const QString& config_file_path,
+                     BackupController* backup_controller,
                      OperationGate* operation_gate, QObject* parent = nullptr);
   ~RealtimeController() override;
 
@@ -255,6 +279,9 @@ class RealtimeController : public QObject {
   void ClearNotifier();
   // TryStartWatching 的调用方：失败时按需要排一次 1000 ms 的重建重试。
   void BeginWatching();
+  // BackupController::repositoryPathChanged 的槽。只在"改仓库已经成功"之后被
+  // 同步调用，且调用点正持有 kRepositoryChange 闸门 —— 这里不取任何闸门。
+  void OnRepositoryPathChanged();
 
   // ---- 事件 ----
   void OnWatcherReadable();
@@ -287,6 +314,9 @@ class RealtimeController : public QObject {
   static std::int64_t SteadyNowMs();
 
   QString realtime_file_path_;
+  // 只用来订阅 repositoryPathChanged，不复制它的任何逻辑。声明顺序与初始化
+  // 列表一致（与 ScheduleController 同一个位置、同一种接法）。
+  BackupController* backup_controller_ = nullptr;
   backupproject::ConfigManager config_manager_;
   backupproject::RealtimeStore store_;
   backupproject::RealtimeConfig config_;
