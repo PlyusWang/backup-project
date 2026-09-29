@@ -220,6 +220,91 @@ else
 fi
 cli realtime disable >/dev/null 2>&1
 
+# ---- D：非法 Filter DSL 必须在 set / enable / watch 之前就被拒绝 ----
+#
+# 旧实现只查长度与 NUL，规则真正编译要等到第一次触发；那时归档目录可能已经
+# 被监听、用户以为配置没问题。现在语法裁决在 Filter::AddRule，与手动/计划同一个。
+if cli realtime set --source "$CLI_WORK/src" --debounce-ms 200 --max-wait-ms 1000 \
+    --retain 2 --strategy full --pack mypack --compression none \
+    --include 'nonsense:xx' >"$OUT" 2>&1; then
+  record_fail "B.15 非法规则被 set 拒绝" "命令居然成功了"
+elif grep -q 'Invalid filter rule' "$OUT"; then
+  record_pass "B.15 非法规则被 set 拒绝，理由来自共享 Filter"
+else
+  record_fail "B.15 非法规则被 set 拒绝" "$(first_line)"
+fi
+if grep -q 'nonsense' "$REALTIME_FILE" 2>/dev/null; then
+  record_fail "B.16 被拒绝的配置没有落盘" "realtime.json 里出现了 nonsense"
+else
+  record_pass "B.16 被拒绝的配置没有落盘"
+fi
+
+# 手写进文件的非法规则：enable 与 watch 都必须拒绝，并且不产生任何快照。
+CLI_BAK_BEFORE="$(find "$CLI_WORK/repo" -name '*.bak' | wc -l)"
+python3 - "$REALTIME_FILE" <<'PY'
+import json
+import sys
+path = sys.argv[1]
+with open(path, encoding="utf-8") as handle:
+    data = json.load(handle)
+data["include_rules"] = ["nonsense:xx"]
+with open(path, "w", encoding="utf-8") as handle:
+    json.dump(data, handle)
+PY
+if cli realtime enable >"$OUT" 2>&1; then
+  record_fail "B.17 非法规则被 enable 拒绝" "命令居然成功了"
+elif grep -q 'Invalid filter rule' "$OUT"; then
+  record_pass "B.17 非法规则被 enable 拒绝（同一条核心错误）"
+else
+  record_fail "B.17 非法规则被 enable 拒绝" "$(first_line)"
+fi
+if cli realtime watch >"$OUT" 2>&1; then
+  record_fail "B.18 非法规则下 watch 拒绝启动" "命令居然成功了"
+else
+  record_pass "B.18 非法规则下 watch 拒绝启动"
+fi
+CLI_BAK_AFTER="$(find "$CLI_WORK/repo" -name '*.bak' | wc -l)"
+if [ "$CLI_BAK_BEFORE" = "$CLI_BAK_AFTER" ]; then
+  record_pass "B.19 判别：非法规则期间没有产生任何快照"
+else
+  record_fail "B.19 非法规则期间没有产生快照" "$CLI_BAK_BEFORE -> $CLI_BAK_AFTER"
+fi
+
+# ---- E：带控制字符的合法 source / 规则必须 Save -> Load 往返 ----
+TAB_DIR="$CLI_WORK/src/tab	here"
+mkdir -p "$TAB_DIR"
+printf 'alpha\n' > "$TAB_DIR/a.txt"
+# 上一段故意把非法规则写进了文件。产品对"文件里有非法规则"的处理是**拒绝读取**
+# 而不是静默修好（strict load），所以这里先把那份被弄坏的文件删掉，
+# 从默认配置重新开始——这本身就是 D 的行为证据。
+rm -f "$REALTIME_FILE"
+if cli realtime set --clear-filters --source "$TAB_DIR" --debounce-ms 200 \
+    --max-wait-ms 1000 --retain 2 --strategy full --pack mypack \
+    --compression none >"$OUT" 2>&1; then
+  if cli realtime show >"$OUT" 2>&1 && grep -q 'tab	here' "$OUT"; then
+    record_pass "B.20 判别：含 tab 的 source path Save -> Load 往返一致"
+  else
+    record_fail "B.20 含 tab 的 source path 往返" "$(first_line)"
+  fi
+else
+  record_fail "B.20 含 tab 的 source path 保存" "$(first_line)"
+fi
+# 文件里不允许出现 raw C0（tab 必须写成 \t，否则共享 parser 直接拒绝）。
+if python3 - "$REALTIME_FILE" <<'PY'
+import sys
+with open(sys.argv[1], "rb") as handle:
+    data = handle.read()
+bad = [b for b in data if b < 0x20 and b != 0x0A]
+sys.exit(1 if bad else 0)
+PY
+then
+  record_pass "B.21 判别：realtime.json 里没有 raw C0 字节"
+else
+  record_fail "B.21 realtime.json 里没有 raw C0 字节" "发现 raw 控制字符"
+fi
+
+cli realtime disable >/dev/null 2>&1
+
 # ============================================================
 echo "[realtime-test] 结果"
 # ============================================================
