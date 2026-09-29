@@ -189,7 +189,7 @@ classify_qmllint() {
       print "ALLOWED\t" msg
       file = ""
       if (match(msg, /[A-Za-z_]+\.qml/)) file = substr(msg, RSTART, RLENGTH)
-      prev_panel_allowed = (file ~ /FilterEditorPanel\.qml/) ? 1 : 0
+      prev_panel_allowed = (file ~ /(FilterEditorPanel|FilterRuleEditor)\.qml/) ? 1 : 0
       prev_allowed_file = file
     }
     function classify(msg, snippet) {
@@ -211,6 +211,22 @@ classify_qmllint() {
       # PR #12：编辑器面板内部引用本组件根 id / 注入属性（含必需的 ruleModelRef）。
       if (msg ~ /Unqualified access/ && msg ~ /FilterEditorPanel\.qml/ &&
           (snippet ~ /panel\./ || snippet ~ /ruleModel/ || snippet ~ /ruleModelRef/)) {
+        MarkAllowed(msg); return
+      }
+      # PR #19 第二轮：三个页面的规则模型（filterRuleModel / scheduleFilterRuleModel /
+      # realtimeFilterRuleModel）同样是 main.cpp 注册的上下文属性，qmllint 不认识
+      # 它们。名字本身足够独特，按名字精确放行。
+      if (msg ~ /Unqualified access/ &&
+          (snippet ~ /filterRuleModel/ || snippet ~ /scheduleFilterRuleModel/ ||
+           snippet ~ /realtimeFilterRuleModel/)) {
+        MarkAllowed(msg); return
+      }
+      # PR #19 第二轮：FilterRuleEditor.qml 是三个页面共用的规则编辑器，它只引用
+      # 上下文属性 theme 与本组件根 id editor（以及注入的 ruleModel）。qmllint
+      # 不认识上下文属性，凡是引用都报 Unqualified access；放行同样精确限定到
+      # "这个文件 + 这几个名字"。
+      if (msg ~ /Unqualified access/ && msg ~ /FilterRuleEditor\.qml/ &&
+          (snippet ~ /theme\./ || snippet ~ /editor\./ || snippet ~ /ruleModel/)) {
         MarkAllowed(msg); return
       }
       # PR #12：紧随上述已放行主诊断的 companion Info（qmllint 不给它文件路径）。
@@ -449,10 +465,13 @@ else
   record_pass "QML 不直接引用 ConfigManager / BackupCatalog / BackupEngine"
 fi
 
-# 筛选编辑器：刷新、添加 Include、添加 Exclude、清空、上移、下移、删除、
-# 添加规则与高级规则 = 6 处。仍然钉死数量，防止漏绑 busy 或复制粘贴出多余按钮。
-expect_count "$QML_DIR/components/FilterEditorPanel.qml" "enabled: !controller.busy" 6 \
-  "筛选编辑器忙碌时禁用输入与按钮"
+# 规则编辑器的 UI 现在只有一份，在 components/FilterRuleEditor.qml 里（备份页 /
+# 自动备份页 / 实时备份页共用）。面板只剩预览卡片的"刷新预览"仍然绑 controller.busy。
+# 两处都钉死数量：漏绑 busy 和复制粘贴出多余按钮都会被这里挡住。
+expect_count "$QML_DIR/components/FilterEditorPanel.qml" "enabled: !controller.busy" 1 \
+  "备份页的刷新预览在忙碌时禁用"
+expect_count "$QML_DIR/components/FilterRuleEditor.qml" "enabled: !editor.busy" 23 \
+  "共享规则编辑器忙碌时禁用全部输入与按钮（23 处）"
 # 规则卡片上的三个动作按钮（上移 / 下移 / 删除）沿用各自的忙碌开关。
 expect_count "$QML_DIR/components/RuleCard.qml" "enabled: !card.busy" 3 \
   "规则卡片忙碌时禁用上移 / 下移 / 删除"
@@ -656,10 +675,11 @@ echo "[modern-gui] 8) 文件筛选在 GUI 路径上生效"
 # 下面先做静态确认，再用 --self-test 走一遍真实控制器路径。
 # 可视化编辑器的链路固定为：面板 -> FilterRuleModel -> BackupController -> 真实 Filter。
 # 面板只跟 model 打交道，model 才调用控制器，所以断言按这个真实结构落在两处。
-expect_count_re "$QML_DIR/components/FilterEditorPanel.qml" "resetForm\(\"include\"\)" 1 \
-  "Modern GUI 提供 Include 添加入口"
-expect_count_re "$QML_DIR/components/FilterEditorPanel.qml" "resetForm\(\"exclude\"\)" 1 \
-  "Modern GUI 提供 Exclude 添加入口"
+# 普通用户看到的是"添加包含规则 / 添加排除规则"，内部才落到 include / exclude。
+expect_count_re "$QML_DIR/components/FilterRuleEditor.qml" "openBuilder\(\"include\"\)" 1 \
+  "规则编辑器提供包含规则入口"
+expect_count_re "$QML_DIR/components/FilterRuleEditor.qml" "openBuilder\(\"exclude\"\)" 1 \
+  "规则编辑器提供排除规则入口"
 expect_count_re "$QML_DIR/components/RuleCard.qml" "ruleModelRef.removeRule" 1 \
   "Modern GUI 可以删除规则（由规则卡片调用模型）"
 expect_count_re "$QML_DIR/components/RuleCard.qml" "ruleModelRef.moveRule" 2 \
@@ -676,22 +696,36 @@ expect_count_re "$ROOT_DIR/ui/desktop/operation_page.cpp" "CollectFilterRules" 3
 # 元数据字段（uid / gid / user / group）与 type 的 7 个取值：表单与模型两层都要
 # 真的有接线，否则界面上能看到字段名，规则却永远生成不出来。下面只查"这一项
 # 存在且成对"，具体实现细节不钉死，避免把重构变成改断言。
-if grep -q -- '"uid", "gid", "user", "group"' "$QML_DIR/components/FilterEditorPanel.qml"; then
-  record_pass "筛选编辑器字段下拉含 uid / gid / user / group"
+# 字段下拉的内容不再写死在 QML 里：它读 FilterRuleModel::editorOptions()，而那张
+# 表直接来自 FilterRuleBuilder 的中文名表。这样"界面上能选的条件"与"核心真的能
+# 生成的条件"是同一份定义，不可能出现"下拉里有一项核心执行不了"。
+if grep -qF 'ruleModel.editorOptions()' "$QML_DIR/components/FilterRuleEditor.qml"; then
+  record_pass "条件类型下拉的选项来自共享 builder（QML 不再自己维护字段表）"
 else
-  record_fail "筛选编辑器字段下拉缺 uid / gid / user / group"
+  record_fail "条件类型下拉没有走共享 builder 的选项表"
 fi
-if grep -q -- '"symlink", "fifo", "char",' "$QML_DIR/components/FilterEditorPanel.qml"; then
-  record_pass "type 下拉含 symlink / fifo / char / block / socket"
-else
-  record_fail "type 下拉缺新的 type 取值"
-fi
-if grep -q -- '"eq", "lt", "le", "gt", "ge", "range"' "$QML_DIR/components/FilterEditorPanel.qml"; then
-  record_pass "uid / gid 比较运算符含 eq / lt / le / gt / ge / range"
-else
-  record_fail "uid / gid 比较运算符缺项"
-fi
-if grep -q -- '"uid_high": panel.formUidHighText' "$QML_DIR/components/FilterEditorPanel.qml"; then
+for field_key in kUid kGid kUser kGroup kMtime; do
+  if grep -qF "bp::RuleField::${field_key}" "$ROOT_DIR/ui/modern/filter_rule_model.cpp"; then
+    record_pass "editorOptions 暴露了 ${field_key}"
+  else
+    record_fail "editorOptions 缺少 ${field_key}"
+  fi
+done
+for type_key in kSymlink kFifo kCharDevice kBlockDevice kSocket; do
+  if grep -qF "bp::RuleTypeValue::${type_key}" "$ROOT_DIR/ui/modern/filter_rule_model.cpp"; then
+    record_pass "type 下拉含 ${type_key}"
+  else
+    record_fail "type 下拉缺 ${type_key}"
+  fi
+done
+for id_key in eq lt le gt ge range; do
+  if grep -qF "{\"${id_key}\"," "$ROOT_DIR/ui/modern/filter_rule_model.cpp"; then
+    record_pass "uid / gid 比较运算符含 ${id_key}"
+  else
+    record_fail "uid / gid 比较运算符缺 ${id_key}"
+  fi
+done
+if grep -qF '"uid_high": editor.formUidHighText' "$QML_DIR/components/FilterRuleEditor.qml"; then
   record_pass "表单把 uid / gid 的上下界一起交给模型"
 else
   record_fail "表单没有提交 uid / gid 的区间上界"
@@ -788,20 +822,27 @@ else
 fi
 
 # mtime 的 5 种形态：字段下拉、类型键、天数与两个日期都要真的接到模型上。
-if grep -q -- '"uid", "gid", "user", "group", "mtime"' "$QML_DIR/components/FilterEditorPanel.qml"; then
-  record_pass "筛选编辑器字段下拉含 mtime"
+if grep -qF '{"mtime", bp::RuleField::kMtime}' "$ROOT_DIR/ui/modern/filter_rule_model.cpp"; then
+  record_pass "条件类型下拉含“修改时间”（核心真的支持 mtime:）"
 else
-  record_fail "筛选编辑器字段下拉缺 mtime"
+  record_fail "条件类型下拉缺“修改时间”"
 fi
-if grep -q -- '"today", "yesterday", "last_days", "day",' "$QML_DIR/components/FilterEditorPanel.qml"; then
-  record_pass "mtime 类型下拉含 today / yesterday / last_days / day / day_range"
+if grep -qF 'parse-time' "$ROOT_DIR/src/filter/filter.cpp"; then
+  record_fail "核心多了未接线的解析分支"
 else
-  record_fail "mtime 类型下拉缺项"
+  record_pass "没有为 UI 新造核心能力"
 fi
-if grep -q -- '"mtime_kind": panel.formMtimeKind' "$QML_DIR/components/FilterEditorPanel.qml" \
-   && grep -q -- '"days_back": panel.formDaysBackText' "$QML_DIR/components/FilterEditorPanel.qml" \
-   && grep -q -- '"date_low": panel.formDateLow' "$QML_DIR/components/FilterEditorPanel.qml" \
-   && grep -q -- '"date_high": panel.formDateHigh' "$QML_DIR/components/FilterEditorPanel.qml"; then
+for mtime_key in today yesterday last_days day day_range; do
+  if grep -qF "{\"${mtime_key}\"," "$ROOT_DIR/ui/modern/filter_rule_model.cpp"; then
+    record_pass "mtime 类型下拉含 ${mtime_key}"
+  else
+    record_fail "mtime 类型下拉缺 ${mtime_key}"
+  fi
+done
+if grep -q -- '"mtime_kind": editor.formMtimeKind' "$QML_DIR/components/FilterRuleEditor.qml" \
+   && grep -q -- '"days_back": editor.formDaysBackText' "$QML_DIR/components/FilterRuleEditor.qml" \
+   && grep -q -- '"date_low": editor.formDateLow' "$QML_DIR/components/FilterRuleEditor.qml" \
+   && grep -q -- '"date_high": editor.formDateHigh' "$QML_DIR/components/FilterRuleEditor.qml"; then
   record_pass "表单把 mtime 类型 / 天数 / 两个日期一起交给模型"
 else
   record_fail "表单没有提交 mtime 的完整取值"
@@ -1481,6 +1522,20 @@ expect_present() {
   fi
 }
 
+# 反向断言（只看代码行）：注释里写"以前这里是 ext:cpp;h"是正常的说明，
+# 断言的是**用户看得到的文案**里没有它，所以先剔掉 // 开头的行。
+expect_missing_code() {
+  local file="$1"
+  local pattern="$2"
+  local label="$3"
+  # grep -n 的输出是 "行号:内容"（没有文件名前缀），所以过滤的是 ^行号: //
+  if grep -nF -- "$pattern" "$file" | grep -vE '^[0-9]+:[[:space:]]*//' | grep -q .; then
+    record_fail "$label（代码里不该出现：$pattern）"
+  else
+    record_pass "$label"
+  fi
+}
+
 # 反向断言：界面上不该出现东西，和"该出现"一样重要。
 expect_missing() {
   local file="$1"
@@ -1502,9 +1557,13 @@ expect_count "$QML_DIR/Main.qml" "SchedulePage {" 1 \
   "StackLayout 里只有一个 SchedulePage 实例"
 
 # --- 页面上该有的控件 ---
-for name in scheduleEnabledToggle scheduleSourceField scheduleIntervalField \
+for name in scheduleEnabledToggle scheduleSourceField scheduleFrequencyValueField \
+            scheduleFrequencyUnitCombo scheduleFrequencyHintText \
             scheduleRetainField schedulePackCombo scheduleCompressionCombo \
-            scheduleEncryptionText scheduleIncludeField scheduleExcludeField \
+            scheduleEncryptionText scheduleEncryptionNote \
+            scheduleAdvancedToggle scheduleAdvancedSection \
+            scheduleStrategyCombo scheduleStrategyHelperText \
+            runScheduleNowHintText \
             saveScheduleButton runScheduleNowButton scheduleHistoryList \
             scheduleManagedList scheduleLastRunText scheduleNextRunText \
             scheduleLastResultText scheduleRunnerText; do
@@ -1512,21 +1571,48 @@ for name in scheduleEnabledToggle scheduleSourceField scheduleIntervalField \
     "计划页有 $name"
 done
 
-# --- 周期 / 保留数量的解析规则只有一份 ---
-# QML 的 parseInt("12abc") 是 12，而 backupctl 对同一个输入是明确拒绝。
-# 界面必须把文本原样交给共享核心，自己不做"解析"。
-expect_present "$SCHEDULE_PAGE_QML" "schedule.saveConfigFromText("   "计划页把周期与保留数量按文本交给共享核心解析"
-expect_missing "$SCHEDULE_PAGE_QML" "parseInt(page.draft"   "计划页不再用 QML 的 parseInt 截断周期 / 保留数量"
-expect_present "$ROOT_DIR/ui/modern/schedule_controller.cpp"   "ParseBoundedScheduleNumber"   "界面侧调用的是共享的 ParseBoundedScheduleNumber"
-expect_present "$ROOT_DIR/src/cli/cli_commands.cpp"   "ParseBoundedScheduleNumber"   "CLI 侧调用的是同一个 ParseBoundedScheduleNumber"
+# --- 备份频率：值 + 单位（每 1 小时），而不是"周期 [60] 分钟" ---
+#
+# 人工验收："周期 [60] 分钟"功能没错，但用户每次都要自己心算。界面改成 值 + 单位，
+# 换算在 C++ 的 schedule_frequency.cpp 里做，而数值文本仍然交给共享核心的
+# ParseBoundedScheduleNumber 解析 —— 所以 QML 里不会出现 parseInt(x) * 10080。
+expect_present "$SCHEDULE_PAGE_QML" "schedule.saveConfigFromFrequencyText(" \
+  "计划页把频率（值 + 单位）与保留数量按文本交给共享核心"
+expect_missing "$SCHEDULE_PAGE_QML" "parseInt(page.draft" \
+  "计划页不用 QML 的 parseInt 截断数值"
+expect_missing "$SCHEDULE_PAGE_QML" "* 10080" \
+  "QML 里不做 值 × 单位 的乘法"
+expect_count_re "$SCHEDULE_PAGE_QML" "schedule.frequencyUnitKey" 2 \
+  "频率单位来自控制器（草稿初值 + 同步各一次，界面不自己定义单位表）"
+expect_present "$ROOT_DIR/ui/modern/schedule_frequency.cpp" \
+  "ParseBoundedScheduleNumber" \
+  "频率的数值解析仍然走共享核心的 ParseBoundedScheduleNumber"
+expect_present "$ROOT_DIR/ui/modern/schedule_frequency.cpp" "kMaxIntervalMinutes" \
+  "频率的上界来自共享核心的 schedule_store.h（界面不另写一套范围）"
+expect_present "$ROOT_DIR/ui/modern/schedule_controller.cpp" \
+  "ParseBoundedScheduleNumber" \
+  "界面侧调用的是共享的 ParseBoundedScheduleNumber"
+expect_present "$ROOT_DIR/src/cli/cli_commands.cpp" \
+  "ParseBoundedScheduleNumber" \
+  "CLI 侧调用的是同一个 ParseBoundedScheduleNumber"
+# 存储 schema 一个字节都没变：核心 / CLI / store 继续只看 interval_minutes。
+# 这里查的是**落盘字段**，不是注释里那个词。
+expect_present "$ROOT_DIR/src/scheduler/schedule_store.cpp" "\"interval_minutes\"" \
+  "落盘字段仍然是 interval_minutes"
+expect_present "$ROOT_DIR/ui/modern/schedule_controller.cpp" \
+  "saveConfigFromFrequencyText" \
+  "频率入口最终仍然走同一个 saveConfig（没有第二条落盘路径）"
 
 # --- 加密边界：没有任何"选加密"的入口，只有一行说明 ---
 expect_missing "$SCHEDULE_PAGE_QML" "scheduleEncryptionCombo" \
   "加密在计划页不是可选项（没有下拉框）"
 expect_count "$SCHEDULE_PAGE_QML" "objectName: \"scheduleEncryptionNote\"" 1 \
   "计划页写明了不加密的原因"
-expect_present "$SCHEDULE_PAGE_QML" "不会保存任何明文密码" \
-  "计划页说明不会保存明文密码"
+expect_present "$SCHEDULE_PAGE_QML" "schedule.encryptionNote" \
+  "计划页的加密说明问控制器要（QML 不复制那句字面量）"
+expect_present "$ROOT_DIR/src/core/backup_mode.cpp" \
+  "定时无人值守加密需要安全的密钥来源" \
+  "那句话本身只有一处：backup_mode.cpp（CLI 与 GUI 都读它）"
 
 # --- 不画未实现的假按钮 ---
 #
@@ -1540,8 +1626,10 @@ expect_present "$SCHEDULE_PAGE_QML" "schedule.supportedModeText" \
   "计划页的模式说明来自共享核心，而不是 QML 自己写死"
 
 # --- 生命周期必须诚实：关掉程序就不会再跑 ---
-expect_present "$SCHEDULE_PAGE_QML" "定时任务在本程序或 backupctl schedule watch 运行期间执行" \
+expect_present "$SCHEDULE_PAGE_QML" "定时任务只在本程序运行期间执行" \
   "计划页写明了定时任务只在程序运行时生效"
+expect_missing_code "$SCHEDULE_PAGE_QML" "backupctl" \
+  "命令行工具名不出现在计划页的用户文案里"
 
 # --- 业务逻辑不在 QML 里 ---
 expect_missing "$SCHEDULE_PAGE_QML" "Date.now" \
@@ -1692,9 +1780,8 @@ expect_count "$QML_DIR/Main.qml" "realtime.clearStatus()" 1 \
 for name in realtimeEnabledToggle realtimeSourceField browseRealtimeSourceButton \
             realtimeStrategyCombo realtimeRetainField saveRealtimeButton \
             realtimeSubtitleText realtimeDebounceField realtimeMaxWaitField \
-            realtimePackCombo realtimeCompressionCombo realtimeIncludeField \
-            addRealtimeIncludeButton realtimeExcludeField addRealtimeExcludeButton \
-            realtimeInvalidRuleText realtimeEncryptionText realtimeEncryptionNote \
+            realtimePackCombo realtimeCompressionCombo realtimeDelayTermText \
+            realtimeEncryptionText realtimeEncryptionNote \
             realtimeAdvancedToggle realtimeAdvancedSection realtimeTechnicalToggle \
             realtimeTechnicalSection realtimeSupportedModeText realtimeRunScopeText \
             realtimeRawPhaseText realtimeWatchText realtimeWatchCountText \
@@ -1725,18 +1812,25 @@ expect_present "$REALTIME_PAGE_QML" 'objectName: "realtimeTechnicalToggle"' \
 # 否则"收起时它仍然占着布局"这种退化不会有人发现。数量断言会因为加一个控件就
 # 失效、且失败信息说不清是谁，所以这里逐个控件断言，失败时直接点名。
 for name in realtimeDebounceField realtimeMaxWaitField realtimePackCombo \
-            realtimeCompressionCombo realtimeIncludeField realtimeExcludeField \
-            realtimeEncryptionText realtimeEncryptionNote; do
+            realtimeCompressionCombo realtimeEncryptionText \
+            realtimeEncryptionNote; do
   if grep -A3 "objectName: \"$name\"" "$REALTIME_PAGE_QML" | grep -q "visible: page.advancedExpanded"; then
     record_pass "$name 显式跟随高级设置折叠状态"
   else
     record_fail "$name 没有显式跟随高级设置折叠状态"
   fi
 done
-# 规则错误提示是例外：它自己的 visible 绑的是"有没有错误消息"，折叠可见性由
-# 上面的容器负责（容器已断言跟随 advancedExpanded）。这里单独钉住它的条件。
-expect_present "$REALTIME_PAGE_QML" 'visible: text !== ""' \
+# 规则错误提示在共享编辑器里：它自己的 visible 绑的是"有没有错误消息"，
+# 折叠可见性由外面的容器负责（容器已断言跟随 advancedExpanded）。
+expect_present "$QML_DIR/components/FilterRuleEditor.qml" 'visible: text.length > 0' \
   "规则错误提示只在真的有错误时出现（折叠可见性由容器负责）"
+if grep -A5 'objectName: editor.nameOf("AdvancedRulesSection")' \
+     "$QML_DIR/components/FilterRuleEditor.qml" | \
+   grep -q "visible: editor.advancedExpanded"; then
+  record_pass "高级规则容器显式跟随折叠状态"
+else
+  record_fail "高级规则容器没有显式跟随折叠状态"
+fi
 for name in realtimeSupportedModeText realtimeRunScopeText realtimeRawPhaseText \
             realtimeWatchText realtimeWatchCountText realtimePendingCountText \
             realtimePendingText realtimeOverflowText realtimeLastEventText \
@@ -1756,19 +1850,35 @@ for name in realtimeSourceField realtimeStrategyCombo realtimeRetainField \
     record_pass "$name 常显（不被折叠状态控制）"
   fi
 done
-# 技术名词不再当主标签：中文在前，英文只在括号里。
-expect_present "$REALTIME_PAGE_QML" 'text: "响应延迟（Debounce）"' \
-  "响应延迟是主标签（英文退到括号里）"
-expect_present "$REALTIME_PAGE_QML" 'text: "最长等待（Max wait）"' \
-  "最长等待是主标签（英文退到括号里）"
+# 技术名词不再当主标签：普通 UI 只有中文，英文术语退到「技术详情」。
+expect_present "$REALTIME_PAGE_QML" 'text: "响应延迟"' \
+  "响应延迟是主标签（纯中文）"
+expect_present "$REALTIME_PAGE_QML" 'text: "最长等待"' \
+  "最长等待是主标签（纯中文）"
+expect_missing_code "$REALTIME_PAGE_QML" "（Debounce）" \
+  "主标签里不再出现英文术语"
+expect_missing_code "$REALTIME_PAGE_QML" "（Max wait）" \
+  "主标签里不再出现英文术语"
+for term in Debounce "Max wait"; do
+  if grep -A4 'objectName: "realtimeDelayTermText"' "$REALTIME_PAGE_QML" | grep -qF "$term"; then
+    record_pass "英文术语 $term 只出现在「技术详情」里"
+  else
+    record_fail "英文术语 $term 没有退到「技术详情」"
+  fi
+done
+if grep -A4 'objectName: "realtimeDelayTermText"' "$REALTIME_PAGE_QML" | grep -q "visible: page.technicalExpanded"; then
+  record_pass "英文术语跟随「技术详情」折叠状态"
+else
+  record_fail "英文术语没有跟随「技术详情」折叠状态"
+fi
 expect_missing "$REALTIME_PAGE_QML" "100..60000" \
   "字段取值范围不作为主视觉文案"
 expect_missing "$REALTIME_PAGE_QML" "500..300000" \
   "字段取值范围不作为主视觉文案"
 # 策略解释：短、面向用户，不出现实现术语。
-expect_present "$REALTIME_PAGE_QML" "完整备份：每次创建一份可独立恢复的完整快照。" \
+expect_present "$REALTIME_PAGE_QML" "完整备份：每次生成一份可以独立恢复的完整备份。" \
   "完整备份有一句用户向解释"
-expect_present "$REALTIME_PAGE_QML" "增量备份：首次建立完整基线，之后只保存变化。" \
+expect_present "$REALTIME_PAGE_QML" "增量备份：首次建立完整基线，之后只保存变化，更节省空间。" \
   "增量备份有一句用户向解释"
 expect_missing "$REALTIME_PAGE_QML" "BKPINC1" \
   "主层不解释增量容器格式"
@@ -1801,9 +1911,21 @@ expect_present "$ROOT_DIR/src/core/backup_mode.cpp" \
   "实时无人值守备份当前不保存密码，因此不启用加密。" \
   "那句话本身只有一处：backup_mode.cpp（CLI 与 GUI 都读它）"
 
-# --- Filter：复用既有规则编辑方式，解析仍然只在共享 Filter 里 ---
-expect_present "$REALTIME_PAGE_QML" "realtime.validateRule(" \
-  "实时页的规则即时反馈问的是控制器（背后是真实 Filter）"
+# --- Filter：与备份页 / 自动备份页共用同一个可视化编辑器 ---
+#
+# 人工验收的结论：两个 raw DSL 输入框（"例如 ext:cpp;h" + "添加包含规则"）是
+# 不合格的默认交互 —— 普通用户被要求自己写语法。现在整块换成共享的
+# FilterRuleEditor，规则文本仍然由同一个 builder 生成、由真实的 Filter 裁决。
+expect_missing "$REALTIME_PAGE_QML" "realtime.validateRule(" \
+  "实时页不再自己调控制器做规则校验（校验走共享编辑器 / builder）"
+expect_missing_code "$REALTIME_PAGE_QML" "例如 ext:cpp;h" \
+  "实时页不再要求用户输入 ext: 语法"
+expect_missing_code "$REALTIME_PAGE_QML" "例如 path:**/build/**" \
+  "实时页不再要求用户输入 path: 语法"
+expect_present "$REALTIME_PAGE_QML" "realtimeFilterRuleModel" \
+  "实时页注入的是自己的规则模型（DSL 由共享 builder 生成）"
+expect_present "$REALTIME_PAGE_QML" 'objectPrefix: "realtime"' \
+  "实时页用的是共享的 FilterRuleEditor"
 expect_present "$REALTIME_PAGE_QML" "realtime.saveConfigFromText(" \
   "实时页把数字按文本交给共享核心解析"
 expect_missing "$REALTIME_PAGE_QML" "parseInt(page.draft" \
@@ -2074,6 +2196,201 @@ expect_present "$QML_DIR/components/AppButton.qml" \
 # 输入框动画的是 border.color，两端都是不透明色，不是黑闪来源，明确保留。
 expect_present "$QML_DIR/components/AppTextField.qml" "Behavior on border.color" \
   "输入框保留边框色过渡（两端不透明，非黑闪来源）"
+
+echo "[modern-gui] 19) 三页共用的 Filter UX（可视化条件 + 高级 DSL）"
+#
+# 人工验收："普通用户仍被要求直接输入 ext:cpp;h、path:**/build/**、Include / Exclude、
+# Debounce、Max wait 等内部概念。"这一节把"三处共用同一个规则编辑器"钉成契约，
+# 并跑一遍 **--filter-ux-test**：它真的切页、真的点按钮、真的往输入框里打字，
+# 然后断言三处拿到的是同一条 DSL。
+SHARED_EDITOR="$QML_DIR/components/FilterRuleEditor.qml"
+expect_count "$RESOURCE_FILE" "qml/components/FilterRuleEditor.qml" 1 \
+  "共享规则编辑器进了资源清单"
+expect_present "$QML_DIR/components/FilterEditorPanel.qml" "FilterRuleEditor {" \
+  "备份页用共享规则编辑器"
+expect_present "$SCHEDULE_PAGE_QML" "FilterRuleEditor {" \
+  "自动备份页用共享规则编辑器"
+expect_present "$REALTIME_PAGE_QML" "FilterRuleEditor {" \
+  "实时备份页用共享规则编辑器"
+# 每个页面只有一个规则编辑器实例，而且都是共享组件（不是各写一套）。
+expect_count "$SCHEDULE_PAGE_QML" "FilterRuleEditor {" 1 \
+  "自动备份页只有一个规则编辑器实例"
+expect_count "$REALTIME_PAGE_QML" "FilterRuleEditor {" 1 \
+  "实时页只有一个规则编辑器实例"
+expect_count "$QML_DIR/components/FilterEditorPanel.qml" "FilterRuleEditor {" 1 \
+  "备份页只有一个规则编辑器实例"
+# 两个自动化页面都不再自己维护 include / exclude 文本列表。
+for page_file in "$SCHEDULE_PAGE_QML" "$REALTIME_PAGE_QML"; do
+  if grep -q "draftInclude" "$page_file" || grep -q "draftExclude" "$page_file"; then
+    record_fail "$(basename "$page_file") 仍然自己维护 include / exclude 列表"
+  else
+    record_pass "$(basename "$page_file") 不再自己维护 include / exclude 列表"
+  fi
+done
+
+# --- 普通模式：条件类型是中文下拉，不是裸文本框 ---
+for label in "文件扩展名" "文件名" "路径" "主文件名" "文件类型" "文件大小" \
+             "用户 ID" "用户组 ID" "修改时间"; do
+  if grep -qF "return \"$label\";" "$ROOT_DIR/src/filter/filter_rule_builder.cpp"; then
+    record_pass "条件类型里有“$label”"
+  else
+    record_fail "条件类型里缺“$label”"
+  fi
+done
+expect_present "$SHARED_EDITOR" "RuleFieldCombo" \
+  "条件类型是一个 ComboBox（用户从下拉里选，不写 ext:）"
+expect_present "$SHARED_EDITOR" "RuleTypeCombo" \
+  "文件类型用 ComboBox"
+expect_present "$SHARED_EDITOR" "RuleSizeCompareCombo" \
+  "文件大小先选比较方式"
+expect_present "$SHARED_EDITOR" "RuleSizeValueField" \
+  "文件大小再填数值"
+expect_present "$SHARED_EDITOR" "RuleSizeUnitCombo" \
+  "文件大小最后选单位"
+expect_missing "$SHARED_EDITOR" "placeholderText: \"ext:" \
+  "普通模式的占位符不教用户写 DSL"
+expect_missing "$SHARED_EDITOR" "placeholderText: \"size:" \
+  "普通模式的占位符不教用户写 DSL"
+
+# --- 高级 DSL：默认折叠，但能力一点没少 ---
+expect_count "$SHARED_EDITOR" "property bool advancedExpanded: false" 1 \
+  "高级规则默认收起"
+expect_present "$SHARED_EDITOR" 'objectName: editor.nameOf("AdvancedRuleField")' \
+  "高级规则仍然可以写完整 DSL"
+expect_present "$SHARED_EDITOR" "editor.ruleModel.addAdvancedRule(" \
+  "高级规则走的是共享模型（语法裁决在 Filter::AddRule）"
+
+# --- 主行讲人话，DSL 降级 ---
+expect_present "$QML_DIR/components/RuleCard.qml" "actionLabel" \
+  "规则卡片的主行用中文动作名"
+expect_present "$QML_DIR/components/RuleCard.qml" "conditionLabel" \
+  "规则卡片的主行用中文条件摘要"
+expect_present "$ROOT_DIR/src/filter/filter_rule_builder.cpp" "SummarizeClauseShort" \
+  "短摘要由共享 builder 生成（界面不自己拼术语）"
+expect_missing "$QML_DIR/components/RuleCard.qml" '(card.isInclude ? "Include" : "Exclude")' \
+  "规则卡片不再直接显示 Include / Exclude"
+
+# --- 三处 parity：真实 GUI 交互 + 生成的 DSL ---
+set +e
+QT_QPA_PLATFORM=offscreen QSG_RHI_BACKEND=software timeout 300 \
+  ./build/backup-gui-modern --filter-ux-test \
+  --config-file "$TEST_STATE_DIR/fux-config.json" \
+  --schedule-file "$TEST_STATE_DIR/fux-schedule.json" \
+  --realtime-file "$TEST_STATE_DIR/fux-realtime.json" \
+  > "$TEST_STATE_DIR/filter-ux.log" 2>&1
+fux_status=$?
+set -e
+cat "$TEST_STATE_DIR/filter-ux.log" >> "$LOG_FILE"
+if [[ "$fux_status" -eq 0 ]]; then
+  record_pass "三页 Filter UX parity 自检通过（$(grep -c '   ok   ' "$TEST_STATE_DIR/filter-ux.log" || true) 项观测全部通过）"
+else
+  record_fail "三页 Filter UX parity 自检退出码 $fux_status"
+  grep 'FAIL' "$TEST_STATE_DIR/filter-ux.log" | tail -8
+fi
+# 固定格式的关键行：脚本按行断言，不靠"程序自己说成功"。
+for pattern in "PARITY-01 三处的包含规则逐字相同" \
+               "PARITY-02 普通表单输入生成的就是核心认可的 DSL" \
+               "PARITY-03 三处的排除规则逐字相同" \
+               "PARITY-04 非法输入在三处得到同一句原因（来自共享 builder）"; do
+  if grep -qF -- "$pattern" "$TEST_STATE_DIR/filter-ux.log"; then
+    record_pass "Filter UX parity：$pattern"
+  else
+    record_fail "Filter UX parity 缺少：$pattern"
+  fi
+done
+# 三处各自都要真的走完一遍（不是只测了某一页）。
+for label in "备份页" "自动备份页" "实时备份页"; do
+  if grep -qF -- "$label 生成 ext:txt;md（用户没有写过 ext:）" "$TEST_STATE_DIR/filter-ux.log"; then
+    record_pass "$label 走完了真实 GUI 交互并生成 ext:txt;md"
+  else
+    record_fail "$label 没有走完真实 GUI 交互"
+  fi
+done
+if grep -qF "qml-warning" "$TEST_STATE_DIR/filter-ux.log"; then
+  record_fail "Filter UX 自检期间出现了 QML 运行期告警"
+else
+  record_pass "Filter UX 自检期间 0 QML 运行期告警"
+fi
+
+echo "[modern-gui] 20) 备份频率（每 N 单位）与存储 schema 不变"
+#
+# 人工验收："周期 [60] 分钟"功能没错但体验差。界面改成 值 + 单位，存储与 CLI
+# 继续只看 interval_minutes —— 这一节同时钉住"界面变好"和"schema 没变"。
+expect_present "$ROOT_DIR/ui/modern/schedule_frequency.h" "SplitFrequency" \
+  "频率的反向折算（取最大整除单位）在 C++ 里"
+expect_present "$ROOT_DIR/ui/modern/schedule_frequency.cpp" \
+  "LargestExactFrequencyUnit" \
+  "120 分钟必须显示成“每 2 小时”，不能显示成“每 120 分钟”"
+expect_missing "$ROOT_DIR/ui/modern/schedule_frequency.cpp" "double" \
+  "频率换算全程是整数（没有浮点，也就没有 1.5 小时）"
+if grep -qF '{"weeks", "周", 10080u}' "$ROOT_DIR/ui/modern/schedule_frequency.cpp" &&
+   grep -qF '{"days", "天", 1440u}' "$ROOT_DIR/ui/modern/schedule_frequency.cpp" &&
+   grep -qF '{"hours", "小时", 60u}' "$ROOT_DIR/ui/modern/schedule_frequency.cpp" &&
+   grep -qF '{"minutes", "分钟", 1u}' "$ROOT_DIR/ui/modern/schedule_frequency.cpp"; then
+  record_pass "频率单位表是 分钟 / 小时 / 天 / 周"
+else
+  record_fail "频率单位表缺项"
+fi
+# 频率自检的输出（--schedule-test 里那一组 FREQ-xx）已经在第 15 节跑过，
+# 这里只复核关键几行确实出现过。
+for pattern in "FREQ-01 每 1 小时 -> 60 分钟" \
+               "FREQ-01 每 2 天 -> 2880 分钟" \
+               "FREQ-01 每 1 周 -> 10080 分钟" \
+               "FREQ-02 60 分钟 -> 每 1 小时" \
+               "FREQ-02 120 分钟 -> 每 2 小时" \
+               "FREQ-02 1440 分钟 -> 每 1 天" \
+               "FREQ-02 10080 分钟 -> 每 1 周" \
+               "FREQ-02 90 分钟 -> 每 90 分钟" \
+               "FREQ-03 拒绝 每 0 分钟" \
+               "FREQ-03 拒绝 每 -1 小时" \
+               "FREQ-03 拒绝 每 525601 分钟" \
+               "FREQ-03 拒绝 每 1000 周" \
+               "FREQ-02 2880 分钟 -> 每 2 天"; do
+  if grep -qF -- "$pattern" "$LOG_FILE"; then
+    record_pass "频率自检：$pattern"
+  else
+    record_fail "频率自检缺少：$pattern"
+  fi
+done
+# schema：store 里只有 interval_minutes，没有任何单位字段。
+if grep -qF '"interval_minutes"' "$ROOT_DIR/src/scheduler/schedule_store.cpp" &&
+   ! grep -qE '"interval_(hours|days|weeks|unit)"' \
+     "$ROOT_DIR/src/scheduler/schedule_store.cpp"; then
+  record_pass "计划存储 schema 未变（仍然只有 interval_minutes）"
+else
+  record_fail "计划存储 schema 出现了单位字段"
+fi
+
+echo "[modern-gui] 21) 用户 UI 不出现开发者术语"
+#
+# 普通用户看到的每一句都应该是"这东西帮我做什么"。命令行工具名、内部格式名、
+# 状态机字段只在「技术详情」里出现，或者根本不出现。
+expect_missing "$REALTIME_PAGE_QML" "Filter parser" \
+  "实时页不解释 Filter parser"
+expect_missing "$REALTIME_PAGE_QML" "共享核心解析并校验" \
+  "实时页不再写“规则由共享核心解析并校验”（那是源码注释，不是用户帮助）"
+expect_missing "$REALTIME_PAGE_QML" "这里不做第二套解析" \
+  "实时页不再写“这里不做第二套解析”"
+expect_missing "$SCHEDULE_PAGE_QML" "这里不做第二套解析" \
+  "自动备份页不再写“这里不做第二套解析”"
+expect_missing "$SCHEDULE_PAGE_QML" 'text: "筛选规则（include / exclude）"' \
+  "自动备份页不再用 include / exclude 当标题"
+expect_missing "$SCHEDULE_PAGE_QML" '"添加 include"' \
+  "自动备份页不再有“添加 include”按钮"
+expect_missing "$SCHEDULE_PAGE_QML" '"添加 exclude"' \
+  "自动备份页不再有“添加 exclude”按钮"
+expect_missing "$REALTIME_PAGE_QML" '"Include"' \
+  "实时页不再出现裸 Include 文案"
+expect_present "$QML_DIR/components/FilterRuleEditor.qml" '"包含"' \
+  "包含 / 排除才是普通 UI 的措辞"
+expect_present "$SCHEDULE_PAGE_QML" '"保存设置"' \
+  "自动备份页的按钮叫“保存设置”"
+expect_present "$SCHEDULE_PAGE_QML" '"立即执行一次"' \
+  "自动备份页的按钮叫“立即执行一次”"
+expect_present "$SCHEDULE_PAGE_QML" "立即检查当前状态，并在需要时创建备份。" \
+  "按钮附近说明“没有变化时不会产生新备份”，不做过度承诺"
+expect_missing "$SCHEDULE_PAGE_QML" '"保存计划"' \
+  "旧文案“保存计划”已经消失"
 
 echo "[modern-gui] 通过 $PASS_COUNT 项，失败 $FAIL_COUNT 项"
 echo "[modern-gui] 日志: $LOG_FILE"
