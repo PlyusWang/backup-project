@@ -4032,15 +4032,55 @@ int main(int argc, char* argv[]) {
   backup_modern::AppTheme theme;
   // 配置路径在这里定型：正常启动是 AppConfigLocation/config.json，
   // 自动测试用 --config-file 指到临时目录，绝不读写真实用户配置。
-  const QString config_file_path = ResolveConfigFilePath(arguments);
+  //
+  // 但"自检模式没给路径就退化成真实用户 profile"确实污染过用户配置：
+  // --realtime-test 之类会把 /tmp/backup-gui-modern-XXXXXX/repository 写进
+  // ~/.config/backup-project/backup-gui-modern/config.json，之后用户不带参数
+  // 正常启动（例如 Demo 的 run.sh）就会看到一个早已被删掉的临时仓库。
+  // 所以自检 / 抓图模式下，只要有哪条路径没被显式指定，就把它重定向到本次
+  // 进程专属的临时目录，并在 stderr 说明。显式参数永远优先；正常启动
+  // （没有任何自检开关）行为完全不变。
+  const bool self_check_mode = smoke_test || path_test || close_guard_test ||
+                               gui_contract_test || preview_test_index >= 0 ||
+                               incremental_test_index >= 0 ||
+                               screenshot_index >= 0 || self_test_index >= 0 ||
+                               repository_test_index >= 0 || realtime_test ||
+                               backup_options_test || schedule_test;
+  QString config_file_path = ResolveConfigFilePath(arguments);
+  QString schedule_file_path = ResolveScheduleFilePath(arguments);
+  QString realtime_file_path = ResolveRealtimeFilePath(arguments);
+  if (self_check_mode) {
+    // static：目录必须活到进程结束（controller 全程读写这三份文件），
+    // 析构时自动清理。放在 if 里是为了让正常启动根本不建临时目录。
+    static QTemporaryDir self_check_profile;
+    if (!self_check_profile.isValid()) {
+      std::fprintf(stderr, "[self-check] 无法创建隔离配置目录\n");
+      return 1;
+    }
+    if (config_file_index < 0) {
+      config_file_path =
+          self_check_profile.filePath(QStringLiteral("config.json"));
+    }
+    if (schedule_file_index < 0) {
+      schedule_file_path =
+          self_check_profile.filePath(QStringLiteral("schedule.json"));
+    }
+    if (realtime_file_index < 0) {
+      realtime_file_path =
+          self_check_profile.filePath(QStringLiteral("realtime.json"));
+    }
+    std::fprintf(stderr,
+                 "[self-check] 隔离配置目录 %s（显式给出的存储路径仍然优先）\n",
+                 self_check_profile.path().toLocal8Bit().constData());
+  }
   // 一个进程内"同一时刻只有一个会改动持久状态的业务操作"的共享闸门。
   // 两个控制器拿到的是同一个对象：手动备份/恢复/删除/改仓库与"后台评估 +
   // 保存计划"互相排斥，由 C++ 保证，而不是靠 QML 把按钮置灰。
   backup_modern::OperationGate operation_gate;
   backup_modern::BackupController controller(config_file_path, &operation_gate);
   // 计划存储文件与配置走同一套默认位置策略（见 app_paths.h）：
-  // backupctl schedule show 读到的就是这一份。
-  const QString schedule_file_path = ResolveScheduleFilePath(arguments);
+  // backupctl schedule show 读到的就是这一份。路径已在上面解析并定型
+  // （自检模式下未显式指定时指向隔离目录）。
   // 定时备份的桥。它自己不做任何业务判断，全部转发给共享核心；
   // 同时订阅 controller.busy，保证手动备份与计划备份不会同时写盘。
   //
@@ -4057,7 +4097,8 @@ int main(int argc, char* argv[]) {
   // 它**不**自己取任何 application lock：GUI 主进程已经在启动时按 per-UID
   // 持有了那把锁，flock 绑在 open file description 上，再取一次只会把自己
   // 判成"另一个实例正在运行"。
-  const QString realtime_file_path = ResolveRealtimeFilePath(arguments);
+  // realtime_file_path 同样已在上面解析并定型（自检模式下未显式指定时
+  // 指向隔离目录）。
   // 第三个参数是 BackupController：实时控制器订阅它的 repositoryPathChanged，
   // 这样设置页把仓库从 A 改成 B 之后，watcher、overlap 校验与快照列表都会跟着
   // 换到 B，旧仓库不会再收到任何新快照（与 ScheduleController 同一种接法）。
