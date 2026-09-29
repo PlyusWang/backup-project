@@ -2,13 +2,21 @@
 //
 // 实时备份页：文件事件触发 + 完整快照 / 增量策略。
 //
-// 这一页只做四件事：展示、编辑配置、点启停、展示最近实时快照。
-// 它不直接调 inotify、不拼 repository 路径、不自己解析 Filter、不判断
+// 页面按"用户先要看什么"分五层，而不是把控制器状态一次铺开：
+//   1. 常用设置 —— 启用状态、备份目录、备份方式、保留版本、保存设置
+//   2. 高级设置 —— 响应延迟、最长等待、打包、压缩、筛选规则、加密说明（默认折叠）
+//   3. 运行状态 —— 先给一句结论，再给必要的错误说明
+//   4. 技术详情 —— 控制器给出的原始状态，排查问题时才展开（默认折叠）
+//   5. 最近备份 —— 实时触发创建出来的备份版本
+//
+// 这一页只做四件事：展示、编辑配置、点启停、展示最近备份。
+// 它不直接监听文件系统事件、不拼 repository 路径、不自己解析 Filter、不判断
 // option support、也不自己执行 retention —— 全部来自 RealtimeController，
 // 而 RealtimeController 背后是与 backupctl realtime 共用的同一份核心。
 //
-// 页面上每一个能点的东西都是真的：加密选择器是**置灰**的，因为它确实不可选
-// （无人值守没有持久密钥来源），而不是"暂时藏起来"。
+// 业务值一律来自 realtime（RealtimeController）与 theme：数字按**文本**交给
+// 共享核心解析，运行状态只做显示层翻译；"该不该监听 / 该不该备份 / 某个选项
+// 支不支持"都不在这一层判断。
 
 import QtQuick
 import QtQuick.Controls.Basic
@@ -20,8 +28,7 @@ import "../components"
 Item {
     id: page
 
-    // draft 语义与自动备份页一致：输入框里的是草稿，点"保存实时配置"才写进
-    // 控制器。
+    // draft 语义与自动备份页一致：输入框里的是草稿，点"保存设置"才写进控制器。
     property bool draftEnabled: realtime.enabled
     property string draftSource: realtime.sourcePath
     property string draftDebounce: String(realtime.debounceMs)
@@ -35,12 +42,35 @@ Item {
     property string draftIncludeInput: ""
     property string draftExcludeInput: ""
 
+    // 两个折叠区都默认收起，而且**不持久化**：折叠是这一屏的临时视图状态，
+    // 不是配置；重新进入页面时回到"常用设置 + 运行状态优先"的默认样子。
+    property bool advancedExpanded: false
+    property bool technicalExpanded: false
+
     readonly property var strategyKeys: ["full", "incremental"]
     readonly property var strategyLabels: ["完整备份", "增量备份"]
     readonly property var packKeys: ["mypack", "ustar", "fast-ustar"]
     readonly property var packLabels: ["MyPack", "USTAR", "Fast USTAR"]
     readonly property var compressionKeys: ["none", "huffman", "lzss-huffman"]
     readonly property var compressionLabels: ["不压缩", "Huffman", "LZSS + Huffman"]
+
+    // 备份方式的短解释：只解释当前选中的那一种，避免两个术语同时出现。
+    readonly property string strategyHelper: page.draftStrategyIndex === 1
+        ? "增量备份：首次建立完整基线，之后只保存变化。"
+        : "完整备份：每次创建一份可独立恢复的完整快照。"
+
+    // 草稿与已保存配置是否一致。只用来提示"这次改动还没生效"，
+    // 不参与任何"能不能保存"的判断 —— 那个判断在共享核心里。
+    readonly property bool draftDirty: page.draftEnabled !== realtime.enabled
+        || page.draftSource !== realtime.sourcePath
+        || page.draftDebounce !== String(realtime.debounceMs)
+        || page.draftMaxWait !== String(realtime.maxWaitMs)
+        || page.draftRetain !== String(realtime.retainCount)
+        || page.strategyKeys[page.draftStrategyIndex] !== realtime.strategyKey
+        || page.packKeys[page.draftPackIndex] !== realtime.packKey
+        || page.compressionKeys[page.draftCompressionIndex] !== realtime.compressionKey
+        || page.draftInclude.join("\n") !== realtime.includeRules.join("\n")
+        || page.draftExclude.join("\n") !== realtime.excludeRules.join("\n")
 
     function syncFromController() {
         page.draftEnabled = realtime.enabled
@@ -66,6 +96,65 @@ Item {
     onSavedSignatureChanged: syncFromController()
 
     Component.onCompleted: syncFromController()
+
+    // ---------- 运行状态：显示层翻译 ----------
+    //
+    // phaseKey 的取值由 RealtimeController 定义（disabled / watching /
+    // debouncing / resync / snapshot_created / no_changes / retention_warning /
+    // watch_degraded / watch_recovered / config_error / failed）。这里只把它
+    // 翻译成一句人话，不新增判断条件：什么时候算"在监听"、什么时候算"不可用"，
+    // 事实全部来自控制器；watchStateText 里那句人类可读的原因也是控制器给的。
+    function runStateFor(phaseKey, watchDegraded, watchStateText) {
+        if (phaseKey === "config_error")
+            return { glyph: "⚠", tone: "error", title: "实时备份已暂停", detail: "" }
+        if (phaseKey === "failed")
+            return { glyph: "⚠", tone: "error", title: "上一次实时备份没有成功",
+                     detail: "失败原因见页面下方的提示；处理之后重新保存设置即可继续。" }
+        if (watchDegraded || phaseKey === "watch_degraded")
+            return { glyph: "⚠", tone: "warning", title: "监听暂时不可用",
+                     detail: watchStateText }
+        if (phaseKey === "debouncing")
+            return { glyph: "●", tone: "busy", title: "正在等待文件稳定",
+                     detail: "已检测到变化，稍后开始备份。" }
+        if (phaseKey === "resync")
+            return { glyph: "●", tone: "busy", title: "正在备份",
+                     detail: "正在创建新的实时备份。" }
+        if (phaseKey === "snapshot_created")
+            return { glyph: "●", tone: "ok", title: "刚刚完成一次备份",
+                     detail: "新的实时备份已经写入备份仓库。" }
+        if (phaseKey === "retention_warning")
+            return { glyph: "⚠", tone: "warning", title: "备份已完成，旧版本没有清理完",
+                     detail: "新的备份已经写入；保留策略这一次没有全部执行成功。" }
+        if (phaseKey === "no_changes")
+            return { glyph: "●", tone: "ok", title: "正在监听",
+                     detail: "刚才的变化已经检查过，没有需要新备份的内容。" }
+        if (phaseKey === "watch_recovered")
+            return { glyph: "●", tone: "ok", title: "正在监听",
+                     detail: "监听已经恢复，文件变化后会自动备份。" }
+        if (phaseKey === "watching")
+            return { glyph: "●", tone: "ok", title: "正在监听",
+                     detail: "文件变化后会自动备份。" }
+        return { glyph: "●", tone: "idle", title: "未启用", detail: "尚未开始实时监听。" }
+    }
+
+    readonly property var runState: page.runStateFor(realtime.phaseKey,
+                                                    realtime.watchDegraded,
+                                                    realtime.watchStateText)
+    readonly property color runStateColor: {
+        const tone = page.runState.tone
+        if (tone === "ok")
+            return theme.success
+        if (tone === "busy")
+            return theme.accent
+        if (tone === "warning")
+            return theme.warning
+        if (tone === "error")
+            return theme.error
+        return theme.textDisabled
+    }
+    readonly property string runStateGlyph: page.runState.glyph
+    readonly property string runStateTitle: page.runState.title
+    readonly property string runStateDetail: page.runState.detail
 
     ScrollView {
         id: pageScroll
@@ -94,63 +183,70 @@ Item {
                 color: theme.textPrimary
             }
 
+            // 副标题面向普通用户：只讲"它能帮我做什么"，不讲它怎么实现。
+            // 架构层面的说明在下面的「技术详情」里。
             Text {
-                objectName: "realtimeSupportedModeText"
+                objectName: "realtimeSubtitleText"
                 Layout.fillWidth: true
-                text: realtime.supportedModeText
+                text: "文件发生变化后会自动创建备份，省去手动操作。程序关闭期间不会监听；"
+                      + "重新打开后会自动同步这段时间的变化。"
                 font.pixelSize: 17
                 color: theme.textSecondary
                 wrapMode: Text.WordWrap
                 Layout.topMargin: -8
             }
 
-            Text {
-                objectName: "realtimeRunScopeText"
-                Layout.fillWidth: true
-                text: "实时监听只在“本程序运行期间”生效：关掉程序就不再监听，"
-                      + "重开时会先做一次重新同步，把关掉那段时间的变化补上。"
-                font.pixelSize: 15
-                color: theme.textSecondary
-                wrapMode: Text.WordWrap
-            }
-
-            // ---------- 实时配置 ----------
+            // ---------- 1. 常用设置 ----------
             AppCard {
                 Layout.fillWidth: true
                 Layout.topMargin: 4
 
                 ColumnLayout {
                     anchors.fill: parent
-                    spacing: 10
+                    spacing: 12
 
+                    // 启用状态：左边是"现在是什么状态"，右边是"能做的动作"。
                     RowLayout {
                         Layout.fillWidth: true
-                        spacing: 12
+                        spacing: 10
 
                         Text {
-                            text: "启用实时备份"
-                            font.pixelSize: 16
-                            font.weight: Font.DemiBold
-                            color: theme.textSecondary
+                            text: "●"
+                            font.pixelSize: 18
+                            color: page.draftEnabled ? theme.success : theme.textDisabled
                         }
 
-                        AppButton {
-                            objectName: "realtimeEnabledToggle"
-                            text: page.draftEnabled ? "已启用" : "已停用"
-                            variant: page.draftEnabled ? "primary" : "secondary"
-                            enabled: !realtime.libraryBusy
-                            onClicked: page.draftEnabled = !page.draftEnabled
+                        Text {
+                            text: page.draftEnabled ? "实时备份已启用" : "实时备份已停用"
+                            font.pixelSize: 18
+                            font.weight: Font.DemiBold
+                            color: theme.textPrimary
+                        }
+
+                        Text {
+                            visible: page.draftDirty
+                            text: "改动尚未保存"
+                            font.pixelSize: 14
+                            color: theme.warning
                         }
 
                         Item { Layout.fillWidth: true }
+
+                        AppButton {
+                            objectName: "realtimeEnabledToggle"
+                            text: page.draftEnabled ? "停用" : "启用"
+                            variant: page.draftEnabled ? "secondary" : "primary"
+                            enabled: !realtime.libraryBusy
+                            onClicked: page.draftEnabled = !page.draftEnabled
+                        }
                     }
 
                     Text {
-                        text: "源目录"
+                        text: "备份目录"
                         font.pixelSize: 16
                         font.weight: Font.DemiBold
                         color: theme.textSecondary
-                        Layout.topMargin: 4
+                        Layout.topMargin: 2
                     }
 
                     RowLayout {
@@ -162,14 +258,14 @@ Item {
                             objectName: "realtimeSourceField"
                             Layout.fillWidth: true
                             enabled: !realtime.libraryBusy
-                            placeholderText: "输入目录路径，或点击“浏览目录”选择"
+                            placeholderText: "输入目录路径，或点击“选择目录”选择"
                             text: page.draftSource
                             onTextEdited: page.draftSource = text
                         }
 
                         AppButton {
                             objectName: "browseRealtimeSourceButton"
-                            text: "浏览目录"
+                            text: "选择目录"
                             iconName: "folder"
                             enabled: !realtime.libraryBusy
                             onClicked: {
@@ -181,60 +277,52 @@ Item {
 
                     Text {
                         Layout.fillWidth: true
-                        text: "实时备份有它自己的源目录，不会跟随备份页上临时输入的路径；"
-                              + "源目录与备份仓库不允许互相包含（否则备份写出的归档会变成下一次事件）。"
-                        font.pixelSize: 15
+                        text: "备份目录与备份仓库不能互相包含，否则备份写出的归档会被当成下一次变化。"
+                        font.pixelSize: 14
                         color: theme.textSecondary
                         wrapMode: Text.WordWrap
                     }
 
+                    Text {
+                        text: "备份方式"
+                        font.pixelSize: 16
+                        font.weight: Font.DemiBold
+                        color: theme.textSecondary
+                        Layout.topMargin: 2
+                    }
+
+                    AppComboBox {
+                        id: strategyBox
+                        objectName: "realtimeStrategyCombo"
+                        implicitWidth: 200
+                        enabled: !realtime.libraryBusy
+                        model: page.strategyLabels
+                        currentIndex: page.draftStrategyIndex
+                        onActivated: page.draftStrategyIndex = currentIndex
+                    }
+
+                    Text {
+                        Layout.fillWidth: true
+                        text: page.strategyHelper
+                        font.pixelSize: 14
+                        color: theme.textSecondary
+                        wrapMode: Text.WordWrap
+                    }
+
+                    Text {
+                        text: "保留版本"
+                        font.pixelSize: 16
+                        font.weight: Font.DemiBold
+                        color: theme.textSecondary
+                        Layout.topMargin: 2
+                    }
+
                     RowLayout {
                         Layout.fillWidth: true
-                        Layout.topMargin: 6
-                        spacing: 10
+                        spacing: 8
 
                         Text {
-                            text: "Debounce"
-                            font.pixelSize: 16
-                            color: theme.textSecondary
-                        }
-                        AppTextField {
-                            id: debounceField
-                            objectName: "realtimeDebounceField"
-                            implicitWidth: 130
-                            enabled: !realtime.libraryBusy
-                            text: page.draftDebounce
-                            onTextEdited: page.draftDebounce = text
-                        }
-                        Text {
-                            text: "ms"
-                            font.pixelSize: 16
-                            color: theme.textSecondary
-                        }
-
-                        Text {
-                            text: "Max wait"
-                            font.pixelSize: 16
-                            color: theme.textSecondary
-                        }
-                        AppTextField {
-                            id: maxWaitField
-                            objectName: "realtimeMaxWaitField"
-                            implicitWidth: 130
-                            enabled: !realtime.libraryBusy
-                            text: page.draftMaxWait
-                            onTextEdited: page.draftMaxWait = text
-                        }
-                        Text {
-                            text: "ms"
-                            font.pixelSize: 16
-                            color: theme.textSecondary
-                        }
-
-                        Item { Layout.fillWidth: true }
-
-                        Text {
-                            text: "保留数量"
+                            text: "保留最近"
                             font.pixelSize: 16
                             color: theme.textSecondary
                         }
@@ -247,246 +335,21 @@ Item {
                             onTextEdited: page.draftRetain = text
                         }
                         Text {
-                            text: "份实时快照"
+                            text: "个版本"
                             font.pixelSize: 16
                             color: theme.textSecondary
                         }
-                    }
-
-                    Text {
-                        Layout.fillWidth: true
-                        text: "Debounce 是事件合并窗口（100..60000 ms）；Max wait 是硬上限"
-                              + "（500..300000 ms，且不小于 Debounce）——持续写入最迟在 Max wait"
-                              + " 到期时形成一次检查点，不会被无限推迟。范围与判断全部来自共享核心。"
-                        font.pixelSize: 15
-                        color: theme.textSecondary
-                        wrapMode: Text.WordWrap
-                    }
-
-                    RowLayout {
-                        Layout.fillWidth: true
-                        Layout.topMargin: 6
-                        spacing: 10
-
-                        Text {
-                            text: "策略"
-                            font.pixelSize: 16
-                            color: theme.textSecondary
-                        }
-                        AppComboBox {
-                            id: strategyBox
-                            objectName: "realtimeStrategyCombo"
-                            implicitWidth: 190
-                            enabled: !realtime.libraryBusy
-                            model: page.strategyLabels
-                            currentIndex: page.draftStrategyIndex
-                            onActivated: page.draftStrategyIndex = currentIndex
-                        }
-
-                        Text {
-                            text: "打包"
-                            font.pixelSize: 16
-                            color: theme.textSecondary
-                        }
-                        AppComboBox {
-                            id: packBox
-                            objectName: "realtimePackCombo"
-                            implicitWidth: 190
-                            enabled: !realtime.libraryBusy
-                            model: page.packLabels
-                            currentIndex: page.draftPackIndex
-                            onActivated: page.draftPackIndex = currentIndex
-                        }
-
                         Item { Layout.fillWidth: true }
-
-                        Text {
-                            text: "压缩"
-                            font.pixelSize: 16
-                            color: theme.textSecondary
-                        }
-                        AppComboBox {
-                            id: compressionBox
-                            objectName: "realtimeCompressionCombo"
-                            implicitWidth: 210
-                            enabled: !realtime.libraryBusy
-                            model: page.compressionLabels
-                            currentIndex: page.draftCompressionIndex
-                            onActivated: page.draftCompressionIndex = currentIndex
-                        }
                     }
 
                     RowLayout {
                         Layout.fillWidth: true
-                        Layout.topMargin: 6
-                        spacing: 10
-
-                        Text {
-                            text: "加密"
-                            font.pixelSize: 16
-                            color: theme.textSecondary
-                        }
-                        // 置灰，不是隐藏：它确实不可选，原因写在下一行。
-                        AppComboBox {
-                            objectName: "realtimeEncryptionCombo"
-                            implicitWidth: 210
-                            enabled: false
-                            model: ["不加密"]
-                            currentIndex: 0
-                        }
-                        Text {
-                            objectName: "realtimeEncryptionText"
-                            text: "不加密"
-                            font.pixelSize: 16
-                            color: theme.textSecondary
-                        }
-                    }
-
-                    Text {
-                        objectName: "realtimeEncryptionNote"
-                        Layout.fillWidth: true
-                        text: realtime.encryptionNote
-                        font.pixelSize: 15
-                        color: theme.textSecondary
-                        wrapMode: Text.WordWrap
-                    }
-
-                    // ---------- Filter ----------
-                    Text {
-                        text: "筛选规则（include / exclude）"
-                        font.pixelSize: 16
-                        font.weight: Font.DemiBold
-                        color: theme.textSecondary
-                        Layout.topMargin: 10
-                    }
-
-                    Text {
-                        Layout.fillWidth: true
-                        text: "语法与备份页完全一致，规则由核心的 Filter 解析并校验；"
-                              + "这里不做第二套解析。"
-                        font.pixelSize: 15
-                        color: theme.textSecondary
-                        wrapMode: Text.WordWrap
-                    }
-
-                    Repeater {
-                        model: page.draftInclude.length + page.draftExclude.length
-                        delegate: RowLayout {
-                            required property int index
-                            Layout.fillWidth: true
-                            spacing: 8
-                            readonly property bool isInclude: index < page.draftInclude.length
-                            readonly property string ruleText: isInclude
-                                ? page.draftInclude[index]
-                                : page.draftExclude[index - page.draftInclude.length]
-                            Text {
-                                Layout.fillWidth: true
-                                text: (parent.isInclude ? "include  " : "exclude  ") + parent.ruleText
-                                font.pixelSize: 15
-                                color: theme.textPrimary
-                                elide: Text.ElideMiddle
-                            }
-                            AppButton {
-                                text: "移除"
-                                variant: "flat"
-                                implicitWidth: 72
-                                enabled: !realtime.libraryBusy
-                                onClicked: {
-                                    if (parent.isInclude) {
-                                        const next = page.draftInclude.slice()
-                                        next.splice(index, 1)
-                                        page.draftInclude = next
-                                    } else {
-                                        const next = page.draftExclude.slice()
-                                        next.splice(index - page.draftInclude.length, 1)
-                                        page.draftExclude = next
-                                    }
-                                }
-                            }
-                        }
-                    }
-
-                    RowLayout {
-                        Layout.fillWidth: true
-                        spacing: 8
-                        AppTextField {
-                            id: includeInput
-                            objectName: "realtimeIncludeField"
-                            Layout.fillWidth: true
-                            enabled: !realtime.libraryBusy
-                            placeholderText: "例如 ext:cpp;h"
-                            text: page.draftIncludeInput
-                            onTextEdited: page.draftIncludeInput = text
-                        }
-                        AppButton {
-                            objectName: "addRealtimeIncludeButton"
-                            text: "添加 include"
-                            enabled: !realtime.libraryBusy && page.draftIncludeInput !== ""
-                            onClicked: {
-                                const error = realtime.validateRule("include", page.draftIncludeInput)
-                                if (error !== "") {
-                                    invalidRuleText.text = error
-                                    return
-                                }
-                                invalidRuleText.text = ""
-                                const next = page.draftInclude.slice()
-                                next.push(page.draftIncludeInput)
-                                page.draftInclude = next
-                                page.draftIncludeInput = ""
-                            }
-                        }
-                    }
-
-                    RowLayout {
-                        Layout.fillWidth: true
-                        spacing: 8
-                        AppTextField {
-                            id: excludeInput
-                            objectName: "realtimeExcludeField"
-                            Layout.fillWidth: true
-                            enabled: !realtime.libraryBusy
-                            placeholderText: "例如 path:**/build/**"
-                            text: page.draftExcludeInput
-                            onTextEdited: page.draftExcludeInput = text
-                        }
-                        AppButton {
-                            objectName: "addRealtimeExcludeButton"
-                            text: "添加 exclude"
-                            enabled: !realtime.libraryBusy && page.draftExcludeInput !== ""
-                            onClicked: {
-                                const error = realtime.validateRule("exclude", page.draftExcludeInput)
-                                if (error !== "") {
-                                    invalidRuleText.text = error
-                                    return
-                                }
-                                invalidRuleText.text = ""
-                                const next = page.draftExclude.slice()
-                                next.push(page.draftExcludeInput)
-                                page.draftExclude = next
-                                page.draftExcludeInput = ""
-                            }
-                        }
-                    }
-
-                    Text {
-                        id: invalidRuleText
-                        objectName: "realtimeInvalidRuleText"
-                        Layout.fillWidth: true
-                        visible: text !== ""
-                        text: ""
-                        font.pixelSize: 15
-                        color: theme.error
-                        wrapMode: Text.WordWrap
-                    }
-
-                    RowLayout {
-                        Layout.fillWidth: true
-                        Layout.topMargin: 12
+                        Layout.topMargin: 4
                         spacing: 12
 
                         AppButton {
                             objectName: "saveRealtimeButton"
-                            text: "保存实时配置"
+                            text: "保存设置"
                             variant: "primary"
                             enabled: !realtime.libraryBusy
                             // 三个数字按**文本**交给 C++：QML 的 parseInt 会把
@@ -505,26 +368,359 @@ Item {
                                 page.strategyKeys[page.draftStrategyIndex])
                         }
 
-                        AppButton {
-                            objectName: "refreshRealtimeSnapshotsButton"
-                            text: "刷新快照列表"
-                            iconName: "refresh"
-                            enabled: !realtime.libraryBusy
-                            onClicked: realtime.refreshSnapshots()
-                        }
-
                         Item { Layout.fillWidth: true }
                     }
                 }
             }
 
-            // ---------- 运行状态 ----------
+            // ---------- 2. 高级设置（默认折叠） ----------
             AppCard {
                 Layout.fillWidth: true
 
                 ColumnLayout {
                     anchors.fill: parent
-                    spacing: 6
+                    spacing: 12
+
+                    RowLayout {
+                        Layout.fillWidth: true
+                        spacing: 12
+
+                        Text {
+                            text: "高级设置"
+                            font.pixelSize: 18
+                            font.weight: Font.DemiBold
+                            color: theme.textSecondary
+                        }
+
+                        Text {
+                            Layout.fillWidth: true
+                            text: "延迟、打包、压缩与筛选规则，一般保持默认即可。"
+                            font.pixelSize: 15
+                            color: theme.textSecondary
+                            elide: Text.ElideRight
+                        }
+
+                        AppButton {
+                            objectName: "realtimeAdvancedToggle"
+                            text: page.advancedExpanded ? "收起 ▾" : "展开 ▸"
+                            variant: "flat"
+                            onClicked: page.advancedExpanded = !page.advancedExpanded
+                        }
+                    }
+
+                    // 折叠区。容器与区内的每个控件都显式跟随折叠状态：
+                    // 收起时它们的 visible 都是 false（不只是"父级看不见"），
+                    // 展开后可见可交互。折叠状态不持久化。
+                    ColumnLayout {
+                        id: advancedSection
+                        objectName: "realtimeAdvancedSection"
+                        Layout.fillWidth: true
+                        spacing: 14
+                        visible: page.advancedExpanded
+
+                        // ---- 响应延迟 ----
+                        ColumnLayout {
+                            Layout.fillWidth: true
+                            spacing: 4
+
+                            Text {
+                                text: "响应延迟（Debounce）"
+                                font.pixelSize: 16
+                                color: theme.textSecondary
+                            }
+
+                            RowLayout {
+                                Layout.fillWidth: true
+                                spacing: 8
+
+                                AppTextField {
+                                    id: debounceField
+                                    objectName: "realtimeDebounceField"
+                                    visible: page.advancedExpanded
+                                    implicitWidth: 130
+                                    enabled: !realtime.libraryBusy
+                                    text: page.draftDebounce
+                                    onTextEdited: page.draftDebounce = text
+                                }
+                                Text {
+                                    text: "ms"
+                                    font.pixelSize: 16
+                                    color: theme.textSecondary
+                                }
+                                Item { Layout.fillWidth: true }
+                            }
+
+                            Text {
+                                Layout.fillWidth: true
+                                text: "文件停止变化多久后开始备份。默认 500 ms（可填 100–60000）。"
+                                font.pixelSize: 14
+                                color: theme.textSecondary
+                                wrapMode: Text.WordWrap
+                            }
+                        }
+
+                        // ---- 最长等待 ----
+                        ColumnLayout {
+                            Layout.fillWidth: true
+                            spacing: 4
+
+                            Text {
+                                text: "最长等待（Max wait）"
+                                font.pixelSize: 16
+                                color: theme.textSecondary
+                            }
+
+                            RowLayout {
+                                Layout.fillWidth: true
+                                spacing: 8
+
+                                AppTextField {
+                                    id: maxWaitField
+                                    objectName: "realtimeMaxWaitField"
+                                    visible: page.advancedExpanded
+                                    implicitWidth: 130
+                                    enabled: !realtime.libraryBusy
+                                    text: page.draftMaxWait
+                                    onTextEdited: page.draftMaxWait = text
+                                }
+                                Text {
+                                    text: "ms"
+                                    font.pixelSize: 16
+                                    color: theme.textSecondary
+                                }
+                                Item { Layout.fillWidth: true }
+                            }
+
+                            Text {
+                                Layout.fillWidth: true
+                                text: "文件持续写入时，最多等待多久就创建一次检查点。默认 5000 ms（可填 500–300000）。"
+                                font.pixelSize: 14
+                                color: theme.textSecondary
+                                wrapMode: Text.WordWrap
+                            }
+                        }
+
+                        // ---- 打包 / 压缩 ----
+                        RowLayout {
+                            Layout.fillWidth: true
+                            spacing: 24
+
+                            ColumnLayout {
+                                spacing: 4
+
+                                Text {
+                                    text: "打包方式"
+                                    font.pixelSize: 16
+                                    color: theme.textSecondary
+                                }
+                                AppComboBox {
+                                    id: packBox
+                                    objectName: "realtimePackCombo"
+                                    visible: page.advancedExpanded
+                                    implicitWidth: 190
+                                    enabled: !realtime.libraryBusy
+                                    model: page.packLabels
+                                    currentIndex: page.draftPackIndex
+                                    onActivated: page.draftPackIndex = currentIndex
+                                }
+                            }
+
+                            ColumnLayout {
+                                spacing: 4
+
+                                Text {
+                                    text: "压缩方式"
+                                    font.pixelSize: 16
+                                    color: theme.textSecondary
+                                }
+                                AppComboBox {
+                                    id: compressionBox
+                                    objectName: "realtimeCompressionCombo"
+                                    visible: page.advancedExpanded
+                                    implicitWidth: 210
+                                    enabled: !realtime.libraryBusy
+                                    model: page.compressionLabels
+                                    currentIndex: page.draftCompressionIndex
+                                    onActivated: page.draftCompressionIndex = currentIndex
+                                }
+                            }
+
+                            Item { Layout.fillWidth: true }
+                        }
+
+                        // ---- 筛选规则 ----
+                        Text {
+                            text: "筛选规则"
+                            font.pixelSize: 16
+                            font.weight: Font.DemiBold
+                            color: theme.textSecondary
+                        }
+
+                        Text {
+                            Layout.fillWidth: true
+                            text: "只有符合条件的文件会被备份。规则由共享核心解析并校验，"
+                                  + "这里不做第二套解析。"
+                            font.pixelSize: 14
+                            color: theme.textSecondary
+                            wrapMode: Text.WordWrap
+                        }
+
+                        Repeater {
+                            model: page.draftInclude.length + page.draftExclude.length
+                            delegate: RowLayout {
+                                required property int index
+                                Layout.fillWidth: true
+                                spacing: 8
+                                readonly property bool isInclude: index < page.draftInclude.length
+                                readonly property string ruleText: isInclude
+                                    ? page.draftInclude[index]
+                                    : page.draftExclude[index - page.draftInclude.length]
+                                Text {
+                                    Layout.fillWidth: true
+                                    text: (parent.isInclude ? "包含  " : "排除  ") + parent.ruleText
+                                    font.pixelSize: 15
+                                    color: theme.textPrimary
+                                    elide: Text.ElideMiddle
+                                }
+                                AppButton {
+                                    text: "移除"
+                                    variant: "flat"
+                                    implicitWidth: 72
+                                    enabled: !realtime.libraryBusy
+                                    onClicked: {
+                                        if (parent.isInclude) {
+                                            const next = page.draftInclude.slice()
+                                            next.splice(index, 1)
+                                            page.draftInclude = next
+                                        } else {
+                                            const next = page.draftExclude.slice()
+                                            next.splice(index - page.draftInclude.length, 1)
+                                            page.draftExclude = next
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
+                        RowLayout {
+                            Layout.fillWidth: true
+                            spacing: 8
+
+                            AppTextField {
+                                id: includeInput
+                                objectName: "realtimeIncludeField"
+                                visible: page.advancedExpanded
+                                Layout.fillWidth: true
+                                enabled: !realtime.libraryBusy
+                                placeholderText: "例如 ext:cpp;h"
+                                text: page.draftIncludeInput
+                                onTextEdited: page.draftIncludeInput = text
+                            }
+                            AppButton {
+                                objectName: "addRealtimeIncludeButton"
+                                text: "添加包含规则"
+                                enabled: !realtime.libraryBusy && page.draftIncludeInput !== ""
+                                onClicked: {
+                                    const error = realtime.validateRule("include", page.draftIncludeInput)
+                                    if (error !== "") {
+                                        invalidRuleText.text = error
+                                        return
+                                    }
+                                    invalidRuleText.text = ""
+                                    const next = page.draftInclude.slice()
+                                    next.push(page.draftIncludeInput)
+                                    page.draftInclude = next
+                                    page.draftIncludeInput = ""
+                                }
+                            }
+                        }
+
+                        RowLayout {
+                            Layout.fillWidth: true
+                            spacing: 8
+
+                            AppTextField {
+                                id: excludeInput
+                                objectName: "realtimeExcludeField"
+                                visible: page.advancedExpanded
+                                Layout.fillWidth: true
+                                enabled: !realtime.libraryBusy
+                                placeholderText: "例如 path:**/build/**"
+                                text: page.draftExcludeInput
+                                onTextEdited: page.draftExcludeInput = text
+                            }
+                            AppButton {
+                                objectName: "addRealtimeExcludeButton"
+                                text: "添加排除规则"
+                                enabled: !realtime.libraryBusy && page.draftExcludeInput !== ""
+                                onClicked: {
+                                    const error = realtime.validateRule("exclude", page.draftExcludeInput)
+                                    if (error !== "") {
+                                        invalidRuleText.text = error
+                                        return
+                                    }
+                                    invalidRuleText.text = ""
+                                    const next = page.draftExclude.slice()
+                                    next.push(page.draftExcludeInput)
+                                    page.draftExclude = next
+                                    page.draftExcludeInput = ""
+                                }
+                            }
+                        }
+
+                        Text {
+                            id: invalidRuleText
+                            objectName: "realtimeInvalidRuleText"
+                            Layout.fillWidth: true
+                            visible: text !== ""
+                            text: ""
+                            font.pixelSize: 15
+                            color: theme.error
+                            wrapMode: Text.WordWrap
+                        }
+
+                        // ---- 加密：一句弱提示，不再摆一个永远点不动的下拉框 ----
+                        RowLayout {
+                            Layout.fillWidth: true
+                            spacing: 8
+
+                            Text {
+                                text: "加密"
+                                font.pixelSize: 16
+                                color: theme.textSecondary
+                            }
+                            Text {
+                                objectName: "realtimeEncryptionText"
+                                visible: page.advancedExpanded
+                                text: "暂不支持"
+                                font.pixelSize: 16
+                                color: theme.textDisabled
+                            }
+                            Item { Layout.fillWidth: true }
+                        }
+
+                        // 说明来自控制器（控制器读的是核心里那句唯一来源），
+                        // 页面不复制一份字面量。
+                        Text {
+                            objectName: "realtimeEncryptionNote"
+                            visible: page.advancedExpanded
+                            Layout.fillWidth: true
+                            text: realtime.encryptionNote
+                            font.pixelSize: 14
+                            color: theme.textSecondary
+                            wrapMode: Text.WordWrap
+                        }
+                    }
+                }
+            }
+
+            // ---------- 3. 运行状态（先给结论） ----------
+            AppCard {
+                Layout.fillWidth: true
+
+                ColumnLayout {
+                    anchors.fill: parent
+                    spacing: 8
 
                     Text {
                         text: "运行状态"
@@ -533,84 +729,32 @@ Item {
                         color: theme.textSecondary
                     }
 
-                    Text {
-                        objectName: "realtimePhaseText"
+                    RowLayout {
                         Layout.fillWidth: true
-                        text: "当前状态：" + realtime.phaseText
-                        font.pixelSize: 16
-                        color: theme.textPrimary
-                        wrapMode: Text.WordWrap
+                        spacing: 8
+
+                        Text {
+                            text: page.runStateGlyph
+                            font.pixelSize: 18
+                            color: page.runStateColor
+                        }
+                        Text {
+                            objectName: "realtimePhaseText"
+                            Layout.fillWidth: true
+                            text: page.runStateTitle
+                            font.pixelSize: 18
+                            font.weight: Font.DemiBold
+                            color: page.runStateColor
+                            wrapMode: Text.WordWrap
+                        }
                     }
 
                     Text {
-                        objectName: "realtimeWatchText"
                         Layout.fillWidth: true
-                        text: realtime.watchStateText
+                        visible: page.runStateDetail !== ""
+                        text: page.runStateDetail
                         font.pixelSize: 15
                         color: theme.textSecondary
-                        wrapMode: Text.WordWrap
-                    }
-
-                    Text {
-                        objectName: "realtimeWatchCountText"
-                        Layout.fillWidth: true
-                        text: "监听目录数：" + realtime.watchCount
-                        font.pixelSize: 15
-                        color: theme.textSecondary
-                    }
-
-                    Text {
-                        objectName: "realtimePendingCountText"
-                        Layout.fillWidth: true
-                        text: "待处理事件数：" + realtime.pendingEventCount
-                        font.pixelSize: 15
-                        color: theme.textSecondary
-                    }
-
-                    Text {
-                        objectName: "realtimePendingText"
-                        Layout.fillWidth: true
-                        text: realtime.pendingStateText
-                        font.pixelSize: 15
-                        color: theme.textSecondary
-                        wrapMode: Text.WordWrap
-                    }
-
-                    Text {
-                        objectName: "realtimeOverflowText"
-                        Layout.fillWidth: true
-                        text: realtime.overflowStateText
-                        font.pixelSize: 15
-                        color: theme.textSecondary
-                        wrapMode: Text.WordWrap
-                    }
-
-                    Text {
-                        objectName: "realtimeLastEventText"
-                        Layout.fillWidth: true
-                        text: realtime.lastEventText
-                        font.pixelSize: 15
-                        color: theme.textSecondary
-                        wrapMode: Text.WordWrap
-                    }
-
-                    Text {
-                        objectName: "realtimeLastSnapshotText"
-                        Layout.fillWidth: true
-                        text: "最近一次产出：" + realtime.lastSnapshotText
-                        font.pixelSize: 15
-                        color: theme.textPrimary
-                        wrapMode: Text.WordWrap
-                    }
-
-                    Text {
-                        objectName: "realtimeRepositoryText"
-                        Layout.fillWidth: true
-                        text: realtime.repositoryConfigured
-                              ? "备份仓库：" + realtime.repositoryPath
-                              : "备份仓库：尚未配置（请在设置页选择仓库目录）"
-                        font.pixelSize: 15
-                        color: realtime.repositoryConfigured ? theme.textSecondary : theme.error
                         wrapMode: Text.WordWrap
                     }
 
@@ -639,26 +783,202 @@ Item {
                 }
             }
 
-            // ---------- 最近实时快照 ----------
+            // ---------- 4. 技术详情（默认折叠） ----------
             AppCard {
                 Layout.fillWidth: true
 
                 ColumnLayout {
                     anchors.fill: parent
-                    spacing: 6
+                    spacing: 12
 
-                    Text {
-                        text: "最近实时快照（只列带 .realtime 标记的那些）"
-                        font.pixelSize: 16
-                        font.weight: Font.DemiBold
-                        color: theme.textSecondary
+                    RowLayout {
+                        Layout.fillWidth: true
+                        spacing: 12
+
+                        Text {
+                            text: "技术详情"
+                            font.pixelSize: 18
+                            font.weight: Font.DemiBold
+                            color: theme.textSecondary
+                        }
+
+                        Text {
+                            Layout.fillWidth: true
+                            text: "控制器给出的原始状态，排查问题时才需要看。"
+                            font.pixelSize: 15
+                            color: theme.textSecondary
+                            elide: Text.ElideRight
+                        }
+
+                        AppButton {
+                            objectName: "realtimeTechnicalToggle"
+                            text: page.technicalExpanded ? "收起 ▾" : "展开 ▸"
+                            variant: "flat"
+                            onClicked: page.technicalExpanded = !page.technicalExpanded
+                        }
+                    }
+
+                    ColumnLayout {
+                        id: technicalSection
+                        objectName: "realtimeTechnicalSection"
+                        Layout.fillWidth: true
+                        spacing: 6
+                        visible: page.technicalExpanded
+
+                        Text {
+                            objectName: "realtimeSupportedModeText"
+                            visible: page.technicalExpanded
+                            Layout.fillWidth: true
+                            text: realtime.supportedModeText
+                            font.pixelSize: 14
+                            color: theme.textSecondary
+                            wrapMode: Text.WordWrap
+                        }
+
+                        Text {
+                            objectName: "realtimeRunScopeText"
+                            visible: page.technicalExpanded
+                            Layout.fillWidth: true
+                            text: "实时监听只在“本程序运行期间”生效：关掉程序就不再监听，"
+                                  + "重开时会先做一次重新同步，把关掉那段时间的变化补上。"
+                            font.pixelSize: 14
+                            color: theme.textSecondary
+                            wrapMode: Text.WordWrap
+                        }
+
+                        Text {
+                            objectName: "realtimeRawPhaseText"
+                            visible: page.technicalExpanded
+                            Layout.fillWidth: true
+                            text: "控制器状态：" + realtime.phaseText
+                            font.pixelSize: 14
+                            color: theme.textSecondary
+                            wrapMode: Text.WordWrap
+                        }
+
+                        Text {
+                            objectName: "realtimeWatchText"
+                            visible: page.technicalExpanded
+                            Layout.fillWidth: true
+                            text: realtime.watchStateText
+                            font.pixelSize: 14
+                            color: theme.textSecondary
+                            wrapMode: Text.WordWrap
+                        }
+
+                        RowLayout {
+                            Layout.fillWidth: true
+                            spacing: 24
+
+                            Text {
+                                objectName: "realtimeWatchCountText"
+                                visible: page.technicalExpanded
+                                text: "监听目录数：" + realtime.watchCount
+                                font.pixelSize: 14
+                                color: theme.textSecondary
+                            }
+
+                            Text {
+                                objectName: "realtimePendingCountText"
+                                visible: page.technicalExpanded
+                                text: "待处理事件数：" + realtime.pendingEventCount
+                                font.pixelSize: 14
+                                color: theme.textSecondary
+                            }
+
+                            Item { Layout.fillWidth: true }
+                        }
+
+                        Text {
+                            objectName: "realtimePendingText"
+                            visible: page.technicalExpanded
+                            Layout.fillWidth: true
+                            text: realtime.pendingStateText
+                            font.pixelSize: 14
+                            color: theme.textSecondary
+                            wrapMode: Text.WordWrap
+                        }
+
+                        Text {
+                            objectName: "realtimeOverflowText"
+                            visible: page.technicalExpanded
+                            Layout.fillWidth: true
+                            text: realtime.overflowStateText
+                            font.pixelSize: 14
+                            color: theme.textSecondary
+                            wrapMode: Text.WordWrap
+                        }
+
+                        Text {
+                            objectName: "realtimeLastEventText"
+                            visible: page.technicalExpanded
+                            Layout.fillWidth: true
+                            text: realtime.lastEventText
+                            font.pixelSize: 14
+                            color: theme.textSecondary
+                            wrapMode: Text.WordWrap
+                        }
+
+                        Text {
+                            objectName: "realtimeLastSnapshotText"
+                            visible: page.technicalExpanded
+                            Layout.fillWidth: true
+                            text: "最近一次产出：" + realtime.lastSnapshotText
+                            font.pixelSize: 14
+                            color: theme.textSecondary
+                            wrapMode: Text.WordWrap
+                        }
+
+                        Text {
+                            objectName: "realtimeRepositoryText"
+                            visible: page.technicalExpanded
+                            Layout.fillWidth: true
+                            text: realtime.repositoryConfigured
+                                  ? "备份仓库：" + realtime.repositoryPath
+                                  : "备份仓库：尚未配置（请在设置页选择仓库目录）"
+                            font.pixelSize: 14
+                            color: realtime.repositoryConfigured ? theme.textSecondary : theme.error
+                            wrapMode: Text.WordWrap
+                        }
+                    }
+                }
+            }
+
+            // ---------- 5. 最近备份 ----------
+            AppCard {
+                Layout.fillWidth: true
+
+                ColumnLayout {
+                    anchors.fill: parent
+                    spacing: 8
+
+                    RowLayout {
+                        Layout.fillWidth: true
+                        spacing: 12
+
+                        Text {
+                            text: "最近备份"
+                            font.pixelSize: 16
+                            font.weight: Font.DemiBold
+                            color: theme.textSecondary
+                        }
+
+                        Item { Layout.fillWidth: true }
+
+                        AppButton {
+                            objectName: "refreshRealtimeSnapshotsButton"
+                            text: "刷新"
+                            iconName: "refresh"
+                            enabled: !realtime.libraryBusy
+                            onClicked: realtime.refreshSnapshots()
+                        }
                     }
 
                     Text {
                         objectName: "realtimeSnapshotEmptyText"
+                        Layout.fillWidth: true
                         visible: realtime.snapshots.length === 0
-                        text: "还没有实时触发创建的快照。手动备份与定时备份不会出现在这里，"
-                              + "也不会被实时保留策略淘汰。"
+                        text: "还没有实时备份。启用后，文件发生变化时会在这里看到新的备份版本。"
                         font.pixelSize: 15
                         color: theme.textSecondary
                         wrapMode: Text.WordWrap
@@ -671,26 +991,62 @@ Item {
                             required property var modelData
                             Layout.fillWidth: true
                             spacing: 2
-                            Text {
+
+                            RowLayout {
                                 Layout.fillWidth: true
-                                text: modelData["createdText"] + "  ·  "
-                                      + modelData["strategyText"] + "  ·  "
-                                      + modelData["basisText"] + "（" + modelData["kindText"] + "）"
-                                      + "  ·  " + modelData["packText"] + " / " + modelData["compressionText"]
-                                      + "  ·  事件 " + modelData["eventCount"]
-                                      + "  ·  " + modelData["sizeText"]
-                                font.pixelSize: 15
-                                color: theme.textPrimary
-                                wrapMode: Text.WordWrap
+                                spacing: 8
+
+                                // 来源 badge：文案直接用控制器给的分类（完整快照 /
+                                // 增量基线 / 增量），页面不自己判断策略。
+                                Rectangle {
+                                    implicitWidth: badgeLabel.implicitWidth + 16
+                                    implicitHeight: badgeLabel.implicitHeight + 6
+                                    radius: 6
+                                    color: theme.accentSoft
+
+                                    Text {
+                                        id: badgeLabel
+                                        anchors.centerIn: parent
+                                        text: modelData["kindText"]
+                                        font.pixelSize: 13
+                                        color: theme.accent
+                                    }
+                                }
+
+                                Text {
+                                    Layout.fillWidth: true
+                                    text: modelData["createdText"] + "  ·  " + modelData["sizeText"]
+                                    font.pixelSize: 15
+                                    color: theme.textPrimary
+                                    elide: Text.ElideRight
+                                }
+
+                                Text {
+                                    visible: !modelData["verified"]
+                                    text: modelData["verifiedText"]
+                                    font.pixelSize: 14
+                                    color: theme.error
+                                }
                             }
+
                             Text {
                                 Layout.fillWidth: true
-                                text: modelData["archiveName"]
-                                      + (modelData["verified"] ? "" : "  ·  " + modelData["verifiedText"])
-                                      + (modelData["diagnostic"] !== "" ? "  ·  " + modelData["diagnostic"] : "")
+                                text: modelData["archiveName"] + "  ·  " + modelData["basisText"]
+                                      + "  ·  " + modelData["packText"] + " / "
+                                      + modelData["compressionText"]
+                                      + "  ·  事件 " + modelData["eventCount"]
                                 font.pixelSize: 14
-                                color: modelData["verified"] ? theme.textSecondary : theme.error
+                                color: theme.textSecondary
                                 elide: Text.ElideMiddle
+                            }
+
+                            Text {
+                                Layout.fillWidth: true
+                                visible: modelData["diagnostic"] !== ""
+                                text: modelData["diagnostic"]
+                                font.pixelSize: 14
+                                color: theme.error
+                                wrapMode: Text.WordWrap
                             }
                         }
                     }
@@ -716,7 +1072,7 @@ Item {
     FolderDialog {
         id: sourceDialog
         objectName: "realtimeSourceFolderDialog"
-        title: "选择实时备份的源目录"
+        title: "选择实时备份的备份目录"
         onAccepted: {
             const chosen = realtime.localPathFromUrl(sourceDialog.selectedFolder)
             if (chosen !== "")
