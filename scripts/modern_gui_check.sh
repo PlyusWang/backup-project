@@ -552,14 +552,27 @@ echo "[modern-gui] 7) 关闭守卫"
 # Alt+F4 与窗口管理器都能绕过去。
 expect_count_re "$QML_DIR/Main.qml" "^[[:space:]]*onClosing:" 1 \
   "主窗口在 onClosing 里处理关闭请求"
+# 关闭条件必须同时覆盖三位 writer：手动备份 / 恢复是 controller.busy，计划评估
+# 与实时触发跑在 QtConcurrent 上，落盘的是各自的 libraryBusy。只写
+# controller.busy 会漏掉"实时备份正在写归档时 Alt+F4 能把窗口关掉"。
+# 用正则版：expect_present 定义在本文件靠后的位置，而这一节在它之前执行。
+expect_count_re "$QML_DIR/Main.qml" \
+  'if \(controller\.busy \|\| schedule\.libraryBusy \|\| realtime\.libraryBusy\)' 1 \
+  "关窗条件覆盖手动 / 计划 / 实时三位 writer"
 # 错误正文要能选中复制，核心给的长路径才有可能贴出来。
 expect_count_re "$QML_DIR/components/StatusBanner.qml" "selectByMouse:[[:space:]]*true" 1 \
   "状态栏正文可鼠标选中"
-# 运行期契约：忙时拒绝关闭并提示，任务结束后放行。
+# 运行期契约：忙时拒绝关闭并提示，任务结束后放行。自检会真的把手动 / 实时 /
+# 计划三位 writer 各跑起来一次，所以这里必须给它自己的 config / schedule /
+# realtime 文件：它会用真实入口写 config.json 与两份 store，不能碰别的用例的
+# 路径，更不能碰用户真实的配置。
 set +e
-QT_QPA_PLATFORM=offscreen QSG_RHI_BACKEND=software \
+QT_QPA_PLATFORM=offscreen QSG_RHI_BACKEND=software timeout 600 \
   ./build/backup-gui-modern --close-guard-test \
-  --config-file "$TEST_CONFIG_FILE" > /tmp/modern-gui-guard.log 2>&1
+  --config-file "$TEST_STATE_DIR/close-guard-config.json" \
+  --schedule-file "$TEST_STATE_DIR/close-guard-schedule.json" \
+  --realtime-file "$TEST_STATE_DIR/close-guard-realtime.json" \
+  > /tmp/modern-gui-guard.log 2>&1
 guard_status=$?
 set -e
 sed 's/^/[modern-gui]     /' /tmp/modern-gui-guard.log
@@ -569,6 +582,18 @@ if [[ "$guard_status" -eq 0 ]]; then
 else
   record_fail "关闭守卫行为与预期不符"
 fi
+# 判别力：三段都必须真的跑过。只断言退出码的话，自检在第一段之后就退出
+# （比如实时 worker 没起来）也会是 0 退出，而那个洞依然在。
+for pattern in "实时 worker 在飞时 close() 被拒绝" \
+               "实时 worker 结束后 close() 被接受" \
+               "计划 worker 在飞时 close() 被拒绝" \
+               "计划 worker 结束后 close() 被接受"; do
+  if grep -qF -- "$pattern" /tmp/modern-gui-guard.log; then
+    record_pass "关闭守卫自检覆盖：$pattern"
+  else
+    record_fail "关闭守卫自检缺少：$pattern"
+  fi
+done
 
 # 人工验收提出的两条 GUI 契约：
 #   * 首页三张卡片的按钮必须完整落在卡片内（固定 196 高度时底边距是 -7px，
@@ -1763,6 +1788,25 @@ expect_present "$ROOT_DIR/ui/modern/operation_gate.h" "kRealtimeConfig," \
   "闸门里有保存实时配置这一格"
 expect_count "$ROOT_DIR/ui/modern/operation_gate.h" "kRealtime" 2 \
   "闸门只加了实时相关的两格"
+
+# --- 运行期改仓库：控制器必须跟上 BackupController::repositoryPathChanged ---
+# 不订阅它，实时触发就会拿着启动时读到的仓库继续写：新事件产生的快照被静默
+# 放进旧位置，新仓库与 source 的 overlap 也不会被重新检查。
+expect_present "$REALTIME_CTRL_H" "void OnRepositoryPathChanged();" \
+  "实时控制器有仓库变化的处理入口"
+expect_count "$REALTIME_CTRL_CPP" "&BackupController::repositoryPathChanged" 1 \
+  "实时控制器订阅的是与计划控制器同一个信号"
+expect_count "$ROOT_DIR/ui/modern/schedule_controller.cpp" \
+  "&BackupController::repositoryPathChanged" 1 \
+  "计划控制器订阅的仍是同一个信号（两边接法一致）"
+expect_present "$REALTIME_CTRL_CPP" "ValidateRealtimeForEnable" \
+  "换仓库后重新做一次共享核心的完整校验（含三种 overlap）"
+# 这个槽由 BackupController 在**持有 kRepositoryChange 闸门期间**同步调用，
+# 再取一次闸门必然自冲突。全程只有"提交评估"这一处显式 Acquire。
+expect_count "$REALTIME_CTRL_CPP" "operation_gate_->Acquire(" 1 \
+  "实时控制器只在提交评估时取一次闸门，仓库变化的 handler 不取闸门"
+expect_missing "$REALTIME_CTRL_CPP" "Kind::kRepositoryChange" \
+  "实时控制器不碰改仓库那把闸门"
 
 # --- 真实控制器链路自检 + 隔离路径 ---
 REALTIME_STORE="$TEST_STATE_DIR/realtime.json"

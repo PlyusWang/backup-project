@@ -23,12 +23,16 @@
 //                                       用来证明 GUI 与 CLI 读的是同一份 store
 //   --realtime-test                     验证实时备份页的控制器链路：写配置并
 //                                       逐字段读回、attach watcher、resync 触发
-//                                       快照、文件事件触发快照、列出实时快照
+//                                       快照、文件事件触发快照、列出实时快照，
+//                                       以及运行期改仓库后跟上新仓库 / 非法仓库
+//                                       只降级不写盘 / 未启用时不启动 watcher
 //   --realtime-show                     把控制器读到的实时配置打成 key=value，
 //                                       用来证明 GUI 与 CLI 读的是同一份 store
 //   --realtime-file <路径> 指定实时存储文件（测试隔离真实实时配置）
 //   --path-test                         验证本地路径与 URL 互转不丢字符
-//   --close-guard-test                  验证任务进行中关窗会被拦下
+//   --close-guard-test                  验证任务进行中关窗会被拦下：手动备份、
+//                                       实时触发、计划评估三位 writer 都要在
+//                                       飞时被拒绝、结束后放行
 //   --gui-contract-test                 验证首页三张卡片的按钮几何，以及
 //                                       "临时提示只属于产生它的页面"这条契约
 //   --incremental-test <源> <仓库>      PR #18 GUI/CLI parity：走真实控制器
@@ -49,6 +53,7 @@
 #include <QFile>
 #include <QFileInfo>
 #include <QGuiApplication>
+#include <QMetaObject>
 #include <QPointF>
 #include <QQmlApplicationEngine>
 #include <QQmlContext>
@@ -754,14 +759,65 @@ int RunPathTest(backup_modern::BackupController* controller) {
   return failures == 0 ? 0 : 1;
 }
 
+// 仓库里的归档清单与数量。定义在文件靠后的位置（--schedule-test 也在用），
+// 这里先声明：--close-guard-test 与 --realtime-test 都要拿它做"到底有没有写盘"
+// 的判别 —— 只看控制器自己报的状态是不够的。
+QStringList ArchiveNames(const QString& repository);
+int CountArchives(const QString& repository);
+
 // --close-guard-test：验证“任务进行中不许关窗”的契约。
-// busy 在 startBackup() 返回前就已置位，而任务结束信号要等回到事件循环
-// 才会派发，所以在同一个事件循环回合里检查，结论不取决于任务跑得多快。
 //
-// 这里用 direct archive 入口：close guard 只关心 busy 这一位，
-// 而 direct 入口不需要先配置仓库，测试因此更短、更聚焦。
+// 不变式只有一条：任何会改动持久状态的业务操作在飞时，窗口不许关。进程里有
+// 三个 writer，忙标志各有一位 —— 手动备份 / 恢复落在 controller.busy，而计划
+// 评估与实时触发都跑在 QtConcurrent 上，真正落盘的那一位是各自的 libraryBusy。
+// 所以判别必须分别落到这三条**真实**路径上，而不是只看 controller.busy：
+// 少了实时那一段，"正在写归档时 Alt+F4 能把窗口关掉"这个洞就测不出来。
+//
+// busy 在 Submit 里、后台任务启动之前就已置位，而任务结束信号要等回到事件循环
+// 才会派发；所以"在同一个事件循环回合里检查"的结论不取决于任务跑得多快。
+// 实时那一段用真实事件循环等到 libraryBusy 真的置起来，再请求关窗。
+//
+// 全程只用临时目录（临时 config / schedule / realtime / 仓库 / 源目录），
+// 绝不读写用户真实配置，也不碰冻结的 Demo。
 int RunCloseGuardTest(QQuickWindow* window,
-                      backup_modern::BackupController* controller) {
+                      backup_modern::BackupController* controller,
+                      backup_modern::ScheduleController* schedule,
+                      backup_modern::RealtimeController* realtime) {
+  int failures = 0;
+
+  // 关窗被拒绝时必须给出说明，而不是"点了没反应"。每段测完都把提示关掉：
+  // 否则下一段的 visible 断言会一直是真的，那条断言就失去判别力。
+  QObject* busy_dialog =
+      window->findChild<QObject*>(QStringLiteral("busyCloseDialog"));
+  const auto dialog_visible = [busy_dialog]() {
+    return busy_dialog != nullptr && busy_dialog->property("visible").toBool();
+  };
+  const auto dismiss_dialog = [busy_dialog]() {
+    if (busy_dialog != nullptr) {
+      QMetaObject::invokeMethod(busy_dialog, "close");
+    }
+  };
+  // 在真实事件循环里等某个 worker 进入"正在落盘"。轮询而不是 sleep：
+  // inotify 事件、debounce 定时器、QtConcurrent 的启动与回收都在这个循环里跑。
+  const auto wait_for_busy = [](auto* worker, int timeout_ms) {
+    QEventLoop loop;
+    QTimer poll;
+    poll.setInterval(10);
+    QObject::connect(&poll, &QTimer::timeout, &loop, [worker, &loop]() {
+      if (worker->libraryBusy()) loop.quit();
+    });
+    QTimer guard;
+    guard.setSingleShot(true);
+    QObject::connect(&guard, &QTimer::timeout, &loop, &QEventLoop::quit);
+    poll.start();
+    guard.start(timeout_ms);
+    if (!worker->libraryBusy()) loop.exec();
+    return worker->libraryBusy();
+  };
+
+  // ---- 1) 手动备份：controller.busy ----
+  //
+  // 这一段用 direct archive 入口：它不需要先配置仓库，测试因此更短、更聚焦。
   QTemporaryDir dir;
   const QString source = dir.filePath(QStringLiteral("source"));
   const QString archive = dir.filePath(QStringLiteral("backup.bak"));
@@ -784,7 +840,6 @@ int RunCloseGuardTest(QQuickWindow* window,
     return 1;
   }
 
-  int failures = 0;
   // 忙的时候关窗：必须被 onClosing 拒绝，窗口留着。
   const bool closed_while_busy = window->close();
   std::printf("%s 忙时 close() 被拒绝 (返回=%s)\n",
@@ -793,13 +848,20 @@ int RunCloseGuardTest(QQuickWindow* window,
   failures += closed_while_busy ? 1 : 0;
 
   // 光拒绝还不够：得给用户一个说明，而不是点了没反应。
-  QObject* dialog =
-      window->findChild<QObject*>(QStringLiteral("busyCloseDialog"));
-  const bool dialog_open =
-      dialog != nullptr && dialog->property("visible").toBool();
+  const bool dialog_open = dialog_visible();
   std::printf("%s 忙时关窗会弹出提示 (visible=%s)\n",
               dialog_open ? "ok  " : "FAIL", dialog_open ? "true" : "false");
   failures += dialog_open ? 0 : 1;
+
+  // 提示能关掉（"知道了"按钮走的就是 close()）。不关掉它，后面两段的 visible
+  // 断言会一直是 true —— 那等于没测。
+  dismiss_dialog();
+  WaitForAnimation(200);
+  const bool dialog_dismissed = !dialog_visible();
+  std::printf("%s 提示可以被用户关掉 (visible=%s)\n",
+              dialog_dismissed ? "ok  " : "FAIL",
+              dialog_visible() ? "true" : "false");
+  failures += dialog_dismissed ? 0 : 1;
 
   if (!controller->waitForIdle(120000) || controller->busy()) {
     std::fprintf(stderr, "FAIL 等待任务结束超时\n");
@@ -812,6 +874,155 @@ int RunCloseGuardTest(QQuickWindow* window,
               closed_when_idle ? "ok  " : "FAIL",
               closed_when_idle ? "true" : "false");
   failures += closed_when_idle ? 0 : 1;
+
+  // 后面两段测的还是同一扇窗口，把它重新显示出来。
+  window->show();
+  WaitForAnimation(50);
+
+  // ---- 2) 实时触发：realtime.libraryBusy ----
+  //
+  // 真的跑一次实时备份（enabled=true 会 attach + 合成一次 resync），再用真实
+  // 事件循环等到 libraryBusy 置起来。判别前提是另外两位都是闲的：此时拒绝
+  // 关窗只可能来自 realtime.libraryBusy。
+  //
+  // 实时与计划共用这一个临时根：仓库必须活到函数结束，计划那一段还要往同一个
+  // 仓库里写归档。
+  QTemporaryDir work;
+  const QString realtime_source =
+      work.filePath(QStringLiteral("realtime-source"));
+  const QString schedule_source =
+      work.filePath(QStringLiteral("schedule-source"));
+  const QString repository = work.filePath(QStringLiteral("repository"));
+  if (!work.isValid() || !QDir().mkpath(realtime_source) ||
+      !QDir().mkpath(schedule_source) || !QDir().mkpath(repository)) {
+    std::fprintf(stderr, "FAIL 实时 / 计划场景的临时目录创建失败\n");
+    return 1;
+  }
+  // 造一批文件：一次实时触发要真的走完扫描 → 打包 → 压缩 → 校验 → 写归档，
+  // worker 才会在事件循环里可观察地停留。
+  for (int i = 0; i < 400; ++i) {
+    QFile file(QStringLiteral("%1/file-%2.bin").arg(realtime_source).arg(i));
+    if (file.open(QIODevice::WriteOnly)) {
+      file.write(QByteArray(8192, 'r'));
+    }
+  }
+
+  // 仓库走设置页的真实入口：写 config.json 并发 repositoryPathChanged。
+  const bool repository_saved = controller->saveRepositoryPath(repository);
+  // enabled=true 走真实产品路径：attach watcher + 合成一次 resync。
+  const bool realtime_saved = realtime->saveConfig(
+      /*enabled=*/true, realtime_source, /*debounce_ms=*/200,
+      /*max_wait_ms=*/2000, /*retain_count=*/3, QStringLiteral("mypack"),
+      QStringLiteral("none"), QStringList(), QStringList(),
+      QStringLiteral("full"));
+  if (!repository_saved || !realtime_saved) {
+    std::fprintf(stderr,
+                 "FAIL 实时场景没有配置成功: repository=[%s] realtime=[%s]\n",
+                 qPrintable(controller->statusMessage()),
+                 qPrintable(realtime->statusMessage()));
+    return 1;
+  }
+  std::printf("ok   实时场景已配置：仓库=%s 监听 %d 个目录\n",
+              qPrintable(realtime->repositoryPath()), realtime->watchCount());
+
+  // resync 那一轮会在 debounce 之后自己开始。万一没赶上（任务在两次轮询之间
+  // 就跑完了），再往源目录里写一个文件重来一次 —— 不靠 sleep 猜时间。
+  bool realtime_busy = wait_for_busy(realtime, 60000);
+  for (int attempt = 0; attempt < 3 && !realtime_busy; ++attempt) {
+    QFile trigger(realtime_source +
+                  QStringLiteral("/trigger-%1.txt").arg(attempt));
+    if (trigger.open(QIODevice::WriteOnly)) trigger.write("trigger");
+    realtime_busy = wait_for_busy(realtime, 60000);
+  }
+  if (!realtime_busy) {
+    std::fprintf(stderr, "FAIL 实时备份没有进入 libraryBusy\n");
+    return 1;
+  }
+
+  const bool others_idle = !controller->busy() && !schedule->libraryBusy();
+  std::printf(
+      "%s 实时 worker 在飞时另外两位是闲的 (controller=%s schedule=%s)\n",
+      others_idle ? "ok  " : "FAIL", controller->busy() ? "busy" : "idle",
+      schedule->libraryBusy() ? "busy" : "idle");
+  failures += others_idle ? 0 : 1;
+
+  const bool closed_while_realtime_busy = window->close();
+  std::printf("%s 实时 worker 在飞时 close() 被拒绝 (返回=%s)\n",
+              closed_while_realtime_busy ? "FAIL" : "ok  ",
+              closed_while_realtime_busy ? "true" : "false");
+  failures += closed_while_realtime_busy ? 1 : 0;
+
+  const bool realtime_dialog_open = dialog_visible();
+  std::printf("%s 实时 worker 在飞时关窗也会给出提示 (visible=%s)\n",
+              realtime_dialog_open ? "ok  " : "FAIL",
+              realtime_dialog_open ? "true" : "false");
+  failures += realtime_dialog_open ? 0 : 1;
+
+  dismiss_dialog();
+  WaitForAnimation(200);
+
+  if (!realtime->waitForIdle(180000) || realtime->libraryBusy()) {
+    std::fprintf(stderr, "FAIL 等待实时备份结束超时\n");
+    return 1;
+  }
+
+  const bool closed_when_realtime_idle = window->close();
+  std::printf("%s 实时 worker 结束后 close() 被接受 (返回=%s)\n",
+              closed_when_realtime_idle ? "ok  " : "FAIL",
+              closed_when_realtime_idle ? "true" : "false");
+  failures += closed_when_realtime_idle ? 0 : 1;
+
+  // 实时这一段的监听停掉：下一段只测计划那一位，也不留下还在跑的重试定时器。
+  realtime->stop();
+  window->show();
+  WaitForAnimation(50);
+
+  // ---- 3) 计划评估：schedule.libraryBusy ----
+  //
+  // runNow() 是"立即检查并运行"的真实入口，busy 在它返回之前就已置位，
+  // 结论因此不取决于任务跑得多快。
+  for (int i = 0; i < 400; ++i) {
+    QFile file(QStringLiteral("%1/file-%2.bin").arg(schedule_source).arg(i));
+    if (file.open(QIODevice::WriteOnly)) {
+      file.write(QByteArray(8192, 's'));
+    }
+  }
+  const bool schedule_saved = schedule->saveConfig(
+      /*enabled=*/true, schedule_source, /*interval_minutes=*/5,
+      /*retain_count=*/3, QStringLiteral("mypack"), QStringLiteral("none"),
+      QStringList(), QStringList(), QStringLiteral("full"));
+  const bool schedule_started = schedule_saved && schedule->runNow();
+  if (!schedule_started || !schedule->libraryBusy()) {
+    std::fprintf(stderr, "FAIL 计划评估没有启动起来: saved=%d status=[%s]\n",
+                 schedule_saved ? 1 : 0, qPrintable(schedule->statusMessage()));
+    return 1;
+  }
+
+  const bool closed_while_schedule_busy = window->close();
+  std::printf("%s 计划 worker 在飞时 close() 被拒绝 (返回=%s)\n",
+              closed_while_schedule_busy ? "FAIL" : "ok  ",
+              closed_while_schedule_busy ? "true" : "false");
+  failures += closed_while_schedule_busy ? 1 : 0;
+
+  const bool schedule_dialog_open = dialog_visible();
+  std::printf("%s 计划 worker 在飞时关窗也会给出提示 (visible=%s)\n",
+              schedule_dialog_open ? "ok  " : "FAIL",
+              schedule_dialog_open ? "true" : "false");
+  failures += schedule_dialog_open ? 0 : 1;
+
+  dismiss_dialog();
+  WaitForAnimation(200);
+
+  if (!schedule->waitForIdle(180000) || schedule->libraryBusy()) {
+    std::fprintf(stderr, "FAIL 等待计划评估结束超时\n");
+    return 1;
+  }
+
+  const bool closed_when_schedule_idle = window->close();
+  std::printf("%s 计划 worker 结束后 close() 被接受 (返回=%s)\n",
+              closed_when_schedule_idle ? "ok  " : "FAIL",
+              closed_when_schedule_idle ? "true" : "false");
+  failures += closed_when_schedule_idle ? 0 : 1;
 
   std::printf("close-guard-test 失败项: %d\n", failures);
   return failures == 0 ? 0 : 1;
@@ -2252,8 +2463,37 @@ bool WaitUntilNewSnapshot(backup_modern::RealtimeController* realtime,
          realtime->lastSnapshotName() != previous;
 }
 
+// 等到指定仓库里的归档数量**超过** before_count，并且实时控制器重新闲下来。
+//
+// 换仓库的场景不能用"归档名变了"当判据：归档名只精确到秒（重名时才加 _001
+// 后缀），同一个秒里在 A、B 两个仓库各写一份，两份的名字会**完全一样**。
+// 所以这里判的是仓库里的真实文件数 —— 那才是"到底写到哪儿去了"。
+bool WaitForRepositoryGrowth(backup_modern::RealtimeController* realtime,
+                             const QString& repository, int before_count,
+                             int timeout_ms) {
+  QEventLoop loop;
+  QTimer poll;
+  poll.setInterval(10);
+  QObject::connect(&poll, &QTimer::timeout, &loop,
+                   [realtime, repository, before_count, &loop]() {
+                     if (!realtime->libraryBusy() && !realtime->pending() &&
+                         CountArchives(repository) > before_count) {
+                       loop.quit();
+                     }
+                   });
+  QTimer guard;
+  guard.setSingleShot(true);
+  QObject::connect(&guard, &QTimer::timeout, &loop, &QEventLoop::quit);
+  poll.start();
+  guard.start(timeout_ms);
+  loop.exec();
+  return !realtime->libraryBusy() && !realtime->pending() &&
+         CountArchives(repository) > before_count;
+}
+
 int RunRealtimeTest(backup_modern::RealtimeController* realtime,
                     backup_modern::OperationGate* gate,
+                    backup_modern::BackupController* controller,
                     const QString& config_path) {
   CheckRun run;
   run.prefix = "[realtime]";
@@ -2474,6 +2714,145 @@ int RunRealtimeTest(backup_modern::RealtimeController* realtime,
     run.Check(realtime->snapshotCount() == before_count + 1,
               QStringLiteral("RT-40 判别：两批事件只合并成一次评估"),
               QString::number(realtime->snapshotCount()));
+  }
+
+  // ---- 运行期改仓库：控制器必须跟上，而且绝不继续写旧仓库 ----
+  //
+  // 这是判别性的一组：此时 realtime 已经 enabled、watcher 已经起来、A 里也已经
+  // 有了快照。改动走 BackupController::saveRepositoryPath —— 与设置页是同一个
+  // 入口、同一个 repositoryPathChanged 信号。三种情形都必须闭环：
+  //
+  //   * 合法的新仓库：监听重建 + 合成一次 resync，新快照只落在新仓库；
+  //   * 不合法的新仓库（落在 source 里）：一个字节都不写，进入 degraded 并给出
+  //     共享核心那句原因，enabled 保持不变；改回合法值后自动恢复；
+  //   * 未启用：只刷新仓库与快照列表，watcher 不启动、也不写任何东西。
+  {
+    const QString repository_next =
+        temp.path() + QStringLiteral("/repository-next");
+    const QString repository_inside =
+        source + QStringLiteral("/inner-repository");
+    QDir().mkpath(repository_next);
+    QDir().mkpath(repository_inside);
+
+    // (1) 合法的新仓库：跟上 + 重建监听 + resync。
+    const int old_repo_before = CountArchives(repository);
+    run.Check(CountArchives(repository_next) == 0,
+              QStringLiteral("RT-41 新仓库一开始是空的（后面的增长才是判别）"),
+              QString::number(CountArchives(repository_next)));
+    run.Check(controller->saveRepositoryPath(repository_next),
+              QStringLiteral("RT-42 设置页把仓库改成新目录（真实入口）"),
+              controller->statusMessage());
+    run.Check(realtime->repositoryPath() == repository_next,
+              QStringLiteral("RT-43 实时控制器立刻读到新仓库"),
+              realtime->repositoryPath());
+    run.Check(realtime->watching() && realtime->watchCount() > 0,
+              QStringLiteral("RT-44 新仓库下监听已重建"),
+              QString::number(realtime->watchCount()));
+    run.Check(WaitForRepositoryGrowth(realtime, repository_next, 0, 60000),
+              QStringLiteral("RT-45 换仓库后合成了一次 resync 并产出快照"),
+              QString::number(CountArchives(repository_next)));
+    const QString after_switch = realtime->lastSnapshotName();
+    run.Check(ArchiveNames(repository_next).contains(after_switch),
+              QStringLiteral("RT-46 新快照落在新仓库里"), after_switch);
+    run.Check(CountArchives(repository) == old_repo_before,
+              QStringLiteral("RT-47 旧仓库没有新增任何快照"),
+              QString::number(CountArchives(repository)));
+    std::printf("[realtime] switch repo=%s snapshot=%s\n",
+                qPrintable(repository_next), qPrintable(after_switch));
+
+    // (2) 不合法的新仓库（落在 source 里）：overlap 必须被重新检查，
+    //     而且**一个快照都不许写**。
+    const int next_repo_before = CountArchives(repository_next);
+    const QString snapshot_before_invalid = realtime->lastSnapshotName();
+    run.Check(
+        controller->saveRepositoryPath(repository_inside),
+        QStringLiteral("RT-48 设置页把仓库改成 source 里的目录（真实入口）"),
+        controller->statusMessage());
+    run.Check(realtime->repositoryPath() == repository_inside,
+              QStringLiteral("RT-49 实时控制器跟着读到这个仓库"),
+              realtime->repositoryPath());
+    run.Check(
+        !realtime->watching(),
+        QStringLiteral("RT-50 不合法时监听被停掉（不再从旧仓库的视角看事件）"));
+    run.Check(realtime->watchDegraded() &&
+                  realtime->phaseKey() == QStringLiteral("watch_degraded"),
+              QStringLiteral("RT-51 进入明确的 degraded 状态"),
+              realtime->phaseKey());
+    run.Check(realtime->statusMessage().contains(QStringLiteral("repository")),
+              QStringLiteral("RT-52 状态里给的是共享核心那句原因"),
+              realtime->statusMessage());
+    run.Check(
+        realtime->enabled(),
+        QStringLiteral("RT-53 不合法不会把实时备份偷偷关掉（仍然 enabled）"));
+
+    // 判别：换仓库**之后**源目录里真的发生了事件，而且等满了一个
+    // debounce + max_wait 窗口。旧仓库一份都不许新增 —— 如果 handler 没有停掉
+    // 旧 watcher、或者还拿着旧仓库路径，这里必然多出一份归档。
+    run.Check(
+        WriteTestFile(source + QStringLiteral("/after-switch.txt"), "moved"),
+        QStringLiteral("RT-54 换仓库之后源目录里再写一个文件"));
+    WaitForAnimation(2500);
+    run.Check(!realtime->libraryBusy() && !realtime->pending(),
+              QStringLiteral("RT-55 不合法仓库下一轮触发都没有"));
+    run.Check(CountArchives(repository_next) == next_repo_before,
+              QStringLiteral("RT-56 判别：旧仓库没有新增任何快照"),
+              QString::number(CountArchives(repository_next)));
+    run.Check(CountArchives(repository_inside) == 0,
+              QStringLiteral("RT-57 非法仓库里一份快照都没有"),
+              QString::number(CountArchives(repository_inside)));
+    run.Check(realtime->lastSnapshotName() == snapshot_before_invalid,
+              QStringLiteral("RT-58 也没有产出任何新的归档名"),
+              realtime->lastSnapshotName());
+
+    // (3) 仓库改回合法值：必须自动恢复（重新 attach + 合成 resync）。
+    const int next_repo_before_recover = CountArchives(repository_next);
+    run.Check(controller->saveRepositoryPath(repository_next),
+              QStringLiteral("RT-59 把仓库改回合法目录"),
+              controller->statusMessage());
+    run.Check(realtime->watching() && realtime->watchCount() > 0 &&
+                  !realtime->watchDegraded(),
+              QStringLiteral("RT-60 degraded 状态自动恢复：监听重建"),
+              realtime->watchStateText());
+    run.Check(WaitForRepositoryGrowth(realtime, repository_next,
+                                      next_repo_before_recover, 60000),
+              QStringLiteral("RT-61 恢复后重新同步并产出快照"),
+              QString::number(CountArchives(repository_next)));
+    const QString recovered = realtime->lastSnapshotName();
+    run.Check(ArchiveNames(repository_next).contains(recovered),
+              QStringLiteral("RT-62 恢复后的快照落在合法仓库里"), recovered);
+    std::printf("[realtime] recover repo=%s snapshot=%s\n",
+                qPrintable(repository_next), qPrintable(recovered));
+
+    // (4) 未启用时改仓库：只刷新仓库与列表，不启动 watcher、不写任何东西。
+    const int next_repo_before_disabled = CountArchives(repository_next);
+    run.Check(realtime->setEnabled(false),
+              QStringLiteral("RT-63 先停用实时备份"));
+    run.Check(!realtime->watching(), QStringLiteral("RT-64 停用后不再监听"));
+    run.Check(controller->saveRepositoryPath(repository),
+              QStringLiteral("RT-65 未启用状态下把仓库改回 A"),
+              controller->statusMessage());
+    run.Check(realtime->repositoryPath() == repository,
+              QStringLiteral("RT-66 未启用时依然跟上仓库路径"),
+              realtime->repositoryPath());
+    run.Check(!realtime->watching() && !realtime->watchDegraded() &&
+                  realtime->watchCount() == 0,
+              QStringLiteral("RT-67 未启用时绝不无故启动 watcher"),
+              realtime->watchStateText());
+    run.Check(realtime->waitForIdle(60000) &&
+                  realtime->snapshotCount() == old_repo_before,
+              QStringLiteral("RT-68 快照列表跟着仓库刷新"),
+              QString::number(realtime->snapshotCount()) + QStringLiteral("/") +
+                  QString::number(old_repo_before));
+    WaitForAnimation(1500);
+    run.Check(CountArchives(repository) == old_repo_before &&
+                  !realtime->libraryBusy(),
+              QStringLiteral("RT-69 未启用时改仓库不写任何快照"),
+              QString::number(CountArchives(repository)));
+    run.Check(CountArchives(repository_next) == next_repo_before_disabled,
+              QStringLiteral("RT-70 也不写回上一个仓库"));
+    std::printf("[realtime] disabled repo=%s snapshots=%d\n",
+                qPrintable(realtime->repositoryPath()),
+                realtime->snapshotCount());
   }
 
   realtime->stop();
@@ -3679,8 +4058,11 @@ int main(int argc, char* argv[]) {
   // 持有了那把锁，flock 绑在 open file description 上，再取一次只会把自己
   // 判成"另一个实例正在运行"。
   const QString realtime_file_path = ResolveRealtimeFilePath(arguments);
+  // 第三个参数是 BackupController：实时控制器订阅它的 repositoryPathChanged，
+  // 这样设置页把仓库从 A 改成 B 之后，watcher、overlap 校验与快照列表都会跟着
+  // 换到 B，旧仓库不会再收到任何新快照（与 ScheduleController 同一种接法）。
   backup_modern::RealtimeController realtime_controller(
-      realtime_file_path, config_file_path, &operation_gate);
+      realtime_file_path, config_file_path, &controller, &operation_gate);
   backup_modern::FilterRuleModel filter_rule_model(&controller);
 
   QQmlApplicationEngine engine;
@@ -3732,7 +4114,7 @@ int main(int argc, char* argv[]) {
     return RunRealtimeShow(&realtime_controller);
   }
   if (realtime_test) {
-    return RunRealtimeTest(&realtime_controller, &operation_gate,
+    return RunRealtimeTest(&realtime_controller, &operation_gate, &controller,
                            config_file_path);
   }
   if (preview_test_index >= 0) {
@@ -3794,7 +4176,9 @@ int main(int argc, char* argv[]) {
   }
 
   if (close_guard_test) {
-    return RunCloseGuardTest(window, &controller);
+    // 三位 writer 都要交给它：只传手动那一位，测不出"实时/计划在写盘时关窗"。
+    return RunCloseGuardTest(window, &controller, &schedule_controller,
+                             &realtime_controller);
   }
 
   if (gui_contract_test) {
