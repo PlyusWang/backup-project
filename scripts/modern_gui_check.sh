@@ -1688,25 +1688,113 @@ expect_count "$QML_DIR/Main.qml" "RealtimePage {" 1 \
 expect_count "$QML_DIR/Main.qml" "realtime.clearStatus()" 1 \
   "离开实时页时消费它自己的临时提示"
 
-# --- 页面上该有的控件 ---
-for name in realtimeEnabledToggle realtimeSourceField realtimeDebounceField \
-            realtimeMaxWaitField realtimeRetainField realtimeStrategyCombo \
-            realtimePackCombo realtimeCompressionCombo realtimeEncryptionCombo \
-            realtimeEncryptionText realtimeEncryptionNote realtimeIncludeField \
-            realtimeExcludeField saveRealtimeButton realtimePhaseText \
-            realtimeWatchCountText realtimePendingCountText realtimeOverflowText \
-            realtimeSnapshotList realtimeStatusBanner; do
+# --- 页面上该有的控件（一个都不许丢，只是分到了不同的层级里） ---
+for name in realtimeEnabledToggle realtimeSourceField browseRealtimeSourceButton \
+            realtimeStrategyCombo realtimeRetainField saveRealtimeButton \
+            realtimeSubtitleText realtimeDebounceField realtimeMaxWaitField \
+            realtimePackCombo realtimeCompressionCombo realtimeIncludeField \
+            addRealtimeIncludeButton realtimeExcludeField addRealtimeExcludeButton \
+            realtimeInvalidRuleText realtimeEncryptionText realtimeEncryptionNote \
+            realtimeAdvancedToggle realtimeAdvancedSection realtimeTechnicalToggle \
+            realtimeTechnicalSection realtimeSupportedModeText realtimeRunScopeText \
+            realtimeRawPhaseText realtimeWatchText realtimeWatchCountText \
+            realtimePendingCountText realtimePendingText realtimeOverflowText \
+            realtimeLastEventText realtimeLastSnapshotText realtimeRepositoryText \
+            realtimePhaseText realtimeLoadErrorText realtimeConfigErrorText \
+            realtimeSnapshotEmptyText realtimeSnapshotList \
+            refreshRealtimeSnapshotsButton realtimeStatusBanner; do
   expect_count "$REALTIME_PAGE_QML" "objectName: \"$name\"" 1 \
     "实时页有 $name"
 done
 
-# --- 加密：只有 none，而且选择器是**置灰**的（不是藏起来） ---
-expect_present "$REALTIME_PAGE_QML" 'objectName: "realtimeEncryptionCombo"' \
-  "实时页有加密选择器"
-expect_present "$REALTIME_PAGE_QML" "enabled: false" \
-  "加密选择器是置灰的，不是隐藏的"
+# --- 信息架构：常用设置 / 高级设置（默认折叠）/ 运行状态 / 技术详情（默认折叠）/ 最近备份 ---
+#
+# 人工验收的结论是"好看，但像开发者控制台"：Debounce / Max wait / MyPack / 压缩 /
+# include-exclude / watch 数 / pending / overflow 全部铺在主层。这一节把新的分层
+# 钉成契约：折叠区默认收起，且区里每个具名控件都显式跟随折叠状态（不是只靠父级
+# 不可见），这样"技术项退回高级区"这件事不会在后续改动里悄悄退化。
+expect_count "$REALTIME_PAGE_QML" "property bool advancedExpanded: false" 1 \
+  "高级设置默认折叠"
+expect_count "$REALTIME_PAGE_QML" "property bool technicalExpanded: false" 1 \
+  "技术详情默认折叠"
+expect_present "$REALTIME_PAGE_QML" 'objectName: "realtimeAdvancedToggle"' \
+  "高级设置有独立的展开/收起入口"
+expect_present "$REALTIME_PAGE_QML" 'objectName: "realtimeTechnicalToggle"' \
+  "技术详情有独立的展开/收起入口"
+# 折叠区里每个具名控件都要自己 visible: false，不能只靠父级不可见：
+# 否则"收起时它仍然占着布局"这种退化不会有人发现。数量断言会因为加一个控件就
+# 失效、且失败信息说不清是谁，所以这里逐个控件断言，失败时直接点名。
+for name in realtimeDebounceField realtimeMaxWaitField realtimePackCombo \
+            realtimeCompressionCombo realtimeIncludeField realtimeExcludeField \
+            realtimeEncryptionText realtimeEncryptionNote; do
+  if grep -A3 "objectName: \"$name\"" "$REALTIME_PAGE_QML" | grep -q "visible: page.advancedExpanded"; then
+    record_pass "$name 显式跟随高级设置折叠状态"
+  else
+    record_fail "$name 没有显式跟随高级设置折叠状态"
+  fi
+done
+# 规则错误提示是例外：它自己的 visible 绑的是"有没有错误消息"，折叠可见性由
+# 上面的容器负责（容器已断言跟随 advancedExpanded）。这里单独钉住它的条件。
+expect_present "$REALTIME_PAGE_QML" 'visible: text !== ""' \
+  "规则错误提示只在真的有错误时出现（折叠可见性由容器负责）"
+for name in realtimeSupportedModeText realtimeRunScopeText realtimeRawPhaseText \
+            realtimeWatchText realtimeWatchCountText realtimePendingCountText \
+            realtimePendingText realtimeOverflowText realtimeLastEventText \
+            realtimeLastSnapshotText realtimeRepositoryText; do
+  if grep -A3 "objectName: \"$name\"" "$REALTIME_PAGE_QML" | grep -q "visible: page.technicalExpanded"; then
+    record_pass "$name 显式跟随技术详情折叠状态"
+  else
+    record_fail "$name 没有显式跟随技术详情折叠状态"
+  fi
+done
+# 常用设置那几个控件不允许挂到折叠状态上：主卡片必须一直是可见的。
+for name in realtimeSourceField realtimeStrategyCombo realtimeRetainField \
+            saveRealtimeButton; do
+  if grep -A4 "objectName: \"$name\"" "$REALTIME_PAGE_QML" | grep -qE "page\.(advanced|technical)Expanded"; then
+    record_fail "$name 属于常用设置，却被折叠状态控制"
+  else
+    record_pass "$name 常显（不被折叠状态控制）"
+  fi
+done
+# 技术名词不再当主标签：中文在前，英文只在括号里。
+expect_present "$REALTIME_PAGE_QML" 'text: "响应延迟（Debounce）"' \
+  "响应延迟是主标签（英文退到括号里）"
+expect_present "$REALTIME_PAGE_QML" 'text: "最长等待（Max wait）"' \
+  "最长等待是主标签（英文退到括号里）"
+expect_missing "$REALTIME_PAGE_QML" "100..60000" \
+  "字段取值范围不作为主视觉文案"
+expect_missing "$REALTIME_PAGE_QML" "500..300000" \
+  "字段取值范围不作为主视觉文案"
+# 策略解释：短、面向用户，不出现实现术语。
+expect_present "$REALTIME_PAGE_QML" "完整备份：每次创建一份可独立恢复的完整快照。" \
+  "完整备份有一句用户向解释"
+expect_present "$REALTIME_PAGE_QML" "增量备份：首次建立完整基线，之后只保存变化。" \
+  "增量备份有一句用户向解释"
+expect_missing "$REALTIME_PAGE_QML" "BKPINC1" \
+  "主层不解释增量容器格式"
+expect_missing "$REALTIME_PAGE_QML" "parent chain" \
+  "主层不解释 parent chain"
+# 最近备份：标题面向用户，空状态给出下一步，不在标题里解释 marker。
+expect_present "$REALTIME_PAGE_QML" 'text: "最近备份"' \
+  "最近快照卡片标题是用户语言"
+expect_missing "$REALTIME_PAGE_QML" "只列带 .realtime 标记" \
+  "标题不解释 .realtime marker"
+expect_present "$REALTIME_PAGE_QML" "还没有实时备份。启用后，文件发生变化时会在这里看到新的备份版本。" \
+  "空状态告诉用户接下来会发生什么"
+# 同一状态不得出现两遍：底部状态栏不是"运行状态"的复读。
+expect_missing "$REALTIME_PAGE_QML" "等待实时备份" \
+  "页面底部没有和运行状态重复的孤立状态文案"
+# 副标题不再是架构说明。
+expect_missing "$REALTIME_PAGE_QML" "与 backupctl 共用同一份核心" \
+  "副标题不再讲架构"
+
+# --- 加密：不再占一个永远置灰的 ComboBox，降级成高级设置里的一条弱提示 ---
+expect_missing "$REALTIME_PAGE_QML" "realtimeEncryptionCombo" \
+  "实时页不再有加密选择器（置灰控件也去掉）"
 expect_missing "$REALTIME_PAGE_QML" "aes-256-ctr-hmac-sha256" \
   "实时页不提供任何加密算法选项"
+expect_present "$REALTIME_PAGE_QML" "realtime.encryptionNote" \
+  "加密说明仍然问控制器要（QML 不复制那句字面量）"
 expect_present "$REALTIME_CTRL_CPP" "UnattendedEncryptionDisabledReason" \
   "加密说明问的是核心那句唯一来源，控制器不复制字面量"
 expect_present "$ROOT_DIR/src/core/backup_mode.cpp" \
@@ -1853,6 +1941,139 @@ if [[ -s "$REALTIME_STORE" ]]; then
 else
   record_fail "自检没有写出 realtime.json"
 fi
+
+echo "[modern-gui] 17) 配置路径隔离（显式参数优先 / 自检不写真实 profile）"
+#
+# 人工验收现场：Demo 的 run.sh 不带参数启动，界面上出现了
+# /tmp/backup-gui-modern-mJeWnE/repository。根因不是"路径解析错了"，而是以前某次
+# 自检没带 --config-file，把自检的临时仓库写进了真实用户 profile 的 config.json，
+# 于是一次普通启动读出来一个早就被删掉的临时仓库。
+# 这一节把三件事钉死：
+#   a) 非自检启动仍然走默认 AppPaths（隔离逻辑不许误伤正常启动）；
+#   b) 自检模式在没给 --config-file/--schedule-file/--realtime-file 时自己隔离，
+#      默认 profile 一个字节都不许变，也不许出现 backup-gui-modern-* 临时路径；
+#   c) 显式给出的路径永远优先，自检就写在显式文件上。
+ISO_HOME="$TEST_STATE_DIR/isolation-home"
+ISO_XDG="$ISO_HOME/.config"
+ISO_PROFILE="$ISO_XDG/backup-project/backup-gui-modern"
+ISO_MARKER_REPO="$TEST_STATE_DIR/isolation-marker-repository"
+ISO_MARKER_CFG="$ISO_PROFILE/config.json"
+ISO_LOG="$TEST_STATE_DIR/isolation.log"
+ISO_EXPLICIT_DIR="$TEST_STATE_DIR/isolation-explicit"
+ISO_EXPLICIT_CFG="$ISO_EXPLICIT_DIR/config.json"
+ISO_EXPLICIT_RT="$ISO_EXPLICIT_DIR/realtime.json"
+rm -rf "$ISO_HOME" "$ISO_EXPLICIT_DIR"
+mkdir -p "$ISO_PROFILE" "$ISO_MARKER_REPO" "$ISO_EXPLICIT_DIR"
+printf '{\n  "version": 1,\n  "backup_repository_path": "%s"\n}\n' "$ISO_MARKER_REPO" > "$ISO_MARKER_CFG"
+printf '{\n  "version": 1,\n  "backup_repository_path": "%s"\n}\n' "$TEST_STATE_DIR/isolation-explicit-repository" > "$ISO_EXPLICIT_CFG"
+iso_marker_md5="$(md5sum "$ISO_MARKER_CFG" | cut -d' ' -f1)"
+
+# a) 非自检模式：--realtime-show 走默认 AppPaths，读到的必须是 marker 仓库。
+set +e
+XDG_CONFIG_HOME="$ISO_XDG" HOME="$ISO_HOME" QT_QPA_PLATFORM=offscreen \
+  ./build/backup-gui-modern --realtime-show > "$ISO_LOG" 2>&1
+iso_show_status=$?
+set -e
+if [[ "$iso_show_status" -eq 0 ]] && grep -qF -- "repository=$ISO_MARKER_REPO" "$ISO_LOG"; then
+  record_pass "非自检启动仍按默认 AppPaths 读 profile（隔离逻辑没有误伤正常启动）"
+else
+  record_fail "非自检启动没有读到默认 profile 的仓库（退出码 $iso_show_status）"
+fi
+
+# b) 自检模式 + 不给任何 --*-file：必须自己隔离，默认 profile 不许被动。
+set +e
+XDG_CONFIG_HOME="$ISO_XDG" HOME="$ISO_HOME" QT_QPA_PLATFORM=offscreen timeout 180 \
+  ./build/backup-gui-modern --realtime-test > "$ISO_LOG" 2>&1
+iso_selftest_status=$?
+set -e
+if [[ "$iso_selftest_status" -eq 0 ]]; then
+  record_pass "自检模式（不带 --*-file）自身仍然通过"
+else
+  record_fail "自检模式（不带 --*-file）退出码 $iso_selftest_status"
+fi
+if grep -qF -- "[self-check] 隔离配置目录" "$ISO_LOG"; then
+  record_pass "自检模式明确报告了隔离目录"
+else
+  record_fail "自检模式没有报告隔离目录（可能又在写真实 profile）"
+fi
+if [[ "$(md5sum "$ISO_MARKER_CFG" | cut -d' ' -f1)" == "$iso_marker_md5" ]]; then
+  record_pass "自检模式没有改写默认 profile 的 config.json"
+else
+  record_fail "自检模式改写了默认 profile 的 config.json"
+fi
+if grep -rqF -- "backup-gui-modern-" "$ISO_XDG" 2>/dev/null; then
+  record_fail "默认 profile 里出现了 backup-gui-modern-* 临时路径"
+else
+  record_pass "普通/自检启动都不会把 backup-gui-modern-* 临时路径写进默认 profile"
+fi
+
+# c) 自检 + 显式路径：显式文件被真正使用，默认 profile 依旧不动。
+set +e
+XDG_CONFIG_HOME="$ISO_XDG" HOME="$ISO_HOME" QT_QPA_PLATFORM=offscreen timeout 180 \
+  ./build/backup-gui-modern --realtime-test \
+  --config-file "$ISO_EXPLICIT_CFG" --realtime-file "$ISO_EXPLICIT_RT" > "$ISO_LOG" 2>&1
+iso_explicit_status=$?
+set -e
+if [[ "$iso_explicit_status" -eq 0 && -s "$ISO_EXPLICIT_RT" ]]; then
+  record_pass "自检 + 显式 --realtime-file：显式文件被真正使用"
+else
+  record_fail "自检 + 显式 --realtime-file 没有写出显式 realtime.json（退出码 $iso_explicit_status）"
+fi
+if grep -qF -- "backup-gui-modern-" "$ISO_EXPLICIT_CFG"; then
+  record_pass "自检的临时仓库写在显式 --config-file 上（证明显式路径优先）"
+else
+  record_fail "显式 --config-file 没有被自检使用"
+fi
+if [[ "$(md5sum "$ISO_MARKER_CFG" | cut -d' ' -f1)" == "$iso_marker_md5" ]]; then
+  record_pass "显式路径生效时默认 profile 仍然没有被改动"
+else
+  record_fail "显式路径生效时默认 profile 被改动了"
+fi
+
+# 静态面：隔离只挂在自检开关上，正常启动那条路径不允许出现 QTemporaryDir profile。
+expect_present "$ROOT_DIR/ui/modern/main.cpp" "const bool self_check_mode =" \
+  "main.cpp 有自检模式判定（隔离只对自检生效）"
+expect_count "$ROOT_DIR/ui/modern/main.cpp" "static QTemporaryDir self_check_profile;" 1 \
+  "隔离目录只有一处声明"
+expect_present "$ROOT_DIR/ui/modern/main.cpp" "if (self_check_mode) {" \
+  "路径重定向写在自检分支里"
+expect_count "$ROOT_DIR/ui/modern/main.cpp" "QString config_file_path = ResolveConfigFilePath(arguments);" 1 \
+  "配置路径只解析一次（解析后即定型，后面不再回默认值）"
+expect_count "$ROOT_DIR/ui/modern/main.cpp" "QString schedule_file_path = ResolveScheduleFilePath(arguments);" 1 \
+  "计划存储路径只解析一次"
+expect_count "$ROOT_DIR/ui/modern/main.cpp" "QString realtime_file_path = ResolveRealtimeFilePath(arguments);" 1 \
+  "实时存储路径只解析一次"
+
+echo "[modern-gui] 18) 浅色主题 hover 结构回归（transparent × 颜色动画 = 黑闪）"
+#
+# 人工现场：浅色主题下鼠标进出任意可 hover 的块会先"黑一下"再恢复。
+# 根因是共享组件的 background 在 "transparent"（RGBA 0,0,0,0）与不透明 hover 色
+# 之间做 ColorAnimation —— 逐分量插值 alpha 与 RGB，中间帧就是"半透明黑"叠在
+# 浅色底上（深色主题底色本就暗，所以看不出）。
+# 修法：固定主题色覆盖层 + 只动画 opacity。这里把它钉成结构契约：
+# 只要有文件同时出现 transparent 与 Behavior on color，黑闪就可能回来。
+hover_bad="$(grep -rl --include=*.qml -- "transparent" "$QML_DIR" | xargs -r grep -l -- "Behavior on color" || true)"
+if [[ -z "$hover_bad" ]]; then
+  record_pass "没有 QML 同时出现 transparent 与 Behavior on color（黑闪根因不会再回来）"
+else
+  record_fail "仍有文件同时出现 transparent 与 Behavior on color：$hover_bad"
+fi
+expect_count "$QML_DIR/components/NavItem.qml" "Behavior on color" 0 \
+  "NavItem 不再对颜色做动画"
+expect_count "$QML_DIR/components/AppButton.qml" "Behavior on color" 0 \
+  "AppButton 不再对颜色做动画"
+expect_count "$QML_DIR/components/NavItem.qml" "Behavior on opacity" 2 \
+  "NavItem 选中 / hover 各一条 opacity 动画"
+expect_count "$QML_DIR/components/AppButton.qml" "Behavior on opacity" 2 \
+  "AppButton hover / pressed 各一条 opacity 动画"
+expect_present "$QML_DIR/components/NavItem.qml" "color: theme.hover" \
+  "NavItem 的 hover 覆盖层用固定主题色"
+expect_present "$QML_DIR/components/AppButton.qml" \
+  "color: control.primary ? theme.accentHover : control.hoverColor" \
+  "AppButton 的 hover 覆盖层用固定主题色"
+# 输入框动画的是 border.color，两端都是不透明色，不是黑闪来源，明确保留。
+expect_present "$QML_DIR/components/AppTextField.qml" "Behavior on border.color" \
+  "输入框保留边框色过渡（两端不透明，非黑闪来源）"
 
 echo "[modern-gui] 通过 $PASS_COUNT 项，失败 $FAIL_COUNT 项"
 echo "[modern-gui] 日志: $LOG_FILE"
