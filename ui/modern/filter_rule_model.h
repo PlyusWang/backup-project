@@ -84,7 +84,8 @@ class FilterRuleModel : public QObject {
   //     "sizeCompares": [{key, label}],         // size / uid / gid 的比较方式
   //     "idCompares":   [{key, label}],         // uid / gid（键与 size 不同）
   //     "sizeUnits":    [{key, label}],         // B / KB / MB / GB
-  //     "mtimeKinds":   [{key, label}]          // 今天 / 昨天 / 最近 N 天 / ...
+  //     "mtimeKinds":   [{key, label}]          // 今天 / 昨天 / 最近 N 天 /
+  //     ...
   //   }
   Q_INVOKABLE QVariantMap editorOptions() const;
 

@@ -38,10 +38,14 @@
 //   --incremental-test <源> <仓库>      PR #18 GUI/CLI parity：走真实控制器
 //                                       入口跑 baseline / no-change / delta /
 //                                       依赖链恢复，按固定格式打印结果
+//   --combo-hover-test                  共享下拉的 hover 残留回归：真的把指针
+//                                       移到某一行、再移走，断言灰底严格跟着指针
+//                                       来去，关掉重开也不留痕迹
 //   --filter-ux-test                    三页 parity：同一个普通表单输入
-//                                       （条件类型 + 取值）在备份页 / 自动备份页 /
-//                                       实时备份页生成同一条 DSL，非法输入三处
-//                                       得到同一句来自共享 builder 的原因
+//                                       （条件类型 + 取值）在备份页 /
+//                                       自动备份页 / 实时备份页生成同一条
+//                                       DSL，非法输入三处 得到同一句来自共享
+//                                       builder 的原因
 //   --native-frame                      退回系统原生标题栏（Wayland 兜底）
 //
 // 这些开关让没有显示器的环境也能验证界面：离屏平台插件把窗口真正建出来，
@@ -57,6 +61,8 @@
 #include <QFile>
 #include <QFileInfo>
 #include <QGuiApplication>
+#include <QHoverEvent>
+#include <QKeyEvent>
 #include <QMetaObject>
 #include <QPointF>
 #include <QQmlApplicationEngine>
@@ -74,6 +80,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <functional>
 
 #include "app_paths.h"
 #include "app_theme.h"
@@ -1274,6 +1281,304 @@ QString FlattenRecord(const QVariantMap& record) {
 // banner 读的是它自己的 showsMessage（"这一页该不该显示这条消息"），不是
 // visible：Qt Quick 的 Item.visible 读出来就是**有效可见性**，StackLayout 里
 // 非当前页整体不可见，用 visible 永远测不出"这一页会不会显示这条消息"。
+// ---- --combo-hover-test ----
+//
+// 共享 AppComboBox 的 hover 残留回归。
+//
+// 人工现场：鼠标移过下拉里的某一项之后，把它移开（甚至移出下拉菜单），那块灰底
+// 不消失；备份 / 自动备份 / 实时备份三页都能复现 —— 因为三页用的是同一个
+// components/AppComboBox.qml。
+//
+// 这个自检真的把指针移到某一行的中心，再移到下一行、再移出 popup，然后逐行读
+// 真实状态：
+//
+//   * 灰底只允许出现在"指针此刻真的在这一行上"的那一行；
+//   * 一行都不能因为 highlightedIndex（常驻的键盘导航索引）而变成灰的；
+//   * 已选择项靠勾号 + 强调色文字表示，不占底色；
+//   * 关掉再打开 popup，上一轮的 hover 不许留下任何痕迹。
+//
+// 它断言的是运行期的真实属性（hovered / color），不是"文件里写了什么"。
+int RunComboHoverTest(QQuickWindow* window, backup_modern::AppTheme* theme) {
+  CheckRun run;
+  run.prefix = "[combo-hover]";
+
+  const QColor hover_color = theme->property("hover").value<QColor>();
+  const QColor keyboard_color = theme->property("accentSoft").value<QColor>();
+  run.Check(hover_color.isValid() && keyboard_color.isValid(),
+            QStringLiteral("主题给出了 hover / keyboard 两种颜色"),
+            QStringLiteral("hover=%1 keyboard=%2")
+                .arg(hover_color.name(), keyboard_color.name()));
+
+  // 页面与控件：备份页 → 共享规则编辑器 → “条件类型”。
+  // 先用真实按钮把表单展开（下拉只有在可见时才收得到 hover）。
+  window->setProperty("currentPage", 1);
+  window->setWidth(1280);
+  window->setHeight(1000);
+  WaitForAnimation(150);
+  // 备份页很长，"条件类型"下拉在筛选编辑器里：先滚到它，再展开表单。
+  // hover 是"窗口里真的有这个点"才成立的，控件在裁剪区外就收不到指针。
+  ScrollBackupPage(window, 700);
+  WaitForAnimation(120);
+  const auto clickByName = [window](const QString& name) -> bool {
+    QQuickItem* item = window->findChild<QQuickItem*>(name);
+    return item != nullptr && QMetaObject::invokeMethod(item, "clicked");
+  };
+  run.Check(clickByName(QStringLiteral("filterAddIncludeRuleButton")),
+            QStringLiteral("展开“新建包含规则”表单"));
+  WaitForAnimation(120);
+
+  QQuickItem* combo =
+      window->findChild<QQuickItem*>(QStringLiteral("filterRuleFieldCombo"));
+  run.Check(combo != nullptr && combo->isVisible(),
+            QStringLiteral("找得到可见的“条件类型”下拉"));
+  if (combo == nullptr) {
+    std::printf("[combo-hover] passed=%d failed=%d\n", run.passed, run.failed);
+    return 1;
+  }
+
+  QObject* popup = combo->property("popup").value<QObject*>();
+  run.Check(popup != nullptr, QStringLiteral("下拉有 popup 对象"));
+  if (popup == nullptr) {
+    std::printf("[combo-hover] passed=%d failed=%d\n", run.passed, run.failed);
+    return 1;
+  }
+
+  // 按行号收集当前 popup 里的行（delegate 只在 popup 打开时存在）。
+  struct Row {
+    int index = -1;
+    QQuickItem* item = nullptr;
+    QQuickItem* background = nullptr;
+  };
+  QQuickItem* popup_content =
+      popup->property("contentItem").value<QQuickItem*>();
+  const auto collectRows = [popup_content]() {
+    QList<QPair<int, QQuickItem*>> rows;
+    std::function<void(QQuickItem*)> walk = [&](QQuickItem* item) {
+      if (item->objectName() == QLatin1String("comboItemRow"))
+        rows.append({item->property("index").toInt(), item});
+      const QList<QQuickItem*> kids = item->childItems();
+      for (QQuickItem* kid : kids) {
+        walk(kid);
+      }
+    };
+    if (popup_content != nullptr) walk(popup_content);
+    std::sort(
+        rows.begin(), rows.end(),
+        [](const QPair<int, QQuickItem*>& a, const QPair<int, QQuickItem*>& b) {
+          return a.first < b.first;
+        });
+    return rows;
+  };
+  const auto backgroundOf = [](QQuickItem* row) -> QQuickItem* {
+    return row->findChild<QQuickItem*>(QStringLiteral("comboItemBackground"));
+  };
+  const auto colorOf = [](QQuickItem* background) -> QColor {
+    return background == nullptr
+               ? QColor()
+               : background->property("color").value<QColor>();
+  };
+  const auto describe = [&](const QList<QPair<int, QQuickItem*>>& rows) {
+    QStringList parts;
+    for (const auto& row : rows) {
+      const QColor color = colorOf(backgroundOf(row.second));
+      parts << QStringLiteral("%1[%2%3]")
+                   .arg(row.first)
+                   .arg(color.alpha() == 0 ? QStringLiteral("透明")
+                                           : color.name())
+                   .arg(row.second->property("hovered").toBool()
+                            ? QStringLiteral(" hover")
+                            : QString());
+    }
+    return parts.join(QStringLiteral(" "));
+  };
+  const auto movePointerTo = [window](const QPointF& pos,
+                                      const QPointF& old_pos) {
+    QHoverEvent hover(QEvent::HoverMove, pos, pos, old_pos);
+    QCoreApplication::sendEvent(window, &hover);
+  };
+  const auto centerOf = [window](QQuickItem* item) {
+    return item->mapToScene(QPointF(item->width() / 2.0, item->height() / 2.0));
+  };
+
+  QMetaObject::invokeMethod(popup, "open");
+  WaitForAnimation(260);
+
+  QList<QPair<int, QQuickItem*>> rows = collectRows();
+  run.Check(
+      rows.size() >= 7, QStringLiteral("条件类型下拉展开了至少 7 行"),
+      QStringLiteral("实际 %1 行（combo 可见=%2，popup 可见=%3，位置=%4,%5）")
+          .arg(rows.size())
+          .arg(combo->isVisible())
+          .arg(popup->property("visible").toBool())
+          .arg(combo->mapToScene(QPointF(0, 0)).x())
+          .arg(combo->mapToScene(QPointF(0, 0)).y()));
+  if (rows.size() < 3) {
+    std::printf("[combo-hover] passed=%d failed=%d\n", run.passed, run.failed);
+    for (const QString& failure : run.failures)
+      std::printf("[combo-hover]   FAIL %s\n", qPrintable(failure));
+    return 1;
+  }
+
+  // ---- 1) 打开之后，没有任何一行是 hover 灰 ----
+  //
+  // 这一条就是那个 bug：改动前 control.highlightedIndex 在下拉打开时等于
+  // currentIndex，于是"当前已选择的项"从一开始就带着 hover 的那块灰。
+  {
+    QStringList stale;
+    for (const auto& row : rows) {
+      if (colorOf(backgroundOf(row.second)) == hover_color)
+        stale << QString::number(row.first);
+    }
+    run.Check(stale.isEmpty(),
+              QStringLiteral("刚打开时没有任何一行带着 hover 灰底"),
+              QStringLiteral("仍然是灰的行：%1（%2）")
+                  .arg(stale.join(QStringLiteral(",")), describe(rows)));
+  }
+  run.Check(combo->property("highlightedIndex").toInt() ==
+                combo->property("currentIndex").toInt(),
+            QStringLiteral("Qt 确实把 highlightedIndex 设成了当前已选择项"),
+            QStringLiteral("highlightedIndex=%1 currentIndex=%2")
+                .arg(combo->property("highlightedIndex").toInt())
+                .arg(combo->property("currentIndex").toInt()));
+
+  // ---- 2) 已选择项用勾号表示，不靠底色 ----
+  {
+    QQuickItem* selected_row = nullptr;
+    for (const auto& row : rows) {
+      if (row.first == combo->property("currentIndex").toInt())
+        selected_row = row.second;
+    }
+    QQuickItem* check = selected_row == nullptr
+                            ? nullptr
+                            : selected_row->findChild<QQuickItem*>(
+                                  QStringLiteral("comboItemCheck"));
+    run.Check(check != nullptr && check->property("visible").toBool() &&
+                  colorOf(backgroundOf(selected_row)) != hover_color,
+              QStringLiteral("已选择项用勾号标记，且没有 hover 灰底"));
+  }
+
+  // ---- 3) 指针移到第 2 行：只有它是灰的 ----
+  const int second_index = rows.at(1).first;
+  QPointF pointer = centerOf(rows.at(1).second);
+  movePointerTo(pointer, centerOf(rows.at(0).second));
+  WaitForAnimation(120);
+  rows = collectRows();
+  {
+    QStringList gray;
+    for (const auto& row : rows) {
+      if (colorOf(backgroundOf(row.second)) == hover_color)
+        gray << QString::number(row.first);
+    }
+    run.Check(gray == QStringList{QString::number(second_index)},
+              QStringLiteral("指针在第 %1 行时，只有这一行是 hover 灰")
+                  .arg(second_index),
+              QStringLiteral("灰的行=%1（%2）")
+                  .arg(gray.join(QStringLiteral(",")), describe(rows)));
+  }
+
+  // ---- 4) 指针移到下一行：上一行立刻不再是灰的 ----
+  const QPointF previous = pointer;
+  pointer = centerOf(rows.at(2).second);
+  movePointerTo(pointer, previous);
+  WaitForAnimation(120);
+  rows = collectRows();
+  {
+    QStringList gray;
+    for (const auto& row : rows) {
+      if (colorOf(backgroundOf(row.second)) == hover_color)
+        gray << QString::number(row.first);
+    }
+    run.Check(gray == QStringList{QString::number(rows.at(2).first)},
+              QStringLiteral("指针换到第 %1 行后，第 %2 行的灰立刻消失")
+                  .arg(rows.at(2).first)
+                  .arg(second_index),
+              QStringLiteral("灰的行=%1（%2）")
+                  .arg(gray.join(QStringLiteral(",")), describe(rows)));
+  }
+
+  // ---- 5) 指针移出 popup：一块灰都不许留下 ----
+  //
+  // 这正是用户看到的现象：移开之后那块灰还在。
+  movePointerTo(QPointF(4, 4), pointer);
+  WaitForAnimation(150);
+  rows = collectRows();
+  {
+    QStringList gray;
+    for (const auto& row : rows) {
+      if (colorOf(backgroundOf(row.second)) == hover_color)
+        gray << QString::number(row.first);
+    }
+    run.Check(gray.isEmpty(),
+              QStringLiteral("指针移出下拉之后没有任何 hover 灰底残留"),
+              QStringLiteral("仍然灰的行=%1（%2）")
+                  .arg(gray.join(QStringLiteral(",")), describe(rows)));
+  }
+
+  // ---- 6) 关掉再打开：上一轮的 hover 不许留下痕迹 ----
+  QMetaObject::invokeMethod(popup, "close");
+  WaitForAnimation(220);
+  QMetaObject::invokeMethod(popup, "open");
+  WaitForAnimation(260);
+  rows = collectRows();
+  {
+    QStringList gray;
+    for (const auto& row : rows) {
+      if (colorOf(backgroundOf(row.second)) == hover_color)
+        gray << QString::number(row.first);
+    }
+    run.Check(gray.isEmpty(), QStringLiteral("重新打开下拉没有 stale hover"),
+              QStringLiteral("仍然灰的行=%1（%2）")
+                  .arg(gray.join(QStringLiteral(",")), describe(rows)));
+  }
+
+  // ---- 7) 那个曾经被当成 hover 用的索引，本身是只读的常驻状态 ----
+  //
+  // highlightedIndex 在 Qt 6.4 里没有 WRITE 访问器（setProperty 返回 false），
+  // 只能由 Qt 自己的键盘处理改动它；下拉一打开它就被设成当前已选择项。这正是
+  // 老实现的问题所在：界面上想"清掉"这块高亮也没有任何办法 —— 它压根不是鼠标
+  // 状态。所以它现在只用来表达"已选择 / 键盘位置"，一律不碰 hover 的那块灰。
+  //
+  // 键盘事件本身在 offscreen 窗口里送不到 popup（窗口没有 active focus），
+  // 所以这一节只断言上面这条**结构性事实**；键盘导航是否需要视觉反馈由
+  // scripts/modern_gui_check.sh 的结构断言 + 真实桌面人工验收覆盖。
+  {
+    run.Check(
+        !combo->setProperty("highlightedIndex", 3) &&
+            combo->property("highlightedIndex").toInt() ==
+                combo->property("currentIndex").toInt(),
+        QStringLiteral(
+            "highlightedIndex 是只读的常驻索引，不是可以清掉的 hover 状态"),
+        QStringLiteral("setProperty 返回 false，读回 %1")
+            .arg(combo->property("highlightedIndex").toInt()));
+    rows = collectRows();
+    QStringList gray_rows;
+    for (const auto& row : rows) {
+      if (colorOf(backgroundOf(row.second)) == hover_color)
+        gray_rows << QString::number(row.first);
+    }
+    run.Check(gray_rows.isEmpty(),
+              QStringLiteral("这个常驻索引没有把任何一行画成 hover 灰"),
+              describe(rows));
+  }
+
+  // ---- 8) 收尾：选择与表单都回到干净状态 ----
+  QMetaObject::invokeMethod(popup, "close");
+  WaitForAnimation(200);
+  run.Check(combo->property("currentIndex").toInt() >= 0,
+            QStringLiteral("清理 hover 的过程没有动坏 currentIndex"),
+            QStringLiteral("currentIndex=%1")
+                .arg(combo->property("currentIndex").toInt()));
+  clickByName(QStringLiteral("filterRuleCancelButton"));
+  WaitForAnimation(80);
+
+  std::printf("[combo-hover] passed=%d failed=%d\n", run.passed, run.failed);
+  if (run.failed != 0) {
+    for (const QString& failure : run.failures)
+      std::printf("[combo-hover]   FAIL %s\n", qPrintable(failure));
+  }
+  return run.failed == 0 ? 0 : 1;
+}
+
 // ---- --filter-ux-test ----
 //
 // 三个页面"同一个普通表单输入 -> 同一条 DSL"的 parity 自检。
@@ -1310,7 +1615,8 @@ int RunFilterUxTest(QQuickWindow* window,
     return QMetaObject::invokeMethod(item, "clicked");
   };
   // 下拉不能只改 currentIndex：onActivated 只由用户激活触发，所以要先把
-  // currentIndex 设成目标值，再发一次 activated(index)，与用户真的点了一下等价。
+  // currentIndex 设成目标值，再发一次
+  // activated(index)，与用户真的点了一下等价。
   const auto choose = [](QQuickItem* combo, int index) -> bool {
     if (combo == nullptr || index < 0) return false;
     combo->setProperty("currentIndex", index);
@@ -1391,8 +1697,9 @@ int RunFilterUxTest(QQuickWindow* window,
               QStringLiteral("%1 新建规则的表单默认收起").arg(label));
     click(named("AddIncludeRuleButton"));
     WaitForAnimation(80);
-    run.Check(shown(builder),
-              QStringLiteral("%1 点“添加包含规则”后表单展开（不是弹窗）").arg(label));
+    run.Check(
+        shown(builder),
+        QStringLiteral("%1 点“添加包含规则”后表单展开（不是弹窗）").arg(label));
 
     // ---- 条件类型下拉显示中文 ----
     QQuickItem* field_combo = named("RuleFieldCombo");
@@ -1406,16 +1713,18 @@ int RunFilterUxTest(QQuickWindow* window,
     for (const QVariant& option : field_options) {
       field_labels << option.toString();
     }
-    run.Check(field_labels.contains(QStringLiteral("文件类型")) &&
-                  field_labels.contains(QStringLiteral("文件大小")) &&
-                  field_labels.contains(QStringLiteral("路径")) &&
-                  !field_labels.contains(QStringLiteral("ext")),
-              QStringLiteral("%1 条件类型下拉全部是中文（没有裸字段名）").arg(label),
-              field_labels.join(QStringLiteral("/")));
-    run.Check(!shown(named("RuleTypeCombo")) &&
-                  !shown(named("RuleSizeCompareCombo")) &&
-                  named("RuleExtensionField") != nullptr,
-              QStringLiteral("%1 选“文件扩展名”时只出现扩展名输入框").arg(label));
+    run.Check(
+        field_labels.contains(QStringLiteral("文件类型")) &&
+            field_labels.contains(QStringLiteral("文件大小")) &&
+            field_labels.contains(QStringLiteral("路径")) &&
+            !field_labels.contains(QStringLiteral("ext")),
+        QStringLiteral("%1 条件类型下拉全部是中文（没有裸字段名）").arg(label),
+        field_labels.join(QStringLiteral("/")));
+    run.Check(
+        !shown(named("RuleTypeCombo")) &&
+            !shown(named("RuleSizeCompareCombo")) &&
+            named("RuleExtensionField") != nullptr,
+        QStringLiteral("%1 选“文件扩展名”时只出现扩展名输入框").arg(label));
 
     // ---- 同一次普通操作：扩展名 -> txt;md ----
     run.Check(typeInto(named("RuleExtensionField"), QStringLiteral("txt;md")),
@@ -1431,11 +1740,12 @@ int RunFilterUxTest(QQuickWindow* window,
     run.Check(click(named("RuleSubmitButton")),
               QStringLiteral("%1 “添加规则”可点").arg(label));
     WaitForAnimation(80);
-    run.Check(page.model->rulesForAction(QStringLiteral("include")) ==
-                  QStringList{QStringLiteral("ext:txt;md")},
-              QStringLiteral("%1 生成 ext:txt;md（用户没有写过 ext:）").arg(label),
-              page.model->rulesForAction(QStringLiteral("include"))
-                  .join(QStringLiteral(",")));
+    run.Check(
+        page.model->rulesForAction(QStringLiteral("include")) ==
+            QStringList{QStringLiteral("ext:txt;md")},
+        QStringLiteral("%1 生成 ext:txt;md（用户没有写过 ext:）").arg(label),
+        page.model->rulesForAction(QStringLiteral("include"))
+            .join(QStringLiteral(",")));
     run.Check(page.model->rulesForAction(QStringLiteral("exclude")).isEmpty(),
               QStringLiteral("%1 这条规则落在包含一侧").arg(label));
 
@@ -1460,9 +1770,9 @@ int RunFilterUxTest(QQuickWindow* window,
     WaitForAnimation(60);
     choose(field_combo, field_labels.indexOf(QStringLiteral("路径")));
     WaitForAnimation(60);
-    run.Check(shown(named("RulePatternField")) &&
-                  !shown(named("RuleExtensionField")),
-              QStringLiteral("%1 换“路径”之后出现的是路径输入框").arg(label));
+    run.Check(
+        shown(named("RulePatternField")) && !shown(named("RuleExtensionField")),
+        QStringLiteral("%1 换“路径”之后出现的是路径输入框").arg(label));
     typeInto(named("RulePatternField"), QStringLiteral("**/build/**"));
     click(named("RuleSubmitButton"));
     WaitForAnimation(80);
@@ -1506,11 +1816,12 @@ int RunFilterUxTest(QQuickWindow* window,
     choose(named("RuleSizeUnitCombo"), 2);  // MB
     click(named("RuleSubmitButton"));
     WaitForAnimation(80);
-    run.Check(page.model->rulesForAction(QStringLiteral("include"))
-                  .contains(QStringLiteral("size:<1MB")),
-              QStringLiteral("%1 生成 size:<1MB（用户没有写过 size:）").arg(label),
-              page.model->rulesForAction(QStringLiteral("include"))
-                  .join(QStringLiteral(",")));
+    run.Check(
+        page.model->rulesForAction(QStringLiteral("include"))
+            .contains(QStringLiteral("size:<1MB")),
+        QStringLiteral("%1 生成 size:<1MB（用户没有写过 size:）").arg(label),
+        page.model->rulesForAction(QStringLiteral("include"))
+            .join(QStringLiteral(",")));
 
     // ---- 非法输入：三处必须拿到同一句共享 builder 的原因 ----
     click(named("AddIncludeRuleButton"));
@@ -1532,17 +1843,18 @@ int RunFilterUxTest(QQuickWindow* window,
              QStringLiteral("99999999999999999999"));
     WaitForAnimation(60);
     const QString overflow_reason = textOf(named("RuleFormErrorText"));
-    run.Check(overflow_reason.contains(QStringLiteral("超出可表示范围")),
-              QStringLiteral("%1 超大数值被明确拒绝（不是静默截断）").arg(label),
-              overflow_reason);
+    run.Check(
+        overflow_reason.contains(QStringLiteral("超出可表示范围")),
+        QStringLiteral("%1 超大数值被明确拒绝（不是静默截断）").arg(label),
+        overflow_reason);
     click(named("RuleCancelButton"));
     WaitForAnimation(60);
 
     // ---- 高级 DSL：默认收起，展开后仍然可用 ----
     QQuickItem* advanced_section = named("AdvancedRulesSection");
-    run.Check(advanced_section != nullptr && !shown(advanced_section),
-              QStringLiteral("%1 高级规则默认收起（普通用户看不到 DSL）")
-                  .arg(label));
+    run.Check(
+        advanced_section != nullptr && !shown(advanced_section),
+        QStringLiteral("%1 高级规则默认收起（普通用户看不到 DSL）").arg(label));
     click(named("AdvancedRulesToggle"));
     WaitForAnimation(60);
     run.Check(shown(advanced_section),
@@ -1571,14 +1883,13 @@ int RunFilterUxTest(QQuickWindow* window,
                 .arg(manual_include.join(QStringLiteral(" ")),
                      schedule_include.join(QStringLiteral(" ")),
                      realtime_include.join(QStringLiteral(" "))));
-  run.Check(manual_include ==
-                QStringList({QStringLiteral("ext:txt;md"),
-                             QStringLiteral("type:folder"),
-                             QStringLiteral("size:<1MB")}),
+  run.Check(manual_include == QStringList({QStringLiteral("ext:txt;md"),
+                                           QStringLiteral("type:folder"),
+                                           QStringLiteral("size:<1MB")}),
             QStringLiteral("PARITY-02 普通表单输入生成的就是核心认可的 DSL"),
             manual_include.join(QStringLiteral(" ")));
   run.Check(manual_model->rulesForAction(QStringLiteral("exclude")) ==
-                schedule_model->rulesForAction(QStringLiteral("exclude")) &&
+                    schedule_model->rulesForAction(QStringLiteral("exclude")) &&
                 schedule_model->rulesForAction(QStringLiteral("exclude")) ==
                     realtime_model->rulesForAction(QStringLiteral("exclude")),
             QStringLiteral("PARITY-03 三处的排除规则逐字相同"));
@@ -1586,7 +1897,8 @@ int RunFilterUxTest(QQuickWindow* window,
                 rejection_reasons.at(0) == rejection_reasons.at(1) &&
                 rejection_reasons.at(1) == rejection_reasons.at(2) &&
                 !rejection_reasons.at(0).isEmpty(),
-            QStringLiteral("PARITY-04 非法输入在三处得到同一句原因（来自共享 builder）"),
+            QStringLiteral(
+                "PARITY-04 非法输入在三处得到同一句原因（来自共享 builder）"),
             rejection_reasons.join(QStringLiteral(" | ")));
 
   // 收尾：三份模型都清空，后面的自检从干净状态开始。
@@ -3287,11 +3599,11 @@ int RunScheduleTest(backup_modern::ScheduleController* schedule,
             schedule->repositoryPath());
   // 这句能力说明改成面向用户的一句之后，断言也跟着改：它必须说的是当前真的
   // 支持什么，而不是"以后会扩展什么"。
-  run.Check(schedule->supportedModeText().contains(QStringLiteral("定时触发")) &&
-                !schedule->supportedModeText().contains(
-                    QStringLiteral("后续将扩展")),
-            QStringLiteral("SCH-07 页面说明只承诺已实现的模式"),
-            schedule->supportedModeText());
+  run.Check(
+      schedule->supportedModeText().contains(QStringLiteral("定时触发")) &&
+          !schedule->supportedModeText().contains(QStringLiteral("后续将扩展")),
+      QStringLiteral("SCH-07 页面说明只承诺已实现的模式"),
+      schedule->supportedModeText());
 
   // ---- 备份频率：值 + 单位 <-> interval_minutes ----
   //
@@ -3304,15 +3616,15 @@ int RunScheduleTest(backup_modern::ScheduleController* schedule,
       int expected;
     };
     const FrequencyCase kAccepted[] = {
-        {"1", "minutes", 1},   {"90", "minutes", 90}, {"1", "hours", 60},
-        {"2", "hours", 120},   {"1", "days", 1440},   {"2", "days", 2880},
+        {"1", "minutes", 1},   {"90", "minutes", 90},   {"1", "hours", 60},
+        {"2", "hours", 120},   {"1", "days", 1440},     {"2", "days", 2880},
         {"1", "weeks", 10080}, {"365", "days", 525600},
     };
     for (const FrequencyCase& item : kAccepted) {
       std::uint32_t minutes = 0;
       std::string error;
-      const bool ok = backup_modern::ParseFrequency(
-          item.value, item.unit, &minutes, &error);
+      const bool ok = backup_modern::ParseFrequency(item.value, item.unit,
+                                                    &minutes, &error);
       run.Check(ok && minutes == static_cast<std::uint32_t>(item.expected),
                 QStringLiteral("FREQ-01 每 %1 %2 -> %3 分钟")
                     .arg(QString::fromLatin1(item.value), unitLabel(item.unit))
@@ -3328,9 +3640,9 @@ int RunScheduleTest(backup_modern::ScheduleController* schedule,
       const char* unit;
     };
     const SplitCase kSplit[] = {
-        {60, "1", "hours"},   {120, "2", "hours"},  {1440, "1", "days"},
-        {2880, "2", "days"},  {10080, "1", "weeks"}, {90, "90", "minutes"},
-        {1, "1", "minutes"},  {525600, "365", "days"},
+        {60, "1", "hours"},  {120, "2", "hours"},     {1440, "1", "days"},
+        {2880, "2", "days"}, {10080, "1", "weeks"},   {90, "90", "minutes"},
+        {1, "1", "minutes"}, {525600, "365", "days"},
     };
     for (const SplitCase& item : kSplit) {
       std::string value;
@@ -3367,8 +3679,8 @@ int RunScheduleTest(backup_modern::ScheduleController* schedule,
     for (const RejectCase& item : kRejected) {
       std::uint32_t minutes = 0;
       std::string error;
-      const bool ok = backup_modern::ParseFrequency(
-          item.value, item.unit, &minutes, &error);
+      const bool ok = backup_modern::ParseFrequency(item.value, item.unit,
+                                                    &minutes, &error);
       run.Check(!ok && !error.empty(),
                 QStringLiteral("FREQ-03 拒绝 每 %1 %2（%3）")
                     .arg(QString::fromLatin1(item.value), unitLabel(item.unit),
@@ -3379,37 +3691,36 @@ int RunScheduleTest(backup_modern::ScheduleController* schedule,
   }
 
   // 控制器入口：界面走的就是这一条，返回值与回显都要对得上。
-  run.Check(schedule->saveConfigFromFrequencyText(
-                true, source, QStringLiteral("1"), QStringLiteral("hours"),
-                QStringLiteral("3"), QStringLiteral("mypack"),
-                QStringLiteral("none"), QStringList(), QStringList(),
-                QStringLiteral("full")) &&
-                schedule->intervalMinutes() == 60 &&
-                schedule->frequencyValueText() == QStringLiteral("1") &&
-                schedule->frequencyUnitKey() == QStringLiteral("hours"),
-            QStringLiteral("FREQ-04 控制器接受“每 1 小时”并回显一致"),
-            QStringLiteral("%1 %2 / %3 分钟")
-                .arg(schedule->frequencyValueText(),
-                     schedule->frequencyUnitKey())
-                .arg(schedule->intervalMinutes()));
-  run.Check(schedule->saveConfigFromFrequencyText(
-                true, source, QStringLiteral("90"),
-                QStringLiteral("minutes"), QStringLiteral("3"),
-                QStringLiteral("mypack"), QStringLiteral("none"),
-                QStringList(), QStringList(), QStringLiteral("full")) &&
-                schedule->intervalMinutes() == 90 &&
-                schedule->frequencyValueText() == QStringLiteral("90") &&
-                schedule->frequencyUnitKey() == QStringLiteral("minutes"),
-            QStringLiteral("FREQ-05 90 分钟不会被显示成 1.5 小时"));
-  run.Check(!schedule->saveConfigFromFrequencyText(
-                true, source, QStringLiteral("0"), QStringLiteral("minutes"),
-                QStringLiteral("3"), QStringLiteral("mypack"),
-                QStringLiteral("none"), QStringList(), QStringList(),
-                QStringLiteral("full")) &&
-                schedule->statusKind() == QStringLiteral("error"),
-            QStringLiteral("FREQ-06 控制器拒绝“每 0 分钟”并给出错误"),
-            schedule->statusTitle() + QStringLiteral("/") +
-                schedule->statusMessage());
+  run.Check(
+      schedule->saveConfigFromFrequencyText(
+          true, source, QStringLiteral("1"), QStringLiteral("hours"),
+          QStringLiteral("3"), QStringLiteral("mypack"), QStringLiteral("none"),
+          QStringList(), QStringList(), QStringLiteral("full")) &&
+          schedule->intervalMinutes() == 60 &&
+          schedule->frequencyValueText() == QStringLiteral("1") &&
+          schedule->frequencyUnitKey() == QStringLiteral("hours"),
+      QStringLiteral("FREQ-04 控制器接受“每 1 小时”并回显一致"),
+      QStringLiteral("%1 %2 / %3 分钟")
+          .arg(schedule->frequencyValueText(), schedule->frequencyUnitKey())
+          .arg(schedule->intervalMinutes()));
+  run.Check(
+      schedule->saveConfigFromFrequencyText(
+          true, source, QStringLiteral("90"), QStringLiteral("minutes"),
+          QStringLiteral("3"), QStringLiteral("mypack"), QStringLiteral("none"),
+          QStringList(), QStringList(), QStringLiteral("full")) &&
+          schedule->intervalMinutes() == 90 &&
+          schedule->frequencyValueText() == QStringLiteral("90") &&
+          schedule->frequencyUnitKey() == QStringLiteral("minutes"),
+      QStringLiteral("FREQ-05 90 分钟不会被显示成 1.5 小时"));
+  run.Check(
+      !schedule->saveConfigFromFrequencyText(
+          true, source, QStringLiteral("0"), QStringLiteral("minutes"),
+          QStringLiteral("3"), QStringLiteral("mypack"), QStringLiteral("none"),
+          QStringList(), QStringList(), QStringLiteral("full")) &&
+          schedule->statusKind() == QStringLiteral("error"),
+      QStringLiteral("FREQ-06 控制器拒绝“每 0 分钟”并给出错误"),
+      schedule->statusTitle() + QStringLiteral("/") +
+          schedule->statusMessage());
   schedule->clearStatus();
 
   // 2) 保存一份真实计划。
@@ -4409,6 +4720,10 @@ int main(int argc, char* argv[]) {
   // 建好之后才分派，也属于自检模式（配置隔离照常生效）。
   const bool filter_ux_test =
       arguments.contains(QStringLiteral("--filter-ux-test"));
+  // 共享 AppComboBox 的 hover 残留回归（见 RunComboHoverTest）。它要真的把指针
+  // 移到一个 popup 行上，所以同样在窗口建好之后才分派。
+  const bool combo_hover_test =
+      arguments.contains(QStringLiteral("--combo-hover-test"));
   const int incremental_test_index =
       arguments.indexOf(QStringLiteral("--incremental-test"));
   const int screenshot_index =
@@ -4508,13 +4823,12 @@ int main(int argc, char* argv[]) {
   // 所以自检 / 抓图模式下，只要有哪条路径没被显式指定，就把它重定向到本次
   // 进程专属的临时目录，并在 stderr 说明。显式参数永远优先；正常启动
   // （没有任何自检开关）行为完全不变。
-  const bool self_check_mode = smoke_test || path_test || close_guard_test ||
-                               gui_contract_test || preview_test_index >= 0 ||
-                               incremental_test_index >= 0 ||
-                               screenshot_index >= 0 || self_test_index >= 0 ||
-                               repository_test_index >= 0 || realtime_test ||
-                               backup_options_test || schedule_test ||
-                               filter_ux_test;
+  const bool self_check_mode =
+      smoke_test || path_test || close_guard_test || gui_contract_test ||
+      preview_test_index >= 0 || incremental_test_index >= 0 ||
+      screenshot_index >= 0 || self_test_index >= 0 ||
+      repository_test_index >= 0 || realtime_test || backup_options_test ||
+      schedule_test || filter_ux_test || combo_hover_test;
   QString config_file_path = ResolveConfigFilePath(arguments);
   QString schedule_file_path = ResolveScheduleFilePath(arguments);
   QString realtime_file_path = ResolveRealtimeFilePath(arguments);
@@ -4705,6 +5019,10 @@ int main(int argc, char* argv[]) {
 
   if (gui_contract_test) {
     return RunGuiContractTest(window, &controller);
+  }
+
+  if (combo_hover_test) {
+    return RunComboHoverTest(window, &theme);
   }
 
   if (filter_ux_test) {

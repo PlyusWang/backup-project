@@ -86,8 +86,10 @@ class ScheduleController : public QObject,
   Q_PROPERTY(int intervalMinutes READ intervalMinutes NOTIFY configChanged)
   // 备份频率的显示形态：把 interval_minutes 拆成"值 + 单位"（60 -> 1 小时，
   // 90 -> 90 分钟）。存储与核心仍然只有 interval_minutes 这一个字段。
-  Q_PROPERTY(QString frequencyValueText READ frequencyValueText NOTIFY configChanged)
-  Q_PROPERTY(QString frequencyUnitKey READ frequencyUnitKey NOTIFY configChanged)
+  Q_PROPERTY(
+      QString frequencyValueText READ frequencyValueText NOTIFY configChanged)
+  Q_PROPERTY(
+      QString frequencyUnitKey READ frequencyUnitKey NOTIFY configChanged)
   Q_PROPERTY(int retainCount READ retainCount NOTIFY configChanged)
   // PR #18：strategyKey 这一条 PR #17 就已经留好了，本轮只是让它真的能被
   // 界面选择与保存（下面两个 saveConfig* 各多一个 strategy_key）。

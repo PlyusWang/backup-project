@@ -170,7 +170,8 @@ std::string Summarize(const FilterRuleDraft& rule);
 // 短摘要：规则卡片**主行**用的那一句，例如 "文件扩展名：cpp、h"、
 // "文件大小 小于 1 MB"。
 //
-// 与 Summarize 的分工：Summarize 是一整句话（"包含：扩展名为 cpp 或 h 的文件"），
+// 与 Summarize 的分工：Summarize 是一整句话（"包含：扩展名为 cpp 或 h
+// 的文件"），
 // 适合放在卡片正文；短摘要是"条件：取值"的名词短语，适合放在标题行，让人一眼
 // 看出这条规则在筛什么。两者都从同一份草稿生成，不解析 DSL 文本。
 std::string SummarizeClauseShort(const FilterClauseDraft& clause);

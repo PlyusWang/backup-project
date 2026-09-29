@@ -70,9 +70,8 @@ bool ParseFrequency(const std::string& value_text, const std::string& unit_key,
   // 大于 kMaxIntervalMinutes。
   std::uint32_t value = 0;
   std::string parse_error;
-  if (!bp::ParseBoundedScheduleNumber(value_text, 1,
-                                      bp::kMaxIntervalMinutes, "备份频率",
-                                      &value, &parse_error)) {
+  if (!bp::ParseBoundedScheduleNumber(value_text, 1, bp::kMaxIntervalMinutes,
+                                      "备份频率", &value, &parse_error)) {
     if (error_message != nullptr) *error_message = parse_error;
     return false;
   }
@@ -82,9 +81,9 @@ bool ParseFrequency(const std::string& value_text, const std::string& unit_key,
   // 先乘就已经回绕了。
   if (value > bp::kMaxIntervalMinutes / unit->minutes) {
     if (error_message != nullptr) {
-      *error_message = "备份频率超出范围：每 " + value_text + " " + unit->label +
-                       "（最多 " + std::to_string(bp::kMaxIntervalMinutes) +
-                       " 分钟）";
+      *error_message = "备份频率超出范围：每 " + value_text + " " +
+                       unit->label + "（最多 " +
+                       std::to_string(bp::kMaxIntervalMinutes) + " 分钟）";
     }
     return false;
   }

@@ -232,7 +232,8 @@ const char* RuleFieldHint(RuleField field) {
     case RuleField::kName:
       return "支持通配符：* 匹配任意多个字符，? 匹配一个字符。";
     case RuleField::kPath:
-      return "相对于备份目录的路径。* 只匹配当前目录内的字符，** 可以跨目录匹配。";
+      return "相对于备份目录的路径。* 只匹配当前目录内的字符，** "
+             "可以跨目录匹配。";
     case RuleField::kStem:
       return "不含扩展名的文件名部分，例如 report 之于 report.pdf。";
     case RuleField::kExt:
