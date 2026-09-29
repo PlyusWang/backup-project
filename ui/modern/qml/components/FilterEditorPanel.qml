@@ -1,6 +1,12 @@
 // FilterEditorPanel.qml
 //
-// 可视化 Filter 规则编辑器（备份页内嵌：宽屏左右两栏，窄屏上下堆叠）。
+// 备份页（Manual Backup）的筛选面板：左边是文件预览，右边是共享的规则编辑器。
+//
+// 规则编辑器本身在 FilterRuleEditor.qml —— 计划页与实时页用的是同一个组件，
+// 三处看到的筛选配置方式因此必然一致。这个文件只剩两件这里独有的事：
+//
+//   1. 布局（宽屏左右两栏，窄屏上下堆叠）；
+//   2. 文件预览：调用 FilterRuleModel 的共享遍历，展示真实 Filter 的判定结果。
 //
 // 分工与依赖方向：
 //   main.cpp 注册 filterRuleModel
@@ -25,197 +31,52 @@ Item {
     required property var ruleModel
 
     // 本地派生状态：子项只读这些。
-    property var ruleList: []
     property var previewList: []
     property bool previewBusy: false
     property bool previewTruncated: false
     property int previewShown: 0
-    property int previewTotal: 0
-    property int previewIncluded: 0
     property int previewLimit: 300
+    property int previewIncluded: 0
     property string previewSource: ""
-    property string summaryLine: ""
-    property string dslPreview: ""
-    property string errorText: ""
-    property string cliLine: ""
-
-    // 表单状态（当前正在编辑的规则）
-    property string formAction: "include"
-    property string formField: "ext"
-    property string formPattern: ""
-    property string formExtensions: ""
-    property string formType: "file"
-    property string formCompare: ">="
-    property string formUnit: "KB"
-    property string formSizeLowText: "1"
-    property string formSizeHighText: "10"
-    // uid / gid 的表单值按文本收集：解析与取值范围由 C++ 侧统一裁决，
-    // QML 侧的 parseInt 会把超范围的值悄悄变成另一个数。
-    property string formUidCompare: "eq"
-    property string formUidText: "0"
-    property string formUidHighText: "0"
-    property string formGidCompare: "eq"
-    property string formGidText: "0"
-    property string formGidHighText: "0"
-    property string formUser: ""
-    property string formGroup: ""
-    // mtime 的表单值：日期原样透传，格式与区间方向由 C++ 侧（builder + 真实
-    // Filter）裁决，QML 不做日期解析，也不判合法性。
-    property string formMtimeKind: "today"
-    property string formDaysBackText: "7"
-    property string formDateLow: ""
-    property string formDateHigh: ""
-    property string formError: ""
 
     readonly property bool wide: width >= 760
 
-    // type 下拉：显示名给用户看，键原样进表单，映射成 RuleTypeValue 由 C++ 侧
-    // 负责（界面不拼 DSL，也不判断规则合法性）。
-    readonly property var typeLabels: ["普通文件", "目录", "符号链接", "FIFO",
-                                       "字符设备", "块设备", "socket"]
-    readonly property var typeKeys: ["file", "folder", "symlink", "fifo", "char",
-                                     "block", "socket"]
-    // uid / gid 的比较运算符：键与 C++ 侧的表单约定一致（eq/lt/le/gt/ge/range）。
-    readonly property var idCompareLabels: ["等于", "小于", "小于等于", "大于",
-                                            "大于等于", "区间"]
-    readonly property var idCompareKeys: ["eq", "lt", "le", "gt", "ge", "range"]
-    // mtime 类型下拉：同样把显示名与表单词分开。
-    readonly property var mtimeLabels: ["今天", "昨天", "最近 N 天", "指定日期",
-                                        "日期区间"]
-    readonly property var mtimeKeys: ["today", "yesterday", "last_days", "day",
-                                      "day_range"]
-    // uid 与 gid 共用同一组控件，这里给出当前字段正在用的运算符。
-    readonly property string idCompare: panel.formField === "uid" ? panel.formUidCompare : panel.formGidCompare
-
-    function syncFromModel() {
-        if (!ruleModel)
+    function syncPreview() {
+        if (!panel.ruleModel)
             return
-        panel.ruleList = panel.ruleModel.rules
         panel.previewList = panel.ruleModel.previewItems
         panel.previewBusy = panel.ruleModel.previewBusy
         panel.previewTruncated = panel.ruleModel.previewTruncated
         panel.previewShown = panel.ruleModel.previewShown
-        panel.previewTotal = panel.ruleModel.previewTotal
-        panel.previewIncluded = panel.ruleModel.previewIncluded
         panel.previewLimit = panel.ruleModel.previewLimit
-        panel.summaryLine = panel.ruleModel.summaryText
-        panel.dslPreview = panel.ruleModel.dslText
-        panel.errorText = panel.ruleModel.lastError
-        panel.cliLine = panel.ruleModel.cliArguments()
-        panel.previewSource = ruleModel.previewSource
-    }
-
-    function formMap() {
-        return {
-            "action": panel.formAction,
-            "field": panel.formField,
-            "pattern": panel.formPattern,
-            "extensions": panel.formExtensions,
-            "type": panel.formType,
-            "compare": panel.formCompare,
-            "unit": panel.formUnit,
-            "sizeLow": panel.sizeLowValue(),
-            "sizeHigh": panel.sizeHighValue(),
-            "uid_compare": panel.formUidCompare,
-            "uid": panel.formUidText,
-            "uid_high": panel.formUidHighText,
-            "gid_compare": panel.formGidCompare,
-            "gid": panel.formGidText,
-            "gid_high": panel.formGidHighText,
-            "user": panel.formUser,
-            "group": panel.formGroup,
-            "mtime_kind": panel.formMtimeKind,
-            "days_back": panel.formDaysBackText,
-            "date_low": panel.formDateLow,
-            "date_high": panel.formDateHigh
-        }
-    }
-
-    // 表单校验同样交给 C++（builder + 真实 Filter 裁决），QML 不自判语法。
-    function isNonNegativeInt(text) {
-        return /^[0-9]+$/.test(text)
-    }
-
-    function sizeLowValue() {
-        return panel.isNonNegativeInt(panel.formSizeLowText) ? parseInt(panel.formSizeLowText) : 0
-    }
-
-    function sizeHighValue() {
-        return panel.isNonNegativeInt(panel.formSizeHighText) ? parseInt(panel.formSizeHighText) : 0
-    }
-
-    function refreshFormError() {
-        if (!ruleModel) {
-            panel.formError = ""
-            return
-        }
-        if (panel.formField === "size") {
-            if (!panel.isNonNegativeInt(panel.formSizeLowText)) {
-                panel.formError = "size 的数值必须是非负整数（当前是 " + panel.formSizeLowText + "）"
-                return
-            }
-            if (panel.formCompare === ".." && !panel.isNonNegativeInt(panel.formSizeHighText)) {
-                panel.formError = "size 区间的上界必须是非负整数（当前是 " + panel.formSizeHighText + "）"
-                return
-            }
-        }
-        panel.formError = panel.ruleModel.validateForm(panel.formMap())
-    }
-
-    function resetForm(action) {
-        panel.formAction = action
-        panel.formField = "ext"
-        panel.formPattern = ""
-        panel.formExtensions = ""
-        panel.formType = "file"
-        panel.formCompare = ">="
-        panel.formUnit = "KB"
-        panel.formSizeLowText = "1"
-        panel.formSizeHighText = "10"
-        panel.formUidCompare = "eq"
-        panel.formUidText = "0"
-        panel.formUidHighText = "0"
-        panel.formGidCompare = "eq"
-        panel.formGidText = "0"
-        panel.formGidHighText = "0"
-        panel.formUser = ""
-        panel.formGroup = ""
-        panel.formMtimeKind = "today"
-        panel.formDaysBackText = "7"
-        panel.formDateLow = ""
-        panel.formDateHigh = ""
-        if (ruleModel)
-            panel.ruleModel.clearError()
-        panel.refreshFormError()
+        panel.previewIncluded = panel.ruleModel.previewIncluded
+        panel.previewSource = panel.ruleModel.previewSource
     }
 
     function refreshPreview() {
-        if (!ruleModel || controller.sourcePath.length === 0)
+        if (!panel.ruleModel || controller.sourcePath.length === 0)
             return
         panel.ruleModel.requestPreview(controller.sourcePath, "")
-        panel.syncFromModel()
+        panel.syncPreview()
+    }
+
+    // 规则变化后：刷新预览（latest-request-wins 由模型负责）。规则列表本身的
+    // 显示由 FilterRuleEditor 自己同步。
+    function onRulesChanged() {
+        panel.refreshPreview()
     }
 
     implicitHeight: layout.implicitHeight
-
-    onRuleModelChanged: syncFromModel()
-
-    // 规则变化后：同步本地状态，并刷新预览（latest-request-wins 由模型负责）。
-    function onRulesChanged() {
-        panel.syncFromModel()
-        panel.refreshPreview()
-    }
 
     // 用显式信号连接，而不是 QML 的 Connections 元素：
     // 静态检查工具的 6.4 版 qmltypes 解析不了 Connections（以及随之而来的 target），
     // 会连锁出一批假告警；显式 connect 行为等价，也不引入新的告警。
     // ruleModel 由父级在创建期注入，Component.onCompleted 时已经就绪（见同步逻辑）。
     Component.onCompleted: {
-        panel.syncFromModel()
+        panel.syncPreview()
         if (panel.ruleModel) {
             panel.ruleModel.rulesChanged.connect(panel.onRulesChanged)
-            panel.ruleModel.previewChanged.connect(panel.syncFromModel)
-            panel.ruleModel.lastErrorChanged.connect(panel.syncFromModel)
+            panel.ruleModel.previewChanged.connect(panel.syncPreview)
         }
     }
 
@@ -309,7 +170,7 @@ Item {
             }
         }
 
-        // ---------------- 右：规则编辑 ----------------
+        // ---------------- 右：规则编辑（共享组件） ----------------
         AppCard {
             Layout.fillWidth: true
             Layout.preferredWidth: panel.wide ? Math.max(420, panel.width * 0.64 - 14) : 0
@@ -331,423 +192,17 @@ Item {
                     wrapMode: Text.WordWrap
                     font.pixelSize: 16
                     color: theme.textSecondary
-                    text: "未设置过滤规则时，将备份源目录中的全部文件与目录结构；若某项同时命中 Include 与 Exclude，则以 Exclude 为准。"
+                    text: "未设置过滤规则时，将备份源目录中的全部文件与目录结构；若某项同时命中包含与排除规则，则以排除规则为准。"
                 }
 
-                RowLayout {
+                FilterRuleEditor {
+                    ruleModel: panel.ruleModel
+                    objectPrefix: "filter"
+                    busy: controller.busy
+                    heading: ""
+                    intro: ""
+                    showCliLine: true
                     Layout.fillWidth: true
-                    spacing: 8
-
-                    AppButton {
-                        text: "添加 Include 规则"
-                        enabled: !controller.busy
-                        onClicked: {
-                            panel.resetForm("include")
-                            editor.visible = true
-                        }
-                    }
-
-                    AppButton {
-                        text: "添加 Exclude 规则"
-                        enabled: !controller.busy
-                        onClicked: {
-                            panel.resetForm("exclude")
-                            editor.visible = true
-                        }
-                    }
-
-                    AppButton {
-                        text: "清空"
-                        enabled: !controller.busy && panel.ruleList.length > 0
-                        onClicked: {
-                            if (ruleModel)
-                                panel.ruleModel.clearRules()
-                        }
-                    }
-                }
-
-                Repeater {
-                    model: panel.ruleList
-
-                    delegate: RuleCard {
-                        required property int index
-                        required property var modelData
-
-                        ruleIndex: index
-                        actionText: String(modelData["action"] || "")
-                        summaryText: String(modelData["summary"] || "")
-                        dslText: String(modelData["dsl"] || "")
-                        detailText: String(modelData["detail"] || "")
-                        ruleModelRef: panel.ruleModel
-                        busy: controller.busy
-                        totalRules: panel.ruleList.length
-                    }
-                }
-
-                // 编辑表单：字段 + 各字段专属控件，用户不需要记语法
-                ColumnLayout {
-                    id: editor
-                    Layout.fillWidth: true
-                    spacing: 6
-                    visible: false
-
-                    Text {
-                        Layout.fillWidth: true
-                        text: panel.formAction === "include" ? "新建 Include 规则" : "新建 Exclude 规则"
-                        font.pixelSize: 16
-                        font.weight: Font.DemiBold
-                        color: theme.textPrimary
-                    }
-
-                    RowLayout {
-                        Layout.fillWidth: true
-                        spacing: 8
-
-                        AppComboBox {
-                            Layout.preferredWidth: 120
-                            // 字段名就是 C++ 侧的表单键，不翻译：翻译只发生在
-                            // 需要给人看的 type / 运算符下拉里。
-                            model: ["ext", "name", "path", "stem", "type", "size", "uid", "gid", "user", "group", "mtime"]
-                            currentIndex: Math.max(0, model.indexOf(panel.formField))
-                            onActivated: {
-                                panel.formField = currentText
-                                panel.refreshFormError()
-                            }
-                        }
-
-                        AppTextField {
-                            Layout.fillWidth: true
-                            visible: panel.formField === "name" || panel.formField === "path" || panel.formField === "stem"
-                            placeholderText: panel.formField === "path" ? "如 **/build/**" : "如 *.txt"
-                            text: panel.formPattern
-                            onTextEdited: {
-                                panel.formPattern = text
-                                panel.refreshFormError()
-                            }
-                        }
-
-                        AppTextField {
-                            Layout.fillWidth: true
-                            visible: panel.formField === "ext"
-                            placeholderText: "扩展名，用分号分隔，如 txt;md"
-                            text: panel.formExtensions
-                            onTextEdited: {
-                                panel.formExtensions = text
-                                panel.refreshFormError()
-                            }
-                        }
-
-                        AppComboBox {
-                            visible: panel.formField === "type"
-                            Layout.preferredWidth: 140
-                            model: panel.typeLabels
-                            currentIndex: Math.max(0, panel.typeKeys.indexOf(panel.formType))
-                            onActivated: {
-                                panel.formType = panel.typeKeys[currentIndex]
-                                panel.refreshFormError()
-                            }
-                        }
-
-                        AppComboBox {
-                            visible: panel.formField === "size"
-                            Layout.preferredWidth: 80
-                            model: ["<", "<=", ">", ">=", ".."]
-                            currentIndex: Math.max(0, model.indexOf(panel.formCompare))
-                            onActivated: {
-                                panel.formCompare = currentText
-                                panel.refreshFormError()
-                            }
-                        }
-
-                        AppTextField {
-                            visible: panel.formField === "size"
-                            Layout.preferredWidth: 80
-                            text: panel.formSizeLowText
-                            onTextEdited: {
-                                panel.formSizeLowText = text
-                                panel.refreshFormError()
-                            }
-                        }
-
-                        AppTextField {
-                            visible: panel.formField === "size" && panel.formCompare === ".."
-                            Layout.preferredWidth: 80
-                            text: panel.formSizeHighText
-                            onTextEdited: {
-                                panel.formSizeHighText = text
-                                panel.refreshFormError()
-                            }
-                        }
-
-                        AppComboBox {
-                            visible: panel.formField === "size"
-                            Layout.preferredWidth: 80
-                            model: ["B", "KB", "MB", "GB"]
-                            currentIndex: Math.max(0, model.indexOf(panel.formUnit))
-                            onActivated: {
-                                panel.formUnit = currentText
-                                panel.refreshFormError()
-                            }
-                        }
-
-                        AppComboBox {
-                            visible: panel.formField === "uid" || panel.formField === "gid"
-                            Layout.preferredWidth: 110
-                            model: panel.idCompareLabels
-                            currentIndex: Math.max(0, panel.idCompareKeys.indexOf(panel.idCompare))
-                            onActivated: {
-                                if (panel.formField === "uid")
-                                    panel.formUidCompare = panel.idCompareKeys[currentIndex]
-                                else
-                                    panel.formGidCompare = panel.idCompareKeys[currentIndex]
-                                panel.refreshFormError()
-                            }
-                        }
-
-                        AppTextField {
-                            visible: panel.formField === "uid" || panel.formField === "gid"
-                            Layout.preferredWidth: 110
-                            placeholderText: panel.formField === "uid" ? "uid，如 1000" : "gid，如 100"
-                            text: panel.formField === "uid" ? panel.formUidText : panel.formGidText
-                            onTextEdited: {
-                                if (panel.formField === "uid")
-                                    panel.formUidText = text
-                                else
-                                    panel.formGidText = text
-                                panel.refreshFormError()
-                            }
-                        }
-
-                        AppTextField {
-                            visible: (panel.formField === "uid" || panel.formField === "gid") && panel.idCompare === "range"
-                            Layout.preferredWidth: 110
-                            placeholderText: "区间上界"
-                            text: panel.formField === "uid" ? panel.formUidHighText : panel.formGidHighText
-                            onTextEdited: {
-                                if (panel.formField === "uid")
-                                    panel.formUidHighText = text
-                                else
-                                    panel.formGidHighText = text
-                                panel.refreshFormError()
-                            }
-                        }
-
-                        AppTextField {
-                            Layout.fillWidth: true
-                            visible: panel.formField === "user" || panel.formField === "group"
-                            placeholderText: panel.formField === "user" ? "用户名，精确匹配，如 alice" : "用户组名，精确匹配，如 staff"
-                            text: panel.formField === "user" ? panel.formUser : panel.formGroup
-                            onTextEdited: {
-                                if (panel.formField === "user")
-                                    panel.formUser = text
-                                else
-                                    panel.formGroup = text
-                                panel.refreshFormError()
-                            }
-                        }
-
-                        AppComboBox {
-                            visible: panel.formField === "mtime"
-                            Layout.preferredWidth: 130
-                            model: panel.mtimeLabels
-                            currentIndex: Math.max(0, panel.mtimeKeys.indexOf(panel.formMtimeKind))
-                            onActivated: {
-                                panel.formMtimeKind = panel.mtimeKeys[currentIndex]
-                                panel.refreshFormError()
-                            }
-                        }
-
-                        AppTextField {
-                            visible: panel.formField === "mtime" && panel.formMtimeKind === "last_days"
-                            Layout.preferredWidth: 110
-                            placeholderText: "天数，如 7"
-                            text: panel.formDaysBackText
-                            onTextEdited: {
-                                panel.formDaysBackText = text
-                                panel.refreshFormError()
-                            }
-                        }
-
-                        AppTextField {
-                            visible: panel.formField === "mtime" && (panel.formMtimeKind === "day" || panel.formMtimeKind === "day_range")
-                            Layout.preferredWidth: 140
-                            placeholderText: "YYYY-MM-DD"
-                            text: panel.formDateLow
-                            onTextEdited: {
-                                panel.formDateLow = text
-                                panel.refreshFormError()
-                            }
-                        }
-
-                        AppTextField {
-                            visible: panel.formField === "mtime" && panel.formMtimeKind === "day_range"
-                            Layout.preferredWidth: 140
-                            placeholderText: "结束日期 YYYY-MM-DD"
-                            text: panel.formDateHigh
-                            onTextEdited: {
-                                panel.formDateHigh = text
-                                panel.refreshFormError()
-                            }
-                        }
-                    }
-
-                    Text {
-                        Layout.fillWidth: true
-                        wrapMode: Text.WordWrap
-                        font.pixelSize: 15
-                        color: theme.accent
-                        text: panel.formError
-                        visible: text.length > 0
-                    }
-
-                    RowLayout {
-                        spacing: 8
-
-                        AppButton {
-                            text: "添加规则"
-                            variant: "primary"
-                            enabled: !controller.busy && panel.formError.length === 0
-                            onClicked: {
-                                if (!ruleModel)
-                                    return
-                                if (panel.ruleModel.addRule(panel.formMap())) {
-                                    panel.resetForm(panel.formAction)
-                                    editor.visible = false
-                                }
-                            }
-                        }
-
-                        AppButton {
-                            text: "取消"
-                            onClicked: {
-                                panel.resetForm(panel.formAction)
-                                editor.visible = false
-                            }
-                        }
-                    }
-
-                    Text {
-                        Layout.fillWidth: true
-                        wrapMode: Text.WordWrap
-                        font.pixelSize: 15
-                        color: theme.textSecondary
-                        text: {
-                            if (panel.formField === "uid" || panel.formField === "gid")
-                                return "uid / gid 填十进制数字，0 是合法值（root）；区间是闭区间，两端都算命中。"
-                            if (panel.formField === "user" || panel.formField === "group")
-                                return "user / group 精确匹配、大小写敏感，不支持通配符。"
-                            if (panel.formField === "mtime")
-                                return "日期格式 YYYY-MM-DD，区间两端都算命中；最近 N 天按 N × 24 小时计算。"
-                            return "通配符：* 匹配任意字符但不跨 /，? 匹配一个字符，** 可以跨 /。"
-                        }
-                    }
-                }
-
-
-                // ---------- 高级规则（完整 DSL）----------
-                //
-                // 可视化表单每条规则只填一个子条件；DSL 允许一条规则里写多个
-                // 条件（AND），而多个 --include 之间是 OR —— 两者并不等价。
-                // 这里让 Manual Backup 的筛选能力与 CLI 完全一致：文本原样交给
-                // 共享核心校验（validateDsl 走的就是 Filter::AddRule）。
-                ColumnLayout {
-                    Layout.fillWidth: true
-                    spacing: 6
-
-                    Text {
-                        Layout.fillWidth: true
-                        wrapMode: Text.WordWrap
-                        font.pixelSize: 16
-                        font.weight: Font.DemiBold
-                        color: theme.textSecondary
-                        text: "高级规则（一条规则写多个条件，用空格分隔，全部满足才命中）"
-                    }
-
-                    RowLayout {
-                        Layout.fillWidth: true
-                        spacing: 8
-
-                        AppComboBox {
-                            id: advancedAction
-                            Layout.preferredWidth: 110
-                            model: ["include", "exclude"]
-                        }
-
-                        AppTextField {
-                            id: advancedDsl
-                            objectName: "advancedFilterRuleField"
-                            Layout.fillWidth: true
-                            placeholderText: "如 name:*.txt size:<1MB"
-                            onTextEdited: advancedError.text = ""
-                        }
-
-                        AppButton {
-                            objectName: "addAdvancedFilterRuleButton"
-                            text: "添加高级规则"
-                            enabled: !controller.busy
-                            onClicked: {
-                                if (!ruleModel)
-                                    return
-                                if (advancedDsl.text.length === 0) {
-                                    advancedError.text = "请先填写规则"
-                                    return
-                                }
-                                if (ruleModel.addAdvancedRule(advancedAction.currentText,
-                                                              advancedDsl.text)) {
-                                    advancedError.text = ""
-                                    advancedDsl.text = ""
-                                } else {
-                                    advancedError.text = ruleModel.lastError
-                                }
-                            }
-                        }
-                    }
-
-                    Text {
-                        id: advancedError
-                        objectName: "advancedFilterRuleError"
-                        Layout.fillWidth: true
-                        wrapMode: Text.WordWrap
-                        font.pixelSize: 15
-                        color: theme.accent
-                        visible: text.length > 0
-                    }
-                }
-
-                Text {
-                    Layout.fillWidth: true
-                    wrapMode: Text.WordWrap
-                    font.pixelSize: 17
-                    color: theme.textPrimary
-                    text: panel.summaryLine
-                }
-
-                Text {
-                    Layout.fillWidth: true
-                    wrapMode: Text.WordWrap
-                    font.pixelSize: 16
-                    font.family: "monospace"
-                    color: theme.textSecondary
-                    text: panel.dslPreview.length > 0 ? panel.dslPreview : "（还没有规则）"
-                }
-
-                Text {
-                    Layout.fillWidth: true
-                    wrapMode: Text.WordWrap
-                    font.pixelSize: 15
-                    color: theme.accent
-                    text: panel.errorText
-                    visible: text.length > 0
-                }
-
-                Text {
-                    Layout.fillWidth: true
-                    wrapMode: Text.WordWrap
-                    font.pixelSize: 16
-                    font.family: "monospace"
-                    color: theme.textSecondary
-                    visible: panel.ruleList.length > 0
-                    text: "CLI 等价参数：" + panel.cliLine
                 }
             }
         }

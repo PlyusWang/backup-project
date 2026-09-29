@@ -112,6 +112,23 @@ struct FilterRuleDraft {
 
 const char* RuleFieldName(RuleField field);
 
+// ---- 展示用的中文表 ----
+//
+// 普通用户不该看到 ext: / name: / size:<1MB 这些语法，所以"有哪些条件可选、
+// 每个条件叫什么、怎么填"必须有地方定义，而且只能有一个地方。
+//
+// 这几张表就是那个地方：GUI 的条件类型下拉、单位下拉、比较方式下拉，以及规则
+// 卡片主行那句人话摘要，全部读这里。于是"界面上能选的条件"与"builder 真的能
+// 生成的条件"在结构上是同一份东西——不会出现"下拉里有一个核心执行不了的项"，
+// 也不会出现"某个条件能生成、界面上却叫不出名字"。
+const char* RuleFieldLabel(RuleField field);
+// 一句面向用户的填写说明（占位符 / 例句之外的那句"为什么"）。
+const char* RuleFieldHint(RuleField field);
+const char* SizeCompareLabel(RuleSizeCompare compare);
+const char* SizeUnitLabel(RuleSizeUnit unit);
+const char* TypeValueLabel(RuleTypeValue type);
+const char* MtimeKindLabel(RuleMtimeKind kind);
+
 // 结构校验：只查"表单填得对不对"（空值、非法日期、range 反向）。
 // 不做语法裁决——那是 ValidateRule 的事。
 bool ValidateClause(const FilterClauseDraft& clause,
@@ -149,6 +166,15 @@ bool BuildFilterFromDrafts(const std::vector<FilterRuleDraft>& rules,
 // 人类可读摘要（中文，给界面显示用）。
 std::string SummarizeClause(const FilterClauseDraft& clause);
 std::string Summarize(const FilterRuleDraft& rule);
+
+// 短摘要：规则卡片**主行**用的那一句，例如 "文件扩展名：cpp、h"、
+// "文件大小 小于 1 MB"。
+//
+// 与 Summarize 的分工：Summarize 是一整句话（"包含：扩展名为 cpp 或 h 的文件"），
+// 适合放在卡片正文；短摘要是"条件：取值"的名词短语，适合放在标题行，让人一眼
+// 看出这条规则在筛什么。两者都从同一份草稿生成，不解析 DSL 文本。
+std::string SummarizeClauseShort(const FilterClauseDraft& clause);
+std::string SummarizeShort(const FilterRuleDraft& rule);
 
 // 拼 CLI 参数：--include / --exclude 与规则文本交替出现，供"复制为 CLI 参数"。
 std::vector<std::string> CliArguments(
