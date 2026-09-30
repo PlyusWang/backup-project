@@ -10,7 +10,7 @@
 #   2. offscreen 启动自检：QML 运行期告警会让进程自己以非 0 退出。
 #   3. qmllint 静态检查；机器上没装就明确说“跳过”，而不是静默算通过。
 #   4. 几条 grep 断言：资源清单、忙时禁用、拒绝假进度、拒绝网络栈，
-#      以及 repository-driven 架构约束（五页结构、没有 standalone 恢复页、
+#      以及 repository-driven 架构约束（七页结构、没有 standalone 恢复页、
 #      QML 不出现 archive 完整路径、不自己拼 repository 路径）。
 #   5. --self-test 真跑一次 direct archive 打包 + 解包，再用 diff -r 比对目录树；
 #      顺带断言这条 direct 测试路径的产物仍是 legacy v0.1
@@ -29,8 +29,13 @@
 #      产品 CLI 没有 --password 选项）；--backup-options-test 走真实控制器路径
 #      验证解析表、四种算法组合、密码校验、未知 key、加密与 legacy 恢复、
 #      目录字段、密码不落盘。
-#  12. 截图（写进 tests/output/，评审产物不进仓库）：两套主题 × 五页 +
+#  12. 截图（写进 tests/output/，评审产物不进仓库）：两套主题 × 七页 +
 #      高级选项展开 + 加密恢复密码对话框。
+#  13. 远程备份页（PR #20）：真的起一个 backup-server 进程，用页面背后的
+#      RemoteController 走完 注册 / 登录 / 上传真实归档 / 列表 / 下载 / 删除 /
+#      退出登录，并断言密码回显模式、口令与 token 不落盘、忙碌时冲突请求被拒、
+#      页面提示不外泄、列表行显示名称 / 大小 / 时间、删除必须确认、两套主题
+#      下关键控件几何正常。
 #
 # 所有 GUI 调用都带 --config-file 指向临时目录，并且导出临时 XDG_CONFIG_HOME：
 # AppTheme 的 QSettings 与 QStandardPaths 都跟着它走，测试绝不读写真实用户配置。
@@ -144,6 +149,16 @@ if [[ -x "$ROOT_DIR/build/backup-gui-modern" ]]; then
   record_pass "构建产物存在"
 else
   record_fail "构建产物缺失"
+fi
+
+# 远程备份页的自检要真的起一个服务端进程：它就是与 network_test.sh、阿里云
+# 部署同一个 Makefile 目标产出的那个 backup-server，不是测试专用的假服务端。
+echo "[modern-gui] 1b) 构建 build/backup-server（--remote-test 需要真服务端）"
+make server 2>&1 | tee -a "$LOG_FILE" | tail -2
+if [[ -x "$ROOT_DIR/build/backup-server" ]]; then
+  record_pass "backup-server 构建产物存在"
+else
+  record_fail "backup-server 构建产物缺失"
 fi
 
 # offscreen 让没有显示器的环境也能真正把窗口建出来；
@@ -282,6 +297,19 @@ classify_qmllint() {
           (snippet ~ /realtime\./ || snippet ~ /page\./)) {
         MarkAllowed(msg); return
       }
+      # PR #20：RemotePage.qml 只引用两个上下文属性 —— main.cpp 注册的
+      # remote（远程备份控制器）与本页自己的根 id page。qmllint 同样不认识
+      # 上下文属性，放行规则精确限定到"这个文件 + 这两个名字"。
+      if (msg ~ /Unqualified access/ && msg ~ /RemotePage\.qml/ &&
+          (snippet ~ /remote\./ || snippet ~ /page\./)) {
+        MarkAllowed(msg); return
+      }
+      # RemoteSnapshotCard.qml 是远程备份列表的委托组件：theme 由上面那条通用
+      # 规则覆盖，这里补它自己的根 id card。
+      if (msg ~ /Unqualified access/ && msg ~ /RemoteSnapshotCard\.qml/ &&
+          (snippet ~ /card\./ || snippet ~ /theme\./)) {
+        MarkAllowed(msg); return
+      }
       if (msg ~ /Cannot defer property assignment to "contentItem"/) {
         MarkAllowed(msg); return
       }
@@ -378,10 +406,11 @@ fi
 # 恢复已经不是独立页面，而是备份管理页里的一个动作 —— 这几条断言把结构钉死，
 # 免得日后又长回一个"恢复页"。
 # PR #19 之后是六页：首页 / 备份 / 自动备份 / 实时备份 / 备份管理 / 设置。
-expect_count "$QML_DIR/Main.qml" "NavItem {" 6 \
-  "侧栏有六个导航项（首页 / 备份 / 自动备份 / 实时备份 / 备份管理 / 设置）"
-expect_count "$QML_DIR/Main.qml" "opacity: root.currentPage === " 6 \
-  "StackLayout 里六页各自绑定可见性"
+# PR #20 之后是七页，最后加上"远程备份"。
+expect_count "$QML_DIR/Main.qml" "NavItem {" 7 \
+  "侧栏有七个导航项（首页 / 备份 / 自动备份 / 实时备份 / 备份管理 / 远程备份 / 设置）"
+expect_count "$QML_DIR/Main.qml" "opacity: root.currentPage === " 7 \
+  "StackLayout 里七页各自绑定可见性"
 expect_count_re "$QML_DIR/Main.qml" "^[[:space:]]*currentIndex: root.currentPage" 1 \
   "StackLayout 跟随 root.currentPage"
 if grep -rq 'OperationPage' "$QML_DIR" "$RESOURCE_FILE"; then
@@ -389,6 +418,76 @@ if grep -rq 'OperationPage' "$QML_DIR" "$RESOURCE_FILE"; then
 else
   record_pass "没有 standalone OperationPage"
 fi
+
+# ---- PR #20 远程备份页 ----
+#
+# 这一页是 GUI 与远程备份网络层之间**唯一**的入口。下面这几条把它钉住：
+# 页面进资源清单、导航只有一个入口、密码框是密码回显、删除必须经过确认、
+# 进度条绑的是网络层的真实字节数。
+REMOTE_PAGE_QML="$QML_DIR/pages/RemotePage.qml"
+REMOTE_CARD_QML="$QML_DIR/components/RemoteSnapshotCard.qml"
+REMOTE_CONTROLLER_H="$ROOT_DIR/ui/modern/remote_controller.h"
+REMOTE_CONTROLLER_CPP="$ROOT_DIR/ui/modern/remote_controller.cpp"
+expect_count "$RESOURCE_FILE" "qml/pages/RemotePage.qml" 1 \
+  "resources.qrc 收录 RemotePage.qml"
+expect_count "$RESOURCE_FILE" "qml/components/RemoteSnapshotCard.qml" 1 \
+  "resources.qrc 收录 RemoteSnapshotCard.qml"
+expect_count "$QML_DIR/Main.qml" 'objectName: "remoteNavItem"' 1 \
+  "侧栏只有一个远程备份入口"
+# 明文常显的密码框在这一页是绝不允许出现的样子。
+expect_count "$REMOTE_PAGE_QML" "echoMode: TextInput.Password" 1 \
+  "远程备份页的密码框是密码回显模式"
+# 删除必须经过确认：整页真正调用客户端删除的地方只有一处，
+# 而且列表行只发意图（一个信号声明 + 一个触发）。
+expect_count "$REMOTE_PAGE_QML" "remote.deleteSnapshot(" 1 \
+  "整页只有一处真正调用删除"
+expect_count "$REMOTE_CARD_QML" "deleteRequested(" 2 \
+  "列表行只发删除意图（声明 + 触发）"
+expect_count "$REMOTE_PAGE_QML" "deleteDialog.open()" 1 \
+  "删除先打开确认对话框"
+expect_count "$REMOTE_PAGE_QML" 'objectName: "remoteDeleteDialog"' 1 \
+  "删除确认对话框存在"
+# 这一页的临时提示属于它自己：离开即消费，不污染其它页面。
+expect_count "$REMOTE_PAGE_QML" 'pageScope: "remote"' 1 \
+  "远程备份页的状态栏声明了 pageScope"
+expect_count "$QML_DIR/Main.qml" "remote.clearStatus()" 1 \
+  "离开远程备份页时消费掉它的临时提示"
+# 进度条必须绑网络层给出的真实比例。
+expect_count "$REMOTE_PAGE_QML" "value: remote.progressRatio" 1 \
+  "进度条绑的是网络层的真实字节比例"
+expect_count "$REMOTE_PAGE_QML" "remote.transferActive" 1 \
+  "进度只在真的有传输时出现"
+# 复用现有组件，而不是另起一套视觉。
+expect_count "$REMOTE_PAGE_QML" "AppCard {" 4 \
+  "远程备份页的四张卡片都用共享 AppCard"
+expect_count "$REMOTE_PAGE_QML" "StatusBanner {" 1 \
+  "远程备份页用共享 StatusBanner"
+expect_count "$REMOTE_PAGE_QML" "AppTextField {" 7 \
+  "远程备份页的输入框都用共享 AppTextField"
+# 第二套 socket / 协议实现？GUI 这一侧只允许经 RemoteController 调共享客户端。
+# 断言只看代码行：注释里说明"这里没有 socket"是正常的。
+REMOTE_CODE_TMP="$TEST_STATE_DIR/remote-code.txt"
+{
+  sed 's://.*::' "$REMOTE_CONTROLLER_H"
+  sed 's://.*::' "$REMOTE_CONTROLLER_CPP"
+  sed 's://.*::' "$REMOTE_PAGE_QML"
+  sed 's://.*::' "$REMOTE_CARD_QML"
+} > "$REMOTE_CODE_TMP"
+if grep -qE 'sys/socket\.h|netinet/in\.h|arpa/inet\.h|AF_INET|::socket\(|::send\(|::recv\(|FrameHeader|kProtocolMagic|Opcode::' "$REMOTE_CODE_TMP"; then
+  record_fail "GUI 里出现了第二套 socket / 协议实现"
+else
+  record_pass "GUI 只经 RemoteController 调共享的 RemoteArchiveClient"
+fi
+expect_count "$REMOTE_CONTROLLER_H" "remote_backup_client.h" 1 \
+  "RemoteController 复用共享客户端头"
+# 口令与会话令牌只在内存里：这一侧不许有任何持久化调用。
+if grep -qE 'QSettings|setValue\(|QStandardPaths::writableLocation' "$REMOTE_CODE_TMP"; then
+  record_fail "RemoteController 或远程备份页里出现了持久化调用"
+else
+  record_pass "口令与令牌只在内存：GUI 侧没有任何持久化调用"
+fi
+expect_count "$REMOTE_CONTROLLER_CPP" "password_.fill(QChar(0))" 2 \
+  "退出登录与析构都会擦掉内存里的口令"
 for page in BackupPage BackupManagementPage SettingsPage; do
   expect_count_re "$RESOURCE_FILE" "qml/pages/${page}\.qml" 1 "resources.qrc 收录 $page.qml"
 done
@@ -571,13 +670,18 @@ echo "[modern-gui] 7) 关闭守卫"
 # Alt+F4 与窗口管理器都能绕过去。
 expect_count_re "$QML_DIR/Main.qml" "^[[:space:]]*onClosing:" 1 \
   "主窗口在 onClosing 里处理关闭请求"
-# 关闭条件必须同时覆盖三位 writer：手动备份 / 恢复是 controller.busy，计划评估
-# 与实时触发跑在 QtConcurrent 上，落盘的是各自的 libraryBusy。只写
-# controller.busy 会漏掉"实时备份正在写归档时 Alt+F4 能把窗口关掉"。
+# 关闭条件必须同时覆盖每一位 writer：手动备份 / 恢复是 controller.busy，计划评估
+# 与实时触发跑在 QtConcurrent 上，落盘的是各自的 libraryBusy；PR #20 之后还要
+# 加上远程传输（remote.busy）。只写 controller.busy 会漏掉"实时备份正在写归档
+# 或正在上传到云端时 Alt+F4 能把窗口关掉"。
 # 用正则版：expect_present 定义在本文件靠后的位置，而这一节在它之前执行。
+# 条件现在跨两行，所以拆成两条：前三位在首行，远程那一位在续行。
 expect_count_re "$QML_DIR/Main.qml" \
-  'if \(controller\.busy \|\| schedule\.libraryBusy \|\| realtime\.libraryBusy\)' 1 \
-  "关窗条件覆盖手动 / 计划 / 实时三位 writer"
+  'if \(controller\.busy \|\| schedule\.libraryBusy \|\| realtime\.libraryBusy$' 1 \
+  "关窗条件覆盖手动 / 计划 / 实时三位本地 writer"
+expect_count_re "$QML_DIR/Main.qml" \
+  '^[[:space:]]*\|\| remote\.busy\) \{$' 1 \
+  "远程传输进行中同样不允许关窗"
 # 错误正文要能选中复制，核心给的长路径才有可能贴出来。
 expect_count_re "$QML_DIR/components/StatusBanner.qml" "selectByMouse:[[:space:]]*true" 1 \
   "状态栏正文可鼠标选中"
@@ -1254,7 +1358,7 @@ fi
 printf '{\n  "version": 1,\n  "backup_repository_path": "%s"\n}\n' "$SHOT_PLAIN_REPO" > "$SHOT_PLAIN_CFG"
 printf '{\n  "version": 1,\n  "backup_repository_path": "%s"\n}\n' "$SHOT_ENC_REPO" > "$SHOT_ENC_CFG"
 
-# 一轮截图 = 十张固定状态（五页 × 两主题）+ 高级选项展开两张（两主题）
+# 一轮截图 = 十四张固定状态（七页 × 两主题）+ 高级选项展开两张（两主题）
 # + 调用方追加的状态（只有加密仓库那一轮才有恢复密码对话框）。
 shot_run() {
   local label="$1"
@@ -1275,6 +1379,7 @@ shot_run() {
   expected="$expected schedule-light schedule-dark"
   expected="$expected management-light management-dark"
   expected="$expected settings-light settings-dark"
+  expected="$expected remote-light remote-dark"
   expected="$expected backup-expanded-light backup-expanded-dark"
   for extra in "$@"; do
     expected="$expected $extra"
@@ -2407,6 +2512,29 @@ expect_present "$SCHEDULE_PAGE_QML" "立即检查当前状态，并在需要时�
 expect_missing "$SCHEDULE_PAGE_QML" '"保存计划"' \
   "旧文案“保存计划”已经消失"
 
+# 远程备份页同理：普通用户只需要知道"服务器 / 账号 / 云端备份 / 上传 / 下载 /
+# 删除"，协议名、算法名、数据库名与传输层实现细节都不该出现在界面文案里。
+# 只看代码行：注释里写"这里没有 BPNET1 / token"正是这条约束的说明，
+# 不能把它自己判成违规（与上面 socket 那条用的是同一份去注释文本）。
+for jargon in "BPNET1" "PBKDF2" "HMAC" "SQLite" "opcode" "request_id" \
+              "FrameHeader" "kProtocolMagic" "SSH" "token"; do
+  if grep -qF -- "$jargon" "$REMOTE_CODE_TMP"; then
+    record_fail "远程备份页出现了开发者术语：$jargon"
+  else
+    record_pass "远程备份页不出现开发者术语：$jargon"
+  fi
+done
+expect_present "$REMOTE_PAGE_QML" '"远程备份"' \
+  "导航与标题用“远程备份”这个说法"
+expect_present "$REMOTE_PAGE_QML" '"连接服务器"' \
+  "远程备份页有连接区域"
+expect_present "$REMOTE_PAGE_QML" '"云端备份"' \
+  "远程备份页有云端备份区域"
+expect_present "$REMOTE_PAGE_QML" '"技术详情"' \
+  "协议层面的信息折叠进“技术详情”"
+expect_present "$REMOTE_PAGE_QML" '"覆盖并重新下载"' \
+  "目标已存在时给的是明确动作，不是常驻开关"
+
 echo "[modern-gui] 22) 共享 ComboBox 的下拉行状态（hover / 键盘光标 / 已选择）"
 #
 # 三轮人工验收踩的是同一个坑的三种形态，根因都是"用一个残影当输入状态用"：
@@ -2555,6 +2683,36 @@ if grep -qF "qml-warning" "$TEST_STATE_DIR/combo-hover.log"; then
   record_fail "下拉状态自检期间出现了 QML 运行期告警"
 else
   record_pass "下拉状态自检期间 0 QML 运行期告警"
+fi
+
+echo "[modern-gui] 23) 远程备份页（RemoteController + 真实 backup-server 进程）"
+#
+# 这一节不是 grep：它真的起一个 backup-server，再用页面背后的 RemoteController
+# 走完 注册 -> 登录 -> 上传真实归档 -> 列表 -> 下载 -> 删除 -> 退出登录，
+# 并断言密码回显模式、口令与 token 不落盘、忙碌时冲突请求被拒、页面提示不外泄、
+# 列表行显示名称 / 大小 / 时间、删除必须确认、两套主题下控件几何正常。
+mkdir -p "$TEST_STATE_DIR/remote"
+set +e
+QT_QPA_PLATFORM=offscreen QSG_RHI_BACKEND=software timeout 600 \
+  ./build/backup-gui-modern --remote-test \
+  --config-file "$TEST_STATE_DIR/remote/config.json" \
+  --schedule-file "$TEST_STATE_DIR/remote/schedule.json" \
+  --realtime-file "$TEST_STATE_DIR/remote/realtime.json" \
+  > "$TEST_STATE_DIR/remote.log" 2>&1
+remote_status=$?
+set -e
+sed 's/^/[modern-gui]     /' "$TEST_STATE_DIR/remote.log"
+cat "$TEST_STATE_DIR/remote.log" >> "$LOG_FILE"
+if [[ "$remote_status" -eq 0 ]]; then
+  record_pass "远程备份页合同测试全部通过（$(grep -oE 'passed=[0-9]+ failed=[0-9]+' "$TEST_STATE_DIR/remote.log" | tail -1)）"
+else
+  record_fail "远程备份页合同测试失败（退出码 $remote_status）" \
+    "$(grep -m3 'FAIL' "$TEST_STATE_DIR/remote.log" | tr '\n' ' ')"
+fi
+if grep -qF "qml-warning" "$TEST_STATE_DIR/remote.log"; then
+  record_fail "远程备份页自检期间出现了 QML 运行期告警"
+else
+  record_pass "远程备份页自检期间 0 QML 运行期告警"
 fi
 
 echo "[modern-gui] 通过 $PASS_COUNT 项，失败 $FAIL_COUNT 项"
