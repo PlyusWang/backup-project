@@ -114,6 +114,7 @@ bool ExtractGlobalOption(std::vector<std::string>* arguments,
 }
 
 bool IsKnownCommand(const std::string& command) {
+  if (command == "realtime") return true;
   return command == "backup" || command == "restore" || command == "preview" ||
          command == "schedule" || command == "repository" ||
          command == "config";
@@ -131,11 +132,15 @@ int main(int argc, char* argv[]) {
   std::string option_error;
   bool saw_config_file = false;
   bool saw_schedule_file = false;
+  bool saw_realtime_file = false;
   if (!ExtractGlobalOption(&arguments, "--config-file",
                            &context.config_file_path, &saw_config_file,
                            &option_error) ||
       !ExtractGlobalOption(&arguments, "--schedule-file",
                            &context.schedule_file_path, &saw_schedule_file,
+                           &option_error) ||
+      !ExtractGlobalOption(&arguments, "--realtime-file",
+                           &context.realtime_file_path, &saw_realtime_file,
                            &option_error)) {
     std::cerr << "Error: " << option_error << "\n\n";
     backupproject::PrintCliUsage(context.program_name, std::cerr);
@@ -193,6 +198,9 @@ int main(int argc, char* argv[]) {
   if (context.schedule_file_path.empty()) {
     context.schedule_file_path = backupproject::DefaultScheduleFilePath();
   }
+  if (context.realtime_file_path.empty()) {
+    context.realtime_file_path = backupproject::DefaultRealtimeFilePath();
+  }
 
   const std::vector<std::string> rest(arguments.begin() + 1, arguments.end());
 
@@ -207,6 +215,9 @@ int main(int argc, char* argv[]) {
   }
   if (command == "schedule") {
     return backupproject::RunScheduleCommand(context, rest);
+  }
+  if (command == "realtime") {
+    return backupproject::RunRealtimeCommand(context, rest);
   }
   if (command == "repository") {
     return backupproject::RunRepositoryCommand(context, rest);

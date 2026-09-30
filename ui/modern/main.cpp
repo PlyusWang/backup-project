@@ -21,13 +21,31 @@
 //   --schedule-file <路径>              指定计划存储文件（测试隔离真实计划）
 //   --schedule-show                     把控制器读到的计划配置打成 key=value，
 //                                       用来证明 GUI 与 CLI 读的是同一份 store
+//   --realtime-test                     验证实时备份页的控制器链路：写配置并
+//                                       逐字段读回、attach watcher、resync 触发
+//                                       快照、文件事件触发快照、列出实时快照，
+//                                       以及运行期改仓库后跟上新仓库 / 非法仓库
+//                                       只降级不写盘 / 未启用时不启动 watcher
+//   --realtime-show                     把控制器读到的实时配置打成 key=value，
+//                                       用来证明 GUI 与 CLI 读的是同一份 store
+//   --realtime-file <路径> 指定实时存储文件（测试隔离真实实时配置）
 //   --path-test                         验证本地路径与 URL 互转不丢字符
-//   --close-guard-test                  验证任务进行中关窗会被拦下
+//   --close-guard-test                  验证任务进行中关窗会被拦下：手动备份、
+//                                       实时触发、计划评估三位 writer 都要在
+//                                       飞时被拒绝、结束后放行
 //   --gui-contract-test                 验证首页三张卡片的按钮几何，以及
 //                                       "临时提示只属于产生它的页面"这条契约
 //   --incremental-test <源> <仓库>      PR #18 GUI/CLI parity：走真实控制器
 //                                       入口跑 baseline / no-change / delta /
 //                                       依赖链恢复，按固定格式打印结果
+//   --combo-hover-test                  共享下拉的 hover 残留回归：真的把指针
+//                                       移到某一行、再移走，断言灰底严格跟着指针
+//                                       来去，关掉重开也不留痕迹
+//   --filter-ux-test                    三页 parity：同一个普通表单输入
+//                                       （条件类型 + 取值）在备份页 /
+//                                       自动备份页 / 实时备份页生成同一条
+//                                       DSL，非法输入三处 得到同一句来自共享
+//                                       builder 的原因
 //   --native-frame                      退回系统原生标题栏（Wayland 兜底）
 //
 // 这些开关让没有显示器的环境也能验证界面：离屏平台插件把窗口真正建出来，
@@ -43,6 +61,9 @@
 #include <QFile>
 #include <QFileInfo>
 #include <QGuiApplication>
+#include <QHoverEvent>
+#include <QKeyEvent>
+#include <QMetaObject>
 #include <QPointF>
 #include <QQmlApplicationEngine>
 #include <QQmlContext>
@@ -59,6 +80,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <functional>
 
 #include "app_paths.h"
 #include "app_theme.h"
@@ -68,13 +90,15 @@
 #include "config_manager.h"
 #include "filter_rule_model.h"
 #include "operation_gate.h"
+#include "realtime_controller.h"
 #include "schedule_controller.h"
+#include "schedule_frequency.h"
 #include "schedule_store.h"
 #include "scheduler_lock.h"
 
 namespace {
 
-const int kPageCount = 5;
+const int kPageCount = 6;
 int g_qml_warnings = 0;
 
 // QML 的运行期问题（binding loop、类型错误、模块缺失……）都以 Qt warning 发出。
@@ -141,6 +165,16 @@ QString ResolveScheduleFilePath(const QStringList& arguments) {
     return arguments.at(index + 1);
   }
   return QString::fromStdString(backupproject::DefaultScheduleFilePath());
+}
+
+// 实时备份存储文件：默认位置同样来自 app_paths.h（backupctl realtime 读的就是
+// 这一份），--realtime-file 只用于测试隔离。
+QString ResolveRealtimeFilePath(const QStringList& arguments) {
+  const int index = arguments.indexOf(QStringLiteral("--realtime-file"));
+  if (index >= 0 && index + 1 < arguments.size()) {
+    return arguments.at(index + 1);
+  }
+  return QString::fromStdString(backupproject::DefaultRealtimeFilePath());
 }
 
 // 在可视项树里按 objectName 找一个 QQuickItem。
@@ -222,9 +256,9 @@ int CaptureScreenshots(QQuickWindow* window, backup_modern::AppTheme* theme,
   };
 
   // 顺序必须与 Main.qml 的 StackLayout 一致：首页 / 备份 / 自动备份 /
-  // 备份管理 / 设置。
-  const char* page_names[kPageCount] = {"home", "backup", "schedule",
-                                        "management", "settings"};
+  // 备份管理 / 设置 / 实时备份。
+  const char* page_names[kPageCount] = {"home",       "backup",   "schedule",
+                                        "management", "settings", "realtime"};
   for (int dark = 0; dark < 2; ++dark) {
     theme->setDark(dark == 1);
     for (int page = 0; page < kPageCount; ++page) {
@@ -737,14 +771,66 @@ int RunPathTest(backup_modern::BackupController* controller) {
   return failures == 0 ? 0 : 1;
 }
 
+// 仓库里的归档清单与数量。定义在文件靠后的位置（--schedule-test 也在用），
+// 这里先声明：--close-guard-test 与 --realtime-test 都要拿它做"到底有没有写盘"
+// 的判别 —— 只看控制器自己报的状态是不够的。
+QStringList ArchiveNames(const QString& repository);
+int CountArchives(const QString& repository);
+QString ScheduleConfigSignature(const backupproject::ScheduleConfig& config);
+
 // --close-guard-test：验证“任务进行中不许关窗”的契约。
-// busy 在 startBackup() 返回前就已置位，而任务结束信号要等回到事件循环
-// 才会派发，所以在同一个事件循环回合里检查，结论不取决于任务跑得多快。
 //
-// 这里用 direct archive 入口：close guard 只关心 busy 这一位，
-// 而 direct 入口不需要先配置仓库，测试因此更短、更聚焦。
+// 不变式只有一条：任何会改动持久状态的业务操作在飞时，窗口不许关。进程里有
+// 三个 writer，忙标志各有一位 —— 手动备份 / 恢复落在 controller.busy，而计划
+// 评估与实时触发都跑在 QtConcurrent 上，真正落盘的那一位是各自的 libraryBusy。
+// 所以判别必须分别落到这三条**真实**路径上，而不是只看 controller.busy：
+// 少了实时那一段，"正在写归档时 Alt+F4 能把窗口关掉"这个洞就测不出来。
+//
+// busy 在 Submit 里、后台任务启动之前就已置位，而任务结束信号要等回到事件循环
+// 才会派发；所以"在同一个事件循环回合里检查"的结论不取决于任务跑得多快。
+// 实时那一段用真实事件循环等到 libraryBusy 真的置起来，再请求关窗。
+//
+// 全程只用临时目录（临时 config / schedule / realtime / 仓库 / 源目录），
+// 绝不读写用户真实配置，也不碰冻结的 Demo。
 int RunCloseGuardTest(QQuickWindow* window,
-                      backup_modern::BackupController* controller) {
+                      backup_modern::BackupController* controller,
+                      backup_modern::ScheduleController* schedule,
+                      backup_modern::RealtimeController* realtime) {
+  int failures = 0;
+
+  // 关窗被拒绝时必须给出说明，而不是"点了没反应"。每段测完都把提示关掉：
+  // 否则下一段的 visible 断言会一直是真的，那条断言就失去判别力。
+  QObject* busy_dialog =
+      window->findChild<QObject*>(QStringLiteral("busyCloseDialog"));
+  const auto dialog_visible = [busy_dialog]() {
+    return busy_dialog != nullptr && busy_dialog->property("visible").toBool();
+  };
+  const auto dismiss_dialog = [busy_dialog]() {
+    if (busy_dialog != nullptr) {
+      QMetaObject::invokeMethod(busy_dialog, "close");
+    }
+  };
+  // 在真实事件循环里等某个 worker 进入"正在落盘"。轮询而不是 sleep：
+  // inotify 事件、debounce 定时器、QtConcurrent 的启动与回收都在这个循环里跑。
+  const auto wait_for_busy = [](auto* worker, int timeout_ms) {
+    QEventLoop loop;
+    QTimer poll;
+    poll.setInterval(10);
+    QObject::connect(&poll, &QTimer::timeout, &loop, [worker, &loop]() {
+      if (worker->libraryBusy()) loop.quit();
+    });
+    QTimer guard;
+    guard.setSingleShot(true);
+    QObject::connect(&guard, &QTimer::timeout, &loop, &QEventLoop::quit);
+    poll.start();
+    guard.start(timeout_ms);
+    if (!worker->libraryBusy()) loop.exec();
+    return worker->libraryBusy();
+  };
+
+  // ---- 1) 手动备份：controller.busy ----
+  //
+  // 这一段用 direct archive 入口：它不需要先配置仓库，测试因此更短、更聚焦。
   QTemporaryDir dir;
   const QString source = dir.filePath(QStringLiteral("source"));
   const QString archive = dir.filePath(QStringLiteral("backup.bak"));
@@ -767,7 +853,6 @@ int RunCloseGuardTest(QQuickWindow* window,
     return 1;
   }
 
-  int failures = 0;
   // 忙的时候关窗：必须被 onClosing 拒绝，窗口留着。
   const bool closed_while_busy = window->close();
   std::printf("%s 忙时 close() 被拒绝 (返回=%s)\n",
@@ -776,13 +861,20 @@ int RunCloseGuardTest(QQuickWindow* window,
   failures += closed_while_busy ? 1 : 0;
 
   // 光拒绝还不够：得给用户一个说明，而不是点了没反应。
-  QObject* dialog =
-      window->findChild<QObject*>(QStringLiteral("busyCloseDialog"));
-  const bool dialog_open =
-      dialog != nullptr && dialog->property("visible").toBool();
+  const bool dialog_open = dialog_visible();
   std::printf("%s 忙时关窗会弹出提示 (visible=%s)\n",
               dialog_open ? "ok  " : "FAIL", dialog_open ? "true" : "false");
   failures += dialog_open ? 0 : 1;
+
+  // 提示能关掉（"知道了"按钮走的就是 close()）。不关掉它，后面两段的 visible
+  // 断言会一直是 true —— 那等于没测。
+  dismiss_dialog();
+  WaitForAnimation(200);
+  const bool dialog_dismissed = !dialog_visible();
+  std::printf("%s 提示可以被用户关掉 (visible=%s)\n",
+              dialog_dismissed ? "ok  " : "FAIL",
+              dialog_visible() ? "true" : "false");
+  failures += dialog_dismissed ? 0 : 1;
 
   if (!controller->waitForIdle(120000) || controller->busy()) {
     std::fprintf(stderr, "FAIL 等待任务结束超时\n");
@@ -795,6 +887,155 @@ int RunCloseGuardTest(QQuickWindow* window,
               closed_when_idle ? "ok  " : "FAIL",
               closed_when_idle ? "true" : "false");
   failures += closed_when_idle ? 0 : 1;
+
+  // 后面两段测的还是同一扇窗口，把它重新显示出来。
+  window->show();
+  WaitForAnimation(50);
+
+  // ---- 2) 实时触发：realtime.libraryBusy ----
+  //
+  // 真的跑一次实时备份（enabled=true 会 attach + 合成一次 resync），再用真实
+  // 事件循环等到 libraryBusy 置起来。判别前提是另外两位都是闲的：此时拒绝
+  // 关窗只可能来自 realtime.libraryBusy。
+  //
+  // 实时与计划共用这一个临时根：仓库必须活到函数结束，计划那一段还要往同一个
+  // 仓库里写归档。
+  QTemporaryDir work;
+  const QString realtime_source =
+      work.filePath(QStringLiteral("realtime-source"));
+  const QString schedule_source =
+      work.filePath(QStringLiteral("schedule-source"));
+  const QString repository = work.filePath(QStringLiteral("repository"));
+  if (!work.isValid() || !QDir().mkpath(realtime_source) ||
+      !QDir().mkpath(schedule_source) || !QDir().mkpath(repository)) {
+    std::fprintf(stderr, "FAIL 实时 / 计划场景的临时目录创建失败\n");
+    return 1;
+  }
+  // 造一批文件：一次实时触发要真的走完扫描 → 打包 → 压缩 → 校验 → 写归档，
+  // worker 才会在事件循环里可观察地停留。
+  for (int i = 0; i < 400; ++i) {
+    QFile file(QStringLiteral("%1/file-%2.bin").arg(realtime_source).arg(i));
+    if (file.open(QIODevice::WriteOnly)) {
+      file.write(QByteArray(8192, 'r'));
+    }
+  }
+
+  // 仓库走设置页的真实入口：写 config.json 并发 repositoryPathChanged。
+  const bool repository_saved = controller->saveRepositoryPath(repository);
+  // enabled=true 走真实产品路径：attach watcher + 合成一次 resync。
+  const bool realtime_saved = realtime->saveConfig(
+      /*enabled=*/true, realtime_source, /*debounce_ms=*/200,
+      /*max_wait_ms=*/2000, /*retain_count=*/3, QStringLiteral("mypack"),
+      QStringLiteral("none"), QStringList(), QStringList(),
+      QStringLiteral("full"));
+  if (!repository_saved || !realtime_saved) {
+    std::fprintf(stderr,
+                 "FAIL 实时场景没有配置成功: repository=[%s] realtime=[%s]\n",
+                 qPrintable(controller->statusMessage()),
+                 qPrintable(realtime->statusMessage()));
+    return 1;
+  }
+  std::printf("ok   实时场景已配置：仓库=%s 监听 %d 个目录\n",
+              qPrintable(realtime->repositoryPath()), realtime->watchCount());
+
+  // resync 那一轮会在 debounce 之后自己开始。万一没赶上（任务在两次轮询之间
+  // 就跑完了），再往源目录里写一个文件重来一次 —— 不靠 sleep 猜时间。
+  bool realtime_busy = wait_for_busy(realtime, 60000);
+  for (int attempt = 0; attempt < 3 && !realtime_busy; ++attempt) {
+    QFile trigger(realtime_source +
+                  QStringLiteral("/trigger-%1.txt").arg(attempt));
+    if (trigger.open(QIODevice::WriteOnly)) trigger.write("trigger");
+    realtime_busy = wait_for_busy(realtime, 60000);
+  }
+  if (!realtime_busy) {
+    std::fprintf(stderr, "FAIL 实时备份没有进入 libraryBusy\n");
+    return 1;
+  }
+
+  const bool others_idle = !controller->busy() && !schedule->libraryBusy();
+  std::printf(
+      "%s 实时 worker 在飞时另外两位是闲的 (controller=%s schedule=%s)\n",
+      others_idle ? "ok  " : "FAIL", controller->busy() ? "busy" : "idle",
+      schedule->libraryBusy() ? "busy" : "idle");
+  failures += others_idle ? 0 : 1;
+
+  const bool closed_while_realtime_busy = window->close();
+  std::printf("%s 实时 worker 在飞时 close() 被拒绝 (返回=%s)\n",
+              closed_while_realtime_busy ? "FAIL" : "ok  ",
+              closed_while_realtime_busy ? "true" : "false");
+  failures += closed_while_realtime_busy ? 1 : 0;
+
+  const bool realtime_dialog_open = dialog_visible();
+  std::printf("%s 实时 worker 在飞时关窗也会给出提示 (visible=%s)\n",
+              realtime_dialog_open ? "ok  " : "FAIL",
+              realtime_dialog_open ? "true" : "false");
+  failures += realtime_dialog_open ? 0 : 1;
+
+  dismiss_dialog();
+  WaitForAnimation(200);
+
+  if (!realtime->waitForIdle(180000) || realtime->libraryBusy()) {
+    std::fprintf(stderr, "FAIL 等待实时备份结束超时\n");
+    return 1;
+  }
+
+  const bool closed_when_realtime_idle = window->close();
+  std::printf("%s 实时 worker 结束后 close() 被接受 (返回=%s)\n",
+              closed_when_realtime_idle ? "ok  " : "FAIL",
+              closed_when_realtime_idle ? "true" : "false");
+  failures += closed_when_realtime_idle ? 0 : 1;
+
+  // 实时这一段的监听停掉：下一段只测计划那一位，也不留下还在跑的重试定时器。
+  realtime->stop();
+  window->show();
+  WaitForAnimation(50);
+
+  // ---- 3) 计划评估：schedule.libraryBusy ----
+  //
+  // runNow() 是"立即检查并运行"的真实入口，busy 在它返回之前就已置位，
+  // 结论因此不取决于任务跑得多快。
+  for (int i = 0; i < 400; ++i) {
+    QFile file(QStringLiteral("%1/file-%2.bin").arg(schedule_source).arg(i));
+    if (file.open(QIODevice::WriteOnly)) {
+      file.write(QByteArray(8192, 's'));
+    }
+  }
+  const bool schedule_saved = schedule->saveConfig(
+      /*enabled=*/true, schedule_source, /*interval_minutes=*/5,
+      /*retain_count=*/3, QStringLiteral("mypack"), QStringLiteral("none"),
+      QStringList(), QStringList(), QStringLiteral("full"));
+  const bool schedule_started = schedule_saved && schedule->runNow();
+  if (!schedule_started || !schedule->libraryBusy()) {
+    std::fprintf(stderr, "FAIL 计划评估没有启动起来: saved=%d status=[%s]\n",
+                 schedule_saved ? 1 : 0, qPrintable(schedule->statusMessage()));
+    return 1;
+  }
+
+  const bool closed_while_schedule_busy = window->close();
+  std::printf("%s 计划 worker 在飞时 close() 被拒绝 (返回=%s)\n",
+              closed_while_schedule_busy ? "FAIL" : "ok  ",
+              closed_while_schedule_busy ? "true" : "false");
+  failures += closed_while_schedule_busy ? 1 : 0;
+
+  const bool schedule_dialog_open = dialog_visible();
+  std::printf("%s 计划 worker 在飞时关窗也会给出提示 (visible=%s)\n",
+              schedule_dialog_open ? "ok  " : "FAIL",
+              schedule_dialog_open ? "true" : "false");
+  failures += schedule_dialog_open ? 0 : 1;
+
+  dismiss_dialog();
+  WaitForAnimation(200);
+
+  if (!schedule->waitForIdle(180000) || schedule->libraryBusy()) {
+    std::fprintf(stderr, "FAIL 等待计划评估结束超时\n");
+    return 1;
+  }
+
+  const bool closed_when_schedule_idle = window->close();
+  std::printf("%s 计划 worker 结束后 close() 被接受 (返回=%s)\n",
+              closed_when_schedule_idle ? "ok  " : "FAIL",
+              closed_when_schedule_idle ? "true" : "false");
+  failures += closed_when_schedule_idle ? 0 : 1;
 
   std::printf("close-guard-test 失败项: %d\n", failures);
   return failures == 0 ? 0 : 1;
@@ -1041,6 +1282,753 @@ QString FlattenRecord(const QVariantMap& record) {
 // banner 读的是它自己的 showsMessage（"这一页该不该显示这条消息"），不是
 // visible：Qt Quick 的 Item.visible 读出来就是**有效可见性**，StackLayout 里
 // 非当前页整体不可见，用 visible 永远测不出"这一页会不会显示这条消息"。
+// ---- --combo-hover-test ----
+//
+// 共享 AppComboBox 下拉行的状态回归（三轮人工验收都栽在同一个坑的不同形态上）。
+//
+//   第一轮：hover 底色绑到 control.highlightedIndex（常驻索引）
+//   第二轮：改成"键盘高亮 + highlightedIndex"，但 highlightedIndex 会被鼠标改脏
+//   第三轮：改成监听 Keys.onPressed，真实桌面上收不到事件（焦点在 ComboBox 上）
+//
+// 现在键盘模式由**Qt 导航的结果**推断：popup ListView 的 currentIndex 变了、
+// 而且当前没有指针活动 —— 不监听按键，也不接管任何键。
+//
+// 这个自检真的把指针移到行上、移走，也真的把 ↓ 送进真实焦点链，然后逐行读
+// 运行期状态（hovered / 覆盖层 opacity / currentIndex / 输入方式闸门）。
+int RunComboHoverTest(QQuickWindow* window, backup_modern::AppTheme* theme) {
+  CheckRun run;
+  run.prefix = "[combo-hover]";
+
+  const QColor hover_color = theme->property("hover").value<QColor>();
+  const QColor keyboard_color = theme->property("accentSoft").value<QColor>();
+  run.Check(hover_color.isValid() && keyboard_color.isValid(),
+            QStringLiteral("主题给出了 hover / keyboard 两种颜色"),
+            QStringLiteral("hover=%1 keyboard=%2")
+                .arg(hover_color.name(), keyboard_color.name()));
+
+  window->setProperty("currentPage", 1);
+  window->setWidth(1280);
+  window->setHeight(1000);
+  WaitForAnimation(150);
+  ScrollBackupPage(window, 700);
+  WaitForAnimation(120);
+  const auto clickByName = [window](const QString& name) -> bool {
+    QQuickItem* item = window->findChild<QQuickItem*>(name);
+    return item != nullptr && QMetaObject::invokeMethod(item, "clicked");
+  };
+  run.Check(clickByName(QStringLiteral("filterAddIncludeRuleButton")),
+            QStringLiteral("展开“新建包含规则”表单"));
+  WaitForAnimation(120);
+
+  QQuickItem* combo =
+      window->findChild<QQuickItem*>(QStringLiteral("filterRuleFieldCombo"));
+  run.Check(combo != nullptr && combo->isVisible(),
+            QStringLiteral("找得到可见的“条件类型”下拉"));
+  if (combo == nullptr) {
+    std::printf("[combo-hover] passed=%d failed=%d\n", run.passed, run.failed);
+    return 1;
+  }
+  QObject* popup = combo->property("popup").value<QObject*>();
+  QQuickItem* list = popup == nullptr
+                         ? nullptr
+                         : popup->property("contentItem").value<QQuickItem*>();
+  run.Check(popup != nullptr && list != nullptr,
+            QStringLiteral("下拉有 popup 与它的 contentItem"));
+  if (popup == nullptr || list == nullptr) {
+    std::printf("[combo-hover] passed=%d failed=%d\n", run.passed, run.failed);
+    return 1;
+  }
+
+  // 复现人工验收截图：当前已选择项 = “路径”，鼠标划过“文件类型”。
+  const QVariantList model = combo->property("model").toList();
+  QStringList labels;
+  for (const QVariant& item : model) {
+    labels << item.toString();
+  }
+  const int path_index = labels.indexOf(QStringLiteral("路径"));
+  const int type_index = labels.indexOf(QStringLiteral("文件类型"));
+  run.Check(path_index >= 0 && type_index >= 0,
+            QStringLiteral("条件类型下拉里能找到“路径”与“文件类型”"),
+            labels.join(QStringLiteral("/")));
+  if (path_index < 0 || type_index < 0) {
+    std::printf("[combo-hover] passed=%d failed=%d\n", run.passed, run.failed);
+    return 1;
+  }
+  combo->setProperty("currentIndex", path_index);
+  WaitForAnimation(100);
+
+  const auto collectRows = [list]() {
+    QList<QPair<int, QQuickItem*>> rows;
+    std::function<void(QQuickItem*)> walk = [&](QQuickItem* item) {
+      if (item->objectName() == QLatin1String("comboItemRow"))
+        rows.append({item->property("index").toInt(), item});
+      const QList<QQuickItem*> kids = item->childItems();
+      for (QQuickItem* kid : kids) {
+        walk(kid);
+      }
+    };
+    walk(list);
+    std::sort(
+        rows.begin(), rows.end(),
+        [](const QPair<int, QQuickItem*>& a, const QPair<int, QQuickItem*>& b) {
+          return a.first < b.first;
+        });
+    return rows;
+  };
+  const auto layerOpacity = [](const QPair<int, QQuickItem*>& row,
+                               const char* name) -> qreal {
+    QQuickItem* layer =
+        row.second->findChild<QQuickItem*>(QString::fromLatin1(name));
+    return layer == nullptr ? -1.0 : layer->property("opacity").toReal();
+  };
+  const auto hoverOpacity =
+      [&layerOpacity](const QPair<int, QQuickItem*>& row) {
+        return layerOpacity(row, "comboItemHoverLayer");
+      };
+  const auto keyboardOpacity =
+      [&layerOpacity](const QPair<int, QQuickItem*>& row) {
+        return layerOpacity(row, "comboItemKeyboardLayer");
+      };
+  const auto hasBackground = [&](const QPair<int, QQuickItem*>& row) -> bool {
+    const QColor base =
+        row.second
+            ->findChild<QQuickItem*>(QStringLiteral("comboItemBackground"))
+            ->property("color")
+            .value<QColor>();
+    return hoverOpacity(row) > 0.01 || keyboardOpacity(row) > 0.01 ||
+           base.alpha() > 0;
+  };
+  const auto rowsWhere =
+      [&](const QList<QPair<int, QQuickItem*>>& rows,
+          const std::function<qreal(const QPair<int, QQuickItem*>&)>& opacity) {
+        QStringList names;
+        for (const auto& row : rows) {
+          if (opacity(row) > 0.01) names << QString::number(row.first);
+        }
+        return names;
+      };
+  const auto describe = [&](const QList<QPair<int, QQuickItem*>>& rows) {
+    QStringList parts;
+    for (const auto& row : rows) {
+      parts << QStringLiteral("%1[h=%2 k=%3 hv=%4 sel=%5]")
+                   .arg(row.first)
+                   .arg(hoverOpacity(row), 0, 'f', 0)
+                   .arg(keyboardOpacity(row), 0, 'f', 0)
+                   .arg(row.second->property("hovered").toBool() ? 1 : 0)
+                   .arg(row.second->property("isSelected").toBool() ? 1 : 0);
+    }
+    return parts.join(QStringLiteral(" "));
+  };
+  const auto hoverRows = [&](const QList<QPair<int, QQuickItem*>>& rows) {
+    return rowsWhere(rows, hoverOpacity);
+  };
+  const auto keyboardRows = [&](const QList<QPair<int, QQuickItem*>>& rows) {
+    return rowsWhere(rows, keyboardOpacity);
+  };
+  const auto keyboardActive = [combo]() {
+    return combo->property("keyboardNavigationActive").toBool();
+  };
+  const auto listIndex = [list]() {
+    return list->property("currentIndex").toInt();
+  };
+  const auto movePointerTo = [window](const QPointF& pos,
+                                      const QPointF& old_pos) {
+    QHoverEvent hover(QEvent::HoverMove, pos, pos, old_pos);
+    QCoreApplication::sendEvent(window, &hover);
+  };
+  const auto centerOf = [](QQuickItem* item) {
+    return item->mapToScene(QPointF(item->width() / 2.0, item->height() / 2.0));
+  };
+  const auto sendKey = [window](int key) {
+    QKeyEvent press(QEvent::KeyPress, key, Qt::NoModifier);
+    QCoreApplication::sendEvent(window, &press);
+    QKeyEvent release(QEvent::KeyRelease, key, Qt::NoModifier);
+    QCoreApplication::sendEvent(window, &release);
+  };
+
+  QMetaObject::invokeMethod(popup, "open");
+  WaitForAnimation(320);
+  QList<QPair<int, QQuickItem*>> rows = collectRows();
+  run.Check(rows.size() >= 7, QStringLiteral("条件类型下拉展开了至少 7 行"),
+            QStringLiteral("实际 %1 行").arg(rows.size()));
+  if (rows.size() < 7) {
+    std::printf("[combo-hover] passed=%d failed=%d\n", run.passed, run.failed);
+    return 1;
+  }
+  const auto rowAt = [&rows](int index) -> QQuickItem* {
+    for (const auto& row : rows) {
+      if (row.first == index) return row.second;
+    }
+    return nullptr;
+  };
+
+  // ---- Mouse 1：打开 popup，指针不在任何地方，键盘模式必须是关的 ----
+  run.Check(
+      !keyboardActive() && hoverRows(rows).isEmpty() &&
+          keyboardRows(rows).isEmpty(),
+      QStringLiteral("Mouse 1 打开 popup：无 hover 底色、无键盘光标、模式关闭"),
+      QStringLiteral("hover 行=%1 键盘行=%2 模式=%3 | %4")
+          .arg(hoverRows(rows).join(QStringLiteral(",")),
+               keyboardRows(rows).join(QStringLiteral(",")))
+          .arg(keyboardActive())
+          .arg(describe(rows)));
+  run.Check(listIndex() == path_index &&
+                combo->property("currentIndex").toInt() == path_index,
+            QStringLiteral("Mouse 1 打开时键盘位置同步到当前已选择项"),
+            QStringLiteral("listCur=%1 currentIndex=%2")
+                .arg(listIndex())
+                .arg(combo->property("currentIndex").toInt()));
+  {
+    QQuickItem* selected_row = rowAt(path_index);
+    QQuickItem* check = selected_row == nullptr
+                            ? nullptr
+                            : selected_row->findChild<QQuickItem*>(
+                                  QStringLiteral("comboItemCheck"));
+    run.Check(check != nullptr && check->property("visible").toBool() &&
+                  !hasBackground({path_index, selected_row}),
+              QStringLiteral("Mouse 1 已选择项（路径）只有勾号，没有底色"));
+  }
+
+  // ---- Mouse 2：指针 hover “文件类型” ----
+  QPointF pointer = centerOf(rowAt(type_index));
+  movePointerTo(pointer, centerOf(rowAt(path_index)));
+  WaitForAnimation(150);
+  rows = collectRows();
+  run.Check(hoverRows(rows) == QStringList{QString::number(type_index)} &&
+                keyboardRows(rows).isEmpty() && !keyboardActive(),
+            QStringLiteral(
+                "Mouse 2 只有“文件类型”有 hover 灰底，且没有误触发键盘模式"),
+            QStringLiteral("hover 行=%1 键盘行=%2 模式=%3 | %4")
+                .arg(hoverRows(rows).join(QStringLiteral(",")),
+                     keyboardRows(rows).join(QStringLiteral(",")))
+                .arg(keyboardActive())
+                .arg(describe(rows)));
+
+  // ---- Mouse 3：指针移出，但 highlightedIndex / listCur 都还停在那一行 ----
+  movePointerTo(QPointF(4, 4), pointer);
+  WaitForAnimation(220);
+  rows = collectRows();
+  const int retained_hl = combo->property("highlightedIndex").toInt();
+  const int retained_list = listIndex();
+  run.Check(
+      !rowAt(type_index)->property("hovered").toBool() &&
+          retained_hl == type_index && retained_list == type_index,
+      QStringLiteral("Mouse 3 指针离开后索引仍停在被划过的那一行（Qt 的行为）"),
+      QStringLiteral("hovered=%1 highlightedIndex=%2 listCur=%3")
+          .arg(rowAt(type_index)->property("hovered").toBool())
+          .arg(retained_hl)
+          .arg(retained_list));
+  run.Check(!keyboardActive() && hoverRows(rows).isEmpty() &&
+                keyboardRows(rows).isEmpty(),
+            QStringLiteral(
+                "Mouse 3 索引留在那一行，但视觉上没有任何底色（人工验收截图）"),
+            QStringLiteral("hover 行=%1 键盘行=%2 模式=%3 | %4")
+                .arg(hoverRows(rows).join(QStringLiteral(",")),
+                     keyboardRows(rows).join(QStringLiteral(",")))
+                .arg(keyboardActive())
+                .arg(describe(rows)));
+
+  // ---- Mouse 4：重新进入，hover 立刻接管 ----
+  movePointerTo(centerOf(rowAt(type_index)), QPointF(4, 4));
+  WaitForAnimation(150);
+  rows = collectRows();
+  run.Check(hoverRows(rows) == QStringList{QString::number(type_index)},
+            QStringLiteral("Mouse 4 指针重新进入：hover 立刻接管"),
+            describe(rows));
+
+  // ---- Keyboard 1：真实焦点链上的 ↓ ----
+  //
+  // 真实桌面实测：点开下拉之后焦点在 ComboBox 上，按键送到窗口后由 ComboBox
+  // 处理， popup ListView 的 currentIndex 随之前移。这里复现同一条链路。
+  movePointerTo(QPointF(4, 4), centerOf(rowAt(type_index)));
+  WaitForAnimation(200);
+  combo->forceActiveFocus();
+  WaitForAnimation(150);
+  const int before_down = listIndex();
+  sendKey(Qt::Key_Down);
+  WaitForAnimation(220);
+  rows = collectRows();
+  run.Check(
+      listIndex() == before_down + 1,
+      QStringLiteral("Keyboard 1 ↓ 让 popup 的 currentIndex 前移一项"),
+      QStringLiteral("listCur %1 -> %2").arg(before_down).arg(listIndex()));
+  run.Check(keyboardActive(),
+            QStringLiteral("Keyboard 1 ↓ 之后键盘模式打开（由导航结果推断）"),
+            QStringLiteral("模式=%1").arg(keyboardActive()));
+  run.Check(
+      keyboardRows(rows) == QStringList{QString::number(listIndex())},
+      QStringLiteral("Keyboard 1 键盘光标正好落在 Qt 移动到的那个 row 上"),
+      QStringLiteral("键盘行=%1 listCur=%2 | %3")
+          .arg(keyboardRows(rows).join(QStringLiteral(",")))
+          .arg(listIndex())
+          .arg(describe(rows)));
+
+  // ---- Keyboard 2：再 ↓ 一次，光标整体下移一行 ----
+  const int first_keyboard_row = listIndex();
+  sendKey(Qt::Key_Down);
+  WaitForAnimation(220);
+  rows = collectRows();
+  run.Check(listIndex() == first_keyboard_row + 1 &&
+                keyboardRows(rows) == QStringList{QString::number(listIndex())},
+            QStringLiteral("Keyboard 2 再 ↓：光标整体下移一行，上一行立刻熄灭"),
+            QStringLiteral("键盘行=%1 listCur=%2 | %3")
+                .arg(keyboardRows(rows).join(QStringLiteral(",")))
+                .arg(listIndex())
+                .arg(describe(rows)));
+
+  // ---- Keyboard 3：↑ 回上一行 ----
+  sendKey(Qt::Key_Up);
+  WaitForAnimation(220);
+  rows = collectRows();
+  run.Check(listIndex() == first_keyboard_row &&
+                keyboardRows(rows) == QStringList{QString::number(listIndex())},
+            QStringLiteral("Keyboard 3 ↑ 把光标移回上一行"),
+            QStringLiteral("键盘行=%1 listCur=%2")
+                .arg(keyboardRows(rows).join(QStringLiteral(",")))
+                .arg(listIndex()));
+
+  // ---- Keyboard 4：光标落在"已选择项"上时仍然看得见 ----
+  while (listIndex() > path_index) {
+    sendKey(Qt::Key_Up);
+    WaitForAnimation(180);
+  }
+  rows = collectRows();
+  {
+    QQuickItem* selected_row = rowAt(path_index);
+    QQuickItem* check = selected_row == nullptr
+                            ? nullptr
+                            : selected_row->findChild<QQuickItem*>(
+                                  QStringLiteral("comboItemCheck"));
+    run.Check(
+        listIndex() == path_index && keyboardActive() &&
+            keyboardOpacity({path_index, selected_row}) > 0.01 &&
+            check != nullptr && check->property("visible").toBool(),
+        QStringLiteral("Keyboard 4 键盘光标落在已选择项上：光标与勾号同时可见"),
+        QStringLiteral("listCur=%1 键盘层=%2 勾号=%3")
+            .arg(listIndex())
+            .arg(keyboardOpacity({path_index, selected_row}))
+            .arg(check != nullptr && check->property("visible").toBool()));
+  }
+
+  // ---- Mouse 5：键盘模式下移动鼠标 -> 键盘模式立刻退出 ----
+  const QPointF back_to_type = centerOf(rowAt(type_index));
+  movePointerTo(back_to_type, QPointF(4, 4));
+  WaitForAnimation(220);
+  rows = collectRows();
+  run.Check(!keyboardActive() && keyboardRows(rows).isEmpty() &&
+                hoverRows(rows) == QStringList{QString::number(type_index)},
+            QStringLiteral(
+                "Mouse 5 键盘模式下移动鼠标：键盘光标立即消失、hover 接管"),
+            QStringLiteral("hover 行=%1 键盘行=%2 模式=%3 | %4")
+                .arg(hoverRows(rows).join(QStringLiteral(",")),
+                     keyboardRows(rows).join(QStringLiteral(",")))
+                .arg(keyboardActive())
+                .arg(describe(rows)));
+
+  // ---- Mouse 6：指针再离开 -> 仍然什么都不留 ----
+  movePointerTo(QPointF(4, 4), back_to_type);
+  WaitForAnimation(200);
+  rows = collectRows();
+  run.Check(!keyboardActive() && hoverRows(rows).isEmpty() &&
+                keyboardRows(rows).isEmpty(),
+            QStringLiteral("Mouse 6 指针离开后没有任何底色残留"),
+            describe(rows));
+
+  // ---- Keyboard 5：Enter 采纳，Esc 不改选择 ----
+  combo->forceActiveFocus();
+  sendKey(Qt::Key_Down);
+  WaitForAnimation(200);
+  const int enter_target = listIndex();
+  sendKey(Qt::Key_Return);
+  WaitForAnimation(260);
+  run.Check(!popup->property("visible").toBool() &&
+                combo->property("currentIndex").toInt() == enter_target &&
+                !keyboardActive(),
+            QStringLiteral("Keyboard 5 Enter 采纳当前键盘行并关闭下拉"),
+            QStringLiteral("visible=%1 currentIndex=%2 期望=%3 模式=%4")
+                .arg(popup->property("visible").toBool())
+                .arg(combo->property("currentIndex").toInt())
+                .arg(enter_target)
+                .arg(keyboardActive()));
+  const int selected_after_enter = combo->property("currentIndex").toInt();
+  QMetaObject::invokeMethod(popup, "open");
+  WaitForAnimation(300);
+  sendKey(Qt::Key_Down);
+  WaitForAnimation(200);
+  sendKey(Qt::Key_Escape);
+  WaitForAnimation(260);
+  run.Check(
+      !popup->property("visible").toBool() &&
+          combo->property("currentIndex").toInt() == selected_after_enter &&
+          !keyboardActive(),
+      QStringLiteral("Keyboard 6 Esc 关闭下拉且不改动已选择的值"),
+      QStringLiteral("visible=%1 currentIndex=%2 期望=%3")
+          .arg(popup->property("visible").toBool())
+          .arg(combo->property("currentIndex").toInt())
+          .arg(selected_after_enter));
+
+  // ---- 关掉再打开：没有 stale ----
+  QMetaObject::invokeMethod(popup, "open");
+  WaitForAnimation(320);
+  rows = collectRows();
+  run.Check(!keyboardActive() && keyboardRows(rows).isEmpty() &&
+                hoverRows(rows).isEmpty(),
+            QStringLiteral(
+                "Reopen 重新打开下拉：没有 stale 键盘光标、没有 stale 灰底"),
+            QStringLiteral("键盘行=%1 hover 行=%2 模式=%3 | %4")
+                .arg(keyboardRows(rows).join(QStringLiteral(",")),
+                     hoverRows(rows).join(QStringLiteral(",")))
+                .arg(keyboardActive())
+                .arg(describe(rows)));
+
+  QMetaObject::invokeMethod(popup, "close");
+  WaitForAnimation(200);
+  clickByName(QStringLiteral("filterRuleCancelButton"));
+  WaitForAnimation(80);
+
+  std::printf("[combo-hover] passed=%d failed=%d\n", run.passed, run.failed);
+  if (run.failed != 0) {
+    for (const QString& failure : run.failures)
+      std::printf("[combo-hover]   FAIL %s\n", qPrintable(failure));
+  }
+  return run.failed == 0 ? 0 : 1;
+}
+
+// ---- --filter-ux-test ----
+//
+// 三个页面"同一个普通表单输入 -> 同一条 DSL"的 parity 自检。
+//
+// 这是 GUI Usability Closure 的核心断言：用户在备份页 / 自动备份页 / 实时备份页
+// 做**同一次操作**（选"文件扩展名"、填 txt;md），最终必须得到同一条规则文本
+// ext:txt;md，而且这条规则必须被真实的 Filter::AddRule 接受。
+//
+// 它走真实界面：切页、展开高级设置、点真实的按钮、往真实的输入框里打字，然后读
+// 真实的模型。不是"两边都调了同一个函数"，也不是 grep 文件。
+//
+// 同时钉住三件事：
+//   * 条件类型下拉显示的是中文（文件扩展名 / 路径 / 文件大小 / 文件类型 ...）；
+//   * 不同条件用不同控件（文件类型与比较方式只能是下拉，大小是
+//     比较方式 + 数值 + 单位，绝不是一个裸文本框）；
+//   * 非法输入在三处拿到**同一句**来自共享 builder 的原因。
+int RunFilterUxTest(QQuickWindow* window,
+                    backup_modern::FilterRuleModel* manual_model,
+                    backup_modern::FilterRuleModel* schedule_model,
+                    backup_modern::FilterRuleModel* realtime_model) {
+  CheckRun run;
+  run.prefix = "[filter-ux]";
+
+  const auto itemByName = [window](const QString& name) -> QQuickItem* {
+    return window->findChild<QQuickItem*>(name);
+  };
+  const auto goToPage = [window](int page) {
+    window->setProperty("currentPage", page);
+    WaitForAnimation(90);
+  };
+  // 点真实按钮：AppButton 是 AbstractButton，clicked 是它的信号。
+  const auto click = [](QQuickItem* item) -> bool {
+    if (item == nullptr) return false;
+    return QMetaObject::invokeMethod(item, "clicked");
+  };
+  // 下拉不能只改 currentIndex：onActivated 只由用户激活触发，所以要先把
+  // currentIndex 设成目标值，再发一次
+  // activated(index)，与用户真的点了一下等价。
+  const auto choose = [](QQuickItem* combo, int index) -> bool {
+    if (combo == nullptr || index < 0) return false;
+    combo->setProperty("currentIndex", index);
+    return QMetaObject::invokeMethod(combo, "activated", Q_ARG(int, index));
+  };
+  // TextField 的 textEdited 在 QML 类型的元对象里是无参信号（实参由控件的
+  // text 属性承载），所以先把 text 设成目标值，再发一次 textEdited()。
+  const auto typeInto = [](QQuickItem* field, const QString& text) -> bool {
+    if (field == nullptr) return false;
+    field->setProperty("text", text);
+    return QMetaObject::invokeMethod(field, "textEdited");
+  };
+  // 输入框用 text，下拉框用 displayText —— 两种控件的"当前显示文本"不是同一个
+  // 属性，读错了会得到空串而不是失败。
+  const auto textOf = [](QQuickItem* item) -> QString {
+    if (item == nullptr) return QStringLiteral("<missing>");
+    const QVariant text = item->property("text");
+    if (text.isValid() && !text.toString().isEmpty()) return text.toString();
+    const QVariant display = item->property("displayText");
+    return display.isValid() ? display.toString() : QString();
+  };
+  // 断言"这个控件此刻可见吗"。不能用 QQuickItem::isVisible()：它要求窗口真的
+  // exposed，而自检跑在 offscreen 平台上；这里读的是控件自己那条 visible 绑定。
+  const auto shown = [](QQuickItem* item) -> bool {
+    return item != nullptr && item->property("visible").toBool();
+  };
+
+  struct PageCase {
+    const char* label;
+    int page;
+    QString prefix;
+    backup_modern::FilterRuleModel* model;
+    // 计划页 / 实时页的规则编辑器在默认折叠的「高级设置」里。
+    QString advanced_toggle;
+    QString advanced_section;
+  };
+  // 页面下标 = Main.qml 里 StackLayout 的顺序（0 首页 / 1 备份 / 2 自动备份 /
+  // 3 备份管理 / 4 设置 / 5 实时备份），不是侧栏导航的顺序。
+  const PageCase kCases[] = {
+      {"备份页", 1, QStringLiteral("filter"), manual_model, QString(),
+       QString()},
+      {"自动备份页", 2, QStringLiteral("schedule"), schedule_model,
+       QStringLiteral("scheduleAdvancedToggle"),
+       QStringLiteral("scheduleAdvancedSection")},
+      {"实时备份页", 5, QStringLiteral("realtime"), realtime_model,
+       QStringLiteral("realtimeAdvancedToggle"),
+       QStringLiteral("realtimeAdvancedSection")},
+  };
+
+  // 三处必须拿到**同一句**错误：它来自共享 builder，不是三份前端文案。
+  QStringList rejection_reasons;
+
+  for (const PageCase& page : kCases) {
+    // 中文标签必须走 fromUtf8：fromLatin1 会把 UTF-8 字节按 Latin-1 解释，
+    // 日志里的页名会变成一串乱码，脚本按名字断言就会假失败。
+    const QString label = QString::fromUtf8(page.label);
+    const auto named = [&page, &itemByName](const char* suffix) -> QQuickItem* {
+      return itemByName(page.prefix + QString::fromLatin1(suffix));
+    };
+
+    goToPage(page.page);
+
+    // ---- 默认折叠：高级设置（规则编辑器在它里面）----
+    if (!page.advanced_toggle.isEmpty()) {
+      QQuickItem* section = itemByName(page.advanced_section);
+      run.Check(section != nullptr && !shown(section),
+                QStringLiteral("%1 高级设置默认收起").arg(label),
+                QStringLiteral("section=%1").arg(section != nullptr));
+      click(itemByName(page.advanced_toggle));
+      WaitForAnimation(80);
+      run.Check(shown(section),
+                QStringLiteral("%1 展开之后高级设置可见").arg(label));
+    }
+
+    // ---- 新建规则的表单默认收起，点"添加包含规则"才出现 ----
+    QQuickItem* builder = named("RuleBuilderForm");
+    run.Check(builder != nullptr && !shown(builder),
+              QStringLiteral("%1 新建规则的表单默认收起").arg(label));
+    click(named("AddIncludeRuleButton"));
+    WaitForAnimation(80);
+    run.Check(
+        shown(builder),
+        QStringLiteral("%1 点“添加包含规则”后表单展开（不是弹窗）").arg(label));
+
+    // ---- 条件类型下拉显示中文 ----
+    QQuickItem* field_combo = named("RuleFieldCombo");
+    run.Check(textOf(field_combo) == QStringLiteral("文件扩展名"),
+              QStringLiteral("%1 条件类型默认显示“文件扩展名”").arg(label),
+              textOf(field_combo));
+    const QVariantList field_options =
+        field_combo == nullptr ? QVariantList()
+                               : field_combo->property("model").toList();
+    QStringList field_labels;
+    for (const QVariant& option : field_options) {
+      field_labels << option.toString();
+    }
+    run.Check(
+        field_labels.contains(QStringLiteral("文件类型")) &&
+            field_labels.contains(QStringLiteral("文件大小")) &&
+            field_labels.contains(QStringLiteral("路径")) &&
+            !field_labels.contains(QStringLiteral("ext")),
+        QStringLiteral("%1 条件类型下拉全部是中文（没有裸字段名）").arg(label),
+        field_labels.join(QStringLiteral("/")));
+    run.Check(
+        !shown(named("RuleTypeCombo")) &&
+            !shown(named("RuleSizeCompareCombo")) &&
+            named("RuleExtensionField") != nullptr,
+        QStringLiteral("%1 选“文件扩展名”时只出现扩展名输入框").arg(label));
+
+    // ---- 同一次普通操作：扩展名 -> txt;md ----
+    run.Check(typeInto(named("RuleExtensionField"), QStringLiteral("txt;md")),
+              QStringLiteral("%1 可以在扩展名输入框里输入").arg(label));
+    WaitForAnimation(60);
+    run.Check(textOf(named("RuleFormSummaryText"))
+                  .startsWith(QStringLiteral("将添加：")),
+              QStringLiteral("%1 实时显示这条规则的人话摘要").arg(label),
+              textOf(named("RuleFormSummaryText")));
+    run.Check(textOf(named("RuleFormErrorText")).isEmpty(),
+              QStringLiteral("%1 合法输入没有报错").arg(label),
+              textOf(named("RuleFormErrorText")));
+    run.Check(click(named("RuleSubmitButton")),
+              QStringLiteral("%1 “添加规则”可点").arg(label));
+    WaitForAnimation(80);
+    run.Check(
+        page.model->rulesForAction(QStringLiteral("include")) ==
+            QStringList{QStringLiteral("ext:txt;md")},
+        QStringLiteral("%1 生成 ext:txt;md（用户没有写过 ext:）").arg(label),
+        page.model->rulesForAction(QStringLiteral("include"))
+            .join(QStringLiteral(",")));
+    run.Check(page.model->rulesForAction(QStringLiteral("exclude")).isEmpty(),
+              QStringLiteral("%1 这条规则落在包含一侧").arg(label));
+
+    // 规则卡片的数据：主行是人话，DSL 是次要信息。
+    const QVariantList rules = page.model->property("rules").toList();
+    if (!rules.isEmpty()) {
+      const QVariantMap first = rules.at(0).toMap();
+      run.Check(first.value(QStringLiteral("actionLabel")).toString() ==
+                        QStringLiteral("包含") &&
+                    first.value(QStringLiteral("conditionLabel")).toString() ==
+                        QStringLiteral("文件扩展名：txt、md"),
+                QStringLiteral("%1 规则主行是“包含 · 文件扩展名：txt、md”")
+                    .arg(label),
+                first.value(QStringLiteral("conditionLabel")).toString());
+      run.Check(first.value(QStringLiteral("dsl")).toString() ==
+                    QStringLiteral("ext:txt;md"),
+                QStringLiteral("%1 卡片的 DSL 字段与提交的一致").arg(label));
+    }
+
+    // ---- 路径：排除规则（同一个表单，换一个条件类型）----
+    click(named("AddExcludeRuleButton"));
+    WaitForAnimation(60);
+    choose(field_combo, field_labels.indexOf(QStringLiteral("路径")));
+    WaitForAnimation(60);
+    run.Check(
+        shown(named("RulePatternField")) && !shown(named("RuleExtensionField")),
+        QStringLiteral("%1 换“路径”之后出现的是路径输入框").arg(label));
+    typeInto(named("RulePatternField"), QStringLiteral("**/build/**"));
+    click(named("RuleSubmitButton"));
+    WaitForAnimation(80);
+    run.Check(page.model->rulesForAction(QStringLiteral("exclude")) ==
+                  QStringList{QStringLiteral("path:**/build/**")},
+              QStringLiteral("%1 生成 path:**/build/**").arg(label),
+              page.model->rulesForAction(QStringLiteral("exclude"))
+                  .join(QStringLiteral(",")));
+
+    // ---- 文件类型：只能是下拉 ----
+    click(named("AddIncludeRuleButton"));
+    WaitForAnimation(60);
+    choose(field_combo, field_labels.indexOf(QStringLiteral("文件类型")));
+    WaitForAnimation(60);
+    QQuickItem* type_combo = named("RuleTypeCombo");
+    run.Check(shown(type_combo),
+              QStringLiteral("%1 文件类型用的是下拉，不是文本框").arg(label));
+    choose(type_combo, 1);  // 目录
+    click(named("RuleSubmitButton"));
+    WaitForAnimation(80);
+    run.Check(page.model->rulesForAction(QStringLiteral("include"))
+                  .contains(QStringLiteral("type:folder")),
+              QStringLiteral("%1 选了“目录”就生成 type:folder").arg(label),
+              page.model->rulesForAction(QStringLiteral("include"))
+                  .join(QStringLiteral(",")));
+
+    // ---- 文件大小：比较方式 + 数值 + 单位 ----
+    click(named("AddIncludeRuleButton"));
+    WaitForAnimation(60);
+    choose(field_combo, field_labels.indexOf(QStringLiteral("文件大小")));
+    WaitForAnimation(60);
+    run.Check(shown(named("RuleSizeCompareCombo")) &&
+                  shown(named("RuleSizeValueField")) &&
+                  shown(named("RuleSizeUnitCombo")),
+              QStringLiteral("%1 文件大小是比较方式 + 数值 + 单位三个控件")
+                  .arg(label));
+    run.Check(textOf(named("RuleSizeCompareCombo")) == QStringLiteral("小于"),
+              QStringLiteral("%1 比较方式默认“小于”").arg(label),
+              textOf(named("RuleSizeCompareCombo")));
+    typeInto(named("RuleSizeValueField"), QStringLiteral("1"));
+    choose(named("RuleSizeUnitCombo"), 2);  // MB
+    click(named("RuleSubmitButton"));
+    WaitForAnimation(80);
+    run.Check(
+        page.model->rulesForAction(QStringLiteral("include"))
+            .contains(QStringLiteral("size:<1MB")),
+        QStringLiteral("%1 生成 size:<1MB（用户没有写过 size:）").arg(label),
+        page.model->rulesForAction(QStringLiteral("include"))
+            .join(QStringLiteral(",")));
+
+    // ---- 非法输入：三处必须拿到同一句共享 builder 的原因 ----
+    click(named("AddIncludeRuleButton"));
+    WaitForAnimation(60);
+    choose(field_combo, field_labels.indexOf(QStringLiteral("文件大小")));
+    WaitForAnimation(60);
+    typeInto(named("RuleSizeValueField"), QStringLiteral("abc"));
+    WaitForAnimation(60);
+    const QString reason = textOf(named("RuleFormErrorText"));
+    rejection_reasons << reason;
+    run.Check(!reason.isEmpty() &&
+                  !named("RuleSubmitButton")->property("enabled").toBool(),
+              QStringLiteral("%1 非法的大小取值被拒绝，且“添加规则”不可点")
+                  .arg(label),
+              reason);
+    // 溢出：以前 QML 会先 parseInt("99999999999999999999")，等 C++ 拿到时它已经
+    // 变成一个浮点数了，谁都没机会拒绝。现在数值按文本解析，溢出是明确失败。
+    typeInto(named("RuleSizeValueField"),
+             QStringLiteral("99999999999999999999"));
+    WaitForAnimation(60);
+    const QString overflow_reason = textOf(named("RuleFormErrorText"));
+    run.Check(
+        overflow_reason.contains(QStringLiteral("超出可表示范围")),
+        QStringLiteral("%1 超大数值被明确拒绝（不是静默截断）").arg(label),
+        overflow_reason);
+    click(named("RuleCancelButton"));
+    WaitForAnimation(60);
+
+    // ---- 高级 DSL：默认收起，展开后仍然可用 ----
+    QQuickItem* advanced_section = named("AdvancedRulesSection");
+    run.Check(
+        advanced_section != nullptr && !shown(advanced_section),
+        QStringLiteral("%1 高级规则默认收起（普通用户看不到 DSL）").arg(label));
+    click(named("AdvancedRulesToggle"));
+    WaitForAnimation(60);
+    run.Check(shown(advanced_section),
+              QStringLiteral("%1 高级规则展开后可见").arg(label));
+    typeInto(named("AdvancedRuleField"), QStringLiteral("size:<abc"));
+    click(named("AddAdvancedRuleButton"));
+    WaitForAnimation(80);
+    run.Check(!textOf(named("AdvancedRuleErrorText")).isEmpty(),
+              QStringLiteral("%1 高级 DSL 的非法输入被共享核心拒绝").arg(label),
+              textOf(named("AdvancedRuleErrorText")));
+    click(named("AdvancedRulesToggle"));
+    WaitForAnimation(60);
+  }
+
+  // ---- parity：三处最终拿到的是同一组规则文本 ----
+  const QStringList manual_include =
+      manual_model->rulesForAction(QStringLiteral("include"));
+  const QStringList schedule_include =
+      schedule_model->rulesForAction(QStringLiteral("include"));
+  const QStringList realtime_include =
+      realtime_model->rulesForAction(QStringLiteral("include"));
+  run.Check(manual_include == schedule_include &&
+                schedule_include == realtime_include,
+            QStringLiteral("PARITY-01 三处的包含规则逐字相同"),
+            QStringLiteral("manual=[%1] schedule=[%2] realtime=[%3]")
+                .arg(manual_include.join(QStringLiteral(" ")),
+                     schedule_include.join(QStringLiteral(" ")),
+                     realtime_include.join(QStringLiteral(" "))));
+  run.Check(manual_include == QStringList({QStringLiteral("ext:txt;md"),
+                                           QStringLiteral("type:folder"),
+                                           QStringLiteral("size:<1MB")}),
+            QStringLiteral("PARITY-02 普通表单输入生成的就是核心认可的 DSL"),
+            manual_include.join(QStringLiteral(" ")));
+  run.Check(manual_model->rulesForAction(QStringLiteral("exclude")) ==
+                    schedule_model->rulesForAction(QStringLiteral("exclude")) &&
+                schedule_model->rulesForAction(QStringLiteral("exclude")) ==
+                    realtime_model->rulesForAction(QStringLiteral("exclude")),
+            QStringLiteral("PARITY-03 三处的排除规则逐字相同"));
+  run.Check(rejection_reasons.size() == 3 &&
+                rejection_reasons.at(0) == rejection_reasons.at(1) &&
+                rejection_reasons.at(1) == rejection_reasons.at(2) &&
+                !rejection_reasons.at(0).isEmpty(),
+            QStringLiteral(
+                "PARITY-04 非法输入在三处得到同一句原因（来自共享 builder）"),
+            rejection_reasons.join(QStringLiteral(" | ")));
+
+  // 收尾：三份模型都清空，后面的自检从干净状态开始。
+  manual_model->clearRules();
+  schedule_model->clearRules();
+  realtime_model->clearRules();
+
+  std::printf("[filter-ux] passed=%d failed=%d\n", run.passed, run.failed);
+  if (run.failed != 0) {
+    for (const QString& failure : run.failures)
+      std::printf("[filter-ux]   FAIL %s\n", qPrintable(failure));
+  }
+  return run.failed == 0 ? 0 : 1;
+}
+
 int RunGuiContractTest(QQuickWindow* window,
                        backup_modern::BackupController* controller) {
   CheckRun run;
@@ -2166,6 +3154,480 @@ int RunScheduleShow(backup_modern::ScheduleController* schedule) {
   return 0;
 }
 
+// ---- --realtime-show：把 GUI 控制器读到的实时配置打成 key=value ----
+//
+// 与 --schedule-show 同构。它是 CLI ↔ GUI parity 的"GUI 侧读"证据：
+// backupctl realtime set 写下的字段，GUI 控制器必须逐项读到同样的值；
+// 反过来 GUI 保存出来的文件，backupctl realtime show 也必须读到同样的值。
+int RunRealtimeShow(backup_modern::RealtimeController* realtime) {
+  realtime->reload();
+  std::printf("enabled=%d\n", realtime->enabled() ? 1 : 0);
+  std::printf("trigger=%s\n", qPrintable(realtime->triggerKey()));
+  std::printf("strategy=%s\n", qPrintable(realtime->strategyKey()));
+  std::printf("source=%s\n", qPrintable(realtime->sourcePath()));
+  std::printf("debounce_ms=%d\n", realtime->debounceMs());
+  std::printf("max_wait_ms=%d\n", realtime->maxWaitMs());
+  std::printf("retain=%d\n", realtime->retainCount());
+  std::printf("pack=%s\n", qPrintable(realtime->packKey()));
+  std::printf("compression=%s\n", qPrintable(realtime->compressionKey()));
+  std::printf("encryption=%s\n", qPrintable(realtime->encryptionKey()));
+  for (const QString& rule : realtime->includeRules()) {
+    std::printf("include=%s\n", qPrintable(rule));
+  }
+  for (const QString& rule : realtime->excludeRules()) {
+    std::printf("exclude=%s\n", qPrintable(rule));
+  }
+  std::printf("repository=%s\n", qPrintable(realtime->repositoryPath()));
+  // 加密边界的那句话也必须来自同一处：GUI 与 CLI 显示的是同一个字符串。
+  std::printf("encryption_note=%s\n", qPrintable(realtime->encryptionNote()));
+  std::printf("snapshots=%d\n", realtime->snapshotCount());
+  std::printf("store=%s\n", qPrintable(realtime->storePath()));
+  if (!realtime->loadError().isEmpty()) {
+    std::printf("load_error=%s\n", qPrintable(realtime->loadError()));
+  }
+  return 0;
+}
+
+// ---- --realtime-test：实时备份页的控制器链路自检 ----
+//
+// 全程跑在临时目录里：临时 config.json、临时 realtime.json、临时仓库与源目录。
+// 绝不读写用户真实的实时配置，也不碰冻结的 Demo 目录。
+//
+// 它刻意不 mock 核心：控制器写进 store 的东西，紧接着用
+// backupproject::RealtimeStore 原样读回来逐项比对 —— 这正是
+// "GUI 与 CLI 读同一份 store、同一套 schema"在单元层面的证据。
+
+// 等到"最近一次产出的归档名"变成 previous 之外的值。
+// 用事件循环等，不用 sleep 堆时间：inotify 事件、debounce 定时器、后台任务
+// 都在这个循环里跑。
+bool WaitUntilNewSnapshot(backup_modern::RealtimeController* realtime,
+                          const QString& previous, int timeout_ms) {
+  QEventLoop loop;
+  QTimer poll;
+  poll.setInterval(10);
+  QObject::connect(&poll, &QTimer::timeout, &loop,
+                   [realtime, previous, &loop]() {
+                     if (!realtime->libraryBusy() && !realtime->pending() &&
+                         !realtime->lastSnapshotName().isEmpty() &&
+                         realtime->lastSnapshotName() != previous) {
+                       loop.quit();
+                     }
+                   });
+  QTimer guard;
+  guard.setSingleShot(true);
+  QObject::connect(&guard, &QTimer::timeout, &loop, &QEventLoop::quit);
+  poll.start();
+  guard.start(timeout_ms);
+  loop.exec();
+  return !realtime->lastSnapshotName().isEmpty() &&
+         realtime->lastSnapshotName() != previous;
+}
+
+// 等到指定仓库里的归档数量**超过** before_count，并且实时控制器重新闲下来。
+//
+// 换仓库的场景不能用"归档名变了"当判据：归档名只精确到秒（重名时才加 _001
+// 后缀），同一个秒里在 A、B 两个仓库各写一份，两份的名字会**完全一样**。
+// 所以这里判的是仓库里的真实文件数 —— 那才是"到底写到哪儿去了"。
+bool WaitForRepositoryGrowth(backup_modern::RealtimeController* realtime,
+                             const QString& repository, int before_count,
+                             int timeout_ms) {
+  QEventLoop loop;
+  QTimer poll;
+  poll.setInterval(10);
+  QObject::connect(&poll, &QTimer::timeout, &loop,
+                   [realtime, repository, before_count, &loop]() {
+                     if (!realtime->libraryBusy() && !realtime->pending() &&
+                         CountArchives(repository) > before_count) {
+                       loop.quit();
+                     }
+                   });
+  QTimer guard;
+  guard.setSingleShot(true);
+  QObject::connect(&guard, &QTimer::timeout, &loop, &QEventLoop::quit);
+  poll.start();
+  guard.start(timeout_ms);
+  loop.exec();
+  return !realtime->libraryBusy() && !realtime->pending() &&
+         CountArchives(repository) > before_count;
+}
+
+int RunRealtimeTest(backup_modern::RealtimeController* realtime,
+                    backup_modern::OperationGate* gate,
+                    backup_modern::BackupController* controller,
+                    const QString& config_path) {
+  CheckRun run;
+  run.prefix = "[realtime]";
+
+  QTemporaryDir temp;
+  if (!temp.isValid()) {
+    std::fprintf(stderr, "[realtime] 无法创建临时目录\n");
+    return 1;
+  }
+  // 从一份干净的 store 开始：自检要断言"默认值"，残留的旧配置会让它测的不是
+  // 默认状态。这里删的是 --realtime-file 指到的文件（测试隔离目录）。
+  QFile::remove(realtime->storePath());
+
+  const QString source = temp.path() + QStringLiteral("/source");
+  const QString repository = temp.path() + QStringLiteral("/repository");
+  QDir().mkpath(source);
+  QDir().mkpath(repository);
+  if (!WriteTestFile(source + QStringLiteral("/a.txt"), "alpha")) {
+    std::fprintf(stderr, "[realtime] 无法准备源文件\n");
+    return 1;
+  }
+
+  // 1) 临时 config.json：把仓库指到临时目录。
+  {
+    backupproject::ConfigManager manager(config_path.toStdString());
+    backupproject::AppConfig config;
+    config.backup_repository_path = repository.toStdString();
+    std::string error;
+    run.Check(manager.Save(config, &error),
+              QStringLiteral("RT-01 临时 config.json 写入成功"),
+              QString::fromStdString(error));
+  }
+
+  realtime->reload();
+
+  run.Check(!realtime->enabled(), QStringLiteral("RT-02 默认未启用"));
+  run.Check(realtime->debounceMs() == 500,
+            QStringLiteral("RT-03 默认 debounce 500 ms"),
+            QString::number(realtime->debounceMs()));
+  run.Check(realtime->maxWaitMs() == 5000,
+            QStringLiteral("RT-04 默认 max wait 5000 ms"),
+            QString::number(realtime->maxWaitMs()));
+  run.Check(realtime->retainCount() == 12,
+            QStringLiteral("RT-05 默认保留 12 份"),
+            QString::number(realtime->retainCount()));
+  run.Check(realtime->triggerKey() == QStringLiteral("realtime"),
+            QStringLiteral("RT-06 trigger 固定为 realtime"),
+            realtime->triggerKey());
+  run.Check(realtime->repositoryPath() == repository,
+            QStringLiteral("RT-07 控制器读到了临时仓库"),
+            realtime->repositoryPath());
+  run.Check(realtime->encryptionKey() == QStringLiteral("none"),
+            QStringLiteral("RT-08 加密固定 none"), realtime->encryptionKey());
+
+  // 2) 写一份临时 realtime.json：strategy=full，逐字段读回。
+  run.Check(realtime->saveConfig(/*enabled=*/false, source, 200, 2000, 3,
+                                 QStringLiteral("mypack"),
+                                 QStringLiteral("none"), QStringList(),
+                                 QStringList(), QStringLiteral("full")),
+            QStringLiteral("RT-09 保存实时配置（full）成功"));
+
+  const QString store_file = realtime->storePath();
+  run.Check(QFile::exists(store_file),
+            QStringLiteral("RT-10 realtime.json 已落盘"), store_file);
+  struct stat store_info;
+  const bool stat_ok =
+      ::stat(store_file.toLocal8Bit().constData(), &store_info) == 0;
+  run.Check(stat_ok && (store_info.st_mode & 07777) == 0600,
+            QStringLiteral("RT-11 realtime.json 权限是 0600"),
+            stat_ok ? QString::number(store_info.st_mode & 07777, 8)
+                    : QStringLiteral("stat 失败"));
+
+  // 用共享核心原样读回来 —— GUI 存的东西必须是共享 schema。
+  {
+    backupproject::RealtimeStore store(store_file.toStdString());
+    backupproject::RealtimeConfig stored;
+    std::string error;
+    const backupproject::RealtimeLoadStatus status =
+        store.Load(&stored, &error);
+    run.Check(status == backupproject::RealtimeLoadStatus::kLoaded,
+              QStringLiteral("RT-12 realtime.json 能被共享核心读回"),
+              QString::fromStdString(error));
+    run.Check(stored.source_path == source.toStdString(),
+              QStringLiteral("RT-13 源目录逐字一致"),
+              QString::fromStdString(stored.source_path));
+    run.Check(stored.debounce_ms == 200 && stored.max_wait_ms == 2000 &&
+                  stored.retain_count == 3,
+              QStringLiteral("RT-14 debounce / max_wait / retain 逐字段一致"),
+              QStringLiteral("%1/%2/%3")
+                  .arg(stored.debounce_ms)
+                  .arg(stored.max_wait_ms)
+                  .arg(stored.retain_count));
+    run.Check(stored.strategy == backupproject::BackupStrategy::kFull,
+              QStringLiteral("RT-15 strategy=full"));
+    run.Check(stored.trigger == backupproject::BackupTrigger::kRealtime,
+              QStringLiteral("RT-16 trigger=realtime"));
+    run.Check(
+        stored.encryption_method == backupproject::EncryptionMethod::kNone,
+        QStringLiteral("RT-17 加密固定 none"));
+    run.Check(!stored.enabled, QStringLiteral("RT-18 enabled 与保存时一致"));
+    run.Check(stored.version == backupproject::kRealtimeConfigVersion,
+              QStringLiteral("RT-19 version 是共享 schema 的当前版本"));
+  }
+  std::printf(
+      "[realtime] config strategy=%s debounce=%d max_wait=%d retain=%d\n",
+      qPrintable(realtime->strategyKey()), realtime->debounceMs(),
+      realtime->maxWaitMs(), realtime->retainCount());
+
+  // 3) 切到 incremental 再读回核对。
+  run.Check(realtime->saveConfig(false, source, 200, 2000, 3,
+                                 QStringLiteral("mypack"),
+                                 QStringLiteral("none"), QStringList(),
+                                 QStringList(), QStringLiteral("incremental")),
+            QStringLiteral("RT-20 保存实时配置（incremental）成功"));
+  {
+    backupproject::RealtimeStore store(store_file.toStdString());
+    backupproject::RealtimeConfig stored;
+    std::string error;
+    const bool loaded = store.Load(&stored, &error) ==
+                        backupproject::RealtimeLoadStatus::kLoaded;
+    run.Check(loaded && stored.strategy ==
+                            backupproject::BackupStrategy::kIncremental,
+              QStringLiteral("RT-21 读回来是 strategy=incremental"),
+              QString::fromStdString(error));
+  }
+  std::printf(
+      "[realtime] config strategy=%s debounce=%d max_wait=%d retain=%d\n",
+      qPrintable(realtime->strategyKey()), realtime->debounceMs(),
+      realtime->maxWaitMs(), realtime->retainCount());
+
+  // 切回 full：下面两次触发断言的都是"完整快照"这条真实产品路径。
+  run.Check(realtime->saveConfig(false, source, 200, 2000, 3,
+                                 QStringLiteral("mypack"),
+                                 QStringLiteral("none"), QStringList(),
+                                 QStringList(), QStringLiteral("full")),
+            QStringLiteral("RT-22 切回 strategy=full 成功"));
+
+  // 4) 启用 -> attach watcher -> 合成一次 resync -> 等第一份快照。
+  run.Check(realtime->setEnabled(true),
+            QStringLiteral("RT-23 启用实时备份成功"));
+  run.Check(realtime->watching() && realtime->watchCount() > 0,
+            QStringLiteral("RT-24 watcher 已建立"),
+            QString::number(realtime->watchCount()));
+  std::printf("[realtime] attach watches=%d\n", realtime->watchCount());
+  run.Check(realtime->waitForIdle(60000),
+            QStringLiteral("RT-25 重新同步触发的第一份快照完成"));
+  run.Check(realtime->lastOutcomeKind() == QStringLiteral("full-snapshot"),
+            QStringLiteral("RT-26 第一次触发产出完整快照"),
+            realtime->lastOutcomeKind());
+  const QString first = realtime->lastSnapshotName();
+  run.Check(!first.isEmpty(), QStringLiteral("RT-27 第一次触发有归档名"));
+  std::printf("[realtime] step1 kind=%s name=%s\n",
+              qPrintable(realtime->lastOutcomeKind()), qPrintable(first));
+
+  // 5) 制造一次文件写入 -> 等 debounce -> 等第二份快照。
+  run.Check(WriteTestFile(source + QStringLiteral("/b.txt"), "beta"),
+            QStringLiteral("RT-28 在源目录里写入新文件"));
+  run.Check(WaitUntilNewSnapshot(realtime, first, 60000),
+            QStringLiteral("RT-29 事件触发的第二份快照完成"));
+  run.Check(realtime->lastOutcomeKind() == QStringLiteral("full-snapshot"),
+            QStringLiteral("RT-30 第二次触发产出完整快照"),
+            realtime->lastOutcomeKind());
+  const QString second = realtime->lastSnapshotName();
+  run.Check(!second.isEmpty() && second != first,
+            QStringLiteral("RT-31 第二次触发产出了新的归档"), second);
+  std::printf("[realtime] step2 kind=%s name=%s\n",
+              qPrintable(realtime->lastOutcomeKind()), qPrintable(second));
+
+  std::printf("[realtime] history count=%d\n", realtime->snapshotCount());
+  run.Check(realtime->snapshotCount() >= 2,
+            QStringLiteral("RT-32 最近实时快照列表里至少有两份"),
+            QString::number(realtime->snapshotCount()));
+  run.Check(realtime->watchCount() > 0,
+            QStringLiteral("RT-33 两轮之间监听一直没断"));
+
+  // ---- 闸门被占时触发不丢：合并成一个 pending generation，释放后补一次 ----
+  //
+  // 这条路径在真实产品里很容易发生（手动备份 / 计划评估正在跑，同时源目录
+  // 又变了）。判别点有两个：闸门被占期间**不写任何东西**，而且几批事件只
+  // 合并成**一次**评估，不是每次事件都排一次队。
+  {
+    const int before_count = realtime->snapshotCount();
+    QString reason;
+    const bool held = gate->Acquire(
+        backup_modern::OperationGate::Kind::kManualBackup, &reason);
+    run.Check(held, QStringLiteral("RT-34 先占住闸门（模拟手动备份正在跑）"),
+              reason);
+
+    run.Check(WriteTestFile(source + QStringLiteral("/c.txt"), "gamma"),
+              QStringLiteral("RT-35 闸门被占期间改第一个文件"));
+    run.Check(WriteTestFile(source + QStringLiteral("/d.txt"), "delta"),
+              QStringLiteral("RT-36 闸门被占期间改第二个文件"));
+
+    auto wait_for_pending = [realtime](int timeout_ms) {
+      QEventLoop loop;
+      QTimer poll;
+      poll.setInterval(10);
+      QObject::connect(&poll, &QTimer::timeout, &loop, [realtime, &loop]() {
+        if (realtime->pending()) loop.quit();
+      });
+      QTimer guard;
+      guard.setSingleShot(true);
+      QObject::connect(&guard, &QTimer::timeout, &loop, &QEventLoop::quit);
+      poll.start();
+      guard.start(timeout_ms);
+      loop.exec();
+      return realtime->pending();
+    };
+    run.Check(wait_for_pending(10000),
+              QStringLiteral("RT-37 闸门被占时这一代被记住（pending）"));
+    run.Check(realtime->snapshotCount() == before_count,
+              QStringLiteral("RT-38 闸门被占期间一份快照都没写"),
+              QString::number(realtime->snapshotCount()));
+
+    gate->Release(backup_modern::OperationGate::Kind::kManualBackup);
+    run.Check(WaitUntilNewSnapshot(realtime, second, 60000),
+              QStringLiteral("RT-39 闸门释放后待办的那一代被补跑"));
+    run.Check(realtime->snapshotCount() == before_count + 1,
+              QStringLiteral("RT-40 判别：两批事件只合并成一次评估"),
+              QString::number(realtime->snapshotCount()));
+  }
+
+  // ---- 运行期改仓库：控制器必须跟上，而且绝不继续写旧仓库 ----
+  //
+  // 这是判别性的一组：此时 realtime 已经 enabled、watcher 已经起来、A 里也已经
+  // 有了快照。改动走 BackupController::saveRepositoryPath —— 与设置页是同一个
+  // 入口、同一个 repositoryPathChanged 信号。三种情形都必须闭环：
+  //
+  //   * 合法的新仓库：监听重建 + 合成一次 resync，新快照只落在新仓库；
+  //   * 不合法的新仓库（落在 source 里）：一个字节都不写，进入 degraded 并给出
+  //     共享核心那句原因，enabled 保持不变；改回合法值后自动恢复；
+  //   * 未启用：只刷新仓库与快照列表，watcher 不启动、也不写任何东西。
+  {
+    const QString repository_next =
+        temp.path() + QStringLiteral("/repository-next");
+    const QString repository_inside =
+        source + QStringLiteral("/inner-repository");
+    QDir().mkpath(repository_next);
+    QDir().mkpath(repository_inside);
+
+    // (1) 合法的新仓库：跟上 + 重建监听 + resync。
+    const int old_repo_before = CountArchives(repository);
+    run.Check(CountArchives(repository_next) == 0,
+              QStringLiteral("RT-41 新仓库一开始是空的（后面的增长才是判别）"),
+              QString::number(CountArchives(repository_next)));
+    run.Check(controller->saveRepositoryPath(repository_next),
+              QStringLiteral("RT-42 设置页把仓库改成新目录（真实入口）"),
+              controller->statusMessage());
+    run.Check(realtime->repositoryPath() == repository_next,
+              QStringLiteral("RT-43 实时控制器立刻读到新仓库"),
+              realtime->repositoryPath());
+    run.Check(realtime->watching() && realtime->watchCount() > 0,
+              QStringLiteral("RT-44 新仓库下监听已重建"),
+              QString::number(realtime->watchCount()));
+    run.Check(WaitForRepositoryGrowth(realtime, repository_next, 0, 60000),
+              QStringLiteral("RT-45 换仓库后合成了一次 resync 并产出快照"),
+              QString::number(CountArchives(repository_next)));
+    const QString after_switch = realtime->lastSnapshotName();
+    run.Check(ArchiveNames(repository_next).contains(after_switch),
+              QStringLiteral("RT-46 新快照落在新仓库里"), after_switch);
+    run.Check(CountArchives(repository) == old_repo_before,
+              QStringLiteral("RT-47 旧仓库没有新增任何快照"),
+              QString::number(CountArchives(repository)));
+    std::printf("[realtime] switch repo=%s snapshot=%s\n",
+                qPrintable(repository_next), qPrintable(after_switch));
+
+    // (2) 不合法的新仓库（落在 source 里）：overlap 必须被重新检查，
+    //     而且**一个快照都不许写**。
+    const int next_repo_before = CountArchives(repository_next);
+    const QString snapshot_before_invalid = realtime->lastSnapshotName();
+    run.Check(
+        controller->saveRepositoryPath(repository_inside),
+        QStringLiteral("RT-48 设置页把仓库改成 source 里的目录（真实入口）"),
+        controller->statusMessage());
+    run.Check(realtime->repositoryPath() == repository_inside,
+              QStringLiteral("RT-49 实时控制器跟着读到这个仓库"),
+              realtime->repositoryPath());
+    run.Check(
+        !realtime->watching(),
+        QStringLiteral("RT-50 不合法时监听被停掉（不再从旧仓库的视角看事件）"));
+    run.Check(realtime->watchDegraded() &&
+                  realtime->phaseKey() == QStringLiteral("watch_degraded"),
+              QStringLiteral("RT-51 进入明确的 degraded 状态"),
+              realtime->phaseKey());
+    run.Check(realtime->statusMessage().contains(QStringLiteral("repository")),
+              QStringLiteral("RT-52 状态里给的是共享核心那句原因"),
+              realtime->statusMessage());
+    run.Check(
+        realtime->enabled(),
+        QStringLiteral("RT-53 不合法不会把实时备份偷偷关掉（仍然 enabled）"));
+
+    // 判别：换仓库**之后**源目录里真的发生了事件，而且等满了一个
+    // debounce + max_wait 窗口。旧仓库一份都不许新增 —— 如果 handler 没有停掉
+    // 旧 watcher、或者还拿着旧仓库路径，这里必然多出一份归档。
+    run.Check(
+        WriteTestFile(source + QStringLiteral("/after-switch.txt"), "moved"),
+        QStringLiteral("RT-54 换仓库之后源目录里再写一个文件"));
+    WaitForAnimation(2500);
+    run.Check(!realtime->libraryBusy() && !realtime->pending(),
+              QStringLiteral("RT-55 不合法仓库下一轮触发都没有"));
+    run.Check(CountArchives(repository_next) == next_repo_before,
+              QStringLiteral("RT-56 判别：旧仓库没有新增任何快照"),
+              QString::number(CountArchives(repository_next)));
+    run.Check(CountArchives(repository_inside) == 0,
+              QStringLiteral("RT-57 非法仓库里一份快照都没有"),
+              QString::number(CountArchives(repository_inside)));
+    run.Check(realtime->lastSnapshotName() == snapshot_before_invalid,
+              QStringLiteral("RT-58 也没有产出任何新的归档名"),
+              realtime->lastSnapshotName());
+
+    // (3) 仓库改回合法值：必须自动恢复（重新 attach + 合成 resync）。
+    const int next_repo_before_recover = CountArchives(repository_next);
+    run.Check(controller->saveRepositoryPath(repository_next),
+              QStringLiteral("RT-59 把仓库改回合法目录"),
+              controller->statusMessage());
+    run.Check(realtime->watching() && realtime->watchCount() > 0 &&
+                  !realtime->watchDegraded(),
+              QStringLiteral("RT-60 degraded 状态自动恢复：监听重建"),
+              realtime->watchStateText());
+    run.Check(WaitForRepositoryGrowth(realtime, repository_next,
+                                      next_repo_before_recover, 60000),
+              QStringLiteral("RT-61 恢复后重新同步并产出快照"),
+              QString::number(CountArchives(repository_next)));
+    const QString recovered = realtime->lastSnapshotName();
+    run.Check(ArchiveNames(repository_next).contains(recovered),
+              QStringLiteral("RT-62 恢复后的快照落在合法仓库里"), recovered);
+    std::printf("[realtime] recover repo=%s snapshot=%s\n",
+                qPrintable(repository_next), qPrintable(recovered));
+
+    // (4) 未启用时改仓库：只刷新仓库与列表，不启动 watcher、不写任何东西。
+    const int next_repo_before_disabled = CountArchives(repository_next);
+    run.Check(realtime->setEnabled(false),
+              QStringLiteral("RT-63 先停用实时备份"));
+    run.Check(!realtime->watching(), QStringLiteral("RT-64 停用后不再监听"));
+    run.Check(controller->saveRepositoryPath(repository),
+              QStringLiteral("RT-65 未启用状态下把仓库改回 A"),
+              controller->statusMessage());
+    run.Check(realtime->repositoryPath() == repository,
+              QStringLiteral("RT-66 未启用时依然跟上仓库路径"),
+              realtime->repositoryPath());
+    run.Check(!realtime->watching() && !realtime->watchDegraded() &&
+                  realtime->watchCount() == 0,
+              QStringLiteral("RT-67 未启用时绝不无故启动 watcher"),
+              realtime->watchStateText());
+    run.Check(realtime->waitForIdle(60000) &&
+                  realtime->snapshotCount() == old_repo_before,
+              QStringLiteral("RT-68 快照列表跟着仓库刷新"),
+              QString::number(realtime->snapshotCount()) + QStringLiteral("/") +
+                  QString::number(old_repo_before));
+    WaitForAnimation(1500);
+    run.Check(CountArchives(repository) == old_repo_before &&
+                  !realtime->libraryBusy(),
+              QStringLiteral("RT-69 未启用时改仓库不写任何快照"),
+              QString::number(CountArchives(repository)));
+    run.Check(CountArchives(repository_next) == next_repo_before_disabled,
+              QStringLiteral("RT-70 也不写回上一个仓库"));
+    std::printf("[realtime] disabled repo=%s snapshots=%d\n",
+                qPrintable(realtime->repositoryPath()),
+                realtime->snapshotCount());
+  }
+
+  realtime->stop();
+
+  std::printf("[realtime] 通过 %d 项，失败 %d 项\n", run.passed, run.failed);
+  if (run.failed != 0) {
+    for (const QString& failure : run.failures) {
+      std::printf("[realtime]   FAIL %s\n", qPrintable(failure));
+    }
+    return 1;
+  }
+  std::printf("[realtime] ok\n");
+  return 0;
+}
+
 // ---- --schedule-test：自动备份页的控制器链路自检 ----
 //
 // 全程跑在临时目录里：临时 config.json、临时 schedule.json、临时仓库与源目录。
@@ -2185,6 +3647,31 @@ int CountArchives(const QString& repository) {
   return ArchiveNames(repository).size();
 }
 
+// scheduler **配置**部分的稳定指纹。M1.5 用它断言"被拒绝的手动备份没有改写
+// 配置"。只放配置字段：managed / history / last-run 属于 state，正在跑的定时
+// 评估会合法地改它们，不能进这个指纹。
+QString ScheduleConfigSignature(const backupproject::ScheduleConfig& config) {
+  QStringList parts;
+  parts << (config.enabled ? QStringLiteral("1") : QStringLiteral("0"))
+        << QString::number(static_cast<int>(config.trigger))
+        << QString::number(static_cast<int>(config.strategy))
+        << QString::fromStdString(config.source_path)
+        << QString::number(config.interval_minutes)
+        << QString::number(config.retain_count)
+        << QString::number(static_cast<int>(config.pack_method))
+        << QString::number(static_cast<int>(config.compression_method))
+        << QString::number(static_cast<int>(config.encryption_method))
+        << QStringLiteral("|");
+  for (const std::string& rule : config.include_rules) {
+    parts << QString::fromStdString(rule);
+  }
+  parts << QStringLiteral("||");
+  for (const std::string& rule : config.exclude_rules) {
+    parts << QString::fromStdString(rule);
+  }
+  return parts.join(QLatin1Char('~'));
+}
+
 QVariantMap LastHistory(const backup_modern::ScheduleController& schedule) {
   const QVariantList history = schedule.history();
   if (history.isEmpty()) return QVariantMap();
@@ -2196,6 +3683,13 @@ int RunScheduleTest(backup_modern::ScheduleController* schedule,
                     const QString& config_path) {
   CheckRun run;
   run.prefix = "[schedule]";
+
+  // 频率断言的人话单位名（内部 key -> 中文），只用于日志。
+  const auto unitLabel = [](const char* key) -> QString {
+    const backup_modern::FrequencyUnit* unit =
+        backup_modern::FindFrequencyUnit(key);
+    return QString::fromUtf8(unit == nullptr ? key : unit->label);
+  };
 
   QTemporaryDir temp;
   if (!temp.isValid()) {
@@ -2243,9 +3737,131 @@ int RunScheduleTest(backup_modern::ScheduleController* schedule,
   run.Check(schedule->repositoryPath() == repository,
             QStringLiteral("SCH-06 控制器读到了临时仓库"),
             schedule->repositoryPath());
-  run.Check(schedule->supportedModeText().contains(
-                QStringLiteral("定时触发 + 完整快照")),
-            QStringLiteral("SCH-07 页面说明只承诺已实现的模式"));
+  // 这句能力说明改成面向用户的一句之后，断言也跟着改：它必须说的是当前真的
+  // 支持什么，而不是"以后会扩展什么"。
+  run.Check(
+      schedule->supportedModeText().contains(QStringLiteral("定时触发")) &&
+          !schedule->supportedModeText().contains(QStringLiteral("后续将扩展")),
+      QStringLiteral("SCH-07 页面说明只承诺已实现的模式"),
+      schedule->supportedModeText());
+
+  // ---- 备份频率：值 + 单位 <-> interval_minutes ----
+  //
+  // 界面上是"每 1 小时"，核心与 backupctl 只认分钟。这一组断言把换算的两端都
+  // 钉住，尤其是"不能整除就回退分钟"和"乘法不许溢出"。
+  {
+    struct FrequencyCase {
+      const char* value;
+      const char* unit;
+      int expected;
+    };
+    const FrequencyCase kAccepted[] = {
+        {"1", "minutes", 1},   {"90", "minutes", 90},   {"1", "hours", 60},
+        {"2", "hours", 120},   {"1", "days", 1440},     {"2", "days", 2880},
+        {"1", "weeks", 10080}, {"365", "days", 525600},
+    };
+    for (const FrequencyCase& item : kAccepted) {
+      std::uint32_t minutes = 0;
+      std::string error;
+      const bool ok = backup_modern::ParseFrequency(item.value, item.unit,
+                                                    &minutes, &error);
+      run.Check(ok && minutes == static_cast<std::uint32_t>(item.expected),
+                QStringLiteral("FREQ-01 每 %1 %2 -> %3 分钟")
+                    .arg(QString::fromLatin1(item.value), unitLabel(item.unit))
+                    .arg(item.expected),
+                ok ? QString::number(minutes) : QString::fromStdString(error));
+    }
+
+    // 加载：取最大的整除单位。10080 必须是"每 1 周"而不是"每 168 小时"，
+    // 90 必须老实回退成"每 90 分钟"，绝不显示"每 1.5 小时"。
+    struct SplitCase {
+      int minutes;
+      const char* value;
+      const char* unit;
+    };
+    const SplitCase kSplit[] = {
+        {60, "1", "hours"},  {120, "2", "hours"},     {1440, "1", "days"},
+        {2880, "2", "days"}, {10080, "1", "weeks"},   {90, "90", "minutes"},
+        {1, "1", "minutes"}, {525600, "365", "days"},
+    };
+    for (const SplitCase& item : kSplit) {
+      std::string value;
+      std::string unit;
+      backup_modern::SplitFrequency(static_cast<std::uint32_t>(item.minutes),
+                                    &value, &unit);
+      run.Check(value == item.value && unit == item.unit,
+                QStringLiteral("FREQ-02 %1 分钟 -> 每 %2 %3")
+                    .arg(item.minutes)
+                    .arg(QString::fromLatin1(item.value), unitLabel(item.unit)),
+                QStringLiteral("%1/%2").arg(QString::fromStdString(value),
+                                            QString::fromStdString(unit)));
+    }
+
+    // 0 / 负数 / 非数字 / 小数点 / 超最大值 / 乘法溢出 / 未知单位：全部拒绝。
+    struct RejectCase {
+      const char* value;
+      const char* unit;
+      const char* why;
+    };
+    const RejectCase kRejected[] = {
+        {"0", "minutes", "零"},
+        {"0", "hours", "零"},
+        {"-1", "hours", "负数"},
+        {"abc", "minutes", "非数字"},
+        {"1.5", "hours", "小数点"},
+        {"", "minutes", "空串"},
+        {"12abc", "minutes", "尾随字母"},
+        {"99999999999999999999", "minutes", "超出 uint32"},
+        {"525601", "minutes", "超出最大分钟数"},
+        {"1000", "weeks", "乘法会溢出上界"},
+        {"1", "lightyears", "未知单位"},
+    };
+    for (const RejectCase& item : kRejected) {
+      std::uint32_t minutes = 0;
+      std::string error;
+      const bool ok = backup_modern::ParseFrequency(item.value, item.unit,
+                                                    &minutes, &error);
+      run.Check(!ok && !error.empty(),
+                QStringLiteral("FREQ-03 拒绝 每 %1 %2（%3）")
+                    .arg(QString::fromLatin1(item.value), unitLabel(item.unit),
+                         QString::fromUtf8(item.why)),
+                ok ? QStringLiteral("被接受了：%1").arg(minutes)
+                   : QStringLiteral("没有任何原因"));
+    }
+  }
+
+  // 控制器入口：界面走的就是这一条，返回值与回显都要对得上。
+  run.Check(
+      schedule->saveConfigFromFrequencyText(
+          true, source, QStringLiteral("1"), QStringLiteral("hours"),
+          QStringLiteral("3"), QStringLiteral("mypack"), QStringLiteral("none"),
+          QStringList(), QStringList(), QStringLiteral("full")) &&
+          schedule->intervalMinutes() == 60 &&
+          schedule->frequencyValueText() == QStringLiteral("1") &&
+          schedule->frequencyUnitKey() == QStringLiteral("hours"),
+      QStringLiteral("FREQ-04 控制器接受“每 1 小时”并回显一致"),
+      QStringLiteral("%1 %2 / %3 分钟")
+          .arg(schedule->frequencyValueText(), schedule->frequencyUnitKey())
+          .arg(schedule->intervalMinutes()));
+  run.Check(
+      schedule->saveConfigFromFrequencyText(
+          true, source, QStringLiteral("90"), QStringLiteral("minutes"),
+          QStringLiteral("3"), QStringLiteral("mypack"), QStringLiteral("none"),
+          QStringList(), QStringList(), QStringLiteral("full")) &&
+          schedule->intervalMinutes() == 90 &&
+          schedule->frequencyValueText() == QStringLiteral("90") &&
+          schedule->frequencyUnitKey() == QStringLiteral("minutes"),
+      QStringLiteral("FREQ-05 90 分钟不会被显示成 1.5 小时"));
+  run.Check(
+      !schedule->saveConfigFromFrequencyText(
+          true, source, QStringLiteral("0"), QStringLiteral("minutes"),
+          QStringLiteral("3"), QStringLiteral("mypack"), QStringLiteral("none"),
+          QStringList(), QStringList(), QStringLiteral("full")) &&
+          schedule->statusKind() == QStringLiteral("error"),
+      QStringLiteral("FREQ-06 控制器拒绝“每 0 分钟”并给出错误"),
+      schedule->statusTitle() + QStringLiteral("/") +
+          schedule->statusMessage());
+  schedule->clearStatus();
 
   // 2) 保存一份真实计划。
   run.Check(schedule->saveConfig(true, source, 1, 3, QStringLiteral("ustar"),
@@ -2636,12 +4252,16 @@ int RunScheduleTest(backup_modern::ScheduleController* schedule,
     // 再"响"几次 tick：既不能有新评估，也不能有每秒一次的 signal 风暴。
     int status_signals = 0;
     int suspended_signals = 0;
-    QObject::connect(schedule,
-                     &backup_modern::ScheduleController::statusChanged,
-                     [&status_signals]() { ++status_signals; });
-    QObject::connect(schedule,
-                     &backup_modern::ScheduleController::suspendedChanged,
-                     [&suspended_signals]() { ++suspended_signals; });
+    // 这两条 connection 只服务于本段的诊断观测，lambda 按引用捕获计数器。
+    // 计数器随本段作用域销毁，connection 却一直挂在 schedule 上，runNow()
+    // 发出 statusChanged 会写到失效的栈对象（ASan: stack-use-after-scope）。
+    // 所以显式持有 connection，并在本段结束前断开。
+    const QMetaObject::Connection status_connection = QObject::connect(
+        schedule, &backup_modern::ScheduleController::statusChanged,
+        [&status_signals]() { ++status_signals; });
+    const QMetaObject::Connection suspended_connection = QObject::connect(
+        schedule, &backup_modern::ScheduleController::suspendedChanged,
+        [&suspended_signals]() { ++suspended_signals; });
     const QString status_before = schedule->statusTitle() +
                                   QStringLiteral("|") +
                                   schedule->statusMessage();
@@ -2680,6 +4300,10 @@ int RunScheduleTest(backup_modern::ScheduleController* schedule,
               QStringLiteral("SCH-89 恢复之后计划真的又能跑了"));
     run.Check(!schedule->suspended(),
               QStringLiteral("SCH-90 成功跑完一轮之后仍然没有挂起"));
+
+    // 计数器就在这个作用域里：离开之前先断开，保证没有回调还能引用它们。
+    QObject::disconnect(status_connection);
+    QObject::disconnect(suspended_connection);
   }
 
   // 16) 同一进程内的单写者：评估在飞的时候不允许保存。
@@ -3028,6 +4652,26 @@ int RunScheduleTest(backup_modern::ScheduleController* schedule,
       if (!file.open(QIODevice::ReadOnly)) return QByteArray();
       return file.readAll();
     };
+    // 只读地取 scheduler 的持久化状态。M3 断言的是"被拒绝的删除没有把受管
+    // 快照移出名单"，而 M1.1 起的后台评估在 busy 窗口里本来就会合法地写
+    // history / last-run / manifest 等 bookkeeping，所以这里必须看结构化
+    // 状态，不能拿整个文件的字节当"没有副作用"的代理。
+    auto load_schedule_document = [](const QString& path,
+                                     backupproject::ScheduleDocument* document,
+                                     std::string* error) {
+      backupproject::ScheduleStore store(path.toStdString());
+      return store.Load(document, error) ==
+             backupproject::ScheduleLoadStatus::kLoaded;
+    };
+    auto is_managed_snapshot =
+        [](const backupproject::ScheduleDocument& document,
+           const QString& name) {
+          for (const backupproject::ScheduledSnapshotRecord& record :
+               document.state.managed_snapshots) {
+            if (QString::fromStdString(record.file_name) == name) return true;
+          }
+          return false;
+        };
     const QString store_path = schedule->storePath();
 
     backup_controller->setSourcePath(source);
@@ -3036,7 +4680,12 @@ int RunScheduleTest(backup_modern::ScheduleController* schedule,
     run.Check(schedule->runNow() && schedule->libraryBusy(),
               QStringLiteral("M1.1 评估进入 busy"));
     const int archives_before = CountArchives(repository);
-    const QByteArray store_before = read_bytes(store_path);
+    backupproject::ScheduleDocument config_document;
+    std::string config_error;
+    const bool config_loaded =
+        load_schedule_document(store_path, &config_document, &config_error);
+    const QString config_before =
+        ScheduleConfigSignature(config_document.config);
     run.Check(!backup_controller->startBackup(),
               QStringLiteral("M1.2 评估在飞时手动备份被 C++ 拒绝"),
               backup_controller->statusMessage());
@@ -3046,15 +4695,54 @@ int RunScheduleTest(backup_modern::ScheduleController* schedule,
               backup_controller->statusMessage());
     run.Check(CountArchives(repository) == archives_before,
               QStringLiteral("M1.4 被拒绝的手动备份没有产生任何归档"));
-    run.Check(read_bytes(store_path) == store_before,
-              QStringLiteral("M1.5 被拒绝的手动备份没有改动 schedule store"));
+    // M1.5：被拒绝的手动备份没有产生属于"手动备份动作"的持久化副作用。
+    //
+    // 这里同样**不**比对整个 schedule.json 的字节：M1.1 起的定时评估在 busy
+    // 窗口里会合法地写 managed / history / last-run 等 state，字节相等在存在
+    // 合法并发写者时是个不成立的前提。手动备份永远不进 scheduler 的受管名单，
+    // 所以能断言的是"这次被拒绝的调用没有改写 scheduler 配置"。
+    backupproject::ScheduleDocument config_after_document;
+    std::string config_after_error;
+    const bool config_after_loaded = load_schedule_document(
+        store_path, &config_after_document, &config_after_error);
+    run.Check(config_after_loaded &&
+                  ScheduleConfigSignature(config_after_document.config) ==
+                      config_before,
+              QStringLiteral("M1.5 被拒绝的手动备份没有改写 scheduler 配置"),
+              QStringLiteral("loaded=") +
+                  QString::number(config_loaded ? 1 : 0) + QStringLiteral("/") +
+                  QString::number(config_after_loaded ? 1 : 0) +
+                  QStringLiteral(" error=") +
+                  QString::fromStdString(config_after_error));
 
     // ---- M2：评估在飞 -> 受管恢复被拒绝 ----
-    const QString managed_name = ArchiveNames(repository).isEmpty()
-                                     ? QString()
-                                     : ArchiveNames(repository).first();
-    run.Check(!managed_name.isEmpty(),
-              QStringLiteral("M2.1 仓库里有一份可恢复的归档"));
+    // 目标取 scheduler **自己管理**的快照（最新的一份）：M3 要证明的是"被拒绝
+    // 的删除没有把这份受管快照移出名单"，拿一份不受管的归档顶替就证明不了。
+    // 最新的那份也最稳：retention 从最旧的开始淘汰。
+    backupproject::ScheduleDocument pre_document;
+    std::string pre_error;
+    const bool pre_loaded =
+        load_schedule_document(store_path, &pre_document, &pre_error);
+    const backupproject::ScheduledSnapshotRecord* newest_managed = nullptr;
+    for (const backupproject::ScheduledSnapshotRecord& record :
+         pre_document.state.managed_snapshots) {
+      if (newest_managed == nullptr ||
+          record.created_time_sec > newest_managed->created_time_sec) {
+        newest_managed = &record;
+      }
+    }
+    const QString managed_name =
+        pre_loaded && newest_managed != nullptr
+            ? QString::fromStdString(newest_managed->file_name)
+            : QString();
+    run.Check(
+        !managed_name.isEmpty(),
+        QStringLiteral("M2.1 scheduler 有一份可恢复的受管快照"),
+        QStringLiteral("loaded=") + QString::number(pre_loaded ? 1 : 0) +
+            QStringLiteral(" managed=") +
+            QString::number(
+                static_cast<int>(pre_document.state.managed_snapshots.size())) +
+            QStringLiteral(" error=") + QString::fromStdString(pre_error));
     const QString restore_dest = temp.path() + QStringLiteral("/gate-restore");
     run.Check(
         !backup_controller->startManagedRestore(managed_name, restore_dest),
@@ -3063,14 +4751,51 @@ int RunScheduleTest(backup_modern::ScheduleController* schedule,
     run.Check(!backup_controller->busy(),
               QStringLiteral("M2.3 被拒绝的恢复没有把控制器置成 busy"));
 
-    // ---- M3：评估在飞 -> 删除被拒绝，store 一个字节不变 ----
+    // ---- M3：评估在飞 -> 删除被拒绝，受管快照不许少一份 ----
+    //
+    // 这里刻意**不**比对整个 schedule.json 的字节。M1.1 起的定时评估正在后台
+    // 跑，它本来就会合法地往同一份 state 里写 history / last-run / manifest 等
+    // bookkeeping；"整个文件一字节不变"在存在合法并发写者时是个不成立的前提，
+    // 之前正是它让这个自检在 ASan 下随机变红。改为断言这次删除动作的语义效果：
+    // 目标仍然是 scheduler 的受管快照，仓库里的归档也一份没少。
     {
-      const QByteArray before = read_bytes(store_path);
+      backupproject::ScheduleDocument document_before;
+      std::string before_error;
+      const bool loaded_before =
+          load_schedule_document(store_path, &document_before, &before_error);
+      const int managed_count =
+          static_cast<int>(document_before.state.managed_snapshots.size());
+      const int retain_count =
+          static_cast<int>(document_before.config.retain_count);
+      // M3.0：目标确实受管，而且保留数量明显够大 —— 后台评估的 retention
+      // 没有任何理由合法淘汰它。这一条不成立，下面的断言就没有意义。
+      run.Check(
+          loaded_before && is_managed_snapshot(document_before, managed_name) &&
+              managed_count <= retain_count,
+          QStringLiteral(
+              "M3.0 目标确实是受管快照，且 retention 不会合法淘汰它"),
+          QStringLiteral("loaded=") + QString::number(loaded_before ? 1 : 0) +
+              QStringLiteral(" managed=") + QString::number(managed_count) +
+              QStringLiteral(" retain=") + QString::number(retain_count) +
+              QStringLiteral(" error=") + QString::fromStdString(before_error));
+
       run.Check(!backup_controller->deleteBackup(managed_name),
                 QStringLiteral("M3.1 评估在飞时删除被 C++ 拒绝"),
                 backup_controller->statusMessage());
-      run.Check(read_bytes(store_path) == before,
-                QStringLiteral("M3.2 被拒绝的删除没有改动 schedule store"));
+
+      backupproject::ScheduleDocument document_after;
+      std::string after_error;
+      const bool loaded_after =
+          load_schedule_document(store_path, &document_after, &after_error);
+      run.Check(
+          loaded_after && is_managed_snapshot(document_after, managed_name),
+          QStringLiteral("M3.2 被拒绝的删除没有移除 scheduler 的受管快照"),
+          QStringLiteral("loaded=") + QString::number(loaded_after ? 1 : 0) +
+              QStringLiteral(" managed=") +
+              QString::number(static_cast<int>(
+                  document_after.state.managed_snapshots.size())) +
+              QStringLiteral(" retain=") + QString::number(retain_count) +
+              QStringLiteral(" error=") + QString::fromStdString(after_error));
       run.Check(CountArchives(repository) == archives_before,
                 QStringLiteral("M3.3 被拒绝的删除没有动仓库"));
     }
@@ -3239,6 +4964,15 @@ int main(int argc, char* argv[]) {
       arguments.contains(QStringLiteral("--close-guard-test"));
   const bool gui_contract_test =
       arguments.contains(QStringLiteral("--gui-contract-test"));
+  // 三个页面"同一个普通表单输入 -> 同一条 DSL"的 parity 自检（见
+  // RunFilterUxTest）。它需要真实 QML 对象，所以和 gui-contract 一样在窗口
+  // 建好之后才分派，也属于自检模式（配置隔离照常生效）。
+  const bool filter_ux_test =
+      arguments.contains(QStringLiteral("--filter-ux-test"));
+  // 共享 AppComboBox 的 hover 残留回归（见 RunComboHoverTest）。它要真的把指针
+  // 移到一个 popup 行上，所以同样在窗口建好之后才分派。
+  const bool combo_hover_test =
+      arguments.contains(QStringLiteral("--combo-hover-test"));
   const int incremental_test_index =
       arguments.indexOf(QStringLiteral("--incremental-test"));
   const int screenshot_index =
@@ -3250,12 +4984,18 @@ int main(int argc, char* argv[]) {
       arguments.indexOf(QStringLiteral("--config-file"));
   const int schedule_file_index =
       arguments.indexOf(QStringLiteral("--schedule-file"));
+  const bool realtime_test =
+      arguments.contains(QStringLiteral("--realtime-test"));
+  const int realtime_file_index =
+      arguments.indexOf(QStringLiteral("--realtime-file"));
   const bool backup_options_test =
       arguments.contains(QStringLiteral("--backup-options-test"));
   const bool schedule_test =
       arguments.contains(QStringLiteral("--schedule-test"));
   const bool schedule_show =
       arguments.contains(QStringLiteral("--schedule-show"));
+  const bool realtime_show =
+      arguments.contains(QStringLiteral("--realtime-show"));
   const int preview_test_index =
       arguments.indexOf(QStringLiteral("--preview-test"));
 
@@ -3267,6 +5007,10 @@ int main(int argc, char* argv[]) {
   }
   if (schedule_file_index >= 0 && schedule_file_index + 1 >= arguments.size()) {
     std::fprintf(stderr, "--schedule-file 需要一个计划存储文件路径参数\n");
+    return 2;
+  }
+  if (realtime_file_index >= 0 && realtime_file_index + 1 >= arguments.size()) {
+    std::fprintf(stderr, "--realtime-file 需要一个实时存储文件路径参数\n");
     return 2;
   }
   if (repository_test_index >= 0 &&
@@ -3320,15 +5064,61 @@ int main(int argc, char* argv[]) {
   backup_modern::AppTheme theme;
   // 配置路径在这里定型：正常启动是 AppConfigLocation/config.json，
   // 自动测试用 --config-file 指到临时目录，绝不读写真实用户配置。
-  const QString config_file_path = ResolveConfigFilePath(arguments);
+  //
+  // 但"自检模式没给路径就退化成真实用户 profile"确实污染过用户配置：
+  // --realtime-test 之类会把 /tmp/backup-gui-modern-XXXXXX/repository 写进
+  // ~/.config/backup-project/backup-gui-modern/config.json，之后用户不带参数
+  // 正常启动（例如 Demo 的 run.sh）就会看到一个早已被删掉的临时仓库。
+  // 所以自检 / 抓图模式下，只要有哪条路径没被显式指定，就把它重定向到本次
+  // 进程专属的临时目录，并在 stderr 说明。显式参数永远优先；正常启动
+  // （没有任何自检开关）行为完全不变。
+  const bool self_check_mode =
+      smoke_test || path_test || close_guard_test || gui_contract_test ||
+      preview_test_index >= 0 || incremental_test_index >= 0 ||
+      screenshot_index >= 0 || self_test_index >= 0 ||
+      repository_test_index >= 0 || realtime_test || backup_options_test ||
+      schedule_test || filter_ux_test || combo_hover_test;
+  QString config_file_path = ResolveConfigFilePath(arguments);
+  QString schedule_file_path = ResolveScheduleFilePath(arguments);
+  QString realtime_file_path = ResolveRealtimeFilePath(arguments);
+  if (self_check_mode) {
+    // static：目录必须活到进程结束（controller 全程读写这三份文件），
+    // 析构时自动清理。放在 if 里是为了让正常启动根本不建临时目录。
+    static QTemporaryDir self_check_profile;
+    if (!self_check_profile.isValid()) {
+      std::fprintf(stderr, "[self-check] 无法创建隔离配置目录\n");
+      return 1;
+    }
+    if (config_file_index < 0) {
+      config_file_path =
+          self_check_profile.filePath(QStringLiteral("config.json"));
+    }
+    if (schedule_file_index < 0) {
+      schedule_file_path =
+          self_check_profile.filePath(QStringLiteral("schedule.json"));
+    }
+    if (realtime_file_index < 0) {
+      realtime_file_path =
+          self_check_profile.filePath(QStringLiteral("realtime.json"));
+    }
+    // 这行只是给人看的提示：stderr 被重定向时（自动化 / parity 测试）它不能
+    // 抢占首行 —— 否则真实业务错误不再是第一条 stderr，观察到的错误契约就变了。
+    // 提示与配置隔离行为无关，隔离本身照旧生效。
+    if (::isatty(::fileno(stderr)) != 0) {
+      std::fprintf(
+          stderr,
+          "[self-check] 隔离配置目录 %s（显式给出的存储路径仍然优先）\n",
+          self_check_profile.path().toLocal8Bit().constData());
+    }
+  }
   // 一个进程内"同一时刻只有一个会改动持久状态的业务操作"的共享闸门。
   // 两个控制器拿到的是同一个对象：手动备份/恢复/删除/改仓库与"后台评估 +
   // 保存计划"互相排斥，由 C++ 保证，而不是靠 QML 把按钮置灰。
   backup_modern::OperationGate operation_gate;
   backup_modern::BackupController controller(config_file_path, &operation_gate);
   // 计划存储文件与配置走同一套默认位置策略（见 app_paths.h）：
-  // backupctl schedule show 读到的就是这一份。
-  const QString schedule_file_path = ResolveScheduleFilePath(arguments);
+  // backupctl schedule show 读到的就是这一份。路径已在上面解析并定型
+  // （自检模式下未显式指定时指向隔离目录）。
   // 定时备份的桥。它自己不做任何业务判断，全部转发给共享核心；
   // 同时订阅 controller.busy，保证手动备份与计划备份不会同时写盘。
   //
@@ -3340,7 +5130,27 @@ int main(int argc, char* argv[]) {
   // 删除归档之后的计划状态同步走这条直接连接，而不是信号：BackupController
   // 会在自己的删除闸门持有期内同步调用它，中间不给后台评估留窗口。
   controller.SetArchiveDeletedObserver(&schedule_controller);
+  // 实时备份的桥。它与手动 / 计划共用同一个 operation_gate，共用同一个仓库，
+  // 也用同一份 realtime.json（backupctl realtime 读的就是这一份）。
+  // 它**不**自己取任何 application lock：GUI 主进程已经在启动时按 per-UID
+  // 持有了那把锁，flock 绑在 open file description 上，再取一次只会把自己
+  // 判成"另一个实例正在运行"。
+  // realtime_file_path 同样已在上面解析并定型（自检模式下未显式指定时
+  // 指向隔离目录）。
+  // 第三个参数是 BackupController：实时控制器订阅它的 repositoryPathChanged，
+  // 这样设置页把仓库从 A 改成 B 之后，watcher、overlap 校验与快照列表都会跟着
+  // 换到 B，旧仓库不会再收到任何新快照（与 ScheduleController 同一种接法）。
+  backup_modern::RealtimeController realtime_controller(
+      realtime_file_path, config_file_path, &controller, &operation_gate);
+  // 三个页面的筛选规则编辑器共用同一个 presentation 组件，但每个页面有**自己**
+  // 的规则列表：备份页的模型直接挂在 BackupController 上（编辑即生效），计划页
+  // 与实时页是"草稿 + 保存"，所以它们的模型不带落点（构造参数为 nullptr），
+  // 只在本地生成 DSL 与摘要，保存时由页面把列表交给各自的控制器。
+  //
+  // 语法裁决仍然只有一条路：任一模型 -> FilterRuleBuilder -> Filter::AddRule。
   backup_modern::FilterRuleModel filter_rule_model(&controller);
+  backup_modern::FilterRuleModel schedule_filter_rule_model(nullptr);
+  backup_modern::FilterRuleModel realtime_filter_rule_model(nullptr);
 
   QQmlApplicationEngine engine;
   // 用上下文属性而不是注册 QML 类型：QML 侧直接写 theme.accent /
@@ -3350,8 +5160,14 @@ int main(int argc, char* argv[]) {
                                            &controller);
   engine.rootContext()->setContextProperty(QStringLiteral("filterRuleModel"),
                                            &filter_rule_model);
+  engine.rootContext()->setContextProperty(
+      QStringLiteral("scheduleFilterRuleModel"), &schedule_filter_rule_model);
+  engine.rootContext()->setContextProperty(
+      QStringLiteral("realtimeFilterRuleModel"), &realtime_filter_rule_model);
   engine.rootContext()->setContextProperty(QStringLiteral("schedule"),
                                            &schedule_controller);
+  engine.rootContext()->setContextProperty(QStringLiteral("realtime"),
+                                           &realtime_controller);
   // 窗口用不用系统边框由 C++ 决定、QML 只读：窗口标志必须在窗口创建时定下来，
   // 之后再改会出现“已经画了一帧才换边框”的闪动。
   engine.rootContext()->setContextProperty(QStringLiteral("useNativeFrame"),
@@ -3383,11 +5199,23 @@ int main(int argc, char* argv[]) {
   if (schedule_show) {
     return RunScheduleShow(&schedule_controller);
   }
+  // 实时自检与计划自检一样：自己控制每一步（从空 store 开始、手动启用、
+  // 手动等快照），所以不自动 start。
+  if (realtime_show) {
+    return RunRealtimeShow(&realtime_controller);
+  }
+  if (realtime_test) {
+    return RunRealtimeTest(&realtime_controller, &operation_gate, &controller,
+                           config_file_path);
+  }
   if (preview_test_index >= 0) {
     return RunPreviewTest(&filter_rule_model,
                           arguments.at(preview_test_index + 1), arguments);
   }
   schedule_controller.start();
+  // 实时备份：读同一份 realtime.json，enabled 时 attach + 合成 resync。
+  // 与计划一样，自检模式不会走到这里。
+  realtime_controller.start();
 
   if (self_test_index >= 0) {
     const int filter_status = ApplyFilterArguments(&controller, arguments);
@@ -3439,15 +5267,27 @@ int main(int argc, char* argv[]) {
   }
 
   if (close_guard_test) {
-    return RunCloseGuardTest(window, &controller);
+    // 三位 writer 都要交给它：只传手动那一位，测不出"实时/计划在写盘时关窗"。
+    return RunCloseGuardTest(window, &controller, &schedule_controller,
+                             &realtime_controller);
   }
 
   if (gui_contract_test) {
     return RunGuiContractTest(window, &controller);
   }
 
+  if (combo_hover_test) {
+    return RunComboHoverTest(window, &theme);
+  }
+
+  if (filter_ux_test) {
+    return RunFilterUxTest(window, &filter_rule_model,
+                           &schedule_filter_rule_model,
+                           &realtime_filter_rule_model);
+  }
+
   if (smoke_test) {
-    // 五个页面都要真的被实例化并切换一次，两套主题也都要切到。
+    // 六个页面都要真的被实例化并切换一次，两套主题也都要切到。
     // 只把 kPageCount 加一而不真正切页，等于根本没有验证新页面。
     for (int page = 0; page < kPageCount; ++page) {
       QTimer::singleShot(120 + page * 90, &app, [window, page]() {

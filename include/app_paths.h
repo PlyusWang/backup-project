@@ -45,6 +45,8 @@ inline constexpr const char* kAppApplicationName = "backup-gui-modern";
 inline constexpr const char* kAppConfigFileName = "config.json";
 // 定时备份 store 的默认文件名。
 inline constexpr const char* kAppScheduleFileName = "schedule.json";
+// 实时备份（Realtime Trigger）store 的默认文件名。
+inline constexpr const char* kAppRealtimeFileName = "realtime.json";
 
 // $XDG_CONFIG_HOME（绝对路径）或 $HOME/.config。两者都拿不到时返回空串。
 std::string GenericConfigDirectory();
@@ -60,6 +62,7 @@ bool AppConfigFilePath(const std::string& file_name, std::string* path,
 // 产品默认位置；拿不到时返回空串（调用方必须显式检查，不能当成相对路径用）。
 std::string DefaultConfigFilePath();
 std::string DefaultScheduleFilePath();
+std::string DefaultRealtimeFilePath();
 
 }  // namespace backupproject
 

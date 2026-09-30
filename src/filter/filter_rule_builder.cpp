@@ -199,6 +199,113 @@ const char* RuleFieldName(RuleField field) {
   return "?";
 }
 
+const char* RuleFieldLabel(RuleField field) {
+  switch (field) {
+    case RuleField::kName:
+      return "文件名";
+    case RuleField::kPath:
+      return "路径";
+    case RuleField::kStem:
+      return "主文件名";
+    case RuleField::kExt:
+      return "文件扩展名";
+    case RuleField::kType:
+      return "文件类型";
+    case RuleField::kSize:
+      return "文件大小";
+    case RuleField::kMtime:
+      return "修改时间";
+    case RuleField::kUid:
+      return "用户 ID";
+    case RuleField::kGid:
+      return "用户组 ID";
+    case RuleField::kUser:
+      return "用户名";
+    case RuleField::kGroup:
+      return "用户组名";
+  }
+  return "未知条件";
+}
+
+const char* RuleFieldHint(RuleField field) {
+  switch (field) {
+    case RuleField::kName:
+      return "支持通配符：* 匹配任意多个字符，? 匹配一个字符。";
+    case RuleField::kPath:
+      return "相对于备份目录的路径。* 只匹配当前目录内的字符，** "
+             "可以跨目录匹配。";
+    case RuleField::kStem:
+      return "不含扩展名的文件名部分，例如 report 之于 report.pdf。";
+    case RuleField::kExt:
+      return "多个扩展名用分号分隔，例如 txt;md;pdf。不需要输入点号。";
+    case RuleField::kType:
+      return "按文件在文件系统里的类型筛选，从下拉里选，不需要写语法。";
+    case RuleField::kSize:
+      return "先选比较方式，再填数字和单位，例如 小于 1 MB。";
+    case RuleField::kMtime:
+      return "按文件最后一次修改的时间筛选。";
+    case RuleField::kUid:
+      return "属主的数字 ID（不是用户名），0 是合法值（root）。";
+    case RuleField::kGid:
+      return "属组的数字 ID（不是用户组名），0 是合法值（root）。";
+    case RuleField::kUser:
+      return "属主用户名，精确匹配、区分大小写，不支持通配符。";
+    case RuleField::kGroup:
+      return "属组名，精确匹配、区分大小写，不支持通配符。";
+  }
+  return "";
+}
+
+const char* SizeCompareLabel(RuleSizeCompare compare) {
+  switch (compare) {
+    case RuleSizeCompare::kLess:
+      return "小于";
+    case RuleSizeCompare::kLessEqual:
+      return "小于等于";
+    case RuleSizeCompare::kGreater:
+      return "大于";
+    case RuleSizeCompare::kGreaterEqual:
+      return "大于等于";
+    case RuleSizeCompare::kRange:
+      return "区间（含两端）";
+    case RuleSizeCompare::kEqual:
+      return "等于";
+  }
+  return "";
+}
+
+const char* SizeUnitLabel(RuleSizeUnit unit) {
+  switch (unit) {
+    case RuleSizeUnit::kByte:
+      return "B";
+    case RuleSizeUnit::kKilo:
+      return "KB";
+    case RuleSizeUnit::kMega:
+      return "MB";
+    case RuleSizeUnit::kGiga:
+      return "GB";
+  }
+  return "";
+}
+
+const char* TypeValueLabel(RuleTypeValue type) { return TypeDisplayName(type); }
+
+const char* MtimeKindLabel(RuleMtimeKind kind) {
+  switch (kind) {
+    case RuleMtimeKind::kToday:
+      return "今天";
+    case RuleMtimeKind::kYesterday:
+      return "昨天";
+    case RuleMtimeKind::kLastDays:
+      return "最近 N 天";
+    case RuleMtimeKind::kDay:
+      return "指定日期";
+    case RuleMtimeKind::kDayRange:
+      return "日期区间";
+  }
+  return "";
+}
+
 bool ValidateClause(const FilterClauseDraft& clause,
                     std::string* error_message) {
   const auto fail = [error_message](const std::string& text) {
@@ -436,6 +543,92 @@ std::string SummarizeClause(const FilterClauseDraft& clause) {
       return "用户组 group = " + clause.group;
   }
   return "未知条件";
+}
+
+std::string SummarizeClauseShort(const FilterClauseDraft& clause) {
+  switch (clause.field) {
+    case RuleField::kName:
+      return std::string(RuleFieldLabel(clause.field)) + "：" + clause.pattern;
+    case RuleField::kPath:
+      return std::string(RuleFieldLabel(clause.field)) + "：" + clause.pattern;
+    case RuleField::kStem:
+      return std::string(RuleFieldLabel(clause.field)) + "：" + clause.pattern;
+    case RuleField::kExt: {
+      std::vector<std::string> cleaned;
+      for (const std::string& raw : clause.extensions) {
+        const std::string value = NormalizeExtension(raw);
+        if (!value.empty()) cleaned.push_back(value);
+      }
+      // 用顿号而不是 " 或 "：主行是"在筛什么"，不是一句话。
+      return std::string(RuleFieldLabel(clause.field)) + "：" +
+             JoinWith(cleaned, "、");
+    }
+    case RuleField::kType:
+      return std::string(RuleFieldLabel(clause.field)) + "：" +
+             TypeValueLabel(clause.type);
+    case RuleField::kSize: {
+      const std::string unit = SizeUnitLabel(clause.unit);
+      const std::string low = FormatBytes(clause.size_low) + " " + unit;
+      if (clause.compare == RuleSizeCompare::kRange) {
+        return std::string(RuleFieldLabel(clause.field)) + " " + low + " 到 " +
+               FormatBytes(clause.size_high) + " " + unit + " 之间";
+      }
+      return std::string(RuleFieldLabel(clause.field)) + " " +
+             SizeCompareLabel(clause.compare) + " " + low;
+    }
+    case RuleField::kMtime:
+      if (clause.mtime_kind == RuleMtimeKind::kLastDays) {
+        return std::string(RuleFieldLabel(clause.field)) + "：最近 " +
+               std::to_string(clause.days_back) + " 天";
+      }
+      if (clause.mtime_kind == RuleMtimeKind::kDay) {
+        return std::string(RuleFieldLabel(clause.field)) + "：" +
+               clause.date_low;
+      }
+      if (clause.mtime_kind == RuleMtimeKind::kDayRange) {
+        return std::string(RuleFieldLabel(clause.field)) + "：" +
+               clause.date_low + " 至 " + clause.date_high;
+      }
+      return std::string(RuleFieldLabel(clause.field)) + "：" +
+             MtimeKindLabel(clause.mtime_kind);
+    case RuleField::kUid: {
+      const std::string value = FormatBytes(clause.uid);
+      if (clause.uid_compare == RuleSizeCompare::kRange) {
+        return std::string(RuleFieldLabel(clause.field)) + " " + value +
+               " 到 " + FormatBytes(clause.uid_high) + " 之间";
+      }
+      return std::string(RuleFieldLabel(clause.field)) + " " +
+             SizeCompareLabel(clause.uid_compare) + " " + value;
+    }
+    case RuleField::kGid: {
+      const std::string value = FormatBytes(clause.gid);
+      if (clause.gid_compare == RuleSizeCompare::kRange) {
+        return std::string(RuleFieldLabel(clause.field)) + " " + value +
+               " 到 " + FormatBytes(clause.gid_high) + " 之间";
+      }
+      return std::string(RuleFieldLabel(clause.field)) + " " +
+             SizeCompareLabel(clause.gid_compare) + " " + value;
+    }
+    case RuleField::kUser:
+      return std::string(RuleFieldLabel(clause.field)) + "：" + clause.user;
+    case RuleField::kGroup:
+      return std::string(RuleFieldLabel(clause.field)) + "：" + clause.group;
+  }
+  return "未知条件";
+}
+
+std::string SummarizeShort(const FilterRuleDraft& rule) {
+  if (!rule.raw_dsl.empty()) {
+    // 高级规则的正文由用户自己写：界面不假装读懂了它，主行只说明这是一条
+    // 手写规则，原文照常显示在卡片里。
+    return "高级规则";
+  }
+  std::string text;
+  for (std::size_t i = 0; i < rule.clauses.size(); ++i) {
+    if (i != 0) text += "，且 ";
+    text += SummarizeClauseShort(rule.clauses[i]);
+  }
+  return text.empty() ? std::string("未设置条件") : text;
 }
 
 std::string Summarize(const FilterRuleDraft& rule) {

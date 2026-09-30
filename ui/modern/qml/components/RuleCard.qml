@@ -1,11 +1,20 @@
 // RuleCard.qml
 //
 // 一条规则的卡片。数据由 delegate 在边界处就拆成显式字符串传进来
-// （actionText / summaryText / dslText / detailText），卡片内部不解析任何
-// 来源不明的 var QVariantMap。
+// （actionText / actionLabel / conditionLabel / summaryText / dslText /
+// detailText），卡片内部不解析任何来源不明的 var QVariantMap。
+//
+// 信息层级是本轮的重点（人工验收："主行要讲人话，DSL 是次要信息"）：
+//
+//   包含 · 文件扩展名：cpp、h              <- 主行：动作 + 条件（人话）
+//   包含：扩展名为 cpp 或 h 的文件          <- 正文：完整句子
+//   DSL: include ext:cpp;h                 <- 次要：小一号字、弱色
+//
+// 主行与正文都来自共享 builder 的中文摘要（SummarizeShort / Summarize），
+// 卡片只负责摆放，不构造任何术语。
 //
 // 布局：正文在上、操作按钮在下并右对齐；卡片高度完全由正文 implicitHeight 决定。
-// 正文的三行 Text 都带 objectName，供 headless 测试读取真实 text/宽高，
+// 正文的几行 Text 都带 objectName，供 headless 测试读取真实 text/宽高，
 // 用来防止"模型里有字符串、屏幕上却是一片空白"的回归。
 
 import QtQuick
@@ -17,6 +26,9 @@ Rectangle {
     objectName: "ruleCard"
     required property int ruleIndex
     required property string actionText
+    // 中文动作名（包含 / 排除）与条件短摘要；由模型给出，卡片不自己翻译。
+    property string actionLabel: ""
+    property string conditionLabel: ""
     required property string summaryText
     required property string dslText
     property string detailText: ""
@@ -26,6 +38,9 @@ Rectangle {
 
     readonly property int cardPadding: 14
     readonly property bool isInclude: card.actionText !== "exclude"
+    readonly property string actionTextForDisplay: card.actionLabel.length > 0
+        ? card.actionLabel
+        : (card.isInclude ? "包含" : "排除")
 
     Layout.fillWidth: true
     Layout.preferredHeight: implicitHeight
@@ -45,8 +60,9 @@ Rectangle {
             id: primaryText
             objectName: "rulePrimaryText"
             Layout.fillWidth: true
-            text: (card.isInclude ? "Include" : "Exclude")
-                  + (card.detailText.length > 0 ? " · " + card.detailText : "")
+            text: card.conditionLabel.length > 0
+                  ? card.actionTextForDisplay + " · " + card.conditionLabel
+                  : card.actionTextForDisplay
             font.pixelSize: 18
             font.weight: Font.DemiBold
             color: card.isInclude ? theme.textPrimary : theme.warning
@@ -63,14 +79,17 @@ Rectangle {
             wrapMode: Text.WordWrap
         }
 
+        // DSL 降级：小一号字、弱色、明确标成 "DSL:"。它仍然在卡片里（能力没有
+        // 丢），但不再是这张卡片的主角。
         Text {
             id: dslTextItem
             objectName: "ruleDslText"
             Layout.fillWidth: true
-            text: card.actionText + " " + card.dslText
-            font.pixelSize: 15
+            text: "DSL: " + card.actionText + " " + card.dslText
+            font.pixelSize: 13
             font.family: "monospace"
             color: theme.textSecondary
+            opacity: 0.85
             wrapMode: Text.WordWrap
         }
 
