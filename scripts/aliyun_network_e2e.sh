@@ -22,6 +22,7 @@ CLI="$REPO_DIR/build/backupctl"
 ARCHIVE_CLI="$REPO_DIR/build/archive-cli"
 WORK_DIR="$PR20_E2E_DIR"
 [ -n "$WORK_DIR" ] || WORK_DIR="$(mktemp -d /tmp/pr20-e2e-XXXXXX)"
+mkdir -p "$WORK_DIR" || exit 1
 PORT=18765
 PASS=0
 FAIL=0
