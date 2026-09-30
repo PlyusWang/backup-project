@@ -19,6 +19,8 @@ mkdir -p "$TEST_ROOT"
 
 PASS=0
 FAIL=0
+# 消毒剂报告计数（只在 NETWORK_TEST_SANITIZE=1 时有意义）。
+SAN_REPORTS=0
 
 record_pass() { PASS=$((PASS + 1)); echo "  PASS  $1"; }
 record_fail() { FAIL=$((FAIL + 1)); echo "  FAIL  $1 -- $2" >&2; }
@@ -114,6 +116,27 @@ run_unit() {
     record_fail "A.$name 全部断言通过" \
       "$(grep -m3 FAIL "$TEST_ROOT/$name.log" | tr '\n' ' ')"
   fi
+  scan_sanitizer_reports "$name"
+}
+
+# 消毒剂构建下任何一条报告都算失败：ASan / UBSan 默认只打印、不改退出码，
+# 所以只看退出码会漏掉"跑完了但有报告"这种情况。
+# 模式与 scripts/legacy_filter_test.sh 用的是同一组（同一个判定口径）。
+scan_sanitizer_reports() {
+  local name="$1"
+  if [ "$SAN_MODE" != "1" ]; then
+    return 0
+  fi
+  local log="$TEST_ROOT/$name.log"
+  local reports
+  reports="$(grep -c -E "ERROR: AddressSanitizer|runtime error:|SUMMARY: AddressSanitizer|LeakSanitizer" "$log" || true)"
+  SAN_REPORTS=$((SAN_REPORTS + reports))
+  if [ "$reports" = "0" ]; then
+    record_pass "A.$name 消毒剂零报告"
+  else
+    record_fail "A.$name 消毒剂零报告" \
+      "$(grep -m2 -E 'ERROR: AddressSanitizer|runtime error:' "$log" | tr '\n' ' ')"
+  fi
 }
 
 echo "[network-test] A. 单元测试"
@@ -126,6 +149,10 @@ run_unit remote_server_test "$SERVER_OBJECTS $CRYPTO_OBJECTS" \
   "$SQLITE_LIBRARY" -pthread
 run_unit remote_transfer_test "$SERVER_OBJECTS $CRYPTO_OBJECTS" \
   "$SQLITE_LIBRARY" -pthread
+# 流式有界内存的证据来自非消毒剂构建；消毒剂构建会明确写"RSS 阈值不适用"。
+# 这两行原样打出来，避免有人以为严格断言被删掉了。
+grep -E '^(RSS_BOUND|ASAN):' "$TEST_ROOT/remote_transfer_test.log" \
+  | sed 's/^/  /' || true
 run_unit remote_client_test "$SERVER_OBJECTS $CRYPTO_OBJECTS" \
   "$SQLITE_LIBRARY" -pthread
 
@@ -388,6 +415,9 @@ else
   kill -TERM "$RACE_PID" 2>/dev/null
 fi
 
+if [ "$SAN_MODE" = "1" ]; then
+  echo "ASAN: aggregate reports = $SAN_REPORTS"
+fi
 echo
 echo "[network-test] 合计: $PASS passed, $FAIL failed"
 [ "$FAIL" = "0" ] || exit 1

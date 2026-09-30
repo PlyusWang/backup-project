@@ -34,6 +34,27 @@
 #include "remote_server.h"
 #include "test_support.h"
 
+// 消毒剂构建的判别宏。
+//
+// "流式实现有没有把整份文件读进内存"和"ASan/UBSan 有没有发现内存错误"是两个
+// 不同的测试目标。ASan 会自己把地址空间放大好几倍（shadow memory + 隔离区），
+// 进程的 VmHWM 因而不是产品 buffering 的度量：拿生产阈值去判一个消毒剂进程，
+// 只会把消毒剂运行时的开销误判成产品的内存回归。
+//
+// 所以 XFER T8 的 RSS 阈值只在非消毒剂构建里断言；消毒剂构建里照常跑完
+// 整份 32 MiB 的传输与 SHA-256 校验，并在输出里明确写"RSS 阈值在这里不适用"。
+// 消毒剂自己的零报告由 scripts/network_test.sh 扫描，与本文件无关。
+#if defined(__SANITIZE_ADDRESS__)
+#define XFER_SANITIZED_BUILD 1
+#elif defined(__has_feature)
+#if __has_feature(address_sanitizer)
+#define XFER_SANITIZED_BUILD 1
+#endif
+#endif
+#ifndef XFER_SANITIZED_BUILD
+#define XFER_SANITIZED_BUILD 0
+#endif
+
 namespace bp = backupproject;
 namespace crypto = backupproject::crypto;
 namespace net = backupproject::net;
@@ -1064,8 +1085,18 @@ int main() {
                        " KB -> " + std::to_string(rss_after_upload) +
                        " KB -> " + std::to_string(rss_after_download) +
                        " KB（增长 " + std::to_string(growth) + " KB）");
+#if XFER_SANITIZED_BUILD
+    // 消毒剂构建：传输与校验照跑（上面已经断言完），只是不拿生产阈值判定
+    // 消毒剂进程的内存水位。把三行写清楚，免得看日志的人以为这条断言被删了。
+    std::printf("RSS_BOUND: non-sanitized = N/A (this build is sanitized)\n");
+    std::printf("ASAN: transfer executed\n");
+    std::printf("ASAN: RSS threshold = N/A under sanitizer\n");
+#else
+    std::printf("RSS_BOUND: non-sanitized = %s\n",
+                growth < 16 * 1024 ? "PASS" : "FAIL");
     test_support::Check(growth < 16 * 1024,
                         "XFER T8 判别：32 MiB 文件没有进内存（峰值增长 < 16 MiB）");
+#endif
 
     const std::string big_blob = big.root + "/users/1/" + big_id + ".bak";
     std::ifstream blob(big_blob.c_str(), std::ios::binary | std::ios::ate);
