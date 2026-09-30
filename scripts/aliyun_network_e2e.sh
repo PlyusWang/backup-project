@@ -145,18 +145,34 @@ SRV="\$HOME/backup-project-server"
 echo "ecs_hostname=\$(hostname)"
 echo "server_pid=\$(cat \$SRV/state/server.pid)"
 echo "loopback_listeners=\$(ss -ltn | grep -c '127.0.0.1:18765')"
-echo "blob_sha256=\$(sha256sum \$SRV/data/users/1/$SNAP.bak | cut -c1-64)"
-echo "blob_size=\$(stat -c%s \$SRV/data/users/1/$SNAP.bak)"
+# 不要写死 users/1：user id 是数据库自增的，历史用户会让新用户不是 1 号。
+# 按文件名定位 blob，并在找不到时明确报出来（否则证据是空的却"通过"）。
+BLOB="\$(find \$SRV/data/users -name '$SNAP.bak' 2>/dev/null | head -1)"
+echo "blob_path=\$BLOB"
+if [ -n "\$BLOB" ]; then
+  echo "blob_sha256=\$(sha256sum "\$BLOB" | cut -c1-64)"
+  echo "blob_size=\$(stat -c%s "\$BLOB")"
+else
+  echo "blob_sha256=BLOB_NOT_FOUND"
+  echo "blob_size=0"
+fi
 # SQL 用单引号包住、且**不含内层引号**：这样不需要在 heredoc 里做二次转义。
 # 之前那版嵌套引号在远端被拆成了好几个命令，证据字段全是空的。
 echo "snapshot_rows=\$(sqlite3 \$SRV/state/metadata.sqlite3 'select id,user_id,size_bytes,sha256 from snapshots;')"
 REMOTE
 then
   sed 's/^/  /' "$WORK_DIR/evidence.txt"
-  if grep -q "$LOCAL_SHA" "$WORK_DIR/evidence.txt"; then
+  REMOTE_BLOB_SHA="$(grep -m1 '^blob_sha256=' "$WORK_DIR/evidence.txt" | cut -d= -f2)"
+  REMOTE_DB_SHA="$(grep -m1 '^snapshot_rows=' "$WORK_DIR/evidence.txt" | awk -F'|' '{print $4}')"
+  if [ "$REMOTE_BLOB_SHA" = "$LOCAL_SHA" ]; then
     record_pass "ECS 上的 blob SHA-256 == 本地归档 SHA-256"
   else
-    record_fail "ECS 上的 blob SHA-256" "对不上"
+    record_fail "ECS 上的 blob SHA-256" "blob 上是 $REMOTE_BLOB_SHA"
+  fi
+  if [ "$REMOTE_DB_SHA" = "$LOCAL_SHA" ]; then
+    record_pass "SQLite 里记的 SHA-256 == 本地归档 SHA-256"
+  else
+    record_fail "SQLite 里记的 SHA-256" "库里是 $REMOTE_DB_SHA"
   fi
 else
   record_fail "ECS 侧证据" "无法读取"
@@ -181,7 +197,8 @@ run delete "$SNAP" --user "$USER_A" >/dev/null 2>&1 \
   || record_fail "G. 删除" "失败"
 REMOTE_CHECK="$(ssh -o BatchMode=yes "$ALIAS" "bash -s" <<REMOTE
 SRV="\$HOME/backup-project-server"
-if [ -f "\$SRV/data/users/1/$SNAP.bak" ]; then echo BLOB_STILL_THERE; else echo BLOB_GONE; fi
+BLOB="\$(find \$SRV/data/users -name '$SNAP.bak' 2>/dev/null | head -1)"
+if [ -n "\$BLOB" ]; then echo BLOB_STILL_THERE; else echo BLOB_GONE; fi
 echo "rows=\$(sqlite3 \$SRV/state/metadata.sqlite3 'select count(*) from snapshots;')"
 REMOTE
 )"
