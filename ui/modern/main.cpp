@@ -4966,9 +4966,15 @@ int main(int argc, char* argv[]) {
       realtime_file_path =
           self_check_profile.filePath(QStringLiteral("realtime.json"));
     }
-    std::fprintf(stderr,
-                 "[self-check] 隔离配置目录 %s（显式给出的存储路径仍然优先）\n",
-                 self_check_profile.path().toLocal8Bit().constData());
+    // 这行只是给人看的提示：stderr 被重定向时（自动化 / parity 测试）它不能
+    // 抢占首行 —— 否则真实业务错误不再是第一条 stderr，观察到的错误契约就变了。
+    // 提示与配置隔离行为无关，隔离本身照旧生效。
+    if (::isatty(::fileno(stderr)) != 0) {
+      std::fprintf(
+          stderr,
+          "[self-check] 隔离配置目录 %s（显式给出的存储路径仍然优先）\n",
+          self_check_profile.path().toLocal8Bit().constData());
+    }
   }
   // 一个进程内"同一时刻只有一个会改动持久状态的业务操作"的共享闸门。
   // 两个控制器拿到的是同一个对象：手动备份/恢复/删除/改仓库与"后台评估 +

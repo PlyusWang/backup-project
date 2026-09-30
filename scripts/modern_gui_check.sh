@@ -2081,6 +2081,7 @@ ISO_PROFILE="$ISO_XDG/backup-project/backup-gui-modern"
 ISO_MARKER_REPO="$TEST_STATE_DIR/isolation-marker-repository"
 ISO_MARKER_CFG="$ISO_PROFILE/config.json"
 ISO_LOG="$TEST_STATE_DIR/isolation.log"
+ISO_TTY_LOG="$TEST_STATE_DIR/isolation-tty.log"
 ISO_EXPLICIT_DIR="$TEST_STATE_DIR/isolation-explicit"
 ISO_EXPLICIT_CFG="$ISO_EXPLICIT_DIR/config.json"
 ISO_EXPLICIT_RT="$ISO_EXPLICIT_DIR/realtime.json"
@@ -2113,10 +2114,24 @@ if [[ "$iso_selftest_status" -eq 0 ]]; then
 else
   record_fail "自检模式（不带 --*-file）退出码 $iso_selftest_status"
 fi
+# 自检提示是给人看的：stderr 被重定向时（自动化 / parity 对照）它必须让位，
+# 否则真实业务错误不再是第一条 stderr，GUI/CLI 的错误契约就被这行提示遮住了。
+# 隔离本身由下面两条硬不变量证明，不依赖这行提示。
 if grep -qF -- "[self-check] 隔离配置目录" "$ISO_LOG"; then
-  record_pass "自检模式明确报告了隔离目录"
+  record_fail "重定向 stderr 时自检提示仍然出现（会遮住真实业务错误）"
 else
-  record_fail "自检模式没有报告隔离目录（可能又在写真实 profile）"
+  record_pass "重定向 stderr 时自检提示不出现（真实错误保住第一条 stderr）"
+fi
+# 交互终端上人仍然要看得到它：给它一个真正的 pty，再跑一次同样的自检。
+set +e
+XDG_CONFIG_HOME="$ISO_XDG" HOME="$ISO_HOME" QT_QPA_PLATFORM=offscreen timeout 180 \
+  script -qec "./build/backup-gui-modern --realtime-test" /dev/null > "$ISO_TTY_LOG" 2>&1
+iso_tty_status=$?
+set -e
+if [[ "$iso_tty_status" -eq 0 ]] && grep -qF -- "[self-check] 隔离配置目录" "$ISO_TTY_LOG"; then
+  record_pass "交互终端（pty）上仍然报出隔离目录，人没有失去这条诊断"
+else
+  record_fail "交互终端上看不到隔离目录提示（pty 退出码 $iso_tty_status）"
 fi
 if [[ "$(md5sum "$ISO_MARKER_CFG" | cut -d' ' -f1)" == "$iso_marker_md5" ]]; then
   record_pass "自检模式没有改写默认 profile 的 config.json"
