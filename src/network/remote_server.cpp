@@ -24,6 +24,10 @@
 #include <fstream>
 #include <sstream>
 
+#include "crypto.h"
+#include "remote_auth.h"
+#include "remote_metadata_store.h"
+
 namespace backupproject {
 namespace net {
 namespace {
@@ -226,7 +230,15 @@ bool RemoteServer::Start(std::string* error_message) {
   if (!LoadSecret(error_message)) {
     return false;
   }
+  store_.reset(new RemoteMetadataStore());
+  if (!store_->Open(config_.database_path, error_message)) {
+    store_.reset();
+    return false;
+  }
+  Log("metadata database opened at " + config_.database_path);
   if (!OpenListener(error_message)) {
+    store_->Close();
+    store_.reset();
     return false;
   }
   {
@@ -310,6 +322,10 @@ void RemoteServer::Stop() {
     ::close(listener_fd_);
     listener_fd_ = -1;
   }
+  if (store_ != nullptr) {
+    store_->Close();
+    store_.reset();
+  }
   {
     std::lock_guard<std::mutex> guard(work_mutex_);
     pending_.clear();
@@ -360,6 +376,232 @@ bool RemoteServer::HandlePing(int fd, const FrameHeader& header,
   return SendStatus(fd, header, Status::kOk, builder.data(), error_message);
 }
 
+namespace {
+
+// 解 REGISTER / LOGIN 的 payload：用户名 + 口令，且不允许尾部多余字节。
+// 尾部有垃圾说明客户端与服务端的字段理解已经不一致，必须明确拒绝，
+// 而不是"读到自己要的就当成功"。
+bool DecodeCredentials(const std::string& payload, std::string* username,
+                       std::string* password, std::string* error_message) {
+  PayloadReader reader(payload);
+  if (!reader.ReadString(kMaxUsernameBytes, username)) {
+    if (error_message != nullptr) {
+      *error_message =
+          "cannot read the username field: " + reader.error_message();
+    }
+    return false;
+  }
+  if (!reader.ReadString(kMaxPasswordBytes, password)) {
+    if (error_message != nullptr) {
+      *error_message =
+          "cannot read the password field: " + reader.error_message();
+    }
+    return false;
+  }
+  if (!reader.AtEnd()) {
+    if (error_message != nullptr) {
+      *error_message = "credentials frame has trailing bytes";
+    }
+    return false;
+  }
+  return true;
+}
+
+}  // namespace
+
+bool RemoteServer::HandleRegister(int fd, const FrameHeader& header,
+                                  const std::string& payload,
+                                  ConnectionContext* context,
+                                  std::string* error_message) {
+  if (context->state != ConnectionState::kConnected) {
+    Log("rejecting REGISTER while a session is already established");
+    return SendError(fd, header.opcode, header.request_id,
+                     Status::kInvalidState, error_message);
+  }
+  std::string username;
+  std::string password;
+  std::string decode_error;
+  if (!DecodeCredentials(payload, &username, &password, &decode_error)) {
+    Log("rejecting a malformed REGISTER: " + decode_error);
+    return SendError(fd, header.opcode, header.request_id,
+                     Status::kInvalidRequest, error_message);
+  }
+  std::string validation_error;
+  if (!IsValidUsername(username, &validation_error)) {
+    Log("rejecting REGISTER with an invalid username: " + validation_error);
+    return SendError(fd, header.opcode, header.request_id,
+                     Status::kInvalidRequest, error_message);
+  }
+  if (password.size() < kMinPasswordBytes ||
+      password.size() > kMaxPasswordBytes) {
+    Log("rejecting REGISTER with a password outside 8..256 bytes");
+    return SendError(fd, header.opcode, header.request_id,
+                     Status::kInvalidRequest, error_message);
+  }
+  PasswordRecord record;
+  std::string hash_error;
+  if (!HashPassword(password, &record, &hash_error)) {
+    Log("cannot derive a password hash: " + hash_error);
+    return SendError(fd, header.opcode, header.request_id,
+                     Status::kInternalError, error_message);
+  }
+  std::int64_t user_id = 0;
+  std::string store_error;
+  const StoreResult result = store_->CreateUser(
+      username, record, static_cast<std::int64_t>(NowSeconds()), &user_id,
+      &store_error);
+  if (result == StoreResult::kAlreadyExists) {
+    Log("rejecting REGISTER for a username that already exists");
+    return SendError(fd, header.opcode, header.request_id,
+                     Status::kAlreadyExists, error_message);
+  }
+  if (result != StoreResult::kOk) {
+    Log("cannot create the user row: " + store_error);
+    return SendError(fd, header.opcode, header.request_id,
+                     Status::kInternalError, error_message);
+  }
+  Log("registered user id=" + std::to_string(user_id));
+  return SendStatus(fd, header, Status::kOk, std::string(), error_message);
+}
+
+bool RemoteServer::HandleLogin(int fd, const FrameHeader& header,
+                               const std::string& payload,
+                               ConnectionContext* context,
+                               std::string* error_message) {
+  if (context->state != ConnectionState::kConnected) {
+    Log("rejecting LOGIN while a session is already established");
+    return SendError(fd, header.opcode, header.request_id,
+                     Status::kInvalidState, error_message);
+  }
+  std::string username;
+  std::string password;
+  std::string decode_error;
+  if (!DecodeCredentials(payload, &username, &password, &decode_error)) {
+    Log("rejecting a malformed LOGIN: " + decode_error);
+    return SendError(fd, header.opcode, header.request_id,
+                     Status::kInvalidRequest, error_message);
+  }
+  RemoteUserRecord user;
+  std::string store_error;
+  const StoreResult result = store_->FindUser(username, &user, &store_error);
+  if (result == StoreResult::kNotFound) {
+    // 不让"这个用户名存不存在"从响应时间上泄漏出去：照样做一次同等代价的
+    // PBKDF2。响应码与口令错误完全一致。
+    PasswordRecord dummy;
+    dummy.salt = std::string(kPasswordSaltBytes, '\0');
+    dummy.hash = std::string(kPasswordHashBytes, '\0');
+    dummy.iterations = kPasswordIterations;
+    bool ignored = false;
+    VerifyPassword(password, dummy, &ignored, nullptr);
+    Log("login rejected: unknown user");
+    return SendError(fd, header.opcode, header.request_id,
+                     Status::kUnauthorized, error_message);
+  }
+  if (result != StoreResult::kOk) {
+    Log("cannot read the user row: " + store_error);
+    return SendError(fd, header.opcode, header.request_id,
+                     Status::kInternalError, error_message);
+  }
+  bool matches = false;
+  std::string verify_error;
+  if (!VerifyPassword(password, user.password, &matches, &verify_error)) {
+    Log("cannot verify the stored password: " + verify_error);
+    return SendError(fd, header.opcode, header.request_id,
+                     Status::kInternalError, error_message);
+  }
+  if (!matches) {
+    Log("login rejected: wrong password for user id=" +
+        std::to_string(user.user_id));
+    return SendError(fd, header.opcode, header.request_id,
+                     Status::kUnauthorized, error_message);
+  }
+  std::string token;
+  std::string token_error;
+  if (!IssueToken(secret_, static_cast<std::uint64_t>(user.user_id),
+                  NowSeconds(), &token, &token_error)) {
+    Log("cannot issue a token: " + token_error);
+    return SendError(fd, header.opcode, header.request_id,
+                     Status::kInternalError, error_message);
+  }
+  context->state = ConnectionState::kAuthenticated;
+  context->user_id = static_cast<std::uint64_t>(user.user_id);
+  context->username = user.username;
+  // token 只出现在这一条响应里，绝不写日志。
+  PayloadBuilder builder;
+  std::string build_error;
+  if (!builder.AppendString(token, kMaxTokenBytes, &build_error)) {
+    Log("cannot encode the token response: " + build_error);
+    return SendError(fd, header.opcode, header.request_id,
+                     Status::kInternalError, error_message);
+  }
+  Log("login accepted for user id=" + std::to_string(user.user_id));
+  return SendStatus(fd, header, Status::kOk, builder.data(), error_message);
+}
+
+bool RemoteServer::HandleLogout(int fd, const FrameHeader& header,
+                                ConnectionContext* context,
+                                std::string* error_message) {
+  if (context->state != ConnectionState::kAuthenticated) {
+    Log("rejecting LOGOUT without a session");
+    return SendError(fd, header.opcode, header.request_id,
+                     Status::kUnauthorized, error_message);
+  }
+  // 服务端不保存会话表，所以 LOGOUT 就是把这条连接的内存会话清掉。
+  // 真正让 token 失效的是它的 12 小时有效期（见 KNOWN-LIMITATIONS）。
+  context->state = ConnectionState::kConnected;
+  context->user_id = 0;
+  context->username.clear();
+  return SendStatus(fd, header, Status::kOk, std::string(), error_message);
+}
+
+bool RemoteServer::HandleList(int fd, const FrameHeader& header,
+                              ConnectionContext* context,
+                              std::string* error_message) {
+  if (context->state != ConnectionState::kAuthenticated) {
+    Log("rejecting LIST without a session");
+    return SendError(fd, header.opcode, header.request_id,
+                     Status::kUnauthorized, error_message);
+  }
+  std::vector<RemoteSnapshotRecord> records;
+  std::string store_error;
+  const StoreResult result = store_->ListSnapshots(
+      static_cast<std::int64_t>(context->user_id), &records, &store_error);
+  if (result != StoreResult::kOk) {
+    Log("cannot list the snapshots: " + store_error);
+    return SendError(fd, header.opcode, header.request_id,
+                     Status::kInternalError, error_message);
+  }
+  if (records.size() > kMaxListEntries) {
+    Log("refusing to build a LIST response with more than " +
+        std::to_string(kMaxListEntries) + " entries");
+    return SendError(fd, header.opcode, header.request_id, Status::kTooLarge,
+                     error_message);
+  }
+  PayloadBuilder builder;
+  builder.AppendU32(static_cast<std::uint32_t>(records.size()));
+  std::string build_error;
+  for (const RemoteSnapshotRecord& record : records) {
+    if (!builder.AppendString(record.snapshot_id, kMaxSnapshotIdBytes,
+                              &build_error) ||
+        !builder.AppendString(record.display_name, kMaxDisplayNameBytes,
+                              &build_error) ||
+        !builder.AppendString(record.sha256, kSha256HexBytes, &build_error)) {
+      Log("cannot encode a LIST entry: " + build_error);
+      return SendError(fd, header.opcode, header.request_id,
+                       Status::kInternalError, error_message);
+    }
+    builder.AppendU64(record.size_bytes);
+    builder.AppendU64(static_cast<std::uint64_t>(record.created_at));
+    // 一帧装不下就明确拒绝，绝不发一个超限的帧。
+    if (builder.size() > kMaxPayloadBytes) {
+      Log("the LIST response would exceed the 1 MiB frame limit");
+      return SendError(fd, header.opcode, header.request_id, Status::kTooLarge,
+                       error_message);
+    }
+  }
+  return SendStatus(fd, header, Status::kOk, builder.data(), error_message);
+}
+
 bool RemoteServer::HandleFrame(int fd, const FrameHeader& header,
                                const std::string& payload,
                                ConnectionContext* context,
@@ -389,9 +631,20 @@ bool RemoteServer::HandleFrame(int fd, const FrameHeader& header,
     return HandlePing(fd, header, error_message);
   }
 
-  // 其余操作码都要先认证。认证后端在 PR20 的第二个 commit 里接入，
-  // 在那之前所有连接都停在 CONNECTED，所以这里**如实**回答"这个操作码
-  // 在当前构建里还不被支持"，而不是假装成功或假装用户没登录。
+  switch (static_cast<Opcode>(header.opcode)) {
+    case Opcode::kRegister:
+      return HandleRegister(fd, header, payload, context, error_message);
+    case Opcode::kLogin:
+      return HandleLogin(fd, header, payload, context, error_message);
+    case Opcode::kLogout:
+      return HandleLogout(fd, header, context, error_message);
+    case Opcode::kList:
+      return HandleList(fd, header, context, error_message);
+    default:
+      break;
+  }
+  // 传输类操作码在 PR20 的第三个 commit 里接入。在那之前这里**如实**回答
+  // "当前构建还不支持"，而不是假装成功。
   Log(std::string("opcode ") + OpcodeName(header.opcode) +
       " is not supported by this build (state=" +
       ConnectionStateName(context->state) + ")");

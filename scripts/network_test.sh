@@ -46,7 +46,8 @@ if [ -z "$SQLITE_LIBRARY" ]; then
 fi
 
 NET_OBJECTS="build/src/network/network_protocol.o"
-SERVER_OBJECTS="build/src/network/network_protocol.o build/src/network/remote_server.o"
+SERVER_OBJECTS="build/src/network/network_protocol.o build/src/network/remote_auth.o \
+build/src/network/remote_metadata_store.o build/src/network/remote_server.o"
 CRYPTO_OBJECTS="build/src/crypto/sha256.o build/src/crypto/hmac.o \
 build/src/crypto/pbkdf2.o build/src/crypto/random.o"
 
@@ -85,6 +86,10 @@ run_unit() {
 
 echo "[network-test] A. 单元测试"
 run_unit network_protocol_test "$NET_OBJECTS"
+run_unit remote_auth_test "build/src/network/remote_auth.o $CRYPTO_OBJECTS"
+run_unit remote_metadata_store_test \
+  "build/src/network/remote_metadata_store.o build/src/network/remote_auth.o \
+$CRYPTO_OBJECTS" "$SQLITE_LIBRARY" -pthread
 run_unit remote_server_test "$SERVER_OBJECTS $CRYPTO_OBJECTS" \
   "$SQLITE_LIBRARY" -pthread
 
