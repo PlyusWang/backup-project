@@ -55,16 +55,23 @@ CORE_SOURCES += src/core/backup_mode.cpp \
 #
 # 桌面端（backupctl / 两个 GUI）不链接 SQLite：只有服务端需要元数据库。
 SERVER_TARGET := $(BUILD_DIR)/backup-server
+# 服务端独有的源码**不放在 src/ 下**：src/ 是桌面核心，若干既有测试脚本会把
+# src/**/*.cpp 整个编译并链接一遍，把需要 SQLite、还带自己的 main() 的服务端
+# 源文件混进去会让它们全部失败。协议与客户端（backupctl/GUI 也要用）留在
+# src/network/，服务端实现放 server/。
 SERVER_CORE_SOURCES := src/network/network_protocol.cpp \
-                       src/network/remote_auth.cpp \
-                       src/network/remote_metadata_store.cpp \
-                       src/network/remote_server.cpp \
+                       server/remote_auth.cpp \
+                       server/remote_metadata_store.cpp \
+                       server/remote_server.cpp \
                        src/crypto/sha256.cpp \
                        src/crypto/hmac.cpp \
                        src/crypto/pbkdf2.cpp \
                        src/crypto/random.cpp
-SERVER_SOURCES := src/server/main.cpp $(SERVER_CORE_SOURCES)
-SERVER_OBJECTS := $(patsubst %.cpp,$(BUILD_DIR)/%.o,$(SERVER_SOURCES))
+SERVER_SOURCES := server/main.cpp $(SERVER_CORE_SOURCES)
+# 服务端的目标文件放在 $(BUILD_DIR)/server/ 下，**不要**落在 $(BUILD_DIR)/src/。
+# 既有的测试脚本用 "find build/src -name '*.o'" 收集核心对象来链接单元测试，
+# 把服务端的 main.o 与需要 SQLite 的目标文件混进去会让它们全部链接失败。
+SERVER_OBJECTS := $(patsubst %.cpp,$(BUILD_DIR)/server/%.o,$(SERVER_SOURCES))
 
 # SQLite 头文件：优先用系统装的 libsqlite3-dev，否则用仓库里固定的官方头。
 # 链接一律直接指向系统运行库 libsqlite3.so.0，不依赖 -lsqlite3 的开发符号
@@ -145,13 +152,9 @@ $(FIXTURE_TARGET): $(FIXTURE_OBJECTS) $(FIXTURE_CORE_OBJECTS)
 	@mkdir -p $(BUILD_DIR)
 	$(CXX) $(CXXFLAGS) $(FIXTURE_OBJECTS) $(CORE_OBJECTS) -o $@
 
-# 服务端源码单独一条模式规则：只有它们需要 SQLite 的头文件路径。
-# GNU Make 会优先选 stem 更短的那条规则，所以 CLI/GUI 的对象文件不受影响。
-$(BUILD_DIR)/src/network/%.o: src/network/%.cpp
-	@mkdir -p $(dir $@)
-	$(CXX) $(CPPFLAGS) -I$(SQLITE_INCLUDE_DIR) $(CXXFLAGS) -MMD -MP -c $< -o $@
-
-$(BUILD_DIR)/src/server/%.o: src/server/%.cpp
+# 服务端源码单独一条模式规则：只有它们需要 SQLite 的头文件路径，
+# 并且统一落在 $(BUILD_DIR)/server/ 下（见上面 SERVER_OBJECTS 的说明）。
+$(BUILD_DIR)/server/%.o: %.cpp
 	@mkdir -p $(dir $@)
 	$(CXX) $(CPPFLAGS) -I$(SQLITE_INCLUDE_DIR) $(CXXFLAGS) -MMD -MP -c $< -o $@
 

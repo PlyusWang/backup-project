@@ -29,8 +29,7 @@ record_fail() { FAIL=$((FAIL + 1)); echo "  FAIL  $1 -- $2" >&2; }
 OBJ_ROOT="build"
 EXTRA_FLAGS=""
 SAN_LABEL=""
-SAN_MODE="$NETWORK_TEST_SANITIZE"
-[ -n "$SAN_MODE" ] || SAN_MODE=0
+SAN_MODE="${NETWORK_TEST_SANITIZE:-0}"
 if [ "$SAN_MODE" = "1" ]; then
   OBJ_ROOT="build-sanitize"
   EXTRA_FLAGS="-fsanitize=address,undefined -fno-omit-frame-pointer"
@@ -40,7 +39,7 @@ fi
 echo "[network-test] PR #20 remote backup suite$SAN_LABEL"
 
 # 服务端目标文件是测试的前置条件：先确保它们存在（也是零警告的证据）。
-if [ ! -f $OBJ_ROOT/src/network/remote_server.o ]; then
+if [ -z "$(find "$OBJ_ROOT/server" -name remote_server.o 2>/dev/null | head -1)" ]; then
   echo "[network-test] $OBJ_ROOT/backup-server is missing; building first..."
   if [ "$OBJ_ROOT" = "build-sanitize" ]; then
     BUILD_CMD="make -j4 sanitize"
@@ -65,9 +64,21 @@ if [ -z "$SQLITE_LIBRARY" ]; then
 fi
 
 NET_OBJECTS="$OBJ_ROOT/src/network/network_protocol.o"
-SERVER_OBJECTS="$OBJ_ROOT/src/network/network_protocol.o $OBJ_ROOT/src/network/remote_auth.o \
-$OBJ_ROOT/src/network/remote_metadata_store.o $OBJ_ROOT/src/network/remote_server.o \
-$OBJ_ROOT/src/network/remote_backup_client.o"
+# 服务端的目标文件统一在 $OBJ_ROOT/server/ 下（见 Makefile 里 SERVER_OBJECTS
+# 的说明）：它们不能落在 $OBJ_ROOT/src/，否则既有测试脚本的
+# "find build/src -name '*.o'" 会把 server/main.o 也链进来，
+# 与单元测试自己的 main 冲突。
+# 用 find 而不是写死路径：服务端目标文件的目录结构随 Makefile 变过一次
+# （先在 $OBJ_ROOT/src/，后移到 $OBJ_ROOT/server/），写死路径会在移动时
+# 静默指向不存在的文件。
+# 排除 main.o：单元测试有自己的 main，链接服务端的 main 会重复定义。
+# 排除 main.o（单元测试有自己的 main）与 crypto/*（那部分统一用
+# $OBJ_ROOT/src/crypto 下的目标文件，两处都链会重复定义）。
+SERVER_ONLY="$(find "$OBJ_ROOT/server" -name '*.o' ! -name 'main.o' \
+  ! -path '*/crypto/*' 2>/dev/null | sort | tr '\n' ' ')"
+SERVER_AUTH_OBJ="$(find "$OBJ_ROOT/server" -name 'remote_auth.o' 2>/dev/null | head -1)"
+SERVER_STORE_OBJ="$(find "$OBJ_ROOT/server" -name 'remote_metadata_store.o' 2>/dev/null | head -1)"
+SERVER_OBJECTS="$SERVER_ONLY $OBJ_ROOT/src/network/remote_backup_client.o"
 CRYPTO_OBJECTS="$OBJ_ROOT/src/crypto/sha256.o $OBJ_ROOT/src/crypto/hmac.o \
 $OBJ_ROOT/src/crypto/pbkdf2.o $OBJ_ROOT/src/crypto/random.o"
 
@@ -107,9 +118,9 @@ run_unit() {
 
 echo "[network-test] A. 单元测试"
 run_unit network_protocol_test "$NET_OBJECTS"
-run_unit remote_auth_test "$OBJ_ROOT/src/network/remote_auth.o $CRYPTO_OBJECTS"
+run_unit remote_auth_test "$SERVER_AUTH_OBJ $CRYPTO_OBJECTS"
 run_unit remote_metadata_store_test \
-  "$OBJ_ROOT/src/network/remote_metadata_store.o $OBJ_ROOT/src/network/remote_auth.o \
+  "$SERVER_STORE_OBJ $SERVER_AUTH_OBJ \
 $CRYPTO_OBJECTS" "$SQLITE_LIBRARY" -pthread
 run_unit remote_server_test "$SERVER_OBJECTS $CRYPTO_OBJECTS" \
   "$SQLITE_LIBRARY" -pthread
