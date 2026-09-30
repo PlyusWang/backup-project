@@ -138,13 +138,16 @@ fi
 
 echo "[e2e] ECS 侧证据"
 if ssh -o BatchMode=yes "$ALIAS" "bash -s" <<REMOTE > "$WORK_DIR/evidence.txt" 2>&1
-SRV="$HOME/backup-project-server"
-echo "ecs_hostname=$(hostname)"
-echo "server_pid=$(cat $SRV/state/server.pid)"
-echo "loopback_listeners=$(ss -ltn | grep -c '127.0.0.1:18765')"
-echo "blob_sha256=$(sha256sum $SRV/data/users/1/$SNAP.bak | cut -d' ' -f1)"
-echo "blob_size=$(stat -c%s $SRV/data/users/1/$SNAP.bak)"
-echo "db_row=$(sqlite3 $SRV/state/metadata.sqlite3 \"select id||'|'||user_id||'|'||size_bytes||'|'||sha256 from snapshots where id='$SNAP';\")"
+# 这个 heredoc 不带引号（$SNAP 需要在本机展开），所以**远端**才该展开的
+# 变量与命令替换必须转义，否则会在本机被吃掉：
+# 之前就是这样打出了本机的 hostname、并且把远端路径展开成了空串。
+SRV="\$HOME/backup-project-server"
+echo "ecs_hostname=\$(hostname)"
+echo "server_pid=\$(cat \$SRV/state/server.pid)"
+echo "loopback_listeners=\$(ss -ltn | grep -c '127.0.0.1:18765')"
+echo "blob_sha256=\$(sha256sum \$SRV/data/users/1/$SNAP.bak | cut -d' ' -f1)"
+echo "blob_size=\$(stat -c%s \$SRV/data/users/1/$SNAP.bak)"
+echo "db_row=\$(sqlite3 \$SRV/state/metadata.sqlite3 \"select id||'|'||user_id||'|'||size_bytes||'|'||sha256 from snapshots where id='$SNAP';\")"
 REMOTE
 then
   sed 's/^/  /' "$WORK_DIR/evidence.txt"
@@ -175,9 +178,9 @@ run delete "$SNAP" --user "$USER_A" >/dev/null 2>&1 \
   && record_pass "G. A 删除自己的快照" \
   || record_fail "G. 删除" "失败"
 REMOTE_CHECK="$(ssh -o BatchMode=yes "$ALIAS" "bash -s" <<REMOTE
-SRV="$HOME/backup-project-server"
-if [ -f "$SRV/data/users/1/$SNAP.bak" ]; then echo BLOB_STILL_THERE; else echo BLOB_GONE; fi
-echo "rows=$(sqlite3 $SRV/state/metadata.sqlite3 \"select count(*) from snapshots where id='$SNAP';\")"
+SRV="\$HOME/backup-project-server"
+if [ -f "\$SRV/data/users/1/$SNAP.bak" ]; then echo BLOB_STILL_THERE; else echo BLOB_GONE; fi
+echo "rows=\$(sqlite3 \$SRV/state/metadata.sqlite3 \"select count(*) from snapshots where id='$SNAP';\")"
 REMOTE
 )"
 echo "$REMOTE_CHECK" | sed 's/^/  /'
