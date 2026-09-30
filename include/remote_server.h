@@ -32,6 +32,7 @@
 #include <condition_variable>
 #include <cstdint>
 #include <deque>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -142,10 +143,22 @@ class RemoteServer {
                  Status status, std::string* error_message);
   bool HandlePing(int fd, const FrameHeader& header,
                   std::string* error_message);
+  bool HandleRegister(int fd, const FrameHeader& header,
+                      const std::string& payload, ConnectionContext* context,
+                      std::string* error_message);
+  bool HandleLogin(int fd, const FrameHeader& header,
+                   const std::string& payload, ConnectionContext* context,
+                   std::string* error_message);
+  bool HandleLogout(int fd, const FrameHeader& header,
+                    ConnectionContext* context, std::string* error_message);
+  bool HandleList(int fd, const FrameHeader& header, ConnectionContext* context,
+                  std::string* error_message);
   void WorkerLoop();
   void Log(const std::string& message);
 
   RemoteServerConfig config_;
+  // 元数据库只在服务端进程里存在：桌面端不链接 SQLite。
+  std::unique_ptr<RemoteMetadataStore> store_;
   int listener_fd_ = -1;
   std::uint16_t bound_port_ = 0;
   std::string secret_;

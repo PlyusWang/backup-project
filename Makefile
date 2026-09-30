@@ -56,6 +56,8 @@ CORE_SOURCES += src/core/backup_mode.cpp \
 # 桌面端（backupctl / 两个 GUI）不链接 SQLite：只有服务端需要元数据库。
 SERVER_TARGET := $(BUILD_DIR)/backup-server
 SERVER_CORE_SOURCES := src/network/network_protocol.cpp \
+                       src/network/remote_auth.cpp \
+                       src/network/remote_metadata_store.cpp \
                        src/network/remote_server.cpp \
                        src/crypto/sha256.cpp \
                        src/crypto/hmac.cpp \

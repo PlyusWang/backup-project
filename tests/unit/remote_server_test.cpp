@@ -22,6 +22,7 @@
 
 #include "crypto.h"
 #include "network_protocol.h"
+#include "remote_auth.h"
 #include "remote_server.h"
 #include "test_support.h"
 
@@ -128,6 +129,15 @@ net::FrameReadStatus RoundTrip(int fd, std::uint16_t opcode,
     return net::FrameReadStatus::kIoError;
   }
   return net::ReceiveFrame(fd, header, response, error);
+}
+
+std::string CredentialsPayload(const std::string& username,
+                                const std::string& password) {
+  net::PayloadBuilder builder;
+  std::string error;
+  builder.AppendString(username, net::kMaxUsernameBytes, &error);
+  builder.AppendString(password, net::kMaxPasswordBytes, &error);
+  return builder.data();
 }
 
 }  // namespace
@@ -272,8 +282,8 @@ int main() {
         std::string(), &header, &response, &error);
     test_support::Check(status == net::FrameReadStatus::kOk &&
                             header.status == static_cast<std::uint32_t>(
-                                                net::Status::kUnsupported),
-                        "SRV T4 没登录的 LIST 被拒绝（当前构建回答 UNSUPPORTED）",
+                                                net::Status::kUnauthorized),
+                        "SRV T4 没登录的 LIST = UNAUTHORIZED",
                         net::StatusName(header.status));
 
     error.clear();
@@ -284,8 +294,19 @@ int main() {
                        12, credentials.data(), &header, &response, &error);
     test_support::Check(status == net::FrameReadStatus::kOk &&
                             header.status == static_cast<std::uint32_t>(
+                                                net::Status::kUnauthorized),
+                        "SRV T4 不存在的账号 LOGIN = UNAUTHORIZED",
+                        net::StatusName(header.status));
+
+    error.clear();
+    // 传输类操作码在第三个 commit 之前**如实**回答"不支持"。
+    status = RoundTrip(client,
+                       static_cast<std::uint16_t>(net::Opcode::kUploadBegin),
+                       17, std::string(), &header, &response, &error);
+    test_support::Check(status == net::FrameReadStatus::kOk &&
+                            header.status == static_cast<std::uint32_t>(
                                                 net::Status::kUnsupported),
-                        "SRV T4 LOGIN 在认证接入前如实回答 UNSUPPORTED",
+                        "SRV T4 UPLOAD_BEGIN 在传输接入前回答 UNSUPPORTED",
                         net::StatusName(header.status));
 
     error.clear();
@@ -487,6 +508,183 @@ int main() {
                             second.Start(&second_error),
                         "SRV T8 同一端口停止后可以重新绑定", second_error);
     second.Stop();
+  }
+
+  test_support::Section("SRV 9. 注册 / 登录 / 会话状态机");
+  {
+    Fixture fixture;
+    SetupFixture(&fixture, "srv-auth");
+    net::RemoteServer server;
+    std::string error;
+    server.Configure(fixture.config, &error);
+    test_support::Check(server.Start(&error), "SRV T9 服务端启动", error);
+    std::thread worker = ServeOneConnection(&server);
+    const int client = ConnectToLoopback(server.bound_port());
+
+    // 用户名与口令全部运行时随机生成；口令不进任何断言文本。
+    const std::string username = "night-" + RandomSecretHex().substr(0, 8);
+    const std::string password = RandomSecretHex().substr(0, 24);
+    const std::string wrong_password = RandomSecretHex().substr(0, 24);
+
+    net::FrameHeader header;
+    std::string response;
+
+    error.clear();
+    net::FrameReadStatus status = RoundTrip(
+        client, static_cast<std::uint16_t>(net::Opcode::kList), 40,
+        std::string(), &header, &response, &error);
+    test_support::Check(status == net::FrameReadStatus::kOk &&
+                            header.status == static_cast<std::uint32_t>(
+                                                net::Status::kUnauthorized),
+                        "SRV T9 没登录就 LIST = UNAUTHORIZED", error);
+
+    error.clear();
+    status = RoundTrip(client, static_cast<std::uint16_t>(net::Opcode::kRegister),
+                       41, CredentialsPayload(username, password), &header,
+                       &response, &error);
+    test_support::Check(status == net::FrameReadStatus::kOk &&
+                            header.status ==
+                                static_cast<std::uint32_t>(net::Status::kOk),
+                        "SRV T9 注册成功", net::StatusName(header.status));
+
+    error.clear();
+    status = RoundTrip(client, static_cast<std::uint16_t>(net::Opcode::kRegister),
+                       42, CredentialsPayload(username, password), &header,
+                       &response, &error);
+    test_support::Check(status == net::FrameReadStatus::kOk &&
+                            header.status == static_cast<std::uint32_t>(
+                                                net::Status::kAlreadyExists),
+                        "SRV T9 同名重复注册 = ALREADY_EXISTS",
+                        net::StatusName(header.status));
+
+    error.clear();
+    status = RoundTrip(client, static_cast<std::uint16_t>(net::Opcode::kRegister),
+                       43, CredentialsPayload("a/b", password), &header,
+                       &response, &error);
+    test_support::Check(status == net::FrameReadStatus::kOk &&
+                            header.status == static_cast<std::uint32_t>(
+                                                net::Status::kInvalidRequest),
+                        "SRV T9 非法用户名注册 = INVALID_REQUEST");
+
+    error.clear();
+    status = RoundTrip(client, static_cast<std::uint16_t>(net::Opcode::kRegister),
+                       44, CredentialsPayload("okname", "short"), &header,
+                       &response, &error);
+    test_support::Check(status == net::FrameReadStatus::kOk &&
+                            header.status == static_cast<std::uint32_t>(
+                                                net::Status::kInvalidRequest),
+                        "SRV T9 过短口令注册 = INVALID_REQUEST");
+
+    error.clear();
+    std::string trailing = CredentialsPayload(username, password) + "junk";
+    status = RoundTrip(client, static_cast<std::uint16_t>(net::Opcode::kRegister),
+                       45, trailing, &header, &response, &error);
+    test_support::Check(status == net::FrameReadStatus::kOk &&
+                            header.status == static_cast<std::uint32_t>(
+                                                net::Status::kInvalidRequest),
+                        "SRV T9 带尾部垃圾的凭证帧 = INVALID_REQUEST");
+
+    error.clear();
+    status = RoundTrip(client, static_cast<std::uint16_t>(net::Opcode::kLogin),
+                       46, CredentialsPayload(username, wrong_password), &header,
+                       &response, &error);
+    test_support::Check(status == net::FrameReadStatus::kOk &&
+                            header.status == static_cast<std::uint32_t>(
+                                                net::Status::kUnauthorized),
+                        "SRV T9 口令错误 = UNAUTHORIZED",
+                        net::StatusName(header.status));
+
+    error.clear();
+    status = RoundTrip(client, static_cast<std::uint16_t>(net::Opcode::kLogin),
+                       47, CredentialsPayload("no-such-user", password), &header,
+                       &response, &error);
+    test_support::Check(status == net::FrameReadStatus::kOk &&
+                            header.status == static_cast<std::uint32_t>(
+                                                net::Status::kUnauthorized),
+                        "SRV T9 不存在的用户与口令错误回答一致（不泄漏存在性）");
+
+    error.clear();
+    status = RoundTrip(client, static_cast<std::uint16_t>(net::Opcode::kLogin),
+                       48, CredentialsPayload(username, password), &header,
+                       &response, &error);
+    test_support::Check(status == net::FrameReadStatus::kOk &&
+                            header.status ==
+                                static_cast<std::uint32_t>(net::Status::kOk),
+                        "SRV T9 登录成功", net::StatusName(header.status));
+    net::PayloadReader token_reader(response);
+    std::string token;
+    const bool token_ok = token_reader.ReadString(net::kMaxTokenBytes, &token) &&
+                          token_reader.AtEnd() &&
+                          token.size() == net::kTokenHexBytes;
+    test_support::Check(token_ok, "SRV T9 响应里是一个定长十六进制 token");
+    test_support::Check(!token.empty() &&
+                            token.find(username) == std::string::npos &&
+                            token.find(password) == std::string::npos,
+                        "SRV T9 判别：token 里既没有用户名也没有口令");
+
+    error.clear();
+    status = RoundTrip(client, static_cast<std::uint16_t>(net::Opcode::kRegister),
+                       49, CredentialsPayload("another-user", password), &header,
+                       &response, &error);
+    test_support::Check(status == net::FrameReadStatus::kOk &&
+                            header.status == static_cast<std::uint32_t>(
+                                                net::Status::kInvalidState),
+                        "SRV T9 登录之后再 REGISTER = INVALID_STATE");
+
+    error.clear();
+    status = RoundTrip(client, static_cast<std::uint16_t>(net::Opcode::kList), 50,
+                       std::string(), &header, &response, &error);
+    net::PayloadReader list_reader(response);
+    std::uint32_t entries = 1;
+    const bool list_ok = status == net::FrameReadStatus::kOk &&
+                         header.status ==
+                             static_cast<std::uint32_t>(net::Status::kOk) &&
+                         list_reader.ReadU32(&entries) && entries == 0 &&
+                         list_reader.AtEnd();
+    test_support::Check(list_ok, "SRV T9 登录后的 LIST 返回 0 条（还没有上传）",
+                        net::StatusName(header.status));
+
+    error.clear();
+    status = RoundTrip(client, static_cast<std::uint16_t>(net::Opcode::kLogout),
+                       51, std::string(), &header, &response, &error);
+    test_support::Check(status == net::FrameReadStatus::kOk &&
+                            header.status ==
+                                static_cast<std::uint32_t>(net::Status::kOk),
+                        "SRV T9 LOGOUT 成功");
+
+    error.clear();
+    status = RoundTrip(client, static_cast<std::uint16_t>(net::Opcode::kList), 52,
+                       std::string(), &header, &response, &error);
+    test_support::Check(status == net::FrameReadStatus::kOk &&
+                            header.status == static_cast<std::uint32_t>(
+                                                net::Status::kUnauthorized),
+                        "SRV T9 判别：LOGOUT 之后 LIST 回到 UNAUTHORIZED");
+
+    error.clear();
+    status = RoundTrip(client, static_cast<std::uint16_t>(net::Opcode::kLogout),
+                       53, std::string(), &header, &response, &error);
+    test_support::Check(status == net::FrameReadStatus::kOk &&
+                            header.status == static_cast<std::uint32_t>(
+                                                net::Status::kUnauthorized),
+                        "SRV T9 没登录时 LOGOUT = UNAUTHORIZED");
+
+    ::close(client);
+    worker.join();
+
+    // 换一条连接重新登录：证明账号真的落在了 SQLite 里，而不是只在会话内存里。
+    std::thread second_worker = ServeOneConnection(&server);
+    const int again = ConnectToLoopback(server.bound_port());
+    error.clear();
+    status = RoundTrip(again, static_cast<std::uint16_t>(net::Opcode::kLogin), 54,
+                       CredentialsPayload(username, password), &header,
+                       &response, &error);
+    test_support::Check(status == net::FrameReadStatus::kOk &&
+                            header.status ==
+                                static_cast<std::uint32_t>(net::Status::kOk),
+                        "SRV T9 判别：新连接上用同一账号可以再次登录");
+    ::close(again);
+    second_worker.join();
+    server.Stop();
   }
 
   return test_support::Finish("remote_server_test");
