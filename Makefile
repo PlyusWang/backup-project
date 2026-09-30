@@ -65,7 +65,6 @@ SERVER_CORE_SOURCES := src/network/network_protocol.cpp \
                        src/crypto/random.cpp
 SERVER_SOURCES := src/server/main.cpp $(SERVER_CORE_SOURCES)
 SERVER_OBJECTS := $(patsubst %.cpp,$(BUILD_DIR)/%.o,$(SERVER_SOURCES))
-DEPENDS += $(SERVER_OBJECTS:.o=.d)
 
 # SQLite 头文件：优先用系统装的 libsqlite3-dev，否则用仓库里固定的官方头。
 # 链接一律直接指向系统运行库 libsqlite3.so.0，不依赖 -lsqlite3 的开发符号
@@ -79,9 +78,23 @@ SQLITE_LIBRARY := $(firstword $(wildcard /usr/lib/x86_64-linux-gnu/libsqlite3.so
                               $(wildcard /usr/lib/libsqlite3.so))
 
 FILESYSTEM_SOURCES := src/filesystem/file_system.cpp
+
+# ---- 远程备份客户端（PR #20）----
+#
+# CLI 与 Modern GUI 共用同一个 RemoteArchiveClient：桌面端只链接协议编解码与
+# 客户端，**不链接 SQLite**（元数据库只属于服务端进程）。
+CORE_SOURCES += src/network/network_protocol.cpp \
+                src/network/remote_backup_client.cpp \
+                src/cli/remote_commands.cpp
 SOURCES := $(APP_SOURCES) $(CORE_SOURCES) $(FILESYSTEM_SOURCES)
 OBJECTS := $(patsubst %.cpp,$(BUILD_DIR)/%.o,$(SOURCES))
 DEPENDS := $(OBJECTS:.o=.d)
+# 注意：这一条必须放在上面的 := 赋值**之后**。DEPENDS 是立即赋值，
+# 放在前面会被整体覆盖，服务端的目标文件就再也不追踪
+# include/remote_server.h，改了头文件也只重建一半目标文件——
+# 两个目标文件对同一个结构体的大小理解不一致，
+# 后果是构造对象时越界写坏调用者的栈 canary。
+DEPENDS += $(SERVER_OBJECTS:.o=.d)
 
 # ---- 归档格式的测试夹具（不是产品命令）----
 #
