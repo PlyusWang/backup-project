@@ -145,9 +145,11 @@ SRV="\$HOME/backup-project-server"
 echo "ecs_hostname=\$(hostname)"
 echo "server_pid=\$(cat \$SRV/state/server.pid)"
 echo "loopback_listeners=\$(ss -ltn | grep -c '127.0.0.1:18765')"
-echo "blob_sha256=\$(sha256sum \$SRV/data/users/1/$SNAP.bak | cut -d' ' -f1)"
+echo "blob_sha256=\$(sha256sum \$SRV/data/users/1/$SNAP.bak | cut -c1-64)"
 echo "blob_size=\$(stat -c%s \$SRV/data/users/1/$SNAP.bak)"
-echo "db_row=\$(sqlite3 \$SRV/state/metadata.sqlite3 \"select id||'|'||user_id||'|'||size_bytes||'|'||sha256 from snapshots where id='$SNAP';\")"
+# SQL 用单引号包住、且**不含内层引号**：这样不需要在 heredoc 里做二次转义。
+# 之前那版嵌套引号在远端被拆成了好几个命令，证据字段全是空的。
+echo "snapshot_rows=\$(sqlite3 \$SRV/state/metadata.sqlite3 'select id,user_id,size_bytes,sha256 from snapshots;')"
 REMOTE
 then
   sed 's/^/  /' "$WORK_DIR/evidence.txt"
@@ -180,7 +182,7 @@ run delete "$SNAP" --user "$USER_A" >/dev/null 2>&1 \
 REMOTE_CHECK="$(ssh -o BatchMode=yes "$ALIAS" "bash -s" <<REMOTE
 SRV="\$HOME/backup-project-server"
 if [ -f "\$SRV/data/users/1/$SNAP.bak" ]; then echo BLOB_STILL_THERE; else echo BLOB_GONE; fi
-echo "rows=\$(sqlite3 \$SRV/state/metadata.sqlite3 \"select count(*) from snapshots where id='$SNAP';\")"
+echo "rows=\$(sqlite3 \$SRV/state/metadata.sqlite3 'select count(*) from snapshots;')"
 REMOTE
 )"
 echo "$REMOTE_CHECK" | sed 's/^/  /'
