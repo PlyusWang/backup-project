@@ -4626,6 +4626,26 @@ int RunScheduleTest(backup_modern::ScheduleController* schedule,
       if (!file.open(QIODevice::ReadOnly)) return QByteArray();
       return file.readAll();
     };
+    // 只读地取 scheduler 的持久化状态。M3 断言的是"被拒绝的删除没有把受管
+    // 快照移出名单"，而 M1.1 起的后台评估在 busy 窗口里本来就会合法地写
+    // history / last-run / manifest 等 bookkeeping，所以这里必须看结构化
+    // 状态，不能拿整个文件的字节当"没有副作用"的代理。
+    auto load_schedule_document = [](const QString& path,
+                                     backupproject::ScheduleDocument* document,
+                                     std::string* error) {
+      backupproject::ScheduleStore store(path.toStdString());
+      return store.Load(document, error) ==
+             backupproject::ScheduleLoadStatus::kLoaded;
+    };
+    auto is_managed_snapshot =
+        [](const backupproject::ScheduleDocument& document,
+           const QString& name) {
+          for (const backupproject::ScheduledSnapshotRecord& record :
+               document.state.managed_snapshots) {
+            if (QString::fromStdString(record.file_name) == name) return true;
+          }
+          return false;
+        };
     const QString store_path = schedule->storePath();
 
     backup_controller->setSourcePath(source);
@@ -4648,11 +4668,33 @@ int RunScheduleTest(backup_modern::ScheduleController* schedule,
               QStringLiteral("M1.5 被拒绝的手动备份没有改动 schedule store"));
 
     // ---- M2：评估在飞 -> 受管恢复被拒绝 ----
-    const QString managed_name = ArchiveNames(repository).isEmpty()
-                                     ? QString()
-                                     : ArchiveNames(repository).first();
-    run.Check(!managed_name.isEmpty(),
-              QStringLiteral("M2.1 仓库里有一份可恢复的归档"));
+    // 目标取 scheduler **自己管理**的快照（最新的一份）：M3 要证明的是"被拒绝
+    // 的删除没有把这份受管快照移出名单"，拿一份不受管的归档顶替就证明不了。
+    // 最新的那份也最稳：retention 从最旧的开始淘汰。
+    backupproject::ScheduleDocument pre_document;
+    std::string pre_error;
+    const bool pre_loaded =
+        load_schedule_document(store_path, &pre_document, &pre_error);
+    const backupproject::ScheduledSnapshotRecord* newest_managed = nullptr;
+    for (const backupproject::ScheduledSnapshotRecord& record :
+         pre_document.state.managed_snapshots) {
+      if (newest_managed == nullptr ||
+          record.created_time_sec > newest_managed->created_time_sec) {
+        newest_managed = &record;
+      }
+    }
+    const QString managed_name =
+        pre_loaded && newest_managed != nullptr
+            ? QString::fromStdString(newest_managed->file_name)
+            : QString();
+    run.Check(
+        !managed_name.isEmpty(),
+        QStringLiteral("M2.1 scheduler 有一份可恢复的受管快照"),
+        QStringLiteral("loaded=") + QString::number(pre_loaded ? 1 : 0) +
+            QStringLiteral(" managed=") +
+            QString::number(
+                static_cast<int>(pre_document.state.managed_snapshots.size())) +
+            QStringLiteral(" error=") + QString::fromStdString(pre_error));
     const QString restore_dest = temp.path() + QStringLiteral("/gate-restore");
     run.Check(
         !backup_controller->startManagedRestore(managed_name, restore_dest),
@@ -4661,14 +4703,51 @@ int RunScheduleTest(backup_modern::ScheduleController* schedule,
     run.Check(!backup_controller->busy(),
               QStringLiteral("M2.3 被拒绝的恢复没有把控制器置成 busy"));
 
-    // ---- M3：评估在飞 -> 删除被拒绝，store 一个字节不变 ----
+    // ---- M3：评估在飞 -> 删除被拒绝，受管快照不许少一份 ----
+    //
+    // 这里刻意**不**比对整个 schedule.json 的字节。M1.1 起的定时评估正在后台
+    // 跑，它本来就会合法地往同一份 state 里写 history / last-run / manifest 等
+    // bookkeeping；"整个文件一字节不变"在存在合法并发写者时是个不成立的前提，
+    // 之前正是它让这个自检在 ASan 下随机变红。改为断言这次删除动作的语义效果：
+    // 目标仍然是 scheduler 的受管快照，仓库里的归档也一份没少。
     {
-      const QByteArray before = read_bytes(store_path);
+      backupproject::ScheduleDocument document_before;
+      std::string before_error;
+      const bool loaded_before =
+          load_schedule_document(store_path, &document_before, &before_error);
+      const int managed_count =
+          static_cast<int>(document_before.state.managed_snapshots.size());
+      const int retain_count =
+          static_cast<int>(document_before.config.retain_count);
+      // M3.0：目标确实受管，而且保留数量明显够大 —— 后台评估的 retention
+      // 没有任何理由合法淘汰它。这一条不成立，下面的断言就没有意义。
+      run.Check(
+          loaded_before && is_managed_snapshot(document_before, managed_name) &&
+              managed_count <= retain_count,
+          QStringLiteral(
+              "M3.0 目标确实是受管快照，且 retention 不会合法淘汰它"),
+          QStringLiteral("loaded=") + QString::number(loaded_before ? 1 : 0) +
+              QStringLiteral(" managed=") + QString::number(managed_count) +
+              QStringLiteral(" retain=") + QString::number(retain_count) +
+              QStringLiteral(" error=") + QString::fromStdString(before_error));
+
       run.Check(!backup_controller->deleteBackup(managed_name),
                 QStringLiteral("M3.1 评估在飞时删除被 C++ 拒绝"),
                 backup_controller->statusMessage());
-      run.Check(read_bytes(store_path) == before,
-                QStringLiteral("M3.2 被拒绝的删除没有改动 schedule store"));
+
+      backupproject::ScheduleDocument document_after;
+      std::string after_error;
+      const bool loaded_after =
+          load_schedule_document(store_path, &document_after, &after_error);
+      run.Check(
+          loaded_after && is_managed_snapshot(document_after, managed_name),
+          QStringLiteral("M3.2 被拒绝的删除没有移除 scheduler 的受管快照"),
+          QStringLiteral("loaded=") + QString::number(loaded_after ? 1 : 0) +
+              QStringLiteral(" managed=") +
+              QString::number(static_cast<int>(
+                  document_after.state.managed_snapshots.size())) +
+              QStringLiteral(" retain=") + QString::number(retain_count) +
+              QStringLiteral(" error=") + QString::fromStdString(after_error));
       run.Check(CountArchives(repository) == archives_before,
                 QStringLiteral("M3.3 被拒绝的删除没有动仓库"));
     }
