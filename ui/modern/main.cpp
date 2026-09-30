@@ -30,12 +30,19 @@
 //                                       用来证明 GUI 与 CLI 读的是同一份 store
 //   --realtime-file <路径> 指定实时存储文件（测试隔离真实实时配置）
 //   --remote-test                       验证远程备份页的控制器链路：真的起一个
-//                                       backup-server，走注册 -> 登录 ->
-//                                       上传真实 归档 -> 列表 ->
-//                                       下载（含默认不覆盖）->
-//                                       删除（含确认路径）-> 退出登录；并断言
-//                                       密码框回显模式、口令与 token 不落盘、
-//                                       忙碌时冲突请求被拒、页面提示不外泄
+//                                       backup-server，走注册 / 登录 / 上传真实
+//                                       归档 / 列表 / 下载（含默认不覆盖）/
+//                                       删除 （含确认路径）/
+//                                       退出登录；并断言密码框回显 模式、口令与
+//                                       token 不落盘、忙碌时冲突请求
+//                                       被拒、页面提示不外泄
+//   --remote-smoke <地址> <端口> <用户名>
+//                                       对着真实远端（阿里云 ECS 上只监听
+//                                       127.0.0.1:18765 的 backup-server，经
+//                                       SSH 隧道转发）走一次 GUI 路径：注册 /
+//                                       登录 / 列表 / 上传真实归档 / 下载比对 /
+//                                       删除。 口令只从环境变量
+//                                       BACKUP_REMOTE_PASSWORD 读，不进 argv
 //   --path-test                         验证本地路径与 URL 互转不丢字符
 //   --close-guard-test                  验证任务进行中关窗会被拦下：手动备份、
 //                                       实时触发、计划评估三位 writer 都要在
@@ -2058,6 +2065,173 @@ int RunFilterUxTest(QQuickWindow* window,
 //   * 列表行显示名称 / 大小 / 时间；
 //   * 删除必须先经过确认对话框；
 //   * 两套主题下关键控件都有正的几何，且主题真的作用到这一页。
+// ---- --remote-smoke：对着真实远端做一次 GUI 路径冒烟 ----
+//
+// 与 --remote-test 的区别：它**不**自己起服务端，而是打到调用方给的真实端点
+// （阿里云 ECS 上那个只监听 127.0.0.1:18765 的 backup-server，经 SSH 隧道
+// 转发到本机的 127.0.0.1:18765）。走的仍是同一条 GUI 路径：
+//
+//   RemoteController -> RemoteArchiveClient -> BPNET1
+//
+// 口令只从环境变量 BACKUP_REMOTE_PASSWORD 读：不进 argv（进程列表对同机
+// 用户可见），也不进日志。
+//
+// 步骤：注册（账号已存在就继续）-> 登录 -> 列表 -> 上传一份真实归档 ->
+// 列表里出现它 -> 下载回来逐字节比对 -> 删除 -> 列表回到原样。
+int RunRemoteSmoke(backup_modern::RemoteController* remote,
+                   backup_modern::BackupController* controller,
+                   const QString& host, const QString& port_text,
+                   const QString& username, const QString& password) {
+  CheckRun run;
+  run.prefix = "[remote-smoke]";
+  std::printf("[remote-smoke] endpoint=%s:%s user=%s\n", qPrintable(host),
+              qPrintable(port_text), qPrintable(username));
+
+  QTemporaryDir temp;
+  run.Check(temp.isValid(), QStringLiteral("SMOKE-00 临时工作目录可用"));
+  if (!temp.isValid()) {
+    return 1;
+  }
+  const QString work = temp.filePath(QStringLiteral("smoke"));
+  QDir().mkpath(work + QStringLiteral("/repo"));
+  QDir().mkpath(work + QStringLiteral("/source"));
+  QDir().mkpath(work + QStringLiteral("/out"));
+  for (int index = 0; index < 6; ++index) {
+    QFile file(QStringLiteral("%1/smoke-%2.txt")
+                   .arg(work + QStringLiteral("/source"))
+                   .arg(index));
+    if (file.open(QIODevice::WriteOnly)) {
+      file.write(QByteArray(300 + index, static_cast<char>('A' + index)));
+    }
+  }
+  run.Check(controller->saveRepositoryPath(work + QStringLiteral("/repo")),
+            QStringLiteral("SMOKE-00 备份仓库已配置"));
+  controller->setSourcePath(work + QStringLiteral("/source"));
+  const bool started = controller->startBackupWithOptions(
+      QStringLiteral("mypack"), QStringLiteral("none"), QStringLiteral("none"),
+      QString(), QString());
+  QElapsedTimer catalog_clock;
+  const auto waitForCatalog = [controller, &catalog_clock]() {
+    catalog_clock.start();
+    while (controller->catalogBusy() && catalog_clock.elapsed() < 60000) {
+      WaitForAnimation(50);
+    }
+  };
+  run.Check(started && controller->waitForIdle(180000),
+            QStringLiteral("SMOKE-00 用产品引擎生成一份真实归档"));
+  waitForCatalog();
+  if (controller->backupRecords().isEmpty()) {
+    controller->refreshBackups();
+    waitForCatalog();
+  }
+  const QVariantList records = controller->backupRecords();
+  const QString archive_name = records.isEmpty()
+                                   ? QString()
+                                   : records.first()
+                                         .toMap()
+                                         .value(QStringLiteral("fileName"))
+                                         .toString();
+  const QString archive_path =
+      controller->repositoryPath() + QStringLiteral("/") + archive_name;
+  run.Check(!archive_name.isEmpty() && QFileInfo::exists(archive_path),
+            QStringLiteral("SMOKE-00 本地归档存在"), archive_path);
+
+  // 注册：账号已经存在时继续（同一个冒烟要能反复跑）。
+  const bool register_accepted =
+      remote->registerAccount(host, port_text, username, password);
+  // waitForIdle 只说明后台任务结束了，不说明它成功：必须同时看 error_kind，
+  // 否则第二次跑（账号已存在）会把服务端的拒绝说成"注册成功"。
+  const bool register_ok =
+      register_accepted && remote->waitForIdle(120000) &&
+      remote->lastErrorKindForTest() == QStringLiteral("none");
+  if (register_ok) {
+    run.Check(true, QStringLiteral("SMOKE-01 注册成功"));
+  } else {
+    run.Check(remote->lastErrorKindForTest() == QStringLiteral("name-taken"),
+              QStringLiteral("SMOKE-01 注册成功（或账号已存在）"),
+              remote->lastErrorKindForTest() + QStringLiteral(": ") +
+                  remote->lastDetailForTest());
+  }
+
+  run.Check(remote->login(host, port_text, username, password) &&
+                remote->waitForIdle(120000) && remote->authenticated(),
+            QStringLiteral("SMOKE-02 登录成功"),
+            remote->lastErrorKindForTest() + QStringLiteral(": ") +
+                remote->lastDetailForTest());
+  run.Check(remote->refreshList() && remote->waitForIdle(120000) &&
+                remote->listLoaded() &&
+                remote->lastErrorKindForTest() == QStringLiteral("none"),
+            QStringLiteral("SMOKE-03 云端列表读取成功"),
+            remote->lastErrorKindForTest() + QStringLiteral(": ") +
+                remote->lastDetailForTest());
+  QStringList ids_before;
+  for (const QVariant& item : remote->snapshots()) {
+    ids_before.append(item.toMap().value(QStringLiteral("id")).toString());
+  }
+  std::printf("[remote-smoke] list_before=%d\n",
+              static_cast<int>(ids_before.size()));
+
+  const bool upload_ok = remote->uploadArchive(archive_path, QString()) &&
+                         remote->waitForIdle(300000);
+  run.Check(
+      upload_ok && remote->lastErrorKindForTest() == QStringLiteral("none"),
+      QStringLiteral("SMOKE-04 上传真实归档成功"),
+      remote->lastErrorKindForTest() + QStringLiteral(": ") +
+          remote->lastDetailForTest());
+  QString uploaded_id;
+  for (const QVariant& item : remote->snapshots()) {
+    const QString id = item.toMap().value(QStringLiteral("id")).toString();
+    if (!ids_before.contains(id)) {
+      uploaded_id = id;
+    }
+  }
+  run.Check(!uploaded_id.isEmpty(),
+            QStringLiteral("SMOKE-05 列表里出现刚上传的那一条"));
+
+  const QString target = work + QStringLiteral("/out/downloaded.bak");
+  run.Check(remote->downloadArchive(uploaded_id, target, false) &&
+                remote->waitForIdle(300000) &&
+                remote->lastErrorKindForTest() == QStringLiteral("none"),
+            QStringLiteral("SMOKE-06 下载成功"),
+            remote->lastErrorKindForTest() + QStringLiteral(": ") +
+                remote->lastDetailForTest());
+  QFile local(archive_path);
+  QFile fetched(target);
+  const bool identical = local.open(QIODevice::ReadOnly) &&
+                         fetched.open(QIODevice::ReadOnly) &&
+                         local.readAll() == fetched.readAll();
+  run.Check(
+      identical && !QFileInfo::exists(target + QStringLiteral(".part")),
+      QStringLiteral("SMOKE-07 下载回来的字节与上传的一致，且没有 .part 残留"));
+
+  run.Check(remote->deleteSnapshot(uploaded_id) &&
+                remote->waitForIdle(180000) &&
+                remote->lastErrorKindForTest() == QStringLiteral("none"),
+            QStringLiteral("SMOKE-08 删除成功"),
+            remote->lastErrorKindForTest() + QStringLiteral(": ") +
+                remote->lastDetailForTest());
+  QStringList ids_after;
+  for (const QVariant& item : remote->snapshots()) {
+    ids_after.append(item.toMap().value(QStringLiteral("id")).toString());
+  }
+  run.Check(
+      !ids_after.contains(uploaded_id) && ids_after.size() == ids_before.size(),
+      QStringLiteral("SMOKE-09 删除之后列表回到上传之前的样子"),
+      QStringLiteral("before=%1 after=%2")
+          .arg(ids_before.size())
+          .arg(ids_after.size()));
+
+  std::printf("[remote-smoke] passed=%d failed=%d\n", run.passed, run.failed);
+  if (run.failed != 0) {
+    for (const QString& failure : run.failures) {
+      std::fprintf(stderr, "[remote-smoke] FAIL %s\n", qPrintable(failure));
+    }
+    return 1;
+  }
+  std::printf("[remote-smoke] REMOTE_SMOKE_PASS\n");
+  return 0;
+}
+
 int RunRemoteTest(QQuickWindow* window, backup_modern::RemoteController* remote,
                   backup_modern::BackupController* controller,
                   backup_modern::AppTheme* theme,
@@ -5591,6 +5765,8 @@ int main(int argc, char* argv[]) {
   const bool realtime_test =
       arguments.contains(QStringLiteral("--realtime-test"));
   const bool remote_test = arguments.contains(QStringLiteral("--remote-test"));
+  const int remote_smoke_index =
+      arguments.indexOf(QStringLiteral("--remote-smoke"));
   const int realtime_file_index =
       arguments.indexOf(QStringLiteral("--realtime-file"));
   const bool backup_options_test =
@@ -5682,7 +5858,8 @@ int main(int argc, char* argv[]) {
       preview_test_index >= 0 || incremental_test_index >= 0 ||
       screenshot_index >= 0 || self_test_index >= 0 ||
       repository_test_index >= 0 || realtime_test || backup_options_test ||
-      schedule_test || filter_ux_test || combo_hover_test || remote_test;
+      schedule_test || filter_ux_test || combo_hover_test || remote_test ||
+      remote_smoke_index >= 0;
   QString config_file_path = ResolveConfigFilePath(arguments);
   QString schedule_file_path = ResolveScheduleFilePath(arguments);
   QString realtime_file_path = ResolveRealtimeFilePath(arguments);
@@ -5809,6 +5986,25 @@ int main(int argc, char* argv[]) {
     return RunRemoteTest(window, &remote_controller, &controller, &theme,
                          config_file_path, schedule_file_path,
                          realtime_file_path);
+  }
+  if (remote_smoke_index >= 0) {
+    if (remote_smoke_index + 3 >= arguments.size()) {
+      std::fprintf(stderr, "--remote-smoke 需要 <地址> <端口> <用户名>\n");
+      return 2;
+    }
+    // 口令只从环境变量读：argv 对同机用户可见，不能用来传口令。
+    const QString smoke_password =
+        qEnvironmentVariable("BACKUP_REMOTE_PASSWORD");
+    if (smoke_password.isEmpty()) {
+      std::fprintf(stderr,
+                   "--remote-smoke 需要环境变量 BACKUP_REMOTE_PASSWORD"
+                   "（口令不进 argv）\n");
+      return 2;
+    }
+    return RunRemoteSmoke(&remote_controller, &controller,
+                          arguments.at(remote_smoke_index + 1),
+                          arguments.at(remote_smoke_index + 2),
+                          arguments.at(remote_smoke_index + 3), smoke_password);
   }
   if (schedule_test) {
     return RunScheduleTest(&schedule_controller, &controller, config_file_path);
