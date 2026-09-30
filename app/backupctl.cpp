@@ -69,6 +69,7 @@
 #include "app_paths.h"
 #include "application_instance_lock.h"
 #include "cli_app.h"
+#include "remote_commands.h"
 
 namespace {
 
@@ -115,6 +116,7 @@ bool ExtractGlobalOption(std::vector<std::string>* arguments,
 
 bool IsKnownCommand(const std::string& command) {
   if (command == "realtime") return true;
+  if (command == "remote") return true;
   return command == "backup" || command == "restore" || command == "preview" ||
          command == "schedule" || command == "repository" ||
          command == "config";
@@ -218,6 +220,9 @@ int main(int argc, char* argv[]) {
   }
   if (command == "realtime") {
     return backupproject::RunRealtimeCommand(context, rest);
+  }
+  if (command == "remote") {
+    return backupproject::RunRemoteCommand(context, rest);
   }
   if (command == "repository") {
     return backupproject::RunRepositoryCommand(context, rest);

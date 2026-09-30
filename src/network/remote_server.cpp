@@ -214,6 +214,10 @@ bool RemoteServer::Start(std::string* error_message) {
     }
     return false;
   }
+  // 停止标志在这里复位，而不是在 Run() 里：如果信号在 Start() 之后、
+  // Run() 之前到达，在 Run() 里复位会把这次停止请求吞掉，进程就再也
+  // 停不下来了。复位必须发生在"开始接受停止请求之前"。
+  stop_requested_.store(false);
   if (!EnsureDirectory(config_.root_directory, error_message)) {
     return false;
   }
@@ -1345,7 +1349,6 @@ bool RemoteServer::Run(std::string* error_message) {
     }
     return false;
   }
-  stop_requested_.store(false);
   worker_count_ = config_.worker_count;
   for (std::size_t index = 0; index < worker_count_; ++index) {
     workers_.push_back(std::thread(&RemoteServer::WorkerLoop, this));
