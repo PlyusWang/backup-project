@@ -46,6 +46,36 @@ CORE_SOURCES += src/core/backup_mode.cpp \
                 src/cli/realtime_commands.cpp \
                 src/cli/cli_commands.cpp
 
+# ---- 远程备份服务端（PR #20）----
+#
+# backup-server 是独立进程，只做"存储后端 + 传输边界"：协议、认证、元数据、
+# 流式落盘。它**不链接** BackupEngine / Filter / MyPack / USTAR / 压缩 /
+# 加密 / 增量链——那些属于本地备份核心，服务端不重新实现第二套。
+# 因此它的源文件列表是显式的，而不是复用 CORE_SOURCES。
+#
+# 桌面端（backupctl / 两个 GUI）不链接 SQLite：只有服务端需要元数据库。
+SERVER_TARGET := $(BUILD_DIR)/backup-server
+SERVER_CORE_SOURCES := src/network/network_protocol.cpp \
+                       src/network/remote_server.cpp \
+                       src/crypto/sha256.cpp \
+                       src/crypto/hmac.cpp \
+                       src/crypto/pbkdf2.cpp \
+                       src/crypto/random.cpp
+SERVER_SOURCES := src/server/main.cpp $(SERVER_CORE_SOURCES)
+SERVER_OBJECTS := $(patsubst %.cpp,$(BUILD_DIR)/%.o,$(SERVER_SOURCES))
+DEPENDS += $(SERVER_OBJECTS:.o=.d)
+
+# SQLite 头文件：优先用系统装的 libsqlite3-dev，否则用仓库里固定的官方头。
+# 链接一律直接指向系统运行库 libsqlite3.so.0，不依赖 -lsqlite3 的开发符号
+# 链接，因此在只装了运行时库的机器上也能构建。
+SQLITE_HEADER := $(firstword $(wildcard /usr/include/sqlite3.h) \
+                            $(wildcard third_party/sqlite/include/sqlite3.h))
+SQLITE_INCLUDE_DIR := $(dir $(SQLITE_HEADER))
+SQLITE_LIBRARY := $(firstword $(wildcard /usr/lib/x86_64-linux-gnu/libsqlite3.so) \
+                              $(wildcard /usr/lib/x86_64-linux-gnu/libsqlite3.so.0) \
+                              $(wildcard /usr/lib64/libsqlite3.so) \
+                              $(wildcard /usr/lib/libsqlite3.so))
+
 FILESYSTEM_SOURCES := src/filesystem/file_system.cpp
 SOURCES := $(APP_SOURCES) $(CORE_SOURCES) $(FILESYSTEM_SOURCES)
 OBJECTS := $(patsubst %.cpp,$(BUILD_DIR)/%.o,$(SOURCES))
@@ -74,10 +104,18 @@ FIXTURE_OBJECTS := $(patsubst %.cpp,$(BUILD_DIR)/%.o,$(FIXTURE_SOURCES))
 FIXTURE_CORE_OBJECTS := $(patsubst %.cpp,$(BUILD_DIR)/%.o,$(CORE_SOURCES) $(FILESYSTEM_SOURCES))
 DEPENDS += $(FIXTURE_OBJECTS:.o=.d)
 
-.PHONY: all debug sanitize test test-fixtures gui gui-modern gui-all clean
+.PHONY: all debug sanitize test test-fixtures server gui gui-modern gui-all clean
 
-# 产品构建：只有产品前端。archive-cli 是测试夹具，见上面的说明。
-all: $(TARGET)
+# 产品构建：三个产品产物（CLI + 服务端 + 测试夹具除外）。
+# archive-cli 是测试夹具，见上面的说明。
+all: $(TARGET) $(SERVER_TARGET)
+
+# 单独构建服务端（部署脚本用）。
+server: $(SERVER_TARGET)
+
+$(SERVER_TARGET): $(SERVER_OBJECTS)
+	@mkdir -p $(BUILD_DIR)
+	$(CXX) $(CXXFLAGS) $(SERVER_OBJECTS) $(SQLITE_LIBRARY) -pthread -o $@
 
 $(TARGET): $(OBJECTS)
 	@mkdir -p $(BUILD_DIR)
@@ -91,6 +129,16 @@ test-fixtures: $(FIXTURE_TARGET)
 $(FIXTURE_TARGET): $(FIXTURE_OBJECTS) $(FIXTURE_CORE_OBJECTS)
 	@mkdir -p $(BUILD_DIR)
 	$(CXX) $(CXXFLAGS) $(FIXTURE_OBJECTS) $(CORE_OBJECTS) -o $@
+
+# 服务端源码单独一条模式规则：只有它们需要 SQLite 的头文件路径。
+# GNU Make 会优先选 stem 更短的那条规则，所以 CLI/GUI 的对象文件不受影响。
+$(BUILD_DIR)/src/network/%.o: src/network/%.cpp
+	@mkdir -p $(dir $@)
+	$(CXX) $(CPPFLAGS) -I$(SQLITE_INCLUDE_DIR) $(CXXFLAGS) -MMD -MP -c $< -o $@
+
+$(BUILD_DIR)/src/server/%.o: src/server/%.cpp
+	@mkdir -p $(dir $@)
+	$(CXX) $(CPPFLAGS) -I$(SQLITE_INCLUDE_DIR) $(CXXFLAGS) -MMD -MP -c $< -o $@
 
 $(BUILD_DIR)/%.o: %.cpp
 	@mkdir -p $(dir $@)
