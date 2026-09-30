@@ -4226,12 +4226,16 @@ int RunScheduleTest(backup_modern::ScheduleController* schedule,
     // 再"响"几次 tick：既不能有新评估，也不能有每秒一次的 signal 风暴。
     int status_signals = 0;
     int suspended_signals = 0;
-    QObject::connect(schedule,
-                     &backup_modern::ScheduleController::statusChanged,
-                     [&status_signals]() { ++status_signals; });
-    QObject::connect(schedule,
-                     &backup_modern::ScheduleController::suspendedChanged,
-                     [&suspended_signals]() { ++suspended_signals; });
+    // 这两条 connection 只服务于本段的诊断观测，lambda 按引用捕获计数器。
+    // 计数器随本段作用域销毁，connection 却一直挂在 schedule 上，runNow()
+    // 发出 statusChanged 会写到失效的栈对象（ASan: stack-use-after-scope）。
+    // 所以显式持有 connection，并在本段结束前断开。
+    const QMetaObject::Connection status_connection = QObject::connect(
+        schedule, &backup_modern::ScheduleController::statusChanged,
+        [&status_signals]() { ++status_signals; });
+    const QMetaObject::Connection suspended_connection = QObject::connect(
+        schedule, &backup_modern::ScheduleController::suspendedChanged,
+        [&suspended_signals]() { ++suspended_signals; });
     const QString status_before = schedule->statusTitle() +
                                   QStringLiteral("|") +
                                   schedule->statusMessage();
@@ -4270,6 +4274,10 @@ int RunScheduleTest(backup_modern::ScheduleController* schedule,
               QStringLiteral("SCH-89 恢复之后计划真的又能跑了"));
     run.Check(!schedule->suspended(),
               QStringLiteral("SCH-90 成功跑完一轮之后仍然没有挂起"));
+
+    // 计数器就在这个作用域里：离开之前先断开，保证没有回调还能引用它们。
+    QObject::disconnect(status_connection);
+    QObject::disconnect(suspended_connection);
   }
 
   // 16) 同一进程内的单写者：评估在飞的时候不允许保存。
