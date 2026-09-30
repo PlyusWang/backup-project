@@ -38,6 +38,7 @@
 #include <thread>
 #include <vector>
 
+#include "crypto.h"
 #include "network_protocol.h"
 
 namespace backupproject {
@@ -91,9 +92,13 @@ struct ConnectionContext {
   std::uint64_t upload_received = 0;
   int upload_fd = -1;
 
+  // 上传中的增量摘要器。Sha256 只能 Final 一次，所以复位靠整体赋值一个新的。
+  crypto::Sha256 upload_hasher;
+
   // 下载中
   std::string download_snapshot_id;
   std::uint64_t download_size = 0;
+  std::string download_sha256;
   std::uint64_t download_sent = 0;
   int download_fd = -1;
 };
@@ -124,6 +129,18 @@ class RemoteServer {
   // 服务一个已经 accept 的 fd，直到对端关闭或发生致命错误。
   bool ServeConnection(int fd, std::string* error_message);
 
+  // 连接收尾：中止未完成的上传（删掉临时文件）、关闭下载句柄。
+  // ServeConnection 的每一条返回路径都会调用它，所以"客户端半路断了"
+  // 不会留下 .part 文件，也不会泄漏 fd。
+  void CleanupConnection(ConnectionContext* context);
+
+  // ---- 测试专用故障注入 ----
+  //
+  // "磁盘写失败时不能留下已发布的 blob"这条路径必须能真的被触发一次。
+  // 产品代码里没有任何地方调用这两个方法。
+  void FailNextBlobWriteForTesting() { fail_next_write_ = true; }
+  void FailNextMetadataInsertForTesting();
+
   // 阻塞式运行：accept + 固定 worker 池，Stop() 之后返回。
   bool Run(std::string* error_message);
   void RequestStop();
@@ -153,6 +170,41 @@ class RemoteServer {
                     ConnectionContext* context, std::string* error_message);
   bool HandleList(int fd, const FrameHeader& header, ConnectionContext* context,
                   std::string* error_message);
+  bool HandleUploadBegin(int fd, const FrameHeader& header,
+                         const std::string& payload, ConnectionContext* context,
+                         std::string* error_message);
+  bool HandleUploadChunk(int fd, const FrameHeader& header,
+                         const std::string& payload, ConnectionContext* context,
+                         std::string* error_message);
+  bool HandleUploadEnd(int fd, const FrameHeader& header,
+                       const std::string& payload, ConnectionContext* context,
+                       std::string* error_message);
+  bool HandleDownloadBegin(int fd, const FrameHeader& header,
+                           const std::string& payload,
+                           ConnectionContext* context,
+                           std::string* error_message);
+  bool HandleDownloadChunk(int fd, const FrameHeader& header,
+                           const std::string& payload,
+                           ConnectionContext* context,
+                           std::string* error_message);
+  bool HandleDownloadEnd(int fd, const FrameHeader& header,
+                         const std::string& payload, ConnectionContext* context,
+                         std::string* error_message);
+  bool HandleDelete(int fd, const FrameHeader& header,
+                    const std::string& payload, ConnectionContext* context,
+                    std::string* error_message);
+
+  // 清掉上传状态但**不**删文件（发布成功之后用）。
+  void ResetUploadState(ConnectionContext* context);
+  // 中止上传：关 fd + 删临时文件 + 清状态。任何失败路径都走这里。
+  void AbortUpload(ConnectionContext* context);
+  void CloseDownload(ConnectionContext* context);
+  std::string UserDirectory(std::int64_t user_id) const;
+  bool EnsureUserDirectory(std::int64_t user_id, std::string* directory,
+                           std::string* error_message);
+  bool WriteAll(int fd, const char* data, std::size_t size,
+                std::string* error_message);
+  bool GenerateSnapshotId(std::string* snapshot_id, std::string* error_message);
   void WorkerLoop();
   void Log(const std::string& message);
 
@@ -173,6 +225,7 @@ class RemoteServer {
   std::atomic<bool> stop_requested_{false};
   std::size_t busy_workers_ = 0;
   std::size_t worker_count_ = 0;
+  bool fail_next_write_ = false;
 };
 
 }  // namespace net

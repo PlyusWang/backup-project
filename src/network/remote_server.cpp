@@ -602,6 +602,620 @@ bool RemoteServer::HandleList(int fd, const FrameHeader& header,
   return SendStatus(fd, header, Status::kOk, builder.data(), error_message);
 }
 
+namespace {
+
+// rename 的持久性要靠父目录 fsync 才算完整：只 fsync 文件本身，
+// 掉电后可能留下"文件内容在、目录项没落盘"的状态。
+void FsyncDirectory(const std::string& path) {
+  const int fd = ::open(path.c_str(), O_RDONLY | O_DIRECTORY);
+  if (fd < 0) {
+    return;
+  }
+  ::fsync(fd);
+  ::close(fd);
+}
+
+}  // namespace
+
+std::string RemoteServer::UserDirectory(std::int64_t user_id) const {
+  // 磁盘路径永远只由服务端生成：数字 user id + 服务端生成的 snapshot id。
+  // 客户端给的用户名与显示名一次都不参与拼接。
+  return config_.root_directory + "/users/" + std::to_string(user_id);
+}
+
+bool RemoteServer::EnsureUserDirectory(std::int64_t user_id,
+                                       std::string* directory,
+                                       std::string* error_message) {
+  const std::string base = UserDirectory(user_id);
+  if (!EnsureDirectory(base, error_message) ||
+      !EnsureDirectory(base + "/tmp", error_message) ||
+      !EnsureDirectory(base + "/trash", error_message)) {
+    return false;
+  }
+  if (directory != nullptr) {
+    *directory = base;
+  }
+  return true;
+}
+
+bool RemoteServer::GenerateSnapshotId(std::string* snapshot_id,
+                                      std::string* error_message) {
+  std::string raw;
+  std::string random_error;
+  if (!crypto::RandomBytes(16, &raw, &random_error)) {
+    if (error_message != nullptr) {
+      *error_message = "cannot generate a snapshot id: " + random_error;
+    }
+    return false;
+  }
+  *snapshot_id = crypto::ToHex(
+      reinterpret_cast<const unsigned char*>(raw.data()), raw.size());
+  return true;
+}
+
+bool RemoteServer::WriteAll(int fd, const char* data, std::size_t size,
+                            std::string* error_message) {
+  if (fail_next_write_) {
+    fail_next_write_ = false;
+    if (error_message != nullptr) {
+      *error_message = "injected blob write failure (test seam)";
+    }
+    return false;
+  }
+  std::size_t written = 0;
+  while (written < size) {
+    const ssize_t step = ::write(fd, data + written, size - written);
+    if (step < 0) {
+      if (errno == EINTR) {
+        continue;
+      }
+      if (error_message != nullptr) {
+        *error_message = std::string("write failed: ") + std::strerror(errno);
+      }
+      return false;
+    }
+    if (step == 0) {
+      if (error_message != nullptr) {
+        *error_message = "write returned zero";
+      }
+      return false;
+    }
+    written += static_cast<std::size_t>(step);
+  }
+  return true;
+}
+
+void RemoteServer::FailNextMetadataInsertForTesting() {
+  if (store_ != nullptr) {
+    store_->FailNextInsertForTesting();
+  }
+}
+
+void RemoteServer::ResetUploadState(ConnectionContext* context) {
+  context->upload_display_name.clear();
+  context->upload_declared_size = 0;
+  context->upload_sha256.clear();
+  context->upload_snapshot_id.clear();
+  context->upload_temp_path.clear();
+  context->upload_received = 0;
+  context->upload_fd = -1;
+  context->upload_hasher = crypto::Sha256();
+  context->state = ConnectionState::kAuthenticated;
+}
+
+void RemoteServer::AbortUpload(ConnectionContext* context) {
+  if (context->upload_fd >= 0) {
+    ::close(context->upload_fd);
+    context->upload_fd = -1;
+  }
+  if (!context->upload_temp_path.empty()) {
+    // 失败路径绝不留下半个文件：临时文件在这里被删掉。
+    if (::unlink(context->upload_temp_path.c_str()) != 0 && errno != ENOENT) {
+      Log("warning: could not remove the upload temp file");
+    }
+  }
+  ResetUploadState(context);
+}
+
+void RemoteServer::CloseDownload(ConnectionContext* context) {
+  if (context->download_fd >= 0) {
+    ::close(context->download_fd);
+    context->download_fd = -1;
+  }
+  context->download_snapshot_id.clear();
+  context->download_size = 0;
+  context->download_sha256.clear();
+  context->download_sent = 0;
+  if (context->state == ConnectionState::kDownloadInProgress) {
+    context->state = ConnectionState::kAuthenticated;
+  }
+}
+
+void RemoteServer::CleanupConnection(ConnectionContext* context) {
+  // 两个都要做：客户端半路断开时上传要删临时文件、下载要关句柄。
+  if (context->state == ConnectionState::kUploadInProgress ||
+      context->upload_fd >= 0) {
+    AbortUpload(context);
+  }
+  CloseDownload(context);
+}
+
+bool RemoteServer::HandleUploadBegin(int fd, const FrameHeader& header,
+                                     const std::string& payload,
+                                     ConnectionContext* context,
+                                     std::string* error_message) {
+  if (context->state != ConnectionState::kAuthenticated) {
+    Log("rejecting UPLOAD_BEGIN outside an authenticated session");
+    return SendError(fd, header.opcode, header.request_id,
+                     Status::kUnauthorized, error_message);
+  }
+  PayloadReader reader(payload);
+  std::string display_name;
+  std::uint64_t declared_size = 0;
+  std::string declared_sha256;
+  if (!reader.ReadString(kMaxDisplayNameBytes, &display_name) ||
+      !reader.ReadU64(&declared_size) ||
+      !reader.ReadString(kSha256HexBytes, &declared_sha256) ||
+      !reader.AtEnd()) {
+    Log("rejecting a malformed UPLOAD_BEGIN: " + reader.error_message());
+    return SendError(fd, header.opcode, header.request_id,
+                     Status::kInvalidRequest, error_message);
+  }
+  std::string validation_error;
+  if (!IsValidDisplayName(display_name, &validation_error) ||
+      !IsValidSha256Hex(declared_sha256, &validation_error)) {
+    Log("rejecting UPLOAD_BEGIN metadata: " + validation_error);
+    return SendError(fd, header.opcode, header.request_id,
+                     Status::kInvalidRequest, error_message);
+  }
+  if (declared_size == 0) {
+    // 0 字节的归档不是合法归档。产品明确拒绝，而不是存一个空文件——
+    // 否则"上传成功"会掩盖客户端读文件读空了这件事。
+    Log("rejecting UPLOAD_BEGIN with a declared size of zero");
+    return SendError(fd, header.opcode, header.request_id,
+                     Status::kInvalidRequest, error_message);
+  }
+  if (declared_size > config_.max_upload_bytes) {
+    Log("rejecting UPLOAD_BEGIN above the configured upload limit");
+    return SendError(fd, header.opcode, header.request_id, Status::kTooLarge,
+                     error_message);
+  }
+  std::string directory;
+  if (!EnsureUserDirectory(static_cast<std::int64_t>(context->user_id),
+                           &directory, error_message)) {
+    Log("cannot create the user directory: " + *error_message);
+    return SendError(fd, header.opcode, header.request_id,
+                     Status::kInternalError, error_message);
+  }
+  std::string snapshot_id;
+  std::string id_error;
+  if (!GenerateSnapshotId(&snapshot_id, &id_error)) {
+    Log("cannot generate a snapshot id: " + id_error);
+    return SendError(fd, header.opcode, header.request_id,
+                     Status::kInternalError, error_message);
+  }
+  const std::string temp_path = directory + "/tmp/" + snapshot_id + ".part";
+  const int temp_fd =
+      ::open(temp_path.c_str(), O_WRONLY | O_CREAT | O_EXCL, 0600);
+  if (temp_fd < 0) {
+    Log(std::string("cannot create the upload temp file: ") +
+        std::strerror(errno));
+    return SendError(fd, header.opcode, header.request_id,
+                     Status::kInternalError, error_message);
+  }
+  context->state = ConnectionState::kUploadInProgress;
+  context->upload_display_name = display_name;
+  context->upload_declared_size = declared_size;
+  context->upload_sha256 = declared_sha256;
+  context->upload_snapshot_id = snapshot_id;
+  context->upload_temp_path = temp_path;
+  context->upload_received = 0;
+  context->upload_fd = temp_fd;
+  context->upload_hasher = crypto::Sha256();
+  return SendStatus(fd, header, Status::kOk, std::string(), error_message);
+}
+
+bool RemoteServer::HandleUploadChunk(int fd, const FrameHeader& header,
+                                     const std::string& payload,
+                                     ConnectionContext* context,
+                                     std::string* error_message) {
+  if (context->state != ConnectionState::kUploadInProgress) {
+    Log("rejecting UPLOAD_CHUNK without an active upload");
+    return SendError(fd, header.opcode, header.request_id,
+                     Status::kInvalidState, error_message);
+  }
+  if (payload.empty()) {
+    // 空块没有任何意义，而且会掩盖客户端的边界 bug：明确拒绝。
+    Log("rejecting an empty UPLOAD_CHUNK");
+    return SendError(fd, header.opcode, header.request_id,
+                     Status::kInvalidRequest, error_message);
+  }
+  if (payload.size() > kTransferChunkBytes) {
+    Log("rejecting an UPLOAD_CHUNK larger than the chunk limit");
+    return SendError(fd, header.opcode, header.request_id, Status::kTooLarge,
+                     error_message);
+  }
+  if (context->upload_received + payload.size() >
+      context->upload_declared_size) {
+    Log("upload exceeded its declared size; aborting");
+    AbortUpload(context);
+    return SendError(fd, header.opcode, header.request_id, Status::kTooLarge,
+                     error_message);
+  }
+  std::string write_error;
+  if (!WriteAll(context->upload_fd, payload.data(), payload.size(),
+                &write_error)) {
+    Log("cannot write the upload temp file: " + write_error);
+    AbortUpload(context);
+    return SendError(fd, header.opcode, header.request_id,
+                     Status::kInternalError, error_message);
+  }
+  context->upload_hasher.Update(payload.data(), payload.size());
+  context->upload_received += payload.size();
+  return SendStatus(fd, header, Status::kOk, std::string(), error_message);
+}
+
+bool RemoteServer::HandleUploadEnd(int fd, const FrameHeader& header,
+                                   const std::string& payload,
+                                   ConnectionContext* context,
+                                   std::string* error_message) {
+  if (context->state != ConnectionState::kUploadInProgress) {
+    Log("rejecting UPLOAD_END without an active upload");
+    return SendError(fd, header.opcode, header.request_id,
+                     Status::kInvalidState, error_message);
+  }
+  if (!payload.empty()) {
+    return SendError(fd, header.opcode, header.request_id,
+                     Status::kInvalidRequest, error_message);
+  }
+  const std::uint64_t received = context->upload_received;
+  const std::uint64_t declared = context->upload_declared_size;
+  const std::string snapshot_id = context->upload_snapshot_id;
+  const std::string display_name = context->upload_display_name;
+  const std::string declared_sha256 = context->upload_sha256;
+  const std::string temp_path = context->upload_temp_path;
+  const int temp_fd = context->upload_fd;
+
+  // 摘要器只能 Final 一次，所以先在副本上收尾，失败路径还要继续用它清场。
+  crypto::Sha256 hasher = context->upload_hasher;
+  unsigned char digest[crypto::kSha256DigestSize];
+  hasher.Final(digest);
+  const std::string actual_sha256 =
+      crypto::ToHex(digest, crypto::kSha256DigestSize);
+
+  if (received != declared) {
+    Log("upload size mismatch: got " + std::to_string(received) + " of " +
+        std::to_string(declared) + " bytes");
+    AbortUpload(context);
+    return SendError(fd, header.opcode, header.request_id,
+                     Status::kIntegrityMismatch, error_message);
+  }
+  if (actual_sha256 != declared_sha256) {
+    Log("upload hash mismatch; the blob was not published");
+    AbortUpload(context);
+    return SendError(fd, header.opcode, header.request_id,
+                     Status::kIntegrityMismatch, error_message);
+  }
+
+  // ---- 发布顺序：fsync -> close -> rename -> 目录 fsync -> SQLite ----
+  if (::fsync(temp_fd) != 0) {
+    Log(std::string("fsync failed: ") + std::strerror(errno));
+    AbortUpload(context);
+    return SendError(fd, header.opcode, header.request_id,
+                     Status::kInternalError, error_message);
+  }
+  if (::close(temp_fd) != 0) {
+    Log(std::string("close failed: ") + std::strerror(errno));
+    context->upload_fd = -1;
+    AbortUpload(context);
+    return SendError(fd, header.opcode, header.request_id,
+                     Status::kInternalError, error_message);
+  }
+  context->upload_fd = -1;
+
+  const std::string directory =
+      UserDirectory(static_cast<std::int64_t>(context->user_id));
+  const std::string final_path = directory + "/" + snapshot_id + ".bak";
+  if (::rename(temp_path.c_str(), final_path.c_str()) != 0) {
+    Log(std::string("cannot publish the blob: ") + std::strerror(errno));
+    AbortUpload(context);
+    return SendError(fd, header.opcode, header.request_id,
+                     Status::kInternalError, error_message);
+  }
+  FsyncDirectory(directory);
+
+  const std::int64_t now = static_cast<std::int64_t>(NowSeconds());
+  RemoteSnapshotRecord record;
+  record.snapshot_id = snapshot_id;
+  record.user_id = static_cast<std::int64_t>(context->user_id);
+  record.display_name = display_name;
+  record.size_bytes = declared;
+  record.sha256 = actual_sha256;
+  record.created_at = now;
+  record.storage_name = snapshot_id + ".bak";
+
+  std::string store_error;
+  const StoreResult result = store_->InsertSnapshot(record, &store_error);
+  if (result != StoreResult::kOk) {
+    // DB 写失败：把已经 rename 出去的 blob 删掉，绝不留"文件在、记录不在"。
+    Log("cannot record the snapshot; rolling the published blob back: " +
+        store_error);
+    if (::unlink(final_path.c_str()) != 0) {
+      Log("warning: the rollback unlink failed; an orphan blob remains");
+    }
+    FsyncDirectory(directory);
+    ResetUploadState(context);
+    return SendError(fd, header.opcode, header.request_id,
+                     result == StoreResult::kAlreadyExists
+                         ? Status::kAlreadyExists
+                         : Status::kInternalError,
+                     error_message);
+  }
+
+  ResetUploadState(context);
+  PayloadBuilder builder;
+  std::string build_error;
+  if (!builder.AppendString(snapshot_id, kMaxSnapshotIdBytes, &build_error) ||
+      !builder.AppendString(actual_sha256, kSha256HexBytes, &build_error)) {
+    Log("cannot encode the UPLOAD_END response: " + build_error);
+    return SendError(fd, header.opcode, header.request_id,
+                     Status::kInternalError, error_message);
+  }
+  builder.AppendU64(declared);
+  builder.AppendU64(static_cast<std::uint64_t>(now));
+  Log("published snapshot " + snapshot_id + " (" + std::to_string(declared) +
+      " bytes)");
+  return SendStatus(fd, header, Status::kOk, builder.data(), error_message);
+}
+
+bool RemoteServer::HandleDownloadBegin(int fd, const FrameHeader& header,
+                                       const std::string& payload,
+                                       ConnectionContext* context,
+                                       std::string* error_message) {
+  if (context->state != ConnectionState::kAuthenticated) {
+    Log("rejecting DOWNLOAD_BEGIN outside an authenticated session");
+    return SendError(fd, header.opcode, header.request_id,
+                     Status::kUnauthorized, error_message);
+  }
+  PayloadReader reader(payload);
+  std::string snapshot_id;
+  if (!reader.ReadString(kMaxSnapshotIdBytes, &snapshot_id) ||
+      !reader.AtEnd()) {
+    Log("rejecting a malformed DOWNLOAD_BEGIN: " + reader.error_message());
+    return SendError(fd, header.opcode, header.request_id,
+                     Status::kInvalidRequest, error_message);
+  }
+  std::string validation_error;
+  if (!IsValidSnapshotId(snapshot_id, &validation_error)) {
+    return SendError(fd, header.opcode, header.request_id,
+                     Status::kInvalidRequest, error_message);
+  }
+  // 查询自带 user_id 过滤：别人的快照与不存在的快照返回同一个答案，
+  // 因此这个接口不能被用来探测"某个 id 是否存在"。
+  RemoteSnapshotRecord record;
+  std::string store_error;
+  const StoreResult result =
+      store_->FindSnapshot(static_cast<std::int64_t>(context->user_id),
+                           snapshot_id, &record, &store_error);
+  if (result == StoreResult::kNotFound) {
+    Log("download rejected: no such snapshot for this user");
+    return SendError(fd, header.opcode, header.request_id, Status::kNotFound,
+                     error_message);
+  }
+  if (result != StoreResult::kOk) {
+    Log("cannot read the snapshot row: " + store_error);
+    return SendError(fd, header.opcode, header.request_id,
+                     Status::kInternalError, error_message);
+  }
+  // 纵深防御：storage_name 是服务端自己写进去的，但仍然确认它是个纯文件名。
+  if (record.storage_name.empty() ||
+      record.storage_name.find('/') != std::string::npos ||
+      record.storage_name.find('\\') != std::string::npos ||
+      record.storage_name != record.snapshot_id + ".bak") {
+    Log("refusing to open a snapshot whose storage name is not canonical");
+    return SendError(fd, header.opcode, header.request_id,
+                     Status::kInternalError, error_message);
+  }
+  const std::string path =
+      UserDirectory(record.user_id) + "/" + record.storage_name;
+  const int blob_fd = ::open(path.c_str(), O_RDONLY);
+  if (blob_fd < 0) {
+    // 记录在、文件不在：这是服务端内部不一致，对客户端只说"没找到"。
+    Log("metadata row has no blob on disk (internal inconsistency)");
+    return SendError(fd, header.opcode, header.request_id, Status::kNotFound,
+                     error_message);
+  }
+  struct stat info;
+  std::memset(&info, 0, sizeof(info));
+  if (::fstat(blob_fd, &info) != 0 || !S_ISREG(info.st_mode) ||
+      static_cast<std::uint64_t>(info.st_size) != record.size_bytes) {
+    Log("the blob on disk does not match its metadata; refusing to serve it");
+    ::close(blob_fd);
+    return SendError(fd, header.opcode, header.request_id, Status::kNotFound,
+                     error_message);
+  }
+  context->state = ConnectionState::kDownloadInProgress;
+  context->download_snapshot_id = record.snapshot_id;
+  context->download_size = record.size_bytes;
+  context->download_sha256 = record.sha256;
+  context->download_sent = 0;
+  context->download_fd = blob_fd;
+
+  PayloadBuilder builder;
+  std::string build_error;
+  if (!builder.AppendString(record.display_name, kMaxDisplayNameBytes,
+                            &build_error) ||
+      !builder.AppendString(record.sha256, kSha256HexBytes, &build_error)) {
+    CloseDownload(context);
+    Log("cannot encode the DOWNLOAD_BEGIN response: " + build_error);
+    return SendError(fd, header.opcode, header.request_id,
+                     Status::kInternalError, error_message);
+  }
+  builder.AppendU64(record.size_bytes);
+  return SendStatus(fd, header, Status::kOk, builder.data(), error_message);
+}
+
+bool RemoteServer::HandleDownloadChunk(int fd, const FrameHeader& header,
+                                       const std::string& payload,
+                                       ConnectionContext* context,
+                                       std::string* error_message) {
+  if (context->state != ConnectionState::kDownloadInProgress) {
+    Log("rejecting DOWNLOAD_CHUNK without an active download");
+    return SendError(fd, header.opcode, header.request_id,
+                     Status::kInvalidState, error_message);
+  }
+  if (!payload.empty()) {
+    return SendError(fd, header.opcode, header.request_id,
+                     Status::kInvalidRequest, error_message);
+  }
+  std::string chunk(kTransferChunkBytes, '\0');
+  ssize_t got = 0;
+  for (;;) {
+    got = ::read(context->download_fd, &chunk[0], chunk.size());
+    if (got < 0 && errno == EINTR) {
+      continue;
+    }
+    break;
+  }
+  if (got < 0) {
+    Log(std::string("cannot read the blob: ") + std::strerror(errno));
+    CloseDownload(context);
+    return SendError(fd, header.opcode, header.request_id,
+                     Status::kInternalError, error_message);
+  }
+  if (got == 0) {
+    // 空 payload = 流结束。客户端随后发 DOWNLOAD_END 收尾。
+    chunk.clear();
+  } else {
+    chunk.resize(static_cast<std::size_t>(got));
+  }
+  context->download_sent += chunk.size();
+  if (context->download_sent > context->download_size) {
+    Log("the blob on disk is longer than its metadata; aborting the download");
+    CloseDownload(context);
+    return SendError(fd, header.opcode, header.request_id, Status::kNotFound,
+                     error_message);
+  }
+  return SendStatus(fd, header, Status::kOk, chunk, error_message);
+}
+
+bool RemoteServer::HandleDownloadEnd(int fd, const FrameHeader& header,
+                                     const std::string& payload,
+                                     ConnectionContext* context,
+                                     std::string* error_message) {
+  if (context->state != ConnectionState::kDownloadInProgress) {
+    Log("rejecting DOWNLOAD_END without an active download");
+    return SendError(fd, header.opcode, header.request_id,
+                     Status::kInvalidState, error_message);
+  }
+  if (!payload.empty()) {
+    return SendError(fd, header.opcode, header.request_id,
+                     Status::kInvalidRequest, error_message);
+  }
+  const std::uint64_t sent = context->download_sent;
+  const std::uint64_t size = context->download_size;
+  CloseDownload(context);
+  if (sent != size) {
+    // 客户端提前收手：对端自己知道，这里只记一行日志。
+    Log("download ended before the whole blob was sent");
+  }
+  return SendStatus(fd, header, Status::kOk, std::string(), error_message);
+}
+
+bool RemoteServer::HandleDelete(int fd, const FrameHeader& header,
+                                const std::string& payload,
+                                ConnectionContext* context,
+                                std::string* error_message) {
+  if (context->state != ConnectionState::kAuthenticated) {
+    Log("rejecting DELETE outside an authenticated session");
+    return SendError(fd, header.opcode, header.request_id,
+                     Status::kUnauthorized, error_message);
+  }
+  PayloadReader reader(payload);
+  std::string snapshot_id;
+  if (!reader.ReadString(kMaxSnapshotIdBytes, &snapshot_id) ||
+      !reader.AtEnd()) {
+    Log("rejecting a malformed DELETE: " + reader.error_message());
+    return SendError(fd, header.opcode, header.request_id,
+                     Status::kInvalidRequest, error_message);
+  }
+  std::string validation_error;
+  if (!IsValidSnapshotId(snapshot_id, &validation_error)) {
+    return SendError(fd, header.opcode, header.request_id,
+                     Status::kInvalidRequest, error_message);
+  }
+  RemoteSnapshotRecord record;
+  std::string store_error;
+  const std::int64_t user_id = static_cast<std::int64_t>(context->user_id);
+  const StoreResult found =
+      store_->FindSnapshot(user_id, snapshot_id, &record, &store_error);
+  if (found == StoreResult::kNotFound) {
+    Log("delete rejected: no such snapshot for this user");
+    return SendError(fd, header.opcode, header.request_id, Status::kNotFound,
+                     error_message);
+  }
+  if (found != StoreResult::kOk) {
+    Log("cannot read the snapshot row: " + store_error);
+    return SendError(fd, header.opcode, header.request_id,
+                     Status::kInternalError, error_message);
+  }
+  if (record.storage_name != record.snapshot_id + ".bak") {
+    Log("refusing to touch a snapshot whose storage name is not canonical");
+    return SendError(fd, header.opcode, header.request_id,
+                     Status::kInternalError, error_message);
+  }
+  const std::string directory = UserDirectory(user_id);
+  const std::string final_path = directory + "/" + record.storage_name;
+  std::string pending_id;
+  std::string id_error;
+  if (!GenerateSnapshotId(&pending_id, &id_error)) {
+    Log("cannot generate a pending name: " + id_error);
+    return SendError(fd, header.opcode, header.request_id,
+                     Status::kInternalError, error_message);
+  }
+  const std::string pending_path = directory + "/trash/" + record.storage_name +
+                                   "." + pending_id + ".deleted";
+
+  // ---- 删除顺序：先把 blob 挪成不可见，再删元数据，最后物理删除 ----
+  //
+  // 直接 unlink 再删记录，会留下"文件没了、记录还在"的窗口；反过来先删记录
+  // 再 unlink，又会在 unlink 失败时把文件变成谁也看不见的孤儿。
+  // 先 rename 到 trash：任何一步失败都能把它改回来。
+  if (::rename(final_path.c_str(), pending_path.c_str()) != 0) {
+    if (errno == ENOENT) {
+      Log("delete rejected: the blob is missing on disk");
+      return SendError(fd, header.opcode, header.request_id, Status::kNotFound,
+                       error_message);
+    }
+    Log(std::string("cannot move the blob to trash: ") + std::strerror(errno));
+    return SendError(fd, header.opcode, header.request_id,
+                     Status::kInternalError, error_message);
+  }
+  RemoteSnapshotRecord removed;
+  const StoreResult deleted =
+      store_->DeleteSnapshot(user_id, snapshot_id, &removed, &store_error);
+  if (deleted != StoreResult::kOk) {
+    // 回滚：把文件改回正式名字，一切照旧。
+    Log("the metadata delete failed; restoring the blob: " + store_error);
+    if (::rename(pending_path.c_str(), final_path.c_str()) != 0) {
+      Log("warning: the rollback rename failed; the blob is left in trash");
+    }
+    return SendError(fd, header.opcode, header.request_id,
+                     deleted == StoreResult::kNotFound ? Status::kNotFound
+                                                       : Status::kInternalError,
+                     error_message);
+  }
+  if (::unlink(pending_path.c_str()) != 0) {
+    // 元数据已经不存在了，这个文件是"不可见的孤儿"：记录警告，
+    // 留给将来的 startup reconciliation 清理，不因此把删除判为失败。
+    Log("warning: could not unlink the pending blob; an invisible orphan"
+        " remains in trash");
+  }
+  FsyncDirectory(directory);
+  Log("deleted snapshot " + snapshot_id);
+  return SendStatus(fd, header, Status::kOk, std::string(), error_message);
+}
+
 bool RemoteServer::HandleFrame(int fd, const FrameHeader& header,
                                const std::string& payload,
                                ConnectionContext* context,
@@ -640,14 +1254,28 @@ bool RemoteServer::HandleFrame(int fd, const FrameHeader& header,
       return HandleLogout(fd, header, context, error_message);
     case Opcode::kList:
       return HandleList(fd, header, context, error_message);
+    case Opcode::kUploadBegin:
+      return HandleUploadBegin(fd, header, payload, context, error_message);
+    case Opcode::kUploadChunk:
+      return HandleUploadChunk(fd, header, payload, context, error_message);
+    case Opcode::kUploadEnd:
+      return HandleUploadEnd(fd, header, payload, context, error_message);
+    case Opcode::kDownloadBegin:
+      return HandleDownloadBegin(fd, header, payload, context, error_message);
+    case Opcode::kDownloadChunk:
+      return HandleDownloadChunk(fd, header, payload, context, error_message);
+    case Opcode::kDownloadEnd:
+      return HandleDownloadEnd(fd, header, payload, context, error_message);
+    case Opcode::kDelete:
+      return HandleDelete(fd, header, payload, context, error_message);
     default:
       break;
   }
-  // 传输类操作码在 PR20 的第三个 commit 里接入。在那之前这里**如实**回答
-  // "当前构建还不支持"，而不是假装成功。
+  // 走到这里说明这个操作码连"已知"都不是（HandleFrame 开头已经挡掉了
+  // 未知操作码），保留一条防御性的答复。
   Log(std::string("opcode ") + OpcodeName(header.opcode) +
-      " is not supported by this build (state=" +
-      ConnectionStateName(context->state) + ")");
+      " is not implemented (state=" + ConnectionStateName(context->state) +
+      ")");
   return SendError(fd, header.opcode, header.request_id, Status::kUnsupported,
                    error_message);
 }
@@ -662,6 +1290,14 @@ bool RemoteServer::ServeConnection(int fd, std::string* error_message) {
   ::setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout));
 
   ConnectionContext context;
+
+  // ServeConnection 的每一条返回路径都要收尾：客户端半路断开时，
+  // 未完成的上传必须删掉临时文件，下载必须关掉句柄。
+  const auto finish = [this, &context](bool result) {
+    CleanupConnection(&context);
+    return result;
+  };
+
   for (;;) {
     FrameHeader header;
     std::string payload;
@@ -670,15 +1306,15 @@ bool RemoteServer::ServeConnection(int fd, std::string* error_message) {
         ReceiveFrame(fd, &header, &payload, &read_error);
     if (status == FrameReadStatus::kClosed) {
       Log("client closed the connection");
-      return true;
+      return finish(true);
     }
     if (status == FrameReadStatus::kCorruptStream) {
       Log("framing is corrupt, dropping the connection: " + read_error);
-      return false;
+      return finish(false);
     }
     if (status == FrameReadStatus::kIoError) {
       Log("connection I/O error: " + read_error);
-      return false;
+      return finish(false);
     }
     if (status == FrameReadStatus::kInvalidFrame) {
       // 流位置完好（magic 与长度都自洽），所以可以回一个错误帧继续服务。
@@ -691,13 +1327,13 @@ bool RemoteServer::ServeConnection(int fd, std::string* error_message) {
       Log(std::string("rejecting an invalid frame: ") + read_error);
       if (!SendError(fd, static_cast<std::uint16_t>(Opcode::kError),
                      header.request_id, reply, error_message)) {
-        return false;
+        return finish(false);
       }
       continue;
     }
     if (!HandleFrame(fd, header, payload, &context, error_message)) {
       Log("connection terminated: " + *error_message);
-      return false;
+      return finish(false);
     }
   }
 }

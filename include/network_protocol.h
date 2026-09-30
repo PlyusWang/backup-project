@@ -61,6 +61,10 @@ inline constexpr std::size_t kSha256HexBytes = 64;
 inline constexpr std::uint32_t kMaxListEntries = 4096;
 
 // 服务端默认的单次上传上限，可用 --max-upload-bytes 调整。
+// 一个文件块的大小。客户端用它切文件，服务端用它读磁盘；两边都远小于
+// 1 MiB 的帧上限，因此"整份归档进内存"这条路径不存在。
+inline constexpr std::size_t kTransferChunkBytes = 256u * 1024u;
+
 inline constexpr std::uint64_t kDefaultMaxUploadBytes =
     8ull * 1024ull * 1024ull * 1024ull;
 

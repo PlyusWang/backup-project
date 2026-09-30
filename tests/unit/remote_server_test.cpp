@@ -305,8 +305,8 @@ int main() {
                        17, std::string(), &header, &response, &error);
     test_support::Check(status == net::FrameReadStatus::kOk &&
                             header.status == static_cast<std::uint32_t>(
-                                                net::Status::kUnsupported),
-                        "SRV T4 UPLOAD_BEGIN 在传输接入前回答 UNSUPPORTED",
+                                                net::Status::kUnauthorized),
+                        "SRV T4 没登录的 UPLOAD_BEGIN = UNAUTHORIZED",
                         net::StatusName(header.status));
 
     error.clear();

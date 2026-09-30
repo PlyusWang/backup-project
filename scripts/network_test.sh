@@ -92,6 +92,8 @@ run_unit remote_metadata_store_test \
 $CRYPTO_OBJECTS" "$SQLITE_LIBRARY" -pthread
 run_unit remote_server_test "$SERVER_OBJECTS $CRYPTO_OBJECTS" \
   "$SQLITE_LIBRARY" -pthread
+run_unit remote_transfer_test "$SERVER_OBJECTS $CRYPTO_OBJECTS" \
+  "$SQLITE_LIBRARY" -pthread
 
 echo
 echo "[network-test] 合计: $PASS passed, $FAIL failed"
