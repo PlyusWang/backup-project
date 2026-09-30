@@ -69,6 +69,39 @@ class FilterRuleModel : public QObject {
   QString lastError() const { return last_error_; }
   QString previewSource() const { return preview_source_; }
 
+  // 三个页面共用的规则编辑器读它来搭界面：条件类型下拉有哪些项、每项叫什么、
+  // 怎么填，以及比较方式 / 单位 / 类型 / 修改时间形态的中文名。
+  //
+  // 为什么放在 C++ 而不是 QML：这些表必须与 FilterRuleBuilder 真正能生成、
+  // Filter::AddRule 真正能执行的条件**完全一致**。放在共享 builder 里，"界面上
+  // 能选的条件"与"核心支持的条件"就是同一张表；放在 QML 里就变成了两份会各自
+  // 漂移的清单（多一个核心执行不了的项，或者少一个核心支持的条件）。
+  //
+  // 返回：
+  //   {
+  //     "fields":       [{key, label, hint}],   // 条件类型下拉
+  //     "types":        [{key, label}],         // type 用
+  //     "sizeCompares": [{key, label}],         // size / uid / gid 的比较方式
+  //     "idCompares":   [{key, label}],         // uid / gid（键与 size 不同）
+  //     "sizeUnits":    [{key, label}],         // B / KB / MB / GB
+  //     "mtimeKinds":   [{key, label}]          // 今天 / 昨天 / 最近 N 天 /
+  //     ...
+  //   }
+  Q_INVOKABLE QVariantMap editorOptions() const;
+
+  // 用一批已经存在的规则文本（DSL）整体替换规则列表。三个页面的"从落盘配置
+  // 载入草稿"都走这里，所以载入路径与手工添加路径是同一套校验：每条都先过
+  // 共享 builder，再交给真实的 Filter::AddRule。
+  //
+  // 失败是整体的：返回 false，规则列表原样不动，原因写进 lastError。绝不静默
+  // 跳过一条读不懂的规则——那等于悄悄放宽了筛选条件。
+  Q_INVOKABLE bool setRules(const QStringList& include_rules,
+                            const QStringList& exclude_rules);
+
+  // 规则列表里某个动作的全部 DSL 文本，顺序与列表一致。页面保存配置时用它
+  // 拿回 include / exclude 两个列表（控制器只认这两个字符串列表）。
+  Q_INVOKABLE QStringList rulesForAction(const QString& action) const;
+
   // 表单 -> DSL / 摘要（只读，用来做实时预览，不改动规则列表）
   Q_INVOKABLE QString dslForForm(const QVariantMap& form) const;
   Q_INVOKABLE QString summaryForForm(const QVariantMap& form) const;

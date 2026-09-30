@@ -56,8 +56,11 @@ const ModeEntry kModeEntries[] = {
     //     的祖先。
     {BackupTrigger::kScheduled, BackupStrategy::kIncremental, true},
     {BackupTrigger::kManual, BackupStrategy::kFull, true},
-    {BackupTrigger::kRealtime, BackupStrategy::kFull, false},
-    {BackupTrigger::kRealtime, BackupStrategy::kIncremental, false},
+    // PR #19：Realtime 成为第三个 Trigger。它只决定"什么时候触发"，
+    // 保存什么仍然完全交给既有 Strategy（Full → BackupEngine，
+    // Incremental → RunIncrementalBackup）。
+    {BackupTrigger::kRealtime, BackupStrategy::kFull, true},
+    {BackupTrigger::kRealtime, BackupStrategy::kIncremental, true},
 };
 
 const char* kUnknown = "unknown";
@@ -132,7 +135,8 @@ std::string UnsupportedBackupModeReason(BackupTrigger trigger,
   return std::string("Unsupported backup mode: ") + BackupTriggerText(trigger) +
          " + " + BackupStrategyText(strategy) +
          ". This version implements Manual + Full, Manual + Incremental, "
-         "Scheduled + Full and Scheduled + Incremental.";
+         "Scheduled + Full, Scheduled + Incremental, Realtime + Full and "
+         "Realtime + Incremental.";
 }
 
 bool IsSupportedBackupOptionCombination(
@@ -146,7 +150,8 @@ bool IsSupportedBackupOptionCombination(
   }
   // 计划路径从来没有"口令"这个东西：无人值守的加密需要安全的密钥来源，
   // 本版本一律拒绝（与 ValidateScheduleConfig 逐字一致的那句话）。
-  if (combination.trigger == BackupTrigger::kScheduled &&
+  if ((combination.trigger == BackupTrigger::kScheduled ||
+       combination.trigger == BackupTrigger::kRealtime) &&
       combination.encryption_method != EncryptionMethod::kNone) {
     return false;
   }
@@ -155,6 +160,17 @@ bool IsSupportedBackupOptionCombination(
     return false;
   }
   return true;
+}
+
+std::string UnattendedEncryptionDisabledReason(BackupTrigger trigger) {
+  if (trigger == BackupTrigger::kScheduled) {
+    return std::string(
+        "定时无人值守加密需要安全的密钥来源；当前版本不会持久化明文密码。");
+  }
+  if (trigger == BackupTrigger::kRealtime) {
+    return std::string("实时无人值守备份当前不保存密码，因此不启用加密。");
+  }
+  return std::string();
 }
 
 std::string UnsupportedBackupOptionCombinationReason(
@@ -167,11 +183,15 @@ std::string UnsupportedBackupOptionCombinationReason(
       !IsSupportedIncrementalPack(combination.pack_method)) {
     return UnsupportedIncrementalPackReason();
   }
-  if (combination.trigger == BackupTrigger::kScheduled &&
+  if ((combination.trigger == BackupTrigger::kScheduled ||
+       combination.trigger == BackupTrigger::kRealtime) &&
       combination.encryption_method != EncryptionMethod::kNone) {
-    return std::string(
-        "Unattended scheduled encryption is not supported: "
-        "定时无人值守加密需要安全的密钥来源；当前版本不会持久化明文密码。");
+    // 前缀说明"这是哪条边界"，句子本体来自唯一来源。
+    const std::string prefix =
+        combination.trigger == BackupTrigger::kScheduled
+            ? "Unattended scheduled encryption is not supported: "
+            : "Unattended realtime encryption is not supported: ";
+    return prefix + UnattendedEncryptionDisabledReason(combination.trigger);
   }
   if (combination.strategy == BackupStrategy::kIncremental &&
       !IsSupportedIncrementalEncryption(combination.encryption_method)) {

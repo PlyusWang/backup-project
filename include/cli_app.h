@@ -37,6 +37,9 @@ struct CliContext {
   std::string program_name = "backupctl";
   std::string config_file_path;
   std::string schedule_file_path;
+  // PR #19：实时备份配置。与 --schedule-file 一样，只为自动测试隔离；
+  // 产品默认值来自 app_paths.h（与 Modern GUI 同源）。
+  std::string realtime_file_path;
 };
 
 // 同一个用法文本：--help 与用法错误共用，输出到哪个流由调用方决定。
@@ -55,6 +58,8 @@ int RunRepositoryCommand(const CliContext& context,
                          const std::vector<std::string>& arguments);
 int RunConfigCommand(const CliContext& context,
                      const std::vector<std::string>& arguments);
+int RunRealtimeCommand(const CliContext& context,
+                       const std::vector<std::string>& arguments);
 
 }  // namespace backupproject
 

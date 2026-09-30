@@ -7,6 +7,7 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <limits>
 #include <string>
 
 #include "backup_preview.h"
@@ -103,6 +104,46 @@ bool IdCompareFromText(const QString& text, bp::RuleSizeCompare* compare) {
   } else {
     return false;
   }
+  return true;
+}
+
+// size 的数值按**文本**解析。
+//
+// 为什么不用 QVariant 的 toULongLong：QML 侧一旦先 parseInt，像
+// "99999999999999999999" 这样的输入就已经变成一个浮点数了，溢出发生在到达
+// C++ 之前，谁都来不及拒绝它——最后生成一条与用户所写完全不同的规则。
+// 这里逐字符累加并**在乘之前**夹住上界（result > (max - digit) / 10），
+// 所以"非法"与"溢出"都是明确的失败，不会回绕。
+bool SizeValueFromForm(const QVariantMap& form, const QString& key,
+                       std::uint64_t* value, QString* error_message) {
+  const QString text = form.value(key).toString().trimmed();
+  if (text.isEmpty()) {
+    if (error_message != nullptr) {
+      *error_message = QStringLiteral("文件大小必须填一个数字。");
+    }
+    return false;
+  }
+  std::uint64_t result = 0;
+  for (const QChar character : text) {
+    if (character < QLatin1Char('0') || character > QLatin1Char('9')) {
+      if (error_message != nullptr) {
+        *error_message = QStringLiteral("文件大小必须是十进制整数（当前是 ") +
+                         text + QStringLiteral("）");
+      }
+      return false;
+    }
+    const std::uint64_t digit =
+        static_cast<std::uint64_t>(character.unicode() - '0');
+    if (result > (std::numeric_limits<std::uint64_t>::max() - digit) / 10u) {
+      if (error_message != nullptr) {
+        *error_message = QStringLiteral("文件大小超出可表示范围（当前是 ") +
+                         text + QStringLiteral("）");
+      }
+      return false;
+    }
+    result = result * 10u + digit;
+  }
+  *value = result;
   return true;
 }
 
@@ -233,12 +274,11 @@ QString ClauseDetail(const bp::FilterClauseDraft& clause) {
         return QStringLiteral("size = ") + low + QStringLiteral(" .. ") +
                QString::number(clause.size_high) + QString::fromLatin1(unit);
       }
-      const char* op = clause.compare == bp::RuleSizeCompare::kLess ? "<"
-                       : clause.compare == bp::RuleSizeCompare::kLessEqual
-                           ? "<="
-                       : clause.compare == bp::RuleSizeCompare::kGreater ? ">"
-                                                                         : ">=";
-      return QStringLiteral("size ") + QString::fromLatin1(op) +
+      if (clause.compare == bp::RuleSizeCompare::kEqual) {
+        return QStringLiteral("size = ") + low;
+      }
+      return QStringLiteral("size ") +
+             QString::fromLatin1(CompareText(clause.compare)) +
              QStringLiteral(" ") + low;
     }
     case bp::RuleField::kMtime:
@@ -273,6 +313,9 @@ bp::RuleSizeCompare CompareFromText(const QString& text) {
   if (text == "<=") return bp::RuleSizeCompare::kLessEqual;
   if (text == ">") return bp::RuleSizeCompare::kGreater;
   if (text == "..") return bp::RuleSizeCompare::kRange;
+  // "等于" 在 size 上由 builder 展开成 a..a（核心的 size 没有单独的 "="），
+  // 在 uid / gid 上就是裸数字。两种展开都在 builder 里，这里只记住用户选了它。
+  if (text == "=") return bp::RuleSizeCompare::kEqual;
   return bp::RuleSizeCompare::kGreaterEqual;
 }
 
@@ -458,8 +501,16 @@ bool FilterRuleModel::DraftFromForm(const QVariantMap& form,
       clause.compare =
           CompareFromText(form.value(QStringLiteral("compare")).toString());
       clause.unit = UnitFromText(form.value(QStringLiteral("unit")).toString());
-      clause.size_low = form.value(QStringLiteral("sizeLow")).toULongLong();
-      clause.size_high = form.value(QStringLiteral("sizeHigh")).toULongLong();
+      // 数值按文本收：解析与范围裁决都在这里，QML 不先 parseInt。
+      if (!SizeValueFromForm(form, QStringLiteral("sizeLowText"),
+                             &clause.size_low, error)) {
+        return false;
+      }
+      if (clause.compare == bp::RuleSizeCompare::kRange &&
+          !SizeValueFromForm(form, QStringLiteral("sizeHighText"),
+                             &clause.size_high, error)) {
+        return false;
+      }
       break;
     case bp::RuleField::kUid:
     case bp::RuleField::kGid: {
@@ -535,6 +586,200 @@ bool FilterRuleModel::DraftFromForm(const QVariantMap& form,
     return false;
   }
   return true;
+}
+
+QVariantMap FilterRuleModel::editorOptions() const {
+  // ---- 条件类型 ----
+  //
+  // 顺序 = 普通用户的使用频率，不是 RuleField 的枚举顺序：先"按名字/扩展名挑
+  // 文件"，再"按大小/时间/属性挑"。user / group
+  // 排在最后：它们需要知道属主是谁， 日常用不到。
+  //
+  // 每一项都必须能真的生成 DSL 并被 Filter::AddRule 接受——这张表与
+  // FilterRuleBuilder::RuleFieldLabel / RuleFieldHint 是同一份定义。
+  struct FieldRow {
+    const char* key;
+    bp::RuleField field;
+  };
+  const FieldRow kFieldRows[] = {
+      {"ext", bp::RuleField::kExt},     {"name", bp::RuleField::kName},
+      {"path", bp::RuleField::kPath},   {"stem", bp::RuleField::kStem},
+      {"type", bp::RuleField::kType},   {"size", bp::RuleField::kSize},
+      {"uid", bp::RuleField::kUid},     {"gid", bp::RuleField::kGid},
+      {"mtime", bp::RuleField::kMtime}, {"user", bp::RuleField::kUser},
+      {"group", bp::RuleField::kGroup},
+  };
+  QVariantList fields;
+  for (const FieldRow& row : kFieldRows) {
+    QVariantMap option;
+    option.insert(QStringLiteral("key"), QString::fromLatin1(row.key));
+    option.insert(QStringLiteral("label"),
+                  QString::fromUtf8(bp::RuleFieldLabel(row.field)));
+    option.insert(QStringLiteral("hint"),
+                  QString::fromUtf8(bp::RuleFieldHint(row.field)));
+    option.insert(QStringLiteral("dslKey"),
+                  QString::fromLatin1(bp::RuleFieldName(row.field)));
+    fields.push_back(option);
+  }
+
+  // ---- type 的 7 个取值 ----
+  const bp::RuleTypeValue kTypes[] = {
+      bp::RuleTypeValue::kFile,       bp::RuleTypeValue::kFolder,
+      bp::RuleTypeValue::kSymlink,    bp::RuleTypeValue::kFifo,
+      bp::RuleTypeValue::kCharDevice, bp::RuleTypeValue::kBlockDevice,
+      bp::RuleTypeValue::kSocket,
+  };
+  QVariantList types;
+  for (const bp::RuleTypeValue type : kTypes) {
+    QVariantMap option;
+    option.insert(QStringLiteral("key"), QString::fromLatin1(TypeText(type)));
+    option.insert(QStringLiteral("label"),
+                  QString::fromUtf8(bp::TypeValueLabel(type)));
+    types.push_back(option);
+  }
+
+  // ---- size 的比较方式 ----
+  //
+  // 顺序刻意做成"日常先用的在上"：小于 / 小于等于 / 等于 / 大于等于 / 大于，
+  // 区间放在最后。键就是表单键，也是 size 的 DSL 运算符（"等于"由 builder
+  // 展开成 a..a，核心的 size 没有单独的 "="）。
+  const bp::RuleSizeCompare kSizeCompares[] = {
+      bp::RuleSizeCompare::kLess,    bp::RuleSizeCompare::kLessEqual,
+      bp::RuleSizeCompare::kEqual,   bp::RuleSizeCompare::kGreaterEqual,
+      bp::RuleSizeCompare::kGreater, bp::RuleSizeCompare::kRange,
+  };
+  QVariantList size_compares;
+  for (const bp::RuleSizeCompare compare : kSizeCompares) {
+    QVariantMap option;
+    option.insert(QStringLiteral("key"),
+                  QString::fromLatin1(CompareText(compare)));
+    option.insert(QStringLiteral("label"),
+                  QString::fromUtf8(bp::SizeCompareLabel(compare)));
+    size_compares.push_back(option);
+  }
+
+  // ---- uid / gid 的比较方式（独立的一组键，不复用符号键）----
+  struct IdRow {
+    const char* key;
+    bp::RuleSizeCompare compare;
+  };
+  const IdRow kIdRows[] = {
+      {"eq", bp::RuleSizeCompare::kEqual},
+      {"lt", bp::RuleSizeCompare::kLess},
+      {"le", bp::RuleSizeCompare::kLessEqual},
+      {"gt", bp::RuleSizeCompare::kGreater},
+      {"ge", bp::RuleSizeCompare::kGreaterEqual},
+      {"range", bp::RuleSizeCompare::kRange},
+  };
+  QVariantList id_compares;
+  for (const IdRow& row : kIdRows) {
+    QVariantMap option;
+    option.insert(QStringLiteral("key"), QString::fromLatin1(row.key));
+    option.insert(QStringLiteral("label"),
+                  QString::fromUtf8(bp::SizeCompareLabel(row.compare)));
+    id_compares.push_back(option);
+  }
+
+  // ---- 大小单位（1024 进制，与 builder 的 RuleSizeUnit 一一对应）----
+  const bp::RuleSizeUnit kUnits[] = {
+      bp::RuleSizeUnit::kByte,
+      bp::RuleSizeUnit::kKilo,
+      bp::RuleSizeUnit::kMega,
+      bp::RuleSizeUnit::kGiga,
+  };
+  QVariantList units;
+  for (const bp::RuleSizeUnit unit : kUnits) {
+    QVariantMap option;
+    option.insert(QStringLiteral("key"),
+                  QString::fromLatin1(bp::SizeUnitLabel(unit)));
+    option.insert(QStringLiteral("label"),
+                  QString::fromUtf8(bp::SizeUnitLabel(unit)));
+    units.push_back(option);
+  }
+
+  // ---- 修改时间的 5 种形态 ----
+  struct MtimeRow {
+    const char* key;
+    bp::RuleMtimeKind kind;
+  };
+  const MtimeRow kMtimeRows[] = {
+      {"today", bp::RuleMtimeKind::kToday},
+      {"yesterday", bp::RuleMtimeKind::kYesterday},
+      {"last_days", bp::RuleMtimeKind::kLastDays},
+      {"day", bp::RuleMtimeKind::kDay},
+      {"day_range", bp::RuleMtimeKind::kDayRange},
+  };
+  QVariantList mtime_kinds;
+  for (const MtimeRow& row : kMtimeRows) {
+    QVariantMap option;
+    option.insert(QStringLiteral("key"), QString::fromLatin1(row.key));
+    option.insert(QStringLiteral("label"),
+                  QString::fromUtf8(bp::MtimeKindLabel(row.kind)));
+    mtime_kinds.push_back(option);
+  }
+
+  QVariantMap options;
+  options.insert(QStringLiteral("fields"), fields);
+  options.insert(QStringLiteral("types"), types);
+  options.insert(QStringLiteral("sizeCompares"), size_compares);
+  options.insert(QStringLiteral("idCompares"), id_compares);
+  options.insert(QStringLiteral("sizeUnits"), units);
+  options.insert(QStringLiteral("mtimeKinds"), mtime_kinds);
+  return options;
+}
+
+bool FilterRuleModel::setRules(const QStringList& include_rules,
+                               const QStringList& exclude_rules) {
+  // 先在**副本**上全部校验通过，再整体替换：半份新规则比旧规则更糟——
+  // 用户看到的列表会既不是他保存的那份，也不是他刚填的那份。
+  std::vector<bp::FilterRuleDraft> next;
+  next.reserve(
+      static_cast<std::size_t>(include_rules.size() + exclude_rules.size()));
+  const auto append = [&next](const QStringList& rules,
+                              bp::FilterAction action) -> QString {
+    for (const QString& text : rules) {
+      bp::FilterRuleDraft draft;
+      draft.action = action;
+      draft.raw_dsl = text.toStdString();
+      std::string error;
+      if (!bp::ValidateRule(draft, &error)) {
+        return QString::fromStdString(error);
+      }
+      next.push_back(draft);
+    }
+    return QString();
+  };
+  const QString include_error =
+      append(include_rules, bp::FilterAction::kInclude);
+  if (!include_error.isEmpty()) {
+    SetError(include_error);
+    return false;
+  }
+  const QString exclude_error =
+      append(exclude_rules, bp::FilterAction::kExclude);
+  if (!exclude_error.isEmpty()) {
+    SetError(exclude_error);
+    return false;
+  }
+  drafts_ = next;
+  SyncController();
+  RebuildRules();
+  clearError();
+  emit rulesChanged();
+  return true;
+}
+
+QStringList FilterRuleModel::rulesForAction(const QString& action) const {
+  const bool want_include = action != QStringLiteral("exclude");
+  QStringList texts;
+  for (const bp::FilterRuleDraft& draft : drafts_) {
+    const bool is_include = draft.action == bp::FilterAction::kInclude;
+    if (is_include != want_include) continue;
+    std::string dsl;
+    if (!bp::ToDsl(draft, &dsl, nullptr)) continue;
+    texts << QString::fromStdString(dsl);
+  }
+  return texts;
 }
 
 QString FilterRuleModel::dslForForm(const QVariantMap& form) const {
@@ -683,10 +928,17 @@ void FilterRuleModel::RebuildRules() {
     std::string dsl;
     bp::ToDsl(draft, &dsl, nullptr);
     QVariantMap item;
-    item.insert(QStringLiteral("action"),
-                draft.action == bp::FilterAction::kInclude
-                    ? QStringLiteral("include")
-                    : QStringLiteral("exclude"));
+    const bool is_include = draft.action == bp::FilterAction::kInclude;
+    item.insert(QStringLiteral("action"), is_include
+                                              ? QStringLiteral("include")
+                                              : QStringLiteral("exclude"));
+    // 主行是给人看的人话："包含 · 文件扩展名：cpp、h"。动作名与条件名都来自
+    // 共享 builder 的中文表，界面不再自己拼一套术语（也就不会出现"一处叫
+    // Include、一处叫包含规则"）。
+    item.insert(QStringLiteral("actionLabel"),
+                is_include ? QStringLiteral("包含") : QStringLiteral("排除"));
+    item.insert(QStringLiteral("conditionLabel"),
+                QString::fromStdString(bp::SummarizeShort(draft)));
     QString detail;
     for (const bp::FilterClauseDraft& clause : draft.clauses) {
       if (!detail.isEmpty()) detail += QStringLiteral("，且 ");

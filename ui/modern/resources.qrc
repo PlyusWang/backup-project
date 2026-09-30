@@ -10,6 +10,7 @@
     <file>qml/components/BackupOptionsPanel.qml</file>
     <file>qml/components/BackupRecordCard.qml</file>
     <file>qml/components/FilterEditorPanel.qml</file>
+    <file>qml/components/FilterRuleEditor.qml</file>
     <file>qml/components/RuleCard.qml</file>
     <file>qml/components/NavItem.qml</file>
     <file>qml/components/StatusBanner.qml</file>
@@ -17,6 +18,7 @@
     <file>qml/pages/BackupPage.qml</file>
     <file>qml/pages/BackupManagementPage.qml</file>
     <file>qml/pages/SchedulePage.qml</file>
+    <file>qml/pages/RealtimePage.qml</file>
     <file>qml/pages/SettingsPage.qml</file>
   </qresource>
 </RCC>

@@ -189,7 +189,7 @@ classify_qmllint() {
       print "ALLOWED\t" msg
       file = ""
       if (match(msg, /[A-Za-z_]+\.qml/)) file = substr(msg, RSTART, RLENGTH)
-      prev_panel_allowed = (file ~ /FilterEditorPanel\.qml/) ? 1 : 0
+      prev_panel_allowed = (file ~ /(FilterEditorPanel|FilterRuleEditor)\.qml/) ? 1 : 0
       prev_allowed_file = file
     }
     function classify(msg, snippet) {
@@ -213,18 +213,36 @@ classify_qmllint() {
           (snippet ~ /panel\./ || snippet ~ /ruleModel/ || snippet ~ /ruleModelRef/)) {
         MarkAllowed(msg); return
       }
+      # PR #19 第二轮：三个页面的规则模型（filterRuleModel / scheduleFilterRuleModel /
+      # realtimeFilterRuleModel）同样是 main.cpp 注册的上下文属性，qmllint 不认识
+      # 它们。名字本身足够独特，按名字精确放行。
+      if (msg ~ /Unqualified access/ &&
+          (snippet ~ /filterRuleModel/ || snippet ~ /scheduleFilterRuleModel/ ||
+           snippet ~ /realtimeFilterRuleModel/)) {
+        MarkAllowed(msg); return
+      }
+      # PR #19 第二轮：FilterRuleEditor.qml 是三个页面共用的规则编辑器，它只引用
+      # 上下文属性 theme 与本组件根 id editor（以及注入的 ruleModel）。qmllint
+      # 不认识上下文属性，凡是引用都报 Unqualified access；放行同样精确限定到
+      # "这个文件 + 这几个名字"。
+      if (msg ~ /Unqualified access/ && msg ~ /FilterRuleEditor\.qml/ &&
+          (snippet ~ /theme\./ || snippet ~ /editor\./ || snippet ~ /ruleModel/)) {
+        MarkAllowed(msg); return
+      }
       # PR #12：紧随上述已放行主诊断的 companion Info（qmllint 不给它文件路径）。
       # 只认这一句精确文本，且只在直接前一条是 FilterEditorPanel.qml 的已放行诊断时才放行；
       # 放行后立刻清状态，避免变成“全局允许某类提示”。
       if (msg ~ /^Info: (ruleModel|modelData) is a member of a parent element\.?$/ &&
-          (prev_panel_allowed == 1 || prev_allowed_file ~ /SchedulePage\.qml/)) {
+          (prev_panel_allowed == 1 || prev_allowed_file ~ /SchedulePage\.qml/ ||
+           prev_allowed_file ~ /RealtimePage\.qml/)) {
         print "ALLOWED\t" msg
         # 不清状态：SchedulePage 的委托用 required property var modelData，
         # qmllint 会在这条之后紧跟一条不带文件名的通用 Info，两条属于同一份诊断。
         return
       }
       if (msg ~ /^Info: You first have to give the element an id\.?$/ &&
-          prev_allowed_file ~ /SchedulePage\.qml/) {
+          (prev_allowed_file ~ /SchedulePage\.qml/ ||
+           prev_allowed_file ~ /RealtimePage\.qml/)) {
         print "ALLOWED\t" msg
         prev_panel_allowed = 0
         prev_allowed_file = ""
@@ -255,6 +273,13 @@ classify_qmllint() {
       # 再由下面那条按 prev_allowed_file 放行。
       if (msg ~ /Unqualified access/ && msg ~ /SchedulePage\.qml/ &&
           (snippet ~ /schedule\./ || snippet ~ /page\./)) {
+        MarkAllowed(msg); return
+      }
+      # PR #19：RealtimePage.qml 只引用两个上下文属性 —— main.cpp 注册的
+      # realtime（实时备份控制器）与本页自己的根 id page。放行规则同样精确限定到
+      # "这个文件 + 这两个名字"。
+      if (msg ~ /Unqualified access/ && msg ~ /RealtimePage\.qml/ &&
+          (snippet ~ /realtime\./ || snippet ~ /page\./)) {
         MarkAllowed(msg); return
       }
       if (msg ~ /Cannot defer property assignment to "contentItem"/) {
@@ -352,10 +377,11 @@ fi
 # 页面结构：首页 / 备份 / 自动备份 / 备份管理 / 设置 五页。
 # 恢复已经不是独立页面，而是备份管理页里的一个动作 —— 这几条断言把结构钉死，
 # 免得日后又长回一个"恢复页"。
-expect_count "$QML_DIR/Main.qml" "NavItem {" 5 \
-  "侧栏有五个导航项（首页 / 备份 / 自动备份 / 备份管理 / 设置）"
-expect_count "$QML_DIR/Main.qml" "opacity: root.currentPage === " 5 \
-  "StackLayout 里五页各自绑定可见性"
+# PR #19 之后是六页：首页 / 备份 / 自动备份 / 实时备份 / 备份管理 / 设置。
+expect_count "$QML_DIR/Main.qml" "NavItem {" 6 \
+  "侧栏有六个导航项（首页 / 备份 / 自动备份 / 实时备份 / 备份管理 / 设置）"
+expect_count "$QML_DIR/Main.qml" "opacity: root.currentPage === " 6 \
+  "StackLayout 里六页各自绑定可见性"
 expect_count_re "$QML_DIR/Main.qml" "^[[:space:]]*currentIndex: root.currentPage" 1 \
   "StackLayout 跟随 root.currentPage"
 if grep -rq 'OperationPage' "$QML_DIR" "$RESOURCE_FILE"; then
@@ -439,10 +465,13 @@ else
   record_pass "QML 不直接引用 ConfigManager / BackupCatalog / BackupEngine"
 fi
 
-# 筛选编辑器：刷新、添加 Include、添加 Exclude、清空、上移、下移、删除、
-# 添加规则与高级规则 = 6 处。仍然钉死数量，防止漏绑 busy 或复制粘贴出多余按钮。
-expect_count "$QML_DIR/components/FilterEditorPanel.qml" "enabled: !controller.busy" 6 \
-  "筛选编辑器忙碌时禁用输入与按钮"
+# 规则编辑器的 UI 现在只有一份，在 components/FilterRuleEditor.qml 里（备份页 /
+# 自动备份页 / 实时备份页共用）。面板只剩预览卡片的"刷新预览"仍然绑 controller.busy。
+# 两处都钉死数量：漏绑 busy 和复制粘贴出多余按钮都会被这里挡住。
+expect_count "$QML_DIR/components/FilterEditorPanel.qml" "enabled: !controller.busy" 1 \
+  "备份页的刷新预览在忙碌时禁用"
+expect_count "$QML_DIR/components/FilterRuleEditor.qml" "enabled: !editor.busy" 23 \
+  "共享规则编辑器忙碌时禁用全部输入与按钮（23 处）"
 # 规则卡片上的三个动作按钮（上移 / 下移 / 删除）沿用各自的忙碌开关。
 expect_count "$QML_DIR/components/RuleCard.qml" "enabled: !card.busy" 3 \
   "规则卡片忙碌时禁用上移 / 下移 / 删除"
@@ -542,14 +571,27 @@ echo "[modern-gui] 7) 关闭守卫"
 # Alt+F4 与窗口管理器都能绕过去。
 expect_count_re "$QML_DIR/Main.qml" "^[[:space:]]*onClosing:" 1 \
   "主窗口在 onClosing 里处理关闭请求"
+# 关闭条件必须同时覆盖三位 writer：手动备份 / 恢复是 controller.busy，计划评估
+# 与实时触发跑在 QtConcurrent 上，落盘的是各自的 libraryBusy。只写
+# controller.busy 会漏掉"实时备份正在写归档时 Alt+F4 能把窗口关掉"。
+# 用正则版：expect_present 定义在本文件靠后的位置，而这一节在它之前执行。
+expect_count_re "$QML_DIR/Main.qml" \
+  'if \(controller\.busy \|\| schedule\.libraryBusy \|\| realtime\.libraryBusy\)' 1 \
+  "关窗条件覆盖手动 / 计划 / 实时三位 writer"
 # 错误正文要能选中复制，核心给的长路径才有可能贴出来。
 expect_count_re "$QML_DIR/components/StatusBanner.qml" "selectByMouse:[[:space:]]*true" 1 \
   "状态栏正文可鼠标选中"
-# 运行期契约：忙时拒绝关闭并提示，任务结束后放行。
+# 运行期契约：忙时拒绝关闭并提示，任务结束后放行。自检会真的把手动 / 实时 /
+# 计划三位 writer 各跑起来一次，所以这里必须给它自己的 config / schedule /
+# realtime 文件：它会用真实入口写 config.json 与两份 store，不能碰别的用例的
+# 路径，更不能碰用户真实的配置。
 set +e
-QT_QPA_PLATFORM=offscreen QSG_RHI_BACKEND=software \
+QT_QPA_PLATFORM=offscreen QSG_RHI_BACKEND=software timeout 600 \
   ./build/backup-gui-modern --close-guard-test \
-  --config-file "$TEST_CONFIG_FILE" > /tmp/modern-gui-guard.log 2>&1
+  --config-file "$TEST_STATE_DIR/close-guard-config.json" \
+  --schedule-file "$TEST_STATE_DIR/close-guard-schedule.json" \
+  --realtime-file "$TEST_STATE_DIR/close-guard-realtime.json" \
+  > /tmp/modern-gui-guard.log 2>&1
 guard_status=$?
 set -e
 sed 's/^/[modern-gui]     /' /tmp/modern-gui-guard.log
@@ -559,6 +601,18 @@ if [[ "$guard_status" -eq 0 ]]; then
 else
   record_fail "关闭守卫行为与预期不符"
 fi
+# 判别力：三段都必须真的跑过。只断言退出码的话，自检在第一段之后就退出
+# （比如实时 worker 没起来）也会是 0 退出，而那个洞依然在。
+for pattern in "实时 worker 在飞时 close() 被拒绝" \
+               "实时 worker 结束后 close() 被接受" \
+               "计划 worker 在飞时 close() 被拒绝" \
+               "计划 worker 结束后 close() 被接受"; do
+  if grep -qF -- "$pattern" /tmp/modern-gui-guard.log; then
+    record_pass "关闭守卫自检覆盖：$pattern"
+  else
+    record_fail "关闭守卫自检缺少：$pattern"
+  fi
+done
 
 # 人工验收提出的两条 GUI 契约：
 #   * 首页三张卡片的按钮必须完整落在卡片内（固定 196 高度时底边距是 -7px，
@@ -621,10 +675,11 @@ echo "[modern-gui] 8) 文件筛选在 GUI 路径上生效"
 # 下面先做静态确认，再用 --self-test 走一遍真实控制器路径。
 # 可视化编辑器的链路固定为：面板 -> FilterRuleModel -> BackupController -> 真实 Filter。
 # 面板只跟 model 打交道，model 才调用控制器，所以断言按这个真实结构落在两处。
-expect_count_re "$QML_DIR/components/FilterEditorPanel.qml" "resetForm\(\"include\"\)" 1 \
-  "Modern GUI 提供 Include 添加入口"
-expect_count_re "$QML_DIR/components/FilterEditorPanel.qml" "resetForm\(\"exclude\"\)" 1 \
-  "Modern GUI 提供 Exclude 添加入口"
+# 普通用户看到的是"添加包含规则 / 添加排除规则"，内部才落到 include / exclude。
+expect_count_re "$QML_DIR/components/FilterRuleEditor.qml" "openBuilder\(\"include\"\)" 1 \
+  "规则编辑器提供包含规则入口"
+expect_count_re "$QML_DIR/components/FilterRuleEditor.qml" "openBuilder\(\"exclude\"\)" 1 \
+  "规则编辑器提供排除规则入口"
 expect_count_re "$QML_DIR/components/RuleCard.qml" "ruleModelRef.removeRule" 1 \
   "Modern GUI 可以删除规则（由规则卡片调用模型）"
 expect_count_re "$QML_DIR/components/RuleCard.qml" "ruleModelRef.moveRule" 2 \
@@ -641,22 +696,36 @@ expect_count_re "$ROOT_DIR/ui/desktop/operation_page.cpp" "CollectFilterRules" 3
 # 元数据字段（uid / gid / user / group）与 type 的 7 个取值：表单与模型两层都要
 # 真的有接线，否则界面上能看到字段名，规则却永远生成不出来。下面只查"这一项
 # 存在且成对"，具体实现细节不钉死，避免把重构变成改断言。
-if grep -q -- '"uid", "gid", "user", "group"' "$QML_DIR/components/FilterEditorPanel.qml"; then
-  record_pass "筛选编辑器字段下拉含 uid / gid / user / group"
+# 字段下拉的内容不再写死在 QML 里：它读 FilterRuleModel::editorOptions()，而那张
+# 表直接来自 FilterRuleBuilder 的中文名表。这样"界面上能选的条件"与"核心真的能
+# 生成的条件"是同一份定义，不可能出现"下拉里有一项核心执行不了"。
+if grep -qF 'ruleModel.editorOptions()' "$QML_DIR/components/FilterRuleEditor.qml"; then
+  record_pass "条件类型下拉的选项来自共享 builder（QML 不再自己维护字段表）"
 else
-  record_fail "筛选编辑器字段下拉缺 uid / gid / user / group"
+  record_fail "条件类型下拉没有走共享 builder 的选项表"
 fi
-if grep -q -- '"symlink", "fifo", "char",' "$QML_DIR/components/FilterEditorPanel.qml"; then
-  record_pass "type 下拉含 symlink / fifo / char / block / socket"
-else
-  record_fail "type 下拉缺新的 type 取值"
-fi
-if grep -q -- '"eq", "lt", "le", "gt", "ge", "range"' "$QML_DIR/components/FilterEditorPanel.qml"; then
-  record_pass "uid / gid 比较运算符含 eq / lt / le / gt / ge / range"
-else
-  record_fail "uid / gid 比较运算符缺项"
-fi
-if grep -q -- '"uid_high": panel.formUidHighText' "$QML_DIR/components/FilterEditorPanel.qml"; then
+for field_key in kUid kGid kUser kGroup kMtime; do
+  if grep -qF "bp::RuleField::${field_key}" "$ROOT_DIR/ui/modern/filter_rule_model.cpp"; then
+    record_pass "editorOptions 暴露了 ${field_key}"
+  else
+    record_fail "editorOptions 缺少 ${field_key}"
+  fi
+done
+for type_key in kSymlink kFifo kCharDevice kBlockDevice kSocket; do
+  if grep -qF "bp::RuleTypeValue::${type_key}" "$ROOT_DIR/ui/modern/filter_rule_model.cpp"; then
+    record_pass "type 下拉含 ${type_key}"
+  else
+    record_fail "type 下拉缺 ${type_key}"
+  fi
+done
+for id_key in eq lt le gt ge range; do
+  if grep -qF "{\"${id_key}\"," "$ROOT_DIR/ui/modern/filter_rule_model.cpp"; then
+    record_pass "uid / gid 比较运算符含 ${id_key}"
+  else
+    record_fail "uid / gid 比较运算符缺 ${id_key}"
+  fi
+done
+if grep -qF '"uid_high": editor.formUidHighText' "$QML_DIR/components/FilterRuleEditor.qml"; then
   record_pass "表单把 uid / gid 的上下界一起交给模型"
 else
   record_fail "表单没有提交 uid / gid 的区间上界"
@@ -753,20 +822,27 @@ else
 fi
 
 # mtime 的 5 种形态：字段下拉、类型键、天数与两个日期都要真的接到模型上。
-if grep -q -- '"uid", "gid", "user", "group", "mtime"' "$QML_DIR/components/FilterEditorPanel.qml"; then
-  record_pass "筛选编辑器字段下拉含 mtime"
+if grep -qF '{"mtime", bp::RuleField::kMtime}' "$ROOT_DIR/ui/modern/filter_rule_model.cpp"; then
+  record_pass "条件类型下拉含“修改时间”（核心真的支持 mtime:）"
 else
-  record_fail "筛选编辑器字段下拉缺 mtime"
+  record_fail "条件类型下拉缺“修改时间”"
 fi
-if grep -q -- '"today", "yesterday", "last_days", "day",' "$QML_DIR/components/FilterEditorPanel.qml"; then
-  record_pass "mtime 类型下拉含 today / yesterday / last_days / day / day_range"
+if grep -qF 'parse-time' "$ROOT_DIR/src/filter/filter.cpp"; then
+  record_fail "核心多了未接线的解析分支"
 else
-  record_fail "mtime 类型下拉缺项"
+  record_pass "没有为 UI 新造核心能力"
 fi
-if grep -q -- '"mtime_kind": panel.formMtimeKind' "$QML_DIR/components/FilterEditorPanel.qml" \
-   && grep -q -- '"days_back": panel.formDaysBackText' "$QML_DIR/components/FilterEditorPanel.qml" \
-   && grep -q -- '"date_low": panel.formDateLow' "$QML_DIR/components/FilterEditorPanel.qml" \
-   && grep -q -- '"date_high": panel.formDateHigh' "$QML_DIR/components/FilterEditorPanel.qml"; then
+for mtime_key in today yesterday last_days day day_range; do
+  if grep -qF "{\"${mtime_key}\"," "$ROOT_DIR/ui/modern/filter_rule_model.cpp"; then
+    record_pass "mtime 类型下拉含 ${mtime_key}"
+  else
+    record_fail "mtime 类型下拉缺 ${mtime_key}"
+  fi
+done
+if grep -q -- '"mtime_kind": editor.formMtimeKind' "$QML_DIR/components/FilterRuleEditor.qml" \
+   && grep -q -- '"days_back": editor.formDaysBackText' "$QML_DIR/components/FilterRuleEditor.qml" \
+   && grep -q -- '"date_low": editor.formDateLow' "$QML_DIR/components/FilterRuleEditor.qml" \
+   && grep -q -- '"date_high": editor.formDateHigh' "$QML_DIR/components/FilterRuleEditor.qml"; then
   record_pass "表单把 mtime 类型 / 天数 / 两个日期一起交给模型"
 else
   record_fail "表单没有提交 mtime 的完整取值"
@@ -1446,6 +1522,20 @@ expect_present() {
   fi
 }
 
+# 反向断言（只看代码行）：注释里写"以前这里是 ext:cpp;h"是正常的说明，
+# 断言的是**用户看得到的文案**里没有它，所以先剔掉 // 开头的行。
+expect_missing_code() {
+  local file="$1"
+  local pattern="$2"
+  local label="$3"
+  # grep -n 的输出是 "行号:内容"（没有文件名前缀），所以过滤的是 ^行号: //
+  if grep -nF -- "$pattern" "$file" | grep -vE '^[0-9]+:[[:space:]]*//' | grep -q .; then
+    record_fail "$label（代码里不该出现：$pattern）"
+  else
+    record_pass "$label"
+  fi
+}
+
 # 反向断言：界面上不该出现东西，和"该出现"一样重要。
 expect_missing() {
   local file="$1"
@@ -1467,9 +1557,13 @@ expect_count "$QML_DIR/Main.qml" "SchedulePage {" 1 \
   "StackLayout 里只有一个 SchedulePage 实例"
 
 # --- 页面上该有的控件 ---
-for name in scheduleEnabledToggle scheduleSourceField scheduleIntervalField \
+for name in scheduleEnabledToggle scheduleSourceField scheduleFrequencyValueField \
+            scheduleFrequencyUnitCombo scheduleFrequencyHintText \
             scheduleRetainField schedulePackCombo scheduleCompressionCombo \
-            scheduleEncryptionText scheduleIncludeField scheduleExcludeField \
+            scheduleEncryptionText scheduleEncryptionNote \
+            scheduleAdvancedToggle scheduleAdvancedSection \
+            scheduleStrategyCombo scheduleStrategyHelperText \
+            runScheduleNowHintText \
             saveScheduleButton runScheduleNowButton scheduleHistoryList \
             scheduleManagedList scheduleLastRunText scheduleNextRunText \
             scheduleLastResultText scheduleRunnerText; do
@@ -1477,21 +1571,48 @@ for name in scheduleEnabledToggle scheduleSourceField scheduleIntervalField \
     "计划页有 $name"
 done
 
-# --- 周期 / 保留数量的解析规则只有一份 ---
-# QML 的 parseInt("12abc") 是 12，而 backupctl 对同一个输入是明确拒绝。
-# 界面必须把文本原样交给共享核心，自己不做"解析"。
-expect_present "$SCHEDULE_PAGE_QML" "schedule.saveConfigFromText("   "计划页把周期与保留数量按文本交给共享核心解析"
-expect_missing "$SCHEDULE_PAGE_QML" "parseInt(page.draft"   "计划页不再用 QML 的 parseInt 截断周期 / 保留数量"
-expect_present "$ROOT_DIR/ui/modern/schedule_controller.cpp"   "ParseBoundedScheduleNumber"   "界面侧调用的是共享的 ParseBoundedScheduleNumber"
-expect_present "$ROOT_DIR/src/cli/cli_commands.cpp"   "ParseBoundedScheduleNumber"   "CLI 侧调用的是同一个 ParseBoundedScheduleNumber"
+# --- 备份频率：值 + 单位（每 1 小时），而不是"周期 [60] 分钟" ---
+#
+# 人工验收："周期 [60] 分钟"功能没错，但用户每次都要自己心算。界面改成 值 + 单位，
+# 换算在 C++ 的 schedule_frequency.cpp 里做，而数值文本仍然交给共享核心的
+# ParseBoundedScheduleNumber 解析 —— 所以 QML 里不会出现 parseInt(x) * 10080。
+expect_present "$SCHEDULE_PAGE_QML" "schedule.saveConfigFromFrequencyText(" \
+  "计划页把频率（值 + 单位）与保留数量按文本交给共享核心"
+expect_missing "$SCHEDULE_PAGE_QML" "parseInt(page.draft" \
+  "计划页不用 QML 的 parseInt 截断数值"
+expect_missing "$SCHEDULE_PAGE_QML" "* 10080" \
+  "QML 里不做 值 × 单位 的乘法"
+expect_count_re "$SCHEDULE_PAGE_QML" "schedule.frequencyUnitKey" 2 \
+  "频率单位来自控制器（草稿初值 + 同步各一次，界面不自己定义单位表）"
+expect_present "$ROOT_DIR/ui/modern/schedule_frequency.cpp" \
+  "ParseBoundedScheduleNumber" \
+  "频率的数值解析仍然走共享核心的 ParseBoundedScheduleNumber"
+expect_present "$ROOT_DIR/ui/modern/schedule_frequency.cpp" "kMaxIntervalMinutes" \
+  "频率的上界来自共享核心的 schedule_store.h（界面不另写一套范围）"
+expect_present "$ROOT_DIR/ui/modern/schedule_controller.cpp" \
+  "ParseBoundedScheduleNumber" \
+  "界面侧调用的是共享的 ParseBoundedScheduleNumber"
+expect_present "$ROOT_DIR/src/cli/cli_commands.cpp" \
+  "ParseBoundedScheduleNumber" \
+  "CLI 侧调用的是同一个 ParseBoundedScheduleNumber"
+# 存储 schema 一个字节都没变：核心 / CLI / store 继续只看 interval_minutes。
+# 这里查的是**落盘字段**，不是注释里那个词。
+expect_present "$ROOT_DIR/src/scheduler/schedule_store.cpp" "\"interval_minutes\"" \
+  "落盘字段仍然是 interval_minutes"
+expect_present "$ROOT_DIR/ui/modern/schedule_controller.cpp" \
+  "saveConfigFromFrequencyText" \
+  "频率入口最终仍然走同一个 saveConfig（没有第二条落盘路径）"
 
 # --- 加密边界：没有任何"选加密"的入口，只有一行说明 ---
 expect_missing "$SCHEDULE_PAGE_QML" "scheduleEncryptionCombo" \
   "加密在计划页不是可选项（没有下拉框）"
 expect_count "$SCHEDULE_PAGE_QML" "objectName: \"scheduleEncryptionNote\"" 1 \
   "计划页写明了不加密的原因"
-expect_present "$SCHEDULE_PAGE_QML" "不会保存任何明文密码" \
-  "计划页说明不会保存明文密码"
+expect_present "$SCHEDULE_PAGE_QML" "schedule.encryptionNote" \
+  "计划页的加密说明问控制器要（QML 不复制那句字面量）"
+expect_present "$ROOT_DIR/src/core/backup_mode.cpp" \
+  "定时无人值守加密需要安全的密钥来源" \
+  "那句话本身只有一处：backup_mode.cpp（CLI 与 GUI 都读它）"
 
 # --- 不画未实现的假按钮 ---
 #
@@ -1505,8 +1626,10 @@ expect_present "$SCHEDULE_PAGE_QML" "schedule.supportedModeText" \
   "计划页的模式说明来自共享核心，而不是 QML 自己写死"
 
 # --- 生命周期必须诚实：关掉程序就不会再跑 ---
-expect_present "$SCHEDULE_PAGE_QML" "定时任务在本程序或 backupctl schedule watch 运行期间执行" \
+expect_present "$SCHEDULE_PAGE_QML" "定时任务只在本程序运行期间执行" \
   "计划页写明了定时任务只在程序运行时生效"
+expect_missing_code "$SCHEDULE_PAGE_QML" "backupctl" \
+  "命令行工具名不出现在计划页的用户文案里"
 
 # --- 业务逻辑不在 QML 里 ---
 expect_missing "$SCHEDULE_PAGE_QML" "Date.now" \
@@ -1636,6 +1759,803 @@ for pattern in "Include rules:  (none)" \
     record_fail "CLI 清空规则后读不到：$pattern"
   fi
 done
+
+echo "[modern-gui] 16) 实时备份页（Realtime Trigger）"
+
+REALTIME_PAGE_QML="$QML_DIR/pages/RealtimePage.qml"
+REALTIME_CTRL_CPP="$ROOT_DIR/ui/modern/realtime_controller.cpp"
+REALTIME_CTRL_H="$ROOT_DIR/ui/modern/realtime_controller.h"
+
+# --- 页面在资源清单与导航里 ---
+expect_count "$RESOURCE_FILE" "qml/pages/RealtimePage.qml" 1 \
+  "RealtimePage.qml 进了资源清单"
+expect_count "$QML_DIR/Main.qml" 'text: "实时备份"' 1 \
+  "侧栏有实时备份入口"
+expect_count "$QML_DIR/Main.qml" "RealtimePage {" 1 \
+  "StackLayout 里只有一个 RealtimePage 实例"
+expect_count "$QML_DIR/Main.qml" "realtime.clearStatus()" 1 \
+  "离开实时页时消费它自己的临时提示"
+
+# --- 页面上该有的控件（一个都不许丢，只是分到了不同的层级里） ---
+for name in realtimeEnabledToggle realtimeSourceField browseRealtimeSourceButton \
+            realtimeStrategyCombo realtimeRetainField saveRealtimeButton \
+            realtimeSubtitleText realtimeDebounceField realtimeMaxWaitField \
+            realtimePackCombo realtimeCompressionCombo realtimeDelayTermText \
+            realtimeEncryptionText realtimeEncryptionNote \
+            realtimeAdvancedToggle realtimeAdvancedSection realtimeTechnicalToggle \
+            realtimeTechnicalSection realtimeSupportedModeText realtimeRunScopeText \
+            realtimeRawPhaseText realtimeWatchText realtimeWatchCountText \
+            realtimePendingCountText realtimePendingText realtimeOverflowText \
+            realtimeLastEventText realtimeLastSnapshotText realtimeRepositoryText \
+            realtimePhaseText realtimeLoadErrorText realtimeConfigErrorText \
+            realtimeSnapshotEmptyText realtimeSnapshotList \
+            refreshRealtimeSnapshotsButton realtimeStatusBanner; do
+  expect_count "$REALTIME_PAGE_QML" "objectName: \"$name\"" 1 \
+    "实时页有 $name"
+done
+
+# --- 信息架构：常用设置 / 高级设置（默认折叠）/ 运行状态 / 技术详情（默认折叠）/ 最近备份 ---
+#
+# 人工验收的结论是"好看，但像开发者控制台"：Debounce / Max wait / MyPack / 压缩 /
+# include-exclude / watch 数 / pending / overflow 全部铺在主层。这一节把新的分层
+# 钉成契约：折叠区默认收起，且区里每个具名控件都显式跟随折叠状态（不是只靠父级
+# 不可见），这样"技术项退回高级区"这件事不会在后续改动里悄悄退化。
+expect_count "$REALTIME_PAGE_QML" "property bool advancedExpanded: false" 1 \
+  "高级设置默认折叠"
+expect_count "$REALTIME_PAGE_QML" "property bool technicalExpanded: false" 1 \
+  "技术详情默认折叠"
+expect_present "$REALTIME_PAGE_QML" 'objectName: "realtimeAdvancedToggle"' \
+  "高级设置有独立的展开/收起入口"
+expect_present "$REALTIME_PAGE_QML" 'objectName: "realtimeTechnicalToggle"' \
+  "技术详情有独立的展开/收起入口"
+# 折叠区里每个具名控件都要自己 visible: false，不能只靠父级不可见：
+# 否则"收起时它仍然占着布局"这种退化不会有人发现。数量断言会因为加一个控件就
+# 失效、且失败信息说不清是谁，所以这里逐个控件断言，失败时直接点名。
+for name in realtimeDebounceField realtimeMaxWaitField realtimePackCombo \
+            realtimeCompressionCombo realtimeEncryptionText \
+            realtimeEncryptionNote; do
+  if grep -A3 "objectName: \"$name\"" "$REALTIME_PAGE_QML" | grep -q "visible: page.advancedExpanded"; then
+    record_pass "$name 显式跟随高级设置折叠状态"
+  else
+    record_fail "$name 没有显式跟随高级设置折叠状态"
+  fi
+done
+# 规则错误提示在共享编辑器里：它自己的 visible 绑的是"有没有错误消息"，
+# 折叠可见性由外面的容器负责（容器已断言跟随 advancedExpanded）。
+expect_present "$QML_DIR/components/FilterRuleEditor.qml" 'visible: text.length > 0' \
+  "规则错误提示只在真的有错误时出现（折叠可见性由容器负责）"
+if grep -A5 'objectName: editor.nameOf("AdvancedRulesSection")' \
+     "$QML_DIR/components/FilterRuleEditor.qml" | \
+   grep -q "visible: editor.advancedExpanded"; then
+  record_pass "高级规则容器显式跟随折叠状态"
+else
+  record_fail "高级规则容器没有显式跟随折叠状态"
+fi
+for name in realtimeSupportedModeText realtimeRunScopeText realtimeRawPhaseText \
+            realtimeWatchText realtimeWatchCountText realtimePendingCountText \
+            realtimePendingText realtimeOverflowText realtimeLastEventText \
+            realtimeLastSnapshotText realtimeRepositoryText; do
+  if grep -A3 "objectName: \"$name\"" "$REALTIME_PAGE_QML" | grep -q "visible: page.technicalExpanded"; then
+    record_pass "$name 显式跟随技术详情折叠状态"
+  else
+    record_fail "$name 没有显式跟随技术详情折叠状态"
+  fi
+done
+# 常用设置那几个控件不允许挂到折叠状态上：主卡片必须一直是可见的。
+for name in realtimeSourceField realtimeStrategyCombo realtimeRetainField \
+            saveRealtimeButton; do
+  if grep -A4 "objectName: \"$name\"" "$REALTIME_PAGE_QML" | grep -qE "page\.(advanced|technical)Expanded"; then
+    record_fail "$name 属于常用设置，却被折叠状态控制"
+  else
+    record_pass "$name 常显（不被折叠状态控制）"
+  fi
+done
+# 技术名词不再当主标签：普通 UI 只有中文，英文术语退到「技术详情」。
+expect_present "$REALTIME_PAGE_QML" 'text: "响应延迟"' \
+  "响应延迟是主标签（纯中文）"
+expect_present "$REALTIME_PAGE_QML" 'text: "最长等待"' \
+  "最长等待是主标签（纯中文）"
+expect_missing_code "$REALTIME_PAGE_QML" "（Debounce）" \
+  "主标签里不再出现英文术语"
+expect_missing_code "$REALTIME_PAGE_QML" "（Max wait）" \
+  "主标签里不再出现英文术语"
+for term in Debounce "Max wait"; do
+  if grep -A4 'objectName: "realtimeDelayTermText"' "$REALTIME_PAGE_QML" | grep -qF "$term"; then
+    record_pass "英文术语 $term 只出现在「技术详情」里"
+  else
+    record_fail "英文术语 $term 没有退到「技术详情」"
+  fi
+done
+if grep -A4 'objectName: "realtimeDelayTermText"' "$REALTIME_PAGE_QML" | grep -q "visible: page.technicalExpanded"; then
+  record_pass "英文术语跟随「技术详情」折叠状态"
+else
+  record_fail "英文术语没有跟随「技术详情」折叠状态"
+fi
+expect_missing "$REALTIME_PAGE_QML" "100..60000" \
+  "字段取值范围不作为主视觉文案"
+expect_missing "$REALTIME_PAGE_QML" "500..300000" \
+  "字段取值范围不作为主视觉文案"
+# 策略解释：短、面向用户，不出现实现术语。
+expect_present "$REALTIME_PAGE_QML" "完整备份：每次生成一份可以独立恢复的完整备份。" \
+  "完整备份有一句用户向解释"
+expect_present "$REALTIME_PAGE_QML" "增量备份：首次建立完整基线，之后只保存变化，更节省空间。" \
+  "增量备份有一句用户向解释"
+expect_missing "$REALTIME_PAGE_QML" "BKPINC1" \
+  "主层不解释增量容器格式"
+expect_missing "$REALTIME_PAGE_QML" "parent chain" \
+  "主层不解释 parent chain"
+# 最近备份：标题面向用户，空状态给出下一步，不在标题里解释 marker。
+expect_present "$REALTIME_PAGE_QML" 'text: "最近备份"' \
+  "最近快照卡片标题是用户语言"
+expect_missing "$REALTIME_PAGE_QML" "只列带 .realtime 标记" \
+  "标题不解释 .realtime marker"
+expect_present "$REALTIME_PAGE_QML" "还没有实时备份。启用后，文件发生变化时会在这里看到新的备份版本。" \
+  "空状态告诉用户接下来会发生什么"
+# 同一状态不得出现两遍：底部状态栏不是"运行状态"的复读。
+expect_missing "$REALTIME_PAGE_QML" "等待实时备份" \
+  "页面底部没有和运行状态重复的孤立状态文案"
+# 副标题不再是架构说明。
+expect_missing "$REALTIME_PAGE_QML" "与 backupctl 共用同一份核心" \
+  "副标题不再讲架构"
+
+# --- 加密：不再占一个永远置灰的 ComboBox，降级成高级设置里的一条弱提示 ---
+expect_missing "$REALTIME_PAGE_QML" "realtimeEncryptionCombo" \
+  "实时页不再有加密选择器（置灰控件也去掉）"
+expect_missing "$REALTIME_PAGE_QML" "aes-256-ctr-hmac-sha256" \
+  "实时页不提供任何加密算法选项"
+expect_present "$REALTIME_PAGE_QML" "realtime.encryptionNote" \
+  "加密说明仍然问控制器要（QML 不复制那句字面量）"
+expect_present "$REALTIME_CTRL_CPP" "UnattendedEncryptionDisabledReason" \
+  "加密说明问的是核心那句唯一来源，控制器不复制字面量"
+expect_present "$ROOT_DIR/src/core/backup_mode.cpp" \
+  "实时无人值守备份当前不保存密码，因此不启用加密。" \
+  "那句话本身只有一处：backup_mode.cpp（CLI 与 GUI 都读它）"
+
+# --- Filter：与备份页 / 自动备份页共用同一个可视化编辑器 ---
+#
+# 人工验收的结论：两个 raw DSL 输入框（"例如 ext:cpp;h" + "添加包含规则"）是
+# 不合格的默认交互 —— 普通用户被要求自己写语法。现在整块换成共享的
+# FilterRuleEditor，规则文本仍然由同一个 builder 生成、由真实的 Filter 裁决。
+expect_missing "$REALTIME_PAGE_QML" "realtime.validateRule(" \
+  "实时页不再自己调控制器做规则校验（校验走共享编辑器 / builder）"
+expect_missing_code "$REALTIME_PAGE_QML" "例如 ext:cpp;h" \
+  "实时页不再要求用户输入 ext: 语法"
+expect_missing_code "$REALTIME_PAGE_QML" "例如 path:**/build/**" \
+  "实时页不再要求用户输入 path: 语法"
+expect_present "$REALTIME_PAGE_QML" "realtimeFilterRuleModel" \
+  "实时页注入的是自己的规则模型（DSL 由共享 builder 生成）"
+expect_present "$REALTIME_PAGE_QML" 'objectPrefix: "realtime"' \
+  "实时页用的是共享的 FilterRuleEditor"
+expect_present "$REALTIME_PAGE_QML" "realtime.saveConfigFromText(" \
+  "实时页把数字按文本交给共享核心解析"
+expect_missing "$REALTIME_PAGE_QML" "parseInt(page.draft" \
+  "实时页不用 QML 的 parseInt 截断 Debounce / Max wait / 保留数量"
+expect_missing "$REALTIME_PAGE_QML" "backupFilePath" \
+  "实时页没有归档完整路径这个概念"
+
+# --- 业务逻辑不在 QML 里：inotify / 核心服务 / retention / 仓库路径拼接 ---
+# 顶层注释里那句"它不直接调 inotify"是有意留下的说明，所以断言的是真实的
+# API 名字，而不是那个词本身。
+expect_missing "$REALTIME_PAGE_QML" "InotifyWatcher" \
+  "QML 不直接碰 inotify"
+expect_missing "$REALTIME_PAGE_QML" "RunRealtimeBackupOnce" \
+  "QML 不直接调核心服务"
+expect_missing "$REALTIME_PAGE_QML" "ListRealtimeSnapshots" \
+  "QML 不直接列实时快照"
+expect_missing "$REALTIME_PAGE_QML" "RunRealtimeRetention" \
+  "QML 不自己执行 retention"
+expect_present "$REALTIME_PAGE_QML" "realtime.repositoryPath" \
+  "实时页只显示控制器给的仓库路径"
+expect_missing "$REALTIME_PAGE_QML" 'repositoryPath + "/"' \
+  "实时页不自己拼 repository 路径"
+
+# --- 窄窗口：内容必须能滚动，而不是被裁掉 ---
+expect_count "$REALTIME_PAGE_QML" "ScrollView {" 1 \
+  "实时页用 ScrollView 承载内容"
+expect_count "$REALTIME_PAGE_QML" "contentWidth: availableWidth" 1 \
+  "实时页在窄窗口下启用横向自适应"
+expect_present "$REALTIME_PAGE_QML" "width: Math.min(pageScroll.availableWidth - 64, 1400)" \
+  "实时页的列宽随可用宽度收缩"
+
+# --- 控制器只是桥：配置 / 监听 / 合并 / 执行 / 历史全部来自共享核心 ---
+expect_present "$REALTIME_CTRL_H" "backupproject::RealtimeStore store_;" \
+  "RealtimeController 直接使用共享的 RealtimeStore"
+expect_present "$REALTIME_CTRL_H" "backupproject::InotifyWatcher watcher_;" \
+  "监听走共享核心的 InotifyWatcher"
+expect_present "$REALTIME_CTRL_CPP" "backupproject::RealtimeDebouncer" \
+  "合并窗口走共享核心的 RealtimeDebouncer"
+expect_present "$REALTIME_CTRL_CPP" "backupproject::RunRealtimeBackupOnce" \
+  "执行走共享核心的 RunRealtimeBackupOnce"
+expect_present "$REALTIME_CTRL_CPP" "backupproject::ListRealtimeSnapshots" \
+  "实时快照列表走共享核心的 ListRealtimeSnapshots"
+expect_present "$REALTIME_CTRL_CPP" "backupproject::ValidateRealtimeConfig" \
+  "结构校验走共享核心"
+expect_present "$REALTIME_CTRL_CPP" "backupproject::ValidateRealtimeForEnable" \
+  "启用前的完整校验走共享核心（backupctl realtime enable 用的是同一个函数）"
+expect_present "$REALTIME_CTRL_CPP" "backupproject::ParseBackupStrategyKey" \
+  "策略 key 解析走共享核心的同一张表"
+# --- 单实例锁与子进程：都**不许**出现 ---
+# GUI 主进程启动时已经按 per-UID 持有了 ApplicationInstanceLock，而 flock 绑在
+# open file description 上：同一进程第二次 open + LOCK_EX|LOCK_NB 会 EWOULDBLOCK，
+# 自己把自己判成"另一个实例正在运行"。核心服务自己不加锁，所以这里也不许有。
+expect_missing "$REALTIME_CTRL_CPP" "ApplicationInstanceLock" \
+  "RealtimeController 不重复申请应用单实例锁"
+expect_missing "$REALTIME_CTRL_CPP" "QProcess" \
+  "RealtimeController 不 spawn 子 backupproject 进程来做备份"
+
+# --- 闸门：进 worker 前必须拿到 kRealtimeEvaluation；保存配置走 kRealtimeConfig ---
+expect_present "$REALTIME_CTRL_CPP" "OperationGate::Kind::kRealtimeEvaluation" \
+  "后台实时评估先过闸门"
+expect_present "$REALTIME_CTRL_CPP" "OperationGate::Kind::kRealtimeConfig" \
+  "保存实时配置先过闸门"
+expect_present "$REALTIME_CTRL_CPP" "retry_timer_.setInterval(kGateRetryMs)" \
+  "抢不到闸门时用 150 ms 的轻量 retry timer，而不是 busy-spin"
+expect_present "$REALTIME_CTRL_H" "backupproject::RealtimeGeneration pending_generation_;" \
+  "抢不到闸门时只保留**一个** pending generation"
+expect_present "$ROOT_DIR/ui/modern/operation_gate.h" "kRealtimeEvaluation," \
+  "闸门里有实时评估这一格"
+expect_present "$ROOT_DIR/ui/modern/operation_gate.h" "kRealtimeConfig," \
+  "闸门里有保存实时配置这一格"
+expect_count "$ROOT_DIR/ui/modern/operation_gate.h" "kRealtime" 2 \
+  "闸门只加了实时相关的两格"
+
+# --- 运行期改仓库：控制器必须跟上 BackupController::repositoryPathChanged ---
+# 不订阅它，实时触发就会拿着启动时读到的仓库继续写：新事件产生的快照被静默
+# 放进旧位置，新仓库与 source 的 overlap 也不会被重新检查。
+expect_present "$REALTIME_CTRL_H" "void OnRepositoryPathChanged();" \
+  "实时控制器有仓库变化的处理入口"
+expect_count "$REALTIME_CTRL_CPP" "&BackupController::repositoryPathChanged" 1 \
+  "实时控制器订阅的是与计划控制器同一个信号"
+expect_count "$ROOT_DIR/ui/modern/schedule_controller.cpp" \
+  "&BackupController::repositoryPathChanged" 1 \
+  "计划控制器订阅的仍是同一个信号（两边接法一致）"
+expect_present "$REALTIME_CTRL_CPP" "ValidateRealtimeForEnable" \
+  "换仓库后重新做一次共享核心的完整校验（含三种 overlap）"
+# 这个槽由 BackupController 在**持有 kRepositoryChange 闸门期间**同步调用，
+# 再取一次闸门必然自冲突。全程只有"提交评估"这一处显式 Acquire。
+expect_count "$REALTIME_CTRL_CPP" "operation_gate_->Acquire(" 1 \
+  "实时控制器只在提交评估时取一次闸门，仓库变化的 handler 不取闸门"
+expect_missing "$REALTIME_CTRL_CPP" "Kind::kRepositoryChange" \
+  "实时控制器不碰改仓库那把闸门"
+
+# --- 真实控制器链路自检 + 隔离路径 ---
+REALTIME_STORE="$TEST_STATE_DIR/realtime.json"
+REALTIME_CONFIG="$TEST_STATE_DIR/realtime-config.json"
+REALTIME_LOG="$TEST_STATE_DIR/realtime-test.log"
+set +e
+QT_QPA_PLATFORM=offscreen QSG_RHI_BACKEND=software timeout 300 \
+  ./build/backup-gui-modern --realtime-test \
+  --config-file "$REALTIME_CONFIG" --realtime-file "$REALTIME_STORE" \
+  > "$REALTIME_LOG" 2>&1
+realtime_status=$?
+set -e
+cat "$REALTIME_LOG" >> "$LOG_FILE"
+if [[ "$realtime_status" -eq 0 ]]; then
+  record_pass "实时页控制器链路自检通过（$(grep -c '   ok   ' "$REALTIME_LOG" || true) 项观测全部通过）"
+else
+  record_fail "实时页控制器链路自检退出码 $realtime_status"
+  grep 'FAIL' "$REALTIME_LOG" | tail -5
+fi
+# 固定格式的输出行：脚本按行断言，不靠"程序自己说成功"。
+for pattern in "config strategy=full debounce=200 max_wait=2000 retain=3" \
+               "config strategy=incremental debounce=200 max_wait=2000 retain=3" \
+               "attach watches=" \
+               "step1 kind=full-snapshot name=" \
+               "step2 kind=full-snapshot name=" \
+               "history count=" \
+               "ok"; do
+  if grep -qF -- "[realtime] $pattern" "$REALTIME_LOG"; then
+    record_pass "实时自检输出：$pattern"
+  else
+    record_fail "实时自检缺少输出：$pattern"
+  fi
+done
+# 两次触发的归档名必须不同：只断言"有 name=" 会漏掉"第二份没有真的新建"。
+realtime_first="$(grep -oE '^\[realtime\] step1 kind=[^ ]+ name=.*$' "$REALTIME_LOG" | head -1 || true)"
+realtime_second="$(grep -oE '^\[realtime\] step2 kind=[^ ]+ name=.*$' "$REALTIME_LOG" | head -1 || true)"
+if [[ -n "$realtime_first" && -n "$realtime_second" && "$realtime_first" != "$realtime_second" ]]; then
+  record_pass "实时自检的两次触发产出了不同的归档"
+else
+  record_fail "实时自检的两次触发没有产出不同的归档"
+fi
+if [[ -s "$REALTIME_STORE" ]]; then
+  record_pass "自检写出的 realtime.json 存在"
+else
+  record_fail "自检没有写出 realtime.json"
+fi
+
+echo "[modern-gui] 17) 配置路径隔离（显式参数优先 / 自检不写真实 profile）"
+#
+# 人工验收现场：Demo 的 run.sh 不带参数启动，界面上出现了
+# /tmp/backup-gui-modern-mJeWnE/repository。根因不是"路径解析错了"，而是以前某次
+# 自检没带 --config-file，把自检的临时仓库写进了真实用户 profile 的 config.json，
+# 于是一次普通启动读出来一个早就被删掉的临时仓库。
+# 这一节把三件事钉死：
+#   a) 非自检启动仍然走默认 AppPaths（隔离逻辑不许误伤正常启动）；
+#   b) 自检模式在没给 --config-file/--schedule-file/--realtime-file 时自己隔离，
+#      默认 profile 一个字节都不许变，也不许出现 backup-gui-modern-* 临时路径；
+#   c) 显式给出的路径永远优先，自检就写在显式文件上。
+ISO_HOME="$TEST_STATE_DIR/isolation-home"
+ISO_XDG="$ISO_HOME/.config"
+ISO_PROFILE="$ISO_XDG/backup-project/backup-gui-modern"
+ISO_MARKER_REPO="$TEST_STATE_DIR/isolation-marker-repository"
+ISO_MARKER_CFG="$ISO_PROFILE/config.json"
+ISO_LOG="$TEST_STATE_DIR/isolation.log"
+ISO_TTY_LOG="$TEST_STATE_DIR/isolation-tty.log"
+ISO_EXPLICIT_DIR="$TEST_STATE_DIR/isolation-explicit"
+ISO_EXPLICIT_CFG="$ISO_EXPLICIT_DIR/config.json"
+ISO_EXPLICIT_RT="$ISO_EXPLICIT_DIR/realtime.json"
+rm -rf "$ISO_HOME" "$ISO_EXPLICIT_DIR"
+mkdir -p "$ISO_PROFILE" "$ISO_MARKER_REPO" "$ISO_EXPLICIT_DIR"
+printf '{\n  "version": 1,\n  "backup_repository_path": "%s"\n}\n' "$ISO_MARKER_REPO" > "$ISO_MARKER_CFG"
+printf '{\n  "version": 1,\n  "backup_repository_path": "%s"\n}\n' "$TEST_STATE_DIR/isolation-explicit-repository" > "$ISO_EXPLICIT_CFG"
+iso_marker_md5="$(md5sum "$ISO_MARKER_CFG" | cut -d' ' -f1)"
+
+# a) 非自检模式：--realtime-show 走默认 AppPaths，读到的必须是 marker 仓库。
+set +e
+XDG_CONFIG_HOME="$ISO_XDG" HOME="$ISO_HOME" QT_QPA_PLATFORM=offscreen \
+  ./build/backup-gui-modern --realtime-show > "$ISO_LOG" 2>&1
+iso_show_status=$?
+set -e
+if [[ "$iso_show_status" -eq 0 ]] && grep -qF -- "repository=$ISO_MARKER_REPO" "$ISO_LOG"; then
+  record_pass "非自检启动仍按默认 AppPaths 读 profile（隔离逻辑没有误伤正常启动）"
+else
+  record_fail "非自检启动没有读到默认 profile 的仓库（退出码 $iso_show_status）"
+fi
+
+# b) 自检模式 + 不给任何 --*-file：必须自己隔离，默认 profile 不许被动。
+set +e
+XDG_CONFIG_HOME="$ISO_XDG" HOME="$ISO_HOME" QT_QPA_PLATFORM=offscreen timeout 180 \
+  ./build/backup-gui-modern --realtime-test > "$ISO_LOG" 2>&1
+iso_selftest_status=$?
+set -e
+if [[ "$iso_selftest_status" -eq 0 ]]; then
+  record_pass "自检模式（不带 --*-file）自身仍然通过"
+else
+  record_fail "自检模式（不带 --*-file）退出码 $iso_selftest_status"
+fi
+# 自检提示是给人看的：stderr 被重定向时（自动化 / parity 对照）它必须让位，
+# 否则真实业务错误不再是第一条 stderr，GUI/CLI 的错误契约就被这行提示遮住了。
+# 隔离本身由下面两条硬不变量证明，不依赖这行提示。
+if grep -qF -- "[self-check] 隔离配置目录" "$ISO_LOG"; then
+  record_fail "重定向 stderr 时自检提示仍然出现（会遮住真实业务错误）"
+else
+  record_pass "重定向 stderr 时自检提示不出现（真实错误保住第一条 stderr）"
+fi
+# 交互终端上人仍然要看得到它：给它一个真正的 pty，再跑一次同样的自检。
+set +e
+XDG_CONFIG_HOME="$ISO_XDG" HOME="$ISO_HOME" QT_QPA_PLATFORM=offscreen timeout 180 \
+  script -qec "./build/backup-gui-modern --realtime-test" /dev/null > "$ISO_TTY_LOG" 2>&1
+iso_tty_status=$?
+set -e
+if [[ "$iso_tty_status" -eq 0 ]] && grep -qF -- "[self-check] 隔离配置目录" "$ISO_TTY_LOG"; then
+  record_pass "交互终端（pty）上仍然报出隔离目录，人没有失去这条诊断"
+else
+  record_fail "交互终端上看不到隔离目录提示（pty 退出码 $iso_tty_status）"
+fi
+if [[ "$(md5sum "$ISO_MARKER_CFG" | cut -d' ' -f1)" == "$iso_marker_md5" ]]; then
+  record_pass "自检模式没有改写默认 profile 的 config.json"
+else
+  record_fail "自检模式改写了默认 profile 的 config.json"
+fi
+if grep -rqF -- "backup-gui-modern-" "$ISO_XDG" 2>/dev/null; then
+  record_fail "默认 profile 里出现了 backup-gui-modern-* 临时路径"
+else
+  record_pass "普通/自检启动都不会把 backup-gui-modern-* 临时路径写进默认 profile"
+fi
+
+# c) 自检 + 显式路径：显式文件被真正使用，默认 profile 依旧不动。
+set +e
+XDG_CONFIG_HOME="$ISO_XDG" HOME="$ISO_HOME" QT_QPA_PLATFORM=offscreen timeout 180 \
+  ./build/backup-gui-modern --realtime-test \
+  --config-file "$ISO_EXPLICIT_CFG" --realtime-file "$ISO_EXPLICIT_RT" > "$ISO_LOG" 2>&1
+iso_explicit_status=$?
+set -e
+if [[ "$iso_explicit_status" -eq 0 && -s "$ISO_EXPLICIT_RT" ]]; then
+  record_pass "自检 + 显式 --realtime-file：显式文件被真正使用"
+else
+  record_fail "自检 + 显式 --realtime-file 没有写出显式 realtime.json（退出码 $iso_explicit_status）"
+fi
+if grep -qF -- "backup-gui-modern-" "$ISO_EXPLICIT_CFG"; then
+  record_pass "自检的临时仓库写在显式 --config-file 上（证明显式路径优先）"
+else
+  record_fail "显式 --config-file 没有被自检使用"
+fi
+if [[ "$(md5sum "$ISO_MARKER_CFG" | cut -d' ' -f1)" == "$iso_marker_md5" ]]; then
+  record_pass "显式路径生效时默认 profile 仍然没有被改动"
+else
+  record_fail "显式路径生效时默认 profile 被改动了"
+fi
+
+# 静态面：隔离只挂在自检开关上，正常启动那条路径不允许出现 QTemporaryDir profile。
+expect_present "$ROOT_DIR/ui/modern/main.cpp" "const bool self_check_mode =" \
+  "main.cpp 有自检模式判定（隔离只对自检生效）"
+expect_count "$ROOT_DIR/ui/modern/main.cpp" "static QTemporaryDir self_check_profile;" 1 \
+  "隔离目录只有一处声明"
+expect_present "$ROOT_DIR/ui/modern/main.cpp" "if (self_check_mode) {" \
+  "路径重定向写在自检分支里"
+expect_count "$ROOT_DIR/ui/modern/main.cpp" "QString config_file_path = ResolveConfigFilePath(arguments);" 1 \
+  "配置路径只解析一次（解析后即定型，后面不再回默认值）"
+expect_count "$ROOT_DIR/ui/modern/main.cpp" "QString schedule_file_path = ResolveScheduleFilePath(arguments);" 1 \
+  "计划存储路径只解析一次"
+expect_count "$ROOT_DIR/ui/modern/main.cpp" "QString realtime_file_path = ResolveRealtimeFilePath(arguments);" 1 \
+  "实时存储路径只解析一次"
+
+echo "[modern-gui] 18) 浅色主题 hover 结构回归（transparent × 颜色动画 = 黑闪）"
+#
+# 人工现场：浅色主题下鼠标进出任意可 hover 的块会先"黑一下"再恢复。
+# 根因是共享组件的 background 在 "transparent"（RGBA 0,0,0,0）与不透明 hover 色
+# 之间做 ColorAnimation —— 逐分量插值 alpha 与 RGB，中间帧就是"半透明黑"叠在
+# 浅色底上（深色主题底色本就暗，所以看不出）。
+# 修法：固定主题色覆盖层 + 只动画 opacity。这里把它钉成结构契约：
+# 只要有文件同时出现 transparent 与 Behavior on color，黑闪就可能回来。
+hover_bad="$(grep -rl --include=*.qml -- "transparent" "$QML_DIR" | xargs -r grep -l -- "Behavior on color" || true)"
+if [[ -z "$hover_bad" ]]; then
+  record_pass "没有 QML 同时出现 transparent 与 Behavior on color（黑闪根因不会再回来）"
+else
+  record_fail "仍有文件同时出现 transparent 与 Behavior on color：$hover_bad"
+fi
+expect_count "$QML_DIR/components/NavItem.qml" "Behavior on color" 0 \
+  "NavItem 不再对颜色做动画"
+expect_count "$QML_DIR/components/AppButton.qml" "Behavior on color" 0 \
+  "AppButton 不再对颜色做动画"
+expect_count "$QML_DIR/components/NavItem.qml" "Behavior on opacity" 2 \
+  "NavItem 选中 / hover 各一条 opacity 动画"
+expect_count "$QML_DIR/components/AppButton.qml" "Behavior on opacity" 2 \
+  "AppButton hover / pressed 各一条 opacity 动画"
+expect_present "$QML_DIR/components/NavItem.qml" "color: theme.hover" \
+  "NavItem 的 hover 覆盖层用固定主题色"
+expect_present "$QML_DIR/components/AppButton.qml" \
+  "color: control.primary ? theme.accentHover : control.hoverColor" \
+  "AppButton 的 hover 覆盖层用固定主题色"
+# 输入框动画的是 border.color，两端都是不透明色，不是黑闪来源，明确保留。
+expect_present "$QML_DIR/components/AppTextField.qml" "Behavior on border.color" \
+  "输入框保留边框色过渡（两端不透明，非黑闪来源）"
+
+echo "[modern-gui] 19) 三页共用的 Filter UX（可视化条件 + 高级 DSL）"
+#
+# 人工验收："普通用户仍被要求直接输入 ext:cpp;h、path:**/build/**、Include / Exclude、
+# Debounce、Max wait 等内部概念。"这一节把"三处共用同一个规则编辑器"钉成契约，
+# 并跑一遍 **--filter-ux-test**：它真的切页、真的点按钮、真的往输入框里打字，
+# 然后断言三处拿到的是同一条 DSL。
+SHARED_EDITOR="$QML_DIR/components/FilterRuleEditor.qml"
+expect_count "$RESOURCE_FILE" "qml/components/FilterRuleEditor.qml" 1 \
+  "共享规则编辑器进了资源清单"
+expect_present "$QML_DIR/components/FilterEditorPanel.qml" "FilterRuleEditor {" \
+  "备份页用共享规则编辑器"
+expect_present "$SCHEDULE_PAGE_QML" "FilterRuleEditor {" \
+  "自动备份页用共享规则编辑器"
+expect_present "$REALTIME_PAGE_QML" "FilterRuleEditor {" \
+  "实时备份页用共享规则编辑器"
+# 每个页面只有一个规则编辑器实例，而且都是共享组件（不是各写一套）。
+expect_count "$SCHEDULE_PAGE_QML" "FilterRuleEditor {" 1 \
+  "自动备份页只有一个规则编辑器实例"
+expect_count "$REALTIME_PAGE_QML" "FilterRuleEditor {" 1 \
+  "实时页只有一个规则编辑器实例"
+expect_count "$QML_DIR/components/FilterEditorPanel.qml" "FilterRuleEditor {" 1 \
+  "备份页只有一个规则编辑器实例"
+# 两个自动化页面都不再自己维护 include / exclude 文本列表。
+for page_file in "$SCHEDULE_PAGE_QML" "$REALTIME_PAGE_QML"; do
+  if grep -q "draftInclude" "$page_file" || grep -q "draftExclude" "$page_file"; then
+    record_fail "$(basename "$page_file") 仍然自己维护 include / exclude 列表"
+  else
+    record_pass "$(basename "$page_file") 不再自己维护 include / exclude 列表"
+  fi
+done
+
+# --- 普通模式：条件类型是中文下拉，不是裸文本框 ---
+for label in "文件扩展名" "文件名" "路径" "主文件名" "文件类型" "文件大小" \
+             "用户 ID" "用户组 ID" "修改时间"; do
+  if grep -qF "return \"$label\";" "$ROOT_DIR/src/filter/filter_rule_builder.cpp"; then
+    record_pass "条件类型里有“$label”"
+  else
+    record_fail "条件类型里缺“$label”"
+  fi
+done
+expect_present "$SHARED_EDITOR" "RuleFieldCombo" \
+  "条件类型是一个 ComboBox（用户从下拉里选，不写 ext:）"
+expect_present "$SHARED_EDITOR" "RuleTypeCombo" \
+  "文件类型用 ComboBox"
+expect_present "$SHARED_EDITOR" "RuleSizeCompareCombo" \
+  "文件大小先选比较方式"
+expect_present "$SHARED_EDITOR" "RuleSizeValueField" \
+  "文件大小再填数值"
+expect_present "$SHARED_EDITOR" "RuleSizeUnitCombo" \
+  "文件大小最后选单位"
+expect_missing "$SHARED_EDITOR" "placeholderText: \"ext:" \
+  "普通模式的占位符不教用户写 DSL"
+expect_missing "$SHARED_EDITOR" "placeholderText: \"size:" \
+  "普通模式的占位符不教用户写 DSL"
+
+# --- 高级 DSL：默认折叠，但能力一点没少 ---
+expect_count "$SHARED_EDITOR" "property bool advancedExpanded: false" 1 \
+  "高级规则默认收起"
+expect_present "$SHARED_EDITOR" 'objectName: editor.nameOf("AdvancedRuleField")' \
+  "高级规则仍然可以写完整 DSL"
+expect_present "$SHARED_EDITOR" "editor.ruleModel.addAdvancedRule(" \
+  "高级规则走的是共享模型（语法裁决在 Filter::AddRule）"
+
+# --- 主行讲人话，DSL 降级 ---
+expect_present "$QML_DIR/components/RuleCard.qml" "actionLabel" \
+  "规则卡片的主行用中文动作名"
+expect_present "$QML_DIR/components/RuleCard.qml" "conditionLabel" \
+  "规则卡片的主行用中文条件摘要"
+expect_present "$ROOT_DIR/src/filter/filter_rule_builder.cpp" "SummarizeClauseShort" \
+  "短摘要由共享 builder 生成（界面不自己拼术语）"
+expect_missing "$QML_DIR/components/RuleCard.qml" '(card.isInclude ? "Include" : "Exclude")' \
+  "规则卡片不再直接显示 Include / Exclude"
+
+# --- 三处 parity：真实 GUI 交互 + 生成的 DSL ---
+set +e
+QT_QPA_PLATFORM=offscreen QSG_RHI_BACKEND=software timeout 300 \
+  ./build/backup-gui-modern --filter-ux-test \
+  --config-file "$TEST_STATE_DIR/fux-config.json" \
+  --schedule-file "$TEST_STATE_DIR/fux-schedule.json" \
+  --realtime-file "$TEST_STATE_DIR/fux-realtime.json" \
+  > "$TEST_STATE_DIR/filter-ux.log" 2>&1
+fux_status=$?
+set -e
+cat "$TEST_STATE_DIR/filter-ux.log" >> "$LOG_FILE"
+if [[ "$fux_status" -eq 0 ]]; then
+  record_pass "三页 Filter UX parity 自检通过（$(grep -c '   ok   ' "$TEST_STATE_DIR/filter-ux.log" || true) 项观测全部通过）"
+else
+  record_fail "三页 Filter UX parity 自检退出码 $fux_status"
+  grep 'FAIL' "$TEST_STATE_DIR/filter-ux.log" | tail -8
+fi
+# 固定格式的关键行：脚本按行断言，不靠"程序自己说成功"。
+for pattern in "PARITY-01 三处的包含规则逐字相同" \
+               "PARITY-02 普通表单输入生成的就是核心认可的 DSL" \
+               "PARITY-03 三处的排除规则逐字相同" \
+               "PARITY-04 非法输入在三处得到同一句原因（来自共享 builder）"; do
+  if grep -qF -- "$pattern" "$TEST_STATE_DIR/filter-ux.log"; then
+    record_pass "Filter UX parity：$pattern"
+  else
+    record_fail "Filter UX parity 缺少：$pattern"
+  fi
+done
+# 三处各自都要真的走完一遍（不是只测了某一页）。
+for label in "备份页" "自动备份页" "实时备份页"; do
+  if grep -qF -- "$label 生成 ext:txt;md（用户没有写过 ext:）" "$TEST_STATE_DIR/filter-ux.log"; then
+    record_pass "$label 走完了真实 GUI 交互并生成 ext:txt;md"
+  else
+    record_fail "$label 没有走完真实 GUI 交互"
+  fi
+done
+if grep -qF "qml-warning" "$TEST_STATE_DIR/filter-ux.log"; then
+  record_fail "Filter UX 自检期间出现了 QML 运行期告警"
+else
+  record_pass "Filter UX 自检期间 0 QML 运行期告警"
+fi
+
+echo "[modern-gui] 20) 备份频率（每 N 单位）与存储 schema 不变"
+#
+# 人工验收："周期 [60] 分钟"功能没错但体验差。界面改成 值 + 单位，存储与 CLI
+# 继续只看 interval_minutes —— 这一节同时钉住"界面变好"和"schema 没变"。
+expect_present "$ROOT_DIR/ui/modern/schedule_frequency.h" "SplitFrequency" \
+  "频率的反向折算（取最大整除单位）在 C++ 里"
+expect_present "$ROOT_DIR/ui/modern/schedule_frequency.cpp" \
+  "LargestExactFrequencyUnit" \
+  "120 分钟必须显示成“每 2 小时”，不能显示成“每 120 分钟”"
+expect_missing "$ROOT_DIR/ui/modern/schedule_frequency.cpp" "double" \
+  "频率换算全程是整数（没有浮点，也就没有 1.5 小时）"
+if grep -qF '{"weeks", "周", 10080u}' "$ROOT_DIR/ui/modern/schedule_frequency.cpp" &&
+   grep -qF '{"days", "天", 1440u}' "$ROOT_DIR/ui/modern/schedule_frequency.cpp" &&
+   grep -qF '{"hours", "小时", 60u}' "$ROOT_DIR/ui/modern/schedule_frequency.cpp" &&
+   grep -qF '{"minutes", "分钟", 1u}' "$ROOT_DIR/ui/modern/schedule_frequency.cpp"; then
+  record_pass "频率单位表是 分钟 / 小时 / 天 / 周"
+else
+  record_fail "频率单位表缺项"
+fi
+# 频率自检的输出（--schedule-test 里那一组 FREQ-xx）已经在第 15 节跑过，
+# 这里只复核关键几行确实出现过。
+for pattern in "FREQ-01 每 1 小时 -> 60 分钟" \
+               "FREQ-01 每 2 天 -> 2880 分钟" \
+               "FREQ-01 每 1 周 -> 10080 分钟" \
+               "FREQ-02 60 分钟 -> 每 1 小时" \
+               "FREQ-02 120 分钟 -> 每 2 小时" \
+               "FREQ-02 1440 分钟 -> 每 1 天" \
+               "FREQ-02 10080 分钟 -> 每 1 周" \
+               "FREQ-02 90 分钟 -> 每 90 分钟" \
+               "FREQ-03 拒绝 每 0 分钟" \
+               "FREQ-03 拒绝 每 -1 小时" \
+               "FREQ-03 拒绝 每 525601 分钟" \
+               "FREQ-03 拒绝 每 1000 周" \
+               "FREQ-02 2880 分钟 -> 每 2 天"; do
+  if grep -qF -- "$pattern" "$LOG_FILE"; then
+    record_pass "频率自检：$pattern"
+  else
+    record_fail "频率自检缺少：$pattern"
+  fi
+done
+# schema：store 里只有 interval_minutes，没有任何单位字段。
+if grep -qF '"interval_minutes"' "$ROOT_DIR/src/scheduler/schedule_store.cpp" &&
+   ! grep -qE '"interval_(hours|days|weeks|unit)"' \
+     "$ROOT_DIR/src/scheduler/schedule_store.cpp"; then
+  record_pass "计划存储 schema 未变（仍然只有 interval_minutes）"
+else
+  record_fail "计划存储 schema 出现了单位字段"
+fi
+
+echo "[modern-gui] 21) 用户 UI 不出现开发者术语"
+#
+# 普通用户看到的每一句都应该是"这东西帮我做什么"。命令行工具名、内部格式名、
+# 状态机字段只在「技术详情」里出现，或者根本不出现。
+expect_missing "$REALTIME_PAGE_QML" "Filter parser" \
+  "实时页不解释 Filter parser"
+expect_missing "$REALTIME_PAGE_QML" "共享核心解析并校验" \
+  "实时页不再写“规则由共享核心解析并校验”（那是源码注释，不是用户帮助）"
+expect_missing "$REALTIME_PAGE_QML" "这里不做第二套解析" \
+  "实时页不再写“这里不做第二套解析”"
+expect_missing "$SCHEDULE_PAGE_QML" "这里不做第二套解析" \
+  "自动备份页不再写“这里不做第二套解析”"
+expect_missing "$SCHEDULE_PAGE_QML" 'text: "筛选规则（include / exclude）"' \
+  "自动备份页不再用 include / exclude 当标题"
+expect_missing "$SCHEDULE_PAGE_QML" '"添加 include"' \
+  "自动备份页不再有“添加 include”按钮"
+expect_missing "$SCHEDULE_PAGE_QML" '"添加 exclude"' \
+  "自动备份页不再有“添加 exclude”按钮"
+expect_missing "$REALTIME_PAGE_QML" '"Include"' \
+  "实时页不再出现裸 Include 文案"
+expect_present "$QML_DIR/components/FilterRuleEditor.qml" '"包含"' \
+  "包含 / 排除才是普通 UI 的措辞"
+expect_present "$SCHEDULE_PAGE_QML" '"保存设置"' \
+  "自动备份页的按钮叫“保存设置”"
+expect_present "$SCHEDULE_PAGE_QML" '"立即执行一次"' \
+  "自动备份页的按钮叫“立即执行一次”"
+expect_present "$SCHEDULE_PAGE_QML" "立即检查当前状态，并在需要时创建备份。" \
+  "按钮附近说明“没有变化时不会产生新备份”，不做过度承诺"
+expect_missing "$SCHEDULE_PAGE_QML" '"保存计划"' \
+  "旧文案“保存计划”已经消失"
+
+echo "[modern-gui] 22) 共享 ComboBox 的下拉行状态（hover / 键盘光标 / 已选择）"
+#
+# 三轮人工验收踩的是同一个坑的三种形态，根因都是"用一个残影当输入状态用"：
+#
+#   第一轮：background 里 row.highlighted（= control.highlightedIndex === index）
+#           与 row.hovered 返回同一块 theme.hover。打开下拉时 Qt 就把
+#           highlightedIndex 设成当前已选择项，于是那一行从打开起就是灰的，
+#           鼠标移开也不会消失。
+#   第二轮：换成"键盘高亮 + accentSoft"之后仍然残留 —— highlightedIndex 会被
+#           鼠标改脏（实测：指针移出 popup 后 highlightedIndex=4、row.hovered=false，
+#           那一行照样被画出一块底色）。
+#   第三轮：改成监听 Keys.onPressed 之后，真实桌面里键盘高亮**永远不亮** ——
+#           真实 xcb 窗口实测：点开下拉后焦点在 ComboBox 上，按键由 ComboBox 处理，
+#           popup 的 ListView 收不到 Keys；而它才是真正移动的对象
+#           （0 -> 1 -> 2 -> 1，control.currentIndex 在 Enter 之前一直不变）。
+#
+# 结论：不要监听"用户有没有按键"，要观察"Qt 把键盘位置移到了哪里"。
+# 键盘模式 = popup ListView 的 currentIndex 变了 && 没有指针活动 && 不是打开时的
+# 初次同步。键盘光标就画在 currentIndex 那一行，与"已选择项"可以叠加。
+COMBO_QML="$QML_DIR/components/AppComboBox.qml"
+
+# --- 视觉：三种状态各走各的通道 ---
+expect_present "$COMBO_QML" "hoverEnabled: true" \
+  "下拉行显式打开 hover（默认值来自系统 style hint，headless 下不一定为真）"
+expect_present "$COMBO_QML" "opacity: row.hovered ? 1 : 0" \
+  "唯一的 hover 灰由 row.hovered 决定"
+expect_present "$COMBO_QML" "objectName: \"comboItemHoverLayer\"" \
+  "hover 是一个独立的固定色覆盖层"
+expect_present "$COMBO_QML" "objectName: \"comboItemKeyboardLayer\"" \
+  "键盘光标是另一个独立的固定色覆盖层"
+expect_present "$COMBO_QML" "opacity: row.keyboardHighlighted ? 1 : 0" \
+  "键盘层由 keyboardHighlighted 决定"
+expect_missing "$COMBO_QML" "Behavior on color" \
+  "两个覆盖层都不做颜色动画（浅色主题那一闪的根因）"
+# hover 层必须画在键盘层之上：两者同时亮时看到的是 hover。
+hover_layer_line="$(grep -n 'objectName: "comboItemHoverLayer"' "$COMBO_QML" | cut -d: -f1)"
+keyboard_layer_line="$(grep -n 'objectName: "comboItemKeyboardLayer"' "$COMBO_QML" | cut -d: -f1)"
+if [[ -n "$keyboard_layer_line" && -n "$hover_layer_line" && "$keyboard_layer_line" -lt "$hover_layer_line" ]]; then
+  record_pass "hover 覆盖层画在键盘层之上（鼠标优先级更高）"
+else
+  record_fail "hover / 键盘覆盖层的叠放顺序不对"
+fi
+
+# --- 输入方式：由导航结果推断，不监听按键 ---
+expect_present "$COMBO_QML" "property bool keyboardNavigationActive: false" \
+  "有一个明确的输入方式闸门（纯 presentation 状态）"
+expect_present "$COMBO_QML" "onCurrentIndexChanged: control.noteNavigationResult()" \
+  "键盘模式来自 popup ListView 的导航结果"
+expect_present "$COMBO_QML" "function noteNavigationResult()" \
+  "推断逻辑有独立入口"
+expect_present "$COMBO_QML" "if (control.suppressNavigationInference) return" \
+  "打开 popup 时的初次同步不算导航"
+expect_present "$COMBO_QML" "if (control.pointerHovering) return" \
+  "有行正被 hover 时不推断键盘模式（hover 引起的 currentIndex 变化归鼠标）"
+expect_missing "$COMBO_QML" "Timer {" \
+  "推断不需要任何延时窗口（同步标志就够，也不引入额外类型）"
+expect_present "$COMBO_QML" "Qt.callLater(function () {" \
+  "初次同步的抑制在下一个事件循环解除（不用 sleep）"
+# 只看代码行：注释里解释"前两轮试过 Keys.onPressed / 接管事件"是正常的历史说明。
+expect_missing_code "$COMBO_QML" "Keys.onPressed" \
+  "不再监听按键：真实桌面里按键根本不到 popup"
+# 只禁"放行按键"那一种写法；WheelHandler 里的 event.accepted = true 是滚轮自己的
+# 处理，和键盘无关，不在这一条的范围内。
+expect_missing_code "$COMBO_QML" "event.accepted = false" \
+  "不接管任何按键，Qt 的方向键行为保持原样"
+expect_present "$COMBO_QML" "onHoveredChanged: {" \
+  "指针进入某一行时记录 hover 状态并让位"
+expect_present "$COMBO_QML" "control.pointerHovering = row.hovered" \
+  "当前是否有 delegate 真的 hovered"
+expect_present "$COMBO_QML" "onOpened: {" \
+  "每次打开 popup 都复位"
+expect_present "$COMBO_QML" "onClosed: {" \
+  "关闭时也复位"
+
+# --- 禁止再用 highlightedIndex 直接推断输入来源 ---
+expect_missing "$COMBO_QML" "control.highlightedIndex === index" \
+  "没有任何视觉分支直接拿 highlightedIndex 当状态"
+combo_highlight_code_hits="$(grep -nF 'control.highlightedIndex' "$COMBO_QML" \
+  | grep -vE '^[0-9]+:[[:space:]]*//' | wc -l)"
+if [[ "$combo_highlight_code_hits" -eq 1 ]]; then
+  record_pass "代码里只剩 Qt 自己的那一条 ListView 绑定用 highlightedIndex"
+else
+  record_fail "代码里有 $combo_highlight_code_hits 处在用 highlightedIndex（应当只有 1 处）"
+fi
+expect_present "$COMBO_QML" "currentIndex: control.highlightedIndex" \
+  "剩下那一处是 ListView 的 currentIndex 绑定，不是视觉状态"
+expect_present "$COMBO_QML" "control.keyboardRowIndex === index" \
+  "键盘光标画在 popup ListView 的 currentIndex 那一行上"
+# 键盘光标与"已选择项"可以叠加：keyboardHighlighted 不许再排除 isSelected。
+keyboard_rule="$(grep -A3 'property bool keyboardHighlighted' "$COMBO_QML")"
+if printf '%s' "$keyboard_rule" | grep -q "isSelected"; then
+  record_fail "键盘光标把已选择项排除了（键盘导航回当前值时会看不见光标）"
+else
+  record_pass "键盘光标不排除已选择项，可以与勾号叠加"
+fi
+
+# --- 已选择项：勾号 + 强调色文字，不占底色 ---
+expect_present "$COMBO_QML" 'objectName: "comboItemCheck"' \
+  "已选择项有独立的勾号标记"
+expect_present "$COMBO_QML" "row.isSelected ? Font.DemiBold : Font.Normal" \
+  "已选择项用字重区分"
+expect_present "$COMBO_QML" "row.isSelected ? theme.accent : theme.textPrimary" \
+  "已选择项用强调色文字区分"
+
+# --- 运行期：真实指针 + 真实焦点链上的方向键 ---
+set +e
+QT_QPA_PLATFORM=offscreen QSG_RHI_BACKEND=software timeout 240 \
+  ./build/backup-gui-modern --combo-hover-test \
+  --config-file "$TEST_STATE_DIR/combo-config.json" \
+  --schedule-file "$TEST_STATE_DIR/combo-schedule.json" \
+  --realtime-file "$TEST_STATE_DIR/combo-realtime.json" \
+  > "$TEST_STATE_DIR/combo-hover.log" 2>&1
+combo_status=$?
+set -e
+cat "$TEST_STATE_DIR/combo-hover.log" >> "$LOG_FILE"
+if [[ "$combo_status" -eq 0 ]]; then
+  record_pass "共享下拉状态自检通过（$(grep -c '   ok   ' "$TEST_STATE_DIR/combo-hover.log" || true) 项观测全部通过）"
+else
+  record_fail "共享下拉状态自检退出码 $combo_status"
+  grep 'FAIL' "$TEST_STATE_DIR/combo-hover.log" | tail -8
+fi
+for pattern in "Mouse 1 打开 popup：无 hover 底色、无键盘光标、模式关闭" \
+               "Mouse 1 已选择项（路径）只有勾号，没有底色" \
+               "Mouse 2 只有“文件类型”有 hover 灰底，且没有误触发键盘模式" \
+               "Mouse 3 指针离开后索引仍停在被划过的那一行" \
+               "Mouse 3 索引留在那一行，但视觉上没有任何底色" \
+               "Mouse 4 指针重新进入：hover 立刻接管" \
+               "Keyboard 1 ↓ 让 popup 的 currentIndex 前移一项" \
+               "Keyboard 1 ↓ 之后键盘模式打开（由导航结果推断）" \
+               "Keyboard 1 键盘光标正好落在 Qt 移动到的那个 row 上" \
+               "Keyboard 2 再 ↓：光标整体下移一行，上一行立刻熄灭" \
+               "Keyboard 3 ↑ 把光标移回上一行" \
+               "Keyboard 4 键盘光标落在已选择项上：光标与勾号同时可见" \
+               "Mouse 5 键盘模式下移动鼠标：键盘光标立即消失、hover 接管" \
+               "Mouse 6 指针离开后没有任何底色残留" \
+               "Keyboard 5 Enter 采纳当前键盘行并关闭下拉" \
+               "Keyboard 6 Esc 关闭下拉且不改动已选择的值" \
+               "Reopen 重新打开下拉：没有 stale 键盘光标、没有 stale 灰底"; do
+  if grep -qF -- "$pattern" "$TEST_STATE_DIR/combo-hover.log"; then
+    record_pass "下拉状态自检：$pattern"
+  else
+    record_fail "下拉状态自检缺少：$pattern"
+  fi
+done
+if grep -qF "qml-warning" "$TEST_STATE_DIR/combo-hover.log"; then
+  record_fail "下拉状态自检期间出现了 QML 运行期告警"
+else
+  record_pass "下拉状态自检期间 0 QML 运行期告警"
+fi
 
 echo "[modern-gui] 通过 $PASS_COUNT 项，失败 $FAIL_COUNT 项"
 echo "[modern-gui] 日志: $LOG_FILE"
