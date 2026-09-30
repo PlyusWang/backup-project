@@ -776,6 +776,7 @@ int RunPathTest(backup_modern::BackupController* controller) {
 // 的判别 —— 只看控制器自己报的状态是不够的。
 QStringList ArchiveNames(const QString& repository);
 int CountArchives(const QString& repository);
+QString ScheduleConfigSignature(const backupproject::ScheduleConfig& config);
 
 // --close-guard-test：验证“任务进行中不许关窗”的契约。
 //
@@ -3646,6 +3647,31 @@ int CountArchives(const QString& repository) {
   return ArchiveNames(repository).size();
 }
 
+// scheduler **配置**部分的稳定指纹。M1.5 用它断言"被拒绝的手动备份没有改写
+// 配置"。只放配置字段：managed / history / last-run 属于 state，正在跑的定时
+// 评估会合法地改它们，不能进这个指纹。
+QString ScheduleConfigSignature(const backupproject::ScheduleConfig& config) {
+  QStringList parts;
+  parts << (config.enabled ? QStringLiteral("1") : QStringLiteral("0"))
+        << QString::number(static_cast<int>(config.trigger))
+        << QString::number(static_cast<int>(config.strategy))
+        << QString::fromStdString(config.source_path)
+        << QString::number(config.interval_minutes)
+        << QString::number(config.retain_count)
+        << QString::number(static_cast<int>(config.pack_method))
+        << QString::number(static_cast<int>(config.compression_method))
+        << QString::number(static_cast<int>(config.encryption_method))
+        << QStringLiteral("|");
+  for (const std::string& rule : config.include_rules) {
+    parts << QString::fromStdString(rule);
+  }
+  parts << QStringLiteral("||");
+  for (const std::string& rule : config.exclude_rules) {
+    parts << QString::fromStdString(rule);
+  }
+  return parts.join(QLatin1Char('~'));
+}
+
 QVariantMap LastHistory(const backup_modern::ScheduleController& schedule) {
   const QVariantList history = schedule.history();
   if (history.isEmpty()) return QVariantMap();
@@ -4654,7 +4680,12 @@ int RunScheduleTest(backup_modern::ScheduleController* schedule,
     run.Check(schedule->runNow() && schedule->libraryBusy(),
               QStringLiteral("M1.1 评估进入 busy"));
     const int archives_before = CountArchives(repository);
-    const QByteArray store_before = read_bytes(store_path);
+    backupproject::ScheduleDocument config_document;
+    std::string config_error;
+    const bool config_loaded =
+        load_schedule_document(store_path, &config_document, &config_error);
+    const QString config_before =
+        ScheduleConfigSignature(config_document.config);
     run.Check(!backup_controller->startBackup(),
               QStringLiteral("M1.2 评估在飞时手动备份被 C++ 拒绝"),
               backup_controller->statusMessage());
@@ -4664,8 +4695,25 @@ int RunScheduleTest(backup_modern::ScheduleController* schedule,
               backup_controller->statusMessage());
     run.Check(CountArchives(repository) == archives_before,
               QStringLiteral("M1.4 被拒绝的手动备份没有产生任何归档"));
-    run.Check(read_bytes(store_path) == store_before,
-              QStringLiteral("M1.5 被拒绝的手动备份没有改动 schedule store"));
+    // M1.5：被拒绝的手动备份没有产生属于"手动备份动作"的持久化副作用。
+    //
+    // 这里同样**不**比对整个 schedule.json 的字节：M1.1 起的定时评估在 busy
+    // 窗口里会合法地写 managed / history / last-run 等 state，字节相等在存在
+    // 合法并发写者时是个不成立的前提。手动备份永远不进 scheduler 的受管名单，
+    // 所以能断言的是"这次被拒绝的调用没有改写 scheduler 配置"。
+    backupproject::ScheduleDocument config_after_document;
+    std::string config_after_error;
+    const bool config_after_loaded = load_schedule_document(
+        store_path, &config_after_document, &config_after_error);
+    run.Check(config_after_loaded &&
+                  ScheduleConfigSignature(config_after_document.config) ==
+                      config_before,
+              QStringLiteral("M1.5 被拒绝的手动备份没有改写 scheduler 配置"),
+              QStringLiteral("loaded=") +
+                  QString::number(config_loaded ? 1 : 0) + QStringLiteral("/") +
+                  QString::number(config_after_loaded ? 1 : 0) +
+                  QStringLiteral(" error=") +
+                  QString::fromStdString(config_after_error));
 
     // ---- M2：评估在飞 -> 受管恢复被拒绝 ----
     // 目标取 scheduler **自己管理**的快照（最新的一份）：M3 要证明的是"被拒绝
