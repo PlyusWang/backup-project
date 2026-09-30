@@ -29,6 +29,13 @@
 //   --realtime-show                     把控制器读到的实时配置打成 key=value，
 //                                       用来证明 GUI 与 CLI 读的是同一份 store
 //   --realtime-file <路径> 指定实时存储文件（测试隔离真实实时配置）
+//   --remote-test                       验证远程备份页的控制器链路：真的起一个
+//                                       backup-server，走注册 -> 登录 ->
+//                                       上传真实 归档 -> 列表 ->
+//                                       下载（含默认不覆盖）->
+//                                       删除（含确认路径）-> 退出登录；并断言
+//                                       密码框回显模式、口令与 token 不落盘、
+//                                       忙碌时冲突请求被拒、页面提示不外泄
 //   --path-test                         验证本地路径与 URL 互转不丢字符
 //   --close-guard-test                  验证任务进行中关窗会被拦下：手动备份、
 //                                       实时触发、计划评估三位 writer 都要在
@@ -56,6 +63,7 @@
 
 #include <QCoreApplication>
 #include <QDir>
+#include <QDirIterator>
 #include <QElapsedTimer>
 #include <QEventLoop>
 #include <QFile>
@@ -63,13 +71,16 @@
 #include <QGuiApplication>
 #include <QHoverEvent>
 #include <QKeyEvent>
+#include <QMap>
 #include <QMetaObject>
 #include <QPointF>
+#include <QProcess>
 #include <QQmlApplicationEngine>
 #include <QQmlContext>
 #include <QQuickItem>
 #include <QQuickStyle>
 #include <QQuickWindow>
+#include <QRandomGenerator>
 #include <QStandardPaths>
 #include <QStringList>
 #include <QTemporaryDir>
@@ -91,6 +102,7 @@
 #include "filter_rule_model.h"
 #include "operation_gate.h"
 #include "realtime_controller.h"
+#include "remote_controller.h"
 #include "schedule_controller.h"
 #include "schedule_frequency.h"
 #include "schedule_store.h"
@@ -98,7 +110,7 @@
 
 namespace {
 
-const int kPageCount = 6;
+const int kPageCount = 7;
 int g_qml_warnings = 0;
 
 // QML 的运行期问题（binding loop、类型错误、模块缺失……）都以 Qt warning 发出。
@@ -258,7 +270,8 @@ int CaptureScreenshots(QQuickWindow* window, backup_modern::AppTheme* theme,
   // 顺序必须与 Main.qml 的 StackLayout 一致：首页 / 备份 / 自动备份 /
   // 备份管理 / 设置 / 实时备份。
   const char* page_names[kPageCount] = {"home",       "backup",   "schedule",
-                                        "management", "settings", "realtime"};
+                                        "management", "settings", "realtime",
+                                        "remote"};
   for (int dark = 0; dark < 2; ++dark) {
     theme->setDark(dark == 1);
     for (int page = 0; page < kPageCount; ++page) {
@@ -2029,15 +2042,604 @@ int RunFilterUxTest(QQuickWindow* window,
   return run.failed == 0 ? 0 : 1;
 }
 
+// ---- --remote-test：远程备份页的控制器链路 ----
+//
+// 它真的起一个 backup-server 进程（与 network_test.sh、阿里云部署用的是同一个
+// 产物），然后用页面背后的 RemoteController 走完整条路：
+//
+//   未登录被拒 -> 注册 -> 登录 -> 生成真实归档 -> 上传 -> 列表 ->
+//   下载（含默认不覆盖）-> 删除（含确认路径）-> 退出登录
+//
+// 同时把这些契约钉死：
+//   * 密码框是密码回显模式；
+//   * 密码与 token 不落盘（整个隔离状态目录逐字节快照比对 + 口令串扫描）；
+//   * 同一事件循环回合里的第二个网络请求在控制器层被拒；
+//   * Remote 页的临时提示不污染其它页面，离开即消费；
+//   * 列表行显示名称 / 大小 / 时间；
+//   * 删除必须先经过确认对话框；
+//   * 两套主题下关键控件都有正的几何，且主题真的作用到这一页。
+int RunRemoteTest(QQuickWindow* window, backup_modern::RemoteController* remote,
+                  backup_modern::BackupController* controller,
+                  backup_modern::AppTheme* theme,
+                  const QString& config_file_path,
+                  const QString& schedule_file_path,
+                  const QString& realtime_file_path) {
+  CheckRun run;
+  run.prefix = "[remote-test]";
+
+  const auto goToPage = [window](int page) {
+    window->setProperty("currentPage", page);
+    WaitForAnimation(400);
+  };
+  const auto itemByName = [window](const char* name) -> QQuickItem* {
+    return window->findChild<QQuickItem*>(QString::fromLatin1(name));
+  };
+  const auto objectByName = [window](const char* name) -> QObject* {
+    return window->findChild<QObject*>(QString::fromLatin1(name));
+  };
+  // "这一页会不会显示这条提示"——读的是 StatusBanner 的 showsMessage，
+  // 与它此刻是不是当前页无关。
+  const auto pageShows = [&objectByName](const char* banner_name,
+                                         const QString& title) {
+    QObject* banner = objectByName(banner_name);
+    return banner != nullptr && banner->property("showsMessage").toBool() &&
+           banner->property("title").toString() == title;
+  };
+  const auto filesEqual = [](const QString& left, const QString& right) {
+    QFile a(left);
+    QFile b(right);
+    if (!a.open(QIODevice::ReadOnly) || !b.open(QIODevice::ReadOnly)) {
+      return false;
+    }
+    if (a.size() != b.size()) {
+      return false;
+    }
+    return a.readAll() == b.readAll();
+  };
+  // 目录里每个文件的完整内容。用来证明"这一段时间里那个目录一个字节都没变"。
+  const auto snapshotDirectory = [](const QString& directory) {
+    QMap<QString, QByteArray> files;
+    if (directory.isEmpty() || !QFileInfo(directory).isDir()) {
+      return files;
+    }
+    QDirIterator iterator(directory, QDir::Files | QDir::NoDotAndDotDot,
+                          QDirIterator::Subdirectories);
+    while (iterator.hasNext()) {
+      const QString path = iterator.next();
+      QFile file(path);
+      if (file.open(QIODevice::ReadOnly)) {
+        files.insert(path, file.readAll());
+      }
+    }
+    return files;
+  };
+  const auto directoryContains = [](const QString& directory,
+                                    const QByteArray& needle) {
+    if (directory.isEmpty() || !QFileInfo(directory).isDir()) {
+      return false;
+    }
+    QDirIterator iterator(directory, QDir::Files | QDir::NoDotAndDotDot,
+                          QDirIterator::Subdirectories);
+    while (iterator.hasNext()) {
+      QFile file(iterator.next());
+      if (file.open(QIODevice::ReadOnly) && file.readAll().contains(needle)) {
+        return true;
+      }
+    }
+    return false;
+  };
+
+  QTemporaryDir temp;
+  if (!temp.isValid()) {
+    std::fprintf(stderr, "[remote-test] 无法创建临时工作目录\n");
+    return 1;
+  }
+  const QString work = temp.filePath(QStringLiteral("remote"));
+  for (const char* part : {"", "/data", "/state", "/repo", "/source", "/out"}) {
+    QDir().mkpath(work + QString::fromLatin1(part));
+  }
+
+  // token secret：随机内容，只落在 0600 的文件里。测试既不读它、也不打印它。
+  const QString secret_file = work + QStringLiteral("/state/secrets.env");
+  {
+    QFile secret(secret_file);
+    if (!secret.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
+      std::fprintf(stderr, "[remote-test] 无法写 secret 文件\n");
+      return 1;
+    }
+    QByteArray material(32, 0);
+    for (int index = 0; index < material.size(); ++index) {
+      material[index] =
+          static_cast<char>(QRandomGenerator::global()->bounded(256));
+    }
+    secret.write("BACKUP_TOKEN_SECRET=" + material.toHex() + "\n");
+    secret.close();
+    secret.setPermissions(QFileDevice::ReadOwner | QFileDevice::WriteOwner);
+  }
+
+  const QString server_binary =
+      QCoreApplication::applicationDirPath() + QStringLiteral("/backup-server");
+  if (!QFileInfo::exists(server_binary)) {
+    std::fprintf(stderr, "[remote-test] 找不到 %s（先 make server）\n",
+                 qPrintable(server_binary));
+    return 1;
+  }
+
+  const QString log_file = work + QStringLiteral("/state/server.log");
+  QProcess server;
+  server.setProgram(server_binary);
+  server.setArguments(
+      {QStringLiteral("--bind"), QStringLiteral("127.0.0.1"),
+       QStringLiteral("--port"), QStringLiteral("0"), QStringLiteral("--root"),
+       work + QStringLiteral("/data"), QStringLiteral("--db"),
+       work + QStringLiteral("/state/metadata.sqlite3"),
+       QStringLiteral("--secret-file"), secret_file,
+       QStringLiteral("--pid-file"), work + QStringLiteral("/state/server.pid"),
+       QStringLiteral("--log-file"), log_file, QStringLiteral("--quiet")});
+  // 无论从哪条 return 出去，服务端都要被收走，不留孤儿进程。
+  struct ServerGuard {
+    QProcess* process;
+    ~ServerGuard() {
+      if (process->state() != QProcess::NotRunning) {
+        process->terminate();
+        if (!process->waitForFinished(5000)) {
+          process->kill();
+          process->waitForFinished(3000);
+        }
+      }
+    }
+  } server_guard{&server};
+  server.start();
+
+  // 端口交给内核分配（--port 0）：服务端把真正绑到的端口写进日志文件，
+  // 所以这里不需要自己探测端口，也就不会在 GUI 代码里出现第二套 socket 逻辑。
+  int port = 0;
+  QElapsedTimer clock;
+  clock.start();
+  while (clock.elapsed() < 15000 && port == 0) {
+    WaitForAnimation(50);
+    QFile log(log_file);
+    if (log.open(QIODevice::ReadOnly)) {
+      const QString text = QString::fromUtf8(log.readAll());
+      const QString marker = QStringLiteral("listening on 127.0.0.1:");
+      const int at = text.indexOf(marker);
+      if (at >= 0) {
+        int end = at + marker.size();
+        while (end < text.size() && text.at(end).isDigit()) {
+          ++end;
+        }
+        port = text.mid(at + marker.size(), end - at - marker.size()).toInt();
+      }
+    }
+  }
+  run.Check(
+      port > 0,
+      QStringLiteral("REMOTE-00 真实 backup-server 已启动（内核分配端口）"),
+      QStringLiteral("port=%1").arg(port));
+  if (port <= 0) {
+    std::printf("[remote-test] passed=%d failed=%d\n", run.passed, run.failed);
+    return 1;
+  }
+  // 只绑环回：这条与部署约束是同一条。
+  run.Check(server.state() == QProcess::Running,
+            QStringLiteral("REMOTE-00 服务端进程存活"));
+
+  const QString host = QStringLiteral("127.0.0.1");
+  const QString port_text = QString::number(port);
+
+  // ---- REMOTE-01：页面与导航 ----
+  QQuickItem* page = itemByName("remotePage");
+  QObject* nav_item = objectByName("remoteNavItem");
+  run.Check(page != nullptr && nav_item != nullptr,
+            QStringLiteral("REMOTE-01 远程备份页与侧栏导航项都存在"));
+  goToPage(6);
+  run.Check(window->property("currentPage").toInt() == 6 && page != nullptr &&
+                page->opacity() > 0.5,
+            QStringLiteral("REMOTE-01 能从导航进入远程备份页"));
+  goToPage(0);
+  run.Check(page != nullptr && page->opacity() < 0.5,
+            QStringLiteral("REMOTE-01 离开之后这一页确实不再显示"));
+
+  // ---- REMOTE-02：密码框是密码回显模式 ----
+  QObject* password_field = objectByName("remotePasswordField");
+  // TextInput.Password == 2：明文常显是这一页绝不允许出现的样子。
+  run.Check(password_field != nullptr &&
+                password_field->property("echoMode").toInt() == 2,
+            QStringLiteral("REMOTE-02 密码输入框是密码回显模式"),
+            password_field == nullptr
+                ? QStringLiteral("找不到 remotePasswordField")
+                : QStringLiteral("echoMode=%1")
+                      .arg(password_field->property("echoMode").toInt()));
+
+  // ---- REMOTE-03：未登录时 list / upload / download / delete 一律不被允许
+  // ----
+  run.Check(!remote->authenticated(),
+            QStringLiteral("REMOTE-03 起始状态未登录"));
+  const QString decoy_file = work + QStringLiteral("/source/decoy.bin");
+  {
+    QFile decoy(decoy_file);
+    decoy.open(QIODevice::WriteOnly);
+    decoy.write(QByteArray(64, 'd'));
+  }
+  const QString absent_id = QStringLiteral("00000000000000000000000000000000");
+  const bool list_rejected = !remote->refreshList();
+  const bool list_reason =
+      remote->lastErrorKindForTest() == QStringLiteral("not-logged-in");
+  const bool upload_rejected = !remote->uploadArchive(decoy_file, QString());
+  const bool download_rejected = !remote->downloadArchive(
+      absent_id, work + QStringLiteral("/out/never.bak"), false);
+  const bool delete_rejected = !remote->deleteSnapshot(absent_id);
+  run.Check(
+      list_rejected && list_reason && upload_rejected && download_rejected &&
+          delete_rejected && !remote->busy(),
+      QStringLiteral("REMOTE-03 未登录时四类操作都被拒，且没有留下忙碌状态"),
+      QStringLiteral("list=%1 upload=%2 download=%3 delete=%4 busy=%5")
+          .arg(list_rejected)
+          .arg(upload_rejected)
+          .arg(download_rejected)
+          .arg(delete_rejected)
+          .arg(remote->busy()));
+  run.Check(!QFileInfo::exists(work + QStringLiteral("/out/never.bak")),
+            QStringLiteral("REMOTE-03 被拒的下载没有碰过目标路径"));
+
+  // ---- REMOTE-04：Remote 页的临时提示不污染其它页面，离开即消费 ----
+  const QString transient_title = remote->statusTitle();
+  run.Check(transient_title == QStringLiteral("尚未登录") &&
+                remote->statusScope() == QStringLiteral("remote"),
+            QStringLiteral("REMOTE-04 未登录的失败提示属于 remote 页"),
+            transient_title + QStringLiteral("/") + remote->statusScope());
+  goToPage(6);
+  const bool shown_on_own_page =
+      pageShows("remoteStatusBanner", transient_title);
+  const char* other_banners[] = {
+      "homeStatusBanner",       "backupStatusBanner",   "scheduleStatusBanner",
+      "managementStatusBanner", "settingsStatusBanner", "realtimeStatusBanner"};
+  bool hidden_elsewhere = true;
+  QString leaked;
+  for (const char* banner_name : other_banners) {
+    if (pageShows(banner_name, transient_title)) {
+      hidden_elsewhere = false;
+      leaked += QString::fromLatin1(banner_name) + QStringLiteral(" ");
+    }
+  }
+  run.Check(shown_on_own_page && hidden_elsewhere,
+            QStringLiteral("REMOTE-04 只在远程备份页显示，其它页面看不到"),
+            leaked.isEmpty() ? QStringLiteral("无泄漏") : leaked);
+  goToPage(1);
+  run.Check(remote->statusKind() == QStringLiteral("idle") &&
+                !pageShows("remoteStatusBanner", transient_title),
+            QStringLiteral("REMOTE-04 离开远程备份页即消费掉这条提示"),
+            remote->statusKind());
+
+  // ---- REMOTE-05：注册 + 登录 ----
+  const QString user =
+      QStringLiteral("gui-user-%1")
+          .arg(QRandomGenerator::global()->bounded(100000, 999999));
+  const QString password =
+      QStringLiteral("gui-secret-%1")
+          .arg(QRandomGenerator::global()->bounded(100000, 999999));
+  // 状态目录的"上锁前快照"：登录之后这里必须一个字节都没变——token 与
+  // 口令都只在内存里。
+  const QString state_directory = QFileInfo(config_file_path).absolutePath();
+  // 三个隔离配置文件必须落在同一个状态目录里：下面那两条"逐字节未变"的
+  // 断言才有意义。
+  run.Check(QFileInfo(schedule_file_path).absolutePath() == state_directory &&
+                QFileInfo(realtime_file_path).absolutePath() == state_directory,
+            QStringLiteral("REMOTE-11 三个隔离配置文件在同一个状态目录里"),
+            state_directory);
+  const QMap<QString, QByteArray> state_before =
+      snapshotDirectory(state_directory);
+
+  run.Check(remote->registerAccount(host, port_text, user, password),
+            QStringLiteral("REMOTE-05 注册请求被受理"));
+  run.Check(remote->waitForIdle(120000) &&
+                remote->lastErrorKindForTest() == QStringLiteral("none"),
+            QStringLiteral("REMOTE-05 注册成功"), remote->lastDetailForTest());
+  run.Check(!remote->authenticated(),
+            QStringLiteral("REMOTE-05 注册之后仍未登录（要显式登录）"));
+  run.Check(remote->login(host, port_text, user, password),
+            QStringLiteral("REMOTE-05 登录请求被受理"));
+  run.Check(remote->waitForIdle(120000) && remote->authenticated(),
+            QStringLiteral("REMOTE-05 登录成功并进入已登录状态"),
+            remote->lastDetailForTest());
+  run.Check(remote->listLoaded(),
+            QStringLiteral("REMOTE-05 登录成功后自动读取了云端列表"));
+  run.Check(
+      remote->statusKind() != QStringLiteral("running") &&
+          remote->statusScope() == QStringLiteral("remote"),
+      QStringLiteral("REMOTE-05 传输结束后状态条回到 remote 页自己的 scope"),
+      remote->statusKind() + QStringLiteral("/") + remote->statusScope());
+  run.Check(snapshotDirectory(state_directory) == state_before,
+            QStringLiteral("REMOTE-11 注册与登录没有在状态目录里写任何东西"),
+            QStringLiteral("之前 %1 个文件，之后 %2 个文件")
+                .arg(state_before.size())
+                .arg(snapshotDirectory(state_directory).size()));
+
+  // ---- REMOTE-06：用真实引擎生成一份归档并上传 ----
+  const QString source = work + QStringLiteral("/source");
+  for (int index = 0; index < 12; ++index) {
+    QFile file(QStringLiteral("%1/note-%2.txt").arg(source).arg(index));
+    if (file.open(QIODevice::WriteOnly)) {
+      file.write(QByteArray(512, static_cast<char>('a' + index % 26)));
+    }
+  }
+  QDir().mkpath(source + QStringLiteral("/sub"));
+  {
+    QFile nested(source + QStringLiteral("/sub/中文 名字.bin"));
+    if (nested.open(QIODevice::WriteOnly)) {
+      nested.write(QByteArray(4096, 'z'));
+    }
+  }
+  run.Check(controller->saveRepositoryPath(work + QStringLiteral("/repo")),
+            QStringLiteral("REMOTE-06 备份仓库已配置"));
+  controller->setSourcePath(source);
+  const bool backup_started = controller->startBackupWithOptions(
+      QStringLiteral("mypack"), QStringLiteral("none"), QStringLiteral("none"),
+      QString(), QString());
+  run.Check(backup_started && controller->waitForIdle(180000),
+            QStringLiteral("REMOTE-06 用真实备份引擎生成一份本地归档"));
+  // 目录扫描跑在后台线程上：等它结束再取文件名（管理页也是这么刷新的）。
+  QElapsedTimer catalog_clock;
+  const auto waitForCatalog = [controller, &catalog_clock]() {
+    catalog_clock.start();
+    while (controller->catalogBusy() && catalog_clock.elapsed() < 60000) {
+      WaitForAnimation(50);
+    }
+  };
+  waitForCatalog();
+  if (controller->backupRecords().isEmpty()) {
+    controller->refreshBackups();
+    waitForCatalog();
+  }
+  const QVariantList records = controller->backupRecords();
+  QString archive_name;
+  if (!records.isEmpty()) {
+    archive_name =
+        records.first().toMap().value(QStringLiteral("fileName")).toString();
+  }
+  const QString archive_path =
+      controller->repositoryPath() + QStringLiteral("/") + archive_name;
+  run.Check(!archive_name.isEmpty() && QFileInfo::exists(archive_path),
+            QStringLiteral("REMOTE-06 归档文件存在"), archive_path);
+
+  // 配置与归档都已经定型：从这里开始，网络操作不该再往状态目录写任何字节。
+  const QMap<QString, QByteArray> state_before_transfer =
+      snapshotDirectory(state_directory);
+
+  const int progress_before = remote->progressCallbackCountForTest();
+  run.Check(remote->uploadArchive(archive_path, QString()),
+            QStringLiteral("REMOTE-06 上传请求被受理"));
+  run.Check(remote->waitForIdle(300000) &&
+                remote->lastErrorKindForTest() == QStringLiteral("none"),
+            QStringLiteral("REMOTE-06 上传成功"), remote->lastDetailForTest());
+  run.Check(remote->progressCallbackCountForTest() > progress_before,
+            QStringLiteral("REMOTE-06 传输进度来自网络层的真实回调"),
+            QStringLiteral("回调次数 %1 -> %2")
+                .arg(progress_before)
+                .arg(remote->progressCallbackCountForTest()));
+
+  // ---- REMOTE-07：列表内容与列表行 ----
+  run.Check(remote->snapshotCountForTest() == 1,
+            QStringLiteral("REMOTE-07 云端列表里正好有一条"),
+            QString::number(remote->snapshotCountForTest()));
+  const QVariantList snapshots = remote->snapshots();
+  const QVariantMap first =
+      snapshots.isEmpty() ? QVariantMap() : snapshots.first().toMap();
+  const QString snapshot_id = first.value(QStringLiteral("id")).toString();
+  run.Check(
+      first.value(QStringLiteral("name")).toString() == archive_name &&
+          !first.value(QStringLiteral("sizeText")).toString().isEmpty() &&
+          !first.value(QStringLiteral("createdText")).toString().isEmpty(),
+      QStringLiteral("REMOTE-07 列表项带名称 / 大小 / 创建时间"),
+      first.value(QStringLiteral("name")).toString() + QStringLiteral(" | ") +
+          first.value(QStringLiteral("sizeText")).toString() +
+          QStringLiteral(" | ") +
+          first.value(QStringLiteral("createdText")).toString());
+  goToPage(6);
+  // 列表行的断言走在 Repeater 真正创建出来的那一项上：itemAt(0) 就是用户
+  // 看到的第一行。QML 的 delegate 并不是窗口 QObject 树的子孙（QQuickRepeater
+  // 只设 visual parent），所以这里不能靠 window->findChild 去找它。
+  QObject* repeater = objectByName("remoteSnapshotRepeater");
+  QQuickItem* row = nullptr;
+  if (repeater != nullptr) {
+    QMetaObject::invokeMethod(repeater, "itemAt",
+                              Q_RETURN_ARG(QQuickItem*, row), Q_ARG(int, 0));
+  }
+  const auto rowChild = [row](const char* name) -> QObject* {
+    return row == nullptr ? nullptr
+                          : row->findChild<QObject*>(QString::fromLatin1(name));
+  };
+  QObject* row_name = rowChild("remoteSnapshotName");
+  QObject* row_size = rowChild("remoteSnapshotSize");
+  QObject* row_time = rowChild("remoteSnapshotTime");
+  run.Check(
+      row_name != nullptr && row_size != nullptr && row_time != nullptr &&
+          row_name->property("text").toString() == archive_name &&
+          row_size->property("text").toString() ==
+              first.value(QStringLiteral("sizeText")).toString() &&
+          row_time->property("text").toString() ==
+              first.value(QStringLiteral("createdText")).toString(),
+      QStringLiteral("REMOTE-07 界面上的行真的显示出名称 / 大小 / 时间"),
+      row_name == nullptr
+          ? QStringLiteral("找不到列表行")
+          : row_name->property("text").toString() + QStringLiteral(" | ") +
+                (row_size == nullptr ? QString()
+                                     : row_size->property("text").toString()) +
+                QStringLiteral(" | ") +
+                (row_time == nullptr ? QString()
+                                     : row_time->property("text").toString()));
+
+  // ---- REMOTE-08：下载（原子发布 + 默认不覆盖）----
+  const QString target = work + QStringLiteral("/out/downloaded.bak");
+  const int progress_before_download = remote->progressCallbackCountForTest();
+  run.Check(remote->downloadArchive(snapshot_id, target, false),
+            QStringLiteral("REMOTE-08 下载请求被受理"));
+  run.Check(remote->waitForIdle(300000) &&
+                remote->lastErrorKindForTest() == QStringLiteral("none"),
+            QStringLiteral("REMOTE-08 下载成功"), remote->lastDetailForTest());
+  run.Check(filesEqual(archive_path, target),
+            QStringLiteral("REMOTE-08 下载回来的字节与上传的归档逐字节一致"));
+  run.Check(!QFileInfo::exists(target + QStringLiteral(".part")),
+            QStringLiteral("REMOTE-08 没有留下 .part 中间文件"));
+  run.Check(remote->progressCallbackCountForTest() > progress_before_download,
+            QStringLiteral("REMOTE-08 下载进度同样来自真实回调"));
+  run.Check(remote->downloadArchive(snapshot_id, target, false) &&
+                remote->waitForIdle(120000),
+            QStringLiteral("REMOTE-08 第二次下载到同一个目标被受理"));
+  run.Check(
+      remote->lastErrorKindForTest() == QStringLiteral("target-exists") &&
+          filesEqual(archive_path, target),
+      QStringLiteral("REMOTE-08 默认不覆盖已存在的目标（原文件没被动过）"),
+      remote->lastDetailForTest());
+  QObject* overwrite_button = objectByName("remoteOverwriteButton");
+  run.Check(
+      overwrite_button != nullptr &&
+          overwrite_button->property("visible").toBool(),
+      QStringLiteral("REMOTE-08 目标冲突时页面给出“覆盖并重新下载”这一个动作"));
+  run.Check(remote->downloadArchive(snapshot_id, target, true) &&
+                remote->waitForIdle(300000) &&
+                remote->lastErrorKindForTest() == QStringLiteral("none") &&
+                filesEqual(archive_path, target),
+            QStringLiteral("REMOTE-08 显式允许覆盖时可以成功"));
+
+  // ---- REMOTE-09：删除必须先确认 ----
+  QObject* page_object = objectByName("remotePage");
+  QObject* delete_dialog = objectByName("remoteDeleteDialog");
+  run.Check(page_object != nullptr && delete_dialog != nullptr,
+            QStringLiteral("REMOTE-09 删除确认对话框存在"));
+  const int rows_before_delete = remote->snapshotCountForTest();
+  const bool invoked = QMetaObject::invokeMethod(page_object, "requestDelete",
+                                                 Q_ARG(QVariant, snapshot_id),
+                                                 Q_ARG(QVariant, archive_name));
+  WaitForAnimation(200);
+  run.Check(invoked && delete_dialog != nullptr &&
+                delete_dialog->property("visible").toBool(),
+            QStringLiteral("REMOTE-09 点删除只弹出确认，不直接删"));
+  run.Check(
+      !remote->busy() && remote->snapshotCountForTest() == rows_before_delete,
+      QStringLiteral("REMOTE-09 确认之前云端一条都没少"),
+      QString::number(remote->snapshotCountForTest()));
+  run.Check(QMetaObject::invokeMethod(page_object, "confirmDelete") &&
+                remote->waitForIdle(180000),
+            QStringLiteral("REMOTE-09 确认之后删除被执行"));
+  run.Check(remote->lastErrorKindForTest() == QStringLiteral("none") &&
+                remote->snapshotCountForTest() == 0,
+            QStringLiteral("REMOTE-09 确认之后云端备份被删除"),
+            remote->lastDetailForTest());
+  run.Check(
+      delete_dialog != nullptr && !delete_dialog->property("visible").toBool(),
+      QStringLiteral("REMOTE-09 删除之后对话框已关闭"));
+
+  // ---- REMOTE-10：同一时刻只允许一个网络操作 ----
+  // 登录是一次"慢操作"（PBKDF2 200000 次迭代，夜班机器上约 1.5 s）。
+  // 提交之后立刻在**同一个事件循环回合里**再发一个请求：它必须在控制器层
+  // 被拒，而不是排队，也不是和正在跑的那一个抢同一条连接。
+  // 服务端对"已经建立会话的连接上再来一次 LOGIN"是明确拒绝的
+  // （INVALID_STATE），所以先本地退出登录，再登录一次——这也正是用户
+  // 重新登录时走的同一条路。
+  remote->logoutLocal();
+  run.Check(remote->login(host, port_text, user, password),
+            QStringLiteral("REMOTE-10 再次登录被受理"));
+  const bool conflict_rejected = !remote->refreshList();
+  const bool conflict_reason =
+      remote->lastErrorKindForTest() == QStringLiteral("busy");
+  run.Check(conflict_rejected && conflict_reason && remote->busy(),
+            QStringLiteral("REMOTE-10 忙碌时的冲突请求被控制器拒绝"),
+            remote->lastErrorKindForTest());
+  run.Check(remote->waitForIdle(120000) && remote->authenticated(),
+            QStringLiteral("REMOTE-10 被拒的请求没有影响原来那一个"));
+
+  // ---- REMOTE-11：密码与 token 没有落盘 ----
+  const QMap<QString, QByteArray> state_after =
+      snapshotDirectory(state_directory);
+  run.Check(
+      state_after == state_before_transfer,
+      QStringLiteral("REMOTE-11 上传 / 下载 / 删除之后状态目录逐字节未变"),
+      QStringLiteral("之前 %1 个文件，之后 %2 个文件")
+          .arg(state_before_transfer.size())
+          .arg(state_after.size()));
+  const QByteArray password_bytes = password.toUtf8();
+  const QString xdg_root = qEnvironmentVariable("XDG_CONFIG_HOME");
+  run.Check(!directoryContains(state_directory, password_bytes) &&
+                !directoryContains(xdg_root, password_bytes),
+            QStringLiteral("REMOTE-11 口令没有出现在任何配置目录里"),
+            QStringLiteral("state=%1 xdg=%2")
+                .arg(directoryContains(state_directory, password_bytes))
+                .arg(directoryContains(xdg_root, password_bytes)));
+
+  // ---- REMOTE-12：两套主题下的组件契约 ----
+  const char* layout_names[] = {"remoteHostField",      "remotePortField",
+                                "remoteUserField",      "remotePasswordField",
+                                "remoteRegisterButton", "remoteLoginButton",
+                                "remoteLogoutButton",   "remoteUploadButton",
+                                "remoteRefreshButton",  "remoteStatusBanner"};
+  QColor light_text;
+  for (int dark = 0; dark < 2; ++dark) {
+    theme->setDark(dark == 1);
+    goToPage(6);
+    bool geometry_ok = true;
+    QString geometry_detail;
+    for (const char* name : layout_names) {
+      QQuickItem* item = itemByName(name);
+      if (item == nullptr || item->width() <= 0.0 || item->height() <= 0.0) {
+        geometry_ok = false;
+        geometry_detail += QString::fromLatin1(name) + QStringLiteral(" ");
+      }
+    }
+    QQuickItem* host_field_item = itemByName("remoteHostField");
+    if (host_field_item != nullptr) {
+      if (dark == 0) {
+        light_text = host_field_item->property("color").value<QColor>();
+      }
+    }
+    run.Check(
+        geometry_ok,
+        QStringLiteral("REMOTE-12 %1主题下关键控件都有正的几何")
+            .arg(dark == 1 ? QStringLiteral("深色") : QStringLiteral("浅色")),
+        geometry_detail);
+  }
+  QQuickItem* host_field_item = itemByName("remoteHostField");
+  const QColor dark_text =
+      host_field_item == nullptr
+          ? QColor()
+          : host_field_item->property("color").value<QColor>();
+  run.Check(host_field_item != nullptr && light_text.isValid() &&
+                dark_text.isValid() && light_text != dark_text,
+            QStringLiteral("REMOTE-12 切换主题真的作用到这一页的控件颜色"),
+            QStringLiteral("light=%1 dark=%2")
+                .arg(light_text.name(), dark_text.name()));
+  theme->setDark(false);
+  goToPage(6);
+
+  // ---- REMOTE-13：退出登录只清内存 ----
+  remote->logoutLocal();
+  run.Check(!remote->authenticated() && !remote->connected() &&
+                remote->snapshotCountForTest() == 0 &&
+                remote->statusKind() == QStringLiteral("idle"),
+            QStringLiteral("REMOTE-13 退出登录清掉内存里的会话、列表与凭据"));
+  run.Check(remote->statusScope() == QStringLiteral("remote"),
+            QStringLiteral("REMOTE-13 退出登录的提示仍属于 remote 页"));
+
+  std::printf("[remote-test] passed=%d failed=%d\n", run.passed, run.failed);
+  if (run.failed != 0) {
+    for (const QString& failure : run.failures) {
+      std::fprintf(stderr, "[remote-test] FAIL %s\n", qPrintable(failure));
+    }
+    return 1;
+  }
+  return 0;
+}
+
 int RunGuiContractTest(QQuickWindow* window,
                        backup_modern::BackupController* controller) {
   CheckRun run;
   run.prefix = "[gui-contract]";
 
   // 页面顺序必须与 Main.qml 的 StackLayout 一致。
-  const char* kBannerNames[5] = {
-      "homeStatusBanner", "backupStatusBanner", "scheduleStatusBanner",
-      "managementStatusBanner", "settingsStatusBanner"};
+  const char* kBannerNames[7] = {
+      "homeStatusBanner",       "backupStatusBanner",   "scheduleStatusBanner",
+      "managementStatusBanner", "settingsStatusBanner", "realtimeStatusBanner",
+      "remoteStatusBanner"};
 
   const auto goToPage = [window](int page) {
     window->setProperty("currentPage", page);
@@ -2224,9 +2826,9 @@ int RunGuiContractTest(QQuickWindow* window,
     controller->setStatusForTest(kind, QStringLiteral("management"), title,
                                  QStringLiteral("detail"));
     const bool shown_on_own_page = pageShows(3, title);
-    const bool hidden_elsewhere = !pageShows(1, title) &&
-                                  !pageShows(4, title) &&
-                                  !pageShows(2, title) && !pageShows(0, title);
+    const bool hidden_elsewhere =
+        !pageShows(1, title) && !pageShows(4, title) && !pageShows(2, title) &&
+        !pageShows(0, title) && !pageShows(5, title) && !pageShows(6, title);
     goToPage(1);
     const bool consumed = controller->statusKind() == QStringLiteral("idle");
     run.Check(shown_on_own_page && hidden_elsewhere && consumed,
@@ -2277,7 +2879,9 @@ int RunGuiContractTest(QQuickWindow* window,
           !pageShows(4, controller->statusTitle()) &&
           !pageShows(3, controller->statusTitle()) &&
           !pageShows(2, controller->statusTitle()) &&
-          !pageShows(0, controller->statusTitle()),
+          !pageShows(0, controller->statusTitle()) &&
+          !pageShows(5, controller->statusTitle()) &&
+          !pageShows(6, controller->statusTitle()),
       QStringLiteral("MSG-04 完成提示只回到备份页，没有出现在当前页或其它页"),
       QStringLiteral(
           "backup=[%1] settings=[%2] management=[%3] schedule=[%4] home=[%5]")
@@ -4986,6 +5590,7 @@ int main(int argc, char* argv[]) {
       arguments.indexOf(QStringLiteral("--schedule-file"));
   const bool realtime_test =
       arguments.contains(QStringLiteral("--realtime-test"));
+  const bool remote_test = arguments.contains(QStringLiteral("--remote-test"));
   const int realtime_file_index =
       arguments.indexOf(QStringLiteral("--realtime-file"));
   const bool backup_options_test =
@@ -5077,7 +5682,7 @@ int main(int argc, char* argv[]) {
       preview_test_index >= 0 || incremental_test_index >= 0 ||
       screenshot_index >= 0 || self_test_index >= 0 ||
       repository_test_index >= 0 || realtime_test || backup_options_test ||
-      schedule_test || filter_ux_test || combo_hover_test;
+      schedule_test || filter_ux_test || combo_hover_test || remote_test;
   QString config_file_path = ResolveConfigFilePath(arguments);
   QString schedule_file_path = ResolveScheduleFilePath(arguments);
   QString realtime_file_path = ResolveRealtimeFilePath(arguments);
@@ -5142,6 +5747,11 @@ int main(int argc, char* argv[]) {
   // 换到 B，旧仓库不会再收到任何新快照（与 ScheduleController 同一种接法）。
   backup_modern::RealtimeController realtime_controller(
       realtime_file_path, config_file_path, &controller, &operation_gate);
+  // 远程备份的桥。它背后是与 backupctl remote **共用**的 RemoteArchiveClient，
+  // 自己不碰 socket、不碰协议帧。它**不**占用 operation_gate：那把闸门保护的是
+  // "同一时刻只有一个本地仓库 writer"，而远程网络 I/O 不改动本地仓库的任何
+  // 持久状态（上传只读一个用户选定的 .bak，下载写的是用户指定的新路径）。
+  backup_modern::RemoteController remote_controller;
   // 三个页面的筛选规则编辑器共用同一个 presentation 组件，但每个页面有**自己**
   // 的规则列表：备份页的模型直接挂在 BackupController 上（编辑即生效），计划页
   // 与实时页是"草稿 + 保存"，所以它们的模型不带落点（构造参数为 nullptr），
@@ -5168,6 +5778,8 @@ int main(int argc, char* argv[]) {
                                            &schedule_controller);
   engine.rootContext()->setContextProperty(QStringLiteral("realtime"),
                                            &realtime_controller);
+  engine.rootContext()->setContextProperty(QStringLiteral("remote"),
+                                           &remote_controller);
   // 窗口用不用系统边框由 C++ 决定、QML 只读：窗口标志必须在窗口创建时定下来，
   // 之后再改会出现“已经画了一帧才换边框”的闪动。
   engine.rootContext()->setContextProperty(QStringLiteral("useNativeFrame"),
@@ -5193,6 +5805,11 @@ int main(int argc, char* argv[]) {
   //
   // 自检模式刻意不自动启动 runner：自检要自己控制每一步（从空 store 开始、
   // 手动触发评估），自动 tick 会和它抢同一份状态。
+  if (remote_test) {
+    return RunRemoteTest(window, &remote_controller, &controller, &theme,
+                         config_file_path, schedule_file_path,
+                         realtime_file_path);
+  }
   if (schedule_test) {
     return RunScheduleTest(&schedule_controller, &controller, config_file_path);
   }

@@ -12,6 +12,7 @@
     <file>qml/components/FilterEditorPanel.qml</file>
     <file>qml/components/FilterRuleEditor.qml</file>
     <file>qml/components/RuleCard.qml</file>
+    <file>qml/components/RemoteSnapshotCard.qml</file>
     <file>qml/components/NavItem.qml</file>
     <file>qml/components/StatusBanner.qml</file>
     <file>qml/pages/HomePage.qml</file>
@@ -20,5 +21,6 @@
     <file>qml/pages/SchedulePage.qml</file>
     <file>qml/pages/RealtimePage.qml</file>
     <file>qml/pages/SettingsPage.qml</file>
+    <file>qml/pages/RemotePage.qml</file>
   </qresource>
 </RCC>
