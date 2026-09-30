@@ -23,12 +23,31 @@ FAIL=0
 record_pass() { PASS=$((PASS + 1)); echo "  PASS  $1"; }
 record_fail() { FAIL=$((FAIL + 1)); echo "  FAIL  $1 -- $2" >&2; }
 
-echo "[network-test] PR #20 remote backup suite"
+# 消毒剂模式：NETWORK_TEST_SANITIZE=1 时改用 build-sanitize 下的目标文件与
+# 二进制，并给单元测试加上同一组 ASan/UBSan 编译参数。
+# 默认（不设该变量）仍然是普通构建，两者跑的是同一套用例。
+OBJ_ROOT="build"
+EXTRA_FLAGS=""
+SAN_LABEL=""
+SAN_MODE="$NETWORK_TEST_SANITIZE"
+[ -n "$SAN_MODE" ] || SAN_MODE=0
+if [ "$SAN_MODE" = "1" ]; then
+  OBJ_ROOT="build-sanitize"
+  EXTRA_FLAGS="-fsanitize=address,undefined -fno-omit-frame-pointer"
+  SAN_LABEL=" [ASan+UBSan]"
+fi
+
+echo "[network-test] PR #20 remote backup suite$SAN_LABEL"
 
 # 服务端目标文件是测试的前置条件：先确保它们存在（也是零警告的证据）。
-if [ ! -f build/src/network/remote_server.o ]; then
-  echo "[network-test] build/backup-server is missing; building first..."
-  if ! make -j4 server >"$TEST_ROOT/build-server.log" 2>&1; then
+if [ ! -f $OBJ_ROOT/src/network/remote_server.o ]; then
+  echo "[network-test] $OBJ_ROOT/backup-server is missing; building first..."
+  if [ "$OBJ_ROOT" = "build-sanitize" ]; then
+    BUILD_CMD="make -j4 sanitize"
+  else
+    BUILD_CMD="make -j4 all server"
+  fi
+  if ! $BUILD_CMD >"$TEST_ROOT/build-server.log" 2>&1; then
     record_fail "make server" "$(tail -3 "$TEST_ROOT/build-server.log" | tr '\n' ' ')"
     echo "network: $PASS passed, $FAIL failed"
     exit 1
@@ -45,12 +64,12 @@ if [ -z "$SQLITE_LIBRARY" ]; then
   exit 1
 fi
 
-NET_OBJECTS="build/src/network/network_protocol.o"
-SERVER_OBJECTS="build/src/network/network_protocol.o build/src/network/remote_auth.o \
-build/src/network/remote_metadata_store.o build/src/network/remote_server.o \
-build/src/network/remote_backup_client.o"
-CRYPTO_OBJECTS="build/src/crypto/sha256.o build/src/crypto/hmac.o \
-build/src/crypto/pbkdf2.o build/src/crypto/random.o"
+NET_OBJECTS="$OBJ_ROOT/src/network/network_protocol.o"
+SERVER_OBJECTS="$OBJ_ROOT/src/network/network_protocol.o $OBJ_ROOT/src/network/remote_auth.o \
+$OBJ_ROOT/src/network/remote_metadata_store.o $OBJ_ROOT/src/network/remote_server.o \
+$OBJ_ROOT/src/network/remote_backup_client.o"
+CRYPTO_OBJECTS="$OBJ_ROOT/src/crypto/sha256.o $OBJ_ROOT/src/crypto/hmac.o \
+$OBJ_ROOT/src/crypto/pbkdf2.o $OBJ_ROOT/src/crypto/random.o"
 
 # run_unit <名字> <目标文件列表> [额外链接参数]
 run_unit() {
@@ -63,8 +82,9 @@ run_unit() {
     record_fail "A.$name 存在" "tests/unit/$name.cpp 不存在"
     return
   fi
-  if ! g++ -std=c++17 -Wall -Wextra -Wpedantic -I"$ROOT_DIR/include" \
-      -I"$ROOT_DIR/tests/unit" "$source" $objects "$@" -o "$binary" \
+  if ! g++ -std=c++17 -Wall -Wextra -Wpedantic $EXTRA_FLAGS \
+      -I"$ROOT_DIR/include" -I"$ROOT_DIR/tests/unit" "$source" $objects "$@" \
+      -o "$binary" \
       >"$TEST_ROOT/$name-build.log" 2>&1; then
     record_fail "A.$name 编译" "$(head -3 "$TEST_ROOT/$name-build.log" | tr '\n' ' ')"
     return
@@ -87,9 +107,9 @@ run_unit() {
 
 echo "[network-test] A. 单元测试"
 run_unit network_protocol_test "$NET_OBJECTS"
-run_unit remote_auth_test "build/src/network/remote_auth.o $CRYPTO_OBJECTS"
+run_unit remote_auth_test "$OBJ_ROOT/src/network/remote_auth.o $CRYPTO_OBJECTS"
 run_unit remote_metadata_store_test \
-  "build/src/network/remote_metadata_store.o build/src/network/remote_auth.o \
+  "$OBJ_ROOT/src/network/remote_metadata_store.o $OBJ_ROOT/src/network/remote_auth.o \
 $CRYPTO_OBJECTS" "$SQLITE_LIBRARY" -pthread
 run_unit remote_server_test "$SERVER_OBJECTS $CRYPTO_OBJECTS" \
   "$SQLITE_LIBRARY" -pthread
@@ -126,7 +146,7 @@ SERVER_ARGS="--bind 127.0.0.1 --port $PORT --root $CLI_WORK/data \
 --db $CLI_WORK/state/metadata.sqlite3 --secret-file $CLI_WORK/secrets.env \
 --pid-file $CLI_WORK/state/server.pid --log-file $CLI_WORK/logs/server.log --quiet"
 # shellcheck disable=SC2086
-./build/backup-server $SERVER_ARGS &
+./$OBJ_ROOT/backup-server $SERVER_ARGS &
 SERVER_PID=$!
 cleanup_server() {
   if kill -0 "$SERVER_PID" 2>/dev/null; then
@@ -168,7 +188,7 @@ REMOTE_OPTS="--host 127.0.0.1 --port $PORT"
 # 注意：这个脚本没有开 errexit，这里也**不能**顺手 set -e——
 # 那会让后面任何一次 grep 未命中直接结束整个套件。
 run_remote() {
-  timeout --signal=KILL 300 ./build/backupctl remote "$@" $REMOTE_OPTS \
+  timeout --signal=KILL 300 ./$OBJ_ROOT/backupctl remote "$@" $REMOTE_OPTS \
     >"$CLI_WORK/last.txt" 2>&1
   echo $?
 }
@@ -212,9 +232,9 @@ printf 'alpha\n' > "$CLI_WORK/src/a.txt"
 printf 'bee\n' > "$CLI_WORK/src/sub/b.txt"
 head -c 4096 /dev/urandom > "$CLI_WORK/src/blob.bin"
 CONFIG_FILE="$CLI_WORK/config.json"
-./build/backupctl config repository set "$CLI_WORK/repo" \
+./$OBJ_ROOT/backupctl config repository set "$CLI_WORK/repo" \
   --config-file "$CONFIG_FILE" >"$CLI_WORK/last.txt" 2>&1
-./build/backupctl backup "$CLI_WORK/src" --config-file "$CONFIG_FILE" \
+./$OBJ_ROOT/backupctl backup "$CLI_WORK/src" --config-file "$CONFIG_FILE" \
   >"$CLI_WORK/backup.txt" 2>&1
 BACKUP_CODE=$?
 if [ "$BACKUP_CODE" = "0" ]; then
@@ -274,10 +294,10 @@ check_remote_fail "B.8 默认不覆盖已存在的目标" \
   download "$SNAPSHOT_ID" "$DOWNLOADED" --user "$USER_A"
 
 # 用同一个 restore 引擎恢复下载回来的归档，再与源目录逐字节比较。
-if [ ! -x ./build/archive-cli ]; then
-  make -C "$ROOT_DIR" test-fixtures >/dev/null 2>&1
+if [ ! -x ./$OBJ_ROOT/archive-cli ]; then
+  make -C "$ROOT_DIR" BUILD_DIR="$OBJ_ROOT" test-fixtures >/dev/null 2>&1
 fi
-timeout --signal=KILL 120 ./build/archive-cli restore "$DOWNLOADED" \
+timeout --signal=KILL 120 ./$OBJ_ROOT/archive-cli restore "$DOWNLOADED" \
   "$CLI_WORK/restored" >"$CLI_WORK/restore.txt" 2>&1
 RESTORE_CODE=$?
 if [ "$RESTORE_CODE" = "0" ] \
@@ -339,7 +359,7 @@ record_pass "B.14 服务端优雅停止"
 # 停止竞态：紧接着 Start 之后发 SIGTERM 也必须能停下来。
 # （stop 标志在 Start() 里复位而不是 Run() 里，否则这次请求会被吞掉。）
 SECOND_PORT=$((PORT + 1))
-./build/backup-server --bind 127.0.0.1 --port "$SECOND_PORT" \
+./$OBJ_ROOT/backup-server --bind 127.0.0.1 --port "$SECOND_PORT" \
   --root "$CLI_WORK/data2" --db "$CLI_WORK/state/metadata2.sqlite3" \
   --secret-file "$CLI_WORK/secrets.env" --pid-file "$CLI_WORK/state/server2.pid" \
   --quiet >/dev/null 2>&1 &
