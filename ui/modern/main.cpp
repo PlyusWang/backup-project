@@ -2742,11 +2742,13 @@ int RunRemoteTest(QQuickWindow* window, backup_modern::RemoteController* remote,
                 .arg(directoryContains(xdg_root, password_bytes)));
 
   // ---- REMOTE-12：两套主题下的组件契约 ----
-  const char* layout_names[] = {"remoteHostField",      "remotePortField",
-                                "remoteUserField",      "remotePasswordField",
-                                "remoteRegisterButton", "remoteLoginButton",
-                                "remoteLogoutButton",   "remoteUploadButton",
-                                "remoteRefreshButton",  "remoteStatusBanner"};
+  // 覆盖从最上面一张卡片到最后一张卡片的整页：只查上半页的话，
+  // "云端备份"与"技术详情"两张卡片布局塌掉是看不出来的。
+  const char* layout_names[] = {
+      "remoteHostField",     "remotePortField",      "remoteUserField",
+      "remotePasswordField", "remoteRegisterButton", "remoteLoginButton",
+      "remoteLogoutButton",  "remoteUploadButton",   "remoteRefreshButton",
+      "remoteListSummary",   "remoteStatusBanner",   "remoteTechnicalToggle"};
   QColor light_text;
   for (int dark = 0; dark < 2; ++dark) {
     theme->setDark(dark == 1);
