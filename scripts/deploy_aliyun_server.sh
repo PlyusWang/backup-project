@@ -34,7 +34,14 @@ SHORT_SHA="$(git rev-parse --short HEAD)"
 TARBALL="$STAGE_DIR/backup-server-src-$SHORT_SHA.tar.gz"
 
 echo "[deploy] commit $SOURCE_SHA"
-tar -czf "$TARBALL" Makefile include src/server src/network src/crypto third_party
+# 服务端独有源码在顶层 server/；src/network 只保留协议与客户端
+# （backupctl 与 GUI 也要用）。tar 失败必须立刻中止：否则会拿上一次的
+# 二进制继续部署，看起来"成功"其实部署的是旧东西。
+if ! tar -czf "$TARBALL" Makefile include server src/network src/crypto \
+     third_party; then
+  echo "[deploy] cannot build the source tarball" >&2
+  exit 1
+fi
 sha256sum "$TARBALL" | tee "$STAGE_DIR/backup-server-src-$SHORT_SHA.sha256"
 
 echo "[deploy] upload the source subset"
