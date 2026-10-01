@@ -161,6 +161,9 @@ run_unit remote_client_test "$SERVER_OBJECTS $CRYPTO_OBJECTS" \
 # 账户注销：真实服务端 + 真实 SQLite + 真实磁盘，含元数据事务故障注入。
 run_unit remote_account_test "$SERVER_OBJECTS $CRYPTO_OBJECTS" \
   "$SQLITE_LIBRARY" -pthread
+# 请求序列回归：空闲超时、错误口令 × 6、LIST × 10、20 轮、注销序列、不重发。
+run_unit remote_sequence_test "$SERVER_OBJECTS $CRYPTO_OBJECTS" \
+  "$SQLITE_LIBRARY" -pthread
 
 echo
 echo
