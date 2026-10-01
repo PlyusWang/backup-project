@@ -76,8 +76,11 @@ NET_OBJECTS="$OBJ_ROOT/src/network/network_protocol.o"
 # 排除 main.o：单元测试有自己的 main，链接服务端的 main 会重复定义。
 # 排除 main.o（单元测试有自己的 main）与 crypto/*（那部分统一用
 # $OBJ_ROOT/src/crypto 下的目标文件，两处都链会重复定义）。
+# 排除 main.o（单元测试有自己的 main）、admin_main.o（管理工具自己的 main，
+# 链接进来会与单元测试的 main 重复定义）与 crypto/*（那部分统一用
+# $OBJ_ROOT/src/crypto 下的目标文件，两处都链会重复定义）。
 SERVER_ONLY="$(find "$OBJ_ROOT/server" -name '*.o' ! -name 'main.o' \
-  ! -path '*/crypto/*' 2>/dev/null | sort | tr '\n' ' ')"
+  ! -name 'admin_main.o' ! -path '*/crypto/*' 2>/dev/null | sort | tr '\n' ' ')"
 SERVER_AUTH_OBJ="$(find "$OBJ_ROOT/server" -name 'remote_auth.o' 2>/dev/null | head -1)"
 SERVER_STORE_OBJ="$(find "$OBJ_ROOT/server" -name 'remote_metadata_store.o' 2>/dev/null | head -1)"
 SERVER_OBJECTS="$SERVER_ONLY $OBJ_ROOT/src/network/remote_backup_client.o"
@@ -154,6 +157,9 @@ run_unit remote_transfer_test "$SERVER_OBJECTS $CRYPTO_OBJECTS" \
 grep -E '^(RSS_BOUND|ASAN):' "$TEST_ROOT/remote_transfer_test.log" \
   | sed 's/^/  /' || true
 run_unit remote_client_test "$SERVER_OBJECTS $CRYPTO_OBJECTS" \
+  "$SQLITE_LIBRARY" -pthread
+# 账户注销：真实服务端 + 真实 SQLite + 真实磁盘，含元数据事务故障注入。
+run_unit remote_account_test "$SERVER_OBJECTS $CRYPTO_OBJECTS" \
   "$SQLITE_LIBRARY" -pthread
 
 echo
