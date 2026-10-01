@@ -471,6 +471,30 @@ int main() {
                                 static_cast<std::uint16_t>(
                                     net::Opcode::kLogin)),
                         "BPNET T15 空 payload 许可表");
+    // PR #20 closure：注销账户是**用户**操作，它出现在协议里；管理员能力不在
+    // 协议里。这两件事必须能被区分开：
+    //   * DELETE_ACCOUNT 是已知操作码，而且必须带口令载荷（不允许空载荷）；
+    //   * 0x0100..0x01FF 这一整段（最容易被后人拿来做 ADMIN_* 的地方）一个
+    //     已知操作码都没有——管理工具是 ECS 本机程序，不通过 BPNET1 暴露，
+    //     也不应该有人在协议里给它留门。
+    test_support::Check(
+        net::IsKnownOpcode(
+            static_cast<std::uint16_t>(net::Opcode::kDeleteAccount)) &&
+            std::string(net::OpcodeName(static_cast<std::uint16_t>(
+                            net::Opcode::kDeleteAccount))) ==
+                "DELETE_ACCOUNT" &&
+            !net::OpcodeAllowsEmptyPayload(static_cast<std::uint16_t>(
+                net::Opcode::kDeleteAccount)),
+        "BPNET T15 注销账户是已知操作码，且必须带口令载荷");
+    bool admin_range_clean = true;
+    for (std::uint32_t opcode = 0x0100; opcode <= 0x01FF; ++opcode) {
+      if (net::IsKnownOpcode(static_cast<std::uint16_t>(opcode))) {
+        admin_range_clean = false;
+      }
+    }
+    test_support::Check(admin_range_clean,
+                        "BPNET T15 0x0100..0x01FF 里没有任何已知操作码"
+                        "（协议里没有管理员入口）");
   }
 
   test_support::Section("BPNET 16. 字段校验表");

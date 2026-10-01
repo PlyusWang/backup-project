@@ -419,6 +419,47 @@ else
   record_pass "没有 standalone OperationPage"
 fi
 
+# ---- 反向 / 正向断言的小工具 ----
+#
+# 这三个函数在 PR #20 的远程备份页一节就要用，而那一节在文件里的位置比"自动
+# 备份页"更靠前，所以定义放在这里（函数在调用时才解析，定义一次两处都能用）。
+expect_present() {
+  local file="$1"
+  local pattern="$2"
+  local label="$3"
+  if grep -qF -- "$pattern" "$file"; then
+    record_pass "$label"
+  else
+    record_fail "$label（缺少：$pattern）"
+  fi
+}
+
+# 反向断言（只看代码行）：注释里写"以前这里是 ext:cpp;h"是正常的说明，
+# 断言的是**用户看得到的文案**里没有它，所以先剔掉 // 开头的行。
+expect_missing_code() {
+  local file="$1"
+  local pattern="$2"
+  local label="$3"
+  # grep -n 的输出是 "行号:内容"（没有文件名前缀），所以过滤的是 ^行号: //
+  if grep -nF -- "$pattern" "$file" | grep -vE '^[0-9]+:[[:space:]]*//' | grep -q .; then
+    record_fail "$label（代码里不该出现：$pattern）"
+  else
+    record_pass "$label"
+  fi
+}
+
+# 反向断言：界面上不该出现东西，和"该出现"一样重要。
+expect_missing() {
+  local file="$1"
+  local pattern="$2"
+  local label="$3"
+  if grep -qF -- "$pattern" "$file"; then
+    record_fail "$label（不该出现：$pattern）"
+  else
+    record_pass "$label"
+  fi
+}
+
 # ---- PR #20 远程备份页 ----
 #
 # 这一页是 GUI 与远程备份网络层之间**唯一**的入口。下面这几条把它钉住：
@@ -435,8 +476,9 @@ expect_count "$RESOURCE_FILE" "qml/components/RemoteSnapshotCard.qml" 1 \
 expect_count "$QML_DIR/Main.qml" 'objectName: "remoteNavItem"' 1 \
   "侧栏只有一个远程备份入口"
 # 明文常显的密码框在这一页是绝不允许出现的样子。
-expect_count "$REMOTE_PAGE_QML" "echoMode: TextInput.Password" 1 \
-  "远程备份页的密码框是密码回显模式"
+# 登录密码 + 注册密码 + 注册确认密码 + 注销确认密码：四个都必须是密码回显。
+expect_count "$REMOTE_PAGE_QML" "echoMode: TextInput.Password" 4 \
+  "远程备份页的四个密码框都是密码回显模式"
 # 删除必须经过确认：整页真正调用客户端删除的地方只有一处，
 # 而且列表行只发意图（一个信号声明 + 一个触发）。
 expect_count "$REMOTE_PAGE_QML" "remote.deleteSnapshot(" 1 \
@@ -462,7 +504,9 @@ expect_count "$REMOTE_PAGE_QML" "AppCard {" 4 \
   "远程备份页的四张卡片都用共享 AppCard"
 expect_count "$REMOTE_PAGE_QML" "StatusBanner {" 1 \
   "远程备份页用共享 StatusBanner"
-expect_count "$REMOTE_PAGE_QML" "AppTextField {" 7 \
+# 地址 / 端口 / 用户名 / 登录密码 / 注册密码 / 注册确认 / 上传路径 / 上传名称 /
+# 下载目标 / 注销密码 / 注销账户名 = 11。
+expect_count "$REMOTE_PAGE_QML" "AppTextField {" 11 \
   "远程备份页的输入框都用共享 AppTextField"
 # 第二套 socket / 协议实现？GUI 这一侧只允许经 RemoteController 调共享客户端。
 # 断言只看代码行：注释里说明"这里没有 socket"是正常的。
@@ -486,8 +530,66 @@ if grep -qE 'QSettings|setValue\(|QStandardPaths::writableLocation' "$REMOTE_COD
 else
   record_pass "口令与令牌只在内存：GUI 侧没有任何持久化调用"
 fi
-expect_count "$REMOTE_CONTROLLER_CPP" "password_.fill(QChar(0))" 2 \
-  "退出登录与析构都会擦掉内存里的口令"
+expect_count "$REMOTE_CONTROLLER_CPP" "password_.fill(QChar(0))" 3 \
+  "退出登录、注销账户与析构都会擦掉内存里的口令"
+
+# ---- PR #20 closure：账户区域（登录 / 注册两个标签页）----
+#
+# 人工验收的结论：用户名 / 密码 / 注册 / 登录 / 退出登录堆在同一块里，用户分不清
+# "我在登录还是在注册"，注册也只有一个密码框。这一节把新的信息架构钉成契约。
+expect_count "$REMOTE_PAGE_QML" 'objectName: "remoteLoginTabButton"' 1 \
+  "账户区域有「登录」标签"
+expect_count "$REMOTE_PAGE_QML" 'objectName: "remoteRegisterTabButton"' 1 \
+  "账户区域有「注册」标签"
+expect_count "$REMOTE_PAGE_QML" 'objectName: "remoteRegisterPasswordField"' 1 \
+  "注册标签有独立的密码输入框"
+expect_count "$REMOTE_PAGE_QML" 'objectName: "remoteRegisterConfirmField"' 1 \
+  "注册标签有「确认密码」输入框"
+expect_count "$REMOTE_PAGE_QML" '"确认密码"' 1 \
+  "确认密码的标签是中文的「确认密码」"
+expect_count "$REMOTE_PAGE_QML" 'objectName: "remoteAccountText"' 1 \
+  "已登录时显示当前账户"
+expect_count "$REMOTE_PAGE_QML" 'objectName: "remoteAccountStateText"' 1 \
+  "已登录时显示「状态：已登录」"
+expect_count "$REMOTE_PAGE_QML" 'objectName: "remoteDeleteAccountButton"' 1 \
+  "已登录时提供注销账户入口"
+expect_count "$REMOTE_PAGE_QML" 'objectName: "remoteDeleteAccountDialog"' 1 \
+  "注销账户有独立的确认对话框"
+expect_count "$REMOTE_PAGE_QML" 'objectName: "remoteDeletePasswordField"' 1 \
+  "注销对话框要求再次输入当前密码"
+expect_count "$REMOTE_PAGE_QML" 'objectName: "remoteDeleteNameField"' 1 \
+  "注销对话框要求逐字输入当前账户名"
+expect_present "$REMOTE_PAGE_QML" \
+  "注销账户会永久删除该账户以及全部云端备份，此操作无法撤销。" \
+  "注销对话框写明了不可撤销的后果"
+expect_count "$REMOTE_PAGE_QML" "remote.deleteAccount(" 1 \
+  "整页只有一处真正调用注销"
+expect_count "$REMOTE_PAGE_QML" "remote.logoutLocal()" 1 \
+  "「退出登录」只有一处，与注销是两个不同的动作"
+expect_present "$REMOTE_PAGE_QML" \
+  "两个密码框必须完全一致；不一致时不会发送任何请求。" \
+  "注册标签写明了两次密码必须一致"
+# 本地校验：不一致时不发请求（检查在控制器里，且在 AcceptEndpoint 之前）。
+expect_present "$REMOTE_CONTROLLER_CPP" "password != confirm_password" \
+  "控制器在提交之前比较两次注册密码"
+expect_present "$REMOTE_CONTROLLER_H" "const QString& confirm_password" \
+  "registerAccount 的签名带确认密码"
+expect_present "$ROOT_DIR/include/remote_backup_client.h" \
+  "bool DeleteAccount(const std::string& password" \
+  "共享客户端有真正的注销账户入口（CLI 与 GUI 共用）"
+# 状态语义：不许再把"还没有连接"写成"未连接 / 已连接"。
+expect_missing_code "$REMOTE_CONTROLLER_CPP" '"未连接"' \
+  "控制器里不再有「未连接」这种常驻状态文案"
+expect_missing "$REMOTE_PAGE_QML" "未连接" \
+  "远程备份页不再显示「未连接」"
+expect_missing "$REMOTE_PAGE_QML" "已连接" \
+  "远程备份页不再显示「已连接」"
+expect_present "$REMOTE_CONTROLLER_CPP" "serverReachabilityText" \
+  "可达性是「上一次连接尝试的结果」，只有试过才有结论"
+expect_present "$REMOTE_PAGE_QML" "remote.serverReachabilityText" \
+  "可达性文案由控制器给出（QML 不自己判断）"
+expect_present "$REMOTE_CONTROLLER_H" "RemoteReachability::kUnknown" \
+  "可达性默认是「还不知道」，而不是「不可达」"
 for page in BackupPage BackupManagementPage SettingsPage; do
   expect_count_re "$RESOURCE_FILE" "qml/pages/${page}\.qml" 1 "resources.qrc 收录 $page.qml"
 done
@@ -1616,42 +1718,8 @@ SCHEDULE_PAGE_QML="$QML_DIR/pages/SchedulePage.qml"
 SCHEDULE_CTRL_CPP="$ROOT_DIR/ui/modern/schedule_controller.cpp"
 SCHEDULE_CTRL_H="$ROOT_DIR/ui/modern/schedule_controller.h"
 
-expect_present() {
-  local file="$1"
-  local pattern="$2"
-  local label="$3"
-  if grep -qF -- "$pattern" "$file"; then
-    record_pass "$label"
-  else
-    record_fail "$label（缺少：$pattern）"
-  fi
-}
-
-# 反向断言（只看代码行）：注释里写"以前这里是 ext:cpp;h"是正常的说明，
-# 断言的是**用户看得到的文案**里没有它，所以先剔掉 // 开头的行。
-expect_missing_code() {
-  local file="$1"
-  local pattern="$2"
-  local label="$3"
-  # grep -n 的输出是 "行号:内容"（没有文件名前缀），所以过滤的是 ^行号: //
-  if grep -nF -- "$pattern" "$file" | grep -vE '^[0-9]+:[[:space:]]*//' | grep -q .; then
-    record_fail "$label（代码里不该出现：$pattern）"
-  else
-    record_pass "$label"
-  fi
-}
-
-# 反向断言：界面上不该出现东西，和"该出现"一样重要。
-expect_missing() {
-  local file="$1"
-  local pattern="$2"
-  local label="$3"
-  if grep -qF -- "$pattern" "$file"; then
-    record_fail "$label（不该出现：$pattern）"
-  else
-    record_pass "$label"
-  fi
-}
+# expect_present / expect_missing / expect_missing_code 定义在文件靠前的
+# "远程备份页"一节之前：那里也要用，而这一节在它后面。
 
 # --- 页面在资源清单与导航里 ---
 expect_count "$RESOURCE_FILE" "qml/pages/SchedulePage.qml" 1 \
