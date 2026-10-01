@@ -31,7 +31,9 @@ HOST="${2:-127.0.0.1}"
 PORT="${3:-18765}"
 IDLE="${4:-31}"
 
-WORK="$ROOT_DIR/testdata/aliyun-sequence"
+# 工作目录刻意放在 /tmp 而不是仓库的 testdata/ 下：仓库里的测试套件（scripts/
+# test.sh）会整棵清掉 testdata，跑在同一个仓库上的复验会被它顺手删掉中间产物。
+WORK="${TMPDIR:-/tmp}/aliyun-sequence"
 rm -rf "$WORK"
 mkdir -p "$WORK/src" "$WORK/repo" "$WORK/out"
 
