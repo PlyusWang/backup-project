@@ -83,6 +83,13 @@ enum class Opcode : std::uint16_t {
   kDownloadChunk = 31,
   kDownloadEnd = 32,
   kDelete = 40,
+  // 注销账户：删除调用方**自己的**账户以及它的全部云端数据。
+  //
+  // 它不是 LOGOUT：LOGOUT 只结束这条连接上的会话，账户与数据都还在。
+  // 载荷是当前口令（u16 前缀字符串），服务端重新校验一次——一个过期或被
+  // 偷到的 token 不足以删掉一个账户。请求里**没有**用户名：目标永远是
+  // token 自己所属的那个 user id，客户端无法指定删别人。
+  kDeleteAccount = 41,
   // 请求帧本身非法（版本不对、操作码不认识）时的通用错误响应。
   kError = 0xFFFE,
 };

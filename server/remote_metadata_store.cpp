@@ -5,6 +5,7 @@
 #include <sqlite3.h>
 
 #include <cstring>
+#include <ctime>
 #include <utility>
 
 namespace backupproject {
@@ -38,6 +39,12 @@ constexpr const char* kSchemaStatements[] = {
     "  created_at INTEGER NOT NULL,"
     "  storage_name TEXT NOT NULL,"
     "  FOREIGN KEY(user_id) REFERENCES users(id)"
+    ");",
+    // 注销墓碑：user id 永不重用的依据，也是"这个账户确实注销过"的审计行。
+    // 它不存用户名、不存口令、不存任何 blob 引用，所以留着它不构成隐私面。
+    "CREATE TABLE IF NOT EXISTS deleted_users ("
+    "  id INTEGER PRIMARY KEY,"
+    "  deleted_at INTEGER NOT NULL"
     ");",
     "CREATE INDEX IF NOT EXISTS snapshots_by_user"
     "  ON snapshots(user_id, created_at, id);",
@@ -253,22 +260,47 @@ StoreResult RemoteMetadataStore::CreateUser(const std::string& username,
     }
     return StoreResult::kError;
   }
+  // user id 显式分配：下一个 id 严格大于 users 与 deleted_users 里的最大值。
+  // 用 INSERT 的隐式 rowid 会在"删掉最大的那一行"之后把 id 还给下一个注册者，
+  // 于是一个注销前签发的 token（签名仍然有效）就命中了别人的新账户。
+  // 整个分配 + 插入在同一个互斥区间里，进程内因此没有竞态。
+  std::int64_t next_user_id = 0;
+  {
+    Statement allocate;
+    if (!Prepare(
+            "SELECT MAX(users_max, deleted_max) + 1 FROM ("
+            "  SELECT COALESCE((SELECT MAX(id) FROM users), 0) AS users_max,"
+            "         COALESCE((SELECT MAX(id) FROM deleted_users), 0)"
+            "           AS deleted_max);",
+            allocate.out(), error_message)) {
+      return StoreResult::kError;
+    }
+    if (sqlite3_step(allocate.get()) != SQLITE_ROW) {
+      if (error_message != nullptr) {
+        *error_message = "cannot allocate the next user id: " + LastError();
+      }
+      return StoreResult::kError;
+    }
+    next_user_id = sqlite3_column_int64(allocate.get(), 0);
+  }
   Statement statement;
   if (!Prepare("INSERT INTO users"
-               " (username, password_salt, password_hash, password_iterations,"
-               "  created_at) VALUES (?, ?, ?, ?, ?);",
+               " (id, username, password_salt, password_hash,"
+               "  password_iterations, created_at) VALUES (?, ?, ?, ?, ?, ?);",
                statement.out(), error_message)) {
     return StoreResult::kError;
   }
-  sqlite3_bind_text(statement.get(), 1, username.c_str(),
+  sqlite3_bind_int64(statement.get(), 1,
+                     static_cast<sqlite3_int64>(next_user_id));
+  sqlite3_bind_text(statement.get(), 2, username.c_str(),
                     static_cast<int>(username.size()), SQLITE_TRANSIENT);
-  sqlite3_bind_blob(statement.get(), 2, password.salt.data(),
+  sqlite3_bind_blob(statement.get(), 3, password.salt.data(),
                     static_cast<int>(password.salt.size()), SQLITE_TRANSIENT);
-  sqlite3_bind_blob(statement.get(), 3, password.hash.data(),
+  sqlite3_bind_blob(statement.get(), 4, password.hash.data(),
                     static_cast<int>(password.hash.size()), SQLITE_TRANSIENT);
-  sqlite3_bind_int64(statement.get(), 4,
-                     static_cast<sqlite3_int64>(password.iterations));
   sqlite3_bind_int64(statement.get(), 5,
+                     static_cast<sqlite3_int64>(password.iterations));
+  sqlite3_bind_int64(statement.get(), 6,
                      static_cast<sqlite3_int64>(created_at));
   const int code = sqlite3_step(statement.get());
   if (code == SQLITE_CONSTRAINT) {
@@ -281,8 +313,7 @@ StoreResult RemoteMetadataStore::CreateUser(const std::string& username,
     return StoreResult::kError;
   }
   if (out_user_id != nullptr) {
-    *out_user_id =
-        static_cast<std::int64_t>(sqlite3_last_insert_rowid(database_));
+    *out_user_id = next_user_id;
   }
   return StoreResult::kOk;
 }
@@ -581,6 +612,232 @@ StoreResult RemoteMetadataStore::CountSnapshots(std::int64_t user_id,
   }
   if (out != nullptr) {
     *out = static_cast<std::uint64_t>(sqlite3_column_int64(statement.get(), 0));
+  }
+  return StoreResult::kOk;
+}
+
+StoreResult RemoteMetadataStore::ListUsers(
+    std::vector<RemoteUserSummary>* out, std::string* error_message) {
+  std::lock_guard<std::mutex> guard(mutex_);
+  if (database_ == nullptr) {
+    if (error_message != nullptr) {
+      *error_message = "the metadata store is not open";
+    }
+    return StoreResult::kError;
+  }
+  // 列是逐个写出来的：口令相关的列一次都不出现在这条 SQL 里。管理工具
+  // 因此不是"记得不要打印 hash"，而是根本拿不到 hash。
+  Statement statement;
+  if (!Prepare(
+          "SELECT u.id, u.username, u.created_at, COUNT(s.id),"
+          " COALESCE(SUM(s.size_bytes), 0) FROM users u"
+          " LEFT JOIN snapshots s ON s.user_id = u.id"
+          " GROUP BY u.id, u.username, u.created_at ORDER BY u.id;",
+          statement.out(), error_message)) {
+    return StoreResult::kError;
+  }
+  std::vector<RemoteUserSummary> parsed;
+  for (;;) {
+    const int code = sqlite3_step(statement.get());
+    if (code == SQLITE_DONE) {
+      break;
+    }
+    if (code != SQLITE_ROW) {
+      if (error_message != nullptr) {
+        *error_message = "cannot read the user rows: " + LastError();
+      }
+      return StoreResult::kError;
+    }
+    RemoteUserSummary summary;
+    summary.user_id = sqlite3_column_int64(statement.get(), 0);
+    summary.username = ColumnText(statement.get(), 1);
+    summary.created_at = sqlite3_column_int64(statement.get(), 2);
+    summary.snapshot_count =
+        static_cast<std::uint64_t>(sqlite3_column_int64(statement.get(), 3));
+    summary.total_bytes =
+        static_cast<std::uint64_t>(sqlite3_column_int64(statement.get(), 4));
+    parsed.push_back(summary);
+  }
+  if (out != nullptr) {
+    *out = parsed;
+  }
+  return StoreResult::kOk;
+}
+
+StoreResult RemoteMetadataStore::StorageOverview(RemoteStorageOverview* out,
+                                                 std::string* error_message) {
+  std::lock_guard<std::mutex> guard(mutex_);
+  if (database_ == nullptr) {
+    if (error_message != nullptr) {
+      *error_message = "the metadata store is not open";
+    }
+    return StoreResult::kError;
+  }
+  RemoteStorageOverview overview;
+  {
+    Statement statement;
+    if (!Prepare("SELECT COUNT(*) FROM users;", statement.out(),
+                 error_message) ||
+        sqlite3_step(statement.get()) != SQLITE_ROW) {
+      if (error_message != nullptr && error_message->empty()) {
+        *error_message = "cannot count the user rows: " + LastError();
+      }
+      return StoreResult::kError;
+    }
+    overview.user_count =
+        static_cast<std::uint64_t>(sqlite3_column_int64(statement.get(), 0));
+  }
+  {
+    Statement statement;
+    if (!Prepare("SELECT COUNT(*), COALESCE(SUM(size_bytes), 0) FROM snapshots;",
+                 statement.out(), error_message) ||
+        sqlite3_step(statement.get()) != SQLITE_ROW) {
+      if (error_message != nullptr && error_message->empty()) {
+        *error_message = "cannot aggregate the snapshot rows: " + LastError();
+      }
+      return StoreResult::kError;
+    }
+    overview.snapshot_count =
+        static_cast<std::uint64_t>(sqlite3_column_int64(statement.get(), 0));
+    overview.total_bytes =
+        static_cast<std::uint64_t>(sqlite3_column_int64(statement.get(), 1));
+  }
+  {
+    Statement statement;
+    if (!Prepare("SELECT COUNT(*) FROM deleted_users;", statement.out(),
+                 error_message) ||
+        sqlite3_step(statement.get()) != SQLITE_ROW) {
+      if (error_message != nullptr && error_message->empty()) {
+        *error_message = "cannot count the deleted user rows: " + LastError();
+      }
+      return StoreResult::kError;
+    }
+    overview.deleted_user_count =
+        static_cast<std::uint64_t>(sqlite3_column_int64(statement.get(), 0));
+  }
+  if (out != nullptr) {
+    *out = overview;
+  }
+  return StoreResult::kOk;
+}
+
+StoreResult RemoteMetadataStore::DeleteUser(std::int64_t user_id,
+                                            std::uint64_t* removed_snapshots,
+                                            std::uint64_t* removed_bytes,
+                                            std::string* error_message) {
+  std::lock_guard<std::mutex> guard(mutex_);
+  if (database_ == nullptr) {
+    if (error_message != nullptr) {
+      *error_message = "the metadata store is not open";
+    }
+    return StoreResult::kError;
+  }
+  if (!Execute("BEGIN IMMEDIATE;", error_message)) {
+    return StoreResult::kError;
+  }
+  const auto rollback = [this]() { Execute("ROLLBACK;", nullptr); };
+
+  std::uint64_t snapshots = 0;
+  std::uint64_t bytes = 0;
+  {
+    Statement select;
+    if (!Prepare("SELECT COUNT(*), COALESCE(SUM(size_bytes), 0) FROM snapshots"
+                 " WHERE user_id = ?;",
+                 select.out(), error_message)) {
+      rollback();
+      return StoreResult::kError;
+    }
+    sqlite3_bind_int64(select.get(), 1, static_cast<sqlite3_int64>(user_id));
+    if (sqlite3_step(select.get()) != SQLITE_ROW) {
+      if (error_message != nullptr) {
+        *error_message = "cannot aggregate the snapshot rows: " + LastError();
+      }
+      rollback();
+      return StoreResult::kError;
+    }
+    snapshots =
+        static_cast<std::uint64_t>(sqlite3_column_int64(select.get(), 0));
+    bytes = static_cast<std::uint64_t>(sqlite3_column_int64(select.get(), 1));
+  }
+  {
+    Statement remove;
+    if (!Prepare("DELETE FROM snapshots WHERE user_id = ?;", remove.out(),
+                 error_message)) {
+      rollback();
+      return StoreResult::kError;
+    }
+    sqlite3_bind_int64(remove.get(), 1, static_cast<sqlite3_int64>(user_id));
+    if (sqlite3_step(remove.get()) != SQLITE_DONE) {
+      if (error_message != nullptr) {
+        *error_message = "cannot delete the snapshot rows: " + LastError();
+      }
+      rollback();
+      return StoreResult::kError;
+    }
+  }
+  {
+    Statement remove;
+    if (!Prepare("DELETE FROM users WHERE id = ?;", remove.out(),
+                 error_message)) {
+      rollback();
+      return StoreResult::kError;
+    }
+    sqlite3_bind_int64(remove.get(), 1, static_cast<sqlite3_int64>(user_id));
+    if (sqlite3_step(remove.get()) != SQLITE_DONE) {
+      if (error_message != nullptr) {
+        *error_message = "cannot delete the user row: " + LastError();
+      }
+      rollback();
+      return StoreResult::kError;
+    }
+    if (sqlite3_changes(database_) != 1) {
+      if (error_message != nullptr) {
+        *error_message = "no such user row";
+      }
+      // 账户不在了（或者从来不存在）：整个事务回滚，调用方按 NOT_FOUND 处理，
+      // 磁盘上的隔离动作也会被撤回。
+      rollback();
+      return StoreResult::kNotFound;
+    }
+  }
+  {
+    // 墓碑：id 从此不再被分配。时间戳只是给人看的审计信息。
+    Statement mark;
+    if (!Prepare("INSERT OR REPLACE INTO deleted_users (id, deleted_at)"
+                 " VALUES (?, ?);",
+                 mark.out(), error_message)) {
+      rollback();
+      return StoreResult::kError;
+    }
+    sqlite3_bind_int64(mark.get(), 1, static_cast<sqlite3_int64>(user_id));
+    sqlite3_bind_int64(mark.get(), 2,
+                       static_cast<sqlite3_int64>(std::time(nullptr)));
+    if (sqlite3_step(mark.get()) != SQLITE_DONE) {
+      if (error_message != nullptr) {
+        *error_message = "cannot write the deleted user tombstone: " +
+                         LastError();
+      }
+      rollback();
+      return StoreResult::kError;
+    }
+  }
+  if (fail_next_delete_user_) {
+    fail_next_delete_user_ = false;
+    if (error_message != nullptr) {
+      *error_message = "injected delete failure (test seam)";
+    }
+    rollback();
+    return StoreResult::kError;
+  }
+  if (!Execute("COMMIT;", error_message)) {
+    rollback();
+    return StoreResult::kError;
+  }
+  if (removed_snapshots != nullptr) {
+    *removed_snapshots = snapshots;
+  }
+  if (removed_bytes != nullptr) {
+    *removed_bytes = bytes;
   }
   return StoreResult::kOk;
 }

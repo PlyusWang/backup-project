@@ -104,6 +104,16 @@ class RemoteArchiveClient {
 
   bool Delete(const std::string& snapshot_id, std::string* error_message);
 
+  // 注销当前账户：服务端删除该账户以及它的全部云端备份。
+  //
+  // 与 Logout 的区别是本模块对外语义的一部分：Logout 只清掉本机内存里的会话
+  // （云端数据一点没动），DeleteAccount 是不可撤销的服务端删除。载荷是当前
+  // 口令——服务端会用同一个账户的口令再校验一次，所以一个被捡到的 token
+  // 不足以删掉账户。口令只走这条连接，不写日志、不落盘。
+  // 成功之后本客户端的会话立即失效（token 在内存里被丢弃，连接仍可继续
+  // 用于注册 / 登录）；失败（例如口令不对）不动会话。
+  bool DeleteAccount(const std::string& password, std::string* error_message);
+
   // 最近一次失败的原始原因（英文协议层原因），供日志与测试使用。
   const std::string& last_error() const { return last_error_; }
 

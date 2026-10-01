@@ -182,6 +182,7 @@ bool IsKnownOpcode(std::uint16_t opcode) {
     case Opcode::kDownloadChunk:
     case Opcode::kDownloadEnd:
     case Opcode::kDelete:
+    case Opcode::kDeleteAccount:
     case Opcode::kError:
       return true;
   }
@@ -214,6 +215,8 @@ const char* OpcodeName(std::uint16_t opcode) {
       return "DOWNLOAD_END";
     case Opcode::kDelete:
       return "DELETE";
+    case Opcode::kDeleteAccount:
+      return "DELETE_ACCOUNT";
     case Opcode::kError:
       return "ERROR";
   }

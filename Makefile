@@ -62,7 +62,9 @@ SERVER_TARGET := $(BUILD_DIR)/backup-server
 SERVER_CORE_SOURCES := src/network/network_protocol.cpp \
                        server/remote_auth.cpp \
                        server/remote_metadata_store.cpp \
+                       server/remote_maintenance.cpp \
                        server/remote_server.cpp \
+                       src/platform/file_lock.cpp \
                        src/crypto/sha256.cpp \
                        src/crypto/hmac.cpp \
                        src/crypto/pbkdf2.cpp \

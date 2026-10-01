@@ -24,6 +24,12 @@
 // 所以"最大并发客户端"就是 worker_count，不存在"每来一个连接 new 一个
 // detached 线程"的路径。SQLite 访问用一把互斥锁串行化 + busy timeout，
 // 因此并发写不会随机得到 "database is locked"。
+//
+// 数据目录锁：Start() 会在 <root>/.backup-server.lock 上抢一把 flock 独占锁，
+// 并一直持有到 Stop()（或进程退出）。它同时是两件事的依据：
+//   * "同一个数据目录只有一个写者"——第二个服务端会直接拒绝启动；
+//   * backup-server-admin 判断"服务器是否正在运行"——不是 pgrep 猜的，
+//     而是内核持有的锁；进程崩溃也会被自动释放，不留 stale 状态。
 
 #ifndef BACKUP_PROJECT_INCLUDE_REMOTE_SERVER_H_
 #define BACKUP_PROJECT_INCLUDE_REMOTE_SERVER_H_
@@ -42,6 +48,11 @@
 #include "network_protocol.h"
 
 namespace backupproject {
+
+// 数据目录上的独占锁（实现见 file_lock.h）。这里只前向声明：不需要把
+// <sys/file.h> 那一套带进每一个包含 remote_server.h 的地方。
+class FileLock;
+
 namespace net {
 
 inline constexpr const char* kServerSoftwareName = "backup-server";
@@ -105,6 +116,7 @@ struct ConnectionContext {
 
 class RemoteMetadataStore;
 class RemoteAuth;
+class RemoteMaintenance;
 
 class RemoteServer {
  public:
@@ -140,6 +152,9 @@ class RemoteServer {
   // 产品代码里没有任何地方调用这两个方法。
   void FailNextBlobWriteForTesting() { fail_next_write_ = true; }
   void FailNextMetadataInsertForTesting();
+  // "注销过程中元数据事务失败时不能留下半删除状态"这条路径必须能真的被触发
+  // 一次。产品代码里没有任何地方调用它。
+  void FailNextAccountDeleteForTesting();
 
   // 阻塞式运行：accept + 固定 worker 池，Stop() 之后返回。
   bool Run(std::string* error_message);
@@ -150,6 +165,9 @@ class RemoteServer {
  private:
   bool OpenListener(std::string* error_message);
   bool LoadSecret(std::string* error_message);
+  // 抢 <root>/.backup-server.lock。抢不到说明另一个 backup-server（或者一个
+  // 正在做破坏性操作的管理工具）正拿着它。
+  bool AcquireDataLock(std::string* error_message);
   // 单个帧的业务处理。返回 false 表示连接必须断开。
   bool HandleFrame(int fd, const FrameHeader& header,
                    const std::string& payload, ConnectionContext* context,
@@ -193,6 +211,23 @@ class RemoteServer {
   bool HandleDelete(int fd, const FrameHeader& header,
                     const std::string& payload, ConnectionContext* context,
                     std::string* error_message);
+  // 注销账户：重新校验当前口令 -> 隔离数据目录 -> 事务删元数据 -> 物理清理。
+  bool HandleDeleteAccount(int fd, const FrameHeader& header,
+                           const std::string& payload,
+                           ConnectionContext* context,
+                           std::string* error_message);
+
+  // 每个"会碰到数据"的操作都先过这一关。
+  //
+  // token 的签名只证明"这条 token 是服务端签发的"，不证明"这个账户还在"：
+  // 服务端不保存会话表，注销之后旧 token 的签名依然有效。所以账户是否仍然
+  // 存在必须每次回查数据库。
+  //
+  // 返回 true 表示"账户已经不存在（或者读不出来），错误帧已经发出了"，
+  // 调用方必须立刻 return true，不要再做任何事。
+  bool RejectIfAccountMissing(int fd, const FrameHeader& header,
+                              ConnectionContext* context,
+                              std::string* error_message);
 
   // 清掉上传状态但**不**删文件（发布成功之后用）。
   void ResetUploadState(ConnectionContext* context);
@@ -211,6 +246,10 @@ class RemoteServer {
   RemoteServerConfig config_;
   // 元数据库只在服务端进程里存在：桌面端不链接 SQLite。
   std::unique_ptr<RemoteMetadataStore> store_;
+  // 数据维护原语：DELETE / DELETE_ACCOUNT 与 ECS 本地管理工具共用同一份实现。
+  std::unique_ptr<RemoteMaintenance> maintenance_;
+  // 数据目录独占锁：Start() 之后一直持有到 Stop()（或进程退出）。
+  std::unique_ptr<backupproject::FileLock> data_lock_;
   int listener_fd_ = -1;
   std::uint16_t bound_port_ = 0;
   std::string secret_;
