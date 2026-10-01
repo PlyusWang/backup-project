@@ -128,7 +128,7 @@ FIXTURE_OBJECTS := $(patsubst %.cpp,$(BUILD_DIR)/%.o,$(FIXTURE_SOURCES))
 FIXTURE_CORE_OBJECTS := $(patsubst %.cpp,$(BUILD_DIR)/%.o,$(CORE_SOURCES) $(FILESYSTEM_SOURCES))
 DEPENDS += $(FIXTURE_OBJECTS:.o=.d)
 
-.PHONY: all debug sanitize test test-fixtures server gui gui-modern gui-all clean
+.PHONY: all debug sanitize test test-fixtures server remote-sequence gui gui-modern gui-all clean
 
 # 产品构建：三个产品产物（CLI + 服务端 + 测试夹具除外）。
 # archive-cli 是测试夹具，见上面的说明。
@@ -172,6 +172,27 @@ test-fixtures: $(FIXTURE_TARGET)
 $(FIXTURE_TARGET): $(FIXTURE_OBJECTS) $(FIXTURE_CORE_OBJECTS)
 	@mkdir -p $(BUILD_DIR)
 	$(CXX) $(CXXFLAGS) $(FIXTURE_OBJECTS) $(CORE_OBJECTS) -o $@
+
+# ---- ECS 真机序列驱动器（测试工具，不是产品功能）----
+#
+# tests/tools/remote_sequence.cpp 把人工验收那一串动作（注册 / 错误口令 ×4 /
+# LIST ×10 / 空闲 / 上传 / 下载 / 删除快照 / 注销）跑在**一条真实连接**上，
+# 供 scripts/aliyun_sequence_e2e.sh 在 ECS 真机复验。和 archive-cli 一样，
+# 它不在默认构建里，需要时显式构建：
+#
+#   make remote-sequence
+REMOTE_SEQUENCE_TARGET := $(BUILD_DIR)/remote-sequence
+REMOTE_SEQUENCE_SOURCES := tests/tools/remote_sequence.cpp
+REMOTE_SEQUENCE_OBJECTS := $(patsubst %.cpp,$(BUILD_DIR)/%.o,$(REMOTE_SEQUENCE_SOURCES))
+# CORE_OBJECTS 在下面才定义（GUI 那一段），这里显式算一份同样的集合。
+REMOTE_SEQUENCE_CORE_OBJECTS := $(patsubst %.cpp,$(BUILD_DIR)/%.o,$(CORE_SOURCES) $(FILESYSTEM_SOURCES))
+DEPENDS += $(REMOTE_SEQUENCE_OBJECTS:.o=.d)
+
+remote-sequence: $(REMOTE_SEQUENCE_TARGET)
+
+$(REMOTE_SEQUENCE_TARGET): $(REMOTE_SEQUENCE_OBJECTS) $(REMOTE_SEQUENCE_CORE_OBJECTS)
+	@mkdir -p $(BUILD_DIR)
+	$(CXX) $(CXXFLAGS) $(REMOTE_SEQUENCE_OBJECTS) $(REMOTE_SEQUENCE_CORE_OBJECTS) -o $@
 
 # 服务端源码单独一条模式规则：只有它们需要 SQLite 的头文件路径，
 # 并且统一落在 $(BUILD_DIR)/server/ 下（见上面 SERVER_OBJECTS 的说明）。
