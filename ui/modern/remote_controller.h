@@ -53,6 +53,22 @@
 
 namespace backup_modern {
 
+// 服务器可达性。
+//
+// 只在一个**真的发生过的连接尝试**之后才有一个确定的答案：
+//   kUnknown      还没有试过（界面什么都不说）
+//   kReachable    刚刚连上过
+//   kUnreachable  刚刚的连接尝试失败了
+//
+// 为什么不直接用 client_.connected()：BPNET1 是"每次操作建立连接"，那个
+// 布尔值既短命又容易被读成"服务器健康状态"。旧界面把"还没有试过连接"
+// 写成"未连接"，人工验收时被理解成"服务器挂了 / 隧道断了"。
+enum class RemoteReachability {
+  kUnknown = 0,
+  kReachable = 1,
+  kUnreachable = 2,
+};
+
 // 一次后台网络操作的返回值。
 //
 // 只用值类型：跨线程只发生一次拷贝，后台线程不读控制器的任何成员，也就不需要
@@ -65,10 +81,14 @@ struct RemoteOpResult {
     kUpload,
     kDownload,
     kDelete,
+    // 注销账户：服务端删除，不是"退出登录"。
+    kDeleteAccount,
   };
 
   Kind kind = Kind::kList;
   bool ok = false;
+  // 这次操作对"服务器是否可达"给出的证据（没有尝试连接时是 kUnknown）。
+  RemoteReachability reachability = RemoteReachability::kUnknown;
   // 网络层给出的结构化原始原因（英文；服务端拒绝时形如
   // "UPLOAD_BEGIN -> ALREADY_EXISTS"）。只进 stderr 日志与测试断言，
   // **不**直接显示给用户——用户看到的是 message。
@@ -120,6 +140,10 @@ class RemoteController : public QObject {
   Q_PROPERTY(bool connected READ connected NOTIFY sessionChanged)
   Q_PROPERTY(bool authenticated READ authenticated NOTIFY sessionChanged)
   Q_PROPERTY(QString sessionText READ sessionText NOTIFY sessionChanged)
+  // 服务器可达性：只有在**真的试过一次连接**之后才有内容，空串表示"还没试
+  // 过"。它是"上一次连接尝试的结果"，不是一个持续探测的连接状态。
+  Q_PROPERTY(QString serverReachabilityText READ serverReachabilityText NOTIFY
+                 reachabilityChanged)
   Q_PROPERTY(bool busy READ busy NOTIFY busyChanged)
   Q_PROPERTY(QString busyAction READ busyAction NOTIFY busyChanged)
 
@@ -160,9 +184,12 @@ class RemoteController : public QObject {
   QString host() const { return QString::fromStdString(endpoint_.host); }
   QString portText() const { return QString::number(endpoint_.port); }
   QString username() const { return username_; }
+  // 只是"此刻这条 socket 在不在"。它是短命的实现细节，界面上**不**允许
+  // 把它渲染成一个常驻的"已连接 / 未连接"状态（见 serverReachabilityText）。
   bool connected() const { return client_.connected(); }
   bool authenticated() const { return authenticated_; }
   QString sessionText() const;
+  QString serverReachabilityText() const;
   bool busy() const { return busy_; }
   QString busyAction() const { return busy_action_; }
   QVariantList snapshots() const { return snapshot_items_; }
@@ -187,10 +214,12 @@ class RemoteController : public QObject {
   //
   // 注册与登录都把整份输入带进来；返回 false 表示请求**没有被受理**
   // （输入不合法、已经有一个操作在跑），此时状态条里已经有原因。
+  // 注册。两次口令必须一致：不一致时**一个字节都不发**，本地直接拒绝。
   Q_INVOKABLE bool registerAccount(const QString& host,
                                    const QString& port_text,
                                    const QString& username,
-                                   const QString& password);
+                                   const QString& password,
+                                   const QString& confirm_password);
   Q_INVOKABLE bool login(const QString& host, const QString& port_text,
                          const QString& username, const QString& password);
 
@@ -198,6 +227,14 @@ class RemoteController : public QObject {
   // 不新增服务端 logout opcode —— 服务端 token 到期前仍然有效，这一点写在
   // 06-KNOWN-LIMITATIONS.md 里，不假装它是撤销。
   Q_INVOKABLE void logoutLocal();
+
+  // 注销账户：服务端删除该账户以及它的全部云端备份（不可撤销）。
+  //
+  // 两道本地闸门（都不发网络请求）：必须已登录；必须逐字输入当前账户名。
+  // 然后服务端还要用当前口令再校验一次——一个被捡到的 token 不足以注销账户。
+  // 与"退出登录"是两个不同的动作：退出登录只清本机内存。
+  Q_INVOKABLE bool deleteAccount(const QString& password,
+                                 const QString& username_confirmation);
 
   Q_INVOKABLE bool refreshList();
   Q_INVOKABLE bool uploadArchive(const QString& local_path,
@@ -231,6 +268,7 @@ class RemoteController : public QObject {
  signals:
   void endpointChanged();
   void sessionChanged();
+  void reachabilityChanged();
   void busyChanged();
   void snapshotsChanged();
   void progressChanged();
@@ -269,6 +307,8 @@ class RemoteController : public QObject {
 
   void SetStatus(const QString& kind, const QString& title,
                  const QString& message);
+  // 只有真的变化时才发信号：界面上的可达性提示不该被无谓地刷新。
+  void SetReachability(RemoteReachability value);
   void SetBusy(bool busy, const QString& action);
   void SetSnapshots(
       const std::vector<backupproject::net::RemoteSnapshotInfo>& snapshots);
@@ -311,8 +351,11 @@ class RemoteController : public QObject {
   QString last_error_kind_ = QStringLiteral("none");
   std::string last_detail_;
 
+  // 上一次连接尝试的结果。默认"不知道"：界面在真的试过之前什么都不说。
+  RemoteReachability reachability_ = RemoteReachability::kUnknown;
+
   QString status_kind_ = QStringLiteral("idle");
-  QString status_title_ = QStringLiteral("尚未连接服务器");
+  QString status_title_ = QStringLiteral("未登录");
   QString status_message_;
 };
 
