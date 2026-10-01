@@ -43,7 +43,8 @@ void PrintRemoteUsageTo(std::ostream& output) {
             "  backupctl remote download <快照ID> <目标路径> --user <用户名>\n"
             "      [--force]\n"
             "  backupctl remote delete <快照ID> --user <用户名>\n"
-            "  backupctl remote delete-account --user <用户名> --confirm <用户名>\n"
+            "  backupctl remote delete-account --user <用户名> --confirm "
+            "<用户名>\n"
             "      （永久删除该账户与它的全部云端备份，不可撤销）\n"
             "  口令只从终端读取；自动测试用 BACKUP_REMOTE_PASSWORD 提供，\n"
             "  两者都不会被打印。默认端点 127.0.0.1:18765。\n";
@@ -424,7 +425,8 @@ int RunRemoteCommand(const CliContext& context,
     // 这里刻意不走 ConnectAndLogin：注销**必须**把同一个口令再交给服务端
     // 校验一次，所以口令要在手里多留一会儿，用完立刻擦掉。
     std::string password;
-    if (!ObtainPassword(options.username, /*confirm=*/false, &password, &error)) {
+    if (!ObtainPassword(options.username, /*confirm=*/false, &password,
+                        &error)) {
       return Fail(error);
     }
     bool ok = client.Login(options.username, password, &error);
