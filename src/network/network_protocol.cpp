@@ -174,6 +174,7 @@ bool IsKnownOpcode(std::uint16_t opcode) {
     case Opcode::kRegister:
     case Opcode::kLogin:
     case Opcode::kLogout:
+    case Opcode::kResume:
     case Opcode::kList:
     case Opcode::kUploadBegin:
     case Opcode::kUploadChunk:
@@ -199,6 +200,8 @@ const char* OpcodeName(std::uint16_t opcode) {
       return "LOGIN";
     case Opcode::kLogout:
       return "LOGOUT";
+    case Opcode::kResume:
+      return "RESUME";
     case Opcode::kList:
       return "LIST";
     case Opcode::kUploadBegin:

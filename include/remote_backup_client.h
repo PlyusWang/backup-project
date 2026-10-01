@@ -68,9 +68,21 @@ class RemoteArchiveClient {
   RemoteArchiveClient& operator=(const RemoteArchiveClient&) = delete;
 
   bool Connect(const RemoteEndpoint& endpoint, std::string* error_message);
+  // 彻底放弃会话：关闭连接**并且**丢掉 token。退出登录、以及服务端明确说
+  // token 无效（UNAUTHORIZED）时用它。
   void Disconnect();
+  // 只关连接、**留着 token**：网络抖动、隧道重启、服务端按 io_timeout 关掉
+  // 空闲连接都属于这一种。下一次请求会自动重连并用 token 恢复会话，用户
+  // 不该因为这些原因"被退出登录"。
+  void DisconnectSocket();
   bool connected() const { return fd_ >= 0; }
+  // 这条连接上现在有没有一个被服务端确认过的会话。
   bool authenticated() const { return authenticated_; }
+  // 手里还留着一个可以在新连接上恢复会话的 token。
+  bool session_resumable() const { return !token_.empty(); }
+  // 最近一次请求里服务端给出的状态码；0 表示这次失败不是服务端状态拒绝，
+  // 而是本地或传输层问题。调用方据此区分"会话真的失效"和"网络抖了一下"。
+  std::uint32_t last_status() const { return last_status_; }
   const RemoteEndpoint& endpoint() const { return endpoint_; }
 
   bool Ping(std::string* software, std::uint16_t* protocol_version,
@@ -122,6 +134,12 @@ class RemoteArchiveClient {
                std::string* response, std::string* error_message);
   bool RequireAuthenticated(const std::string& what,
                             std::string* error_message);
+  // 发请求**之前**确认连接可用：没有连接就重连，对端已经关掉就换一条，并在
+  // 手里还有 token 时先恢复会话。它发生在发送任何字节之前，所以这不是"失败
+  // 之后偷偷重发"——本项目明确禁止自动重发（见交付报告的 no-retry 一节）。
+  bool PrepareConnection(std::string* error_message);
+  // 在新连接上用 token 恢复会话。服务端明确回 UNAUTHORIZED 时才丢掉 token。
+  bool ResumeSession(std::string* error_message);
   void Fail(const std::string& reason);
 
   int fd_ = -1;
@@ -130,6 +148,7 @@ class RemoteArchiveClient {
   RemoteEndpoint endpoint_;
   std::string token_;
   std::string last_error_;
+  std::uint32_t last_status_ = 0;
 };
 
 }  // namespace net

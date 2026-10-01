@@ -5,6 +5,7 @@
 #include <arpa/inet.h>
 #include <fcntl.h>
 #include <netinet/in.h>
+#include <poll.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/types.h>
@@ -80,6 +81,39 @@ bool HashFile(const std::string& path, std::string* sha256_hex,
   return true;
 }
 
+// 这条连接的对端是不是已经关了？只做零等待的探测（poll + MSG_PEEK）。
+//
+// 为什么必须有这一步：服务端会在 io_timeout 之后主动关掉空闲连接，而客户端
+// 手里的 fd 依然"有效"——往里写不会立刻报错，响应却永远不会来。人工验收看到
+// 的"奇数次失败、偶数次有响应"就是它：失败那一次之后客户端把 token 一起丢了，
+// 下一次只能重新登录，于是又"好"了一次。
+bool SocketLooksClosed(int fd) {
+  pollfd entry;
+  entry.fd = fd;
+  entry.events = POLLIN;
+  entry.revents = 0;
+  const int ready = ::poll(&entry, 1, 0);
+  if (ready <= 0) {
+    // 0 = 没有可读事件（正常情况）；< 0 = poll 自己出错，留给后面的收发去报。
+    return false;
+  }
+  if ((entry.revents & (POLLHUP | POLLERR | POLLNVAL)) != 0) {
+    return true;
+  }
+  if ((entry.revents & POLLIN) == 0) {
+    return false;
+  }
+  char byte = 0;
+  const ssize_t got = ::recv(fd, &byte, 1, MSG_PEEK);
+  if (got == 0) {
+    return true;  // 对端干净关闭
+  }
+  if (got < 0) {
+    return errno == ECONNRESET || errno == ENOTCONN || errno == EBADF;
+  }
+  return false;
+}
+
 bool WriteWholeFile(int fd, const char* data, std::size_t size,
                     std::string* error_message) {
   std::size_t written = 0;
@@ -141,13 +175,19 @@ void RemoteArchiveClient::Fail(const std::string& reason) {
   last_error_ = reason;
 }
 
-void RemoteArchiveClient::Disconnect() {
+void RemoteArchiveClient::DisconnectSocket() {
   if (fd_ >= 0) {
     ::close(fd_);
     fd_ = -1;
   }
+  // 连接没了，这条连接上的会话自然也没了；但 token 还在手里，可以在新连接
+  // 上恢复（Authenticate/PrepareConnection 会做这件事）。
   authenticated_ = false;
-  // token 只活在内存里：断开就丢掉，绝不写文件。
+}
+
+void RemoteArchiveClient::Disconnect() {
+  DisconnectSocket();
+  // token 只活在内存里：明确放弃会话时就丢掉，绝不写文件。
   if (!token_.empty()) {
     token_.clear();
   }
@@ -155,7 +195,9 @@ void RemoteArchiveClient::Disconnect() {
 
 bool RemoteArchiveClient::Connect(const RemoteEndpoint& endpoint,
                                   std::string* error_message) {
-  Disconnect();
+  // 只换连接，不动 token：重连之后可能还要用它恢复会话。
+  // 想彻底放弃会话的调用方应该显式调用 Disconnect()。
+  DisconnectSocket();
   if (endpoint.host.empty() || endpoint.port == 0) {
     if (error_message != nullptr) {
       *error_message = "endpoint host and port must be set";
@@ -203,12 +245,92 @@ bool RemoteArchiveClient::Connect(const RemoteEndpoint& endpoint,
   return true;
 }
 
+bool RemoteArchiveClient::PrepareConnection(std::string* error_message) {
+  if (fd_ >= 0 && !SocketLooksClosed(fd_)) {
+    return true;
+  }
+  // 走到这里说明连接不可用（或者本来就没连）。重连，并在手里还有 token 时先用
+  // token 恢复会话。**这一刻还没有发送任何请求字节**，所以这不是"失败之后偷偷
+  // 重发一次"：重发在本项目里是被明确禁止的。
+  const RemoteEndpoint endpoint = endpoint_;
+  if (endpoint.host.empty() || endpoint.port == 0) {
+    if (error_message != nullptr) {
+      *error_message = "not connected";
+    }
+    return false;
+  }
+  DisconnectSocket();
+  std::string connect_error;
+  if (!Connect(endpoint, &connect_error)) {
+    if (error_message != nullptr) {
+      *error_message = connect_error;
+    }
+    return false;
+  }
+  if (token_.empty()) {
+    return true;
+  }
+  std::string resume_error;
+  if (!ResumeSession(&resume_error)) {
+    if (error_message != nullptr) {
+      *error_message = resume_error;
+    }
+    return false;
+  }
+  return true;
+}
+
+bool RemoteArchiveClient::ResumeSession(std::string* error_message) {
+  if (token_.empty()) {
+    if (error_message != nullptr) {
+      *error_message = "there is no saved session to resume";
+    }
+    return false;
+  }
+  PayloadBuilder builder;
+  std::string build_error;
+  if (!builder.AppendString(token_, kMaxTokenBytes, &build_error)) {
+    if (error_message != nullptr) {
+      *error_message = build_error;
+    }
+    return false;
+  }
+  FrameHeader header;
+  std::string response;
+  std::string resume_error;
+  if (Request(Opcode::kResume, builder.data(), &header, &response,
+              &resume_error)) {
+    authenticated_ = true;
+    return true;
+  }
+  if (last_status_ == static_cast<std::uint32_t>(Status::kUnauthorized)) {
+    // 服务端明确拒绝：token 过期、被轮换，或者账户已经注销。这才是真的失效，
+    // 只有这一种情况允许丢掉 token。
+    Disconnect();
+    if (error_message != nullptr) {
+      // 用**共享的状态文案**，而不是再编一句英文：控制器靠它反查状态码，
+      // 从而把这种情况归类成"会话失效"（清会话、提示重新登录），
+      // 而不是"网络抖动"（保留会话）。
+      *error_message = RemoteStatusMessage(
+          static_cast<std::uint32_t>(Status::kUnauthorized));
+    }
+    return false;
+  }
+  if (error_message != nullptr) {
+    *error_message = resume_error;
+  }
+  return false;
+}
+
 bool RemoteArchiveClient::Request(Opcode opcode, const std::string& payload,
                                   FrameHeader* header, std::string* response,
                                   std::string* error_message) {
-  if (fd_ < 0) {
+  last_status_ = 0;
+  std::string prepare_error;
+  if (!PrepareConnection(&prepare_error)) {
+    Fail(prepare_error);
     if (error_message != nullptr) {
-      *error_message = "not connected";
+      *error_message = prepare_error;
     }
     return false;
   }
@@ -220,6 +342,8 @@ bool RemoteArchiveClient::Request(Opcode opcode, const std::string& payload,
     if (error_message != nullptr) {
       *error_message = "cannot send the request: " + io_error;
     }
+    // 写失败了：这条连接不可信。**不重发**——这个请求有可能已经被对端收到了。
+    DisconnectSocket();
     return false;
   }
   const FrameReadStatus status = ReceiveFrame(fd_, header, response, &io_error);
@@ -228,8 +352,9 @@ bool RemoteArchiveClient::Request(Opcode opcode, const std::string& payload,
     if (error_message != nullptr) {
       *error_message = "cannot read the response: " + io_error;
     }
-    // 帧流已经不可信：这条连接不能再用了。
-    Disconnect();
+    // 帧流已经不可信：关掉这条连接，但**保留 token**。网络抖动不等于退出登录，
+    // 下一次操作会用 token 在新连接上恢复会话。同样**不重发**本次请求。
+    DisconnectSocket();
     return false;
   }
   if (header->request_id != request_id) {
@@ -240,6 +365,7 @@ bool RemoteArchiveClient::Request(Opcode opcode, const std::string& payload,
     return false;
   }
   if (header->status != static_cast<std::uint32_t>(Status::kOk)) {
+    last_status_ = header->status;
     Fail(std::string(OpcodeName(header->opcode)) + " -> " +
          StatusName(header->status));
     if (error_message != nullptr) {
@@ -252,7 +378,9 @@ bool RemoteArchiveClient::Request(Opcode opcode, const std::string& payload,
 
 bool RemoteArchiveClient::RequireAuthenticated(const std::string& what,
                                                std::string* error_message) {
-  if (authenticated_) {
+  // 这条 TCP 连接上的会话可能已经随着连接一起没了，但 token 还在：只要手里有
+  // token 就允许继续，Request 会先重连并恢复会话。
+  if (authenticated_ || !token_.empty()) {
     return true;
   }
   if (error_message != nullptr) {
@@ -298,6 +426,10 @@ bool RemoteArchiveClient::Ping(std::string* software,
 bool RemoteArchiveClient::Register(const std::string& username,
                                    const std::string& password,
                                    std::string* error_message) {
+  // 同 Login：注册是"重新开始"，先丢掉旧会话，避免服务端回 INVALID_STATE。
+  if (authenticated_ || !token_.empty()) {
+    Disconnect();
+  }
   PayloadBuilder builder;
   std::string build_error;
   if (!builder.AppendString(username, kMaxUsernameBytes, &build_error) ||
@@ -316,6 +448,12 @@ bool RemoteArchiveClient::Register(const std::string& username,
 bool RemoteArchiveClient::Login(const std::string& username,
                                 const std::string& password,
                                 std::string* error_message) {
+  // 显式登录意味着"重新开始"：先丢掉旧会话（如果有）。否则服务端会按
+  // "这条连接上已经有会话了"拒绝（INVALID_STATE），用户看到的会是一句
+  // 与登录无关的错误。
+  if (authenticated_ || !token_.empty()) {
+    Disconnect();
+  }
   PayloadBuilder builder;
   std::string build_error;
   if (!builder.AppendString(username, kMaxUsernameBytes, &build_error) ||
