@@ -291,8 +291,9 @@ QString RemoteController::DescribeFailure(const QString& error_kind) {
     return QStringLiteral("服务器拒绝了这个请求（两端版本可能不一致）。");
   }
   if (error_kind == QStringLiteral("network")) {
-    return QStringLiteral("网络连接中断，这次操作没有完成；登录状态与云端数据都"
-                          "没有变化，可以直接再试一次。");
+    return QStringLiteral(
+        "网络连接中断，这次操作没有完成；登录状态与云端数据都"
+        "没有变化，可以直接再试一次。");
   }
   if (error_kind == QStringLiteral("local")) {
     return QStringLiteral("本地文件不可用（不存在、不是普通文件，或者为空）。");
@@ -687,7 +688,8 @@ void RemoteController::ApplyResult(const RemoteOpResult& result) {
     // 会话要不要清掉，取决于**服务端说了什么**，而不是"网络有没有抖一下"：
     //
     //   not-logged-in（服务端明确 UNAUTHORIZED）-> token 真的没用了，清会话
-    //   network / local / 其它传输层失败        -> 只关这条连接、**保留 token**；
+    //   network / local / 其它传输层失败        -> 只关这条连接、**保留
+    //   token**；
     //                                            下一次操作会自动重连并恢复会话
     //
     // 这一条是人工验收里"点一次刷新就被退出登录"的根因：以前任何一次网络抖动
