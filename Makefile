@@ -134,12 +134,31 @@ DEPENDS += $(FIXTURE_OBJECTS:.o=.d)
 # archive-cli 是测试夹具，见上面的说明。
 all: $(TARGET) $(SERVER_TARGET)
 
-# 单独构建服务端（部署脚本用）。
-server: $(SERVER_TARGET)
+# ---- ECS 本地管理工具（PR #20 closure）----
+#
+# backup-server-admin 是**只能在服务器本机运行**的管理工具：管理员先 SSH 进
+# ECS，再在 ECS 上执行它。它不监听任何端口（源码里没有 socket() / bind() /
+# listen()）、不说 BPNET1、不链接 Qt，也不在任何 GUI / CLI 的调用路径上。
+#
+# 它和服务端共用同一份 RemoteMaintenance 与 RemoteMetadataStore：管理工具的
+# 删除动作与服务端的 DELETE / DELETE_ACCOUNT 走的是同一批函数，不存在
+# "管理工具另有一套删除逻辑"这种分叉。
+ADMIN_TARGET := $(BUILD_DIR)/backup-server-admin
+ADMIN_SOURCES := server/admin_main.cpp $(SERVER_CORE_SOURCES)
+ADMIN_OBJECTS := $(patsubst %.cpp,$(BUILD_DIR)/server/%.o,$(ADMIN_SOURCES))
+DEPENDS += $(ADMIN_OBJECTS:.o=.d)
+
+# 单独构建服务端（部署脚本用）。管理工具与服务端同属"服务器侧交付物"，
+# 所以同一条目标一起构建。
+server: $(SERVER_TARGET) $(ADMIN_TARGET)
 
 $(SERVER_TARGET): $(SERVER_OBJECTS)
 	@mkdir -p $(BUILD_DIR)
 	$(CXX) $(CXXFLAGS) $(SERVER_OBJECTS) $(SQLITE_LIBRARY) -pthread -o $@
+
+$(ADMIN_TARGET): $(ADMIN_OBJECTS)
+	@mkdir -p $(BUILD_DIR)
+	$(CXX) $(CXXFLAGS) $(ADMIN_OBJECTS) $(SQLITE_LIBRARY) -pthread -o $@
 
 $(TARGET): $(OBJECTS)
 	@mkdir -p $(BUILD_DIR)
