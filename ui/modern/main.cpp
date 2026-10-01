@@ -2384,14 +2384,22 @@ int RunRemoteTest(QQuickWindow* window, backup_modern::RemoteController* remote,
   // 端口先给 0（内核分配），拿到真实端口之后 CASE D 会用**同一个端口**重启
   // 服务端，验证"服务端回来了，客户端自己重连并恢复会话"。
   QStringList server_arguments = {
-      QStringLiteral("--bind"),   QStringLiteral("127.0.0.1"),
-      QStringLiteral("--port"),   QStringLiteral("0"),
-      QStringLiteral("--io-timeout"), QStringLiteral("2"),
-      QStringLiteral("--root"),   work + QStringLiteral("/data"),
-      QStringLiteral("--db"),     work + QStringLiteral("/state/metadata.sqlite3"),
-      QStringLiteral("--secret-file"), secret_file,
-      QStringLiteral("--pid-file"), work + QStringLiteral("/state/server.pid"),
-      QStringLiteral("--log-file"), log_file,
+      QStringLiteral("--bind"),
+      QStringLiteral("127.0.0.1"),
+      QStringLiteral("--port"),
+      QStringLiteral("0"),
+      QStringLiteral("--io-timeout"),
+      QStringLiteral("2"),
+      QStringLiteral("--root"),
+      work + QStringLiteral("/data"),
+      QStringLiteral("--db"),
+      work + QStringLiteral("/state/metadata.sqlite3"),
+      QStringLiteral("--secret-file"),
+      secret_file,
+      QStringLiteral("--pid-file"),
+      work + QStringLiteral("/state/server.pid"),
+      QStringLiteral("--log-file"),
+      log_file,
       QStringLiteral("--quiet")};
   server.setArguments(server_arguments);
   // 无论从哪条 return 出去，服务端都要被收走，不留孤儿进程。
@@ -2970,14 +2978,14 @@ int RunRemoteTest(QQuickWindow* window, backup_modern::RemoteController* remote,
         ++busy_stuck;
       }
     }
-    run.Check(visible_errors == 4 && busy_stuck == 0 &&
-                  !remote->authenticated(),
-              QStringLiteral("REMOTE-15A 四次错误口令都有可见错误、都不卡 busy、"
-                             "都没有进入已登录"),
-              QStringLiteral("errors=%1 stuck=%2 title=%3")
-                  .arg(visible_errors)
-                  .arg(busy_stuck)
-                  .arg(last_title));
+    run.Check(
+        visible_errors == 4 && busy_stuck == 0 && !remote->authenticated(),
+        QStringLiteral("REMOTE-15A 四次错误口令都有可见错误、都不卡 busy、"
+                       "都没有进入已登录"),
+        QStringLiteral("errors=%1 stuck=%2 title=%3")
+            .arg(visible_errors)
+            .arg(busy_stuck)
+            .arg(last_title));
   }
 
   {
@@ -3008,9 +3016,9 @@ int RunRemoteTest(QQuickWindow* window, backup_modern::RemoteController* remote,
     while (idle_clock.elapsed() < 3000) {
       WaitForAnimation(100);
     }
-    const bool refreshed = remote->refreshList() &&
-                           remote->waitForIdle(120000) &&
-                           remote->lastErrorKindForTest() == QStringLiteral("none");
+    const bool refreshed =
+        remote->refreshList() && remote->waitForIdle(120000) &&
+        remote->lastErrorKindForTest() == QStringLiteral("none");
     run.Check(refreshed && remote->authenticated(),
               QStringLiteral("REMOTE-15C 空闲超时之后第一次刷新就成功"
                              "（不再是 peer closed，也没有掉登录）"),
@@ -3024,11 +3032,12 @@ int RunRemoteTest(QQuickWindow* window, backup_modern::RemoteController* remote,
     const bool accepted = remote->refreshList();
     const bool finished = accepted && remote->waitForIdle(120000);
     const QString kind = remote->lastErrorKindForTest();
-    run.Check(finished && kind == QStringLiteral("network") &&
-                  !remote->busy() && remote->authenticated(),
-              QStringLiteral("REMOTE-15D 服务端不可用时刷新如实报错、busy 复位、"
-                             "会话保留"),
-              kind + QStringLiteral(": ") + remote->lastDetailForTest());
+    run.Check(
+        finished && kind == QStringLiteral("network") && !remote->busy() &&
+            remote->authenticated(),
+        QStringLiteral("REMOTE-15D 服务端不可用时刷新如实报错、busy 复位、"
+                       "会话保留"),
+        kind + QStringLiteral(": ") + remote->lastDetailForTest());
     // 同一个端口重启服务端：客户端应该自己重连 + 用 token 恢复会话。
     server_arguments[3] = port_text;
     server.setArguments(server_arguments);
@@ -3037,10 +3046,11 @@ int RunRemoteTest(QQuickWindow* window, backup_modern::RemoteController* remote,
     const bool recovered =
         remote->refreshList() && remote->waitForIdle(120000) &&
         remote->lastErrorKindForTest() == QStringLiteral("none");
-    run.Check(recovered && remote->authenticated(),
-              QStringLiteral("REMOTE-15D 服务端恢复之后刷新自动重连 + 恢复会话"),
-              remote->lastErrorKindForTest() + QStringLiteral(": ") +
-                  remote->lastDetailForTest());
+    run.Check(
+        recovered && remote->authenticated(),
+        QStringLiteral("REMOTE-15D 服务端恢复之后刷新自动重连 + 恢复会话"),
+        remote->lastErrorKindForTest() + QStringLiteral(": ") +
+            remote->lastDetailForTest());
   }
 
   // ---- REMOTE-14：注销账户（服务端删除，不是"退出登录"）----
@@ -3062,11 +3072,12 @@ int RunRemoteTest(QQuickWindow* window, backup_modern::RemoteController* remote,
   const bool wrong_delete_finished =
       wrong_delete_accepted && remote->waitForIdle(120000);
   const QString wrong_delete_error = remote->deleteAccountError();
-  run.Check(wrong_delete_finished && remote->authenticated() &&
-                remote->lastErrorKindForTest() == QStringLiteral("account-password"),
-            QStringLiteral("REMOTE-14 口令错误：服务端拒绝，账户与数据都还在"),
-            remote->lastErrorKindForTest() + QStringLiteral(": ") +
-                remote->lastDetailForTest());
+  run.Check(
+      wrong_delete_finished && remote->authenticated() &&
+          remote->lastErrorKindForTest() == QStringLiteral("account-password"),
+      QStringLiteral("REMOTE-14 口令错误：服务端拒绝，账户与数据都还在"),
+      remote->lastErrorKindForTest() + QStringLiteral(": ") +
+          remote->lastDetailForTest());
   // 注销失败必须在**对话框自己的错误行**里留下可见原因（人工验收时这里曾经
   // 只有终端打印、界面上什么都没有）。
   run.Check(!wrong_delete_error.isEmpty() &&
