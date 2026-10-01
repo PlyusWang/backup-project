@@ -37,8 +37,8 @@ echo "[deploy] commit $SOURCE_SHA"
 # 服务端独有源码在顶层 server/；src/network 只保留协议与客户端
 # （backupctl 与 GUI 也要用）。tar 失败必须立刻中止：否则会拿上一次的
 # 二进制继续部署，看起来"成功"其实部署的是旧东西。
-if ! tar -czf "$TARBALL" Makefile include server src/network src/crypto \
-     third_party; then
+if ! tar -czf "$TARBALL" Makefile include server src/network src/platform \
+     src/crypto scripts/backup-server-admin.sh third_party; then
   echo "[deploy] cannot build the source tarball" >&2
   exit 1
 fi
@@ -58,9 +58,13 @@ tar -xzf "backup-server-src-$SHA.tar.gz" -C "src-$SHA"
 cd "src-$SHA"
 make -j2 server > build.log 2>&1 || { tail -20 build.log; exit 1; }
 echo "[deploy] build warnings: $(grep -ci warning build.log || true)"
-sha256sum build/backup-server | tee "$SRV/deploy/backup-server-$SHA.sha256"
+sha256sum build/backup-server build/backup-server-admin \
+  | tee "$SRV/deploy/backup-server-$SHA.sha256"
 install -m 0755 build/backup-server "$SRV/bin/backup-server"
+install -m 0755 build/backup-server-admin "$SRV/bin/backup-server-admin"
+install -m 0755 scripts/backup-server-admin.sh "$SRV/bin/backup-server-admin.sh"
 echo "[deploy] installed sha256: $(sha256sum "$SRV/bin/backup-server" | cut -d' ' -f1)"
+echo "[deploy] admin sha256: $(sha256sum "$SRV/bin/backup-server-admin" | cut -d' ' -f1)"
 REMOTE
 
 echo "[deploy] source tarball: $TARBALL"
