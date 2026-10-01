@@ -89,13 +89,30 @@ RemoteController::~RemoteController() {
 
 QString RemoteController::sessionText() const {
   if (authenticated_) {
-    return QStringLiteral("已登录：%1 @ %2:%3")
-        .arg(username_, host(), portText());
+    return QStringLiteral("当前账户：%1（已登录）").arg(username_);
   }
-  if (client_.connected()) {
-    return QStringLiteral("已连接 %1:%2，尚未登录").arg(host(), portText());
+  return QStringLiteral("未登录");
+}
+
+// 服务器可达性：空串表示"还没有试过"，于是界面什么都不说。
+QString RemoteController::serverReachabilityText() const {
+  switch (reachability_) {
+    case RemoteReachability::kReachable:
+      return QStringLiteral("服务器可达");
+    case RemoteReachability::kUnreachable:
+      return QStringLiteral("服务器暂时不可达");
+    case RemoteReachability::kUnknown:
+      break;
   }
-  return QStringLiteral("未连接");
+  return QString();
+}
+
+void RemoteController::SetReachability(RemoteReachability value) {
+  if (reachability_ == value) {
+    return;
+  }
+  reachability_ = value;
+  emit reachabilityChanged();
 }
 
 QString RemoteController::statusScope() const {
@@ -170,6 +187,8 @@ QString RemoteController::KindName(RemoteOpResult::Kind kind) {
       return QStringLiteral("download");
     case RemoteOpResult::Kind::kDelete:
       return QStringLiteral("delete");
+    case RemoteOpResult::Kind::kDeleteAccount:
+      return QStringLiteral("delete-account");
   }
   return QStringLiteral("unknown");
 }
@@ -179,10 +198,16 @@ QString RemoteController::ClassifyFailure(const std::string& status_name,
                                           RemoteOpResult::Kind kind) {
   if (!status_name.empty()) {
     if (status_name == "UNAUTHORIZED") {
-      // 登录本身被拒 = 用户名或密码不对；别的操作用到它 = 会话已经不在。
-      return kind == RemoteOpResult::Kind::kLogin
-                 ? QStringLiteral("credentials")
-                 : QStringLiteral("not-logged-in");
+      // 登录被拒 = 用户名或密码不对；注销账户被拒 = 当前口令不对（服务端对
+      // "口令错"和"账户已经不存在"回同一个码，不泄漏账户是否存在）；
+      // 别的操作用到它 = 会话已经不在（例如账户刚被注销）。
+      if (kind == RemoteOpResult::Kind::kLogin) {
+        return QStringLiteral("credentials");
+      }
+      if (kind == RemoteOpResult::Kind::kDeleteAccount) {
+        return QStringLiteral("account-password");
+      }
+      return QStringLiteral("not-logged-in");
     }
     if (status_name == "ALREADY_EXISTS") {
       return kind == RemoteOpResult::Kind::kRegister
@@ -232,6 +257,15 @@ QString RemoteController::DescribeFailure(const QString& error_kind) {
   if (error_kind == QStringLiteral("credentials")) {
     return QStringLiteral("登录失败：用户名或密码不正确。");
   }
+  if (error_kind == QStringLiteral("account-password")) {
+    return QStringLiteral("当前密码不正确，账户与全部云端备份都没有被删除。");
+  }
+  if (error_kind == QStringLiteral("password-mismatch")) {
+    return QStringLiteral("两次输入的密码不一致，请重新输入。");
+  }
+  if (error_kind == QStringLiteral("confirm-mismatch")) {
+    return QStringLiteral("账户名不一致，请输入当前账户名以确认注销。");
+  }
   if (error_kind == QStringLiteral("name-taken")) {
     return QStringLiteral("这个用户名已经被占用，换一个再试。");
   }
@@ -274,6 +308,15 @@ QString RemoteController::DescribeFailure(const QString& error_kind) {
 QString RemoteController::TitleForFailure(const QString& error_kind) {
   if (error_kind == QStringLiteral("credentials")) {
     return QStringLiteral("登录失败");
+  }
+  if (error_kind == QStringLiteral("account-password")) {
+    return QStringLiteral("当前密码不正确");
+  }
+  if (error_kind == QStringLiteral("password-mismatch")) {
+    return QStringLiteral("两次输入的密码不一致");
+  }
+  if (error_kind == QStringLiteral("confirm-mismatch")) {
+    return QStringLiteral("账户名不一致");
   }
   if (error_kind == QStringLiteral("name-taken")) {
     return QStringLiteral("用户名已被占用");
@@ -340,14 +383,21 @@ void RemoteController::ResetIdleStatus() {
     return;
   }
   if (authenticated_) {
-    SetStatus(QStringLiteral("idle"), QStringLiteral("已登录"), QString());
-  } else if (client_.connected()) {
-    SetStatus(QStringLiteral("idle"), QStringLiteral("已连接，尚未登录"),
-              QString());
-  } else {
-    SetStatus(QStringLiteral("idle"), QStringLiteral("尚未连接服务器"),
-              QString());
+    SetStatus(QStringLiteral("idle"),
+              QStringLiteral("已登录：%1").arg(username_), QString());
+    return;
   }
+  // 未登录。这里**不**说"未连接"：BPNET1 是每次操作建立连接，没有长期连接，
+  // 把那个短命的 socket 状态写成页面的常驻状态，用户只会读成"服务器挂了"。
+  // 只有真的试过一次连接并且失败了，才说一句"不可达"。
+  if (reachability_ == RemoteReachability::kUnreachable) {
+    SetStatus(QStringLiteral("idle"), QStringLiteral("服务器暂时不可达"),
+              QStringLiteral("上一次连接没有成功。请确认服务器正在运行，"
+                             "地址与端口正确。"));
+    return;
+  }
+  SetStatus(QStringLiteral("idle"), QStringLiteral("未登录"),
+            QStringLiteral("填写服务器地址与账号后点“登录”。"));
 }
 
 void RemoteController::clearStatus() { ResetIdleStatus(); }
@@ -536,15 +586,21 @@ RemoteOpResult RemoteController::RunOperation(
     case RemoteOpResult::Kind::kRegister:
       if (!client->connected() && !client->Connect(request.endpoint, &error)) {
         result.ok = false;
+        // 连不上就是"不可达"的证据：这是本页唯一会得出这个结论的地方，
+        // 不靠任何猜测或定时探测。
+        result.reachability = RemoteReachability::kUnreachable;
         break;
       }
+      result.reachability = RemoteReachability::kReachable;
       result.ok = client->Register(request.username, request.password, &error);
       break;
     case RemoteOpResult::Kind::kLogin:
       if (!client->connected() && !client->Connect(request.endpoint, &error)) {
         result.ok = false;
+        result.reachability = RemoteReachability::kUnreachable;
         break;
       }
+      result.reachability = RemoteReachability::kReachable;
       result.ok = client->Login(request.username, request.password, &error);
       break;
     case RemoteOpResult::Kind::kList:
@@ -562,6 +618,9 @@ RemoteOpResult RemoteController::RunOperation(
       break;
     case RemoteOpResult::Kind::kDelete:
       result.ok = client->Delete(request.snapshot_id, &error);
+      break;
+    case RemoteOpResult::Kind::kDeleteAccount:
+      result.ok = client->DeleteAccount(request.password, &error);
       break;
   }
   if (!result.ok) {
@@ -605,6 +664,11 @@ void RemoteController::OnOperationFinished() {
 }
 
 void RemoteController::ApplyResult(const RemoteOpResult& result) {
+  if (result.reachability != RemoteReachability::kUnknown) {
+    // 只在这条后台线程真的试过连接时更新：登录 / 注册会连接，其它操作复用
+    // 已有连接，因此对"可达性"没有新证据。
+    SetReachability(result.reachability);
+  }
   if (result.ok) {
     last_error_kind_ = QStringLiteral("none");
     last_detail_.clear();
@@ -679,6 +743,23 @@ void RemoteController::ApplyResult(const RemoteOpResult& result) {
       SetStatus(QStringLiteral("success"), QStringLiteral("已删除"),
                 QStringLiteral("云端的那份备份已经删除。"));
       break;
+    case RemoteOpResult::Kind::kDeleteAccount:
+      // 账户已经不存在了：本机内存里的会话、口令与列表全部清掉，界面回到
+      // "未登录"。云端数据由服务端删除，这里不做任何本地清理。
+      authenticated_ = false;
+      client_.Disconnect();
+      password_.fill(QChar(0));
+      password_.clear();
+      password_.squeeze();
+      list_loaded_ = false;
+      SetSnapshots(std::vector<RemoteSnapshotInfo>());
+      list_summary_ = QStringLiteral("尚未登录");
+      SetReachability(RemoteReachability::kUnknown);
+      emit sessionChanged();
+      emit snapshotsChanged();
+      SetStatus(QStringLiteral("success"), QStringLiteral("账户已注销"),
+                QStringLiteral("该账户以及它的全部云端备份已经被删除。"));
+      break;
   }
 }
 
@@ -687,7 +768,16 @@ void RemoteController::ApplyResult(const RemoteOpResult& result) {
 bool RemoteController::registerAccount(const QString& host,
                                        const QString& port_text,
                                        const QString& username,
-                                       const QString& password) {
+                                       const QString& password,
+                                       const QString& confirm_password) {
+  // 两次输入必须一致：不一致时**一个字节都不发**。这条检查放在最前面
+  // （早于 AcceptEndpoint），所以连"上一次生效的地址"都不会被这次输入改掉。
+  if (password != confirm_password) {
+    last_error_kind_ = QStringLiteral("password-mismatch");
+    SetStatus(QStringLiteral("error"), QStringLiteral("两次输入的密码不一致"),
+              QStringLiteral("请重新输入，两个密码框必须完全相同。"));
+    return false;
+  }
   if (!AcceptEndpoint(host, port_text, username)) {
     return false;
   }
@@ -738,6 +828,8 @@ void RemoteController::logoutLocal() {
     return;
   }
   client_.Disconnect();
+  // 断开之后"服务器可不可达"重新变成未知：界面不再声称任何结论。
+  SetReachability(RemoteReachability::kUnknown);
   if (authenticated_) {
     authenticated_ = false;
     emit sessionChanged();
@@ -849,6 +941,30 @@ bool RemoteController::deleteSnapshot(const QString& snapshot_id) {
   request.kind = RemoteOpResult::Kind::kDelete;
   request.endpoint = endpoint_;
   request.snapshot_id = snapshot_id.toStdString();
+  Submit(request);
+  return true;
+}
+
+bool RemoteController::deleteAccount(const QString& password,
+                                       const QString& username_confirmation) {
+  // 二次确认：必须逐字敲出当前账户名。少一个字符都不发请求——注销是不可撤销
+  // 的服务端删除，不能是一个"点快了就没了"的按钮。
+  if (username_confirmation.trimmed() != username_) {
+    last_error_kind_ = QStringLiteral("confirm-mismatch");
+    SetStatus(QStringLiteral("error"), QStringLiteral("账户名不一致"),
+              QStringLiteral("请输入当前账户名 %1 以确认注销。").arg(username_));
+    return false;
+  }
+  if (!AcceptPassword(password)) {
+    return false;
+  }
+  if (!BeginOperation(QStringLiteral("正在注销账户"), /*need_login=*/true)) {
+    return false;
+  }
+  RemoteRequest request;
+  request.kind = RemoteOpResult::Kind::kDeleteAccount;
+  request.endpoint = endpoint_;
+  request.password = password.toStdString();
   Submit(request);
   return true;
 }

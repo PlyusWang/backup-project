@@ -34,6 +34,14 @@ Item {
     property string draftPort: ""
     property string draftUser: ""
     property string draftPassword: ""
+    // 注册标签页的两个口令草稿（登录标签页继续用 draftPassword）。
+    property string draftRegisterPassword: ""
+    property string draftConfirmPassword: ""
+    // 注销账户对话框：再次输入当前密码 + 逐字输入当前账户名。
+    property string draftDeletePassword: ""
+    property string draftDeleteName: ""
+    // 账户区域当前标签页：0 = 登录，1 = 注册。
+    property int accountTab: 0
     property string draftUploadPath: ""
     property string draftUploadName: ""
     property string draftDownloadPath: ""
@@ -135,7 +143,11 @@ Item {
                 Layout.topMargin: -8
             }
 
-            // ---------- 1. 连接服务器 ----------
+            // ---------- 1. 账户（登录 / 注册两个标签页）----------
+            //
+            // 人工验收的结论：用户名 / 密码 / 注册 / 登录 / 退出登录全堆在同一块
+            // 里，用户分不清"我现在是在登录还是在注册"，注册也只有一个密码框。
+            // 现在拆成两个标签页；已登录时整块换成账户卡片。
             AppCard {
                 Layout.fillWidth: true
                 Layout.topMargin: 4
@@ -145,7 +157,7 @@ Item {
                     spacing: 6
 
                     Text {
-                        text: "连接服务器"
+                        text: "服务器账户"
                         font.pixelSize: 16
                         font.weight: Font.DemiBold
                         color: theme.textSecondary
@@ -198,33 +210,61 @@ Item {
                         }
                     }
 
-                    RowLayout {
+                    ColumnLayout {
                         Layout.fillWidth: true
-                        spacing: 12
+                        spacing: 4
 
-                        ColumnLayout {
-                            Layout.fillWidth: true
-                            spacing: 4
-
-                            Text {
-                                text: "用户名"
-                                font.pixelSize: 15
-                                color: theme.textSecondary
-                            }
-
-                            AppTextField {
-                                id: userField
-                                objectName: "remoteUserField"
-                                Layout.fillWidth: true
-                                enabled: !remote.busy
-                                placeholderText: "字母、数字、点、下划线或减号"
-                                text: page.draftUser
-                                onTextEdited: page.draftUser = text
-                            }
+                        Text {
+                            text: "用户名"
+                            font.pixelSize: 15
+                            color: theme.textSecondary
                         }
 
+                        AppTextField {
+                            id: userField
+                            objectName: "remoteUserField"
+                            Layout.fillWidth: true
+                            enabled: !remote.busy
+                            placeholderText: "字母、数字、点、下划线或减号"
+                            text: page.draftUser
+                            onTextEdited: page.draftUser = text
+                        }
+                    }
+
+                    // ---------- 未登录：登录 / 注册两个标签页 ----------
+                    ColumnLayout {
+                        Layout.fillWidth: true
+                        Layout.topMargin: 8
+                        visible: !remote.authenticated
+                        spacing: 8
+
+                        RowLayout {
+                            Layout.fillWidth: true
+                            spacing: 8
+
+                            AppButton {
+                                objectName: "remoteLoginTabButton"
+                                text: "登录"
+                                variant: page.accountTab === 0 ? "primary" : "flat"
+                                enabled: !remote.busy
+                                onClicked: page.accountTab = 0
+                            }
+
+                            AppButton {
+                                objectName: "remoteRegisterTabButton"
+                                text: "注册"
+                                variant: page.accountTab === 1 ? "primary" : "flat"
+                                enabled: !remote.busy
+                                onClicked: page.accountTab = 1
+                            }
+
+                            Item { Layout.fillWidth: true }
+                        }
+
+                        // ---- 登录标签：密码只输一次 ----
                         ColumnLayout {
                             Layout.fillWidth: true
+                            visible: page.accountTab === 0
                             spacing: 4
 
                             Text {
@@ -240,7 +280,7 @@ Item {
                                 enabled: !remote.busy
                                 // 密码永远不明文常显：不回读、不落盘、不进日志。
                                 echoMode: TextInput.Password
-                                placeholderText: "登录或注册时使用"
+                                placeholderText: "登录密码"
                                 text: page.draftPassword
                                 onTextEdited: page.draftPassword = text
                                 onAccepted: {
@@ -248,47 +288,161 @@ Item {
                                         remote.login(page.draftHost, page.draftPort, page.draftUser, page.draftPassword)
                                 }
                             }
-                        }
-                    }
 
-                    RowLayout {
-                        Layout.fillWidth: true
-                        Layout.topMargin: 10
-                        spacing: 12
+                            RowLayout {
+                                Layout.fillWidth: true
+                                Layout.topMargin: 8
+                                spacing: 12
 
-                        AppButton {
-                            objectName: "remoteRegisterButton"
-                            text: "注册"
-                            enabled: !remote.busy
-                            onClicked: remote.registerAccount(page.draftHost, page.draftPort, page.draftUser, page.draftPassword)
-                        }
+                                AppButton {
+                                    objectName: "remoteLoginButton"
+                                    text: "登录"
+                                    variant: "primary"
+                                    enabled: !remote.busy
+                                    onClicked: remote.login(page.draftHost, page.draftPort, page.draftUser, page.draftPassword)
+                                }
 
-                        AppButton {
-                            objectName: "remoteLoginButton"
-                            text: "登录"
-                            variant: "primary"
-                            enabled: !remote.busy
-                            onClicked: remote.login(page.draftHost, page.draftPort, page.draftUser, page.draftPassword)
-                        }
-
-                        AppButton {
-                            objectName: "remoteLogoutButton"
-                            text: "退出登录"
-                            enabled: remote.authenticated && !remote.busy
-                            onClicked: {
-                                remote.logoutLocal()
-                                // 退出之后这一页也不再留着口令草稿。
-                                page.draftPassword = ""
+                                Text {
+                                    objectName: "remoteReachabilityText"
+                                    Layout.fillWidth: true
+                                    // 只有真的试过一次连接之后才有内容：没试过
+                                    // 的时候这一行根本不出现，也就不会有人把
+                                    // "还没有连接"读成"服务器挂了"。
+                                    visible: remote.serverReachabilityText !== ""
+                                    text: remote.serverReachabilityText
+                                    font.pixelSize: 15
+                                    color: theme.textSecondary
+                                    wrapMode: Text.WrapAnywhere
+                                }
                             }
                         }
 
-                        Item { Layout.fillWidth: true }
+                        // ---- 注册标签：两个密码框，必须完全一致 ----
+                        ColumnLayout {
+                            Layout.fillWidth: true
+                            visible: page.accountTab === 1
+                            spacing: 4
+
+                            Text {
+                                text: "密码"
+                                font.pixelSize: 15
+                                color: theme.textSecondary
+                            }
+
+                            AppTextField {
+                                id: registerPasswordField
+                                objectName: "remoteRegisterPasswordField"
+                                Layout.fillWidth: true
+                                enabled: !remote.busy
+                                echoMode: TextInput.Password
+                                placeholderText: "至少 8 个字符"
+                                text: page.draftRegisterPassword
+                                onTextEdited: page.draftRegisterPassword = text
+                            }
+
+                            Text {
+                                text: "确认密码"
+                                font.pixelSize: 15
+                                color: theme.textSecondary
+                                Layout.topMargin: 4
+                            }
+
+                            AppTextField {
+                                id: registerConfirmField
+                                objectName: "remoteRegisterConfirmField"
+                                Layout.fillWidth: true
+                                enabled: !remote.busy
+                                // 两个密码框都必须是密码回显模式：确认密码不是
+                                // "再看一眼明文"的地方。
+                                echoMode: TextInput.Password
+                                placeholderText: "再输入一次"
+                                text: page.draftConfirmPassword
+                                onTextEdited: page.draftConfirmPassword = text
+                            }
+
+                            RowLayout {
+                                Layout.fillWidth: true
+                                Layout.topMargin: 8
+                                spacing: 12
+
+                                AppButton {
+                                    objectName: "remoteRegisterButton"
+                                    text: "注册"
+                                    variant: "primary"
+                                    enabled: !remote.busy
+                                    onClicked: remote.registerAccount(page.draftHost, page.draftPort, page.draftUser, page.draftRegisterPassword, page.draftConfirmPassword)
+                                }
+
+                                Text {
+                                    objectName: "remoteRegisterHint"
+                                    Layout.fillWidth: true
+                                    text: "两个密码框必须完全一致；不一致时不会发送任何请求。"
+                                    font.pixelSize: 15
+                                    color: theme.textSecondary
+                                    wrapMode: Text.WrapAnywhere
+                                }
+                            }
+                        }
+                    }
+
+                    // ---------- 已登录：账户卡片 ----------
+                    ColumnLayout {
+                        Layout.fillWidth: true
+                        Layout.topMargin: 8
+                        visible: remote.authenticated
+                        spacing: 4
+
+                        Text {
+                            objectName: "remoteAccountText"
+                            Layout.fillWidth: true
+                            text: "当前账户：" + remote.username
+                            font.pixelSize: 17
+                            color: theme.textPrimary
+                        }
+
+                        Text {
+                            objectName: "remoteAccountStateText"
+                            Layout.fillWidth: true
+                            text: "状态：已登录"
+                            font.pixelSize: 15
+                            color: theme.success
+                        }
+
+                        RowLayout {
+                            Layout.fillWidth: true
+                            Layout.topMargin: 8
+                            spacing: 12
+
+                            AppButton {
+                                objectName: "remoteLogoutButton"
+                                text: "退出登录"
+                                enabled: !remote.busy
+                                onClicked: {
+                                    remote.logoutLocal()
+                                    // 退出之后这一页也不再留着口令草稿。
+                                    page.draftPassword = ""
+                                }
+                            }
+
+                            AppButton {
+                                objectName: "remoteDeleteAccountButton"
+                                text: "注销账户"
+                                enabled: !remote.busy
+                                onClicked: {
+                                    page.draftDeletePassword = ""
+                                    page.draftDeleteName = ""
+                                    deleteAccountDialog.open()
+                                }
+                            }
+
+                            Item { Layout.fillWidth: true }
+                        }
                     }
 
                     Text {
                         objectName: "remoteSessionText"
                         Layout.fillWidth: true
-                        Layout.topMargin: 4
+                        Layout.topMargin: 6
                         text: remote.sessionText
                         font.pixelSize: 15
                         color: remote.authenticated ? theme.success : theme.textSecondary
@@ -680,6 +834,119 @@ Item {
                     variant: "primary"
                     enabled: !remote.busy
                     onClicked: page.confirmDelete()
+                }
+            }
+        }
+    }
+
+    // 注册成功 / 登录成功 / 注销成功之后的界面清理。
+    //
+    // 放在这里而不是按钮的 onClicked 里：这三件事的结果是异步回来的，
+    // 只有操作真的结束了才知道该清哪些草稿、该不该切标签页。
+    Connections {
+        target: remote
+
+        function onOperationFinished(kind, succeeded) {
+            if (!succeeded)
+                return
+            if (kind === "register") {
+                // 推荐行为：切回「登录」标签、保留刚注册的用户名、不保存密码。
+                page.draftRegisterPassword = ""
+                page.draftConfirmPassword = ""
+                page.accountTab = 0
+            } else if (kind === "login") {
+                page.draftPassword = ""
+            } else if (kind === "delete-account") {
+                page.draftPassword = ""
+                page.draftDeletePassword = ""
+                page.draftDeleteName = ""
+                page.accountTab = 0
+            }
+        }
+    }
+
+    // 注销账户。这是一个不可撤销的服务端删除，所以确认文案必须说清楚后果，
+    // 而且要求"再次输入当前密码" + "逐字输入当前账户名"两件事都做对。
+    Dialog {
+        id: deleteAccountDialog
+        objectName: "remoteDeleteAccountDialog"
+        anchors.centerIn: parent
+        modal: true
+        padding: 18
+        closePolicy: Popup.CloseOnEscape
+
+        background: Rectangle {
+            color: theme.surfaceElevated
+            border.width: 1
+            border.color: theme.border
+            radius: 10
+        }
+
+        contentItem: ColumnLayout {
+            spacing: 12
+
+            Text {
+                text: "注销账户"
+                color: theme.textPrimary
+                font.pixelSize: 16
+                font.weight: Font.DemiBold
+            }
+
+            Text {
+                Layout.preferredWidth: 420
+                text: "注销账户会永久删除该账户以及全部云端备份，此操作无法撤销。\n\n"
+                      + "当前账户：" + remote.username
+                color: theme.textSecondary
+                font.pixelSize: 15
+                wrapMode: Text.WordWrap
+            }
+
+            AppTextField {
+                id: deletePasswordField
+                objectName: "remoteDeletePasswordField"
+                Layout.fillWidth: true
+                enabled: !remote.busy
+                echoMode: TextInput.Password
+                placeholderText: "再次输入当前密码"
+                text: page.draftDeletePassword
+                onTextEdited: page.draftDeletePassword = text
+            }
+
+            AppTextField {
+                id: deleteNameField
+                objectName: "remoteDeleteNameField"
+                Layout.fillWidth: true
+                enabled: !remote.busy
+                placeholderText: "输入账户名以确认：" + remote.username
+                text: page.draftDeleteName
+                onTextEdited: page.draftDeleteName = text
+            }
+
+            RowLayout {
+                Layout.fillWidth: true
+                spacing: 10
+
+                Item { Layout.fillWidth: true }
+
+                AppButton {
+                    objectName: "remoteDeleteAccountCancelButton"
+                    text: "取消"
+                    onClicked: {
+                        page.draftDeletePassword = ""
+                        page.draftDeleteName = ""
+                        deleteAccountDialog.close()
+                    }
+                }
+
+                AppButton {
+                    objectName: "remoteDeleteAccountConfirmButton"
+                    text: "确认注销"
+                    variant: "primary"
+                    enabled: !remote.busy
+                    onClicked: {
+                        if (remote.deleteAccount(page.draftDeletePassword, page.draftDeleteName))
+                            deleteAccountDialog.close()
+                    }
                 }
             }
         }
