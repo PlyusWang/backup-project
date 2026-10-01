@@ -75,6 +75,17 @@ enum class Opcode : std::uint16_t {
   kRegister = 2,
   kLogin = 3,
   kLogout = 4,
+  // 恢复会话：在一**条新的** TCP 连接上用 token 重新认证。
+  //
+  // 为什么需要它：token 是 12 小时有效的无状态签名凭据，而 TCP 连接的生命周期
+  // 短得多（服务端会在 io_timeout 之后主动关掉空闲连接，隧道重启也会断）。
+  // 没有这个操作码，一次空闲超时就会把用户"踢下线"——而 token 其实还好好的。
+  // 有了它：连接断了就重连再用 token 认证，用户无感；token 真的无效（过期、
+  // 账户已注销）时服务端明确回 UNAUTHORIZED。
+  //
+  // 载荷：token（u16 前缀字符串）。目标账户来自 token 自己的签名内容，
+  // 客户端无法指定"恢复成谁"。
+  kResume = 5,
   kList = 10,
   kUploadBegin = 20,
   kUploadChunk = 21,

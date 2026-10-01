@@ -156,7 +156,20 @@ const char* ConnectionStateName(ConnectionState state) {
   return "UNKNOWN_STATE";
 }
 
-RemoteServer::RemoteServer() = default;
+RemoteServer::RemoteServer() {
+  // std::atomic 的默认构造在 C++17 里不保证清零：显式初始化。
+  for (std::size_t index = 0; index < 256; ++index) {
+    request_counts_[index].store(0);
+  }
+}
+
+std::uint64_t RemoteServer::request_count_for_testing(
+    std::uint16_t opcode) const {
+  if (opcode > 255) {
+    return 0;
+  }
+  return request_counts_[opcode].load();
+}
 
 RemoteServer::~RemoteServer() { Stop(); }
 
@@ -585,6 +598,53 @@ bool RemoteServer::HandleLogout(int fd, const FrameHeader& header,
   context->state = ConnectionState::kConnected;
   context->user_id = 0;
   context->username.clear();
+  return SendStatus(fd, header, Status::kOk, std::string(), error_message);
+}
+
+bool RemoteServer::HandleResume(int fd, const FrameHeader& header,
+                                const std::string& payload,
+                                ConnectionContext* context,
+                                std::string* error_message) {
+  if (context->state != ConnectionState::kConnected) {
+    Log("rejecting RESUME while a session is already established");
+    return SendError(fd, header.opcode, header.request_id,
+                     Status::kInvalidState, error_message);
+  }
+  PayloadReader reader(payload);
+  std::string token;
+  if (!reader.ReadString(kMaxTokenBytes, &token) || !reader.AtEnd()) {
+    Log("rejecting a malformed RESUME: " + reader.error_message());
+    return SendError(fd, header.opcode, header.request_id,
+                     Status::kInvalidRequest, error_message);
+  }
+  TokenPayload parsed;
+  std::string verify_error;
+  if (!VerifyToken(secret_, token, NowSeconds(), &parsed, &verify_error)) {
+    // 失败原因只写日志：里面既没有 token 内容，也没有 secret。
+    Log("resume rejected: " + verify_error);
+    return SendError(fd, header.opcode, header.request_id, Status::kUnauthorized,
+                     error_message);
+  }
+  // token 的签名说明"这是我们签发的"，但**不**说明"这个账户还在"：注销过的
+  // 账户必须在这里被挡住。这一条正是"注销之后旧 token 立刻失效"的实现。
+  RemoteUserRecord user;
+  std::string store_error;
+  const StoreResult found = store_->FindUserById(
+      static_cast<std::int64_t>(parsed.user_id), &user, &store_error);
+  if (found == StoreResult::kNotFound) {
+    Log("resume rejected: the account no longer exists");
+    return SendError(fd, header.opcode, header.request_id, Status::kUnauthorized,
+                     error_message);
+  }
+  if (found != StoreResult::kOk) {
+    Log("cannot read the user row: " + store_error);
+    return SendError(fd, header.opcode, header.request_id,
+                     Status::kInternalError, error_message);
+  }
+  context->state = ConnectionState::kAuthenticated;
+  context->user_id = parsed.user_id;
+  context->username = user.username;
+  Log("session resumed for user id=" + std::to_string(parsed.user_id));
   return SendStatus(fd, header, Status::kOk, std::string(), error_message);
 }
 
@@ -1390,6 +1450,8 @@ bool RemoteServer::HandleFrame(int fd, const FrameHeader& header,
       return HandleLogin(fd, header, payload, context, error_message);
     case Opcode::kLogout:
       return HandleLogout(fd, header, context, error_message);
+    case Opcode::kResume:
+      return HandleResume(fd, header, payload, context, error_message);
     case Opcode::kList:
       return HandleList(fd, header, context, error_message);
     case Opcode::kUploadBegin:
@@ -1470,6 +1532,18 @@ bool RemoteServer::ServeConnection(int fd, std::string* error_message) {
         return finish(false);
       }
       continue;
+    }
+    // 按操作码计数：**收到就算**（哪怕接下来就断开、根本没有处理）。
+    // 测试用它证明客户端不会在失败之后偷偷重发一次请求。
+    if (header.opcode < 256) {
+      request_counts_[header.opcode].fetch_add(1);
+    }
+    // 测试专用：模拟"这一帧读进来了，但服务端没回应就断了"（进程被 kill、
+    // 隧道重启都属于这一类）。客户端必须如实报告失败，并且**不重发**。
+    // 产品代码从不设置这个标志。
+    if (fail_next_response_.exchange(false)) {
+      Log("injected: dropping the connection before answering a frame (test seam)");
+      return finish(false);
     }
     if (!HandleFrame(fd, header, payload, &context, error_message)) {
       Log("connection terminated: " + *error_message);

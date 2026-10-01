@@ -151,6 +151,14 @@ class RemoteServer {
   // "磁盘写失败时不能留下已发布的 blob"这条路径必须能真的被触发一次。
   // 产品代码里没有任何地方调用这两个方法。
   void FailNextBlobWriteForTesting() { fail_next_write_ = true; }
+  // 让服务端**处理完这一帧之后**直接断开连接。它用来确定性地制造"请求可能已经
+  // 被服务端执行、但客户端读不到响应"的中间态（进程被 kill、隧道重启都属于这
+  // 一类）。产品代码里没有任何地方调用它。
+  void FailNextResponseForTesting() { fail_next_response_.store(true); }
+
+  // 按操作码统计收到的请求数。测试用它证明"客户端不会在失败之后偷偷重发一次
+  // 请求"：重发会让计数变成 2。
+  std::uint64_t request_count_for_testing(std::uint16_t opcode) const;
   void FailNextMetadataInsertForTesting();
   // "注销过程中元数据事务失败时不能留下半删除状态"这条路径必须能真的被触发
   // 一次。产品代码里没有任何地方调用它。
@@ -186,6 +194,10 @@ class RemoteServer {
                    std::string* error_message);
   bool HandleLogout(int fd, const FrameHeader& header,
                     ConnectionContext* context, std::string* error_message);
+  // 在新连接上用 token 恢复会话（见 network_protocol.h 里 kResume 的说明）。
+  bool HandleResume(int fd, const FrameHeader& header,
+                    const std::string& payload, ConnectionContext* context,
+                    std::string* error_message);
   bool HandleList(int fd, const FrameHeader& header, ConnectionContext* context,
                   std::string* error_message);
   bool HandleUploadBegin(int fd, const FrameHeader& header,
@@ -265,6 +277,9 @@ class RemoteServer {
   std::size_t busy_workers_ = 0;
   std::size_t worker_count_ = 0;
   bool fail_next_write_ = false;
+  std::atomic<bool> fail_next_response_{false};
+  // 每个操作码收到的请求数。协议里用到的操作码都 < 256，超出范围的不统计。
+  std::atomic<std::uint64_t> request_counts_[256];
 };
 
 }  // namespace net
