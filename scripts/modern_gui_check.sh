@@ -249,7 +249,8 @@ classify_qmllint() {
       # 放行后立刻清状态，避免变成“全局允许某类提示”。
       if (msg ~ /^Info: (ruleModel|modelData) is a member of a parent element\.?$/ &&
           (prev_panel_allowed == 1 || prev_allowed_file ~ /SchedulePage\.qml/ ||
-           prev_allowed_file ~ /RealtimePage\.qml/)) {
+           prev_allowed_file ~ /RealtimePage\.qml/ ||
+           prev_allowed_file ~ /SegmentedTabs\.qml/)) {
         print "ALLOWED\t" msg
         # 不清状态：SchedulePage 的委托用 required property var modelData，
         # qmllint 会在这条之后紧跟一条不带文件名的通用 Info，两条属于同一份诊断。
@@ -326,6 +327,15 @@ classify_qmllint() {
       # 规则覆盖，这里补它自己的根 id card。
       if (msg ~ /Unqualified access/ && msg ~ /RemoteSnapshotCard\.qml/ &&
           (snippet ~ /card\./ || snippet ~ /theme\./)) {
+        MarkAllowed(msg); return
+      }
+      # PR #20（人工验收修复）：SegmentedTabs.qml 是本轮新增的共享分段控件。
+      # 它只引用上下文属性 theme、本组件根 id control，以及委托里的 segment /
+      # modelData（委托是独立组件作用域，6.4 的静态检查解析不到外层 id；运行期
+      # 正常，--remote-test 与启动自检都是 0 条 QML 运行期告警）。
+      if (msg ~ /Unqualified access/ && msg ~ /SegmentedTabs\.qml/ &&
+          (snippet ~ /theme\./ || snippet ~ /control\./ ||
+           snippet ~ /segment\./ || snippet ~ /modelData/)) {
         MarkAllowed(msg); return
       }
       if (msg ~ /Cannot defer property assignment to "contentItem"/) {
@@ -484,6 +494,9 @@ expect_missing() {
 # 页面进资源清单、导航只有一个入口、密码框是密码回显、删除必须经过确认、
 # 进度条绑的是网络层的真实字节数。
 REMOTE_PAGE_QML="$QML_DIR/pages/RemotePage.qml"
+SEGMENTED_QML="$QML_DIR/components/SegmentedTabs.qml"
+CLIENT_CPP="$ROOT_DIR/src/network/remote_backup_client.cpp"
+CLIENT_H="$ROOT_DIR/include/remote_backup_client.h"
 REMOTE_CARD_QML="$QML_DIR/components/RemoteSnapshotCard.qml"
 REMOTE_CONTROLLER_H="$ROOT_DIR/ui/modern/remote_controller.h"
 REMOTE_CONTROLLER_CPP="$ROOT_DIR/ui/modern/remote_controller.cpp"
@@ -555,10 +568,33 @@ expect_count "$REMOTE_CONTROLLER_CPP" "password_.fill(QChar(0))" 3 \
 #
 # 人工验收的结论：用户名 / 密码 / 注册 / 登录 / 退出登录堆在同一块里，用户分不清
 # "我在登录还是在注册"，注册也只有一个密码框。这一节把新的信息架构钉成契约。
-expect_count "$REMOTE_PAGE_QML" 'objectName: "remoteLoginTabButton"' 1 \
-  "账户区域有「登录」标签"
-expect_count "$REMOTE_PAGE_QML" 'objectName: "remoteRegisterTabButton"' 1 \
-  "账户区域有「注册」标签"
+# 账户区域是一个**分段控件**：一个圆角容器 + 两个等宽分段。人工验收的结论是
+# 两个各自独立的按钮看起来像"可以同时按"，不像"二选一"。
+expect_count "$REMOTE_PAGE_QML" "SegmentedTabs {" 1 \
+  "账户区域用共享的分段控件（不是两个独立按钮）"
+expect_count "$REMOTE_PAGE_QML" 'objectName: "remoteAccountTabs"' 1 \
+  "分段控件有 objectName（自动化要能点到它）"
+expect_count "$RESOURCE_FILE" "qml/components/SegmentedTabs.qml" 1 \
+  "SegmentedTabs.qml 进了资源清单"
+expect_count "$SEGMENTED_QML" "theme.accent" 2 \
+  "选中分段用强调色（与 primary 按钮同一个 token）"
+expect_count "$SEGMENTED_QML" "theme.surface" 2 \
+  "容器用次级按钮的中性底色（浅色=较深灰 / 深色=较亮灰，由 token 决定）"
+expect_count "$SEGMENTED_QML" "theme.border" 2 \
+  "容器与分段边框用共享的 border token"
+expect_count "$SEGMENTED_QML" "theme.hover" 2 \
+  "未选中分段的 hover 用共享的 hover token"
+expect_count "$SEGMENTED_QML" "radius: 9" 1 \
+  "外圆角与 AppButton 一致（9）"
+expect_count "$SEGMENTED_QML" '"#ffffff"' 1 \
+  "选中分段的文字用白字（与 primary 按钮一致）"
+expect_missing "$SEGMENTED_QML" "theme.dark" \
+  "分段控件不自己判断主题：两套配色都走 token"
+if grep -nE '#[0-9a-fA-F]{6}' "$SEGMENTED_QML" | grep -v '#ffffff' | grep -q .; then
+  record_fail "分段控件硬编码了颜色（除了强调色上的白字）"
+else
+  record_pass "分段控件不硬编码任何颜色（除了强调色上的白字）"
+fi
 expect_count "$REMOTE_PAGE_QML" 'objectName: "remoteRegisterPasswordField"' 1 \
   "注册标签有独立的密码输入框"
 expect_count "$REMOTE_PAGE_QML" 'objectName: "remoteRegisterConfirmField"' 1 \
@@ -584,9 +620,41 @@ expect_count "$REMOTE_PAGE_QML" "remote.deleteAccount(" 1 \
   "整页只有一处真正调用注销"
 expect_count "$REMOTE_PAGE_QML" "remote.logoutLocal()" 1 \
   "「退出登录」只有一处，与注销是两个不同的动作"
-expect_present "$REMOTE_PAGE_QML" \
-  "两个密码框必须完全一致；不一致时不会发送任何请求。" \
-  "注册标签写明了两次密码必须一致"
+# 注册页的正常状态只给一句弱化的辅助文字；只有真的不一致时才换成红色错误。
+expect_count "$REMOTE_PAGE_QML" "请再次输入密码以确认。" 1 \
+  "注册标签的正常状态只有一句弱化的辅助文字"
+expect_missing "$REMOTE_PAGE_QML" "不会发送任何请求" \
+  "页面不再写开发者式的说明"
+expect_count "$REMOTE_PAGE_QML" "两次输入的密码不一致" 1 \
+  "不一致时明确写出「两次输入的密码不一致」"
+expect_count "$REMOTE_PAGE_QML" "color: theme.error" 2 \
+  "不一致错误与注销错误都用共享的 error 色"
+expect_present "$REMOTE_PAGE_QML" "visible: page.registerPasswordMismatch" 1 \
+  "错误行由「两次密码是否一致」这个计算属性驱动（改一个字符就更新）"
+expect_present "$REMOTE_PAGE_QML" "page.draftRegisterPassword !== page.draftConfirmPassword" 1 \
+  "不一致是本地判定的（不发网络请求）"
+# 注销对话框：失败原因必须出现在对话框内部，而且只有成功才关闭。
+expect_count "$REMOTE_PAGE_QML" 'objectName: "remoteDeleteAccountError"' 1 \
+  "注销对话框里有自己的错误行"
+expect_count "$REMOTE_PAGE_QML" "remote.deleteAccountError" 2 \
+  "错误行绑到控制器的 deleteAccountError（可见性 + 文本）"
+expect_missing "$REMOTE_PAGE_QML" "if (remote.deleteAccount(" \
+  "确认注销不再在提交时就关闭对话框"
+expect_count "$REMOTE_PAGE_QML" "deleteAccountDialog.close()" 2 \
+  "对话框只由「取消」和「操作成功」两条路径关闭"
+# 传输层：请求生命周期与连接生命周期分开，且**没有**自动重发。
+expect_present "$CLIENT_CPP" "PrepareConnection(&prepare_error)" 1 \
+  "发请求之前先准备连接（重连 / 恢复会话都发生在发送之前）"
+expect_present "$CLIENT_H" "bool session_resumable() const" 1 \
+  "客户端能区分「连接断了」与「token 也没了」"
+expect_present "$CLIENT_CPP" "Opcode::kResume" 1 \
+  "新连接上用 RESUME 恢复会话，而不是让用户重新登录"
+expect_missing "$CLIENT_CPP" "retry" \
+  "客户端里没有 retry 逻辑：失败绝不自动重发"
+expect_present "$ROOT_DIR/include/network_protocol.h" "kResume = 5" \
+  "RESUME 是协议里的一个新操作码（token 说明它恢复的是谁）"
+expect_count "$ROOT_DIR/include/network_protocol.h" "kResume = 5" 1 \
+  "RESUME 的操作码值只定义一次"
 # 本地校验：不一致时不发请求（检查在控制器里，且在 AcceptEndpoint 之前）。
 expect_present "$REMOTE_CONTROLLER_CPP" "password != confirm_password" \
   "控制器在提交之前比较两次注册密码"
