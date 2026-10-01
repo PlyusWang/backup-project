@@ -39,6 +39,30 @@
   代码结构把"连接 + 收发"限制在一个很小的接口上，将来替换成 TLS 不需要动
   协议语义，但**本版本没有实现原生 TLS**，不要当成已有能力。
 
+## 2.1 连接与会话是两件事
+
+BPNET1 的**会话是 token，不是 TCP 连接**：
+
+* token 是 12 小时有效的签名凭据，与具体连接无关；
+* 服务端会在 `--io-timeout`（默认 30 秒）之后主动关掉**空闲**连接（慢连接保护）；
+* SSH 隧道重启、网络抖动同样会断掉连接。
+
+客户端因此把两件事分开处理：
+
+    连接断了        -> 关掉这条 socket，**保留 token**；下一次操作先重连，
+                       再用 RESUME（opcode 5）在新连接上恢复会话
+    token 真的无效  -> 服务端明确回 UNAUTHORIZED（过期、被轮换、账户已注销）；
+                       这时才丢掉 token，并要求重新登录
+
+这条规则修的是人工验收里"点一次刷新就被退出登录 / 奇数次失败偶数次正常"：以前任何
+一次连接断开都会把 token 一起丢掉。现在**每一次独立用户操作，第一次请求就得到确定
+结果**——客户端在发送请求之前会先确认连接可用（`poll` + `MSG_PEEK` 探测对端是否
+已经关闭），必要时先重连并恢复会话，然后才发送。
+
+客户端**不会自动重发**已经发出去的请求（no retry）：失败就如实报错，用户再点一次
+即可（upload / delete / delete-account 这类有副作用的操作尤其不能悄悄重试）。自动化
+测试用服务端的"按操作码请求计数"证明失败之后服务端只收到过一次请求。
+
 ## 3. 服务端
 
 在 ECS 上（~/backup-project-server/）：
@@ -152,6 +176,10 @@ scripts/backup-server-admin.sh 一起装到 ECS 的 bin/ 下。
 ## 7. 测试
 
     bash scripts/network_test.sh            # 单元 + 本地 CLI 端到端
+                                            #   （含 remote_sequence_test：
+                                            #    空闲超时 / 错误口令 × 6 /
+                                            #    LIST × 10 / 20 轮 / 注销序列 /
+                                            #    不重发 的确定性回归）
     bash scripts/account_deletion_test.sh   # 账户注销端到端（真实服务端 + 磁盘）
     bash scripts/server_admin_test.sh       # ECS 本地管理工具的安全边界
     bash scripts/aliyun_network_e2e.sh      # 阿里云真实端到端（需要隧道前置条件）
