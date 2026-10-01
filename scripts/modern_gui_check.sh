@@ -304,6 +304,24 @@ classify_qmllint() {
           (snippet ~ /remote\./ || snippet ~ /page\./)) {
         MarkAllowed(msg); return
       }
+      # PR #20 closure：RemotePage.qml 用 Connections 把"一次操作结束"的结果落回
+      # 界面草稿（注册成功切回登录标签、注销成功清空密码框）。qmllint 6.4.2 的
+      # qmltypes 里没有 Connections 这个类型，于是同一处冒出三条诊断：
+      # Connections was not found / Binding assigned to "target" / 紧跟其后的
+      # Unqualified access（target: remote 这一行没有点号，因此上面的通用规则
+      # 接不住它）。运行期实测正常：--remote-test 的 REMOTE-05 / 05a / 14 全绿、
+      # 启动自检 0 条 QML 运行期告警。放行精确限定到"这个文件 + 这一组诊断"。
+      if (msg ~ /RemotePage\.qml/ && msg ~ /Connections was not found/) {
+        MarkAllowed(msg); return
+      }
+      if (msg ~ /RemotePage\.qml/ &&
+          msg ~ /Binding assigned to "target", but no property "target" exists/) {
+        MarkAllowed(msg); return
+      }
+      if (msg ~ /Unqualified access/ && msg ~ /RemotePage\.qml/ &&
+          snippet ~ /target: remote/) {
+        MarkAllowed(msg); return
+      }
       # RemoteSnapshotCard.qml 是远程备份列表的委托组件：theme 由上面那条通用
       # 规则覆盖，这里补它自己的根 id card。
       if (msg ~ /Unqualified access/ && msg ~ /RemoteSnapshotCard\.qml/ &&
@@ -2594,8 +2612,9 @@ for jargon in "BPNET1" "PBKDF2" "HMAC" "SQLite" "opcode" "request_id" \
 done
 expect_present "$REMOTE_PAGE_QML" '"远程备份"' \
   "导航与标题用“远程备份”这个说法"
-expect_present "$REMOTE_PAGE_QML" '"连接服务器"' \
-  "远程备份页有连接区域"
+# 账户区域现在是"服务器账户"卡片：地址 / 端口 / 用户名 + 登录、注册两个标签页。
+expect_present "$REMOTE_PAGE_QML" '"服务器账户"' \
+  "远程备份页有账户区域（地址 / 端口 / 用户名 + 登录注册标签页）"
 expect_present "$REMOTE_PAGE_QML" '"云端备份"' \
   "远程备份页有云端备份区域"
 expect_present "$REMOTE_PAGE_QML" '"技术详情"' \
