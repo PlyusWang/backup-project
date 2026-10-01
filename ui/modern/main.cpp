@@ -2238,22 +2238,24 @@ int RunRemoteSmoke(backup_modern::RemoteController* remote,
                     QStringLiteral("confirm-mismatch") &&
                 remote->authenticated(),
             QStringLiteral("SMOKE-11 账户名不一致：本地拒绝，账户还在"));
-  run.Check(remote->deleteAccount(password, username) &&
-                remote->waitForIdle(180000) && !remote->authenticated() &&
-                remote->lastErrorKindForTest() == QStringLiteral("none"),
-            QStringLiteral("SMOKE-11 注销账户成功（服务端删除该账户与全部备份）"),
-            remote->lastErrorKindForTest() + QStringLiteral(": ") +
-                remote->lastDetailForTest());
+  run.Check(
+      remote->deleteAccount(password, username) &&
+          remote->waitForIdle(180000) && !remote->authenticated() &&
+          remote->lastErrorKindForTest() == QStringLiteral("none"),
+      QStringLiteral("SMOKE-11 注销账户成功（服务端删除该账户与全部备份）"),
+      remote->lastErrorKindForTest() + QStringLiteral(": ") +
+          remote->lastDetailForTest());
   // login() 返回 true 只表示"请求被受理"：必须等后台任务结束之后再断言。
   const bool relogin_accepted =
       remote->login(host, port_text, username, password);
   const bool relogin_idle = remote->waitForIdle(120000);
   const bool relogin_still_out = !remote->authenticated();
   const QString relogin_kind = remote->lastErrorKindForTest();
-  run.Check(relogin_accepted && relogin_idle && relogin_still_out &&
-                relogin_kind == QStringLiteral("credentials"),
-            QStringLiteral("SMOKE-12 注销之后原账户无法再登录（服务端没有这一行）"),
-            relogin_kind);
+  run.Check(
+      relogin_accepted && relogin_idle && relogin_still_out &&
+          relogin_kind == QStringLiteral("credentials"),
+      QStringLiteral("SMOKE-12 注销之后原账户无法再登录（服务端没有这一行）"),
+      relogin_kind);
 
   std::printf("[remote-smoke] passed=%d failed=%d\n", run.passed, run.failed);
   if (run.failed != 0) {
@@ -2573,10 +2575,10 @@ int RunRemoteTest(QQuickWindow* window, backup_modern::RemoteController* remote,
   // 的输入连 endpoint 都没有改（更不可能发请求）。
   const QString endpoint_before_host = remote->host();
   const QString endpoint_before_port = remote->portText();
-  const bool mismatch_accepted = remote->registerAccount(
-      QStringLiteral("192.0.2.1"), QStringLiteral("9"),
-      QStringLiteral("local-only-check"), password,
-      password + QStringLiteral("x"));
+  const bool mismatch_accepted =
+      remote->registerAccount(QStringLiteral("192.0.2.1"), QStringLiteral("9"),
+                              QStringLiteral("local-only-check"), password,
+                              password + QStringLiteral("x"));
   const QString mismatch_kind = remote->lastErrorKindForTest();
   const QString mismatch_title = remote->statusTitle();
   run.Check(!mismatch_accepted &&
@@ -2586,8 +2588,8 @@ int RunRemoteTest(QQuickWindow* window, backup_modern::RemoteController* remote,
                 remote->portText() == endpoint_before_port && !remote->busy(),
             QStringLiteral("REMOTE-05a 两次密码不一致：本地拒绝且不发网络请求"),
             mismatch_kind + QStringLiteral(": ") + mismatch_title +
-                QStringLiteral(" / ") + remote->host() +
-                QStringLiteral(":") + remote->portText());
+                QStringLiteral(" / ") + remote->host() + QStringLiteral(":") +
+                remote->portText());
 
   run.Check(remote->registerAccount(host, port_text, user, password, password),
             QStringLiteral("REMOTE-05 注册请求被受理"));
@@ -2839,21 +2841,15 @@ int RunRemoteTest(QQuickWindow* window, backup_modern::RemoteController* remote,
   // 三个阶段都要在两种主题下检查几何：只查一种状态，另一种状态里的标签页
   // 塌掉是看不出来的。
   const char* signed_in_names[] = {
-      "remoteHostField",
-      "remotePortField",
-      "remoteUserField",
-      "remoteAccountText",
-      "remoteAccountStateText",
-      "remoteLogoutButton",
-      "remoteDeleteAccountButton",
-      "remoteUploadButton",
-      "remoteRefreshButton",
-      "remoteListSummary",
-      "remoteStatusBanner",
-      "remoteTechnicalToggle"};
-  const char* login_tab_names[] = {
-      "remoteLoginTabButton", "remoteRegisterTabButton", "remotePasswordField",
-      "remoteLoginButton"};
+      "remoteHostField",           "remotePortField",
+      "remoteUserField",           "remoteAccountText",
+      "remoteAccountStateText",    "remoteLogoutButton",
+      "remoteDeleteAccountButton", "remoteUploadButton",
+      "remoteRefreshButton",       "remoteListSummary",
+      "remoteStatusBanner",        "remoteTechnicalToggle"};
+  const char* login_tab_names[] = {"remoteLoginTabButton",
+                                   "remoteRegisterTabButton",
+                                   "remotePasswordField", "remoteLoginButton"};
   const char* register_tab_names[] = {
       "remoteLoginTabButton", "remoteRegisterTabButton",
       "remoteRegisterPasswordField", "remoteRegisterConfirmField",
@@ -2880,10 +2876,10 @@ int RunRemoteTest(QQuickWindow* window, backup_modern::RemoteController* remote,
         dark == 1 ? QStringLiteral("深色") : QStringLiteral("浅色");
     theme->setDark(dark == 1);
     goToPage(6);
-    checkLayout(signed_in_names,
-                sizeof(signed_in_names) / sizeof(signed_in_names[0]),
-                QStringLiteral("REMOTE-12 %1主题下已登录区域的关键控件都有正的几何")
-                    .arg(theme_label));
+    checkLayout(
+        signed_in_names, sizeof(signed_in_names) / sizeof(signed_in_names[0]),
+        QStringLiteral("REMOTE-12 %1主题下已登录区域的关键控件都有正的几何")
+            .arg(theme_label));
     QQuickItem* host_field_item = itemByName("remoteHostField");
     if (host_field_item != nullptr && dark == 0) {
       light_text = host_field_item->property("color").value<QColor>();
@@ -2891,18 +2887,19 @@ int RunRemoteTest(QQuickWindow* window, backup_modern::RemoteController* remote,
     // 未登录的两种标签页各查一遍；查完把账户登回来，后面的小节继续用。
     remote->logoutLocal();
     WaitForAnimation(200);
-    checkLayout(login_tab_names,
-                sizeof(login_tab_names) / sizeof(login_tab_names[0]),
-                QStringLiteral("REMOTE-12 %1主题下登录标签的关键控件都有正的几何")
-                    .arg(theme_label));
+    checkLayout(
+        login_tab_names, sizeof(login_tab_names) / sizeof(login_tab_names[0]),
+        QStringLiteral("REMOTE-12 %1主题下登录标签的关键控件都有正的几何")
+            .arg(theme_label));
     if (remote_page_item != nullptr) {
       remote_page_item->setProperty("accountTab", 1);
     }
     WaitForAnimation(200);
-    checkLayout(register_tab_names,
-                sizeof(register_tab_names) / sizeof(register_tab_names[0]),
-                QStringLiteral("REMOTE-12 %1主题下注册标签的关键控件都有正的几何")
-                    .arg(theme_label));
+    checkLayout(
+        register_tab_names,
+        sizeof(register_tab_names) / sizeof(register_tab_names[0]),
+        QStringLiteral("REMOTE-12 %1主题下注册标签的关键控件都有正的几何")
+            .arg(theme_label));
     if (remote_page_item != nullptr) {
       remote_page_item->setProperty("accountTab", 0);
     }
@@ -2946,20 +2943,21 @@ int RunRemoteTest(QQuickWindow* window, backup_modern::RemoteController* remote,
                 remote->authenticated() && !remote->busy(),
             QStringLiteral("REMOTE-14 账户名不一致：本地拒绝，账户还在"),
             remote->lastErrorKindForTest());
-  run.Check(remote->deleteAccount(password + QStringLiteral("-wrong"), user) &&
-                remote->waitForIdle(120000) && remote->authenticated() &&
-                remote->lastErrorKindForTest() ==
-                    QStringLiteral("account-password"),
-            QStringLiteral("REMOTE-14 口令错误：服务端拒绝，账户与数据都还在"),
-            remote->lastErrorKindForTest() + QStringLiteral(": ") +
-                remote->lastDetailForTest());
-  run.Check(remote->deleteAccount(password, user) &&
-                remote->waitForIdle(120000) && !remote->authenticated() &&
-                remote->lastErrorKindForTest() == QStringLiteral("none") &&
-                remote->snapshotCountForTest() == 0,
-            QStringLiteral("REMOTE-14 正确口令 + 正确账户名：账户与云端数据被删除"),
-            remote->lastErrorKindForTest() + QStringLiteral(": ") +
-                remote->lastDetailForTest());
+  run.Check(
+      remote->deleteAccount(password + QStringLiteral("-wrong"), user) &&
+          remote->waitForIdle(120000) && remote->authenticated() &&
+          remote->lastErrorKindForTest() == QStringLiteral("account-password"),
+      QStringLiteral("REMOTE-14 口令错误：服务端拒绝，账户与数据都还在"),
+      remote->lastErrorKindForTest() + QStringLiteral(": ") +
+          remote->lastDetailForTest());
+  run.Check(
+      remote->deleteAccount(password, user) && remote->waitForIdle(120000) &&
+          !remote->authenticated() &&
+          remote->lastErrorKindForTest() == QStringLiteral("none") &&
+          remote->snapshotCountForTest() == 0,
+      QStringLiteral("REMOTE-14 正确口令 + 正确账户名：账户与云端数据被删除"),
+      remote->lastErrorKindForTest() + QStringLiteral(": ") +
+          remote->lastDetailForTest());
   // 注意：login() 返回 true 只表示"请求被受理"，不代表登录成功。必须等后台
   // 任务结束之后再看 authenticated() 与失败类别——上一次这里漏了 waitForIdle，
   // 结果把"还在跑"当成了结论。
@@ -2973,10 +2971,11 @@ int RunRemoteTest(QQuickWindow* window, backup_modern::RemoteController* remote,
 
   const bool second_delete_accepted = remote->deleteAccount(password, user);
   const QString second_delete_kind = remote->lastErrorKindForTest();
-  run.Check(!second_delete_accepted && !remote->busy() &&
-                second_delete_kind == QStringLiteral("not-logged-in"),
-            QStringLiteral("REMOTE-14 未登录时注销被拒（同一按钮点两次不会误删）"),
-            second_delete_kind);
+  run.Check(
+      !second_delete_accepted && !remote->busy() &&
+          second_delete_kind == QStringLiteral("not-logged-in"),
+      QStringLiteral("REMOTE-14 未登录时注销被拒（同一按钮点两次不会误删）"),
+      second_delete_kind);
 
   std::printf("[remote-test] passed=%d failed=%d\n", run.passed, run.failed);
   if (run.failed != 0) {

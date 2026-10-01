@@ -946,13 +946,14 @@ bool RemoteController::deleteSnapshot(const QString& snapshot_id) {
 }
 
 bool RemoteController::deleteAccount(const QString& password,
-                                       const QString& username_confirmation) {
+                                     const QString& username_confirmation) {
   // 二次确认：必须逐字敲出当前账户名。少一个字符都不发请求——注销是不可撤销
   // 的服务端删除，不能是一个"点快了就没了"的按钮。
   if (username_confirmation.trimmed() != username_) {
     last_error_kind_ = QStringLiteral("confirm-mismatch");
-    SetStatus(QStringLiteral("error"), QStringLiteral("账户名不一致"),
-              QStringLiteral("请输入当前账户名 %1 以确认注销。").arg(username_));
+    SetStatus(
+        QStringLiteral("error"), QStringLiteral("账户名不一致"),
+        QStringLiteral("请输入当前账户名 %1 以确认注销。").arg(username_));
     return false;
   }
   if (!AcceptPassword(password)) {

@@ -13,7 +13,8 @@
 //
 // 失败一致性（账户注销）：
 //
-//   1. <root>/users/<id> 整体 rename 到 <root>/trash/account-<id>.<随机>.deleted
+//   1. <root>/users/<id> 整体 rename 到
+//   <root>/trash/account-<id>.<随机>.deleted
 //      —— 这一步是原子的，做完之后这些字节对任何客户端都不再可见；
 //   2. 元数据库在**一个事务**里删 snapshots 行 + users 行 + 写墓碑；
 //   3. 事务失败 -> 把目录改回原名字（数据完好如初），返回失败；
