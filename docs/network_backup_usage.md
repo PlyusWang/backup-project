@@ -70,11 +70,15 @@
         [--repository <仓库目录>]
     backupctl remote download <快照ID> <目标路径> --user <用户名> [--force]
     backupctl remote delete <快照ID> --user <用户名>
+    backupctl remote delete-account --user <用户名> --confirm <用户名>
 
 * 端点默认 127.0.0.1:18765，可用 --host / --port 覆盖。
 * 口令只从 /dev/tty 读（register 问两次）；命令行里**没有** --password。
   自动测试用 BACKUP_REMOTE_PASSWORD（只读不打印）。
 * token 只在进程内存里，命令结束即丢弃；服务端不保存会话表。
+* delete-account 会**永久删除**该账户以及它的全部云端备份（服务端删除，
+  不可撤销），因此要 --confirm 逐字给出同一个用户名，服务端还会用当前
+  口令再校验一次。它与"退出登录"完全不同：后者只清本机内存。
 * upload --repository <仓库> 会先调用产品自己的
   LoadVerifiedSnapshotIdentity 证明这份归档"实际字节与声明一致"，再上传。
 * download 默认不覆盖已存在的目标；写入 <目标>.part，长度与 SHA-256 都
@@ -91,13 +95,52 @@
 * 归属隔离：所有查询都带 user_id，别人的 snapshot id 与不存在的 id 返回
   完全相同的 NOT_FOUND，不能用来探测"某个 id 是否存在"。
 
+## 5.1 服务器管理员：SSH 到 ECS 后使用本机管理工具
+
+管理员能力**不在协议里**，也不在 GUI / CLI 里。唯一的使用方式是先 SSH 登录到
+ECS，再在 ECS 本机运行 backup-server-admin：
+
+    ssh aliyun-ecs
+    cd ~/backup-project-server
+
+    ./bin/backup-server-admin.sh          # 交互菜单（推荐）
+    ./bin/backup-server-admin --help      # 子命令用法
+
+菜单三块：用户管理（列表 / 详情 / 删除用户及其全部备份）、备份文件管理
+（按用户列出 / 详情 / 删除单个快照）、存储概览（用户数 / 快照总数 / blob 总
+大小 / 占用最多的用户），外加服务状态。
+
+边界（每一条都有自动测试）：
+
+* 管理工具**不监听任何端口**（源码里没有 socket/bind/listen/accept），也不
+  新增公网或 localhost 的 admin 端口；
+* 它是**本机程序**：任何已经获得合法 ECS SSH 权限的终端都能用——Windows
+  物理机、Ubuntu 开发 VM 都一样，都是"SSH 进去，再在本机执行"；
+* 破坏性操作（删快照 / 删账户）复用服务端的**同一份**删除实现，并且要求
+  --confirm 与目标逐字一致；同时必须先抢到数据目录锁。
+* 只读操作（列表 / 详情 / 概览）在服务端运行时照常可用；**破坏性操作在
+  backup-server 运行时被明确拒绝**，并提示先停服务，而不是与正在写的服务端
+  竞态（这不是 pgrep 猜一下，而是内核持有的 flock）。
+* 输出里永远不会出现口令 salt / hash 或 token secret。
+
+数据目录锁是 `<root>/.backup-server.lock` 上的一把 flock：进程崩溃、被
+SIGKILL 都会自动释放，不留 stale 状态；同一个数据目录上启动第二个
+backup-server 也会因此明确失败。
+
+部署：scripts/deploy_aliyun_server.sh 会把 backup-server-admin 与
+scripts/backup-server-admin.sh 一起装到 ECS 的 bin/ 下。
+
 ## 6. 当前限制
 
 * 原生 TLS 未实现，机密性依赖 SSH 隧道。
 * 没有 systemd / 守护进程化；服务端就是前台进程 + PID 文件。
 * 不支持断点续传（resume），也不支持远程块级增量（delta）。
 * token 在有效期内无法单独吊销（服务端无会话状态）；轮换
-  BACKUP_TOKEN_SECRET 会让所有已签发 token 立即失效。
+  BACKUP_TOKEN_SECRET 会让所有已签发 token 立即失效。唯一的例外是账户
+  注销：账户行不存在之后，旧 token 在任何操作上都会被拒绝（每次操作都会
+  回查账户是否还在），而且被注销账户的 user id 不会被重用。
+* 管理工具不做"运行中删除"：backup-server 在跑时，破坏性管理操作会被拒绝
+  （见 5.1），需要先停服务。
 * list 一次最多 4096 条、响应必须装进一个 1 MiB 的帧；超出会明确报
   TOO_LARGE，没有分页。
 * 登录失败没有速率限制（当前部署只在 SSH 隧道内可达）。
@@ -109,6 +152,8 @@
 ## 7. 测试
 
     bash scripts/network_test.sh            # 单元 + 本地 CLI 端到端
+    bash scripts/account_deletion_test.sh   # 账户注销端到端（真实服务端 + 磁盘）
+    bash scripts/server_admin_test.sh       # ECS 本地管理工具的安全边界
     bash scripts/aliyun_network_e2e.sh      # 阿里云真实端到端（需要隧道前置条件）
 
 scripts/network_test.sh 覆盖：协议编解码边界、认证、元数据与归属隔离、
