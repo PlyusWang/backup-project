@@ -25,7 +25,9 @@
 #include <sstream>
 
 #include "crypto.h"
+#include "file_lock.h"
 #include "remote_auth.h"
+#include "remote_maintenance.h"
 #include "remote_metadata_store.h"
 
 namespace backupproject {
@@ -224,6 +226,15 @@ bool RemoteServer::Start(std::string* error_message) {
   if (!EnsureDirectory(config_.root_directory + "/users", error_message)) {
     return false;
   }
+  // 账户注销的隔离区：与 users/ 同级，不属于任何用户目录。
+  if (!EnsureDirectory(config_.root_directory + "/trash", error_message)) {
+    return false;
+  }
+  // 数据目录独占锁。抢不到就是"这个数据目录已经有写者了"：如实拒绝启动，
+  // 而不是两个进程同时写同一个 SQLite 与同一批 blob。
+  if (!AcquireDataLock(error_message)) {
+    return false;
+  }
   const std::size_t slash = config_.database_path.find_last_of('/');
   if (slash != std::string::npos && slash > 0) {
     if (!EnsureDirectory(config_.database_path.substr(0, slash),
@@ -232,17 +243,26 @@ bool RemoteServer::Start(std::string* error_message) {
     }
   }
   if (!LoadSecret(error_message)) {
+    data_lock_.reset();
     return false;
   }
   store_.reset(new RemoteMetadataStore());
   if (!store_->Open(config_.database_path, error_message)) {
     store_.reset();
+    data_lock_.reset();
     return false;
   }
   Log("metadata database opened at " + config_.database_path);
+  // 维护层复用**这一个** store 连接：管理动作与协议处理看到的是同一个
+  // SQLite 连接与同一把互斥锁，不存在第二个写者。
+  maintenance_.reset(
+      new RemoteMaintenance(store_.get(), config_.root_directory));
+  maintenance_->set_log([this](const std::string& message) { Log(message); });
   if (!OpenListener(error_message)) {
+    maintenance_.reset();
     store_->Close();
     store_.reset();
+    data_lock_.reset();
     return false;
   }
   {
@@ -340,9 +360,19 @@ void RemoteServer::Stop() {
     }
   }
   workers_.clear();
+  // 维护层与数据目录锁最后释放：锁一放，管理工具就可以动这个目录了，
+  // 所以必须在所有 worker 都停下来之后。
+  maintenance_.reset();
+  data_lock_.reset();
 }
 
 void RemoteServer::RequestStop() { stop_requested_.store(true); }
+
+void RemoteServer::FailNextAccountDeleteForTesting() {
+  if (store_ != nullptr) {
+    store_->FailNextDeleteUserForTesting();
+  }
+}
 
 bool RemoteServer::SendError(int fd, std::uint16_t opcode,
                              std::uint64_t request_id, Status status,
@@ -566,6 +596,9 @@ bool RemoteServer::HandleList(int fd, const FrameHeader& header,
     return SendError(fd, header.opcode, header.request_id,
                      Status::kUnauthorized, error_message);
   }
+  if (RejectIfAccountMissing(fd, header, context, error_message)) {
+    return true;
+  }
   std::vector<RemoteSnapshotRecord> records;
   std::string store_error;
   const StoreResult result = store_->ListSnapshots(
@@ -753,6 +786,9 @@ bool RemoteServer::HandleUploadBegin(int fd, const FrameHeader& header,
     return SendError(fd, header.opcode, header.request_id,
                      Status::kUnauthorized, error_message);
   }
+  if (RejectIfAccountMissing(fd, header, context, error_message)) {
+    return true;
+  }
   PayloadReader reader(payload);
   std::string display_name;
   std::uint64_t declared_size = 0;
@@ -872,6 +908,11 @@ bool RemoteServer::HandleUploadEnd(int fd, const FrameHeader& header,
     return SendError(fd, header.opcode, header.request_id,
                      Status::kInvalidRequest, error_message);
   }
+  // 上传期间账户可能已经被另一个连接注销了：发布之前再确认一次账户还在，
+  // 否则一份已注销账户的 blob 会被写进磁盘并留下元数据行。
+  if (RejectIfAccountMissing(fd, header, context, error_message)) {
+    return true;
+  }
   const std::uint64_t received = context->upload_received;
   const std::uint64_t declared = context->upload_declared_size;
   const std::string snapshot_id = context->upload_snapshot_id;
@@ -980,6 +1021,9 @@ bool RemoteServer::HandleDownloadBegin(int fd, const FrameHeader& header,
     Log("rejecting DOWNLOAD_BEGIN outside an authenticated session");
     return SendError(fd, header.opcode, header.request_id,
                      Status::kUnauthorized, error_message);
+  }
+  if (RejectIfAccountMissing(fd, header, context, error_message)) {
+    return true;
   }
   PayloadReader reader(payload);
   std::string snapshot_id;
@@ -1135,6 +1179,9 @@ bool RemoteServer::HandleDelete(int fd, const FrameHeader& header,
     return SendError(fd, header.opcode, header.request_id,
                      Status::kUnauthorized, error_message);
   }
+  if (RejectIfAccountMissing(fd, header, context, error_message)) {
+    return true;
+  }
   PayloadReader reader(payload);
   std::string snapshot_id;
   if (!reader.ReadString(kMaxSnapshotIdBytes, &snapshot_id) ||
@@ -1148,76 +1195,163 @@ bool RemoteServer::HandleDelete(int fd, const FrameHeader& header,
     return SendError(fd, header.opcode, header.request_id,
                      Status::kInvalidRequest, error_message);
   }
-  RemoteSnapshotRecord record;
-  std::string store_error;
   const std::int64_t user_id = static_cast<std::int64_t>(context->user_id);
-  const StoreResult found =
-      store_->FindSnapshot(user_id, snapshot_id, &record, &store_error);
-  if (found == StoreResult::kNotFound) {
-    Log("delete rejected: no such snapshot for this user");
-    return SendError(fd, header.opcode, header.request_id, Status::kNotFound,
-                     error_message);
-  }
-  if (found != StoreResult::kOk) {
-    Log("cannot read the snapshot row: " + store_error);
-    return SendError(fd, header.opcode, header.request_id,
-                     Status::kInternalError, error_message);
-  }
-  if (record.storage_name != record.snapshot_id + ".bak") {
-    Log("refusing to touch a snapshot whose storage name is not canonical");
-    return SendError(fd, header.opcode, header.request_id,
-                     Status::kInternalError, error_message);
-  }
-  const std::string directory = UserDirectory(user_id);
-  const std::string final_path = directory + "/" + record.storage_name;
-  std::string pending_id;
-  std::string id_error;
-  if (!GenerateSnapshotId(&pending_id, &id_error)) {
-    Log("cannot generate a pending name: " + id_error);
-    return SendError(fd, header.opcode, header.request_id,
-                     Status::kInternalError, error_message);
-  }
-  const std::string pending_path = directory + "/trash/" + record.storage_name +
-                                   "." + pending_id + ".deleted";
-
-  // ---- 删除顺序：先把 blob 挪成不可见，再删元数据，最后物理删除 ----
-  //
-  // 直接 unlink 再删记录，会留下"文件没了、记录还在"的窗口；反过来先删记录
-  // 再 unlink，又会在 unlink 失败时把文件变成谁也看不见的孤儿。
-  // 先 rename 到 trash：任何一步失败都能把它改回来。
-  if (::rename(final_path.c_str(), pending_path.c_str()) != 0) {
-    if (errno == ENOENT) {
-      Log("delete rejected: the blob is missing on disk");
-      return SendError(fd, header.opcode, header.request_id, Status::kNotFound,
-                       error_message);
-    }
-    Log(std::string("cannot move the blob to trash: ") + std::strerror(errno));
-    return SendError(fd, header.opcode, header.request_id,
-                     Status::kInternalError, error_message);
-  }
   RemoteSnapshotRecord removed;
-  const StoreResult deleted =
-      store_->DeleteSnapshot(user_id, snapshot_id, &removed, &store_error);
+  std::string delete_error;
+  // 删除的全部顺序（先挪成不可见、再删元数据、失败回滚）在共享的
+  // RemoteMaintenance 里：ECS 本地的 backup-server-admin 走的是同一条路径，
+  // 不存在"管理工具另有一套删除逻辑"这种分叉。
+  const StoreResult deleted = maintenance_->DeleteSnapshot(
+      user_id, snapshot_id, &removed, &delete_error);
   if (deleted != StoreResult::kOk) {
-    // 回滚：把文件改回正式名字，一切照旧。
-    Log("the metadata delete failed; restoring the blob: " + store_error);
-    if (::rename(pending_path.c_str(), final_path.c_str()) != 0) {
-      Log("warning: the rollback rename failed; the blob is left in trash");
-    }
+    Log("delete failed for snapshot " + snapshot_id + ": " + delete_error);
     return SendError(fd, header.opcode, header.request_id,
                      deleted == StoreResult::kNotFound ? Status::kNotFound
                                                        : Status::kInternalError,
                      error_message);
   }
-  if (::unlink(pending_path.c_str()) != 0) {
-    // 元数据已经不存在了，这个文件是"不可见的孤儿"：记录警告，
-    // 留给将来的 startup reconciliation 清理，不因此把删除判为失败。
-    Log("warning: could not unlink the pending blob; an invisible orphan"
-        " remains in trash");
-  }
-  FsyncDirectory(directory);
   Log("deleted snapshot " + snapshot_id);
   return SendStatus(fd, header, Status::kOk, std::string(), error_message);
+}
+
+bool RemoteServer::HandleDeleteAccount(int fd, const FrameHeader& header,
+                                       const std::string& payload,
+                                       ConnectionContext* context,
+                                       std::string* error_message) {
+  if (context->state != ConnectionState::kAuthenticated) {
+    Log("rejecting DELETE_ACCOUNT outside an authenticated session");
+    return SendError(fd, header.opcode, header.request_id,
+                     Status::kUnauthorized, error_message);
+  }
+  // 载荷只有口令。目标账户永远是 token 自己所属的那个 user id：协议里没有
+  // 任何字段可以让调用方指定"删谁"，删别人的账户在这条路径上不可表达。
+  PayloadReader reader(payload);
+  std::string password;
+  if (!reader.ReadString(kMaxPasswordBytes, &password) || !reader.AtEnd()) {
+    Log("rejecting a malformed DELETE_ACCOUNT: " + reader.error_message());
+    return SendError(fd, header.opcode, header.request_id,
+                     Status::kInvalidRequest, error_message);
+  }
+  std::string validation_error;
+  if (!IsValidPassword(password, &validation_error)) {
+    Log("rejecting DELETE_ACCOUNT with an invalid password field");
+    return SendError(fd, header.opcode, header.request_id,
+                     Status::kInvalidRequest, error_message);
+  }
+  // 一个有效的 token 不足以注销账户：token 可能被别人捡到，而注销不可逆。
+  // 服务端重新校验一次当前口令。
+  RemoteUserRecord user;
+  std::string store_error;
+  const StoreResult found = store_->FindUserById(
+      static_cast<std::int64_t>(context->user_id), &user, &store_error);
+  if (found == StoreResult::kNotFound) {
+    Log("delete-account rejected: the account no longer exists");
+    context->state = ConnectionState::kConnected;
+    context->user_id = 0;
+    context->username.clear();
+    return SendError(fd, header.opcode, header.request_id,
+                     Status::kUnauthorized, error_message);
+  }
+  if (found != StoreResult::kOk) {
+    Log("cannot read the user row: " + store_error);
+    return SendError(fd, header.opcode, header.request_id,
+                     Status::kInternalError, error_message);
+  }
+  bool matches = false;
+  std::string verify_error;
+  if (!VerifyPassword(password, user.password, &matches, &verify_error)) {
+    Log("cannot verify the stored password: " + verify_error);
+    return SendError(fd, header.opcode, header.request_id,
+                     Status::kInternalError, error_message);
+  }
+  if (!matches) {
+    // 口令本身绝不进日志——连长度都不写。
+    Log("delete-account rejected: wrong password for user id=" +
+        std::to_string(user.user_id));
+    return SendError(fd, header.opcode, header.request_id,
+                     Status::kUnauthorized, error_message);
+  }
+  const std::int64_t user_id = static_cast<std::int64_t>(user.user_id);
+  std::uint64_t removed_snapshots = 0;
+  std::uint64_t removed_bytes = 0;
+  const StoreResult deleted = maintenance_->DeleteAccount(
+      user_id, &removed_snapshots, &removed_bytes, &store_error);
+  if (deleted != StoreResult::kOk) {
+    // 失败时数据与元数据都还在（隔离动作已经被回滚）：如实回错误，
+    // 不假装删除成功。
+    Log("delete-account failed for user id=" + std::to_string(user_id) + ": " +
+        store_error);
+    return SendError(fd, header.opcode, header.request_id,
+                     Status::kInternalError, error_message);
+  }
+  // 这条连接上的会话立即失效。别的连接上那些签名仍然有效的旧 token 会在
+  // 每次操作前被 RejectIfAccountMissing 挡掉——账户已经不存在了。
+  context->state = ConnectionState::kConnected;
+  context->user_id = 0;
+  context->username.clear();
+  {
+    std::ostringstream line;
+    line << "account deleted: user id=" << user_id
+         << " snapshots=" << removed_snapshots << " bytes=" << removed_bytes;
+    Log(line.str());
+  }
+  return SendStatus(fd, header, Status::kOk, std::string(), error_message);
+}
+
+bool RemoteServer::RejectIfAccountMissing(int fd, const FrameHeader& header,
+                                          ConnectionContext* context,
+                                          std::string* error_message) {
+  RemoteUserRecord user;
+  std::string store_error;
+  const StoreResult result = store_->FindUserById(
+      static_cast<std::int64_t>(context->user_id), &user, &store_error);
+  if (result == StoreResult::kOk) {
+    return false;
+  }
+  if (result == StoreResult::kNotFound) {
+    // 账户注销之后，之前签发的 token 在密码学上依然有效（服务端不保存会话
+    // 表），所以"账户还在不在"必须每次回查。这里就是那道闸门。
+    Log("rejecting an operation for an account that no longer exists");
+    context->state = ConnectionState::kConnected;
+    context->user_id = 0;
+    context->username.clear();
+    SendError(fd, header.opcode, header.request_id, Status::kUnauthorized,
+              error_message);
+    return true;
+  }
+  Log("cannot read the user row: " + store_error);
+  SendError(fd, header.opcode, header.request_id, Status::kInternalError,
+            error_message);
+  return true;
+}
+
+bool RemoteServer::AcquireDataLock(std::string* error_message) {
+  data_lock_.reset(new backupproject::FileLock());
+  const std::string path =
+      RemoteMaintenance::LockFilePath(config_.root_directory);
+  std::string lock_error;
+  const backupproject::FileLockStatus status =
+      data_lock_->Acquire(path, &lock_error);
+  if (status == backupproject::FileLockStatus::kAcquired) {
+    Log("data directory lock acquired: " + path);
+    return true;
+  }
+  data_lock_.reset();
+  if (status == backupproject::FileLockStatus::kBusy) {
+    const std::string hint =
+        RemoteMaintenance::ReadLockHint(config_.root_directory);
+    if (error_message != nullptr) {
+      *error_message =
+          "another process is already using the data directory " +
+          config_.root_directory +
+          (hint.empty() ? std::string() : " (" + hint + ")");
+    }
+    return false;
+  }
+  if (error_message != nullptr) {
+    *error_message = "cannot lock the data directory: " + lock_error;
+  }
+  return false;
 }
 
 bool RemoteServer::HandleFrame(int fd, const FrameHeader& header,
@@ -1272,6 +1406,8 @@ bool RemoteServer::HandleFrame(int fd, const FrameHeader& header,
       return HandleDownloadEnd(fd, header, payload, context, error_message);
     case Opcode::kDelete:
       return HandleDelete(fd, header, payload, context, error_message);
+    case Opcode::kDeleteAccount:
+      return HandleDeleteAccount(fd, header, payload, context, error_message);
     default:
       break;
   }

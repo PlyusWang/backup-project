@@ -13,7 +13,10 @@
 //     显示名；
 //   * 一把互斥锁把写串行化，加上 busy_timeout，因此并发上传不会随机得到
 //     "database is locked"；
-//   * database is locked 之类的内部错误只写服务端日志，不回给客户端。
+//   * database is locked 之类的内部错误只写服务端日志，不回给客户端；
+//   * user id 显式分配且**永不重用**：注销一个账户会在 deleted_users 里留下
+//     一条墓碑，下一个 id 一定大于所有历史 id。否则 rowid 会在删掉最大 id
+//     之后被重用，一个注销前签发的 token 就会命中新注册的账户。
 //
 // 头文件刻意不包含 sqlite3.h：只有服务端的 .cpp 需要它，
 // 桌面端（backupctl / GUI）根本不链接 SQLite。
@@ -63,6 +66,27 @@ struct RemoteSnapshotRecord {
   std::string storage_name;
 };
 
+// 管理视图用的每用户汇总。
+//
+// 这里刻意只有 id / 名字 / 创建时间 / 数量 / 字节数：**没有** salt、hash 或
+// 迭代次数。管理工具因此不是"保证不打印口令字段"，而是根本取不到它们。
+struct RemoteUserSummary {
+  std::int64_t user_id = 0;
+  std::string username;
+  std::int64_t created_at = 0;
+  std::uint64_t snapshot_count = 0;
+  std::uint64_t total_bytes = 0;
+};
+
+// 存储概览：四个标量，全部由 SQL 聚合出来，不在应用层遍历文件系统。
+struct RemoteStorageOverview {
+  std::uint64_t user_count = 0;
+  std::uint64_t snapshot_count = 0;
+  std::uint64_t total_bytes = 0;
+  // 已经注销的账户数（墓碑表里的行数）。
+  std::uint64_t deleted_user_count = 0;
+};
+
 class RemoteMetadataStore {
  public:
   RemoteMetadataStore();
@@ -100,11 +124,29 @@ class RemoteMetadataStore {
   StoreResult CountSnapshots(std::int64_t user_id, std::uint64_t* out,
                              std::string* error_message);
 
+  // ---- 管理视图（服务端与 ECS 本地管理工具共用）----
+  StoreResult ListUsers(std::vector<RemoteUserSummary>* out,
+                        std::string* error_message);
+  StoreResult StorageOverview(RemoteStorageOverview* out,
+                              std::string* error_message);
+
+  // 删除一个用户的**全部元数据**：snapshots 行 + users 行 + 一条墓碑。
+  //
+  // 三步在同一个事务里，所以不存在"用户行没了、快照行还在"或者反过来的
+  // 中间态：要么全部生效，要么一行都没动（返回 kError）。磁盘上的 blob 由
+  // 调用方按 trash/quarantine 顺序处理，见 remote_maintenance.h。
+  StoreResult DeleteUser(std::int64_t user_id, std::uint64_t* removed_snapshots,
+                         std::uint64_t* removed_bytes,
+                         std::string* error_message);
+
   // ---- 测试专用故障注入 ----
   //
   // "DB 写入失败时最终 blob 必须被回滚"这条路径必须能真的被触发一次，
   // 而不是只写在注释里。产品代码里没有任何地方调用它。
   void FailNextInsertForTesting() { fail_next_insert_ = true; }
+  // 让下一次 DeleteUser 在提交之前失败：事务整体回滚，磁盘上的隔离动作
+  // 必须由调用方撤回来。产品代码里没有任何地方调用它。
+  void FailNextDeleteUserForTesting() { fail_next_delete_user_ = true; }
 
  private:
   bool Execute(const std::string& sql, std::string* error_message);
@@ -116,6 +158,7 @@ class RemoteMetadataStore {
   sqlite3* database_ = nullptr;
   std::string path_;
   bool fail_next_insert_ = false;
+  bool fail_next_delete_user_ = false;
   // 保护 database_ 与 fail_next_insert_：worker 线程会并发进来。
   mutable std::mutex mutex_;
 };

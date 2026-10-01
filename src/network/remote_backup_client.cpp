@@ -684,5 +684,30 @@ bool RemoteArchiveClient::Delete(const std::string& snapshot_id,
                  error_message);
 }
 
+bool RemoteArchiveClient::DeleteAccount(const std::string& password,
+                                        std::string* error_message) {
+  if (!RequireAuthenticated("delete-account", error_message)) {
+    return false;
+  }
+  PayloadBuilder request;
+  std::string build_error;
+  if (!request.AppendString(password, kMaxPasswordBytes, &build_error)) {
+    if (error_message != nullptr) {
+      *error_message = build_error;
+    }
+    return false;
+  }
+  FrameHeader header;
+  std::string response;
+  const bool ok = Request(Opcode::kDeleteAccount, request.data(), &header,
+                          &response, error_message);
+  if (ok) {
+    // 账户已经不存在了：这条连接上的会话没有任何意义，token 立刻丢掉。
+    authenticated_ = false;
+    token_.clear();
+  }
+  return ok;
+}
+
 }  // namespace net
 }  // namespace backupproject
