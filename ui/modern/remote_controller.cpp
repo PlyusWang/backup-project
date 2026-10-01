@@ -270,7 +270,7 @@ QString RemoteController::DescribeFailure(const QString& error_kind) {
     return QStringLiteral("这个用户名已经被占用，换一个再试。");
   }
   if (error_kind == QStringLiteral("not-logged-in")) {
-    return QStringLiteral("尚未登录，请先登录再操作。");
+    return QStringLiteral("尚未登录或登录状态已经失效，请重新登录后再试。");
   }
   if (error_kind == QStringLiteral("not-found")) {
     return QStringLiteral("这个云端备份已经不存在了，刷新列表看看。");
@@ -291,7 +291,8 @@ QString RemoteController::DescribeFailure(const QString& error_kind) {
     return QStringLiteral("服务器拒绝了这个请求（两端版本可能不一致）。");
   }
   if (error_kind == QStringLiteral("network")) {
-    return QStringLiteral("网络连接中断，请确认服务器地址与端口后重试。");
+    return QStringLiteral("网络连接中断，这次操作没有完成；登录状态与云端数据都"
+                          "没有变化，可以直接再试一次。");
   }
   if (error_kind == QStringLiteral("local")) {
     return QStringLiteral("本地文件不可用（不存在、不是普通文件，或者为空）。");
@@ -683,13 +684,45 @@ void RemoteController::ApplyResult(const RemoteOpResult& result) {
         result.detail.empty() ? "(没有更多信息)" : result.detail.c_str());
     // 连接已经不可信时如实降级：不让界面继续显示"已登录"，否则用户会对着
     // 一个假的登录状态反复重试。
-    if (result.error_kind == QStringLiteral("network") ||
-        result.error_kind == QStringLiteral("not-logged-in")) {
+    // 会话要不要清掉，取决于**服务端说了什么**，而不是"网络有没有抖一下"：
+    //
+    //   not-logged-in（服务端明确 UNAUTHORIZED）-> token 真的没用了，清会话
+    //   network / local / 其它传输层失败        -> 只关这条连接、**保留 token**；
+    //                                            下一次操作会自动重连并恢复会话
+    //
+    // 这一条是人工验收里"点一次刷新就被退出登录"的根因：以前任何一次网络抖动
+    // 都会清掉登录态，而 token 明明是好的。现在网络错误只影响这一次操作，
+    // 登录状态与云端数据都不动。
+    if (result.error_kind == QStringLiteral("not-logged-in")) {
+      client_.Disconnect();
+      list_loaded_ = false;
+      SetSnapshots(std::vector<RemoteSnapshotInfo>());
+      list_summary_ = QStringLiteral("尚未登录");
+      emit snapshotsChanged();
       if (authenticated_) {
         authenticated_ = false;
         emit sessionChanged();
       }
+    }
+    if (result.kind == RemoteOpResult::Kind::kLogin) {
+      // 登录失败 = 没有会话。哪怕这一次尝试之前是登录状态，它也已经把那条会话
+      // 换掉了（客户端在 Login 之前先丢掉旧会话）。界面上不允许同时出现
+      // "登录失败"和"当前账户：xxx（已登录）"——那正是人工验收里看到的
+      // "注销之后居然还能显示登录成功"的那类自相矛盾状态。
       client_.Disconnect();
+      list_loaded_ = false;
+      SetSnapshots(std::vector<RemoteSnapshotInfo>());
+      list_summary_ = QStringLiteral("尚未登录");
+      emit snapshotsChanged();
+      if (authenticated_) {
+        authenticated_ = false;
+        emit sessionChanged();
+      }
+    }
+    if (result.kind == RemoteOpResult::Kind::kDeleteAccount) {
+      // 注销的失败原因进对话框自己的错误行（成功时在下面的 switch 里清掉）。
+      delete_account_error_ = result.message;
+      emit deleteAccountErrorChanged();
     }
     SetStatus(QStringLiteral("error"), TitleForFailure(result.error_kind),
               result.message);
@@ -746,6 +779,11 @@ void RemoteController::ApplyResult(const RemoteOpResult& result) {
     case RemoteOpResult::Kind::kDeleteAccount:
       // 账户已经不存在了：本机内存里的会话、口令与列表全部清掉，界面回到
       // "未登录"。云端数据由服务端删除，这里不做任何本地清理。
+      //
+      // 这一组更新必须一起发生：只要还有一处留着旧状态，界面就会出现"服务端
+      // 已经删了、本机还显示已登录"这种自相矛盾的样子（人工验收见过）。
+      delete_account_error_.clear();
+      emit deleteAccountErrorChanged();
       authenticated_ = false;
       client_.Disconnect();
       password_.fill(QChar(0));
@@ -945,8 +983,18 @@ bool RemoteController::deleteSnapshot(const QString& snapshot_id) {
   return true;
 }
 
+void RemoteController::clearDeleteAccountError() {
+  if (delete_account_error_.isEmpty()) {
+    return;
+  }
+  delete_account_error_.clear();
+  emit deleteAccountErrorChanged();
+}
+
 bool RemoteController::deleteAccount(const QString& password,
                                      const QString& username_confirmation) {
+  // 重新提交时先把上一次的错误行清掉：否则用户看到的会是两次不同尝试的原因。
+  clearDeleteAccountError();
   // 二次确认：必须逐字敲出当前账户名。少一个字符都不发请求——注销是不可撤销
   // 的服务端删除，不能是一个"点快了就没了"的按钮。
   if (username_confirmation.trimmed() != username_) {

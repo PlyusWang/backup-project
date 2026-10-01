@@ -175,6 +175,10 @@ class RemoteController : public QObject {
   // 后者只出现在默认折叠的"技术详情"里——诊断信息不丢，但也不喧宾夺主。
   Q_PROPERTY(QString lastErrorKind READ lastErrorKind NOTIFY statusChanged)
   Q_PROPERTY(QString diagnosticText READ diagnosticText NOTIFY statusChanged)
+  // 注销对话框自己的错误行。注销失败的原因必须出现在**对话框里**，而不是只
+  // 出现在这一页底部：用户是在对话框里点的"确认注销"，结果也应该在那里看到。
+  Q_PROPERTY(QString deleteAccountError READ deleteAccountError NOTIFY
+                 deleteAccountErrorChanged)
 
  public:
   explicit RemoteController(QObject* parent = nullptr);
@@ -206,6 +210,7 @@ class RemoteController : public QObject {
   QString statusMessage() const { return status_message_; }
   QString statusScope() const;
   QString lastErrorKind() const { return last_error_kind_; }
+  QString deleteAccountError() const { return delete_account_error_; }
   QString diagnosticText() const {
     return QString::fromStdString(last_detail_);
   }
@@ -244,6 +249,8 @@ class RemoteController : public QObject {
                                    bool allow_overwrite);
   Q_INVOKABLE bool deleteSnapshot(const QString& snapshot_id);
   Q_INVOKABLE void clearStatus();
+  // 打开注销对话框 / 重新提交时清掉上一次的错误行。
+  Q_INVOKABLE void clearDeleteAccountError();
 
   // 文件对话框的 URL 互转与其它页面同一套实现。
   Q_INVOKABLE QString localPathFromUrl(const QUrl& url) const;
@@ -269,6 +276,7 @@ class RemoteController : public QObject {
   void endpointChanged();
   void sessionChanged();
   void reachabilityChanged();
+  void deleteAccountErrorChanged();
   void busyChanged();
   void snapshotsChanged();
   void progressChanged();
@@ -287,6 +295,9 @@ class RemoteController : public QObject {
   bool AcceptPassword(const QString& password);
   // 提交前的统一闸门：busy 与"是否已登录"都在这里挡住。
   bool BeginOperation(const QString& action_text, bool need_login);
+  // 提交一次后台操作。**调用前必须已经通过 BeginOperation**：busy_ 在提交之前
+  // 同步置位，所以任何一个时刻只可能有一个 watcher 在跑，也就不存在"旧结果
+  // 覆盖新状态"的窗口（async stale-result 的结构性防线）。
   void Submit(const RemoteRequest& request);
   // 把后台线程的返回值落到界面状态上。结果只从 QFuture 里读一次：
   // 后台线程写、主线程读的就是同一个值，不存在第二份"待读结果"。
@@ -350,6 +361,7 @@ class RemoteController : public QObject {
 
   QString last_error_kind_ = QStringLiteral("none");
   std::string last_detail_;
+  QString delete_account_error_;
 
   // 上一次连接尝试的结果。默认"不知道"：界面在真的试过之前什么都不说。
   RemoteReachability reachability_ = RemoteReachability::kUnknown;
