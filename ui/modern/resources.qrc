@@ -12,6 +12,7 @@
     <file>qml/components/FilterEditorPanel.qml</file>
     <file>qml/components/FilterRuleEditor.qml</file>
     <file>qml/components/RuleCard.qml</file>
+    <file>qml/components/SegmentedTabs.qml</file>
     <file>qml/components/RemoteSnapshotCard.qml</file>
     <file>qml/components/NavItem.qml</file>
     <file>qml/components/StatusBanner.qml</file>

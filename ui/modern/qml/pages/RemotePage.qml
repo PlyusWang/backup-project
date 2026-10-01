@@ -42,6 +42,11 @@ Item {
     property string draftDeleteName: ""
     // 账户区域当前标签页：0 = 登录，1 = 注册。
     property int accountTab: 0
+    // 两个密码框都填了、但不一样：注册页据此显示红色错误（改一个字符就自动重算，
+    // 所以错误会随用户修改立刻消失或更新）。
+    readonly property bool registerPasswordMismatch:
+        page.draftRegisterPassword !== "" && page.draftConfirmPassword !== "" &&
+        page.draftRegisterPassword !== page.draftConfirmPassword
     property string draftUploadPath: ""
     property string draftUploadName: ""
     property string draftDownloadPath: ""
@@ -238,24 +243,23 @@ Item {
                         visible: !remote.authenticated
                         spacing: 8
 
+                        // 登录 / 注册是一个分段控件（二选一），不是两个独立按钮。
                         RowLayout {
                             Layout.fillWidth: true
                             spacing: 8
 
-                            AppButton {
-                                objectName: "remoteLoginTabButton"
-                                text: "登录"
-                                variant: page.accountTab === 0 ? "primary" : "flat"
+                            SegmentedTabs {
+                                objectName: "remoteAccountTabs"
+                                Layout.preferredWidth: 260
                                 enabled: !remote.busy
-                                onClicked: page.accountTab = 0
-                            }
-
-                            AppButton {
-                                objectName: "remoteRegisterTabButton"
-                                text: "注册"
-                                variant: page.accountTab === 1 ? "primary" : "flat"
-                                enabled: !remote.busy
-                                onClicked: page.accountTab = 1
+                                currentKey: page.accountTab === 0 ? "login" : "register"
+                                model: [
+                                    { "key": "login", "text": "登录" },
+                                    { "key": "register", "text": "注册" }
+                                ]
+                                onActivated: function (key) {
+                                    page.accountTab = (key === "login") ? 0 : 1
+                                }
                             }
 
                             Item { Layout.fillWidth: true }
@@ -373,12 +377,25 @@ Item {
                                     onClicked: remote.registerAccount(page.draftHost, page.draftPort, page.draftUser, page.draftRegisterPassword, page.draftConfirmPassword)
                                 }
 
+                                // 正常状态只给一句弱化的辅助文字；只有真的不一致时才
+                                // 换成红色错误（两条互斥，不会同时出现）。
                                 Text {
                                     objectName: "remoteRegisterHint"
                                     Layout.fillWidth: true
-                                    text: "两个密码框必须完全一致；不一致时不会发送任何请求。"
+                                    visible: !page.registerPasswordMismatch
+                                    text: "请再次输入密码以确认。"
                                     font.pixelSize: 15
                                     color: theme.textSecondary
+                                    wrapMode: Text.WrapAnywhere
+                                }
+
+                                Text {
+                                    objectName: "remoteRegisterMismatch"
+                                    Layout.fillWidth: true
+                                    visible: page.registerPasswordMismatch
+                                    text: "两次输入的密码不一致"
+                                    font.pixelSize: 15
+                                    color: theme.error
                                     wrapMode: Text.WrapAnywhere
                                 }
                             }
@@ -431,6 +448,7 @@ Item {
                                 onClicked: {
                                     page.draftDeletePassword = ""
                                     page.draftDeleteName = ""
+                                    remote.clearDeleteAccountError()
                                     deleteAccountDialog.open()
                                 }
                             }
@@ -857,10 +875,13 @@ Item {
             } else if (kind === "login") {
                 page.draftPassword = ""
             } else if (kind === "delete-account") {
+                // 只有成功才走到这里（失败在上面 return 掉了）：关对话框、
+                // 清掉三层口令草稿、回到登录标签。
                 page.draftPassword = ""
                 page.draftDeletePassword = ""
                 page.draftDeleteName = ""
                 page.accountTab = 0
+                deleteAccountDialog.close()
             }
         }
     }
@@ -922,6 +943,19 @@ Item {
                 onTextEdited: page.draftDeleteName = text
             }
 
+            // 失败原因就显示在这里（对话框内部）：用户是在这个对话框里点的
+            // "确认注销"，结果也必须在这里看到——不能关掉对话框之后无事发生。
+            Text {
+                objectName: "remoteDeleteAccountError"
+                Layout.fillWidth: true
+                Layout.preferredWidth: 420
+                visible: remote.deleteAccountError !== ""
+                text: remote.deleteAccountError
+                color: theme.error
+                font.pixelSize: 15
+                wrapMode: Text.WordWrap
+            }
+
             RowLayout {
                 Layout.fillWidth: true
                 spacing: 10
@@ -944,8 +978,10 @@ Item {
                     variant: "primary"
                     enabled: !remote.busy
                     onClicked: {
-                        if (remote.deleteAccount(page.draftDeletePassword, page.draftDeleteName))
-                            deleteAccountDialog.close()
+                        // 只提交，不关对话框：注销是异步的，而且失败必须留在
+                        // 对话框里显示原因。关闭由操作真正成功之后（下面
+                        // Connections 的 delete-account 分支）来做。
+                        remote.deleteAccount(page.draftDeletePassword, page.draftDeleteName)
                     }
                 }
             }
