@@ -27,6 +27,8 @@ struct RemoteOptions {
   std::string username;
   std::string display_name;
   std::string repository_directory;
+  // 注销账户的二次确认：必须逐字等于 --user 给的用户名。
+  std::string confirm_username;
   bool force = false;
   std::vector<std::string> positional;
 };
@@ -41,6 +43,8 @@ void PrintRemoteUsageTo(std::ostream& output) {
             "  backupctl remote download <快照ID> <目标路径> --user <用户名>\n"
             "      [--force]\n"
             "  backupctl remote delete <快照ID> --user <用户名>\n"
+            "  backupctl remote delete-account --user <用户名> --confirm <用户名>\n"
+            "      （永久删除该账户与它的全部云端备份，不可撤销）\n"
             "  口令只从终端读取；自动测试用 BACKUP_REMOTE_PASSWORD 提供，\n"
             "  两者都不会被打印。默认端点 127.0.0.1:18765。\n";
 }
@@ -87,6 +91,11 @@ bool ParseOptions(const std::vector<std::string>& arguments,
       }
     } else if (token == "--repository") {
       if (!TakeValue(arguments, &index, token, &options->repository_directory,
+                     error_message)) {
+        return false;
+      }
+    } else if (token == "--confirm") {
+      if (!TakeValue(arguments, &index, token, &options->confirm_username,
                      error_message)) {
         return false;
       }
@@ -390,6 +399,45 @@ int RunRemoteCommand(const CliContext& context,
       return Fail(error);
     }
     std::cout << "已删除远程快照 " << options.positional[0] << "\n";
+    return kCliExitSuccess;
+  }
+
+  if (subcommand == "delete-account") {
+    if (!options.positional.empty()) {
+      std::cerr << "Error: remote delete-account 不接受位置参数。\n";
+      return kCliExitUsageError;
+    }
+    if (options.username.empty()) {
+      std::cerr << "Error: remote delete-account 需要 --user。\n";
+      return kCliExitUsageError;
+    }
+    // 二次确认必须逐字给出账户名：注销是不可撤销的服务端删除，不能是
+    // "回车一下"就完成的事。
+    if (options.confirm_username != options.username) {
+      std::cerr << "Error: 需要 --confirm " << options.username
+                << " 才能注销账户（这会永久删除该账户与它的全部云端备份）。\n";
+      return kCliExitUsageError;
+    }
+    if (!client.Connect(options.endpoint, &error)) {
+      return Fail(error);
+    }
+    // 这里刻意不走 ConnectAndLogin：注销**必须**把同一个口令再交给服务端
+    // 校验一次，所以口令要在手里多留一会儿，用完立刻擦掉。
+    std::string password;
+    if (!ObtainPassword(options.username, /*confirm=*/false, &password, &error)) {
+      return Fail(error);
+    }
+    bool ok = client.Login(options.username, password, &error);
+    if (ok) {
+      ok = client.DeleteAccount(password, &error);
+    }
+    password.assign(password.size(), '\0');
+    password.clear();
+    if (!ok) {
+      return Fail(error);
+    }
+    std::cout << "已注销账户 " << options.username
+              << "（服务端已删除该账户以及它的全部云端备份，此操作不可撤销）\n";
     return kCliExitSuccess;
   }
 
