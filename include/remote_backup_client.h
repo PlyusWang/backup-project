@@ -99,6 +99,9 @@ class RemoteArchiveClient {
 
   // 上传一个已经存在的本地文件。两遍读：第一遍算 SHA-256（UPLOAD_BEGIN 之前
   // 必须给出），第二遍分块发送。文件不会被整份读进内存。
+  // UPLOAD_BEGIN 被接受之后的本地失败（读文件出错、文件被截短）会关掉连接：
+  // 服务端据此删掉上传临时文件，token 保留，下一次操作自动重连 + RESUME。
+  // 这一次失败的上传不会被自动重发。
   bool UploadArchiveFile(const std::string& local_path,
                          const std::string& display_name,
                          const RemoteProgressCallback& progress,
@@ -114,6 +117,8 @@ class RemoteArchiveClient {
   //     下载过程中才被别的进程创建，也不会被覆盖，而是明确失败；
   //   * allow_overwrite 为真 -> 原子替换（用户明确同意覆盖）。
   // 任何失败都不会破坏已有目标文件，也不会留下临时文件。
+  // DOWNLOAD_BEGIN 被接受之后，无论哪一步在本地失败，都会显式给服务端发一次
+  // DOWNLOAD_END（服务端允许提前结束），所以连接不会被留在"下载中"状态。
   bool DownloadArchiveFile(const std::string& snapshot_id,
                            const std::string& target_path, bool allow_overwrite,
                            const RemoteProgressCallback& progress,
