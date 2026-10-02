@@ -181,18 +181,17 @@ int main() {
     std::string software;
     std::uint16_t version = 0;
     std::uint64_t server_time = 0;
-    test_support::Check(
-        client.Ping(&software, &version, &server_time, &error) &&
-            software == net::kServerSoftwareName &&
-            version == net::kProtocolVersion && server_time > 0,
-        "CLI T1 ping 往返", error);
+    test_support::Check(client.Ping(&software, &version, &server_time, &error) &&
+                            software == net::kServerSoftwareName &&
+                            version == net::kProtocolVersion && server_time > 0,
+                        "CLI T1 ping 往返", error);
 
     std::vector<net::RemoteSnapshotInfo> snapshots;
     test_support::Check(!client.List(&snapshots, &error),
                         "CLI T1 未登录时 list 失败");
-    test_support::Check(
-        error.find("session") != std::string::npos || !error.empty(),
-        "CLI T1 未登录时给出可读原因");
+    test_support::Check(error.find("session") != std::string::npos ||
+                            !error.empty(),
+                        "CLI T1 未登录时给出可读原因");
 
     const std::string username = "cli-" + RandomHex(4);
     const std::string password = RandomHex(16);
@@ -205,9 +204,9 @@ int main() {
     test_support::Check(!client.Login(username, password + "x", &error),
                         "CLI T1 口令错误登录失败");
     error.clear();
-    test_support::Check(
-        client.Login(username, password, &error) && client.authenticated(),
-        "CLI T1 登录成功", error);
+    test_support::Check(client.Login(username, password, &error) &&
+                            client.authenticated(),
+                        "CLI T1 登录成功", error);
     snapshots.clear();
     test_support::Check(client.List(&snapshots, &error) && snapshots.empty(),
                         "CLI T1 新账号列表为空", error);
@@ -253,8 +252,8 @@ int main() {
     const std::string username = "xfer-" + RandomHex(4);
     const std::string password = RandomHex(16);
     client.Register(username, password, &error);
-    test_support::Check(client.Login(username, password, &error), "CLI T2 登录",
-                        error);
+    test_support::Check(client.Login(username, password, &error),
+                        "CLI T2 登录", error);
 
     std::vector<net::RemoteTransferProgress> progress;
     const auto recorder = [&progress](const net::RemoteTransferProgress& step) {
@@ -264,11 +263,10 @@ int main() {
     test_support::Check(client.UploadArchiveFile(local_path, "local.bak",
                                                  recorder, &uploaded, &error),
                         "CLI T2 上传成功", error);
-    test_support::Check(
-        uploaded.sha256 == expected_sha &&
-            uploaded.size_bytes == content.size() &&
-            net::IsValidSnapshotId(uploaded.snapshot_id, &error),
-        "CLI T2 判别：上传回来的摘要 / 长度与本地文件一致");
+    test_support::Check(uploaded.sha256 == expected_sha &&
+                            uploaded.size_bytes == content.size() &&
+                            net::IsValidSnapshotId(uploaded.snapshot_id, &error),
+                        "CLI T2 判别：上传回来的摘要 / 长度与本地文件一致");
     test_support::Check(progress.size() >= 2 &&
                             progress.front().bytes_done == 0 &&
                             progress.back().bytes_done == content.size() &&
@@ -284,10 +282,10 @@ int main() {
 
     const std::string target = fixture.base + "/downloaded.bak";
     net::RemoteSnapshotInfo downloaded;
-    test_support::Check(
-        client.DownloadArchiveFile(uploaded.snapshot_id, target, false,
-                                   recorder, &downloaded, &error),
-        "CLI T2 下载成功", error);
+    test_support::Check(client.DownloadArchiveFile(uploaded.snapshot_id, target,
+                                                   false, recorder, &downloaded,
+                                                   &error),
+                        "CLI T2 下载成功", error);
     test_support::Check(ReadWholeFile(target) == content &&
                             Sha256OfFile(target) == expected_sha,
                         "CLI T2 判别：下载回来的文件与本地文件逐字节一致");
@@ -296,17 +294,17 @@ int main() {
 
     const std::string before = ReadWholeFile(target);
     error.clear();
-    test_support::Check(
-        !client.DownloadArchiveFile(uploaded.snapshot_id, target, false,
-                                    nullptr, nullptr, &error),
-        "CLI T2 默认不覆盖已存在的目标");
+    test_support::Check(!client.DownloadArchiveFile(uploaded.snapshot_id, target,
+                                                    false, nullptr, nullptr,
+                                                    &error),
+                        "CLI T2 默认不覆盖已存在的目标");
     test_support::Check(ReadWholeFile(target) == before,
                         "CLI T2 判别：被拒绝的下载没有动过目标文件");
     error.clear();
-    test_support::Check(
-        client.DownloadArchiveFile(uploaded.snapshot_id, target, true, nullptr,
-                                   nullptr, &error),
-        "CLI T2 --force 时允许覆盖", error);
+    test_support::Check(client.DownloadArchiveFile(uploaded.snapshot_id, target,
+                                                   true, nullptr, nullptr,
+                                                   &error),
+                        "CLI T2 --force 时允许覆盖", error);
 
     test_support::Check(client.Delete(uploaded.snapshot_id, &error),
                         "CLI T2 删除成功", error);
@@ -348,10 +346,10 @@ int main() {
     client.Login(username, password, &error);
 
     error.clear();
-    test_support::Check(
-        !client.UploadArchiveFile(fixture.base + "/missing.bak", "missing.bak",
-                                  nullptr, nullptr, &error),
-        "CLI T3 不存在的文件上传失败");
+    test_support::Check(!client.UploadArchiveFile(fixture.base + "/missing.bak",
+                                                  "missing.bak", nullptr,
+                                                  nullptr, &error),
+                        "CLI T3 不存在的文件上传失败");
     const std::string empty_path = fixture.base + "/empty.bak";
     test_support::WriteFile(empty_path, std::string(), 0600);
     error.clear();
@@ -362,32 +360,31 @@ int main() {
     const std::string local_path = fixture.base + "/good.bak";
     test_support::WriteFile(local_path, RandomHex(2048), 0600);
     net::RemoteSnapshotInfo uploaded;
-    client.UploadArchiveFile(local_path, "good.bak", nullptr, &uploaded,
-                             &error);
+    client.UploadArchiveFile(local_path, "good.bak", nullptr, &uploaded, &error);
 
     error.clear();
     net::RemoteSnapshotInfo ignored;
-    test_support::Check(!client.DownloadArchiveFile(
-                            std::string(32, 'a'), fixture.base + "/nope.bak",
-                            false, nullptr, &ignored, &error),
+    test_support::Check(!client.DownloadArchiveFile(std::string(32, 'a'),
+                                                    fixture.base + "/nope.bak",
+                                                    false, nullptr, &ignored,
+                                                    &error),
                         "CLI T3 下载不存在的快照失败");
 
     // 把服务端的 blob 换成同长度的另一份内容：客户端必须拒绝发布。
-    const std::string blob =
-        fixture.root + "/users/1/" + uploaded.snapshot_id + ".bak";
+    const std::string blob = fixture.root + "/users/1/" +
+                             uploaded.snapshot_id + ".bak";
     test_support::Check(test_support::WriteFile(
                             blob, std::string(uploaded.size_bytes, 'Z'), 0600),
                         "CLI T3 夹具：篡改服务端 blob（长度不变）");
     const std::string tampered_target = fixture.base + "/tampered.bak";
     error.clear();
-    test_support::Check(
-        !client.DownloadArchiveFile(uploaded.snapshot_id, tampered_target,
-                                    false, nullptr, &ignored, &error),
-        "CLI T3 篡改过的 blob 下载被拒绝", error);
-    test_support::Check(
-        !test_support::Exists(tampered_target) &&
-            !test_support::Exists(tampered_target + ".part"),
-        "CLI T3 判别：失败的下载没有发布文件，也没有留下 .part");
+    test_support::Check(!client.DownloadArchiveFile(uploaded.snapshot_id,
+                                                    tampered_target, false,
+                                                    nullptr, &ignored, &error),
+                        "CLI T3 篡改过的 blob 下载被拒绝", error);
+    test_support::Check(!test_support::Exists(tampered_target) &&
+                            !test_support::Exists(tampered_target + ".part"),
+                        "CLI T3 判别：失败的下载没有发布文件，也没有留下 .part");
 
     client.Disconnect();
     server.RequestStop();
@@ -440,12 +437,13 @@ int main() {
     g_real_link = file_io_syscalls::LinkHook();
     file_io_syscalls::LinkHook() = &InjectTargetBeforePublish;
     error.clear();
-    const bool raced = client.DownloadArchiveFile(
-        uploaded.snapshot_id, race_target, false, nullptr, nullptr, &error);
+    const bool raced =
+        client.DownloadArchiveFile(uploaded.snapshot_id, race_target, false,
+                                   nullptr, nullptr, &error);
     file_io_syscalls::LinkHook() = g_real_link;
     g_race_target = nullptr;
-    test_support::Check(!raced, "CLI T4 判别：发布前才出现的目标让这次下载失败",
-                        error);
+    test_support::Check(!raced,
+                        "CLI T4 判别：发布前才出现的目标让这次下载失败", error);
     test_support::Check(g_race_injections == 1,
                         "CLI T4 判别：注入正好发生在发布那一刻");
     std::string race_content;
@@ -458,10 +456,10 @@ int main() {
     error.clear();
     net::RemoteSnapshotInfo still_usable;
     const std::string second_target = fixture.base + "/second.bak";
-    test_support::Check(
-        client.DownloadArchiveFile(uploaded.snapshot_id, second_target, false,
-                                   nullptr, &still_usable, &error),
-        "CLI T4 判别：一次被拒绝的发布之后连接仍然可用", error);
+    test_support::Check(client.DownloadArchiveFile(uploaded.snapshot_id,
+                                                   second_target, false, nullptr,
+                                                   &still_usable, &error),
+                        "CLI T4 判别：一次被拒绝的发布之后连接仍然可用", error);
 
     // (b) 固定的 target + ".part" 是用户自己的文件：新实现不再占用这个名字，
     //     所以既不能截断它，也不能删掉它（老实现会 O_TRUNC 再 rename 走）。
@@ -473,10 +471,10 @@ int main() {
         "CLI T4 夹具：目标旁边预先放一个 target.part");
     error.clear();
     net::RemoteSnapshotInfo downloaded;
-    test_support::Check(
-        client.DownloadArchiveFile(uploaded.snapshot_id, fixed_target, false,
-                                   nullptr, &downloaded, &error),
-        "CLI T4 有 target.part 时下载正常完成", error);
+    test_support::Check(client.DownloadArchiveFile(
+                            uploaded.snapshot_id, fixed_target, false, nullptr,
+                            &downloaded, &error),
+                        "CLI T4 有 target.part 时下载正常完成", error);
     std::string fixed_content;
     std::string part_content;
     test_support::ReadFile(fixed_target, &fixed_content);
@@ -495,10 +493,10 @@ int main() {
         "CLI T4 夹具：把目标换成另一份内容");
     error.clear();
     net::RemoteSnapshotInfo forced;
-    test_support::Check(
-        client.DownloadArchiveFile(uploaded.snapshot_id, fixed_target, true,
-                                   nullptr, &forced, &error),
-        "CLI T4 --force 覆盖同一个目标成功", error);
+    test_support::Check(client.DownloadArchiveFile(uploaded.snapshot_id,
+                                                   fixed_target, true, nullptr,
+                                                   &forced, &error),
+                        "CLI T4 --force 覆盖同一个目标成功", error);
     std::string forced_content;
     std::string part_after_force;
     test_support::ReadFile(fixed_target, &forced_content);
@@ -562,8 +560,9 @@ int main() {
         };
     error.clear();
     net::RemoteSnapshotInfo uploaded;
-    const bool upload_ok = client.UploadArchiveFile(
-        shrink_path, "shrink.bak", shrink_on_begin, &uploaded, &error);
+    const bool upload_ok =
+        client.UploadArchiveFile(shrink_path, "shrink.bak", shrink_on_begin,
+                                 &uploaded, &error);
     test_support::Check(!upload_ok,
                         "CLI T5 判别：中途被截短的本地文件让上传失败");
     test_support::Check(truncations == 1,
@@ -673,15 +672,16 @@ int main() {
     std::vector<net::RemoteSnapshotInfo> snapshots;
     test_support::Check(client.List(&snapshots, &error),
                         "CLI T6 判别：下载失败之后同一条连接仍然可用", error);
-    test_support::Check(snapshots.size() == 1, "CLI T6 判别：快照列表仍然正常");
+    test_support::Check(snapshots.size() == 1,
+                        "CLI T6 判别：快照列表仍然正常");
     // 事务真的结束了：同一条连接上还能继续下载。
     const std::string good_target = fixture.base + "/abort-after.bak";
     error.clear();
     net::RemoteSnapshotInfo again;
-    test_support::Check(
-        client.DownloadArchiveFile(uploaded.snapshot_id, good_target, false,
-                                   nullptr, &again, &error),
-        "CLI T6 判别：收尾之后还能正常下载", error);
+    test_support::Check(client.DownloadArchiveFile(uploaded.snapshot_id,
+                                                   good_target, false, nullptr,
+                                                   &again, &error),
+                        "CLI T6 判别：收尾之后还能正常下载", error);
     test_support::Check(Sha256OfFile(good_target) == uploaded.sha256,
                         "CLI T6 判别：收尾之后下载回来的字节仍然正确");
 
