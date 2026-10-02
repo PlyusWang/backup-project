@@ -85,168 +85,55 @@ bool HasBackupSuffix(const std::string& name) {
   return name.size() > 4 && name.compare(name.size() - 4, 4, ".bak") == 0;
 }
 
-// ---- 本地索引：服务端快照 id <-> 缓存里的归档名 ----
-//
-// 为什么必须有它：服务端的 snapshot id（16 字节随机数的十六进制）与归档
-// **自己**的身份（完整快照是 payload 摘要派生，delta 是信封自摘要）是两个
-// 不同的东西，谁也不能从另一个算出来。而"续链"要回答的第一个问题就是
-// "服务端说的那个父快照，本地缓存里有没有、叫什么名字"。
-//
-// 这个索引是**缓存层，不是信任来源**：它指向的每一份材料在使用前都要过
-// LoadVerifiedSnapshotIdentity（实际字节 + 两个副文件），链的父子关系还要
-// 过引擎自己的校验。索引丢了最多让下一次备份重新下载一遍；索引写错了只会
-// 让校验失败，不会让它信一份错的材料。
-std::string RemoteIndexPath(const std::string& cache_directory) {
-  return cache_directory + "/.remote-index.tsv";
-}
-
-void LoadRemoteIndex(const std::string& cache_directory,
-                     std::map<std::string, std::string>* index) {
-  index->clear();
-  const std::string path = RemoteIndexPath(cache_directory);
-  const int fd = ::open(path.c_str(), O_RDONLY | O_NOFOLLOW);
-  if (fd < 0) {
-    return;
-  }
-  std::string content;
-  char buffer[4096];
-  for (;;) {
-    const ssize_t got = ::read(fd, buffer, sizeof(buffer));
-    if (got < 0) {
-      if (errno == EINTR) {
-        continue;
-      }
-      break;
-    }
-    if (got == 0) {
-      break;
-    }
-    content.append(buffer, static_cast<std::size_t>(got));
-  }
-  ::close(fd);
-  std::size_t start = 0;
-  while (start < content.size()) {
-    std::size_t end = content.find('\n', start);
-    if (end == std::string::npos) {
-      end = content.size();
-    }
-    const std::string line = content.substr(start, end - start);
-    start = end + 1;
-    const std::size_t tab = line.find('\t');
-    if (tab == std::string::npos || tab == 0 || tab + 1 >= line.size()) {
-      continue;
-    }
-    (*index)[line.substr(0, tab)] = line.substr(tab + 1);
-  }
-}
-
-bool SaveRemoteIndex(const std::string& cache_directory,
-                     const std::map<std::string, std::string>& index,
-                     std::string* error_message) {
-  const std::string path = RemoteIndexPath(cache_directory);
-  const std::string part =
-      path + ".part-" + std::to_string(static_cast<long>(::getpid()));
-  ::unlink(part.c_str());
-  const int fd = ::open(part.c_str(), O_WRONLY | O_CREAT | O_EXCL, 0600);
-  if (fd < 0) {
-    SetError(error_message, "无法写缓存索引 " + part + "：" + StrerrorText());
-    return false;
-  }
-  std::string content;
-  for (const auto& entry : index) {
-    if (entry.first.empty() || entry.second.empty()) {
-      continue;
-    }
-    content += entry.first;
-    content += '\t';
-    content += entry.second;
-    content += '\n';
-  }
-  std::size_t written = 0;
-  while (written < content.size()) {
-    const ssize_t got = ::write(fd, content.data() + written,
-                               content.size() - written);
-    if (got < 0) {
-      if (errno == EINTR) {
-        continue;
-      }
-      const std::string reason = StrerrorText();
-      ::close(fd);
-      ::unlink(part.c_str());
-      SetError(error_message, "写缓存索引失败：" + reason);
-      return false;
-    }
-    written += static_cast<std::size_t>(got);
-  }
-  if (::fsync(fd) != 0 || ::close(fd) != 0) {
-    ::unlink(part.c_str());
-    SetError(error_message, "缓存索引落盘失败");
-    return false;
-  }
-  // 索引是缓存元数据，允许被替换（它指向的材料仍然要逐个验证）。
-  if (::rename(part.c_str(), path.c_str()) != 0) {
-    const std::string reason = StrerrorText();
-    ::unlink(part.c_str());
-    SetError(error_message, "无法发布缓存索引：" + reason);
-    return false;
-  }
-  return true;
-}
-
-void RememberSnapshotInIndex(const std::string& cache_directory,
-                             const std::string& snapshot_id,
-                             const std::string& archive_name) {
-  std::map<std::string, std::string> index;
-  LoadRemoteIndex(cache_directory, &index);
-  if (index[snapshot_id] == archive_name) {
-    return;
-  }
-  index[snapshot_id] = archive_name;
-  std::string ignore;
-  SaveRemoteIndex(cache_directory, index, &ignore);
-}
-
-// 缓存里这个名字的归档是不是一份**验证通过**的材料。
-bool CacheHasVerifiedArchive(const std::string& cache_directory,
-                             const std::string& archive_name) {
-  if (!HasBackupSuffix(archive_name)) {
-    return false;
-  }
-  struct stat info;
-  if (::stat((cache_directory + "/" + archive_name).c_str(), &info) != 0 ||
-      !S_ISREG(info.st_mode)) {
-    return false;
-  }
-  SnapshotIdentity identity;
-  std::string load_error;
-  return LoadVerifiedSnapshotIdentity(cache_directory, archive_name, &identity,
-                                      nullptr, &load_error) &&
-         identity.sidecars_verified;
-}
-
-// 在缓存目录里找"这份远端快照的本地材料"。先查索引（它给出名字），再让
-// LoadVerifiedSnapshotIdentity 用**实际字节与副文件**确认这份材料可信。
+// 在缓存目录里找"这份远端快照的本地材料"。判据不是文件名，而是
+// LoadVerifiedSnapshotIdentity 给出的**实际内容身份**：只有字节验证通过、
+// 且两个副文件都核过的快照才算数。
 bool ScanCacheForSnapshot(const std::string& cache_directory,
                           const std::string& snapshot_id,
                           std::string* archive_name, bool* found,
                           std::string* error_message) {
-  (void)error_message;
   *found = false;
   archive_name->clear();
-  std::map<std::string, std::string> index;
-  LoadRemoteIndex(cache_directory, &index);
-  const auto entry = index.find(snapshot_id);
-  if (entry == index.end()) {
-    return true;
+  DIR* directory = ::opendir(cache_directory.c_str());
+  if (directory == nullptr) {
+    SetError(error_message, "无法打开缓存目录 " + cache_directory + "：" +
+                                StrerrorText());
+    return false;
   }
-  if (!CacheHasVerifiedArchive(cache_directory, entry->second)) {
-    // 索引指向的材料已经不在了，或者验证不过：当作不在缓存里，
-    // 让调用方重新下载一遍（而不是相信一个陈旧的索引条目）。
-    return true;
+  bool ok = true;
+  while (true) {
+    errno = 0;
+    struct dirent* entry = ::readdir(directory);
+    if (entry == nullptr) {
+      break;
+    }
+    const std::string name = entry->d_name;
+    if (name == "." || name == "..") {
+      continue;
+    }
+    if (!HasBackupSuffix(name) ||
+        name.compare(0, std::strlen(kRemoteArchivePrefix),
+                     kRemoteArchivePrefix) != 0) {
+      continue;
+    }
+    SnapshotIdentity identity;
+    std::string load_error;
+    if (!LoadVerifiedSnapshotIdentity(cache_directory, name, &identity, nullptr,
+                                      &load_error)) {
+      // 不可信的缓存条目直接跳过（不是错误：缓存本来就是可有可无的加速层）。
+      continue;
+    }
+    if (!identity.sidecars_verified) {
+      continue;
+    }
+    if (identity.snapshot_id == snapshot_id) {
+      *archive_name = name;
+      *found = true;
+      break;
+    }
   }
-  *archive_name = entry->second;
-  *found = true;
-  return true;
+  ::closedir(directory);
+  return ok;
 }
 
 // 下载 + 解包 + 验证一份远端快照的材料，把它放进缓存目录。
@@ -278,60 +165,39 @@ bool FetchSnapshotMaterial(RemoteArchiveClient* client,
     ::unlink(bundle_path.c_str());
     return false;
   }
-  if (downloaded.sha256 != std::string()) {
-    // DownloadArchiveFile 已经把"实际字节的 SHA-256 == 服务端声明值"验过了；
-    // 这里只做记账。
-  }
+  // DownloadArchiveFile 内部已经验过"实际字节的 SHA-256 == 服务端声明值"
+  // 并且只在通过之后才发布目标文件；这里拿到的是一份长度与摘要都对得上的包。
 
   SnapshotBundleInfo bundle;
   std::string extract_error;
   if (!ExtractSnapshotBundle(bundle_path, cache.cache_directory, &bundle,
                              &extract_error)) {
-    // 缓存里已经有同名的三件套时发布会被拒绝（NoReplace）。这通常意味着
-    // 索引丢了而材料还在：只要那份材料**验证得过去**，就当它命中，而不是
-    // 覆盖它或者失败。验证不过就如实失败——绝不覆盖一份来路不明的材料。
-    SnapshotBundleInfo existing;
-    std::string inspect_error;
-    if (InspectSnapshotBundle(bundle_path, &existing, &inspect_error) &&
-        CacheHasVerifiedArchive(cache.cache_directory, existing.archive_name)) {
-      ::unlink(bundle_path.c_str());
-      RememberSnapshotInIndex(cache.cache_directory, snapshot_id,
-                              existing.archive_name);
-      if (downloaded_bytes != nullptr) {
-        *downloaded_bytes += existing.bundle_size;
-      }
-      *archive_name = existing.archive_name;
-      return true;
-    }
+    // 解包失败：缓存目录里可能留下**本次刚发布**的三件套吗？不会——
+    // ExtractSnapshotBundle 在任何失败路径上都会撤掉自己发布的东西。
     ::unlink(bundle_path.c_str());
     SetError(error_message, "材料包解包失败：" + extract_error);
     return false;
   }
   ::unlink(bundle_path.c_str());
-  RememberSnapshotInIndex(cache.cache_directory, snapshot_id,
-                          bundle.archive_name);
   if (downloaded_bytes != nullptr) {
     *downloaded_bytes += bundle.bundle_size;
   }
 
-  // 关键一步：真正算数的是归档自己的字节与两个副文件，而不是服务端说它是谁。
-  //
-  // 注意两个 id 不是一回事：服务端的 snapshot_id 是 16 字节随机数，而归档
-  // 自己的身份（SnapshotIdentity::snapshot_id）来自 payload 摘要 / 信封自摘要。
-  // 谁也推不出另一个，所以这里检查的是"这份材料自身完整且可信"，把
-  // "服务端 id -> 本地归档名"的对应关系留给缓存索引；而"服务端给的父子边"
-  // 与"归档信封里的父子边"是否一致，由 EnsureChainMaterial 在整条链上交叉校验。
+  // 关键一步：服务端元数据说"这份材料属于 snapshot_id"，但真正算数的是
+  // 归档自己的字节与副文件。身份对不上就把它从缓存里撤掉，绝不留下一份
+  // "看起来在缓存里、其实对不上号"的材料。
   SnapshotIdentity identity;
   std::string load_error;
   const bool verified = LoadVerifiedSnapshotIdentity(
       cache.cache_directory, bundle.archive_name, &identity, nullptr,
       &load_error);
-  if (!verified || !identity.sidecars_verified) {
+  if (!verified || !identity.sidecars_verified ||
+      identity.snapshot_id != snapshot_id) {
     for (const SnapshotBundleMember& member : bundle.members) {
       ::unlink((cache.cache_directory + "/" + member.name).c_str());
     }
     SetError(error_message,
-             "下载到的材料自身验证不通过（" +
+             "下载到的材料与远端元数据不一致（" +
                  (verified ? identity.sidecar_diagnostic : load_error) +
                  "）：已从缓存中撤掉");
     return false;
@@ -357,15 +223,12 @@ bool EnsureChainMaterial(RemoteArchiveClient* client,
                           error_message)) {
     return false;
   }
-  std::vector<std::string> names;
-  names.reserve(chain->size());
   for (const RemoteSnapshotInfo& snapshot : *chain) {
     std::string name;
     if (!FetchSnapshotMaterial(client, cache, snapshot.snapshot_id, &name,
                                downloaded_bytes, progress, error_message)) {
       return false;
     }
-    names.push_back(name);
     if (snapshot.snapshot_id == target_snapshot_id) {
       *target_archive_name = name;
     }
@@ -373,45 +236,6 @@ bool EnsureChainMaterial(RemoteArchiveClient* client,
   if (target_archive_name->empty()) {
     SetError(error_message, "内部错误：目标快照的材料没有落进缓存");
     return false;
-  }
-
-  // 交叉校验：服务端给的父子边必须与**归档自己的信封**一致。
-  //
-  // 元数据负责"去哪里找"，归档负责"这是什么"：这里把两者对上，任何一方
-  // 被改动（服务端元数据被篡改、缓存里混进了别的同名文件）都会在恢复之前
-  // 就失败。这一条也是"服务端元数据不替代归档自验证"的可执行版本。
-  std::vector<SnapshotIdentity> identities(chain->size());
-  for (std::size_t index = 0; index < chain->size(); ++index) {
-    std::string load_error;
-    if (!LoadVerifiedSnapshotIdentity(cache.cache_directory, names[index],
-                                      &identities[index], nullptr,
-                                      &load_error)) {
-      SetError(error_message, "链上的材料无法验证：" + load_error);
-      return false;
-    }
-  }
-  for (std::size_t index = 1; index < chain->size(); ++index) {
-    const SnapshotIdentity& child = identities[index];
-    const SnapshotIdentity& parent = identities[index - 1];
-    if (child.parent_file_name != names[index - 1]) {
-      SetError(error_message,
-               "远端元数据与归档不一致：第 " + std::to_string(index) +
-                   " 跳声明的父是 " + names[index - 1] + "，归档信封里写的却是 " +
-                   child.parent_file_name);
-      return false;
-    }
-    if (!child.parent_snapshot_id.empty() &&
-        child.parent_snapshot_id != parent.snapshot_id) {
-      SetError(error_message,
-               "远端元数据与归档不一致：父子身份不匹配（第 " +
-                   std::to_string(index) + " 跳）");
-      return false;
-    }
-    if (!parent.sidecars_verified) {
-      SetError(error_message, "链上的父快照副文件验证未通过（第 " +
-                                  std::to_string(index - 1) + " 跳）");
-      return false;
-    }
   }
   return true;
 }
@@ -676,9 +500,6 @@ bool RunRemoteBackup(const RemoteBackupRequest& request,
   outcome->parent_snapshot_id = uploaded.parent_snapshot_id;
   outcome->generation = uploaded.generation;
   outcome->uploaded_bytes = bundle.bundle_size;
-  // 记下"服务端 id -> 本地归档名"，下一次续链就能直接找到父材料。
-  RememberSnapshotInIndex(request.cache.cache_directory, uploaded.snapshot_id,
-                          new_name);
 
   // 服务端必须按父推导代数；对不上说明元数据出了问题，如实报告而不是掩盖。
   if (produced_delta) {

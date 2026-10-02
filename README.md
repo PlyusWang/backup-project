@@ -53,6 +53,10 @@ Linux 环境下的数据备份与恢复软件课程项目。
 - `docs/04_release_and_demo.md`：发布与演示
 - `docs/backlog/backup_mode_roadmap.md`：备份触发方式 × 备份策略的后续开发路线
 - `docs/scheduled_backup_usage.md`：定时备份（Scheduled + Full）的使用说明
+- `docs/network_backup_usage.md`：远程备份使用说明（BPSEC1 传输加密 + 远端增量）
+- `docs/secure_transport.md`：BPSEC1 —— 本项目自己的认证加密传输层（协议、安全性质、明确的非目标）
+- `docs/remote_incremental.md`：远端增量备份与恢复（材料包、链元数据、信任模型、限制）
+- `docs/research/pr21_secure_transport_sources.md`：X25519 / HKDF / AES-CTR 的规范出处与测试向量来源
 
 ## 开发环境
 

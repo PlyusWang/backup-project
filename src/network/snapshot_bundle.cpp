@@ -390,9 +390,6 @@ bool BuildSnapshotBundle(const std::string& repository_directory,
     AppendU16(&member_header, static_cast<std::uint16_t>(members[index].name.size()));
     member_header.append(members[index].name);
     AppendU64(&member_header, members[index].size);
-    member_header.append(members[index].sha256.size() == kSha256Bytes * 2
-                             ? std::string()
-                             : std::string());
     // 摘要按**原始 32 字节**写，不是十六进制文本。
     std::string raw_digest;
     if (!crypto::FromHex(members[index].sha256, &raw_digest) ||
