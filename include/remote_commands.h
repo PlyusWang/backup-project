@@ -11,7 +11,7 @@
 //   list     -> List
 //   upload   -> UploadArchiveFile（可选 --repository 走
 //               LoadVerifiedSnapshotIdentity 先证明归档身份）
-//   download -> DownloadArchiveFile（.part + 校验 + 原子改名）
+//   download -> DownloadArchiveFile（唯一临时文件 + 校验 + 原子发布）
 //   delete   -> Delete
 //
 // 命令行里没有 --password：口令只从终端读，或者由自动测试通过

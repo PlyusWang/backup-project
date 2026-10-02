@@ -6,7 +6,7 @@
 // 一套 socket"的结构。它只负责：
 //
 //   连接 / 帧收发 / 会话（token 只在内存里）/
-//   流式上传（读一个块发一个块）/ 流式下载（先写 .part，校验后原子改名）/
+//   流式上传（读一个块发一个块）/ 流式下载（唯一临时文件 + 校验 + 原子发布）/
 //   列表 / 删除
 //
 // 它**不解析归档内容**：客户端送出去的是本地已经生成好的 .bak 字节，
@@ -105,9 +105,15 @@ class RemoteArchiveClient {
                          RemoteSnapshotInfo* uploaded,
                          std::string* error_message);
 
-  // 下载到 target_path。目标已存在且 allow_overwrite 为假时**不做任何事**
-  // 直接失败；允许覆盖时也是"先写 .part、校验通过才原子改名"，
-  // 所以下载失败不会破坏已有的目标文件。
+  // 下载到 target_path。
+  //
+  // 中间产物是**目标目录里唯一命名的**临时文件（mkstemp，0600），不是固定的
+  // target + ".part"：用户自己放在那里的 <target>.part 一个字节都不会被动。
+  // 长度与 SHA-256 都通过、fsync 并 close 之后才发布：
+  //   * allow_overwrite 为假 -> 原子的"不覆盖"发布（内核保证），所以目标即使是
+  //     下载过程中才被别的进程创建，也不会被覆盖，而是明确失败；
+  //   * allow_overwrite 为真 -> 原子替换（用户明确同意覆盖）。
+  // 任何失败都不会破坏已有目标文件，也不会留下临时文件。
   bool DownloadArchiveFile(const std::string& snapshot_id,
                            const std::string& target_path, bool allow_overwrite,
                            const RemoteProgressCallback& progress,
