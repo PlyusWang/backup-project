@@ -39,6 +39,12 @@ constexpr const char* kSchemaStatements[] = {
     "  sha256 TEXT NOT NULL,"
     "  created_at INTEGER NOT NULL,"
     "  storage_name TEXT NOT NULL,"
+    // PR #21 的链元数据。parent_id 用空串表示"没有父"，不用 NULL：
+    // 少一种边界状态，SQL 与绑定参数都少一处分支。
+    "  snapshot_kind INTEGER NOT NULL DEFAULT 0,"
+    "  parent_id TEXT NOT NULL DEFAULT '',"
+    "  generation INTEGER NOT NULL DEFAULT 0,"
+    "  lineage TEXT NOT NULL DEFAULT '',"
     "  FOREIGN KEY(user_id) REFERENCES users(id)"
     ");",
     // 注销墓碑：user id 永不重用的依据，也是"这个账户确实注销过"的审计行。
@@ -51,7 +57,33 @@ constexpr const char* kSchemaStatements[] = {
     "  ON snapshots(user_id, created_at, id);",
 };
 
-constexpr int kSchemaVersion = 1;
+// 依赖感知删除要按 (user_id, parent_id) 找子节点。这个索引引用 PR #21 才加的
+// 列，所以**必须**等列补齐之后再建：旧库上先建索引会以
+// "no such column: parent_id" 失败，整个迁移就会回滚。
+constexpr const char* kChainIndexStatements[] = {
+    "CREATE INDEX IF NOT EXISTS snapshots_by_parent"
+    "  ON snapshots(user_id, parent_id);",
+};
+
+// PR #21：schema 1 -> 2 加入远端增量链元数据（snapshot_kind / parent_id /
+// generation / lineage）。版本号就是 PRAGMA user_version。
+//
+// 迁移规则（这也是"绝不 DROP TABLE、绝不清库"的兑现方式）：
+//   * 只做 ALTER TABLE ADD COLUMN 与 CREATE INDEX IF NOT EXISTS；
+//   * 旧的 PR #20 行一律留成"legacy standalone full"：snapshot_kind=0、
+//     parent_id=''、generation=0、lineage=''——DEFAULT 子句就是它们的值，
+//     不需要 UPDATE，也就不存在"迁移一半改了半张表"的中间态；
+//   * 整个迁移在一个 BEGIN IMMEDIATE 事务里，任何一步失败都 ROLLBACK；
+//   * 幂等：列已经存在时不再 ALTER，所以重复执行（包括服务器被 kill 之后
+//     重启）都是安全的；
+//   * **只有服务端的可写打开路径会调用它**。只读的管理工具走
+//     VerifyExistingSchema，版本不对就明确失败，绝不偷偷升级。
+constexpr int kSchemaVersion = 2;
+constexpr int kLegacySchemaVersion = 1;
+
+// 每个新列：名字 + 建表片段。顺序固定，方便审计。
+constexpr const char* kChainColumnNames[] = {"snapshot_kind", "parent_id",
+                                             "generation", "lineage"};
 
 std::string ColumnText(sqlite3_stmt* statement, int index) {
   const unsigned char* text = sqlite3_column_text(statement, index);
@@ -83,11 +115,18 @@ RemoteSnapshotRecord ReadSnapshotRow(sqlite3_stmt* statement) {
   record.sha256 = ColumnText(statement, 4);
   record.created_at = sqlite3_column_int64(statement, 5);
   record.storage_name = ColumnText(statement, 6);
+  record.snapshot_kind = static_cast<std::uint16_t>(
+      sqlite3_column_int(statement, 7));
+  record.parent_id = ColumnText(statement, 8);
+  record.generation =
+      static_cast<std::uint64_t>(sqlite3_column_int64(statement, 9));
+  record.lineage = ColumnText(statement, 10);
   return record;
 }
 
 constexpr const char* kSnapshotColumns =
-    "id, user_id, display_name, size_bytes, sha256, created_at, storage_name";
+    "id, user_id, display_name, size_bytes, sha256, created_at, storage_name,"
+    " snapshot_kind, parent_id, generation, lineage";
 
 // RAII：语句用完一定 finalize，异常路径也不例外。
 class Statement {
@@ -119,6 +158,8 @@ const char* StoreResultName(StoreResult result) {
       return "ALREADY_EXISTS";
     case StoreResult::kError:
       return "ERROR";
+    case StoreResult::kHasDependents:
+      return "HAS_DEPENDENTS";
   }
   return "UNKNOWN";
 }
@@ -167,16 +208,106 @@ bool RemoteMetadataStore::Execute(const std::string& sql,
   return true;
 }
 
+// snapshots 表当前实际有哪些列。迁移只补**缺的**列，因此可以重复执行。
+bool RemoteMetadataStore::SnapshotColumnsPresent(
+    std::vector<std::string>* columns, std::string* error_message) {
+  columns->clear();
+  Statement statement;
+  if (!Prepare("PRAGMA table_info(snapshots);", statement.out(),
+               error_message)) {
+    return false;
+  }
+  for (;;) {
+    const int code = sqlite3_step(statement.get());
+    if (code == SQLITE_DONE) {
+      break;
+    }
+    if (code != SQLITE_ROW) {
+      if (error_message != nullptr) {
+        *error_message = "cannot read the snapshots table layout: " + LastError();
+      }
+      return false;
+    }
+    // table_info 的第 1 列（下标 1）是列名。
+    columns->push_back(ColumnText(statement.get(), 1));
+  }
+  return true;
+}
+
 bool RemoteMetadataStore::EnsureSchema(std::string* error_message) {
   for (const char* pragma : kPragmaStatements) {
     if (!Execute(pragma, error_message)) {
       return false;
     }
   }
+  int version = 0;
+  {
+    Statement statement;
+    if (!Prepare("PRAGMA user_version;", statement.out(), error_message)) {
+      return false;
+    }
+    if (sqlite3_step(statement.get()) != SQLITE_ROW) {
+      if (error_message != nullptr) {
+        *error_message = "cannot read the schema version: " + LastError();
+      }
+      return false;
+    }
+    version = sqlite3_column_int(statement.get(), 0);
+  }
+  if (version != 0 && version != kLegacySchemaVersion &&
+      version != kSchemaVersion) {
+    if (error_message != nullptr) {
+      *error_message = "the metadata database has schema version " +
+                       std::to_string(version) +
+                       ", which this build cannot open (supported: 1 -> 2)";
+    }
+    return false;
+  }
+
+  // 整个迁移是一个事务：建表、补列、写版本号要么全部生效，要么全部回滚。
   if (!Execute("BEGIN IMMEDIATE;", error_message)) {
     return false;
   }
   for (const char* statement : kSchemaStatements) {
+    if (!Execute(statement, error_message)) {
+      Execute("ROLLBACK;", nullptr);
+      return false;
+    }
+  }
+  std::vector<std::string> columns;
+  if (!SnapshotColumnsPresent(&columns, error_message)) {
+    Execute("ROLLBACK;", nullptr);
+    return false;
+  }
+  // 旧库（version 1）缺这四列；新库在建表时就已经有了。按列名判断而不是按
+  // 版本号判断，迁移因此是幂等的：重复执行不会 ALTER 第二次。
+  for (const char* name : kChainColumnNames) {
+    bool present = false;
+    for (const std::string& column : columns) {
+      if (column == name) {
+        present = true;
+        break;
+      }
+    }
+    if (present) {
+      continue;
+    }
+    std::string statement = "ALTER TABLE snapshots ADD COLUMN ";
+    if (std::string(name) == "snapshot_kind") {
+      statement += "snapshot_kind INTEGER NOT NULL DEFAULT 0;";
+    } else if (std::string(name) == "parent_id") {
+      statement += "parent_id TEXT NOT NULL DEFAULT '';";
+    } else if (std::string(name) == "generation") {
+      statement += "generation INTEGER NOT NULL DEFAULT 0;";
+    } else {
+      statement += "lineage TEXT NOT NULL DEFAULT '';";
+    }
+    if (!Execute(statement, error_message)) {
+      Execute("ROLLBACK;", nullptr);
+      return false;
+    }
+  }
+  for (const char* statement : kChainIndexStatements) {
     if (!Execute(statement, error_message)) {
       Execute("ROLLBACK;", nullptr);
       return false;
@@ -198,6 +329,8 @@ constexpr const char* kRequiredTables[] = {"users", "snapshots", "deleted_users"
 bool RemoteMetadataStore::VerifyExistingSchema(std::string* error_message) {
   // 版本不匹配就明确失败，而不是"顺手"把库升级成新 schema：那是一次写操作，
   // 而只读命令完全可能正在 backup-server 运行时执行。
+  // PR #21 的迁移只发生在服务端启动路径（EnsureSchema）；管理工具面对一个
+  // 还没迁移过的旧库时必须拒绝工作，而不是自己动手升级。
   {
     Statement statement;
     if (!Prepare("PRAGMA user_version;", statement.out(), error_message)) {
@@ -561,7 +694,8 @@ StoreResult RemoteMetadataStore::InsertSnapshot(
   Statement statement;
   if (!Prepare("INSERT INTO snapshots"
                " (id, user_id, display_name, size_bytes, sha256, created_at,"
-               "  storage_name) VALUES (?, ?, ?, ?, ?, ?, ?);",
+               "  storage_name, snapshot_kind, parent_id, generation, lineage)"
+               " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);",
                statement.out(), error_message)) {
     return StoreResult::kError;
   }
@@ -582,6 +716,15 @@ StoreResult RemoteMetadataStore::InsertSnapshot(
   sqlite3_bind_text(statement.get(), 7, record.storage_name.c_str(),
                     static_cast<int>(record.storage_name.size()),
                     SQLITE_TRANSIENT);
+  sqlite3_bind_int(statement.get(), 8,
+                   static_cast<int>(record.snapshot_kind));
+  sqlite3_bind_text(statement.get(), 9, record.parent_id.c_str(),
+                    static_cast<int>(record.parent_id.size()),
+                    SQLITE_TRANSIENT);
+  sqlite3_bind_int64(statement.get(), 10,
+                     static_cast<sqlite3_int64>(record.generation));
+  sqlite3_bind_text(statement.get(), 11, record.lineage.c_str(),
+                    static_cast<int>(record.lineage.size()), SQLITE_TRANSIENT);
   const int code = sqlite3_step(statement.get());
   if (code == SQLITE_CONSTRAINT) {
     return StoreResult::kAlreadyExists;
@@ -704,6 +847,37 @@ StoreResult RemoteMetadataStore::DeleteSnapshot(std::int64_t user_id,
     }
     existing = ReadSnapshotRow(select.get());
   }
+  // PR #21：依赖感知删除的**最后一道闸门**。调用方（RemoteMaintenance）在动
+  // 磁盘之前就已经查过一次子节点；这里再查一次，是为了让"绕过调用方直接删"
+  // 也不可能造成断链——删除一个还有子节点的快照会让那些子快照永远无法恢复。
+  {
+    Statement children;
+    if (!Prepare("SELECT count(*) FROM snapshots"
+                 " WHERE user_id = ? AND parent_id = ?;",
+                 children.out(), error_message)) {
+      return StoreResult::kError;
+    }
+    sqlite3_bind_int64(children.get(), 1,
+                       static_cast<sqlite3_int64>(user_id));
+    sqlite3_bind_text(children.get(), 2, snapshot_id.c_str(),
+                      static_cast<int>(snapshot_id.size()), SQLITE_TRANSIENT);
+    if (sqlite3_step(children.get()) != SQLITE_ROW) {
+      if (error_message != nullptr) {
+        *error_message = "cannot count the dependent snapshots: " + LastError();
+      }
+      return StoreResult::kError;
+    }
+    const sqlite3_int64 dependents = sqlite3_column_int64(children.get(), 0);
+    if (dependents > 0) {
+      if (error_message != nullptr) {
+        *error_message = "snapshot " + snapshot_id + " still has " +
+                         std::to_string(dependents) +
+                         " dependent incremental snapshot(s); delete the"
+                         " descendants first";
+      }
+      return StoreResult::kHasDependents;
+    }
+  }
   Statement remove;
   if (!Prepare("DELETE FROM snapshots WHERE id = ? AND user_id = ?;",
                remove.out(), error_message)) {
@@ -727,6 +901,37 @@ StoreResult RemoteMetadataStore::DeleteSnapshot(std::int64_t user_id,
   }
   if (removed != nullptr) {
     *removed = existing;
+  }
+  return StoreResult::kOk;
+}
+
+StoreResult RemoteMetadataStore::CountSnapshotChildren(
+    std::int64_t user_id, const std::string& snapshot_id, std::uint64_t* out,
+    std::string* error_message) {
+  std::lock_guard<std::mutex> guard(mutex_);
+  if (database_ == nullptr) {
+    if (error_message != nullptr) {
+      *error_message = "the metadata store is not open";
+    }
+    return StoreResult::kError;
+  }
+  Statement statement;
+  if (!Prepare("SELECT count(*) FROM snapshots"
+               " WHERE user_id = ? AND parent_id = ?;",
+               statement.out(), error_message)) {
+    return StoreResult::kError;
+  }
+  sqlite3_bind_int64(statement.get(), 1, static_cast<sqlite3_int64>(user_id));
+  sqlite3_bind_text(statement.get(), 2, snapshot_id.c_str(),
+                    static_cast<int>(snapshot_id.size()), SQLITE_TRANSIENT);
+  if (sqlite3_step(statement.get()) != SQLITE_ROW) {
+    if (error_message != nullptr) {
+      *error_message = "cannot count the dependent snapshots: " + LastError();
+    }
+    return StoreResult::kError;
+  }
+  if (out != nullptr) {
+    *out = static_cast<std::uint64_t>(sqlite3_column_int64(statement.get(), 0));
   }
   return StoreResult::kOk;
 }

@@ -168,6 +168,11 @@ void DecodeFrameHeaderFields(const unsigned char* data, std::size_t size,
 
 // ---- 名字表 ----
 
+bool IsKnownSnapshotKind(std::uint16_t kind) {
+  return kind == static_cast<std::uint16_t>(SnapshotKind::kFull) ||
+         kind == static_cast<std::uint16_t>(SnapshotKind::kIncremental);
+}
+
 bool IsKnownOpcode(std::uint16_t opcode) {
   switch (static_cast<Opcode>(opcode)) {
     case Opcode::kPing:

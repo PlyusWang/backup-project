@@ -45,6 +45,9 @@ void PrintUsage(std::FILE* out, const char* program) {
       "  --root <目录>           blob 存储根目录\n"
       "  --db <文件>             SQLite 元数据库文件\n"
       "  --secret-file <文件>    含 BACKUP_TOKEN_SECRET 的 secrets.env\n"
+      "  --transport-key-file <文件>\n"
+      "                          BPSEC1 传输身份私钥（0600，32 字节）；必填，\n"
+      "                          用 backup-server-keygen 生成\n"
       "  --log-file <文件>       追加日志文件（默认只写 stderr）\n"
       "  --pid-file <文件>       PID 文件（同一个 root/db/port 只允许一个）\n"
       "  --workers <数量>        并发 worker 数，默认 4（1..64）\n"
@@ -53,8 +56,9 @@ void PrintUsage(std::FILE* out, const char* program) {
       "  --quiet                 不往 stderr 打日志\n"
       "  --help                  显示这份用法\n"
       "\n"
-      "本版本没有原生 TLS：BPNET1 的口令与 token 只能走在 SSH 隧道里，所以监听\n"
-      "地址只能是 127.0.0.1（--bind 给任何别的地址都会直接拒绝启动）。远程使用：\n"
+      "BPNET1 的全部流量由 BPSEC1 加密（X25519 + HKDF-SHA256 + AES-256-CTR +\n"
+      "HMAC-SHA256）；SSH 隧道仍然是部署层的纵深防御。监听地址只能是\n"
+      "127.0.0.1（--bind 给任何别的地址都会直接拒绝启动）。远程使用：\n"
       "  ssh -N -L 18765:127.0.0.1:18765 <ecs-host>\n"
       "\n"
       "退出码: 0 正常停止 / 1 运行期失败 / 2 用法错误\n",
@@ -154,6 +158,7 @@ int main(int argc, char* argv[]) {
   bool have_root = false;
   bool have_db = false;
   bool have_secret = false;
+  bool have_transport_key = false;
 
   for (int index = 1; index < argc; ++index) {
     const std::string name = argv[index];
@@ -190,6 +195,9 @@ int main(int argc, char* argv[]) {
     } else if (name == "--secret-file") {
       config.secret_file_path = value;
       have_secret = true;
+    } else if (name == "--transport-key-file") {
+      config.transport_key_file_path = value;
+      have_transport_key = true;
     } else if (name == "--log-file") {
       config.log_file_path = value;
     } else if (name == "--pid-file") {
@@ -219,9 +227,10 @@ int main(int argc, char* argv[]) {
     }
   }
 
-  if (!have_root || !have_db || !have_secret) {
+  if (!have_root || !have_db || !have_secret || !have_transport_key) {
     std::fprintf(stderr,
-                 "Error: --root, --db and --secret-file are all required.\n\n");
+                 "Error: --root, --db, --secret-file and --transport-key-file"
+                 " are all required.\n\n");
     PrintUsage(stderr, program);
     return 2;
   }

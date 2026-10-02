@@ -24,6 +24,7 @@
 #include <vector>
 
 #include "network_protocol.h"
+#include "secure_transport.h"
 
 namespace backupproject {
 namespace net {
@@ -35,6 +36,14 @@ struct RemoteEndpoint {
   std::string host = kDefaultRemoteHost;
   std::uint16_t port = kDefaultRemotePort;
   int timeout_seconds = 60;
+  // 服务端 BPSEC1 身份公钥的 pin：
+  //   "sha256:<64 个十六进制字符>"  只 pin 指纹
+  //   "hex:<64 个十六进制字符>"     直接 pin 公钥
+  //
+  // **必须配置**：空白会让 Connect() 直接失败（错误分类 kNoPinConfigured）。
+  // 本客户端不做"第一次见到谁就信谁"（TOFU）——否则中间人可以随便换密钥，
+  // 传输加密就只剩一个好看的名字。
+  std::string server_key_pin;
 };
 
 struct RemoteSnapshotInfo {
@@ -43,6 +52,24 @@ struct RemoteSnapshotInfo {
   std::uint64_t size_bytes = 0;
   std::string sha256;
   std::uint64_t created_at = 0;
+
+  // ---- PR #21：远端增量链 ----
+  //
+  // 这些字段**只用来定位与展示**。它们来自服务端元数据，因此在恢复路径上
+  // 永远不能替代"下载到的实际字节 + SHA-256 验证"（见 docs/remote_incremental.md）。
+  // 0 = full（链根），1 = incremental。
+  std::uint16_t snapshot_kind = 0;
+  std::string parent_snapshot_id;
+  std::uint64_t generation = 0;
+  std::string lineage;
+};
+
+// 上传时要声明的链关系。full 用默认值即可（parent 为空、generation 由服务端
+// 定为 0）；incremental 必须给出父快照 id 与 lineage。
+struct RemoteUploadOptions {
+  std::uint16_t snapshot_kind = 0;
+  std::string parent_snapshot_id;
+  std::string lineage;
 };
 
 // 进度回调。CLI 用它打印进度行，GUI 用它更新进度条；
@@ -108,6 +135,17 @@ class RemoteArchiveClient {
                          RemoteSnapshotInfo* uploaded,
                          std::string* error_message);
 
+  // PR #21：带链关系的上传。与上一个函数的差别只有 UPLOAD_BEGIN 里多声明的
+  // 三个字段（类型 / 父 id / lineage）以及 UPLOAD_END 响应里多回来的
+  // （类型 / generation / 父 id）。服务端会校验父必须存在、属于同一个用户、
+  // lineage 相同，并自己推导 generation。
+  bool UploadSnapshotFile(const std::string& local_path,
+                          const std::string& display_name,
+                          const RemoteUploadOptions& options,
+                          const RemoteProgressCallback& progress,
+                          RemoteSnapshotInfo* uploaded,
+                          std::string* error_message);
+
   // 下载到 target_path。
   //
   // 中间产物是**目标目录里唯一命名的**临时文件（mkstemp，0600），不是固定的
@@ -140,6 +178,15 @@ class RemoteArchiveClient {
   // 最近一次失败的原始原因（英文协议层原因），供日志与测试使用。
   const std::string& last_error() const { return last_error_; }
 
+  // 最近一次会话里服务端出示的身份公钥指纹（64 个小写十六进制字符）。
+  // 传输层握手成功之前是空串。它不是秘密，可以写进日志。
+  const std::string& server_fingerprint() const {
+    return channel_.peer_fingerprint();
+  }
+  // 最近一次加密传输层的错误分类（握手失败、记录校验失败、重放等）。
+  // 调用方据此把"服务端密钥不对"和"网络抖了一下"分开报。
+  SecureTransportError last_secure_error() const { return channel_.last_error(); }
+
  private:
   bool Request(Opcode opcode, const std::string& payload, FrameHeader* header,
                std::string* response, std::string* error_message);
@@ -158,6 +205,9 @@ class RemoteArchiveClient {
   bool authenticated_ = false;
   RemoteEndpoint endpoint_;
   std::string token_;
+  // 这条 TCP 连接的 BPSEC1 通道：每条连接都是一次新的握手、一套新的会话密钥。
+  SecureChannel channel_;
+  ServerKeyPin server_key_pin_;
   std::string last_error_;
   std::uint32_t last_status_ = 0;
 };

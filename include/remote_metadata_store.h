@@ -44,6 +44,9 @@ enum class StoreResult {
   kNotFound,
   kAlreadyExists,
   kError,
+  // PR #21：这个快照还被别的快照当作父引用着，删掉它会让那些子快照
+  // 永远无法恢复。删除必须依赖感知：先删叶子，再删祖先。
+  kHasDependents,
 };
 
 const char* StoreResultName(StoreResult result);
@@ -64,6 +67,20 @@ struct RemoteSnapshotRecord {
   std::int64_t created_at = 0;
   // 服务端生成的磁盘文件名（<snapshot_id>.bak）。永远不来自客户端。
   std::string storage_name;
+
+  // ---- PR #21：远端增量链 ----
+  //
+  // 0 = full（链根，generation 0、没有父），1 = incremental（必须有父）。
+  std::uint16_t snapshot_kind = 0;
+  // 父快照的 id；full 恒为空串。**服务端校验过**：父必须存在、属于同一个
+  // 用户、lineage 相同；generation 由服务端按 parent.generation + 1 推导，
+  // 客户端根本没有机会自己填一个数。
+  std::string parent_id;
+  // 距离链根的代数：full = 0，每挂一层 +1。
+  std::uint64_t generation = 0;
+  // 链的归属摘要（64 个小写十六进制字符）。同一个源 + 同一个远端仓库身份
+  // 得到同一个 lineage；不同 lineage 之间不允许建立父子关系。
+  std::string lineage;
 };
 
 // 管理视图用的每用户汇总。
@@ -145,6 +162,11 @@ class RemoteMetadataStore {
                              std::string* error_message);
   StoreResult CountSnapshots(std::int64_t user_id, std::uint64_t* out,
                              std::string* error_message);
+  // 有多少个快照把这个 id 当作父。删除前的依赖检查用它：非 0 就不许删。
+  StoreResult CountSnapshotChildren(std::int64_t user_id,
+                                    const std::string& snapshot_id,
+                                    std::uint64_t* out,
+                                    std::string* error_message);
 
   // ---- 管理视图（服务端与 ECS 本地管理工具共用）----
   StoreResult ListUsers(std::vector<RemoteUserSummary>* out,
@@ -175,6 +197,10 @@ class RemoteMetadataStore {
   bool Prepare(const std::string& sql, sqlite3_stmt** statement,
                std::string* error_message);
   bool EnsureSchema(std::string* error_message);
+  // snapshots 表当前有哪些列（PRAGMA table_info）。迁移据此只补缺的列，
+  // 所以它是幂等的。只在服务端的可写打开路径上调用。
+  bool SnapshotColumnsPresent(std::vector<std::string>* columns,
+                              std::string* error_message);
   // 只读 / 可写两种"打开已经存在的库"的公共实现（writable 决定连接标志）。
   bool OpenExistingWithMode(const std::string& path, bool writable,
                             std::string* error_message);

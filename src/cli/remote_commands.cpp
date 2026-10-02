@@ -2,6 +2,8 @@
 
 #include "remote_commands.h"
 
+#include "remote_incremental.h"
+
 #include <libgen.h>
 
 #include <cstdio>
@@ -27,6 +29,16 @@ struct RemoteOptions {
   std::string username;
   std::string display_name;
   std::string repository_directory;
+  // 服务端 BPSEC1 身份 pin（"sha256:<指纹>" 或 "hex:<公钥>"）。
+  std::string server_key;
+  // 远端 backup 的参数：策略、显示名、过滤规则（规则原文同时留给增量链的
+  // identity —— 规则变了就必须重建基线，这是引擎的硬规则）。
+  bool incremental = true;
+  bool saw_strategy = false;
+  std::vector<std::string> include_rules;
+  std::vector<std::string> exclude_rules;
+  Filter filter;
+  BackupOptions backup_options;
   // 注销账户的二次确认：必须逐字等于 --user 给的用户名。
   std::string confirm_username;
   bool force = false;
@@ -42,12 +54,24 @@ void PrintRemoteUsageTo(std::ostream& output) {
             "      [--name <显示名>] [--repository <仓库目录>]\n"
             "  backupctl remote download <快照ID> <目标路径> --user <用户名>\n"
             "      [--force]\n"
+            "  backupctl remote backup <源目录> --user <用户名>\n"
+            "      [--strategy full|incremental] [--name <显示名>]\n"
+            "      [--include <规则>]... [--exclude <规则>]...\n"
+            "      （incremental 是默认值：没有可续的链时自动先建一份完整基线）\n"
+            "  backupctl remote restore <快照ID> <目标目录> --user <用户名>\n"
+            "      （自动把整条依赖链拉下来、逐字节验证后恢复；不需要手工下载 delta）\n"
             "  backupctl remote delete <快照ID> --user <用户名>\n"
             "  backupctl remote delete-account --user <用户名> --confirm "
             "<用户名>\n"
             "      （永久删除该账户与它的全部云端备份，不可撤销）\n"
             "  口令只从终端读取；自动测试用 BACKUP_REMOTE_PASSWORD 提供，\n"
-            "  两者都不会被打印。默认端点 127.0.0.1:18765。\n";
+            "  两者都不会被打印。默认端点 127.0.0.1:18765。\n"
+            "\n"
+            "  所有 remote 子命令都需要 --server-key <sha256:指纹|hex:公钥>\n"
+            "  （也可以放在环境变量 BACKUP_REMOTE_SERVER_KEY 里）。BPNET1 的\n"
+            "  全部流量由 BPSEC1 加密，客户端必须事先知道服务端身份公钥；\n"
+            "  本项目不做首次连接自动信任。用下面的命令取得 pin：\n"
+            "      backup-server-keygen --show --key-file <身份私钥文件>\n";
 }
 
 bool TakeValue(const std::vector<std::string>& arguments, std::size_t* index,
@@ -95,6 +119,37 @@ bool ParseOptions(const std::vector<std::string>& arguments,
                      error_message)) {
         return false;
       }
+    } else if (token == "--strategy") {
+      std::string value;
+      if (!TakeValue(arguments, &index, token, &value, error_message)) {
+        return false;
+      }
+      if (value != "full" && value != "incremental") {
+        *error_message = "--strategy 只接受 full 或 incremental";
+        return false;
+      }
+      options->incremental = value == "incremental";
+      options->saw_strategy = true;
+    } else if (token == "--include" || token == "--exclude") {
+      std::string value;
+      if (!TakeValue(arguments, &index, token, &value, error_message)) {
+        return false;
+      }
+      const FilterAction action = token == "--include" ? FilterAction::kInclude
+                                                       : FilterAction::kExclude;
+      if (!options->filter.AddRule(action, value, error_message)) {
+        return false;
+      }
+      if (action == FilterAction::kInclude) {
+        options->include_rules.push_back(value);
+      } else {
+        options->exclude_rules.push_back(value);
+      }
+    } else if (token == "--server-key") {
+      if (!TakeValue(arguments, &index, token, &options->server_key,
+                     error_message)) {
+        return false;
+      }
     } else if (token == "--confirm") {
       if (!TakeValue(arguments, &index, token, &options->confirm_username,
                      error_message)) {
@@ -107,6 +162,15 @@ bool ParseOptions(const std::vector<std::string>& arguments,
       return false;
     } else {
       options->positional.push_back(token);
+    }
+  }
+  // pin 优先级：--server-key -> 环境变量 BACKUP_REMOTE_SERVER_KEY。
+  // 两者都没有时在 RunRemoteCommand 里明确报错（不做 TOFU）。
+  options->endpoint.server_key_pin = options->server_key;
+  if (options->endpoint.server_key_pin.empty()) {
+    const char* from_environment = std::getenv("BACKUP_REMOTE_SERVER_KEY");
+    if (from_environment != nullptr && from_environment[0] != '\0') {
+      options->endpoint.server_key_pin = from_environment;
     }
   }
   if (!host.empty()) {
@@ -237,6 +301,16 @@ int RunRemoteCommand(const CliContext& context,
     return kCliExitUsageError;
   }
 
+  if (options.endpoint.server_key_pin.empty()) {
+    std::cerr << "Error: 缺少 --server-key <sha256:指纹|hex:公钥>。\n"
+                 "  BPSEC1 要求客户端事先知道服务端身份公钥，本项目不做首次\n"
+                 "  连接自动信任（TOFU）。用下面的命令取得 pin：\n"
+                 "      backup-server-keygen --show --key-file <身份私钥文件>\n"
+                 "  也可以把它放进环境变量 BACKUP_REMOTE_SERVER_KEY。\n\n";
+    PrintRemoteUsageTo(std::cerr);
+    return kCliExitUsageError;
+  }
+
   net::RemoteArchiveClient client;
   std::string error;
 
@@ -325,6 +399,102 @@ int RunRemoteCommand(const CliContext& context,
                   info.sha256.substr(0, 12).c_str(), info.display_name.c_str());
     }
     return kCliExitSuccess;
+  }
+
+  if (subcommand == "backup") {
+    if (options.positional.size() != 1) {
+      std::cerr << "Error: remote backup 需要正好一个源目录。\n\n";
+      PrintRemoteUsageTo(std::cerr);
+      return kCliExitUsageError;
+    }
+    if (options.username.empty()) {
+      std::cerr << "Error: remote backup 需要 --user。\n";
+      return kCliExitUsageError;
+    }
+    const std::string source_directory = options.positional[0];
+    if (!ConnectAndLogin(options, /*need_login=*/true, &client, &error)) {
+      return Fail(error);
+    }
+    net::RemoteCacheLayout cache;
+    if (!net::PrepareRemoteCache(std::string(), client.server_fingerprint(),
+                                 options.username, &cache, &error)) {
+      return Fail(error);
+    }
+    net::RemoteBackupRequest request;
+    request.client = &client;
+    request.cache = cache;
+    request.source_directory = source_directory;
+    request.include_rules = options.include_rules;
+    request.exclude_rules = options.exclude_rules;
+    request.filter = options.filter;
+    request.options = options.backup_options;
+    request.allow_incremental = options.incremental;
+    request.display_name = options.display_name;
+    request.progress = PrintProgress;
+    net::RemoteBackupOutcome outcome;
+    if (!net::RunRemoteBackup(request, &outcome, &error)) {
+      return Fail(error);
+    }
+    if (outcome.no_changes) {
+      std::cout << "源目录没有变化，没有创建新的远端快照。\n";
+      return 0;
+    }
+    std::cout << (outcome.produced_delta ? "已上传增量快照" : "已上传完整快照")
+              << "\n";
+    std::cout << "  快照 ID:   " << outcome.snapshot_id << "\n";
+    std::cout << "  类型:      "
+              << (outcome.produced_delta ? "incremental" : "full") << "\n";
+    std::cout << "  代数:      " << outcome.generation << "\n";
+    if (!outcome.parent_snapshot_id.empty()) {
+      std::cout << "  父快照:    " << outcome.parent_snapshot_id << "\n";
+    }
+    std::cout << "  归档名:    " << outcome.archive_name << "\n";
+    std::cout << "  本次上传:  " << outcome.uploaded_bytes << " 字节\n";
+    if (outcome.chain_root_bytes > 0) {
+      std::cout << "  链根大小:  " << outcome.chain_root_bytes
+                << " 字节（本次只传了增量部分）\n";
+    }
+    if (outcome.rebuilt_full_baseline) {
+      std::cout << "  说明:      引擎判断无法续链，已重建完整基线（"
+                << outcome.baseline_reason << "）\n";
+    }
+    std::cout << "  本地缓存:  " << cache.cache_directory << "\n";
+    return 0;
+  }
+
+  if (subcommand == "restore") {
+    if (options.positional.size() != 2) {
+      std::cerr << "Error: remote restore 需要 <快照ID> <目标目录>。\n\n";
+      PrintRemoteUsageTo(std::cerr);
+      return kCliExitUsageError;
+    }
+    if (options.username.empty()) {
+      std::cerr << "Error: remote restore 需要 --user。\n";
+      return kCliExitUsageError;
+    }
+    const std::string snapshot_id = options.positional[0];
+    const std::string target_directory = options.positional[1];
+    if (!ConnectAndLogin(options, /*need_login=*/true, &client, &error)) {
+      return Fail(error);
+    }
+    net::RemoteCacheLayout cache;
+    if (!net::PrepareRemoteCache(std::string(), client.server_fingerprint(),
+                                 options.username, &cache, &error)) {
+      return Fail(error);
+    }
+    // 增量链不支持加密（外层信封不受内层保护），所以恢复不需要口令。
+    net::RemoteRestoreOutcome outcome;
+    if (!net::RunRemoteRestore(&client, cache, snapshot_id, target_directory,
+                               RestoreOptions(), &outcome, &error)) {
+      return Fail(error);
+    }
+    std::cout << "已从远端恢复 " << outcome.archive_name << "\n";
+    std::cout << "  目标目录:  " << target_directory << "\n";
+    std::cout << "  依赖链:    " << outcome.chain_length << " 份快照（"
+              << outcome.delta_count << " 个增量）\n";
+    std::cout << "  本次下载:  " << outcome.downloaded_bytes << " 字节\n";
+    std::cout << "  恢复条目:  " << outcome.restored_entries << "\n";
+    return 0;
   }
 
   if (subcommand == "upload") {

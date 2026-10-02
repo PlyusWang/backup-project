@@ -43,6 +43,7 @@ run() {
 
 run lint bash scripts/lint.sh
 run secure-transport bash scripts/secure_transport_test.sh
+run remote-incremental bash scripts/remote_incremental_test.sh
 run secure-transport-sanitize env SECURE_TRANSPORT_TEST_EXTRA_FLAGS="-g -O1 -fsanitize=address,undefined -fno-omit-frame-pointer" bash scripts/secure_transport_test.sh
 run quality bash scripts/quality_test.sh
 
