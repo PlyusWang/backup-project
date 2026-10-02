@@ -1052,6 +1052,102 @@ void TestHandshakeMutations() {
   }
 }
 
+// 读当前进程的常驻内存（KB）。只用于"没有线性增长"这条证据。
+long ResidentKilobytes() {
+  std::FILE* file = std::fopen("/proc/self/statm", "r");
+  if (file == nullptr) {
+    return -1;
+  }
+  long total_pages = 0;
+  long resident_pages = 0;
+  const int matched = std::fscanf(file, "%ld %ld", &total_pages, &resident_pages);
+  std::fclose(file);
+  if (matched != 2) {
+    return -1;
+  }
+  return resident_pages * (sysconf(_SC_PAGESIZE) / 1024);
+}
+
+void TestLargeStreamingTransfer() {
+  // 32 MiB 连续经过加密记录层：证明它是**流式**的，而不是"整份读进内存再加密"。
+  // 每个记录正好携带一个 1 MiB payload 的 BPNET1 帧（协议允许的最大帧）。
+  std::printf("[transport] 32 MiB 流式传输与内存上界\n");
+  TransportIdentity identity;
+  std::string error;
+  Check(GenerateTransportIdentity(&identity, &error), "生成身份密钥", error);
+  ServerKeyPin pin;
+  Check(ParseServerKeyPin(
+            "sha256:" +
+                backupproject::crypto::X25519Fingerprint(identity.public_key),
+            &pin, &error),
+        "pin", error);
+
+  auto pair = MakePair(identity, pin);
+  Check(pair->ok, "大流量用例：握手成功");
+
+  const std::size_t chunk_bytes = backupproject::net::kMaxPayloadBytes;  // 1 MiB
+  const std::size_t target_bytes = 32u * 1024u * 1024u;                  // 32 MiB
+  const std::size_t expected_frames = target_bytes / chunk_bytes;
+
+  std::atomic<std::size_t> received_frames{0};
+  std::atomic<std::size_t> received_bytes{0};
+  std::atomic<bool> payload_ok{true};
+  std::thread reader([&pair, &received_frames, &received_bytes, &payload_ok]() {
+    std::string error_text;
+    for (;;) {
+      FrameHeader header;
+      std::string payload;
+      const FrameReadStatus status = pair->server.ReceiveFrame(
+          pair->server_fd, &header, &payload, &error_text);
+      if (status != FrameReadStatus::kOk) {
+        break;
+      }
+      // 每个 payload 都是同一个 4 字节模式，长度必须是 1 MiB。
+      if (payload.size() != backupproject::net::kMaxPayloadBytes ||
+          payload[0] != 'Z' || payload[payload.size() - 1] != 'Z') {
+        payload_ok.store(false);
+      }
+      received_frames.fetch_add(1);
+      received_bytes.fetch_add(payload.size());
+    }
+  });
+
+  const std::string chunk(chunk_bytes, 'Z');
+  const long rss_before = ResidentKilobytes();
+  bool sent = true;
+  for (std::size_t index = 0; index < expected_frames; ++index) {
+    if (!pair->client.SendFrame(pair->client_fd,
+                                static_cast<std::uint16_t>(Opcode::kUploadChunk),
+                                0, static_cast<std::uint64_t>(index + 1), chunk,
+                                &error)) {
+      sent = false;
+      break;
+    }
+  }
+  // 发完就关掉客户端，让读线程在收完最后一帧后拿到 kClosed 退出。
+  Check(sent, "32 MiB 全部发出", error);
+  ::shutdown(pair->client_fd, SHUT_WR);
+  reader.join();
+  const long rss_after = ResidentKilobytes();
+
+  Check(received_frames.load() == expected_frames && sent,
+        "32 MiB 全部收到",
+        std::to_string(received_frames.load()) + "/" +
+            std::to_string(expected_frames) + " 帧");
+  Check(received_bytes.load() == target_bytes, "收到的字节数正确",
+        std::to_string(received_bytes.load()));
+  Check(payload_ok.load(), "每一帧的 payload 逐字节完整（长度与首尾字节都对）");
+  const long growth = (rss_before > 0 && rss_after > 0) ? rss_after - rss_before : -1;
+  Check(growth >= 0 && growth < 16 * 1024,
+        "RSS 没有线性增长（32 MiB 传输）",
+        "RSS " + std::to_string(rss_before) + " -> " + std::to_string(rss_after) +
+            " KB");
+  std::printf("  RSS_BOUND: %ld KB -> %ld KB（传输 %zu MiB）\n", rss_before,
+              rss_after, target_bytes / (1024u * 1024u));
+  ::close(pair->client_fd);
+  ::close(pair->server_fd);
+}
+
 }  // namespace
 
 int main() {
@@ -1060,6 +1156,7 @@ int main() {
   TestWireCaptureHasNoPlaintext();
   TestRecordTamperMatrix();
   TestHandshakeMutations();
+  TestLargeStreamingTransfer();
   const int passed = g_checks - g_failures;
   std::printf("secure-transport-test: %d/%d checks passed\n", passed, g_checks);
   return g_failures == 0 ? 0 : 1;
