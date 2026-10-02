@@ -20,6 +20,10 @@
 #  13. backup-server 正在运行时，破坏性操作被拒绝（内核锁，不是 pgrep 猜的）
 #  14. 用户选择器：id:<编号> / name:<用户名> 明确指定；裸输入同时命中 id 与
 #      用户名时拒绝并给出两种写法；删除操作必须显式指定（绝不猜）
+#  15. 只读命令（status / list-users / show-user / list-snapshots / overview）
+#      是**真的**只读：服务端运行时可用，而且不产生写事务（连接是 READONLY）
+#  16. 源码树里的 backup-server-admin.sh 不再猜实例：没有 BACKUP_SERVER_ROOT
+#      就 fail closed，不会去读另一个实例
 
 set -uo pipefail
 
@@ -255,6 +259,69 @@ if grep -q "$SNAP_B1" "$TEST_ROOT/admin.txt"; then
   record_pass "被拒绝之后数据完好（两份快照都还在）"
 else
   record_fail "被拒绝之后的数据" "快照不见了"
+fi
+
+# ---- 15. 只读命令必须**真的**只读：服务端在跑也安全，而且不写库 ----
+#
+# 这一版修掉的 review finding：status / list-users / show-user / overview 以前走
+# 的是带 SQLITE_OPEN_CREATE 的"能读也能写"的连接，打开时还会 EnsureSchema
+# （BEGIN IMMEDIATE + CREATE TABLE + PRAGMA user_version）——一次货真价实的写事务。
+# 现在只读命令用 SQLITE_OPEN_READONLY 的连接（外加 PRAGMA query_only），
+# 破坏性命令才用可写连接。
+#
+# 运行时证据：这些命令在服务端**正在运行**时全部成功，而主库与 WAL 一个字节都
+# 没有变。
+DB_SHA_BEFORE="$(sha256sum "$DB" | cut -d' ' -f1)"
+WAL_SIZE_BEFORE="$(stat -c %s "$DB-wal" 2>/dev/null || echo 0)"
+RO_OK=1
+for command in "status" "list-users" "overview" "show-user name:$USER_A" \
+               "list-snapshots name:$USER_B"; do
+  # shellcheck disable=SC2086
+  [ "$(run_admin $command)" = "0" ] || RO_OK=0
+done
+if [ "$RO_OK" = "1" ]; then
+  record_pass "服务端运行时 status / list-users / overview / show-user / list-snapshots 全部成功"
+else
+  record_fail "服务端运行时的只读命令" "$(head -3 "$TEST_ROOT/admin.txt" | tr '\n' ' ')"
+fi
+DB_SHA_AFTER="$(sha256sum "$DB" | cut -d' ' -f1)"
+WAL_SIZE_AFTER="$(stat -c %s "$DB-wal" 2>/dev/null || echo 0)"
+if [ "$DB_SHA_AFTER" = "$DB_SHA_BEFORE" ] \
+   && [ "$WAL_SIZE_AFTER" = "$WAL_SIZE_BEFORE" ]; then
+  record_pass "只读命令之后主库与 WAL 都没有变化（没有写事务）"
+else
+  record_fail "只读命令的写效应" \
+    "db $DB_SHA_BEFORE->$DB_SHA_AFTER wal $WAL_SIZE_BEFORE->$WAL_SIZE_AFTER"
+fi
+# 一条只读命令的输出前后一致：不是"某几条其实读的是别的东西"。
+run_admin list-users >/dev/null
+RO_LIST_A="$(cat "$TEST_ROOT/admin.txt")"
+run_admin list-users >/dev/null
+RO_LIST_B="$(cat "$TEST_ROOT/admin.txt")"
+if [ -n "$RO_LIST_A" ] && [ "$RO_LIST_A" = "$RO_LIST_B" ]; then
+  record_pass "重复执行 list-users 的输出完全一致（只读视图稳定）"
+else
+  record_fail "只读视图的稳定性" "两次输出不同"
+fi
+
+# 源码级契约：两种打开方式是两个入口；共用的打开实现只**校验** schema。
+RO_BODY="$(awk '/^bool RemoteMetadataStore::OpenExistingWithMode[(]/{inside=1} inside{print} inside && /^}$/{exit}' server/remote_metadata_store.cpp)"
+RO_STATIC=1
+printf '%s' "$RO_BODY" | grep -q "SQLITE_OPEN_READONLY" || RO_STATIC=0
+printf '%s' "$RO_BODY" | grep -q "VerifyExistingSchema" || RO_STATIC=0
+if printf '%s' "$RO_BODY" | grep -qE "EnsureSchema|BEGIN IMMEDIATE|CREATE TABLE"; then
+  RO_STATIC=0
+fi
+grep -q "OpenExistingReadOnly" server/admin_main.cpp || RO_STATIC=0
+grep -q "OpenExistingReadWrite" server/admin_main.cpp || RO_STATIC=0
+if grep -n "OpenExisting(" server/admin_main.cpp server/remote_metadata_store.cpp \
+     2>/dev/null | grep -vE ':[0-9]+:[[:space:]]*//' | grep -q .; then
+  RO_STATIC=0
+fi
+if [ "$RO_STATIC" = "1" ]; then
+  record_pass "管理工具只用 OpenExistingReadOnly / OpenExistingReadWrite，且打开路径不建表"
+else
+  record_fail "管理工具的打开方式" "只读 / 可写没有分开，或者打开路径仍会改 schema"
 fi
 
 # 数据目录锁：同一个 root 上不允许起第二个服务端。
@@ -504,6 +571,31 @@ if grep -qF "$SECRET_VALUE" "$LOG" 2>/dev/null; then
   record_fail "服务端日志里没有 secret" "日志里出现了 secret"
 else
   record_pass "服务端日志里没有出现过 token secret"
+fi
+
+# ---- 16. 源码树里的 wrapper 不再猜实例（fail closed）----
+SRC_WRAP_OUT="$TEST_ROOT/wrapper-src.txt"
+SRC_WRAP_CODE=0
+( cd "$ROOT_DIR" && env -u BACKUP_SERVER_ROOT -u BACKUP_SERVER_DATA \
+    -u BACKUP_SERVER_DB bash scripts/backup-server-admin.sh </dev/null ) \
+  > "$SRC_WRAP_OUT" 2>&1 || SRC_WRAP_CODE=$?
+if [ "$SRC_WRAP_CODE" != "0" ] && grep -q "源码树" "$SRC_WRAP_OUT"; then
+  record_pass "源码树里的 wrapper 在没有 BACKUP_SERVER_ROOT 时 fail closed"
+else
+  record_fail "源码树 wrapper" \
+    "exit=$SRC_WRAP_CODE $(head -2 "$SRC_WRAP_OUT" | tr '\n' ' ')"
+fi
+# 显式给出实例根之后，同一条路径必须正常工作（逃生口不是死的）。
+SRC_WRAP_OK=0
+BACKUP_SERVER_ROOT="$TEST_ROOT" timeout --signal=KILL 60 \
+  bash "$ROOT_DIR/scripts/backup-server-admin.sh" </dev/null \
+  > "$TEST_ROOT/wrapper-src-ok.txt" 2>&1 && SRC_WRAP_OK=1
+if [ "$SRC_WRAP_OK" = "1" ] \
+   && grep -q "已退出管理工具" "$TEST_ROOT/wrapper-src-ok.txt"; then
+  record_pass "显式给出 BACKUP_SERVER_ROOT 之后，源码树 wrapper 正常工作"
+else
+  record_fail "源码树 wrapper 的逃生口" \
+    "$(head -3 "$TEST_ROOT/wrapper-src-ok.txt" | tr '\n' ' ')"
 fi
 
 finish

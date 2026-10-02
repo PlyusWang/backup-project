@@ -158,6 +158,25 @@ int main() {
     error.clear();
     test_support::Check(!server.Configure(config, &error),
                         "SRV T1 非 IPv4 字面量被拒绝", error);
+    // 本版本没有原生 TLS：任何非环回地址都必须 fail closed。0.0.0.0 是"监听
+    // 所有网卡"，私网 / 公网地址同样会把明文协议暴露在共享网络上，127.0.0.2
+    // 也不接受——规则是**相等**判断，不是"127/8 都行"。
+    for (const char* address :
+         {"0.0.0.0", "127.0.0.2", "192.168.1.10", "8.8.8.8", "10.1.2.3"}) {
+      config.bind_address = address;
+      error.clear();
+      test_support::Check(!server.Configure(config, &error),
+                          std::string("SRV T1 非环回地址 ") + address +
+                              " 被拒绝");
+      test_support::Check(error.find("127.0.0.1") != std::string::npos,
+                          std::string("SRV T1 判别：") + address +
+                              " 的拒绝理由里点名了 127.0.0.1");
+    }
+    // IPv6 字面量同样不接受：这一版只解析 IPv4。
+    config.bind_address = "::1";
+    error.clear();
+    test_support::Check(!server.Configure(config, &error),
+                        "SRV T1 IPv6 字面量被拒绝");
     config.bind_address = "127.0.0.1";
     config.root_directory = "";
     error.clear();
@@ -216,6 +235,95 @@ int main() {
                               !server.running(),
                           "SRV T2 secret 过短时拒绝启动", error);
     }
+  }
+
+  test_support::Section("SRV 2b. secret 文件：权限 / 类型 / 符号链接都 fail closed");
+  {
+    Fixture fixture;
+    test_support::Check(SetupFixture(&fixture, "srv-secret-mode"),
+                        "SRV T2b 夹具就绪");
+    std::string secret_text;
+    test_support::ReadFile(fixture.secret_file, &secret_text);
+    const std::string key = "BACKUP_TOKEN_SECRET=";
+    const std::size_t at = secret_text.find(key);
+    std::string secret_value =
+        at == std::string::npos ? std::string() : secret_text.substr(at + key.size());
+    while (!secret_value.empty() && (secret_value.back() == '\n' ||
+                                     secret_value.back() == '\r')) {
+      secret_value.pop_back();
+    }
+    test_support::Check(!secret_value.empty(),
+                        "SRV T2b 夹具：夹具 secret 非空（用来做泄漏判别）");
+
+    // 起一次就停：Start() 成功即证明这份 secret 文件被接受。
+    const auto starts_with_secret = [&fixture](std::string* error) {
+      net::RemoteServer server;
+      if (!server.Configure(fixture.config, error)) {
+        return false;
+      }
+      if (!server.Start(error)) {
+        return false;
+      }
+      server.Stop();
+      return true;
+    };
+
+    // 每一轮都要先恢复可写：上一轮可能把文件留成 0400（owner 只读），
+    // 那样下一次 O_WRONLY 打开会直接 EACCES，测的就不是"服务端拒绝了"。
+    const auto rewrite_secret = [&fixture, &secret_text](std::uint32_t mode) {
+      (void)::chmod(fixture.secret_file.c_str(), 0600);
+      return test_support::WriteFile(fixture.secret_file, secret_text, mode);
+    };
+
+    std::string error;
+    test_support::Check(rewrite_secret(0600) && starts_with_secret(&error),
+                        "SRV T2b 0600 的 secret 文件被接受", error);
+    error.clear();
+    test_support::Check(rewrite_secret(0400) && starts_with_secret(&error),
+                        "SRV T2b 0400（只有 owner 能读）也被接受", error);
+    for (const std::uint32_t mode : {0644u, 0660u, 0640u, 0604u, 0666u}) {
+      test_support::Check(rewrite_secret(mode),
+                          "SRV T2b 夹具：secret 文件已改成 " +
+                              test_support::Octal(mode));
+      error.clear();
+      const bool started = starts_with_secret(&error);
+      test_support::Check(!started,
+                          "SRV T2b 模式 " + test_support::Octal(mode) +
+                              " 的 secret 文件被拒绝");
+      test_support::Check(error.find(secret_value) == std::string::npos,
+                          "SRV T2b 判别：拒绝信息里没有 secret 的值", error);
+    }
+
+    // 符号链接：拒绝（O_NOFOLLOW），哪怕它指向一个 0600 的正规文件。
+    test_support::Check(rewrite_secret(0600),
+                        "SRV T2b 夹具：secret 文件恢复成 0600");
+    const std::string link_path = fixture.secret_file + ".link";
+    test_support::Check(
+        test_support::CreateSymlink(fixture.secret_file, link_path),
+        "SRV T2b 夹具：指向 secret 的符号链接已创建");
+    {
+      net::RemoteServer server;
+      net::RemoteServerConfig config = fixture.config;
+      config.secret_file_path = link_path;
+      error.clear();
+      test_support::Check(!server.Configure(config, &error) ||
+                              !server.Start(&error),
+                          "SRV T2b 指向 secret 的符号链接被拒绝", error);
+    }
+    // 目录：拒绝（不是普通文件）。
+    {
+      net::RemoteServer server;
+      net::RemoteServerConfig config = fixture.config;
+      config.secret_file_path = fixture.root;
+      error.clear();
+      test_support::Check(!server.Configure(config, &error) ||
+                              !server.Start(&error),
+                          "SRV T2b 目录当 secret 文件被拒绝", error);
+    }
+    // 合法文件重新被接受：证明前面的拒绝都来自"那一份坏文件"，不是环境坏了。
+    error.clear();
+    test_support::Check(starts_with_secret(&error),
+                        "SRV T2b 判别：换回 0600 正规文件之后又能启动", error);
   }
 
   test_support::Section("SRV 3. PING 往返（真实 TCP 环回）");

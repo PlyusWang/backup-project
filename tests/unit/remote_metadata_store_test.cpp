@@ -6,8 +6,11 @@
 // 而是"按 id 也查不到"。这条在协议层还会再测一遍（socket 层），
 // 这里先把存储层的语义钉死。
 
+#include <sqlite3.h>
+
 #include <cstdint>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "remote_auth.h"
@@ -46,6 +49,54 @@ net::RemoteSnapshotRecord MakeSnapshot(const std::string& id,
 }
 
 std::string SnapshotId(char fill) { return std::string(32, fill); }
+
+// ---- "schema 不对的库"夹具 --------------------------------------------------
+//
+// 管理工具的任何一种打开方式都必须**拒绝**这种库，而不是把缺的表建出来。
+// 用同一份 SQLite 直接造，不经过产品代码。
+
+bool RunSqlOnFreshDatabase(const std::string& path, const char* sql) {
+  sqlite3* database = nullptr;
+  if (sqlite3_open(path.c_str(), &database) != SQLITE_OK) {
+    if (database != nullptr) {
+      sqlite3_close(database);
+    }
+    return false;
+  }
+  char* message = nullptr;
+  const int code = sqlite3_exec(database, sql, nullptr, nullptr, &message);
+  if (message != nullptr) {
+    sqlite3_free(message);
+  }
+  sqlite3_close(database);
+  return code == SQLITE_OK;
+}
+
+// sqlite_master 里的表数量：用来证明"失败的打开没有偷偷建表"。
+int CountTables(const std::string& path) {
+  sqlite3* database = nullptr;
+  if (sqlite3_open_v2(path.c_str(), &database, SQLITE_OPEN_READONLY, nullptr) !=
+      SQLITE_OK) {
+    if (database != nullptr) {
+      sqlite3_close(database);
+    }
+    return -1;
+  }
+  sqlite3_stmt* statement = nullptr;
+  int count = -1;
+  if (sqlite3_prepare_v2(database,
+                         "SELECT count(*) FROM sqlite_master"
+                         " WHERE type = 'table';",
+                         -1, &statement, nullptr) == SQLITE_OK &&
+      sqlite3_step(statement) == SQLITE_ROW) {
+    count = sqlite3_column_int(statement, 0);
+  }
+  if (statement != nullptr) {
+    sqlite3_finalize(statement);
+  }
+  sqlite3_close(database);
+  return count;
+}
 
 }  // namespace
 
@@ -328,6 +379,134 @@ int main() {
       test_support::Check(closed.CountSnapshots(1, &count, &error) ==
                               net::StoreResult::kError,
                           "STORE T6 未打开的库上查询返回 kError");
+    }
+  }
+
+  test_support::Section("STORE 7. 只读 / 可写两种打开方式（管理工具不再写库）");
+  {
+    const std::string base = test_support::FreshDir("store-modes");
+    const std::string path = base + "/metadata.sqlite3";
+    {
+      net::RemoteMetadataStore store;
+      std::string error;
+      test_support::Check(store.Open(path, &error),
+                          "STORE T7 先用服务端的方式建一个正常的库", error);
+      std::int64_t alice = 0;
+      test_support::Check(store.CreateUser("alice", FakePasswordRecord(), 100,
+                                           &alice, &error) ==
+                              net::StoreResult::kOk,
+                          "STORE T7 库里写入一个用户", error);
+      store.Close();
+    }
+    std::string before;
+    test_support::Check(test_support::ReadFile(path, &before),
+                        "STORE T7 读出库文件的字节（作为未改动的基准）");
+
+    // 只读打开：能读、写不进去、而且一个字节都没有变。
+    {
+      net::RemoteMetadataStore store;
+      std::string error;
+      test_support::Check(store.OpenExistingReadOnly(path, &error),
+                          "STORE T7 只读打开已经存在的库", error);
+      std::vector<net::RemoteUserSummary> users;
+      test_support::Check(store.ListUsers(&users, &error) ==
+                                  net::StoreResult::kOk &&
+                              users.size() == 1 &&
+                              users[0].username == "alice",
+                          "STORE T7 判别：只读连接把真实数据读出来了", error);
+      std::int64_t created = 0;
+      error.clear();
+      const net::StoreResult write_result =
+          store.CreateUser("bob", FakePasswordRecord(), 200, &created, &error);
+      test_support::Check(write_result == net::StoreResult::kError,
+                          "STORE T7 判别：只读连接上的写入被拒绝",
+                          std::string(net::StoreResultName(write_result)) + ": " +
+                              error);
+      users.clear();
+      store.ListUsers(&users, &error);
+      test_support::Check(users.size() == 1,
+                          "STORE T7 判别：被拒绝的写入没有留下任何行");
+      store.Close();
+    }
+    std::string after;
+    test_support::Check(test_support::ReadFile(path, &after) && after == before,
+                        "STORE T7 判别：只读打开 + 读取 + 被拒绝的写入之后，"
+                        "库文件逐字节未变");
+
+    // 可写打开：破坏性命令走的那一条，同一份数据可以删。
+    {
+      net::RemoteMetadataStore store;
+      std::string error;
+      test_support::Check(store.OpenExistingReadWrite(path, &error),
+                          "STORE T7 可写打开已经存在的库", error);
+      std::vector<net::RemoteUserSummary> users;
+      store.ListUsers(&users, &error);
+      test_support::Check(users.size() == 1 && users[0].user_id == 1,
+                          "STORE T7 判别：可写连接读到的是同一个用户");
+      std::uint64_t removed_snapshots = 0;
+      std::uint64_t removed_bytes = 0;
+      test_support::Check(store.DeleteUser(1, &removed_snapshots, &removed_bytes,
+                                           &error) == net::StoreResult::kOk,
+                          "STORE T7 判别：可写连接可以执行删除", error);
+      store.Close();
+    }
+
+    // schema 不对的库：两种打开方式都必须 fail closed，而且绝不"顺手"建表。
+    for (const auto& fixture_case :
+         std::vector<std::pair<std::string, const char*>>{
+             {"store-foreign", "CREATE TABLE bogus(x); PRAGMA user_version=7;"},
+             {"store-version-only", "PRAGMA user_version=1;"}}) {
+      const std::string wrong = base + "/" + fixture_case.first + ".sqlite3";
+      test_support::Check(RunSqlOnFreshDatabase(wrong, fixture_case.second),
+                          "STORE T7 夹具：" + fixture_case.first + " 已创建");
+      std::string wrong_before;
+      test_support::ReadFile(wrong, &wrong_before);
+      {
+        net::RemoteMetadataStore read_only;
+        std::string error;
+        test_support::Check(!read_only.OpenExistingReadOnly(wrong, &error),
+                            "STORE T7 判别：" + fixture_case.first +
+                                " 只读打开失败（schema 校验）",
+                            error);
+        test_support::Check(!read_only.IsOpen(),
+                            "STORE T7 判别：失败之后没有留下打开的连接");
+        error.clear();
+        test_support::Check(!read_only.OpenExistingReadWrite(wrong, &error),
+                            "STORE T7 判别：" + fixture_case.first +
+                                " 可写打开同样失败（不建表）",
+                            error);
+      }
+      std::string wrong_after;
+      test_support::Check(test_support::ReadFile(wrong, &wrong_after) &&
+                              wrong_after == wrong_before,
+                          "STORE T7 判别：" + fixture_case.first +
+                              " 的库文件逐字节未变");
+      const int tables = CountTables(wrong);
+      const int expected = fixture_case.first == "store-foreign" ? 1 : 0;
+      test_support::Check(tables == expected,
+                          "STORE T7 判别：" + fixture_case.first +
+                              " 里没有多出任何表（表数 " +
+                              std::to_string(tables) + "）");
+    }
+
+    // 路径不存在 / 是目录：明确失败，而且不创建任何东西。
+    {
+      net::RemoteMetadataStore store;
+      std::string error;
+      const std::string missing = base + "/missing.sqlite3";
+      test_support::Check(!store.OpenExistingReadOnly(missing, &error),
+                          "STORE T7 不存在的库被拒绝");
+      test_support::Check(!test_support::Exists(missing),
+                          "STORE T7 判别：拒绝之后也没有凭空建出一个库");
+      error.clear();
+      test_support::Check(!store.OpenExistingReadWrite(missing, &error),
+                          "STORE T7 可写打开也不创建新库");
+      error.clear();
+      test_support::Check(!store.OpenExistingReadOnly(base, &error),
+                          "STORE T7 目录被拒绝");
+      error.clear();
+      test_support::Check(!store.OpenExistingReadOnly(std::string(), &error),
+                          "STORE T7 空路径被拒绝");
     }
   }
 

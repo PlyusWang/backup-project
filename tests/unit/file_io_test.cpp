@@ -30,6 +30,7 @@ namespace {
 using backupproject::CheckFreeSpace;
 using backupproject::FileSink;
 using backupproject::PublishNoReplace;
+using backupproject::PublishReplacing;
 using backupproject::RemoveTreeNoFollow;
 using backupproject::TempDirectoryGuard;
 namespace syscalls = backupproject::file_io_syscalls;
@@ -415,6 +416,64 @@ void TestPublishNoReplace(const std::string& root) {
       "the cross-directory target has the exact bytes");
 }
 
+void TestPublishReplacing(const std::string& root) {
+  test_support::Section("PublishReplacing: 原子替换（只在明确允许覆盖时用）");
+  const std::string base = root + "/replace";
+  test_support::Check(test_support::Mkdir(base, 0755), "replace root created");
+  const std::string work = base + "/work";
+  const std::string out = base + "/out";
+  test_support::Check(test_support::Mkdir(work, 0755), "replace work created");
+  test_support::Check(test_support::Mkdir(out, 0755), "replace out created");
+
+  std::string error;
+  // 目标不存在：与"替换"的语义一致地把它创建出来。
+  const std::string fresh_temp = work + "/.bptmp-fresh";
+  const std::string fresh_target = out + "/fresh.bak";
+  test_support::Check(test_support::WriteFile(fresh_temp, "first payload", 0600),
+                      "replace temp fixture written");
+  test_support::Check(PublishReplacing(fresh_temp, fresh_target, &error),
+                      "replacing onto a free path creates the file", error);
+  CheckMode(fresh_target, 0600, "the replaced-in file is 0600");
+  test_support::Check(!test_support::Exists(fresh_temp),
+                      "rename consumes the temp name");
+
+  // 目标已存在：整份替换，旧的字节一个都不留。
+  const std::string target = out + "/taken.bak";
+  test_support::Check(test_support::WriteFile(target, "old payload", 0600),
+                      "existing target written");
+  const std::string temp = work + "/.bptmp-second";
+  test_support::Check(test_support::WriteFile(temp, "new payload", 0600),
+                      "replacement temp fixture written");
+  error.clear();
+  test_support::Check(PublishReplacing(temp, target, &error),
+                      "replacing an existing file succeeds", error);
+  std::string content;
+  test_support::Check(test_support::ReadFile(target, &content) &&
+                          content == "new payload",
+                      "the target holds exactly the new bytes after a replace");
+  test_support::Check(!test_support::Exists(temp),
+                      "the replacement temp name is gone");
+
+  // 失败路径：临时文件不存在 -> 明确失败，目标保持原样。
+  test_support::Check(test_support::WriteFile(target, "keep me", 0600),
+                      "target reset before the failure case");
+  error.clear();
+  test_support::Check(!PublishReplacing(work + "/missing", target, &error),
+                      "replacing from a missing temp fails");
+  test_support::Check(!error.empty(), "the failure is explained", error);
+  content.clear();
+  test_support::Check(test_support::ReadFile(target, &content) &&
+                          content == "keep me",
+                      "a failed replace leaves the target untouched");
+
+  error.clear();
+  test_support::Check(!PublishReplacing(std::string(), target, &error),
+                      "an empty temp path is refused");
+  error.clear();
+  test_support::Check(!PublishReplacing(fresh_target, std::string(), &error),
+                      "an empty final path is refused");
+}
+
 void TestTempDirectoryGuard(const std::string& root) {
   test_support::Section("TempDirectoryGuard");
   TempDirectoryGuard guard;
@@ -703,6 +762,7 @@ int main() {
   TestOpenExisting(root);
   TestOpenTemp(root);
   TestPublishNoReplace(root);
+  TestPublishReplacing(root);
   TestPublishAtomicFallbacks(root);
   TestTempDirectoryGuard(root);
   TestCheckFreeSpace(root);
