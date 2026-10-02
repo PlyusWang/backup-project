@@ -6,16 +6,19 @@
 // 这里断言的是"客户端库拿到手的行为"：会话、进度回调、流式上传下载、
 // 默认不覆盖目标、下载失败不发布文件。
 
+#include <fcntl.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
 #include <cstdint>
+#include <cstring>
 #include <fstream>
 #include <string>
 #include <thread>
 #include <vector>
 
 #include "crypto.h"
+#include "file_io.h"
 #include "remote_backup_client.h"
 #include "remote_server.h"
 #include "test_support.h"
@@ -59,6 +62,46 @@ std::string ReadWholeFile(const std::string& path) {
   std::string content;
   test_support::ReadFile(path, &content);
   return content;
+}
+
+// ---- 下载发布时刻的确定性注入点 --------------------------------------------
+//
+// 真实竞态是"目标在下载开始之后、发布之前才被创建"，靠 sleep 猜时机既不稳定
+// 也不可复现。PublishNoReplace 的第一步就是 link(temp, target)，而 file_io 已经
+// 把这个 syscall 做成了可注入点（它本来就是为"三个发布分支"准备的）。注入的
+// 钩子在**发布那一刻**先把目标造出来，再调用真的 link()——内核返回的 EEXIST
+// 就是真实竞态里会得到的那一个结果。
+// file_io 的发布原语注入点：与 tests/unit/file_io_test.cpp 用的是同一个 seam。
+namespace file_io_syscalls = backupproject::file_io_syscalls;
+
+const char* const kRaceSentinel = "SENTINEL: another process owns this path\n";
+const char* g_race_target = nullptr;
+int g_race_injections = 0;
+file_io_syscalls::LinkFn g_real_link = nullptr;
+
+int InjectTargetBeforePublish(const char* existing_path, const char* new_path) {
+  if (g_race_target != nullptr && new_path != nullptr &&
+      std::strcmp(new_path, g_race_target) == 0 &&
+      ::access(new_path, F_OK) != 0) {
+    const int fd = ::open(new_path, O_WRONLY | O_CREAT | O_EXCL, 0600);
+    if (fd >= 0) {
+      (void)::write(fd, kRaceSentinel, std::strlen(kRaceSentinel));
+      ::close(fd);
+      g_race_injections += 1;
+    }
+  }
+  return g_real_link(existing_path, new_path);
+}
+
+// 目录里没有以 prefix 开头的条目：用来证明下载没有留下自己的临时文件。
+bool NoEntriesWithPrefix(const std::string& directory,
+                         const std::string& prefix) {
+  for (const std::string& name : test_support::DirEntries(directory)) {
+    if (name.compare(0, prefix.size(), prefix) == 0) {
+      return false;
+    }
+  }
+  return true;
 }
 
 struct Fixture {
@@ -321,6 +364,129 @@ int main() {
     test_support::Check(!test_support::Exists(tampered_target) &&
                             !test_support::Exists(tampered_target + ".part"),
                         "CLI T3 判别：失败的下载没有发布文件，也没有留下 .part");
+
+    client.Disconnect();
+    server.RequestStop();
+    runner.join();
+    server.Stop();
+  }
+
+  test_support::Section("CLI 4. 下载发布：不覆盖由内核保证（含 TOCTOU 竞态）");
+  {
+    Fixture fixture;
+    SetupFixture(&fixture, "client-publish");
+    net::RemoteServer server;
+    std::string error;
+    server.Configure(fixture.config, &error);
+    server.Start(&error);
+    std::string run_error;
+    bool run_result = true;
+    std::thread runner([&server, &run_error, &run_result] {
+      run_result = server.Run(&run_error);
+    });
+
+    net::RemoteArchiveClient client;
+    net::RemoteEndpoint endpoint;
+    endpoint.host = "127.0.0.1";
+    endpoint.port = server.bound_port();
+    client.Connect(endpoint, &error);
+    const std::string username = "pub-" + RandomHex(4);
+    const std::string password = RandomHex(16);
+    client.Register(username, password, &error);
+    client.Login(username, password, &error);
+
+    const std::string payload = RandomHex(64 * 1024);
+    const std::string local_path = fixture.base + "/publish.bak";
+    test_support::Check(test_support::WriteFile(local_path, payload, 0600),
+                        "CLI T4 夹具：本地归档已写好");
+    net::RemoteSnapshotInfo uploaded;
+    test_support::Check(client.UploadArchiveFile(local_path, "publish.bak",
+                                                 nullptr, &uploaded, &error),
+                        "CLI T4 上传夹具归档", error);
+    test_support::Check(uploaded.size_bytes == payload.size(),
+                        "CLI T4 判别：上传回来的长度与本地一致");
+
+    // (a) TOCTOU：目标在"下载开始之后、发布之前"才被另一个进程创建。
+    //     老实现最后走的是普通 rename(part, target)，会把目标直接覆盖掉。
+    const std::string race_target = fixture.base + "/race.bak";
+    test_support::Check(!test_support::Exists(race_target),
+                        "CLI T4 夹具：下载开始前目标还不存在");
+    g_race_target = race_target.c_str();
+    g_race_injections = 0;
+    g_real_link = file_io_syscalls::LinkHook();
+    file_io_syscalls::LinkHook() = &InjectTargetBeforePublish;
+    error.clear();
+    const bool raced =
+        client.DownloadArchiveFile(uploaded.snapshot_id, race_target, false,
+                                   nullptr, nullptr, &error);
+    file_io_syscalls::LinkHook() = g_real_link;
+    g_race_target = nullptr;
+    test_support::Check(!raced,
+                        "CLI T4 判别：发布前才出现的目标让这次下载失败", error);
+    test_support::Check(g_race_injections == 1,
+                        "CLI T4 判别：注入正好发生在发布那一刻");
+    std::string race_content;
+    test_support::ReadFile(race_target, &race_content);
+    test_support::Check(race_content == kRaceSentinel,
+                        "CLI T4 判别：目标仍是 SENTINEL，一个字节都没被覆盖");
+    test_support::Check(NoEntriesWithPrefix(fixture.base, "race.bak.part-"),
+                        "CLI T4 判别：被拒绝的发布没有留下唯一临时文件");
+    // 发布失败之后连接必须仍然可用（服务端已经收到 DOWNLOAD_END）。
+    error.clear();
+    net::RemoteSnapshotInfo still_usable;
+    const std::string second_target = fixture.base + "/second.bak";
+    test_support::Check(client.DownloadArchiveFile(uploaded.snapshot_id,
+                                                   second_target, false, nullptr,
+                                                   &still_usable, &error),
+                        "CLI T4 判别：一次被拒绝的发布之后连接仍然可用", error);
+
+    // (b) 固定的 target + ".part" 是用户自己的文件：新实现不再占用这个名字，
+    //     所以既不能截断它，也不能删掉它（老实现会 O_TRUNC 再 rename 走）。
+    const std::string fixed_target = fixture.base + "/fixed.bak";
+    const std::string fixed_part = fixed_target + ".part";
+    const std::string part_sentinel = "SENTINEL: pre-existing .part file\n";
+    test_support::Check(
+        test_support::WriteFile(fixed_part, part_sentinel, 0600),
+        "CLI T4 夹具：目标旁边预先放一个 target.part");
+    error.clear();
+    net::RemoteSnapshotInfo downloaded;
+    test_support::Check(client.DownloadArchiveFile(
+                            uploaded.snapshot_id, fixed_target, false, nullptr,
+                            &downloaded, &error),
+                        "CLI T4 有 target.part 时下载正常完成", error);
+    std::string fixed_content;
+    std::string part_content;
+    test_support::ReadFile(fixed_target, &fixed_content);
+    test_support::ReadFile(fixed_part, &part_content);
+    test_support::Check(fixed_content == payload &&
+                            Sha256OfFile(fixed_target) == uploaded.sha256,
+                        "CLI T4 判别：下载回来的字节与上传的一致");
+    test_support::Check(part_content == part_sentinel,
+                        "CLI T4 判别：用户已有的 target.part 一字未动");
+    test_support::Check(NoEntriesWithPrefix(fixture.base, "fixed.bak.part-"),
+                        "CLI T4 判别：成功的下载没有留下自己的临时文件");
+
+    // (c) --force：明确同意覆盖时才做原子替换，同样不留临时文件。
+    test_support::Check(
+        test_support::WriteFile(fixed_target, RandomHex(4096), 0600),
+        "CLI T4 夹具：把目标换成另一份内容");
+    error.clear();
+    net::RemoteSnapshotInfo forced;
+    test_support::Check(client.DownloadArchiveFile(uploaded.snapshot_id,
+                                                   fixed_target, true, nullptr,
+                                                   &forced, &error),
+                        "CLI T4 --force 覆盖同一个目标成功", error);
+    std::string forced_content;
+    std::string part_after_force;
+    test_support::ReadFile(fixed_target, &forced_content);
+    test_support::ReadFile(fixed_part, &part_after_force);
+    test_support::Check(forced_content == payload &&
+                            Sha256OfFile(fixed_target) == uploaded.sha256,
+                        "CLI T4 判别：覆盖之后的内容就是下载回来的那一份");
+    test_support::Check(part_after_force == part_sentinel,
+                        "CLI T4 判别：覆盖发布也没有动用户的 target.part");
+    test_support::Check(NoEntriesWithPrefix(fixture.base, "fixed.bak.part-"),
+                        "CLI T4 判别：覆盖发布之后没有残留临时文件");
 
     client.Disconnect();
     server.RequestStop();

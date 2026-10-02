@@ -65,6 +65,16 @@ if [ -z "$SQLITE_LIBRARY" ]; then
   exit 1
 fi
 
+# SQLite 头文件：与 Makefile 同一条发现顺序（系统开发包优先，否则用仓库里
+# vendored 的那一份）。单元测试直接 include <sqlite3.h>，编译行因此也要带上它。
+SQLITE_INCLUDE_DIR="$(dirname "$(ls -1 /usr/include/sqlite3.h \
+  "$ROOT_DIR"/third_party/sqlite/include/sqlite3.h 2>/dev/null | head -1)")"
+if [ -z "$SQLITE_INCLUDE_DIR" ] || [ ! -f "$SQLITE_INCLUDE_DIR/sqlite3.h" ]; then
+  record_fail "sqlite3 头文件" "找不到 sqlite3.h"
+  echo "network: $PASS passed, $FAIL failed"
+  exit 1
+fi
+
 NET_OBJECTS="$OBJ_ROOT/src/network/network_protocol.o"
 # 服务端的目标文件统一在 $OBJ_ROOT/server/ 下（见 Makefile 里 SERVER_OBJECTS
 # 的说明）：它们不能落在 $OBJ_ROOT/src/，否则既有测试脚本的
@@ -83,7 +93,10 @@ SERVER_ONLY="$(find "$OBJ_ROOT/server" -name '*.o' ! -name 'main.o' \
   ! -name 'admin_main.o' ! -path '*/crypto/*' 2>/dev/null | sort | tr '\n' ' ')"
 SERVER_AUTH_OBJ="$(find "$OBJ_ROOT/server" -name 'remote_auth.o' 2>/dev/null | head -1)"
 SERVER_STORE_OBJ="$(find "$OBJ_ROOT/server" -name 'remote_metadata_store.o' 2>/dev/null | head -1)"
-SERVER_OBJECTS="$SERVER_ONLY $OBJ_ROOT/src/network/remote_backup_client.o"
+# 客户端下载现在用 file_io 的 FileSink / PublishNoReplace / PublishReplacing 发布，
+# 所以单元测试也要把 file_io 的目标文件链进来（产品构建里它本来就在 CORE 里）。
+SERVER_OBJECTS="$SERVER_ONLY $OBJ_ROOT/src/network/remote_backup_client.o \
+$OBJ_ROOT/src/core/file_io.o"
 CRYPTO_OBJECTS="$OBJ_ROOT/src/crypto/sha256.o $OBJ_ROOT/src/crypto/hmac.o \
 $OBJ_ROOT/src/crypto/pbkdf2.o $OBJ_ROOT/src/crypto/random.o"
 
@@ -99,7 +112,8 @@ run_unit() {
     return
   fi
   if ! g++ -std=c++17 -Wall -Wextra -Wpedantic $EXTRA_FLAGS \
-      -I"$ROOT_DIR/include" -I"$ROOT_DIR/tests/unit" "$source" $objects "$@" \
+      -I"$ROOT_DIR/include" -I"$ROOT_DIR/tests/unit" \
+      -I"$SQLITE_INCLUDE_DIR" "$source" $objects "$@" \
       -o "$binary" \
       >"$TEST_ROOT/$name-build.log" 2>&1; then
     record_fail "A.$name 编译" "$(head -3 "$TEST_ROOT/$name-build.log" | tr '\n' ' ')"
@@ -423,6 +437,147 @@ else
   record_fail "B.15 启动后立刻 SIGTERM 也能优雅停止" "进程没有退出"
   kill -TERM "$RACE_PID" 2>/dev/null
 fi
+
+echo
+echo
+echo "[network-test] C. 启动边界：只允许 127.0.0.1 + secret 文件必须是私有的"
+
+BOUND_WORK="$TEST_ROOT/boundary"
+rm -rf "$BOUND_WORK"
+mkdir -p "$BOUND_WORK/data" "$BOUND_WORK/state" "$BOUND_WORK/logs"
+
+# secret 只存在于 600 / 400 的文件里，脚本不打印它的内容。
+head -c 32 /dev/urandom | sha256sum | cut -c1-64 \
+  | sed 's/^/BACKUP_TOKEN_SECRET=/' > "$BOUND_WORK/secrets.env"
+chmod 600 "$BOUND_WORK/secrets.env"
+
+# 找一个空闲端口。每次拒绝都用一个**新的**端口，这样"没有 listener"这条判别
+# 的对象是明确的：不是"系统里恰好没有别的监听"，而是"这个端口上没有被起过
+# listener"。
+bound_port() {
+  local candidate
+  for candidate in $(seq 20300 20360); do
+    if ! ss -ltn 2>/dev/null | grep -q ":$candidate "; then
+      echo "$candidate"
+      return 0
+    fi
+  done
+  return 1
+}
+
+no_listener() {
+  ! ss -ltn 2>/dev/null | grep -q ":$1 "
+}
+
+# C.1 非环回地址一律拒绝启动，而且不产生任何 listener。
+#     （0.0.0.0 = 所有网卡；192.168.1.10 / 8.8.8.8 = 私网与公网；127.0.0.2
+#     证明规则是"等于 127.0.0.1"，而不是"127/8 都行"。）
+for address in 0.0.0.0 192.168.1.10 8.8.8.8 127.0.0.2; do
+  BOUND_PORT="$(bound_port)" || { record_fail "C.1 端口" "20300-20360 都被占用"; break; }
+  refuse_out="$(timeout --signal=KILL 20 ./$OBJ_ROOT/backup-server \
+    --bind "$address" --port "$BOUND_PORT" --root "$BOUND_WORK/data" \
+    --db "$BOUND_WORK/state/metadata.sqlite3" \
+    --secret-file "$BOUND_WORK/secrets.env" --quiet 2>&1)"
+  refuse_code=$?
+  if [ "$refuse_code" != "0" ] \
+     && printf '%s' "$refuse_out" | grep -q "127.0.0.1"; then
+    record_pass "C.1 --bind $address 拒绝启动（退出码 $refuse_code）"
+  else
+    record_fail "C.1 --bind $address" \
+      "退出码 $refuse_code: $(printf '%s' "$refuse_out" | head -1)"
+  fi
+  if no_listener "$BOUND_PORT"; then
+    record_pass "C.1 --bind $address 没有产生 listener"
+  else
+    record_fail "C.1 --bind $address 的 listener" "端口 $BOUND_PORT 上有监听"
+  fi
+  if [ -e "$BOUND_WORK/state/metadata.sqlite3" ]; then
+    record_fail "C.1 --bind $address 不留下任何状态" "居然建出了元数据库"
+  else
+    record_pass "C.1 --bind $address 被拒绝时不创建任何文件"
+  fi
+done
+
+# C.2 secret 文件权限：0644 必须拒绝启动，0600 / 0400 必须正常启动。
+chmod 0644 "$BOUND_WORK/secrets.env"
+BOUND_PORT="$(bound_port)" || BOUND_PORT=20361
+perm_out="$(timeout --signal=KILL 20 ./$OBJ_ROOT/backup-server --bind 127.0.0.1 \
+  --port "$BOUND_PORT" --root "$BOUND_WORK/data" \
+  --db "$BOUND_WORK/state/metadata.sqlite3" \
+  --secret-file "$BOUND_WORK/secrets.env" --quiet 2>&1)"
+perm_code=$?
+if [ "$perm_code" != "0" ] \
+   && printf '%s' "$perm_out" | grep -q "0600"; then
+  record_pass "C.2 0644 的 secret 文件被拒绝启动（退出码 $perm_code）"
+else
+  record_fail "C.2 0644 的 secret 文件" \
+    "退出码 $perm_code: $(printf '%s' "$perm_out" | head -1)"
+fi
+if no_listener "$BOUND_PORT"; then
+  record_pass "C.2 0644 的 secret 没有产生 listener"
+else
+  record_fail "C.2 0644 的 secret 的 listener" "端口 $BOUND_PORT 上有监听"
+fi
+# 拒绝信息里绝不能出现 secret 的值本身。
+if printf '%s' "$perm_out" | grep -qF "$(cut -d= -f2 "$BOUND_WORK/secrets.env")"; then
+  record_fail "C.2 拒绝信息里没有 secret" "拒绝信息里出现了 secret 的值"
+else
+  record_pass "C.2 拒绝信息里没有 secret 的值"
+fi
+
+# 符号链接同样拒绝（O_NOFOLLOW）：哪怕它指向一个 0600 的正规文件。
+chmod 0600 "$BOUND_WORK/secrets.env"
+ln -sf "$BOUND_WORK/secrets.env" "$BOUND_WORK/secrets-link.env"
+BOUND_PORT="$(bound_port)" || BOUND_PORT=20362
+link_out="$(timeout --signal=KILL 20 ./$OBJ_ROOT/backup-server --bind 127.0.0.1 \
+  --port "$BOUND_PORT" --root "$BOUND_WORK/data" \
+  --db "$BOUND_WORK/state/metadata.sqlite3" \
+  --secret-file "$BOUND_WORK/secrets-link.env" --quiet 2>&1)"
+link_code=$?
+if [ "$link_code" != "0" ] && no_listener "$BOUND_PORT"; then
+  record_pass "C.2 指向 secret 的符号链接被拒绝启动（退出码 $link_code）"
+else
+  record_fail "C.2 符号链接 secret" \
+    "退出码 $link_code: $(printf '%s' "$link_out" | head -1)"
+fi
+
+# 0400 也接受：owner 只读同样满足"别人读不到"。
+chmod 0400 "$BOUND_WORK/secrets.env"
+BOUND_PORT="$(bound_port)" || BOUND_PORT=20363
+./$OBJ_ROOT/backup-server --bind 127.0.0.1 --port "$BOUND_PORT" \
+  --root "$BOUND_WORK/data" --db "$BOUND_WORK/state/metadata.sqlite3" \
+  --secret-file "$BOUND_WORK/secrets.env" \
+  --pid-file "$BOUND_WORK/state/server.pid" \
+  --log-file "$BOUND_WORK/logs/server.log" --quiet \
+  > "$BOUND_WORK/logs/start.log" 2>&1 &
+PRIVATE_PID=$!
+private_ready=0
+for _ in $(seq 1 50); do
+  if ss -ltn 2>/dev/null | grep -q "127.0.0.1:$BOUND_PORT "; then
+    private_ready=1
+    break
+  fi
+  sleep 0.1
+done
+if [ "$private_ready" = "1" ]; then
+  record_pass "C.2 0400 的 secret 文件启动成功并监听 127.0.0.1:$BOUND_PORT"
+else
+  record_fail "C.2 0400 的 secret 文件" \
+    "$(head -2 "$BOUND_WORK/logs/start.log" | tr '\n' ' ')"
+fi
+if ss -ltn 2>/dev/null | grep -q "0.0.0.0:$BOUND_PORT "; then
+  record_fail "C.2 只绑环回" "出现了 0.0.0.0 监听"
+else
+  record_pass "C.2 服务端只绑环回地址"
+fi
+if kill -0 "$PRIVATE_PID" 2>/dev/null; then
+  kill -TERM "$PRIVATE_PID" 2>/dev/null
+  wait "$PRIVATE_PID" 2>/dev/null
+  record_pass "C.2 0400 启动的服务端可以优雅停止"
+else
+  record_fail "C.2 0400 启动的服务端" "进程提前退出了"
+fi
+chmod 0600 "$BOUND_WORK/secrets.env"
 
 if [ "$SAN_MODE" = "1" ]; then
   echo "ASAN: aggregate reports = $SAN_REPORTS"
