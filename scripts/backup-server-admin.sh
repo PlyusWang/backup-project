@@ -121,21 +121,42 @@ user_menu() {
         pause
         ;;
       2)
-        printf '用户 id 或用户名：'
+        printf '用户选择器（id:<编号> 或 name:<用户名>）：'
         read -r selector || return 0
         clear_screen
         admin show-user "$selector"
         pause
         ;;
       3)
-        printf '要删除的用户 id 或用户名：'
+        # 删除是不可逆的：这里**要求**用户写成 id:<编号> 或 name:<用户名>。
+        # 裸输入可能是编号也可能是用户名，管理工具不会替用户猜。
+        printf '要删除的用户（必须写成 id:<编号> 或 name:<用户名>）：'
         read -r selector || return 0
         [ -n "$selector" ] || continue
+        case "$selector" in
+          id:*|name:*) ;;
+          *)
+            printf '\n删除操作必须明确指定用户：id:<编号> 或 name:<用户名>。\n'
+            printf '（裸输入可能是编号也可能是用户名，管理工具不会替你猜。）\n'
+            pause
+            continue
+            ;;
+        esac
         clear_screen
-        admin show-user "$selector" || { pause; continue; }
+        local detail target_name target_id
+        detail="$(admin show-user "$selector" 2>&1)"
+        printf '%s\n' "$detail"
+        target_name="$(printf '%s\n' "$detail" | awk -F'：' '/^用户名：/ { print $2; exit }')"
+        target_id="$(printf '%s\n' "$detail" | awk -F'：' '/^用户 ID：/ { print $2; exit }')"
+        if [ -z "$target_name" ] || [ -z "$target_id" ]; then
+          pause
+          continue
+        fi
         printf '\n'
-        printf '警告：这会永久删除该账户以及它的全部云端备份，且无法撤销。\n'
-        printf '请输入 DELETE <用户名> 以确认（直接回车取消）：'
+        printf '警告：这会永久删除账户 "%s"（id=%s）以及它的全部云端备份，且无法撤销。\n' \
+          "$target_name" "$target_id"
+        printf '请输入 DELETE %s#%s 以确认（直接回车取消）：' \
+          "$target_name" "$target_id"
         read -r confirmation || return 0
         [ -n "$confirmation" ] || continue
         admin delete-user "$selector" --confirm "$confirmation"
@@ -161,7 +182,7 @@ snapshot_menu() {
     read -r choice || return 0
     case "$choice" in
       1)
-        printf '用户 id 或用户名：'
+        printf '用户选择器（id:<编号> 或 name:<用户名>）：'
         read -r selector || return 0
         clear_screen
         admin list-snapshots "$selector"
@@ -175,8 +196,18 @@ snapshot_menu() {
         pause
         ;;
       3)
-        printf '用户 id 或用户名：'
+        # 与删除用户同一条规则：破坏性操作必须显式指定选择器。
+        printf '用户选择器（必须写成 id:<编号> 或 name:<用户名>）：'
         read -r selector || return 0
+        case "$selector" in
+          id:*|name:*) ;;
+          *)
+            printf '\n删除操作必须明确指定用户：id:<编号> 或 name:<用户名>。\n'
+            printf '（裸输入可能是编号也可能是用户名，管理工具不会替你猜。）\n'
+            pause
+            continue
+            ;;
+        esac
         printf '快照 id：'
         read -r snapshot_id || return 0
         [ -n "$selector" ] && [ -n "$snapshot_id" ] || continue
