@@ -246,9 +246,27 @@ FrameReadStatus ReceiveFrame(int fd, FrameHeader* header, std::string* payload,
 
 // ---- 字段校验 ----
 
+// 用户名校验的**原因**。规则只有 ValidateUsername 这一份实现：核心决定原因，
+// 界面只负责把原因翻译成用户看得懂的一句话——界面不许自己再解析一遍用户名，
+// 否则"长度不合法"会被显示成"字符不合法"，把用户引到错误的修法上。
+//
+// kEmpty 与 kTooShort 用同一条英文原因（保持 IsValidUsername 的历史行为一个
+// 字节都不变），区别只在给界面看的分类上。
+enum class UsernameValidation {
+  kOk = 0,
+  kEmpty,
+  kTooShort,
+  kTooLong,
+  kInvalidCharacter,
+};
+
 // 用户名：3..64 字节，只允许 [A-Za-z0-9_.-]，且不能是 "." 或 ".."。
+// 允许的字符全部是单字节 ASCII，所以字节数与字符数是同一个数。
 // 用户名永远不会被拼进文件系统路径（磁盘上一律用数字 user id），
 // 这条校验是为了让日志、SQL 与显示都只面对一个很小的字符集。
+UsernameValidation ValidateUsername(const std::string& username,
+                                    std::string* error_message);
+// 兼容包装（== kOk）：老调用方继续用它，行为与以前完全一致。
 bool IsValidUsername(const std::string& username, std::string* error_message);
 // 密码：1..256 字节，不允许内嵌 NUL。空密码在这里就被拒绝。
 bool IsValidPassword(const std::string& password, std::string* error_message);
