@@ -189,7 +189,13 @@ Item {
                                 enabled: !remote.busy
                                 placeholderText: "例如 127.0.0.1"
                                 text: page.draftHost
-                                onTextEdited: page.draftHost = text
+                                // 输入一改，上一次的错误就不再成立：立刻收起来，
+                                // 免得旧原因挂在新输入上。
+                                onTextEdited: {
+                                    page.draftHost = text
+                                    remote.clearLoginError()
+                                    remote.clearRegisterError()
+                                }
                             }
                         }
 
@@ -210,7 +216,11 @@ Item {
                                 enabled: !remote.busy
                                 placeholderText: "18765"
                                 text: page.draftPort
-                                onTextEdited: page.draftPort = text
+                                onTextEdited: {
+                                    page.draftPort = text
+                                    remote.clearLoginError()
+                                    remote.clearRegisterError()
+                                }
                             }
                         }
                     }
@@ -232,7 +242,11 @@ Item {
                             enabled: !remote.busy
                             placeholderText: "字母、数字、点、下划线或减号"
                             text: page.draftUser
-                            onTextEdited: page.draftUser = text
+                            onTextEdited: {
+                                page.draftUser = text
+                                remote.clearLoginError()
+                                remote.clearRegisterError()
+                            }
                         }
                     }
 
@@ -286,7 +300,10 @@ Item {
                                 echoMode: TextInput.Password
                                 placeholderText: "登录密码"
                                 text: page.draftPassword
-                                onTextEdited: page.draftPassword = text
+                                onTextEdited: {
+                                    page.draftPassword = text
+                                    remote.clearLoginError()
+                                }
                                 onAccepted: {
                                     if (!remote.busy)
                                         remote.login(page.draftHost, page.draftPort, page.draftUser, page.draftPassword)
@@ -319,6 +336,19 @@ Item {
                                     wrapMode: Text.WrapAnywhere
                                 }
                             }
+
+                            // 登录失败的原因就写在这张表单下面：用户是在这里点的
+                            // "登录"，反馈也必须在这里看到——不再只出现在页面底部
+                            // 的横幅里（那样看起来就像"点了没反应"）。
+                            Text {
+                                objectName: "remoteLoginError"
+                                Layout.fillWidth: true
+                                visible: remote.loginError !== ""
+                                text: remote.loginError
+                                color: theme.error
+                                font.pixelSize: 15
+                                wrapMode: Text.WrapAnywhere
+                            }
                         }
 
                         // ---- 注册标签：两个密码框，必须完全一致 ----
@@ -341,7 +371,10 @@ Item {
                                 echoMode: TextInput.Password
                                 placeholderText: "至少 8 个字符"
                                 text: page.draftRegisterPassword
-                                onTextEdited: page.draftRegisterPassword = text
+                                onTextEdited: {
+                                    page.draftRegisterPassword = text
+                                    remote.clearRegisterError()
+                                }
                             }
 
                             Text {
@@ -361,7 +394,10 @@ Item {
                                 echoMode: TextInput.Password
                                 placeholderText: "再输入一次"
                                 text: page.draftConfirmPassword
-                                onTextEdited: page.draftConfirmPassword = text
+                                onTextEdited: {
+                                    page.draftConfirmPassword = text
+                                    remote.clearRegisterError()
+                                }
                             }
 
                             RowLayout {
@@ -377,12 +413,13 @@ Item {
                                     onClicked: remote.registerAccount(page.draftHost, page.draftPort, page.draftUser, page.draftRegisterPassword, page.draftConfirmPassword)
                                 }
 
-                                // 正常状态只给一句弱化的辅助文字；只有真的不一致时才
-                                // 换成红色错误（两条互斥，不会同时出现）。
+                                // 正常状态只给一句弱化的辅助文字；真的不一致时换成
+                                // 红色提示。控制器已经报了错就让位——同一件事只说一遍。
                                 Text {
                                     objectName: "remoteRegisterHint"
                                     Layout.fillWidth: true
-                                    visible: !page.registerPasswordMismatch
+                                    visible: !page.registerPasswordMismatch &&
+                                             remote.registerError === ""
                                     text: "请再次输入密码以确认。"
                                     font.pixelSize: 15
                                     color: theme.textSecondary
@@ -392,12 +429,25 @@ Item {
                                 Text {
                                     objectName: "remoteRegisterMismatch"
                                     Layout.fillWidth: true
-                                    visible: page.registerPasswordMismatch
+                                    visible: page.registerPasswordMismatch &&
+                                             remote.registerError === ""
                                     text: "两次输入的密码不一致"
                                     font.pixelSize: 15
                                     color: theme.error
                                     wrapMode: Text.WrapAnywhere
                                 }
+                            }
+
+                            // 注册被拒的原因写在这张表单下面（服务端说"该用户名已被
+                            // 使用"也在这里），不再只出现在页面底部的横幅里。
+                            Text {
+                                objectName: "remoteRegisterError"
+                                Layout.fillWidth: true
+                                visible: remote.registerError !== ""
+                                text: remote.registerError
+                                color: theme.error
+                                font.pixelSize: 15
+                                wrapMode: Text.WrapAnywhere
                             }
                         }
                     }
@@ -457,15 +507,6 @@ Item {
                         }
                     }
 
-                    Text {
-                        objectName: "remoteSessionText"
-                        Layout.fillWidth: true
-                        Layout.topMargin: 6
-                        text: remote.sessionText
-                        font.pixelSize: 15
-                        color: remote.authenticated ? theme.success : theme.textSecondary
-                        wrapMode: Text.WrapAnywhere
-                    }
                 }
             }
 
@@ -930,7 +971,10 @@ Item {
                 echoMode: TextInput.Password
                 placeholderText: "再次输入当前密码"
                 text: page.draftDeletePassword
-                onTextEdited: page.draftDeletePassword = text
+                onTextEdited: {
+                    page.draftDeletePassword = text
+                    remote.clearDeleteAccountError()
+                }
             }
 
             AppTextField {
@@ -940,7 +984,10 @@ Item {
                 enabled: !remote.busy
                 placeholderText: "输入账户名以确认：" + remote.username
                 text: page.draftDeleteName
-                onTextEdited: page.draftDeleteName = text
+                onTextEdited: {
+                    page.draftDeleteName = text
+                    remote.clearDeleteAccountError()
+                }
             }
 
             // 失败原因就显示在这里（对话框内部）：用户是在这个对话框里点的
