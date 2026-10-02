@@ -255,6 +255,58 @@ else
   record_fail "STATE G（再次登录）" "login=$G_CODE admin=$G_ADMIN"
 fi
 
+# ---- 5b. 重复注册：拒绝 + 库里只有一行 + 原口令不受影响 ----
+#
+# 人工验收第 5 条：同一个用户名注册第二次，界面（GUI / CLI）上要看得见"该用户名
+# 已被使用"，而且**原来的账户不能被换掉**。这里在四个真值源上验证：
+#
+#   * 第一次注册成功，第二次被服务端拒绝（ALREADY_EXISTS）；
+#   * 库里这个用户名只有 1 行（有 sqlite3 就直接查文件）；
+#   * 原口令仍然能登录，第二次用的口令登不进去。
+remote_pw() {
+  local password="$1"
+  shift
+  BACKUP_REMOTE_PASSWORD="$password" timeout --signal=KILL 120 \
+    ./build/backupctl remote "$@" $REMOTE_OPTS > "$TEST_ROOT/remote.txt" 2>&1
+  echo $?
+}
+dup_rows() {
+  if command -v sqlite3 >/dev/null 2>&1; then
+    sqlite3 -readonly "$DB_PATH" "SELECT COUNT(*) FROM users WHERE username='$DUP_NAME';"
+  else
+    admin_out show-user "name:$DUP_NAME" >/dev/null
+    if grep -q "没有叫" "$TEST_ROOT/admin.txt"; then echo 0; else echo 1; fi
+  fi
+}
+DUP_NAME="qa_dup_$(head -c 4 /dev/urandom | od -An -tx1 | tr -d ' \n')"
+DUP_ORIGINAL="dup-original-$(head -c 8 /dev/urandom | od -An -tx1 | tr -d ' \n')"
+DUP_SECOND="dup-second-$(head -c 8 /dev/urandom | od -An -tx1 | tr -d ' \n')"
+DUP_FIRST="$(remote_pw "$DUP_ORIGINAL" register --user "$DUP_NAME")"
+DUP_AGAIN="$(remote_pw "$DUP_SECOND" register --user "$DUP_NAME")"
+DUP_AGAIN_TEXT="$(cat "$TEST_ROOT/remote.txt")"
+DUP_LOGIN_ORIGINAL="$(remote_pw "$DUP_ORIGINAL" login --user "$DUP_NAME")"
+DUP_LOGIN_SECOND="$(remote_pw "$DUP_SECOND" login --user "$DUP_NAME")"
+DUP_ROWS="$(dup_rows)"
+if [ "$DUP_FIRST" = "0" ] && [ "$DUP_AGAIN" != "0" ] && [ "$DUP_ROWS" = "1" ] \
+   && [ "$DUP_LOGIN_ORIGINAL" = "0" ] && [ "$DUP_LOGIN_SECOND" != "0" ]; then
+  record_pass "重复注册：第一次成功、第二次被拒、库里只有 1 行、原口令仍可用"
+else
+  record_fail "重复注册" \
+    "first=$DUP_FIRST again=$DUP_AGAIN rows=$DUP_ROWS orig=$DUP_LOGIN_ORIGINAL second=$DUP_LOGIN_SECOND"
+fi
+if printf '%s' "$DUP_AGAIN_TEXT" | grep -q "名字已经被占用"; then
+  record_pass "重复注册的拒绝原因在输出里可见（服务端 ALREADY_EXISTS → 名字已经被占用）"
+else
+  record_fail "重复注册的拒绝原因" "$(printf '%s' "$DUP_AGAIN_TEXT" | head -2 | tr '\n' ' ')"
+fi
+# 原账户没有被"覆盖写"：第二个口令在任何路径上都进不去
+if [ "$DUP_LOGIN_SECOND" != "0" ] && [ "$DUP_LOGIN_ORIGINAL" = "0" ]; then
+  record_pass "第二个口令登不进去（原账户没有被后一次注册覆盖）"
+else
+  record_fail "重复注册之后的口令" \
+    "orig=$DUP_LOGIN_ORIGINAL second=$DUP_LOGIN_SECOND"
+fi
+
 # ---- 6. §20：错误的实例根必须 fail closed，且不创建任何东西 ----
 BAD_ROOT="$TEST_ROOT/wrong-instance-$(head -c 3 /dev/urandom | od -An -tx1 | tr -d ' \n')"
 BAD_CODE="$(admin_out --server-root "$BAD_ROOT" --root "$BAD_ROOT/data" \
