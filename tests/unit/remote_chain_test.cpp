@@ -13,6 +13,7 @@
 // 退出码：0 = 全部通过。
 
 #include <sqlite3.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 #include <cstdio>
@@ -601,6 +602,26 @@ void TestUnknownSchemaVersion() {
   std::string after;
   Check(ReadFile(path, &after), "读迁移后的库");
   Check(before == after, "被拒绝之后库文件一个字节都没变");
+  // 迁移失败必须整体回滚：把库文件设成只读，ALTER 必然失败，此时
+  // 版本号与数据都必须保持原样（不能出现"加了列却没写版本"的半迁移状态）。
+  {
+    const std::string read_only = root + "/readonly.sqlite3";
+    Check(CreateLegacyDatabase(read_only), "再造一个 v1 数据库");
+    std::string before_bytes;
+    Check(ReadFile(read_only, &before_bytes), "读只读迁移前的库");
+    Check(::chmod(read_only.c_str(), 0444) == 0, "把库文件设为只读");
+    RemoteMetadataStore blocked;
+    std::string blocked_error;
+    Check(!blocked.Open(read_only, &blocked_error),
+          "只读库上的迁移失败", blocked_error);
+    Check(ReadUserVersion(read_only) == 1, "迁移失败后版本号仍然是 1");
+    Check(::chmod(read_only.c_str(), 0644) == 0, "恢复权限以便比对");
+    std::string after_bytes;
+    Check(ReadFile(read_only, &after_bytes), "读只读迁移后的库");
+    Check(before_bytes == after_bytes, "迁移失败后库文件一个字节都没变");
+    blocked.Close();
+  }
+
   const std::string cleanup = "rm -rf '" + root + "'";
   (void)std::system(cleanup.c_str());
 }
