@@ -46,10 +46,64 @@ CORE_SOURCES += src/core/backup_mode.cpp \
                 src/cli/realtime_commands.cpp \
                 src/cli/cli_commands.cpp
 
+# ---- 远程备份服务端（PR #20）----
+#
+# backup-server 是独立进程，只做"存储后端 + 传输边界"：协议、认证、元数据、
+# 流式落盘。它**不链接** BackupEngine / Filter / MyPack / USTAR / 压缩 /
+# 加密 / 增量链——那些属于本地备份核心，服务端不重新实现第二套。
+# 因此它的源文件列表是显式的，而不是复用 CORE_SOURCES。
+#
+# 桌面端（backupctl / 两个 GUI）不链接 SQLite：只有服务端需要元数据库。
+SERVER_TARGET := $(BUILD_DIR)/backup-server
+# 服务端独有的源码**不放在 src/ 下**：src/ 是桌面核心，若干既有测试脚本会把
+# src/**/*.cpp 整个编译并链接一遍，把需要 SQLite、还带自己的 main() 的服务端
+# 源文件混进去会让它们全部失败。协议与客户端（backupctl/GUI 也要用）留在
+# src/network/，服务端实现放 server/。
+SERVER_CORE_SOURCES := src/network/network_protocol.cpp \
+                       server/remote_auth.cpp \
+                       server/remote_metadata_store.cpp \
+                       server/remote_maintenance.cpp \
+                       server/remote_server.cpp \
+                       src/platform/file_lock.cpp \
+                       src/crypto/sha256.cpp \
+                       src/crypto/hmac.cpp \
+                       src/crypto/pbkdf2.cpp \
+                       src/crypto/random.cpp
+SERVER_SOURCES := server/main.cpp $(SERVER_CORE_SOURCES)
+# 服务端的目标文件放在 $(BUILD_DIR)/server/ 下，**不要**落在 $(BUILD_DIR)/src/。
+# 既有的测试脚本用 "find build/src -name '*.o'" 收集核心对象来链接单元测试，
+# 把服务端的 main.o 与需要 SQLite 的目标文件混进去会让它们全部链接失败。
+SERVER_OBJECTS := $(patsubst %.cpp,$(BUILD_DIR)/server/%.o,$(SERVER_SOURCES))
+
+# SQLite 头文件：优先用系统装的 libsqlite3-dev，否则用仓库里固定的官方头。
+# 链接一律直接指向系统运行库 libsqlite3.so.0，不依赖 -lsqlite3 的开发符号
+# 链接，因此在只装了运行时库的机器上也能构建。
+SQLITE_HEADER := $(firstword $(wildcard /usr/include/sqlite3.h) \
+                            $(wildcard third_party/sqlite/include/sqlite3.h))
+SQLITE_INCLUDE_DIR := $(dir $(SQLITE_HEADER))
+SQLITE_LIBRARY := $(firstword $(wildcard /usr/lib/x86_64-linux-gnu/libsqlite3.so) \
+                              $(wildcard /usr/lib/x86_64-linux-gnu/libsqlite3.so.0) \
+                              $(wildcard /usr/lib64/libsqlite3.so) \
+                              $(wildcard /usr/lib/libsqlite3.so))
+
 FILESYSTEM_SOURCES := src/filesystem/file_system.cpp
+
+# ---- 远程备份客户端（PR #20）----
+#
+# CLI 与 Modern GUI 共用同一个 RemoteArchiveClient：桌面端只链接协议编解码与
+# 客户端，**不链接 SQLite**（元数据库只属于服务端进程）。
+CORE_SOURCES += src/network/network_protocol.cpp \
+                src/network/remote_backup_client.cpp \
+                src/cli/remote_commands.cpp
 SOURCES := $(APP_SOURCES) $(CORE_SOURCES) $(FILESYSTEM_SOURCES)
 OBJECTS := $(patsubst %.cpp,$(BUILD_DIR)/%.o,$(SOURCES))
 DEPENDS := $(OBJECTS:.o=.d)
+# 注意：这一条必须放在上面的 := 赋值**之后**。DEPENDS 是立即赋值，
+# 放在前面会被整体覆盖，服务端的目标文件就再也不追踪
+# include/remote_server.h，改了头文件也只重建一半目标文件——
+# 两个目标文件对同一个结构体的大小理解不一致，
+# 后果是构造对象时越界写坏调用者的栈 canary。
+DEPENDS += $(SERVER_OBJECTS:.o=.d)
 
 # ---- 归档格式的测试夹具（不是产品命令）----
 #
@@ -74,10 +128,37 @@ FIXTURE_OBJECTS := $(patsubst %.cpp,$(BUILD_DIR)/%.o,$(FIXTURE_SOURCES))
 FIXTURE_CORE_OBJECTS := $(patsubst %.cpp,$(BUILD_DIR)/%.o,$(CORE_SOURCES) $(FILESYSTEM_SOURCES))
 DEPENDS += $(FIXTURE_OBJECTS:.o=.d)
 
-.PHONY: all debug sanitize test test-fixtures gui gui-modern gui-all clean
+.PHONY: all debug sanitize test test-fixtures server remote-sequence gui gui-modern gui-all clean
 
-# 产品构建：只有产品前端。archive-cli 是测试夹具，见上面的说明。
-all: $(TARGET)
+# 产品构建：三个产品产物（CLI + 服务端 + 测试夹具除外）。
+# archive-cli 是测试夹具，见上面的说明。
+all: $(TARGET) $(SERVER_TARGET)
+
+# ---- ECS 本地管理工具（PR #20 closure）----
+#
+# backup-server-admin 是**只能在服务器本机运行**的管理工具：管理员先 SSH 进
+# ECS，再在 ECS 上执行它。它不监听任何端口（源码里没有 socket() / bind() /
+# listen()）、不说 BPNET1、不链接 Qt，也不在任何 GUI / CLI 的调用路径上。
+#
+# 它和服务端共用同一份 RemoteMaintenance 与 RemoteMetadataStore：管理工具的
+# 删除动作与服务端的 DELETE / DELETE_ACCOUNT 走的是同一批函数，不存在
+# "管理工具另有一套删除逻辑"这种分叉。
+ADMIN_TARGET := $(BUILD_DIR)/backup-server-admin
+ADMIN_SOURCES := server/admin_main.cpp $(SERVER_CORE_SOURCES)
+ADMIN_OBJECTS := $(patsubst %.cpp,$(BUILD_DIR)/server/%.o,$(ADMIN_SOURCES))
+DEPENDS += $(ADMIN_OBJECTS:.o=.d)
+
+# 单独构建服务端（部署脚本用）。管理工具与服务端同属"服务器侧交付物"，
+# 所以同一条目标一起构建。
+server: $(SERVER_TARGET) $(ADMIN_TARGET)
+
+$(SERVER_TARGET): $(SERVER_OBJECTS)
+	@mkdir -p $(BUILD_DIR)
+	$(CXX) $(CXXFLAGS) $(SERVER_OBJECTS) $(SQLITE_LIBRARY) -pthread -o $@
+
+$(ADMIN_TARGET): $(ADMIN_OBJECTS)
+	@mkdir -p $(BUILD_DIR)
+	$(CXX) $(CXXFLAGS) $(ADMIN_OBJECTS) $(SQLITE_LIBRARY) -pthread -o $@
 
 $(TARGET): $(OBJECTS)
 	@mkdir -p $(BUILD_DIR)
@@ -91,6 +172,33 @@ test-fixtures: $(FIXTURE_TARGET)
 $(FIXTURE_TARGET): $(FIXTURE_OBJECTS) $(FIXTURE_CORE_OBJECTS)
 	@mkdir -p $(BUILD_DIR)
 	$(CXX) $(CXXFLAGS) $(FIXTURE_OBJECTS) $(CORE_OBJECTS) -o $@
+
+# ---- ECS 真机序列驱动器（测试工具，不是产品功能）----
+#
+# tests/tools/remote_sequence.cpp 把人工验收那一串动作（注册 / 错误口令 ×4 /
+# LIST ×10 / 空闲 / 上传 / 下载 / 删除快照 / 注销）跑在**一条真实连接**上，
+# 供 scripts/aliyun_sequence_e2e.sh 在 ECS 真机复验。和 archive-cli 一样，
+# 它不在默认构建里，需要时显式构建：
+#
+#   make remote-sequence
+REMOTE_SEQUENCE_TARGET := $(BUILD_DIR)/remote-sequence
+REMOTE_SEQUENCE_SOURCES := tests/tools/remote_sequence.cpp
+REMOTE_SEQUENCE_OBJECTS := $(patsubst %.cpp,$(BUILD_DIR)/%.o,$(REMOTE_SEQUENCE_SOURCES))
+# CORE_OBJECTS 在下面才定义（GUI 那一段），这里显式算一份同样的集合。
+REMOTE_SEQUENCE_CORE_OBJECTS := $(patsubst %.cpp,$(BUILD_DIR)/%.o,$(CORE_SOURCES) $(FILESYSTEM_SOURCES))
+DEPENDS += $(REMOTE_SEQUENCE_OBJECTS:.o=.d)
+
+remote-sequence: $(REMOTE_SEQUENCE_TARGET)
+
+$(REMOTE_SEQUENCE_TARGET): $(REMOTE_SEQUENCE_OBJECTS) $(REMOTE_SEQUENCE_CORE_OBJECTS)
+	@mkdir -p $(BUILD_DIR)
+	$(CXX) $(CXXFLAGS) $(REMOTE_SEQUENCE_OBJECTS) $(REMOTE_SEQUENCE_CORE_OBJECTS) -o $@
+
+# 服务端源码单独一条模式规则：只有它们需要 SQLite 的头文件路径，
+# 并且统一落在 $(BUILD_DIR)/server/ 下（见上面 SERVER_OBJECTS 的说明）。
+$(BUILD_DIR)/server/%.o: %.cpp
+	@mkdir -p $(dir $@)
+	$(CXX) $(CPPFLAGS) -I$(SQLITE_INCLUDE_DIR) $(CXXFLAGS) -MMD -MP -c $< -o $@
 
 $(BUILD_DIR)/%.o: %.cpp
 	@mkdir -p $(dir $@)

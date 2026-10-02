@@ -37,7 +37,8 @@ ApplicationWindow {
     // 只看 controller.busy 会漏掉"实时备份正在写归档时 Alt+F4 能关掉窗口"。
     // 这是同一条全局不变式（持久状态操作进行中不得关窗），不是三种特例。
     onClosing: function (close) {
-        if (controller.busy || schedule.libraryBusy || realtime.libraryBusy) {
+        if (controller.busy || schedule.libraryBusy || realtime.libraryBusy
+                || remote.busy) {
             close.accepted = false
             busyCloseDialog.open()
         }
@@ -63,6 +64,8 @@ ApplicationWindow {
             schedule.clearStatus()
         else if (pageIndex === 5)
             realtime.clearStatus()
+        else if (pageIndex === 6)
+            remote.clearStatus()
     }
 
     onCurrentPageChanged: {
@@ -209,6 +212,17 @@ ApplicationWindow {
                         checked: root.currentPage === 3
                         onClicked: root.currentPage = 3
                     }
+                    // 远程备份同样是一个独立业务页面：它有自己的服务器连接、
+                    // 云端备份列表与上传 / 下载 / 删除动作，不是"备份管理"里的
+                    // 一个选项。
+                    NavItem {
+                        objectName: "remoteNavItem"
+                        Layout.fillWidth: true
+                        text: "远程备份"
+                        iconName: "cloud"
+                        checked: root.currentPage === 6
+                        onClicked: root.currentPage = 6
+                    }
                     NavItem {
                         Layout.fillWidth: true
                         text: "设置"
@@ -229,7 +243,7 @@ ApplicationWindow {
                 }
             }
 
-            // 页面区：五页叠在同一位置，切换时当前页淡入。
+            // 页面区：七页叠在同一位置，切换时当前页淡入。
             StackLayout {
                 id: pageStack
                 Layout.fillWidth: true
@@ -267,6 +281,11 @@ ApplicationWindow {
 
                 RealtimePage {
                     opacity: root.currentPage === 5 ? 1 : 0
+                    Behavior on opacity { NumberAnimation { duration: 150; easing.type: Easing.OutCubic } }
+                }
+
+                RemotePage {
+                    opacity: root.currentPage === 6 ? 1 : 0
                     Behavior on opacity { NumberAnimation { duration: 150; easing.type: Easing.OutCubic } }
                 }
             }

@@ -558,6 +558,24 @@ bool PublishNoReplace(const std::string& temp_file,
   return false;
 }
 
+bool PublishReplacing(const std::string& temp_file,
+                      const std::string& final_path,
+                      std::string* error_message) {
+  if (temp_file.empty() || final_path.empty()) {
+    SetError(error_message, "Internal error: publish with an empty path");
+    return false;
+  }
+  // 这一条路径**允许**覆盖，所以不需要"不覆盖"的原语：目标已存在时 rename
+  // 直接替换它，不存在时就是创建——两种情况都是一步原子的，与"先删再改"
+  // 或"先截断再写"有本质区别：任何时刻读者看到的都是完整的一份。
+  if (::rename(temp_file.c_str(), final_path.c_str()) != 0) {
+    SetError(error_message, Describe(errno, "Failed to replace", final_path));
+    return false;
+  }
+  SyncDirectoryQuietly(ParentDirectoryOf(final_path));
+  return true;
+}
+
 bool CheckFreeSpace(const std::string& directory, std::uint64_t need_bytes,
                     std::string* error_message) {
   std::string base = directory.empty() ? std::string(".") : directory;

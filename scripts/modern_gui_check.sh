@@ -10,7 +10,7 @@
 #   2. offscreen 启动自检：QML 运行期告警会让进程自己以非 0 退出。
 #   3. qmllint 静态检查；机器上没装就明确说“跳过”，而不是静默算通过。
 #   4. 几条 grep 断言：资源清单、忙时禁用、拒绝假进度、拒绝网络栈，
-#      以及 repository-driven 架构约束（五页结构、没有 standalone 恢复页、
+#      以及 repository-driven 架构约束（七页结构、没有 standalone 恢复页、
 #      QML 不出现 archive 完整路径、不自己拼 repository 路径）。
 #   5. --self-test 真跑一次 direct archive 打包 + 解包，再用 diff -r 比对目录树；
 #      顺带断言这条 direct 测试路径的产物仍是 legacy v0.1
@@ -29,8 +29,13 @@
 #      产品 CLI 没有 --password 选项）；--backup-options-test 走真实控制器路径
 #      验证解析表、四种算法组合、密码校验、未知 key、加密与 legacy 恢复、
 #      目录字段、密码不落盘。
-#  12. 截图（写进 tests/output/，评审产物不进仓库）：两套主题 × 五页 +
+#  12. 截图（写进 tests/output/，评审产物不进仓库）：两套主题 × 七页 +
 #      高级选项展开 + 加密恢复密码对话框。
+#  13. 远程备份页（PR #20）：真的起一个 backup-server 进程，用页面背后的
+#      RemoteController 走完 注册 / 登录 / 上传真实归档 / 列表 / 下载 / 删除 /
+#      退出登录，并断言密码回显模式、口令与 token 不落盘、忙碌时冲突请求被拒、
+#      页面提示不外泄、列表行显示名称 / 大小 / 时间、删除必须确认、两套主题
+#      下关键控件几何正常。
 #
 # 所有 GUI 调用都带 --config-file 指向临时目录，并且导出临时 XDG_CONFIG_HOME：
 # AppTheme 的 QSettings 与 QStandardPaths 都跟着它走，测试绝不读写真实用户配置。
@@ -146,6 +151,16 @@ else
   record_fail "构建产物缺失"
 fi
 
+# 远程备份页的自检要真的起一个服务端进程：它就是与 network_test.sh、阿里云
+# 部署同一个 Makefile 目标产出的那个 backup-server，不是测试专用的假服务端。
+echo "[modern-gui] 1b) 构建 build/backup-server（--remote-test 需要真服务端）"
+make server 2>&1 | tee -a "$LOG_FILE" | tail -2
+if [[ -x "$ROOT_DIR/build/backup-server" ]]; then
+  record_pass "backup-server 构建产物存在"
+else
+  record_fail "backup-server 构建产物缺失"
+fi
+
 # offscreen 让没有显示器的环境也能真正把窗口建出来；
 # QSG_RHI_BACKEND=software 避开虚拟机里没有 3D 驱动的问题。
 # --smoke-test 自己会把 QML 运行期告警算进退出码，所以这里只看退出码。
@@ -234,7 +249,8 @@ classify_qmllint() {
       # 放行后立刻清状态，避免变成“全局允许某类提示”。
       if (msg ~ /^Info: (ruleModel|modelData) is a member of a parent element\.?$/ &&
           (prev_panel_allowed == 1 || prev_allowed_file ~ /SchedulePage\.qml/ ||
-           prev_allowed_file ~ /RealtimePage\.qml/)) {
+           prev_allowed_file ~ /RealtimePage\.qml/ ||
+           prev_allowed_file ~ /SegmentedTabs\.qml/)) {
         print "ALLOWED\t" msg
         # 不清状态：SchedulePage 的委托用 required property var modelData，
         # qmllint 会在这条之后紧跟一条不带文件名的通用 Info，两条属于同一份诊断。
@@ -280,6 +296,46 @@ classify_qmllint() {
       # "这个文件 + 这两个名字"。
       if (msg ~ /Unqualified access/ && msg ~ /RealtimePage\.qml/ &&
           (snippet ~ /realtime\./ || snippet ~ /page\./)) {
+        MarkAllowed(msg); return
+      }
+      # PR #20：RemotePage.qml 只引用两个上下文属性 —— main.cpp 注册的
+      # remote（远程备份控制器）与本页自己的根 id page。qmllint 同样不认识
+      # 上下文属性，放行规则精确限定到"这个文件 + 这两个名字"。
+      if (msg ~ /Unqualified access/ && msg ~ /RemotePage\.qml/ &&
+          (snippet ~ /remote\./ || snippet ~ /page\./)) {
+        MarkAllowed(msg); return
+      }
+      # PR #20 closure：RemotePage.qml 用 Connections 把"一次操作结束"的结果落回
+      # 界面草稿（注册成功切回登录标签、注销成功清空密码框）。qmllint 6.4.2 的
+      # qmltypes 里没有 Connections 这个类型，于是同一处冒出三条诊断：
+      # Connections was not found / Binding assigned to "target" / 紧跟其后的
+      # Unqualified access（target: remote 这一行没有点号，因此上面的通用规则
+      # 接不住它）。运行期实测正常：--remote-test 的 REMOTE-05 / 05a / 14 全绿、
+      # 启动自检 0 条 QML 运行期告警。放行精确限定到"这个文件 + 这一组诊断"。
+      if (msg ~ /RemotePage\.qml/ && msg ~ /Connections was not found/) {
+        MarkAllowed(msg); return
+      }
+      if (msg ~ /RemotePage\.qml/ &&
+          msg ~ /Binding assigned to "target", but no property "target" exists/) {
+        MarkAllowed(msg); return
+      }
+      if (msg ~ /Unqualified access/ && msg ~ /RemotePage\.qml/ &&
+          snippet ~ /target: remote/) {
+        MarkAllowed(msg); return
+      }
+      # RemoteSnapshotCard.qml 是远程备份列表的委托组件：theme 由上面那条通用
+      # 规则覆盖，这里补它自己的根 id card。
+      if (msg ~ /Unqualified access/ && msg ~ /RemoteSnapshotCard\.qml/ &&
+          (snippet ~ /card\./ || snippet ~ /theme\./)) {
+        MarkAllowed(msg); return
+      }
+      # PR #20（人工验收修复）：SegmentedTabs.qml 是本轮新增的共享分段控件。
+      # 它只引用上下文属性 theme、本组件根 id control，以及委托里的 segment /
+      # modelData（委托是独立组件作用域，6.4 的静态检查解析不到外层 id；运行期
+      # 正常，--remote-test 与启动自检都是 0 条 QML 运行期告警）。
+      if (msg ~ /Unqualified access/ && msg ~ /SegmentedTabs\.qml/ &&
+          (snippet ~ /theme\./ || snippet ~ /control\./ ||
+           snippet ~ /segment\./ || snippet ~ /modelData/)) {
         MarkAllowed(msg); return
       }
       if (msg ~ /Cannot defer property assignment to "contentItem"/) {
@@ -378,10 +434,11 @@ fi
 # 恢复已经不是独立页面，而是备份管理页里的一个动作 —— 这几条断言把结构钉死，
 # 免得日后又长回一个"恢复页"。
 # PR #19 之后是六页：首页 / 备份 / 自动备份 / 实时备份 / 备份管理 / 设置。
-expect_count "$QML_DIR/Main.qml" "NavItem {" 6 \
-  "侧栏有六个导航项（首页 / 备份 / 自动备份 / 实时备份 / 备份管理 / 设置）"
-expect_count "$QML_DIR/Main.qml" "opacity: root.currentPage === " 6 \
-  "StackLayout 里六页各自绑定可见性"
+# PR #20 之后是七页，最后加上"远程备份"。
+expect_count "$QML_DIR/Main.qml" "NavItem {" 7 \
+  "侧栏有七个导航项（首页 / 备份 / 自动备份 / 实时备份 / 备份管理 / 远程备份 / 设置）"
+expect_count "$QML_DIR/Main.qml" "opacity: root.currentPage === " 7 \
+  "StackLayout 里七页各自绑定可见性"
 expect_count_re "$QML_DIR/Main.qml" "^[[:space:]]*currentIndex: root.currentPage" 1 \
   "StackLayout 跟随 root.currentPage"
 if grep -rq 'OperationPage' "$QML_DIR" "$RESOURCE_FILE"; then
@@ -389,6 +446,320 @@ if grep -rq 'OperationPage' "$QML_DIR" "$RESOURCE_FILE"; then
 else
   record_pass "没有 standalone OperationPage"
 fi
+
+# ---- 反向 / 正向断言的小工具 ----
+#
+# 这三个函数在 PR #20 的远程备份页一节就要用，而那一节在文件里的位置比"自动
+# 备份页"更靠前，所以定义放在这里（函数在调用时才解析，定义一次两处都能用）。
+expect_present() {
+  local file="$1"
+  local pattern="$2"
+  local label="$3"
+  if grep -qF -- "$pattern" "$file"; then
+    record_pass "$label"
+  else
+    record_fail "$label（缺少：$pattern）"
+  fi
+}
+
+# 反向断言（只看代码行）：注释里写"以前这里是 ext:cpp;h"是正常的说明，
+# 断言的是**用户看得到的文案**里没有它，所以先剔掉 // 开头的行。
+expect_missing_code() {
+  local file="$1"
+  local pattern="$2"
+  local label="$3"
+  # grep -n 的输出是 "行号:内容"（没有文件名前缀），所以过滤的是 ^行号: //
+  if grep -nF -- "$pattern" "$file" | grep -vE '^[0-9]+:[[:space:]]*//' | grep -q .; then
+    record_fail "$label（代码里不该出现：$pattern）"
+  else
+    record_pass "$label"
+  fi
+}
+
+# 反向断言：界面上不该出现东西，和"该出现"一样重要。
+expect_missing() {
+  local file="$1"
+  local pattern="$2"
+  local label="$3"
+  if grep -qF -- "$pattern" "$file"; then
+    record_fail "$label（不该出现：$pattern）"
+  else
+    record_pass "$label"
+  fi
+}
+
+# ---- PR #20 远程备份页 ----
+#
+# 这一页是 GUI 与远程备份网络层之间**唯一**的入口。下面这几条把它钉住：
+# 页面进资源清单、导航只有一个入口、密码框是密码回显、删除必须经过确认、
+# 进度条绑的是网络层的真实字节数。
+REMOTE_PAGE_QML="$QML_DIR/pages/RemotePage.qml"
+SEGMENTED_QML="$QML_DIR/components/SegmentedTabs.qml"
+CLIENT_CPP="$ROOT_DIR/src/network/remote_backup_client.cpp"
+CLIENT_H="$ROOT_DIR/include/remote_backup_client.h"
+REMOTE_CARD_QML="$QML_DIR/components/RemoteSnapshotCard.qml"
+REMOTE_CONTROLLER_H="$ROOT_DIR/ui/modern/remote_controller.h"
+REMOTE_CONTROLLER_CPP="$ROOT_DIR/ui/modern/remote_controller.cpp"
+expect_count "$RESOURCE_FILE" "qml/pages/RemotePage.qml" 1 \
+  "resources.qrc 收录 RemotePage.qml"
+expect_count "$RESOURCE_FILE" "qml/components/RemoteSnapshotCard.qml" 1 \
+  "resources.qrc 收录 RemoteSnapshotCard.qml"
+expect_count "$QML_DIR/Main.qml" 'objectName: "remoteNavItem"' 1 \
+  "侧栏只有一个远程备份入口"
+# 明文常显的密码框在这一页是绝不允许出现的样子。
+# 登录密码 + 注册密码 + 注册确认密码 + 注销确认密码：四个都必须是密码回显。
+expect_count "$REMOTE_PAGE_QML" "echoMode: TextInput.Password" 4 \
+  "远程备份页的四个密码框都是密码回显模式"
+# 删除必须经过确认：整页真正调用客户端删除的地方只有一处，
+# 而且列表行只发意图（一个信号声明 + 一个触发）。
+expect_count "$REMOTE_PAGE_QML" "remote.deleteSnapshot(" 1 \
+  "整页只有一处真正调用删除"
+expect_count "$REMOTE_CARD_QML" "deleteRequested(" 2 \
+  "列表行只发删除意图（声明 + 触发）"
+expect_count "$REMOTE_PAGE_QML" "deleteDialog.open()" 1 \
+  "删除先打开确认对话框"
+expect_count "$REMOTE_PAGE_QML" 'objectName: "remoteDeleteDialog"' 1 \
+  "删除确认对话框存在"
+# 这一页的临时提示属于它自己：离开即消费，不污染其它页面。
+expect_count "$REMOTE_PAGE_QML" 'pageScope: "remote"' 1 \
+  "远程备份页的状态栏声明了 pageScope"
+expect_count "$QML_DIR/Main.qml" "remote.clearStatus()" 1 \
+  "离开远程备份页时消费掉它的临时提示"
+# 进度条必须绑网络层给出的真实比例。
+expect_count "$REMOTE_PAGE_QML" "value: remote.progressRatio" 1 \
+  "进度条绑的是网络层的真实字节比例"
+expect_count "$REMOTE_PAGE_QML" "remote.transferActive" 1 \
+  "进度只在真的有传输时出现"
+# 复用现有组件，而不是另起一套视觉。
+expect_count "$REMOTE_PAGE_QML" "AppCard {" 4 \
+  "远程备份页的四张卡片都用共享 AppCard"
+expect_count "$REMOTE_PAGE_QML" "StatusBanner {" 1 \
+  "远程备份页用共享 StatusBanner"
+# 地址 / 端口 / 用户名 / 登录密码 / 注册密码 / 注册确认 / 上传路径 / 上传名称 /
+# 下载目标 / 注销密码 / 注销账户名 = 11。
+expect_count "$REMOTE_PAGE_QML" "AppTextField {" 11 \
+  "远程备份页的输入框都用共享 AppTextField"
+# 第二套 socket / 协议实现？GUI 这一侧只允许经 RemoteController 调共享客户端。
+# 断言只看代码行：注释里说明"这里没有 socket"是正常的。
+REMOTE_CODE_TMP="$TEST_STATE_DIR/remote-code.txt"
+{
+  sed 's://.*::' "$REMOTE_CONTROLLER_H"
+  sed 's://.*::' "$REMOTE_CONTROLLER_CPP"
+  sed 's://.*::' "$REMOTE_PAGE_QML"
+  sed 's://.*::' "$REMOTE_CARD_QML"
+} > "$REMOTE_CODE_TMP"
+if grep -qE 'sys/socket\.h|netinet/in\.h|arpa/inet\.h|AF_INET|::socket\(|::send\(|::recv\(|FrameHeader|kProtocolMagic|Opcode::' "$REMOTE_CODE_TMP"; then
+  record_fail "GUI 里出现了第二套 socket / 协议实现"
+else
+  record_pass "GUI 只经 RemoteController 调共享的 RemoteArchiveClient"
+fi
+expect_count "$REMOTE_CONTROLLER_H" "remote_backup_client.h" 1 \
+  "RemoteController 复用共享客户端头"
+# 口令与会话令牌只在内存里：这一侧不许有任何持久化调用。
+if grep -qE 'QSettings|setValue\(|QStandardPaths::writableLocation' "$REMOTE_CODE_TMP"; then
+  record_fail "RemoteController 或远程备份页里出现了持久化调用"
+else
+  record_pass "口令与令牌只在内存：GUI 侧没有任何持久化调用"
+fi
+expect_count "$REMOTE_CONTROLLER_CPP" "password_.fill(QChar(0))" 3 \
+  "退出登录、注销账户与析构都会擦掉内存里的口令"
+
+# ---- PR #20 closure：账户区域（登录 / 注册两个标签页）----
+#
+# 人工验收的结论：用户名 / 密码 / 注册 / 登录 / 退出登录堆在同一块里，用户分不清
+# "我在登录还是在注册"，注册也只有一个密码框。这一节把新的信息架构钉成契约。
+# 账户区域是一个**分段控件**：一个圆角容器 + 两个等宽分段。人工验收的结论是
+# 两个各自独立的按钮看起来像"可以同时按"，不像"二选一"。
+expect_count "$REMOTE_PAGE_QML" "SegmentedTabs {" 1 \
+  "账户区域用共享的分段控件（不是两个独立按钮）"
+expect_count "$REMOTE_PAGE_QML" 'objectName: "remoteAccountTabs"' 1 \
+  "分段控件有 objectName（自动化要能点到它）"
+expect_count "$RESOURCE_FILE" "qml/components/SegmentedTabs.qml" 1 \
+  "SegmentedTabs.qml 进了资源清单"
+expect_count "$SEGMENTED_QML" "theme.accent" 2 \
+  "选中分段用强调色（与 primary 按钮同一个 token）"
+expect_count "$SEGMENTED_QML" "theme.surface" 2 \
+  "容器用次级按钮的中性底色（浅色=较深灰 / 深色=较亮灰，由 token 决定）"
+expect_count "$SEGMENTED_QML" "theme.border" 2 \
+  "容器与分段边框用共享的 border token"
+expect_count "$SEGMENTED_QML" "theme.hover" 2 \
+  "未选中分段的 hover 用共享的 hover token"
+expect_count "$SEGMENTED_QML" "radius: 9" 1 \
+  "外圆角与 AppButton 一致（9）"
+expect_count "$SEGMENTED_QML" '"#ffffff"' 1 \
+  "选中分段的文字用白字（与 primary 按钮一致）"
+expect_missing "$SEGMENTED_QML" "theme.dark" \
+  "分段控件不自己判断主题：两套配色都走 token"
+if grep -nE '#[0-9a-fA-F]{6}' "$SEGMENTED_QML" | grep -v '#ffffff' | grep -q .; then
+  record_fail "分段控件硬编码了颜色（除了强调色上的白字）"
+else
+  record_pass "分段控件不硬编码任何颜色（除了强调色上的白字）"
+fi
+expect_count "$REMOTE_PAGE_QML" 'objectName: "remoteRegisterPasswordField"' 1 \
+  "注册标签有独立的密码输入框"
+expect_count "$REMOTE_PAGE_QML" 'objectName: "remoteRegisterConfirmField"' 1 \
+  "注册标签有「确认密码」输入框"
+expect_count "$REMOTE_PAGE_QML" '"确认密码"' 1 \
+  "确认密码的标签是中文的「确认密码」"
+expect_count "$REMOTE_PAGE_QML" 'objectName: "remoteAccountText"' 1 \
+  "已登录时显示当前账户"
+expect_count "$REMOTE_PAGE_QML" 'objectName: "remoteAccountStateText"' 1 \
+  "已登录时显示「状态：已登录」"
+expect_count "$REMOTE_PAGE_QML" 'objectName: "remoteDeleteAccountButton"' 1 \
+  "已登录时提供注销账户入口"
+expect_count "$REMOTE_PAGE_QML" 'objectName: "remoteDeleteAccountDialog"' 1 \
+  "注销账户有独立的确认对话框"
+expect_count "$REMOTE_PAGE_QML" 'objectName: "remoteDeletePasswordField"' 1 \
+  "注销对话框要求再次输入当前密码"
+expect_count "$REMOTE_PAGE_QML" 'objectName: "remoteDeleteNameField"' 1 \
+  "注销对话框要求逐字输入当前账户名"
+expect_present "$REMOTE_PAGE_QML" \
+  "注销账户会永久删除该账户以及全部云端备份，此操作无法撤销。" \
+  "注销对话框写明了不可撤销的后果"
+expect_count "$REMOTE_PAGE_QML" "remote.deleteAccount(" 1 \
+  "整页只有一处真正调用注销"
+expect_count "$REMOTE_PAGE_QML" "remote.logoutLocal()" 1 \
+  "「退出登录」只有一处，与注销是两个不同的动作"
+# 注册页的正常状态只给一句弱化的辅助文字；只有真的不一致时才换成红色错误。
+expect_count "$REMOTE_PAGE_QML" "请再次输入密码以确认。" 1 \
+  "注册标签的正常状态只有一句弱化的辅助文字"
+expect_missing "$REMOTE_PAGE_QML" "不会发送任何请求" \
+  "页面不再写开发者式的说明"
+expect_count "$REMOTE_PAGE_QML" "两次输入的密码不一致" 1 \
+  "不一致时明确写出「两次输入的密码不一致」"
+# 四处错误行（注册不一致 / 注册被拒 / 登录被拒 / 注销失败）都用共享的 error 色：
+# 页面里没有第二套红色，也没有硬编码的 #ff0000。
+expect_count "$REMOTE_PAGE_QML" "color: theme.error" 4 \
+  "四处错误行都用共享的 error 色"
+expect_present "$REMOTE_PAGE_QML" "visible: page.registerPasswordMismatch" 1 \
+  "错误行由「两次密码是否一致」这个计算属性驱动（改一个字符就更新）"
+expect_present "$REMOTE_PAGE_QML" "page.draftRegisterPassword !== page.draftConfirmPassword" 1 \
+  "不一致是本地判定的（不发网络请求）"
+# 注销对话框：失败原因必须出现在对话框内部，而且只有成功才关闭。
+expect_count "$REMOTE_PAGE_QML" 'objectName: "remoteDeleteAccountError"' 1 \
+  "注销对话框里有自己的错误行"
+expect_count "$REMOTE_PAGE_QML" "remote.deleteAccountError" 2 \
+  "错误行绑到控制器的 deleteAccountError（可见性 + 文本）"
+expect_missing "$REMOTE_PAGE_QML" "if (remote.deleteAccount(" \
+  "确认注销不再在提交时就关闭对话框"
+expect_count "$REMOTE_PAGE_QML" "deleteAccountDialog.close()" 2 \
+  "对话框只由「取消」和「操作成功」两条路径关闭"
+# 每一次主动操作都要在**触发它的那个位置**给出反馈（人工验收的核心标准）。
+#
+#   * 登录失败 -> 登录表单下面（remoteLoginError）
+#   * 注册失败 -> 注册表单下面（remoteRegisterError）
+#   * 注销失败 -> 对话框内部（remoteDeleteAccountError）
+#   * 页面级操作（上传 / 下载 / 刷新 / 删除云端备份）-> 页面底部横幅
+#
+# 旧实现把登录 / 注册的校验失败写进页面底部的横幅（甚至只打终端日志），于是
+# 用户看到的是"我点了，但不知道程序到底有没有反应"。
+expect_count "$REMOTE_PAGE_QML" 'objectName: "remoteLoginError"' 1 \
+  "登录表单有自己的错误行"
+expect_count "$REMOTE_PAGE_QML" 'objectName: "remoteRegisterError"' 1 \
+  "注册表单有自己的错误行"
+expect_count "$REMOTE_PAGE_QML" "remote.loginError" 2 \
+  "登录错误行绑到控制器的 loginError（可见性 + 文本）"
+expect_count "$REMOTE_PAGE_QML" "remote.registerError" 4 \
+  "注册错误行绑到控制器的 registerError（可见性 + 文本 + 两条互斥提示）"
+expect_count "$REMOTE_PAGE_QML" "remote.clearLoginError()" 4 \
+  "改动地址 / 端口 / 用户名 / 登录密码都会清掉登录错误行"
+expect_count "$REMOTE_PAGE_QML" "remote.clearRegisterError()" 5 \
+  "改动地址 / 端口 / 用户名 / 两个注册密码框都会清掉注册错误行"
+expect_count "$REMOTE_PAGE_QML" "remote.clearDeleteAccountError()" 3 \
+  "打开对话框与改动对话框里的两个输入框都会清掉对话框错误行"
+# 冗余状态文本：账户卡片已经写了"当前账户：X"和"状态：已登录"，页面上不允许
+# 再有第三行重复同一个事实（人工验收点名的那一行）。
+expect_missing "$REMOTE_PAGE_QML" 'objectName: "remoteSessionText"' \
+  "页面上没有第三行重复的登录状态文本"
+expect_count "$REMOTE_PAGE_QML" "remote.sessionText" 1 \
+  "sessionText 只留在默认折叠的「技术详情」里"
+# 对话框里的错误行必须在**对话框内部**（在对话框起点之后、确认按钮之前）。
+DIALOG_LINE="$(grep -n 'objectName: "remoteDeleteAccountDialog"' "$REMOTE_PAGE_QML" | head -1 | cut -d: -f1)"
+DIALOG_ERROR_LINE="$(grep -n 'objectName: "remoteDeleteAccountError"' "$REMOTE_PAGE_QML" | head -1 | cut -d: -f1)"
+DIALOG_CONFIRM_LINE="$(grep -n 'objectName: "remoteDeleteAccountConfirmButton"' "$REMOTE_PAGE_QML" | head -1 | cut -d: -f1)"
+if [ -n "$DIALOG_LINE" ] && [ -n "$DIALOG_ERROR_LINE" ] && [ -n "$DIALOG_CONFIRM_LINE" ] \
+   && [ "$DIALOG_LINE" -lt "$DIALOG_ERROR_LINE" ] \
+   && [ "$DIALOG_ERROR_LINE" -lt "$DIALOG_CONFIRM_LINE" ]; then
+  record_pass "注销失败的错误行在对话框内部（对话框之后、确认按钮之前）"
+else
+  record_fail "对话框错误行的位置" \
+    "dialog=$DIALOG_LINE error=$DIALOG_ERROR_LINE confirm=$DIALOG_CONFIRM_LINE"
+fi
+# 控制器一侧：错误按位置路由，校验失败不再写横幅，操作结束横幅不留运行状态。
+expect_present "$REMOTE_CONTROLLER_H" "enum class ErrorSurface" \
+  "控制器把「错误该出现在哪里」写成一个枚举（登录 / 注册 / 对话框 / 横幅）"
+expect_present "$REMOTE_CONTROLLER_H" "QString loginError() const" \
+  "控制器提供 loginError 给登录表单"
+expect_present "$REMOTE_CONTROLLER_H" "QString registerError() const" \
+  "控制器提供 registerError 给注册表单"
+expect_present "$REMOTE_CONTROLLER_CPP" "void RemoteController::ReportSurfaceError" \
+  "错误只有一条上报路径：ReportSurfaceError"
+expect_present "$REMOTE_CONTROLLER_CPP" "SurfaceFailureMessage(result.kind, result.error_kind, result.message)" \
+  "失败信息按操作改写（登录 / 注册 / 注销各说各的话）"
+expect_present "$REMOTE_CONTROLLER_CPP" "SetIdleBaseline();" \
+  "操作结束后横幅回到当前真实状态的基线（不会停在「正在登录」）"
+expect_missing "$REMOTE_CONTROLLER_CPP" "bool RemoteController::AcceptEndpoint" \
+  "旧的 AcceptEndpoint 已经删除（它把校验失败写进页面底部横幅）"
+expect_missing "$REMOTE_CONTROLLER_CPP" "bool RemoteController::AcceptPassword" \
+  "旧的 AcceptPassword 已经删除"
+expect_present "$REMOTE_CONTROLLER_CPP" "该用户名已被使用，请更换用户名" \
+  "重复注册的文案是「该用户名已被使用，请更换用户名」"
+expect_present "$REMOTE_CONTROLLER_CPP" "当前密码不正确，账户与全部云端备份都没有被删除" \
+  "注销失败明确说明「账户与全部云端备份都没有被删除」"
+# 用户名校验的**原因**：核心决定原因，界面只负责翻译。旧实现把"长度不合法"
+# 与"字符不合法"合成一句固定文案，人工验收里输入 "W" 被误导成"字符有问题"。
+expect_present "$ROOT_DIR/include/network_protocol.h" "enum class UsernameValidation" \
+  "用户名校验有结构化的原因（empty / 太短 / 太长 / 字符非法 / ok）"
+expect_present "$ROOT_DIR/include/network_protocol.h" "UsernameValidation ValidateUsername" \
+  "共享头暴露 ValidateUsername（规则的唯一实现）"
+expect_present "$ROOT_DIR/src/network/network_protocol.cpp" "UsernameValidation ValidateUsername" \
+  "实现只有一份：ValidateUsername 决定原因"
+expect_present "$ROOT_DIR/src/network/network_protocol.cpp" "bool IsValidUsername" \
+  "IsValidUsername 仍然存在（兼容包装，行为不变）"
+expect_present "$REMOTE_CONTROLLER_CPP" "backupproject::net::ValidateUsername" \
+  "控制器用结构化校验器，不自己判断长度或字符集"
+expect_count "$REMOTE_CONTROLLER_CPP" "用户名长度需要为" 1 \
+  "长度原因有自己的一句话（只写一处）"
+expect_count "$REMOTE_CONTROLLER_CPP" "用户名只能包含字母、数字、点、下划线或减号" 1 \
+  "字符集原因有自己的一句话（与长度那句不是同一句）"
+expect_missing "$REMOTE_PAGE_QML" "用户名长度" \
+  "QML 不自己判断用户名校验（文案由控制器给出）"
+expect_missing "$REMOTE_PAGE_QML" "用户名只能包含" \
+  "QML 里没有第二份用户名校验文案"
+# 传输层：请求生命周期与连接生命周期分开，且**没有**自动重发。
+expect_present "$CLIENT_CPP" "PrepareConnection(&prepare_error)" 1 \
+  "发请求之前先准备连接（重连 / 恢复会话都发生在发送之前）"
+expect_present "$CLIENT_H" "bool session_resumable() const" 1 \
+  "客户端能区分「连接断了」与「token 也没了」"
+expect_present "$CLIENT_CPP" "Opcode::kResume" 1 \
+  "新连接上用 RESUME 恢复会话，而不是让用户重新登录"
+expect_missing "$CLIENT_CPP" "retry" \
+  "客户端里没有 retry 逻辑：失败绝不自动重发"
+expect_present "$ROOT_DIR/include/network_protocol.h" "kResume = 5" \
+  "RESUME 是协议里的一个新操作码（token 说明它恢复的是谁）"
+expect_count "$ROOT_DIR/include/network_protocol.h" "kResume = 5" 1 \
+  "RESUME 的操作码值只定义一次"
+# 本地校验：不一致时不发请求（检查在控制器里，且在 AcceptEndpoint 之前）。
+expect_present "$REMOTE_CONTROLLER_CPP" "password != confirm_password" \
+  "控制器在提交之前比较两次注册密码"
+expect_present "$REMOTE_CONTROLLER_H" "const QString& confirm_password" \
+  "registerAccount 的签名带确认密码"
+expect_present "$ROOT_DIR/include/remote_backup_client.h" \
+  "bool DeleteAccount(const std::string& password" \
+  "共享客户端有真正的注销账户入口（CLI 与 GUI 共用）"
+# 状态语义：不许再把"还没有连接"写成"未连接 / 已连接"。
+expect_missing_code "$REMOTE_CONTROLLER_CPP" '"未连接"' \
+  "控制器里不再有「未连接」这种常驻状态文案"
+expect_missing "$REMOTE_PAGE_QML" "未连接" \
+  "远程备份页不再显示「未连接」"
+expect_missing "$REMOTE_PAGE_QML" "已连接" \
+  "远程备份页不再显示「已连接」"
+expect_present "$REMOTE_CONTROLLER_CPP" "serverReachabilityText" \
+  "可达性是「上一次连接尝试的结果」，只有试过才有结论"
+expect_present "$REMOTE_PAGE_QML" "remote.serverReachabilityText" \
+  "可达性文案由控制器给出（QML 不自己判断）"
+expect_present "$REMOTE_CONTROLLER_H" "RemoteReachability::kUnknown" \
+  "可达性默认是「还不知道」，而不是「不可达」"
 for page in BackupPage BackupManagementPage SettingsPage; do
   expect_count_re "$RESOURCE_FILE" "qml/pages/${page}\.qml" 1 "resources.qrc 收录 $page.qml"
 done
@@ -571,13 +942,18 @@ echo "[modern-gui] 7) 关闭守卫"
 # Alt+F4 与窗口管理器都能绕过去。
 expect_count_re "$QML_DIR/Main.qml" "^[[:space:]]*onClosing:" 1 \
   "主窗口在 onClosing 里处理关闭请求"
-# 关闭条件必须同时覆盖三位 writer：手动备份 / 恢复是 controller.busy，计划评估
-# 与实时触发跑在 QtConcurrent 上，落盘的是各自的 libraryBusy。只写
-# controller.busy 会漏掉"实时备份正在写归档时 Alt+F4 能把窗口关掉"。
+# 关闭条件必须同时覆盖每一位 writer：手动备份 / 恢复是 controller.busy，计划评估
+# 与实时触发跑在 QtConcurrent 上，落盘的是各自的 libraryBusy；PR #20 之后还要
+# 加上远程传输（remote.busy）。只写 controller.busy 会漏掉"实时备份正在写归档
+# 或正在上传到云端时 Alt+F4 能把窗口关掉"。
 # 用正则版：expect_present 定义在本文件靠后的位置，而这一节在它之前执行。
+# 条件现在跨两行，所以拆成两条：前三位在首行，远程那一位在续行。
 expect_count_re "$QML_DIR/Main.qml" \
-  'if \(controller\.busy \|\| schedule\.libraryBusy \|\| realtime\.libraryBusy\)' 1 \
-  "关窗条件覆盖手动 / 计划 / 实时三位 writer"
+  'if \(controller\.busy \|\| schedule\.libraryBusy \|\| realtime\.libraryBusy$' 1 \
+  "关窗条件覆盖手动 / 计划 / 实时三位本地 writer"
+expect_count_re "$QML_DIR/Main.qml" \
+  '^[[:space:]]*\|\| remote\.busy\) \{$' 1 \
+  "远程传输进行中同样不允许关窗"
 # 错误正文要能选中复制，核心给的长路径才有可能贴出来。
 expect_count_re "$QML_DIR/components/StatusBanner.qml" "selectByMouse:[[:space:]]*true" 1 \
   "状态栏正文可鼠标选中"
@@ -1254,7 +1630,7 @@ fi
 printf '{\n  "version": 1,\n  "backup_repository_path": "%s"\n}\n' "$SHOT_PLAIN_REPO" > "$SHOT_PLAIN_CFG"
 printf '{\n  "version": 1,\n  "backup_repository_path": "%s"\n}\n' "$SHOT_ENC_REPO" > "$SHOT_ENC_CFG"
 
-# 一轮截图 = 十张固定状态（五页 × 两主题）+ 高级选项展开两张（两主题）
+# 一轮截图 = 十四张固定状态（七页 × 两主题）+ 高级选项展开两张（两主题）
 # + 调用方追加的状态（只有加密仓库那一轮才有恢复密码对话框）。
 shot_run() {
   local label="$1"
@@ -1275,6 +1651,7 @@ shot_run() {
   expected="$expected schedule-light schedule-dark"
   expected="$expected management-light management-dark"
   expected="$expected settings-light settings-dark"
+  expected="$expected remote-light remote-dark"
   expected="$expected backup-expanded-light backup-expanded-dark"
   for extra in "$@"; do
     expected="$expected $extra"
@@ -1511,42 +1888,8 @@ SCHEDULE_PAGE_QML="$QML_DIR/pages/SchedulePage.qml"
 SCHEDULE_CTRL_CPP="$ROOT_DIR/ui/modern/schedule_controller.cpp"
 SCHEDULE_CTRL_H="$ROOT_DIR/ui/modern/schedule_controller.h"
 
-expect_present() {
-  local file="$1"
-  local pattern="$2"
-  local label="$3"
-  if grep -qF -- "$pattern" "$file"; then
-    record_pass "$label"
-  else
-    record_fail "$label（缺少：$pattern）"
-  fi
-}
-
-# 反向断言（只看代码行）：注释里写"以前这里是 ext:cpp;h"是正常的说明，
-# 断言的是**用户看得到的文案**里没有它，所以先剔掉 // 开头的行。
-expect_missing_code() {
-  local file="$1"
-  local pattern="$2"
-  local label="$3"
-  # grep -n 的输出是 "行号:内容"（没有文件名前缀），所以过滤的是 ^行号: //
-  if grep -nF -- "$pattern" "$file" | grep -vE '^[0-9]+:[[:space:]]*//' | grep -q .; then
-    record_fail "$label（代码里不该出现：$pattern）"
-  else
-    record_pass "$label"
-  fi
-}
-
-# 反向断言：界面上不该出现东西，和"该出现"一样重要。
-expect_missing() {
-  local file="$1"
-  local pattern="$2"
-  local label="$3"
-  if grep -qF -- "$pattern" "$file"; then
-    record_fail "$label（不该出现：$pattern）"
-  else
-    record_pass "$label"
-  fi
-}
+# expect_present / expect_missing / expect_missing_code 定义在文件靠前的
+# "远程备份页"一节之前：那里也要用，而这一节在它后面。
 
 # --- 页面在资源清单与导航里 ---
 expect_count "$RESOURCE_FILE" "qml/pages/SchedulePage.qml" 1 \
@@ -2407,6 +2750,30 @@ expect_present "$SCHEDULE_PAGE_QML" "立即检查当前状态，并在需要时�
 expect_missing "$SCHEDULE_PAGE_QML" '"保存计划"' \
   "旧文案“保存计划”已经消失"
 
+# 远程备份页同理：普通用户只需要知道"服务器 / 账号 / 云端备份 / 上传 / 下载 /
+# 删除"，协议名、算法名、数据库名与传输层实现细节都不该出现在界面文案里。
+# 只看代码行：注释里写"这里没有 BPNET1 / token"正是这条约束的说明，
+# 不能把它自己判成违规（与上面 socket 那条用的是同一份去注释文本）。
+for jargon in "BPNET1" "PBKDF2" "HMAC" "SQLite" "opcode" "request_id" \
+              "FrameHeader" "kProtocolMagic" "SSH" "token"; do
+  if grep -qF -- "$jargon" "$REMOTE_CODE_TMP"; then
+    record_fail "远程备份页出现了开发者术语：$jargon"
+  else
+    record_pass "远程备份页不出现开发者术语：$jargon"
+  fi
+done
+expect_present "$REMOTE_PAGE_QML" '"远程备份"' \
+  "导航与标题用“远程备份”这个说法"
+# 账户区域现在是"服务器账户"卡片：地址 / 端口 / 用户名 + 登录、注册两个标签页。
+expect_present "$REMOTE_PAGE_QML" '"服务器账户"' \
+  "远程备份页有账户区域（地址 / 端口 / 用户名 + 登录注册标签页）"
+expect_present "$REMOTE_PAGE_QML" '"云端备份"' \
+  "远程备份页有云端备份区域"
+expect_present "$REMOTE_PAGE_QML" '"技术详情"' \
+  "协议层面的信息折叠进“技术详情”"
+expect_present "$REMOTE_PAGE_QML" '"覆盖并重新下载"' \
+  "目标已存在时给的是明确动作，不是常驻开关"
+
 echo "[modern-gui] 22) 共享 ComboBox 的下拉行状态（hover / 键盘光标 / 已选择）"
 #
 # 三轮人工验收踩的是同一个坑的三种形态，根因都是"用一个残影当输入状态用"：
@@ -2555,6 +2922,36 @@ if grep -qF "qml-warning" "$TEST_STATE_DIR/combo-hover.log"; then
   record_fail "下拉状态自检期间出现了 QML 运行期告警"
 else
   record_pass "下拉状态自检期间 0 QML 运行期告警"
+fi
+
+echo "[modern-gui] 23) 远程备份页（RemoteController + 真实 backup-server 进程）"
+#
+# 这一节不是 grep：它真的起一个 backup-server，再用页面背后的 RemoteController
+# 走完 注册 -> 登录 -> 上传真实归档 -> 列表 -> 下载 -> 删除 -> 退出登录，
+# 并断言密码回显模式、口令与 token 不落盘、忙碌时冲突请求被拒、页面提示不外泄、
+# 列表行显示名称 / 大小 / 时间、删除必须确认、两套主题下控件几何正常。
+mkdir -p "$TEST_STATE_DIR/remote"
+set +e
+QT_QPA_PLATFORM=offscreen QSG_RHI_BACKEND=software timeout 600 \
+  ./build/backup-gui-modern --remote-test \
+  --config-file "$TEST_STATE_DIR/remote/config.json" \
+  --schedule-file "$TEST_STATE_DIR/remote/schedule.json" \
+  --realtime-file "$TEST_STATE_DIR/remote/realtime.json" \
+  > "$TEST_STATE_DIR/remote.log" 2>&1
+remote_status=$?
+set -e
+sed 's/^/[modern-gui]     /' "$TEST_STATE_DIR/remote.log"
+cat "$TEST_STATE_DIR/remote.log" >> "$LOG_FILE"
+if [[ "$remote_status" -eq 0 ]]; then
+  record_pass "远程备份页合同测试全部通过（$(grep -oE 'passed=[0-9]+ failed=[0-9]+' "$TEST_STATE_DIR/remote.log" | tail -1)）"
+else
+  record_fail "远程备份页合同测试失败（退出码 $remote_status）" \
+    "$(grep -m3 'FAIL' "$TEST_STATE_DIR/remote.log" | tr '\n' ' ')"
+fi
+if grep -qF "qml-warning" "$TEST_STATE_DIR/remote.log"; then
+  record_fail "远程备份页自检期间出现了 QML 运行期告警"
+else
+  record_pass "远程备份页自检期间 0 QML 运行期告警"
 fi
 
 echo "[modern-gui] 通过 $PASS_COUNT 项，失败 $FAIL_COUNT 项"
