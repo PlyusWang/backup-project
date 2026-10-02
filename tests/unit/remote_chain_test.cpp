@@ -186,6 +186,34 @@ void TestSnapshotBundle() {
                                                  &ignored2, &error),
         "缺副文件时打包失败");
 
+  // 超大声明：成员长度超过上限时必须拒绝，而且**不能按声明值分配内存**。
+  {
+    std::string header;
+    header.append("BPSNAP1\0", 8);
+    auto append_u16 = [&header](std::uint16_t value) {
+      header.push_back(static_cast<char>((value >> 8) & 0xFF));
+      header.push_back(static_cast<char>(value & 0xFF));
+    };
+    auto append_u64 = [&header](std::uint64_t value) {
+      for (int shift = 56; shift >= 0; shift -= 8) {
+        header.push_back(static_cast<char>((value >> shift) & 0xFF));
+      }
+    };
+    append_u16(1);  // 版本
+    append_u16(3);  // 成员数
+    const std::string first_name = archive;
+    append_u16(static_cast<std::uint16_t>(first_name.size()));
+    header.append(first_name);
+    append_u64(backupproject::net::kSnapshotBundleMaxMemberBytes + 1);
+    header.append(32, '\0');  // 假摘要
+    const std::string oversized_path = root + "/oversized.bundle";
+    Check(WriteFile(oversized_path, header), "写出超大声明的材料包");
+    SnapshotBundleInfo oversized_info;
+    Check(!backupproject::net::InspectSnapshotBundle(oversized_path,
+                                                     &oversized_info, &error),
+          "声明的成员长度超过上限时被拒绝（不按声明值分配）");
+  }
+
   // 名字作弊：成员名带路径分隔符时必须拒绝（用真实包改名字字段）。
   std::string path_trick = bytes;
   const std::size_t first_name_offset = 14;  // magic(8) + version(2) + count(2) + len(2)
@@ -465,6 +493,118 @@ void TestMigrationAndChainMetadata() {
   (void)std::system(cleanup.c_str());
 }
 
+// ---- 4. 材料包的确定性变异 ----
+
+std::uint64_t NextRandom(std::uint64_t* state) {
+  std::uint64_t value = *state;
+  value ^= value << 13;
+  value ^= value >> 7;
+  value ^= value << 17;
+  *state = value;
+  return value;
+}
+
+void TestBundleFuzz() {
+  // 材料包里没有"被忽略的字节"：magic、版本、成员数、每个成员的名字/长度/
+  // SHA-256/数据都被校验。所以任何一处变异都必须让解包失败，而且失败之后
+  // 目标目录里不能留下任何东西（不能留下"解了一半"的三件套）。
+  std::printf("[chain] 材料包确定性变异\n");
+  const std::string root = WorkRoot() + "/bundle-fuzz";
+  const std::string repo = root + "/repo";
+  Check(MakeDirectory(repo), "建测试目录");
+
+  const std::string archive = "remote-cccccccccccc-300-g0.bak";
+  Check(WriteFile(repo + "/" + archive, std::string(500, 'M')), "写入 .bak");
+  Check(WriteFile(repo + "/" + archive + ".manifest", "BPMANIFEST3 1\nx\n"),
+        "写入 .manifest");
+  Check(WriteFile(repo + "/" + archive + ".identity", "BPIDENT2\nsnapshot_id=x\n"),
+        "写入 .identity");
+
+  const std::string bundle = root + "/valid.bundle";
+  SnapshotBundleInfo info;
+  std::string error;
+  Check(backupproject::net::BuildSnapshotBundle(repo, archive, bundle, &info,
+                                                &error),
+        "打出基准材料包", error);
+  std::string bytes;
+  Check(ReadFile(bundle, &bytes), "读回材料包");
+
+  const int rounds = 200;
+  int rejected = 0;
+  int leftovers = 0;
+  std::uint64_t state = 0x9E3779B97F4A7C15ull;
+  for (int round = 0; round < rounds; ++round) {
+    std::string mutated = bytes;
+    const int mutations = 1 + static_cast<int>(NextRandom(&state) % 3);
+    for (int index = 0; index < mutations; ++index) {
+      const std::size_t offset =
+          static_cast<std::size_t>(NextRandom(&state) % mutated.size());
+      mutated[offset] = static_cast<char>(mutated[offset] ^
+                                          (1u << (NextRandom(&state) % 8)));
+    }
+    const std::string mutated_path =
+        root + "/mutated-" + std::to_string(round) + ".bundle";
+    if (!WriteFile(mutated_path, mutated)) {
+      Check(false, "写出变异材料包");
+      return;
+    }
+    const std::string out = root + "/out-" + std::to_string(round);
+    if (!MakeDirectory(out)) {
+      Check(false, "建解包目录");
+      return;
+    }
+    SnapshotBundleInfo result;
+    std::string extract_error;
+    if (!backupproject::net::ExtractSnapshotBundle(mutated_path, out, &result,
+                                                   &extract_error)) {
+      rejected += 1;
+    }
+    if (FileExists(out + "/" + archive) ||
+        FileExists(out + "/" + archive + ".manifest") ||
+        FileExists(out + "/" + archive + ".identity")) {
+      leftovers += 1;
+    }
+    const std::string cleanup = "rm -rf '" + out + "' '" + mutated_path + "'";
+    (void)std::system(cleanup.c_str());
+  }
+  Check(rejected == rounds, "200 个变异材料包全部被拒绝",
+        std::to_string(rejected) + "/" + std::to_string(rounds));
+  Check(leftovers == 0, "被拒绝时目标目录里没有留下任何文件");
+  const std::string cleanup = "rm -rf '" + root + "'";
+  (void)std::system(cleanup.c_str());
+}
+
+// ---- 5. 迁移的 fail-closed：不认识的版本一个字节都不改 ----
+
+void TestUnknownSchemaVersion() {
+  std::printf("[chain] 未知 schema 版本必须 fail closed\n");
+  const std::string root = WorkRoot() + "/unknown-schema";
+  Check(MakeDirectory(root), "建测试目录");
+  const std::string path = root + "/future.sqlite3";
+  Check(CreateLegacyDatabase(path), "造一个 v1 数据库");
+  {
+    sqlite3* database = nullptr;
+    if (sqlite3_open_v2(path.c_str(), &database,
+                        SQLITE_OPEN_READWRITE, nullptr) == SQLITE_OK) {
+      ExecSql(database, "PRAGMA user_version=99;");
+    }
+    if (database != nullptr) {
+      sqlite3_close(database);
+    }
+  }
+  std::string before;
+  Check(ReadFile(path, &before), "读迁移前的库");
+  RemoteMetadataStore store;
+  std::string error;
+  Check(!store.Open(path, &error), "版本 99 的库被拒绝打开", error);
+  Check(error.find("99") != std::string::npos, "错误信息里点明了版本号", error);
+  std::string after;
+  Check(ReadFile(path, &after), "读迁移后的库");
+  Check(before == after, "被拒绝之后库文件一个字节都没变");
+  const std::string cleanup = "rm -rf '" + root + "'";
+  (void)std::system(cleanup.c_str());
+}
+
 }  // namespace
 
 int main() {
@@ -472,6 +612,8 @@ int main() {
   TestSnapshotBundle();
   TestChainResolution();
   TestMigrationAndChainMetadata();
+  TestBundleFuzz();
+  TestUnknownSchemaVersion();
   const int passed = g_checks - g_failures;
   std::printf("remote-chain-test: %d/%d checks passed\n", passed, g_checks);
   return g_failures == 0 ? 0 : 1;
