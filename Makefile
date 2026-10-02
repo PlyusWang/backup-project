@@ -232,10 +232,11 @@ debug:
 	@$(MAKE) BUILD_DIR=build-debug CXXFLAGS="$(CXXFLAGS) -g" all
 
 # AddressSanitizer + UndefinedBehaviorSanitizer build.
-# sanitize 是测试用的构建，所以顺带把测试夹具也建出来（脚本里的 sanitizer
-# 维度要跑它）。产品构建（all）里没有这一条。
+# sanitize 是测试用的构建，所以顺带把测试夹具与**服务器侧交付物**也建出来：
+# 脚本里的 sanitizer 维度要用 backup-server-keygen 生成传输身份密钥，
+# 只建 all 的话它不存在（PR #21 就是这么暴露出来的）。产品构建（all）里没有这一条。
 sanitize:
-	@$(MAKE) BUILD_DIR=build-sanitize CXXFLAGS="$(CXXFLAGS) -g -O1 -fsanitize=address,undefined -fno-omit-frame-pointer" all test-fixtures
+	@$(MAKE) BUILD_DIR=build-sanitize CXXFLAGS="$(CXXFLAGS) -g -O1 -fsanitize=address,undefined -fno-omit-frame-pointer" all test-fixtures server
 
 test: all
 	@bash scripts/test.sh
