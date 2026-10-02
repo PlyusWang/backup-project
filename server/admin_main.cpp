@@ -32,14 +32,15 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+#include <climits>
 #include <cstdio>
 #include <cstdlib>
-#include <climits>
 #include <cstring>
 #include <ctime>
 #include <string>
 #include <vector>
 
+#include "admin_selector.h"
 #include "file_lock.h"
 #include "network_protocol.h"
 #include "remote_maintenance.h"
@@ -49,6 +50,13 @@ namespace {
 
 using backupproject::FileLock;
 using backupproject::FileLockStatus;
+using backupproject::admin::AmbiguityMessage;
+using backupproject::admin::DecideUserResolution;
+using backupproject::admin::IsAllDigits;
+using backupproject::admin::ParseUserSelector;
+using backupproject::admin::UserResolution;
+using backupproject::admin::UserSelector;
+using backupproject::admin::UserSelectorKind;
 using backupproject::net::IsValidSnapshotId;
 using backupproject::net::IsValidUsername;
 using backupproject::net::RemoteMaintenance;
@@ -63,7 +71,8 @@ void PrintUsage(std::FILE* out, const char* program) {
   std::fprintf(
       out,
       "用法: %s --root <数据目录> --db <数据库文件> <命令> [参数]\n"
-      "      backup-server-admin --server-root <部署根> [--root ...] [--db ...] ...\n"
+      "      backup-server-admin --server-root <部署根> [--root ...] [--db "
+      "...] ...\n"
       "\n"
       "  缺省布局（部署脚本安装的样子）：\n"
       "    <server-root>/data                 数据根（--root）\n"
@@ -73,14 +82,24 @@ void PrintUsage(std::FILE* out, const char* program) {
       "只读命令（backup-server 运行时也可以用）：\n"
       "  status                                   服务状态与总量\n"
       "  list-users                               用户列表\n"
-      "  show-user <用户 id 或用户名>             用户详情\n"
-      "  list-snapshots <用户 id 或用户名>        某个用户的备份列表\n"
+      "  show-user <用户选择器>                   用户详情\n"
+      "  list-snapshots <用户选择器>              某个用户的备份列表\n"
       "  show-snapshot <快照 id>                  备份详情（含完整 SHA-256）\n"
       "  overview                                 存储概览\n"
       "\n"
+      "用户选择器（**不会替你猜**）：\n"
+      "  id:<编号>        只按编号找，例如 id:23\n"
+      "  name:<用户名>    只按用户名找，例如 name:23（用户名允许是纯数字）\n"
+      "  裸输入           只有不产生歧义时才被接受：同时命中 id "
+      "与用户名就拒绝，\n"
+      "                   并告诉你应该写成 id:23 还是 name:23。\n"
+      "\n"
       "破坏性命令（要求 backup-server 已停止，且 --confirm 与目标一致）：\n"
-      "  delete-snapshot <快照 id> --user <用户 id 或用户名> --confirm <快照 id>\n"
-      "  delete-user <用户 id 或用户名> --confirm \"DELETE <用户名>\"\n"
+      "  这两条命令的用户选择器**必须**写成 id:<编号> 或 name:<用户名>。\n"
+      "  delete-snapshot <快照 id> --user id:<编号>|name:<用户名> --confirm "
+      "<快照 id>\n"
+      "  delete-user id:<编号>|name:<用户名> --confirm \"DELETE "
+      "<用户名>#<编号>\"\n"
       "\n"
       "退出码: 0 成功 / 1 失败或被拒绝 / 2 用法错误\n",
       program);
@@ -279,9 +298,8 @@ bool DescribeServerState(const std::string& root_directory, std::string* text) {
 bool AcquireDestructiveLock(const std::string& root_directory, FileLock* lock,
                             std::string* error_message) {
   std::string lock_error;
-  const FileLockStatus status =
-      lock->Acquire(RemoteMaintenance::LockFilePath(root_directory),
-                    &lock_error);
+  const FileLockStatus status = lock->Acquire(
+      RemoteMaintenance::LockFilePath(root_directory), &lock_error);
   if (status == FileLockStatus::kAcquired) {
     return true;
   }
@@ -298,45 +316,107 @@ bool AcquireDestructiveLock(const std::string& root_directory, FileLock* lock,
   return false;
 }
 
-bool ResolveUser(RemoteMetadataStore* store, const std::string& selector,
-                 std::int64_t* user_id, std::string* username,
-                 std::string* error_message) {
-  if (selector.empty()) {
-    *error_message = "缺少用户参数（用户 id 或用户名）";
+// 快照 id 允许写成 snapshot:<32 位十六进制>：前缀只是为了和用户选择器看起来
+// 一致，去掉之后仍然按 32 位十六进制校验，规则不放松。
+std::string StripSnapshotPrefix(const std::string& text) {
+  const std::string prefix = "snapshot:";
+  if (text.rfind(prefix, 0) == 0) {
+    return text.substr(prefix.size());
+  }
+  return text;
+}
+
+// 把用户输入变成一个**确切的**账户。三种写法：
+//
+//   id:<编号>      只按 id 找
+//   name:<用户名>  只按用户名找
+//   裸输入         两个候选都查一遍：同时命中就拒绝（绝不猜），只命中一个就用
+//                  那一个，并在 stderr 上说明这次是按哪一种解析的
+//
+// require_explicit（删除操作用 true）：裸输入一律拒绝——删除是不可逆的，不能让
+// 一个"23 到底是编号还是用户名"的疑问决定删掉哪个账户。
+bool ResolveUser(RemoteMetadataStore* store, const std::string& selector_text,
+                 bool require_explicit, std::int64_t* user_id,
+                 std::string* username, std::string* error_message) {
+  UserSelector selector;
+  std::string parse_error;
+  if (!ParseUserSelector(selector_text, &selector, &parse_error)) {
+    *error_message = parse_error;
     return false;
   }
+  if (require_explicit && selector.kind == UserSelectorKind::kBare) {
+    *error_message =
+        "这是删除操作，必须明确指定用户：请写成 id:<编号> 或 name:<用户名>。"
+        "裸输入 " +
+        selector.text +
+        " 既可能是编号也可能是用户名，管理工具不会替你猜"
+        "（可以先用 show-user 看一眼再删）。";
+    return false;
+  }
+  // 两个候选各查一次：只有把两个结果都摆出来，才谈得上"不猜"。
   RemoteUserRecord record;
+  bool has_id_match = false;
+  bool has_name_match = false;
   std::string store_error;
-  StoreResult result = StoreResult::kNotFound;
-  bool numeric = true;
-  for (const char character : selector) {
-    if (character < '0' || character > '9') {
-      numeric = false;
-      break;
+  if (selector.kind != UserSelectorKind::kName && IsAllDigits(selector.text) &&
+      selector.text.size() <= 18) {
+    RemoteUserRecord by_id;
+    const StoreResult result =
+        store->FindUserById(selector.id, &by_id, &store_error);
+    if (result == StoreResult::kOk) {
+      record = by_id;
+      has_id_match = true;
+    } else if (result != StoreResult::kNotFound) {
+      *error_message = "读取用户记录失败：" + store_error;
+      return false;
     }
   }
-  if (numeric && selector.size() <= 18) {
-    result = store->FindUserById(
-        static_cast<std::int64_t>(std::strtoll(selector.c_str(), nullptr, 10)),
-        &record, &store_error);
-  } else {
+  if (selector.kind != UserSelectorKind::kId) {
     // 用户名先过共享校验器：它只允许 [A-Za-z0-9_.-]，而且**永远不会**被拼进
     // 文件系统路径（磁盘上一律用数字 id）。
     std::string validation_error;
-    if (!IsValidUsername(selector, &validation_error)) {
-      *error_message = "用户参数既不像是 id，也不是合法用户名：" +
-                       validation_error;
-      return false;
+    if (IsValidUsername(selector.text, &validation_error)) {
+      RemoteUserRecord by_name;
+      const StoreResult result =
+          store->FindUser(selector.text, &by_name, &store_error);
+      if (result == StoreResult::kOk) {
+        record = by_name;
+        has_name_match = true;
+      } else if (result != StoreResult::kNotFound) {
+        *error_message = "读取用户记录失败：" + store_error;
+        return false;
+      }
     }
-    result = store->FindUser(selector, &record, &store_error);
   }
-  if (result == StoreResult::kNotFound) {
-    *error_message = "没有这个用户：" + selector;
-    return false;
-  }
-  if (result != StoreResult::kOk) {
-    *error_message = "读取用户记录失败：" + store_error;
-    return false;
+  switch (DecideUserResolution(selector, has_id_match, has_name_match)) {
+    case UserResolution::kAmbiguous:
+      *error_message = AmbiguityMessage(selector.text);
+      return false;
+    case UserResolution::kNotFound:
+      if (selector.kind == UserSelectorKind::kId) {
+        *error_message = "没有 id=" + selector.text + " 的用户";
+      } else if (selector.kind == UserSelectorKind::kName) {
+        *error_message = "没有叫 " + selector.text + " 的用户";
+      } else {
+        *error_message = "没有这个用户：" + selector.text;
+      }
+      return false;
+    case UserResolution::kUseId:
+      if (selector.kind == UserSelectorKind::kBare) {
+        std::fprintf(stderr,
+                     "提示：%s 这次按编号解析（id=%lld）。写成 id:%s 就不会有"
+                     "歧义。\n",
+                     selector.text.c_str(), static_cast<long long>(selector.id),
+                     selector.text.c_str());
+      }
+      break;
+    case UserResolution::kUseName:
+      if (selector.kind == UserSelectorKind::kBare) {
+        std::fprintf(stderr,
+                     "提示：%s 这次按用户名解析。写成 name:%s 就不会有歧义。\n",
+                     selector.text.c_str(), selector.text.c_str());
+      }
+      break;
   }
   *user_id = record.user_id;
   *username = record.username;
@@ -354,8 +434,7 @@ int OpenAll(const Options& options, RemoteMetadataStore* store,
   if (!store->OpenExisting(options.database_path, error_message)) {
     return -1;
   }
-  *maintenance =
-      RemoteMaintenance(store, options.root_directory);
+  *maintenance = RemoteMaintenance(store, options.root_directory);
   if (!maintenance->ready()) {
     *error_message = "维护层没有配置好";
     return -1;
@@ -366,28 +445,37 @@ int OpenAll(const Options& options, RemoteMetadataStore* store,
 // 每次运行都先把"我在看哪个实例"说清楚：主机、部署根、数据根、元数据库、
 // 服务状态（含 PID）。人工验收时这一块必须和下面的列表出现在同一屏里——脱离
 // 上下文的"还没有任何用户"是这次 P0 的直接诱因。
-void PrintIdentity(const Options& options) {
+void PrintIdentity(const Options& options, bool lock_held_by_this_run) {
   const std::string data_root = AbsolutePath(options.root_directory);
   std::printf("Host:        %s\n", HostName().c_str());
   std::printf("Server root: %s\n", ServerRootOf(options).c_str());
   std::printf("Data root:   %s\n", data_root.c_str());
   std::printf("Metadata DB: %s\n", AbsolutePath(options.database_path).c_str());
   std::string state;
-  DescribeServerState(data_root, &state);
+  if (lock_held_by_this_run) {
+    // 破坏性操作会**持有**数据目录锁（见 AcquireDestructiveLock），这时候再去
+    // 试探这把锁一定是 busy——而 busy 的正是本次操作自己拿的锁。直接说清楚：
+    // 谎称"backup-server 正在运行"会让用户以为自己的服务端没停干净。
+    state = "未运行（数据目录锁由本次管理操作持有）";
+  } else {
+    DescribeServerState(data_root, &state);
+  }
   std::printf("Service:     %s\n", state.c_str());
 }
 
-// 统计块。实例身份由 main() 统一在最前面打印一次：这一版**不再**在这里重复打印，
-// 否则 status（菜单首页就是它）会把身份块显示两遍。
+// 统计块。实例身份由 main()
+// 统一在最前面打印一次：这一版**不再**在这里重复打印， 否则
+// status（菜单首页就是它）会把身份块显示两遍。
 void PrintStatus(RemoteMetadataStore* store) {
   RemoteStorageOverview overview;
   std::string error;
   if (store->StorageOverview(&overview, &error) == StoreResult::kOk) {
-    std::printf("用户数：%llu　快照数：%llu　blob 总大小：%s　已注销账户：%llu\n",
-                static_cast<unsigned long long>(overview.user_count),
-                static_cast<unsigned long long>(overview.snapshot_count),
-                FormatSize(overview.total_bytes).c_str(),
-                static_cast<unsigned long long>(overview.deleted_user_count));
+    std::printf(
+        "用户数：%llu　快照数：%llu　blob 总大小：%s　已注销账户：%llu\n",
+        static_cast<unsigned long long>(overview.user_count),
+        static_cast<unsigned long long>(overview.snapshot_count),
+        FormatSize(overview.total_bytes).c_str(),
+        static_cast<unsigned long long>(overview.deleted_user_count));
   } else {
     std::printf("统计失败：%s\n", error.c_str());
   }
@@ -422,7 +510,8 @@ int CommandShowUser(RemoteMetadataStore* store, const std::string& selector) {
   std::int64_t user_id = 0;
   std::string username;
   std::string error;
-  if (!ResolveUser(store, selector, &user_id, &username, &error)) {
+  if (!ResolveUser(store, selector, /*require_explicit=*/false, &user_id,
+                   &username, &error)) {
     std::fprintf(stderr, "%s\n", error.c_str());
     return 1;
   }
@@ -481,7 +570,8 @@ int CommandListSnapshots(RemoteMetadataStore* store,
   std::int64_t user_id = 0;
   std::string username;
   std::string error;
-  if (!ResolveUser(store, selector, &user_id, &username, &error)) {
+  if (!ResolveUser(store, selector, /*require_explicit=*/false, &user_id,
+                   &username, &error)) {
     std::fprintf(stderr, "%s\n", error.c_str());
     return 1;
   }
@@ -498,7 +588,10 @@ int CommandListSnapshots(RemoteMetadataStore* store,
 }
 
 int CommandShowSnapshot(RemoteMetadataStore* store,
-                        const std::string& snapshot_id) {
+                        const std::string& snapshot_id_text) {
+  // 允许写成 snapshot:<32 位十六进制>：前缀只是为了和用户选择器看起来一致，
+  // 去掉之后仍然按 32 位十六进制校验，规则不放松。
+  const std::string snapshot_id = StripSnapshotPrefix(snapshot_id_text);
   std::string validation_error;
   if (!IsValidSnapshotId(snapshot_id, &validation_error)) {
     std::fprintf(stderr, "快照 id 不合法：%s\n", validation_error.c_str());
@@ -570,11 +663,10 @@ int CommandOverview(RemoteMetadataStore* store,
     if (limit > 0) {
       std::printf("占用最多的用户：\n");
       for (std::size_t index = 0; index < limit; ++index) {
-        std::printf("  %-24s %10s（%llu 个备份）\n",
-                    users[index].username.c_str(),
-                    FormatSize(users[index].total_bytes).c_str(),
-                    static_cast<unsigned long long>(
-                        users[index].snapshot_count));
+        std::printf(
+            "  %-24s %10s（%llu 个备份）\n", users[index].username.c_str(),
+            FormatSize(users[index].total_bytes).c_str(),
+            static_cast<unsigned long long>(users[index].snapshot_count));
       }
     }
   }
@@ -583,8 +675,10 @@ int CommandOverview(RemoteMetadataStore* store,
 
 int CommandDeleteSnapshot(RemoteMetadataStore* store,
                           RemoteMaintenance* maintenance,
-                          const Options& options, const std::string& snapshot_id,
+                          const Options& options,
+                          const std::string& snapshot_id_text,
                           std::string* error_message) {
+  const std::string snapshot_id = StripSnapshotPrefix(snapshot_id_text);
   std::string validation_error;
   if (!IsValidSnapshotId(snapshot_id, &validation_error)) {
     *error_message = "快照 id 不合法：" + validation_error;
@@ -598,15 +692,14 @@ int CommandDeleteSnapshot(RemoteMetadataStore* store,
   }
   std::int64_t user_id = 0;
   std::string username;
-  if (!ResolveUser(store, options.user_selector, &user_id, &username,
-                   error_message)) {
+  if (!ResolveUser(store, options.user_selector, /*require_explicit=*/true,
+                   &user_id, &username, error_message)) {
     return 1;
   }
   RemoteSnapshotRecord removed;
   std::string delete_error;
-  const StoreResult result =
-      maintenance->DeleteSnapshot(user_id, snapshot_id, &removed,
-                                  &delete_error);
+  const StoreResult result = maintenance->DeleteSnapshot(
+      user_id, snapshot_id, &removed, &delete_error);
   if (result != StoreResult::kOk) {
     *error_message = "删除失败（磁盘与元数据都保持原样）：" + delete_error;
     return 1;
@@ -618,28 +711,30 @@ int CommandDeleteSnapshot(RemoteMetadataStore* store,
 }
 
 int CommandDeleteUser(RemoteMetadataStore* store,
-                      RemoteMaintenance* maintenance,
-                      const Options& options, const std::string& selector,
-                      std::string* error_message) {
+                      RemoteMaintenance* maintenance, const Options& options,
+                      const std::string& selector, std::string* error_message) {
   std::int64_t user_id = 0;
   std::string username;
-  if (!ResolveUser(store, selector, &user_id, &username, error_message)) {
+  if (!ResolveUser(store, selector, /*require_explicit=*/true, &user_id,
+                   &username, error_message)) {
     return 1;
   }
-  // 二次确认必须写出完整的 "DELETE <用户名>"：一个 y 键按不出不可逆的删除。
-  const std::string expected = "DELETE " + username;
+  // 二次确认必须写出完整的 "DELETE <用户名>#<编号>"：一个 y 键按不出不可逆的
+  // 删除，而且用户名与编号都要出现——同名的两个账户在看这一行的时候就能分清。
+  const std::string expected = "DELETE " + username + "#" +
+                               std::to_string(static_cast<long long>(user_id));
   if (options.confirm != expected) {
-    *error_message = "确认字符串不正确。要真的删除这个账户及其全部云端备份，"
-                     "请加 --confirm \"" +
-                     expected + "\"。";
+    *error_message =
+        "确认字符串不正确。这会不可逆地删除账户 \"" + username +
+        "\"（id=" + std::to_string(static_cast<long long>(user_id)) +
+        "）以及它的全部云端备份，请加 --confirm \"" + expected + "\"。";
     return 1;
   }
   std::uint64_t removed_snapshots = 0;
   std::uint64_t removed_bytes = 0;
   std::string delete_error;
-  const StoreResult result =
-      maintenance->DeleteAccount(user_id, &removed_snapshots, &removed_bytes,
-                                 &delete_error);
+  const StoreResult result = maintenance->DeleteAccount(
+      user_id, &removed_snapshots, &removed_bytes, &delete_error);
   if (result != StoreResult::kOk) {
     *error_message = "删除账户失败（数据与元数据都保持原样）：" + delete_error;
     return 1;
@@ -668,8 +763,8 @@ int main(int argc, char* argv[]) {
     return 2;
   }
 
-  const bool destructive = options.command == "delete-snapshot" ||
-                           options.command == "delete-user";
+  const bool destructive =
+      options.command == "delete-snapshot" || options.command == "delete-user";
 
   // 破坏性操作先抢数据目录锁，再打开数据库：服务端在跑的时候要尽早拒绝，
   // 而且绝不能在"以为安全"的状态下动一个正在被写的目录。
@@ -705,7 +800,9 @@ int main(int argc, char* argv[]) {
     return 1;
   }
   // 每一条命令都先打印实例身份，再打印结果。
-  PrintIdentity(options);
+  // destructive 为真时锁已经在本次进程手里：身份块要如实这么说，而不是
+  // 把"自己持有锁"显示成"backup-server 正在运行"。
+  PrintIdentity(options, destructive);
   std::printf("\n");
   // 维护层的日志只写 stderr：管理工具的输出是给人看的表格，不该被日志混进去。
   maintenance.set_log([](const std::string& message) {
@@ -738,8 +835,9 @@ int main(int argc, char* argv[]) {
                    options.command.c_str());
       return 2;
     }
-    return options.command == "show-user" ? CommandShowUser(&store, selector)
-                                          : CommandListSnapshots(&store, selector);
+    return options.command == "show-user"
+               ? CommandShowUser(&store, selector)
+               : CommandListSnapshots(&store, selector);
   }
   if (options.command == "show-snapshot") {
     std::string snapshot_id;
@@ -756,9 +854,8 @@ int main(int argc, char* argv[]) {
       return 2;
     }
     std::string error;
-    const int status =
-        CommandDeleteSnapshot(&store, &maintenance, options, snapshot_id,
-                              &error);
+    const int status = CommandDeleteSnapshot(&store, &maintenance, options,
+                                             snapshot_id, &error);
     if (status != 0) {
       std::fprintf(stderr, "错误：%s\n", error.c_str());
     }
