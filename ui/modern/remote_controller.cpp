@@ -267,7 +267,8 @@ QString RemoteController::DescribeFailure(const QString& error_kind) {
     return QStringLiteral("账户名不一致，请输入当前账户名以确认注销。");
   }
   if (error_kind == QStringLiteral("name-taken")) {
-    return QStringLiteral("这个用户名已经被占用，换一个再试。");
+    // 与 SurfaceFailureMessage 里的注册文案保持一致：同一个事实只有一种说法。
+    return QStringLiteral("该用户名已被使用，请更换用户名。");
   }
   if (error_kind == QStringLiteral("not-logged-in")) {
     return QStringLiteral("尚未登录或登录状态已经失效，请重新登录后再试。");
@@ -384,6 +385,10 @@ void RemoteController::ResetIdleStatus() {
   if (busy_) {
     return;
   }
+  SetIdleBaseline();
+}
+
+void RemoteController::SetIdleBaseline() {
   if (authenticated_) {
     SetStatus(QStringLiteral("idle"),
               QStringLiteral("已登录：%1").arg(username_), QString());
@@ -474,79 +479,242 @@ void RemoteController::OnProgressNotify() {
 
 // ---- 输入校验 ----
 
-bool RemoteController::AcceptEndpoint(const QString& host,
-                                      const QString& port_text,
-                                      const QString& username) {
+void RemoteController::ReportSurfaceError(ErrorSurface surface,
+                                          const QString& message) {
+  // 错误只写在**触发它的那个位置**：登录表单、注册表单、注销对话框，或者
+  // 页面底部的状态横幅。last_error_kind_ 由调用方先设置好（横幅标题要用
+  // 它），这里只负责把同一句话送到正确的容器里，且同一个容器不重复发信号。
+  switch (surface) {
+    case ErrorSurface::kLogin:
+      if (login_error_ != message) {
+        login_error_ = message;
+        emit loginErrorChanged();
+      }
+      return;
+    case ErrorSurface::kRegister:
+      if (register_error_ != message) {
+        register_error_ = message;
+        emit registerErrorChanged();
+      }
+      return;
+    case ErrorSurface::kDeleteAccount:
+      if (delete_account_error_ != message) {
+        delete_account_error_ = message;
+        emit deleteAccountErrorChanged();
+      }
+      return;
+    case ErrorSurface::kBanner: {
+      // 页面级操作（上传 / 下载 / 刷新 / 删除云端备份）没有"自己的表单"，
+      // 它们的触发点就在页面上，所以继续用这一页底部的状态横幅。
+      //
+      // busy 是"稍后再试"的提示而不是失败：颜色与文案都不该像一次报错。
+      const QString kind = last_error_kind_ == QStringLiteral("busy")
+                               ? QStringLiteral("warning")
+                               : QStringLiteral("error");
+      SetStatus(kind, TitleForFailure(last_error_kind_), message);
+      return;
+    }
+  }
+}
+
+void RemoteController::ClearSurfaceError(ErrorSurface surface) {
+  switch (surface) {
+    case ErrorSurface::kLogin:
+      if (!login_error_.isEmpty()) {
+        login_error_.clear();
+        emit loginErrorChanged();
+      }
+      return;
+    case ErrorSurface::kRegister:
+      if (!register_error_.isEmpty()) {
+        register_error_.clear();
+        emit registerErrorChanged();
+      }
+      return;
+    case ErrorSurface::kDeleteAccount:
+      if (!delete_account_error_.isEmpty()) {
+        delete_account_error_.clear();
+        emit deleteAccountErrorChanged();
+      }
+      return;
+    case ErrorSurface::kBanner:
+      return;
+  }
+}
+
+bool RemoteController::ValidateEndpoint(const QString& host,
+                                        const QString& port_text,
+                                        const QString& username,
+                                        ErrorSurface surface, QString* out_host,
+                                        int* out_port, QString* out_username) {
+  last_error_kind_ = QStringLiteral("validation");
   const QString trimmed_host = host.trimmed();
   if (trimmed_host.isEmpty()) {
-    SetStatus(QStringLiteral("error"), QStringLiteral("服务器地址不能为空"),
-              QStringLiteral("填写服务器地址，例如 127.0.0.1。"));
+    ReportSurfaceError(surface, QStringLiteral("请输入服务器地址"));
     return false;
   }
   bool port_ok = false;
   const int port = port_text.trimmed().toInt(&port_ok);
   if (!port_ok || port < 1 || port > 65535) {
-    SetStatus(QStringLiteral("error"), QStringLiteral("端口不合法"),
-              QStringLiteral("端口要填 1 到 65535 之间的整数。"));
+    ReportSurfaceError(surface,
+                       QStringLiteral("端口要填 1 到 65535 之间的整数"));
     return false;
   }
-  const std::string user = username.trimmed().toStdString();
+  const QString trimmed_username = username.trimmed();
+  if (trimmed_username.isEmpty()) {
+    // "还没填"和"填错了"是两句不同的话：前者用户只是没写完，后者才是格式问题。
+    ReportSurfaceError(surface, QStringLiteral("请输入用户名"));
+    return false;
+  }
+  const std::string user = trimmed_username.toStdString();
   std::string user_error;
   // 复用共享校验器：规则只有一份，"3..64 字节、[A-Za-z0-9_.-]"不在 QML 里重写。
   if (!backupproject::net::IsValidUsername(user, &user_error)) {
-    SetStatus(QStringLiteral("error"), QStringLiteral("用户名不合法"),
-              QStringLiteral("用户名要 3 到 64 个字节，只能用字母、数字、"
-                             "点、下划线或减号。"));
+    ReportSurfaceError(
+        surface, QStringLiteral("用户名只能包含字母、数字、点、下划线或减号"));
     std::fprintf(stderr, "[remote] 用户名不合法：%s\n", user_error.c_str());
     return false;
   }
-  const QString trimmed_username = QString::fromStdString(user);
-  if (endpoint_.host != trimmed_host.toStdString() ||
-      endpoint_.port != static_cast<std::uint16_t>(port) ||
-      username_ != trimmed_username) {
-    endpoint_.host = trimmed_host.toStdString();
-    endpoint_.port = static_cast<std::uint16_t>(port);
-    username_ = trimmed_username;
-    emit endpointChanged();
+  if (out_host != nullptr) {
+    *out_host = trimmed_host;
+  }
+  if (out_port != nullptr) {
+    *out_port = port;
+  }
+  if (out_username != nullptr) {
+    *out_username = trimmed_username;
   }
   return true;
 }
 
-bool RemoteController::AcceptPassword(const QString& password) {
+void RemoteController::CommitEndpoint(const QString& host, int port,
+                                      const QString& username) {
+  // 只有全部输入都通过校验之后才动"上一次生效的地址"：被拒的输入连这个状态
+  // 都不改，界面上显示的连接目标永远是**真的用过**的那一个。
+  if (endpoint_.host == host.toStdString() &&
+      endpoint_.port == static_cast<std::uint16_t>(port) &&
+      username_ == username) {
+    return;
+  }
+  endpoint_.host = host.toStdString();
+  endpoint_.port = static_cast<std::uint16_t>(port);
+  username_ = username;
+  emit endpointChanged();
+}
+
+bool RemoteController::ValidatePassword(const QString& password,
+                                        ErrorSurface surface) {
+  last_error_kind_ = QStringLiteral("validation");
+  if (password.isEmpty()) {
+    ReportSurfaceError(surface, QStringLiteral("请输入密码"));
+    return false;
+  }
   const std::string bytes = password.toStdString();
   // 长度下限来自共享常量（服务端注册时的同一条策略），数字不在 QML 里重写。
   if (bytes.size() < backupproject::net::kMinPasswordBytes) {
-    SetStatus(QStringLiteral("error"), QStringLiteral("密码太短"),
-              QStringLiteral("密码至少要 %1 个字符。")
-                  .arg(backupproject::net::kMinPasswordBytes));
+    ReportSurfaceError(surface,
+                       QStringLiteral("密码至少需要 %1 个字符")
+                           .arg(backupproject::net::kMinPasswordBytes));
     return false;
   }
   std::string password_error;
   if (!backupproject::net::IsValidPassword(bytes, &password_error)) {
-    SetStatus(QStringLiteral("error"), QStringLiteral("密码不合法"),
-              QStringLiteral("密码不能超过 256 字节，也不能包含空字符。"));
+    ReportSurfaceError(
+        surface, QStringLiteral("密码不能超过 256 字节，也不能包含空字符"));
     std::fprintf(stderr, "[remote] 密码不合法：%s\n", password_error.c_str());
     return false;
   }
   return true;
 }
 
+bool RemoteController::ValidateCurrentPassword(const QString& password) {
+  last_error_kind_ = QStringLiteral("validation");
+  if (password.isEmpty()) {
+    ReportSurfaceError(ErrorSurface::kDeleteAccount,
+                       QStringLiteral("请输入当前密码"));
+    return false;
+  }
+  const std::string bytes = password.toStdString();
+  if (bytes.size() < backupproject::net::kMinPasswordBytes) {
+    ReportSurfaceError(ErrorSurface::kDeleteAccount,
+                       QStringLiteral("当前密码至少需要 %1 个字符")
+                           .arg(backupproject::net::kMinPasswordBytes));
+    return false;
+  }
+  return true;
+}
+
+QString RemoteController::SurfaceFailureMessage(RemoteOpResult::Kind kind,
+                                                const QString& error_kind,
+                                                const QString& fallback) const {
+  const bool network = error_kind == QStringLiteral("network");
+  const bool server_side = error_kind == QStringLiteral("server") ||
+                           error_kind == QStringLiteral("rejected") ||
+                           error_kind == QStringLiteral("unknown");
+  switch (kind) {
+    case RemoteOpResult::Kind::kLogin:
+      // 账户枚举防护：用户不存在与密码错误回**同一句话**，界面不泄露账号是否存在。
+      if (error_kind == QStringLiteral("credentials")) {
+        return QStringLiteral("用户名或密码错误");
+      }
+      if (network) {
+        return QStringLiteral("无法连接到服务器，请稍后重试");
+      }
+      if (server_side) {
+        return QStringLiteral("服务器暂时无法完成登录");
+      }
+      break;
+    case RemoteOpResult::Kind::kRegister:
+      if (error_kind == QStringLiteral("name-taken")) {
+        return QStringLiteral("该用户名已被使用，请更换用户名");
+      }
+      if (network) {
+        return QStringLiteral("无法连接到服务器，请稍后重试");
+      }
+      if (server_side) {
+        return QStringLiteral("服务器暂时无法完成注册");
+      }
+      break;
+    case RemoteOpResult::Kind::kDeleteAccount:
+      if (error_kind == QStringLiteral("account-password")) {
+        return QStringLiteral("当前密码不正确，账户与全部云端备份都没有被删除");
+      }
+      if (error_kind == QStringLiteral("not-logged-in")) {
+        return QStringLiteral("登录状态已经失效，账户未注销，请重新登录");
+      }
+      if (network) {
+        return QStringLiteral("网络连接中断，账户未注销，请重试");
+      }
+      if (server_side) {
+        return QStringLiteral("服务器暂时无法完成注销，账户未注销");
+      }
+      break;
+    default:
+      break;
+  }
+  return fallback;
+}
 bool RemoteController::BeginOperation(const QString& action_text,
-                                      bool need_login) {
+                                      bool need_login, ErrorSurface surface) {
   if (busy_) {
     // 控制器层的真闸门：QML 的 enabled 只是可见性，同一个回合里的第二个请求
     // 在这里被拒——不排队，也不和正在跑的那一个抢同一条连接。
     last_error_kind_ = QStringLiteral("busy");
-    SetStatus(QStringLiteral("warning"), QStringLiteral("操作正在进行"),
-              QStringLiteral("正在%1，等它结束之后再试。")
-                  .arg(busy_action_.isEmpty() ? QStringLiteral("处理上一个请求")
-                                              : busy_action_));
+    ReportSurfaceError(surface, QStringLiteral("正在%1，请等它结束后再试")
+                                    .arg(busy_action_.isEmpty()
+                                             ? QStringLiteral("处理上一个请求")
+                                             : busy_action_));
     return false;
   }
   if (need_login && !authenticated_) {
     last_error_kind_ = QStringLiteral("not-logged-in");
-    SetStatus(QStringLiteral("error"), TitleForFailure(last_error_kind_),
-              DescribeFailure(last_error_kind_));
+    // 在注销对话框里点"确认注销"时登录态已经失效：这句话要留在对话框里，
+    // 而且必须明确说"账户没有被删"。
+    ReportSurfaceError(
+        surface,
+        surface == ErrorSurface::kDeleteAccount
+            ? QStringLiteral("登录状态已经失效，账户未注销，请重新登录")
+            : DescribeFailure(last_error_kind_));
     return false;
   }
   last_error_kind_ = QStringLiteral("none");
@@ -721,23 +889,47 @@ void RemoteController::ApplyResult(const RemoteOpResult& result) {
         emit sessionChanged();
       }
     }
-    if (result.kind == RemoteOpResult::Kind::kDeleteAccount) {
-      // 注销的失败原因进对话框自己的错误行（成功时在下面的 switch 里清掉）。
-      delete_account_error_ = result.message;
-      emit deleteAccountErrorChanged();
+    // 失败的归属：登录失败进登录表单的错误行，注册失败进注册表单的错误行，
+    // 注销失败进对话框自己的错误行——三个界面各自说自己的话。页面底部的横幅
+    // 留给上传 / 下载 / 刷新 / 删除云端备份这些**页面级**操作：它们在页面上
+    // 触发，也在页面上回报。
+    const QString message =
+        SurfaceFailureMessage(result.kind, result.error_kind, result.message);
+    // 登录 / 注册 / 注销各自有错误行：原因写在那里，页面底部的横幅也不能继续
+    // 挂着"正在登录"这种已经过期的运行状态（那是"点了没反应"的另一面：按钮
+    // 早就停了，横幅还在转，而且 running 还是跨页可见的全局状态）。
+    const bool has_own_surface =
+        result.kind == RemoteOpResult::Kind::kLogin ||
+        result.kind == RemoteOpResult::Kind::kRegister ||
+        result.kind == RemoteOpResult::Kind::kDeleteAccount;
+    if (has_own_surface) {
+      SetIdleBaseline();
     }
-    SetStatus(QStringLiteral("error"), TitleForFailure(result.error_kind),
-              result.message);
-    return;
+    switch (result.kind) {
+      case RemoteOpResult::Kind::kLogin:
+        ReportSurfaceError(ErrorSurface::kLogin, message);
+        return;
+      case RemoteOpResult::Kind::kRegister:
+        ReportSurfaceError(ErrorSurface::kRegister, message);
+        return;
+      case RemoteOpResult::Kind::kDeleteAccount:
+        ReportSurfaceError(ErrorSurface::kDeleteAccount, message);
+        return;
+      default:
+        ReportSurfaceError(ErrorSurface::kBanner, message);
+        return;
+    }
   }
 
   switch (result.kind) {
     case RemoteOpResult::Kind::kRegister:
+      ClearSurfaceError(ErrorSurface::kRegister);
       authenticated_ = false;
       SetStatus(QStringLiteral("success"), QStringLiteral("注册成功"),
                 QStringLiteral("账号已经创建，现在可以点“登录”。"));
       break;
     case RemoteOpResult::Kind::kLogin:
+      ClearSurfaceError(ErrorSurface::kLogin);
       if (!authenticated_) {
         authenticated_ = true;
         emit sessionChanged();
@@ -784,8 +976,11 @@ void RemoteController::ApplyResult(const RemoteOpResult& result) {
       //
       // 这一组更新必须一起发生：只要还有一处留着旧状态，界面就会出现"服务端
       // 已经删了、本机还显示已登录"这种自相矛盾的样子（人工验收见过）。
-      delete_account_error_.clear();
-      emit deleteAccountErrorChanged();
+      // 账户已经不存在了：三个错误行一起清掉，免得注销成功之后登录表单里还
+      // 留着上一次"用户名或密码错误"这种已经不成立的话。
+      ClearSurfaceError(ErrorSurface::kDeleteAccount);
+      ClearSurfaceError(ErrorSurface::kLogin);
+      ClearSurfaceError(ErrorSurface::kRegister);
       authenticated_ = false;
       client_.Disconnect();
       password_.fill(QChar(0));
@@ -810,29 +1005,43 @@ bool RemoteController::registerAccount(const QString& host,
                                        const QString& username,
                                        const QString& password,
                                        const QString& confirm_password) {
-  // 两次输入必须一致：不一致时**一个字节都不发**。这条检查放在最前面
-  // （早于 AcceptEndpoint），所以连"上一次生效的地址"都不会被这次输入改掉。
+  // 上一次的失败原因先清掉：重新提交之后，表单里留下的必须是这一次的结果。
+  ClearSurfaceError(ErrorSurface::kRegister);
+  // 校验顺序是"填没填 → 合不合法 → 两次一不一样"。任何一步被拒都**一个字节
+  // 都不发**，而且被拒的输入连"上一次生效的地址"都不会改：地址要等全部校验
+  // 通过之后才提交。
+  QString valid_host;
+  QString valid_username;
+  int valid_port = 0;
+  if (!ValidateEndpoint(host, port_text, username, ErrorSurface::kRegister,
+                        &valid_host, &valid_port, &valid_username)) {
+    return false;
+  }
+  if (!ValidatePassword(password, ErrorSurface::kRegister)) {
+    return false;
+  }
+  if (confirm_password.isEmpty()) {
+    last_error_kind_ = QStringLiteral("validation");
+    ReportSurfaceError(ErrorSurface::kRegister,
+                       QStringLiteral("请再输入一次密码以确认"));
+    return false;
+  }
   if (password != confirm_password) {
     last_error_kind_ = QStringLiteral("password-mismatch");
-    SetStatus(QStringLiteral("error"), QStringLiteral("两次输入的密码不一致"),
-              QStringLiteral("请重新输入，两个密码框必须完全相同。"));
+    ReportSurfaceError(ErrorSurface::kRegister,
+                       QStringLiteral("两次输入的密码不一致，请重新输入"));
     return false;
   }
-  if (!AcceptEndpoint(host, port_text, username)) {
-    return false;
-  }
-  if (!AcceptPassword(password)) {
-    return false;
-  }
-  if (!BeginOperation(QStringLiteral("正在注册账号"),
-                      /*need_login=*/false)) {
+  CommitEndpoint(valid_host, valid_port, valid_username);
+  if (!BeginOperation(QStringLiteral("正在注册账号"), /*need_login=*/false,
+                      ErrorSurface::kRegister)) {
     return false;
   }
   password_ = password;
   RemoteRequest request;
   request.kind = RemoteOpResult::Kind::kRegister;
   request.endpoint = endpoint_;
-  request.username = username_.toStdString();
+  request.username = valid_username.toStdString();
   request.password = password.toStdString();
   Submit(request);
   return true;
@@ -840,26 +1049,31 @@ bool RemoteController::registerAccount(const QString& host,
 
 bool RemoteController::login(const QString& host, const QString& port_text,
                              const QString& username, const QString& password) {
-  if (!AcceptEndpoint(host, port_text, username)) {
+  ClearSurfaceError(ErrorSurface::kLogin);
+  QString valid_host;
+  QString valid_username;
+  int valid_port = 0;
+  if (!ValidateEndpoint(host, port_text, username, ErrorSurface::kLogin,
+                        &valid_host, &valid_port, &valid_username)) {
     return false;
   }
-  if (!AcceptPassword(password)) {
+  if (!ValidatePassword(password, ErrorSurface::kLogin)) {
     return false;
   }
-  if (!BeginOperation(QStringLiteral("正在登录"),
-                      /*need_login=*/false)) {
+  CommitEndpoint(valid_host, valid_port, valid_username);
+  if (!BeginOperation(QStringLiteral("正在登录"), /*need_login=*/false,
+                      ErrorSurface::kLogin)) {
     return false;
   }
   password_ = password;
   RemoteRequest request;
   request.kind = RemoteOpResult::Kind::kLogin;
   request.endpoint = endpoint_;
-  request.username = username_.toStdString();
+  request.username = valid_username.toStdString();
   request.password = password.toStdString();
   Submit(request);
   return true;
 }
-
 void RemoteController::logoutLocal() {
   if (busy_) {
     // 传输中不给退：会话正是这次传输的一部分。
@@ -986,30 +1200,49 @@ bool RemoteController::deleteSnapshot(const QString& snapshot_id) {
 }
 
 void RemoteController::clearDeleteAccountError() {
-  if (delete_account_error_.isEmpty()) {
-    return;
-  }
-  delete_account_error_.clear();
-  emit deleteAccountErrorChanged();
+  ClearSurfaceError(ErrorSurface::kDeleteAccount);
+}
+
+void RemoteController::clearLoginError() {
+  ClearSurfaceError(ErrorSurface::kLogin);
+}
+
+void RemoteController::clearRegisterError() {
+  ClearSurfaceError(ErrorSurface::kRegister);
 }
 
 bool RemoteController::deleteAccount(const QString& password,
                                      const QString& username_confirmation) {
   // 重新提交时先把上一次的错误行清掉：否则用户看到的会是两次不同尝试的原因。
   clearDeleteAccountError();
+  const QString confirm = username_confirmation.trimmed();
+  // "两样都没填"和"只填了一样"要给三句不同的话：否则用户按完按钮还是不知道
+  // 自己漏了什么。全部检查都在**本地**做，任何一条不过都不发请求。
+  if (password.isEmpty() && confirm.isEmpty()) {
+    last_error_kind_ = QStringLiteral("validation");
+    ReportSurfaceError(ErrorSurface::kDeleteAccount,
+                       QStringLiteral("请输入当前密码，并输入账户名以确认"));
+    return false;
+  }
+  if (!ValidateCurrentPassword(password)) {
+    return false;
+  }
+  if (confirm.isEmpty()) {
+    last_error_kind_ = QStringLiteral("validation");
+    ReportSurfaceError(ErrorSurface::kDeleteAccount,
+                       QStringLiteral("请输入账户名以确认注销"));
+    return false;
+  }
   // 二次确认：必须逐字敲出当前账户名。少一个字符都不发请求——注销是不可撤销
   // 的服务端删除，不能是一个"点快了就没了"的按钮。
-  if (username_confirmation.trimmed() != username_) {
+  if (confirm != username_) {
     last_error_kind_ = QStringLiteral("confirm-mismatch");
-    SetStatus(
-        QStringLiteral("error"), QStringLiteral("账户名不一致"),
-        QStringLiteral("请输入当前账户名 %1 以确认注销。").arg(username_));
+    ReportSurfaceError(ErrorSurface::kDeleteAccount,
+                       QStringLiteral("输入的账户名与当前账户不一致"));
     return false;
   }
-  if (!AcceptPassword(password)) {
-    return false;
-  }
-  if (!BeginOperation(QStringLiteral("正在注销账户"), /*need_login=*/true)) {
+  if (!BeginOperation(QStringLiteral("正在注销账户"), /*need_login=*/true,
+                      ErrorSurface::kDeleteAccount)) {
     return false;
   }
   RemoteRequest request;
@@ -1019,7 +1252,6 @@ bool RemoteController::deleteAccount(const QString& password,
   Submit(request);
   return true;
 }
-
 bool RemoteController::waitForIdle(int timeout_ms) {
   QEventLoop loop;
   QTimer poll;

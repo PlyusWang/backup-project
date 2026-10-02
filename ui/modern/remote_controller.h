@@ -179,6 +179,11 @@ class RemoteController : public QObject {
   // 出现在这一页底部：用户是在对话框里点的"确认注销"，结果也应该在那里看到。
   Q_PROPERTY(QString deleteAccountError READ deleteAccountError NOTIFY
                  deleteAccountErrorChanged)
+  // 登录 / 注册表单各自的错误行。同一条规则：错误写在**触发它的那个表单**
+  // 里——用户点了"登录"，反馈就出现在登录框下面，而不是页面最底下。
+  Q_PROPERTY(QString loginError READ loginError NOTIFY loginErrorChanged)
+  Q_PROPERTY(
+      QString registerError READ registerError NOTIFY registerErrorChanged)
 
  public:
   explicit RemoteController(QObject* parent = nullptr);
@@ -211,6 +216,8 @@ class RemoteController : public QObject {
   QString statusScope() const;
   QString lastErrorKind() const { return last_error_kind_; }
   QString deleteAccountError() const { return delete_account_error_; }
+  QString loginError() const { return login_error_; }
+  QString registerError() const { return register_error_; }
   QString diagnosticText() const {
     return QString::fromStdString(last_detail_);
   }
@@ -251,6 +258,9 @@ class RemoteController : public QObject {
   Q_INVOKABLE void clearStatus();
   // 打开注销对话框 / 重新提交时清掉上一次的错误行。
   Q_INVOKABLE void clearDeleteAccountError();
+  // 输入框一被编辑就清掉对应表单的错误行：旧原因不能挂在新输入上。
+  Q_INVOKABLE void clearLoginError();
+  Q_INVOKABLE void clearRegisterError();
 
   // 文件对话框的 URL 互转与其它页面同一套实现。
   Q_INVOKABLE QString localPathFromUrl(const QUrl& url) const;
@@ -277,6 +287,8 @@ class RemoteController : public QObject {
   void sessionChanged();
   void reachabilityChanged();
   void deleteAccountErrorChanged();
+  void loginErrorChanged();
+  void registerErrorChanged();
   void busyChanged();
   void snapshotsChanged();
   void progressChanged();
@@ -288,13 +300,32 @@ class RemoteController : public QObject {
   // 传输方向。用整数原子变量跨线程传，避免在后台线程碰 QString。
   enum class Phase { kNone = 0, kUpload = 1, kDownload = 2 };
 
-  // 输入校验：合规时填好 endpoint_/username_，否则写状态条并返回 false。
-  bool AcceptEndpoint(const QString& host, const QString& port_text,
-                      const QString& username);
+  // 一条错误该出现在哪里。三个表单各自有错误行，页面级操作用底部横幅。
+  enum class ErrorSurface { kLogin, kRegister, kDeleteAccount, kBanner };
+
+  // 把一句话送到指定的错误容器（同一个容器里不重复发信号）。
+  void ReportSurfaceError(ErrorSurface surface, const QString& message);
+  void ClearSurfaceError(ErrorSurface surface);
+  // 输入校验：合规时把结果写进 out_*，否则把原因写进 surface 的错误行并返回
+  // false。**不**改动 endpoint_/username_——那是 CommitEndpoint 的事，所以
+  // 被拒的输入不会污染"上一次生效的地址"。
+  bool ValidateEndpoint(const QString& host, const QString& port_text,
+                        const QString& username, ErrorSurface surface,
+                        QString* out_host, int* out_port,
+                        QString* out_username);
+  void CommitEndpoint(const QString& host, int port, const QString& username);
   // 口令校验：长度下限来自共享常量，上限与 NUL 规则来自共享校验器。
-  bool AcceptPassword(const QString& password);
-  // 提交前的统一闸门：busy 与"是否已登录"都在这里挡住。
-  bool BeginOperation(const QString& action_text, bool need_login);
+  bool ValidatePassword(const QString& password, ErrorSurface surface);
+  // 注销对话框里的"当前密码"：空值、过短各给一句自己的话。
+  bool ValidateCurrentPassword(const QString& password);
+  // 失败信息按**操作**改写：同一个 error_kind 在登录 / 注册 / 注销三种场景
+  // 下要说三句不同的话，而且都要说清"数据有没有变化"。
+  QString SurfaceFailureMessage(RemoteOpResult::Kind kind,
+                                const QString& error_kind,
+                                const QString& fallback) const;
+  // 提交前的统一闸门：busy 与"是否已登录"都在这里挡住，原因写进 surface。
+  bool BeginOperation(const QString& action_text, bool need_login,
+                      ErrorSurface surface = ErrorSurface::kBanner);
   // 提交一次后台操作。**调用前必须已经通过 BeginOperation**：busy_ 在提交之前
   // 同步置位，所以任何一个时刻只可能有一个 watcher 在跑，也就不存在"旧结果
   // 覆盖新状态"的窗口（async stale-result 的结构性防线）。
@@ -305,6 +336,9 @@ class RemoteController : public QObject {
   void ApplyResult(const RemoteOpResult& result);
   // 空闲基线：把这一页的临时提示换成"当前真实的连接状态"。
   void ResetIdleStatus();
+  // 同一条基线，但**不看 busy_**：一次操作的失败结果是在 SetBusy(false) 之前
+  // 处理的，那时横幅上还挂着"正在登录"这类已经过期的运行状态。
+  void SetIdleBaseline();
 
   // 后台线程里跑的那一段。只用参数与局部变量，不碰任何成员状态。
   static RemoteOpResult RunOperation(
@@ -362,6 +396,8 @@ class RemoteController : public QObject {
   QString last_error_kind_ = QStringLiteral("none");
   std::string last_detail_;
   QString delete_account_error_;
+  QString login_error_;
+  QString register_error_;
 
   // 上一次连接尝试的结果。默认"不知道"：界面在真的试过之前什么都不说。
   RemoteReachability reachability_ = RemoteReachability::kUnknown;
