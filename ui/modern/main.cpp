@@ -2500,8 +2500,16 @@ int RunRemoteTest(QQuickWindow* window, backup_modern::RemoteController* remote,
                 objectByName("remoteRegisterButton") != nullptr &&
                 objectByName("remoteDeleteAccountButton") != nullptr &&
                 objectByName("remoteAccountText") != nullptr &&
-                objectByName("remoteRegisterMismatch") != nullptr,
-            QStringLiteral("REMOTE-02 账户区域是一个分段的登录 / 注册控件"));
+                objectByName("remoteRegisterMismatch") != nullptr &&
+                objectByName("remoteLoginError") != nullptr &&
+                objectByName("remoteRegisterError") != nullptr,
+            QStringLiteral("REMOTE-02 账户区域是一个分段的登录 / 注册控件，"
+                           "两张表单各自带着自己的错误行"));
+  // 冗余状态文本：账户卡片已经说了"当前账户"和"状态：已登录"，页面上不允许
+  // 再有第三行重复同一个事实（人工验收点名的那一行）。
+  run.Check(objectByName("remoteSessionText") == nullptr &&
+                objectByName("remoteAccountStateText") != nullptr,
+            QStringLiteral("REMOTE-02 页面里没有第三行重复的登录状态文本"));
 
   // ---- REMOTE-03：未登录时 list / upload / download / delete 一律不被允许
   // ----
@@ -2591,21 +2599,27 @@ int RunRemoteTest(QQuickWindow* window, backup_modern::RemoteController* remote,
   // 的输入连 endpoint 都没有改（更不可能发请求）。
   const QString endpoint_before_host = remote->host();
   const QString endpoint_before_port = remote->portText();
+  const QString banner_before_mismatch = remote->statusTitle();
   const bool mismatch_accepted =
       remote->registerAccount(QStringLiteral("192.0.2.1"), QStringLiteral("9"),
                               QStringLiteral("local-only-check"), password,
                               password + QStringLiteral("x"));
   const QString mismatch_kind = remote->lastErrorKindForTest();
-  const QString mismatch_title = remote->statusTitle();
-  run.Check(!mismatch_accepted &&
-                mismatch_kind == QStringLiteral("password-mismatch") &&
-                mismatch_title == QStringLiteral("两次输入的密码不一致") &&
-                remote->host() == endpoint_before_host &&
-                remote->portText() == endpoint_before_port && !remote->busy(),
-            QStringLiteral("REMOTE-05a 两次密码不一致：本地拒绝且不发网络请求"),
-            mismatch_kind + QStringLiteral(": ") + mismatch_title +
-                QStringLiteral(" / ") + remote->host() + QStringLiteral(":") +
-                remote->portText());
+  // 错误必须出现在**触发它的那张表单**里（人工验收："点了没反应"的根因就是
+  // 校验失败只写了页面底部的横幅，甚至只打了终端日志）。
+  const QString mismatch_row = remote->registerError();
+  run.Check(
+      !mismatch_accepted &&
+          mismatch_kind == QStringLiteral("password-mismatch") &&
+          mismatch_row == QStringLiteral("两次输入的密码不一致，请重新输入") &&
+          remote->statusTitle() == banner_before_mismatch &&
+          remote->host() == endpoint_before_host &&
+          remote->portText() == endpoint_before_port && !remote->busy(),
+      QStringLiteral("REMOTE-05a 两次密码不一致：本地拒绝、只写在注册"
+                     "表单里、横幅不动且不发网络请求"),
+      mismatch_kind + QStringLiteral(": ") + mismatch_row +
+          QStringLiteral(" / ") + remote->host() + QStringLiteral(":") +
+          remote->portText());
 
   run.Check(remote->registerAccount(host, port_text, user, password, password),
             QStringLiteral("REMOTE-05 注册请求被受理"));
@@ -2631,6 +2645,153 @@ int RunRemoteTest(QQuickWindow* window, backup_modern::RemoteController* remote,
             QStringLiteral("之前 %1 个文件，之后 %2 个文件")
                 .arg(state_before.size())
                 .arg(snapshotDirectory(state_directory).size()));
+
+  // ---- REMOTE-17：每一次主动操作的反馈矩阵（GUI 校验 / 反馈归属）----
+  //
+  // 验收标准是"用户每一次主动操作，无论成功、输入非法、认证失败、网络失败还是
+  // 服务器失败，都能从当前交互位置知道发生了什么"。这张表把登录 / 注册 / 注销
+  // 三种动作的**非法输入**逐条铺开，每一条都要求：
+  //
+  //   1) 返回值说明请求没有被受理；
+  //   2) 原因出现在**触发它的那张表单自己的错误行**里（loginError /
+  //      registerError / deleteAccountError）——不再是"点了没反应"；
+  //   3) 页面底部的横幅不被占用：横幅是上传 / 下载 / 刷新 / 删除云端备份
+  //      这些页面级操作的地盘；
+  //   4) 另外两张表单的错误行保持干净：错误没有串台；
+  //   5) busy 仍然是 false。Submit() 只可能发生在 BeginOperation 之后，而
+  //      BeginOperation 会同步置位 busy_，所以"busy 还是 false"就等于"这一
+  //      次一个字节都没有发出去"。下面紧跟一条正向对照，证明这条判别式真的
+  //      能区分"发了"和"没发"。
+  {
+    struct ValidationCase {
+      const char* label;
+      int surface;  // 0=登录 1=注册 2=注销
+      QString host;
+      QString port;
+      QString user;
+      QString password;
+      QString confirm;
+      QString expect_message;
+      QString expect_kind;
+    };
+    const QString good_host = host;
+    const QString good_port = port_text;
+    const QString good_user = user;
+    const QString good_password = password;
+    const ValidationCase cases[] = {
+        {"REMOTE-17 登录：地址为空", 0, QString(), good_port, good_user,
+         good_password, QString(), QStringLiteral("请输入服务器地址"),
+         QStringLiteral("validation")},
+        {"REMOTE-17 登录：端口不是数字", 0, good_host, QStringLiteral("http"),
+         good_user, good_password, QString(),
+         QStringLiteral("端口要填 1 到 65535 之间的整数"),
+         QStringLiteral("validation")},
+        {"REMOTE-17 登录：端口越界", 0, good_host, QStringLiteral("70000"),
+         good_user, good_password, QString(),
+         QStringLiteral("端口要填 1 到 65535 之间的整数"),
+         QStringLiteral("validation")},
+        {"REMOTE-17 登录：用户名为空", 0, good_host, good_port, QString(),
+         good_password, QString(), QStringLiteral("请输入用户名"),
+         QStringLiteral("validation")},
+        {"REMOTE-17 登录：用户名太短", 0, good_host, good_port,
+         QStringLiteral("ab"), good_password, QString(),
+         QStringLiteral("用户名只能包含字母、数字、点、下划线或减号"),
+         QStringLiteral("validation")},
+        {"REMOTE-17 登录：用户名含空格", 0, good_host, good_port,
+         QStringLiteral("bad user"), good_password, QString(),
+         QStringLiteral("用户名只能包含字母、数字、点、下划线或减号"),
+         QStringLiteral("validation")},
+        {"REMOTE-17 登录：密码为空", 0, good_host, good_port, good_user,
+         QString(), QString(), QStringLiteral("请输入密码"),
+         QStringLiteral("validation")},
+        {"REMOTE-17 登录：密码太短", 0, good_host, good_port, good_user,
+         QStringLiteral("short"), QString(),
+         QStringLiteral("密码至少需要 8 个字符"), QStringLiteral("validation")},
+        {"REMOTE-17 注册：两次密码不一致", 1, good_host, good_port, good_user,
+         good_password, good_password + QStringLiteral("x"),
+         QStringLiteral("两次输入的密码不一致，请重新输入"),
+         QStringLiteral("password-mismatch")},
+        {"REMOTE-17 注册：确认密码为空", 1, good_host, good_port, good_user,
+         good_password, QString(), QStringLiteral("请再输入一次密码以确认"),
+         QStringLiteral("validation")},
+        {"REMOTE-17 注册：用户名非法", 1, good_host, good_port,
+         QStringLiteral("has space"), good_password, good_password,
+         QStringLiteral("用户名只能包含字母、数字、点、下划线或减号"),
+         QStringLiteral("validation")},
+        {"REMOTE-17 注册：密码太短", 1, good_host, good_port, good_user,
+         QStringLiteral("short"), QStringLiteral("short"),
+         QStringLiteral("密码至少需要 8 个字符"), QStringLiteral("validation")},
+        {"REMOTE-17 注销：两样都没填", 2, good_host, good_port, good_user,
+         QString(), QString(),
+         QStringLiteral("请输入当前密码，并输入账户名以确认"),
+         QStringLiteral("validation")},
+        {"REMOTE-17 注销：只填了密码", 2, good_host, good_port, good_user,
+         good_password, QString(), QStringLiteral("请输入账户名以确认注销"),
+         QStringLiteral("validation")},
+        {"REMOTE-17 注销：只填了账户名", 2, good_host, good_port, good_user,
+         QString(), good_user, QStringLiteral("请输入当前密码"),
+         QStringLiteral("validation")},
+        {"REMOTE-17 注销：账户名不一致", 2, good_host, good_port, good_user,
+         good_password, QStringLiteral("someone-else"),
+         QStringLiteral("输入的账户名与当前账户不一致"),
+         QStringLiteral("confirm-mismatch")},
+        {"REMOTE-17 注销：当前密码太短", 2, good_host, good_port, good_user,
+         QStringLiteral("short"), good_user,
+         QStringLiteral("当前密码至少需要 8 个字符"),
+         QStringLiteral("validation")},
+    };
+    for (const ValidationCase& item : cases) {
+      remote->clearLoginError();
+      remote->clearRegisterError();
+      remote->clearDeleteAccountError();
+      const QString banner_before = remote->statusTitle();
+      bool accepted = false;
+      if (item.surface == 2) {
+        accepted = remote->deleteAccount(item.password, item.confirm);
+      } else if (item.surface == 1) {
+        accepted = remote->registerAccount(item.host, item.port, item.user,
+                                           item.password, item.confirm);
+      } else {
+        accepted =
+            remote->login(item.host, item.port, item.user, item.password);
+      }
+      const QString row = item.surface == 2
+                              ? remote->deleteAccountError()
+                              : (item.surface == 1 ? remote->registerError()
+                                                   : remote->loginError());
+      const bool others_clean =
+          item.surface == 0
+              ? remote->registerError().isEmpty() &&
+                    remote->deleteAccountError().isEmpty()
+              : (item.surface == 1 ? remote->loginError().isEmpty() &&
+                                         remote->deleteAccountError().isEmpty()
+                                   : remote->loginError().isEmpty() &&
+                                         remote->registerError().isEmpty());
+      run.Check(!accepted && row == item.expect_message &&
+                    remote->lastErrorKindForTest() == item.expect_kind &&
+                    remote->statusTitle() == banner_before && others_clean &&
+                    !remote->busy(),
+                QString::fromUtf8(item.label) +
+                    QStringLiteral("：本地拒绝、原因只写进自己的错误行、"
+                                   "横幅不动、一个字节都没发"),
+                row + QStringLiteral(" / kind=") +
+                    remote->lastErrorKindForTest() + QStringLiteral(" / ") +
+                    remote->statusTitle());
+    }
+    // 正向对照：合法输入必须真的被受理（busy 立刻置位）。没有这一条，上面那句
+    // "busy 还是 false 就说明没发出去"只是一个没有被检验过的断言。
+    const bool positive_accepted =
+        remote->login(good_host, good_port, good_user, good_password);
+    const bool positive_busy = remote->busy();
+    const bool positive_finished =
+        positive_accepted && remote->waitForIdle(120000);
+    run.Check(positive_accepted && positive_busy && positive_finished &&
+                  remote->authenticated() && remote->loginError().isEmpty(),
+              QStringLiteral("REMOTE-17 正向对照：合法输入立刻忙起来并成功，"
+                             "成功之后登录错误行被清空"),
+              remote->loginError() + QStringLiteral(" / kind=") +
+                  remote->lastErrorKindForTest());
+  }
 
   // ---- REMOTE-06：用真实引擎生成一份归档并上传 ----
   const QString source = work + QStringLiteral("/source");
@@ -2961,31 +3122,42 @@ int RunRemoteTest(QQuickWindow* window, backup_modern::RemoteController* remote,
   {
     int visible_errors = 0;
     int busy_stuck = 0;
-    QString last_title;
+    QString last_row;
     for (int attempt = 0; attempt < 4; ++attempt) {
       if (!remote->login(host, port_text, user,
                          password + QStringLiteral("-wrong"))) {
-        last_title = remote->statusTitle();
+        // 被本地校验挡下来也算"有反馈"：原因在表单自己的错误行里。
+        last_row = remote->loginError();
         continue;
       }
       remote->waitForIdle(120000);
-      last_title = remote->statusTitle();
+      last_row = remote->loginError();
       if (remote->lastErrorKindForTest() == QStringLiteral("credentials") &&
-          !remote->statusMessage().isEmpty()) {
+          last_row == QStringLiteral("用户名或密码错误")) {
         ++visible_errors;
       }
       if (remote->busy()) {
         ++busy_stuck;
       }
     }
+    // 横幅不能停在"正在登录"上：一次操作结束之后还挂着运行状态，界面就在说
+    // 一件已经不成立的事（而且 running 是跨页可见的全局状态）。登录失败的原因
+    // 只写在登录表单里，横幅回到当前真实状态的基线。
+    const QString banner_kind = remote->statusKind();
+    const QString banner_title = remote->statusTitle();
     run.Check(
-        visible_errors == 4 && busy_stuck == 0 && !remote->authenticated(),
-        QStringLiteral("REMOTE-15A 四次错误口令都有可见错误、都不卡 busy、"
-                       "都没有进入已登录"),
-        QStringLiteral("errors=%1 stuck=%2 title=%3")
+        visible_errors == 4 && busy_stuck == 0 && !remote->authenticated() &&
+            banner_kind != QStringLiteral("running") &&
+            banner_title != QStringLiteral("正在登录") &&
+            remote->statusMessage() != last_row,
+        QStringLiteral("REMOTE-15A 四次错误口令都在登录表单里留下可见错误、"
+                       "都不卡 busy、都没有进入已登录、横幅不留在运行状态"),
+        QStringLiteral("errors=%1 stuck=%2 banner=%3/%4 row=%5")
             .arg(visible_errors)
             .arg(busy_stuck)
-            .arg(last_title));
+            .arg(banner_kind)
+            .arg(banner_title)
+            .arg(last_row));
   }
 
   {
@@ -3078,13 +3250,18 @@ int RunRemoteTest(QQuickWindow* window, backup_modern::RemoteController* remote,
       QStringLiteral("REMOTE-14 口令错误：服务端拒绝，账户与数据都还在"),
       remote->lastErrorKindForTest() + QStringLiteral(": ") +
           remote->lastDetailForTest());
-  // 注销失败必须在**对话框自己的错误行**里留下可见原因（人工验收时这里曾经
-  // 只有终端打印、界面上什么都没有）。
+  // 注销失败必须在**对话框自己的错误行**里留下可见原因，而且**只**在对话框
+  // 里：页面底部的横幅是页面级操作的地盘，对话框里的失败不许外溢到那里
+  // （人工验收见过同一个原因同时出现在两处）。
   run.Check(!wrong_delete_error.isEmpty() &&
-                wrong_delete_error == remote->statusMessage() &&
+                wrong_delete_error ==
+                    QStringLiteral(
+                        "当前密码不正确，账户与全部云端备份都没有被删除") &&
+                remote->statusMessage() != wrong_delete_error &&
                 !remote->lastDetailForTest().isEmpty(),
-            QStringLiteral("REMOTE-14 注销失败在对话框里留下可见错误"),
-            wrong_delete_error);
+            QStringLiteral("REMOTE-14 注销失败只在对话框里留下可见错误"),
+            wrong_delete_error + QStringLiteral(" / banner=") +
+                remote->statusMessage());
   run.Check(
       remote->deleteAccount(password, user) && remote->waitForIdle(120000) &&
           !remote->authenticated() &&
@@ -3173,6 +3350,55 @@ int RunRemoteTest(QQuickWindow* window, backup_modern::RemoteController* remote,
         QStringLiteral("REMOTE-16 服务端侧账户已消失：GUI 立刻回到未登录"),
         kind + QStringLiteral(": ") + remote->lastDetailForTest() +
             QStringLiteral(" session=") + remote->sessionText());
+  }
+
+  // ---- REMOTE-17b：重复注册的反馈（人工验收第 5 条）----
+  //
+  // 同一个用户名注册第二次必须被服务端拒绝，而且界面上要看得见"该用户名已被
+  // 使用"；同时**原来的账户不能被换掉**：原口令还能登进去，第二个口令不能。
+  // （数据库里"只有一行"这件事在 scripts/same_instance_truth_test.sh 里查。）
+  {
+    const QString duplicate_user =
+        QStringLiteral("gui-dup-%1")
+            .arg(QRandomGenerator::global()->bounded(1000000, 9999999));
+    const QString dup_original = QStringLiteral("dup-original-1");
+    const QString dup_second = QStringLiteral("dup-second-1");
+    const bool first_accepted = remote->registerAccount(
+        host, port_text, duplicate_user, dup_original, dup_original);
+    const bool first_finished = first_accepted && remote->waitForIdle(120000);
+    run.Check(
+        first_finished &&
+            remote->lastErrorKindForTest() == QStringLiteral("none") &&
+            remote->registerError().isEmpty() && !remote->authenticated(),
+        QStringLiteral("REMOTE-17b 第一次注册：受理并成功，注册错误行干净"),
+        remote->lastErrorKindForTest() + QStringLiteral(": ") +
+            remote->lastDetailForTest());
+    const bool second_accepted = remote->registerAccount(
+        host, port_text, duplicate_user, dup_second, dup_second);
+    const bool second_finished = second_accepted && remote->waitForIdle(120000);
+    const QString second_row = remote->registerError();
+    run.Check(
+        second_finished &&
+            remote->lastErrorKindForTest() == QStringLiteral("name-taken") &&
+            second_row == QStringLiteral("该用户名已被使用，请更换用户名"),
+        QStringLiteral("REMOTE-17b 重复注册：服务端拒绝，注册表单里看得见原因"),
+        remote->lastErrorKindForTest() + QStringLiteral(": ") + second_row);
+    // 原账户没有被换掉：原口令仍然能登录。
+    run.Check(
+        remote->login(host, port_text, duplicate_user, dup_original) &&
+            remote->waitForIdle(120000) && remote->authenticated(),
+        QStringLiteral("REMOTE-17b 重复注册之后原口令仍然有效（账户没被换掉）"),
+        remote->lastErrorKindForTest() + QStringLiteral(": ") +
+            remote->lastDetailForTest());
+    // 第二个口令登不进去：如果注册是"覆盖写"，这里会成功。
+    const bool other_accepted =
+        remote->login(host, port_text, duplicate_user, dup_second);
+    const bool other_finished = other_accepted && remote->waitForIdle(120000);
+    run.Check(other_finished && !remote->authenticated() &&
+                  remote->loginError() == QStringLiteral("用户名或密码错误"),
+              QStringLiteral("REMOTE-17b 第二个口令登不进去（原口令没被覆盖）"),
+              remote->loginError() + QStringLiteral(" / kind=") +
+                  remote->lastErrorKindForTest());
   }
 
   std::printf("[remote-test] passed=%d failed=%d\n", run.passed, run.failed);
