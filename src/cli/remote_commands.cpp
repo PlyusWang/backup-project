@@ -2,8 +2,6 @@
 
 #include "remote_commands.h"
 
-#include "remote_incremental.h"
-
 #include <libgen.h>
 
 #include <cstdio>
@@ -16,6 +14,7 @@
 
 #include "incremental_backup.h"
 #include "remote_backup_client.h"
+#include "remote_incremental.h"
 #include "terminal_secret.h"
 
 namespace backupproject {
@@ -46,32 +45,34 @@ struct RemoteOptions {
 };
 
 void PrintRemoteUsageTo(std::ostream& output) {
-  output << "  backupctl remote ping [--host <地址>] [--port <端口>]\n"
-            "  backupctl remote register --user <用户名> [--host] [--port]\n"
-            "  backupctl remote login --user <用户名> [--host] [--port]\n"
-            "  backupctl remote list --user <用户名> [--host] [--port]\n"
-            "  backupctl remote upload <本地归档> --user <用户名>\n"
-            "      [--name <显示名>] [--repository <仓库目录>]\n"
-            "  backupctl remote download <快照ID> <目标路径> --user <用户名>\n"
-            "      [--force]\n"
-            "  backupctl remote backup <源目录> --user <用户名>\n"
-            "      [--strategy full|incremental] [--name <显示名>]\n"
-            "      [--include <规则>]... [--exclude <规则>]...\n"
-            "      （incremental 是默认值：没有可续的链时自动先建一份完整基线）\n"
-            "  backupctl remote restore <快照ID> <目标目录> --user <用户名>\n"
-            "      （自动把整条依赖链拉下来、逐字节验证后恢复；不需要手工下载 delta）\n"
-            "  backupctl remote delete <快照ID> --user <用户名>\n"
-            "  backupctl remote delete-account --user <用户名> --confirm "
-            "<用户名>\n"
-            "      （永久删除该账户与它的全部云端备份，不可撤销）\n"
-            "  口令只从终端读取；自动测试用 BACKUP_REMOTE_PASSWORD 提供，\n"
-            "  两者都不会被打印。默认端点 127.0.0.1:18765。\n"
-            "\n"
-            "  所有 remote 子命令都需要 --server-key <sha256:指纹|hex:公钥>\n"
-            "  （也可以放在环境变量 BACKUP_REMOTE_SERVER_KEY 里）。BPNET1 的\n"
-            "  全部流量由 BPSEC1 加密，客户端必须事先知道服务端身份公钥；\n"
-            "  本项目不做首次连接自动信任。用下面的命令取得 pin：\n"
-            "      backup-server-keygen --show --key-file <身份私钥文件>\n";
+  output
+      << "  backupctl remote ping [--host <地址>] [--port <端口>]\n"
+         "  backupctl remote register --user <用户名> [--host] [--port]\n"
+         "  backupctl remote login --user <用户名> [--host] [--port]\n"
+         "  backupctl remote list --user <用户名> [--host] [--port]\n"
+         "  backupctl remote upload <本地归档> --user <用户名>\n"
+         "      [--name <显示名>] [--repository <仓库目录>]\n"
+         "  backupctl remote download <快照ID> <目标路径> --user <用户名>\n"
+         "      [--force]\n"
+         "  backupctl remote backup <源目录> --user <用户名>\n"
+         "      [--strategy full|incremental] [--name <显示名>]\n"
+         "      [--include <规则>]... [--exclude <规则>]...\n"
+         "      （incremental 是默认值：没有可续的链时自动先建一份完整基线）\n"
+         "  backupctl remote restore <快照ID> <目标目录> --user <用户名>\n"
+         "      （自动把整条依赖链拉下来、逐字节验证后恢复；不需要手工下载 "
+         "delta）\n"
+         "  backupctl remote delete <快照ID> --user <用户名>\n"
+         "  backupctl remote delete-account --user <用户名> --confirm "
+         "<用户名>\n"
+         "      （永久删除该账户与它的全部云端备份，不可撤销）\n"
+         "  口令只从终端读取；自动测试用 BACKUP_REMOTE_PASSWORD 提供，\n"
+         "  两者都不会被打印。默认端点 127.0.0.1:18765。\n"
+         "\n"
+         "  所有 remote 子命令都需要 --server-key <sha256:指纹|hex:公钥>\n"
+         "  （也可以放在环境变量 BACKUP_REMOTE_SERVER_KEY 里）。BPNET1 的\n"
+         "  全部流量由 BPSEC1 加密，客户端必须事先知道服务端身份公钥；\n"
+         "  本项目不做首次连接自动信任。用下面的命令取得 pin：\n"
+         "      backup-server-keygen --show --key-file <身份私钥文件>\n";
 }
 
 bool TakeValue(const std::vector<std::string>& arguments, std::size_t* index,

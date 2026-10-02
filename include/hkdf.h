@@ -29,8 +29,8 @@ inline constexpr std::size_t kHkdfMaxOutputBytes = 255 * 32;
 bool HkdfExtract(const std::string& salt, const std::string& ikm,
                  std::string* prk, std::string* error_message);
 
-// HKDF-Expand：T(1) = HMAC(PRK, info || 0x01)，T(i) = HMAC(PRK, T(i-1) || info || i)。
-// length == 0 时输出空串（合法）；length > 255 * 32 时失败。
+// HKDF-Expand：T(1) = HMAC(PRK, info || 0x01)，T(i) = HMAC(PRK, T(i-1) || info
+// || i)。 length == 0 时输出空串（合法）；length > 255 * 32 时失败。
 bool HkdfExpand(const std::string& prk, const std::string& info,
                 std::size_t length, std::string* okm,
                 std::string* error_message);

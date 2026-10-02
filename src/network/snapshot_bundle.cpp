@@ -22,7 +22,8 @@ namespace net {
 namespace {
 
 constexpr std::size_t kCopyChunkBytes = 256u * 1024u;
-constexpr const char kBundleMagic[8] = {'B', 'P', 'S', 'N', 'A', 'P', '1', '\0'};
+constexpr const char kBundleMagic[8] = {'B', 'P', 'S', 'N',
+                                        'A', 'P', '1', '\0'};
 constexpr std::size_t kSha256Bytes = crypto::kSha256DigestSize;
 
 std::string StrerrorText() { return std::string(std::strerror(errno)); }
@@ -145,7 +146,8 @@ bool OpenRegularFile(const std::string& path, int* fd, std::uint64_t* size,
   if (!S_ISREG(info.st_mode)) {
     ::close(opened);
     if (error_message != nullptr) {
-      *error_message = path + " 不是普通文件（拒绝把符号链接或设备当成快照材料）";
+      *error_message =
+          path + " 不是普通文件（拒绝把符号链接或设备当成快照材料）";
     }
     return false;
   }
@@ -196,8 +198,9 @@ bool HashFile(const std::string& path, std::string* sha256_hex,
 }
 
 std::string PartPathFor(const std::string& target_path, std::size_t index) {
-  return target_path + ".part-" + std::to_string(static_cast<long>(::getpid())) +
-         "-" + std::to_string(index);
+  return target_path + ".part-" +
+         std::to_string(static_cast<long>(::getpid())) + "-" +
+         std::to_string(index);
 }
 
 // 读 bundle 的成员表（不解包）。
@@ -223,8 +226,8 @@ bool ReadBundleIndex(int fd, const std::string& bundle_path,
   const std::uint16_t count = LoadU16(header + 10);
   if (count != kSnapshotBundleMemberCount) {
     if (error_message != nullptr) {
-      *error_message = "材料包的成员数不是 " +
-                       std::to_string(kSnapshotBundleMemberCount);
+      *error_message =
+          "材料包的成员数不是 " + std::to_string(kSnapshotBundleMemberCount);
     }
     return false;
   }
@@ -276,8 +279,8 @@ bool ReadBundleIndex(int fd, const std::string& bundle_path,
       return false;
     }
   }
-  info->archive_name = info->members.empty() ? std::string()
-                                             : info->members[0].name;
+  info->archive_name =
+      info->members.empty() ? std::string() : info->members[0].name;
   return true;
 }
 
@@ -296,8 +299,7 @@ bool MembersMatchArchive(const SnapshotBundleInfo& info,
   }
   const std::string manifest = backupproject::SnapshotManifestFileName(archive);
   const std::string identity = backupproject::SnapshotIdentityFileName(archive);
-  if (info.members[1].name != manifest ||
-      info.members[2].name != identity) {
+  if (info.members[1].name != manifest || info.members[2].name != identity) {
     if (error_message != nullptr) {
       *error_message = "材料包的三件套名字对不上（应当是 " + archive + " / " +
                        manifest + " / " + identity + "）";
@@ -387,7 +389,8 @@ bool BuildSnapshotBundle(const std::string& repository_directory,
   std::vector<char> buffer(kCopyChunkBytes);
   for (std::size_t index = 0; ok && index < members.size(); ++index) {
     std::string member_header;
-    AppendU16(&member_header, static_cast<std::uint16_t>(members[index].name.size()));
+    AppendU16(&member_header,
+              static_cast<std::uint16_t>(members[index].name.size()));
     member_header.append(members[index].name);
     AppendU64(&member_header, members[index].size);
     // 摘要按**原始 32 字节**写，不是十六进制文本。
@@ -416,8 +419,8 @@ bool BuildSnapshotBundle(const std::string& repository_directory,
     }
     if (source_size != members[index].size) {
       if (error_message != nullptr) {
-        *error_message = sources[index].path +
-                         " 在打包期间被改动（长度变了），已放弃";
+        *error_message =
+            sources[index].path + " 在打包期间被改动（长度变了），已放弃";
       }
       ::close(in);
       ok = false;
@@ -433,8 +436,8 @@ bool BuildSnapshotBundle(const std::string& repository_directory,
           continue;
         }
         if (error_message != nullptr) {
-          *error_message = "读取 " + sources[index].path + " 失败：" +
-                           StrerrorText();
+          *error_message =
+              "读取 " + sources[index].path + " 失败：" + StrerrorText();
         }
         ok = false;
         break;
@@ -455,7 +458,8 @@ bool BuildSnapshotBundle(const std::string& repository_directory,
     }
     if (::close(in) != 0 && ok) {
       if (error_message != nullptr) {
-        *error_message = "关闭 " + sources[index].path + " 失败：" + StrerrorText();
+        *error_message =
+            "关闭 " + sources[index].path + " 失败：" + StrerrorText();
       }
       ok = false;
     }
@@ -498,7 +502,8 @@ bool BuildSnapshotBundle(const std::string& repository_directory,
 }
 
 bool InspectSnapshotBundle(const std::string& bundle_path,
-                           SnapshotBundleInfo* info, std::string* error_message) {
+                           SnapshotBundleInfo* info,
+                           std::string* error_message) {
   if (info == nullptr) {
     if (error_message != nullptr) {
       *error_message = "检查材料包时输出指针为空";
@@ -522,7 +527,8 @@ bool InspectSnapshotBundle(const std::string& bundle_path,
 
 bool ExtractSnapshotBundle(const std::string& bundle_path,
                            const std::string& target_directory,
-                           SnapshotBundleInfo* info, std::string* error_message) {
+                           SnapshotBundleInfo* info,
+                           std::string* error_message) {
   if (info == nullptr) {
     if (error_message != nullptr) {
       *error_message = "解包材料时输出指针为空";
@@ -541,7 +547,8 @@ bool ExtractSnapshotBundle(const std::string& bundle_path,
     ::close(fd);
     return false;
   }
-  if (::lseek(fd, static_cast<off_t>(kSnapshotBundleHeaderSize), SEEK_SET) < 0) {
+  if (::lseek(fd, static_cast<off_t>(kSnapshotBundleHeaderSize), SEEK_SET) <
+      0) {
     if (error_message != nullptr) {
       *error_message = "无法回到材料包开头：" + StrerrorText();
     }
@@ -578,7 +585,8 @@ bool ExtractSnapshotBundle(const std::string& bundle_path,
     const std::string final_path = target_directory + "/" + name;
     const std::string part_path = PartPathFor(final_path, i);
     ::unlink(part_path.c_str());
-    const int out = ::open(part_path.c_str(), O_WRONLY | O_CREAT | O_EXCL, 0600);
+    const int out =
+        ::open(part_path.c_str(), O_WRONLY | O_CREAT | O_EXCL, 0600);
     if (out < 0) {
       if (error_message != nullptr) {
         *error_message = "无法创建 " + part_path + "：" + StrerrorText();
@@ -623,8 +631,8 @@ bool ExtractSnapshotBundle(const std::string& bundle_path,
     const std::string actual_sha256 = crypto::ToHex(digest, sizeof(digest));
     if (actual_sha256 != expected_sha256) {
       if (error_message != nullptr) {
-        *error_message = "材料包里的 " + name +
-                         " 内容校验失败（SHA-256 与包头声明不符）";
+        *error_message =
+            "材料包里的 " + name + " 内容校验失败（SHA-256 与包头声明不符）";
       }
       ::unlink(part_path.c_str());
       ok = false;
@@ -650,8 +658,8 @@ bool ExtractSnapshotBundle(const std::string& bundle_path,
     if (!PublishNoReplace(part_paths[published], final_paths[published],
                           &publish_error)) {
       if (error_message != nullptr) {
-        *error_message = "无法发布 " + final_paths[published] + "：" +
-                         publish_error;
+        *error_message =
+            "无法发布 " + final_paths[published] + "：" + publish_error;
       }
       break;
     }

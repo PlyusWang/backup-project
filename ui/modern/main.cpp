@@ -2110,8 +2110,9 @@ int RunRemoteSmoke(backup_modern::RemoteController* remote,
                  qPrintable(remote->serverKeyPinError()));
     return 1;
   }
-  std::printf("[remote-smoke] 服务器身份指纹已配置（来自 "
-              "BACKUP_REMOTE_SERVER_KEY）\n");
+  std::printf(
+      "[remote-smoke] 服务器身份指纹已配置（来自 "
+      "BACKUP_REMOTE_SERVER_KEY）\n");
 
   QTemporaryDir temp;
   run.Check(temp.isValid(), QStringLiteral("SMOKE-00 临时工作目录可用"));
@@ -2467,12 +2468,11 @@ int RunRemoteTest(QQuickWindow* window, backup_modern::RemoteController* remote,
     keygen.setArguments({QStringLiteral("--output"), transport_key_file});
     keygen.start();
     if (!keygen.waitForStarted(15000) || !keygen.waitForFinished(30000) ||
-        keygen.exitStatus() != QProcess::NormalExit ||
-        keygen.exitCode() != 0 || !QFileInfo::exists(transport_key_file)) {
-      std::fprintf(stderr,
-                   "[remote-test] backup-server-keygen --output %s 失败（%s）\n",
-                   qPrintable(transport_key_file),
-                   qPrintable(keygenFailure(keygen)));
+        keygen.exitStatus() != QProcess::NormalExit || keygen.exitCode() != 0 ||
+        !QFileInfo::exists(transport_key_file)) {
+      std::fprintf(
+          stderr, "[remote-test] backup-server-keygen --output %s 失败（%s）\n",
+          qPrintable(transport_key_file), qPrintable(keygenFailure(keygen)));
       return 1;
     }
     // (2) 打印公钥与指纹；其中一行就是产品给用户的 --server-key。
@@ -2509,8 +2509,9 @@ int RunRemoteTest(QQuickWindow* window, backup_modern::RemoteController* remote,
                  qPrintable(remote->serverKeyPinError()));
     return 1;
   }
-  std::printf("[remote-test] 服务器身份指纹已配置（取自 backup-server-keygen "
-              "--show）\n");
+  std::printf(
+      "[remote-test] 服务器身份指纹已配置（取自 backup-server-keygen "
+      "--show）\n");
 
   const QString log_file = work + QStringLiteral("/state/server.log");
   QProcess server;
@@ -2521,26 +2522,16 @@ int RunRemoteTest(QQuickWindow* window, backup_modern::RemoteController* remote,
   // 端口先给 0（内核分配），拿到真实端口之后 CASE D 会用**同一个端口**重启
   // 服务端，验证"服务端回来了，客户端自己重连并恢复会话"。
   QStringList server_arguments = {
-      QStringLiteral("--bind"),
-      QStringLiteral("127.0.0.1"),
-      QStringLiteral("--port"),
-      QStringLiteral("0"),
-      QStringLiteral("--io-timeout"),
-      QStringLiteral("2"),
-      QStringLiteral("--root"),
-      work + QStringLiteral("/data"),
-      QStringLiteral("--db"),
-      work + QStringLiteral("/state/metadata.sqlite3"),
-      QStringLiteral("--secret-file"),
-      secret_file,
+      QStringLiteral("--bind"), QStringLiteral("127.0.0.1"),
+      QStringLiteral("--port"), QStringLiteral("0"),
+      QStringLiteral("--io-timeout"), QStringLiteral("2"),
+      QStringLiteral("--root"), work + QStringLiteral("/data"),
+      QStringLiteral("--db"), work + QStringLiteral("/state/metadata.sqlite3"),
+      QStringLiteral("--secret-file"), secret_file,
       // 传输身份私钥：PR #21 起服务端没有它就以用法错误退出。
-      QStringLiteral("--transport-key-file"),
-      transport_key_file,
-      QStringLiteral("--pid-file"),
-      work + QStringLiteral("/state/server.pid"),
-      QStringLiteral("--log-file"),
-      log_file,
-      QStringLiteral("--quiet")};
+      QStringLiteral("--transport-key-file"), transport_key_file,
+      QStringLiteral("--pid-file"), work + QStringLiteral("/state/server.pid"),
+      QStringLiteral("--log-file"), log_file, QStringLiteral("--quiet")};
   server.setArguments(server_arguments);
   // 无论从哪条 return 出去，服务端都要被收走，不留孤儿进程。
   struct ServerGuard {
@@ -3292,13 +3283,13 @@ int RunRemoteTest(QQuickWindow* window, backup_modern::RemoteController* remote,
   // 三个阶段都要在两种主题下检查几何：只查一种状态，另一种状态里的标签页
   // 塌掉是看不出来的。
   const char* signed_in_names[] = {
-      "remoteHostField",           "remotePortField",
-      "remoteUserField",           "remoteServerKeyPinField",
-      "remoteAccountText",
-      "remoteAccountStateText",    "remoteLogoutButton",
-      "remoteDeleteAccountButton", "remoteUploadButton",
-      "remoteRefreshButton",       "remoteListSummary",
-      "remoteStatusBanner",        "remoteTechnicalToggle"};
+      "remoteHostField",      "remotePortField",
+      "remoteUserField",      "remoteServerKeyPinField",
+      "remoteAccountText",    "remoteAccountStateText",
+      "remoteLogoutButton",   "remoteDeleteAccountButton",
+      "remoteUploadButton",   "remoteRefreshButton",
+      "remoteListSummary",    "remoteStatusBanner",
+      "remoteTechnicalToggle"};
   // 账户区域现在是一个分段控件（一个容器里两个分段），不再是两个独立按钮。
   const char* login_tab_names[] = {"remoteAccountTabs", "remotePasswordField",
                                    "remoteLoginButton"};
@@ -3601,6 +3592,9 @@ int RunRemoteTest(QQuickWindow* window, backup_modern::RemoteController* remote,
     other_endpoint.host = host.toStdString();
     other_endpoint.port = static_cast<std::uint16_t>(port_text.toUShort());
     other_endpoint.timeout_seconds = 30;
+    // 这一条是**裸客户端**（不经过控制器），所以 pin 要显式带上：BPSEC1
+    // 每一次连接都要握手，没有 pin 的连接会被客户端自己拒绝（不做 TOFU）。
+    other_endpoint.server_key_pin = remote->serverKeyPin().toStdString();
     backupproject::net::RemoteArchiveClient other;
     std::string other_error;
     const bool deleted_elsewhere =

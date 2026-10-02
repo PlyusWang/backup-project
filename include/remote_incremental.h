@@ -16,8 +16,8 @@
 //
 //   * **服务端元数据只用来定位，不用来信任。** 下载到的每一个字节都要过
 //     SHA-256（下载路径 + 材料包成员 + 引擎自己的 payload 验证），解包之后
-//     还要用 LoadVerifiedSnapshotIdentity 确认"这份文件真的就是那个 snapshot_id"。
-//     服务端说"这是 R2 的父"不算数，归档自己的信封说了才算。
+//     还要用 LoadVerifiedSnapshotIdentity 确认"这份文件真的就是那个
+//     snapshot_id"。 服务端说"这是 R2 的父"不算数，归档自己的信封说了才算。
 //   * **缓存里没有凭据。** 不存口令、不存 token、不存服务端私钥。缓存目录里
 //     只有三件套本身，删掉它最多让下一次备份重新下载一遍链。
 //   * **链不能从中间断开。** 删除由服务端做依赖检查（还有后代就不许删），
@@ -56,8 +56,8 @@ struct RemoteCacheLayout {
 // remote-cache（与 schedule.json / realtime.json 同一处）。
 bool PrepareRemoteCache(const std::string& root_directory,
                         const std::string& server_fingerprint,
-                        const std::string& username,
-                        RemoteCacheLayout* layout, std::string* error_message);
+                        const std::string& username, RemoteCacheLayout* layout,
+                        std::string* error_message);
 
 // 这条链的标识（64 个小写十六进制字符）：与增量引擎的 source identity 用
 // 同一套输入（源路径 + 逻辑仓库身份），因此同一份数据在同一账户下只有一条链。
@@ -75,8 +75,8 @@ bool ResolveRemoteChain(const std::vector<RemoteSnapshotInfo>& snapshots,
 // 任何其他快照当作父引用的那一个。多个候选时取创建时间最新的（并列时取
 // generation 更大、id 更小的）。没有候选时返回 false 并给出原因（不是错误）。
 bool FindRemoteLineageHead(const std::vector<RemoteSnapshotInfo>& snapshots,
-                           const std::string& lineage,
-                           RemoteSnapshotInfo* head, std::string* reason);
+                           const std::string& lineage, RemoteSnapshotInfo* head,
+                           std::string* reason);
 
 struct RemoteBackupRequest {
   RemoteArchiveClient* client = nullptr;
@@ -125,7 +125,8 @@ bool RunRemoteRestore(RemoteArchiveClient* client,
                       const std::string& snapshot_id,
                       const std::string& destination_directory,
                       const RestoreOptions& restore_options,
-                      RemoteRestoreOutcome* outcome, std::string* error_message);
+                      RemoteRestoreOutcome* outcome,
+                      std::string* error_message);
 
 }  // namespace net
 }  // namespace backupproject

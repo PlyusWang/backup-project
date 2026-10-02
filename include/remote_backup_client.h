@@ -56,8 +56,8 @@ struct RemoteSnapshotInfo {
   // ---- PR #21：远端增量链 ----
   //
   // 这些字段**只用来定位与展示**。它们来自服务端元数据，因此在恢复路径上
-  // 永远不能替代"下载到的实际字节 + SHA-256 验证"（见 docs/remote_incremental.md）。
-  // 0 = full（链根），1 = incremental。
+  // 永远不能替代"下载到的实际字节 + SHA-256 验证"（见
+  // docs/remote_incremental.md）。 0 = full（链根），1 = incremental。
   std::uint16_t snapshot_kind = 0;
   std::string parent_snapshot_id;
   std::uint64_t generation = 0;
@@ -185,7 +185,9 @@ class RemoteArchiveClient {
   }
   // 最近一次加密传输层的错误分类（握手失败、记录校验失败、重放等）。
   // 调用方据此把"服务端密钥不对"和"网络抖了一下"分开报。
-  SecureTransportError last_secure_error() const { return channel_.last_error(); }
+  SecureTransportError last_secure_error() const {
+    return channel_.last_error();
+  }
 
  private:
   bool Request(Opcode opcode, const std::string& payload, FrameHeader* header,

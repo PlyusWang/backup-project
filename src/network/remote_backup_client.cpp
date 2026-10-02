@@ -262,8 +262,7 @@ bool RemoteArchiveClient::Connect(const RemoteEndpoint& endpoint,
   std::string pin_error;
   if (!ParseServerKeyPin(endpoint.server_key_pin, &server_key_pin_,
                          &pin_error)) {
-    const std::string reason =
-        "无法使用服务端传输身份 pin：" + pin_error;
+    const std::string reason = "无法使用服务端传输身份 pin：" + pin_error;
     ::close(fd_);
     fd_ = -1;
     if (error_message != nullptr) {
@@ -274,10 +273,9 @@ bool RemoteArchiveClient::Connect(const RemoteEndpoint& endpoint,
   }
   std::string handshake_error;
   if (!channel_.HandshakeClient(fd_, server_key_pin_, &handshake_error)) {
-    const std::string reason =
-        std::string("BPSEC1 握手失败（") +
-        SecureTransportErrorName(channel_.last_error()) + "）：" +
-        handshake_error;
+    const std::string reason = std::string("BPSEC1 握手失败（") +
+                               SecureTransportErrorName(channel_.last_error()) +
+                               "）：" + handshake_error;
     ::close(fd_);
     fd_ = -1;
     if (error_message != nullptr) {
@@ -748,7 +746,8 @@ bool RemoteArchiveClient::UploadSnapshotFile(
   if (!reader.ReadString(kMaxSnapshotIdBytes, &info.snapshot_id) ||
       !reader.ReadString(kSha256HexBytes, &info.sha256) ||
       !reader.ReadU64(&info.size_bytes) || !reader.ReadU64(&created_at) ||
-      !reader.ReadU16(&info.snapshot_kind) || !reader.ReadU64(&info.generation) ||
+      !reader.ReadU16(&info.snapshot_kind) ||
+      !reader.ReadU64(&info.generation) ||
       !reader.ReadString(kMaxSnapshotIdBytes, &info.parent_snapshot_id) ||
       !reader.AtEnd()) {
     if (error_message != nullptr) {
