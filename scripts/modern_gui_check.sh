@@ -627,8 +627,10 @@ expect_missing "$REMOTE_PAGE_QML" "不会发送任何请求" \
   "页面不再写开发者式的说明"
 expect_count "$REMOTE_PAGE_QML" "两次输入的密码不一致" 1 \
   "不一致时明确写出「两次输入的密码不一致」"
-expect_count "$REMOTE_PAGE_QML" "color: theme.error" 2 \
-  "不一致错误与注销错误都用共享的 error 色"
+# 四处错误行（注册不一致 / 注册被拒 / 登录被拒 / 注销失败）都用共享的 error 色：
+# 页面里没有第二套红色，也没有硬编码的 #ff0000。
+expect_count "$REMOTE_PAGE_QML" "color: theme.error" 4 \
+  "四处错误行都用共享的 error 色"
 expect_present "$REMOTE_PAGE_QML" "visible: page.registerPasswordMismatch" 1 \
   "错误行由「两次密码是否一致」这个计算属性驱动（改一个字符就更新）"
 expect_present "$REMOTE_PAGE_QML" "page.draftRegisterPassword !== page.draftConfirmPassword" 1 \
@@ -642,6 +644,68 @@ expect_missing "$REMOTE_PAGE_QML" "if (remote.deleteAccount(" \
   "确认注销不再在提交时就关闭对话框"
 expect_count "$REMOTE_PAGE_QML" "deleteAccountDialog.close()" 2 \
   "对话框只由「取消」和「操作成功」两条路径关闭"
+# 每一次主动操作都要在**触发它的那个位置**给出反馈（人工验收的核心标准）。
+#
+#   * 登录失败 -> 登录表单下面（remoteLoginError）
+#   * 注册失败 -> 注册表单下面（remoteRegisterError）
+#   * 注销失败 -> 对话框内部（remoteDeleteAccountError）
+#   * 页面级操作（上传 / 下载 / 刷新 / 删除云端备份）-> 页面底部横幅
+#
+# 旧实现把登录 / 注册的校验失败写进页面底部的横幅（甚至只打终端日志），于是
+# 用户看到的是"我点了，但不知道程序到底有没有反应"。
+expect_count "$REMOTE_PAGE_QML" 'objectName: "remoteLoginError"' 1 \
+  "登录表单有自己的错误行"
+expect_count "$REMOTE_PAGE_QML" 'objectName: "remoteRegisterError"' 1 \
+  "注册表单有自己的错误行"
+expect_count "$REMOTE_PAGE_QML" "remote.loginError" 2 \
+  "登录错误行绑到控制器的 loginError（可见性 + 文本）"
+expect_count "$REMOTE_PAGE_QML" "remote.registerError" 4 \
+  "注册错误行绑到控制器的 registerError（可见性 + 文本 + 两条互斥提示）"
+expect_count "$REMOTE_PAGE_QML" "remote.clearLoginError()" 4 \
+  "改动地址 / 端口 / 用户名 / 登录密码都会清掉登录错误行"
+expect_count "$REMOTE_PAGE_QML" "remote.clearRegisterError()" 5 \
+  "改动地址 / 端口 / 用户名 / 两个注册密码框都会清掉注册错误行"
+expect_count "$REMOTE_PAGE_QML" "remote.clearDeleteAccountError()" 3 \
+  "打开对话框与改动对话框里的两个输入框都会清掉对话框错误行"
+# 冗余状态文本：账户卡片已经写了"当前账户：X"和"状态：已登录"，页面上不允许
+# 再有第三行重复同一个事实（人工验收点名的那一行）。
+expect_missing "$REMOTE_PAGE_QML" 'objectName: "remoteSessionText"' \
+  "页面上没有第三行重复的登录状态文本"
+expect_count "$REMOTE_PAGE_QML" "remote.sessionText" 1 \
+  "sessionText 只留在默认折叠的「技术详情」里"
+# 对话框里的错误行必须在**对话框内部**（在对话框起点之后、确认按钮之前）。
+DIALOG_LINE="$(grep -n 'objectName: "remoteDeleteAccountDialog"' "$REMOTE_PAGE_QML" | head -1 | cut -d: -f1)"
+DIALOG_ERROR_LINE="$(grep -n 'objectName: "remoteDeleteAccountError"' "$REMOTE_PAGE_QML" | head -1 | cut -d: -f1)"
+DIALOG_CONFIRM_LINE="$(grep -n 'objectName: "remoteDeleteAccountConfirmButton"' "$REMOTE_PAGE_QML" | head -1 | cut -d: -f1)"
+if [ -n "$DIALOG_LINE" ] && [ -n "$DIALOG_ERROR_LINE" ] && [ -n "$DIALOG_CONFIRM_LINE" ] \
+   && [ "$DIALOG_LINE" -lt "$DIALOG_ERROR_LINE" ] \
+   && [ "$DIALOG_ERROR_LINE" -lt "$DIALOG_CONFIRM_LINE" ]; then
+  record_pass "注销失败的错误行在对话框内部（对话框之后、确认按钮之前）"
+else
+  record_fail "对话框错误行的位置" \
+    "dialog=$DIALOG_LINE error=$DIALOG_ERROR_LINE confirm=$DIALOG_CONFIRM_LINE"
+fi
+# 控制器一侧：错误按位置路由，校验失败不再写横幅，操作结束横幅不留运行状态。
+expect_present "$REMOTE_CONTROLLER_H" "enum class ErrorSurface" \
+  "控制器把「错误该出现在哪里」写成一个枚举（登录 / 注册 / 对话框 / 横幅）"
+expect_present "$REMOTE_CONTROLLER_H" "QString loginError() const" \
+  "控制器提供 loginError 给登录表单"
+expect_present "$REMOTE_CONTROLLER_H" "QString registerError() const" \
+  "控制器提供 registerError 给注册表单"
+expect_present "$REMOTE_CONTROLLER_CPP" "void RemoteController::ReportSurfaceError" \
+  "错误只有一条上报路径：ReportSurfaceError"
+expect_present "$REMOTE_CONTROLLER_CPP" "SurfaceFailureMessage(result.kind, result.error_kind, result.message)" \
+  "失败信息按操作改写（登录 / 注册 / 注销各说各的话）"
+expect_present "$REMOTE_CONTROLLER_CPP" "SetIdleBaseline();" \
+  "操作结束后横幅回到当前真实状态的基线（不会停在「正在登录」）"
+expect_missing "$REMOTE_CONTROLLER_CPP" "bool RemoteController::AcceptEndpoint" \
+  "旧的 AcceptEndpoint 已经删除（它把校验失败写进页面底部横幅）"
+expect_missing "$REMOTE_CONTROLLER_CPP" "bool RemoteController::AcceptPassword" \
+  "旧的 AcceptPassword 已经删除"
+expect_present "$REMOTE_CONTROLLER_CPP" "该用户名已被使用，请更换用户名" \
+  "重复注册的文案是「该用户名已被使用，请更换用户名」"
+expect_present "$REMOTE_CONTROLLER_CPP" "当前密码不正确，账户与全部云端备份都没有被删除" \
+  "注销失败明确说明「账户与全部云端备份都没有被删除」"
 # 传输层：请求生命周期与连接生命周期分开，且**没有**自动重发。
 expect_present "$CLIENT_CPP" "PrepareConnection(&prepare_error)" 1 \
   "发请求之前先准备连接（重连 / 恢复会话都发生在发送之前）"
