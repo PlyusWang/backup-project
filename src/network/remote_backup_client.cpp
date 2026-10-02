@@ -607,6 +607,19 @@ bool RemoteArchiveClient::UploadArchiveFile(
     return false;
   }
 
+  // UPLOAD_BEGIN 已经被服务端接受：服务端现在处于 UPLOAD_IN_PROGRESS。
+  // 这一版协议没有 UPLOAD_ABORT，所以本地失败一律用**连接**当事务边界：
+  // 关掉 socket 之后服务端读到 EOF，会走 CleanupConnection -> AbortUpload，
+  // 删掉上传临时文件，连接状态也不会留在"上传中"。
+  // 用 DisconnectSocket() 而不是 Disconnect()：token 必须留着。本地文件出的
+  // 错就是本地错误，不能顺手把用户"退出登录"；下一次操作会自己重连并用
+  // RESUME 恢复会话。这不是"自动重试上传"：这一次上传已经失败，重连只发生在
+  // 用户下一次主动操作的时候。
+  const auto abort_upload_transaction = [&]() {
+    ::close(source);
+    DisconnectSocket();
+  };
+
   // 第二遍：分块发送。内存里只有一个块。
   std::vector<char> buffer(kTransferChunkBytes);
   std::uint64_t sent = 0;
@@ -623,23 +636,28 @@ bool RemoteArchiveClient::UploadArchiveFile(
       break;
     }
     if (got < 0) {
-      ::close(source);
+      // 先记下本地错误（StrerrorText 要在 close 之前读 errno），再终止事务：
+      // 收尾不能覆盖调用方看到的原始原因。
       if (error_message != nullptr) {
         *error_message = "cannot read " + local_path + ": " + StrerrorText();
       }
+      abort_upload_transaction();
       return false;
     }
     if (got == 0) {
-      ::close(source);
+      // 文件在算完摘要之后被截短了：同样是本地错误，事务同样要终止。
       if (error_message != nullptr) {
         *error_message = "the file shrank while it was being uploaded";
       }
+      abort_upload_transaction();
       return false;
     }
     if (!Request(Opcode::kUploadChunk,
                  std::string(buffer.data(), static_cast<std::size_t>(got)),
                  &header, &response, error_message)) {
-      ::close(source);
+      // 发送失败时 Request 已经自己关过连接（token 保留）；这里只是让
+      // "UPLOAD_BEGIN 之后失败"这条路径只有一个出口。
+      abort_upload_transaction();
       return false;
     }
     sent += static_cast<std::uint64_t>(got);
@@ -712,6 +730,33 @@ bool RemoteArchiveClient::DownloadArchiveFile(
                error_message)) {
     return false;
   }
+  // 服务端从这里开始处于 DOWNLOAD_IN_PROGRESS。之后不管哪一步在本地失败
+  // （响应解码、创建临时文件、本地写、服务端多发字节），都必须显式收尾一次：
+  // 服务端允许客户端提前结束（HandleDownloadEnd 接受 sent != declared），
+  // 会关掉句柄并把连接放回"已认证"。
+  // 判断依据是"事务开始了没有"，不是"数据收完了没有"：本地失败时数据往往还
+  // 没收完，但 socket 完全可能还是好的。
+  bool download_active = true;
+  // 收尾请求用一个**独立的**错误变量：调用方拿到手的永远是那个原始本地错误，
+  // 不会被收尾的结果覆盖。收尾本身失败不影响已经发布的文件：如实报告（Fail）
+  // 但不回滚。收尾请求自己失败时 Request 会关掉这条连接（token 保留），
+  // 下一次操作照常重连 + RESUME。
+  // 连接已经不可用就不用（也不该）为它重连一次：服务端在 EOF 时已经清过
+  // 上传 / 下载状态了。
+  const auto end_download_transaction = [&]() {
+    if (!download_active) {
+      return;
+    }
+    download_active = false;
+    if (fd_ < 0 || SocketLooksClosed(fd_)) {
+      return;
+    }
+    std::string finish_error;
+    if (!Request(Opcode::kDownloadEnd, std::string(), &header, &response,
+                 &finish_error)) {
+      Fail(finish_error);
+    }
+  };
   RemoteSnapshotInfo info;
   std::uint64_t declared_size = 0;
   PayloadReader reader(response);
@@ -721,6 +766,8 @@ bool RemoteArchiveClient::DownloadArchiveFile(
     if (error_message != nullptr) {
       *error_message = "cannot decode the DOWNLOAD_BEGIN response";
     }
+    // 请求已经被接受了：解码失败也是"事务已经开始"之后失败。
+    end_download_transaction();
     return false;
   }
   info.snapshot_id = snapshot_id;
@@ -743,6 +790,8 @@ bool RemoteArchiveClient::DownloadArchiveFile(
   }
   FileSink sink;
   if (!sink.OpenTemp(target_directory, leaf + ".part-", error_message)) {
+    // 临时文件都没建起来，但服务端那边的下载事务已经开始了：收尾。
+    end_download_transaction();
     return false;
   }
   const std::string part_path = sink.path();
@@ -752,9 +801,6 @@ bool RemoteArchiveClient::DownloadArchiveFile(
     progress(RemoteTransferProgress{"download", 0, declared_size});
   }
   bool ok = true;
-  // 整条下载流是否已经收完（服务端发来一个空 chunk 就是"发完了"）。只有收完
-  // 的那几种失败才需要发 DOWNLOAD_END：中途断掉的连接已经不可用了。
-  bool stream_complete = false;
   for (;;) {
     if (!Request(Opcode::kDownloadChunk, std::string(), &header, &response,
                  error_message)) {
@@ -762,7 +808,7 @@ bool RemoteArchiveClient::DownloadArchiveFile(
       break;
     }
     if (response.empty()) {
-      stream_complete = true;
+      // 服务端发来一个空 chunk 就是"发完了"。
       break;
     }
     if (!sink.Write(response.data(), response.size(), error_message)) {
@@ -799,23 +845,11 @@ bool RemoteArchiveClient::DownloadArchiveFile(
   if (ok && !sink.Close(error_message)) {
     ok = false;
   }
-  // 下载流收尾：让服务端立刻释放句柄，并把连接状态从"下载中"放回"已认证"。
-  // 少了这一步，同一个连接上的下一次 DOWNLOAD_BEGIN 会被服务端按
-  // "不在已认证状态"拒绝——校验失败或发布失败之后连接就废了。
-  // 收尾本身失败不影响已经发布的文件：如实报告（Fail）但不回滚。
-  const auto finish_download_stream = [&]() {
-    std::string finish_error;
-    if (!Request(Opcode::kDownloadEnd, std::string(), &header, &response,
-                 &finish_error)) {
-      Fail(finish_error);
-    }
-  };
   if (!ok) {
-    // 失败绝不发布目标文件：只删掉自己这个唯一命名的临时文件。
+    // 失败绝不发布目标文件：只删掉自己这个唯一命名的临时文件，
+    // 然后无论失败发生在哪一步都收尾（连接已经坏了的话这一步自动跳过）。
     sink.Abandon();
-    if (stream_complete) {
-      finish_download_stream();
-    }
+    end_download_transaction();
     return false;
   }
   // 发布是**一步原子操作**，"不覆盖"由内核保证（link 已存在返回 EEXIST；
@@ -846,10 +880,10 @@ bool RemoteArchiveClient::DownloadArchiveFile(
                              : publish_error;
       }
     }
-    finish_download_stream();
+    end_download_transaction();
     return false;
   }
-  finish_download_stream();
+  end_download_transaction();
   if (downloaded != nullptr) {
     *downloaded = info;
   }
