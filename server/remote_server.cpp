@@ -93,10 +93,23 @@ bool EnsureDirectory(const std::string& path, std::string* error_message) {
   return true;
 }
 
+// secrets.env 的大小上限：它是几行配置，不是数据文件。没有上限就等于给
+// "读一个巨大的文件"留门（非普通文件在下面已经被拒，但普通文件也可能是 10 GiB）。
+constexpr std::size_t kMaxSecretFileBytes = 1024 * 1024;
+
 // 读 secrets.env 里的 BACKUP_TOKEN_SECRET。
 //
 // 硬规则：函数只把值交给调用方，**任何**日志、错误信息、返回值里都不出现
 // 值本身，最多出现长度。文件缺失、权限不对、没有这个键、值太短，都明确失败。
+//
+// "权限不对"必须是**真的检查过**的，而且检查与读取必须作用于同一个 inode：
+//   * open(O_NOFOLLOW)：符号链接直接失败。否则别人只要把 secrets.env 指向
+//     别处，"这是一个 0600 的 secret 文件"这句承诺就只是关于链接本身的；
+//   * fstat(fd)，而不是 stat(path) 之后再重新打开：没有 check/use 分离，
+//     中间不会被换成另一个文件（没有 TOCTOU）；
+//   * 必须是普通文件；
+//   * group / other 位一个都不能有：0600 与 0400 都接受，0640 / 0644 / 0660 /
+//     0666 一律拒绝——secret 落在别人的可读范围里就等于泄漏。
 bool ReadSecretFile(const std::string& path, std::string* secret,
                     std::string* error_message) {
   if (path.empty()) {
@@ -105,16 +118,82 @@ bool ReadSecretFile(const std::string& path, std::string* secret,
     }
     return false;
   }
-  std::ifstream input(path.c_str());
-  if (!input) {
+  const int fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+  if (fd < 0) {
     if (error_message != nullptr) {
-      *error_message = "cannot open the secret file " + path;
+      if (errno == ELOOP) {
+        *error_message = "the secret file must not be a symbolic link: " + path;
+      } else {
+        *error_message = "cannot open the secret file " + path + ": " +
+                         std::strerror(errno);
+      }
     }
     return false;
   }
-  std::string line;
+  struct stat info;
+  if (::fstat(fd, &info) != 0) {
+    const std::string reason = std::strerror(errno);
+    ::close(fd);
+    if (error_message != nullptr) {
+      *error_message = "cannot inspect the secret file " + path + ": " + reason;
+    }
+    return false;
+  }
+  if (!S_ISREG(info.st_mode)) {
+    ::close(fd);
+    if (error_message != nullptr) {
+      *error_message = "the secret file must be a regular file: " + path;
+    }
+    return false;
+  }
+  if ((info.st_mode & 0077) != 0) {
+    char mode[16];
+    std::snprintf(mode, sizeof(mode), "%04o",
+                  static_cast<unsigned>(info.st_mode & 07777));
+    ::close(fd);
+    if (error_message != nullptr) {
+      *error_message =
+          "the secret file must not be readable or writable by group or others"
+          " (expected mode 0600; 0400 is also accepted): " +
+          path + " is " + mode;
+    }
+    return false;
+  }
+  // 从**同一个 fd** 读完整份内容，之后只解析内存里的这一份。
+  std::string content;
+  char buffer[4096];
+  for (;;) {
+    const ssize_t got = ::read(fd, buffer, sizeof(buffer));
+    if (got < 0) {
+      if (errno == EINTR) {
+        continue;
+      }
+      const std::string reason = std::strerror(errno);
+      ::close(fd);
+      if (error_message != nullptr) {
+        *error_message = "cannot read the secret file " + path + ": " + reason;
+      }
+      return false;
+    }
+    if (got == 0) {
+      break;
+    }
+    content.append(buffer, static_cast<std::size_t>(got));
+    if (content.size() > kMaxSecretFileBytes) {
+      ::close(fd);
+      if (error_message != nullptr) {
+        *error_message = "the secret file is larger than 1 MiB: " + path;
+      }
+      return false;
+    }
+  }
+  ::close(fd);
   std::string value;
-  while (std::getline(input, line)) {
+  std::size_t start = 0;
+  while (start <= content.size()) {
+    const std::size_t end = content.find('\n', start);
+    std::string line = content.substr(
+        start, end == std::string::npos ? std::string::npos : end - start);
     if (!line.empty() && line.back() == '\r') {
       line.pop_back();
     }
@@ -123,6 +202,10 @@ bool ReadSecretFile(const std::string& path, std::string* secret,
       value = line.substr(key.size());
       break;
     }
+    if (end == std::string::npos) {
+      break;
+    }
+    start = end + 1;
   }
   if (value.empty()) {
     if (error_message != nullptr) {
@@ -185,6 +268,23 @@ bool RemoteServer::Configure(const RemoteServerConfig& config,
   if (::inet_pton(AF_INET, config.bind_address.c_str(), &probe) != 1) {
     if (error_message != nullptr) {
       *error_message = "--bind must be a dotted-quad IPv4 address";
+    }
+    return false;
+  }
+  // 只允许监听 127.0.0.1，而且是**相等**判断（127.0.0.2 之类同样拒绝）。
+  //
+  // 本版本没有原生 TLS：BPNET1 的口令与 token 是明文，机密性完全由 SSH 隧道
+  // 提供。既然机密性不在协议里，监听地址就必须只能是被隧道指向的那个环回地址；
+  // 0.0.0.0 与任何私网 / 公网地址都会把明文协议直接暴露在一个共享网络上。
+  // 所以这里 fail closed：不提供 --insecure / --allow-public 之类的开关，
+  // 也不给"只这一次"的例外。将来有了原生 TLS，再连同协议一起重新设计。
+  if (config.bind_address != "127.0.0.1") {
+    if (error_message != nullptr) {
+      *error_message =
+          "--bind must be 127.0.0.1, not " + config.bind_address +
+          ": this version has no native TLS, so the server only accepts"
+          " loopback connections; reach a remote instance through an SSH"
+          " tunnel (ssh -N -L 18765:127.0.0.1:18765 <host>)";
     }
     return false;
   }

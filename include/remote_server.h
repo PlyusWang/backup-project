@@ -59,6 +59,8 @@ inline constexpr const char* kServerSoftwareName = "backup-server";
 inline constexpr const char* kServerSoftwareVersion = "0.1.0";
 
 struct RemoteServerConfig {
+  // 监听地址。本版本**只接受** "127.0.0.1"：没有原生 TLS，机密性由 SSH 隧道
+  // 提供，Configure() 对任何非环回地址（0.0.0.0 / 私网 / 公网）都 fail closed。
   std::string bind_address = "127.0.0.1";
   std::uint16_t port = 18765;
   // blob 根目录：<root>/users/<user-id>/<snapshot-id>.bak
