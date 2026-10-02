@@ -62,7 +62,8 @@ bool EnsureDirectoryTree(const std::string& path, std::string* error_message) {
         current += "/" + part;
       }
       if (::mkdir(current.c_str(), 0700) != 0 && errno != EEXIST) {
-        SetError(error_message, "无法创建目录 " + current + "：" + StrerrorText());
+        SetError(error_message,
+                 "无法创建目录 " + current + "：" + StrerrorText());
         return false;
       }
     }
@@ -164,8 +165,8 @@ bool SaveRemoteIndex(const std::string& cache_directory,
   }
   std::size_t written = 0;
   while (written < content.size()) {
-    const ssize_t got = ::write(fd, content.data() + written,
-                               content.size() - written);
+    const ssize_t got =
+        ::write(fd, content.data() + written, content.size() - written);
     if (got < 0) {
       if (errno == EINTR) {
         continue;
@@ -321,9 +322,9 @@ bool FetchSnapshotMaterial(RemoteArchiveClient* client,
   // 与"归档信封里的父子边"是否一致，由 EnsureChainMaterial 在整条链上交叉校验。
   SnapshotIdentity identity;
   std::string load_error;
-  const bool verified = LoadVerifiedSnapshotIdentity(
-      cache.cache_directory, bundle.archive_name, &identity, nullptr,
-      &load_error);
+  const bool verified =
+      LoadVerifiedSnapshotIdentity(cache.cache_directory, bundle.archive_name,
+                                   &identity, nullptr, &load_error);
   if (!verified || !identity.sidecars_verified) {
     for (const SnapshotBundleMember& member : bundle.members) {
       ::unlink((cache.cache_directory + "/" + member.name).c_str());
@@ -392,17 +393,16 @@ bool EnsureChainMaterial(RemoteArchiveClient* client,
     const SnapshotIdentity& child = identities[index];
     const SnapshotIdentity& parent = identities[index - 1];
     if (child.parent_file_name != names[index - 1]) {
-      SetError(error_message,
-               "远端元数据与归档不一致：第 " + std::to_string(index) +
-                   " 跳声明的父是 " + names[index - 1] + "，归档信封里写的却是 " +
-                   child.parent_file_name);
+      SetError(error_message, "远端元数据与归档不一致：第 " +
+                                  std::to_string(index) + " 跳声明的父是 " +
+                                  names[index - 1] + "，归档信封里写的却是 " +
+                                  child.parent_file_name);
       return false;
     }
     if (!child.parent_snapshot_id.empty() &&
         child.parent_snapshot_id != parent.snapshot_id) {
-      SetError(error_message,
-               "远端元数据与归档不一致：父子身份不匹配（第 " +
-                   std::to_string(index) + " 跳）");
+      SetError(error_message, "远端元数据与归档不一致：父子身份不匹配（第 " +
+                                  std::to_string(index) + " 跳）");
       return false;
     }
     if (!parent.sidecars_verified) {
@@ -418,8 +418,8 @@ bool EnsureChainMaterial(RemoteArchiveClient* client,
 
 bool PrepareRemoteCache(const std::string& root_directory,
                         const std::string& server_fingerprint,
-                        const std::string& username,
-                        RemoteCacheLayout* layout, std::string* error_message) {
+                        const std::string& username, RemoteCacheLayout* layout,
+                        std::string* error_message) {
   if (layout == nullptr) {
     SetError(error_message, "缓存布局的输出指针为空");
     return false;
@@ -440,11 +440,10 @@ bool PrepareRemoteCache(const std::string& root_directory,
   layout->root_directory = root;
   layout->server_fingerprint = server_fingerprint;
   layout->username = username;
-  layout->cache_directory = root + "/" + FirstSixteen(server_fingerprint) + "/" +
-                            username;
+  layout->cache_directory =
+      root + "/" + FirstSixteen(server_fingerprint) + "/" + username;
   // 逻辑身份：与"本机路径"无关，所以另一台机器上传的同一条链能被认出来。
-  layout->repository_identity =
-      "remote:" + server_fingerprint + ":" + username;
+  layout->repository_identity = "remote:" + server_fingerprint + ":" + username;
   return EnsureDirectoryTree(layout->cache_directory, error_message);
 }
 
@@ -476,9 +475,9 @@ bool ResolveRemoteChain(const std::vector<RemoteSnapshotInfo>& snapshots,
     }
     chain->push_back(found->second);
     if (chain->size() > kMaxDeltaChainDepth + 1) {
-      SetError(error_message,
-               "远端链超过恢复侧允许的最大深度（" +
-                   std::to_string(kMaxDeltaChainDepth) + " 个 delta）");
+      SetError(error_message, "远端链超过恢复侧允许的最大深度（" +
+                                  std::to_string(kMaxDeltaChainDepth) +
+                                  " 个 delta）");
       return false;
     }
     if (found->second.parent_snapshot_id.empty()) {
@@ -495,16 +494,16 @@ bool ResolveRemoteChain(const std::vector<RemoteSnapshotInfo>& snapshots,
     const RemoteSnapshotInfo& snapshot = (*chain)[i];
     if (i == 0) {
       if (!snapshot.parent_snapshot_id.empty() || snapshot.generation != 0) {
-        SetError(error_message,
-                 "远端链的根不是一份 generation 0 的完整快照（元数据自相矛盾）");
+        SetError(
+            error_message,
+            "远端链的根不是一份 generation 0 的完整快照（元数据自相矛盾）");
         return false;
       }
       continue;
     }
     if (snapshot.parent_snapshot_id != (*chain)[i - 1].snapshot_id ||
         snapshot.generation != (*chain)[i - 1].generation + 1) {
-      SetError(error_message,
-               "远端链的父子关系或代数不连续（元数据自相矛盾）");
+      SetError(error_message, "远端链的父子关系或代数不连续（元数据自相矛盾）");
       return false;
     }
   }
@@ -601,8 +600,7 @@ bool RunRemoteBackup(const RemoteBackupRequest& request,
   }
 
   // 2) 让**既有引擎**决定这次是 delta 还是完整基线。
-  const std::uint64_t generation =
-      have_head ? head.generation + 1 : 0;
+  const std::uint64_t generation = have_head ? head.generation + 1 : 0;
   const std::string new_name =
       std::string(kRemoteArchivePrefix) + lineage.substr(0, 12) + "-" +
       std::to_string(static_cast<long long>(::time(nullptr))) + "-g" +
@@ -610,24 +608,24 @@ bool RunRemoteBackup(const RemoteBackupRequest& request,
 
   IncrementalOutcome incremental;
   std::string engine_error;
-  if (!RunIncrementalBackup(request.source_directory,
-                            request.cache.cache_directory, new_name,
-                            request.cache.repository_identity, request.filter,
-                            request.options, request.include_rules,
-                            request.exclude_rules, baseline_name, &incremental,
-                            &engine_error)) {
+  if (!RunIncrementalBackup(
+          request.source_directory, request.cache.cache_directory, new_name,
+          request.cache.repository_identity, request.filter, request.options,
+          request.include_rules, request.exclude_rules, baseline_name,
+          &incremental, &engine_error)) {
     SetError(error_message, "增量引擎失败：" + engine_error);
     return false;
   }
-  outcome->baseline_reason =
-      incremental.baseline_reason.empty() ? outcome->baseline_reason
-                                          : incremental.baseline_reason;
+  outcome->baseline_reason = incremental.baseline_reason.empty()
+                                 ? outcome->baseline_reason
+                                 : incremental.baseline_reason;
   if (incremental.kind == IncrementalOutcome::Kind::kNoChanges) {
     outcome->no_changes = true;
     return true;
   }
 
-  const bool produced_delta = incremental.kind == IncrementalOutcome::Kind::kDelta;
+  const bool produced_delta =
+      incremental.kind == IncrementalOutcome::Kind::kDelta;
   outcome->produced_delta = produced_delta;
   outcome->rebuilt_full_baseline = !produced_delta && have_head;
   outcome->archive_name = incremental.snapshot_file_name;
@@ -646,9 +644,8 @@ bool RunRemoteBackup(const RemoteBackupRequest& request,
   }
 
   RemoteUploadOptions upload_options;
-  upload_options.snapshot_kind =
-      static_cast<std::uint16_t>(produced_delta ? SnapshotKind::kIncremental
-                                                : SnapshotKind::kFull);
+  upload_options.snapshot_kind = static_cast<std::uint16_t>(
+      produced_delta ? SnapshotKind::kIncremental : SnapshotKind::kFull);
   upload_options.lineage = lineage;
   if (produced_delta) {
     if (!have_head) {
@@ -686,8 +683,7 @@ bool RunRemoteBackup(const RemoteBackupRequest& request,
                "服务端登记的链关系与客户端请求不一致（父或代数对不上）");
       return false;
     }
-  } else if (uploaded.generation != 0 ||
-             !uploaded.parent_snapshot_id.empty()) {
+  } else if (uploaded.generation != 0 || !uploaded.parent_snapshot_id.empty()) {
     SetError(error_message, "服务端把一份完整基线登记成了增量快照");
     return false;
   }
@@ -699,7 +695,8 @@ bool RunRemoteRestore(RemoteArchiveClient* client,
                       const std::string& snapshot_id,
                       const std::string& destination_directory,
                       const RestoreOptions& restore_options,
-                      RemoteRestoreOutcome* outcome, std::string* error_message) {
+                      RemoteRestoreOutcome* outcome,
+                      std::string* error_message) {
   if (outcome == nullptr || client == nullptr) {
     SetError(error_message, "远端恢复的参数为空");
     return false;

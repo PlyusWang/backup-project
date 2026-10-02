@@ -53,9 +53,9 @@ inline constexpr std::uint64_t kSnapshotBundleMaxMemberBytes =
     16ull * 1024ull * 1024ull * 1024ull;
 
 struct SnapshotBundleMember {
-  std::string name;      // 单组件文件名
+  std::string name;  // 单组件文件名
   std::uint64_t size = 0;
-  std::string sha256;    // 64 个小写十六进制字符
+  std::string sha256;  // 64 个小写十六进制字符
 };
 
 struct SnapshotBundleInfo {
@@ -77,7 +77,8 @@ bool BuildSnapshotBundle(const std::string& repository_directory,
 
 // 只读成员表（不解包）。诊断与测试用它。
 bool InspectSnapshotBundle(const std::string& bundle_path,
-                           SnapshotBundleInfo* info, std::string* error_message);
+                           SnapshotBundleInfo* info,
+                           std::string* error_message);
 
 // 解包到 target_directory。
 //
@@ -92,7 +93,8 @@ bool InspectSnapshotBundle(const std::string& bundle_path,
 //     不存在，不允许被覆盖）。
 bool ExtractSnapshotBundle(const std::string& bundle_path,
                            const std::string& target_directory,
-                           SnapshotBundleInfo* info, std::string* error_message);
+                           SnapshotBundleInfo* info,
+                           std::string* error_message);
 
 }  // namespace net
 }  // namespace backupproject

@@ -118,8 +118,8 @@ void FeAdd(const Fe& a, const Fe& b, Fe* out) {
 // r -= value（小整数）。调用方保证不会二次借位（见 FeSub 的说明）。
 void SubtractSmall(Limb r[8], Limb value) {
   std::int64_t borrow = 0;
-  std::int64_t cur = static_cast<std::int64_t>(r[0]) -
-                     static_cast<std::int64_t>(value);
+  std::int64_t cur =
+      static_cast<std::int64_t>(r[0]) - static_cast<std::int64_t>(value);
   r[0] = Low32Signed(cur);
   borrow = (cur < 0) ? 1 : 0;
   for (std::size_t i = 1; borrow != 0 && i < 8; ++i) {
@@ -251,9 +251,10 @@ void MontgomeryLadder(const unsigned char scalar[32], const Fe& x1, Fe* out) {
 
   Limb swap = 0;
   for (int t = 254; t >= 0; --t) {
-    const Limb bit = static_cast<Limb>(
-        (scalar[static_cast<std::size_t>(t) >> 3] >>
-         (static_cast<unsigned>(t) & 7u)) & 1u);
+    const Limb bit =
+        static_cast<Limb>((scalar[static_cast<std::size_t>(t) >> 3] >>
+                           (static_cast<unsigned>(t) & 7u)) &
+                          1u);
     swap ^= bit;
     Cswap(swap, &x2, &x3);
     Cswap(swap, &z2, &z3);
@@ -338,7 +339,8 @@ bool X25519(const std::string& scalar, const std::string& u_coordinate,
   }
   if (u_coordinate.size() != kX25519KeySize) {
     SetError(error_message, "X25519 的 u 坐标必须是 32 字节（实际 " +
-                                std::to_string(u_coordinate.size()) + " 字节）");
+                                std::to_string(u_coordinate.size()) +
+                                " 字节）");
     return false;
   }
 
@@ -434,8 +436,9 @@ bool X25519ParseKeyText(const std::string& text, std::string* out,
   if (body.compare(0, 4, "hex:") == 0) {
     body = body.substr(4);
   } else if (body.find(':') != std::string::npos) {
-    SetError(error_message,
-             "不认识的公钥前缀（只接受 hex: 前缀，或直接给 64 个十六进制字符）");
+    SetError(
+        error_message,
+        "不认识的公钥前缀（只接受 hex: 前缀，或直接给 64 个十六进制字符）");
     return false;
   }
   if (body.size() != kX25519KeySize * 2) {

@@ -76,7 +76,8 @@ inline constexpr std::size_t kBssec1MaxRecordSize =
     kBssec1RecordHeaderSize + kBssec1MaxPlaintextBytes + kBssec1TagSize;
 
 // HMAC 覆盖的范围里带的协议标签（16 字节，正好一个分组）：
-//   HMAC(mac_key, label || direction || sequence || ciphertext_length || ciphertext)
+//   HMAC(mac_key, label || direction || sequence || ciphertext_length ||
+//   ciphertext)
 inline constexpr char kBssec1RecordLabel[] = "BPSEC1 record v1";
 inline constexpr std::size_t kBssec1RecordLabelSize = 16;
 inline constexpr std::uint8_t kBssec1DirectionClientToServer = 1;
@@ -100,18 +101,18 @@ inline constexpr char kBssec1InfoServerFinished[] = "BPSEC1 server finished";
 
 enum class SecureTransportError {
   kNone = 0,
-  kIoError,               // 传输层读写失败 / 对端中途关闭
-  kMalformedMessage,      // 消息 magic、类型、保留字段或长度不合法
-  kUnsupportedVersion,    // 版本或密码套件不认识
-  kServerKeyMismatch,     // 服务端身份公钥与本地 pin 不一致
+  kIoError,           // 传输层读写失败 / 对端中途关闭
+  kMalformedMessage,  // 消息 magic、类型、保留字段或长度不合法
+  kUnsupportedVersion,  // 版本或密码套件不认识
+  kServerKeyMismatch,   // 服务端身份公钥与本地 pin 不一致
   kAuthenticationFailed,  // Finished 校验失败（transcript 被改 / 密钥不一致）
-  kWeakSharedSecret,      // 共享秘密全零（对端给了低阶点）
-  kNoPinConfigured,       // 客户端没有配置服务端公钥/指纹（拒绝连接，不做 TOFU）
+  kWeakSharedSecret,  // 共享秘密全零（对端给了低阶点）
+  kNoPinConfigured,  // 客户端没有配置服务端公钥/指纹（拒绝连接，不做 TOFU）
   kRecordAuthentication,  // 记录层 tag 校验失败
   kReplayDetected,        // 记录序号不连续：重放、跳号或乱序
   kOversizedRecord,       // 记录长度超过上限
-  kStateError,            // 没有完成握手就使用记录层，或序号耗尽
-  kCryptoFailure,         // 本地密码学原语失败（密钥/IV 长度不合法等）
+  kStateError,     // 没有完成握手就使用记录层，或序号耗尽
+  kCryptoFailure,  // 本地密码学原语失败（密钥/IV 长度不合法等）
 };
 
 const char* SecureTransportErrorName(SecureTransportError error);
@@ -186,7 +187,8 @@ class SecureChannel {
   const std::string& peer_public_key() const { return peer_public_key_; }
   // 客户端：对端身份公钥的指纹（64 个小写十六进制字符）。
   const std::string& peer_fingerprint() const { return peer_fingerprint_; }
-  // 这次会话的握手 transcript 摘要（32 字节，SHA-256(ClientHello||ServerHello)），
+  // 这次会话的握手 transcript 摘要（32
+  // 字节，SHA-256(ClientHello||ServerHello)），
   // 只用于日志/测试断言，不能当密钥用。
   const std::string& transcript_hash() const { return transcript_hash_; }
   std::uint64_t send_sequence() const { return send_sequence_; }
@@ -202,7 +204,8 @@ class SecureChannel {
   bool SendFrame(int fd, std::uint16_t opcode, std::uint32_t status,
                  std::uint64_t request_id, const std::string& payload,
                  std::string* error_message);
-  FrameReadStatus ReceiveFrame(int fd, FrameHeader* header, std::string* payload,
+  FrameReadStatus ReceiveFrame(int fd, FrameHeader* header,
+                               std::string* payload,
                                std::string* error_message);
 
   // ---- 记录层原语（测试与诊断用；产品路径上是上面两个函数）----

@@ -70,7 +70,8 @@ struct RemoteServerConfig {
   std::string database_path;
   // 含 BACKUP_TOKEN_SECRET 的 secrets.env（600）。只读，绝不打印内容。
   std::string secret_file_path;
-  // BPSEC1 的服务端长期身份私钥文件（32 字节原始 X25519 标量，0600，O_NOFOLLOW）。
+  // BPSEC1 的服务端长期身份私钥文件（32 字节原始 X25519
+  // 标量，0600，O_NOFOLLOW）。
   //
   // **必填**：Configure/Start 都拒绝空值。这不是"可选加固"——BPNET1 的口令、
   // token、用户名与快照元数据全部由 BPSEC1 保护，缺了它就没有任何一条可以

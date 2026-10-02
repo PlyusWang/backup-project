@@ -40,8 +40,8 @@ namespace crypto {
 // X25519 的标量（private key）与 u 坐标（public key）都是 32 字节。
 inline constexpr std::size_t kX25519KeySize = 32;
 
-// RFC 7748 第 5 节的 decodeScalar25519：k[0] &= 248; k[31] &= 127; k[31] |= 64。
-// 就地修改 32 字节标量。这个操作是幂等的（对已经 clamp 过的标量再调用一次
+// RFC 7748 第 5 节的 decodeScalar25519：k[0] &= 248; k[31] &= 127; k[31] |=
+// 64。 就地修改 32 字节标量。这个操作是幂等的（对已经 clamp 过的标量再调用一次
 // 结果不变），所以"文件里存 clamp 过的标量 + 使用时再 clamp"是安全的。
 void X25519ClampScalar(unsigned char scalar[kX25519KeySize]);
 

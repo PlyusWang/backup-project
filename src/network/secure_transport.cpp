@@ -29,7 +29,7 @@ using crypto::Sha256;
 using crypto::X25519GenerateKeyPair;
 using crypto::X25519SharedSecret;
 
-inline constexpr std::size_t kX25519Bytes = crypto::kX25519KeySize;  // 32
+inline constexpr std::size_t kX25519Bytes = crypto::kX25519KeySize;     // 32
 inline constexpr std::size_t kSha256Bytes = crypto::kSha256DigestSize;  // 32
 
 std::string StrerrorText() { return std::string(std::strerror(errno)); }
@@ -80,14 +80,16 @@ std::string Sha256Of(const std::string& data) {
 }
 
 // 记录层的 tag：
-//   HMAC(mac_key, "BPSEC1 record v1" || direction || seq || ciphertext_length || ciphertext)
+//   HMAC(mac_key, "BPSEC1 record v1" || direction || seq || ciphertext_length
+//   || ciphertext)
 // 用流式 HMAC 拼，避免为 1 MiB 的记录再复制一份 mac 输入。
 std::string RecordTag(const std::string& mac_key, std::uint8_t direction,
                       std::uint64_t sequence, const std::string& ciphertext) {
   unsigned char header[13];
   header[0] = direction;
   for (std::size_t i = 0; i < 8; ++i) {
-    header[1 + i] = static_cast<unsigned char>((sequence >> (56 - 8 * i)) & 0xFFu);
+    header[1 + i] =
+        static_cast<unsigned char>((sequence >> (56 - 8 * i)) & 0xFFu);
   }
   const std::uint32_t length = static_cast<std::uint32_t>(ciphertext.size());
   header[9] = static_cast<unsigned char>((length >> 24) & 0xFFu);
@@ -105,7 +107,8 @@ std::string RecordTag(const std::string& mac_key, std::uint8_t direction,
 }
 
 // AES-CTR 的 128 位计数器块：
-//   nonce_prefix(4 字节) || record_sequence(8 字节大端) || block_counter(4 字节大端)
+//   nonce_prefix(4 字节) || record_sequence(8 字节大端) || block_counter(4
+//   字节大端)
 //
 // 这样**每条记录的计数器空间互不重叠**：block_counter 从 0 开始，最多
 // 2^32 - 1 个块（一条记录远达不到），因此不会像"IV = base + seq，然后让
@@ -203,7 +206,8 @@ bool CheckMessageHeader(const unsigned char* raw, std::size_t size,
   if (LoadU32(raw) != kBssec1Magic) {
     *error = SecureTransportError::kMalformedMessage;
     if (error_message != nullptr) {
-      *error_message = std::string(what) + " 的 magic 不是 BPS1（对端不是 BPSEC1，"
+      *error_message = std::string(what) +
+                       " 的 magic 不是 BPS1（对端不是 BPSEC1，"
                        "或链路上有东西在改写字节）";
     }
     return false;
@@ -240,8 +244,9 @@ struct SessionKeys {
   std::string server_finished;
 };
 
-// HKDF-Extract(salt = client_random || server_random, IKM = DH_static || DH_ephemeral)
-// 之后按 8 个互不相同的 info 标签各 Expand 一次：方向分离 + 用途分离。
+// HKDF-Extract(salt = client_random || server_random, IKM = DH_static ||
+// DH_ephemeral) 之后按 8 个互不相同的 info 标签各 Expand 一次：方向分离 +
+// 用途分离。
 bool DeriveSessionKeys(const std::string& shared_secret,
                        const std::string& client_random,
                        const std::string& server_random, SessionKeys* keys,
@@ -267,8 +272,8 @@ bool DeriveSessionKeys(const std::string& shared_secret,
       {kBssec1InfoServerFinished, kSha256Bytes, &keys->server_finished},
   };
   for (const Request& request : requests) {
-    if (!HkdfExpand(prk, std::string(request.info), request.length,
-                    request.out, error_message)) {
+    if (!HkdfExpand(prk, std::string(request.info), request.length, request.out,
+                    error_message)) {
       return false;
     }
   }
@@ -331,13 +336,15 @@ std::string SecureTransportErrorMessage(SecureTransportError error) {
     case SecureTransportError::kUnsupportedVersion:
       return "BPSEC1 版本或密码套件不被支持";
     case SecureTransportError::kServerKeyMismatch:
-      return "服务端传输身份公钥与本地 pin 不一致（可能存在中间人，或服务端换过密钥）";
+      return "服务端传输身份公钥与本地 pin "
+             "不一致（可能存在中间人，或服务端换过密钥）";
     case SecureTransportError::kAuthenticationFailed:
       return "BPSEC1 握手校验失败：握手的字节被改过，或双方密钥不一致";
     case SecureTransportError::kWeakSharedSecret:
       return "X25519 共享秘密退化（对端给了低阶点），拒绝建立会话";
     case SecureTransportError::kNoPinConfigured:
-      return "没有配置服务端传输公钥/指纹，拒绝连接（本项目不做首次连接自动信任）";
+      return "没有配置服务端传输公钥/"
+             "指纹，拒绝连接（本项目不做首次连接自动信任）";
     case SecureTransportError::kRecordAuthentication:
       return "加密记录校验失败：数据在传输途中被修改过";
     case SecureTransportError::kReplayDetected:
@@ -454,9 +461,8 @@ bool SaveTransportIdentity(const std::string& path,
   }
   std::size_t written = 0;
   while (written < kX25519Bytes) {
-    const ssize_t count =
-        ::write(fd, identity.private_key.data() + written,
-                kX25519Bytes - written);
+    const ssize_t count = ::write(fd, identity.private_key.data() + written,
+                                  kX25519Bytes - written);
     if (count < 0) {
       if (errno == EINTR) {
         continue;
@@ -619,6 +625,11 @@ void SecureChannel::Reset() {
 bool SecureChannel::Fail(SecureTransportError error, const std::string& detail,
                          std::string* error_message) {
   last_error_ = error;
+  // 失败之后这条通道**永远**不可再用。规则放在这里，而不是散在十几个返回点：
+  // 变异测试抓到过一个真实缺口——服务端在"读 ClientFinished 失败"时返回了
+  // false，但 DeriveKeys 已经把手上的 established_ 置成了 true。调用方即使
+  // 误判，也不该把明文交给一条没有完成认证的连接。
+  established_ = false;
   if (error_message != nullptr) {
     std::string text = SecureTransportErrorMessage(error);
     if (!detail.empty()) {
@@ -631,8 +642,8 @@ bool SecureChannel::Fail(SecureTransportError error, const std::string& detail,
 
 bool SecureChannel::DeriveKeys(const std::string& shared_secret,
                                const std::string& client_random,
-                               const std::string& server_random,
-                               bool is_client, std::string* error_message) {
+                               const std::string& server_random, bool is_client,
+                               std::string* error_message) {
   SessionKeys keys;
   if (!DeriveSessionKeys(shared_secret, client_random, server_random, &keys,
                          error_message)) {
@@ -687,8 +698,8 @@ bool SecureChannel::HandshakeClient(int fd, const ServerKeyPin& pin,
   const std::string hello = BuildClientHello(client_random, ephemeral_public);
   std::string io_error;
   if (!SendAll(fd, hello.data(), hello.size(), &io_error)) {
-    return Fail(SecureTransportError::kIoError, "发送 ClientHello 失败：" + io_error,
-                error_message);
+    return Fail(SecureTransportError::kIoError,
+                "发送 ClientHello 失败：" + io_error, error_message);
   }
 
   unsigned char raw[kBssec1ServerHelloSize];
@@ -725,7 +736,8 @@ bool SecureChannel::HandshakeClient(int fd, const ServerKeyPin& pin,
   if (pin.has_key) {
     if (!ConstantTimeEquals(pin.public_key, server_static)) {
       return Fail(SecureTransportError::kServerKeyMismatch,
-                  "ServerHello 里的身份公钥与本地 pin 的公钥不同", error_message);
+                  "ServerHello 里的身份公钥与本地 pin 的公钥不同",
+                  error_message);
     }
   }
   if (LowerHex(pin.fingerprint_hex) != peer_fingerprint_) {
@@ -755,7 +767,8 @@ bool SecureChannel::HandshakeClient(int fd, const ServerKeyPin& pin,
     return false;
   }
 
-  const std::string server_hello(reinterpret_cast<const char*>(raw), sizeof(raw));
+  const std::string server_hello(reinterpret_cast<const char*>(raw),
+                                 sizeof(raw));
   transcript_hash_ = Sha256Of(hello + server_hello);
 
   const std::string client_finished =
@@ -778,13 +791,13 @@ bool SecureChannel::HandshakeClient(int fd, const ServerKeyPin& pin,
   }
   if (LoadU32(server_finished_raw) != kBssec1Magic ||
       server_finished_raw[4] != kBssec1MessageServerFinished ||
-      server_finished_raw[5] != kBssec1Version ||
-      server_finished_raw[6] != 0 || server_finished_raw[7] != 0) {
+      server_finished_raw[5] != kBssec1Version || server_finished_raw[6] != 0 ||
+      server_finished_raw[7] != 0) {
     return Fail(SecureTransportError::kMalformedMessage,
                 "ServerFinished 消息格式不合法", error_message);
   }
-  const std::string expected_server_finished = HmacTag(
-      server_finished_key_, transcript_hash_ + client_finished);
+  const std::string expected_server_finished =
+      HmacTag(server_finished_key_, transcript_hash_ + client_finished);
   const std::string got_server_finished(
       reinterpret_cast<const char*>(server_finished_raw + 8), kSha256Bytes);
   if (!ConstantTimeEquals(expected_server_finished, got_server_finished)) {
@@ -869,7 +882,8 @@ bool SecureChannel::HandshakeServer(int fd, const TransportIdentity& identity,
     return false;
   }
 
-  const std::string client_hello(reinterpret_cast<const char*>(raw), sizeof(raw));
+  const std::string client_hello(reinterpret_cast<const char*>(raw),
+                                 sizeof(raw));
   transcript_hash_ = Sha256Of(client_hello + server_hello);
 
   unsigned char client_finished_raw[kBssec1FinishedSize];
@@ -882,8 +896,8 @@ bool SecureChannel::HandshakeServer(int fd, const TransportIdentity& identity,
   }
   if (LoadU32(client_finished_raw) != kBssec1Magic ||
       client_finished_raw[4] != kBssec1MessageClientFinished ||
-      client_finished_raw[5] != kBssec1Version ||
-      client_finished_raw[6] != 0 || client_finished_raw[7] != 0) {
+      client_finished_raw[5] != kBssec1Version || client_finished_raw[6] != 0 ||
+      client_finished_raw[7] != 0) {
     return Fail(SecureTransportError::kMalformedMessage,
                 "ClientFinished 消息格式不合法", error_message);
   }
@@ -919,8 +933,8 @@ bool SecureChannel::SendRecord(int fd, const std::string& plaintext,
   }
   if (plaintext.size() > kBssec1MaxPlaintextBytes) {
     return Fail(SecureTransportError::kOversizedRecord,
-                "单条记录的明文超过 " + std::to_string(kBssec1MaxPlaintextBytes) +
-                    " 字节",
+                "单条记录的明文超过 " +
+                    std::to_string(kBssec1MaxPlaintextBytes) + " 字节",
                 error_message);
   }
   if (send_sequence_ == 0xFFFFFFFFFFFFFFFFull) {
@@ -982,8 +996,8 @@ FrameReadStatus SecureChannel::ReceiveRecord(int fd, std::string* plaintext,
   }
   plaintext->clear();
   if (!established_) {
-    Fail(SecureTransportError::kStateError,
-         "还没有完成 BPSEC1 握手就接收记录", error_message);
+    Fail(SecureTransportError::kStateError, "还没有完成 BPSEC1 握手就接收记录",
+         error_message);
     return FrameReadStatus::kCorruptStream;
   }
 
@@ -1002,8 +1016,8 @@ FrameReadStatus SecureChannel::ReceiveRecord(int fd, std::string* plaintext,
   }
 
   if (LoadU32(header) != kBssec1Magic) {
-    Fail(SecureTransportError::kMalformedMessage,
-         "记录头 magic 不是 BPS1", nullptr);
+    Fail(SecureTransportError::kMalformedMessage, "记录头 magic 不是 BPS1",
+         nullptr);
     if (error_message != nullptr) {
       *error_message = "记录头 magic 不对：对端不是 BPSEC1，或链路被改写";
     }
@@ -1019,7 +1033,8 @@ FrameReadStatus SecureChannel::ReceiveRecord(int fd, std::string* plaintext,
     return FrameReadStatus::kCorruptStream;
   }
   if (header[5] != kBssec1Version) {
-    Fail(SecureTransportError::kUnsupportedVersion, "记录版本不被支持", nullptr);
+    Fail(SecureTransportError::kUnsupportedVersion, "记录版本不被支持",
+         nullptr);
     if (error_message != nullptr) {
       *error_message = "记录层的 BPSEC1 版本不被支持";
     }
@@ -1027,7 +1042,8 @@ FrameReadStatus SecureChannel::ReceiveRecord(int fd, std::string* plaintext,
     return FrameReadStatus::kCorruptStream;
   }
   if (header[6] != 0 || header[7] != 0) {
-    Fail(SecureTransportError::kMalformedMessage, "记录保留字段不是 0", nullptr);
+    Fail(SecureTransportError::kMalformedMessage, "记录保留字段不是 0",
+         nullptr);
     if (error_message != nullptr) {
       *error_message = "记录头保留字段不是 0";
     }
@@ -1038,8 +1054,8 @@ FrameReadStatus SecureChannel::ReceiveRecord(int fd, std::string* plaintext,
   const std::uint64_t sequence = LoadU64(header + 8);
   const std::uint32_t ciphertext_length = LoadU32(header + 16);
   if (ciphertext_length > kBssec1MaxPlaintextBytes) {
-    Fail(SecureTransportError::kOversizedRecord,
-         "记录声明的密文长度超过上限", nullptr);
+    Fail(SecureTransportError::kOversizedRecord, "记录声明的密文长度超过上限",
+         nullptr);
     if (error_message != nullptr) {
       *error_message = "记录声明的密文长度 " +
                        std::to_string(ciphertext_length) + " 超过上限 " +
@@ -1081,8 +1097,8 @@ FrameReadStatus SecureChannel::ReceiveRecord(int fd, std::string* plaintext,
   const std::string expected_tag =
       RecordTag(receive_mac_key_, receive_direction_, sequence, ciphertext);
   if (!ConstantTimeEquals(expected_tag, tag)) {
-    Fail(SecureTransportError::kRecordAuthentication,
-         "记录 HMAC 校验失败", nullptr);
+    Fail(SecureTransportError::kRecordAuthentication, "记录 HMAC 校验失败",
+         nullptr);
     if (error_message != nullptr) {
       *error_message =
           "加密记录校验失败：数据被修改过（或密钥不一致）；这条连接不可信";
@@ -1094,7 +1110,8 @@ FrameReadStatus SecureChannel::ReceiveRecord(int fd, std::string* plaintext,
   const std::string counter = CounterBlock(receive_nonce_prefix_, sequence);
   crypto::Aes256Ctr cipher(receive_key_, counter);
   if (!cipher.valid()) {
-    Fail(SecureTransportError::kCryptoFailure, "AES-256-CTR 初始化失败", nullptr);
+    Fail(SecureTransportError::kCryptoFailure, "AES-256-CTR 初始化失败",
+         nullptr);
     if (error_message != nullptr) {
       *error_message = "AES-256-CTR 初始化失败（本地密码学原语错误）";
     }
