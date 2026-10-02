@@ -706,6 +706,26 @@ expect_present "$REMOTE_CONTROLLER_CPP" "该用户名已被使用，请更换用
   "重复注册的文案是「该用户名已被使用，请更换用户名」"
 expect_present "$REMOTE_CONTROLLER_CPP" "当前密码不正确，账户与全部云端备份都没有被删除" \
   "注销失败明确说明「账户与全部云端备份都没有被删除」"
+# 用户名校验的**原因**：核心决定原因，界面只负责翻译。旧实现把"长度不合法"
+# 与"字符不合法"合成一句固定文案，人工验收里输入 "W" 被误导成"字符有问题"。
+expect_present "$ROOT_DIR/include/network_protocol.h" "enum class UsernameValidation" \
+  "用户名校验有结构化的原因（empty / 太短 / 太长 / 字符非法 / ok）"
+expect_present "$ROOT_DIR/include/network_protocol.h" "UsernameValidation ValidateUsername" \
+  "共享头暴露 ValidateUsername（规则的唯一实现）"
+expect_present "$ROOT_DIR/src/network/network_protocol.cpp" "UsernameValidation ValidateUsername" \
+  "实现只有一份：ValidateUsername 决定原因"
+expect_present "$ROOT_DIR/src/network/network_protocol.cpp" "bool IsValidUsername" \
+  "IsValidUsername 仍然存在（兼容包装，行为不变）"
+expect_present "$REMOTE_CONTROLLER_CPP" "backupproject::net::ValidateUsername" \
+  "控制器用结构化校验器，不自己判断长度或字符集"
+expect_count "$REMOTE_CONTROLLER_CPP" "用户名长度需要为" 1 \
+  "长度原因有自己的一句话（只写一处）"
+expect_count "$REMOTE_CONTROLLER_CPP" "用户名只能包含字母、数字、点、下划线或减号" 1 \
+  "字符集原因有自己的一句话（与长度那句不是同一句）"
+expect_missing "$REMOTE_PAGE_QML" "用户名长度" \
+  "QML 不自己判断用户名校验（文案由控制器给出）"
+expect_missing "$REMOTE_PAGE_QML" "用户名只能包含" \
+  "QML 里没有第二份用户名校验文案"
 # 传输层：请求生命周期与连接生命周期分开，且**没有**自动重发。
 expect_present "$CLIENT_CPP" "PrepareConnection(&prepare_error)" 1 \
   "发请求之前先准备连接（重连 / 恢复会话都发生在发送之前）"
