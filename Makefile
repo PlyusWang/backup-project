@@ -22,6 +22,7 @@ CORE_SOURCES := src/core/archive_entry.cpp src/core/archive_pipeline.cpp \
                 src/compression/lzss.cpp src/crypto/aes.cpp \
                 src/crypto/des.cpp src/crypto/hmac.cpp src/crypto/pbkdf2.cpp \
                 src/crypto/random.cpp src/crypto/sha256.cpp \
+                src/crypto/x25519.cpp src/crypto/hkdf.cpp \
                 src/filter/filter.cpp src/filter/filter_rule_builder.cpp
 
 
@@ -68,7 +69,10 @@ SERVER_CORE_SOURCES := src/network/network_protocol.cpp \
                        src/crypto/sha256.cpp \
                        src/crypto/hmac.cpp \
                        src/crypto/pbkdf2.cpp \
-                       src/crypto/random.cpp
+                       src/crypto/random.cpp \
+                       src/crypto/x25519.cpp \
+                       src/crypto/hkdf.cpp \
+                       src/network/secure_transport.cpp
 SERVER_SOURCES := server/main.cpp $(SERVER_CORE_SOURCES)
 # 服务端的目标文件放在 $(BUILD_DIR)/server/ 下，**不要**落在 $(BUILD_DIR)/src/。
 # 既有的测试脚本用 "find build/src -name '*.o'" 收集核心对象来链接单元测试，
@@ -93,6 +97,7 @@ FILESYSTEM_SOURCES := src/filesystem/file_system.cpp
 # CLI 与 Modern GUI 共用同一个 RemoteArchiveClient：桌面端只链接协议编解码与
 # 客户端，**不链接 SQLite**（元数据库只属于服务端进程）。
 CORE_SOURCES += src/network/network_protocol.cpp \
+                src/network/secure_transport.cpp \
                 src/network/remote_backup_client.cpp \
                 src/cli/remote_commands.cpp
 SOURCES := $(APP_SOURCES) $(CORE_SOURCES) $(FILESYSTEM_SOURCES)
