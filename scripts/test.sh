@@ -2078,6 +2078,27 @@ run_inc_cli() {
   set -e
 }
 
+# 挑出仓库里"增量/差异"那一份归档。
+#
+# 为什么不能按文件名挑：增量归档只有在**同一秒内**与基线重名时才会带上 _NNN
+# 后缀（BackupCatalog 的去重规则）。基线快照与 delta 差一秒就都没有后缀，于是
+# 原来的 "*_001.bak" 匹配不到任何东西 —— basename 拿不到参数，set -e 会让整个
+# 套件直接退出（exit=123）。这条断言因此与机器快慢相关，属于既有的偶发失败。
+# 判据改成内容：增量归档里带 parent 引用，完整基线里没有。
+find_delta_archive() {
+  local repository="$1"
+  local candidate
+  for candidate in "$repository"/*.bak; do
+    [[ -e "$candidate" ]] || continue
+    if grep -aq "parent" "$candidate"; then
+      basename "$candidate"
+      return 0
+    fi
+  done
+  # 兜底：一份带 parent 的都没有时取最新的（调用方自己判断结果对不对）。
+  ls -t "$repository"/*.bak 2>/dev/null | head -1 | xargs -r basename
+}
+
 # INC-01 第一次：没有可信基线 -> 完整基线，而且必须说出来。
 run_inc_cli
 if [[ $INC_STATUS -eq 0 ]] &&
@@ -2199,7 +2220,7 @@ fi
   >/dev/null 2>&1
 # 明确挑"_NNN.bak"那一份（delta），不靠 sort 的标点顺序：
 # 排序规则受 locale 影响，"a.bak" 与 "a_001.bak" 谁在前并不稳定。
-INC_DELTA="$(ls "$INC/repo-cli"/*.bak | grep -E '_[0-9]{3}\.bak$' | head -1 | xargs basename)"
+INC_DELTA="$(find_delta_archive "$INC/repo-cli")"
 rm -rf "$INC/restored"
 set +e
 timeout --signal=KILL "$TIMEOUT_SECONDS" "$BACKUPCTL" --config-file "$INC_CONFIG" \
@@ -2288,7 +2309,7 @@ else
   record_fail "INC-11 retention 保住了祖先" "backups=$SCHED_INC_BACKUPS"
 fi
 # 保住还不够：那条链必须真的还能恢复。
-SCHED_INC_DELTA="$(ls "$SCHED_INC/repo"/*_001.bak 2>/dev/null | head -1 | xargs -r basename)"
+SCHED_INC_DELTA="$(find_delta_archive "$SCHED_INC/repo")"
 rm -rf "$SCHED_INC/restored"
 set +e
 timeout --signal=KILL "$TIMEOUT_SECONDS" "$BACKUPCTL" --config-file "$SCHED_INC_CFG" \

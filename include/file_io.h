@@ -212,6 +212,19 @@ bool PublishNoReplace(const std::string& temp_file,
                       const std::string& final_path,
                       std::string* error_message);
 
+// 把已经 fsync 好的临时文件**原子替换**成 final_path（调用方明确同意覆盖）。
+//
+// 与 PublishNoReplace 相对：这里只有一步 rename(temp, final)。rename 在 POSIX
+// 上是原子的，所以读者看到的要么是旧的完整内容、要么是新的完整内容，绝不会是
+// 半份；成功之后 fsync 父目录让目录项落盘（少数文件系统不支持，不算错误）。
+//
+// 只给"用户已经明确同意覆盖"的调用点用（例如下载 --force）：任何默认路径都必须
+// 走 PublishNoReplace，绝不覆盖已有文件。失败时 final_path 保持原样，
+// temp_file 由调用方负责清理。
+bool PublishReplacing(const std::string& temp_file,
+                      const std::string& final_path,
+                      std::string* error_message);
+
 // 可用空间 sanity check：目录所在文件系统的可用字节数是否够 need_bytes。
 // 明确不够就提前失败，而不是写到 ENOSPC 才知道。
 bool CheckFreeSpace(const std::string& directory, std::uint64_t need_bytes,

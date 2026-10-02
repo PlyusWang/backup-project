@@ -235,6 +235,19 @@ Canvas {
             ctx.lineTo(5.2, 12.8)
             ctx.stroke()
             break
+        case "cloud":
+            // 一朵云：远程备份在国际惯例里就是它，比画一台服务器更容易在
+            // 16px 下认出来。三段等半径半圆共切线 + 一条底边，一个闭合路径，
+            // 不需要任何填充。
+            ctx.beginPath()
+            ctx.moveTo(4.6, 13.2)
+            ctx.lineTo(11.2, 13.2)
+            ctx.arc(11.2, 11.0, 2.2, Math.PI * 0.5, -Math.PI * 0.5, true)
+            ctx.arc(9.0, 8.8, 2.2, 0, Math.PI, true)
+            ctx.arc(6.8, 11.0, 2.2, -Math.PI * 0.5, Math.PI * 0.5, true)
+            ctx.closePath()
+            ctx.stroke()
+            break
         default:
             break
         }
