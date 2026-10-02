@@ -134,6 +134,36 @@ ECS，再在 ECS 本机运行 backup-server-admin：
 （按用户列出 / 详情 / 删除单个快照）、存储概览（用户数 / 快照总数 / blob 总
 大小 / 占用最多的用户），外加服务状态。
 
+**每一次运行都会先打印"我在看哪个实例"**：
+
+    Host:        2025040908016
+    Server root: /home/ubuntu/backup-project-server
+    Data root:   /home/ubuntu/backup-project-server/data
+    Metadata DB: /home/ubuntu/backup-project-server/state/metadata.sqlite3
+    Service:     backup-server 正在运行（pid=… started_at=…）
+
+    用户数：12　快照数：0　blob 总大小：0 B　已注销账户：9
+
+路径一律显示 realpath 之后的绝对路径：脱离上下文的相对路径正是"看错实例"的
+温床（见下面那条 P0）。
+
+**状态根从部署布局推导，且 fail closed**：
+
+    <server-root>/bin/backup-server-admin.sh   从自己所在目录推 <server-root>
+    <server-root>/data                         数据根（--root）
+    <server-root>/state/metadata.sqlite3       元数据库（--db）
+
+* `BACKUP_SERVER_ROOT` / `BACKUP_SERVER_DATA` / `BACKUP_SERVER_DB` 可以覆盖；
+* 管理工具**只打开已经存在的数据库**（`OpenExisting`，不带 SQLITE_OPEN_CREATE）：
+  路径不对就报错退出，绝不创建一个空库。原因是人工验收里出过一次真实事故：
+  wrapper 的默认值是 `<server-root>/data/metadata.sqlite3`（正确的位置是
+  `state/`），SQLite 在文件不存在时会新建，于是管理工具安静地读了一个**自己刚
+  建出来的空库**，屏幕上"还没有任何用户"与"你看错实例了"完全一样，而 GUI 那边的
+  "已登录"其实是对的。
+* 回归测试：`scripts/same_instance_truth_test.sh`（本地四源一致性 + 错误实例根
+  必须失败且不创建文件）与 `scripts/aliyun_truth_matrix.sh`（ECS 真机：
+  客户端 / 管理 CLI / SQLite 三方真值矩阵）。
+
 边界（每一条都有自动测试）：
 
 * 管理工具**不监听任何端口**（源码里没有 socket/bind/listen/accept），也不
@@ -181,6 +211,9 @@ scripts/backup-server-admin.sh 一起装到 ECS 的 bin/ 下。
                                             #    LIST × 10 / 20 轮 / 注销序列 /
                                             #    不重发 的确定性回归）
     bash scripts/account_deletion_test.sh   # 账户注销端到端（真实服务端 + 磁盘）
+    bash scripts/same_instance_truth_test.sh # 四源一致性（客户端/管理 CLI/DB/进程）
+    bash scripts/aliyun_truth_matrix.sh      # ECS 真机三方真值矩阵
+    bash scripts/final_gate.sh               # canonical final gate（全部套件）
     bash scripts/server_admin_test.sh       # ECS 本地管理工具的安全边界
     bash scripts/aliyun_network_e2e.sh      # 阿里云真实端到端（需要隧道前置条件）
 
