@@ -564,19 +564,32 @@ FrameReadStatus ReceiveFrame(int fd, FrameHeader* header, std::string* payload,
 
 // ---- 字段校验 ----
 
-bool IsValidUsername(const std::string& username, std::string* error_message) {
-  if (username.size() < kMinUsernameBytes ||
-      username.size() > kMaxUsernameBytes) {
+UsernameValidation ValidateUsername(const std::string& username,
+                                    std::string* error_message) {
+  if (username.empty()) {
     if (error_message != nullptr) {
       *error_message = "username must be 3 to 64 bytes long";
     }
-    return false;
+    return UsernameValidation::kEmpty;
+  }
+  if (username.size() < kMinUsernameBytes) {
+    if (error_message != nullptr) {
+      *error_message = "username must be 3 to 64 bytes long";
+    }
+    return UsernameValidation::kTooShort;
+  }
+  if (username.size() > kMaxUsernameBytes) {
+    if (error_message != nullptr) {
+      *error_message = "username must be 3 to 64 bytes long";
+    }
+    return UsernameValidation::kTooLong;
   }
   if (username == "." || username == "..") {
     if (error_message != nullptr) {
       *error_message = "username must not be a dot path";
     }
-    return false;
+    // 长度下限是 3，所以这两个值其实到不了这里；分类上归入"字符不合法"。
+    return UsernameValidation::kInvalidCharacter;
   }
   for (const char character : username) {
     const bool digit = character >= '0' && character <= '9';
@@ -590,10 +603,14 @@ bool IsValidUsername(const std::string& username, std::string* error_message) {
             "username may only contain letters, digits, dot, dash and "
             "underscore";
       }
-      return false;
+      return UsernameValidation::kInvalidCharacter;
     }
   }
-  return true;
+  return UsernameValidation::kOk;
+}
+
+bool IsValidUsername(const std::string& username, std::string* error_message) {
+  return ValidateUsername(username, error_message) == UsernameValidation::kOk;
 }
 
 bool IsValidPassword(const std::string& password, std::string* error_message) {

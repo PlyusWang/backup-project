@@ -61,6 +61,48 @@ bool Contains(const std::string& haystack, const char* needle) {
   return haystack.find(needle) != std::string::npos;
 }
 
+// 把核心校验器给出的用户名原因翻译成用户看得懂的一句话。这里是**唯一**的
+// 翻译点：登录与注册共用它，所以两张表单不可能对同一段输入说出不同的话。
+//
+// 长度与字符集的规则只在 ValidateUsername 里实现一次；这里不判断长度，也不
+// 遍历字符。允许的字符全部是单字节 ASCII，所以"字节"与"字符"是同一个数，
+// 但对用户说"字符"更自然。
+QString UsernameReasonText(backupproject::net::UsernameValidation reason) {
+  using backupproject::net::UsernameValidation;
+  switch (reason) {
+    case UsernameValidation::kEmpty:
+      return QStringLiteral("请输入用户名");
+    case UsernameValidation::kTooShort:
+    case UsernameValidation::kTooLong:
+      return QStringLiteral("用户名长度需要为 %1～%2 个字符")
+          .arg(backupproject::net::kMinUsernameBytes)
+          .arg(backupproject::net::kMaxUsernameBytes);
+    case UsernameValidation::kInvalidCharacter:
+      return QStringLiteral("用户名只能包含字母、数字、点、下划线或减号");
+    case UsernameValidation::kOk:
+      break;
+  }
+  return QString();
+}
+
+// 终端上仍然打印核心给的英文原因（诊断用），并带上分类名，便于对数。
+const char* UsernameReasonName(backupproject::net::UsernameValidation reason) {
+  using backupproject::net::UsernameValidation;
+  switch (reason) {
+    case UsernameValidation::kEmpty:
+      return "empty";
+    case UsernameValidation::kTooShort:
+      return "too-short";
+    case UsernameValidation::kTooLong:
+      return "too-long";
+    case UsernameValidation::kInvalidCharacter:
+      return "invalid-character";
+    case UsernameValidation::kOk:
+      break;
+  }
+  return "ok";
+}
+
 }  // namespace
 
 RemoteController::RemoteController(QObject* parent) : QObject(parent) {
@@ -568,11 +610,15 @@ bool RemoteController::ValidateEndpoint(const QString& host,
   }
   const std::string user = trimmed_username.toStdString();
   std::string user_error;
-  // 复用共享校验器：规则只有一份，"3..64 字节、[A-Za-z0-9_.-]"不在 QML 里重写。
-  if (!backupproject::net::IsValidUsername(user, &user_error)) {
-    ReportSurfaceError(
-        surface, QStringLiteral("用户名只能包含字母、数字、点、下划线或减号"));
-    std::fprintf(stderr, "[remote] 用户名不合法：%s\n", user_error.c_str());
+  // 复用共享校验器，而且用**结构化**的那一个：规则只有一份，界面只把原因翻
+  // 译成文案。旧实现把"长度不合法"和"字符不合法"合成一句固定文案，于是输入
+  // "W"（1 个字符）被显示成"字符有问题"——人工验收发现的最后一处 UX mismatch。
+  const backupproject::net::UsernameValidation username_reason =
+      backupproject::net::ValidateUsername(user, &user_error);
+  if (username_reason != backupproject::net::UsernameValidation::kOk) {
+    ReportSurfaceError(surface, UsernameReasonText(username_reason));
+    std::fprintf(stderr, "[remote] 用户名不合法（%s）：%s\n",
+                 UsernameReasonName(username_reason), user_error.c_str());
     return false;
   }
   if (out_host != nullptr) {
