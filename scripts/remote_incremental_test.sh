@@ -86,6 +86,9 @@ WORK="$TEST_ROOT/e2e"
 mkdir -p "$WORK/data" "$WORK/state" "$WORK/logs" "$WORK/src" "$WORK/home/.config"
 # 缓存与配置落在测试自己的 HOME 里，绝不碰真实 HOME。
 export HOME="$WORK/home"
+# 本地已验证缓存的位置（由服务端指纹与用户名决定）。B.4b 与 B.9 都要用它，
+# 所以在这里一次性定下来，不要在脚本中间再定义一遍。
+CACHE_ROOT="$HOME/.config/backup-project/backup-gui-modern/remote-cache"
 
 head -c 32 /dev/urandom | sha256sum | cut -c1-64 >"$WORK/secret.value"
 echo "BACKUP_TOKEN_SECRET=$(cat "$WORK/secret.value")" >"$WORK/secrets.env"
@@ -204,6 +207,22 @@ else
   record_fail "B.4 增量的父是 R0" "$R0_ID"
 fi
 
+# 本地缓存必须真的被用上：续链时不该重新下载父快照的材料。
+# （这条断言是必需的：少了它，"索引丢了但靠兜底路径重新解包"也会让用例通过，
+#   而那条路径其实是把已经验证过的材料又重新下载了一遍。）
+if grep -q "download" "$WORK/r1.log"; then
+  record_fail "B.4b 续链命中本地缓存（没有重新下载父）" \
+    "$(grep -m1 download "$WORK/r1.log")"
+else
+  record_pass "B.4b 续链命中本地缓存（没有重新下载父）"
+fi
+INDEX_FILE="$(find "$CACHE_ROOT" -name '.remote-index.tsv' 2>/dev/null | head -1)"
+if [ -n "$INDEX_FILE" ] && grep -q "$R0_ID" "$INDEX_FILE" 2>/dev/null; then
+  record_pass "B.4b 本地缓存索引记录了服务端快照 id"
+else
+  record_fail "B.4b 本地缓存索引" "找不到索引或里面没有 R0"
+fi
+
 # 再修改一次：C 变化、D 改名。
 printf 'C-v2\n' >"$WORK/src/C.txt"
 mv "$WORK/src/D.txt" "$WORK/src/D-renamed.txt"
@@ -246,7 +265,6 @@ else
 fi
 
 # 冷缓存 bootstrap：删掉整个缓存后恢复 R1，必须自动从服务端取回依赖。
-CACHE_ROOT="$HOME/.config/backup-project/backup-gui-modern/remote-cache"
 rm -rf "$CACHE_ROOT"
 mkdir -p "$WORK/expect-r1"
 printf 'A-v2-with-more-content\n' >"$WORK/expect-r1/A.txt"
