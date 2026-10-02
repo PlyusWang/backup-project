@@ -82,6 +82,49 @@ inline constexpr std::uint64_t kDefaultMaxUploadBytes =
     8ull * 1024ull * 1024ull * 1024ull;
 
 // ---- 操作码 ----
+//
+// 每个操作码的 payload 字段（**顺序即线上顺序**，整数一律大端，字符串一律
+// u16 长度前缀 + 原始字节）。PR #21 新增的字段都用 (PR21) 标出来，它们都追加
+// 在原有字段**之后**：旧客户端会在"读不到 / 有尾巴"处被明确拒绝，不做兼容猜测。
+//
+//   kPing          请求: 空
+//                  响应: string software, u16 version, u64 server_time
+//   kRegister      请求: string username, string password
+//                  响应: 空
+//   kLogin         请求: string username, string password
+//                  响应: string token
+//   kLogout        请求/响应: 空
+//   kResume        请求: string token
+//                  响应: 空
+//   kList          请求: 空
+//                  响应: u32 count, 然后每项
+//                        string snapshot_id, string display_name,
+//                        string sha256, u64 size_bytes, u64 created_at,
+//                        u16 snapshot_kind (PR21), u64 generation (PR21),
+//                        string parent_snapshot_id (PR21), string lineage (PR21)
+//   kUploadBegin   请求: string display_name, u64 declared_size,
+//                        string declared_sha256,
+//                        u16 snapshot_kind (PR21),
+//                        string parent_snapshot_id (PR21), string lineage (PR21)
+//                  响应: 空
+//   kUploadChunk   请求: 裸字节块（<= 256 KiB，长度由帧头承载）
+//                  响应: 空
+//   kUploadEnd     请求: 空
+//                  响应: string snapshot_id, string sha256, u64 size_bytes,
+//                        u64 created_at, u16 snapshot_kind (PR21),
+//                        u64 generation (PR21), string parent_snapshot_id (PR21)
+//   kDownloadBegin 请求: string snapshot_id
+//                  响应: string display_name, string sha256, u64 size_bytes
+//   kDownloadChunk 请求: 空；响应: 裸字节块（空 payload = 流结束）
+//   kDownloadEnd   请求/响应: 空
+//   kDelete        请求: string snapshot_id；响应: 空
+//   kDeleteAccount 请求: string password；响应: 空
+//   kError         响应: 空（原因只写服务端日志）
+//
+// PR #21 的语义补充：snapshot_kind 0 = 完整快照、1 = 增量；parent_snapshot_id
+// 为空串表示"没有父"（完整快照）；lineage 为空串表示"不属于任何链的独立快照"
+// （PR #20 时代的旧数据与低层 remote upload 都是这一类）。generation 由
+// **服务端**按父推导，客户端不发送它。
 
 enum class Opcode : std::uint16_t {
   kPing = 1,
