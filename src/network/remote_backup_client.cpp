@@ -17,12 +17,36 @@
 #include <vector>
 
 #include "crypto.h"
+#include "file_io.h"
 
 namespace backupproject {
 namespace net {
 namespace {
 
 std::string StrerrorText() { return std::string(std::strerror(errno)); }
+
+// 路径里最后一个 '/' 之前的部分。
+// "a" -> "."、"/a" -> "/"。
+// 下载的临时文件必须落在目标所在目录里
+// （只有同一个文件系统上才能原子发布）。
+std::string ParentDirectoryOf(const std::string& path) {
+  const std::size_t slash = path.rfind('/');
+  if (slash == std::string::npos) {
+    return std::string(".");
+  }
+  if (slash == 0) {
+    return std::string("/");
+  }
+  return path.substr(0, slash);
+}
+
+std::string BaseNameOf(const std::string& path) {
+  const std::size_t slash = path.rfind('/');
+  if (slash == std::string::npos) {
+    return path;
+  }
+  return path.substr(slash + 1);
+}
 
 bool StatRegularFile(const std::string& path, std::uint64_t* size,
                      std::string* error_message) {
@@ -112,25 +136,6 @@ bool SocketLooksClosed(int fd) {
     return errno == ECONNRESET || errno == ENOTCONN || errno == EBADF;
   }
   return false;
-}
-
-bool WriteWholeFile(int fd, const char* data, std::size_t size,
-                    std::string* error_message) {
-  std::size_t written = 0;
-  while (written < size) {
-    const ssize_t step = ::write(fd, data + written, size - written);
-    if (step < 0) {
-      if (errno == EINTR) {
-        continue;
-      }
-      if (error_message != nullptr) {
-        *error_message = std::string("cannot write: ") + StrerrorText();
-      }
-      return false;
-    }
-    written += static_cast<std::size_t>(step);
-  }
-  return true;
 }
 
 }  // namespace
@@ -681,7 +686,12 @@ bool RemoteArchiveClient::DownloadArchiveFile(
     }
     return false;
   }
-  // 默认不覆盖已经存在的目标：先判，再动任何字节。
+  // 默认不覆盖已经存在的目标。
+  // 这一步只是**尽早**失败（连 DOWNLOAD_BEGIN 都不发）。
+  // 它不是"不覆盖"的保证：
+  // 真正的保证来自最后那一步原子的 PublishNoReplace()。
+  // 目标即使在这次下载开始之后才被别的进程创建，
+  // 也绝不会有字节被写进去。
   if (!allow_overwrite && ::access(target_path.c_str(), F_OK) == 0) {
     if (error_message != nullptr) {
       *error_message = target_path + " already exists (use --force to replace)";
@@ -716,21 +726,35 @@ bool RemoteArchiveClient::DownloadArchiveFile(
   info.snapshot_id = snapshot_id;
   info.size_bytes = declared_size;
 
-  const std::string part_path = target_path + ".part";
-  const int output =
-      ::open(part_path.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0600);
-  if (output < 0) {
-    if (error_message != nullptr) {
-      *error_message = "cannot create " + part_path + ": " + StrerrorText();
-    }
+  // 中间产物是**唯一命名的**临时文件，而不是固定的 target + ".part"：
+  //   * 固定名字会 O_TRUNC 掉用户本来就在那里的同名文件，而那是用户的数据；
+  //   * mkstemp 出来的名字带随机后缀、0600、O_CREAT|O_EXCL，所以既不会截断
+  //     别人预放的文件，也不会跟随别人预放的符号链接；
+  //   * 必须与目标同目录：只有同一个文件系统上才能原子发布。
+  const std::string target_directory = ParentDirectoryOf(target_path);
+  std::string leaf = BaseNameOf(target_path);
+  // 模板要留出后缀的位置（NAME_MAX 是 255），
+  // 临时文件叫什么并不重要。
+  if (leaf.size() > 40) {
+    leaf.resize(40);
+  }
+  if (leaf.empty()) {
+    leaf = "download";
+  }
+  FileSink sink;
+  if (!sink.OpenTemp(target_directory, leaf + ".part-", error_message)) {
     return false;
   }
+  const std::string part_path = sink.path();
   crypto::Sha256 hasher;
   std::uint64_t received = 0;
   if (progress) {
     progress(RemoteTransferProgress{"download", 0, declared_size});
   }
   bool ok = true;
+  // 整条下载流是否已经收完（服务端发来一个空 chunk 就是"发完了"）。只有收完
+  // 的那几种失败才需要发 DOWNLOAD_END：中途断掉的连接已经不可用了。
+  bool stream_complete = false;
   for (;;) {
     if (!Request(Opcode::kDownloadChunk, std::string(), &header, &response,
                  error_message)) {
@@ -738,10 +762,10 @@ bool RemoteArchiveClient::DownloadArchiveFile(
       break;
     }
     if (response.empty()) {
+      stream_complete = true;
       break;
     }
-    if (!WriteWholeFile(output, response.data(), response.size(),
-                        error_message)) {
+    if (!sink.Write(response.data(), response.size(), error_message)) {
       ok = false;
       break;
     }
@@ -771,32 +795,61 @@ bool RemoteArchiveClient::DownloadArchiveFile(
     }
     ok = false;
   }
-  if (ok && ::fsync(output) != 0) {
-    if (error_message != nullptr) {
-      *error_message = std::string("fsync failed: ") + StrerrorText();
-    }
+  // flush -> fsync -> close 三步全部成功，才算"临时文件已经完整落盘"。
+  if (ok && !sink.Close(error_message)) {
     ok = false;
   }
-  ::close(output);
-  if (!ok) {
-    // 失败绝不发布目标文件：只删掉自己的 .part。
-    ::unlink(part_path.c_str());
-    return false;
-  }
-  if (::rename(part_path.c_str(), target_path.c_str()) != 0) {
-    if (error_message != nullptr) {
-      *error_message = "cannot publish " + target_path + ": " + StrerrorText();
+  // 下载流收尾：让服务端立刻释放句柄，并把连接状态从"下载中"放回"已认证"。
+  // 少了这一步，同一个连接上的下一次 DOWNLOAD_BEGIN 会被服务端按
+  // "不在已认证状态"拒绝——校验失败或发布失败之后连接就废了。
+  // 收尾本身失败不影响已经发布的文件：如实报告（Fail）但不回滚。
+  const auto finish_download_stream = [&]() {
+    std::string finish_error;
+    if (!Request(Opcode::kDownloadEnd, std::string(), &header, &response,
+                 &finish_error)) {
+      Fail(finish_error);
     }
-    ::unlink(part_path.c_str());
+  };
+  if (!ok) {
+    // 失败绝不发布目标文件：只删掉自己这个唯一命名的临时文件。
+    sink.Abandon();
+    if (stream_complete) {
+      finish_download_stream();
+    }
     return false;
   }
-  // 下载流收尾。这一步失败不影响已经校验并发布的文件，只是让服务端早点
-  // 释放句柄；如实报告但不回滚。
-  std::string finish_error;
-  if (!Request(Opcode::kDownloadEnd, std::string(), &header, &response,
-               &finish_error)) {
-    Fail(finish_error);
+  // 发布是**一步原子操作**，"不覆盖"由内核保证（link 已存在返回 EEXIST；
+  // 不支持 link 时退到 renameat2(RENAME_NOREPLACE)；
+  // 两个都不可用就 fail closed，绝不退回普通 rename）。
+  // 所以目标文件是这次下载开始之后才被创建的也好、
+  // 是早就存在的也好，只要不允许覆盖，
+  // 就不可能有一个字节被写进去。
+  // allow_overwrite 为真时才做原子替换：那是用户明确同意的覆盖。
+  std::string publish_error;
+  const bool published =
+      allow_overwrite
+          ? PublishReplacing(part_path, target_path, &publish_error)
+          : PublishNoReplace(part_path, target_path, &publish_error);
+  if (!published) {
+    // 两种发布原语都保证失败时目标文件一个字节都没被碰过；这里只清理自己的
+    // 临时文件（Close() 成功之后 FileSink 认为路径已提交，不会再替我们删）。
+    ::unlink(part_path.c_str());
+    sink.Abandon();
+    if (error_message != nullptr) {
+      if (!allow_overwrite && ::access(target_path.c_str(), F_OK) == 0) {
+        *error_message = target_path +
+                         " already exists (use --force to replace); nothing was"
+                         " published";
+      } else {
+        *error_message = publish_error.empty()
+                             ? ("cannot publish " + target_path)
+                             : publish_error;
+      }
+    }
+    finish_download_stream();
+    return false;
   }
+  finish_download_stream();
   if (downloaded != nullptr) {
     *downloaded = info;
   }
