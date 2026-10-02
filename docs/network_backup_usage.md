@@ -1,4 +1,4 @@
-# 远程备份使用说明（PR #20 Network Backup Foundation）
+# 远程备份使用说明（PR #21：BPSEC1 传输加密 + 远端增量）
 
 本文说明怎么用 backup-server + BPNET1 + backupctl remote 把本地已经生成并
 验证过的 .bak 归档送到远端（当前部署在阿里云 ECS），以及再取回来恢复。
@@ -24,24 +24,45 @@
 ## 2. 拓扑与传输加密
 
     backupctl / Modern GUI
+        |  BPSEC1（X25519 握手 + AES-256-CTR + HMAC-SHA256）  <- 机密性在这一层
         |  127.0.0.1:18765
-        |  SSH encrypted tunnel
+        |  SSH encrypted tunnel                                <- 部署层纵深防御
         v
     ECS 127.0.0.1:18765 -> backup-server
 
 * backup-server **只**绑 127.0.0.1，不绑 0.0.0.0，也不对外开放安全组。这是一条
   **硬约束**，不是默认值：Configure() 对任何非 127.0.0.1 的 --bind
   （0.0.0.0 / 私网地址 / 公网地址 / 127.0.0.2）都直接拒绝启动并说明原因，
-  没有 --insecure / --allow-public 之类的开关。理由是本版本没有原生 TLS：
-  既然机密性由 SSH 隧道提供，监听地址就只能是被隧道指向的那个环回地址。
+  没有 --insecure / --allow-public 之类的开关。理由与加密无关（业务流量的
+  机密性由 BPSEC1 提供，见 2.2）：只该由隧道访问的端口直接暴露在共享网络上
+  没有任何好处，所以这条 fail-closed 规则继续保留。
 * 本机用 SSH 隧道把 127.0.0.1:18765 转到 ECS 的 127.0.0.1:18765：
 
       ssh -o BatchMode=yes -o ExitOnForwardFailure=yes -N \
           -L 127.0.0.1:18765:127.0.0.1:18765 aliyun-ecs
 
-* **BPNET1 本身没有原生 TLS**：当前的传输机密性完全来自它跑在 SSH 隧道里。
-  代码结构把"连接 + 收发"限制在一个很小的接口上，将来替换成 TLS 不需要动
-  协议语义，但**本版本没有实现原生 TLS**，不要当成已有能力。
+* **BPNET1 的每一个字节都由 BPSEC1 保护**（PR #21）：整帧（含帧头里的
+  opcode / status / 长度）作为明文加密封装成记录，Encrypt-then-MAC，序号严格
+  递增抗重放。服务端有长期 X25519 身份密钥，客户端必须事先 pin 住它——没有
+  配置 pin 就拒绝连接，本项目**不做**"第一次见到谁就信谁"。
+* **BPSEC1 不是 TLS，也不与 TLS 兼容**：它是本项目自己实现的教学协议，
+  没有经过外部审计。安全性质、明确的非目标与已知限制见 docs/secure_transport.md。
+
+### 2.2 传输加密（BPSEC1）
+
+    服务端：backup-server-keygen --output <服务器上的私钥文件>   # 0600，只在本机
+    客户端：backupctl remote ... --server-key sha256:<指纹>
+            （或把同一个值放进环境变量 BACKUP_REMOTE_SERVER_KEY）
+
+* 服务端启动必须带 --transport-key-file <文件>（缺了直接以用法错误退出，
+  没有"不加密也能连"的模式）；私钥只在服务器上存在，不进 Git、不进日志、不进 ZIP。
+* 公钥与指纹不是秘密：backup-server-keygen --show --key-file <文件> 会打印
+  "sha256:<指纹>" 与 "hex:<公钥>" 两种可直接使用的 pin。
+* 每次 TCP 连接都会重新握手、重新派生会话密钥；连接断了重连就必须重新握手，
+  然后照旧用 RESUME 恢复 token 会话（连接与会话仍然是两件事，见 2.1）。
+* 握手失败、pin 不符、记录校验失败、重放/乱序：一律断连，并且**绝不**退回明文。
+  错误分类（server-key-mismatch / record-authentication-failed / ...）会原样
+  出现在 CLI 与 GUI 的错误信息里。
 
 ## 2.1 连接与会话是两件事
 
@@ -227,9 +248,15 @@ scripts/backup-server-admin.sh 一起装到 ECS 的 bin/ 下。
 
 ## 6. 当前限制
 
-* 原生 TLS 未实现，机密性依赖 SSH 隧道。
+* BPSEC1 是本项目手写的教学协议：不是 TLS、没有外部审计、没有形式化验证。
+  它提供机密性、完整性、服务端身份 pin、抗重放与每连接前向保密；
+  **不**声称与任何标准传输层兼容。
 * 没有 systemd / 守护进程化；服务端就是前台进程 + PID 文件。
-* 不支持断点续传（resume），也不支持远程块级增量（delta）。
+* 不支持断点续传（resume）：一次被中断的上传/下载会在服务端清理临时文件，
+  用户需要重新执行该命令。
+* 远端增量（PR #21）已经可用：remote backup / remote restore 会复用本地
+  增量引擎生成与恢复 delta 链，链关系（父 / 代数 / lineage）由服务端校验，
+  依赖感知删除保证链不会从中间断开。用法与限制见 docs/remote_incremental.md。
 * token 在有效期内无法单独吊销（服务端无会话状态）；轮换
   BACKUP_TOKEN_SECRET 会让所有已签发 token 立即失效。唯一的例外是账户
   注销：账户行不存在之后，旧 token 在任何操作上都会被拒绝（每次操作都会
@@ -246,6 +273,8 @@ scripts/backup-server-admin.sh 一起装到 ECS 的 bin/ 下。
 
 ## 7. 测试
 
+    bash scripts/secure_transport_test.sh   # BPSEC1：官方向量 / 握手 / 线上字节
+                                            #   捕获 / 篡改矩阵 / pin 校验
     bash scripts/network_test.sh            # 单元 + 本地 CLI 端到端
                                             #   （含 remote_sequence_test：
                                             #    空闲超时 / 错误口令 × 6 /

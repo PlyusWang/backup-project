@@ -60,6 +60,19 @@ inline constexpr std::size_t kSha256HexBytes = 64;
 // 一个 LIST 响应里最多多少条（防止一帧被撑爆）。
 inline constexpr std::uint32_t kMaxListEntries = 4096;
 
+// PR #21：远端链的 lineage 标识。它必须正好是 64 个小写十六进制字符
+// （与 SHA-256 十六进制同形，因此复用同一个校验器），含义是"这条增量链
+// 属于哪个源 + 哪个远端仓库身份"的摘要。客户端与服务端都不解释它的内容，
+// 只做**相等**比较：父与子的 lineage 不同就是跨链，直接拒绝。
+inline constexpr std::size_t kMaxLineageBytes = 64;
+
+// 远端快照的类型。full 自成一条链的根（generation 0、没有父），
+// incremental 必须声明一个**已经存在**的父（服务端据此推导 generation）。
+enum class SnapshotKind : std::uint16_t {
+  kFull = 0,
+  kIncremental = 1,
+};
+
 // 服务端默认的单次上传上限，可用 --max-upload-bytes 调整。
 // 一个文件块的大小。客户端用它切文件，服务端用它读磁盘；两边都远小于
 // 1 MiB 的帧上限，因此"整份归档进内存"这条路径不存在。
@@ -273,6 +286,8 @@ bool IsValidPassword(const std::string& password, std::string* error_message);
 // 显示名：1..255 字节，不允许 NUL 与控制字符。
 // 允许含 '/' 与 '..'——它**只**进 SQLite 的 metadata，永远不参与路径拼接。
 bool IsValidDisplayName(const std::string& name, std::string* error_message);
+// 远端快照类型是否合法（未知值一律拒绝，不"猜一个默认值"）。
+bool IsKnownSnapshotKind(std::uint16_t kind);
 // snapshot id：32 个小写十六进制字符（16 字节随机数）。
 bool IsValidSnapshotId(const std::string& snapshot_id,
                        std::string* error_message);

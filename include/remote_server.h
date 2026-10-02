@@ -46,6 +46,7 @@
 
 #include "crypto.h"
 #include "network_protocol.h"
+#include "secure_transport.h"
 
 namespace backupproject {
 
@@ -69,6 +70,12 @@ struct RemoteServerConfig {
   std::string database_path;
   // 含 BACKUP_TOKEN_SECRET 的 secrets.env（600）。只读，绝不打印内容。
   std::string secret_file_path;
+  // BPSEC1 的服务端长期身份私钥文件（32 字节原始 X25519 标量，0600，O_NOFOLLOW）。
+  //
+  // **必填**：Configure/Start 都拒绝空值。这不是"可选加固"——BPNET1 的口令、
+  // token、用户名与快照元数据全部由 BPSEC1 保护，缺了它就没有任何一条可以
+  // 安全服务的路径，因此不存在"不配密钥就退回明文"的分支。
+  std::string transport_key_file_path;
   // 追加日志文件；空串表示只写 stderr。
   std::string log_file_path;
   std::uint64_t max_upload_bytes = kDefaultMaxUploadBytes;
@@ -104,6 +111,14 @@ struct ConnectionContext {
   std::string upload_temp_path;
   std::uint64_t upload_received = 0;
   int upload_fd = -1;
+
+  // PR #21：这次上传要登记的链关系。UPLOAD_BEGIN 时校验并定下来，
+  // UPLOAD_END 发布时写进元数据。generation 由**服务端**按父的 generation
+  // 推导（父 + 1），客户端没有机会自己填一个数。
+  std::uint16_t upload_kind = 0;
+  std::string upload_parent_id;
+  std::uint64_t upload_generation = 0;
+  std::string upload_lineage;
 
   // 上传中的增量摘要器。Sha256 只能 Final 一次，所以复位靠整体赋值一个新的。
   crypto::Sha256 upload_hasher;
@@ -175,6 +190,9 @@ class RemoteServer {
  private:
   bool OpenListener(std::string* error_message);
   bool LoadSecret(std::string* error_message);
+  // 读 BPSEC1 长期身份私钥并推导公钥。文件必须是 0600 的普通文件，
+  // 不跟随符号链接；任何一步失败都让 Start() 整体失败。
+  bool LoadTransportIdentityKey(std::string* error_message);
   // 抢 <root>/.backup-server.lock。抢不到说明另一个 backup-server（或者一个
   // 正在做破坏性操作的管理工具）正拿着它。
   bool AcquireDataLock(std::string* error_message);
@@ -267,6 +285,9 @@ class RemoteServer {
   int listener_fd_ = -1;
   std::uint16_t bound_port_ = 0;
   std::string secret_;
+  // BPSEC1 长期身份密钥。客户端 pin 的就是它的公钥（或公钥的 SHA-256 指纹）。
+  // 私钥只在内存与 0600 文件里存在，绝不打印、绝不进日志。
+  TransportIdentity transport_identity_;
   std::string last_error_;
 
   std::mutex log_mutex_;
