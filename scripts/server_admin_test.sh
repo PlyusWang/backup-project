@@ -18,6 +18,8 @@
 #  11. 用户输入不会直接变成文件系统路径
 #  12. 输出里不出现 password hash / salt / token secret
 #  13. backup-server 正在运行时，破坏性操作被拒绝（内核锁，不是 pgrep 猜的）
+#  14. 用户选择器：id:<编号> / name:<用户名> 明确指定；裸输入同时命中 id 与
+#      用户名时拒绝并给出两种写法；删除操作必须显式指定（绝不猜）
 
 set -uo pipefail
 
@@ -242,7 +244,7 @@ if [ "$REFUSE" != "0" ] && grep -q "请先在服务器上停止 backup-server" "
 else
   record_fail "服务端运行时的 delete-user" "$(head -2 "$TEST_ROOT/admin.txt" | tr '\n' ' ')"
 fi
-REFUSE_SNAP="$(run_admin delete-snapshot "$SNAP_B1" --user "$USER_B" --confirm "$SNAP_B1")"
+REFUSE_SNAP="$(run_admin delete-snapshot "$SNAP_B1" --user "name:$USER_B" --confirm "$SNAP_B1")"
 if [ "$REFUSE_SNAP" != "0" ]; then
   record_pass "backup-server 运行时 delete-snapshot 也被拒绝"
 else
@@ -274,18 +276,138 @@ else
   fi
 fi
 
+# ---- 14. 用户选择器：id: / name: 明确指定，裸输入永不猜 ----
+#
+# 人工验收里的问题：`show-user 23` 到底是 "id=23" 还是 "用户名叫 23"？旧实现直接
+# 按数字当 id 解析，于是可能显示成另一个账户，而且没有任何提示。
+#
+# 要真的造出"两个候选同时存在"，就得让一个数字**既**是某个账户的 id、**又**是
+# 另一个账户的用户名。用户名最少 3 个字节，所以用带前导零的 "001"：它作为编号
+# 解析就是 id=1（USER_A），作为用户名解析则是另一个账户。用户名允许纯数字是
+# **产品规则**，不改；这里正是要证明两种解释各自都能被明确指定。
+NUM_NAME="001"
+PW_C="$(head -c 24 /dev/urandom | sha256sum | cut -c1-24)"
+if [ "$(run_remote "$PW_C" register --user "$NUM_NAME")" = "0" ]; then
+  record_pass "注册了一个用户名为纯数字（$NUM_NAME）的账户：纯数字用户名仍然合法"
+else
+  record_fail "纯数字用户名" "$(head -3 "$TEST_ROOT/last.txt" | tr '\n' ' ')"
+fi
+run_admin list-users >/dev/null
+NUM_ID="$(awk -v name="$NUM_NAME" '$2 == name { print $1 }' "$TEST_ROOT/admin.txt")"
+if [ -n "$NUM_ID" ] && [ "$NUM_ID" != "$USER_A_ID" ]; then
+  record_pass "数字用户名与 id=$USER_A_ID 是两个不同的账户（name=$NUM_NAME id=$NUM_ID）"
+else
+  record_fail "纯数字用户名" "解析出的 id 不对：num_id=$NUM_ID"
+fi
+
+# 裸输入同时命中 id 与用户名 -> 拒绝，而且把两种写法都写给用户
+AMBIG="$(run_admin show-user "$NUM_NAME")"
+AMBIG_TEXT="$(cat "$TEST_ROOT/admin.txt")"
+if [ "$AMBIG" != "0" ] \
+   && printf '%s' "$AMBIG_TEXT" | grep -q "存在歧义" \
+   && printf '%s' "$AMBIG_TEXT" | grep -q "id:$NUM_NAME" \
+   && printf '%s' "$AMBIG_TEXT" | grep -q "name:$NUM_NAME"; then
+  record_pass "裸输入同时命中 id 与用户名：拒绝，并给出 id: / name: 两种写法"
+else
+  record_fail "歧义输入" "$(printf '%s' "$AMBIG_TEXT" | head -3 | tr '\n' ' ')"
+fi
+
+# 显式写法各自解析到**不同**的账户：这是"不猜"的正面证据
+run_admin show-user "id:$NUM_NAME" >/dev/null
+ID_TEXT="$(cat "$TEST_ROOT/admin.txt")"
+ID_OK=1
+printf '%s' "$ID_TEXT" | grep -q "用户 ID：$USER_A_ID" || ID_OK=0
+printf '%s' "$ID_TEXT" | grep -q "用户名：$USER_A" || ID_OK=0
+run_admin show-user "name:$NUM_NAME" >/dev/null
+NAME_TEXT="$(cat "$TEST_ROOT/admin.txt")"
+NAME_OK=1
+printf '%s' "$NAME_TEXT" | grep -q "用户 ID：$NUM_ID" || NAME_OK=0
+printf '%s' "$NAME_TEXT" | grep -q "用户名：$NUM_NAME" || NAME_OK=0
+if [ "$ID_OK" = "1" ] && [ "$NAME_OK" = "1" ]; then
+  record_pass "id:$NUM_NAME 解析到 $USER_A；name:$NUM_NAME 解析到 id=$NUM_ID（两条路各走各的）"
+else
+  record_fail "显式选择器" "id_ok=$ID_OK name_ok=$NAME_OK"
+fi
+
+# 只有一个候选时裸输入仍然可用，但会在 stderr 上说明这次按哪一种解析
+BARE_ID="$(run_admin show-user "$USER_B_ID")"
+BARE_ID_TEXT="$(cat "$TEST_ROOT/admin.txt")"
+BARE_NAME="$(run_admin show-user "$USER_A")"
+BARE_NAME_TEXT="$(cat "$TEST_ROOT/admin.txt")"
+if [ "$BARE_ID" = "0" ] \
+   && printf '%s' "$BARE_ID_TEXT" | grep -q "按编号解析" \
+   && printf '%s' "$BARE_ID_TEXT" | grep -q "用户名：$USER_B" \
+   && [ "$BARE_NAME" = "0" ] \
+   && printf '%s' "$BARE_NAME_TEXT" | grep -q "按用户名解析" \
+   && printf '%s' "$BARE_NAME_TEXT" | grep -q "用户名：$USER_A"; then
+  record_pass "不产生歧义的裸输入仍然可用，并说明这次按哪一种解析"
+else
+  record_fail "裸输入的唯一候选" "id=$BARE_ID name=$BARE_NAME"
+fi
+run_admin show-user "name:$USER_A" >/dev/null
+if ! grep -q "提示：" "$TEST_ROOT/admin.txt"; then
+  record_pass "显式 name: 写法不打印提示（用户已经把话说清楚了）"
+else
+  record_fail "显式写法" "不该出现提示行"
+fi
+
+# 找不到的时候，id: 与 name: 各说各的话，不会让人误会成另一种解释
+NOT_FOUND_ID="$(run_admin show-user id:99999)"
+NOT_FOUND_ID_TEXT="$(cat "$TEST_ROOT/admin.txt")"
+NOT_FOUND_NAME="$(run_admin show-user "name:nobody-$$")"
+NOT_FOUND_NAME_TEXT="$(cat "$TEST_ROOT/admin.txt")"
+if [ "$NOT_FOUND_ID" != "0" ] \
+   && printf '%s' "$NOT_FOUND_ID_TEXT" | grep -q "没有 id=99999 的用户" \
+   && [ "$NOT_FOUND_NAME" != "0" ] \
+   && printf '%s' "$NOT_FOUND_NAME_TEXT" | grep -q "没有叫 nobody-$$ 的用户"; then
+  record_pass "id: 与 name: 找不到时各说各的话"
+else
+  record_fail "找不到的用户" "id=[$(printf '%s' "$NOT_FOUND_ID_TEXT" | head -1)] name=[$(printf '%s' "$NOT_FOUND_NAME_TEXT" | head -1)]"
+fi
+
 # ---- 停服务，开始做破坏性操作 ----
 kill -TERM "$SERVER_PID" 2>/dev/null
 wait "$SERVER_PID" 2>/dev/null
 SERVER_PID=""
 record_pass "服务端已优雅停止"
 
+# ---- 14（续）：删除操作必须明确指定选择器 ----
+# 删除不可逆：不能由一个"这个数字到底是编号还是用户名"的疑问来决定删掉谁。
+BARE_DELETE="$(run_admin delete-user "$USER_B" --confirm "DELETE $USER_B#$USER_B_ID")"
+if [ "$BARE_DELETE" != "0" ] && grep -q "必须明确指定用户" "$TEST_ROOT/admin.txt"; then
+  record_pass "delete-user 拒绝裸输入，并说明要写成 id: 或 name:"
+else
+  record_fail "delete-user 的裸输入" "$(head -3 "$TEST_ROOT/admin.txt" | tr '\n' ' ')"
+fi
+BARE_SNAP="$(run_admin delete-snapshot "$SNAP_B2" --user "$USER_B" --confirm "$SNAP_B2")"
+if [ "$BARE_SNAP" != "0" ] && grep -q "必须明确指定用户" "$TEST_ROOT/admin.txt"; then
+  record_pass "delete-snapshot 同样拒绝裸用户选择器"
+else
+  record_fail "delete-snapshot 的裸输入" "$(head -3 "$TEST_ROOT/admin.txt" | tr '\n' ' ')"
+fi
+# 确认串必须同时写出用户名与编号：同名不同号的两个账户在这一行就能分清
+WRONG_CONFIRM="$(run_admin delete-user "name:$USER_B" --confirm "DELETE $USER_B")"
+if [ "$WRONG_CONFIRM" != "0" ] \
+   && grep -q "DELETE $USER_B#$USER_B_ID" "$TEST_ROOT/admin.txt" \
+   && grep -q "id=$USER_B_ID" "$TEST_ROOT/admin.txt"; then
+  record_pass "确认串要写成 DELETE <用户名>#<编号>，错误提示里两个都给出"
+else
+  record_fail "确认串" "$(head -3 "$TEST_ROOT/admin.txt" | tr '\n' ' ')"
+fi
+# 快照 id 允许 snapshot:<32 位十六进制>，与裸写法等价
+run_admin show-snapshot "snapshot:$SNAP_B2" >/dev/null
+if grep -q "$SNAP_B2" "$TEST_ROOT/admin.txt"; then
+  record_pass "show-snapshot 接受 snapshot:<32 位十六进制>，与裸 id 等价"
+else
+  record_fail "snapshot 前缀" "$(head -3 "$TEST_ROOT/admin.txt" | tr '\n' ' ')"
+fi
+
 BLOB_A="$DATA/users/$USER_A_ID/$SNAP_A.bak"
 BLOB_B1="$DATA/users/$USER_B_ID/$SNAP_B1.bak"
 BLOB_B2="$DATA/users/$USER_B_ID/$SNAP_B2.bak"
 
 # ---- 7. 删除单个 snapshot：blob 与元数据一致 ----
-DELETE_SNAP="$(run_admin delete-snapshot "$SNAP_B1" --user "$USER_B" --confirm "$SNAP_B1")"
+DELETE_SNAP="$(run_admin delete-snapshot "$SNAP_B1" --user "name:$USER_B" --confirm "$SNAP_B1")"
 if [ "$DELETE_SNAP" = "0" ]; then
   record_pass "delete-snapshot 成功"
 else
@@ -295,6 +417,14 @@ if [ ! -f "$BLOB_B1" ] && [ -f "$BLOB_B2" ] && [ -f "$BLOB_A" ]; then
   record_pass "被删的那一份 blob 消失，别的 blob 一个都没动"
 else
   record_fail "删除单个快照之后的磁盘状态" "文件状态不对"
+fi
+# 破坏性操作会持有数据目录锁，于是"试锁"一定是 busy：身份块必须说清楚这一点，
+# 不能把"锁在本次操作手里"显示成"backup-server 正在运行"（服务端明明已经停了）。
+if ! grep -q "backup-server 正在运行" "$TEST_ROOT/admin.txt" \
+   && grep -q "数据目录锁由本次管理操作持有" "$TEST_ROOT/admin.txt"; then
+  record_pass "破坏性操作的实例身份块不谎称服务端在运行（锁是本次操作持有的）"
+else
+  record_fail "破坏性操作的实例身份块" "$(grep -m1 'Service:' "$TEST_ROOT/admin.txt")"
 fi
 run_admin list-snapshots "$USER_B" >/dev/null
 if ! grep -q "$SNAP_B1" "$TEST_ROOT/admin.txt" && grep -q "$SNAP_B2" "$TEST_ROOT/admin.txt"; then
@@ -337,7 +467,7 @@ else
 fi
 
 # ---- 8/9. 删除 user：A 全部数据删除，B 完全不受影响 ----
-DELETE_USER="$(run_admin delete-user "$USER_A" --confirm "DELETE $USER_A")"
+DELETE_USER="$(run_admin delete-user "name:$USER_A" --confirm "DELETE $USER_A#$USER_A_ID")"
 if [ "$DELETE_USER" = "0" ]; then
   record_pass "delete-user 成功"
 else
