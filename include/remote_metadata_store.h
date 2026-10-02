@@ -102,7 +102,22 @@ class RemoteMetadataStore {
   // 管理与诊断工具用它：路径写错时必须明确失败，而不是让 SQLite 悄悄建一个
   // 空库——那样"这个实例还没有任何用户"和"你指的是另一个实例"在界面上一模一样，
   // 人工验收会得出完全错误的结论（本轮 P0 就是这么发生的）。
-  bool OpenExisting(const std::string& path, std::string* error_message);
+  //
+  // 打开方式显式分成两个入口，因为"只读"与"可写"是两种相反的产品承诺，
+  // 不能藏在同一个 OpenExisting() 里：
+  //   * OpenExistingReadOnly：管理工具的只读命令（status / list-users /
+  //     show-user / list-snapshots / overview）用它。连接是
+  //     SQLITE_OPEN_READONLY（外加 PRAGMA query_only），所以不可能建表、
+  //     不可能写 user_version、不可能开写事务——backup-server 正在运行时它
+  //     也只是读者，这正是"服务端在跑也能安全查看"的兑现方式；
+  //   * OpenExistingReadWrite：破坏性命令（delete-user / delete-snapshot）
+  //     用它，调用方必须**已经**持有数据目录锁（证明服务端已停止）才允许走到
+  //     这里。
+  // 两者都不 CREATE、不建表：schema 必须已经存在而且版本正确，否则明确失败。
+  bool OpenExistingReadOnly(const std::string& path,
+                            std::string* error_message);
+  bool OpenExistingReadWrite(const std::string& path,
+                             std::string* error_message);
   void Close();
   bool IsOpen() const { return database_ != nullptr; }
 
@@ -160,6 +175,12 @@ class RemoteMetadataStore {
   bool Prepare(const std::string& sql, sqlite3_stmt** statement,
                std::string* error_message);
   bool EnsureSchema(std::string* error_message);
+  // 只读 / 可写两种"打开已经存在的库"的公共实现（writable 决定连接标志）。
+  bool OpenExistingWithMode(const std::string& path, bool writable,
+                            std::string* error_message);
+  // 校验一个已经存在的库：schema 版本对得上、必要的表都在、并且真的能读。
+  // 只读，绝不改写——它代替了以前"打开管理工具就顺手 EnsureSchema"的行为。
+  bool VerifyExistingSchema(std::string* error_message);
   std::string LastError() const;
 
   sqlite3* database_ = nullptr;

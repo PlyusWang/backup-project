@@ -31,7 +31,8 @@
 #
 # 环境变量（覆盖自动推导；都是可选）：
 #
-#   BACKUP_SERVER_ROOT   部署根，默认 = 本脚本所在目录的上一级
+#   BACKUP_SERVER_ROOT   部署根，默认 = 本脚本所在目录的上一级；
+#                        在源码树里运行时**必须**显式给出，否则 fail closed
 #   BACKUP_SERVER_DATA   数据根，默认 = $BACKUP_SERVER_ROOT/data
 #   BACKUP_SERVER_DB     元数据库，默认 = $BACKUP_SERVER_ROOT/state/metadata.sqlite3
 #   BACKUP_SERVER_ADMIN  管理工具，默认 = 与本脚本同目录的 backup-server-admin
@@ -42,18 +43,28 @@ set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 
-# 部署布局：管理工具与本脚本同在 bin/ 下，部署根就是它的上一级。
-# 从源码树里直接跑（<repo>/scripts/...）时，产物在 build/ 下，实例位置必须由
-# 环境变量给出——不会去猜 $HOME 下的某个目录。
+# 部署布局：管理工具与本脚本同在 bin/ 下，部署根就是它的上一级——这一条只对
+# **部署后**的脚本成立，因为那个 bin/.. 就是被管理的那个实例。
 if [ -x "$SCRIPT_DIR/backup-server-admin" ]; then
   ADMIN_BIN="${BACKUP_SERVER_ADMIN:-$SCRIPT_DIR/backup-server-admin}"
   SERVER_ROOT_DEFAULT="$(cd "$SCRIPT_DIR/.." && pwd)"
+  SERVER_ROOT="${BACKUP_SERVER_ROOT:-$SERVER_ROOT_DEFAULT}"
 else
+  # 源码树里直接跑（<repo>/scripts/backup-server-admin.sh）：产物在 build/ 下，
+  # 这里**推不出**任何真实实例。以前它猜 $HOME/backup-project-server——猜错了就会
+  # 去读另一个实例（SQLite 还会顺手把不存在的文件建成空库），人工验收因此得出过
+  # 完全错误的结论。现在 fail closed：要么用部署后的脚本，要么显式给出
+  # BACKUP_SERVER_ROOT。
   ADMIN_BIN="${BACKUP_SERVER_ADMIN:-$SCRIPT_DIR/../build/backup-server-admin}"
-  SERVER_ROOT_DEFAULT="$HOME/backup-project-server"
+  if [ -z "${BACKUP_SERVER_ROOT:-}" ]; then
+    echo "ERROR: 这是源码树里的脚本，无法推断要管理哪个实例。" >&2
+    echo "  请 SSH 到服务器，使用部署后的 <server-root>/bin/backup-server-admin.sh；" >&2
+    echo "  或者显式设置 BACKUP_SERVER_ROOT（可选 BACKUP_SERVER_DATA / BACKUP_SERVER_DB）。" >&2
+    exit 1
+  fi
+  SERVER_ROOT="$BACKUP_SERVER_ROOT"
 fi
 
-SERVER_ROOT="${BACKUP_SERVER_ROOT:-$SERVER_ROOT_DEFAULT}"
 DATA_ROOT="${BACKUP_SERVER_DATA:-$SERVER_ROOT/data}"
 DB_PATH="${BACKUP_SERVER_DB:-$SERVER_ROOT/state/metadata.sqlite3}"
 

@@ -191,6 +191,55 @@ bool RemoteMetadataStore::EnsureSchema(std::string* error_message) {
   return true;
 }
 
+// 一个已经存在的库必须有的表。只验证它们**能读**，绝不 CREATE：
+// 管理工具在任何模式下都不负责建库、建表或升级 schema。
+constexpr const char* kRequiredTables[] = {"users", "snapshots", "deleted_users"};
+
+bool RemoteMetadataStore::VerifyExistingSchema(std::string* error_message) {
+  // 版本不匹配就明确失败，而不是"顺手"把库升级成新 schema：那是一次写操作，
+  // 而只读命令完全可能正在 backup-server 运行时执行。
+  {
+    Statement statement;
+    if (!Prepare("PRAGMA user_version;", statement.out(), error_message)) {
+      return false;
+    }
+    if (sqlite3_step(statement.get()) != SQLITE_ROW) {
+      if (error_message != nullptr) {
+        *error_message = "cannot read the schema version: " + LastError();
+      }
+      return false;
+    }
+    const int version = sqlite3_column_int(statement.get(), 0);
+    if (version != kSchemaVersion) {
+      if (error_message != nullptr) {
+        *error_message = "the metadata database has schema version " +
+                         std::to_string(version) + ", expected " +
+                         std::to_string(kSchemaVersion);
+      }
+      return false;
+    }
+  }
+  for (const char* table : kRequiredTables) {
+    Statement statement;
+    const std::string sql = std::string("SELECT count(*) FROM ") + table + ";";
+    if (!Prepare(sql, statement.out(), nullptr)) {
+      if (error_message != nullptr) {
+        *error_message = "the metadata database is missing the " +
+                         std::string(table) + " table: " + LastError();
+      }
+      return false;
+    }
+    if (sqlite3_step(statement.get()) != SQLITE_ROW) {
+      if (error_message != nullptr) {
+        *error_message =
+            "cannot read the " + std::string(table) + " table: " + LastError();
+      }
+      return false;
+    }
+  }
+  return true;
+}
+
 bool RemoteMetadataStore::Open(const std::string& path,
                                std::string* error_message) {
   std::lock_guard<std::mutex> guard(mutex_);
@@ -233,8 +282,25 @@ bool RemoteMetadataStore::Open(const std::string& path,
   return true;
 }
 
-bool RemoteMetadataStore::OpenExisting(const std::string& path,
-                                          std::string* error_message) {
+bool RemoteMetadataStore::OpenExistingReadOnly(
+    const std::string& path, std::string* error_message) {
+  return OpenExistingWithMode(path, /*writable=*/false, error_message);
+}
+
+bool RemoteMetadataStore::OpenExistingReadWrite(
+    const std::string& path, std::string* error_message) {
+  return OpenExistingWithMode(path, /*writable=*/true, error_message);
+}
+
+bool RemoteMetadataStore::OpenExistingWithMode(const std::string& path,
+                                               bool writable,
+                                               std::string* error_message) {
+  if (path.empty()) {
+    if (error_message != nullptr) {
+      *error_message = "the metadata database path is empty";
+    }
+    return false;
+  }
   // 先自己看一眼：文件必须存在、必须是普通文件。这样错误信息能说清"是哪个
   // 路径不对"，而不是把 SQLite 的 "unable to open database file" 原样抛出去。
   struct stat info;
@@ -257,18 +323,15 @@ bool RemoteMetadataStore::OpenExisting(const std::string& path,
     }
     return false;
   }
-  if (path.empty()) {
-    if (error_message != nullptr) {
-      *error_message = "the metadata database path is empty";
-    }
-    return false;
-  }
   sqlite3* database = nullptr;
   // 刻意不带 SQLITE_OPEN_CREATE：即使上面那个 stat 与这里之间文件被删掉，
   // 这一次打开也只会失败，不会创建一个空库。
-  const int code = sqlite3_open_v2(
-      path.c_str(), &database,
-      SQLITE_OPEN_READWRITE | SQLITE_OPEN_FULLMUTEX, nullptr);
+  //
+  // 只读命令更是连"可写"都不申请：那条连接在 SQLite 层面就是读者，
+  // "这条命令不会写库"因此不是约定，而是连接本身的性质。
+  const int flags = (writable ? SQLITE_OPEN_READWRITE : SQLITE_OPEN_READONLY) |
+                    SQLITE_OPEN_FULLMUTEX;
+  const int code = sqlite3_open_v2(path.c_str(), &database, flags, nullptr);
   if (code != SQLITE_OK) {
     const std::string reason =
         database != nullptr ? sqlite3_errmsg(database) : "unknown";
@@ -283,7 +346,28 @@ bool RemoteMetadataStore::OpenExisting(const std::string& path,
   }
   database_ = database;
   path_ = path;
-  if (!EnsureSchema(error_message)) {
+  // 下面两条都是**连接级** pragma，不写数据库文件本身。journal_mode 才是写
+  // 操作（它会把库改成 WAL 并写进文件头），这里刻意不设：管理工具不修改它
+  // 打开的库。busy_timeout 让"服务端正在写"时读到的是等待，而不是立刻
+  // SQLITE_BUSY；query_only 是只读路径的第二道锁——以后就算有人在这一层手滑
+  // 写了 SQL，也会被直接拒绝，而不是悄悄改掉数据。
+  //
+  // foreign_keys 只在可写连接上打开：破坏性删除要按"先 snapshots 后 users"
+  // 的顺序做，这条外键就是那个顺序的护栏，和服务端连接上的语义保持一致。
+  std::string pragma_error;
+  if (!Execute("PRAGMA busy_timeout=5000;", &pragma_error) ||
+      !Execute(writable ? "PRAGMA foreign_keys=ON;" : "PRAGMA query_only=ON;",
+               &pragma_error)) {
+    sqlite3_close(database_);
+    database_ = nullptr;
+    path_.clear();
+    if (error_message != nullptr) {
+      *error_message = pragma_error;
+    }
+    return false;
+  }
+  // 只验证，不建表：管理工具不是"初始化实例"的地方。
+  if (!VerifyExistingSchema(error_message)) {
     sqlite3_close(database_);
     database_ = nullptr;
     path_.clear();

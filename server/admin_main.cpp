@@ -423,15 +423,27 @@ bool ResolveUser(RemoteMetadataStore* store, const std::string& selector_text,
   return true;
 }
 
-int OpenAll(const Options& options, RemoteMetadataStore* store,
-            RemoteMaintenance* maintenance, std::string* error_message) {
+int OpenAll(const Options& options, bool writable,
+            RemoteMetadataStore* store, RemoteMaintenance* maintenance,
+            std::string* error_message) {
   // **fail closed**：只打开已经存在的数据库。
   //
   // 管理工具没有"初始化一个新实例"的语义。以前这里用的是 store->Open()，它带
   // SQLITE_OPEN_CREATE：路径写错时 SQLite 会悄悄建一个空库，于是"这个实例还
   // 没有用户"和"你看的是另一个实例"在屏幕上完全一样——人工验收因此得出了
   // "ECS 上没有任何用户"的错误结论（而 GUI 显示的 Wjy 已登录其实是真的）。
-  if (!store->OpenExisting(options.database_path, error_message)) {
+  //
+  // 打开方式由命令决定，不共用一个"能读也能写"的连接：
+  //   * 只读命令走 SQLITE_OPEN_READONLY：backup-server 正在运行也能安全查询，
+  //     而且这条连接根本写不了库（以前它会在打开时 EnsureSchema——BEGIN
+  //     IMMEDIATE + CREATE TABLE + PRAGMA user_version，那是写事务）；
+  //   * 破坏性命令走可写连接：调用方**已经**先拿到数据目录锁，证明服务端已停止。
+  // 两条路都不 CREATE、不建表。
+  const bool opened =
+      writable ? store->OpenExistingReadWrite(options.database_path, error_message)
+               : store->OpenExistingReadOnly(options.database_path,
+                                             error_message);
+  if (!opened) {
     return -1;
   }
   *maintenance = RemoteMaintenance(store, options.root_directory);
@@ -780,7 +792,7 @@ int main(int argc, char* argv[]) {
   RemoteMetadataStore store;
   RemoteMaintenance maintenance;
   std::string open_error;
-  if (OpenAll(options, &store, &maintenance, &open_error) != 0) {
+  if (OpenAll(options, destructive, &store, &maintenance, &open_error) != 0) {
     std::fprintf(stderr,
                  "ERROR: 未找到服务器状态数据库：\n"
                  "  %s\n"
