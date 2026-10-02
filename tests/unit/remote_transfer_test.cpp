@@ -32,6 +32,7 @@
 #include "network_protocol.h"
 #include "remote_auth.h"
 #include "remote_server.h"
+#include "remote_test_support.h"
 #include "test_support.h"
 
 // 消毒剂构建的判别宏。
@@ -135,6 +136,9 @@ struct Fixture {
   std::string root;
   std::string database;
   std::string secret_file;
+  // PR #21：BPSEC1 的服务端身份私钥与客户端 pin 文本（同一次生成）。
+  std::string transport_key_file;
+  std::string pin;
 };
 
 bool SetupFixture(Fixture* fixture, const std::string& name) {
@@ -151,11 +155,22 @@ bool SetupFixture(Fixture* fixture, const std::string& name) {
                                "BACKUP_TOKEN_SECRET=" + secret + "\n", 0600)) {
     return false;
   }
+  // BPSEC1 身份密钥：服务端在 ServeConnection 的第一步就要用它；缺了它
+  // Start() 直接失败，所以每个 fixture 都得有自己的一套。
+  fixture->transport_key_file = fixture->base + "/transport.key";
+  net::TransportIdentity identity;
+  std::string identity_error;
+  if (!remote_test_support::PrepareTransportIdentity(
+          fixture->transport_key_file, &identity, &fixture->pin,
+          &identity_error)) {
+    return false;
+  }
   fixture->config.bind_address = "127.0.0.1";
   fixture->config.port = 0;
   fixture->config.root_directory = fixture->root;
   fixture->config.database_path = fixture->database;
   fixture->config.secret_file_path = fixture->secret_file;
+  fixture->config.transport_key_file_path = fixture->transport_key_file;
   fixture->config.quiet = true;
   return true;
 }
@@ -197,18 +212,34 @@ std::thread ServeOneConnection(net::RemoteServer* server) {
 
 struct Session {
   int fd = -1;
+  // BPSEC1 会话密钥 / 序号：一条连接一个，握手完成后所有帧都走它。
+  net::SecureChannel channel;
   std::uint64_t next_request_id = 1;
 };
+
+// 客户端侧握手。失败时必须显式 shutdown(SHUT_RDWR)：服务端线程这时还等在
+// ServeConnection 的握手读上，不关连接的话 worker.join() 会永远卡住。
+bool HandshakeOrShutdown(Session* session, const std::string& pin,
+                         std::string* error) {
+  if (remote_test_support::HandshakeTestClient(session->fd, pin,
+                                               &session->channel, error)) {
+    return true;
+  }
+  ::shutdown(session->fd, SHUT_RDWR);
+  return false;
+}
 
 net::FrameReadStatus Request(Session* session, net::Opcode opcode,
                              const std::string& payload, net::FrameHeader* header,
                              std::string* response, std::string* error) {
   const std::uint64_t request_id = session->next_request_id++;
-  if (!net::SendFrame(session->fd, static_cast<std::uint16_t>(opcode), 0,
-                      request_id, payload, error)) {
+  if (!remote_test_support::SendTestFrame(
+          &session->channel, session->fd, static_cast<std::uint16_t>(opcode), 0,
+          request_id, payload, error)) {
     return net::FrameReadStatus::kIoError;
   }
-  return net::ReceiveFrame(session->fd, header, response, error);
+  return remote_test_support::ReceiveTestFrame(&session->channel, session->fd,
+                                               header, response, error);
 }
 
 std::string Credentials(const std::string& username,
@@ -250,11 +281,16 @@ bool Login(Session* session, const std::string& username,
 
 // 完整的"注册 + 登录"流程（新连接上用同一个账号时只走登录）。
 bool OpenSession(net::RemoteServer* server, const std::string& username,
-                 const std::string& password, Session* session,
-                 std::string* error) {
+                 const std::string& password, const std::string& pin,
+                 Session* session, std::string* error) {
   session->fd = ConnectToLoopback(server->bound_port());
   if (session->fd < 0) {
     *error = "cannot connect";
+    return false;
+  }
+  // 服务端在业务帧之前先握手，客户端必须跟着做第一步，否则整套序列都会
+  // 停在"服务端等 ClientHello、客户端等响应"上。
+  if (!HandshakeOrShutdown(session, pin, error)) {
     return false;
   }
   std::uint32_t status = 0;
@@ -273,6 +309,14 @@ bool OpenSession(net::RemoteServer* server, const std::string& username,
   return true;
 }
 
+// 远端链元数据：UPLOAD_BEGIN 的字段顺序是
+//   display_name -> size -> sha256 -> kind -> parent_id -> lineage
+// 服务端不给缺字段的请求做默认值补齐，所以这三个字段必须显式带上。
+//
+// 这个文件里上传的都是**独立完整快照**（与低层 remote upload 的语义一致）：
+// kind = kFull、没有父、lineage 为空串（空串表示"不属于任何链"）。整套用例
+// 都不碰增量链，链本身由专门的链测试覆盖。所以这里发的字节与产品 CLI 在
+// remote upload 下发的完全一致。
 std::string UploadBeginPayload(const std::string& display_name,
                                std::uint64_t size,
                                const std::string& sha256) {
@@ -281,6 +325,9 @@ std::string UploadBeginPayload(const std::string& display_name,
   builder.AppendString(display_name, net::kMaxDisplayNameBytes, &error);
   builder.AppendU64(size);
   builder.AppendString(sha256, net::kSha256HexBytes, &error);
+  builder.AppendU16(static_cast<std::uint16_t>(net::SnapshotKind::kFull));
+  builder.AppendString(std::string(), net::kMaxSnapshotIdBytes, &error);
+  builder.AppendString(std::string(), net::kMaxLineageBytes, &error);
   return builder.data();
 }
 
@@ -334,15 +381,28 @@ bool UploadBuffer(Session* session, const std::string& display_name,
   if (header.status != static_cast<std::uint32_t>(net::Status::kOk)) {
     return true;
   }
+  // UPLOAD_END 响应：snapshot_id -> sha256 -> size -> created_at -> kind ->
+  // generation -> parent_id（链特性之后多了后三个字段）。
   net::PayloadReader reader(response);
   std::string sha;
   std::uint64_t size = 0;
   std::uint64_t created_at = 0;
+  std::uint16_t kind = 0;
+  std::uint64_t generation = 0;
+  std::string parent_id;
   if (!reader.ReadString(net::kMaxSnapshotIdBytes, snapshot_id) ||
       !reader.ReadString(net::kSha256HexBytes, &sha) ||
       !reader.ReadU64(&size) || !reader.ReadU64(&created_at) ||
+      !reader.ReadU16(&kind) || !reader.ReadU64(&generation) ||
+      !reader.ReadString(net::kMaxSnapshotIdBytes, &parent_id) ||
       !reader.AtEnd()) {
     *error = "cannot decode the UPLOAD_END response";
+    return false;
+  }
+  // full 快照必须是链根：没有父、代数 0。
+  if (kind != static_cast<std::uint16_t>(net::SnapshotKind::kFull) ||
+      generation != 0 || !parent_id.empty()) {
+    *error = "the server did not report this upload as a full chain root";
     return false;
   }
   *error = sha + "|" + std::to_string(size) + "|" + std::to_string(created_at);
@@ -417,9 +477,14 @@ bool UploadStream(Session* session, const std::string& display_name,
   std::string returned_sha;
   std::uint64_t size = 0;
   std::uint64_t created_at = 0;
+  std::uint16_t kind = 0;
+  std::uint64_t generation = 0;
+  std::string parent_id;
   if (!reader.ReadString(net::kMaxSnapshotIdBytes, snapshot_id) ||
       !reader.ReadString(net::kSha256HexBytes, &returned_sha) ||
-      !reader.ReadU64(&size) || !reader.ReadU64(&created_at)) {
+      !reader.ReadU64(&size) || !reader.ReadU64(&created_at) ||
+      !reader.ReadU16(&kind) || !reader.ReadU64(&generation) ||
+      !reader.ReadString(net::kMaxSnapshotIdBytes, &parent_id)) {
     *error = "cannot decode the UPLOAD_END response";
     return false;
   }
@@ -553,10 +618,18 @@ bool ListSnapshots(Session* session,
     std::string sha;
     std::uint64_t size = 0;
     std::uint64_t created_at = 0;
+    // 链元数据：kind -> generation -> parent_id -> lineage。
+    std::uint16_t kind = 0;
+    std::uint64_t generation = 0;
+    std::string parent_id;
+    std::string lineage;
     if (!reader.ReadString(net::kMaxSnapshotIdBytes, &id) ||
         !reader.ReadString(net::kMaxDisplayNameBytes, &display_name) ||
         !reader.ReadString(net::kSha256HexBytes, &sha) ||
-        !reader.ReadU64(&size) || !reader.ReadU64(&created_at)) {
+        !reader.ReadU64(&size) || !reader.ReadU64(&created_at) ||
+        !reader.ReadU16(&kind) || !reader.ReadU64(&generation) ||
+        !reader.ReadString(net::kMaxSnapshotIdBytes, &parent_id) ||
+        !reader.ReadString(net::kMaxLineageBytes, &lineage)) {
       *error = "cannot decode a LIST entry";
       return false;
     }
@@ -636,7 +709,8 @@ int main() {
   Session session;
   std::string session_error;
   test_support::Check(
-      OpenSession(&server, username, password, &session, &session_error),
+      OpenSession(&server, username, password, fixture.pin, &session,
+                  &session_error),
       "XFER T1 注册并登录", session_error);
 
   const std::string data = RandomHex(512);  // 1024 字节
@@ -924,6 +998,12 @@ int main() {
     big_reader.ReadString(net::kSha256HexBytes, &big_sha);
     big_reader.ReadU64(&big_size);
     big_reader.ReadU64(&big_created);
+    std::uint16_t big_kind = 0;
+    std::uint64_t big_generation = 0;
+    std::string big_parent;
+    big_reader.ReadU16(&big_kind);
+    big_reader.ReadU64(&big_generation);
+    big_reader.ReadString(net::kMaxSnapshotIdBytes, &big_parent);
     test_support::Check(big_sha == Sha256Of(big_body) &&
                             big_size == big_body.size(),
                         "XFER T5 判别：最终 blob 就是完整的 300 KiB");
@@ -973,7 +1053,8 @@ int main() {
     Session second;
     std::string second_error;
     test_support::Check(
-        OpenSession(&server, username, password, &second, &second_error),
+        OpenSession(&server, username, password, fixture.pin, &second,
+                    &second_error),
         "XFER T6 第二条连接登录", second_error);
     net::FrameHeader header;
     std::string response;
@@ -1044,7 +1125,7 @@ int main() {
     const std::string big_user = "big-" + RandomHex(4);
     const std::string big_password = RandomHex(16);
     test_support::Check(OpenSession(&big_server, big_user, big_password,
-                                    &big_session, &big_session_error),
+                                    big.pin, &big_session, &big_session_error),
                         "XFER T8 注册并登录", big_session_error);
 
     const std::uint64_t rss_before = PeakRssKb();
@@ -1126,14 +1207,14 @@ int main() {
     Session alice;
     std::string alice_error;
     test_support::Check(OpenSession(&shared_server, "alice-01", alice_password,
-                                    &alice, &alice_error),
+                                    shared.pin, &alice, &alice_error),
                         "XFER T9 用户 A 注册并登录", alice_error);
     std::thread bob_worker = ServeOneConnection(&shared_server);
     const std::string bob_password = RandomHex(16);
     Session bob;
     std::string bob_error;
-    test_support::Check(OpenSession(&shared_server, "bob-01", bob_password, &bob,
-                                    &bob_error),
+    test_support::Check(OpenSession(&shared_server, "bob-01", bob_password,
+                                    shared.pin, &bob, &bob_error),
                         "XFER T9 用户 B 注册并登录", bob_error);
 
     const std::string body = RandomHex(200);

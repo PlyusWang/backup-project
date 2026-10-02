@@ -74,6 +74,38 @@ if [ ! -x "$ADMIN" ]; then
 fi
 record_pass "make all server 成功（warning $(grep -ci warning "$TEST_ROOT/build.log" || true) 条）"
 
+# ---- PR #21：BPSEC1 服务端身份密钥 + 客户端 pin ----
+# 服务端必须带 --transport-key-file 才能启动；客户端必须先知道服务端公钥指纹
+# （pin），没有就直接用法错误退出（不做 TOFU）。密钥只生成在测试自己的临时
+# 目录里，私钥内容不打印；pin 从 keygen 输出里读进环境变量，不写明文常量。
+# 这一段必须在**任何** backupctl remote 调用之前：pin 缺失时 remote 会以
+# 用法错误退出，那样下面"不认识 admin 子命令"之类的断言就会被 pin 错误顶掉。
+KEYGEN="./build/backup-server-keygen"
+TRANSPORT_KEY="$TEST_ROOT/transport.key"
+KEYGEN_OUT="$TEST_ROOT/keygen.out"
+if [ ! -x "$KEYGEN" ]; then
+  record_fail "backup-server-keygen 已构建" "$KEYGEN 不存在（make server 应该产出它）"
+  finish
+fi
+if ! "$KEYGEN" --output "$TRANSPORT_KEY" > "$KEYGEN_OUT" 2>&1; then
+  record_fail "生成服务端传输身份密钥" "$(head -2 "$KEYGEN_OUT" | tr '\n' ' ')"
+  finish
+fi
+KEY_MODE="$(stat -c '%a' "$TRANSPORT_KEY" 2>/dev/null || echo missing)"
+if [ "$KEY_MODE" = "600" ]; then
+  record_pass "服务端传输身份私钥已生成且权限 0600"
+else
+  record_fail "传输身份私钥权限" "期望 0600，实际 $KEY_MODE"
+  finish
+fi
+export BACKUP_REMOTE_SERVER_KEY="$(grep -oE 'sha256:[0-9a-f]{64}' "$KEYGEN_OUT" | head -1)"
+if [ -n "$BACKUP_REMOTE_SERVER_KEY" ]; then
+  record_pass "客户端 pin 已从 keygen 输出读入环境变量 BACKUP_REMOTE_SERVER_KEY（不打印、不写常量）"
+else
+  record_fail "客户端 pin" "keygen 输出里没有 sha256:<64 位十六进制> 指纹"
+  finish
+fi
+
 run_admin() {
   timeout --signal=KILL 120 "$ADMIN" --root "$DATA" --db "$DB" "$@" \
     >"$TEST_ROOT/admin.txt" 2>&1
@@ -103,6 +135,19 @@ if printf '%s' "$ADMIN_AS_SUBCOMMAND" | grep -q "未知的 remote 子命令"; th
   record_pass "backupctl remote 不认识 admin 子命令"
 else
   record_fail "backupctl remote admin" "居然被当成合法子命令"
+fi
+# PR #21：pin 是**必填项**。上面那条断言能继续成立，靠的正是它带了 pin
+# （环境变量），所以这里再用 env -u 摘掉 pin 证明：没有 pin 时命令在连接
+# 之前就以用法错误（退出码 2）失败，错误信息里能看到 --server-key。
+NO_PIN_CODE=0
+env -u BACKUP_REMOTE_SERVER_KEY timeout 60 ./build/backupctl remote \
+  ping --host 127.0.0.1 --port 1 > "$TEST_ROOT/no-pin.txt" 2>&1 \
+  || NO_PIN_CODE=$?
+if [ "$NO_PIN_CODE" = "2" ] && grep -q -- "--server-key" "$TEST_ROOT/no-pin.txt"; then
+  record_pass "没有 pin 时 remote 以用法错误退出（退出码 2，提示 --server-key）"
+else
+  record_fail "没有 pin 时的 remote" \
+    "退出码 $NO_PIN_CODE $(head -2 "$TEST_ROOT/no-pin.txt" | tr '\n' ' ')"
 fi
 
 # ---- 2. BPNET1 里没有 admin 操作码（运行时由 network_protocol_test 断言，
@@ -152,7 +197,8 @@ done
 [ -n "$PORT" ] || { record_fail "端口" "20150-20180 都被占用"; finish; }
 
 ./build/backup-server --bind 127.0.0.1 --port "$PORT" --root "$DATA" --db "$DB" \
-  --secret-file "$SECRET" --pid-file "$TEST_ROOT/state/server.pid" \
+  --secret-file "$SECRET" --transport-key-file "$TRANSPORT_KEY" \
+  --pid-file "$TEST_ROOT/state/server.pid" \
   --log-file "$LOG" --quiet > "$TEST_ROOT/logs/server-stderr.log" 2>&1 &
 SERVER_PID=$!
 ready=0
@@ -325,9 +371,13 @@ else
 fi
 
 # 数据目录锁：同一个 root 上不允许起第二个服务端。
+# 第二个实例同样带上 --transport-key-file：PR #21 起缺这个参数会直接以用法
+# 错误退出，那样下面就会因为"参数不全"而不是"目录锁"退出——断言虽然还是
+# 检查 "already using the data directory"，但测的就不是锁了。
 SECOND_PORT=$((PORT + 1))
 ./build/backup-server --bind 127.0.0.1 --port "$SECOND_PORT" --root "$DATA" --db "$DB" \
-  --secret-file "$SECRET" --quiet > "$TEST_ROOT/logs/second.log" 2>&1 &
+  --secret-file "$SECRET" --transport-key-file "$TRANSPORT_KEY" \
+  --quiet > "$TEST_ROOT/logs/second.log" 2>&1 &
 SECOND_PID=$!
 sleep 1
 if kill -0 "$SECOND_PID" 2>/dev/null; then

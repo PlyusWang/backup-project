@@ -30,6 +30,25 @@ echo "[ecs-truth] ECS 真机三方真值矩阵（客户端 / 管理 CLI / SQLite
 
 ADMIN_STATE_FILE="${TMPDIR:-/tmp}/ecs-truth-admin-state.txt"
 
+# ---- PR #21：客户端 pin（服务端身份公钥指纹）----
+# 从 ECS 本机的身份私钥上读出公钥与指纹（--show 不打印私钥内容），私钥不
+# scp、不进日志。pin 放进环境变量，下面的 backupctl remote 调用不用逐个加
+# --server-key，也绝不写成明文常量。
+KEYGEN_OUT="${TMPDIR:-/tmp}/ecs-truth-keygen.out"
+if ! ssh -o BatchMode=yes "$ALIAS" \
+     '~/backup-project-server/bin/backup-server-keygen --show --key-file ~/backup-project-server/state/transport.key' \
+     > "$KEYGEN_OUT" 2>&1; then
+  record_fail "读取服务端传输身份指纹" "$(head -2 "$KEYGEN_OUT" | tr '\n' ' ')"
+  echo "[ecs-truth] 取不到 pin（缺 state/transport.key？），停止。" >&2
+  exit 1
+fi
+export BACKUP_REMOTE_SERVER_KEY="$(grep -oE 'sha256:[0-9a-f]{64}' "$KEYGEN_OUT" | head -1)"
+if [ -z "$BACKUP_REMOTE_SERVER_KEY" ]; then
+  record_fail "服务端传输身份指纹" "keygen 输出里没有 sha256:<64 位十六进制>"
+  exit 1
+fi
+record_pass "已从 ECS 本机读到服务端身份指纹（pin 只进环境变量，不打印）"
+
 # ---- 0. 实例身份：服务端进程实际用的路径 ----
 SERVER_INFO="$(ssh -o BatchMode=yes "$ALIAS" '
   SP=$(pgrep -f "bin/backup-server --bind" | head -1)
@@ -39,15 +58,19 @@ SERVER_INFO="$(ssh -o BatchMode=yes "$ALIAS" '
   echo "cwd=$(readlink -f /proc/$SP/cwd)"
   echo "root=$(tr "\0" "\n" < /proc/$SP/cmdline | awk "/^--root$/{getline; print}")"
   echo "db=$(tr "\0" "\n" < /proc/$SP/cmdline | awk "/^--db$/{getline; print}")"
+  echo "transport_key=$(tr "\0" "\n" < /proc/$SP/cmdline | awk "/^--transport-key-file$/{getline; print}")"
   echo "sha=$(sha256sum /proc/$SP/exe | cut -d" " -f1)"')"
 echo "$SERVER_INFO" | sed 's/^/    /'
 SERVER_PID="$(printf '%s\n' "$SERVER_INFO" | sed -n 's/^pid=//p')"
 SERVER_DB="$(printf '%s\n' "$SERVER_INFO" | sed -n 's/^db=//p')"
 SERVER_SHA="$(printf '%s\n' "$SERVER_INFO" | sed -n 's/^sha=//p')"
-if [ -n "$SERVER_PID" ] && [ -n "$SERVER_DB" ]; then
-  record_pass "服务端实例：pid=$SERVER_PID db=$SERVER_DB"
+# PR #21：运行中的服务端必须带 --transport-key-file。它同时证明多了一个"带值的
+# 选项"之后，上面按选项名整行精确匹配的 --root / --db 解析没有被打断。
+SERVER_KEY="$(printf '%s\n' "$SERVER_INFO" | sed -n 's/^transport_key=//p')"
+if [ -n "$SERVER_PID" ] && [ -n "$SERVER_DB" ] && [ -n "$SERVER_KEY" ]; then
+  record_pass "服务端实例：pid=$SERVER_PID db=$SERVER_DB transport_key=$SERVER_KEY"
 else
-  record_fail "解析服务端实例" "$SERVER_INFO"
+  record_fail "解析服务端实例（含 --transport-key-file）" "$SERVER_INFO"
 fi
 
 # ---- 1. 管理 CLI（wrapper）必须指向同一个库，并且能看到真实用户数 ----
@@ -152,6 +175,7 @@ NEW_PID="$(ssh -o BatchMode=yes "$ALIAS" "cd ~/backup-project-server && \
   setsid nohup ./bin/backup-server --bind 127.0.0.1 --port $PORT \
     --root \$PWD/data --db \$PWD/state/metadata.sqlite3 \
     --secret-file /home/ubuntu/.config/backup-project-server/secrets.env \
+    --transport-key-file /home/ubuntu/backup-project-server/state/transport.key \
     --log-file \$PWD/logs/server.log --pid-file \$PWD/state/server.pid \
     > \$PWD/logs/server.stdout 2>&1 < /dev/null & sleep 3 ; \
   pgrep -f 'bin/backup-server --bind' | head -1")"

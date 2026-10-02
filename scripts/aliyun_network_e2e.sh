@@ -5,7 +5,10 @@
 #   bash scripts/aliyun_network_e2e.sh [ssh-alias]
 #
 # 前置条件：ECS 上的 backup-server 已在运行且**只**绑 127.0.0.1:18765；
-# 本机能以 BatchMode 免密登录该 alias；secrets.env 在 ECS 上存在可读。
+# 本机能以 BatchMode 免密登录该 alias；secrets.env 在 ECS 上存在可读；
+# ECS 上有 PR #21 的服务端与它的传输身份私钥（<server-root>/state/transport.key，
+# 由 scripts/deploy_aliyun_server.sh 在服务器本机生成）。客户端 pin 从这把私钥
+# 的公钥指纹读出来，私钥本身永远不离开 ECS。
 #
 # 隧道只绑本机环回：127.0.0.1:18765 -> ECS 127.0.0.1:18765。
 # 不改安全组，不把 18765 暴露到公网。
@@ -38,6 +41,25 @@ if ! ssh -o BatchMode=yes "$ALIAS" 'hostname' > "$WORK_DIR/host.txt" 2>&1; then
   exit 1
 fi
 echo "[e2e] ECS hostname: $(cat "$WORK_DIR/host.txt")"
+
+# ---- PR #21：客户端必须先知道服务端身份 pin（不做 TOFU）----
+# 从 ECS 本机的身份私钥上读出公钥指纹：backup-server-keygen --show 只打印
+# 公钥与指纹，私钥不 scp、不进日志、不进 argv。pin 放进环境变量，后面的
+# backupctl remote 调用就不用逐个加 --server-key（也绝不写成明文常量）。
+KEYGEN_OUT="$WORK_DIR/keygen.out"
+if ! ssh -o BatchMode=yes "$ALIAS" \
+     '~/backup-project-server/bin/backup-server-keygen --show --key-file ~/backup-project-server/state/transport.key' \
+     > "$KEYGEN_OUT" 2>&1; then
+  echo "[e2e] 无法从 ECS 读取服务端传输身份（缺 state/transport.key？）：" >&2
+  head -2 "$KEYGEN_OUT" >&2
+  exit 1
+fi
+export BACKUP_REMOTE_SERVER_KEY="$(grep -oE 'sha256:[0-9a-f]{64}' "$KEYGEN_OUT" | head -1)"
+if [ -z "$BACKUP_REMOTE_SERVER_KEY" ]; then
+  echo "[e2e] ECS 的 keygen 输出里没有 sha256:<64 位十六进制> 指纹" >&2
+  exit 1
+fi
+record_pass "已从 ECS 本机读到服务端身份指纹（pin 只进环境变量，不打印）"
 
 echo "[e2e] 建立 SSH tunnel（只绑环回）"
 ssh -o BatchMode=yes -o ExitOnForwardFailure=yes -o ServerAliveInterval=30 \

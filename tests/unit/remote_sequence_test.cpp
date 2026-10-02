@@ -36,6 +36,7 @@
 #include "network_protocol.h"
 #include "remote_backup_client.h"
 #include "remote_server.h"
+#include "remote_test_support.h"
 #include "test_support.h"
 
 namespace bp = backupproject;
@@ -60,6 +61,9 @@ struct Fixture {
   net::RemoteServerConfig config;
   std::string base;
   std::string server_log;
+  // PR #21：BPSEC1 的服务端身份私钥与客户端 pin 文本（同一次生成）。
+  std::string transport_key_file;
+  std::string pin;
 };
 
 bool SetupFixture(Fixture* fixture, const std::string& name) {
@@ -75,11 +79,21 @@ bool SetupFixture(Fixture* fixture, const std::string& name) {
                                "BACKUP_TOKEN_SECRET=" + secret + "\n", 0600)) {
     return false;
   }
+  // BPSEC1 身份密钥：服务端每个连接的第一步就是它，缺了 Start() 直接失败。
+  fixture->transport_key_file = base + "/transport.key";
+  net::TransportIdentity identity;
+  std::string identity_error;
+  if (!remote_test_support::PrepareTransportIdentity(
+          fixture->transport_key_file, &identity, &fixture->pin,
+          &identity_error)) {
+    return false;
+  }
   fixture->config.bind_address = "127.0.0.1";
   fixture->config.port = 0;
   fixture->config.root_directory = base + "/data";
   fixture->config.database_path = base + "/state/db.sqlite3";
   fixture->config.secret_file_path = base + "/secrets.env";
+  fixture->config.transport_key_file_path = fixture->transport_key_file;
   fixture->config.log_file_path = fixture->server_log;
   fixture->config.io_timeout_seconds = static_cast<int>(kIdleTimeout);
   fixture->config.quiet = true;
@@ -104,6 +118,8 @@ class ServerFixture {
     endpoint_.host = "127.0.0.1";
     endpoint_.port = server_.bound_port();
     endpoint_.timeout_seconds = 15;
+    // BPSEC1 不做 TOFU：这个端点必须带上本次 fixture 的 pin。
+    endpoint_.server_key_pin = fixture_.pin;
     return true;
   }
 
