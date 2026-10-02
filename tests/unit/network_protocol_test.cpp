@@ -6,6 +6,8 @@
 // 截断的帧头、截断的 payload、假 magic、错版本、未知操作码、超大长度、
 // 超长字符串、内嵌 NUL、一帧之后接垃圾、同一个流里的多帧，逐条覆盖。
 
+#include "network_protocol.h"
+
 #include <sys/socket.h>
 #include <sys/types.h>
 #include <unistd.h>
@@ -14,7 +16,6 @@
 #include <string>
 #include <vector>
 
-#include "network_protocol.h"
 #include "test_support.h"
 
 namespace bp = backupproject;
@@ -55,13 +56,13 @@ int main() {
     test_support::Check(encoded.size() == net::kFrameHeaderSize,
                         "BPNET T1 帧头正好 32 字节");
     test_support::Check(ToHex(encoded) ==
-                            "42504e31"      // magic "BPN1"
-                            "0001"          // version
-                            "000a"          // opcode LIST
-                            "0000"          // flags
-                            "0000"          // reserved
-                            "01020304"      // status
-                            "0102030405060708"  // request_id
+                            "42504e31"           // magic "BPN1"
+                            "0001"               // version
+                            "000a"               // opcode LIST
+                            "0000"               // flags
+                            "0000"               // reserved
+                            "01020304"           // status
+                            "0102030405060708"   // request_id
                             "0000000000000011",  // payload_length
                         "BPNET T1 判别：逐字节大端布局与字段顺序",
                         ToHex(encoded));
@@ -98,38 +99,38 @@ int main() {
 
     std::string bad_magic = good;
     bad_magic[0] = 'X';
-    test_support::Check(!net::DecodeFrameHeader(
-                            reinterpret_cast<const unsigned char*>(
-                                bad_magic.data()),
-                            bad_magic.size(), &out, &error),
-                        "BPNET T3 假 magic 被拒绝", error);
+    test_support::Check(
+        !net::DecodeFrameHeader(
+            reinterpret_cast<const unsigned char*>(bad_magic.data()),
+            bad_magic.size(), &out, &error),
+        "BPNET T3 假 magic 被拒绝", error);
 
     std::string bad_version = good;
     bad_version[5] = 2;
     error.clear();
-    test_support::Check(!net::DecodeFrameHeader(
-                            reinterpret_cast<const unsigned char*>(
-                                bad_version.data()),
-                            bad_version.size(), &out, &error),
-                        "BPNET T3 未知版本被拒绝", error);
+    test_support::Check(
+        !net::DecodeFrameHeader(
+            reinterpret_cast<const unsigned char*>(bad_version.data()),
+            bad_version.size(), &out, &error),
+        "BPNET T3 未知版本被拒绝", error);
 
     std::string bad_flags = good;
     bad_flags[9] = 1;
     error.clear();
-    test_support::Check(!net::DecodeFrameHeader(
-                            reinterpret_cast<const unsigned char*>(
-                                bad_flags.data()),
-                            bad_flags.size(), &out, &error),
-                        "BPNET T3 flags 非 0 被拒绝", error);
+    test_support::Check(
+        !net::DecodeFrameHeader(
+            reinterpret_cast<const unsigned char*>(bad_flags.data()),
+            bad_flags.size(), &out, &error),
+        "BPNET T3 flags 非 0 被拒绝", error);
 
     std::string bad_reserved = good;
     bad_reserved[11] = 7;
     error.clear();
-    test_support::Check(!net::DecodeFrameHeader(
-                            reinterpret_cast<const unsigned char*>(
-                                bad_reserved.data()),
-                            bad_reserved.size(), &out, &error),
-                        "BPNET T3 reserved 非 0 被拒绝", error);
+    test_support::Check(
+        !net::DecodeFrameHeader(
+            reinterpret_cast<const unsigned char*>(bad_reserved.data()),
+            bad_reserved.size(), &out, &error),
+        "BPNET T3 reserved 非 0 被拒绝", error);
 
     // payload_length = 0xFFFFFFFFFFFFFFFF：必须在这里被挡住，
     // 绝不能走到"按这个长度分配"。
@@ -162,10 +163,10 @@ int main() {
     net::DecodeFrameHeaderFields(
         reinterpret_cast<const unsigned char*>(bad_version.data()),
         bad_version.size(), &filled);
-    test_support::Check(filled.request_id == 0x0102030405060708ull &&
-                            filled.opcode ==
-                                static_cast<std::uint16_t>(net::Opcode::kList),
-                        "BPNET T4 判别：帧头非法但 request_id / opcode 可回填");
+    test_support::Check(
+        filled.request_id == 0x0102030405060708ull &&
+            filled.opcode == static_cast<std::uint16_t>(net::Opcode::kList),
+        "BPNET T4 判别：帧头非法但 request_id / opcode 可回填");
     net::FrameHeader partial;
     net::DecodeFrameHeaderFields(
         reinterpret_cast<const unsigned char*>(bad_version.data()), 10,
@@ -221,8 +222,9 @@ int main() {
     lying += "abcd";
     net::PayloadReader string_reader(lying);
     std::string text;
-    test_support::Check(!string_reader.ReadString(net::kMaxUsernameBytes, &text),
-                        "BPNET T6 超长字符串字段被拒绝");
+    test_support::Check(
+        !string_reader.ReadString(net::kMaxUsernameBytes, &text),
+        "BPNET T6 超长字符串字段被拒绝");
     test_support::Check(text.empty(), "BPNET T6 判别：被拒绝时没有写入输出");
 
     net::PayloadReader short_reader(payload);
@@ -280,20 +282,19 @@ int main() {
                         "BPNET T9 socketpair 建立");
     std::string error;
     const std::string payload = "hello-bpnet";
-    test_support::Check(net::SendFrame(pair[0],
-                                       static_cast<std::uint16_t>(
-                                           net::Opcode::kUploadBegin),
-                                       0, 42, payload, &error),
-                        "BPNET T9 发送帧", error);
+    test_support::Check(
+        net::SendFrame(pair[0],
+                       static_cast<std::uint16_t>(net::Opcode::kUploadBegin), 0,
+                       42, payload, &error),
+        "BPNET T9 发送帧", error);
     net::FrameHeader header;
     std::string received;
     const net::FrameReadStatus status =
         net::ReceiveFrame(pair[1], &header, &received, &error);
     test_support::Check(status == net::FrameReadStatus::kOk,
                         "BPNET T9 接收帧成功", error);
-    test_support::Check(header.opcode ==
-                                static_cast<std::uint16_t>(
-                                    net::Opcode::kUploadBegin) &&
+    test_support::Check(header.opcode == static_cast<std::uint16_t>(
+                                             net::Opcode::kUploadBegin) &&
                             header.request_id == 42 && received == payload,
                         "BPNET T9 判别：opcode / request_id / payload 一致");
     ::close(pair[0]);
@@ -384,10 +385,9 @@ int main() {
         net::ReceiveFrame(pair[1], &header, &payload, &error);
     test_support::Check(status == net::FrameReadStatus::kInvalidFrame,
                         "BPNET T12 错版本归类为可恢复的非法帧", error);
-    test_support::Check(header.version == 2 &&
-                            header.request_id ==
-                                version_two.request_id,
-                        "BPNET T12 判别：非法帧仍然回填了字段");
+    test_support::Check(
+        header.version == 2 && header.request_id == version_two.request_id,
+        "BPNET T12 判别：非法帧仍然回填了字段");
     ::close(pair[0]);
     ::close(pair[1]);
   }
@@ -453,24 +453,23 @@ int main() {
 
   test_support::Section("BPNET 15. 操作码与状态码表");
   {
-    test_support::Check(net::IsKnownOpcode(
-                            static_cast<std::uint16_t>(net::Opcode::kPing)) &&
-                            net::IsKnownOpcode(static_cast<std::uint16_t>(
-                                net::Opcode::kUploadEnd)) &&
-                            !net::IsKnownOpcode(9999),
-                        "BPNET T15 操作码识别表");
-    test_support::Check(std::string(net::OpcodeName(9999)) == "UNKNOWN" &&
-                            std::string(net::StatusName(
-                                static_cast<std::uint32_t>(
-                                    net::Status::kIntegrityMismatch))) ==
-                                "INTEGRITY_MISMATCH",
-                        "BPNET T15 名字表");
-    test_support::Check(net::OpcodeAllowsEmptyPayload(
-                            static_cast<std::uint16_t>(net::Opcode::kPing)) &&
-                            !net::OpcodeAllowsEmptyPayload(
-                                static_cast<std::uint16_t>(
-                                    net::Opcode::kLogin)),
-                        "BPNET T15 空 payload 许可表");
+    test_support::Check(
+        net::IsKnownOpcode(static_cast<std::uint16_t>(net::Opcode::kPing)) &&
+            net::IsKnownOpcode(
+                static_cast<std::uint16_t>(net::Opcode::kUploadEnd)) &&
+            !net::IsKnownOpcode(9999),
+        "BPNET T15 操作码识别表");
+    test_support::Check(
+        std::string(net::OpcodeName(9999)) == "UNKNOWN" &&
+            std::string(net::StatusName(static_cast<std::uint32_t>(
+                net::Status::kIntegrityMismatch))) == "INTEGRITY_MISMATCH",
+        "BPNET T15 名字表");
+    test_support::Check(
+        net::OpcodeAllowsEmptyPayload(
+            static_cast<std::uint16_t>(net::Opcode::kPing)) &&
+            !net::OpcodeAllowsEmptyPayload(
+                static_cast<std::uint16_t>(net::Opcode::kLogin)),
+        "BPNET T15 空 payload 许可表");
     // PR #20 closure：注销账户是**用户**操作，它出现在协议里；管理员能力不在
     // 协议里。这两件事必须能被区分开：
     //   * DELETE_ACCOUNT 是已知操作码，而且必须带口令载荷（不允许空载荷）；
@@ -481,10 +480,9 @@ int main() {
         net::IsKnownOpcode(
             static_cast<std::uint16_t>(net::Opcode::kDeleteAccount)) &&
             std::string(net::OpcodeName(static_cast<std::uint16_t>(
-                            net::Opcode::kDeleteAccount))) ==
-                "DELETE_ACCOUNT" &&
-            !net::OpcodeAllowsEmptyPayload(static_cast<std::uint16_t>(
-                net::Opcode::kDeleteAccount)),
+                net::Opcode::kDeleteAccount))) == "DELETE_ACCOUNT" &&
+            !net::OpcodeAllowsEmptyPayload(
+                static_cast<std::uint16_t>(net::Opcode::kDeleteAccount)),
         "BPNET T15 注销账户是已知操作码，且必须带口令载荷");
     bool admin_range_clean = true;
     for (std::uint32_t opcode = 0x0100; opcode <= 0x01FF; ++opcode) {
@@ -514,9 +512,43 @@ int main() {
                         "BPNET T16 含反斜杠的用户名被拒绝");
     test_support::Check(!net::IsValidUsername("has space", &error),
                         "BPNET T16 含空格的用户名被拒绝");
-    test_support::Check(
-        !net::IsValidUsername(std::string("ab\0cd", 5), &error),
-        "BPNET T16 含 NUL 的用户名被拒绝");
+    test_support::Check(!net::IsValidUsername(std::string("ab\0cd", 5), &error),
+                        "BPNET T16 含 NUL 的用户名被拒绝");
+
+    // 结构化的原因：界面只负责把**这个**原因翻译成文案，不许自己重新解析一遍
+    // 用户名。这一段就是"输入 W 却被显示成字符不合法"那类 UX mismatch 的防线。
+    struct UsernameReasonCase {
+      const char* label;
+      std::string username;
+      net::UsernameValidation expect;
+    };
+    const UsernameReasonCase reason_cases[] = {
+        {"空", std::string(), net::UsernameValidation::kEmpty},
+        {"1 个字符", std::string("W"), net::UsernameValidation::kTooShort},
+        {"2 个字符", std::string("ab"), net::UsernameValidation::kTooShort},
+        {"3 个字符", std::string("abc"), net::UsernameValidation::kOk},
+        {"纯数字", std::string("123"), net::UsernameValidation::kOk},
+        {"下划线", std::string("a_b"), net::UsernameValidation::kOk},
+        {"减号", std::string("a-b"), net::UsernameValidation::kOk},
+        {"点", std::string("a.b"), net::UsernameValidation::kOk},
+        {"字符非法", std::string("abc@"),
+         net::UsernameValidation::kInvalidCharacter},
+        {"64 个字符", std::string(64, 'a'), net::UsernameValidation::kOk},
+        {"65 个字符", std::string(65, 'a'), net::UsernameValidation::kTooLong},
+    };
+    for (const UsernameReasonCase& item : reason_cases) {
+      const net::UsernameValidation reason =
+          net::ValidateUsername(item.username, &error);
+      test_support::Check(
+          reason == item.expect,
+          std::string("BPNET T16 用户名原因：") + item.label,
+          std::string("reason=") + std::to_string(static_cast<int>(reason)));
+      // 兼容包装与结构化结果必须完全一致：老调用方的行为一个字节都没变。
+      test_support::Check(
+          net::IsValidUsername(item.username, &error) ==
+              (item.expect == net::UsernameValidation::kOk),
+          std::string("BPNET T16 IsValidUsername 与原因一致：") + item.label);
+    }
 
     test_support::Check(!net::IsValidPassword("", &error),
                         "BPNET T16 空密码被拒绝");
@@ -526,7 +558,8 @@ int main() {
                         "BPNET T16 超长密码被拒绝");
 
     test_support::Check(net::IsValidDisplayName("../x", &error),
-                        "BPNET T16 显示名允许 \"../x\"（只进 metadata）", error);
+                        "BPNET T16 显示名允许 \"../x\"（只进 metadata）",
+                        error);
     test_support::Check(net::IsValidDisplayName("/absolute", &error),
                         "BPNET T16 显示名允许绝对路径样式");
     test_support::Check(net::IsValidDisplayName("a\\b", &error),

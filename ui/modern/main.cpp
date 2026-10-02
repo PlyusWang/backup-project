@@ -2695,7 +2695,7 @@ int RunRemoteTest(QQuickWindow* window, backup_modern::RemoteController* remote,
          QStringLiteral("validation")},
         {"REMOTE-17 登录：用户名太短", 0, good_host, good_port,
          QStringLiteral("ab"), good_password, QString(),
-         QStringLiteral("用户名只能包含字母、数字、点、下划线或减号"),
+         QStringLiteral("用户名长度需要为 3～64 个字符"),
          QStringLiteral("validation")},
         {"REMOTE-17 登录：用户名含空格", 0, good_host, good_port,
          QStringLiteral("bad user"), good_password, QString(),
@@ -2791,6 +2791,117 @@ int RunRemoteTest(QQuickWindow* window, backup_modern::RemoteController* remote,
                              "成功之后登录错误行被清空"),
               remote->loginError() + QStringLiteral(" / kind=") +
                   remote->lastErrorKindForTest());
+  }
+
+  // ---- REMOTE-18：用户名校验的**原因**必须与真实失败原因一致 ----
+  //
+  // 人工验收发现的最后一处 UX mismatch：输入 "W"（1 个字符）时，核心校验器给的
+  // 原因是长度，GUI 却显示"用户名只能包含字母、数字、点、下划线或减号"——把
+  // "太短"说成了"字符不合法"，用户会被引到错误的修法上。
+  //
+  // 这张表把用户名的五种结果逐条铺开。每一行都问三个地方：
+  //
+  //   1) 共享校验器（ValidateUsername）给出的原因；
+  //   2) 登录表单里显示的那句话；
+  //   3) 注册表单里显示的那句话——两张表单必须**逐字相同**；
+  //
+  // 非法行还要断言"没发请求"：busy 仍为 false、页面横幅逐字未变。
+  {
+    using backupproject::net::UsernameValidation;
+    struct UsernameCase {
+      const char* label;
+      QString username;
+      UsernameValidation expect_reason;
+      QString expect_message;  // 非法时的原话；合法时为空
+    };
+    const QString max_name(64, QLatin1Char('a'));
+    const QString too_long_name(65, QLatin1Char('a'));
+    const UsernameCase cases[] = {
+        {"空", QString(), UsernameValidation::kEmpty,
+         QStringLiteral("请输入用户名")},
+        {"1 个字符（人工验收的那一个）", QStringLiteral("W"),
+         UsernameValidation::kTooShort,
+         QStringLiteral("用户名长度需要为 3～64 个字符")},
+        {"2 个字符", QStringLiteral("ab"), UsernameValidation::kTooShort,
+         QStringLiteral("用户名长度需要为 3～64 个字符")},
+        {"3 个字符", QStringLiteral("abc"), UsernameValidation::kOk, QString()},
+        {"纯数字（Admin CLI 用 id:/name: 消歧，这里必须合法）",
+         QStringLiteral("123"), UsernameValidation::kOk, QString()},
+        {"下划线", QStringLiteral("a_b"), UsernameValidation::kOk, QString()},
+        {"减号", QStringLiteral("a-b"), UsernameValidation::kOk, QString()},
+        {"点", QStringLiteral("a.b"), UsernameValidation::kOk, QString()},
+        {"字符非法", QStringLiteral("abc@"),
+         UsernameValidation::kInvalidCharacter,
+         QStringLiteral("用户名只能包含字母、数字、点、下划线或减号")},
+        {"64 个字符", max_name, UsernameValidation::kOk, QString()},
+        {"65 个字符", too_long_name, UsernameValidation::kTooLong,
+         QStringLiteral("用户名长度需要为 3～64 个字符")},
+    };
+    for (const UsernameCase& item : cases) {
+      std::string reason_error;
+      // 核心校验器：原因由它决定，界面只负责翻译。
+      const UsernameValidation reason = backupproject::net::ValidateUsername(
+          item.username.toStdString(), &reason_error);
+      bool ok = reason == item.expect_reason;
+      if (!item.expect_message.isEmpty()) {
+        const QString banner_before = remote->statusTitle();
+        const bool login_rejected =
+            !remote->login(host, port_text, item.username, password);
+        const QString login_row = remote->loginError();
+        const bool register_rejected = !remote->registerAccount(
+            host, port_text, item.username, password, password);
+        const QString register_row = remote->registerError();
+        ok = ok && login_rejected && register_rejected &&
+             login_row == item.expect_message &&
+             register_row == item.expect_message &&
+             remote->statusTitle() == banner_before && !remote->busy();
+      }
+      run.Check(ok,
+                QStringLiteral("REMOTE-18 ") + QString::fromUtf8(item.label) +
+                    QStringLiteral("：真实原因与界面文案一致，且登录 / 注册"
+                                   "说的是同一句话"),
+                QStringLiteral("reason=%1 login=%2 register=%3")
+                    .arg(static_cast<int>(reason))
+                    .arg(remote->loginError())
+                    .arg(remote->registerError()));
+    }
+    // 纯数字用户名必须**真的**能用：本地不许把它当成"id"。这里发一次真实登录
+    // 请求（用户 123 不存在，所以服务端会拒绝）——被受理本身就说明本地没拦它。
+    const bool numeric_accepted =
+        remote->login(host, port_text, QStringLiteral("123"), password);
+    const bool numeric_busy = remote->busy();
+    const bool numeric_finished =
+        numeric_accepted && remote->waitForIdle(120000);
+    run.Check(
+        numeric_accepted && numeric_busy && numeric_finished &&
+            remote->lastErrorKindForTest() == QStringLiteral("credentials") &&
+            remote->loginError() == QStringLiteral("用户名或密码错误"),
+        QStringLiteral("REMOTE-18 纯数字用户名（123）被受理：本地不把它当 id"),
+        remote->lastErrorKindForTest() + QStringLiteral(": ") +
+            remote->loginError());
+    // 合法用户名必须**真的**能注册（注册表单的 valid 一侧）。
+    const QString ok_name =
+        QStringLiteral("gui-ok-%1")
+            .arg(QRandomGenerator::global()->bounded(100000, 999999));
+    const bool register_accepted =
+        remote->registerAccount(host, port_text, ok_name, password, password);
+    const bool register_busy = remote->busy();
+    const bool register_finished =
+        register_accepted && remote->waitForIdle(120000);
+    run.Check(
+        register_accepted && register_busy && register_finished &&
+            remote->lastErrorKindForTest() == QStringLiteral("none") &&
+            remote->registerError().isEmpty(),
+        QStringLiteral("REMOTE-18 合法用户名真的能注册，且成功后错误行为空"),
+        remote->lastErrorKindForTest() + QStringLiteral(": ") +
+            remote->registerError());
+    // 上面两次探针都会换掉本地会话（失败的登录会清会话）：重新登录回测试账户，
+    // 后面的 REMOTE-06 起才继续在"已登录"状态下跑。
+    run.Check(remote->login(host, port_text, user, password) &&
+                  remote->waitForIdle(120000) && remote->authenticated(),
+              QStringLiteral("REMOTE-18 探针之后重新登录测试账户"),
+              remote->lastErrorKindForTest() + QStringLiteral(": ") +
+                  remote->lastDetailForTest());
   }
 
   // ---- REMOTE-06：用真实引擎生成一份归档并上传 ----
