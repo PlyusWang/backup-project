@@ -3116,6 +3116,62 @@ int RunRemoteTest(QQuickWindow* window, backup_modern::RemoteController* remote,
       QStringLiteral("REMOTE-14 未登录时注销被拒（同一按钮点两次不会误删）"),
       second_delete_kind);
 
+  // ---- REMOTE-16：服务端侧账户已经不存在时，GUI 不允许继续显示"已登录" ----
+  //
+  // 这一条对应人工验收里最刺眼的那个矛盾：屏幕上写着"当前账户：xxx / 状态：已登录"，
+  // 而同一台服务器上的真值（管理工具 / 数据库）根本没有这个用户。会话必须是
+  // **服务端确认过的**：只要服务端说这个会话不再有效，界面就必须立刻回到未登录，
+  // 不能靠本机的一个布尔量继续声称"已登录"。
+  {
+    const QString truth_user =
+        QStringLiteral("gui-truth-%1")
+            .arg(QRandomGenerator::global()->bounded(100000, 999999));
+    const bool registered =
+        remote->registerAccount(host, port_text, truth_user, password, password) &&
+        remote->waitForIdle(120000) &&
+        remote->lastErrorKindForTest() == QStringLiteral("none");
+    run.Check(registered, QStringLiteral("REMOTE-16 注册第二个测试账户"),
+              remote->lastErrorKindForTest() + QStringLiteral(": ") +
+                  remote->lastDetailForTest());
+    const bool logged = remote->login(host, port_text, truth_user, password) &&
+                        remote->waitForIdle(120000) && remote->authenticated();
+    const bool listed = logged && remote->refreshList() &&
+                        remote->waitForIdle(120000) &&
+                        remote->lastErrorKindForTest() == QStringLiteral("none");
+    run.Check(listed, QStringLiteral("REMOTE-16 第二个账户登录并列表成功"),
+              remote->lastErrorKindForTest() + QStringLiteral(": ") +
+                  remote->lastDetailForTest());
+
+    // 另一条连接（另一个 RemoteArchiveClient）把这个账户注销掉。
+    backupproject::net::RemoteEndpoint other_endpoint;
+    other_endpoint.host = host.toStdString();
+    other_endpoint.port = static_cast<std::uint16_t>(port_text.toUShort());
+    other_endpoint.timeout_seconds = 30;
+    backupproject::net::RemoteArchiveClient other;
+    std::string other_error;
+    const bool deleted_elsewhere =
+        other.Connect(other_endpoint, &other_error) &&
+        other.Login(truth_user.toStdString(), password.toStdString(),
+                    &other_error) &&
+        other.DeleteAccount(password.toStdString(), &other_error);
+    run.Check(deleted_elsewhere,
+              QStringLiteral("REMOTE-16 另一条连接把该账户注销掉"),
+              QString::fromStdString(other_error));
+
+    // 现在 GUI 这条会话在服务端已经无效：下一次操作必须被拒，而且界面立刻回到
+    // "未登录"——不允许留下 stale 的"已登录"。
+    const bool accepted = remote->refreshList();
+    const bool finished = accepted && remote->waitForIdle(120000);
+    const QString kind = remote->lastErrorKindForTest();
+    run.Check(finished && kind == QStringLiteral("not-logged-in") &&
+                  !remote->authenticated() &&
+                  remote->sessionText() == QStringLiteral("未登录") &&
+                  remote->snapshotCountForTest() == 0,
+              QStringLiteral("REMOTE-16 服务端侧账户已消失：GUI 立刻回到未登录"),
+              kind + QStringLiteral(": ") + remote->lastDetailForTest() +
+                  QStringLiteral(" session=") + remote->sessionText());
+  }
+
   std::printf("[remote-test] passed=%d failed=%d\n", run.passed, run.failed);
   if (run.failed != 0) {
     for (const QString& failure : run.failures) {
