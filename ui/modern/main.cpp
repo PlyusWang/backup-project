@@ -3118,8 +3118,9 @@ int RunRemoteTest(QQuickWindow* window, backup_modern::RemoteController* remote,
 
   // ---- REMOTE-16：服务端侧账户已经不存在时，GUI 不允许继续显示"已登录" ----
   //
-  // 这一条对应人工验收里最刺眼的那个矛盾：屏幕上写着"当前账户：xxx / 状态：已登录"，
-  // 而同一台服务器上的真值（管理工具 / 数据库）根本没有这个用户。会话必须是
+  // 这一条对应人工验收里最刺眼的那个矛盾：屏幕上写着"当前账户：xxx /
+  // 状态：已登录"， 而同一台服务器上的真值（管理工具 /
+  // 数据库）根本没有这个用户。会话必须是
   // **服务端确认过的**：只要服务端说这个会话不再有效，界面就必须立刻回到未登录，
   // 不能靠本机的一个布尔量继续声称"已登录"。
   {
@@ -3127,7 +3128,8 @@ int RunRemoteTest(QQuickWindow* window, backup_modern::RemoteController* remote,
         QStringLiteral("gui-truth-%1")
             .arg(QRandomGenerator::global()->bounded(100000, 999999));
     const bool registered =
-        remote->registerAccount(host, port_text, truth_user, password, password) &&
+        remote->registerAccount(host, port_text, truth_user, password,
+                                password) &&
         remote->waitForIdle(120000) &&
         remote->lastErrorKindForTest() == QStringLiteral("none");
     run.Check(registered, QStringLiteral("REMOTE-16 注册第二个测试账户"),
@@ -3135,9 +3137,9 @@ int RunRemoteTest(QQuickWindow* window, backup_modern::RemoteController* remote,
                   remote->lastDetailForTest());
     const bool logged = remote->login(host, port_text, truth_user, password) &&
                         remote->waitForIdle(120000) && remote->authenticated();
-    const bool listed = logged && remote->refreshList() &&
-                        remote->waitForIdle(120000) &&
-                        remote->lastErrorKindForTest() == QStringLiteral("none");
+    const bool listed =
+        logged && remote->refreshList() && remote->waitForIdle(120000) &&
+        remote->lastErrorKindForTest() == QStringLiteral("none");
     run.Check(listed, QStringLiteral("REMOTE-16 第二个账户登录并列表成功"),
               remote->lastErrorKindForTest() + QStringLiteral(": ") +
                   remote->lastDetailForTest());
@@ -3163,13 +3165,14 @@ int RunRemoteTest(QQuickWindow* window, backup_modern::RemoteController* remote,
     const bool accepted = remote->refreshList();
     const bool finished = accepted && remote->waitForIdle(120000);
     const QString kind = remote->lastErrorKindForTest();
-    run.Check(finished && kind == QStringLiteral("not-logged-in") &&
-                  !remote->authenticated() &&
-                  remote->sessionText() == QStringLiteral("未登录") &&
-                  remote->snapshotCountForTest() == 0,
-              QStringLiteral("REMOTE-16 服务端侧账户已消失：GUI 立刻回到未登录"),
-              kind + QStringLiteral(": ") + remote->lastDetailForTest() +
-                  QStringLiteral(" session=") + remote->sessionText());
+    run.Check(
+        finished && kind == QStringLiteral("not-logged-in") &&
+            !remote->authenticated() &&
+            remote->sessionText() == QStringLiteral("未登录") &&
+            remote->snapshotCountForTest() == 0,
+        QStringLiteral("REMOTE-16 服务端侧账户已消失：GUI 立刻回到未登录"),
+        kind + QStringLiteral(": ") + remote->lastDetailForTest() +
+            QStringLiteral(" session=") + remote->sessionText());
   }
 
   std::printf("[remote-test] passed=%d failed=%d\n", run.passed, run.failed);
