@@ -34,6 +34,10 @@ Item {
     property string draftPort: ""
     property string draftUser: ""
     property string draftPassword: ""
+    // 服务器身份指纹（server-key）：连接之前必须有的"我要连的是哪一台服务器"。
+    // 它不是口令——公钥/指纹可以公开、可以抄进部署文档——但它是必填项：
+    // 不填时客户端拒绝连接（不做"第一次见到谁就信谁"）。
+    property string draftServerKeyPin: ""
     // 注册标签页的两个口令草稿（登录标签页继续用 draftPassword）。
     property string draftRegisterPassword: ""
     property string draftConfirmPassword: ""
@@ -65,6 +69,9 @@ Item {
         page.draftHost = remote.host
         page.draftPort = remote.portText
         page.draftUser = remote.username
+        // 调用方（CLI / 自检 harness）已经给过一个指纹就回填进来，界面上看到的
+        // 永远是"现在真的会用哪一个"，而不是一个空框。
+        page.draftServerKeyPin = remote.serverKeyPin
     }
 
     // ---------- 从列表发起的动作 ----------
@@ -247,6 +254,69 @@ Item {
                                 remote.clearLoginError()
                                 remote.clearRegisterError()
                             }
+                        }
+                    }
+
+                    // 服务器身份指纹：连接设置的一部分（地址 / 端口 / 用户名 /
+                    // 指纹）。指纹错了就是一个输入问题，"应用"之后原因写在这
+                    // 张表单自己的错误行里，不弹对话框，也不占用页面底部横幅。
+                    ColumnLayout {
+                        Layout.fillWidth: true
+                        Layout.topMargin: 4
+                        spacing: 4
+
+                        Text {
+                            text: "服务器身份指纹（server-key）"
+                            font.pixelSize: 15
+                            color: theme.textSecondary
+                        }
+
+                        RowLayout {
+                            Layout.fillWidth: true
+                            spacing: 12
+
+                            AppTextField {
+                                id: serverKeyPinField
+                                objectName: "remoteServerKeyPinField"
+                                Layout.fillWidth: true
+                                enabled: !remote.busy
+                                placeholderText: "例如 sha256:0123…（服务器管理员给出）"
+                                text: page.draftServerKeyPin
+                                onTextEdited: {
+                                    page.draftServerKeyPin = text
+                                    remote.clearServerKeyPinError()
+                                }
+                                onAccepted: {
+                                    if (!remote.busy)
+                                        remote.setServerKeyPin(page.draftServerKeyPin)
+                                }
+                            }
+
+                            AppButton {
+                                objectName: "remoteServerKeyPinApplyButton"
+                                text: "应用"
+                                enabled: !remote.busy
+                                onClicked: remote.setServerKeyPin(page.draftServerKeyPin)
+                            }
+                        }
+
+                        // 指纹不是密码：这句话解释它为什么可以贴在这里，也说明它
+                        // 只用来确认"连到的确实是你的服务器"。
+                        Text {
+                            text: "公钥指纹不是密码：它只用来确认连到的确实是你的服务器。"
+                            font.pixelSize: 14
+                            color: theme.textSecondary
+                            wrapMode: Text.WrapAnywhere
+                        }
+
+                        Text {
+                            objectName: "remoteServerKeyPinError"
+                            Layout.fillWidth: true
+                            visible: remote.serverKeyPinError !== ""
+                            text: remote.serverKeyPinError
+                            color: theme.error
+                            font.pixelSize: 15
+                            wrapMode: Text.WrapAnywhere
                         }
                     }
 
