@@ -40,7 +40,7 @@ void PrintUsage(std::FILE* out, const char* program) {
       out,
       "用法: %s [选项]\n"
       "\n"
-      "  --bind <地址>           监听地址，默认 127.0.0.1\n"
+      "  --bind <地址>           监听地址，本版本固定 127.0.0.1\n"
       "  --port <端口>           监听端口，默认 18765（0 = 由内核分配）\n"
       "  --root <目录>           blob 存储根目录\n"
       "  --db <文件>             SQLite 元数据库文件\n"
@@ -52,6 +52,10 @@ void PrintUsage(std::FILE* out, const char* program) {
       "  --max-upload-bytes <n>  单次上传上限，默认 8 GiB\n"
       "  --quiet                 不往 stderr 打日志\n"
       "  --help                  显示这份用法\n"
+      "\n"
+      "本版本没有原生 TLS：BPNET1 的口令与 token 只能走在 SSH 隧道里，所以监听\n"
+      "地址只能是 127.0.0.1（--bind 给任何别的地址都会直接拒绝启动）。远程使用：\n"
+      "  ssh -N -L 18765:127.0.0.1:18765 <ecs-host>\n"
       "\n"
       "退出码: 0 正常停止 / 1 运行期失败 / 2 用法错误\n",
       program);
