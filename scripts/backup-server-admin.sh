@@ -3,12 +3,25 @@
 # backup-server-admin.sh —— 备份服务器本机管理菜单（只在 ECS 本机使用）。
 #
 # 它只做四件事：清屏、显示菜单、读选择、调用同目录下的 backup-server-admin。
-#
 # 真正危险的数据操作**一个都不在这里做**：没有 SQL，没有 rm，没有直接改目录。
-# shell 只负责把用户的选择翻成一次子命令调用，所以"删除"永远只有一份实现
-# （C++ 侧的 RemoteMaintenance，与服务端 DELETE / DELETE_ACCOUNT 共用）。
-# 这条边界是刻意的：把 rm 与 SQL 写进 shell，等于给数据留了第二条不受保护的
-# 删除路径。
+#
+# ---- 实例身份（这一版的重点）----
+#
+# 部署布局（scripts/deploy_aliyun_server.sh 安装出来的样子）：
+#
+#   <server-root>/bin/backup-server-admin        管理工具
+#   <server-root>/bin/backup-server-admin.sh     本脚本
+#   <server-root>/data                           数据根
+#   <server-root>/state/metadata.sqlite3         元数据库
+#
+# 脚本从**自己所在的目录**推出这个布局，因此天然与同一个部署里的 backup-server
+# 指向同一个状态根。上一版硬编码成 "$HOME/backup-project-server/data/metadata.sqlite3"，
+# 而服务端用的是 state/metadata.sqlite3 —— 路径分叉加上 SQLite 的"文件不存在就
+# 新建"，让管理工具读到了一个**刚被自己创建出来的空库**，屏幕上显示"还没有任何
+# 用户"，人工验收因此以为 ECS 上没有任何用户（其实用户都在正确的库里）。
+#
+# 现在：路径错了就明确失败（fail closed），绝不创建空库；而且每次运行都会先打印
+# Host / Server root / Data root / Metadata DB / Service，让人一眼看出在看哪个实例。
 #
 # 用法（先 SSH 登录到 ECS，再在本机执行）：
 #
@@ -16,29 +29,49 @@
 #   cd ~/backup-project-server
 #   ./bin/backup-server-admin.sh
 #
-# 环境变量（都有默认值，部署脚本不写死路径）：
+# 环境变量（覆盖自动推导；都是可选）：
 #
-#   BACKUP_SERVER_ROOT   数据目录，默认 $HOME/backup-project-server/data
-#   BACKUP_SERVER_DB     元数据库，默认 $BACKUP_SERVER_ROOT/metadata.sqlite3
-#   BACKUP_SERVER_ADMIN  管理工具，默认与本脚本同目录的 backup-server-admin
+#   BACKUP_SERVER_ROOT   部署根，默认 = 本脚本所在目录的上一级
+#   BACKUP_SERVER_DATA   数据根，默认 = $BACKUP_SERVER_ROOT/data
+#   BACKUP_SERVER_DB     元数据库，默认 = $BACKUP_SERVER_ROOT/state/metadata.sqlite3
+#   BACKUP_SERVER_ADMIN  管理工具，默认 = 与本脚本同目录的 backup-server-admin
 #
 # 本脚本不读、不打印 token secret：管理工具不需要它。
 
 set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-ADMIN_BIN="${BACKUP_SERVER_ADMIN:-$SCRIPT_DIR/backup-server-admin}"
-ROOT_DIR="${BACKUP_SERVER_ROOT:-$HOME/backup-project-server/data}"
-DB_PATH="${BACKUP_SERVER_DB:-$ROOT_DIR/metadata.sqlite3}"
+
+# 部署布局：管理工具与本脚本同在 bin/ 下，部署根就是它的上一级。
+# 从源码树里直接跑（<repo>/scripts/...）时，产物在 build/ 下，实例位置必须由
+# 环境变量给出——不会去猜 $HOME 下的某个目录。
+if [ -x "$SCRIPT_DIR/backup-server-admin" ]; then
+  ADMIN_BIN="${BACKUP_SERVER_ADMIN:-$SCRIPT_DIR/backup-server-admin}"
+  SERVER_ROOT_DEFAULT="$(cd "$SCRIPT_DIR/.." && pwd)"
+else
+  ADMIN_BIN="${BACKUP_SERVER_ADMIN:-$SCRIPT_DIR/../build/backup-server-admin}"
+  SERVER_ROOT_DEFAULT="$HOME/backup-project-server"
+fi
+
+SERVER_ROOT="${BACKUP_SERVER_ROOT:-$SERVER_ROOT_DEFAULT}"
+DATA_ROOT="${BACKUP_SERVER_DATA:-$SERVER_ROOT/data}"
+DB_PATH="${BACKUP_SERVER_DB:-$SERVER_ROOT/state/metadata.sqlite3}"
 
 if [ ! -x "$ADMIN_BIN" ]; then
   echo "找不到管理工具：$ADMIN_BIN" >&2
   echo "先构建：make server（产物在 build/backup-server-admin）" >&2
   exit 1
 fi
-if [ ! -d "$ROOT_DIR" ]; then
-  echo "数据目录不存在：$ROOT_DIR" >&2
-  echo "用 BACKUP_SERVER_ROOT 指定 backup-server 的 --root。" >&2
+if [ ! -d "$DATA_ROOT" ]; then
+  echo "ERROR: 数据目录不存在：$DATA_ROOT" >&2
+  echo "  Server root: $SERVER_ROOT" >&2
+  echo "  用 BACKUP_SERVER_ROOT / BACKUP_SERVER_DATA 指向正确的实例。" >&2
+  exit 1
+fi
+if [ ! -f "$DB_PATH" ]; then
+  echo "ERROR: 未找到服务器状态数据库：$DB_PATH" >&2
+  echo "  Server root: $SERVER_ROOT" >&2
+  echo "  请确认正在管理正确的 backup-server 实例；管理工具不会创建空库。" >&2
   exit 1
 fi
 
@@ -51,7 +84,8 @@ clear_screen() {
 }
 
 admin() {
-  "$ADMIN_BIN" --root "$ROOT_DIR" --db "$DB_PATH" "$@"
+  "$ADMIN_BIN" --server-root "$SERVER_ROOT" --root "$DATA_ROOT" \
+    --db "$DB_PATH" "$@"
 }
 
 pause() {

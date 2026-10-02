@@ -34,6 +34,7 @@
 
 #include <cstdio>
 #include <cstdlib>
+#include <climits>
 #include <cstring>
 #include <ctime>
 #include <string>
@@ -62,6 +63,12 @@ void PrintUsage(std::FILE* out, const char* program) {
   std::fprintf(
       out,
       "用法: %s --root <数据目录> --db <数据库文件> <命令> [参数]\n"
+      "      backup-server-admin --server-root <部署根> [--root ...] [--db ...] ...\n"
+      "\n"
+      "  缺省布局（部署脚本安装的样子）：\n"
+      "    <server-root>/data                 数据根（--root）\n"
+      "    <server-root>/state/metadata.sqlite3  元数据库（--db）\n"
+      "  数据库必须**已经存在**：管理工具不会创建空库，路径不对就报错退出。\n"
       "\n"
       "只读命令（backup-server 运行时也可以用）：\n"
       "  status                                   服务状态与总量\n"
@@ -114,6 +121,38 @@ std::string FormatSize(std::uint64_t bytes) {
   return std::string(buffer);
 }
 
+// 把路径变成"可以直接粘贴进终端"的绝对路径：存在时解析符号链接，不存在时
+// 退化成"目录的 realpath + 文件名"。所有面向用户的路径都过这一层，避免界面上
+// 出现 "data"/"state/metadata.sqlite3" 这种脱离上下文的相对路径——人工验收正是
+// 因为看不出"这是哪一个库"而把空库读成了"ECS 里没有用户"。
+std::string AbsolutePath(const std::string& path) {
+  if (path.empty()) {
+    return path;
+  }
+  char resolved[PATH_MAX];
+  if (::realpath(path.c_str(), resolved) != nullptr) {
+    return std::string(resolved);
+  }
+  const std::size_t slash = path.find_last_of('/');
+  if (slash == std::string::npos) {
+    char cwd[PATH_MAX];
+    if (::getcwd(cwd, sizeof(cwd)) == nullptr) {
+      return path;
+    }
+    return std::string(cwd) + "/" + path;
+  }
+  const std::string directory = path.substr(0, slash == 0 ? 1 : slash);
+  const std::string name = path.substr(slash + 1);
+  std::string resolved_directory = directory;
+  if (::realpath(directory.c_str(), resolved) != nullptr) {
+    resolved_directory = resolved;
+  }
+  if (name.empty()) {
+    return resolved_directory;
+  }
+  return resolved_directory + "/" + name;
+}
+
 std::string HostName() {
   char buffer[256];
   if (::gethostname(buffer, sizeof(buffer)) != 0) {
@@ -124,6 +163,10 @@ std::string HostName() {
 }
 
 struct Options {
+  // 部署根目录（<server-root>/bin 的上一级）。用于在界面上说清"我在看哪个
+  // 实例"：--root 默认是 <server-root>/data，--db 默认是
+  // <server-root>/state/metadata.sqlite3。
+  std::string server_root;
   std::string root_directory;
   std::string database_path;
   std::string command;
@@ -132,6 +175,20 @@ struct Options {
   std::string confirm;
 };
 
+// 这个实例的部署根：显式给了就用，否则按约定从数据目录推（<server-root>/data）。
+// 定义放在 Options 之后：它要用到那个结构体。
+std::string ServerRootOf(const Options& options) {
+  if (!options.server_root.empty()) {
+    return AbsolutePath(options.server_root);
+  }
+  const std::string data_root = AbsolutePath(options.root_directory);
+  const std::size_t slash = data_root.find_last_of('/');
+  if (slash == std::string::npos || slash == 0) {
+    return data_root;
+  }
+  return data_root.substr(0, slash);
+}
+
 bool ParseOptions(int argc, char* argv[], Options* options,
                   std::string* error_message) {
   for (int index = 1; index < argc; ++index) {
@@ -139,14 +196,16 @@ bool ParseOptions(int argc, char* argv[], Options* options,
     if (name == "--help" || name == "-h") {
       return false;
     }
-    if (name == "--root" || name == "--db" || name == "--user" ||
-        name == "--confirm") {
+    if (name == "--server-root" || name == "--root" || name == "--db" ||
+        name == "--user" || name == "--confirm") {
       if (index + 1 >= argc) {
         *error_message = name + " needs a value";
         return false;
       }
       const std::string value = argv[++index];
-      if (name == "--root") {
+      if (name == "--server-root") {
+        options->server_root = value;
+      } else if (name == "--root") {
         options->root_directory = value;
       } else if (name == "--db") {
         options->database_path = value;
@@ -171,9 +230,25 @@ bool ParseOptions(int argc, char* argv[], Options* options,
     *error_message = "no command given";
     return false;
   }
-  if (options->root_directory.empty() || options->database_path.empty()) {
+  // 只给 --server-root 也能按部署约定推出另外两个；显式给出的永远优先。
+  if (options->server_root.empty() && options->root_directory.empty() &&
+      options->database_path.empty()) {
     *error_message = "--root and --db are both required";
     return false;
+  }
+  if (options->root_directory.empty()) {
+    if (options->server_root.empty()) {
+      *error_message = "--root is required when --server-root is not given";
+      return false;
+    }
+    options->root_directory = options->server_root + "/data";
+  }
+  if (options->database_path.empty()) {
+    if (options->server_root.empty()) {
+      *error_message = "--db is required when --server-root is not given";
+      return false;
+    }
+    options->database_path = options->server_root + "/state/metadata.sqlite3";
   }
   return true;
 }
@@ -270,7 +345,13 @@ bool ResolveUser(RemoteMetadataStore* store, const std::string& selector,
 
 int OpenAll(const Options& options, RemoteMetadataStore* store,
             RemoteMaintenance* maintenance, std::string* error_message) {
-  if (!store->Open(options.database_path, error_message)) {
+  // **fail closed**：只打开已经存在的数据库。
+  //
+  // 管理工具没有"初始化一个新实例"的语义。以前这里用的是 store->Open()，它带
+  // SQLITE_OPEN_CREATE：路径写错时 SQLite 会悄悄建一个空库，于是"这个实例还
+  // 没有用户"和"你看的是另一个实例"在屏幕上完全一样——人工验收因此得出了
+  // "ECS 上没有任何用户"的错误结论（而 GUI 显示的 Wjy 已登录其实是真的）。
+  if (!store->OpenExisting(options.database_path, error_message)) {
     return -1;
   }
   *maintenance =
@@ -282,13 +363,23 @@ int OpenAll(const Options& options, RemoteMetadataStore* store,
   return 0;
 }
 
-void PrintStatus(RemoteMetadataStore* store, const Options& options) {
-  std::printf("服务器：%s\n", HostName().c_str());
-  std::printf("数据目录：%s\n", options.root_directory.c_str());
-  std::printf("数据库：%s\n", options.database_path.c_str());
+// 每次运行都先把"我在看哪个实例"说清楚：主机、部署根、数据根、元数据库、
+// 服务状态（含 PID）。人工验收时这一块必须和下面的列表出现在同一屏里——脱离
+// 上下文的"还没有任何用户"是这次 P0 的直接诱因。
+void PrintIdentity(const Options& options) {
+  const std::string data_root = AbsolutePath(options.root_directory);
+  std::printf("Host:        %s\n", HostName().c_str());
+  std::printf("Server root: %s\n", ServerRootOf(options).c_str());
+  std::printf("Data root:   %s\n", data_root.c_str());
+  std::printf("Metadata DB: %s\n", AbsolutePath(options.database_path).c_str());
   std::string state;
-  DescribeServerState(options.root_directory, &state);
-  std::printf("服务状态：%s\n", state.c_str());
+  DescribeServerState(data_root, &state);
+  std::printf("Service:     %s\n", state.c_str());
+}
+
+// 统计块。实例身份由 main() 统一在最前面打印一次：这一版**不再**在这里重复打印，
+// 否则 status（菜单首页就是它）会把身份块显示两遍。
+void PrintStatus(RemoteMetadataStore* store) {
   RemoteStorageOverview overview;
   std::string error;
   if (store->StorageOverview(&overview, &error) == StoreResult::kOk) {
@@ -595,9 +686,27 @@ int main(int argc, char* argv[]) {
   RemoteMaintenance maintenance;
   std::string open_error;
   if (OpenAll(options, &store, &maintenance, &open_error) != 0) {
-    std::fprintf(stderr, "无法打开数据目录：%s\n", open_error.c_str());
+    std::fprintf(stderr,
+                 "ERROR: 未找到服务器状态数据库：\n"
+                 "  %s\n"
+                 "\n"
+                 "请确认正在管理正确的 backup-server 实例：\n"
+                 "  Server root: %s\n"
+                 "  Data root:   %s\n"
+                 "  Metadata DB: %s\n"
+                 "\n"
+                 "（原因：%s）\n"
+                 "管理工具只读取**已经存在**的数据库，不会创建空库。\n",
+                 AbsolutePath(options.database_path).c_str(),
+                 ServerRootOf(options).c_str(),
+                 AbsolutePath(options.root_directory).c_str(),
+                 AbsolutePath(options.database_path).c_str(),
+                 open_error.c_str());
     return 1;
   }
+  // 每一条命令都先打印实例身份，再打印结果。
+  PrintIdentity(options);
+  std::printf("\n");
   // 维护层的日志只写 stderr：管理工具的输出是给人看的表格，不该被日志混进去。
   maintenance.set_log([](const std::string& message) {
     std::fprintf(stderr, "[admin] %s\n", message.c_str());
@@ -613,7 +722,7 @@ int main(int argc, char* argv[]) {
   };
 
   if (options.command == "status") {
-    PrintStatus(&store, options);
+    PrintStatus(&store);
     return 0;
   }
   if (options.command == "list-users") {
