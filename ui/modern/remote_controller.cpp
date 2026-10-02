@@ -15,6 +15,7 @@
 
 #include "network_protocol.h"
 #include "remote_auth.h"
+#include "secure_transport.h"
 
 namespace backup_modern {
 namespace {
@@ -108,6 +109,9 @@ const char* UsernameReasonName(backupproject::net::UsernameValidation reason) {
 RemoteController::RemoteController(QObject* parent) : QObject(parent) {
   endpoint_.host = backupproject::net::kDefaultRemoteHost;
   endpoint_.port = backupproject::net::kDefaultRemotePort;
+  // pin 没有默认值（空 = 不能连接）。这里只是把"同一个值的两个落点"从一开始
+  // 就对齐：调用方 setServerKeyPin() 之后两处一起更新。
+  endpoint_.server_key_pin = serverKeyPin().toStdString();
   QObject::connect(&watcher_, &QFutureWatcher<RemoteOpResult>::finished, this,
                    &RemoteController::OnOperationFinished);
 }
@@ -545,6 +549,14 @@ void RemoteController::ReportSurfaceError(ErrorSurface surface,
         emit deleteAccountErrorChanged();
       }
       return;
+    case ErrorSurface::kServerKey:
+      // 连接设置里的"服务器身份指纹"有自己的一行：指纹填错了就是一个输入
+      // 问题，反馈必须贴在**这个输入框**下面，而不是页面底部的横幅。
+      if (server_key_pin_error_ != message) {
+        server_key_pin_error_ = message;
+        emit serverKeyPinErrorChanged();
+      }
+      return;
     case ErrorSurface::kBanner: {
       // 页面级操作（上传 / 下载 / 刷新 / 删除云端备份）没有"自己的表单"，
       // 它们的触发点就在页面上，所以继续用这一页底部的状态横幅。
@@ -577,6 +589,12 @@ void RemoteController::ClearSurfaceError(ErrorSurface surface) {
       if (!delete_account_error_.isEmpty()) {
         delete_account_error_.clear();
         emit deleteAccountErrorChanged();
+      }
+      return;
+    case ErrorSurface::kServerKey:
+      if (!server_key_pin_error_.isEmpty()) {
+        server_key_pin_error_.clear();
+        emit serverKeyPinErrorChanged();
       }
       return;
     case ErrorSurface::kBanner:
@@ -644,6 +662,9 @@ void RemoteController::CommitEndpoint(const QString& host, int port,
   }
   endpoint_.host = host.toStdString();
   endpoint_.port = static_cast<std::uint16_t>(port);
+  // pin 与地址 / 端口是同一份"上一次真正生效的连接配置"：这里再对齐一次，
+  // 免得出现"地址换了、pin 掉了"的组合。
+  endpoint_.server_key_pin = serverKeyPin().toStdString();
   username_ = username;
   emit endpointChanged();
 }
@@ -761,6 +782,17 @@ bool RemoteController::BeginOperation(const QString& action_text,
         surface == ErrorSurface::kDeleteAccount
             ? QStringLiteral("登录状态已经失效，账户未注销，请重新登录")
             : DescribeFailure(last_error_kind_));
+    return false;
+  }
+  // 连接之前必须有服务端身份 pin：没有它客户端会**直接拒绝连接**（不做首次
+  // 连接自动信任），而那是一条协议级的底层原因，用户读不懂"我到底少做了什么"。
+  // 与地址 / 端口 / 口令同一条规矩：本地就挡住，一个字节都不发。
+  if (server_key_pin_.isEmpty()) {
+    last_error_kind_ = QStringLiteral("validation");
+    ReportSurfaceError(
+        surface,
+        QStringLiteral("还没有填写服务器身份指纹：把服务器管理员给出的 "
+                       "sha256:… 指纹填进“服务器身份指纹”再试一次"));
     return false;
   }
   last_error_kind_ = QStringLiteral("none");
@@ -1087,6 +1119,8 @@ bool RemoteController::registerAccount(const QString& host,
   RemoteRequest request;
   request.kind = RemoteOpResult::Kind::kRegister;
   request.endpoint = endpoint_;
+  // pin 与地址是同一份快照：每一处提交都显式带上它（见头文件里的说明）。
+  request.endpoint.server_key_pin = serverKeyPin().toStdString();
   request.username = valid_username.toStdString();
   request.password = password.toStdString();
   Submit(request);
@@ -1115,6 +1149,8 @@ bool RemoteController::login(const QString& host, const QString& port_text,
   RemoteRequest request;
   request.kind = RemoteOpResult::Kind::kLogin;
   request.endpoint = endpoint_;
+  // pin 与地址是同一份快照：每一处提交都显式带上它（见头文件里的说明）。
+  request.endpoint.server_key_pin = serverKeyPin().toStdString();
   request.username = valid_username.toStdString();
   request.password = password.toStdString();
   Submit(request);
@@ -1153,6 +1189,8 @@ bool RemoteController::refreshList() {
   RemoteRequest request;
   request.kind = RemoteOpResult::Kind::kList;
   request.endpoint = endpoint_;
+  // pin 与地址是同一份快照：每一处提交都显式带上它（见头文件里的说明）。
+  request.endpoint.server_key_pin = serverKeyPin().toStdString();
   Submit(request);
   return true;
 }
@@ -1194,6 +1232,8 @@ bool RemoteController::uploadArchive(const QString& local_path,
   RemoteRequest request;
   request.kind = RemoteOpResult::Kind::kUpload;
   request.endpoint = endpoint_;
+  // pin 与地址是同一份快照：每一处提交都显式带上它（见头文件里的说明）。
+  request.endpoint.server_key_pin = serverKeyPin().toStdString();
   request.local_path = local_path.toStdString();
   request.display_name = chosen_name.toStdString();
   Submit(request);
@@ -1220,6 +1260,8 @@ bool RemoteController::downloadArchive(const QString& snapshot_id,
   RemoteRequest request;
   request.kind = RemoteOpResult::Kind::kDownload;
   request.endpoint = endpoint_;
+  // pin 与地址是同一份快照：每一处提交都显式带上它（见头文件里的说明）。
+  request.endpoint.server_key_pin = serverKeyPin().toStdString();
   request.snapshot_id = snapshot_id.toStdString();
   request.target_path = target_path.toStdString();
   request.allow_overwrite = allow_overwrite;
@@ -1240,6 +1282,8 @@ bool RemoteController::deleteSnapshot(const QString& snapshot_id) {
   RemoteRequest request;
   request.kind = RemoteOpResult::Kind::kDelete;
   request.endpoint = endpoint_;
+  // pin 与地址是同一份快照：每一处提交都显式带上它（见头文件里的说明）。
+  request.endpoint.server_key_pin = serverKeyPin().toStdString();
   request.snapshot_id = snapshot_id.toStdString();
   Submit(request);
   return true;
@@ -1255,6 +1299,50 @@ void RemoteController::clearLoginError() {
 
 void RemoteController::clearRegisterError() {
   ClearSurfaceError(ErrorSurface::kRegister);
+}
+
+void RemoteController::clearServerKeyPinError() {
+  ClearSurfaceError(ErrorSurface::kServerKey);
+}
+
+bool RemoteController::setServerKeyPin(const QString& pin) {
+  // 重新提交先把上一次的原因清掉：这一行里留下的必须是这一次的结果。
+  ClearSurfaceError(ErrorSurface::kServerKey);
+  // 首尾空白丢掉：从终端复制 --server-key 那一行时经常带上空格。除此之外
+  // 一个字符都不改——大小写由共享解析器归一化，界面不做第二套"看起来对"的
+  // 判断（规则只有一份）。
+  const QString text = pin.trimmed();
+  if (text.isEmpty()) {
+    last_error_kind_ = QStringLiteral("validation");
+    ReportSurfaceError(
+        ErrorSurface::kServerKey,
+        QStringLiteral("请填写服务器身份指纹（向服务器管理员索取，"
+                       "形如 sha256: 开头的 64 位十六进制）"));
+    return false;
+  }
+  backupproject::net::ServerKeyPin parsed;
+  std::string parse_error;
+  if (!backupproject::net::ParseServerKeyPin(text.toStdString(), &parsed,
+                                             &parse_error)) {
+    last_error_kind_ = QStringLiteral("validation");
+    ReportSurfaceError(ErrorSurface::kServerKey,
+                       QStringLiteral("服务器身份指纹不合法：%1")
+                           .arg(QString::fromStdString(parse_error)));
+    // 终端上留一条原始原因（诊断用），界面上只出现上面那一句。
+    std::fprintf(stderr, "[remote] 服务端 pin 不合法：%s\n",
+                 parse_error.c_str());
+    return false;
+  }
+  if (server_key_pin_ == text) {
+    return true;
+  }
+  server_key_pin_ = text;
+  // 两个落点一起更新：request.endpoint 由 endpoint_ 拷贝而来，各个提交点再
+  // 显式带一次 pin（见头文件）。已经建立的连接不受影响——pin 只在握手时用，
+  // 下一次连接才会用到新值。
+  endpoint_.server_key_pin = server_key_pin_.toStdString();
+  emit serverKeyPinChanged();
+  return true;
 }
 
 bool RemoteController::deleteAccount(const QString& password,
@@ -1294,6 +1382,8 @@ bool RemoteController::deleteAccount(const QString& password,
   RemoteRequest request;
   request.kind = RemoteOpResult::Kind::kDeleteAccount;
   request.endpoint = endpoint_;
+  // pin 与地址是同一份快照：每一处提交都显式带上它（见头文件里的说明）。
+  request.endpoint.server_key_pin = serverKeyPin().toStdString();
   request.password = password.toStdString();
   Submit(request);
   return true;

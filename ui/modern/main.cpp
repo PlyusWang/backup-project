@@ -2087,6 +2087,32 @@ int RunRemoteSmoke(backup_modern::RemoteController* remote,
   std::printf("[remote-smoke] endpoint=%s:%s user=%s\n", qPrintable(host),
               qPrintable(port_text), qPrintable(username));
 
+  // PR #21：连接之前必须把服务端的传输身份 pin 交给控制器——没有它
+  // RemoteArchiveClient::Connect() 直接失败（kNoPinConfigured），客户端不做
+  // "第一次见到谁就信谁"。--remote-smoke 打的是调用方给的真实端点，所以 pin
+  // 也从调用方来：与 backupctl remote 用同一个环境变量
+  // BACKUP_REMOTE_SERVER_KEY（pin 不是秘密，但与口令一样不进 argv）。
+  // 缺了它这里就**明确失败**：否则下面每一条都会以"连接被拒绝"红掉，看不出
+  // 真正的原因。
+  const QString server_key_pin =
+      qEnvironmentVariable("BACKUP_REMOTE_SERVER_KEY").trimmed();
+  if (server_key_pin.isEmpty()) {
+    std::fprintf(stderr,
+                 "[remote-smoke] 缺少环境变量 BACKUP_REMOTE_SERVER_KEY："
+                 "没有服务器身份指纹（sha256:<64 位十六进制> 或 "
+                 "hex:<64 位公钥>）客户端拒绝连接。\n"
+                 "  它就在 backup-server-keygen --show --key-file <身份私钥> "
+                 "打印的 \"--server-key sha256:…\" 那一行里。\n");
+    return 1;
+  }
+  if (!remote->setServerKeyPin(server_key_pin)) {
+    std::fprintf(stderr, "[remote-smoke] 服务器身份指纹不被接受：%s\n",
+                 qPrintable(remote->serverKeyPinError()));
+    return 1;
+  }
+  std::printf("[remote-smoke] 服务器身份指纹已配置（来自 "
+              "BACKUP_REMOTE_SERVER_KEY）\n");
+
   QTemporaryDir temp;
   run.Check(temp.isValid(), QStringLiteral("SMOKE-00 临时工作目录可用"));
   if (!temp.isValid()) {
@@ -2268,6 +2294,33 @@ int RunRemoteSmoke(backup_modern::RemoteController* remote,
   return 0;
 }
 
+// 从 backup-server-keygen 的输出里取出 "sha256:<64 位十六进制>"。
+//
+// keygen --show 会打印 "  --server-key sha256:…" 这一行，这里就认这一行——
+// 也就是产品文档里让用户复制的那一行。找不到、长度不够或者不是十六进制一律
+// 返回空串，让调用方**明确失败**：拿一个"猜出来的"指纹去连接，错误会出现在
+// 握手那一层，比在这里说清楚难懂得多。
+QString ExtractServerKeyPin(const QString& keygen_output) {
+  const QString marker = QStringLiteral("--server-key sha256:");
+  const int at = keygen_output.indexOf(marker);
+  if (at < 0) {
+    return QString();
+  }
+  const QString fingerprint = keygen_output.mid(at + marker.size(), 64);
+  if (fingerprint.size() != 64) {
+    return QString();
+  }
+  for (const QChar ch : fingerprint) {
+    const bool hex = (ch >= QLatin1Char('0') && ch <= QLatin1Char('9')) ||
+                     (ch >= QLatin1Char('a') && ch <= QLatin1Char('f')) ||
+                     (ch >= QLatin1Char('A') && ch <= QLatin1Char('F'));
+    if (!hex) {
+      return QString();
+    }
+  }
+  return QStringLiteral("sha256:") + fingerprint.toLower();
+}
+
 int RunRemoteTest(QQuickWindow* window, backup_modern::RemoteController* remote,
                   backup_modern::BackupController* controller,
                   backup_modern::AppTheme* theme,
@@ -2375,6 +2428,90 @@ int RunRemoteTest(QQuickWindow* window, backup_modern::RemoteController* remote,
     return 1;
   }
 
+  // ---- 服务端传输身份（PR #21 起是必填项）----
+  //
+  // 两件事必须成对出现，少一件这条自检就跑不下去：
+  //   * 服务端必须带 --transport-key-file（缺了它以用法错误退出，起不来）；
+  //   * 客户端必须拿到这把私钥对应公钥的指纹（pin）——没有 pin 时 Connect()
+  //     直接失败（kNoPinConfigured）。
+  //
+  // pin 只从 backup-server-keygen 的输出里取，这里**不**自己算指纹：工具的
+  // 打印格式就是产品给用户的格式，测试再算一份等于验了一份第二实现。
+  // 私钥内容既不读也不打印，它只活在这次自检的临时目录里。
+  const QString keygen_binary = QCoreApplication::applicationDirPath() +
+                                QStringLiteral("/backup-server-keygen");
+  if (!QFileInfo::exists(keygen_binary)) {
+    std::fprintf(stderr,
+                 "[remote-test] 找不到 %s（先 make server）：没有它就生成不了"
+                 "服务端传输身份密钥，客户端也就拿不到连接前必须配置的服务器"
+                 "身份指纹\n",
+                 qPrintable(keygen_binary));
+    return 1;
+  }
+  const QString transport_key_file =
+      work + QStringLiteral("/state/transport.key");
+  // keygen 的失败必须**明确**报出来（退出码 + stderr）：静默继续只会让后面
+  // 每一条断言都以"连接被拒绝"这种看不懂的方式红掉。
+  const auto keygenFailure = [](QProcess& process) {
+    return QStringLiteral("退出码 %1；stderr：%2")
+        .arg(process.exitStatus() == QProcess::NormalExit
+                 ? QString::number(process.exitCode())
+                 : QStringLiteral("异常结束"))
+        .arg(QString::fromUtf8(process.readAllStandardError()).trimmed());
+  };
+  QString server_key_pin;
+  {
+    // (1) 生成 0600 的身份私钥。路径在临时目录里，所以不会撞上任何真实身份。
+    QProcess keygen;
+    keygen.setProgram(keygen_binary);
+    keygen.setArguments({QStringLiteral("--output"), transport_key_file});
+    keygen.start();
+    if (!keygen.waitForStarted(15000) || !keygen.waitForFinished(30000) ||
+        keygen.exitStatus() != QProcess::NormalExit ||
+        keygen.exitCode() != 0 || !QFileInfo::exists(transport_key_file)) {
+      std::fprintf(stderr,
+                   "[remote-test] backup-server-keygen --output %s 失败（%s）\n",
+                   qPrintable(transport_key_file),
+                   qPrintable(keygenFailure(keygen)));
+      return 1;
+    }
+    // (2) 打印公钥与指纹；其中一行就是产品给用户的 --server-key。
+    QProcess keygen_show;
+    keygen_show.setProgram(keygen_binary);
+    keygen_show.setArguments({QStringLiteral("--show"),
+                              QStringLiteral("--key-file"),
+                              transport_key_file});
+    keygen_show.start();
+    if (!keygen_show.waitForStarted(15000) ||
+        !keygen_show.waitForFinished(30000) ||
+        keygen_show.exitStatus() != QProcess::NormalExit ||
+        keygen_show.exitCode() != 0) {
+      std::fprintf(stderr,
+                   "[remote-test] backup-server-keygen --show --key-file %s "
+                   "失败（%s）\n",
+                   qPrintable(transport_key_file),
+                   qPrintable(keygenFailure(keygen_show)));
+      return 1;
+    }
+    server_key_pin = ExtractServerKeyPin(
+        QString::fromUtf8(keygen_show.readAllStandardOutput()));
+    if (server_key_pin.isEmpty()) {
+      std::fprintf(stderr,
+                   "[remote-test] keygen --show 的输出里没有 "
+                   "\"--server-key sha256:<64 位十六进制>\" 这一行，"
+                   "拿不到服务器身份指纹\n");
+      return 1;
+    }
+  }
+  // (3) 第一次连接之前交给控制器；控制器会用共享的 ParseServerKeyPin 再校验。
+  if (!remote->setServerKeyPin(server_key_pin)) {
+    std::fprintf(stderr, "[remote-test] 控制器不接受 keygen 打印的指纹：%s\n",
+                 qPrintable(remote->serverKeyPinError()));
+    return 1;
+  }
+  std::printf("[remote-test] 服务器身份指纹已配置（取自 backup-server-keygen "
+              "--show）\n");
+
   const QString log_file = work + QStringLiteral("/state/server.log");
   QProcess server;
   server.setProgram(server_binary);
@@ -2396,6 +2533,9 @@ int RunRemoteTest(QQuickWindow* window, backup_modern::RemoteController* remote,
       work + QStringLiteral("/state/metadata.sqlite3"),
       QStringLiteral("--secret-file"),
       secret_file,
+      // 传输身份私钥：PR #21 起服务端没有它就以用法错误退出。
+      QStringLiteral("--transport-key-file"),
+      transport_key_file,
       QStringLiteral("--pid-file"),
       work + QStringLiteral("/state/server.pid"),
       QStringLiteral("--log-file"),
@@ -2494,6 +2634,29 @@ int RunRemoteTest(QQuickWindow* window, backup_modern::RemoteController* remote,
             QStringLiteral("password=%1 confirm=%2")
                 .arg(echo_mode_text(register_password_field),
                      echo_mode_text(register_confirm_field)));
+  // 服务器身份指纹：页面上有它自己的输入框，控制器的校验用共享解析器
+  // （只认带前缀的两种写法），而且被拒的输入不会顶掉已经生效的值——否则
+  // 用户打错一个字符就会把"能连上"变成"连不上"。
+  QObject* server_key_pin_field = objectByName("remoteServerKeyPinField");
+  const QString pin_in_effect = remote->serverKeyPin();
+  const bool bare_hex_rejected =
+      !remote->setServerKeyPin(QString(64, QLatin1Char('a')));
+  const bool bare_hex_reported = !remote->serverKeyPinError().isEmpty();
+  const bool pin_kept = remote->serverKeyPin() == pin_in_effect;
+  run.Check(server_key_pin_field != nullptr && bare_hex_rejected &&
+                bare_hex_reported && pin_kept &&
+                remote->lastErrorKindForTest() == QStringLiteral("validation"),
+            QStringLiteral("REMOTE-02 服务器身份指纹有输入框；不带前缀的"
+                           "裸十六进制被拒，且没有顶掉生效的指纹"),
+            QStringLiteral("field=%1 rejected=%2 reported=%3 kept=%4 kind=%5")
+                .arg(server_key_pin_field != nullptr)
+                .arg(bare_hex_rejected)
+                .arg(bare_hex_reported)
+                .arg(pin_kept)
+                .arg(remote->lastErrorKindForTest()));
+  remote->clearServerKeyPinError();
+  run.Check(remote->serverKeyPinError().isEmpty(),
+            QStringLiteral("REMOTE-02 清掉错误行之后这一行不再显示原因"));
   // 账户区域是一个分段控件（"登录 / 注册"二选一）+ 已登录时的注销入口。
   run.Check(objectByName("remoteAccountTabs") != nullptr &&
                 objectByName("remoteLoginButton") != nullptr &&
@@ -3130,7 +3293,8 @@ int RunRemoteTest(QQuickWindow* window, backup_modern::RemoteController* remote,
   // 塌掉是看不出来的。
   const char* signed_in_names[] = {
       "remoteHostField",           "remotePortField",
-      "remoteUserField",           "remoteAccountText",
+      "remoteUserField",           "remoteServerKeyPinField",
+      "remoteAccountText",
       "remoteAccountStateText",    "remoteLogoutButton",
       "remoteDeleteAccountButton", "remoteUploadButton",
       "remoteRefreshButton",       "remoteListSummary",

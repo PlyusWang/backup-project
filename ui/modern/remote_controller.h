@@ -25,6 +25,19 @@
 // 诚实的边界：QString 可能因隐式共享留下副本，也没有 mlock，所以这是
 // "尽力而为的进程内保密"，不是内存加密，也不等于 native TLS。
 //
+// ---- 服务端身份（serverKeyPin）----
+//
+// 与 password 正相反：pin 是服务端的**公钥 / 公钥指纹**，不是秘密——它可以
+// 显示在界面上、可以抄进部署文档、也可以在内存里长期保留。它是"我要连的
+// 到底是哪一台服务器"的期望值：为空或格式不对时 RemoteArchiveClient::Connect()
+// **直接失败**（kNoPinConfigured，信息里是"没有配置服务端传输公钥/指纹"），
+// 客户端不做"第一次见到谁就信谁"。
+//
+// 它**不落盘**：本页的 host / port 本来就没有持久化落点（见下面端点的说明），
+// pin 与它们是同一类东西，不为了它单独新造一套配置系统。所以它只存在于内存，
+// 由调用方在**第一次连接之前**设置：界面上的"服务器身份指纹"输入框，
+// 或者 main.cpp 里 --remote-test / --remote-smoke 两条自检路径。
+//
 // ---- 并发 ----
 //
 // 同一个控制器同一时刻最多一个网络操作。busy_ 在**提交任务之前**同步置位，
@@ -135,6 +148,13 @@ class RemoteController : public QObject {
   Q_PROPERTY(QString host READ host NOTIFY endpointChanged)
   Q_PROPERTY(QString portText READ portText NOTIFY endpointChanged)
   Q_PROPERTY(QString username READ username NOTIFY endpointChanged)
+  // 服务端传输身份 pin（"sha256:<64 位十六进制>" 或 "hex:<64 位十六进制>"）。
+  // 与地址 / 端口同属"连接配置"，但**没有默认值**：不填就不能连接。
+  Q_PROPERTY(QString serverKeyPin READ serverKeyPin NOTIFY serverKeyPinChanged)
+  // 这个输入框自己的错误行。没填、格式不对都写在这里：不弹对话框，也不占用
+  // 页面底部的横幅——与 loginError / registerError 是同一条规矩。
+  Q_PROPERTY(QString serverKeyPinError READ serverKeyPinError NOTIFY
+                 serverKeyPinErrorChanged)
 
   // ---- 会话 ----
   Q_PROPERTY(bool connected READ connected NOTIFY sessionChanged)
@@ -193,6 +213,8 @@ class RemoteController : public QObject {
   QString host() const { return QString::fromStdString(endpoint_.host); }
   QString portText() const { return QString::number(endpoint_.port); }
   QString username() const { return username_; }
+  // 上一次被接受的服务器身份 pin（原样回读，供界面回填与自检比对）。
+  QString serverKeyPin() const { return server_key_pin_; }
   // 只是"此刻这条 socket 在不在"。它是短命的实现细节，界面上**不**允许
   // 把它渲染成一个常驻的"已连接 / 未连接"状态（见 serverReachabilityText）。
   bool connected() const { return client_.connected(); }
@@ -218,6 +240,7 @@ class RemoteController : public QObject {
   QString deleteAccountError() const { return delete_account_error_; }
   QString loginError() const { return login_error_; }
   QString registerError() const { return register_error_; }
+  QString serverKeyPinError() const { return server_key_pin_error_; }
   QString diagnosticText() const {
     return QString::fromStdString(last_detail_);
   }
@@ -262,6 +285,17 @@ class RemoteController : public QObject {
   Q_INVOKABLE void clearLoginError();
   Q_INVOKABLE void clearRegisterError();
 
+  // 设置服务器身份指纹（连接配置，不是口令）。
+  //
+  // 校验复用共享的 ParseServerKeyPin：只接受 "sha256:<64 位十六进制>" 与
+  // "hex:<64 位十六进制>" 两种写法；不带前缀的裸十六进制会被拒——公钥与指纹
+  // 长度相同，混起来就会把指纹当成公钥用。不合法时原因写进 serverKeyPinError
+  // 并返回 false（一个字节都不发，也不改动上一次被接受的值）；合法则保存并
+  // 返回 true。**下一次连接**（以及它之后的每一次）都会用这个新值。
+  Q_INVOKABLE bool setServerKeyPin(const QString& pin);
+  // 输入框一被编辑就清掉这一行：旧原因不能挂在新输入上。
+  Q_INVOKABLE void clearServerKeyPinError();
+
   // 文件对话框的 URL 互转与其它页面同一套实现。
   Q_INVOKABLE QString localPathFromUrl(const QUrl& url) const;
   // 选择器的起始位置：目录就用它本身，文件就用它所在目录，
@@ -289,6 +323,8 @@ class RemoteController : public QObject {
   void deleteAccountErrorChanged();
   void loginErrorChanged();
   void registerErrorChanged();
+  void serverKeyPinChanged();
+  void serverKeyPinErrorChanged();
   void busyChanged();
   void snapshotsChanged();
   void progressChanged();
@@ -300,8 +336,15 @@ class RemoteController : public QObject {
   // 传输方向。用整数原子变量跨线程传，避免在后台线程碰 QString。
   enum class Phase { kNone = 0, kUpload = 1, kDownload = 2 };
 
-  // 一条错误该出现在哪里。三个表单各自有错误行，页面级操作用底部横幅。
-  enum class ErrorSurface { kLogin, kRegister, kDeleteAccount, kBanner };
+  // 一条错误该出现在哪里。每个表单各有自己的错误行（登录 / 注册 / 注销
+  // 对话框 / 连接设置里的服务器身份指纹），页面级操作用底部横幅。
+  enum class ErrorSurface {
+    kLogin,
+    kRegister,
+    kDeleteAccount,
+    kServerKey,
+    kBanner
+  };
 
   // 把一句话送到指定的错误容器（同一个容器里不重复发信号）。
   void ReportSurfaceError(ErrorSurface surface, const QString& message);
@@ -369,8 +412,14 @@ class RemoteController : public QObject {
   static QString FormatTime(std::uint64_t unix_seconds);
 
   backupproject::net::RemoteArchiveClient client_;
+  // endpoint_.server_key_pin 与 server_key_pin_ 必须始终是同一个值：每一次
+  // 提交（request.endpoint = endpoint_ 的每一处）都要再显式带一次 pin，
+  // 少一处就等于那一条操作在"没有 pin"的情况下连接，会以 kNoPinConfigured
+  // 失败。见 .cpp 里 CommitEndpoint / setServerKeyPin / 各个提交点。
   backupproject::net::RemoteEndpoint endpoint_;
   QString username_;
+  // 服务器身份 pin：可以公开，但同样只存在于内存（不落盘，见文件顶部说明）。
+  QString server_key_pin_;
   // 只存在于内存；退出登录与析构时擦除。绝不落盘、绝不进日志。
   QString password_;
 
@@ -398,6 +447,7 @@ class RemoteController : public QObject {
   QString delete_account_error_;
   QString login_error_;
   QString register_error_;
+  QString server_key_pin_error_;
 
   // 上一次连接尝试的结果。默认"不知道"：界面在真的试过之前什么都不说。
   RemoteReachability reachability_ = RemoteReachability::kUnknown;
