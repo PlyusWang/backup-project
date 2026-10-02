@@ -3,6 +3,7 @@
 #include "remote_metadata_store.h"
 
 #include <sqlite3.h>
+#include <sys/stat.h>
 
 #include <cstring>
 #include <ctime>
@@ -218,6 +219,65 @@ bool RemoteMetadataStore::Open(const std::string& path,
     }
     if (error_message != nullptr) {
       *error_message = "cannot open the metadata database: " + reason;
+    }
+    return false;
+  }
+  database_ = database;
+  path_ = path;
+  if (!EnsureSchema(error_message)) {
+    sqlite3_close(database_);
+    database_ = nullptr;
+    path_.clear();
+    return false;
+  }
+  return true;
+}
+
+bool RemoteMetadataStore::OpenExisting(const std::string& path,
+                                          std::string* error_message) {
+  // 先自己看一眼：文件必须存在、必须是普通文件。这样错误信息能说清"是哪个
+  // 路径不对"，而不是把 SQLite 的 "unable to open database file" 原样抛出去。
+  struct stat info;
+  if (::stat(path.c_str(), &info) != 0) {
+    if (error_message != nullptr) {
+      *error_message = "the metadata database does not exist: " + path;
+    }
+    return false;
+  }
+  if (!S_ISREG(info.st_mode)) {
+    if (error_message != nullptr) {
+      *error_message = "the metadata database is not a regular file: " + path;
+    }
+    return false;
+  }
+  std::lock_guard<std::mutex> guard(mutex_);
+  if (database_ != nullptr) {
+    if (error_message != nullptr) {
+      *error_message = "the metadata store is already open";
+    }
+    return false;
+  }
+  if (path.empty()) {
+    if (error_message != nullptr) {
+      *error_message = "the metadata database path is empty";
+    }
+    return false;
+  }
+  sqlite3* database = nullptr;
+  // 刻意不带 SQLITE_OPEN_CREATE：即使上面那个 stat 与这里之间文件被删掉，
+  // 这一次打开也只会失败，不会创建一个空库。
+  const int code = sqlite3_open_v2(
+      path.c_str(), &database,
+      SQLITE_OPEN_READWRITE | SQLITE_OPEN_FULLMUTEX, nullptr);
+  if (code != SQLITE_OK) {
+    const std::string reason =
+        database != nullptr ? sqlite3_errmsg(database) : "unknown";
+    if (database != nullptr) {
+      sqlite3_close(database);
+    }
+    if (error_message != nullptr) {
+      *error_message = "cannot open the metadata database " + path + ": " +
+                       reason;
     }
     return false;
   }

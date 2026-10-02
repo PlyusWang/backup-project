@@ -95,7 +95,14 @@ class RemoteMetadataStore {
   RemoteMetadataStore(const RemoteMetadataStore&) = delete;
   RemoteMetadataStore& operator=(const RemoteMetadataStore&) = delete;
 
+  // 打开（必要时创建）元数据库。服务端用它：一个新实例本来就该被初始化。
   bool Open(const std::string& path, std::string* error_message);
+  // 只打开**已经存在**的数据库文件，绝不创建。
+  //
+  // 管理与诊断工具用它：路径写错时必须明确失败，而不是让 SQLite 悄悄建一个
+  // 空库——那样"这个实例还没有任何用户"和"你指的是另一个实例"在界面上一模一样，
+  // 人工验收会得出完全错误的结论（本轮 P0 就是这么发生的）。
+  bool OpenExisting(const std::string& path, std::string* error_message);
   void Close();
   bool IsOpen() const { return database_ != nullptr; }
 
