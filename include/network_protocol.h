@@ -101,18 +101,21 @@ inline constexpr std::uint64_t kDefaultMaxUploadBytes =
 //                        string snapshot_id, string display_name,
 //                        string sha256, u64 size_bytes, u64 created_at,
 //                        u16 snapshot_kind (PR21), u64 generation (PR21),
-//                        string parent_snapshot_id (PR21), string lineage (PR21)
+//                        string parent_snapshot_id (PR21), string lineage
+//                        (PR21)
 //   kUploadBegin   请求: string display_name, u64 declared_size,
 //                        string declared_sha256,
 //                        u16 snapshot_kind (PR21),
-//                        string parent_snapshot_id (PR21), string lineage (PR21)
+//                        string parent_snapshot_id (PR21), string lineage
+//                        (PR21)
 //                  响应: 空
 //   kUploadChunk   请求: 裸字节块（<= 256 KiB，长度由帧头承载）
 //                  响应: 空
 //   kUploadEnd     请求: 空
 //                  响应: string snapshot_id, string sha256, u64 size_bytes,
 //                        u64 created_at, u16 snapshot_kind (PR21),
-//                        u64 generation (PR21), string parent_snapshot_id (PR21)
+//                        u64 generation (PR21), string parent_snapshot_id
+//                        (PR21)
 //   kDownloadBegin 请求: string snapshot_id
 //                  响应: string display_name, string sha256, u64 size_bytes
 //   kDownloadChunk 请求: 空；响应: 裸字节块（空 payload = 流结束）
