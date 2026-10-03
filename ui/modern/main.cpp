@@ -119,6 +119,7 @@
 #include "backup_controller.h"
 #include "config_manager.h"
 #include "filter_rule_model.h"
+#include "incremental_delta.h"
 #include "operation_gate.h"
 #include "realtime_controller.h"
 #include "remote_controller.h"
@@ -2307,7 +2308,39 @@ int RunRemoteProductFlow(backup_modern::RemoteController* remote, CheckRun* run,
              remote->lastErrorKindForTest() + QStringLiteral(": ") +
                  remote->lastDetailForTest());
 
-  // ---- GUI-P08：原始归档上传的条目不能做链恢复 ----
+  // ---- GUI-P08：三类远端对象的**类型**契约（raw / full / incremental）----
+  //
+  // 列表里同时存在"产品链成员"和"手动上传的原始归档"时，用户必须一眼看得出
+  // 区别。类型只来自服务端元数据（lineage / snapshot_kind），不按文件名猜。
+  run->Check(!root_row.isEmpty() &&
+                 root_row.value(QStringLiteral("kind")).toString() ==
+                     QStringLiteral("full") &&
+                 root_row.value(QStringLiteral("kindText")).toString() ==
+                     QStringLiteral("完整备份") &&
+                 root_row.value(QStringLiteral("generationVisible")).toBool() &&
+                 root_row.value(QStringLiteral("generation")).toInt() == 0 &&
+                 root_row.value(QStringLiteral("restoreLabel")).toString() ==
+                     QStringLiteral("恢复"),
+             QStringLiteral("GUI-P08 完整备份：badge=完整备份、代数 0 可见、"
+                            "主操作=恢复"),
+             root_row.value(QStringLiteral("kindText")).toString());
+  run->Check(
+      !delta_row.isEmpty() &&
+          delta_row.value(QStringLiteral("kindText")).toString() ==
+              QStringLiteral("增量备份") &&
+          delta_row.value(QStringLiteral("generationVisible")).toBool() &&
+          delta_row.value(QStringLiteral("generation")).toInt() == 1 &&
+          delta_row.value(QStringLiteral("parentShort")).toString() ==
+              root_id.left(12) &&
+          delta_row.value(QStringLiteral("restoreLabel")).toString() ==
+              QStringLiteral("恢复"),
+      QStringLiteral("GUI-P08 增量备份：badge=增量备份、代数 1 + 父可见、"
+                     "主操作=恢复"),
+      delta_row.value(QStringLiteral("kindText")).toString());
+
+  // ---- RAW-R03：任意文件（显示名以 .bak 结尾）不能当成备份归档 ----
+  //
+  // 它证明"格式由**内容**决定"：文件名、扩展名一律不参与判断。
   const QString raw_file = work + QStringLiteral("/gui-raw-archive.bin");
   {
     QFile raw(raw_file);
@@ -2315,37 +2348,315 @@ int RunRemoteProductFlow(backup_modern::RemoteController* remote, CheckRun* run,
       raw.write(QByteArray(4096, 'R'));
     }
   }
-  const QString raw_name = QStringLiteral("gui-raw-archive");
+  const QString raw_name = QStringLiteral("gui-raw-archive.bak");
   const bool raw_uploaded =
       remote->uploadArchive(raw_file, raw_name) &&
       remote->waitForIdle(300000) &&
       remote->lastErrorKindForTest() == QStringLiteral("none");
   run->Check(raw_uploaded && refresh(),
-             QStringLiteral("GUI-P08 原始归档上传成功（低层 raw 操作）"),
+             QStringLiteral("RAW-R03 原始归档上传成功（低层 raw 操作）"),
              remote->lastErrorKindForTest() + QStringLiteral(": ") +
                  remote->lastDetailForTest());
   const QVariantMap raw_row = findByDisplayName(raw_name);
+  // 类型契约：raw 就是 raw —— badge 是"原始归档"、没有代数、没有父，
+  // 主操作叫"尝试恢复"（不是"恢复"，也不是禁用的按钮）。
   run->Check(
       !raw_row.isEmpty() &&
-          !raw_row.value(QStringLiteral("restorable")).toBool() &&
-          raw_row.value(QStringLiteral("restoreHint"))
-              .toString()
-              .contains(QStringLiteral("原始归档")),
-      QStringLiteral("GUI-P08 原始归档条目：禁用链恢复并在卡片上说明原因"),
-      raw_row.value(QStringLiteral("restoreHint")).toString());
-  const bool raw_restore_accepted = remote->restoreSnapshot(
+          raw_row.value(QStringLiteral("kind")).toString() ==
+              QStringLiteral("raw") &&
+          raw_row.value(QStringLiteral("kindText")).toString() ==
+              QStringLiteral("原始归档") &&
+          !raw_row.value(QStringLiteral("generationVisible")).toBool() &&
+          raw_row.value(QStringLiteral("parentShort")).toString().isEmpty() &&
+          raw_row.value(QStringLiteral("restoreLabel")).toString() ==
+              QStringLiteral("尝试恢复") &&
+          raw_row.value(QStringLiteral("restoreLabel")).toString() !=
+              root_row.value(QStringLiteral("restoreLabel")).toString() &&
+          !raw_row.value(QStringLiteral("typeNote")).toString().isEmpty(),
+      QStringLiteral(
+          "RAW-R03/GUI-P08 原始归档：badge=原始归档、不显示代数与父、"
+          "主操作=尝试恢复（与产品级“恢复”不是同一个词）"),
+      raw_row.value(QStringLiteral("kindText")).toString() +
+          QStringLiteral(" / ") +
+          raw_row.value(QStringLiteral("typeNote")).toString());
+
+  // 目标目录必须保持"没有被碰过"：失败不能留下半成品。
+  const auto destinationUnused = [](const QString& path) {
+    if (!QFileInfo::exists(path)) {
+      return true;
+    }
+    return QDir(path)
+        .entryList(QDir::Files | QDir::AllDirs | QDir::NoDotAndDotDot,
+                   QDir::NoSort)
+        .isEmpty();
+  };
+
+  // 绕过界面直接请求**链恢复**：共享 core 也必须拒绝（原始归档不是 BPSNAP1
+  // 材料包）。这与下面"尝试恢复"是两条不同的路，两条都要有明确结论。
+  const bool chain_on_raw_accepted = remote->restoreSnapshot(
       raw_row.value(QStringLiteral("id")).toString(), raw_out);
-  const bool raw_restore_idle =
-      raw_restore_accepted && remote->waitForIdle(300000);
-  const QString raw_kind = remote->lastErrorKindForTest();
+  const bool chain_on_raw_idle =
+      chain_on_raw_accepted && remote->waitForIdle(300000);
   run->Check(
-      raw_restore_idle && raw_kind == QStringLiteral("not-a-bundle") &&
-          QDir(raw_out)
-              .entryList(QDir::Files | QDir::AllDirs | QDir::NoDotAndDotDot,
-                         QDir::NoSort)
-              .isEmpty(),
-      QStringLiteral("GUI-P08 对原始归档做链恢复：明确诊断且目标目录为空"),
-      raw_kind + QStringLiteral(": ") + remote->lastDetailForTest());
+      chain_on_raw_idle &&
+          remote->lastErrorKindForTest() == QStringLiteral("not-a-bundle") &&
+          destinationUnused(raw_out),
+      QStringLiteral("RAW-R03 对原始归档做链恢复：明确诊断且目标目录为空"),
+      remote->lastErrorKindForTest() + QStringLiteral(": ") +
+          remote->lastDetailForTest());
+
+  // "尝试恢复"：下载那一个 blob，按内容认出它不是备份归档 -> 明确失败，
+  // 目标目录仍然没有被创建。
+  const bool raw_invalid_accepted = remote->restoreRawArchive(
+      raw_row.value(QStringLiteral("id")).toString(), raw_out, QString());
+  const bool raw_invalid_idle =
+      raw_invalid_accepted && remote->waitForIdle(600000);
+  run->Check(
+      raw_invalid_idle &&
+          remote->lastErrorKindForTest() == QStringLiteral("raw-unsupported") &&
+          destinationUnused(raw_out),
+      QStringLiteral("RAW-R03 任意文件（显示名 .bak）：尝试恢复失败并"
+                     "说明“不是受支持的备份归档”，目标目录为空"),
+      remote->lastErrorKindForTest() + QStringLiteral(": ") +
+          remote->lastDetailForTest());
+
+  // ---- RAW-R01：可独立恢复的完整 .bak（本项目自己的备份流水线生成）----
+  const QString standalone_src = work + QStringLiteral("/raw-standalone-src");
+  const QString standalone_root = work + QStringLiteral("/raw-standalone");
+  const QString standalone_bak =
+      standalone_root + QStringLiteral("/report.bak");
+  const QString standalone_out = work + QStringLiteral("/raw-standalone-out");
+  QDir().mkpath(standalone_src);
+  QDir().mkpath(standalone_root);
+  writeText(standalone_src + QStringLiteral("/a.txt"),
+            QStringLiteral("alpha\n"));
+  writeText(standalone_src + QStringLiteral("/b.txt"),
+            QStringLiteral("beta\n"));
+  QDir().mkpath(standalone_src + QStringLiteral("/nested"));
+  writeText(standalone_src + QStringLiteral("/nested/c.txt"),
+            QStringLiteral("gamma\n"));
+  {
+    // 用产品自己的 v2 流水线造这份归档：它就是"用户在本机做了一份完整备份、
+    // 然后把它原始上传"的那个文件。
+    std::string pipeline_error;
+    const bool built = backupproject::RunBackupPipeline(
+        standalone_src.toStdString(), standalone_bak.toStdString(),
+        backupproject::Filter(), backupproject::BackupOptions(),
+        &pipeline_error);
+    run->Check(built && QFileInfo::exists(standalone_bak),
+               QStringLiteral("RAW-R01 用产品自己的备份流水线生成一份独立的"
+                              "完整 .bak"),
+               QString::fromStdString(pipeline_error));
+  }
+  const QString standalone_name = QStringLiteral("raw-standalone-full.bak");
+  const bool standalone_uploaded =
+      remote->uploadArchive(standalone_bak, standalone_name) &&
+      remote->waitForIdle(300000) &&
+      remote->lastErrorKindForTest() == QStringLiteral("none");
+  run->Check(standalone_uploaded && refresh(),
+             QStringLiteral("RAW-R01 独立 .bak 原始上传成功"),
+             remote->lastErrorKindForTest() + QStringLiteral(": ") +
+                 remote->lastDetailForTest());
+  const QVariantMap standalone_row = findByDisplayName(standalone_name);
+  const QString standalone_id =
+      standalone_row.value(QStringLiteral("id")).toString();
+  const bool standalone_accepted =
+      !standalone_id.isEmpty() &&
+      remote->restoreRawArchive(standalone_id, standalone_out, QString());
+  const bool standalone_idle =
+      standalone_accepted && remote->waitForIdle(900000);
+  run->Check(standalone_idle &&
+                 remote->lastErrorKindForTest() == QStringLiteral("none") &&
+                 remote->lastRawRestoreFormatForTest() ==
+                     QStringLiteral("v2-container") &&
+                 remote->lastRawRestoreEntriesForTest() > 0 &&
+                 remote->lastRawRestoreDownloadedBytesForTest() > 0,
+             QStringLiteral("RAW-R01 原始归档：下载 -> SHA-256 校验 -> 交给"
+                            "既有本地恢复核心 -> 成功"),
+             remote->lastErrorKindForTest() + QStringLiteral(": ") +
+                 remote->lastDetailForTest());
+  run->Check(treeMatches(standalone_src, standalone_out),
+             QStringLiteral("RAW-R01 恢复出来的目录与源目录逐字节一致"
+                            "（等价于 diff -r 通过）"));
+  run->Check(
+      !remote->lastRawRestoreSha256ForTest().isEmpty() &&
+          remote->lastRawRestoreSha256ForTest().left(12) ==
+              standalone_row.value(QStringLiteral("sha256Short")).toString(),
+      QStringLiteral("RAW-R01 恢复用的是**下载并校验过的字节**：摘要与"
+                     "列表里登记的一致"),
+      remote->lastRawRestoreSha256ForTest());
+
+  // ---- RAW-R02：被篡改的归档 ----
+  const QString corrupted_bak = work + QStringLiteral("/raw-corrupted.bak");
+  const QString corrupted_out = work + QStringLiteral("/raw-corrupted-out");
+  QFile::remove(corrupted_bak);
+  {
+    const bool copied = QFile::copy(standalone_bak, corrupted_bak);
+    QFile file(corrupted_bak);
+    bool flipped = false;
+    if (copied && file.open(QIODevice::ReadWrite)) {
+      const qint64 size = file.size();
+      const qint64 offset = size > 400 ? size / 2 : 40;
+      if (file.seek(offset) && file.getChar(nullptr)) {
+        char original = 0;
+        file.seek(offset);
+        if (file.getChar(&original)) {
+          const char changed = static_cast<char>(original ^ 0x5A);
+          file.seek(offset);
+          flipped = file.putChar(changed);
+        }
+      }
+    }
+    run->Check(
+        copied && flipped,
+        QStringLiteral("RAW-R02 造一份被篡改的完整归档（改中间一个字节）"));
+  }
+  const QString corrupted_name = QStringLiteral("raw-corrupted.bak");
+  const bool corrupted_uploaded =
+      remote->uploadArchive(corrupted_bak, corrupted_name) &&
+      remote->waitForIdle(300000) &&
+      remote->lastErrorKindForTest() == QStringLiteral("none");
+  run->Check(corrupted_uploaded && refresh(),
+             QStringLiteral("RAW-R02 被篡改的归档上传成功（服务端只存字节）"),
+             remote->lastErrorKindForTest() + QStringLiteral(": ") +
+                 remote->lastDetailForTest());
+  const QVariantMap corrupted_row = findByDisplayName(corrupted_name);
+  const bool corrupted_accepted = remote->restoreRawArchive(
+      corrupted_row.value(QStringLiteral("id")).toString(), corrupted_out,
+      QString());
+  const bool corrupted_idle = corrupted_accepted && remote->waitForIdle(900000);
+  run->Check(corrupted_idle &&
+                 remote->lastErrorKindForTest() != QStringLiteral("none") &&
+                 destinationUnused(corrupted_out),
+             QStringLiteral("RAW-R02 被篡改的归档：校验失败、目标目录为空"
+                            "（没有半成品）"),
+             remote->lastErrorKindForTest() + QStringLiteral(": ") +
+                 remote->lastDetailForTest());
+
+  // ---- RAW-R04：单独的 delta（缺少父链）----
+  //
+  // delta 从**已验证缓存**里按内容挑出来（不按文件名猜）：它就是远端 R1 的
+  // 那一份。单独上传之后，它属于某条链这件事不会因为"只有它一个"而改变。
+  QString delta_material;
+  {
+    QDirIterator iterator(QString::fromStdString(layout.cache_directory),
+                          QDir::Files | QDir::NoDotAndDotDot,
+                          QDirIterator::Subdirectories);
+    while (iterator.hasNext()) {
+      const QString path = iterator.next();
+      if (backupproject::ClassifySnapshotFile(path.toStdString(), nullptr) ==
+          backupproject::SnapshotFileKind::kDelta) {
+        delta_material = path;
+        break;
+      }
+    }
+  }
+  const QString delta_alone_bak = work + QStringLiteral("/raw-delta-alone.bak");
+  const QString delta_alone_out = work + QStringLiteral("/raw-delta-alone-out");
+  QFile::remove(delta_alone_bak);
+  const bool delta_copied =
+      !delta_material.isEmpty() && QFile::copy(delta_material, delta_alone_bak);
+  run->Check(delta_copied,
+             QStringLiteral("RAW-R04 从已验证缓存里按内容取出 R1 的那份 delta"),
+             delta_material);
+  const QString delta_alone_name = QStringLiteral("raw-delta-alone.bak");
+  const bool delta_uploaded =
+      delta_copied &&
+      remote->uploadArchive(delta_alone_bak, delta_alone_name) &&
+      remote->waitForIdle(300000) &&
+      remote->lastErrorKindForTest() == QStringLiteral("none");
+  run->Check(delta_uploaded && refresh(),
+             QStringLiteral("RAW-R04 单独的 delta 上传成功"),
+             remote->lastErrorKindForTest() + QStringLiteral(": ") +
+                 remote->lastDetailForTest());
+  const QVariantMap delta_alone_row = findByDisplayName(delta_alone_name);
+  const bool delta_alone_accepted = remote->restoreRawArchive(
+      delta_alone_row.value(QStringLiteral("id")).toString(), delta_alone_out,
+      QString());
+  const bool delta_alone_idle =
+      delta_alone_accepted && remote->waitForIdle(600000);
+  run->Check(
+      delta_alone_idle &&
+          remote->lastErrorKindForTest() == QStringLiteral("raw-delta") &&
+          remote->statusMessage().contains(QStringLiteral("增量")) &&
+          remote->statusMessage().contains(QStringLiteral("依赖链")) &&
+          destinationUnused(delta_alone_out),
+      QStringLiteral("RAW-R04 单独的 delta：明确说“这是增量备份，不能"
+                     "脱离依赖链单独恢复”，目标目录为空"),
+      remote->lastErrorKindForTest() + QStringLiteral(": ") +
+          remote->lastDetailForTest());
+
+  // ---- RAW-R05：加密的独立归档（正确密码 / 错误密码 / 没填密码）----
+  const QString encrypted_bak = standalone_root + QStringLiteral("/secret.bak");
+  const QString encrypted_pw = QStringLiteral("PR21_RAW_ARCHIVE_PW_7k3");
+  {
+    backupproject::BackupOptions options;
+    options.encryption_method =
+        backupproject::EncryptionMethod::kAes256CtrHmacSha256;
+    options.password = encrypted_pw.toStdString();
+    std::string pipeline_error;
+    const bool built = backupproject::RunBackupPipeline(
+        standalone_src.toStdString(), encrypted_bak.toStdString(),
+        backupproject::Filter(), options, &pipeline_error);
+    run->Check(built && QFileInfo::exists(encrypted_bak),
+               QStringLiteral("RAW-R05 造一份加密的独立 .bak（AES-256-CTR + "
+                              "HMAC-SHA256）"),
+               QString::fromStdString(pipeline_error));
+  }
+  const QString encrypted_name = QStringLiteral("raw-encrypted.bak");
+  const bool encrypted_uploaded =
+      remote->uploadArchive(encrypted_bak, encrypted_name) &&
+      remote->waitForIdle(300000) &&
+      remote->lastErrorKindForTest() == QStringLiteral("none");
+  run->Check(encrypted_uploaded && refresh(),
+             QStringLiteral("RAW-R05 加密归档上传成功"),
+             remote->lastErrorKindForTest() + QStringLiteral(": ") +
+                 remote->lastDetailForTest());
+  const QVariantMap encrypted_row = findByDisplayName(encrypted_name);
+  const QString encrypted_id =
+      encrypted_row.value(QStringLiteral("id")).toString();
+  // (1) 没填密码：明确要求密码，不尝试绕过加密。
+  const QString encrypted_out_a = work + QStringLiteral("/raw-encrypted-out-a");
+  const bool no_password_accepted =
+      remote->restoreRawArchive(encrypted_id, encrypted_out_a, QString());
+  const bool no_password_idle =
+      no_password_accepted && remote->waitForIdle(600000);
+  run->Check(
+      no_password_idle &&
+          remote->lastErrorKindForTest() == QStringLiteral("raw-password") &&
+          remote->lastRawRestorePasswordRequiredForTest() &&
+          destinationUnused(encrypted_out_a),
+      QStringLiteral("RAW-R05 加密归档没填密码：明确要求密码，"
+                     "目标目录为空"),
+      remote->lastErrorKindForTest() + QStringLiteral(": ") +
+          remote->lastDetailForTest());
+  // (2) 错误密码：失败，且目标目录仍然为空。
+  const QString encrypted_out_b = work + QStringLiteral("/raw-encrypted-out-b");
+  const bool wrong_password_accepted = remote->restoreRawArchive(
+      encrypted_id, encrypted_out_b, QStringLiteral("wrong-password"));
+  const bool wrong_password_idle =
+      wrong_password_accepted && remote->waitForIdle(900000);
+  run->Check(wrong_password_idle &&
+                 remote->lastErrorKindForTest() != QStringLiteral("none") &&
+                 destinationUnused(encrypted_out_b),
+             QStringLiteral("RAW-R05 错误密码：恢复失败，目标目录为空"),
+             remote->lastErrorKindForTest() + QStringLiteral(": ") +
+                 remote->lastDetailForTest());
+  // (3) 正确密码：与本地恢复同一条密码流程 -> 成功。
+  const QString encrypted_out_c = work + QStringLiteral("/raw-encrypted-out-c");
+  const bool right_password_accepted =
+      remote->restoreRawArchive(encrypted_id, encrypted_out_c, encrypted_pw);
+  const bool right_password_idle =
+      right_password_accepted && remote->waitForIdle(900000);
+  run->Check(right_password_accepted && right_password_idle &&
+                 remote->lastErrorKindForTest() == QStringLiteral("none") &&
+                 remote->lastRawRestoreEntriesForTest() > 0,
+             QStringLiteral("RAW-R05 正确密码：按本地恢复同一条密码流程成功"),
+             remote->lastErrorKindForTest() + QStringLiteral(": ") +
+                 remote->lastDetailForTest());
+  run->Check(
+      treeMatches(standalone_src, encrypted_out_c),
+      QStringLiteral("RAW-R05 加密归档恢复出来的目录与源目录逐字节一致"));
 
   // ---- GUI-P09：错 pin 时远端备份可见地失败，但不踢掉登录状态 ----
   // ---- GUI-P09：服务器身份 pin 在**建立连接**时被强制 ----
@@ -2766,6 +3077,10 @@ int RunRemoteAcceptance(QQuickWindow* window,
   };
   // 一页里所有"必须不重叠"的相邻控件对。
   const auto checkPairsAndBounds = [&](const QString& tag) {
+    // 列表刚刚变化过（新建快照 / 刷新 /
+    // 换账号）时布局可能还没算完：先让事件循环 转一圈。否则会读到宽度为 0
+    // 的卡片，把"布局尚未发生"误判成"控件越界"。
+    WaitForAnimation(260);
     const Box page_box = boxOf(page, QStringLiteral("remotePage"));
     const Box source_field = byName("remoteBackupSourceField");
     const Box browse_button = byName("remoteBackupSourceBrowseButton");
@@ -2975,6 +3290,12 @@ int RunRemoteAcceptance(QQuickWindow* window,
   page->setProperty("draftBackupSource", source);
   page->setProperty("backupStrategy", 0);
   WaitForAnimation(200);
+  // "把服务器指纹抄进客户端"这条人工流程的 GUI 端：指纹经界面"应用"生效，
+  // 输入框里就是管理员给出的那一串。客户端那一端（backup-server-admin 首页
+  // 打印的同一行）在 server-admin 的截图 / 文本证据里。
+  grab(QStringLiteral("remote-pin-copy-flow.png"), 1180, 760,
+       QStringLiteral(
+           "服务器身份指纹经界面“应用”生效（指纹复制流程的客户端一端）"));
 
   // ---- ACC-03：没有 pin 的控制器在本地就被挡住（一个字节都不发）----
   {
@@ -3159,17 +3480,21 @@ int RunRemoteAcceptance(QQuickWindow* window,
       }
       return QVariantMap();
     }();
-    run.Check(row.value(QStringLiteral("kind")).toString() ==
-                      QStringLiteral("full") &&
-                  row.value(QStringLiteral("generation")).toInt() == 0 &&
-                  row.value(QStringLiteral("kindText")).toString() ==
-                      QStringLiteral("完整") &&
-                  row.value(QStringLiteral("restorable")).toBool() &&
-                  row.value(QStringLiteral("parentShort")).toString().isEmpty(),
-              QStringLiteral("ACC-07 卡片显示“完整 / 代数 0 / 可恢复 / 无父”"),
-              QStringLiteral("kind=%1 gen=%2")
-                  .arg(row.value(QStringLiteral("kind")).toString())
-                  .arg(row.value(QStringLiteral("generation")).toInt()));
+    run.Check(
+        row.value(QStringLiteral("kind")).toString() ==
+                QStringLiteral("full") &&
+            row.value(QStringLiteral("generation")).toInt() == 0 &&
+            row.value(QStringLiteral("kindText")).toString() ==
+                QStringLiteral("完整备份") &&
+            row.value(QStringLiteral("generationVisible")).toBool() &&
+            row.value(QStringLiteral("restoreLabel")).toString() ==
+                QStringLiteral("恢复") &&
+            row.value(QStringLiteral("restorable")).toBool() &&
+            row.value(QStringLiteral("parentShort")).toString().isEmpty(),
+        QStringLiteral("ACC-07 卡片显示“完整备份 / 代数 0 / 可恢复 / 无父”"),
+        QStringLiteral("kind=%1 gen=%2")
+            .arg(row.value(QStringLiteral("kind")).toString())
+            .arg(row.value(QStringLiteral("generation")).toInt()));
   }
   checkPairsAndBounds(QStringLiteral("ACC-07"));
   run.Check(scrollTo(firstByName("remoteSnapshotRestoreButton"), 240),
@@ -3213,12 +3538,14 @@ int RunRemoteAcceptance(QQuickWindow* window,
           .arg(delta_row.value(QStringLiteral("parentShort")).toString()));
   run.Check(
       delta_row.value(QStringLiteral("kindText")).toString() ==
-              QStringLiteral("增量") &&
+              QStringLiteral("增量备份") &&
+          delta_row.value(QStringLiteral("restoreLabel")).toString() ==
+              QStringLiteral("恢复") &&
           delta_row.value(QStringLiteral("generation")).toInt() == 1 &&
           delta_row.value(QStringLiteral("parentShort")).toString().length() ==
               12 &&
           delta_row.value(QStringLiteral("restorable")).toBool(),
-      QStringLiteral("ACC-09 卡片显示“增量 / 代数 1 / 父短 ID / 可恢复”"),
+      QStringLiteral("ACC-09 卡片显示“增量备份 / 代数 1 / 父短 ID / 可恢复”"),
       QStringLiteral("kindText=%1 gen=%2 parent=%3")
           .arg(delta_row.value(QStringLiteral("kindText")).toString())
           .arg(delta_row.value(QStringLiteral("generation")).toInt())
@@ -3372,8 +3699,20 @@ int RunRemoteAcceptance(QQuickWindow* window,
   // ---- ACC-13 / S07：原始归档条目与产品链条目的区别 ----
   //
   // 这一条走的是**低层 raw 上传**：服务端只认"名字 + 长度 + SHA-256"，
-  // 不解析内容，所以它不属于任何链（lineage 为空）——列表里照样显示，
-  // 但链恢复必须不可用，而且在卡片上就说明原因。
+  // 不解析内容，所以它不属于任何链（lineage 为空）。
+  //
+  // 它要证明的是"三类对象在**同一页**里一眼可分"，所以先显式回到第一个账号：
+  // 完整基线 R0 与增量 R1/R2 都在它名下（ACC-10..12 用的是 fallback 账号，
+  // 那里只有一份完整基线——在那边截图不会有"增量备份"这一行）。
+  remote->logoutLocal();
+  const bool back_to_main =
+      remote->login(host, port_text, username, password) &&
+      remote->waitForIdle(180000) && remote->authenticated() &&
+      remote->refreshList() && remote->waitForIdle(120000);
+  run.Check(back_to_main && remote->username() == username,
+            QStringLiteral("ACC-13 回到第一个账号（三类对象将在同一页里出现）"),
+            remote->lastErrorKindForTest() + QStringLiteral(": ") +
+                remote->lastDetailForTest());
   QString archive_path;
   {
     const QString repository = work + QStringLiteral("/repo");
@@ -3425,13 +3764,22 @@ int RunRemoteAcceptance(QQuickWindow* window,
     }
   }
   const QVariantMap raw_row = rowOf(raw_id);
-  // 产品链条目：列表里第一条"可恢复"的（raw 上传的那一条一定不可恢复）。
-  QVariantMap product_row;
+  const QString raw_target_name =
+      raw_row.value(QStringLiteral("name")).toString();
+  // 产品链条目：按类型各取一条（完整备份 = 链根；增量备份 = 有父的那一条）。
+  QVariantMap full_row;
+  QVariantMap incremental_row;
   for (const QVariant& item : remote->snapshots()) {
     const QVariantMap map = item.toMap();
-    if (map.value(QStringLiteral("restorable")).toBool()) {
-      product_row = map;
-      break;
+    if (map.value(QStringLiteral("kind")).toString() ==
+            QStringLiteral("full") &&
+        full_row.isEmpty()) {
+      full_row = map;
+    }
+    if (map.value(QStringLiteral("kind")).toString() ==
+            QStringLiteral("incremental") &&
+        incremental_row.isEmpty()) {
+      incremental_row = map;
     }
   }
   run.Check(raw_uploaded &&
@@ -3440,36 +3788,143 @@ int RunRemoteAcceptance(QQuickWindow* window,
             QStringLiteral("ACC-13 原始归档上传成功，列表里出现这一条"),
             remote->lastErrorKindForTest() + QStringLiteral(": ") +
                 remote->lastDetailForTest());
+  // ---- 三类对象的 presentation 契约（不靠文件名猜）----
   run.Check(
       !raw_row.isEmpty() &&
-          !raw_row.value(QStringLiteral("restorable")).toBool() &&
-          !raw_row.value(QStringLiteral("restoreHint")).toString().isEmpty() &&
-          raw_row.value(QStringLiteral("restoreHint"))
-              .toString()
-              .contains(QStringLiteral("下载归档")),
-      QStringLiteral("ACC-13 原始归档条目：恢复不可用 + 卡片上有明确说明"
-                     "（而不是点下去才报错）"),
-      raw_row.value(QStringLiteral("restoreHint")).toString());
+          raw_row.value(QStringLiteral("kind")).toString() ==
+              QStringLiteral("raw") &&
+          raw_row.value(QStringLiteral("kindText")).toString() ==
+              QStringLiteral("原始归档") &&
+          !raw_row.value(QStringLiteral("generationVisible")).toBool() &&
+          raw_row.value(QStringLiteral("parentShort")).toString().isEmpty() &&
+          raw_row.value(QStringLiteral("restoreLabel")).toString() ==
+              QStringLiteral("尝试恢复") &&
+          raw_row.value(QStringLiteral("restorable")).toBool() &&
+          !raw_row.value(QStringLiteral("typeNote")).toString().isEmpty(),
+      QStringLiteral("ACC-13 原始归档：badge=原始归档、不显示代数与父、主操作="
+                     "尝试恢复（不是禁用的“恢复”）"),
+      raw_row.value(QStringLiteral("kindText")).toString() +
+          QStringLiteral(" / ") +
+          raw_row.value(QStringLiteral("typeNote")).toString());
+  run.Check(!full_row.isEmpty() &&
+                full_row.value(QStringLiteral("kindText")).toString() ==
+                    QStringLiteral("完整备份") &&
+                full_row.value(QStringLiteral("generationVisible")).toBool() &&
+                full_row.value(QStringLiteral("generation")).toInt() == 0 &&
+                full_row.value(QStringLiteral("restoreLabel")).toString() ==
+                    QStringLiteral("恢复"),
+            QStringLiteral("ACC-13 完整备份：badge=完整备份、代数 0 可见、"
+                           "主操作=恢复"),
+            full_row.value(QStringLiteral("kindText")).toString());
   run.Check(
-      !product_row.isEmpty() &&
-          product_row.value(QStringLiteral("restorable")).toBool() &&
-          !product_row.value(QStringLiteral("kindText")).toString().isEmpty(),
-      QStringLiteral("ACC-13 产品链条目仍然可恢复（两种条目在同一个列表"
-                     "里按 lineage 区分，不靠文件名猜）"));
-  const QList<QQuickItem*> restore_buttons =
-      allByName(QStringLiteral("remoteSnapshotRestoreButton"));
-  int disabled_restore = 0;
-  for (QQuickItem* button : restore_buttons) {
-    if (!button->isEnabled()) {
-      ++disabled_restore;
+      !incremental_row.isEmpty() &&
+          incremental_row.value(QStringLiteral("kindText")).toString() ==
+              QStringLiteral("增量备份") &&
+          incremental_row.value(QStringLiteral("generationVisible")).toBool() &&
+          !incremental_row.value(QStringLiteral("parentShort"))
+               .toString()
+               .isEmpty() &&
+          incremental_row.value(QStringLiteral("restoreLabel")).toString() ==
+              QStringLiteral("恢复"),
+      QStringLiteral("ACC-13 增量备份：badge=增量备份、代数 N + 父可见、"
+                     "主操作=恢复"),
+      incremental_row.value(QStringLiteral("kindText")).toString());
+  run.Check(
+      raw_row.value(QStringLiteral("kindText")).toString() !=
+              full_row.value(QStringLiteral("kindText")).toString() &&
+          raw_row.value(QStringLiteral("kindText")).toString() !=
+              incremental_row.value(QStringLiteral("kindText")).toString() &&
+          full_row.value(QStringLiteral("kindText")).toString() !=
+              incremental_row.value(QStringLiteral("kindText")).toString(),
+      QStringLiteral("ACC-13 三种类型是三个不同的词（原始归档绝不能显示成"
+                     "“完整”）"));
+  // 三种类型**同屏**：这是用户最重要的一张人工验收图，所以三类必须真的同时
+  // 落在视口里，而不是"截图里有其中两种"。为了让列表拿到真实几何，先把窗口开高
+  // 一点并滚到列表（这不是"改造界面"，与 remote-idle-overview-* 同一条做法：
+  // 只是把窗口开高，让本来就存在的内容同屏）。
+  WaitForAnimation(320);
+  const int types_height = 1000;
+  window->setWidth(1180);
+  window->setHeight(types_height);
+  WaitForAnimation(320);
+  run.Check(scrollTo(firstByName("remoteSnapshotKindBadge"), 96),
+            QStringLiteral("ACC-13 列表已滚进视野"));
+  WaitForAnimation(280);
+  checkPairsAndBounds(QStringLiteral("ACC-13"));
+  const auto badgesInViewport = [&]() {
+    QQuickItem* flickable =
+        scroll->property("contentItem").value<QQuickItem*>();
+    int visible = 0;
+    QStringList texts;
+    QStringList positions;
+    for (QQuickItem* badge :
+         allByName(QStringLiteral("remoteSnapshotKindBadge"))) {
+      if (flickable == nullptr || badge == nullptr) {
+        continue;
+      }
+      const QPointF top = badge->mapToItem(flickable, QPointF(0, 0));
+      positions.append(QString::number(top.y(), 'f', 0));
+      if (top.y() + badge->height() > 0 && top.y() < scroll->height()) {
+        ++visible;
+        QQuickItem* label = nullptr;
+        std::function<void(QQuickItem*)> walk = [&](QQuickItem* item) {
+          if (item == nullptr || label != nullptr) {
+            return;
+          }
+          if (item->objectName() == QStringLiteral("remoteSnapshotKindText")) {
+            label = item;
+            return;
+          }
+          for (QQuickItem* child : item->childItems()) {
+            walk(child);
+          }
+        };
+        walk(badge);
+        if (label != nullptr) {
+          texts.append(label->property("text").toString());
+        }
+      }
     }
-  }
-  run.Check(restore_buttons.size() >= 2 && disabled_restore >= 1,
-            QStringLiteral("ACC-13 列表里至少有一个“恢复”按钮是禁用的（原始"
-                           "归档那一条）"),
-            QStringLiteral("buttons=%1 disabled=%2")
-                .arg(restore_buttons.size())
-                .arg(disabled_restore));
+    // 视口高度与每个徽标的视口 y 一起带出来：万一将来某次布局变了导致"三类
+    // 不同屏"，失败信息里直接有数字，不用再猜。
+    texts.append(QStringLiteral("[viewport=%1 y=%2]")
+                     .arg(scroll->height(), 0, 'f', 0)
+                     .arg(positions.join(QStringLiteral(","))));
+    return std::make_pair(visible, texts);
+  };
+  const auto light_badges = badgesInViewport();
+  run.Check(light_badges.first >= 3 &&
+                light_badges.second.contains(QStringLiteral("原始归档")) &&
+                light_badges.second.contains(QStringLiteral("完整备份")) &&
+                light_badges.second.contains(QStringLiteral("增量备份")),
+            QStringLiteral("ACC-13 原始归档 / 完整备份 / 增量备份 三类同屏"
+                           "（浅色）"),
+            QStringLiteral("visible=%1 texts=%2")
+                .arg(light_badges.first)
+                .arg(light_badges.second.join(QStringLiteral(","))));
+  grab(QStringLiteral("remote-types-light.png"), 1180, types_height,
+       QStringLiteral("三种远端对象类型同屏（浅色）"));
+  prepare(true);
+  window->setWidth(1180);
+  window->setHeight(types_height);
+  WaitForAnimation(320);
+  run.Check(scrollTo(firstByName("remoteSnapshotKindBadge"), 96),
+            QStringLiteral("ACC-13 深色下列表再次滚进视野"));
+  const auto dark_badges = badgesInViewport();
+  run.Check(dark_badges.first >= 3,
+            QStringLiteral("ACC-13 三类同屏在深色主题下同样成立"),
+            QStringLiteral("visible=%1 texts=%2")
+                .arg(dark_badges.first)
+                .arg(dark_badges.second.join(QStringLiteral(","))));
+  grab(QStringLiteral("remote-types-dark.png"), 1180, types_height,
+       QStringLiteral("三种远端对象类型同屏（深色）"));
+  prepare(false);
+  run.Check(scrollTo(firstByName("remoteSnapshotKindBadge"), 96),
+            QStringLiteral("ACC-13 回到浅色并重新滚到列表"));
+  grab(QStringLiteral("remote-raw-light.png"), 1180, 760,
+       QStringLiteral("原始归档条目：badge=原始归档、主操作=尝试恢复（浅色）"));
+
+  // ---- ACC-13b：链恢复对原始归档必须被拒绝（绕过界面直接请求也是）----
   QDir(restore_b).removeRecursively();
   QDir().mkpath(restore_b);
   const bool raw_restore_accepted = remote->restoreSnapshot(raw_id, restore_b);
@@ -3479,15 +3934,105 @@ int RunRemoteAcceptance(QQuickWindow* window,
       raw_restore_idle &&
           remote->lastErrorKindForTest() == QStringLiteral("not-a-bundle") &&
           collectTree(restore_b).isEmpty(),
-      QStringLiteral("ACC-13 就算绕过界面直接请求，链恢复也会被共享 core "
+      QStringLiteral("ACC-13b 就算绕过界面直接请求，链恢复也会被共享 core "
                      "拒绝，目标目录保持为空"),
       remote->lastErrorKindForTest() + QStringLiteral(": ") +
           remote->lastDetailForTest());
-  checkPairsAndBounds(QStringLiteral("ACC-13"));
-  run.Check(scrollTo(firstByName("remoteSnapshotRestoreButton"), 300),
-            QStringLiteral("ACC-13 原始归档那一条已滚进视野"));
-  grab(QStringLiteral("remote-raw-light.png"), 1180, 760,
-       QStringLiteral("原始归档条目：恢复不可用（浅色）"));
+
+  // ---- ACC-13c：原始归档的"尝试恢复"（下载 -> 校验 -> 既有本地恢复核心）----
+  //
+  // 这份 raw 归档就是上面用**产品引擎**生成的完整备份，所以它可以被独立
+  // 恢复：这正是"原始归档 ≠ 永远不可恢复"的产品语义。
+  const QString raw_restore_target = work + QStringLiteral("/raw-restore-out");
+  QDir(raw_restore_target).removeRecursively();
+  page->setProperty("draftRawRestorePath", raw_restore_target);
+  const bool raw_dialog_invoked = QMetaObject::invokeMethod(
+      page, "requestRawRestore", Q_ARG(QVariant, raw_id),
+      Q_ARG(QVariant, raw_target_name));
+  WaitForAnimation(250);
+  // Dialog 是 Popup（不是 QQuickItem），所以按 QObject 查；它里面的控件是
+  // QQuickItem，按名字查得到。
+  QObject* raw_dialog =
+      window->findChild<QObject*>(QStringLiteral("remoteRawRestoreDialog"));
+  run.Check(raw_dialog_invoked && raw_dialog != nullptr &&
+                raw_dialog->property("visible").toBool() &&
+                named("remoteRawRestoreTargetField") != nullptr &&
+                named("remoteRawRestorePasswordField") != nullptr,
+            QStringLiteral("ACC-13c “尝试恢复”对话框：目标目录 + 可选密码都在"
+                           "（密码框是 Password 回显）"),
+            raw_dialog == nullptr ? QStringLiteral("找不到对话框")
+                                  : QStringLiteral("ok"));
+  grab(QStringLiteral("remote-raw-restore-light.png"), 1180, 760,
+       QStringLiteral("原始归档“尝试恢复”对话框（浅色）"));
+  const bool raw_confirmed =
+      QMetaObject::invokeMethod(page, "confirmRawRestore");
+  const bool raw_restore_finished =
+      raw_confirmed && remote->waitForIdle(600000);
+  run.Check(
+      raw_restore_finished &&
+          remote->lastErrorKindForTest() == QStringLiteral("none") &&
+          remote->lastRawRestoreFormatForTest() ==
+              QStringLiteral("v2-container") &&
+          remote->lastRawRestoreEntriesForTest() > 0 &&
+          remote->lastRawRestoreDownloadedBytesForTest() > 0,
+      QStringLiteral("ACC-13c 原始归档“尝试恢复”：下载 -> SHA-256 校验 -> "
+                     "本地恢复核心 -> 成功"),
+      remote->lastErrorKindForTest() + QStringLiteral(": ") +
+          remote->lastDetailForTest());
+  run.Check(treeMatches(source, raw_restore_target),
+            QStringLiteral("ACC-13c 原始归档恢复出来的目录与源目录逐字节一致"
+                           "（等价于 diff -r 通过）"));
+  run.Check(!remote->lastRawRestoreSha256ForTest().isEmpty() &&
+                remote->lastRawRestoreSha256ForTest().left(12) ==
+                    raw_row.value(QStringLiteral("sha256Short")).toString(),
+            QStringLiteral("ACC-13c 恢复用的是下载并校验过的字节（摘要与列表"
+                           "登记值一致）"),
+            remote->lastRawRestoreSha256ForTest());
+
+  // ---- ACC-13d：不是备份归档的 raw 对象（显示名仍是 .bak）必须明确失败 ----
+  const QString invalid_raw_path = work + QStringLiteral("/not-an-archive.bak");
+  {
+    QFile invalid(invalid_raw_path);
+    if (invalid.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
+      invalid.write(QByteArray(4096, 'X'));
+    }
+  }
+  QStringList ids_before_invalid;
+  for (const QVariant& item : remote->snapshots()) {
+    ids_before_invalid.append(
+        item.toMap().value(QStringLiteral("id")).toString());
+  }
+  const bool invalid_uploaded =
+      remote->uploadArchive(invalid_raw_path,
+                            QStringLiteral("looks-like.bak")) &&
+      remote->waitForIdle(600000);
+  QString invalid_id;
+  for (const QVariant& item : remote->snapshots()) {
+    const QString id = item.toMap().value(QStringLiteral("id")).toString();
+    if (!ids_before_invalid.contains(id)) {
+      invalid_id = id;
+    }
+  }
+  const QString invalid_out = work + QStringLiteral("/invalid-raw-out");
+  QDir(invalid_out).removeRecursively();
+  const bool invalid_accepted =
+      invalid_uploaded && !invalid_id.isEmpty() &&
+      remote->restoreRawArchive(invalid_id, invalid_out, QString());
+  const bool invalid_idle = invalid_accepted && remote->waitForIdle(600000);
+  run.Check(
+      invalid_idle &&
+          remote->lastErrorKindForTest() == QStringLiteral("raw-unsupported") &&
+          !QFileInfo::exists(invalid_out),
+      QStringLiteral("ACC-13d 随机文件（显示名 looks-like.bak）：按内容"
+                     "识别 -> 明确失败，目标目录没有被创建"),
+      remote->lastErrorKindForTest() + QStringLiteral(": ") +
+          remote->lastDetailForTest());
+  run.Check(scrollTo(named("remoteStatusBanner"), 300),
+            QStringLiteral("ACC-13d 失败原因那一行已滚进视野"));
+  grab(QStringLiteral("remote-raw-invalid-error.png"), 1180, 760,
+       QStringLiteral("原始归档不是备份归档时的可见失败（浅色）"));
+  run.Check(scrollTo(firstByName("remoteSnapshotKindBadge"), 110),
+            QStringLiteral("ACC-13d 回到列表"));
 
   // ---- ACC-14：清掉本地缓存之后仍然能恢复整条链（冷缓存）----
   remote->logoutLocal();
@@ -5392,9 +5937,16 @@ int RunRemoteTest(QQuickWindow* window, backup_modern::RemoteController* remote,
                   objectByName("remoteBackupButton") != nullptr &&
                   objectByName("remoteBackupSummary") != nullptr &&
                   objectByName("remoteBackupSourceFolderDialog") != nullptr &&
-                  objectByName("remoteRestoreFolderDialog") != nullptr,
+                  objectByName("remoteRestoreFolderDialog") != nullptr &&
+                  objectByName("remoteRawRestoreDialog") != nullptr &&
+                  objectByName("remoteRawRestoreFolderDialog") != nullptr &&
+                  objectByName("remoteRawRestoreTargetField") != nullptr &&
+                  objectByName("remoteRawRestorePasswordField") != nullptr &&
+                  objectByName("remoteRawRestoreConfirmButton") != nullptr &&
+                  objectByName("remoteRestoreMechanismHint") != nullptr,
               QStringLiteral("REMOTE-G01 远端备份区域：源目录选择器 / 策略 / "
-                             "备份按钮 / 结论行 / 两个目录对话框都在"));
+                             "备份按钮 / 结论行 / 目录对话框 / 原始归档的"
+                             "“尝试恢复”对话框（目标 + 密码）都在"));
     run.Check(objectByName("remoteSnapshotRestoreButton") != nullptr ||
                   remote->snapshotCountForTest() == 0,
               QStringLiteral("REMOTE-G01 快照卡片有独立的“恢复”主操作"));

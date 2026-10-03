@@ -64,6 +64,14 @@ run bundle-source-mutation-sanitize env BUNDLE_SOURCE_MUTATION_SANITIZE=1 bash s
 run account-deletion bash scripts/account_deletion_test.sh
 run same-instance-truth bash scripts/same_instance_truth_test.sh
 run server-admin bash scripts/server_admin_test.sh
+# 原始归档的"单独恢复"（QML -> RemoteController -> RunRemoteRawRestore ->
+# 既有本地恢复核心）：RAW-R01..RAW-R05 五条由 --remote-test 里的真服务端走一遍，
+# 本脚本只断言那些条目真的跑了并且全部通过。
+run raw-archive-restore bash scripts/raw_archive_restore_test.sh
+# 同一个入口在 ASan + UBSan 下跑边界输入（截断 / 任意字节 / 离谱的声明长度 /
+# 加密归档的三种情况 / 单独的 delta / 不存在的 id）：每一条都要求 fail-closed
+# 且消毒剂报告为 0。和 network-sanitize 一样必须排在 quality 之前。
+run raw-archive-restore-sanitize env RAW_RESTORE_SANITIZE=1 bash scripts/raw_archive_restore_test.sh
 run scheduled_backup bash scripts/scheduled_backup_test.sh
 run realtime bash scripts/realtime_test.sh
 run modern_gui bash scripts/modern_gui_check.sh
