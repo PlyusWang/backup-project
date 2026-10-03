@@ -392,7 +392,8 @@ int RunRemoteCommand(const CliContext& context,
     }
     std::cout << "共 " << snapshots.size() << " 个远程快照\n";
     // 列出链关系：kind / generation / parent 是老师现场验收"远端增量"
-    // 最直接的证据（NAME 仍然放在最后一列：脚本里"取最后一列当名字"的写法不受影响）。
+    // 最直接的证据（NAME
+    // 仍然放在最后一列：脚本里"取最后一列当名字"的写法不受影响）。
     std::printf("%-34s %-12s %-20s %-14s %-12s %-4s %-34s %s\n", "SNAPSHOT_ID",
                 "SIZE", "CREATED", "SHA256", "KIND", "GEN", "PARENT", "NAME");
     for (const net::RemoteSnapshotInfo& info : snapshots) {
