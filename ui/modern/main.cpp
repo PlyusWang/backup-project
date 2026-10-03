@@ -110,6 +110,7 @@
 #include "operation_gate.h"
 #include "realtime_controller.h"
 #include "remote_controller.h"
+#include "remote_incremental.h"
 #include "schedule_controller.h"
 #include "schedule_frequency.h"
 #include "schedule_store.h"
@@ -2049,6 +2050,351 @@ int RunFilterUxTest(QQuickWindow* window,
   return run.failed == 0 ? 0 : 1;
 }
 
+// ---- 产品级远端备份 / 链恢复：GUI 路径的契约自检 ----
+//
+// 这一组把"GUI 真的能做完产品级的远端完整 / 增量备份与链恢复"钉死，并且与
+// --remote-test（自己起服务端）和 --remote-smoke（打真实端点，例如 ECS）**共用
+// 同一段代码**：两条路径覆盖的是同一批断言。
+//
+// 它用的是一个临时账号，结束前注销掉——正式数据一个字节都不动。
+//
+// 编号（与交接文档 02-GUI-CONTRACT.txt 一致）：
+//   GUI-P01 策略=完整：建出一份完整基线
+//   GUI-P02 改一个文件 -> 下一次是增量（parent / generation 正确、字节远小于完整）
+//   GUI-P03 源目录没有变化 -> 不创建快照，并且页面显示"没有检测到有效变化"
+//   GUI-P04 第一次就选"增量"但云端没有可续的链 -> 实际产出完整基线，
+//           页面按**实际类型**显示（不能写成"增量成功"）
+//   GUI-P05 列表暴露 kind / generation / parent
+//   GUI-P06 只给目标快照就能恢复整条链（内容逐字节一致）
+//   GUI-P07 冷缓存（清掉该账号的缓存目录）之后仍然能恢复
+//   GUI-P08 原始归档条目：restorable=false + 卡片上有明确提示；链恢复被拒，
+//           而且目标目录保持为空
+//   GUI-P09 错 pin：远端备份可见地失败，但**不会**把登录状态踢掉
+//   GUI-P10 服务端空闲关连接之后，下一次操作自动重连 + RESUME，不需要重新登录
+//   GUI-P11 忙碌：同一个控制器上的第二个长操作被拒（busy）
+int RunRemoteProductFlow(backup_modern::RemoteController* remote, CheckRun* run,
+                         const QString& work, const QString& username,
+                         const QString& password, const QString& fingerprint) {
+  const QString source = work + QStringLiteral("/product-src");
+  const QString first_out = work + QStringLiteral("/product-out-1");
+  const QString cold_out = work + QStringLiteral("/product-out-2");
+  const QString raw_out = work + QStringLiteral("/product-out-raw");
+  for (const QString& directory : {source, first_out, cold_out, raw_out}) {
+    QDir().mkpath(directory);
+  }
+  const auto writeText = [](const QString& path, const QString& text) {
+    QFile file(path);
+    if (file.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
+      file.write(text.toUtf8());
+    }
+  };
+  // 一份 200 KiB 的随机文件 + 两个小文本（其中一个在子目录里）：这样"改一个
+  // 小文件"之后的增量必须远小于完整基线。
+  {
+    QFile big(source + QStringLiteral("/data.bin"));
+    if (big.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
+      QByteArray payload(200 * 1024, 0);
+      for (int index = 0; index < payload.size(); ++index) {
+        payload[index] = static_cast<char>(
+            QRandomGenerator::global()->bounded(256));
+      }
+      big.write(payload);
+    }
+  }
+  writeText(source + QStringLiteral("/notes.txt"), QStringLiteral("v0\n"));
+  QDir().mkpath(source + QStringLiteral("/sub"));
+  writeText(source + QStringLiteral("/sub/inner.txt"),
+            QStringLiteral("inner-0\n"));
+
+  // 目录树逐字节比较（相对路径 + 内容）。恢复会把源目录本身作为一层放进去，
+  // 所以两种形状都接受：<dst>/... 或 <dst>/<source 名>/...
+  const auto collectTree = [](const QString& root) {
+    QMap<QString, QByteArray> files;
+    QDirIterator iterator(root, QDir::Files | QDir::NoDotAndDotDot,
+                          QDirIterator::Subdirectories);
+    while (iterator.hasNext()) {
+      const QString path = iterator.next();
+      QFile file(path);
+      if (file.open(QIODevice::ReadOnly)) {
+        files.insert(QDir(root).relativeFilePath(path), file.readAll());
+      }
+    }
+    return files;
+  };
+  const auto sameTree = [&collectTree](const QString& left,
+                                       const QString& right) {
+    const QMap<QString, QByteArray> a = collectTree(left);
+    const QMap<QString, QByteArray> b = collectTree(right);
+    return !a.isEmpty() && a == b;
+  };
+  const auto treeMatches = [&sameTree](const QString& left,
+                                       const QString& right) {
+    if (sameTree(left, right)) {
+      return true;
+    }
+    const QString nested =
+        right + QStringLiteral("/") + QFileInfo(left).fileName();
+    return QFileInfo(nested).isDir() && sameTree(left, nested);
+  };
+  const auto findSnapshot = [remote](const QString& id) {
+    for (const QVariant& item : remote->snapshots()) {
+      const QVariantMap map = item.toMap();
+      if (map.value(QStringLiteral("id")).toString() == id) {
+        return map;
+      }
+    }
+    return QVariantMap();
+  };
+  const auto findByDisplayName = [remote](const QString& display_name) {
+    for (const QVariant& item : remote->snapshots()) {
+      const QVariantMap map = item.toMap();
+      if (map.value(QStringLiteral("name")).toString() == display_name) {
+        return map;
+      }
+    }
+    return QVariantMap();
+  };
+  const auto refresh = [remote]() {
+    return remote->refreshList() && remote->waitForIdle(120000) &&
+           remote->lastErrorKindForTest() == QStringLiteral("none");
+  };
+  const auto removeTree = [](const QString& path) {
+    QDir directory(path);
+    if (directory.exists()) {
+      directory.removeRecursively();
+    }
+  };
+
+  // ---- GUI-P01：策略 = 完整 ----
+  remote->clearBackupSummary();
+  const bool full_accepted =
+      remote->backupRemote(source, /*allow_incremental=*/false);
+  const bool full_idle = full_accepted && remote->waitForIdle(900000);
+  const QString root_id = remote->lastBackupSnapshotIdForTest();
+  run->Check(full_idle &&
+                 remote->lastErrorKindForTest() == QStringLiteral("none") &&
+                 !remote->lastBackupProducedDeltaForTest() &&
+                 !remote->lastBackupNoChangesForTest() && !root_id.isEmpty(),
+             QStringLiteral("GUI-P01 策略=完整：建出一份完整基线"),
+             remote->lastErrorKindForTest() + QStringLiteral(": ") +
+                 remote->lastDetailForTest());
+  const qint64 root_bytes = remote->lastBackupUploadedBytesForTest();
+  const QVariantMap root_row = findSnapshot(root_id);
+  run->Check(!root_row.isEmpty() &&
+                 root_row.value(QStringLiteral("kind")).toString() ==
+                     QStringLiteral("full") &&
+                 root_row.value(QStringLiteral("generation")).toInt() == 0 &&
+                 root_row.value(QStringLiteral("restorable")).toBool(),
+             QStringLiteral("GUI-P05 列表暴露 kind / generation / parent（链根）"),
+             QStringLiteral("row=%1").arg(root_row.isEmpty() ? QStringLiteral("(missing)") : QStringLiteral("ok")));
+
+  // ---- GUI-P02：改一个小文件 -> 增量 ----
+  writeText(source + QStringLiteral("/notes.txt"), QStringLiteral("v1\n"));
+  const bool delta_accepted =
+      remote->backupRemote(source, /*allow_incremental=*/true);
+  const bool delta_idle = delta_accepted && remote->waitForIdle(900000);
+  const QString delta_id = remote->lastBackupSnapshotIdForTest();
+  const bool delta_ok =
+      delta_idle && remote->lastErrorKindForTest() == QStringLiteral("none") &&
+      remote->lastBackupProducedDeltaForTest() &&
+      !remote->lastBackupNoChangesForTest() && !delta_id.isEmpty() &&
+      remote->lastBackupSnapshotIdForTest() != root_id;
+  run->Check(delta_ok, QStringLiteral("GUI-P02 策略=增量：改一个文件后是增量快照"),
+             remote->lastErrorKindForTest() + QStringLiteral(": ") +
+                 remote->lastDetailForTest());
+  const QVariantMap delta_row = findSnapshot(delta_id);
+  run->Check(
+      !delta_row.isEmpty() &&
+          delta_row.value(QStringLiteral("kind")).toString() ==
+              QStringLiteral("incremental") &&
+          delta_row.value(QStringLiteral("generation")).toInt() == 1 &&
+          delta_row.value(QStringLiteral("parentShort")).toString() ==
+              root_id.left(12) &&
+          delta_row.value(QStringLiteral("restorable")).toBool(),
+      QStringLiteral("GUI-P02/P05 增量的父与代数在列表里可见（父=链根）"),
+      QStringLiteral("gen=%1 parent=%2")
+          .arg(delta_row.value(QStringLiteral("generation")).toInt())
+          .arg(delta_row.value(QStringLiteral("parentShort")).toString()));
+  run->Check(root_bytes > 0 &&
+                 remote->lastBackupUploadedBytesForTest() * 4 < root_bytes,
+             QStringLiteral("GUI-P02 增量字节远小于完整基线"),
+             QStringLiteral("增量=%1 完整=%2")
+                 .arg(remote->lastBackupUploadedBytesForTest())
+                 .arg(root_bytes));
+
+  // ---- GUI-P03：源目录没有变化 -> 不创建快照 ----
+  const int count_before = remote->snapshotCountForTest();
+  const bool nochange_accepted =
+      remote->backupRemote(source, /*allow_incremental=*/true);
+  const bool nochange_idle =
+      nochange_accepted && remote->waitForIdle(900000);
+  run->Check(nochange_idle && remote->lastBackupNoChangesForTest() &&
+                 remote->backupSummaryKind() == QStringLiteral("no-change") &&
+                 remote->backupSummary().contains(QStringLiteral("没有检测到有效变化")),
+             QStringLiteral("GUI-P03 没有变化：不创建新备份，页面说明没有变化"),
+             remote->backupSummary() + QStringLiteral(" / ") +
+                 remote->lastErrorKindForTest());
+  run->Check(refresh() && remote->snapshotCountForTest() == count_before,
+             QStringLiteral("GUI-P03 没有变化时列表不增加行"),
+             QStringLiteral("before=%1 after=%2")
+                 .arg(count_before)
+                 .arg(remote->snapshotCountForTest()));
+
+  // ---- GUI-P04：第一次就选"增量"，但云端没有可续的链 ----
+  const QString fresh = work + QStringLiteral("/product-fresh");
+  QDir().mkpath(fresh);
+  writeText(fresh + QStringLiteral("/only.txt"), QStringLiteral("fresh\n"));
+  const bool fresh_accepted =
+      remote->backupRemote(fresh, /*allow_incremental=*/true);
+  const bool fresh_idle = fresh_accepted && remote->waitForIdle(900000);
+  run->Check(fresh_idle &&
+                 remote->lastErrorKindForTest() == QStringLiteral("none") &&
+                 !remote->lastBackupProducedDeltaForTest() &&
+                 !remote->lastBackupNoChangesForTest() &&
+                 remote->backupSummary().contains(
+                     QStringLiteral("完整基线")),
+             QStringLiteral("GUI-P04 第一次选增量：实际产出完整基线且如实显示"),
+             remote->backupSummary() + QStringLiteral(" / ") +
+                 remote->lastErrorKindForTest());
+
+  // ---- GUI-P06：只给目标快照就能恢复整条链 ----
+  const bool restore_accepted = remote->restoreSnapshot(delta_id, first_out);
+  const bool restore_idle =
+      restore_accepted && remote->waitForIdle(900000);
+  run->Check(restore_idle &&
+                 remote->lastErrorKindForTest() == QStringLiteral("none") &&
+                 remote->lastRestoreChainLengthForTest() >= 2 &&
+                 remote->lastRestoreDeltaCountForTest() >= 1,
+             QStringLiteral("GUI-P06 只给目标快照：整条依赖链自动恢复"),
+             remote->lastErrorKindForTest() + QStringLiteral(": ") +
+                 remote->lastDetailForTest());
+  run->Check(treeMatches(source, first_out),
+             QStringLiteral("GUI-P06 恢复出来的目录与源目录逐字节一致"));
+
+  // ---- GUI-P07：冷缓存 ----
+  backupproject::net::RemoteCacheLayout layout;
+  std::string cache_error;
+  const bool layout_ok = backupproject::net::PrepareRemoteCache(
+      std::string(), fingerprint.toStdString(), username.toStdString(), &layout,
+      &cache_error);
+  removeTree(QString::fromStdString(layout.cache_directory));
+  run->Check(layout_ok && !QFileInfo::exists(QString::fromStdString(
+                              layout.cache_directory)),
+             QStringLiteral("GUI-P07 冷缓存：该账号的缓存目录已清空"),
+             QString::fromStdString(cache_error));
+  const bool cold_accepted = remote->restoreSnapshot(delta_id, cold_out);
+  const bool cold_idle = cold_accepted && remote->waitForIdle(900000);
+  run->Check(cold_idle &&
+                 remote->lastErrorKindForTest() == QStringLiteral("none") &&
+                 treeMatches(source, cold_out),
+             QStringLiteral("GUI-P07 冷缓存之后仍然能恢复整条链"),
+             remote->lastErrorKindForTest() + QStringLiteral(": ") +
+                 remote->lastDetailForTest());
+
+  // ---- GUI-P08：原始归档上传的条目不能做链恢复 ----
+  const QString raw_file = work + QStringLiteral("/gui-raw-archive.bin");
+  {
+    QFile raw(raw_file);
+    if (raw.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
+      raw.write(QByteArray(4096, 'R'));
+    }
+  }
+  const QString raw_name = QStringLiteral("gui-raw-archive");
+  const bool raw_uploaded = remote->uploadArchive(raw_file, raw_name) &&
+                            remote->waitForIdle(300000) &&
+                            remote->lastErrorKindForTest() ==
+                                QStringLiteral("none");
+  run->Check(raw_uploaded && refresh(),
+             QStringLiteral("GUI-P08 原始归档上传成功（低层 raw 操作）"),
+             remote->lastErrorKindForTest() + QStringLiteral(": ") +
+                 remote->lastDetailForTest());
+  const QVariantMap raw_row = findByDisplayName(raw_name);
+  run->Check(!raw_row.isEmpty() &&
+                 !raw_row.value(QStringLiteral("restorable")).toBool() &&
+                 raw_row.value(QStringLiteral("restoreHint")).toString().contains(
+                     QStringLiteral("原始归档")),
+             QStringLiteral("GUI-P08 原始归档条目：禁用链恢复并在卡片上说明原因"),
+             raw_row.value(QStringLiteral("restoreHint")).toString());
+  const bool raw_restore_accepted =
+      remote->restoreSnapshot(raw_row.value(QStringLiteral("id")).toString(),
+                              raw_out);
+  const bool raw_restore_idle =
+      raw_restore_accepted && remote->waitForIdle(300000);
+  const QString raw_kind = remote->lastErrorKindForTest();
+  run->Check(raw_restore_idle && raw_kind == QStringLiteral("not-a-bundle") &&
+                 QDir(raw_out)
+                     .entryList(QDir::Files | QDir::AllDirs |
+                                    QDir::NoDotAndDotDot,
+                                QDir::NoSort)
+                     .isEmpty(),
+             QStringLiteral("GUI-P08 对原始归档做链恢复：明确诊断且目标目录为空"),
+             raw_kind + QStringLiteral(": ") + remote->lastDetailForTest());
+
+  // ---- GUI-P09：错 pin 时远端备份可见地失败，但不踢掉登录状态 ----
+  const QString good_pin = remote->serverKeyPin();
+  const QString wrong_pin = QStringLiteral("sha256:") + QString(64, 'b');
+  const bool pin_set = remote->setServerKeyPin(wrong_pin);
+  // pin 是"建立连接时的期望值"：连接还活着的时候不会重新校验它（这是对的）。
+  // 这里等服务端按 --io-timeout 把空闲连接关掉，让下一次操作必须重新握手——
+  // 那一次就必须用**当前**的指纹，于是被挡住。这一条同时钉死了
+  // RemoteArchiveClient::SetReconnectEndpoint 的语义（重连用的是当前 pin，
+  // 而不是很久以前那一次 Connect 存下来的旧值）。
+  WaitForAnimation(4000);
+  const bool wrong_accepted =
+      remote->backupRemote(source, /*allow_incremental=*/false);
+  const bool wrong_idle = wrong_accepted && remote->waitForIdle(300000);
+  const QString wrong_kind = remote->lastErrorKindForTest();
+  run->Check(pin_set && wrong_idle &&
+                 wrong_kind == QStringLiteral("pin-mismatch") &&
+                 remote->statusKind() == QStringLiteral("error") &&
+                 remote->authenticated(),
+             QStringLiteral("GUI-P09 错 pin：重连被身份校验挡住，会话不被踢掉"),
+             wrong_kind + QStringLiteral(": ") + remote->lastDetailForTest());
+  run->Check(remote->setServerKeyPin(good_pin) && refresh(),
+             QStringLiteral("GUI-P09 换回正确指纹之后立刻恢复正常"),
+             remote->lastErrorKindForTest() + QStringLiteral(": ") +
+                 remote->lastDetailForTest());
+
+  // ---- GUI-P10：空闲被服务端关掉之后自动重连 + RESUME ----
+  // --remote-test 起服务端时用的是 --io-timeout 2；这里等它把空闲连接关掉。
+  WaitForAnimation(4000);
+  const bool after_idle = refresh() && remote->authenticated();
+  run->Check(after_idle,
+             QStringLiteral("GUI-P10 空闲断连之后列表仍然可读（自动重连 + RESUME）"),
+             remote->lastErrorKindForTest() + QStringLiteral(": ") +
+                 remote->lastDetailForTest());
+  writeText(source + QStringLiteral("/notes.txt"), QStringLiteral("v2\n"));
+  const bool resumed_backup =
+      remote->backupRemote(source, /*allow_incremental=*/true) &&
+      remote->waitForIdle(900000);
+  run->Check(resumed_backup &&
+                 remote->lastErrorKindForTest() == QStringLiteral("none") &&
+                 remote->lastBackupProducedDeltaForTest() &&
+                 remote->lastBackupGenerationForTest() == 2,
+             QStringLiteral("GUI-P10 空闲断连之后还能继续增量（generation=2）"),
+             remote->lastErrorKindForTest() + QStringLiteral(": ") +
+                 remote->lastDetailForTest());
+
+  // ---- GUI-P11：忙碌时第二个长操作被拒 ----
+  const bool first_accept = remote->backupRemote(source, false);
+  const bool second_accept = remote->backupRemote(source, false);
+  const QString busy_kind = remote->lastErrorKindForTest();
+  run->Check(first_accept && !second_accept &&
+                 busy_kind == QStringLiteral("busy") && remote->busy(),
+             QStringLiteral("GUI-P11 忙碌：第二个远端操作在控制器层被拒"),
+             busy_kind + QStringLiteral(" busy=") +
+                 QString::number(remote->busy()));
+  remote->waitForIdle(900000);
+
+  // ---- 清理：注销临时账号（正式数据不受影响）----
+  const bool deleted = remote->deleteAccount(password, username) &&
+                       remote->waitForIdle(300000) && !remote->authenticated();
+  run->Check(deleted, QStringLiteral("GUI-P12 临时账号已注销（正式数据不动）"),
+             remote->lastErrorKindForTest() + QStringLiteral(": ") +
+                 remote->lastDetailForTest());
+  return 0;
+}
+
 // ---- --remote-test：远程备份页的控制器链路 ----
 //
 // 它真的起一个 backup-server 进程（与 network_test.sh、阿里云部署用的是同一个
@@ -2283,6 +2629,29 @@ int RunRemoteSmoke(backup_modern::RemoteController* remote,
           relogin_kind == QStringLiteral("credentials"),
       QStringLiteral("SMOKE-12 注销之后原账户无法再登录（服务端没有这一行）"),
       relogin_kind);
+
+  // ---- 产品级远端备份 / 链恢复：与 --remote-test 共用同一段断言 ----
+  {
+    const QString product_user =
+        QStringLiteral("gui-prod-%1")
+            .arg(QRandomGenerator::global()->bounded(1000000, 9999999));
+    const bool product_registered = remote->registerAccount(
+        host, port_text, product_user, password, password);
+    const bool product_ready =
+        product_registered && remote->waitForIdle(120000) &&
+        remote->login(host, port_text, product_user, password) &&
+        remote->waitForIdle(120000) && remote->authenticated();
+    run.Check(product_ready,
+              QStringLiteral("SMOKE-G01 产品级流程的临时账号就绪"),
+              remote->lastErrorKindForTest() + QStringLiteral(": ") +
+                  remote->lastDetailForTest());
+    QString fingerprint = server_key_pin;
+    fingerprint.remove(QStringLiteral("sha256:"));
+    if (product_ready) {
+      RunRemoteProductFlow(remote, &run, work, product_user, password,
+                           fingerprint);
+    }
+  }
 
   std::printf("[remote-smoke] passed=%d failed=%d\n", run.passed, run.failed);
   if (run.failed != 0) {
@@ -3668,6 +4037,50 @@ int RunRemoteTest(QQuickWindow* window, backup_modern::RemoteController* remote,
               QStringLiteral("REMOTE-17b 第二个口令登不进去（原口令没被覆盖）"),
               remote->loginError() + QStringLiteral(" / kind=") +
                   remote->lastErrorKindForTest());
+  }
+
+  // ---- 产品级远端备份 / 链恢复（GUI 路径）----
+  //
+  // 这一节是 PR #21 的 GUI 闭环：QML 上的"远端备份"区域与快照卡片上的"恢复"
+  // 必须真的能走完整条链路，而不是只有 CLI 能用。
+  {
+    const auto objectByName = [window](const char* name) -> QObject* {
+      return window->findChild<QObject*>(QString::fromLatin1(name));
+    };
+    run.Check(objectByName("remoteBackupSourceField") != nullptr &&
+                  objectByName("remoteBackupSourceBrowseButton") != nullptr &&
+                  objectByName("remoteBackupStrategyTabs") != nullptr &&
+                  objectByName("remoteBackupButton") != nullptr &&
+                  objectByName("remoteBackupSummary") != nullptr &&
+                  objectByName("remoteBackupSourceFolderDialog") != nullptr &&
+                  objectByName("remoteRestoreFolderDialog") != nullptr,
+              QStringLiteral("REMOTE-G01 远端备份区域：源目录选择器 / 策略 / "
+                             "备份按钮 / 结论行 / 两个目录对话框都在"));
+    run.Check(objectByName("remoteSnapshotRestoreButton") != nullptr ||
+                  remote->snapshotCountForTest() == 0,
+              QStringLiteral("REMOTE-G01 快照卡片有独立的“恢复”主操作"));
+    run.Check(objectByName("remoteSnapshotDownloadButton") != nullptr ||
+                  remote->snapshotCountForTest() == 0,
+              QStringLiteral("REMOTE-G01 “下载归档”与“恢复”是两个按钮"));
+    const QString product_user =
+        QStringLiteral("gui-prod-%1")
+            .arg(QRandomGenerator::global()->bounded(1000000, 9999999));
+    const bool product_registered = remote->registerAccount(
+        host, port_text, product_user, password, password);
+    const bool product_ready =
+        product_registered && remote->waitForIdle(120000) &&
+        remote->login(host, port_text, product_user, password) &&
+        remote->waitForIdle(120000) && remote->authenticated();
+    run.Check(product_ready,
+              QStringLiteral("REMOTE-G01 产品级流程的临时账号就绪"),
+              remote->lastErrorKindForTest() + QStringLiteral(": ") +
+                  remote->lastDetailForTest());
+    QString fingerprint = server_key_pin;
+    fingerprint.remove(QStringLiteral("sha256:"));
+    if (product_ready) {
+      RunRemoteProductFlow(remote, &run, work, product_user, password,
+                           fingerprint);
+    }
   }
 
   std::printf("[remote-test] passed=%d failed=%d\n", run.passed, run.failed);
