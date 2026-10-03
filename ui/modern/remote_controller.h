@@ -96,6 +96,14 @@ struct RemoteOpResult {
     kDelete,
     // 注销账户：服务端删除，不是"退出登录"。
     kDeleteAccount,
+    // PR #21 产品级远端增量：把**目录**备份到远端（完整或增量）——
+    // 对应 backupctl remote backup。与 kUpload（上传一个本地 .bak）是
+    // 两件事：那一条是低层 raw 归档操作，这一条走材料包 + 链。
+    kBackup,
+    // 产品级链恢复：把某个远端快照（连同它的依赖链）恢复到本地目录——
+    // 对应 backupctl remote restore。与 kDownload（下载一个 blob）也是
+    // 两件事。
+    kRestore,
   };
 
   Kind kind = Kind::kList;
@@ -118,6 +126,30 @@ struct RemoteOpResult {
   backupproject::net::RemoteSnapshotInfo archive;
   std::uint64_t bytes_done = 0;
   std::uint64_t bytes_total = 0;
+
+  // ---- kBackup：产品级远端备份的结果（全部来自共享 core 的 outcome）----
+  //
+  // 关键的一条是"用户选的策略"与"这次实际产出的类型"**不是**同一件事：
+  // 允许增量但本地没有可信基线（或链太深、缓存不可信）时，core 会重建完整
+  // 基线。界面必须按 produced_delta / rebuilt_full_baseline 如实说，不能因为
+  // 用户点了"增量"就报"增量成功"。
+  bool backup_produced_delta = false;
+  bool backup_rebuilt_full = false;
+  bool backup_no_changes = false;
+  std::string backup_snapshot_id;
+  std::string backup_parent_snapshot_id;
+  std::uint64_t backup_generation = 0;
+  std::uint64_t backup_uploaded_bytes = 0;
+  std::uint64_t backup_chain_root_bytes = 0;
+  std::string backup_baseline_reason;
+  std::string backup_archive_name;
+
+  // ---- kRestore：产品级链恢复的结果 ----
+  std::uint64_t restore_chain_length = 0;
+  std::uint64_t restore_delta_count = 0;
+  std::uint64_t restore_downloaded_bytes = 0;
+  std::uint64_t restore_reused_bytes = 0;
+  std::uint64_t restore_restored_entries = 0;
 };
 
 // 后台线程需要的全部输入。刻意做成一个值类型：后台线程只读它，
@@ -132,6 +164,14 @@ struct RemoteRequest {
   std::string snapshot_id;
   std::string target_path;
   bool allow_overwrite = false;
+  // kBackup：源目录；allow_incremental 就是界面上的策略（false = Full，
+  // true = Incremental）。除此之外的一切（能不能续链、父是谁、代数、
+  // lineage、要不要 bootstrap 缓存）都由 core 决定，GUI 不参与。
+  std::string source_directory;
+  bool allow_incremental = false;
+  // kBackup：显示名。留空时由 core 按链规则生成。
+  // kRestore：目标目录。
+  std::string restore_destination;
 };
 
 class RemoteController : public QObject {
@@ -168,11 +208,24 @@ class RemoteController : public QObject {
   Q_PROPERTY(QString busyAction READ busyAction NOTIFY busyChanged)
 
   // ---- 云端备份列表 ----
-  // 每一项是 {id, name, sizeBytes, sizeText, createdText, sha256Short}：
-  // 页面只做展示，不再自己算大小与时间。
+  // 每一项是 {id, name, sizeBytes, sizeText, createdText, sha256Short} 加上
+  // PR #21 的链元数据 {kind, kindText, generation, parentId, parentShort,
+  // lineageShort, restorable, restoreHint}：页面只做展示，不再自己算大小、
+  // 时间，也不自己推断"这一条能不能恢复"。
   Q_PROPERTY(QVariantList snapshots READ snapshots NOTIFY snapshotsChanged)
   Q_PROPERTY(QString listSummary READ listSummary NOTIFY snapshotsChanged)
   Q_PROPERTY(bool listLoaded READ listLoaded NOTIFY snapshotsChanged)
+
+  // ---- 最近一次产品级远端备份的结论（给界面直接显示）----
+  //
+  // 为什么单独留一个属性，而不是只写进状态条：状态条是"临时提示"，会被下一次
+  // 操作顶掉；而"本次实际创建的是完整基线"这条信息必须在用户看着 Remote
+  // Backup 区域时一直成立。kind 取值：""（还没做过）/ "full" / "incremental"
+  // / "no-change"。summary 是给用户看的一句话。
+  Q_PROPERTY(QString backupSummary READ backupSummary NOTIFY backupSummaryChanged)
+  Q_PROPERTY(
+      QString backupSummaryKind READ backupSummaryKind NOTIFY
+          backupSummaryChanged)
 
   // ---- 传输进度 ----
   // 刻意不叫 progressValue / percent：modern_gui_check.sh 里有一条"不许出现
@@ -226,6 +279,10 @@ class RemoteController : public QObject {
   QVariantList snapshots() const { return snapshot_items_; }
   QString listSummary() const { return list_summary_; }
   bool listLoaded() const { return list_loaded_; }
+  // 最近一次产品级远端备份的结论（给 Remote Backup 区域常驻显示；
+  // 与 status_* 的临时提示分开，见文件末尾的成员说明）。
+  QString backupSummary() const { return backup_summary_; }
+  QString backupSummaryKind() const { return backup_summary_kind_; }
   bool transferActive() const { return transfer_active_; }
   QString transferPhaseText() const { return transfer_phase_text_; }
   qint64 bytesDone() const { return static_cast<qint64>(bytes_done_.load()); }
@@ -303,6 +360,23 @@ class RemoteController : public QObject {
   Q_INVOKABLE QUrl fileDialogStartUrl(const QString& path) const;
   Q_INVOKABLE QString suggestedDownloadName(const QString& display_name) const;
 
+  // ---- 产品级远端备份 / 链恢复（QML 入口）----
+  //
+  // 与 backupctl remote backup / remote restore 走**同一个** core：
+  //   QML -> RemoteController -> RunRemoteBackup / RunRemoteRestore
+  // GUI 只传"源目录 + 策略"和"目标快照 + 目标目录"，其余全部由 core 决定。
+  // 返回 false 表示请求没有被受理（输入不合法 / 忙碌 / 未登录 / 没有 pin），
+  // 此时页面上已经有原因。
+  Q_INVOKABLE bool backupRemote(const QString& source_directory,
+                                bool allow_incremental);
+  // 恢复某个远端快照（自动解析并下载整条依赖链）。snapshot_id 为空或目标目录
+  // 为空都在本地被拒，一个字节都不发。
+  Q_INVOKABLE bool restoreSnapshot(const QString& snapshot_id,
+                                   const QString& destination_directory);
+  // 用户改了源目录 / 策略或离开了这一页时清掉上一次的结论：旧结论挂在新输入上
+  // 会误导（"增量备份完成"是上一次的事）。
+  Q_INVOKABLE void clearBackupSummary();
+
   // ---- 仅供 main.cpp 的自动化测试使用（刻意不是 Q_INVOKABLE）----
   bool waitForIdle(int timeout_ms);
   QString lastErrorKindForTest() const { return last_error_kind_; }
@@ -315,6 +389,41 @@ class RemoteController : public QObject {
   int progressCallbackCountForTest() const {
     return progress_callbacks_.load();
   }
+  // ---- 产品级远端备份 / 恢复：自检需要读的结构化结果 ----
+  bool lastBackupProducedDeltaForTest() const {
+    return last_backup_produced_delta_;
+  }
+  bool lastBackupRebuiltFullForTest() const {
+    return last_backup_rebuilt_full_;
+  }
+  bool lastBackupNoChangesForTest() const { return last_backup_no_changes_; }
+  QString lastBackupSnapshotIdForTest() const {
+    return last_backup_snapshot_id_;
+  }
+  qint64 lastBackupUploadedBytesForTest() const {
+    return static_cast<qint64>(last_backup_uploaded_bytes_);
+  }
+  qint64 lastBackupGenerationForTest() const {
+    return static_cast<qint64>(last_backup_generation_);
+  }
+  qint64 lastBackupChainRootBytesForTest() const {
+    return static_cast<qint64>(last_backup_chain_root_bytes_);
+  }
+  QString lastBackupBaselineReasonForTest() const {
+    return last_backup_baseline_reason_;
+  }
+  qint64 lastRestoreChainLengthForTest() const {
+    return static_cast<qint64>(last_restore_chain_length_);
+  }
+  qint64 lastRestoreDeltaCountForTest() const {
+    return static_cast<qint64>(last_restore_delta_count_);
+  }
+  qint64 lastRestoreDownloadedBytesForTest() const {
+    return static_cast<qint64>(last_restore_downloaded_bytes_);
+  }
+  qint64 lastRestoreEntriesForTest() const {
+    return static_cast<qint64>(last_restore_entries_);
+  }
 
  signals:
   void endpointChanged();
@@ -325,6 +434,8 @@ class RemoteController : public QObject {
   void registerErrorChanged();
   void serverKeyPinChanged();
   void serverKeyPinErrorChanged();
+  // 最近一次产品级备份的结论（完整 / 增量 / 无变化）发生变化。
+  void backupSummaryChanged();
   void busyChanged();
   void snapshotsChanged();
   void progressChanged();
@@ -455,6 +566,25 @@ class RemoteController : public QObject {
   QString status_kind_ = QStringLiteral("idle");
   QString status_title_ = QStringLiteral("未登录");
   QString status_message_;
+
+  // ---- 最近一次产品级远端备份的结论 ----
+  //
+  // 与 status_* 分开存放：状态条是"临时提示"，这一组是"当前这一页关于上一次
+  // 远端备份的事实"，不会被别的操作顺手清掉，直到用户改了输入或又做了一次。
+  QString backup_summary_;
+  QString backup_summary_kind_;
+  bool last_backup_produced_delta_ = false;
+  bool last_backup_rebuilt_full_ = false;
+  bool last_backup_no_changes_ = false;
+  QString last_backup_snapshot_id_;
+  std::uint64_t last_backup_uploaded_bytes_ = 0;
+  std::uint64_t last_backup_chain_root_bytes_ = 0;
+  std::uint64_t last_backup_generation_ = 0;
+  QString last_backup_baseline_reason_;
+  std::uint64_t last_restore_chain_length_ = 0;
+  std::uint64_t last_restore_delta_count_ = 0;
+  std::uint64_t last_restore_downloaded_bytes_ = 0;
+  std::uint64_t last_restore_entries_ = 0;
 };
 
 }  // namespace backup_modern
