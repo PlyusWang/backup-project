@@ -51,7 +51,8 @@
 ## 6. 明确没有做的事
 
 * 没有从任何第三方库（OpenSSL / LibreSSL / BoringSSL / libsodium / mbedTLS / wolfSSL / Crypto++ / Botan / Qt SSL / Boost.Asio SSL / libssh）复制、改编或链接任何实现代码；整个传输层只依赖 C++17 标准库、POSIX 与**本项目自己写的**密码学原语。
-* 没有从博客、StackOverflow 或 RFC 附录的参考实现里抄代码：RFC 7748 的 ladder 以**伪代码形式**出现在标准正文中，本实现按该算法定义自行编写，变量命名、数据结构（8x51 而非 10x25.5 或 5x51 limb 之外的任何既有布局）、归约与求逆策略都是本项目自己的写法。
+* 没有从博客、StackOverflow 或 RFC 附录的参考实现里抄代码：RFC 7748 的 ladder 以**伪代码形式**出现在标准正文中，本实现按该算法定义自行编写。
+  数据结构与归约策略都是本项目自己的写法：有限域元素是 **8 个 2^32 进制 limb**（不是 5x51 / 10x25.5 之类的既有布局），乘法是 8x8 教科书展开后用 2^256 ≡ 38 折叠高位，进位链只用 uint64_t（**不依赖 __int128** 一类编译器扩展），求逆用固定指数的平方-乘法。
 * 没有引入任何新的第三方依赖（Makefile 里的链接库与 PR #20 完全一致：只有 libsqlite3 与 pthread）。
 
 No third-party implementation source was copied.
