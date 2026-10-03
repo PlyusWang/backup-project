@@ -246,6 +246,8 @@ QString RemoteController::KindName(RemoteOpResult::Kind kind) {
       return QStringLiteral("backup");
     case RemoteOpResult::Kind::kRestore:
       return QStringLiteral("restore");
+    case RemoteOpResult::Kind::kRestoreRaw:
+      return QStringLiteral("restore-raw");
   }
   return QStringLiteral("unknown");
 }
@@ -297,6 +299,26 @@ QString RemoteController::ClassifyFailure(const std::string& status_name,
       return QStringLiteral("rejected");
     }
     return QStringLiteral("server");
+  }
+  // 原始归档单独恢复（kRestoreRaw）的三个专有失败。必须排在通用规则**之前**：
+  // 那些原因里含"依赖链""加密"等字样，落到通用规则上会被归成 integrity 之类，
+  // 用户就拿不到"改用产品级恢复 / 请填密码 /
+  // 这不是备份归档"这三句可照做的提示。 标记来自共享
+  // core（remote_incremental.cpp），是稳定的英文前缀。
+  if (Contains(detail, "raw restore: not a supported archive")) {
+    return QStringLiteral("raw-unsupported");
+  }
+  if (Contains(detail, "raw restore: needs a password")) {
+    return QStringLiteral("raw-password");
+  }
+  if (Contains(detail, "raw restore: download failed")) {
+    return QStringLiteral("raw-download");
+  }
+  if (Contains(detail, "raw restore: delta needs its chain")) {
+    return QStringLiteral("raw-delta");
+  }
+  if (Contains(detail, "raw restore:")) {
+    return QStringLiteral("raw-restore");
   }
   if (Contains(detail, "before login") || Contains(detail, "needs a session")) {
     return QStringLiteral("not-logged-in");
@@ -379,6 +401,32 @@ QString RemoteController::DescribeFailure(const QString& error_kind) {
         "这一条不是远端备份链的材料包（它是原始归档上传）：不能用链恢复，"
         "请改用“下载归档”。");
   }
+  // ---- 原始归档单独恢复：三种失败各有各的动作 ----
+  if (error_kind == QStringLiteral("raw-unsupported")) {
+    return QStringLiteral(
+        "该远端对象不是这个软件能独立恢复的备份归档（按内容识别，与文件名、"
+        "扩展名无关）。目标目录没有被创建，也没有留下任何文件。");
+  }
+  if (error_kind == QStringLiteral("raw-password")) {
+    return QStringLiteral(
+        "这份归档是加密的：请填写恢复密码之后再点“尝试恢复”。没有密码"
+        "无法恢复，也不会绕过加密。");
+  }
+  if (error_kind == QStringLiteral("raw-delta")) {
+    return QStringLiteral(
+        "这是一份增量备份，不能脱离依赖链单独恢复：它需要同一序列里的父快照"
+        "与配套材料。请改用产品级“恢复”，它会自动取回整条依赖链。");
+  }
+  if (error_kind == QStringLiteral("raw-download")) {
+    return QStringLiteral(
+        "下载这份原始归档时失败（网络中断，或者字节没有通过 SHA-256 校验）："
+        "本地没有留下任何文件，可以直接再试一次。");
+  }
+  if (error_kind == QStringLiteral("raw-restore")) {
+    return QStringLiteral(
+        "按本地备份格式恢复失败（归档损坏，或者它不是一份完整备份）。"
+        "目标目录没有被创建，也没有留下任何文件。");
+  }
   if (error_kind == QStringLiteral("forbidden")) {
     return QStringLiteral("没有权限访问这个云端备份。");
   }
@@ -441,6 +489,21 @@ QString RemoteController::TitleForFailure(const QString& error_kind) {
   }
   if (error_kind == QStringLiteral("not-a-bundle")) {
     return QStringLiteral("不是可恢复的远端备份");
+  }
+  if (error_kind == QStringLiteral("raw-unsupported")) {
+    return QStringLiteral("不是可独立恢复的备份归档");
+  }
+  if (error_kind == QStringLiteral("raw-password")) {
+    return QStringLiteral("需要恢复密码");
+  }
+  if (error_kind == QStringLiteral("raw-delta")) {
+    return QStringLiteral("增量备份不能单独恢复");
+  }
+  if (error_kind == QStringLiteral("raw-download")) {
+    return QStringLiteral("下载原始归档失败");
+  }
+  if (error_kind == QStringLiteral("raw-restore")) {
+    return QStringLiteral("按本地格式恢复失败");
   }
   if (error_kind == QStringLiteral("forbidden")) {
     return QStringLiteral("没有权限");
@@ -522,7 +585,17 @@ void RemoteController::SetSnapshots(
   std::sort(
       ordered.begin(), ordered.end(),
       [](const RemoteSnapshotInfo& left, const RemoteSnapshotInfo& right) {
-        return left.created_at > right.created_at;
+        if (left.created_at != right.created_at) {
+          return left.created_at > right.created_at;
+        }
+        // 同一秒创建的快照（一次链式备份就是这种情况：R0/R1/R2 落在同一秒里）
+        // 必须有一个**确定**的顺序，否则 std::sort 给出的排列可能让子快照排到
+        // 父快照下面——用户看到的"最新的一份"就不是最新的了，验收截图也不可
+        // 复现。规则：代数大的在前，最后用 id 兜底。
+        if (left.generation != right.generation) {
+          return left.generation > right.generation;
+        }
+        return left.snapshot_id < right.snapshot_id;
       });
   QVariantList items;
   for (const RemoteSnapshotInfo& info : ordered) {
@@ -536,35 +609,71 @@ void RemoteController::SetSnapshots(
     item.insert(QStringLiteral("createdText"), FormatTime(info.created_at));
     item.insert(QStringLiteral("sha256Short"),
                 QString::fromStdString(info.sha256).left(12));
-    // ---- PR #21：链元数据（界面据此显示 Full/Incremental、代数、父）----
+    // ---- 远端对象的**类型**：三类，界面必须一眼分得开 ----
+    //
+    // 唯一依据是服务端元数据（lineage / snapshot_kind），不按文件名、不按
+    // 显示名猜：
+    //
+    //   rawArchive   lineage 为空、不是增量
+    //                -> PR #20 时代的原始归档上传 / 低层 remote upload。
+    //                   它不是 BPSNAP1 材料包，**没有**链语义（没有父、没有
+    //                   代数），所以既不能显示成"完整备份"，也没有"代数 0"
+    //                   可言。它可以"下载之后按本地格式独立恢复"，但那不是
+    //                   链恢复——两者的按钮与说明必须是两套话。
+    //   productFull  lineage 非空、不是增量
+    //                -> 产品级完整基线（链根，代数 0）。
+    //   incremental  增量
+    //                -> 产品级增量：有代数、有父。
     const bool incremental = info.snapshot_kind == 1;
+    const bool raw_archive = !incremental && info.lineage.empty();
+    const bool product_full = !incremental && !info.lineage.empty();
     const QString parent = QString::fromStdString(info.parent_snapshot_id);
-    // "这一条能不能做链恢复"完全由**服务端元数据**决定，界面不猜：
-    //   增量                    -> 产品链成员，能恢复；
-    //   完整 + lineage 非空     -> 产品完整基线（链根），能恢复；
-    //   完整 + lineage 为空     -> PR #20 时代的原始归档上传 / 低层 remote
-    //                              upload：它的 blob 不是 BPSNAP1 材料包，
-    //                              链恢复对它没有意义（服务端也不解析内容，
-    //                              所以这是客户端唯一能区分的方式）。
-    const bool product_snapshot = incremental || !info.lineage.empty();
     item.insert(QStringLiteral("kind"), incremental
                                             ? QStringLiteral("incremental")
-                                            : QStringLiteral("full"));
+                                        : raw_archive ? QStringLiteral("raw")
+                                                      : QStringLiteral("full"));
+    // badge 文案：三类三个词。raw 绝不能显示成"完整"——那样用户会以为它是
+    // 一份完整备份，然后问"为什么不能恢复"。
     item.insert(QStringLiteral("kindText"),
-                incremental ? QStringLiteral("增量") : QStringLiteral("完整"));
+                incremental   ? QStringLiteral("增量备份")
+                : raw_archive ? QStringLiteral("原始归档")
+                              : QStringLiteral("完整备份"));
+    item.insert(QStringLiteral("rawArchive"), raw_archive);
+    // "代数"只对产品链成员有意义：raw 没有链，显示"代数 0"就是编出来的语义。
+    item.insert(QStringLiteral("generationVisible"), !raw_archive);
     item.insert(QStringLiteral("generation"),
                 static_cast<qulonglong>(info.generation));
     item.insert(QStringLiteral("parentId"), parent);
     item.insert(QStringLiteral("parentShort"), parent.left(12));
     item.insert(QStringLiteral("lineageShort"),
                 QString::fromStdString(info.lineage).left(12));
-    item.insert(QStringLiteral("restorable"), product_snapshot);
+    // 主操作的文案：产品级是"恢复"（自动取回整条依赖链），原始归档是
+    // "尝试恢复"（下载之后按本地格式独立恢复；能不能恢复要看内容）。
+    item.insert(QStringLiteral("restoreLabel"), raw_archive
+                                                    ? QStringLiteral("尝试恢复")
+                                                    : QStringLiteral("恢复"));
     item.insert(
-        QStringLiteral("restoreHint"),
-        product_snapshot
-            ? QString()
-            : QStringLiteral("该远程条目是原始归档上传，不属于远端备份链；"
-                             "请使用“下载归档”。"));
+        QStringLiteral("restoreTooltip"),
+        raw_archive
+            ? QStringLiteral("下载该归档，并尝试按本地备份格式独立恢复；"
+                             "原始归档不属于远端增量链。")
+            : QStringLiteral("自动获取完整依赖链并恢复此快照。"));
+    // 卡片上那一句说明。raw 需要一句"它是什么"，产品级不需要。
+    item.insert(QStringLiteral("typeNote"),
+                raw_archive ? QStringLiteral(
+                                  "手动上传的备份归档，不属于远端增量备份链。")
+                            : QString());
+    // 能不能点主操作：
+    //   * 产品级（full / incremental）-> 由链语义决定，能恢复；
+    //   * raw -> 可以"尝试恢复"：能不能恢复要看内容，所以这里允许点击，
+    //     真正的失败（随机文件 / 损坏 / 单独的 delta / 缺密码）由 core 给出
+    //     明确原因，而不是在这里凭元数据猜。
+    item.insert(QStringLiteral("restorable"),
+                product_full || incremental || raw_archive);
+    // restoreHint 只用于"这一条现在确实不能恢复"的情况（目前只剩产品级里
+    // 链自洽性异常这种理论情形）。raw 的说明走 typeNote，不再写"请用下载归档"
+    // ——那句话在"原始归档也能独立恢复"之后已经不成立了。
+    item.insert(QStringLiteral("restoreHint"), QString());
     items.append(item);
   }
   snapshot_items_ = items;
@@ -866,6 +975,36 @@ QString RemoteController::SurfaceFailureMessage(RemoteOpResult::Kind kind,
         return QStringLiteral("服务器暂时无法完成这次恢复");
       }
       break;
+    case RemoteOpResult::Kind::kRestoreRaw:
+      if (error_kind == QStringLiteral("raw-unsupported")) {
+        return QStringLiteral(
+            "该远端对象不是这个软件能独立恢复的备份归档（按内容识别）："
+            "目标目录没有被创建，也没有留下任何文件");
+      }
+      if (error_kind == QStringLiteral("raw-delta")) {
+        return QStringLiteral(
+            "这是一份增量备份，不能脱离依赖链单独恢复：请改用产品级“恢复”");
+      }
+      if (error_kind == QStringLiteral("raw-password")) {
+        return QStringLiteral("这份归档是加密的：请填写恢复密码之后再试");
+      }
+      if (error_kind == QStringLiteral("raw-download")) {
+        return QStringLiteral(
+            "下载这份原始归档失败（网络中断或校验不通过）：本地没有留下任何文"
+            "件");
+      }
+      if (error_kind == QStringLiteral("raw-restore")) {
+        return QStringLiteral(
+            "按本地备份格式恢复失败：目标目录没有被创建，也没有留下任何文件");
+      }
+      if (network) {
+        return QStringLiteral(
+            "网络连接中断，这份原始归档没有被恢复；目标目录没有被改动");
+      }
+      if (server_side) {
+        return QStringLiteral("服务器暂时无法取回这份原始归档");
+      }
+      break;
     case RemoteOpResult::Kind::kDeleteAccount:
       if (error_kind == QStringLiteral("account-password")) {
         return QStringLiteral("当前密码不正确，账户与全部云端备份都没有被删除");
@@ -1056,6 +1195,37 @@ RemoteOpResult RemoteController::RunOperation(
       }
       break;
     }
+    case RemoteOpResult::Kind::kRestoreRaw: {
+      // 原始归档的单独恢复：下载那一个 blob，按内容认出格式，再交给**既有的
+      // 本地恢复核心**（BackupEngine / RunRestorePipeline）。这里没有链、
+      // 没有父、没有副文件，也没有任何 GUI 自己解析归档的代码。
+      backupproject::net::RemoteCacheLayout cache;
+      if (!backupproject::net::PrepareRemoteCache(
+              std::string(), client->server_fingerprint(), request.username,
+              &cache, &error)) {
+        result.ok = false;
+        break;
+      }
+      backupproject::net::RemoteRawRestoreRequest raw;
+      raw.client = client;
+      raw.cache = cache;
+      raw.snapshot_id = request.snapshot_id;
+      raw.display_name = request.display_name;
+      raw.destination_directory = request.restore_destination;
+      raw.restore_options.password = request.restore_password;
+      raw.progress = progress;
+      backupproject::net::RemoteRawRestoreOutcome outcome;
+      result.ok =
+          backupproject::net::RunRemoteRawRestore(raw, &outcome, &error);
+      result.raw_password_required = outcome.password_required;
+      if (result.ok) {
+        result.raw_downloaded_bytes = outcome.downloaded_bytes;
+        result.raw_verified_sha256 = outcome.verified_sha256;
+        result.raw_archive_format = outcome.archive_format;
+        result.raw_restored_entries = outcome.restored_entries;
+      }
+      break;
+    }
   }
   if (!result.ok) {
     result.detail =
@@ -1112,6 +1282,15 @@ void RemoteController::ApplyResult(const RemoteOpResult& result) {
   } else {
     last_error_kind_ = result.error_kind;
     last_detail_ = result.detail;
+    // 原始归档单独恢复的**失败**也要把结构化结果留下来：缺密码与"不是备份
+    // 归档"必须能被区分开，界面（以及自检）才能给出各自可照做的动作。
+    if (result.kind == RemoteOpResult::Kind::kRestoreRaw) {
+      last_raw_restore_password_required_ = result.raw_password_required;
+      last_raw_restore_sha256_ =
+          QString::fromStdString(result.raw_verified_sha256);
+      last_raw_restore_format_ =
+          QString::fromStdString(result.raw_archive_format);
+    }
     std::fprintf(
         stderr, "[remote] %s 没有完成：%s%s%s\n",
         KindName(result.kind).toUtf8().constData(),
@@ -1314,6 +1493,24 @@ void RemoteController::ApplyResult(const RemoteOpResult& result) {
       }
       break;
     }
+    case RemoteOpResult::Kind::kRestoreRaw:
+      // 原始归档的单独恢复：结论必须与产品级"恢复"分得开——它没有链，走的
+      // 也不是链恢复。这里如实说"下载了什么、按什么格式恢复的、恢复了多少条目"。
+      last_raw_restore_downloaded_bytes_ = result.raw_downloaded_bytes;
+      last_raw_restore_entries_ = result.raw_restored_entries;
+      last_raw_restore_sha256_ =
+          QString::fromStdString(result.raw_verified_sha256);
+      last_raw_restore_format_ =
+          QString::fromStdString(result.raw_archive_format);
+      last_raw_restore_password_required_ = result.raw_password_required;
+      SetStatus(
+          QStringLiteral("success"), QStringLiteral("原始归档恢复完成"),
+          QStringLiteral("已下载并校验（SHA-256 %1…），按本地格式 %2 独立恢复，"
+                         "恢复了 %3 个条目。它不是远端备份链的一部分。")
+              .arg(QString::fromStdString(result.raw_verified_sha256).left(12),
+                   QString::fromStdString(result.raw_archive_format))
+              .arg(static_cast<qulonglong>(result.raw_restored_entries)));
+      break;
     case RemoteOpResult::Kind::kRestore:
       last_restore_chain_length_ = result.restore_chain_length;
       last_restore_delta_count_ = result.restore_delta_count;
@@ -1794,6 +1991,51 @@ bool RemoteController::restoreSnapshot(const QString& snapshot_id,
   request.username = username_.toStdString();
   request.snapshot_id = id.toStdString();
   request.restore_destination = destination.toStdString();
+  Submit(request);
+  return true;
+}
+
+bool RemoteController::restoreRawArchive(const QString& snapshot_id,
+                                         const QString& destination_directory,
+                                         const QString& password) {
+  const QString id = snapshot_id.trimmed();
+  const QString destination = destination_directory.trimmed();
+  if (id.isEmpty()) {
+    SetStatus(QStringLiteral("error"), QStringLiteral("没有选中云端备份"),
+              QStringLiteral("先在列表里选中一条原始归档，再点“尝试恢复”。"));
+    return false;
+  }
+  if (destination.isEmpty()) {
+    SetStatus(QStringLiteral("error"), QStringLiteral("还没有选择恢复位置"),
+              QStringLiteral("点“选择恢复位置”，指定恢复到哪个目录。"));
+    return false;
+  }
+  // 密码**不是**必填项：只有那份归档确实是加密的，core 才会要求它。这里不做
+  // 任何"看起来像密码"的猜测，也不把口令写进日志或状态文本。
+  if (!BeginOperation(QStringLiteral("正在下载原始归档并尝试恢复"),
+                      /*need_login=*/true)) {
+    return false;
+  }
+  RemoteRequest request;
+  request.kind = RemoteOpResult::Kind::kRestoreRaw;
+  request.endpoint = endpoint_;
+  // pin 与地址是同一份快照：每一处提交都显式带上它（见头文件里的说明）。
+  request.endpoint.server_key_pin = serverKeyPin().toStdString();
+  // 缓存路径里带用户名（<指纹>/<用户名>/），下载与恢复都要用它。
+  request.username = username_.toStdString();
+  request.snapshot_id = id.toStdString();
+  request.restore_destination = destination.toStdString();
+  request.restore_password = password.toStdString();
+  // 显示名只用来给下载下来的临时文件起一个看得懂的名字（core 会把它降级成
+  // 单组件文件名）。它**不参与**任何格式判断——那只看内容。
+  for (const QVariant& entry : snapshot_items_) {
+    const QVariantMap item = entry.toMap();
+    if (item.value(QStringLiteral("id")).toString() == id) {
+      request.display_name =
+          item.value(QStringLiteral("name")).toString().toStdString();
+      break;
+    }
+  }
   Submit(request);
   return true;
 }

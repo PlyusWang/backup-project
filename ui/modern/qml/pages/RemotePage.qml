@@ -11,7 +11,13 @@
 //   2. 远端备份   —— 选一个**源目录**，完整或增量备份到远端（产品级能力，
 //                    与 backupctl remote backup 共用同一套 core）
 //   3. 云端备份   —— 列表（名称 / 类型 / 代数 / 父 / 大小 / 时间）
-//                    + 恢复（链恢复）/ 下载归档 / 删除
+//                    + 恢复（产品级链恢复）/ 下载归档 / 删除。
+//                    列表里同时可能出现**三类**对象，它们一眼可分：
+//                      [原始归档]  手动上传的归档：没有链、没有代数、没有父；
+//                                  主操作是"尝试恢复"（下载后按本地格式独立
+//                                  恢复），不是链恢复。
+//                      [完整备份]  产品链根：代数 0，主操作是"恢复"。
+//                      [增量备份]  产品链成员：代数 N + 父快照前 12 位。
 //   4. 高级       —— 上传 / 下载**原始归档**（低层 raw 操作，与上面的产品级
 //                    备份是两件事，刻意分开放）
 //   5. 技术详情   —— 默认折叠：编号、摘要、最近一次失败的技术原因
@@ -79,6 +85,13 @@ Item {
     property string pendingRestoreId: ""
     property string pendingRestoreName: ""
     property string draftRestorePath: ""
+    // ---- 原始归档的"尝试恢复"（与产品级链恢复是两套机制）----
+    // 原始归档没有链：先把那一个 blob 下载下来，再按本地备份格式独立恢复。
+    // 目标目录与（可选的）恢复密码都只活在这个对话框里；密码不落盘、不回读。
+    property string pendingRawRestoreId: ""
+    property string pendingRawRestoreName: ""
+    property string draftRawRestorePath: ""
+    property string draftRawRestorePassword: ""
 
     // 真正的互斥在控制器里（busy_ 在提交任务之前同步置位）；这里只是可见性。
     readonly property bool canOperate: remote.authenticated && !remote.busy
@@ -122,13 +135,48 @@ Item {
         remote.downloadArchive(snapshotId, page.draftDownloadPath, false)
     }
 
-    // 恢复一份远端备份：先选目标目录（必填），选完才发起。
-    // 这里**不**问用户父快照 / 代数 / lineage：那是 core 的事。
-    function requestRestore(snapshotId, name) {
+    // 恢复一份远端备份。
+    //
+    // 两种类型走**两条不同的路**，所以对话框也不同：
+    //   * 产品级（完整备份 / 增量备份）：选目标目录 -> 自动取回整条依赖链再恢复；
+    //   * 原始归档（lineage 为空）：选目标目录（+ 加密时才需要的密码）->
+    //     下载那一个 blob、按本地格式独立恢复。
+    // 判断只看控制器给的类型，不按名字猜。
+    function requestRestore(snapshotId, name, isRawArchive) {
+        if (isRawArchive) {
+            page.requestRawRestore(snapshotId, name)
+            return
+        }
         page.pendingRestoreId = snapshotId
         page.pendingRestoreName = name
         restoreDialog.currentFolder = remote.fileDialogStartUrl(page.draftRestorePath)
         restoreDialog.open()
+    }
+
+    // 原始归档：打开"尝试恢复"对话框。密码留空表示"没填"——只有那份归档
+    // 确实是加密的，core 才会要求它，这里不做任何猜测。
+    function requestRawRestore(snapshotId, name) {
+        page.pendingRawRestoreId = snapshotId
+        page.pendingRawRestoreName = name
+        // 口令永远不预填（它只活在这一页的内存里）；目标目录保留上一次的选择，
+        // 与产品级恢复对话框同一条行为：用户改了目录也会被记住。
+        page.draftRawRestorePassword = ""
+        rawRestoreFolderDialog.currentFolder =
+            remote.fileDialogStartUrl(page.draftRawRestorePath)
+        rawRestoreDialog.open()
+    }
+
+    function confirmRawRestore() {
+        const target = page.pendingRawRestoreId
+        const destination = page.draftRawRestorePath
+        const password = page.draftRawRestorePassword
+        if (target === "" || destination === "")
+            return
+        rawRestoreDialog.close()
+        page.pendingRawRestoreId = ""
+        page.pendingRawRestoreName = ""
+        page.draftRawRestorePassword = ""
+        remote.restoreRawArchive(target, destination, password)
     }
 
     // 策略当前值（SegmentedTabs 用的键）。
@@ -807,6 +855,19 @@ Item {
                         wrapMode: Text.WrapAnywhere
                     }
 
+                    // 两种恢复机制的一句话区别。列表里同时存在"完整备份 /
+                    // 增量备份"（产品链）与"原始归档"（手动上传的归档）时，
+                    // 这句话让用户不用点开就知道两个按钮不是一回事。
+                    Text {
+                        objectName: "remoteRestoreMechanismHint"
+                        Layout.fillWidth: true
+                        visible: page.rowCount > 0
+                        text: "「恢复」会自动取回完整依赖链并恢复此快照；「尝试恢复」只用于原始归档——先下载，再按本地备份格式独立恢复。"
+                        font.pixelSize: 15
+                        color: theme.textSecondary
+                        wrapMode: Text.WrapAnywhere
+                    }
+
                     Text {
                         objectName: "remoteListEmptyText"
                         Layout.fillWidth: true
@@ -863,12 +924,18 @@ Item {
                             createdText: String(modelData["createdText"] || "")
                             kindText: String(modelData["kindText"] || "")
                             kindKey: String(modelData["kind"] || "")
+                            rawArchive: modelData["rawArchive"] === true
+                            generationVisible: modelData["generationVisible"] !== false
                             generation: Number(modelData["generation"] || 0)
                             parentShort: String(modelData["parentShort"] || "")
+                            typeNote: String(modelData["typeNote"] || "")
+                            restoreLabel: String(modelData["restoreLabel"] || "恢复")
                             restorable: modelData["restorable"] !== false
                             restoreHint: String(modelData["restoreHint"] || "")
                             busy: remote.busy
-                            onRestoreRequested: function (snapshotId, name) { page.requestRestore(snapshotId, name) }
+                            onRestoreRequested: function (snapshotId, name) {
+                                page.requestRestore(snapshotId, name, modelData["rawArchive"] === true)
+                            }
                             onDownloadRequested: function (snapshotId, name) { page.requestDownload(snapshotId, name) }
                             onDeleteRequested: function (snapshotId, name) { page.requestDelete(snapshotId, name) }
                         }
@@ -928,8 +995,9 @@ Item {
                     }
 
                     Text {
+                        objectName: "remoteUploadExplanation"
                         Layout.fillWidth: true
-                        text: "这是低层操作：把一个已经存在的 .bak 原样放到云端，与上面的“远端备份”不是一回事——它不参与增量链，也不能用来做链恢复。"
+                        text: "这是低层操作：把一个已经存在的 .bak 原样放到云端，与上面的“远端备份”不是一回事——它不参与增量链，也不会出现在链恢复里。上传之后，列表里那一条是【原始归档】：要取回来就用它的“尝试恢复”（下载后按本地格式独立恢复）或“下载归档”。"
                         font.pixelSize: 15
                         color: theme.textSecondary
                         wrapMode: Text.WrapAnywhere
@@ -1105,6 +1173,122 @@ Item {
             page.pendingRestoreId = ""
             if (target !== "")
                 remote.restoreSnapshot(target, chosen)
+        }
+    }
+
+    // 原始归档"尝试恢复"的目标目录。选完只填进对话框，**不**立刻发起：
+    // 用户可能还要填恢复密码，一次点"尝试恢复"就够了。
+    FolderDialog {
+        id: rawRestoreFolderDialog
+        objectName: "remoteRawRestoreFolderDialog"
+        title: "选择恢复原始归档到哪个目录"
+        onAccepted: {
+            const chosen = remote.localPathFromUrl(rawRestoreFolderDialog.selectedFolder)
+            if (chosen !== "")
+                page.draftRawRestorePath = chosen
+        }
+    }
+
+    // 原始归档的"尝试恢复"。
+    //
+    // 这一页只说三件事：恢复到哪、要不要密码、会走哪条路。它**不**解析归档、
+    // 不解密、不解压：那些全部在共享的本地恢复核心（core）里，与 CLI 的
+    // backupctl restore / GUI 的本地恢复是同一份实现。
+    Dialog {
+        id: rawRestoreDialog
+        objectName: "remoteRawRestoreDialog"
+        anchors.centerIn: parent
+        modal: true
+        padding: 18
+        closePolicy: Popup.CloseOnEscape
+
+        background: Rectangle {
+            color: theme.surfaceElevated
+            border.width: 1
+            border.color: theme.border
+            radius: 10
+        }
+
+        contentItem: ColumnLayout {
+            spacing: 10
+
+            Text {
+                text: "尝试恢复原始归档"
+                color: theme.textPrimary
+                font.pixelSize: 16
+                font.weight: Font.DemiBold
+            }
+
+            Text {
+                objectName: "remoteRawRestoreDialogText"
+                Layout.preferredWidth: 430
+                text: "目标：" + page.pendingRawRestoreName + "\n\n"
+                      + "会先下载这份归档并校验 SHA-256，再按本地备份格式尝试独立恢复。"
+                      + "原始归档不属于远端增量链：它没有父快照，也不会自动取回别的对象。"
+                color: theme.textSecondary
+                font.pixelSize: 15
+                wrapMode: Text.WordWrap
+            }
+
+            RowLayout {
+                Layout.fillWidth: true
+                spacing: 8
+
+                AppTextField {
+                    id: rawRestoreTargetField
+                    objectName: "remoteRawRestoreTargetField"
+                    Layout.fillWidth: true
+                    enabled: !remote.busy
+                    placeholderText: "恢复到哪个目录（必填）"
+                    text: page.draftRawRestorePath
+                    onTextEdited: page.draftRawRestorePath = text
+                }
+
+                AppButton {
+                    objectName: "remoteRawRestoreBrowseButton"
+                    text: "选择恢复位置"
+                    iconName: "folder"
+                    enabled: !remote.busy
+                    onClicked: rawRestoreFolderDialog.open()
+                }
+            }
+
+            AppTextField {
+                id: rawRestorePasswordField
+                objectName: "remoteRawRestorePasswordField"
+                Layout.fillWidth: true
+                enabled: !remote.busy
+                echoMode: TextInput.Password
+                placeholderText: "恢复密码（只有加密归档才需要，可留空）"
+                text: page.draftRawRestorePassword
+                onTextEdited: page.draftRawRestorePassword = text
+            }
+
+            RowLayout {
+                Layout.fillWidth: true
+                spacing: 10
+
+                Item { Layout.fillWidth: true }
+
+                AppButton {
+                    objectName: "remoteRawRestoreCancelButton"
+                    text: "取消"
+                    onClicked: {
+                        page.pendingRawRestoreId = ""
+                        page.pendingRawRestoreName = ""
+                        page.draftRawRestorePassword = ""
+                        rawRestoreDialog.close()
+                    }
+                }
+
+                AppButton {
+                    objectName: "remoteRawRestoreConfirmButton"
+                    text: "尝试恢复"
+                    variant: "primary"
+                    enabled: !remote.busy && page.draftRawRestorePath !== ""
+                    onClicked: page.confirmRawRestore()
+                }
+            }
         }
     }
 

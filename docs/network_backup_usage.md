@@ -170,9 +170,9 @@ ECS，再在 ECS 本机运行 backup-server-admin：
     ./bin/backup-server-admin.sh          # 交互菜单（推荐）
     ./bin/backup-server-admin --help      # 子命令用法
 
-菜单三块：用户管理（列表 / 详情 / 删除用户及其全部备份）、备份文件管理
+菜单四块：用户管理（列表 / 详情 / 删除用户及其全部备份）、备份文件管理
 （按用户列出 / 详情 / 删除单个快照）、存储概览（用户数 / 快照总数 / blob 总
-大小 / 占用最多的用户），外加服务状态。
+大小 / 占用最多的用户）、**服务器身份信息**，外加服务状态。
 
 **每一次运行都会先打印"我在看哪个实例"**：
 
@@ -181,11 +181,26 @@ ECS，再在 ECS 本机运行 backup-server-admin：
     Data root:   /home/ubuntu/backup-project-server/data
     Metadata DB: /home/ubuntu/backup-project-server/state/metadata.sqlite3
     Service:     backup-server 正在运行（pid=… started_at=…）
+    传输身份指纹: sha256:<64 位小写十六进制>
+                  来源: 正在运行的 backup-server（pid …）加载的身份私钥
 
     用户数：12　快照数：0　blob 总大小：0 B　已注销账户：9
 
 路径一律显示 realpath 之后的绝对路径：脱离上下文的相对路径正是"看错实例"的
 温床（见下面那条 P0）。
+
+**传输身份指纹就在首页那一行上**（客户端要填的就是它）：
+
+* 它来自**当前真正在服役的那把身份私钥**：先看正在运行的 `backup-server` 命令行里的
+  `--transport-key-file`（只读 `/proc/<pid>/cmdline`，不发信号、不连端口），取不到才退到部署
+  约定路径 `<server-root>/state/transport.key`；
+* 读私钥用服务端与 `backup-server-keygen` 共用的同一个函数，算指纹也是同一个函数——这里
+  **没有**第二份 X25519 实现，所以"显示的指纹 == 服务端在用的身份"不是靠约定，
+  而是靠同一份代码；
+* 全程**只读**：不启动 / 不停止服务，不生成 / 不修改 / 不移动任何密钥文件；
+  读不到时只打印一行「传输身份指纹: 不可用」+ 原因，其余输出照常；
+* 菜单第 5 项「服务器身份信息」显示完整的 Fingerprint 与 Public key
+  （`transport-identity` 子命令），**永远不打印私钥**。
 
 **用户选择器：不会替你猜**（`show-user` / `list-snapshots` / `--user`）：
 
@@ -259,8 +274,19 @@ scripts/backup-server-admin.sh 一起装到 ECS 的 bin/ 下。
   依赖感知删除保证链不会从中间断开。用法与限制见 docs/remote_incremental.md。
 * 同一套能力在 **Modern GUI** 的远程页上也有：远端备份（源目录 + 完整/增量）、
   云端快照列表（类型 / 代数 / 父）与链恢复。GUI 与 CLI 走**同一个** core
-  （RunRemoteBackup / RunRemoteRestore），GUI 侧不做任何增量判断；原始归档的
-  上传/下载仍然单独放在"高级"区域，与产品级备份区分开。
+  （RunRemoteBackup / RunRemoteRestore），GUI 侧不做任何增量判断。
+* 云端列表里的对象有**三类**，界面上是三个词、一眼可分（判定只用服务端已有的
+  lineage 与 snapshot_kind，不按文件名猜）：
+
+      [原始归档]  lineage 为空：手动上传的归档。没有父、没有代数，
+                  主操作是「尝试恢复」（下载 → SHA-256 校验 → 按本地格式独立恢复）
+      [完整备份]  lineage 非空、kind=full：链根，代数 0，主操作「恢复」
+      [增量备份]  kind=incremental：代数 N + 父快照前 12 位，主操作「恢复」
+
+  「恢复」会自动取回整条依赖链；「尝试恢复」只针对原始归档，走的是**既有的**
+  本地恢复核心（BackupEngine / RunRestorePipeline），不是链恢复。原始归档如果
+  是随机文件 / 损坏 / 单独的 delta / 缺密码，都会**明确失败**，且不会在目标目录
+  留下半成品。上传/下载原始归档仍然单独放在"高级"区域。
 * 长操作进行中，远程页上会直接显示"现在正在做什么"（内容来自控制器的
   busyAction，不是估算出来的进度），同时备份 / 恢复 / 删除 / 上传 / 刷新 /
   退出登录等冲突操作在界面上全部不可用；控制器层的闸门另有回归（同一事件

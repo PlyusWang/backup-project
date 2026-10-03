@@ -104,6 +104,10 @@ struct RemoteOpResult {
     // 对应 backupctl remote restore。与 kDownload（下载一个 blob）也是
     // 两件事。
     kRestore,
+    // 原始归档的"单独恢复"（PR #21 UI closure）：下载那一个 blob，按**内容**
+    // 认出它是不是本机能独立恢复的归档，然后交给既有的本地恢复核心。
+    // 它**不是**链恢复：原始归档没有 lineage / parent / 副文件。
+    kRestoreRaw,
   };
 
   Kind kind = Kind::kList;
@@ -154,6 +158,13 @@ struct RemoteOpResult {
   std::uint64_t restore_downloaded_bytes = 0;
   std::uint64_t restore_reused_bytes = 0;
   std::uint64_t restore_restored_entries = 0;
+
+  // ---- kRestoreRaw：原始归档单独恢复的结果 ----
+  std::uint64_t raw_downloaded_bytes = 0;
+  std::string raw_verified_sha256;
+  std::string raw_archive_format;
+  std::uint64_t raw_restored_entries = 0;
+  bool raw_password_required = false;
 };
 
 // 后台线程需要的全部输入。刻意做成一个值类型：后台线程只读它，
@@ -164,6 +175,9 @@ struct RemoteRequest {
   std::string username;
   std::string password;
   std::string local_path;
+  // kUpload：上传时用的显示名。
+  // kRestoreRaw：只用来给下载下来的临时文件起名（不可信输入，core 会降级成
+  // 单组件文件名）；它**不参与**任何格式判断。
   std::string display_name;
   std::string snapshot_id;
   std::string target_path;
@@ -173,9 +187,12 @@ struct RemoteRequest {
   // lineage、要不要 bootstrap 缓存）都由 core 决定，GUI 不参与。
   std::string source_directory;
   bool allow_incremental = false;
-  // kBackup：显示名。留空时由 core 按链规则生成。
-  // kRestore：目标目录。
+  // kBackup：显示名留空时由 core 按链规则生成。
+  // kRestore：目标目录。kRestoreRaw：下载之后本地恢复的目标目录。
   std::string restore_destination;
+  // kRestoreRaw：如果那份归档是加密的，这里是用户在界面上填的恢复密码。
+  // kRestore（链恢复）不需要它：增量链的外层信封由内层身份记录保护。
+  std::string restore_password;
 };
 
 class RemoteController : public QObject {
@@ -383,6 +400,16 @@ class RemoteController : public QObject {
   // 为空都在本地被拒，一个字节都不发。
   Q_INVOKABLE bool restoreSnapshot(const QString& snapshot_id,
                                    const QString& destination_directory);
+  // "尝试恢复"一份**原始归档**（lineage 为空的远端条目）。
+  //
+  // 与 restoreSnapshot 的区别是产品语义，不只是文案：它下载那一个 blob，
+  // 由 core 按**内容**认出格式，再交给既有的本地恢复核心独立恢复；
+  // 它不需要、也不使用任何远端依赖链。随机文件、损坏归档、单独的 delta 都会
+  // 明确失败，并且不会在目标目录留下半成品。
+  // password 只在归档确实是加密的时候才需要（留空表示"没填"）。
+  Q_INVOKABLE bool restoreRawArchive(const QString& snapshot_id,
+                                     const QString& destination_directory,
+                                     const QString& password);
   // 用户改了源目录 / 策略或离开了这一页时清掉上一次的结论：旧结论挂在新输入上
   // 会误导（"增量备份完成"是上一次的事）。
   Q_INVOKABLE void clearBackupSummary();
@@ -433,6 +460,22 @@ class RemoteController : public QObject {
   }
   qint64 lastRestoreEntriesForTest() const {
     return static_cast<qint64>(last_restore_entries_);
+  }
+  // ---- 原始归档单独恢复（kRestoreRaw）：自检需要读的结构化结果 ----
+  QString lastRawRestoreSha256ForTest() const {
+    return last_raw_restore_sha256_;
+  }
+  QString lastRawRestoreFormatForTest() const {
+    return last_raw_restore_format_;
+  }
+  qint64 lastRawRestoreDownloadedBytesForTest() const {
+    return static_cast<qint64>(last_raw_restore_downloaded_bytes_);
+  }
+  qint64 lastRawRestoreEntriesForTest() const {
+    return static_cast<qint64>(last_raw_restore_entries_);
+  }
+  bool lastRawRestorePasswordRequiredForTest() const {
+    return last_raw_restore_password_required_;
   }
 
  signals:
@@ -597,6 +640,11 @@ class RemoteController : public QObject {
   std::uint64_t last_restore_delta_count_ = 0;
   std::uint64_t last_restore_downloaded_bytes_ = 0;
   std::uint64_t last_restore_entries_ = 0;
+  std::uint64_t last_raw_restore_downloaded_bytes_ = 0;
+  std::uint64_t last_raw_restore_entries_ = 0;
+  bool last_raw_restore_password_required_ = false;
+  QString last_raw_restore_sha256_;
+  QString last_raw_restore_format_;
 };
 
 }  // namespace backup_modern
