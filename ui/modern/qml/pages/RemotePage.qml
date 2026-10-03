@@ -6,11 +6,18 @@
 // 它**不**自己开 socket、不拼协议帧、不解析归档、不重新打包压缩加密——
 // 那些全部在共享的 RemoteArchiveClient 里，与 backupctl remote 是同一份实现。
 //
-// 页面按"用户先要看什么"分四层：
-//   1. 连接服务器 —— 地址 / 端口 / 用户名 / 密码，注册与登录
-//   2. 上传备份   —— 选一个本机的 .bak，传到云端
-//   3. 云端备份   —— 列表（名称 / 大小 / 时间）+ 下载 / 删除
-//   4. 技术详情   —— 默认折叠：编号、摘要、最近一次失败的技术原因
+// 页面按"用户先要看什么"分五层：
+//   1. 连接服务器 —— 地址 / 端口 / 用户名 / 密码，注册与登录（含服务器身份指纹）
+//   2. 远端备份   —— 选一个**源目录**，完整或增量备份到远端（产品级能力，
+//                    与 backupctl remote backup 共用同一套 core）
+//   3. 云端备份   —— 列表（名称 / 类型 / 代数 / 父 / 大小 / 时间）
+//                    + 恢复（链恢复）/ 下载归档 / 删除
+//   4. 高级       —— 上传 / 下载**原始归档**（低层 raw 操作，与上面的产品级
+//                    备份是两件事，刻意分开放）
+//   5. 技术详情   —— 默认折叠：编号、摘要、最近一次失败的技术原因
+//
+// "恢复"与"下载归档"的区别是这一页的重点之一：恢复会自动解析并下载整条依赖
+// 链、逐成员校验、原子发布到目标目录；下载归档只是把云端那一个 blob 取回来。
 //
 // 主界面不出现协议术语：没有 BPNET1 / PBKDF2 / HMAC / SQLite / opcode /
 // frame / request_id，也没有原始 token。
@@ -34,6 +41,10 @@ Item {
     property string draftPort: ""
     property string draftUser: ""
     property string draftPassword: ""
+    // 服务器身份指纹（server-key）：连接之前必须有的"我要连的是哪一台服务器"。
+    // 它不是口令——公钥/指纹可以公开、可以抄进部署文档——但它是必填项：
+    // 不填时客户端拒绝连接（不做"第一次见到谁就信谁"）。
+    property string draftServerKeyPin: ""
     // 注册标签页的两个口令草稿（登录标签页继续用 draftPassword）。
     property string draftRegisterPassword: ""
     property string draftConfirmPassword: ""
@@ -57,6 +68,18 @@ Item {
     property string pendingDownloadId: ""
     property bool technicalExpanded: false
 
+    // ---- PR #21 产品级远端备份 ----
+    // 这一页只收集"源目录 + 策略"和"目标快照 + 目标目录"；能不能续链、父是
+    // 谁、代数、lineage、要不要 bootstrap 缓存，全部由共享 core 决定。
+    property string draftBackupSource: ""
+    // 0 = 完整（默认），1 = 增量。增量在没有可信基线时会由 core 自动改成
+    // 完整基线，页面按控制器回来的**实际类型**显示。
+    property int backupStrategy: 0
+    // 待恢复的目标：目录对话框选完之后才真正发起恢复。
+    property string pendingRestoreId: ""
+    property string pendingRestoreName: ""
+    property string draftRestorePath: ""
+
     // 真正的互斥在控制器里（busy_ 在提交任务之前同步置位）；这里只是可见性。
     readonly property bool canOperate: remote.authenticated && !remote.busy
     readonly property int rowCount: remote.snapshots.length
@@ -65,6 +88,9 @@ Item {
         page.draftHost = remote.host
         page.draftPort = remote.portText
         page.draftUser = remote.username
+        // 调用方（CLI / 自检 harness）已经给过一个指纹就回填进来，界面上看到的
+        // 永远是"现在真的会用哪一个"，而不是一个空框。
+        page.draftServerKeyPin = remote.serverKeyPin
     }
 
     // ---------- 从列表发起的动作 ----------
@@ -96,6 +122,20 @@ Item {
         remote.downloadArchive(snapshotId, page.draftDownloadPath, false)
     }
 
+    // 恢复一份远端备份：先选目标目录（必填），选完才发起。
+    // 这里**不**问用户父快照 / 代数 / lineage：那是 core 的事。
+    function requestRestore(snapshotId, name) {
+        page.pendingRestoreId = snapshotId
+        page.pendingRestoreName = name
+        restoreDialog.currentFolder = remote.fileDialogStartUrl(page.draftRestorePath)
+        restoreDialog.open()
+    }
+
+    // 策略当前值（SegmentedTabs 用的键）。
+    function backupStrategyKey() {
+        return page.backupStrategy === 1 ? "incremental" : "full"
+    }
+
     // 技术详情：默认折叠。这里是唯一允许出现编号、摘要与原始原因的地方。
     function technicalText() {
         const lines = []
@@ -105,10 +145,19 @@ Item {
         lines.push("服务器只监听本机回环地址，客户端通过部署时配置的安全通道访问它。")
         if (remote.diagnosticText !== "")
             lines.push("最近一次失败的技术原因：" + remote.diagnosticText)
+        // core 给出的“为什么这次不是增量”的原始理由（英文）：属于诊断，
+        // 只出现在这张默认折叠的卡片里，不出现在结论那一行。
+        if (remote.backupBaselineReason !== "")
+            lines.push("最近一次基线的核心原因：" + remote.backupBaselineReason)
         for (let i = 0; i < remote.snapshots.length; ++i) {
             const item = remote.snapshots[i]
-            lines.push("云端备份编号：" + item["id"]
-                       + "（" + item["name"] + "，SHA-256 前 12 位 " + item["sha256Short"] + "）")
+            let line = "云端备份编号：" + item["id"]
+                       + "（" + item["name"] + "，SHA-256 前 12 位 " + item["sha256Short"]
+                       + "，类型 " + item["kind"] + "，代数 " + item["generation"]
+            if (item["kind"] === "incremental")
+                line += "，父 " + item["parentId"]
+            line += "）"
+            lines.push(line)
         }
         return lines.join("\n")
     }
@@ -247,6 +296,69 @@ Item {
                                 remote.clearLoginError()
                                 remote.clearRegisterError()
                             }
+                        }
+                    }
+
+                    // 服务器身份指纹：连接设置的一部分（地址 / 端口 / 用户名 /
+                    // 指纹）。指纹错了就是一个输入问题，"应用"之后原因写在这
+                    // 张表单自己的错误行里，不弹对话框，也不占用页面底部横幅。
+                    ColumnLayout {
+                        Layout.fillWidth: true
+                        Layout.topMargin: 4
+                        spacing: 4
+
+                        Text {
+                            text: "服务器身份指纹（server-key）"
+                            font.pixelSize: 15
+                            color: theme.textSecondary
+                        }
+
+                        RowLayout {
+                            Layout.fillWidth: true
+                            spacing: 12
+
+                            AppTextField {
+                                id: serverKeyPinField
+                                objectName: "remoteServerKeyPinField"
+                                Layout.fillWidth: true
+                                enabled: !remote.busy
+                                placeholderText: "例如 sha256:0123…（服务器管理员给出）"
+                                text: page.draftServerKeyPin
+                                onTextEdited: {
+                                    page.draftServerKeyPin = text
+                                    remote.clearServerKeyPinError()
+                                }
+                                onAccepted: {
+                                    if (!remote.busy)
+                                        remote.setServerKeyPin(page.draftServerKeyPin)
+                                }
+                            }
+
+                            AppButton {
+                                objectName: "remoteServerKeyPinApplyButton"
+                                text: "应用"
+                                enabled: !remote.busy
+                                onClicked: remote.setServerKeyPin(page.draftServerKeyPin)
+                            }
+                        }
+
+                        // 指纹不是密码：这句话解释它为什么可以贴在这里，也说明它
+                        // 只用来确认"连到的确实是你的服务器"。
+                        Text {
+                            text: "公钥指纹不是密码：它只用来确认连到的确实是你的服务器。"
+                            font.pixelSize: 14
+                            color: theme.textSecondary
+                            wrapMode: Text.WrapAnywhere
+                        }
+
+                        Text {
+                            objectName: "remoteServerKeyPinError"
+                            Layout.fillWidth: true
+                            visible: remote.serverKeyPinError !== ""
+                            text: remote.serverKeyPinError
+                            color: theme.error
+                            font.pixelSize: 15
+                            wrapMode: Text.WrapAnywhere
                         }
                     }
 
@@ -510,7 +622,11 @@ Item {
                 }
             }
 
-            // ---------- 2. 上传 ----------
+            // ---------- 2. 远端备份（产品级）----------
+            // 对应 backupctl remote backup：把一个**目录**备份到远端。
+            // 这一块只收集"源目录 + 策略"；能不能续链、父是谁、代数、lineage
+            // 全部由共享 core 决定。用户选的策略与实际产出的类型不一定相同
+            // （没有可信基线时会重建完整基线），所以下面那一行结论说的是实际值。
             AppCard {
                 Layout.fillWidth: true
 
@@ -519,54 +635,82 @@ Item {
                     spacing: 6
 
                     Text {
-                        text: "上传备份到云端"
+                        text: "远端备份"
                         font.pixelSize: 16
                         font.weight: Font.DemiBold
                         color: theme.textSecondary
                     }
 
+                    Text {
+                        Layout.fillWidth: true
+                        text: "把一个目录备份到远端。增量只上传变化的部分；云端还没有可续的链时会先自动建一份完整基线。"
+                        font.pixelSize: 15
+                        color: theme.textSecondary
+                        wrapMode: Text.WrapAnywhere
+                    }
+
                     RowLayout {
                         Layout.fillWidth: true
+                        Layout.topMargin: 6
                         spacing: 8
 
                         AppTextField {
-                            id: uploadPathField
-                            objectName: "remoteUploadPathField"
+                            id: backupSourceField
+                            objectName: "remoteBackupSourceField"
                             Layout.fillWidth: true
                             enabled: !remote.busy
-                            placeholderText: "选择本机上的一个备份文件（.bak）"
-                            text: page.draftUploadPath
-                            onTextEdited: page.draftUploadPath = text
+                            readOnly: true
+                            placeholderText: "选择要备份到远端的目录"
+                            text: page.draftBackupSource
                         }
 
                         AppButton {
-                            objectName: "remoteUploadBrowseButton"
-                            text: "选择本地备份"
+                            objectName: "remoteBackupSourceBrowseButton"
+                            text: "选择源目录"
                             iconName: "folder"
                             enabled: !remote.busy
                             onClicked: {
-                                uploadDialog.currentFolder = remote.fileDialogStartUrl(controller.repositoryPath)
-                                uploadDialog.open()
+                                backupSourceDialog.currentFolder = remote.fileDialogStartUrl(page.draftBackupSource)
+                                backupSourceDialog.open()
                             }
                         }
                     }
 
-                    AppTextField {
-                        id: uploadNameField
-                        objectName: "remoteUploadNameField"
+                    RowLayout {
                         Layout.fillWidth: true
-                        enabled: !remote.busy
-                        placeholderText: "云端名称（留空就用文件名）"
-                        text: page.draftUploadName
-                        onTextEdited: page.draftUploadName = text
-                    }
+                        Layout.topMargin: 6
+                        spacing: 12
 
-                    Text {
-                        Layout.fillWidth: true
-                        text: "上传的是备份工具自己生成的 .bak 文件；云端只负责保存和取回，不会重新打包、压缩或加密。"
-                        font.pixelSize: 15
-                        color: theme.textSecondary
-                        wrapMode: Text.WrapAnywhere
+                        Text {
+                            text: "策略"
+                            font.pixelSize: 15
+                            color: theme.textSecondary
+                        }
+
+                        SegmentedTabs {
+                            objectName: "remoteBackupStrategyTabs"
+                            model: [
+                                { "key": "full", "text": "完整" },
+                                { "key": "incremental", "text": "增量" }
+                            ]
+                            currentKey: page.backupStrategyKey()
+                            onActivated: function (key) {
+                                page.backupStrategy = (key === "incremental") ? 1 : 0
+                                // 上一次的结论不能挂在新策略上。
+                                remote.clearBackupSummary()
+                            }
+                        }
+
+                        Text {
+                            objectName: "remoteBackupStrategyHint"
+                            Layout.fillWidth: true
+                            text: page.backupStrategy === 1
+                                  ? "增量：云端没有可续的链时会自动先建完整基线。"
+                                  : "完整：每次都创建一份完整的基线快照。"
+                            font.pixelSize: 15
+                            color: theme.textSecondary
+                            wrapMode: Text.WrapAnywhere
+                        }
                     }
 
                     RowLayout {
@@ -575,21 +719,51 @@ Item {
                         spacing: 12
 
                         AppButton {
-                            objectName: "remoteUploadButton"
-                            text: "上传"
+                            objectName: "remoteBackupButton"
+                            text: "开始远端备份"
                             variant: "primary"
-                            enabled: page.canOperate
-                            onClicked: remote.uploadArchive(page.draftUploadPath, page.draftUploadName)
+                            enabled: page.canOperate && page.draftBackupSource !== ""
+                            onClicked: remote.backupRemote(page.draftBackupSource, page.backupStrategy === 1)
                         }
 
                         Text {
-                            objectName: "remoteUploadHint"
+                            objectName: "remoteBackupHint"
                             Layout.fillWidth: true
-                            text: remote.authenticated ? "" : "登录之后才能上传。"
+                            text: remote.authenticated
+                                  ? (page.draftBackupSource === ""
+                                     ? "先点“选择源目录”挑一个要备份的目录。"
+                                     : "")
+                                  : "登录之后才能开始远端备份。"
                             font.pixelSize: 15
                             color: theme.textSecondary
                             wrapMode: Text.WrapAnywhere
                         }
+                    }
+
+                    // 长操作进行中的一行状态：进度回调到达之前（连接、握手、
+                    // 重新生成材料包）也有东西可看，而不是只看到一排灰掉的按钮。
+                    // 内容来自控制器的 busyAction，不是画上去的假进度。
+                    Text {
+                        objectName: "remoteBusyText"
+                        Layout.fillWidth: true
+                        Layout.topMargin: 4
+                        visible: remote.busy
+                        text: remote.busyAction
+                        font.pixelSize: 15
+                        color: theme.textSecondary
+                        wrapMode: Text.WrapAnywhere
+                    }
+
+                    // 最近一次远端备份的**实际**结论：完整 / 增量 / 没有变化。
+                    // 这一行不会因为别的操作被顶掉（与页面底部的临时提示不同）。
+                    Text {
+                        objectName: "remoteBackupSummary"
+                        Layout.fillWidth: true
+                        visible: remote.backupSummary !== ""
+                        text: remote.backupSummary
+                        font.pixelSize: 15
+                        color: theme.textPrimary
+                        wrapMode: Text.WrapAnywhere
                     }
                 }
             }
@@ -639,7 +813,7 @@ Item {
                         visible: page.rowCount === 0
                         text: remote.authenticated
                               ? (remote.listLoaded
-                                 ? "云端还没有备份。点上面的“上传”把第一份备份放上去。"
+                                 ? "云端还没有备份。选好源目录后点上面的“开始远端备份”；原始归档用最下面的“高级：原始归档”上传。"
                                  : "点“刷新”读取云端备份列表。")
                               : "登录之后可以查看云端备份。"
                         font.pixelSize: 16
@@ -657,14 +831,14 @@ Item {
                             objectName: "remoteDownloadTargetField"
                             Layout.fillWidth: true
                             enabled: !remote.busy
-                            placeholderText: "下载保存到哪里（点右边的按钮选择）"
+                            placeholderText: "下载归档保存到哪里（原始归档，点右边的按钮选择）"
                             text: page.draftDownloadPath
                             onTextEdited: page.draftDownloadPath = text
                         }
 
                         AppButton {
                             objectName: "remoteDownloadBrowseButton"
-                            text: "选择保存位置"
+                            text: "选择归档保存位置"
                             iconName: "folder"
                             enabled: !remote.busy
                             onClicked: {
@@ -687,9 +861,100 @@ Item {
                             nameText: String(modelData["name"] || "")
                             sizeText: String(modelData["sizeText"] || "")
                             createdText: String(modelData["createdText"] || "")
+                            kindText: String(modelData["kindText"] || "")
+                            kindKey: String(modelData["kind"] || "")
+                            generation: Number(modelData["generation"] || 0)
+                            parentShort: String(modelData["parentShort"] || "")
+                            restorable: modelData["restorable"] !== false
+                            restoreHint: String(modelData["restoreHint"] || "")
                             busy: remote.busy
+                            onRestoreRequested: function (snapshotId, name) { page.requestRestore(snapshotId, name) }
                             onDownloadRequested: function (snapshotId, name) { page.requestDownload(snapshotId, name) }
                             onDeleteRequested: function (snapshotId, name) { page.requestDelete(snapshotId, name) }
+                        }
+                    }
+                }
+            }
+
+            // ---------- 4. 高级：原始归档 ----------
+            AppCard {
+                Layout.fillWidth: true
+
+                ColumnLayout {
+                    anchors.fill: parent
+                    spacing: 6
+
+                    Text {
+                        text: "上传原始归档（高级）"
+                        font.pixelSize: 16
+                        font.weight: Font.DemiBold
+                        color: theme.textSecondary
+                    }
+
+                    RowLayout {
+                        Layout.fillWidth: true
+                        spacing: 8
+
+                        AppTextField {
+                            id: uploadPathField
+                            objectName: "remoteUploadPathField"
+                            Layout.fillWidth: true
+                            enabled: !remote.busy
+                            placeholderText: "选择本机上的一个备份文件（.bak）"
+                            text: page.draftUploadPath
+                            onTextEdited: page.draftUploadPath = text
+                        }
+
+                        AppButton {
+                            objectName: "remoteUploadBrowseButton"
+                            text: "选择本地备份"
+                            iconName: "folder"
+                            enabled: !remote.busy
+                            onClicked: {
+                                uploadDialog.currentFolder = remote.fileDialogStartUrl(controller.repositoryPath)
+                                uploadDialog.open()
+                            }
+                        }
+                    }
+
+                    AppTextField {
+                        id: uploadNameField
+                        objectName: "remoteUploadNameField"
+                        Layout.fillWidth: true
+                        enabled: !remote.busy
+                        placeholderText: "云端名称（留空就用文件名）"
+                        text: page.draftUploadName
+                        onTextEdited: page.draftUploadName = text
+                    }
+
+                    Text {
+                        Layout.fillWidth: true
+                        text: "这是低层操作：把一个已经存在的 .bak 原样放到云端，与上面的“远端备份”不是一回事——它不参与增量链，也不能用来做链恢复。"
+                        font.pixelSize: 15
+                        color: theme.textSecondary
+                        wrapMode: Text.WrapAnywhere
+                    }
+
+                    RowLayout {
+                        Layout.fillWidth: true
+                        Layout.topMargin: 10
+                        spacing: 12
+
+                        AppButton {
+                            objectName: "remoteUploadButton"
+                            text: "上传"
+                            variant: "primary"
+                            enabled: page.canOperate
+                            onClicked: remote.uploadArchive(page.draftUploadPath, page.draftUploadName)
+                        }
+
+                        Text {
+                            objectName: "remoteUploadHint"
+                            Layout.fillWidth: true
+                            text: remote.authenticated ? "" : "登录之后才能上传。"
+                            font.pixelSize: 15
+                            color: theme.textSecondary
+                            wrapMode: Text.WrapAnywhere
                         }
                     }
                 }
@@ -807,6 +1072,39 @@ Item {
             }
 
             Item { Layout.fillHeight: true }
+        }
+    }
+
+    // 选择远端备份的源目录（产品级备份）。
+    FolderDialog {
+        id: backupSourceDialog
+        objectName: "remoteBackupSourceFolderDialog"
+        title: "选择要备份到远端的目录"
+        onAccepted: {
+            const chosen = remote.localPathFromUrl(backupSourceDialog.selectedFolder)
+            if (chosen === "")
+                return
+            page.draftBackupSource = chosen
+            // 换了源目录，上一次的结论（完整 / 增量 / 无变化）就不再适用。
+            remote.clearBackupSummary()
+        }
+    }
+
+    // 链恢复的目标目录：选完立刻发起恢复。用户只需要选"恢复到哪里"，
+    // 依赖链的解析与下载全部由 core 负责。
+    FolderDialog {
+        id: restoreDialog
+        objectName: "remoteRestoreFolderDialog"
+        title: "选择恢复到哪个目录"
+        onAccepted: {
+            const chosen = remote.localPathFromUrl(restoreDialog.selectedFolder)
+            if (chosen === "")
+                return
+            page.draftRestorePath = chosen
+            const target = page.pendingRestoreId
+            page.pendingRestoreId = ""
+            if (target !== "")
+                remote.restoreSnapshot(target, chosen)
         }
     }
 

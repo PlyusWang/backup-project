@@ -13,8 +13,16 @@
 #include <cstdio>
 #include <utility>
 
+// PR #21 产品级远端备份 / 链恢复：与 backupctl remote backup / remote restore
+// 用的是**同一个** core。GUI 不重新实现任何增量判断（有没有可信基线、父是谁、
+// 代数、lineage、要不要 bootstrap 缓存）——它只把"源目录 + 策略"和
+// "目标快照 + 目标目录"交给这一层。
+#include "incremental_backup.h"
+#include "incremental_restore.h"
 #include "network_protocol.h"
 #include "remote_auth.h"
+#include "remote_incremental.h"
+#include "secure_transport.h"
 
 namespace backup_modern {
 namespace {
@@ -108,6 +116,9 @@ const char* UsernameReasonName(backupproject::net::UsernameValidation reason) {
 RemoteController::RemoteController(QObject* parent) : QObject(parent) {
   endpoint_.host = backupproject::net::kDefaultRemoteHost;
   endpoint_.port = backupproject::net::kDefaultRemotePort;
+  // pin 没有默认值（空 = 不能连接）。这里只是把"同一个值的两个落点"从一开始
+  // 就对齐：调用方 setServerKeyPin() 之后两处一起更新。
+  endpoint_.server_key_pin = serverKeyPin().toStdString();
   QObject::connect(&watcher_, &QFutureWatcher<RemoteOpResult>::finished, this,
                    &RemoteController::OnOperationFinished);
 }
@@ -231,6 +242,10 @@ QString RemoteController::KindName(RemoteOpResult::Kind kind) {
       return QStringLiteral("delete");
     case RemoteOpResult::Kind::kDeleteAccount:
       return QStringLiteral("delete-account");
+    case RemoteOpResult::Kind::kBackup:
+      return QStringLiteral("backup");
+    case RemoteOpResult::Kind::kRestore:
+      return QStringLiteral("restore");
   }
   return QStringLiteral("unknown");
 }
@@ -259,6 +274,12 @@ QString RemoteController::ClassifyFailure(const std::string& status_name,
     if (status_name == "NOT_FOUND") {
       return QStringLiteral("not-found");
     }
+    if (status_name == "CHAIN_CONFLICT") {
+      // 服务端在链的边界上说不（父已经有一个孩子 / 代数超上限 / lineage
+      // 不符）。
+      // 这不是"网络失败"，也不是"服务器忙"：界面必须说清"本次备份没有创建"。
+      return QStringLiteral("chain-conflict");
+    }
     if (status_name == "INTEGRITY_MISMATCH") {
       return QStringLiteral("integrity");
     }
@@ -283,13 +304,32 @@ QString RemoteController::ClassifyFailure(const std::string& status_name,
   if (Contains(detail, "already exists")) {
     return QStringLiteral("target-exists");
   }
+  // 服务端身份 pin 不符：这是"连错服务器 / 服务器换了密钥"，不是网络抖动。
+  // 单独一类，界面才能给出"去找管理员核对指纹"这句话，而不是让人一直重试。
+  if (Contains(detail, "server-key-mismatch") || Contains(detail, "握手") ||
+      Contains(detail, "身份")) {
+    return QStringLiteral("pin-mismatch");
+  }
   if (Contains(detail, "not connected") || Contains(detail, "cannot send") ||
       Contains(detail, "cannot read the response") ||
       Contains(detail, "connect")) {
     return QStringLiteral("network");
   }
+  // 材料包这一层的失败（中文原因来自 snapshot_bundle.cpp /
+  // remote_incremental.cpp）：
+  // 解包失败、成员校验失败、链解析失败都归到"材料不可信"，而不是笼统的
+  // unknown。
+  if (Contains(detail, "BPSNAP1") || Contains(detail, "材料包") ||
+      Contains(detail, "解包")) {
+    return QStringLiteral("not-a-bundle");
+  }
+  if (Contains(detail, "依赖链") || Contains(detail, "lineage") ||
+      Contains(detail, "generation")) {
+    return QStringLiteral("integrity");
+  }
   if (Contains(detail, "cannot open") || Contains(detail, "cannot create") ||
-      Contains(detail, "is empty") || Contains(detail, "No such file")) {
+      Contains(detail, "is empty") || Contains(detail, "No such file") ||
+      Contains(detail, "不是目录") || Contains(detail, "源目录")) {
     return QStringLiteral("local");
   }
   return QStringLiteral("unknown");
@@ -318,11 +358,26 @@ QString RemoteController::DescribeFailure(const QString& error_kind) {
   if (error_kind == QStringLiteral("not-found")) {
     return QStringLiteral("这个云端备份已经不存在了，刷新列表看看。");
   }
+  if (error_kind == QStringLiteral("pin-mismatch")) {
+    return QStringLiteral(
+        "服务器身份校验没有通过：当前填的指纹与服务器上的身份不符。"
+        "请找服务器管理员核对“服务器身份指纹”，不要在这里反复重试。");
+  }
   if (error_kind == QStringLiteral("target-exists")) {
     return QStringLiteral("目标文件已经存在。换一个文件名，或勾选“允许覆盖”。");
   }
   if (error_kind == QStringLiteral("integrity")) {
     return QStringLiteral("文件完整性校验失败，这次传输的结果没有被采用。");
+  }
+  if (error_kind == QStringLiteral("chain-conflict")) {
+    return QStringLiteral(
+        "服务端拒绝了这个链关系（同一个父已经有一条增量，或者代数超过上限）："
+        "本次远端备份没有创建任何东西，可以直接再试一次（会重新判断基线）。");
+  }
+  if (error_kind == QStringLiteral("not-a-bundle")) {
+    return QStringLiteral(
+        "这一条不是远端备份链的材料包（它是原始归档上传）：不能用链恢复，"
+        "请改用“下载归档”。");
   }
   if (error_kind == QStringLiteral("forbidden")) {
     return QStringLiteral("没有权限访问这个云端备份。");
@@ -372,11 +427,20 @@ QString RemoteController::TitleForFailure(const QString& error_kind) {
   if (error_kind == QStringLiteral("not-found")) {
     return QStringLiteral("云端备份不存在");
   }
+  if (error_kind == QStringLiteral("pin-mismatch")) {
+    return QStringLiteral("服务器身份校验失败");
+  }
   if (error_kind == QStringLiteral("target-exists")) {
     return QStringLiteral("目标文件已存在");
   }
   if (error_kind == QStringLiteral("integrity")) {
     return QStringLiteral("完整性校验失败");
+  }
+  if (error_kind == QStringLiteral("chain-conflict")) {
+    return QStringLiteral("链关系被拒绝");
+  }
+  if (error_kind == QStringLiteral("not-a-bundle")) {
+    return QStringLiteral("不是可恢复的远端备份");
   }
   if (error_kind == QStringLiteral("forbidden")) {
     return QStringLiteral("没有权限");
@@ -472,6 +536,35 @@ void RemoteController::SetSnapshots(
     item.insert(QStringLiteral("createdText"), FormatTime(info.created_at));
     item.insert(QStringLiteral("sha256Short"),
                 QString::fromStdString(info.sha256).left(12));
+    // ---- PR #21：链元数据（界面据此显示 Full/Incremental、代数、父）----
+    const bool incremental = info.snapshot_kind == 1;
+    const QString parent = QString::fromStdString(info.parent_snapshot_id);
+    // "这一条能不能做链恢复"完全由**服务端元数据**决定，界面不猜：
+    //   增量                    -> 产品链成员，能恢复；
+    //   完整 + lineage 非空     -> 产品完整基线（链根），能恢复；
+    //   完整 + lineage 为空     -> PR #20 时代的原始归档上传 / 低层 remote
+    //                              upload：它的 blob 不是 BPSNAP1 材料包，
+    //                              链恢复对它没有意义（服务端也不解析内容，
+    //                              所以这是客户端唯一能区分的方式）。
+    const bool product_snapshot = incremental || !info.lineage.empty();
+    item.insert(QStringLiteral("kind"), incremental
+                                            ? QStringLiteral("incremental")
+                                            : QStringLiteral("full"));
+    item.insert(QStringLiteral("kindText"),
+                incremental ? QStringLiteral("增量") : QStringLiteral("完整"));
+    item.insert(QStringLiteral("generation"),
+                static_cast<qulonglong>(info.generation));
+    item.insert(QStringLiteral("parentId"), parent);
+    item.insert(QStringLiteral("parentShort"), parent.left(12));
+    item.insert(QStringLiteral("lineageShort"),
+                QString::fromStdString(info.lineage).left(12));
+    item.insert(QStringLiteral("restorable"), product_snapshot);
+    item.insert(
+        QStringLiteral("restoreHint"),
+        product_snapshot
+            ? QString()
+            : QStringLiteral("该远程条目是原始归档上传，不属于远端备份链；"
+                             "请使用“下载归档”。"));
     items.append(item);
   }
   snapshot_items_ = items;
@@ -545,6 +638,14 @@ void RemoteController::ReportSurfaceError(ErrorSurface surface,
         emit deleteAccountErrorChanged();
       }
       return;
+    case ErrorSurface::kServerKey:
+      // 连接设置里的"服务器身份指纹"有自己的一行：指纹填错了就是一个输入
+      // 问题，反馈必须贴在**这个输入框**下面，而不是页面底部的横幅。
+      if (server_key_pin_error_ != message) {
+        server_key_pin_error_ = message;
+        emit serverKeyPinErrorChanged();
+      }
+      return;
     case ErrorSurface::kBanner: {
       // 页面级操作（上传 / 下载 / 刷新 / 删除云端备份）没有"自己的表单"，
       // 它们的触发点就在页面上，所以继续用这一页底部的状态横幅。
@@ -577,6 +678,12 @@ void RemoteController::ClearSurfaceError(ErrorSurface surface) {
       if (!delete_account_error_.isEmpty()) {
         delete_account_error_.clear();
         emit deleteAccountErrorChanged();
+      }
+      return;
+    case ErrorSurface::kServerKey:
+      if (!server_key_pin_error_.isEmpty()) {
+        server_key_pin_error_.clear();
+        emit serverKeyPinErrorChanged();
       }
       return;
     case ErrorSurface::kBanner:
@@ -644,6 +751,9 @@ void RemoteController::CommitEndpoint(const QString& host, int port,
   }
   endpoint_.host = host.toStdString();
   endpoint_.port = static_cast<std::uint16_t>(port);
+  // pin 与地址 / 端口是同一份"上一次真正生效的连接配置"：这里再对齐一次，
+  // 免得出现"地址换了、pin 掉了"的组合。
+  endpoint_.server_key_pin = serverKeyPin().toStdString();
   username_ = username;
   emit endpointChanged();
 }
@@ -721,6 +831,41 @@ QString RemoteController::SurfaceFailureMessage(RemoteOpResult::Kind kind,
         return QStringLiteral("服务器暂时无法完成注册");
       }
       break;
+    case RemoteOpResult::Kind::kBackup:
+      if (network) {
+        return QStringLiteral(
+            "网络连接中断，本次远端备份没有完成；云端与本地都没有变化，"
+            "可以直接再试一次");
+      }
+      if (error_kind == QStringLiteral("chain-conflict")) {
+        return QStringLiteral(
+            "服务端拒绝了这个链关系（父已经有一条增量，或者代数超过上限）："
+            "本次没有创建任何云端备份，可以直接再试一次");
+      }
+      if (server_side) {
+        return QStringLiteral("服务器暂时无法完成这次远端备份");
+      }
+      break;
+    case RemoteOpResult::Kind::kRestore:
+      if (error_kind == QStringLiteral("not-a-bundle")) {
+        return QStringLiteral(
+            "这一条不是远端备份链的材料包（原始归档上传）：不能用链恢复，"
+            "请改用“下载归档”");
+      }
+      if (error_kind == QStringLiteral("integrity")) {
+        return QStringLiteral(
+            "下载到的备份材料没有通过完整性校验，本次恢复没有完成，"
+            "目标目录没有被改动");
+      }
+      if (network) {
+        return QStringLiteral(
+            "网络连接中断，本次恢复没有完成；目标目录没有被改动，"
+            "可以直接再试一次");
+      }
+      if (server_side) {
+        return QStringLiteral("服务器暂时无法完成这次恢复");
+      }
+      break;
     case RemoteOpResult::Kind::kDeleteAccount:
       if (error_kind == QStringLiteral("account-password")) {
         return QStringLiteral("当前密码不正确，账户与全部云端备份都没有被删除");
@@ -763,6 +908,17 @@ bool RemoteController::BeginOperation(const QString& action_text,
             : DescribeFailure(last_error_kind_));
     return false;
   }
+  // 连接之前必须有服务端身份 pin：没有它客户端会**直接拒绝连接**（不做首次
+  // 连接自动信任），而那是一条协议级的底层原因，用户读不懂"我到底少做了什么"。
+  // 与地址 / 端口 / 口令同一条规矩：本地就挡住，一个字节都不发。
+  if (server_key_pin_.isEmpty()) {
+    last_error_kind_ = QStringLiteral("validation");
+    ReportSurfaceError(
+        surface,
+        QStringLiteral("还没有填写服务器身份指纹：把服务器管理员给出的 "
+                       "sha256:… 指纹填进“服务器身份指纹”再试一次"));
+    return false;
+  }
   last_error_kind_ = QStringLiteral("none");
   last_detail_.clear();
   SetBusy(true, action_text);
@@ -798,6 +954,11 @@ RemoteOpResult RemoteController::RunOperation(
         }
       };
   std::string error;
+  // 每一次操作都先用**当前**的 endpoint / pin 更新重连参数：用户刚改过服务器
+  // 身份指纹时，重连必须用新的那一份（否则界面说的"下一次连接生效"就是假的）。
+  // 它不发字节、不动 token，会话与 RESUME 语义不变。
+  client->SetReconnectEndpoint(request.endpoint);
+  result.backup_incremental_requested = request.allow_incremental;
   switch (request.kind) {
     case RemoteOpResult::Kind::kRegister:
       if (!client->connected() && !client->Connect(request.endpoint, &error)) {
@@ -838,6 +999,63 @@ RemoteOpResult RemoteController::RunOperation(
     case RemoteOpResult::Kind::kDeleteAccount:
       result.ok = client->DeleteAccount(request.password, &error);
       break;
+    case RemoteOpResult::Kind::kBackup: {
+      // 与 backupctl remote backup 逐行一致的三步：准备缓存 -> 组装请求 ->
+      // 交给共享 core。缓存根用空串 = 应用配置目录下的 remote-cache（与 CLI
+      // 的默认值相同；自检通过隔离 HOME/XDG 来隔离它）。
+      backupproject::net::RemoteCacheLayout cache;
+      if (!backupproject::net::PrepareRemoteCache(
+              std::string(), client->server_fingerprint(), request.username,
+              &cache, &error)) {
+        result.ok = false;
+        break;
+      }
+      backupproject::net::RemoteBackupRequest backup;
+      backup.client = client;
+      backup.cache = cache;
+      backup.source_directory = request.source_directory;
+      backup.allow_incremental = request.allow_incremental;
+      backup.display_name = request.display_name;
+      backup.progress = progress;
+      backupproject::net::RemoteBackupOutcome outcome;
+      result.ok = backupproject::net::RunRemoteBackup(backup, &outcome, &error);
+      if (result.ok) {
+        result.backup_produced_delta = outcome.produced_delta;
+        result.backup_rebuilt_full = outcome.rebuilt_full_baseline;
+        result.backup_no_changes = outcome.no_changes;
+        result.backup_snapshot_id = outcome.snapshot_id;
+        result.backup_parent_snapshot_id = outcome.parent_snapshot_id;
+        result.backup_generation = outcome.generation;
+        result.backup_uploaded_bytes = outcome.uploaded_bytes;
+        result.backup_chain_root_bytes = outcome.chain_root_bytes;
+        result.backup_baseline_reason = outcome.baseline_reason;
+        result.backup_archive_name = outcome.archive_name;
+      }
+      break;
+    }
+    case RemoteOpResult::Kind::kRestore: {
+      backupproject::net::RemoteCacheLayout cache;
+      if (!backupproject::net::PrepareRemoteCache(
+              std::string(), client->server_fingerprint(), request.username,
+              &cache, &error)) {
+        result.ok = false;
+        break;
+      }
+      // 恢复不需要口令：增量链的外层信封由内层身份记录保护（与 CLI 同一条
+      // 结论）。整条依赖链的解析、下载、逐成员校验、逐跳应用全在 core 里。
+      backupproject::net::RemoteRestoreOutcome outcome;
+      result.ok = backupproject::net::RunRemoteRestore(
+          client, cache, request.snapshot_id, request.restore_destination,
+          backupproject::RestoreOptions(), &outcome, &error);
+      if (result.ok) {
+        result.restore_chain_length = outcome.chain_length;
+        result.restore_delta_count = outcome.delta_count;
+        result.restore_downloaded_bytes = outcome.downloaded_bytes;
+        result.restore_reused_bytes = outcome.reused_bytes;
+        result.restore_restored_entries = outcome.restored_entries;
+      }
+      break;
+    }
   }
   if (!result.ok) {
     result.detail =
@@ -873,7 +1091,10 @@ void RemoteController::OnOperationFinished() {
   const bool chain = result.ok && !shutting_down_.load() &&
                      (result.kind == RemoteOpResult::Kind::kLogin ||
                       result.kind == RemoteOpResult::Kind::kUpload ||
-                      result.kind == RemoteOpResult::Kind::kDelete);
+                      result.kind == RemoteOpResult::Kind::kDelete ||
+                      // 产品级远端备份之后也自动读一次列表：新快照（或者
+                      // "没有变化、没有新快照"这个事实）必须马上反映在列表上。
+                      result.kind == RemoteOpResult::Kind::kBackup);
   if (chain) {
     refreshList();
   }
@@ -1016,6 +1237,97 @@ void RemoteController::ApplyResult(const RemoteOpResult& result) {
       SetStatus(QStringLiteral("success"), QStringLiteral("已删除"),
                 QStringLiteral("云端的那份备份已经删除。"));
       break;
+    case RemoteOpResult::Kind::kBackup: {
+      // 用户选择的"策略"与这次**实际**产出的类型不是同一件事，界面必须如实说：
+      //   no_changes            -> 没有创建新快照（列表不会多一行）
+      //   produced_delta        -> 真的是增量
+      //   否则（含 rebuilt_full）-> 本次创建的是完整基线，并给出 core 的理由
+      const auto set_summary = [this](const QString& kind,
+                                      const QString& text) {
+        if (backup_summary_kind_ == kind && backup_summary_ == text) {
+          return;
+        }
+        backup_summary_kind_ = kind;
+        backup_summary_ = text;
+        emit backupSummaryChanged();
+      };
+      last_backup_produced_delta_ = result.backup_produced_delta;
+      last_backup_rebuilt_full_ = result.backup_rebuilt_full;
+      last_backup_no_changes_ = result.backup_no_changes;
+      last_backup_snapshot_id_ =
+          QString::fromStdString(result.backup_snapshot_id);
+      last_backup_uploaded_bytes_ = result.backup_uploaded_bytes;
+      last_backup_chain_root_bytes_ = result.backup_chain_root_bytes;
+      last_backup_generation_ = result.backup_generation;
+      last_backup_baseline_reason_ =
+          QString::fromStdString(result.backup_baseline_reason);
+      last_backup_incremental_requested_ = result.backup_incremental_requested;
+      emit backupSummaryChanged();
+      if (result.backup_no_changes) {
+        set_summary(QStringLiteral("no-change"),
+                    QStringLiteral("没有检测到有效变化，本次未创建新备份。"));
+        SetStatus(QStringLiteral("idle"), QStringLiteral("没有检测到有效变化"),
+                  QStringLiteral("源目录与上一次远端备份相比没有变化，"
+                                 "本次没有创建新的云端备份。"));
+        break;
+      }
+      const QString short_id = last_backup_snapshot_id_.left(12);
+      const QString size_text = FormatSize(result.backup_uploaded_bytes);
+      if (result.backup_produced_delta) {
+        const QString parent_short =
+            QString::fromStdString(result.backup_parent_snapshot_id).left(12);
+        set_summary(QStringLiteral("incremental"),
+                    QStringLiteral("增量备份完成：快照 %1（父 %2，代数 %3），"
+                                   "本次上传 %4。")
+                        .arg(short_id, parent_short)
+                        .arg(static_cast<qulonglong>(result.backup_generation))
+                        .arg(size_text));
+        SetStatus(QStringLiteral("success"), QStringLiteral("增量备份完成"),
+                  QStringLiteral("快照 %1 是增量（父 %2，代数 %3），"
+                                 "本次只上传了 %4。")
+                      .arg(short_id, parent_short)
+                      .arg(static_cast<qulonglong>(result.backup_generation))
+                      .arg(size_text));
+      } else if (last_backup_incremental_requested_) {
+        // 用户点了“增量”，实际产出的却是一份完整基线：这是**兜底**，必须
+        // 明说“本次创建的是完整基线”，不能让用户以为增量成功了。core 的
+        // 英文理由不进这一行（它在技术详情里），用户看到的是中文结论。
+        set_summary(QStringLiteral("full"),
+                    QStringLiteral("本次创建的是完整基线：快照 %1，"
+                                   "本次上传 %2。")
+                        .arg(short_id, size_text));
+        SetStatus(QStringLiteral("success"), QStringLiteral("已创建完整基线"),
+                  QStringLiteral("云端没有可续的链，本次创建的是完整基线 %1，"
+                                 "上传 %2；下一次改过文件之后再点“增量”就是"
+                                 "真正的增量。")
+                      .arg(short_id, size_text));
+      } else {
+        // 用户选的就是“完整”：这是一次正常的完整备份，不是兜底。
+        set_summary(QStringLiteral("full"),
+                    QStringLiteral("完整备份完成：快照 %1（完整基线，代数 0），"
+                                   "本次上传 %2。")
+                        .arg(short_id, size_text));
+        SetStatus(QStringLiteral("success"), QStringLiteral("完整备份完成"),
+                  QStringLiteral("快照 %1 是一份完整基线（代数 0），"
+                                 "本次上传 %2。")
+                      .arg(short_id, size_text));
+      }
+      break;
+    }
+    case RemoteOpResult::Kind::kRestore:
+      last_restore_chain_length_ = result.restore_chain_length;
+      last_restore_delta_count_ = result.restore_delta_count;
+      last_restore_downloaded_bytes_ = result.restore_downloaded_bytes;
+      last_restore_entries_ = result.restore_restored_entries;
+      SetStatus(
+          QStringLiteral("success"), QStringLiteral("恢复完成"),
+          QStringLiteral("依赖链 %1 份快照（%2 个增量），本次下载 %3，"
+                         "恢复了 %4 个条目。")
+              .arg(static_cast<qulonglong>(result.restore_chain_length))
+              .arg(static_cast<qulonglong>(result.restore_delta_count))
+              .arg(FormatSize(result.restore_downloaded_bytes))
+              .arg(static_cast<qulonglong>(result.restore_restored_entries)));
+      break;
     case RemoteOpResult::Kind::kDeleteAccount:
       // 账户已经不存在了：本机内存里的会话、口令与列表全部清掉，界面回到
       // "未登录"。云端数据由服务端删除，这里不做任何本地清理。
@@ -1087,6 +1399,8 @@ bool RemoteController::registerAccount(const QString& host,
   RemoteRequest request;
   request.kind = RemoteOpResult::Kind::kRegister;
   request.endpoint = endpoint_;
+  // pin 与地址是同一份快照：每一处提交都显式带上它（见头文件里的说明）。
+  request.endpoint.server_key_pin = serverKeyPin().toStdString();
   request.username = valid_username.toStdString();
   request.password = password.toStdString();
   Submit(request);
@@ -1115,6 +1429,8 @@ bool RemoteController::login(const QString& host, const QString& port_text,
   RemoteRequest request;
   request.kind = RemoteOpResult::Kind::kLogin;
   request.endpoint = endpoint_;
+  // pin 与地址是同一份快照：每一处提交都显式带上它（见头文件里的说明）。
+  request.endpoint.server_key_pin = serverKeyPin().toStdString();
   request.username = valid_username.toStdString();
   request.password = password.toStdString();
   Submit(request);
@@ -1153,6 +1469,8 @@ bool RemoteController::refreshList() {
   RemoteRequest request;
   request.kind = RemoteOpResult::Kind::kList;
   request.endpoint = endpoint_;
+  // pin 与地址是同一份快照：每一处提交都显式带上它（见头文件里的说明）。
+  request.endpoint.server_key_pin = serverKeyPin().toStdString();
   Submit(request);
   return true;
 }
@@ -1194,6 +1512,8 @@ bool RemoteController::uploadArchive(const QString& local_path,
   RemoteRequest request;
   request.kind = RemoteOpResult::Kind::kUpload;
   request.endpoint = endpoint_;
+  // pin 与地址是同一份快照：每一处提交都显式带上它（见头文件里的说明）。
+  request.endpoint.server_key_pin = serverKeyPin().toStdString();
   request.local_path = local_path.toStdString();
   request.display_name = chosen_name.toStdString();
   Submit(request);
@@ -1220,6 +1540,8 @@ bool RemoteController::downloadArchive(const QString& snapshot_id,
   RemoteRequest request;
   request.kind = RemoteOpResult::Kind::kDownload;
   request.endpoint = endpoint_;
+  // pin 与地址是同一份快照：每一处提交都显式带上它（见头文件里的说明）。
+  request.endpoint.server_key_pin = serverKeyPin().toStdString();
   request.snapshot_id = snapshot_id.toStdString();
   request.target_path = target_path.toStdString();
   request.allow_overwrite = allow_overwrite;
@@ -1240,6 +1562,8 @@ bool RemoteController::deleteSnapshot(const QString& snapshot_id) {
   RemoteRequest request;
   request.kind = RemoteOpResult::Kind::kDelete;
   request.endpoint = endpoint_;
+  // pin 与地址是同一份快照：每一处提交都显式带上它（见头文件里的说明）。
+  request.endpoint.server_key_pin = serverKeyPin().toStdString();
   request.snapshot_id = snapshot_id.toStdString();
   Submit(request);
   return true;
@@ -1255,6 +1579,50 @@ void RemoteController::clearLoginError() {
 
 void RemoteController::clearRegisterError() {
   ClearSurfaceError(ErrorSurface::kRegister);
+}
+
+void RemoteController::clearServerKeyPinError() {
+  ClearSurfaceError(ErrorSurface::kServerKey);
+}
+
+bool RemoteController::setServerKeyPin(const QString& pin) {
+  // 重新提交先把上一次的原因清掉：这一行里留下的必须是这一次的结果。
+  ClearSurfaceError(ErrorSurface::kServerKey);
+  // 首尾空白丢掉：从终端复制 --server-key 那一行时经常带上空格。除此之外
+  // 一个字符都不改——大小写由共享解析器归一化，界面不做第二套"看起来对"的
+  // 判断（规则只有一份）。
+  const QString text = pin.trimmed();
+  if (text.isEmpty()) {
+    last_error_kind_ = QStringLiteral("validation");
+    ReportSurfaceError(
+        ErrorSurface::kServerKey,
+        QStringLiteral("请填写服务器身份指纹（向服务器管理员索取，"
+                       "形如 sha256: 开头的 64 位十六进制）"));
+    return false;
+  }
+  backupproject::net::ServerKeyPin parsed;
+  std::string parse_error;
+  if (!backupproject::net::ParseServerKeyPin(text.toStdString(), &parsed,
+                                             &parse_error)) {
+    last_error_kind_ = QStringLiteral("validation");
+    ReportSurfaceError(ErrorSurface::kServerKey,
+                       QStringLiteral("服务器身份指纹不合法：%1")
+                           .arg(QString::fromStdString(parse_error)));
+    // 终端上留一条原始原因（诊断用），界面上只出现上面那一句。
+    std::fprintf(stderr, "[remote] 服务端 pin 不合法：%s\n",
+                 parse_error.c_str());
+    return false;
+  }
+  if (server_key_pin_ == text) {
+    return true;
+  }
+  server_key_pin_ = text;
+  // 两个落点一起更新：request.endpoint 由 endpoint_ 拷贝而来，各个提交点再
+  // 显式带一次 pin（见头文件）。已经建立的连接不受影响——pin 只在握手时用，
+  // 下一次连接才会用到新值。
+  endpoint_.server_key_pin = server_key_pin_.toStdString();
+  emit serverKeyPinChanged();
+  return true;
 }
 
 bool RemoteController::deleteAccount(const QString& password,
@@ -1294,6 +1662,8 @@ bool RemoteController::deleteAccount(const QString& password,
   RemoteRequest request;
   request.kind = RemoteOpResult::Kind::kDeleteAccount;
   request.endpoint = endpoint_;
+  // pin 与地址是同一份快照：每一处提交都显式带上它（见头文件里的说明）。
+  request.endpoint.server_key_pin = serverKeyPin().toStdString();
   request.password = password.toStdString();
   Submit(request);
   return true;
@@ -1345,6 +1715,87 @@ QString RemoteController::suggestedDownloadName(
     return QStringLiteral("remote-backup.bak");
   }
   return name;
+}
+
+// ---- 产品级远端备份 / 链恢复（与 backupctl 共用同一套 core）----
+
+void RemoteController::clearBackupSummary() {
+  if (backup_summary_.isEmpty() && backup_summary_kind_.isEmpty()) {
+    return;
+  }
+  backup_summary_.clear();
+  backup_summary_kind_.clear();
+  emit backupSummaryChanged();
+}
+
+bool RemoteController::backupRemote(const QString& source_directory,
+                                    bool allow_incremental) {
+  const QString source = source_directory.trimmed();
+  if (source.isEmpty()) {
+    SetStatus(QStringLiteral("error"), QStringLiteral("还没有选择源目录"),
+              QStringLiteral("先点“选择源目录”，挑一个要备份到远端的目录。"));
+    return false;
+  }
+  const QFileInfo info(source);
+  if (!info.exists() || !info.isDir()) {
+    SetStatus(QStringLiteral("error"), QStringLiteral("源目录不可用"),
+              QStringLiteral("这个路径不存在，或者不是一个目录：%1")
+                  .arg(info.fileName().isEmpty() ? source : info.fileName()));
+    return false;
+  }
+  // 策略只决定"允不允许续链"：真正的判断（有没有可信基线、链深、缓存是否
+  // 可信）在 core 里。GUI 不传递 parent / generation / lineage。
+  if (!BeginOperation(allow_incremental
+                          ? QStringLiteral("正在准备增量远端备份")
+                          : QStringLiteral("正在准备完整远端备份"),
+                      /*need_login=*/true)) {
+    return false;
+  }
+  RemoteRequest request;
+  request.kind = RemoteOpResult::Kind::kBackup;
+  request.endpoint = endpoint_;
+  // pin 与地址是同一份快照：每一处提交都显式带上它（见头文件里的说明）。
+  request.endpoint.server_key_pin = serverKeyPin().toStdString();
+  // 远端缓存的路径里带用户名（<指纹>/<用户名>/），所以这两条产品级操作必须把
+  // 当前账户名一起带进后台线程——raw 上/下载不需要它，这里需要。
+  request.username = username_.toStdString();
+  request.source_directory = source.toStdString();
+  request.allow_incremental = allow_incremental;
+  // 显示名留空：链的命名（remote-<lineage 前 12 位>-<时间>-g<代数>.bak）由
+  // core 按链规则生成——GUI 不参与命名，也就不会造出与链不一致的名字。
+  Submit(request);
+  return true;
+}
+
+bool RemoteController::restoreSnapshot(const QString& snapshot_id,
+                                       const QString& destination_directory) {
+  const QString id = snapshot_id.trimmed();
+  const QString destination = destination_directory.trimmed();
+  if (id.isEmpty()) {
+    SetStatus(QStringLiteral("error"), QStringLiteral("没有选中云端备份"),
+              QStringLiteral("先在列表里选中一条远端备份，再点“恢复”。"));
+    return false;
+  }
+  if (destination.isEmpty()) {
+    SetStatus(QStringLiteral("error"), QStringLiteral("还没有选择恢复位置"),
+              QStringLiteral("点“选择恢复位置”，指定恢复到哪个目录。"));
+    return false;
+  }
+  if (!BeginOperation(QStringLiteral("正在解析远端依赖链"),
+                      /*need_login=*/true)) {
+    return false;
+  }
+  RemoteRequest request;
+  request.kind = RemoteOpResult::Kind::kRestore;
+  request.endpoint = endpoint_;
+  // pin 与地址是同一份快照：每一处提交都显式带上它（见头文件里的说明）。
+  request.endpoint.server_key_pin = serverKeyPin().toStdString();
+  // 与 backupRemote 同理：缓存路径需要用户名。
+  request.username = username_.toStdString();
+  request.snapshot_id = id.toStdString();
+  request.restore_destination = destination.toStdString();
+  Submit(request);
+  return true;
 }
 
 }  // namespace backup_modern

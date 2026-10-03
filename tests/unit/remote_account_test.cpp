@@ -40,6 +40,7 @@
 #include "remote_maintenance.h"
 #include "remote_metadata_store.h"
 #include "remote_server.h"
+#include "remote_test_support.h"
 #include "test_support.h"
 
 namespace bp = backupproject;
@@ -66,6 +67,9 @@ struct Fixture {
   std::string database;
   std::string secret_file;
   std::string log_file;
+  // PR #21：BPSEC1 的服务端身份私钥与客户端 pin 文本（同一次生成）。
+  std::string transport_key_file;
+  std::string pin;
 };
 
 bool SetupFixture(Fixture* fixture, const std::string& name) {
@@ -86,11 +90,21 @@ bool SetupFixture(Fixture* fixture, const std::string& name) {
                                "BACKUP_TOKEN_SECRET=" + secret + "\n", 0600)) {
     return false;
   }
+  // BPSEC1 身份密钥：服务端握手第一步就要用，缺了它 Start() 直接失败。
+  fixture->transport_key_file = base + "/transport.key";
+  net::TransportIdentity identity;
+  std::string identity_error;
+  if (!remote_test_support::PrepareTransportIdentity(
+          fixture->transport_key_file, &identity, &fixture->pin,
+          &identity_error)) {
+    return false;
+  }
   fixture->config.bind_address = "127.0.0.1";
   fixture->config.port = 0;
   fixture->config.root_directory = fixture->root;
   fixture->config.database_path = fixture->database;
   fixture->config.secret_file_path = fixture->secret_file;
+  fixture->config.transport_key_file_path = fixture->transport_key_file;
   fixture->config.log_file_path = fixture->log_file;
   fixture->config.quiet = true;
   return true;
@@ -128,15 +142,20 @@ struct RawResponse {
 };
 
 // 原始帧调用：用它来验证"客户端本地就挡住了"的那些路径在服务端**也**挡得住。
-bool RawRequest(int fd, std::uint16_t opcode, const std::string& payload,
-                std::uint64_t request_id, RawResponse* out) {
+// BPSEC1 之后"原始"指的是绕过 RemoteArchiveClient，而不是绕过加密层：帧仍然
+// 必须走通道，否则服务端在记录层就断连，根本走不到业务判别。
+bool RawRequest(net::SecureChannel* channel, int fd, std::uint16_t opcode,
+                const std::string& payload, std::uint64_t request_id,
+                RawResponse* out) {
   std::string error;
-  if (!net::SendFrame(fd, opcode, 0, request_id, payload, &error)) {
+  if (!remote_test_support::SendTestFrame(channel, fd, opcode, 0, request_id,
+                                          payload, &error)) {
     return false;
   }
   net::FrameHeader header;
   std::string body;
-  if (net::ReceiveFrame(fd, &header, &body, &error) !=
+  if (remote_test_support::ReceiveTestFrame(channel, fd, &header, &body,
+                                            &error) !=
       net::FrameReadStatus::kOk) {
     return false;
   }
@@ -241,6 +260,8 @@ int main() {
   endpoint.host = "127.0.0.1";
   endpoint.port = port;
   endpoint.timeout_seconds = kClientTimeoutSeconds;
+  // BPSEC1 不做 TOFU：没有 pin 的客户端连不上，所以这里必须填。
+  endpoint.server_key_pin = fixture.pin;
 
   Inspector inspector;
   test_support::Check(inspector.Open(fixture.database),
@@ -255,10 +276,24 @@ int main() {
   {
     const int fd = ConnectToLoopback(port);
     test_support::Check(fd >= 0, "ACC T1 能连上服务端");
+    net::SecureChannel channel;
+    std::string handshake_error;
+    const bool handshaken =
+        fd >= 0 && remote_test_support::HandshakeTestClient(fd, fixture.pin,
+                                                           &channel,
+                                                           &handshake_error);
+    test_support::Check(fd < 0 || handshaken, "ACC T1 原始连接的 BPSEC1 握手完成",
+                        handshake_error);
+    if (fd >= 0 && !handshaken) {
+      // 握手没成时服务端还在等 ClientHello，显式 shutdown 才能让它及时收尾。
+      ::shutdown(fd, SHUT_RDWR);
+    }
     RawResponse response;
     const bool answered =
-        fd >= 0 && RawRequest(fd, static_cast<std::uint16_t>(net::Opcode::kDeleteAccount),
-                              PasswordPayload(password_a), 1, &response);
+        handshaken &&
+        RawRequest(&channel, fd,
+                   static_cast<std::uint16_t>(net::Opcode::kDeleteAccount),
+                   PasswordPayload(password_a), 1, &response);
     test_support::Check(answered &&
                             response.status ==
                                 static_cast<std::uint32_t>(

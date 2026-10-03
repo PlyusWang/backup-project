@@ -78,6 +78,37 @@ DATA_ROOT="$SERVER_ROOT/data"
 DB_PATH="$SERVER_ROOT/state/metadata.sqlite3"
 ADMIN="$SERVER_ROOT/bin/backup-server-admin"
 
+# ---- PR #21：BPSEC1 传输身份密钥（部署布局的一部分）+ 客户端 pin ----
+# 服务端从这一版起必须带 --transport-key-file；密钥放在部署根的 state/ 下，
+# 与 ECS 上的正式位置（<server-root>/state/transport.key，0600）一致。密钥由
+# 测试自己生成在临时部署根里，私钥内容不打印。客户端 pin 从 keygen 的输出里
+# 读进环境变量：remote 命令不加 --server-key 也拿得到，且不会退化成明文常量。
+KEYGEN="./build/backup-server-keygen"
+TRANSPORT_KEY="$SERVER_ROOT/state/transport.key"
+KEYGEN_OUT="$TEST_ROOT/keygen.out"
+if [ ! -x "$KEYGEN" ]; then
+  record_fail "backup-server-keygen 已构建" "$KEYGEN 不存在（make server 应该产出它）"
+  finish
+fi
+if ! "$KEYGEN" --output "$TRANSPORT_KEY" > "$KEYGEN_OUT" 2>&1; then
+  record_fail "生成服务端传输身份密钥" "$(head -2 "$KEYGEN_OUT" | tr '\n' ' ')"
+  finish
+fi
+KEY_MODE="$(stat -c '%a' "$TRANSPORT_KEY" 2>/dev/null || echo missing)"
+if [ "$KEY_MODE" = "600" ]; then
+  record_pass "部署布局里的传输身份私钥已生成且权限 0600（$TRANSPORT_KEY）"
+else
+  record_fail "传输身份私钥权限" "期望 0600，实际 $KEY_MODE"
+  finish
+fi
+export BACKUP_REMOTE_SERVER_KEY="$(grep -oE 'sha256:[0-9a-f]{64}' "$KEYGEN_OUT" | head -1)"
+if [ -n "$BACKUP_REMOTE_SERVER_KEY" ]; then
+  record_pass "客户端 pin 已从 keygen 输出读入环境变量 BACKUP_REMOTE_SERVER_KEY（不打印、不写常量）"
+else
+  record_fail "客户端 pin" "keygen 输出里没有 sha256:<64 位十六进制> 指纹"
+  finish
+fi
+
 PORT=""
 for candidate in $(seq 20250 20280); do
   if ! ss -ltn 2>/dev/null | grep -q ":$candidate "; then PORT="$candidate"; break; fi
@@ -87,6 +118,7 @@ done
 # 服务端**从部署根启动**，用的就是部署脚本安装出来的那一份二进制。
 ( cd "$SERVER_ROOT" && ./bin/backup-server --bind 127.0.0.1 --port "$PORT" \
     --root "$DATA_ROOT" --db "$DB_PATH" --secret-file "$TEST_ROOT/secrets.env" \
+    --transport-key-file "$TRANSPORT_KEY" \
     --pid-file "$SERVER_ROOT/state/server.pid" \
     --log-file "$SERVER_ROOT/logs-server.log" --quiet \
     > "$TEST_ROOT/server-stderr.log" 2>&1 ) &
@@ -114,7 +146,21 @@ record_pass "部署布局里的 backup-server 监听 127.0.0.1:$PORT（pid $SERV
 SERVER_CMDLINE="$(tr '\0' '\n' < "/proc/$SERVER_PID/cmdline" 2>/dev/null)"
 SERVER_DB_ARG="$(printf '%s\n' "$SERVER_CMDLINE" | awk '/^--db$/{getline; print}')"
 SERVER_ROOT_ARG="$(printf '%s\n' "$SERVER_CMDLINE" | awk '/^--root$/{getline; print}')"
-record_pass "从 /proc/$SERVER_PID/cmdline 解析出 --root=$SERVER_ROOT_ARG --db=$SERVER_DB_ARG"
+# PR #21 新增的必填参数。它在这里有两个作用：一是证明多了一个"带值的选项"
+# 之后，上面两条按选项名**整行精确匹配**的解析没有被打断（awk 匹配的是
+# '--root' / '--db' 本身，不会把 --transport-key-file 的值误当成它们）；
+# 二是证明服务端真的用的是部署根 state/ 下那一把身份密钥。
+SERVER_KEY_ARG="$(printf '%s\n' "$SERVER_CMDLINE" | awk '/^--transport-key-file$/{getline; print}')"
+SERVER_KEY_REAL="$(realpath "$SERVER_KEY_ARG" 2>/dev/null || echo "(none)")"
+TRANSPORT_KEY_REAL="$(realpath "$TRANSPORT_KEY" 2>/dev/null || echo "(none)")"
+if [ "$(realpath "$SERVER_ROOT_ARG" 2>/dev/null || echo "(none)")" = "$(realpath "$DATA_ROOT")" ] \
+   && [ "$(realpath "$SERVER_DB_ARG" 2>/dev/null || echo "(none)")" = "$(realpath "$DB_PATH")" ] \
+   && [ "$SERVER_KEY_REAL" = "$TRANSPORT_KEY_REAL" ]; then
+  record_pass "从 /proc/$SERVER_PID/cmdline 解析出 --root=$SERVER_ROOT_ARG --db=$SERVER_DB_ARG --transport-key-file=$SERVER_KEY_ARG"
+else
+  record_fail "从 /proc/$SERVER_PID/cmdline 解析服务端参数" \
+    "root=$SERVER_ROOT_ARG db=$SERVER_DB_ARG key=$SERVER_KEY_REAL（期望 root=$DATA_ROOT db=$DB_PATH key=$TRANSPORT_KEY_REAL）"
+fi
 
 # ---- 2. 管理工具解析出来的路径与身份（wrapper，人工验收用的入口）----
 WRAPPER_OUT="$TEST_ROOT/wrapper-status.txt"
@@ -160,6 +206,18 @@ if [ -z "$STRAY" ]; then
 else
   record_fail "部署根里只有一个 metadata.sqlite3" "$STRAY"
 fi
+# ---- 4b. PR #21 的身份密钥：只在 state/ 下、权限 0600 ----
+# 上面的检查按**文件名** metadata.sqlite3 找第二个库，transport.key 不是这个
+# 名字，所以不可能触发它；这里反过来正面断言密钥的位置与权限，免得日后有人
+# 把密钥放到 data/ 或部署根里，把"只有一个状态根"这件事搞浑。
+STRAY_KEY="$(find "$SERVER_ROOT" -name 'transport.key' ! -path "$SERVER_ROOT/state/*" 2>/dev/null | head -5)"
+if [ -f "$TRANSPORT_KEY" ] && [ "$(stat -c '%a' "$TRANSPORT_KEY")" = "600" ] \
+   && [ -z "$STRAY_KEY" ]; then
+  record_pass "传输身份私钥只在部署根的 state/ 下且权限 0600（不会被当成第二个状态文件）"
+else
+  record_fail "传输身份私钥的位置与权限" \
+    "mode=$(stat -c '%a' "$TRANSPORT_KEY" 2>/dev/null || echo missing) stray=$STRAY_KEY"
+fi
 
 # ---- 5. Truth Matrix ----
 USER_NAME="qa_truth_$(head -c 4 /dev/urandom | od -An -tx1 | tr -d ' \n')"
@@ -167,6 +225,19 @@ export BACKUP_REMOTE_PASSWORD="$(head -c 24 /dev/urandom | sha256sum | cut -c1-2
 REMOTE_OPTS="--host 127.0.0.1 --port $PORT"
 ADMIN_OPTS="--server-root $SERVER_ROOT --root $DATA_ROOT --db $DB_PATH"
 echo "[same-instance] 唯一测试账户：$USER_NAME"
+
+# PR #21：pin 是必填项。用 env -u 摘掉环境变量，命令必须**在连接之前**就
+# 以用法错误（退出码 2）失败——这一条同时证明后面的真值矩阵不是"碰巧连上了"。
+NO_PIN_CODE=0
+env -u BACKUP_REMOTE_SERVER_KEY timeout --signal=KILL 60 \
+  ./build/backupctl remote ping $REMOTE_OPTS > "$TEST_ROOT/no-pin.txt" 2>&1 \
+  || NO_PIN_CODE=$?
+if [ "$NO_PIN_CODE" = "2" ] && grep -q -- "--server-key" "$TEST_ROOT/no-pin.txt"; then
+  record_pass "没有 pin 时 remote 以用法错误退出（退出码 2，提示 --server-key）"
+else
+  record_fail "没有 pin 时的 remote" \
+    "退出码 $NO_PIN_CODE $(head -2 "$TEST_ROOT/no-pin.txt" | tr '\n' ' ')"
+fi
 
 admin_out() { "$ADMIN" $ADMIN_OPTS "$@" > "$TEST_ROOT/admin.txt" 2>&1; echo $?; }
 remote_out() { timeout --signal=KILL 120 ./build/backupctl remote "$@" $REMOTE_OPTS \

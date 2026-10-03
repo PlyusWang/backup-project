@@ -43,6 +43,16 @@
 //                                       登录 / 列表 / 上传真实归档 / 下载比对 /
 //                                       删除。 口令只从环境变量
 //                                       BACKUP_REMOTE_PASSWORD 读，不进 argv
+//   --remote-acceptance <输出目录> <地址> <端口> <用户名>
+//                                       PR #21 无人值守 GUI 最终验收：抓真实
+//                                       窗口截图（浅色 / 深色 / 窄窗口）、读
+//                                       关键控件的真实几何并断言不重叠不越界，
+//                                       并把完整 / 增量 / 回退成完整基线 /
+//                                       无变化 / 原始归档 / 冷缓存链恢复 /
+//                                       错 pin / 空闲重连 + RESUME / 忙碌
+//                                       逐个真的走一遍。口令与指纹走环境变量
+//                                       BACKUP_REMOTE_PASSWORD /
+//                                       BACKUP_REMOTE_PIN，不进 argv
 //   --path-test                         验证本地路径与 URL 互转不丢字符
 //   --close-guard-test                  验证任务进行中关窗会被拦下：手动备份、
 //                                       实时触发、计划评估三位 writer 都要在
@@ -88,6 +98,7 @@
 #include <QQuickStyle>
 #include <QQuickWindow>
 #include <QRandomGenerator>
+#include <QSet>
 #include <QStandardPaths>
 #include <QStringList>
 #include <QTemporaryDir>
@@ -96,6 +107,7 @@
 #include <QVariantMap>
 #include <algorithm>
 #include <cmath>
+#include <csignal>
 #include <cstdio>
 #include <cstring>
 #include <functional>
@@ -110,6 +122,7 @@
 #include "operation_gate.h"
 #include "realtime_controller.h"
 #include "remote_controller.h"
+#include "remote_incremental.h"
 #include "schedule_controller.h"
 #include "schedule_frequency.h"
 #include "schedule_store.h"
@@ -2049,6 +2062,1629 @@ int RunFilterUxTest(QQuickWindow* window,
   return run.failed == 0 ? 0 : 1;
 }
 
+// ---- 产品级远端备份 / 链恢复：GUI 路径的契约自检 ----
+//
+// 这一组把"GUI 真的能做完产品级的远端完整 / 增量备份与链恢复"钉死，并且与
+// --remote-test（自己起服务端）和 --remote-smoke（打真实端点，例如 ECS）**共用
+// 同一段代码**：两条路径覆盖的是同一批断言。
+//
+// 它用的是一个临时账号，结束前注销掉——正式数据一个字节都不动。
+//
+// 编号（与交接文档 02-GUI-CONTRACT.txt 一致）：
+//   GUI-P01 策略=完整：建出一份完整基线
+//   GUI-P02 改一个文件 -> 下一次是增量（parent / generation
+//   正确、字节远小于完整） GUI-P03 源目录没有变化 ->
+//   不创建快照，并且页面显示"没有检测到有效变化" GUI-P04
+//   第一次就选"增量"但云端没有可续的链 -> 实际产出完整基线，
+//           页面按**实际类型**显示（不能写成"增量成功"）
+//   GUI-P05 列表暴露 kind / generation / parent
+//   GUI-P06 只给目标快照就能恢复整条链（内容逐字节一致）
+//   GUI-P07 冷缓存（清掉该账号的缓存目录）之后仍然能恢复
+//   GUI-P08 原始归档条目：restorable=false + 卡片上有明确提示；链恢复被拒，
+//           而且目标目录保持为空
+//   GUI-P09 错 pin：远端备份可见地失败，但**不会**把登录状态踢掉
+//   GUI-P10 服务端空闲关连接之后，下一次操作自动重连 + RESUME，不需要重新登录
+//   GUI-P11 忙碌：同一个控制器上的第二个长操作被拒（busy）
+int RunRemoteProductFlow(backup_modern::RemoteController* remote, CheckRun* run,
+                         const QString& work, const QString& host,
+                         const QString& port_text, const QString& username,
+                         const QString& password, const QString& fingerprint) {
+  const QString source = work + QStringLiteral("/product-src");
+  const QString first_out = work + QStringLiteral("/product-out-1");
+  const QString cold_out = work + QStringLiteral("/product-out-2");
+  const QString raw_out = work + QStringLiteral("/product-out-raw");
+  for (const QString& directory : {source, first_out, cold_out, raw_out}) {
+    QDir().mkpath(directory);
+  }
+  const auto writeText = [](const QString& path, const QString& text) {
+    QFile file(path);
+    if (file.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
+      file.write(text.toUtf8());
+    }
+  };
+  // 一份 200 KiB 的随机文件 + 两个小文本（其中一个在子目录里）：这样"改一个
+  // 小文件"之后的增量必须远小于完整基线。
+  {
+    QFile big(source + QStringLiteral("/data.bin"));
+    if (big.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
+      QByteArray payload(200 * 1024, 0);
+      for (int index = 0; index < payload.size(); ++index) {
+        payload[index] =
+            static_cast<char>(QRandomGenerator::global()->bounded(256));
+      }
+      big.write(payload);
+    }
+  }
+  writeText(source + QStringLiteral("/notes.txt"), QStringLiteral("v0\n"));
+  QDir().mkpath(source + QStringLiteral("/sub"));
+  writeText(source + QStringLiteral("/sub/inner.txt"),
+            QStringLiteral("inner-0\n"));
+
+  // 目录树逐字节比较（相对路径 + 内容）。恢复会把源目录本身作为一层放进去，
+  // 所以两种形状都接受：<dst>/... 或 <dst>/<source 名>/...
+  const auto collectTree = [](const QString& root) {
+    QMap<QString, QByteArray> files;
+    QDirIterator iterator(root, QDir::Files | QDir::NoDotAndDotDot,
+                          QDirIterator::Subdirectories);
+    while (iterator.hasNext()) {
+      const QString path = iterator.next();
+      QFile file(path);
+      if (file.open(QIODevice::ReadOnly)) {
+        files.insert(QDir(root).relativeFilePath(path), file.readAll());
+      }
+    }
+    return files;
+  };
+  const auto sameTree = [&collectTree](const QString& left,
+                                       const QString& right) {
+    const QMap<QString, QByteArray> a = collectTree(left);
+    const QMap<QString, QByteArray> b = collectTree(right);
+    return !a.isEmpty() && a == b;
+  };
+  const auto treeMatches = [&sameTree](const QString& left,
+                                       const QString& right) {
+    if (sameTree(left, right)) {
+      return true;
+    }
+    const QString nested =
+        right + QStringLiteral("/") + QFileInfo(left).fileName();
+    return QFileInfo(nested).isDir() && sameTree(left, nested);
+  };
+  const auto findSnapshot = [remote](const QString& id) {
+    for (const QVariant& item : remote->snapshots()) {
+      const QVariantMap map = item.toMap();
+      if (map.value(QStringLiteral("id")).toString() == id) {
+        return map;
+      }
+    }
+    return QVariantMap();
+  };
+  const auto findByDisplayName = [remote](const QString& display_name) {
+    for (const QVariant& item : remote->snapshots()) {
+      const QVariantMap map = item.toMap();
+      if (map.value(QStringLiteral("name")).toString() == display_name) {
+        return map;
+      }
+    }
+    return QVariantMap();
+  };
+  const auto refresh = [remote]() {
+    return remote->refreshList() && remote->waitForIdle(120000) &&
+           remote->lastErrorKindForTest() == QStringLiteral("none");
+  };
+  const auto removeTree = [](const QString& path) {
+    QDir directory(path);
+    if (directory.exists()) {
+      directory.removeRecursively();
+    }
+  };
+
+  // ---- GUI-P01：策略 = 完整 ----
+  remote->clearBackupSummary();
+  const bool full_accepted =
+      remote->backupRemote(source, /*allow_incremental=*/false);
+  const bool full_idle = full_accepted && remote->waitForIdle(900000);
+  const QString root_id = remote->lastBackupSnapshotIdForTest();
+  run->Check(full_idle &&
+                 remote->lastErrorKindForTest() == QStringLiteral("none") &&
+                 !remote->lastBackupProducedDeltaForTest() &&
+                 !remote->lastBackupNoChangesForTest() && !root_id.isEmpty(),
+             QStringLiteral("GUI-P01 策略=完整：建出一份完整基线"),
+             remote->lastErrorKindForTest() + QStringLiteral(": ") +
+                 remote->lastDetailForTest());
+  const qint64 root_bytes = remote->lastBackupUploadedBytesForTest();
+  const QVariantMap root_row = findSnapshot(root_id);
+  run->Check(
+      !root_row.isEmpty() &&
+          root_row.value(QStringLiteral("kind")).toString() ==
+              QStringLiteral("full") &&
+          root_row.value(QStringLiteral("generation")).toInt() == 0 &&
+          root_row.value(QStringLiteral("restorable")).toBool(),
+      QStringLiteral("GUI-P05 列表暴露 kind / generation / parent（链根）"),
+      QStringLiteral("row=%1").arg(root_row.isEmpty()
+                                       ? QStringLiteral("(missing)")
+                                       : QStringLiteral("ok")));
+
+  // ---- GUI-P02：改一个小文件 -> 增量 ----
+  writeText(source + QStringLiteral("/notes.txt"), QStringLiteral("v1\n"));
+  const bool delta_accepted =
+      remote->backupRemote(source, /*allow_incremental=*/true);
+  const bool delta_idle = delta_accepted && remote->waitForIdle(900000);
+  const QString delta_id = remote->lastBackupSnapshotIdForTest();
+  const bool delta_ok =
+      delta_idle && remote->lastErrorKindForTest() == QStringLiteral("none") &&
+      remote->lastBackupProducedDeltaForTest() &&
+      !remote->lastBackupNoChangesForTest() && !delta_id.isEmpty() &&
+      remote->lastBackupSnapshotIdForTest() != root_id;
+  run->Check(delta_ok,
+             QStringLiteral("GUI-P02 策略=增量：改一个文件后是增量快照"),
+             remote->lastErrorKindForTest() + QStringLiteral(": ") +
+                 remote->lastDetailForTest());
+  const QVariantMap delta_row = findSnapshot(delta_id);
+  run->Check(
+      !delta_row.isEmpty() &&
+          delta_row.value(QStringLiteral("kind")).toString() ==
+              QStringLiteral("incremental") &&
+          delta_row.value(QStringLiteral("generation")).toInt() == 1 &&
+          delta_row.value(QStringLiteral("parentShort")).toString() ==
+              root_id.left(12) &&
+          delta_row.value(QStringLiteral("restorable")).toBool(),
+      QStringLiteral("GUI-P02/P05 增量的父与代数在列表里可见（父=链根）"),
+      QStringLiteral("gen=%1 parent=%2")
+          .arg(delta_row.value(QStringLiteral("generation")).toInt())
+          .arg(delta_row.value(QStringLiteral("parentShort")).toString()));
+  run->Check(root_bytes > 0 &&
+                 remote->lastBackupUploadedBytesForTest() * 4 < root_bytes,
+             QStringLiteral("GUI-P02 增量字节远小于完整基线"),
+             QStringLiteral("增量=%1 完整=%2")
+                 .arg(remote->lastBackupUploadedBytesForTest())
+                 .arg(root_bytes));
+
+  // ---- GUI-P03：源目录没有变化 -> 不创建快照 ----
+  const int count_before = remote->snapshotCountForTest();
+  const bool nochange_accepted =
+      remote->backupRemote(source, /*allow_incremental=*/true);
+  const bool nochange_idle = nochange_accepted && remote->waitForIdle(900000);
+  run->Check(nochange_idle && remote->lastBackupNoChangesForTest() &&
+                 remote->backupSummaryKind() == QStringLiteral("no-change") &&
+                 remote->backupSummary().contains(
+                     QStringLiteral("没有检测到有效变化")),
+             QStringLiteral("GUI-P03 没有变化：不创建新备份，页面说明没有变化"),
+             remote->backupSummary() + QStringLiteral(" / ") +
+                 remote->lastErrorKindForTest());
+  run->Check(refresh() && remote->snapshotCountForTest() == count_before,
+             QStringLiteral("GUI-P03 没有变化时列表不增加行"),
+             QStringLiteral("before=%1 after=%2")
+                 .arg(count_before)
+                 .arg(remote->snapshotCountForTest()));
+
+  // ---- GUI-P04：第一次就选"增量"，但云端没有可续的链 ----
+  const QString fresh = work + QStringLiteral("/product-fresh");
+  QDir().mkpath(fresh);
+  writeText(fresh + QStringLiteral("/only.txt"), QStringLiteral("fresh\n"));
+  const bool fresh_accepted =
+      remote->backupRemote(fresh, /*allow_incremental=*/true);
+  const bool fresh_idle = fresh_accepted && remote->waitForIdle(900000);
+  run->Check(fresh_idle &&
+                 remote->lastErrorKindForTest() == QStringLiteral("none") &&
+                 !remote->lastBackupProducedDeltaForTest() &&
+                 !remote->lastBackupNoChangesForTest() &&
+                 remote->backupSummary().contains(QStringLiteral("完整基线")),
+             QStringLiteral("GUI-P04 第一次选增量：实际产出完整基线且如实显示"),
+             remote->backupSummary() + QStringLiteral(" / ") +
+                 remote->lastErrorKindForTest());
+
+  // ---- GUI-P06：只给目标快照就能恢复整条链 ----
+  const bool restore_accepted = remote->restoreSnapshot(delta_id, first_out);
+  const bool restore_idle = restore_accepted && remote->waitForIdle(900000);
+  run->Check(restore_idle &&
+                 remote->lastErrorKindForTest() == QStringLiteral("none") &&
+                 remote->lastRestoreChainLengthForTest() >= 2 &&
+                 remote->lastRestoreDeltaCountForTest() >= 1,
+             QStringLiteral("GUI-P06 只给目标快照：整条依赖链自动恢复"),
+             remote->lastErrorKindForTest() + QStringLiteral(": ") +
+                 remote->lastDetailForTest());
+  run->Check(treeMatches(source, first_out),
+             QStringLiteral("GUI-P06 恢复出来的目录与源目录逐字节一致"));
+
+  // ---- GUI-P07：冷缓存 ----
+  backupproject::net::RemoteCacheLayout layout;
+  std::string cache_error;
+  const bool layout_ok = backupproject::net::PrepareRemoteCache(
+      std::string(), fingerprint.toStdString(), username.toStdString(), &layout,
+      &cache_error);
+  removeTree(QString::fromStdString(layout.cache_directory));
+  run->Check(layout_ok && !QFileInfo::exists(
+                              QString::fromStdString(layout.cache_directory)),
+             QStringLiteral("GUI-P07 冷缓存：该账号的缓存目录已清空"),
+             QString::fromStdString(cache_error));
+  const bool cold_accepted = remote->restoreSnapshot(delta_id, cold_out);
+  const bool cold_idle = cold_accepted && remote->waitForIdle(900000);
+  run->Check(cold_idle &&
+                 remote->lastErrorKindForTest() == QStringLiteral("none") &&
+                 treeMatches(source, cold_out),
+             QStringLiteral("GUI-P07 冷缓存之后仍然能恢复整条链"),
+             remote->lastErrorKindForTest() + QStringLiteral(": ") +
+                 remote->lastDetailForTest());
+
+  // ---- GUI-P08：原始归档上传的条目不能做链恢复 ----
+  const QString raw_file = work + QStringLiteral("/gui-raw-archive.bin");
+  {
+    QFile raw(raw_file);
+    if (raw.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
+      raw.write(QByteArray(4096, 'R'));
+    }
+  }
+  const QString raw_name = QStringLiteral("gui-raw-archive");
+  const bool raw_uploaded =
+      remote->uploadArchive(raw_file, raw_name) &&
+      remote->waitForIdle(300000) &&
+      remote->lastErrorKindForTest() == QStringLiteral("none");
+  run->Check(raw_uploaded && refresh(),
+             QStringLiteral("GUI-P08 原始归档上传成功（低层 raw 操作）"),
+             remote->lastErrorKindForTest() + QStringLiteral(": ") +
+                 remote->lastDetailForTest());
+  const QVariantMap raw_row = findByDisplayName(raw_name);
+  run->Check(
+      !raw_row.isEmpty() &&
+          !raw_row.value(QStringLiteral("restorable")).toBool() &&
+          raw_row.value(QStringLiteral("restoreHint"))
+              .toString()
+              .contains(QStringLiteral("原始归档")),
+      QStringLiteral("GUI-P08 原始归档条目：禁用链恢复并在卡片上说明原因"),
+      raw_row.value(QStringLiteral("restoreHint")).toString());
+  const bool raw_restore_accepted = remote->restoreSnapshot(
+      raw_row.value(QStringLiteral("id")).toString(), raw_out);
+  const bool raw_restore_idle =
+      raw_restore_accepted && remote->waitForIdle(300000);
+  const QString raw_kind = remote->lastErrorKindForTest();
+  run->Check(
+      raw_restore_idle && raw_kind == QStringLiteral("not-a-bundle") &&
+          QDir(raw_out)
+              .entryList(QDir::Files | QDir::AllDirs | QDir::NoDotAndDotDot,
+                         QDir::NoSort)
+              .isEmpty(),
+      QStringLiteral("GUI-P08 对原始归档做链恢复：明确诊断且目标目录为空"),
+      raw_kind + QStringLiteral(": ") + remote->lastDetailForTest());
+
+  // ---- GUI-P09：错 pin 时远端备份可见地失败，但不踢掉登录状态 ----
+  // ---- GUI-P09：服务器身份 pin 在**建立连接**时被强制 ----
+  //
+  // pin 是"连接建立时的期望值"：连接还活着的时候改 pin 不会立刻断线（这是
+  // **对**的产品行为，见 12-KNOWN-LIMITATIONS.md）。所以这里分两步，
+  // 在两种环境下都确定：
+  //   (1) 改错 pin 之后立刻做一次备份：连接还活着 -> 沿用现有连接、成功；
+  //       已被服务端按 io-timeout 关掉 -> 重连必须用**当前** pin，于是失败。
+  //       两种结果都接受（取决于服务端 io-timeout），但会话都不许被踢掉。
+  //       在 --remote-test（io-timeout 2）下走的是"被挡住"那一条，这一条同时
+  //       钉死了 RemoteArchiveClient::SetReconnectEndpoint 的语义：重连用的是
+  //       当前 pin，而不是很久以前那一次 Connect 存下来的旧值。
+  //   (2) 显式登录一次（登录**一定**新建连接）：错 pin 必须在这里被挡住，
+  //       而且分类必须是 pin-mismatch（不是笼统的网络错误）。
+  const QString good_pin = remote->serverKeyPin();
+  const QString wrong_pin = QStringLiteral("sha256:") + QString(64, 'b');
+  const bool pin_set = remote->setServerKeyPin(wrong_pin);
+  WaitForAnimation(4000);
+  const bool wrong_accepted =
+      remote->backupRemote(source, /*allow_incremental=*/false);
+  const bool wrong_idle = wrong_accepted && remote->waitForIdle(900000);
+  const QString wrong_kind = remote->lastErrorKindForTest();
+  const bool wrong_blocked = wrong_kind == QStringLiteral("pin-mismatch");
+  run->Check(
+      pin_set && wrong_idle && remote->authenticated() &&
+          (wrong_blocked || wrong_kind == QStringLiteral("none")),
+      QStringLiteral(
+          "GUI-P09 错 pin：重连被挡住（连接还活着则沿用），会话不被踢掉"),
+      wrong_kind + QStringLiteral(": ") + remote->lastDetailForTest());
+  const bool relogin_accepted =
+      remote->login(host, port_text, username, password);
+  const bool relogin_idle = relogin_accepted && remote->waitForIdle(300000);
+  const QString relogin_kind = remote->lastErrorKindForTest();
+  run->Check(
+      relogin_idle && relogin_kind == QStringLiteral("pin-mismatch"),
+      QStringLiteral("GUI-P09 错 pin：显式登录（必然新建连接）被身份校验挡住"),
+      relogin_kind + QStringLiteral(": ") + remote->lastDetailForTest());
+  const bool pin_restored = remote->setServerKeyPin(good_pin);
+  const bool relogin_ok = remote->login(host, port_text, username, password) &&
+                          remote->waitForIdle(300000) &&
+                          remote->authenticated();
+  run->Check(pin_restored && relogin_ok && refresh(),
+             QStringLiteral("GUI-P09 换回正确指纹、重新登录之后一切恢复"),
+             remote->lastErrorKindForTest() + QStringLiteral(": ") +
+                 remote->lastDetailForTest());
+
+  // ---- GUI-P10：空闲被服务端关掉之后自动重连 + RESUME ----
+  // --remote-test 起服务端时用的是 --io-timeout 2；这里等它把空闲连接关掉。
+  WaitForAnimation(4000);
+  const bool after_idle = refresh() && remote->authenticated();
+  run->Check(
+      after_idle,
+      QStringLiteral("GUI-P10 空闲断连之后列表仍然可读（自动重连 + RESUME）"),
+      remote->lastErrorKindForTest() + QStringLiteral(": ") +
+          remote->lastDetailForTest());
+  // 备份之前先把"这条链已经存在的 id"记下来：新的增量必须挂在其中一个上
+  // （而不是凭空造一个新链根）。这样断言与 P09 的实际结果无关，两种环境都成立。
+  QStringList ids_before;
+  for (const QVariant& item : remote->snapshots()) {
+    ids_before.append(item.toMap().value(QStringLiteral("id")).toString());
+  }
+  writeText(source + QStringLiteral("/notes.txt"), QStringLiteral("v2\n"));
+  const bool resumed_backup =
+      remote->backupRemote(source, /*allow_incremental=*/true) &&
+      remote->waitForIdle(900000);
+  const QVariantMap resumed_row =
+      findSnapshot(remote->lastBackupSnapshotIdForTest());
+  const QVariantMap resumed_parent =
+      findSnapshot(resumed_row.value(QStringLiteral("parentId")).toString());
+  run->Check(
+      resumed_backup &&
+          remote->lastErrorKindForTest() == QStringLiteral("none") &&
+          remote->lastBackupProducedDeltaForTest() &&
+          !resumed_parent.isEmpty() &&
+          ids_before.contains(
+              resumed_parent.value(QStringLiteral("id")).toString()) &&
+          resumed_row.value(QStringLiteral("generation")).toInt() ==
+              resumed_parent.value(QStringLiteral("generation")).toInt() + 1,
+      QStringLiteral(
+          "GUI-P10 空闲断连之后继续这条链（父已存在、代数 = 父 + 1）"),
+      remote->lastErrorKindForTest() + QStringLiteral(": ") +
+          remote->lastDetailForTest() + QStringLiteral(" gen=") +
+          QString::number(
+              resumed_row.value(QStringLiteral("generation")).toInt()) +
+          QStringLiteral(" parent=") +
+          resumed_row.value(QStringLiteral("parentShort")).toString());
+
+  // ---- GUI-P11：忙碌时第二个长操作被拒 ----
+  const bool first_accept = remote->backupRemote(source, false);
+  const bool second_accept = remote->backupRemote(source, false);
+  const QString busy_kind = remote->lastErrorKindForTest();
+  run->Check(
+      first_accept && !second_accept && busy_kind == QStringLiteral("busy") &&
+          remote->busy(),
+      QStringLiteral("GUI-P11 忙碌：第二个远端操作在控制器层被拒"),
+      busy_kind + QStringLiteral(" busy=") + QString::number(remote->busy()));
+  remote->waitForIdle(900000);
+
+  // ---- 清理：注销临时账号（正式数据不受影响）----
+  const bool deleted = remote->deleteAccount(password, username) &&
+                       remote->waitForIdle(300000) && !remote->authenticated();
+  run->Check(deleted, QStringLiteral("GUI-P12 临时账号已注销（正式数据不动）"),
+             remote->lastErrorKindForTest() + QStringLiteral(": ") +
+                 remote->lastDetailForTest());
+  return 0;
+}
+
+// ---- --remote-acceptance：PR #21 无人值守 GUI 最终验收 ----
+//
+// 与 --remote-test / --remote-smoke 的区别：那两个验的是"链路能不能走通"，
+// 这一个验的是"人打开这一页会看到什么"，并且把看到的东西留下来：
+//
+//   1. 真的把窗口抓成 PNG（走窗口自己的 grabWindow()，与用户看到的是同一条
+//      渲染路径），浅色 / 深色 / 窄窗口三套尺寸；
+//   2. 读出关键控件的真实几何（x/y/宽/高/可见/可用）并断言：正的几何、
+//      不越过页面右边界、不重叠、卡片内容在卡片里、恢复按钮在卡片里；
+//   3. 把每一个产品状态真的走一遍（完整 / 增量 / 回退成完整基线 / 无变化 /
+//      原始归档 / 冷缓存链恢复 / 错 pin / 空闲重连 + RESUME / 忙碌）；
+//   4. 抓图期间的所有 QML 警告照常计数：有任何一条，进程就以非 0 退出。
+//
+// 它**不**改产品行为：所有输入都由 harness 从外面喂进去（页面上的草稿属性 +
+// 控制器接口 + 隔离的临时账号），产品 QML 里没有一行"测试模式"分支。
+//
+// 用法：--remote-acceptance <输出目录> <地址> <端口> <用户名>
+//   BACKUP_REMOTE_PASSWORD    口令（不进 argv；进程列表对同机用户可见）
+//   BACKUP_REMOTE_PIN         服务端身份指纹（公开信息）
+//   BACKUP_REMOTE_IDLE_WAIT   服务端空闲关连接的秒数（默认 5）
+//   BACKUP_REMOTE_SERVER_PID  本地自检时服务端的 pid：用它 SIGSTOP 造一个
+//                             **确定**的"长操作进行中"窗口，不靠 sleep 猜时间
+int RunRemoteAcceptance(QQuickWindow* window,
+                        backup_modern::RemoteController* remote,
+                        backup_modern::BackupController* controller,
+                        backup_modern::AppTheme* theme, const QString& out_dir,
+                        const QString& host, const QString& port_text,
+                        const QString& username) {
+  CheckRun run;
+  run.prefix = "[remote-acceptance]";
+  const QString password = qEnvironmentVariable("BACKUP_REMOTE_PASSWORD");
+  const QString pin = qEnvironmentVariable("BACKUP_REMOTE_PIN");
+  if (password.isEmpty() || pin.isEmpty()) {
+    std::fprintf(stderr,
+                 "[remote-acceptance] 需要环境变量 BACKUP_REMOTE_PASSWORD "
+                 "与 BACKUP_REMOTE_PIN\n");
+    return 2;
+  }
+  int idle_wait_ms = 5000;
+  {
+    bool ok = false;
+    const int seconds =
+        qEnvironmentVariable("BACKUP_REMOTE_IDLE_WAIT").toInt(&ok);
+    if (ok && seconds >= 1 && seconds <= 120) {
+      idle_wait_ms = seconds * 1000;
+    }
+  }
+  int server_pid = 0;
+  {
+    bool ok = false;
+    const int value =
+        qEnvironmentVariable("BACKUP_REMOTE_SERVER_PID").toInt(&ok);
+    if (ok && value > 1) {
+      server_pid = value;
+    }
+  }
+  if (!QDir().mkpath(out_dir)) {
+    std::fprintf(stderr, "[remote-acceptance] 无法创建输出目录 %s\n",
+                 qPrintable(out_dir));
+    return 1;
+  }
+  QStringList geometry_report;
+  int shots = 0;
+
+  QTemporaryDir temp;
+  if (!temp.isValid()) {
+    std::fprintf(stderr, "[remote-acceptance] 无法创建临时工作目录\n");
+    return 1;
+  }
+  const QString work = temp.filePath(QStringLiteral("acceptance"));
+  const QString source = work + QStringLiteral("/source");
+  const QString restore_a = work + QStringLiteral("/restore-a");
+  const QString restore_b = work + QStringLiteral("/restore-b");
+  for (const QString& directory : {work, source, restore_a, restore_b}) {
+    QDir().mkpath(directory);
+  }
+  const auto writeText = [](const QString& path, const QString& text) {
+    QFile file(path);
+    if (file.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
+      file.write(text.toUtf8());
+    }
+  };
+  {
+    QFile big(source + QStringLiteral("/data.bin"));
+    if (big.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
+      QByteArray payload(160 * 1024, 0);
+      for (int index = 0; index < payload.size(); ++index) {
+        payload[index] =
+            static_cast<char>(QRandomGenerator::global()->bounded(256));
+      }
+      big.write(payload);
+    }
+  }
+  writeText(source + QStringLiteral("/notes.txt"), QStringLiteral("v0\n"));
+  QDir().mkpath(source + QStringLiteral("/sub"));
+  writeText(source + QStringLiteral("/sub/inner.txt"),
+            QStringLiteral("inner-0\n"));
+
+  const auto collectTree = [](const QString& root) {
+    QMap<QString, QByteArray> files;
+    QDirIterator iterator(root, QDir::Files | QDir::NoDotAndDotDot,
+                          QDirIterator::Subdirectories);
+    while (iterator.hasNext()) {
+      const QString path = iterator.next();
+      QFile file(path);
+      if (file.open(QIODevice::ReadOnly)) {
+        files.insert(QDir(root).relativeFilePath(path), file.readAll());
+      }
+    }
+    return files;
+  };
+  const auto treeMatches = [&collectTree](const QString& left,
+                                          const QString& right) {
+    const QMap<QString, QByteArray> a = collectTree(left);
+    const QMap<QString, QByteArray> b = collectTree(right);
+    if (!a.isEmpty() && a == b) {
+      return true;
+    }
+    const QString nested =
+        right + QStringLiteral("/") + QFileInfo(left).fileName();
+    return QFileInfo(nested).isDir() && !a.isEmpty() &&
+           a == collectTree(nested);
+  };
+
+  QQuickItem* page =
+      window->findChild<QQuickItem*>(QStringLiteral("remotePage"));
+  QQuickItem* scroll =
+      window->findChild<QQuickItem*>(QStringLiteral("remotePageScroll"));
+  run.Check(page != nullptr && scroll != nullptr,
+            QStringLiteral("ACC-01 Remote 页与它的滚动容器都在"),
+            page == nullptr ? QStringLiteral("找不到 remotePage")
+                            : QStringLiteral("ok"));
+  if (page == nullptr || scroll == nullptr) {
+    std::printf("[remote-acceptance] passed=%d failed=%d\n", run.passed,
+                run.failed);
+    return 1;
+  }
+  const auto named = [window](const char* name) -> QQuickItem* {
+    return window->findChild<QQuickItem*>(QString::fromLatin1(name));
+  };
+  // Repeater 的委托只能在**可视项树**里找（QObject 父链不是窗口，见
+  // ManagementPage 抓记录卡片时的同一条经验）。列表行里的按钮、徽标、
+  // 代数、父短 ID 都属于这一层。
+  const auto allByName = [window](const QString& name) {
+    QList<QQuickItem*> found;
+    std::function<void(QQuickItem*)> walk = [&](QQuickItem* item) {
+      if (item == nullptr) {
+        return;
+      }
+      if (item->objectName() == name) {
+        found.append(item);
+      }
+      const QList<QQuickItem*> children = item->childItems();
+      for (QQuickItem* child : children) {
+        walk(child);
+      }
+    };
+    walk(window->contentItem());
+    return found;
+  };
+  const auto firstByName = [&allByName](const char* name) -> QQuickItem* {
+    const QList<QQuickItem*> items = allByName(QString::fromLatin1(name));
+    return items.isEmpty() ? nullptr : items.first();
+  };
+  const auto click = [](QQuickItem* item) -> bool {
+    return item != nullptr && QMetaObject::invokeMethod(item, "clicked");
+  };
+  const auto goRemote = [window]() {
+    window->setProperty("currentPage", 6);
+    WaitForAnimation(400);
+  };
+  // 每个状态开头的归一化：确保页面是 Remote、窗口是主开发尺寸、主题已知。
+  const auto prepare = [&](bool dark) {
+    goRemote();
+    theme->setDark(dark);
+    window->setMinimumWidth(0);
+    window->setMinimumHeight(0);
+    window->setWidth(1180);
+    window->setHeight(760);
+    WaitForAnimation(320);
+  };
+  // ScrollView 的 contentItem 是 Flickable：它的 height() 是**视口**高度，
+  // 内容实际有多高要看 contentHeight。这两者混用会让"滚动"和"越界"两个判断
+  // 同时失效（第一版就是这么错的）。
+  const auto contentHeight = [&]() {
+    QQuickItem* flickable =
+        scroll->property("contentItem").value<QQuickItem*>();
+    return flickable == nullptr
+               ? 0.0
+               : flickable->property("contentHeight").toDouble();
+  };
+  // 页面比窗口高是**正常**的（ScrollView，整页内容本来就放不进一屏）。
+  // 抓"列表里的卡片"这类状态之前先把它滚进视野，否则截到的是一张空图；
+  // 这不改变任何布局，只改滚动位置。
+  const auto scrollTo = [&](QQuickItem* item, double offset) {
+    QQuickItem* flickable =
+        scroll->property("contentItem").value<QQuickItem*>();
+    if (flickable == nullptr || item == nullptr) {
+      std::printf("[remote-acceptance] scroll: item=%s\n",
+                  item == nullptr ? "null" : "found");
+      return false;
+    }
+    // mapToItem(flickable) 给的是**视口**坐标（Flickable 的坐标系是视口，
+    // 内容偏移在它内部生效），所以内容坐标要自己加回 contentY。第一版就是
+    // 少了这一步：页面已经被滚过一次之后，第二次计算出来的目标永远是 0，
+    // 于是截图又回到页首。
+    const double viewport = scroll->height();
+    const double content_height = contentHeight();
+    const double maximum = std::max(0.0, content_height - viewport);
+    const double current = flickable->property("contentY").toDouble();
+    const QPointF in_view = item->mapToItem(flickable, QPointF(0, 0));
+    const double content_y = in_view.y() + current;
+    const double target = std::min(std::max(0.0, content_y - offset), maximum);
+    flickable->setProperty("contentY", target);
+    WaitForAnimation(250);
+    const double landed = flickable->property("contentY").toDouble();
+    const QPointF after = item->mapToItem(flickable, QPointF(0, 0));
+    const bool in_viewport =
+        after.y() + item->height() > 0 && after.y() < viewport;
+    std::printf(
+        "[remote-acceptance] scroll content_y=%.1f contentHeight=%.1f "
+        "viewport=%.1f max=%.1f target=%.1f landed=%.1f after=%.1f "
+        "in_viewport=%d\n",
+        content_y, content_height, viewport, maximum, target, landed, after.y(),
+        in_viewport ? 1 : 0);
+    return in_viewport;
+  };
+  // 整页高度：四段（连接 / 远端备份 / 云端备份 / 原始归档）同屏需要多高的
+  // 窗口，只有问真实的 contentItem 才知道，不猜。
+  const auto wholePageHeight = [&]() {
+    QQuickItem* flickable =
+        scroll->property("contentItem").value<QQuickItem*>();
+    if (flickable == nullptr) {
+      return 0;
+    }
+    return static_cast<int>(std::ceil(contentHeight())) + 16;
+  };
+
+  // ---- 几何 ----
+  //
+  // 坐标一律换算到窗口内容项：比较"谁在谁里面 / 谁压住谁"时才不会混用
+  // 两套坐标系。tolerance 取 0.5 px：QML 布局会算出小数坐标。
+  struct Box {
+    QString name;
+    bool found = false;
+    bool visible = false;
+    bool enabled = true;
+    double x = 0;
+    double y = 0;
+    double w = 0;
+    double h = 0;
+    double right() const { return x + w; }
+    double bottom() const { return y + h; }
+  };
+  const double tolerance = 0.5;
+  const auto boxOf = [window](QQuickItem* item, const QString& name) {
+    Box box;
+    box.name = name;
+    if (item == nullptr) {
+      return box;
+    }
+    const QPointF origin =
+        item->mapToItem(window->contentItem(), QPointF(0, 0));
+    box.found = true;
+    box.visible = item->isVisible();
+    box.enabled = item->isEnabled();
+    box.x = origin.x();
+    box.y = origin.y();
+    box.w = item->width();
+    box.h = item->height();
+    return box;
+  };
+  const auto byName = [&boxOf, window](const char* name) {
+    return boxOf(window->findChild<QQuickItem*>(QString::fromLatin1(name)),
+                 QString::fromLatin1(name));
+  };
+  const auto overlaps = [tolerance](const Box& a, const Box& b) {
+    return a.x < b.right() - tolerance && b.x < a.right() - tolerance &&
+           a.y < b.bottom() - tolerance && b.y < a.bottom() - tolerance;
+  };
+  const auto contains = [tolerance](const Box& outer, const Box& inner) {
+    return inner.x >= outer.x - tolerance && inner.y >= outer.y - tolerance &&
+           inner.right() <= outer.right() + tolerance &&
+           inner.bottom() <= outer.bottom() + tolerance;
+  };
+  const auto record = [&geometry_report](const Box& box) {
+    geometry_report.append(
+        QStringLiteral("    %1 x=%2 y=%3 w=%4 h=%5 visible=%6 enabled=%7")
+            .arg(box.name)
+            .arg(box.x, 0, 'f', 1)
+            .arg(box.y, 0, 'f', 1)
+            .arg(box.w, 0, 'f', 1)
+            .arg(box.h, 0, 'f', 1)
+            .arg(box.visible ? QStringLiteral("true") : QStringLiteral("false"))
+            .arg(box.enabled ? QStringLiteral("true")
+                             : QStringLiteral("false")));
+  };
+  // 卡片：从卡片内的控件往上找"带 snapshotId / restorable 属性的祖先"。
+  // 这样不必给产品 QML 加测试专用的 objectName。
+  const auto cardOf = [](QQuickItem* item) -> QQuickItem* {
+    QQuickItem* current = item == nullptr ? nullptr : item->parentItem();
+    while (current != nullptr) {
+      if (current->property("snapshotId").isValid() &&
+          current->property("restorable").isValid()) {
+        return current;
+      }
+      current = current->parentItem();
+    }
+    return nullptr;
+  };
+  // 一页里所有"必须不重叠"的相邻控件对。
+  const auto checkPairsAndBounds = [&](const QString& tag) {
+    const Box page_box = boxOf(page, QStringLiteral("remotePage"));
+    const Box source_field = byName("remoteBackupSourceField");
+    const Box browse_button = byName("remoteBackupSourceBrowseButton");
+    const Box strategy_tabs = byName("remoteBackupStrategyTabs");
+    const Box strategy_hint = byName("remoteBackupStrategyHint");
+    const Box backup_button = byName("remoteBackupButton");
+    const Box backup_hint = byName("remoteBackupHint");
+    const Box upload_field = byName("remoteUploadPathField");
+    const Box upload_browse = byName("remoteUploadBrowseButton");
+    record(source_field);
+    record(browse_button);
+    record(strategy_tabs);
+    record(strategy_hint);
+    record(backup_button);
+    record(backup_hint);
+    record(upload_field);
+    record(upload_browse);
+    run.Check(!overlaps(source_field, browse_button),
+              tag + QStringLiteral(" 源目录输入框没有被“选择源目录”按钮压住"),
+              QStringLiteral("field.right=%1 button.left=%2")
+                  .arg(source_field.right())
+                  .arg(browse_button.x));
+    run.Check(!overlaps(strategy_tabs, strategy_hint),
+              tag + QStringLiteral(" 策略分段控件与说明文字不重叠"));
+    run.Check(!overlaps(backup_button, backup_hint),
+              tag + QStringLiteral(" 开始远端备份按钮与提示文字不重叠"));
+    run.Check(!overlaps(upload_field, upload_browse),
+              tag + QStringLiteral(" 原始归档输入框没有被浏览按钮压住"));
+    for (const Box& box : {source_field, browse_button, strategy_tabs,
+                           backup_button, upload_field, upload_browse}) {
+      run.Check(box.found && box.right() <= page_box.right() + tolerance,
+                tag + QStringLiteral(" %1 没有越过页面右边界").arg(box.name),
+                QStringLiteral("right=%1 page.right=%2")
+                    .arg(box.right())
+                    .arg(page_box.right()));
+    }
+    // 分段控件必须在“远端备份”这张卡片里：往上找到同时包含源目录输入框的
+    // 那个祖先，就是这张卡片。
+    QQuickItem* tabs_item = named("remoteBackupStrategyTabs");
+    QQuickItem* field_item = named("remoteBackupSourceField");
+    QQuickItem* card = tabs_item == nullptr ? nullptr : tabs_item->parentItem();
+    while (card != nullptr && field_item != nullptr &&
+           !card->isAncestorOf(field_item)) {
+      card = card->parentItem();
+    }
+    const Box card_box = boxOf(card, QStringLiteral("remoteBackupCard"));
+    record(card_box);
+    run.Check(contains(card_box, strategy_tabs),
+              tag + QStringLiteral(" 策略分段控件在“远端备份”卡片内"));
+    run.Check(
+        contains(card_box, source_field) && contains(card_box, backup_button),
+        tag + QStringLiteral(" 源目录输入框与备份按钮都在同一张卡片内"));
+    // 状态行必须在它自己的区域内。页面比一屏高是正常的（ScrollView），所以
+    // 垂直方向的边界是**滚动内容项**，不是视口——否则"内容比窗口高"会被误判
+    // 成布局错误。
+    QQuickItem* content_item =
+        scroll->property("contentItem").value<QQuickItem*>();
+    QQuickItem* banner_item = named("remoteStatusBanner");
+    const Box banner = boxOf(banner_item, QStringLiteral("remoteStatusBanner"));
+    record(banner);
+    if (banner_item != nullptr && content_item != nullptr) {
+      const QPointF in_content =
+          banner_item->mapToItem(content_item, QPointF(0, 0));
+      const double content_height = contentHeight();
+      const bool inside = in_content.y() >= -tolerance &&
+                          in_content.y() + banner_item->height() <=
+                              content_height + tolerance &&
+                          in_content.x() >= -tolerance &&
+                          in_content.x() + banner_item->width() <=
+                              content_item->width() + tolerance;
+      run.Check(inside, tag + QStringLiteral(" 状态横幅在页面内容范围内"),
+                QStringLiteral("y=%1 h=%2 contentHeight=%3")
+                    .arg(in_content.y())
+                    .arg(banner_item->height())
+                    .arg(content_height));
+    }
+    // 卡片内容在卡片内、恢复按钮在卡片内。
+    const QList<QQuickItem*> buttons =
+        allByName(QStringLiteral("remoteSnapshotRestoreButton"));
+    // 列表为空时本来就没有卡片：只有控制器确实有行时才要求看得见卡片。
+    if (!remote->snapshots().isEmpty()) {
+      run.Check(!buttons.isEmpty(),
+                tag + QStringLiteral(" 列表里至少有一张卡片（找得到恢复按钮）"),
+                QStringLiteral("buttons=%1").arg(buttons.size()));
+    }
+    for (QQuickItem* button : buttons) {
+      QQuickItem* card_item = cardOf(button);
+      if (card_item == nullptr) {
+        continue;
+      }
+      const Box card_bounds = boxOf(card_item, QStringLiteral("card"));
+      const Box button_box = boxOf(button, QStringLiteral("restore"));
+      const Box badge = boxOf(card_item->findChild<QQuickItem*>(
+                                  QStringLiteral("remoteSnapshotKindBadge")),
+                              QStringLiteral("kindBadge"));
+      const Box generation =
+          boxOf(card_item->findChild<QQuickItem*>(
+                    QStringLiteral("remoteSnapshotGenerationText")),
+                QStringLiteral("generation"));
+      const Box parent_text =
+          boxOf(card_item->findChild<QQuickItem*>(
+                    QStringLiteral("remoteSnapshotParentText")),
+                QStringLiteral("parent"));
+      record(card_bounds);
+      record(button_box);
+      record(badge);
+      record(generation);
+      record(parent_text);
+      run.Check(card_bounds.found && card_bounds.w > 0 && card_bounds.h > 0,
+                tag + QStringLiteral(" 卡片有正的几何"));
+      run.Check(contains(card_bounds, button_box),
+                tag + QStringLiteral(" 恢复按钮在卡片内"),
+                QStringLiteral("button.bottom=%1 card.bottom=%2")
+                    .arg(button_box.bottom())
+                    .arg(card_bounds.bottom()));
+      run.Check(
+          contains(card_bounds, badge) && contains(card_bounds, generation),
+          tag + QStringLiteral(" 类型徽标与代数在卡片内"));
+      run.Check(button_box.found &&
+                    button_box.right() <= card_bounds.right() + tolerance,
+                tag + QStringLiteral(" 恢复按钮没有越过卡片右边界"));
+      if (parent_text.found && parent_text.visible) {
+        run.Check(contains(card_bounds, parent_text),
+                  tag + QStringLiteral(" 父快照短 ID 在卡片内"));
+      }
+    }
+  };
+
+  // ---- 抓图 ----
+  const auto grab = [&](const QString& file, int expected_width,
+                        int expected_height, const QString& state) {
+    WaitForAnimation(350);
+    const QImage image = window->grabWindow();
+    if (image.isNull()) {
+      run.Check(false, QStringLiteral("ACC-SHOT %1 抓图成功").arg(file),
+                QStringLiteral("grabWindow() 返回空图像"));
+      return false;
+    }
+    const QString path = out_dir + QStringLiteral("/") + file;
+    if (!image.save(path)) {
+      run.Check(false, QStringLiteral("ACC-SHOT %1 保存成功").arg(file), path);
+      return false;
+    }
+    // 程序化自检：尺寸、非全黑 / 非全白 / 不透明。文案正确性不靠 OCR，
+    // 由上面那些 QML / 控制器断言负责。
+    int minimum = 255;
+    int maximum = 0;
+    int opaque = 0;
+    int sampled = 0;
+    int distinct = 0;
+    QSet<int> colors;
+    for (int y = 0; y < image.height(); y += 7) {
+      for (int x = 0; x < image.width(); x += 7) {
+        const QColor color = image.pixelColor(x, y);
+        const int luminance =
+            (color.red() * 299 + color.green() * 587 + color.blue() * 114) /
+            1000;
+        minimum = std::min(minimum, luminance);
+        maximum = std::max(maximum, luminance);
+        if (color.alpha() >= 255) {
+          ++opaque;
+        }
+        ++sampled;
+        colors.insert(color.rgb());
+        distinct = colors.size();
+      }
+    }
+    const bool size_ok =
+        image.width() == expected_width && image.height() == expected_height;
+    const bool content_ok = maximum - minimum >= 32 && distinct >= 8;
+    const bool alpha_ok = sampled > 0 && opaque == sampled;
+    run.Check(size_ok && content_ok && alpha_ok,
+              QStringLiteral("ACC-SHOT %1 %2（%3×%4）")
+                  .arg(file, state)
+                  .arg(image.width())
+                  .arg(image.height()),
+              QStringLiteral("size_ok=%1 luminance=%2..%3 distinct=%4 "
+                             "opaque=%5/%6")
+                  .arg(size_ok ? 1 : 0)
+                  .arg(minimum)
+                  .arg(maximum)
+                  .arg(distinct)
+                  .arg(opaque)
+                  .arg(sampled));
+    ++shots;
+    std::printf("[remote-acceptance] shot %s %dx%d state=%s\n",
+                qPrintable(file), image.width(), image.height(),
+                qPrintable(state));
+    return true;
+  };
+
+  // ---- ACC-02：指纹走界面上的“应用”按钮 ----
+  prepare(false);
+  page->setProperty("draftServerKeyPin", pin);
+  WaitForAnimation(120);
+  const bool pin_clicked = click(named("remoteServerKeyPinApplyButton"));
+  WaitForAnimation(200);
+  run.Check(pin_clicked && remote->serverKeyPin() == pin,
+            QStringLiteral("ACC-02 服务器身份指纹经界面“应用”按钮生效"),
+            remote->serverKeyPinError());
+  // 地址 / 端口 / 账号填进页面草稿：截图里看到的是"人填过"的样子，
+  // 但这些值是 harness 从外面喂的，产品 QML 没有默认值。
+  page->setProperty("draftHost", host);
+  page->setProperty("draftPort", port_text);
+  page->setProperty("draftUser", username);
+  page->setProperty("draftPassword", password);
+  page->setProperty("draftBackupSource", source);
+  page->setProperty("backupStrategy", 0);
+  WaitForAnimation(200);
+
+  // ---- ACC-03：没有 pin 的控制器在本地就被挡住（一个字节都不发）----
+  {
+    backup_modern::RemoteController fresh;
+    const bool accepted = fresh.login(host, port_text, username, password);
+    run.Check(
+        !accepted && !fresh.authenticated() &&
+            fresh.lastErrorKindForTest() == QStringLiteral("validation") &&
+            fresh.loginError().contains(QStringLiteral("服务器身份指纹")),
+        QStringLiteral("ACC-03 没有配置指纹时登录在本地被拒（不发字节）"),
+        fresh.lastErrorKindForTest() + QStringLiteral(": ") +
+            fresh.loginError());
+  }
+
+  // ---- ACC-04 / S01 / S02 / S11：未登录的空闲页 ----
+  goRemote();
+  const Box idle_host = byName("remoteHostField");
+  const Box idle_backup_source = byName("remoteBackupSourceField");
+  const Box idle_list = byName("remoteListSummary");
+  const Box idle_upload = byName("remoteUploadPathField");
+  record(idle_host);
+  record(idle_backup_source);
+  record(idle_list);
+  record(idle_upload);
+  run.Check(idle_host.visible && idle_backup_source.visible &&
+                idle_list.visible && idle_upload.visible,
+            QStringLiteral(
+                "ACC-04 连接 / 远端备份 / 云端备份 / 原始归档四个区域都在"));
+  run.Check(remote->snapshots().isEmpty() && remote->backupSummary().isEmpty(),
+            QStringLiteral("ACC-04 未登录时列表为空、也没有上一次的结论"));
+  checkPairsAndBounds(QStringLiteral("ACC-04"));
+  grab(QStringLiteral("remote-idle-light.png"), 1180, 760,
+       QStringLiteral("未登录空闲页（浅色）"));
+  prepare(true);
+  grab(QStringLiteral("remote-idle-dark.png"), 1180, 760,
+       QStringLiteral("未登录空闲页（深色）"));
+  // 产品默认窗口是 1180x760，而四段内容加起来比一屏高：额外给两张"整页总览"，
+  // 同一套 QML、同一条 grabWindow 路径，只是把窗口开高一点，让四段同屏可核对。
+  const int overview_height = wholePageHeight();
+  if (overview_height > 760 && overview_height <= 1600) {
+    prepare(false);
+    window->setWidth(1180);
+    window->setHeight(overview_height);
+    WaitForAnimation(320);
+    grab(QStringLiteral("remote-idle-overview-light.png"), 1180,
+         overview_height,
+         QStringLiteral(
+             "整页总览：连接 / 远端备份 / 云端备份 / 原始归档（浅色）"));
+    prepare(true);
+    window->setWidth(1180);
+    window->setHeight(overview_height);
+    WaitForAnimation(320);
+    grab(QStringLiteral("remote-idle-overview-dark.png"), 1180, overview_height,
+         QStringLiteral("整页总览（深色）"));
+  } else {
+    std::printf("[remote-acceptance] 整页高度 %d，不需要额外总览图\n",
+                overview_height);
+  }
+  prepare(false);
+  window->setWidth(900);
+  window->setHeight(700);
+  WaitForAnimation(320);
+  checkPairsAndBounds(QStringLiteral("ACC-04-narrow"));
+  grab(QStringLiteral("remote-idle-narrow.png"), 900, 700,
+       QStringLiteral("未登录空闲页（900x700 窄窗口）"));
+  prepare(false);
+
+  // ---- ACC-05 / S08：错 pin 的可见失败 ----
+  const QString wrong_pin = QStringLiteral("sha256:") + QString(64, 'b');
+  page->setProperty("draftServerKeyPin", wrong_pin);
+  click(named("remoteServerKeyPinApplyButton"));
+  WaitForAnimation(200);
+  run.Check(remote->serverKeyPin() == wrong_pin,
+            QStringLiteral("ACC-05 界面可以改成错误的指纹（格式合法）"));
+  const bool wrong_login = click(named("remoteLoginButton"));
+  WaitForAnimation(300);
+  const bool wrong_idle = remote->waitForIdle(120000);
+  const Box login_error = byName("remoteLoginError");
+  const Box delete_dialog = byName("remoteDeleteAccountDialog");
+  const Box overwrite = byName("remoteOverwriteButton");
+  record(login_error);
+  record(delete_dialog);
+  record(overwrite);
+  run.Check(
+      wrong_login && wrong_idle &&
+          remote->lastErrorKindForTest() == QStringLiteral("pin-mismatch") &&
+          !remote->authenticated(),
+      QStringLiteral("ACC-05 错指纹：登录被身份校验挡住，会话没有建立"),
+      remote->lastErrorKindForTest() + QStringLiteral(": ") +
+          remote->lastDetailForTest());
+  run.Check(login_error.found && login_error.visible && login_error.w > 0 &&
+                login_error.h > 0,
+            QStringLiteral("ACC-05 失败原因显示在登录表单自己的错误行里"),
+            QStringLiteral("visible=%1 w=%2")
+                .arg(login_error.visible ? 1 : 0)
+                .arg(login_error.w));
+  run.Check(remote->loginError().contains(QStringLiteral("指纹")),
+            QStringLiteral("ACC-05 错误文案指向“服务器身份指纹”"),
+            remote->loginError());
+  run.Check(!(delete_dialog.found && delete_dialog.visible) &&
+                !(overwrite.found && overwrite.visible),
+            QStringLiteral("ACC-05 没有弹出无关的对话框 / 覆盖按钮"));
+  run.Check(
+      remote->statusKind() != QStringLiteral("error"),
+      QStringLiteral("ACC-05 同一个错误没有在页面底部再报一遍（不重复）"),
+      remote->statusKind() + QStringLiteral(": ") + remote->statusMessage());
+  checkPairsAndBounds(QStringLiteral("ACC-05"));
+  grab(QStringLiteral("remote-error-light.png"), 1180, 760,
+       QStringLiteral("错指纹的可见失败（浅色）"));
+
+  // ---- ACC-06 / S03：正确指纹 + 注册 + 登录 + 完整备份 ----
+  page->setProperty("draftServerKeyPin", pin);
+  click(named("remoteServerKeyPinApplyButton"));
+  WaitForAnimation(200);
+  const bool registered =
+      remote->registerAccount(host, port_text, username, password, password);
+  run.Check(
+      registered && remote->waitForIdle(180000) &&
+          (remote->lastErrorKindForTest() == QStringLiteral("none") ||
+           remote->lastErrorKindForTest() == QStringLiteral("name-taken")),
+      QStringLiteral("ACC-06 临时账号注册成功（已存在则继续）"),
+      remote->lastErrorKindForTest() + QStringLiteral(": ") +
+          remote->lastDetailForTest());
+  remote->clearLoginError();
+  page->setProperty("draftBackupSource", source);
+  page->setProperty("backupStrategy", 0);
+  WaitForAnimation(150);
+  const bool login_clicked = click(named("remoteLoginButton"));
+  WaitForAnimation(300);
+  const bool logged_in =
+      login_clicked && remote->waitForIdle(180000) && remote->authenticated();
+  run.Check(logged_in, QStringLiteral("ACC-06 正确指纹下登录成功"),
+            remote->lastErrorKindForTest() + QStringLiteral(": ") +
+                remote->lastDetailForTest());
+  if (!logged_in) {
+    std::printf("[remote-acceptance] passed=%d failed=%d\n", run.passed,
+                run.failed);
+    return 1;
+  }
+  run.Check(remote->refreshList() && remote->waitForIdle(120000) &&
+                remote->listLoaded(),
+            QStringLiteral("ACC-06 云端列表读取成功"));
+  QStringList ids_before;
+  for (const QVariant& item : remote->snapshots()) {
+    ids_before.append(item.toMap().value(QStringLiteral("id")).toString());
+  }
+  remote->clearBackupSummary();
+  const bool full_clicked = click(named("remoteBackupButton"));
+  WaitForAnimation(300);
+  const bool full_idle = full_clicked && remote->waitForIdle(900000);
+  const QString root_id = remote->lastBackupSnapshotIdForTest();
+  const qint64 root_bytes = remote->lastBackupUploadedBytesForTest();
+  run.Check(full_idle &&
+                remote->lastErrorKindForTest() == QStringLiteral("none") &&
+                !remote->lastBackupProducedDeltaForTest() &&
+                !remote->lastBackupNoChangesForTest() && !root_id.isEmpty(),
+            QStringLiteral("ACC-06 策略=完整：建出一份完整基线"),
+            remote->lastErrorKindForTest() + QStringLiteral(": ") +
+                remote->lastDetailForTest());
+  run.Check(!ids_before.contains(root_id),
+            QStringLiteral("ACC-06 列表里多了一条新的完整快照"));
+  // 用户选的就是“完整”：这一行必须说“完整备份完成”，不能写成“兜底建基线”，
+  // 也不能把 core 的英文理由摆在结论里（本轮 GUI
+  // 验收正是在这里发现过一个缺陷）。
+  run.Check(
+      remote->backupSummary().startsWith(QStringLiteral("完整备份完成")) &&
+          remote->backupSummaryKind() == QStringLiteral("full"),
+      QStringLiteral("ACC-06 策略=完整时页面说“完整备份完成”"
+                     "（不是“本次创建的是完整基线”）"),
+      remote->backupSummary());
+  run.Check(!remote->backupSummary().contains(QStringLiteral("baseline")) &&
+                !remote->backupSummary().contains(QStringLiteral("the ")),
+            QStringLiteral("ACC-06 结论那一行里没有 core 的英文诊断"),
+            remote->backupSummary());
+  {
+    const QVariantMap row = [&remote, &root_id]() {
+      for (const QVariant& item : remote->snapshots()) {
+        const QVariantMap map = item.toMap();
+        if (map.value(QStringLiteral("id")).toString() == root_id) {
+          return map;
+        }
+      }
+      return QVariantMap();
+    }();
+    run.Check(row.value(QStringLiteral("kind")).toString() ==
+                      QStringLiteral("full") &&
+                  row.value(QStringLiteral("generation")).toInt() == 0 &&
+                  row.value(QStringLiteral("kindText")).toString() ==
+                      QStringLiteral("完整") &&
+                  row.value(QStringLiteral("restorable")).toBool() &&
+                  row.value(QStringLiteral("parentShort")).toString().isEmpty(),
+              QStringLiteral("ACC-07 卡片显示“完整 / 代数 0 / 可恢复 / 无父”"),
+              QStringLiteral("kind=%1 gen=%2")
+                  .arg(row.value(QStringLiteral("kind")).toString())
+                  .arg(row.value(QStringLiteral("generation")).toInt()));
+  }
+  checkPairsAndBounds(QStringLiteral("ACC-07"));
+  run.Check(scrollTo(firstByName("remoteSnapshotRestoreButton"), 240),
+            QStringLiteral("ACC-07 列表卡片已滚进视野（截图里能看见卡片）"));
+  grab(QStringLiteral("remote-full-light.png"), 1180, 760,
+       QStringLiteral("已登录 + 一份完整快照（浅色）"));
+
+  // ---- ACC-08 / S04 / S10 / S12：改一个文件 -> 增量 ----
+  writeText(source + QStringLiteral("/notes.txt"), QStringLiteral("v1\n"));
+  page->setProperty("backupStrategy", 1);
+  WaitForAnimation(150);
+  remote->clearBackupSummary();
+  const bool delta_clicked = click(named("remoteBackupButton"));
+  WaitForAnimation(300);
+  const bool delta_idle = delta_clicked && remote->waitForIdle(900000);
+  const QString delta_id = remote->lastBackupSnapshotIdForTest();
+  const qint64 delta_bytes = remote->lastBackupUploadedBytesForTest();
+  const auto rowOf = [&remote](const QString& id) {
+    for (const QVariant& item : remote->snapshots()) {
+      const QVariantMap map = item.toMap();
+      if (map.value(QStringLiteral("id")).toString() == id) {
+        return map;
+      }
+    }
+    return QVariantMap();
+  };
+  const QVariantMap delta_row = rowOf(delta_id);
+  run.Check(
+      delta_idle && remote->lastErrorKindForTest() == QStringLiteral("none") &&
+          remote->lastBackupProducedDeltaForTest() &&
+          !remote->lastBackupNoChangesForTest() &&
+          remote->lastBackupGenerationForTest() == 1 &&
+          delta_row.value(QStringLiteral("parentId")).toString() == root_id &&
+          delta_bytes > 0 && delta_bytes * 4 < root_bytes,
+      QStringLiteral("ACC-08 改一个文件之后是增量（父=R0、代数 1、"
+                     "字节远小于完整）"),
+      QStringLiteral("gen=%1 bytes=%2/%3 parent=%4")
+          .arg(remote->lastBackupGenerationForTest())
+          .arg(delta_bytes)
+          .arg(root_bytes)
+          .arg(delta_row.value(QStringLiteral("parentShort")).toString()));
+  run.Check(
+      delta_row.value(QStringLiteral("kindText")).toString() ==
+              QStringLiteral("增量") &&
+          delta_row.value(QStringLiteral("generation")).toInt() == 1 &&
+          delta_row.value(QStringLiteral("parentShort")).toString().length() ==
+              12 &&
+          delta_row.value(QStringLiteral("restorable")).toBool(),
+      QStringLiteral("ACC-09 卡片显示“增量 / 代数 1 / 父短 ID / 可恢复”"),
+      QStringLiteral("kindText=%1 gen=%2 parent=%3")
+          .arg(delta_row.value(QStringLiteral("kindText")).toString())
+          .arg(delta_row.value(QStringLiteral("generation")).toInt())
+          .arg(delta_row.value(QStringLiteral("parentShort")).toString()));
+  run.Check(remote->backupSummary().contains(QStringLiteral("增量")) &&
+                remote->backupSummaryKind() == QStringLiteral("incremental"),
+            QStringLiteral("ACC-09 页面按实际类型显示“增量备份完成”"),
+            remote->backupSummary());
+  checkPairsAndBounds(QStringLiteral("ACC-09"));
+  run.Check(scrollTo(firstByName("remoteSnapshotRestoreButton"), 240),
+            QStringLiteral("ACC-09 列表卡片已滚进视野（截图里能看见卡片）"));
+  grab(QStringLiteral("remote-incremental-light.png"), 1180, 760,
+       QStringLiteral("R0 完整 + R1 增量（浅色）"));
+  prepare(true);
+  run.Check(scrollTo(firstByName("remoteSnapshotRestoreButton"), 240),
+            QStringLiteral("ACC-09 深色截图里列表卡片可见"));
+  grab(QStringLiteral("remote-incremental-dark.png"), 1180, 760,
+       QStringLiteral("R0 完整 + R1 增量（深色）"));
+  prepare(false);
+  window->setWidth(900);
+  window->setHeight(700);
+  WaitForAnimation(320);
+  checkPairsAndBounds(QStringLiteral("ACC-09-narrow"));
+  run.Check(scrollTo(firstByName("remoteSnapshotRestoreButton"), 240),
+            QStringLiteral("ACC-09 窄窗口截图里列表卡片可见"));
+  grab(QStringLiteral("remote-incremental-narrow.png"), 900, 700,
+       QStringLiteral("R0 完整 + R1 增量（900x700 窄窗口）"));
+  prepare(false);
+
+  // ---- ACC-10：空闲被服务端关掉之后自动重连 + RESUME，并继续原链 ----
+  writeText(source + QStringLiteral("/notes.txt"), QStringLiteral("v2\n"));
+  WaitForAnimation(idle_wait_ms);
+  const bool resumed_list =
+      remote->refreshList() && remote->waitForIdle(180000) &&
+      remote->lastErrorKindForTest() == QStringLiteral("none") &&
+      remote->authenticated();
+  run.Check(resumed_list,
+            QStringLiteral("ACC-10 服务端按 io-timeout 关掉空闲连接之后，列表"
+                           "仍然可读（自动重连 + RESUME，不需要重新登录）"),
+            remote->lastErrorKindForTest() + QStringLiteral(": ") +
+                remote->lastDetailForTest());
+  const bool resumed_backup =
+      remote->backupRemote(source, /*allow_incremental=*/true) &&
+      remote->waitForIdle(900000);
+  const QVariantMap resumed_row = rowOf(remote->lastBackupSnapshotIdForTest());
+  const QVariantMap resumed_parent =
+      rowOf(resumed_row.value(QStringLiteral("parentId")).toString());
+  run.Check(
+      resumed_backup &&
+          remote->lastErrorKindForTest() == QStringLiteral("none") &&
+          remote->lastBackupProducedDeltaForTest() &&
+          !resumed_parent.isEmpty() &&
+          resumed_row.value(QStringLiteral("generation")).toInt() ==
+              resumed_parent.value(QStringLiteral("generation")).toInt() + 1,
+      QStringLiteral("ACC-10 重连之后继续原链（父=上一条链头、"
+                     "代数=父+1）"),
+      QStringLiteral("gen=%1 parent=%2")
+          .arg(resumed_row.value(QStringLiteral("generation")).toInt())
+          .arg(resumed_row.value(QStringLiteral("parentShort")).toString()));
+  const QString head_id = remote->lastBackupSnapshotIdForTest();
+
+  // ---- ACC-11 / S05：第一次就选增量 -> 实际产出完整基线 ----
+  const QString fallback_user = username + QStringLiteral("-fb");
+  remote->logoutLocal();
+  const bool fallback_registered = remote->registerAccount(
+      host, port_text, fallback_user, password, password);
+  const bool fallback_ready =
+      fallback_registered && remote->waitForIdle(180000) &&
+      remote->login(host, port_text, fallback_user, password) &&
+      remote->waitForIdle(180000) && remote->refreshList() &&
+      remote->waitForIdle(120000) && remote->authenticated();
+  run.Check(fallback_ready,
+            QStringLiteral("ACC-11 第二个临时账号（清单里没有可续的链）就绪"),
+            remote->lastErrorKindForTest() + QStringLiteral(": ") +
+                remote->lastDetailForTest());
+  remote->clearBackupSummary();
+  page->setProperty("backupStrategy", 1);
+  WaitForAnimation(150);
+  const bool fallback_clicked = click(named("remoteBackupButton"));
+  WaitForAnimation(300);
+  const bool fallback_idle = fallback_clicked && remote->waitForIdle(900000);
+  // 云端没有任何可续的链时，core 产出的是一份**完整基线**（链根），
+  // 不是 delta——这一点必须看实际结果，不能看用户点了什么。
+  const QVariantMap fallback_row = rowOf(remote->lastBackupSnapshotIdForTest());
+  run.Check(fallback_idle &&
+                remote->lastErrorKindForTest() == QStringLiteral("none") &&
+                !remote->lastBackupProducedDeltaForTest() &&
+                !remote->lastBackupNoChangesForTest() &&
+                !remote->lastBackupSnapshotIdForTest().isEmpty() &&
+                fallback_row.value(QStringLiteral("kind")).toString() ==
+                    QStringLiteral("full") &&
+                fallback_row.value(QStringLiteral("generation")).toInt() == 0,
+            QStringLiteral("ACC-11 选“增量”但云端没有可信基线：实际产出的是一份"
+                           "完整基线（kind=full、代数 0）"),
+            remote->lastErrorKindForTest() + QStringLiteral(": ") +
+                remote->lastDetailForTest() + QStringLiteral(" kind=") +
+                fallback_row.value(QStringLiteral("kind")).toString() +
+                QStringLiteral(" reason=") +
+                remote->lastBackupBaselineReasonForTest());
+  run.Check(
+      remote->backupSummary().startsWith(
+          QStringLiteral("本次创建的是完整基线")) &&
+          !remote->backupSummary().contains(QStringLiteral("增量备份完成")),
+      QStringLiteral("ACC-11 页面按**实际**类型说“本次创建的是完整基线”，"
+                     "没有写“增量成功”"),
+      remote->backupSummary());
+  run.Check(!remote->backupSummary().contains(remote->backupBaselineReason()) &&
+                (!remote->backupBaselineReason().isEmpty() ||
+                 remote->backupSummary().isEmpty()),
+            QStringLiteral("ACC-11 core 的英文理由只进技术详情，不进结论行"),
+            remote->backupSummary() + QStringLiteral(" / reason=") +
+                remote->backupBaselineReason());
+  run.Check(
+      remote->backupBaselineReason().isEmpty() ||
+          !remote->backupBaselineReason().contains(QStringLiteral("原因")),
+      QStringLiteral("ACC-11 技术详情里的原始理由保持原文（不二次加工）"),
+      remote->backupBaselineReason());
+  checkPairsAndBounds(QStringLiteral("ACC-11"));
+  run.Check(scrollTo(firstByName("remoteSnapshotRestoreButton"), 240),
+            QStringLiteral("ACC-11 列表卡片已滚进视野"));
+  grab(QStringLiteral("remote-fallback-light.png"), 1180, 760,
+       QStringLiteral("选了增量但实际创建完整基线（浅色）"));
+
+  // ---- ACC-12 / S06：源目录没有变化 -> 不创建新快照 ----
+  const int count_before_nochange = remote->snapshotCountForTest();
+  remote->clearBackupSummary();
+  const bool nochange_clicked = click(named("remoteBackupButton"));
+  WaitForAnimation(300);
+  const bool nochange_idle = nochange_clicked && remote->waitForIdle(900000);
+  run.Check(
+      nochange_idle &&
+          remote->lastErrorKindForTest() == QStringLiteral("none") &&
+          remote->lastBackupNoChangesForTest() &&
+          remote->snapshotCountForTest() == count_before_nochange,
+      QStringLiteral("ACC-12 源目录没有变化：没有创建新快照（列表条数不变）"),
+      QStringLiteral("no_changes=%1 count=%2->%3")
+          .arg(remote->lastBackupNoChangesForTest() ? 1 : 0)
+          .arg(count_before_nochange)
+          .arg(remote->snapshotCountForTest()));
+  run.Check(remote->backupSummary() ==
+                QStringLiteral("没有检测到有效变化，本次未创建新备份。"),
+            QStringLiteral("ACC-12 页面明确显示“没有检测到有效变化，"
+                           "本次未创建新备份”"),
+            remote->backupSummary());
+  checkPairsAndBounds(QStringLiteral("ACC-12"));
+  run.Check(scrollTo(firstByName("remoteSnapshotRestoreButton"), 240),
+            QStringLiteral("ACC-12 列表卡片已滚进视野"));
+  grab(QStringLiteral("remote-nochange-light.png"), 1180, 760,
+       QStringLiteral("没有检测到有效变化（浅色）"));
+
+  // ---- ACC-13 / S07：原始归档条目与产品链条目的区别 ----
+  //
+  // 这一条走的是**低层 raw 上传**：服务端只认"名字 + 长度 + SHA-256"，
+  // 不解析内容，所以它不属于任何链（lineage 为空）——列表里照样显示，
+  // 但链恢复必须不可用，而且在卡片上就说明原因。
+  QString archive_path;
+  {
+    const QString repository = work + QStringLiteral("/repo");
+    QDir().mkpath(repository);
+    if (controller->saveRepositoryPath(repository)) {
+      controller->setSourcePath(source);
+      const bool started = controller->startBackupWithOptions(
+          QStringLiteral("mypack"), QStringLiteral("none"),
+          QStringLiteral("none"), QString(), QString());
+      QElapsedTimer clock;
+      clock.start();
+      while (controller->catalogBusy() && clock.elapsed() < 60000) {
+        WaitForAnimation(50);
+      }
+      if (started && controller->waitForIdle(180000)) {
+        if (controller->backupRecords().isEmpty()) {
+          controller->refreshBackups();
+          clock.restart();
+          while (controller->catalogBusy() && clock.elapsed() < 60000) {
+            WaitForAnimation(50);
+          }
+        }
+        const QVariantList records = controller->backupRecords();
+        if (!records.isEmpty()) {
+          archive_path = repository + QStringLiteral("/") +
+                         records.first()
+                             .toMap()
+                             .value(QStringLiteral("fileName"))
+                             .toString();
+        }
+      }
+    }
+  }
+  run.Check(
+      !archive_path.isEmpty() && QFileInfo::exists(archive_path),
+      QStringLiteral("ACC-13 用产品引擎生成一份真实归档（raw 上传的输入）"),
+      archive_path);
+  QStringList raw_ids_before;
+  for (const QVariant& item : remote->snapshots()) {
+    raw_ids_before.append(item.toMap().value(QStringLiteral("id")).toString());
+  }
+  const bool raw_uploaded = remote->uploadArchive(archive_path, QString()) &&
+                            remote->waitForIdle(600000);
+  QString raw_id;
+  for (const QVariant& item : remote->snapshots()) {
+    const QString id = item.toMap().value(QStringLiteral("id")).toString();
+    if (!raw_ids_before.contains(id)) {
+      raw_id = id;
+    }
+  }
+  const QVariantMap raw_row = rowOf(raw_id);
+  // 产品链条目：列表里第一条"可恢复"的（raw 上传的那一条一定不可恢复）。
+  QVariantMap product_row;
+  for (const QVariant& item : remote->snapshots()) {
+    const QVariantMap map = item.toMap();
+    if (map.value(QStringLiteral("restorable")).toBool()) {
+      product_row = map;
+      break;
+    }
+  }
+  run.Check(raw_uploaded &&
+                remote->lastErrorKindForTest() == QStringLiteral("none") &&
+                !raw_id.isEmpty(),
+            QStringLiteral("ACC-13 原始归档上传成功，列表里出现这一条"),
+            remote->lastErrorKindForTest() + QStringLiteral(": ") +
+                remote->lastDetailForTest());
+  run.Check(
+      !raw_row.isEmpty() &&
+          !raw_row.value(QStringLiteral("restorable")).toBool() &&
+          !raw_row.value(QStringLiteral("restoreHint")).toString().isEmpty() &&
+          raw_row.value(QStringLiteral("restoreHint"))
+              .toString()
+              .contains(QStringLiteral("下载归档")),
+      QStringLiteral("ACC-13 原始归档条目：恢复不可用 + 卡片上有明确说明"
+                     "（而不是点下去才报错）"),
+      raw_row.value(QStringLiteral("restoreHint")).toString());
+  run.Check(
+      !product_row.isEmpty() &&
+          product_row.value(QStringLiteral("restorable")).toBool() &&
+          !product_row.value(QStringLiteral("kindText")).toString().isEmpty(),
+      QStringLiteral("ACC-13 产品链条目仍然可恢复（两种条目在同一个列表"
+                     "里按 lineage 区分，不靠文件名猜）"));
+  const QList<QQuickItem*> restore_buttons =
+      allByName(QStringLiteral("remoteSnapshotRestoreButton"));
+  int disabled_restore = 0;
+  for (QQuickItem* button : restore_buttons) {
+    if (!button->isEnabled()) {
+      ++disabled_restore;
+    }
+  }
+  run.Check(restore_buttons.size() >= 2 && disabled_restore >= 1,
+            QStringLiteral("ACC-13 列表里至少有一个“恢复”按钮是禁用的（原始"
+                           "归档那一条）"),
+            QStringLiteral("buttons=%1 disabled=%2")
+                .arg(restore_buttons.size())
+                .arg(disabled_restore));
+  QDir(restore_b).removeRecursively();
+  QDir().mkpath(restore_b);
+  const bool raw_restore_accepted = remote->restoreSnapshot(raw_id, restore_b);
+  const bool raw_restore_idle =
+      raw_restore_accepted && remote->waitForIdle(180000);
+  run.Check(
+      raw_restore_idle &&
+          remote->lastErrorKindForTest() == QStringLiteral("not-a-bundle") &&
+          collectTree(restore_b).isEmpty(),
+      QStringLiteral("ACC-13 就算绕过界面直接请求，链恢复也会被共享 core "
+                     "拒绝，目标目录保持为空"),
+      remote->lastErrorKindForTest() + QStringLiteral(": ") +
+          remote->lastDetailForTest());
+  checkPairsAndBounds(QStringLiteral("ACC-13"));
+  run.Check(scrollTo(firstByName("remoteSnapshotRestoreButton"), 300),
+            QStringLiteral("ACC-13 原始归档那一条已滚进视野"));
+  grab(QStringLiteral("remote-raw-light.png"), 1180, 760,
+       QStringLiteral("原始归档条目：恢复不可用（浅色）"));
+
+  // ---- ACC-14：清掉本地缓存之后仍然能恢复整条链（冷缓存）----
+  remote->logoutLocal();
+  run.Check(remote->login(host, port_text, username, password) &&
+                remote->waitForIdle(180000) && remote->authenticated() &&
+                remote->refreshList() && remote->waitForIdle(120000),
+            QStringLiteral("ACC-14 回到第一个账号（云端链 R0/R1/R2 还在）"),
+            remote->lastErrorKindForTest() + QStringLiteral(": ") +
+                remote->lastDetailForTest());
+  QString fingerprint = pin;
+  fingerprint.remove(QStringLiteral("sha256:"));
+  {
+    backupproject::net::RemoteCacheLayout layout;
+    std::string cache_error;
+    if (backupproject::net::PrepareRemoteCache(
+            std::string(), fingerprint.toStdString(), username.toStdString(),
+            &layout, &cache_error)) {
+      std::printf("[remote-acceptance] cold-cache dir=%s\n",
+                  layout.root_directory.c_str());
+      QDir(QString::fromStdString(layout.root_directory)).removeRecursively();
+    } else {
+      std::fprintf(stderr, "[remote-acceptance] 拿不到缓存目录: %s\n",
+                   cache_error.c_str());
+    }
+  }
+  const bool restore_ok = remote->restoreSnapshot(head_id, restore_a) &&
+                          remote->waitForIdle(900000);
+  run.Check(restore_ok &&
+                remote->lastErrorKindForTest() == QStringLiteral("none") &&
+                treeMatches(source, restore_a),
+            QStringLiteral("ACC-14 冷缓存：只给目标快照就恢复出与源目录逐字节"
+                           "一致的内容"),
+            QStringLiteral("chain=%1 deltas=%2 entries=%3")
+                .arg(remote->lastRestoreChainLengthForTest())
+                .arg(remote->lastRestoreDeltaCountForTest())
+                .arg(remote->lastRestoreEntriesForTest()));
+  run.Check(remote->lastRestoreChainLengthForTest() >= 2 ||
+                remote->lastRestoreDeltaCountForTest() >= 1,
+            QStringLiteral("ACC-14 恢复的是一条链（不是单个快照）"),
+            QStringLiteral("chain=%1 deltas=%2")
+                .arg(remote->lastRestoreChainLengthForTest())
+                .arg(remote->lastRestoreDeltaCountForTest()));
+
+  // ---- ACC-15：连接还活着时改 pin 不会立刻断线；下一次真正的重连用新 pin ----
+  page->setProperty("draftServerKeyPin", wrong_pin);
+  click(named("remoteServerKeyPinApplyButton"));
+  WaitForAnimation(200);
+  const bool live_list =
+      remote->refreshList() && remote->waitForIdle(180000) &&
+      remote->lastErrorKindForTest() == QStringLiteral("none") &&
+      remote->authenticated();
+  run.Check(live_list,
+            QStringLiteral("ACC-15 连接还活着时改 pin：当前连接不被踢掉"
+                           "（下一次连接才生效）"),
+            remote->lastErrorKindForTest() + QStringLiteral(": ") +
+                remote->lastDetailForTest());
+  WaitForAnimation(idle_wait_ms);
+  const bool reconnect_attempt =
+      remote->refreshList() && remote->waitForIdle(180000);
+  run.Check(
+      reconnect_attempt &&
+          remote->lastErrorKindForTest() == QStringLiteral("pin-mismatch") &&
+          remote->authenticated(),
+      QStringLiteral("ACC-15 空闲断连之后的下一次重连用的是**新** pin："
+                     "错的 pin 必须可见地失败，而且会话不被踢掉"),
+      remote->lastErrorKindForTest() + QStringLiteral(": ") +
+          remote->lastDetailForTest());
+  page->setProperty("draftServerKeyPin", pin);
+  click(named("remoteServerKeyPinApplyButton"));
+  WaitForAnimation(200);
+  run.Check(remote->refreshList() && remote->waitForIdle(180000) &&
+                remote->lastErrorKindForTest() == QStringLiteral("none"),
+            QStringLiteral("ACC-15 换回正确指纹之后列表又能读"),
+            remote->lastErrorKindForTest() + QStringLiteral(": ") +
+                remote->lastDetailForTest());
+
+  // ---- ACC-16 / S09：忙碌 ----
+  //
+  // 用一个**确定**的长操作窗口：把服务端 SIGSTOP 住。连接仍会被内核接受，
+  // 但握手永远等不到回包，于是 busy 一定为 true——不需要 sleep 猜时间，
+  // 也不依赖网速。之后 SIGCONT，操作自己会走完。
+  bool busy_shot = false;
+  if (server_pid > 0) {
+    ::kill(server_pid, SIGSTOP);
+    WaitForAnimation(150);
+  }
+  const bool busy_accept = remote->backupRemote(source, false);
+  const bool busy_now = remote->busy();
+  const QString busy_action = remote->busyAction();
+  const bool busy_second = remote->restoreSnapshot(head_id, restore_b);
+  const QString busy_kind = remote->lastErrorKindForTest();
+  run.Check(busy_accept && busy_now && !busy_second &&
+                busy_kind == QStringLiteral("busy"),
+            QStringLiteral("ACC-16 长操作进行中：同一控制器上的第二个远端操作"
+                           "被拒（控制器层闸门）"),
+            QStringLiteral("accept=%1 busy=%2 second=%3 kind=%4")
+                .arg(busy_accept ? 1 : 0)
+                .arg(busy_now ? 1 : 0)
+                .arg(busy_second ? 1 : 0)
+                .arg(busy_kind));
+  const QList<QString> conflicting = {
+      QStringLiteral("remoteBackupButton"),
+      QStringLiteral("remoteRefreshButton"),
+      QStringLiteral("remoteUploadButton"),
+      QStringLiteral("remoteLogoutButton"),
+      QStringLiteral("remoteDeleteAccountButton"),
+      QStringLiteral("remoteBackupSourceBrowseButton"),
+  };
+  int disabled_count = 0;
+  for (const QString& name : conflicting) {
+    QQuickItem* item = named(name.toUtf8().constData());
+    record(boxOf(item, name));
+    if (item != nullptr && !item->isEnabled()) {
+      ++disabled_count;
+    }
+  }
+  run.Check(disabled_count == conflicting.size(),
+            QStringLiteral("ACC-16 忙碌时冲突操作在界面上全部不可用（界面层"
+                           "可见性）"),
+            QStringLiteral("disabled=%1/%2")
+                .arg(disabled_count)
+                .arg(conflicting.size()));
+  QQuickItem* busy_text = named("remoteBusyText");
+  const bool busy_text_ok =
+      busy_text != nullptr && busy_text->property("visible").toBool() &&
+      busy_text->property("text").toString() == busy_action &&
+      !busy_action.isEmpty();
+  record(boxOf(busy_text, QStringLiteral("remoteBusyText")));
+  run.Check(busy_text_ok,
+            QStringLiteral("ACC-16 页面上显示“当前正在做什么”（来自控制器的"
+                           "busyAction，不是假进度）"),
+            busy_text == nullptr ? QStringLiteral("找不到 remoteBusyText")
+                                 : busy_text->property("text").toString());
+  checkPairsAndBounds(QStringLiteral("ACC-16"));
+  run.Check(scrollTo(named("remoteBackupButton"), 200),
+            QStringLiteral("ACC-16 忙碌状态截图：备份按钮与列表卡片同屏"));
+  if (server_pid > 0) {
+    busy_shot = grab(QStringLiteral("remote-busy-light.png"), 1180, 760,
+                     QStringLiteral("长操作进行中：冲突操作不可用（浅色）"));
+    run.Check(remote->busy(),
+              QStringLiteral("ACC-16 抓图期间这个操作确实一直在跑（不是抓完"
+                             "就已经结束）"));
+    ::kill(server_pid, SIGCONT);
+  } else {
+    std::printf(
+        "[remote-acceptance] 没有 BACKUP_REMOTE_SERVER_PID："
+        "忙碌截图 NOT PRODUCED\n");
+  }
+  const bool busy_finished = remote->waitForIdle(300000);
+  run.Check(busy_finished && !remote->busy() && remote->authenticated(),
+            QStringLiteral("ACC-16 长操作结束后回到空闲，会话仍然有效"),
+            remote->lastErrorKindForTest() + QStringLiteral(": ") +
+                remote->lastDetailForTest());
+
+  // ---- 清理：两个临时账号都注销（正式数据一个字节都不动）----
+  remote->logoutLocal();
+  const bool fallback_deleted =
+      remote->login(host, port_text, fallback_user, password) &&
+      remote->waitForIdle(180000) &&
+      remote->deleteAccount(password, fallback_user) &&
+      remote->waitForIdle(300000) && !remote->authenticated();
+  run.Check(fallback_deleted, QStringLiteral("ACC-17 第二个临时账号已注销"),
+            remote->lastErrorKindForTest() + QStringLiteral(": ") +
+                remote->lastDetailForTest());
+  const bool main_deleted =
+      remote->login(host, port_text, username, password) &&
+      remote->waitForIdle(180000) &&
+      remote->deleteAccount(password, username) &&
+      remote->waitForIdle(300000) && !remote->authenticated();
+  run.Check(main_deleted, QStringLiteral("ACC-17 第一个临时账号已注销"),
+            remote->lastErrorKindForTest() + QStringLiteral(": ") +
+                remote->lastDetailForTest());
+
+  // ---- 几何报告落盘（给人工 / 评审看每个控件的真实坐标）----
+  {
+    QFile report(out_dir + QStringLiteral("/geometry-checks.txt"));
+    if (report.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
+      report.write(
+          QStringLiteral(
+              "# Remote 页关键控件的真实几何（坐标已换算到窗口内容项）\n"
+              "# 抓图状态数：%1，忙碌截图：%2\n")
+              .arg(shots)
+              .arg(busy_shot ? QStringLiteral("produced")
+                             : QStringLiteral("NOT PRODUCED"))
+              .toUtf8());
+      report.write(geometry_report.join(QStringLiteral("\n")).toUtf8());
+      report.write("\n");
+    }
+  }
+  std::printf("[remote-acceptance] passed=%d failed=%d shots=%d\n", run.passed,
+              run.failed, shots);
+  for (const QString& failure : run.failures) {
+    std::printf("[remote-acceptance]   FAIL %s\n", qPrintable(failure));
+  }
+  return run.failed == 0 ? 0 : 1;
+}
+
 // ---- --remote-test：远程备份页的控制器链路 ----
 //
 // 它真的起一个 backup-server 进程（与 network_test.sh、阿里云部署用的是同一个
@@ -2086,6 +3722,33 @@ int RunRemoteSmoke(backup_modern::RemoteController* remote,
   run.prefix = "[remote-smoke]";
   std::printf("[remote-smoke] endpoint=%s:%s user=%s\n", qPrintable(host),
               qPrintable(port_text), qPrintable(username));
+
+  // PR #21：连接之前必须把服务端的传输身份 pin 交给控制器——没有它
+  // RemoteArchiveClient::Connect() 直接失败（kNoPinConfigured），客户端不做
+  // "第一次见到谁就信谁"。--remote-smoke 打的是调用方给的真实端点，所以 pin
+  // 也从调用方来：与 backupctl remote 用同一个环境变量
+  // BACKUP_REMOTE_SERVER_KEY（pin 不是秘密，但与口令一样不进 argv）。
+  // 缺了它这里就**明确失败**：否则下面每一条都会以"连接被拒绝"红掉，看不出
+  // 真正的原因。
+  const QString server_key_pin =
+      qEnvironmentVariable("BACKUP_REMOTE_SERVER_KEY").trimmed();
+  if (server_key_pin.isEmpty()) {
+    std::fprintf(stderr,
+                 "[remote-smoke] 缺少环境变量 BACKUP_REMOTE_SERVER_KEY："
+                 "没有服务器身份指纹（sha256:<64 位十六进制> 或 "
+                 "hex:<64 位公钥>）客户端拒绝连接。\n"
+                 "  它就在 backup-server-keygen --show --key-file <身份私钥> "
+                 "打印的 \"--server-key sha256:…\" 那一行里。\n");
+    return 1;
+  }
+  if (!remote->setServerKeyPin(server_key_pin)) {
+    std::fprintf(stderr, "[remote-smoke] 服务器身份指纹不被接受：%s\n",
+                 qPrintable(remote->serverKeyPinError()));
+    return 1;
+  }
+  std::printf(
+      "[remote-smoke] 服务器身份指纹已配置（来自 "
+      "BACKUP_REMOTE_SERVER_KEY）\n");
 
   QTemporaryDir temp;
   run.Check(temp.isValid(), QStringLiteral("SMOKE-00 临时工作目录可用"));
@@ -2257,6 +3920,29 @@ int RunRemoteSmoke(backup_modern::RemoteController* remote,
       QStringLiteral("SMOKE-12 注销之后原账户无法再登录（服务端没有这一行）"),
       relogin_kind);
 
+  // ---- 产品级远端备份 / 链恢复：与 --remote-test 共用同一段断言 ----
+  {
+    const QString product_user =
+        QStringLiteral("gui-prod-%1")
+            .arg(QRandomGenerator::global()->bounded(1000000, 9999999));
+    const bool product_registered = remote->registerAccount(
+        host, port_text, product_user, password, password);
+    const bool product_ready =
+        product_registered && remote->waitForIdle(120000) &&
+        remote->login(host, port_text, product_user, password) &&
+        remote->waitForIdle(120000) && remote->authenticated();
+    run.Check(product_ready,
+              QStringLiteral("SMOKE-G01 产品级流程的临时账号就绪"),
+              remote->lastErrorKindForTest() + QStringLiteral(": ") +
+                  remote->lastDetailForTest());
+    QString fingerprint = server_key_pin;
+    fingerprint.remove(QStringLiteral("sha256:"));
+    if (product_ready) {
+      RunRemoteProductFlow(remote, &run, work, host, port_text, product_user,
+                           password, fingerprint);
+    }
+  }
+
   std::printf("[remote-smoke] passed=%d failed=%d\n", run.passed, run.failed);
   if (run.failed != 0) {
     for (const QString& failure : run.failures) {
@@ -2266,6 +3952,33 @@ int RunRemoteSmoke(backup_modern::RemoteController* remote,
   }
   std::printf("[remote-smoke] REMOTE_SMOKE_PASS\n");
   return 0;
+}
+
+// 从 backup-server-keygen 的输出里取出 "sha256:<64 位十六进制>"。
+//
+// keygen --show 会打印 "  --server-key sha256:…" 这一行，这里就认这一行——
+// 也就是产品文档里让用户复制的那一行。找不到、长度不够或者不是十六进制一律
+// 返回空串，让调用方**明确失败**：拿一个"猜出来的"指纹去连接，错误会出现在
+// 握手那一层，比在这里说清楚难懂得多。
+QString ExtractServerKeyPin(const QString& keygen_output) {
+  const QString marker = QStringLiteral("--server-key sha256:");
+  const int at = keygen_output.indexOf(marker);
+  if (at < 0) {
+    return QString();
+  }
+  const QString fingerprint = keygen_output.mid(at + marker.size(), 64);
+  if (fingerprint.size() != 64) {
+    return QString();
+  }
+  for (const QChar ch : fingerprint) {
+    const bool hex = (ch >= QLatin1Char('0') && ch <= QLatin1Char('9')) ||
+                     (ch >= QLatin1Char('a') && ch <= QLatin1Char('f')) ||
+                     (ch >= QLatin1Char('A') && ch <= QLatin1Char('F'));
+    if (!hex) {
+      return QString();
+    }
+  }
+  return QStringLiteral("sha256:") + fingerprint.toLower();
 }
 
 int RunRemoteTest(QQuickWindow* window, backup_modern::RemoteController* remote,
@@ -2375,6 +4088,90 @@ int RunRemoteTest(QQuickWindow* window, backup_modern::RemoteController* remote,
     return 1;
   }
 
+  // ---- 服务端传输身份（PR #21 起是必填项）----
+  //
+  // 两件事必须成对出现，少一件这条自检就跑不下去：
+  //   * 服务端必须带 --transport-key-file（缺了它以用法错误退出，起不来）；
+  //   * 客户端必须拿到这把私钥对应公钥的指纹（pin）——没有 pin 时 Connect()
+  //     直接失败（kNoPinConfigured）。
+  //
+  // pin 只从 backup-server-keygen 的输出里取，这里**不**自己算指纹：工具的
+  // 打印格式就是产品给用户的格式，测试再算一份等于验了一份第二实现。
+  // 私钥内容既不读也不打印，它只活在这次自检的临时目录里。
+  const QString keygen_binary = QCoreApplication::applicationDirPath() +
+                                QStringLiteral("/backup-server-keygen");
+  if (!QFileInfo::exists(keygen_binary)) {
+    std::fprintf(stderr,
+                 "[remote-test] 找不到 %s（先 make server）：没有它就生成不了"
+                 "服务端传输身份密钥，客户端也就拿不到连接前必须配置的服务器"
+                 "身份指纹\n",
+                 qPrintable(keygen_binary));
+    return 1;
+  }
+  const QString transport_key_file =
+      work + QStringLiteral("/state/transport.key");
+  // keygen 的失败必须**明确**报出来（退出码 + stderr）：静默继续只会让后面
+  // 每一条断言都以"连接被拒绝"这种看不懂的方式红掉。
+  const auto keygenFailure = [](QProcess& process) {
+    return QStringLiteral("退出码 %1；stderr：%2")
+        .arg(process.exitStatus() == QProcess::NormalExit
+                 ? QString::number(process.exitCode())
+                 : QStringLiteral("异常结束"))
+        .arg(QString::fromUtf8(process.readAllStandardError()).trimmed());
+  };
+  QString server_key_pin;
+  {
+    // (1) 生成 0600 的身份私钥。路径在临时目录里，所以不会撞上任何真实身份。
+    QProcess keygen;
+    keygen.setProgram(keygen_binary);
+    keygen.setArguments({QStringLiteral("--output"), transport_key_file});
+    keygen.start();
+    if (!keygen.waitForStarted(15000) || !keygen.waitForFinished(30000) ||
+        keygen.exitStatus() != QProcess::NormalExit || keygen.exitCode() != 0 ||
+        !QFileInfo::exists(transport_key_file)) {
+      std::fprintf(
+          stderr, "[remote-test] backup-server-keygen --output %s 失败（%s）\n",
+          qPrintable(transport_key_file), qPrintable(keygenFailure(keygen)));
+      return 1;
+    }
+    // (2) 打印公钥与指纹；其中一行就是产品给用户的 --server-key。
+    QProcess keygen_show;
+    keygen_show.setProgram(keygen_binary);
+    keygen_show.setArguments({QStringLiteral("--show"),
+                              QStringLiteral("--key-file"),
+                              transport_key_file});
+    keygen_show.start();
+    if (!keygen_show.waitForStarted(15000) ||
+        !keygen_show.waitForFinished(30000) ||
+        keygen_show.exitStatus() != QProcess::NormalExit ||
+        keygen_show.exitCode() != 0) {
+      std::fprintf(stderr,
+                   "[remote-test] backup-server-keygen --show --key-file %s "
+                   "失败（%s）\n",
+                   qPrintable(transport_key_file),
+                   qPrintable(keygenFailure(keygen_show)));
+      return 1;
+    }
+    server_key_pin = ExtractServerKeyPin(
+        QString::fromUtf8(keygen_show.readAllStandardOutput()));
+    if (server_key_pin.isEmpty()) {
+      std::fprintf(stderr,
+                   "[remote-test] keygen --show 的输出里没有 "
+                   "\"--server-key sha256:<64 位十六进制>\" 这一行，"
+                   "拿不到服务器身份指纹\n");
+      return 1;
+    }
+  }
+  // (3) 第一次连接之前交给控制器；控制器会用共享的 ParseServerKeyPin 再校验。
+  if (!remote->setServerKeyPin(server_key_pin)) {
+    std::fprintf(stderr, "[remote-test] 控制器不接受 keygen 打印的指纹：%s\n",
+                 qPrintable(remote->serverKeyPinError()));
+    return 1;
+  }
+  std::printf(
+      "[remote-test] 服务器身份指纹已配置（取自 backup-server-keygen "
+      "--show）\n");
+
   const QString log_file = work + QStringLiteral("/state/server.log");
   QProcess server;
   server.setProgram(server_binary);
@@ -2384,23 +4181,16 @@ int RunRemoteTest(QQuickWindow* window, backup_modern::RemoteController* remote,
   // 端口先给 0（内核分配），拿到真实端口之后 CASE D 会用**同一个端口**重启
   // 服务端，验证"服务端回来了，客户端自己重连并恢复会话"。
   QStringList server_arguments = {
-      QStringLiteral("--bind"),
-      QStringLiteral("127.0.0.1"),
-      QStringLiteral("--port"),
-      QStringLiteral("0"),
-      QStringLiteral("--io-timeout"),
-      QStringLiteral("2"),
-      QStringLiteral("--root"),
-      work + QStringLiteral("/data"),
-      QStringLiteral("--db"),
-      work + QStringLiteral("/state/metadata.sqlite3"),
-      QStringLiteral("--secret-file"),
-      secret_file,
-      QStringLiteral("--pid-file"),
-      work + QStringLiteral("/state/server.pid"),
-      QStringLiteral("--log-file"),
-      log_file,
-      QStringLiteral("--quiet")};
+      QStringLiteral("--bind"), QStringLiteral("127.0.0.1"),
+      QStringLiteral("--port"), QStringLiteral("0"),
+      QStringLiteral("--io-timeout"), QStringLiteral("2"),
+      QStringLiteral("--root"), work + QStringLiteral("/data"),
+      QStringLiteral("--db"), work + QStringLiteral("/state/metadata.sqlite3"),
+      QStringLiteral("--secret-file"), secret_file,
+      // 传输身份私钥：PR #21 起服务端没有它就以用法错误退出。
+      QStringLiteral("--transport-key-file"), transport_key_file,
+      QStringLiteral("--pid-file"), work + QStringLiteral("/state/server.pid"),
+      QStringLiteral("--log-file"), log_file, QStringLiteral("--quiet")};
   server.setArguments(server_arguments);
   // 无论从哪条 return 出去，服务端都要被收走，不留孤儿进程。
   struct ServerGuard {
@@ -2494,6 +4284,29 @@ int RunRemoteTest(QQuickWindow* window, backup_modern::RemoteController* remote,
             QStringLiteral("password=%1 confirm=%2")
                 .arg(echo_mode_text(register_password_field),
                      echo_mode_text(register_confirm_field)));
+  // 服务器身份指纹：页面上有它自己的输入框，控制器的校验用共享解析器
+  // （只认带前缀的两种写法），而且被拒的输入不会顶掉已经生效的值——否则
+  // 用户打错一个字符就会把"能连上"变成"连不上"。
+  QObject* server_key_pin_field = objectByName("remoteServerKeyPinField");
+  const QString pin_in_effect = remote->serverKeyPin();
+  const bool bare_hex_rejected =
+      !remote->setServerKeyPin(QString(64, QLatin1Char('a')));
+  const bool bare_hex_reported = !remote->serverKeyPinError().isEmpty();
+  const bool pin_kept = remote->serverKeyPin() == pin_in_effect;
+  run.Check(server_key_pin_field != nullptr && bare_hex_rejected &&
+                bare_hex_reported && pin_kept &&
+                remote->lastErrorKindForTest() == QStringLiteral("validation"),
+            QStringLiteral("REMOTE-02 服务器身份指纹有输入框；不带前缀的"
+                           "裸十六进制被拒，且没有顶掉生效的指纹"),
+            QStringLiteral("field=%1 rejected=%2 reported=%3 kept=%4 kind=%5")
+                .arg(server_key_pin_field != nullptr)
+                .arg(bare_hex_rejected)
+                .arg(bare_hex_reported)
+                .arg(pin_kept)
+                .arg(remote->lastErrorKindForTest()));
+  remote->clearServerKeyPinError();
+  run.Check(remote->serverKeyPinError().isEmpty(),
+            QStringLiteral("REMOTE-02 清掉错误行之后这一行不再显示原因"));
   // 账户区域是一个分段控件（"登录 / 注册"二选一）+ 已登录时的注销入口。
   run.Check(objectByName("remoteAccountTabs") != nullptr &&
                 objectByName("remoteLoginButton") != nullptr &&
@@ -2783,6 +4596,55 @@ int RunRemoteTest(QQuickWindow* window, backup_modern::RemoteController* remote,
     const bool positive_accepted =
         remote->login(good_host, good_port, good_user, good_password);
     const bool positive_busy = remote->busy();
+    // 忙碌必须在页面上**看得见**：一排灰掉的按钮只说了一半，另一半是
+    // "现在正在做什么"。这一行读的是控制器的 busyAction，不是画上去的进度。
+    QQuickItem* busy_text =
+        window->findChild<QQuickItem*>(QStringLiteral("remoteBusyText"));
+    // 忙碌那一行的**可见性**要等界面真的有机会刷一次才会落到控件上（同一回合
+    // 里读到的还是上一次的值：内容已经是新的，visible 还不是）。所以这里在
+    // "操作还在跑"的前提下轮询最多 300ms——登录里的 PBKDF2 约 1.5s，这个窗口
+    // 不可能把它跑完；如果 300ms 内这一行始终不出现，那就是真的没出现。
+    // 这一行在"当前页不是远程备份页"时不会被界面刷新（StackLayout 把非当前页
+    // 整体设为不可见）——所以断言之前先把这一页切到前台，这正是用户看到它的
+    // 前提条件；查完再切回去，不影响后面的用例。
+    const int page_before_check = window->property("currentPage").toInt();
+    window->setProperty("currentPage", 6);
+    WaitForAnimation(60);
+    bool busy_line_seen = false;
+    QElapsedTimer busy_line_clock;
+    busy_line_clock.start();
+    while (remote->busy() && busy_line_clock.elapsed() < 300) {
+      WaitForAnimation(10);
+      if (busy_text != nullptr && busy_text->property("visible").toBool()) {
+        busy_line_seen = true;
+        break;
+      }
+    }
+    window->setProperty("currentPage", page_before_check);
+    WaitForAnimation(20);
+    const bool busy_text_ok =
+        positive_busy && busy_text != nullptr && busy_line_seen &&
+        busy_text->property("text").toString() == remote->busyAction() &&
+        !remote->busyAction().isEmpty();
+    run.Check(
+        busy_text_ok,
+        QStringLiteral("REMOTE-17 忙碌时页面上能看到当前正在做什么"
+                       "（remoteBusyText 跟着 busyAction 走）"),
+        QStringLiteral("busy=%1 found=%2 visible=%3 text=[%4] "
+                       "action=[%5] accepted=%6 page=%7 parent=%8")
+            .arg(positive_busy ? 1 : 0)
+            .arg(busy_text != nullptr ? 1 : 0)
+            .arg(busy_text == nullptr
+                     ? -1
+                     : (busy_text->property("visible").toBool() ? 1 : 0))
+            .arg(busy_text == nullptr ? QStringLiteral("(null)")
+                                      : busy_text->property("text").toString())
+            .arg(remote->busyAction())
+            .arg(positive_accepted ? 1 : 0)
+            .arg(page_before_check)
+            .arg(busy_text == nullptr || busy_text->parentItem() == nullptr
+                     ? QStringLiteral("(null)")
+                     : busy_text->parentItem()->objectName()));
     const bool positive_finished =
         positive_accepted && remote->waitForIdle(120000);
     run.Check(positive_accepted && positive_busy && positive_finished &&
@@ -3129,12 +4991,13 @@ int RunRemoteTest(QQuickWindow* window, backup_modern::RemoteController* remote,
   // 三个阶段都要在两种主题下检查几何：只查一种状态，另一种状态里的标签页
   // 塌掉是看不出来的。
   const char* signed_in_names[] = {
-      "remoteHostField",           "remotePortField",
-      "remoteUserField",           "remoteAccountText",
-      "remoteAccountStateText",    "remoteLogoutButton",
-      "remoteDeleteAccountButton", "remoteUploadButton",
-      "remoteRefreshButton",       "remoteListSummary",
-      "remoteStatusBanner",        "remoteTechnicalToggle"};
+      "remoteHostField",      "remotePortField",
+      "remoteUserField",      "remoteServerKeyPinField",
+      "remoteAccountText",    "remoteAccountStateText",
+      "remoteLogoutButton",   "remoteDeleteAccountButton",
+      "remoteUploadButton",   "remoteRefreshButton",
+      "remoteListSummary",    "remoteStatusBanner",
+      "remoteTechnicalToggle"};
   // 账户区域现在是一个分段控件（一个容器里两个分段），不再是两个独立按钮。
   const char* login_tab_names[] = {"remoteAccountTabs", "remotePasswordField",
                                    "remoteLoginButton"};
@@ -3437,6 +5300,9 @@ int RunRemoteTest(QQuickWindow* window, backup_modern::RemoteController* remote,
     other_endpoint.host = host.toStdString();
     other_endpoint.port = static_cast<std::uint16_t>(port_text.toUShort());
     other_endpoint.timeout_seconds = 30;
+    // 这一条是**裸客户端**（不经过控制器），所以 pin 要显式带上：BPSEC1
+    // 每一次连接都要握手，没有 pin 的连接会被客户端自己拒绝（不做 TOFU）。
+    other_endpoint.server_key_pin = remote->serverKeyPin().toStdString();
     backupproject::net::RemoteArchiveClient other;
     std::string other_error;
     const bool deleted_elsewhere =
@@ -3510,6 +5376,50 @@ int RunRemoteTest(QQuickWindow* window, backup_modern::RemoteController* remote,
               QStringLiteral("REMOTE-17b 第二个口令登不进去（原口令没被覆盖）"),
               remote->loginError() + QStringLiteral(" / kind=") +
                   remote->lastErrorKindForTest());
+  }
+
+  // ---- 产品级远端备份 / 链恢复（GUI 路径）----
+  //
+  // 这一节是 PR #21 的 GUI 闭环：QML 上的"远端备份"区域与快照卡片上的"恢复"
+  // 必须真的能走完整条链路，而不是只有 CLI 能用。
+  {
+    const auto objectByName = [window](const char* name) -> QObject* {
+      return window->findChild<QObject*>(QString::fromLatin1(name));
+    };
+    run.Check(objectByName("remoteBackupSourceField") != nullptr &&
+                  objectByName("remoteBackupSourceBrowseButton") != nullptr &&
+                  objectByName("remoteBackupStrategyTabs") != nullptr &&
+                  objectByName("remoteBackupButton") != nullptr &&
+                  objectByName("remoteBackupSummary") != nullptr &&
+                  objectByName("remoteBackupSourceFolderDialog") != nullptr &&
+                  objectByName("remoteRestoreFolderDialog") != nullptr,
+              QStringLiteral("REMOTE-G01 远端备份区域：源目录选择器 / 策略 / "
+                             "备份按钮 / 结论行 / 两个目录对话框都在"));
+    run.Check(objectByName("remoteSnapshotRestoreButton") != nullptr ||
+                  remote->snapshotCountForTest() == 0,
+              QStringLiteral("REMOTE-G01 快照卡片有独立的“恢复”主操作"));
+    run.Check(objectByName("remoteSnapshotDownloadButton") != nullptr ||
+                  remote->snapshotCountForTest() == 0,
+              QStringLiteral("REMOTE-G01 “下载归档”与“恢复”是两个按钮"));
+    const QString product_user =
+        QStringLiteral("gui-prod-%1")
+            .arg(QRandomGenerator::global()->bounded(1000000, 9999999));
+    const bool product_registered = remote->registerAccount(
+        host, port_text, product_user, password, password);
+    const bool product_ready =
+        product_registered && remote->waitForIdle(120000) &&
+        remote->login(host, port_text, product_user, password) &&
+        remote->waitForIdle(120000) && remote->authenticated();
+    run.Check(product_ready,
+              QStringLiteral("REMOTE-G01 产品级流程的临时账号就绪"),
+              remote->lastErrorKindForTest() + QStringLiteral(": ") +
+                  remote->lastDetailForTest());
+    QString fingerprint = server_key_pin;
+    fingerprint.remove(QStringLiteral("sha256:"));
+    if (product_ready) {
+      RunRemoteProductFlow(remote, &run, work, host, port_text, product_user,
+                           password, fingerprint);
+    }
   }
 
   std::printf("[remote-test] passed=%d failed=%d\n", run.passed, run.failed);
@@ -6483,6 +8393,8 @@ int main(int argc, char* argv[]) {
   const bool realtime_test =
       arguments.contains(QStringLiteral("--realtime-test"));
   const bool remote_test = arguments.contains(QStringLiteral("--remote-test"));
+  const int remote_acceptance_index =
+      arguments.indexOf(QStringLiteral("--remote-acceptance"));
   const int remote_smoke_index =
       arguments.indexOf(QStringLiteral("--remote-smoke"));
   const int realtime_file_index =
@@ -6577,7 +8489,7 @@ int main(int argc, char* argv[]) {
       screenshot_index >= 0 || self_test_index >= 0 ||
       repository_test_index >= 0 || realtime_test || backup_options_test ||
       schedule_test || filter_ux_test || combo_hover_test || remote_test ||
-      remote_smoke_index >= 0;
+      remote_acceptance_index >= 0 || remote_smoke_index >= 0;
   QString config_file_path = ResolveConfigFilePath(arguments);
   QString schedule_file_path = ResolveScheduleFilePath(arguments);
   QString realtime_file_path = ResolveRealtimeFilePath(arguments);
@@ -6700,6 +8612,20 @@ int main(int argc, char* argv[]) {
   //
   // 自检模式刻意不自动启动 runner：自检要自己控制每一步（从空 store 开始、
   // 手动触发评估），自动 tick 会和它抢同一份状态。
+  if (remote_acceptance_index >= 0) {
+    if (remote_acceptance_index + 4 >= arguments.size()) {
+      std::fprintf(stderr,
+                   "--remote-acceptance 需要 <输出目录> <地址> <端口> <用户名>"
+                   "（口令走 BACKUP_REMOTE_PASSWORD、指纹走 "
+                   "BACKUP_REMOTE_PIN）\n");
+      return 2;
+    }
+    return RunRemoteAcceptance(window, &remote_controller, &controller, &theme,
+                               arguments.at(remote_acceptance_index + 1),
+                               arguments.at(remote_acceptance_index + 2),
+                               arguments.at(remote_acceptance_index + 3),
+                               arguments.at(remote_acceptance_index + 4));
+  }
   if (remote_test) {
     return RunRemoteTest(window, &remote_controller, &controller, &theme,
                          config_file_path, schedule_file_path,

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# final_gate.sh —— PR #20 的 canonical final gate。
+# final_gate.sh —— PR #21 的 canonical final gate（含 PR #20 的全部套件）。
 #
 #   bash scripts/final_gate.sh
 #
@@ -42,6 +42,9 @@ run() {
 }
 
 run lint bash scripts/lint.sh
+run secure-transport bash scripts/secure_transport_test.sh
+run remote-incremental bash scripts/remote_incremental_test.sh
+run secure-transport-sanitize env SECURE_TRANSPORT_TEST_EXTRA_FLAGS="-g -O1 -fsanitize=address,undefined -fno-omit-frame-pointer" bash scripts/secure_transport_test.sh
 run quality bash scripts/quality_test.sh
 
 # quality 会 make clean：把两个 GUI 重新构建出来，后面 test.sh 的 GUI parity 用例
@@ -52,6 +55,12 @@ echo "GATE gui-rebuild exit=$? warnings=$(grep -ci warning "$GUI_BUILD_LOG" || t
 run suite-main bash scripts/test.sh
 run network bash scripts/network_test.sh
 run network-sanitize env NETWORK_TEST_SANITIZE=1 bash scripts/network_test.sh
+# BPSNAP1 打包一致性（copy 绑定）：同一个复现程序在**当前树**与 git archive
+# 2889116 出来的独立旧树上各编一次，跑 2x2 判别（对角必须通过、反对角必须失败）。
+# 与 network-sanitize 一样必须排在 quality 之前：quality 会 make clean，把
+# build-sanitize 一起删掉。
+run bundle-source-mutation bash scripts/bundle_source_mutation_test.sh
+run bundle-source-mutation-sanitize env BUNDLE_SOURCE_MUTATION_SANITIZE=1 bash scripts/bundle_source_mutation_test.sh
 run account-deletion bash scripts/account_deletion_test.sh
 run same-instance-truth bash scripts/same_instance_truth_test.sh
 run server-admin bash scripts/server_admin_test.sh

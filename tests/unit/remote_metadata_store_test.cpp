@@ -8,11 +8,16 @@
 
 #include <sqlite3.h>
 
+#include <condition_variable>
 #include <cstdint>
+#include <cstdio>
+#include <mutex>
 #include <string>
+#include <thread>
 #include <utility>
 #include <vector>
 
+#include "network_protocol.h"
 #include "remote_auth.h"
 #include "remote_metadata_store.h"
 #include "test_support.h"
@@ -508,6 +513,257 @@ int main() {
       test_support::Check(!store.OpenExistingReadOnly(std::string(), &error),
                           "STORE T7 空路径被拒绝");
     }
+  }
+
+  test_support::Section("STORE 9. 远端增量链的边界条件（父/代数/线性/深度/竞态）");
+  {
+    // PR #21 审查：链的边界条件必须在**与 INSERT 同一个互斥区间**里成立，
+    // 否则删除与上传并发时会留下"父没了、子还在"的孤儿。这一节把这些条件
+    // 逐条钉成断言，并包含两个真正并发的竞态用例（屏障启动，不靠 sleep 猜）。
+    const std::string base = test_support::FreshDir("store-chain");
+    const std::string chain_path = base + "/chain.sqlite3";
+    net::RemoteMetadataStore store;
+    std::string error;
+    test_support::Check(store.Open(chain_path, &error), "STORE 9 打开链测试库",
+                        error);
+    std::int64_t user = 0;
+    test_support::Check(store.CreateUser("chain", FakePasswordRecord(), 1000,
+                                         &user, &error) ==
+                            net::StoreResult::kOk,
+                        "STORE 9 建用户", error);
+    const std::string lineage(64, 'd');
+    const std::string other_lineage(64, 'e');
+
+    net::RemoteSnapshotRecord root =
+        MakeSnapshot(SnapshotId('a'), user, "r0", 100, 1000);
+    root.lineage = lineage;
+    test_support::Check(store.InsertSnapshot(root, &error) ==
+                            net::StoreResult::kOk,
+                        "STORE 9 完整快照（gen 0、无父）可以插入", error);
+
+    net::RemoteSnapshotRecord bad_full =
+        MakeSnapshot(SnapshotId('b'), user, "bad-full", 100, 1000);
+    bad_full.parent_id = root.snapshot_id;
+    bad_full.generation = 1;
+    test_support::Check(store.InsertSnapshot(bad_full, &error) ==
+                            net::StoreResult::kChainConflict,
+                        "STORE 9 完整快照不许声明父", error);
+    bad_full.parent_id.clear();
+    bad_full.generation = 3;
+    test_support::Check(store.InsertSnapshot(bad_full, &error) ==
+                            net::StoreResult::kChainConflict,
+                        "STORE 9 完整快照的代数必须是 0", error);
+
+    net::RemoteSnapshotRecord child =
+        MakeSnapshot(SnapshotId('c'), user, "r1", 100, 2000);
+    child.snapshot_kind = 1;
+    child.parent_id = SnapshotId('f');  // 不存在的父
+    child.generation = 1;
+    child.lineage = lineage;
+    test_support::Check(store.InsertSnapshot(child, &error) ==
+                            net::StoreResult::kNotFound,
+                        "STORE 9 父不存在 -> kNotFound（不是一个模糊的错误）", error);
+
+    child.parent_id = root.snapshot_id;
+    test_support::Check(store.InsertSnapshot(child, &error) ==
+                            net::StoreResult::kOk,
+                        "STORE 9 合法的增量（gen 1）可以插入", error);
+
+    net::RemoteSnapshotRecord wrong_lineage = child;
+    wrong_lineage.snapshot_id = SnapshotId('d');
+    wrong_lineage.lineage = other_lineage;
+    test_support::Check(store.InsertSnapshot(wrong_lineage, &error) ==
+                            net::StoreResult::kChainConflict,
+                        "STORE 9 跨 lineage 的增量被拒绝", error);
+
+    net::RemoteSnapshotRecord wrong_generation = child;
+    wrong_generation.snapshot_id = SnapshotId('e');
+    wrong_generation.generation = 5;
+    test_support::Check(store.InsertSnapshot(wrong_generation, &error) ==
+                            net::StoreResult::kChainConflict,
+                        "STORE 9 代数不是父+1 被拒绝", error);
+
+    net::RemoteSnapshotRecord second_child = child;
+    second_child.snapshot_id = SnapshotId('1');
+    test_support::Check(store.InsertSnapshot(second_child, &error) ==
+                            net::StoreResult::kChainConflict,
+                        "STORE 9 同一个父的第二个孩子被拒绝（线性链）", error);
+
+    // ---- 深度上界：链底 + 64 层可以，第 65 层必须被拒 ----
+    std::string previous = child.snapshot_id;
+    std::uint64_t deepest = 1;
+    bool depth_ok = true;
+    for (std::uint64_t generation = 2;
+         generation <= net::kMaxRemoteChainGeneration; ++generation) {
+      char id[33];
+      std::snprintf(id, sizeof(id), "%032llu",
+                    static_cast<unsigned long long>(generation));
+      net::RemoteSnapshotRecord next = child;
+      next.snapshot_id = id;
+      next.parent_id = previous;
+      next.generation = generation;
+      const net::StoreResult inserted = store.InsertSnapshot(next, &error);
+      if (inserted != net::StoreResult::kOk) {
+        depth_ok = false;
+        test_support::Check(false,
+                            "STORE 9 深度链在 generation " +
+                                std::to_string(generation) + " 处断掉",
+                            error + " / " + net::StoreResultName(inserted));
+        break;
+      }
+      previous = next.snapshot_id;
+      deepest = generation;
+    }
+    test_support::Check(depth_ok &&
+                            deepest == net::kMaxRemoteChainGeneration,
+                        "STORE 9 深度到 " +
+                            std::to_string(net::kMaxRemoteChainGeneration) +
+                            " 的链可以完整建立");
+
+    net::RemoteSnapshotRecord too_deep = child;
+    too_deep.snapshot_id = std::string(32, 'q');
+    too_deep.parent_id = previous;
+    too_deep.generation = net::kMaxRemoteChainGeneration + 1;
+    const net::StoreResult deep_result = store.InsertSnapshot(too_deep, &error);
+    test_support::Check(deep_result == net::StoreResult::kChainConflict,
+                        "STORE 9 超过可恢复上限的代数被拒绝（不存下产品恢复不了的东西）",
+                        std::string(net::StoreResultName(deep_result)) + " / " +
+                            error);
+
+    // ---- 并发：同一个父，两个线程抢着挂孩子（屏障启动，不靠 sleep） ----
+    {
+      net::RemoteSnapshotRecord race_root =
+          MakeSnapshot(std::string(32, 'R'), user, "race-root", 100, 5000);
+      race_root.lineage = lineage;
+      test_support::Check(store.InsertSnapshot(race_root, &error) ==
+                              net::StoreResult::kOk,
+                          "STORE 9 竞态用例的根", error);
+      net::RemoteSnapshotRecord left = child;
+      left.snapshot_id = std::string(32, 'L');
+      left.parent_id = race_root.snapshot_id;
+      left.generation = 1;
+      net::RemoteSnapshotRecord right = left;
+      right.snapshot_id = std::string(32, 'M');
+
+      std::mutex gate_mutex;
+      std::condition_variable gate;
+      bool open = false;
+      net::StoreResult left_result = net::StoreResult::kError;
+      net::StoreResult right_result = net::StoreResult::kError;
+      std::string left_error;
+      std::string right_error;
+      auto worker = [&](net::RemoteSnapshotRecord* record,
+                        net::StoreResult* result, std::string* message) {
+        {
+          std::unique_lock<std::mutex> lock(gate_mutex);
+          gate.wait(lock, [&open] { return open; });
+        }
+        *result = store.InsertSnapshot(*record, message);
+      };
+      std::thread first(worker, &left, &left_result, &left_error);
+      std::thread second(worker, &right, &right_result, &right_error);
+      {
+        std::lock_guard<std::mutex> lock(gate_mutex);
+        open = true;
+      }
+      gate.notify_all();
+      first.join();
+      second.join();
+      const int successes = (left_result == net::StoreResult::kOk ? 1 : 0) +
+                            (right_result == net::StoreResult::kOk ? 1 : 0);
+      const int conflicts =
+          (left_result == net::StoreResult::kChainConflict ? 1 : 0) +
+          (right_result == net::StoreResult::kChainConflict ? 1 : 0);
+      test_support::Check(successes == 1 && conflicts == 1,
+                          "STORE 9 两个线程抢同一个父：恰好一个成功、一个冲突",
+                          std::to_string(successes) + " 成功 / " +
+                              std::to_string(conflicts) + " 冲突（" +
+                              net::StoreResultName(left_result) + " / " +
+                              net::StoreResultName(right_result) + "）");
+      const std::string winner = left_result == net::StoreResult::kOk
+                                     ? left.snapshot_id
+                                     : right.snapshot_id;
+      const std::string loser = left_result == net::StoreResult::kOk
+                                    ? right.snapshot_id
+                                    : left.snapshot_id;
+      net::RemoteSnapshotRecord survivor;
+      net::RemoteSnapshotRecord ghost;
+      test_support::Check(store.FindSnapshot(user, winner, &survivor, &error) ==
+                                  net::StoreResult::kOk &&
+                              store.FindSnapshot(user, loser, &ghost, &error) ==
+                                  net::StoreResult::kNotFound,
+                          "STORE 9 只有赢家那一行在库里（输家没有留下半行）");
+    }
+
+    // ---- 删除与插入的竞态：不允许"父没了、子还在" ----
+    {
+      for (int round = 0; round < 20; ++round) {
+        char root_id[33];
+        char child_id[33];
+        std::snprintf(root_id, sizeof(root_id), "%032d", 1000 + round);
+        std::snprintf(child_id, sizeof(child_id), "%032d", 2000 + round);
+        net::RemoteSnapshotRecord race_root =
+            MakeSnapshot(root_id, user, "race", 100, 6000 + round);
+        race_root.lineage = lineage;
+        std::string round_error;
+        test_support::Check(store.InsertSnapshot(race_root, &round_error) ==
+                                net::StoreResult::kOk,
+                            "STORE 9 删除/插入竞态第 " + std::to_string(round) +
+                                " 轮的父",
+                            round_error);
+        net::RemoteSnapshotRecord race_child = child;
+        race_child.snapshot_id = child_id;
+        race_child.parent_id = race_root.snapshot_id;
+        race_child.generation = 1;
+
+        std::mutex gate_mutex;
+        std::condition_variable gate;
+        bool open = false;
+        net::StoreResult delete_result = net::StoreResult::kError;
+        net::StoreResult insert_result = net::StoreResult::kError;
+        std::string delete_error;
+        std::string insert_error;
+        net::RemoteSnapshotRecord removed;
+        std::thread deleter([&]() {
+          {
+            std::unique_lock<std::mutex> lock(gate_mutex);
+            gate.wait(lock, [&open] { return open; });
+          }
+          delete_result = store.DeleteSnapshot(user, race_root.snapshot_id,
+                                               &removed, &delete_error);
+        });
+        std::thread inserter([&]() {
+          {
+            std::unique_lock<std::mutex> lock(gate_mutex);
+            gate.wait(lock, [&open] { return open; });
+          }
+          insert_result = store.InsertSnapshot(race_child, &insert_error);
+        });
+        {
+          std::lock_guard<std::mutex> lock(gate_mutex);
+          open = true;
+        }
+        gate.notify_all();
+        deleter.join();
+        inserter.join();
+
+        net::RemoteSnapshotRecord parent_row;
+        net::RemoteSnapshotRecord child_row;
+        const bool parent_exists =
+            store.FindSnapshot(user, race_root.snapshot_id, &parent_row,
+                               &error) == net::StoreResult::kOk;
+        const bool child_exists =
+            store.FindSnapshot(user, race_child.snapshot_id, &child_row,
+                               &error) == net::StoreResult::kOk;
+        test_support::Check(!(child_exists && !parent_exists),
+                            "STORE 9 删除/插入竞态：不存在'父没了、子还在'",
+                            "parent=" + std::string(parent_exists ? "有" : "无") +
+                                " child=" + std::string(child_exists ? "有" : "无") +
+                                " delete=" + net::StoreResultName(delete_result) +
+                                " insert=" + net::StoreResultName(insert_result));
+      }
+    }
+    store.Close();
   }
 
   return test_support::Finish("remote_metadata_store_test");

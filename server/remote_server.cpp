@@ -29,6 +29,7 @@
 #include "remote_auth.h"
 #include "remote_maintenance.h"
 #include "remote_metadata_store.h"
+#include "secure_transport.h"
 
 namespace backupproject {
 namespace net {
@@ -38,6 +39,16 @@ namespace {
 constexpr int kListenBacklog = 64;
 // 最大 worker 数。超过这个数就不再是"foundation 的有界模型"了。
 constexpr std::size_t kMaxWorkers = 64;
+
+// 这条 worker 线程正在服务的连接所用的 BPSEC1 通道。
+//
+// 一个连接从握手到关闭全程只由**同一个** worker 线程处理（见 WorkerLoop），
+// 所以放在 thread_local 里是安全的；这样 SendError / SendStatus 这类只拿得到
+// fd 的深层函数不必逐个改签名就能走加密层。产品路径上它一定非空：
+// ServeConnection 在进入帧循环之前先完成握手，握手失败直接断连。
+// g_connection_channel == nullptr 时**不发任何字节**（fail closed），
+// 不存在"退回明文 BPNET1"的代码路径。
+thread_local SecureChannel* g_connection_channel = nullptr;
 // Run() 的轮询间隔：让 Stop() 最迟 200 ms 内生效，同时不空转。
 constexpr int kPollIntervalMs = 200;
 
@@ -94,7 +105,8 @@ bool EnsureDirectory(const std::string& path, std::string* error_message) {
 }
 
 // secrets.env 的大小上限：它是几行配置，不是数据文件。没有上限就等于给
-// "读一个巨大的文件"留门（非普通文件在下面已经被拒，但普通文件也可能是 10 GiB）。
+// "读一个巨大的文件"留门（非普通文件在下面已经被拒，但普通文件也可能是 10
+// GiB）。
 constexpr std::size_t kMaxSecretFileBytes = 1024 * 1024;
 
 // 读 secrets.env 里的 BACKUP_TOKEN_SECRET。
@@ -124,8 +136,8 @@ bool ReadSecretFile(const std::string& path, std::string* secret,
       if (errno == ELOOP) {
         *error_message = "the secret file must not be a symbolic link: " + path;
       } else {
-        *error_message = "cannot open the secret file " + path + ": " +
-                         std::strerror(errno);
+        *error_message =
+            "cannot open the secret file " + path + ": " + std::strerror(errno);
       }
     }
     return false;
@@ -273,11 +285,11 @@ bool RemoteServer::Configure(const RemoteServerConfig& config,
   }
   // 只允许监听 127.0.0.1，而且是**相等**判断（127.0.0.2 之类同样拒绝）。
   //
-  // 本版本没有原生 TLS：BPNET1 的口令与 token 是明文，机密性完全由 SSH 隧道
-  // 提供。既然机密性不在协议里，监听地址就必须只能是被隧道指向的那个环回地址；
-  // 0.0.0.0 与任何私网 / 公网地址都会把明文协议直接暴露在一个共享网络上。
-  // 所以这里 fail closed：不提供 --insecure / --allow-public 之类的开关，
-  // 也不给"只这一次"的例外。将来有了原生 TLS，再连同协议一起重新设计。
+  // PR #21 起，BPNET1 的每一个字节都由 BPSEC1 加密（见 secure_transport.h），
+  // 机密性不再依赖 SSH 隧道；隧道降级为部署层的纵深防御。监听地址仍然只能是
+  // 环回地址——这是纵深防御的一部分，不是机密性的前提：把只该由隧道访问的
+  // 端口直接暴露在共享网络上没有任何好处，所以这里继续 fail closed，
+  // 不提供 --insecure / --allow-public 之类的开关。
   if (config.bind_address != "127.0.0.1") {
     if (error_message != nullptr) {
       *error_message =
@@ -297,6 +309,15 @@ bool RemoteServer::Configure(const RemoteServerConfig& config,
   if (config.database_path.empty()) {
     if (error_message != nullptr) {
       *error_message = "--db must not be empty";
+    }
+    return false;
+  }
+  if (config.transport_key_file_path.empty()) {
+    if (error_message != nullptr) {
+      *error_message =
+          "--transport-key-file must not be empty: BPSEC1 needs a server"
+          " identity key, and this server has no plaintext mode (generate one"
+          " with backup-server-keygen --output <path>)";
     }
     return false;
   }
@@ -359,6 +380,10 @@ bool RemoteServer::Start(std::string* error_message) {
     data_lock_.reset();
     return false;
   }
+  if (!LoadTransportIdentityKey(error_message)) {
+    data_lock_.reset();
+    return false;
+  }
   store_.reset(new RemoteMetadataStore());
   if (!store_->Open(config_.database_path, error_message)) {
     store_.reset();
@@ -383,7 +408,9 @@ bool RemoteServer::Start(std::string* error_message) {
     line << "listening on " << config_.bind_address << ":" << bound_port_
          << " root=" << config_.root_directory
          << " workers=" << config_.worker_count
-         << " max_upload=" << config_.max_upload_bytes;
+         << " max_upload=" << config_.max_upload_bytes << " bspec1=on"
+         << " transport_fingerprint="
+         << crypto::X25519Fingerprint(transport_identity_.public_key);
     Log(line.str());
   }
   return true;
@@ -397,6 +424,17 @@ bool RemoteServer::LoadSecret(std::string* error_message) {
   std::ostringstream line;
   line << "token secret loaded (" << secret_.size() << " bytes)";
   Log(line.str());
+  return true;
+}
+
+bool RemoteServer::LoadTransportIdentityKey(std::string* error_message) {
+  if (!LoadTransportIdentity(config_.transport_key_file_path,
+                             &transport_identity_, error_message)) {
+    return false;
+  }
+  // 只记指纹（公开信息），不记私钥。
+  Log("BPSEC1 transport identity loaded, fingerprint=" +
+      crypto::X25519Fingerprint(transport_identity_.public_key));
   return true;
 }
 
@@ -492,8 +530,16 @@ bool RemoteServer::SendError(int fd, std::uint16_t opcode,
                              std::string* error_message) {
   // 错误响应的 payload 永远是空的：原因只写服务端日志，不回给客户端，
   // 免得把内部路径或 errno 漏出去。
-  if (!SendFrame(fd, opcode, static_cast<std::uint32_t>(status), request_id,
-                 std::string(), error_message)) {
+  if (g_connection_channel == nullptr) {
+    // 没有加密通道时一个字节都不发：没有明文回退路径。
+    if (error_message != nullptr) {
+      *error_message = "refusing to send a frame without a BPSEC1 channel";
+    }
+    return false;
+  }
+  if (!g_connection_channel->SendFrame(
+          fd, opcode, static_cast<std::uint32_t>(status), request_id,
+          std::string(), error_message)) {
     return false;
   }
   return true;
@@ -505,8 +551,16 @@ bool RemoteServer::SendStatus(int fd, const FrameHeader& request, Status status,
   const std::uint16_t opcode = IsKnownOpcode(request.opcode)
                                    ? request.opcode
                                    : static_cast<std::uint16_t>(Opcode::kError);
-  return SendFrame(fd, opcode, static_cast<std::uint32_t>(status),
-                   request.request_id, payload, error_message);
+  if (g_connection_channel == nullptr) {
+    // 同上：没有加密通道就不发。
+    if (error_message != nullptr) {
+      *error_message = "refusing to send a frame without a BPSEC1 channel";
+    }
+    return false;
+  }
+  return g_connection_channel->SendFrame(
+      fd, opcode, static_cast<std::uint32_t>(status), request.request_id,
+      payload, error_message);
 }
 
 bool RemoteServer::HandlePing(int fd, const FrameHeader& header,
@@ -722,8 +776,8 @@ bool RemoteServer::HandleResume(int fd, const FrameHeader& header,
   if (!VerifyToken(secret_, token, NowSeconds(), &parsed, &verify_error)) {
     // 失败原因只写日志：里面既没有 token 内容，也没有 secret。
     Log("resume rejected: " + verify_error);
-    return SendError(fd, header.opcode, header.request_id, Status::kUnauthorized,
-                     error_message);
+    return SendError(fd, header.opcode, header.request_id,
+                     Status::kUnauthorized, error_message);
   }
   // token 的签名说明"这是我们签发的"，但**不**说明"这个账户还在"：注销过的
   // 账户必须在这里被挡住。这一条正是"注销之后旧 token 立刻失效"的实现。
@@ -733,8 +787,8 @@ bool RemoteServer::HandleResume(int fd, const FrameHeader& header,
       static_cast<std::int64_t>(parsed.user_id), &user, &store_error);
   if (found == StoreResult::kNotFound) {
     Log("resume rejected: the account no longer exists");
-    return SendError(fd, header.opcode, header.request_id, Status::kUnauthorized,
-                     error_message);
+    return SendError(fd, header.opcode, header.request_id,
+                     Status::kUnauthorized, error_message);
   }
   if (found != StoreResult::kOk) {
     Log("cannot read the user row: " + store_error);
@@ -789,6 +843,16 @@ bool RemoteServer::HandleList(int fd, const FrameHeader& header,
     }
     builder.AppendU64(record.size_bytes);
     builder.AppendU64(static_cast<std::uint64_t>(record.created_at));
+    // PR #21：链元数据。客户端据此自己走父链，服务端不替它解释链。
+    builder.AppendU16(record.snapshot_kind);
+    builder.AppendU64(record.generation);
+    if (!builder.AppendString(record.parent_id, kMaxSnapshotIdBytes,
+                              &build_error) ||
+        !builder.AppendString(record.lineage, kMaxLineageBytes, &build_error)) {
+      Log("cannot encode a LIST entry: " + build_error);
+      return SendError(fd, header.opcode, header.request_id,
+                       Status::kInternalError, error_message);
+    }
     // 一帧装不下就明确拒绝，绝不发一个超限的帧。
     if (builder.size() > kMaxPayloadBytes) {
       Log("the LIST response would exceed the 1 MiB frame limit");
@@ -953,10 +1017,18 @@ bool RemoteServer::HandleUploadBegin(int fd, const FrameHeader& header,
   std::string display_name;
   std::uint64_t declared_size = 0;
   std::string declared_sha256;
+  std::uint16_t snapshot_kind = 0;
+  std::string parent_snapshot_id;
+  std::string lineage;
   if (!reader.ReadString(kMaxDisplayNameBytes, &display_name) ||
       !reader.ReadU64(&declared_size) ||
       !reader.ReadString(kSha256HexBytes, &declared_sha256) ||
-      !reader.AtEnd()) {
+      !reader.ReadU16(&snapshot_kind) ||
+      !reader.ReadString(kMaxSnapshotIdBytes, &parent_snapshot_id) ||
+      !reader.ReadString(kMaxLineageBytes, &lineage) || !reader.AtEnd()) {
+    // 旧客户端（PR #20）的 UPLOAD_BEGIN 少了后面三个字段：这里会因为
+    // 读不到 / 有尾巴而拒绝。这是刻意的——加密与链元数据一起上线，
+    // 不存在"勉强接受旧格式"的分支。
     Log("rejecting a malformed UPLOAD_BEGIN: " + reader.error_message());
     return SendError(fd, header.opcode, header.request_id,
                      Status::kInvalidRequest, error_message);
@@ -967,6 +1039,77 @@ bool RemoteServer::HandleUploadBegin(int fd, const FrameHeader& header,
     Log("rejecting UPLOAD_BEGIN metadata: " + validation_error);
     return SendError(fd, header.opcode, header.request_id,
                      Status::kInvalidRequest, error_message);
+  }
+  // lineage：完整快照**允许为空**——空串表示这一份不属于任何链（PR #20 时代
+  // 上传的旧数据与低层 remote upload 都是这一类）。非空时必须是 64 位十六进
+  // 制；增量则**必须**带一个合法的链标识：没有链标识的增量在语义上不存在。
+  if (!IsKnownSnapshotKind(snapshot_kind)) {
+    Log("rejecting UPLOAD_BEGIN with an unknown snapshot kind");
+    return SendError(fd, header.opcode, header.request_id,
+                     Status::kInvalidRequest, error_message);
+  }
+  if (!lineage.empty() && !IsValidSha256Hex(lineage, &validation_error)) {
+    Log("rejecting UPLOAD_BEGIN with a malformed lineage: " + validation_error);
+    return SendError(fd, header.opcode, header.request_id,
+                     Status::kInvalidRequest, error_message);
+  }
+  if (snapshot_kind == static_cast<std::uint16_t>(SnapshotKind::kIncremental) &&
+      lineage.empty()) {
+    Log("rejecting an incremental snapshot without a lineage");
+    return SendError(fd, header.opcode, header.request_id,
+                     Status::kInvalidRequest, error_message);
+  }
+  // ---- PR #21：链关系校验。全部由服务端做，客户端说什么都要在这里过一遍 ----
+  //
+  //   full          parent 必须为空、generation 恒为 0（新链的根）
+  //   incremental   parent 必须已经存在、属于**同一个用户**、lineage 相同；
+  //                 generation = parent.generation + 1（服务端算的）
+  //
+  // 因为 parent 只能指向**已经存在**的不可变快照，所以不可能出现指向未来的
+  // 环（self parent 也一样：自己的 id 是在这之后才生成的）。
+  // 客户端根本没有 generation 字段可填，所以"代数跳跃"在这条路径上不存在。
+  std::uint64_t generation = 0;
+  if (snapshot_kind == static_cast<std::uint16_t>(SnapshotKind::kFull)) {
+    if (!parent_snapshot_id.empty()) {
+      Log("rejecting a full snapshot that declares a parent");
+      return SendError(fd, header.opcode, header.request_id,
+                       Status::kInvalidRequest, error_message);
+    }
+  } else {
+    if (parent_snapshot_id.empty()) {
+      Log("rejecting an incremental snapshot without a parent");
+      return SendError(fd, header.opcode, header.request_id,
+                       Status::kInvalidRequest, error_message);
+    }
+    std::string parent_validation;
+    if (!IsValidSnapshotId(parent_snapshot_id, &parent_validation)) {
+      Log("rejecting an incremental snapshot with a malformed parent id");
+      return SendError(fd, header.opcode, header.request_id,
+                       Status::kInvalidRequest, error_message);
+    }
+    RemoteSnapshotRecord parent;
+    std::string parent_error;
+    const StoreResult parent_result =
+        store_->FindSnapshot(static_cast<std::int64_t>(context->user_id),
+                             parent_snapshot_id, &parent, &parent_error);
+    if (parent_result == StoreResult::kNotFound) {
+      // 不存在的父与"别人的父"是同一个答案：不允许按 id 探测别人的快照。
+      Log("rejecting an incremental upload: the parent snapshot does not "
+          "exist");
+      return SendError(fd, header.opcode, header.request_id, Status::kNotFound,
+                       error_message);
+    }
+    if (parent_result != StoreResult::kOk) {
+      Log("cannot read the parent snapshot row: " + parent_error);
+      return SendError(fd, header.opcode, header.request_id,
+                       Status::kInternalError, error_message);
+    }
+    if (parent.lineage != lineage) {
+      Log("rejecting an incremental upload across lineages");
+      return SendError(fd, header.opcode, header.request_id,
+                       Status::kInvalidRequest, error_message);
+    }
+    generation = parent.generation + 1;
   }
   if (declared_size == 0) {
     // 0 字节的归档不是合法归档。产品明确拒绝，而不是存一个空文件——
@@ -1012,6 +1155,10 @@ bool RemoteServer::HandleUploadBegin(int fd, const FrameHeader& header,
   context->upload_received = 0;
   context->upload_fd = temp_fd;
   context->upload_hasher = crypto::Sha256();
+  context->upload_kind = snapshot_kind;
+  context->upload_parent_id = parent_snapshot_id;
+  context->upload_generation = generation;
+  context->upload_lineage = lineage;
   return SendStatus(fd, header, Status::kOk, std::string(), error_message);
 }
 
@@ -1080,6 +1227,11 @@ bool RemoteServer::HandleUploadEnd(int fd, const FrameHeader& header,
   const std::string declared_sha256 = context->upload_sha256;
   const std::string temp_path = context->upload_temp_path;
   const int temp_fd = context->upload_fd;
+  // 链关系在 UPLOAD_BEGIN 时就已经校验并定下来；这里只把它落到记录与响应里。
+  const std::uint16_t snapshot_kind = context->upload_kind;
+  const std::string parent_snapshot_id = context->upload_parent_id;
+  const std::uint64_t generation = context->upload_generation;
+  const std::string lineage = context->upload_lineage;
 
   // 摘要器只能 Final 一次，所以先在副本上收尾，失败路径还要继续用它清场。
   crypto::Sha256 hasher = context->upload_hasher;
@@ -1138,6 +1290,10 @@ bool RemoteServer::HandleUploadEnd(int fd, const FrameHeader& header,
   record.sha256 = actual_sha256;
   record.created_at = now;
   record.storage_name = snapshot_id + ".bak";
+  record.snapshot_kind = snapshot_kind;
+  record.parent_id = parent_snapshot_id;
+  record.generation = generation;
+  record.lineage = lineage;
 
   std::string store_error;
   const StoreResult result = store_->InsertSnapshot(record, &store_error);
@@ -1150,10 +1306,16 @@ bool RemoteServer::HandleUploadEnd(int fd, const FrameHeader& header,
     }
     FsyncDirectory(directory);
     ResetUploadState(context);
-    return SendError(fd, header.opcode, header.request_id,
-                     result == StoreResult::kAlreadyExists
-                         ? Status::kAlreadyExists
-                         : Status::kInternalError,
+    Status status = Status::kInternalError;
+    if (result == StoreResult::kAlreadyExists) {
+      status = Status::kAlreadyExists;
+    } else if (result == StoreResult::kNotFound) {
+      // 父在 UPLOAD_BEGIN 之后被删掉了：如实告诉客户端"链已经变了"。
+      status = Status::kChainConflict;
+    } else if (result == StoreResult::kChainConflict) {
+      status = Status::kChainConflict;
+    }
+    return SendError(fd, header.opcode, header.request_id, status,
                      error_message);
   }
 
@@ -1168,8 +1330,17 @@ bool RemoteServer::HandleUploadEnd(int fd, const FrameHeader& header,
   }
   builder.AppendU64(declared);
   builder.AppendU64(static_cast<std::uint64_t>(now));
+  builder.AppendU16(snapshot_kind);
+  builder.AppendU64(generation);
+  if (!builder.AppendString(parent_snapshot_id, kMaxSnapshotIdBytes,
+                            &build_error)) {
+    Log("cannot encode the UPLOAD_END response: " + build_error);
+    return SendError(fd, header.opcode, header.request_id,
+                     Status::kInternalError, error_message);
+  }
   Log("published snapshot " + snapshot_id + " (" + std::to_string(declared) +
-      " bytes)");
+      " bytes, kind=" + std::to_string(snapshot_kind) +
+      " generation=" + std::to_string(generation) + ")");
   return SendStatus(fd, header, Status::kOk, builder.data(), error_message);
 }
 
@@ -1365,6 +1536,12 @@ bool RemoteServer::HandleDelete(int fd, const FrameHeader& header,
       user_id, snapshot_id, &removed, &delete_error);
   if (deleted != StoreResult::kOk) {
     Log("delete failed for snapshot " + snapshot_id + ": " + delete_error);
+    if (deleted == StoreResult::kHasDependents) {
+      // 链不能从中间断开：这个快照还有增量后代，必须先删后代。
+      // 管理工具走的是同一个 RemoteMaintenance，所以管理员也绕不过这条规则。
+      return SendError(fd, header.opcode, header.request_id,
+                       Status::kInvalidState, error_message);
+    }
     return SendError(fd, header.opcode, header.request_id,
                      deleted == StoreResult::kNotFound ? Status::kNotFound
                                                        : Status::kInternalError,
@@ -1501,10 +1678,9 @@ bool RemoteServer::AcquireDataLock(std::string* error_message) {
     const std::string hint =
         RemoteMaintenance::ReadLockHint(config_.root_directory);
     if (error_message != nullptr) {
-      *error_message =
-          "another process is already using the data directory " +
-          config_.root_directory +
-          (hint.empty() ? std::string() : " (" + hint + ")");
+      *error_message = "another process is already using the data directory " +
+                       config_.root_directory +
+                       (hint.empty() ? std::string() : " (" + hint + ")");
     }
     return false;
   }
@@ -1585,6 +1761,11 @@ bool RemoteServer::HandleFrame(int fd, const FrameHeader& header,
 bool RemoteServer::ServeConnection(int fd, std::string* error_message) {
   // 慢连接保护：读写在 io_timeout_seconds 之后超时返回，因此一个挂着不动的
   // 客户端最多占用一个 worker 这么久，不会永久占用。
+  //
+  // 审查轮更正：SO_RCVTIMEO 是**每次 recv** 的超时，对"每个超时周期挤 1 个
+  // 字节"的对端无效——那样一条未认证的连接可以把 worker 占住约 112 个超时
+  // 周期（默认 io_timeout 30 秒 → 接近一小时）。握手因此额外有一个整体预算，
+  // 见下面的 SetHandshakeTimeoutMs。
   timeval timeout;
   timeout.tv_sec = config_.io_timeout_seconds;
   timeout.tv_usec = 0;
@@ -1592,20 +1773,47 @@ bool RemoteServer::ServeConnection(int fd, std::string* error_message) {
   ::setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout));
 
   ConnectionContext context;
+  // 这条连接的加密通道。必须比 finish 活得久，所以在这里声明。
+  SecureChannel channel;
 
   // ServeConnection 的每一条返回路径都要收尾：客户端半路断开时，
-  // 未完成的上传必须删掉临时文件，下载必须关掉句柄。
-  const auto finish = [this, &context](bool result) {
+  // 未完成的上传必须删掉临时文件，下载必须关掉句柄；同时把 thread-local
+  // 的通道指针复位，免得被下一条连接误用。
+  const auto finish = [this, &context, &channel](bool result) {
+    if (g_connection_channel == &channel) {
+      g_connection_channel = nullptr;
+    }
     CleanupConnection(&context);
     return result;
   };
+
+  // PR #21：任何业务帧之前先完成 BPSEC1 握手。
+  //
+  // 失败就关连接：口令、token、用户名、快照元数据一个字节都不会以明文出现在
+  // 网络上，也没有"握手失败就退回明文 BPNET1"的分支。
+  // 握手一共只有 112 个字节的往返，正常网络下几秒内一定完成；给两倍 IO 超时
+  // （下限 30 秒）作为整体预算，超了就按 IO 错误关连接。
+  std::uint64_t handshake_budget_seconds =
+      static_cast<std::uint64_t>(config_.io_timeout_seconds) * 2;
+  if (handshake_budget_seconds < 30) {
+    handshake_budget_seconds = 30;
+  }
+  channel.SetHandshakeTimeoutMs(handshake_budget_seconds * 1000);
+  if (!channel.HandshakeServer(fd, transport_identity_, error_message)) {
+    Log(std::string("BPSEC1 handshake failed: ") +
+        (error_message != nullptr && !error_message->empty()
+             ? *error_message
+             : std::string("unknown reason")));
+    return finish(false);
+  }
+  g_connection_channel = &channel;
 
   for (;;) {
     FrameHeader header;
     std::string payload;
     std::string read_error;
     const FrameReadStatus status =
-        ReceiveFrame(fd, &header, &payload, &read_error);
+        channel.ReceiveFrame(fd, &header, &payload, &read_error);
     if (status == FrameReadStatus::kClosed) {
       Log("client closed the connection");
       return finish(true);
@@ -1642,7 +1850,8 @@ bool RemoteServer::ServeConnection(int fd, std::string* error_message) {
     // 隧道重启都属于这一类）。客户端必须如实报告失败，并且**不重发**。
     // 产品代码从不设置这个标志。
     if (fail_next_response_.exchange(false)) {
-      Log("injected: dropping the connection before answering a frame (test seam)");
+      Log("injected: dropping the connection before answering a frame (test "
+          "seam)");
       return finish(false);
     }
     if (!HandleFrame(fd, header, payload, &context, error_message)) {
