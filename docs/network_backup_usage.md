@@ -257,6 +257,10 @@ scripts/backup-server-admin.sh 一起装到 ECS 的 bin/ 下。
 * 远端增量（PR #21）已经可用：remote backup / remote restore 会复用本地
   增量引擎生成与恢复 delta 链，链关系（父 / 代数 / lineage）由服务端校验，
   依赖感知删除保证链不会从中间断开。用法与限制见 docs/remote_incremental.md。
+* 同一套能力在 **Modern GUI** 的远程页上也有：远端备份（源目录 + 完整/增量）、
+  云端快照列表（类型 / 代数 / 父）与链恢复。GUI 与 CLI 走**同一个** core
+  （RunRemoteBackup / RunRemoteRestore），GUI 侧不做任何增量判断；原始归档的
+  上传/下载仍然单独放在"高级"区域，与产品级备份区分开。
 * token 在有效期内无法单独吊销（服务端无会话状态）；轮换
   BACKUP_TOKEN_SECRET 会让所有已签发 token 立即失效。唯一的例外是账户
   注销：账户行不存在之后，旧 token 在任何操作上都会被拒绝（每次操作都会
@@ -283,6 +287,10 @@ scripts/backup-server-admin.sh 一起装到 ECS 的 bin/ 下。
     bash scripts/account_deletion_test.sh   # 账户注销端到端（真实服务端 + 磁盘）
     bash scripts/same_instance_truth_test.sh # 四源一致性（客户端/管理 CLI/DB/进程）
     bash scripts/aliyun_truth_matrix.sh      # ECS 真机三方真值矩阵
+    bash scripts/modern_gui_check.sh        # Modern GUI：页面 / 几何 / 0 QML 告警，
+                                            #   含 --remote-test 的远程页合同自检
+                                            #   （远端备份 / 增量 / 无变化 / 链恢复 /
+                                            #    冷缓存 / 原始归档区分 / pin / 忙碌）
     bash scripts/final_gate.sh               # canonical final gate（全部套件）
     bash scripts/server_admin_test.sh       # ECS 本地管理工具的安全边界
     bash scripts/aliyun_network_e2e.sh      # 阿里云真实端到端（需要隧道前置条件）
