@@ -145,6 +145,10 @@ Item {
         lines.push("服务器只监听本机回环地址，客户端通过部署时配置的安全通道访问它。")
         if (remote.diagnosticText !== "")
             lines.push("最近一次失败的技术原因：" + remote.diagnosticText)
+        // core 给出的“为什么这次不是增量”的原始理由（英文）：属于诊断，
+        // 只出现在这张默认折叠的卡片里，不出现在结论那一行。
+        if (remote.backupBaselineReason !== "")
+            lines.push("最近一次基线的核心原因：" + remote.backupBaselineReason)
         for (let i = 0; i < remote.snapshots.length; ++i) {
             const item = remote.snapshots[i]
             let line = "云端备份编号：" + item["id"]
@@ -736,6 +740,20 @@ Item {
                         }
                     }
 
+                    // 长操作进行中的一行状态：进度回调到达之前（连接、握手、
+                    // 重新生成材料包）也有东西可看，而不是只看到一排灰掉的按钮。
+                    // 内容来自控制器的 busyAction，不是画上去的假进度。
+                    Text {
+                        objectName: "remoteBusyText"
+                        Layout.fillWidth: true
+                        Layout.topMargin: 4
+                        visible: remote.busy
+                        text: remote.busyAction
+                        font.pixelSize: 15
+                        color: theme.textSecondary
+                        wrapMode: Text.WrapAnywhere
+                    }
+
                     // 最近一次远端备份的**实际**结论：完整 / 增量 / 没有变化。
                     // 这一行不会因为别的操作被顶掉（与页面底部的临时提示不同）。
                     Text {
@@ -795,7 +813,7 @@ Item {
                         visible: page.rowCount === 0
                         text: remote.authenticated
                               ? (remote.listLoaded
-                                 ? "云端还没有备份。点上面的“上传”把第一份备份放上去。"
+                                 ? "云端还没有备份。选好源目录后点上面的“开始远端备份”；原始归档用最下面的“高级：原始归档”上传。"
                                  : "点“刷新”读取云端备份列表。")
                               : "登录之后可以查看云端备份。"
                         font.pixelSize: 16
