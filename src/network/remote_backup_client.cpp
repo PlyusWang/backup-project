@@ -169,6 +169,9 @@ std::string RemoteStatusMessage(std::uint32_t status) {
       return "服务端认为这个帧不合法";
     case Status::kUnsupported:
       return "这个操作在当前构建里还不被支持";
+    case Status::kChainConflict:
+      return "远端增量链状态冲突（父快照已被删除、已经有别的增量挂在它下面，"
+             "或代数超过了可恢复的上限）";
   }
   return "未知错误";
 }

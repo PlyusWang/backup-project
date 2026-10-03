@@ -73,6 +73,14 @@ enum class SnapshotKind : std::uint16_t {
   kIncremental = 1,
 };
 
+// 远端链允许的最大代数（含）。本地增量引擎最多恢复 64 个 delta，也就是
+// 链底完整快照 + 64 层，最深那一份的 generation == 64。服务端必须自己拦住
+// generation 65+，否则会存下"客户端造得出、产品恢复不了"的快照。
+//
+// 它必须与引擎的 kMaxDeltaChainDepth 一致：src/network/remote_incremental.cpp
+// 里有一条 static_assert 把两者钉在一起（那一处同时看得到两个头文件）。
+inline constexpr std::uint64_t kMaxRemoteChainGeneration = 64;
+
 // 服务端默认的单次上传上限，可用 --max-upload-bytes 调整。
 // 一个文件块的大小。客户端用它切文件，服务端用它读磁盘；两边都远小于
 // 1 MiB 的帧上限，因此"整份归档进内存"这条路径不存在。
@@ -186,6 +194,11 @@ enum class Status : std::uint32_t {
   // 只有协议、帧循环与 PING，之后的 commit 才把其余操作码一个个接上。
   // 在那之前服务端如实回答"不支持"，不假装成功。
   kUnsupported = 12,
+  // PR #21 审查修复：远端增量链的边界条件不成立。四种情况共用这一个码：
+  // 父快照已经被删除、lineage 不同、代数不是父+1、父已经有活着的孩子
+  // （本产品是线性链），以及代数超过本地引擎能恢复的上限。
+  // 单独一个码是为了让界面能说清"这是链的问题"，而不是笼统的"请求不合法"。
+  kChainConflict = 13,
 };
 
 // ---- 帧头 ----

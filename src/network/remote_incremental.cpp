@@ -24,6 +24,14 @@
 
 namespace backupproject {
 namespace net {
+
+// 服务端允许的最大远端代数必须与本地增量引擎能恢复的深度一致：
+// 引擎最多恢复 kMaxDeltaChainDepth 个 delta（链底 full + 64 层 => generation 64）。
+// 两者一旦漂移，服务端就会存下"客户端造得出、产品恢复不了"的快照。
+static_assert(kMaxRemoteChainGeneration == kMaxDeltaChainDepth,
+              "remote chain generation limit must match the incremental engine "
+              "chain depth limit");
+
 namespace {
 
 constexpr const char* kRemoteArchivePrefix = "remote-";

@@ -1308,10 +1308,16 @@ bool RemoteServer::HandleUploadEnd(int fd, const FrameHeader& header,
     }
     FsyncDirectory(directory);
     ResetUploadState(context);
-    return SendError(fd, header.opcode, header.request_id,
-                     result == StoreResult::kAlreadyExists
-                         ? Status::kAlreadyExists
-                         : Status::kInternalError,
+    Status status = Status::kInternalError;
+    if (result == StoreResult::kAlreadyExists) {
+      status = Status::kAlreadyExists;
+    } else if (result == StoreResult::kNotFound) {
+      // 父在 UPLOAD_BEGIN 之后被删掉了：如实告诉客户端"链已经变了"。
+      status = Status::kChainConflict;
+    } else if (result == StoreResult::kChainConflict) {
+      status = Status::kChainConflict;
+    }
+    return SendError(fd, header.opcode, header.request_id, status,
                      error_message);
   }
 

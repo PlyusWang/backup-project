@@ -259,6 +259,8 @@ const char* StatusName(std::uint32_t status) {
       return "MALFORMED_FRAME";
     case Status::kUnsupported:
       return "UNSUPPORTED";
+    case Status::kChainConflict:
+      return "CHAIN_CONFLICT";
   }
   return "UNKNOWN_STATUS";
 }
