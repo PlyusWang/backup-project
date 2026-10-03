@@ -162,7 +162,8 @@ class RemoteMetadataStore {
   //   * 完整快照：parent 必须为空、generation 必须为 0。
   // 调用方在 UPLOAD_BEGIN 时也会校验一次，但那只是"早点给用户一个说法"：
   // 真正的权威校验必须与写入原子，否则删除与上传并发时会留下"父没了、子还在"
-  // 的孤儿（TOCTOU）。返回 kNotFound 表示父不存在，kChainConflict 表示其余冲突。
+  // 的孤儿（TOCTOU）。返回 kNotFound 表示父不存在，kChainConflict
+  // 表示其余冲突。
   StoreResult InsertSnapshot(const RemoteSnapshotRecord& record,
                              std::string* error_message);
   StoreResult ListSnapshots(std::int64_t user_id,
