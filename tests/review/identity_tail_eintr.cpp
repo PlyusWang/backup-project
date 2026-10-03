@@ -86,8 +86,8 @@ bool WriteKeyFile(const std::string& path, const std::string& bytes) {
 }  // namespace
 
 int main() {
-  const std::string root =
-      "/tmp/identity-tail-eintr-" + std::to_string(static_cast<long>(::getpid()));
+  const std::string root = "/tmp/identity-tail-eintr-" +
+                           std::to_string(static_cast<long>(::getpid()));
   if (::mkdir(root.c_str(), 0700) != 0 && errno != EEXIST) {
     std::printf("无法创建 %s\n", root.c_str());
     return 1;
@@ -114,8 +114,8 @@ int main() {
   const bool derived = backupproject::crypto::X25519PublicKeyFromPrivate(
       material, &expected_public, &derive_error);
   // 公钥是 32 字节原始 u 坐标（不是十六进制文本）。
-  Check(derived && expected_public.size() == 32, "独立推导出期望公钥（32 字节）",
-        derive_error);
+  Check(derived && expected_public.size() == 32,
+        "独立推导出期望公钥（32 字节）", derive_error);
 
   // ---- 用例 1：33 字节 + 尾部 EINTR 注入 -> 必须拒绝 ----
   backupproject::net::TransportIdentity identity;
@@ -139,7 +139,8 @@ int main() {
   const bool ok32 =
       backupproject::net::LoadTransportIdentity(key32, &accepted, &error);
   const int injected32 = ReadEintrDisarm();
-  Check(injected32 == 1, "EINTR 注入确实落在尾部那一次 1 字节读取上（32 字节用例）",
+  Check(injected32 == 1,
+        "EINTR 注入确实落在尾部那一次 1 字节读取上（32 字节用例）",
         std::to_string(injected32) + " 次");
   Check(ok32, "32 字节的私钥仍然被接受（重试之后读到 EOF）", error);
   Check(ok32 && accepted.private_key == material, "私钥字节被完整读入");
@@ -155,7 +156,8 @@ int main() {
   backupproject::net::TransportIdentity control;
   const bool rejected_without_injection =
       backupproject::net::LoadTransportIdentity(key33, &control, &error);
-  Check(!rejected_without_injection, "控制组：33 字节的私钥本来就被拒绝", error);
+  Check(!rejected_without_injection, "控制组：33 字节的私钥本来就被拒绝",
+        error);
 
   ::unlink(key32.c_str());
   ::unlink(key33.c_str());
