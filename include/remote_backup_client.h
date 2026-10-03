@@ -95,6 +95,17 @@ class RemoteArchiveClient {
   RemoteArchiveClient& operator=(const RemoteArchiveClient&) = delete;
 
   bool Connect(const RemoteEndpoint& endpoint, std::string* error_message);
+  // 更新"这条连接不可用时往哪里重连、用哪个服务器身份 pin"。
+  //
+  // 为什么需要它：Connect() 会记住当时的 endpoint（含 pin），之后所有
+  // PrepareConnection 的重连都用那一份。于是"用户改了服务器身份指纹"这件事
+  // 只有在**下一次显式 Connect**（例如重新登录）时才生效——而界面上的说明是
+  // "下一次连接就会用新值"，重连本身正是一次连接。控制器因此在每一次操作之前
+  // 用当前的 endpoint 调用它。
+  //
+  // 它不发任何字节、不关连接、不动 token：只改"下次重连的参数"。会话与
+  // RESUME 语义完全不变。
+  void SetReconnectEndpoint(const RemoteEndpoint& endpoint);
   // 彻底放弃会话：关闭连接**并且**丢掉 token。退出登录、以及服务端明确说
   // token 无效（UNAUTHORIZED）时用它。
   void Disconnect();

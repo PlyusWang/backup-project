@@ -293,6 +293,11 @@ bool RemoteArchiveClient::Connect(const RemoteEndpoint& endpoint,
   return true;
 }
 
+void RemoteArchiveClient::SetReconnectEndpoint(const RemoteEndpoint& endpoint) {
+  // 只改"下次重连的参数"。连接、会话、token 都不动（见头文件里的说明）。
+  endpoint_ = endpoint;
+}
+
 bool RemoteArchiveClient::PrepareConnection(std::string* error_message) {
   if (fd_ >= 0 && !SocketLooksClosed(fd_)) {
     return true;
