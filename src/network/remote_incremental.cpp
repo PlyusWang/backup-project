@@ -18,6 +18,8 @@
 
 #include "app_paths.h"
 #include "backup_catalog.h"
+#include "backup_engine.h"
+#include "file_io.h"
 #include "incremental_backup.h"
 #include "incremental_delta.h"
 #include "incremental_restore.h"
@@ -789,6 +791,160 @@ bool RunRemoteRestore(RemoteArchiveClient* client,
                             destination_directory, restore_options, &report,
                             &restore_error)) {
     SetError(error_message, "恢复失败：" + restore_error);
+    return false;
+  }
+  outcome->restored_entries = report.restored_entries;
+  return true;
+}
+
+// ---- 原始归档：下载之后交给既有的本地恢复核心 ----
+
+namespace {
+
+// 服务端登记的显示名是**不可信输入**（可能含 '/'、控制字符，甚至是 ".."）。
+// 这里把它降成一个单组件文件名：只保留 [A-Za-z0-9._-]，长度截断；结果为空、
+// 或本身就是 "." / ".." 时用 snapshot id 兜底。名字只在一个刚 mkdtemp 出来的
+// 0700 目录里使用，所以既不会变成路径，也不会跟随任何预先放好的符号链接。
+std::string SafeArchiveLeafName(const std::string& display_name,
+                                const std::string& snapshot_id) {
+  std::string leaf;
+  const std::size_t slash = display_name.find_last_of('/');
+  const std::string tail = slash == std::string::npos
+                               ? display_name
+                               : display_name.substr(slash + 1);
+  for (const char character : tail) {
+    const unsigned char byte = static_cast<unsigned char>(character);
+    const bool keep = (byte >= '0' && byte <= '9') ||
+                      (byte >= 'a' && byte <= 'z') ||
+                      (byte >= 'A' && byte <= 'Z') || character == '.' ||
+                      character == '_' || character == '-';
+    if (keep) {
+      leaf.push_back(character);
+    }
+  }
+  if (leaf.size() > 120) {
+    leaf.resize(120);
+  }
+  if (leaf.empty() || leaf == "." || leaf == "..") {
+    leaf = snapshot_id + ".bak";
+  }
+  return leaf;
+}
+
+}  // namespace
+
+bool RunRemoteRawRestore(const RemoteRawRestoreRequest& request,
+                         RemoteRawRestoreOutcome* outcome,
+                         std::string* error_message) {
+  if (outcome == nullptr || request.client == nullptr) {
+    SetError(error_message, "raw restore: the request is empty");
+    return false;
+  }
+  *outcome = RemoteRawRestoreOutcome();
+  if (request.destination_directory.empty()) {
+    SetError(
+        error_message,
+        "raw restore: a destination directory is required（需要目标目录）");
+    return false;
+  }
+  if (request.cache.cache_directory.empty()) {
+    SetError(error_message, "raw restore: the remote cache directory is empty");
+    return false;
+  }
+
+  // 1) 唯一私有工作目录（mkdtemp，0700）。下载下来的归档住在里面，
+  //    **不**落在目标目录里，也不使用任何固定名字（不是 <目标>.part 那种）。
+  //    守卫在任何返回路径上都会删掉整棵目录，所以失败时不会留下未经验证的
+  //    半份文件；成功时也不保留副本——远端那一份还在，用户要留一个本地副本
+  //    可以用界面上的"下载归档"另存。
+  TempDirectoryGuard workspace;
+  if (!workspace.Create(request.cache.cache_directory, "raw-restore-",
+                        error_message)) {
+    return false;
+  }
+
+  // 2) 下载。唯一命名的临时文件 + 长度与 SHA-256 校验 + 原子发布全部在既有
+  //    客户端里完成：校验没过就一个字节都不会发布，"先发布再校验"不存在。
+  const std::string leaf =
+      SafeArchiveLeafName(request.display_name, request.snapshot_id);
+  const std::string archive_path = workspace.Child(leaf);
+  RemoteSnapshotInfo downloaded;
+  if (!request.client->DownloadArchiveFile(request.snapshot_id, archive_path,
+                                           /*allow_overwrite=*/false,
+                                           request.progress, &downloaded,
+                                           error_message)) {
+    SetError(error_message,
+             "raw restore: download failed — 下载或校验失败，本地没有留下任何"
+             "文件（目标目录没有被创建）：" +
+                 (error_message == nullptr ? std::string() : *error_message));
+    return false;
+  }
+  outcome->archive_name = leaf;
+  outcome->downloaded_bytes = downloaded.size_bytes;
+  outcome->verified_sha256 = downloaded.sha256;
+
+  // 3) 只按**内容**判断格式（magic）：文件名、扩展名一律不参与判断。随机文件
+  //    即使显示名是 something.bak 也必须在这里被挡住。
+  const SnapshotFileKind kind = ClassifySnapshotFile(archive_path, nullptr);
+  ArchiveFileInfo info;
+  std::string identify_error;
+  const bool identified =
+      IdentifyArchiveFile(archive_path, &info, &identify_error);
+
+  if (kind == SnapshotFileKind::kDelta) {
+    // 单独的 delta：它属于某条链。原因由**既有**的链解析器给出，这里不另写
+    // 一套"这算不算 delta"的判断。
+    SnapshotChain chain;
+    std::string chain_error;
+    ResolveSnapshotChain(workspace.path(), leaf, &chain, &chain_error);
+    SetError(error_message,
+             "raw restore: delta needs its chain — 这是增量备份的一部分，"
+             "不能脱离依赖链单独恢复（它需要同一序列里的父快照与配套材料）。"
+             "请改用产品级“恢复”，它会自动取回整条依赖链。" +
+                 (chain_error.empty() ? std::string()
+                                      : " 引擎原因：" + chain_error));
+    return false;
+  }
+  if (!identified) {
+    SetError(error_message,
+             "raw restore: not a supported archive — 该远端对象不是受支持的"
+             "备份归档（按内容识别，与文件名无关）。" +
+                 (identify_error.empty() ? std::string()
+                                         : " 原因：" + identify_error));
+    return false;
+  }
+  if (!info.password_hint.empty() && request.restore_options.password.empty()) {
+    // 加密归档没有密码时**明确失败**：不尝试绕过，也不假装成功。
+    outcome->password_required = true;
+    SetError(error_message, "raw restore: needs a password — 该归档已加密（" +
+                                info.password_hint +
+                                "），请填写恢复密码后重试。");
+    return false;
+  }
+
+  // 4) 真正恢复的那一步是既有的本地核心：v2 容器走 RunRestorePipeline（它自带
+  //    唯一暂存目录 + 全部成功之后才原子发布），legacy v0.1 走它自己的 reader。
+  //    与 backupctl restore / GUI 的本地恢复是同一条分发。standalone 归档没有
+  //    .manifest / .identity 副文件，所以这里**不能**走链入口（链入口要求身份
+  //    副文件，那正是产品级链路才有的东西）。
+  BackupEngine engine;
+  RestoreReport report;
+  std::string restore_error;
+  bool restored = false;
+  if (info.kind == ArchiveFileInfo::Kind::kContainerV2) {
+    restored = engine.Restore(archive_path, request.destination_directory,
+                              request.restore_options, &report, &restore_error);
+    outcome->archive_format = "v2-container";
+  } else {
+    restored = engine.Restore(archive_path, request.destination_directory,
+                              &restore_error);
+    outcome->archive_format = "legacy-v0.1";
+  }
+  if (!restored) {
+    SetError(error_message,
+             "raw restore: 按本地格式恢复失败（目标目录没有被"
+             "改动）：" +
+                 restore_error);
     return false;
   }
   outcome->restored_entries = report.restored_entries;

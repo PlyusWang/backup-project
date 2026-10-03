@@ -128,6 +128,59 @@ bool RunRemoteRestore(RemoteArchiveClient* client,
                       RemoteRestoreOutcome* outcome,
                       std::string* error_message);
 
+// ---- 原始归档的"单独恢复"（PR #21 UI closure）----
+//
+// 远端对象分两类，恢复机制**不是**同一套：
+//
+//   * 产品级备份链成员（lineage 非空：完整基线 + 增量）——走
+//     RunRemoteRestore：解析依赖链、把整条链的材料取回来、逐跳应用；
+//   * 原始归档（lineage 为空：用户把本机的一个 .bak 直接传上去的旧式条目）——
+//     没有链、没有父、没有 .manifest / .identity 副文件，所以**不能**走链恢复。
+//     但如果它本身是这个软件能独立恢复的归档，就可以"下载下来按本地格式恢复"。
+//
+// 这个函数就是第二条路：下载 -> 校验 -> 交给**既有的本地恢复核心**。它不解析
+// MyPack/USTAR、不解密、不解压、不自己写文件：那些全部在 BackupEngine /
+// RunRestorePipeline / ArchiveReader 里，与 backupctl restore、GUI 的本地恢复
+// 是同一份实现。
+//
+// 硬性行为（都有对应的自动化测试）：
+//
+//   * 按**内容**判断格式，不看文件名、不看扩展名：随机文件即使叫 .bak 也必须
+//     失败，并且明确说"不是受支持的备份归档"；
+//   * 单独的 delta 一定失败，并且说清"它属于某条链、不能脱离依赖链单独恢复"；
+//   * 加密归档没有密码时不尝试绕过：明确要求密码；
+//   * 下载下来的字节必须先通过服务端声明的 SHA-256（由 DownloadArchiveFile
+//     完成），任何失败都只删掉自己的临时文件，不在目标目录留下半成品
+//     （原子发布由既有的恢复流水线保证）。
+struct RemoteRawRestoreRequest {
+  RemoteArchiveClient* client = nullptr;
+  RemoteCacheLayout cache;
+  std::string snapshot_id;
+  // 服务端登记的显示名：只用来给下载下来的临时文件起一个看得懂的名字。
+  // 它是**不可信输入**（可能含 '/'、控制字符），会被降成单组件文件名；
+  // 留空就用 snapshot id。格式判断与它无关。
+  std::string display_name;
+  std::string destination_directory;
+  RestoreOptions restore_options;
+  RemoteProgressCallback progress;
+};
+
+struct RemoteRawRestoreOutcome {
+  // 下载并校验通过的那份归档：名字、字节数与**实际字节**的 SHA-256。
+  std::string archive_name;
+  std::uint64_t downloaded_bytes = 0;
+  std::string verified_sha256;
+  // 按内容识别出来的格式（"v2-container" / "legacy-v0.1"）。
+  std::string archive_format;
+  std::uint64_t restored_entries = 0;
+  // 归档是加密的、而调用方没给密码：界面据此提示"请输入恢复密码"。
+  bool password_required = false;
+};
+
+bool RunRemoteRawRestore(const RemoteRawRestoreRequest& request,
+                         RemoteRawRestoreOutcome* outcome,
+                         std::string* error_message);
+
 }  // namespace net
 }  // namespace backupproject
 
