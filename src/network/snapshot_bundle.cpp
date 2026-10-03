@@ -271,6 +271,15 @@ bool ReadBundleIndex(int fd, const std::string& bundle_path,
     SnapshotBundleMember member;
     member.name = name;
     member.size = LoadU64(fixed);
+    // 写侧明确拒绝空文件（见源文件里 "是空文件，拒绝打包"），读侧必须同样
+    // 拒绝：否则"读侧接受、写侧永不产出"的输入会成为一个只存在于解析层的
+    // 状态，三件套的成员数与摘要约定跟着松掉（审查轮 F1，用例 RT1.20）。
+    if (member.size == 0) {
+      if (error_message != nullptr) {
+        *error_message = "材料包里的成员长度为 0（写侧从不产出空成员）";
+      }
+      return false;
+    }
     if (member.size > kSnapshotBundleMaxMemberBytes) {
       if (error_message != nullptr) {
         *error_message = "材料包里的成员长度超过上限";
@@ -591,7 +600,21 @@ bool ExtractSnapshotBundle(const std::string& bundle_path,
     const std::uint64_t data_size = LoadU64(fixed);
     const std::string expected_sha256 = crypto::ToHex(fixed + 8, kSha256Bytes);
 
-    const std::string final_path = target_directory + "/" + name;
+    // 第二遍读到的成员头**只用来交叉校验**，路径一律取第一遍已经校验过的
+    // 成员表。两次解析之间文件内容是可变的（bundle 是本地文件），如果这里用
+    // 刚读到的 name 去拼路径，就等于把"写到哪个文件"的决定权交给能在两次解析
+    // 之间改写文件的人——审查轮实测 40 轮里 6-9 轮能把文件写到目标目录之外
+    // （用例 RT2.10）。改成索引取值 + 逐项比对之后，改写只会导致失败。
+    const SnapshotBundleMember& indexed = index.members[i];
+    if (name != indexed.name || data_size != indexed.size ||
+        expected_sha256 != indexed.sha256) {
+      if (error_message != nullptr) {
+        *error_message = "材料包在两次解析之间被改写（成员表与第一次索引不符）";
+      }
+      ok = false;
+      break;
+    }
+    const std::string final_path = target_directory + "/" + indexed.name;
     const std::string part_path = PartPathFor(final_path, i);
     ::unlink(part_path.c_str());
     const int out =
