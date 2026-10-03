@@ -17,6 +17,7 @@
 #include <map>
 
 #include "app_paths.h"
+#include "backup_catalog.h"
 #include "incremental_backup.h"
 #include "incremental_delta.h"
 #include "incremental_restore.h"
@@ -109,6 +110,36 @@ std::string RemoteIndexPath(const std::string& cache_directory) {
   return cache_directory + "/.remote-index.tsv";
 }
 
+// 索引行的形状校验。索引不是信任根，但它**不能成为路径注入根**：一条被污染
+// 的行只能被忽略，绝不允许它把读取引到缓存目录之外。
+//
+//   * server id：32 个小写十六进制字符（服务端生成 id 的格式）；
+//   * 归档名：受管的单组件 .bak 名字，且不含任何控制字符（否则会破坏
+//     "一行一条"的格式，或者变成换行/制表符注入）。
+bool IsCanonicalIndexEntry(const std::string& snapshot_id,
+                           const std::string& archive_name) {
+  if (snapshot_id.size() != 32) {
+    return false;
+  }
+  for (const char character : snapshot_id) {
+    const bool digit = character >= '0' && character <= '9';
+    const bool lower = character >= 'a' && character <= 'f';
+    if (!digit && !lower) {
+      return false;
+    }
+  }
+  if (!backupproject::IsManagedBackupFileName(archive_name)) {
+    return false;
+  }
+  for (const char character : archive_name) {
+    const unsigned char value = static_cast<unsigned char>(character);
+    if (value < 0x20 || value == 0x7F) {
+      return false;
+    }
+  }
+  return true;
+}
+
 void LoadRemoteIndex(const std::string& cache_directory,
                      std::map<std::string, std::string>* index) {
   index->clear();
@@ -145,7 +176,14 @@ void LoadRemoteIndex(const std::string& cache_directory,
     if (tab == std::string::npos || tab == 0 || tab + 1 >= line.size()) {
       continue;
     }
-    (*index)[line.substr(0, tab)] = line.substr(tab + 1);
+    const std::string snapshot_id = line.substr(0, tab);
+    const std::string archive_name = line.substr(tab + 1);
+    // 形状不对（含注入尝试）的行一律忽略：宁可当成 cache miss 重新下载，
+    // 也不许一个被污染的名字把读取引到缓存之外。
+    if (!IsCanonicalIndexEntry(snapshot_id, archive_name)) {
+      continue;
+    }
+    (*index)[snapshot_id] = archive_name;
   }
 }
 
@@ -163,7 +201,7 @@ bool SaveRemoteIndex(const std::string& cache_directory,
   }
   std::string content;
   for (const auto& entry : index) {
-    if (entry.first.empty() || entry.second.empty()) {
+    if (!IsCanonicalIndexEntry(entry.first, entry.second)) {
       continue;
     }
     content += entry.first;

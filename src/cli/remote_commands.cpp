@@ -391,13 +391,26 @@ int RunRemoteCommand(const CliContext& context,
       return Fail(error);
     }
     std::cout << "共 " << snapshots.size() << " 个远程快照\n";
-    std::printf("%-34s %-12s %-20s %-14s %s\n", "SNAPSHOT_ID", "SIZE",
-                "CREATED", "SHA256", "NAME");
+    // 列出链关系：kind / generation / parent 是老师现场验收"远端增量"
+    // 最直接的证据（NAME 仍然放在最后一列：脚本里"取最后一列当名字"的写法不受影响）。
+    std::printf("%-34s %-12s %-20s %-14s %-12s %-4s %-34s %s\n", "SNAPSHOT_ID",
+                "SIZE", "CREATED", "SHA256", "KIND", "GEN", "PARENT", "NAME");
     for (const net::RemoteSnapshotInfo& info : snapshots) {
-      std::printf("%-34s %-12llu %-20s %-14s %s\n", info.snapshot_id.c_str(),
+      const std::string kind =
+          info.snapshot_kind ==
+                  static_cast<std::uint16_t>(net::SnapshotKind::kIncremental)
+              ? "incremental"
+              : "full";
+      const std::string parent = info.parent_snapshot_id.empty()
+                                     ? std::string("-")
+                                     : info.parent_snapshot_id.substr(0, 12);
+      std::printf("%-34s %-12llu %-20s %-14s %-12s %-4llu %-34s %s\n",
+                  info.snapshot_id.c_str(),
                   static_cast<unsigned long long>(info.size_bytes),
                   FormatTime(info.created_at).c_str(),
-                  info.sha256.substr(0, 12).c_str(), info.display_name.c_str());
+                  info.sha256.substr(0, 12).c_str(), kind.c_str(),
+                  static_cast<unsigned long long>(info.generation),
+                  parent.c_str(), info.display_name.c_str());
     }
     return kCliExitSuccess;
   }
