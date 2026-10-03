@@ -2,7 +2,7 @@
 #
 # secure_transport_test.sh —— PR #21 的加密传输层测试入口。
 #
-# 跑四个二进制：
+# 跑五个二进制：
 #   1) x25519-test          —— 手写 X25519（RFC 7748）与 HKDF-SHA256（RFC 5869）
 #                              的官方向量、随机对称性、退化输入拒绝、长度边界；
 #   2) secure-transport-test —— BPSEC1 握手（真实 TCP loopback）、线上字节捕获
@@ -18,7 +18,15 @@
 #                              include 进来，所以**不能**再单独链接那份 .cpp；
 #   4) review-sequence-exhaustion —— review-only：记录层序号耗尽（发送侧拒绝
 #                              UINT64_MAX 且不回绕；接收侧回绕行为，见文件里的
-#                              FINDING 注释）。同样自己 include 那份 .cpp。
+#                              FINDING 注释）。同样自己 include 那份 .cpp；
+#   5) review-identity-tail-eintr —— review-only：LoadTransportIdentity() 读满
+#                              32 字节之后那一次"尾部 1 字节"读取遇到 EINTR 时
+#                              必须重试，不能当成"没有多余字节"（否则一次信号
+#                              打断就能让一个 >32 字节的文件被当成合法私钥）。
+#                              它随 tests/review/read_eintr_interposer.cpp 一起
+#                              链接：后者在链接期覆盖 read()，确定性地只在那一次
+#                              读取上注入 EINTR（不需要 LD_PRELOAD，也不 sleep
+#                              撞运气）。
 #
 # 产物一律放在 /tmp 下的临时目录，退出时自动清理。
 # 环境变量 SECURE_TRANSPORT_TEST_EXTRA_FLAGS 可以追加编译参数（sanitizer 构建）。
@@ -106,6 +114,11 @@ run_one x25519-test "$CRYPTO_SOURCES" tests/unit/x25519_hkdf_test.cpp
 run_one secure-transport-test "$CRYPTO_SOURCES $NET_SOURCES" tests/unit/secure_transport_test.cpp
 run_one review-counter-block "$CRYPTO_SOURCES $NET_SOURCES_REVIEW" tests/review/counter_block_harness.cpp
 run_one review-sequence-exhaustion "$CRYPTO_SOURCES $NET_SOURCES_REVIEW" tests/review/sequence_exhaustion_harness.cpp
+# 读侧 EINTR 探针：read_eintr_interposer.cpp 不是"被测源码"，而是配套的链接期
+# 注入器（它单独一个转换单元，故意不包含 <unistd.h>），所以放在 sources 位置。
+run_one review-identity-tail-eintr \
+    "$CRYPTO_SOURCES $NET_SOURCES tests/review/read_eintr_interposer.cpp" \
+    tests/review/identity_tail_eintr.cpp
 
 if [ $FAILURES -ne 0 ]; then
     echo "[secure-transport] 失败项：$FAILURES" >&2
