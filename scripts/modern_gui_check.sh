@@ -561,13 +561,13 @@ expect_count "$REMOTE_PAGE_QML" "value: remote.progressRatio" 1 \
 expect_count "$REMOTE_PAGE_QML" "remote.transferActive" 1 \
   "进度只在真的有传输时出现"
 # 复用现有组件，而不是另起一套视觉。
-expect_count "$REMOTE_PAGE_QML" "AppCard {" 4 \
-  "远程备份页的四张卡片都用共享 AppCard"
+expect_count "$REMOTE_PAGE_QML" "AppCard {" 5 \
+  "远程备份页的五张卡片都用共享 AppCard（连接 / 远端备份 / 云端备份 / 高级 / 技术详情）"
 expect_count "$REMOTE_PAGE_QML" "StatusBanner {" 1 \
   "远程备份页用共享 StatusBanner"
 # 地址 / 端口 / 用户名 / 服务器身份指纹 / 登录密码 / 注册密码 / 注册确认 /
-# 上传路径 / 上传名称 / 下载目标 / 注销密码 / 注销账户名 = 12。
-expect_count "$REMOTE_PAGE_QML" "AppTextField {" 12 \
+# 远端备份源目录 / 上传路径 / 上传名称 / 下载目标 / 注销密码 / 注销账户名 = 13。
+expect_count "$REMOTE_PAGE_QML" "AppTextField {" 13 \
   "远程备份页的输入框都用共享 AppTextField"
 # PR #21：客户端连接之前**必须**有服务端传输身份的 pin。它不是口令（公钥与
 # 指纹都可以公开），但它是必填的连接配置：页面上有自己的输入框与明确的提交
@@ -588,8 +588,8 @@ expect_count "$REMOTE_CONTROLLER_H" "QString serverKeyPin() const" 1 \
 expect_count "$REMOTE_CONTROLLER_CPP" "backupproject::net::ParseServerKeyPin" 1 \
   "指纹的校验复用共享解析器（只认带前缀的两种写法）"
 expect_count "$REMOTE_CONTROLLER_CPP" \
-  "request.endpoint.server_key_pin = serverKeyPin()" 7 \
-  "七处提交点每一处都带上 pin（漏一处就等于那一条操作没有 pin）"
+  "request.endpoint.server_key_pin = serverKeyPin()" 9 \
+  "九处提交点每一处都带上 pin（含远端备份与链恢复；漏一处就等于那条操作没有 pin）"
 # 第二套 socket / 协议实现？GUI 这一侧只允许经 RemoteController 调共享客户端。
 # 断言只看代码行：注释里说明"这里没有 socket"是正常的。
 REMOTE_CODE_TMP="$TEST_STATE_DIR/remote-code.txt"
@@ -621,8 +621,8 @@ expect_count "$REMOTE_CONTROLLER_CPP" "password_.fill(QChar(0))" 3 \
 # "我在登录还是在注册"，注册也只有一个密码框。这一节把新的信息架构钉成契约。
 # 账户区域是一个**分段控件**：一个圆角容器 + 两个等宽分段。人工验收的结论是
 # 两个各自独立的按钮看起来像"可以同时按"，不像"二选一"。
-expect_count "$REMOTE_PAGE_QML" "SegmentedTabs {" 1 \
-  "账户区域用共享的分段控件（不是两个独立按钮）"
+expect_count "$REMOTE_PAGE_QML" "SegmentedTabs {" 2 \
+  "账户区域与远端备份策略都用共享的分段控件（不是各自独立的按钮）"
 expect_count "$REMOTE_PAGE_QML" 'objectName: "remoteAccountTabs"' 1 \
   "分段控件有 objectName（自动化要能点到它）"
 expect_count "$RESOURCE_FILE" "qml/components/SegmentedTabs.qml" 1 \
