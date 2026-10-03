@@ -444,6 +444,19 @@ bool BuildSnapshotBundle(const std::string& repository_directory,
       ok = false;
       break;
     }
+    // 第二遍**同时**对真正复制进 bundle 的字节再算一次 SHA-256。
+    //
+    // 第一遍的摘要只证明"索引那一刻"的内容。两遍之间（以及第二遍复制期间的
+    // 任意时刻）一次**同长度**的改写不会让下面的长度检查发现任何异常，于是
+    // 包头声明的摘要与实际写进去的字节就脱钩了——而这样的包服务端照样收
+    // （它只校验整个 blob 的摘要，不解析成员），坏材料要等到将来 restore 才
+    // 炸。所以"写进去的字节"必须绑回包头声明：
+    //
+    //   SHA-256(实际复制进 bundle 的字节) == 第一遍声明的 SHA-256
+    //
+    // 这是本函数唯一正确的判据：mtime / inode / size 只能提高发现概率，不能
+    // 保证任何东西（见 tests/review/bundle_source_mutation.cpp 的 OLD/NEW 判别）。
+    crypto::Sha256 copied_hasher;
     std::uint64_t remaining = source_size;
     while (remaining > 0) {
       const std::size_t want = static_cast<std::size_t>(
@@ -467,6 +480,7 @@ bool BuildSnapshotBundle(const std::string& repository_directory,
         ok = false;
         break;
       }
+      copied_hasher.Update(buffer.data(), static_cast<std::size_t>(got));
       if (!WriteAll(out, buffer.data(), static_cast<std::size_t>(got),
                     error_message)) {
         ok = false;
@@ -474,12 +488,52 @@ bool BuildSnapshotBundle(const std::string& repository_directory,
       }
       remaining -= static_cast<std::uint64_t>(got);
     }
+    // 复制完声明的长度之后再读 1 个字节：源文件在**打开之后**变长时，多出来
+    // 的尾巴既没被复制、也没进摘要，同属"声明与内容脱钩"。0 才是正常。
+    // EINTR 只重试，绝不当作 EOF——否则一次信号打断就能让一个超长的文件
+    // 被当成"正好复制完"。
+    while (ok) {
+      char extra = 0;
+      const ssize_t tail = ::read(in, &extra, 1);
+      if (tail < 0) {
+        if (errno == EINTR) {
+          continue;
+        }
+        if (error_message != nullptr) {
+          *error_message =
+              "读取 " + sources[index].path + " 失败：" + StrerrorText();
+        }
+        ok = false;
+        break;
+      }
+      if (tail > 0) {
+        if (error_message != nullptr) {
+          *error_message = sources[index].path +
+                           " 在打包期间变长（复制完之后还有多余字节），已放弃";
+        }
+        ok = false;
+      }
+      break;
+    }
     if (::close(in) != 0 && ok) {
       if (error_message != nullptr) {
         *error_message =
             "关闭 " + sources[index].path + " 失败：" + StrerrorText();
       }
       ok = false;
+    }
+    if (ok) {
+      unsigned char copied_digest[kSha256Bytes];
+      copied_hasher.Final(copied_digest);
+      if (crypto::ToHex(copied_digest, sizeof(copied_digest)) !=
+          members[index].sha256) {
+        if (error_message != nullptr) {
+          *error_message =
+              sources[index].path +
+              " 在打包期间内容发生变化（实际复制进材料包的字节与第一遍摘要不符），已放弃";
+        }
+        ok = false;
+      }
     }
   }
 
