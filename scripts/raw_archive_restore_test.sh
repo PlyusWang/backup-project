@@ -153,7 +153,7 @@ sanitize_section() {
     >"$harness_log" 2>&1 || status=$?
   sed 's/^/      /' "$harness_log"
 
-  cp "$harness_log" "$OUT_DIR/raw-restore-sanitize.log"
+  cp "$harness_log" "$OUT_DIR/raw-restore-sanitize-harness.log"
   if [ "$status" = "0" ]; then
     record_pass "harness 退出码 0"
   else
@@ -208,16 +208,20 @@ record_pass "Modern GUI 已构建（$GUI）"
 STATE_DIR="$(mktemp -d)"
 cleanup_state() { rm -rf "$STATE_DIR"; }
 trap cleanup_state EXIT
+# 状态文件放 state/，XDG_CONFIG_HOME 放 xdg/：两者必须是**兄弟目录**。自检里
+# REMOTE-11 会递归快照"状态目录"并要求上传/下载/删除前后逐字节不变，而 GUI 的
+# 主题设置写在 XDG_CONFIG_HOME 下——把 xdg/ 放进状态目录里会让那条断言因为
+# "换了主题"这种无关紧要的写入而失败（第一版就是这么红的）。
 export XDG_CONFIG_HOME="$STATE_DIR/xdg"
-mkdir -p "$XDG_CONFIG_HOME"
+mkdir -p "$XDG_CONFIG_HOME" "$STATE_DIR/state"
 
 LOG_FILE="$STATE_DIR/remote-test.log"
 set +e
 QT_QPA_PLATFORM=offscreen QSG_RHI_BACKEND=software timeout 2400 \
   "$GUI" --remote-test \
-  --config-file "$STATE_DIR/config.json" \
-  --schedule-file "$STATE_DIR/schedule.json" \
-  --realtime-file "$STATE_DIR/realtime.json" \
+  --config-file "$STATE_DIR/state/config.json" \
+  --schedule-file "$STATE_DIR/state/schedule.json" \
+  --realtime-file "$STATE_DIR/state/realtime.json" \
   >"$LOG_FILE" 2>&1
 test_status=$?
 set -e
@@ -274,7 +278,9 @@ for line in "GUI-P08 完整备份：badge=完整备份" "GUI-P08 增量备份：
   fi
 done
 
-cp "$LOG_FILE" "$OUT_DIR/raw-restore.log"
+# GUI 自己的完整输出单独留一份：本脚本的 stdout 由调用方重定向（通常就是
+# tests/output/raw-restore.log），两者混在同一个文件里会互相截断。
+cp "$LOG_FILE" "$OUT_DIR/raw-restore-gui.log"
 
 echo
 echo "---- RAW-R 逐条结果 ----"

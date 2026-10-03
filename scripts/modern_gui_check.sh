@@ -537,8 +537,9 @@ expect_count "$RESOURCE_FILE" "qml/components/RemoteSnapshotCard.qml" 1 \
 expect_count "$QML_DIR/Main.qml" 'objectName: "remoteNavItem"' 1 \
   "侧栏只有一个远程备份入口"
 # 明文常显的密码框在这一页是绝不允许出现的样子。
-# 登录密码 + 注册密码 + 注册确认密码 + 注销确认密码：四个都必须是密码回显。
-expect_count "$REMOTE_PAGE_QML" "echoMode: TextInput.Password" 4 \
+# 登录密码 + 注册密码 + 注册确认密码 + 注销确认密码 + 原始归档的恢复密码：
+# 五个都必须是密码回显。
+expect_count "$REMOTE_PAGE_QML" "echoMode: TextInput.Password" 5 \
   "远程备份页的四个密码框都是密码回显模式"
 # 删除必须经过确认：整页真正调用客户端删除的地方只有一处，
 # 而且列表行只发意图（一个信号声明 + 一个触发）。
@@ -566,8 +567,9 @@ expect_count "$REMOTE_PAGE_QML" "AppCard {" 5 \
 expect_count "$REMOTE_PAGE_QML" "StatusBanner {" 1 \
   "远程备份页用共享 StatusBanner"
 # 地址 / 端口 / 用户名 / 服务器身份指纹 / 登录密码 / 注册密码 / 注册确认 /
-# 远端备份源目录 / 上传路径 / 上传名称 / 下载目标 / 注销密码 / 注销账户名 = 13。
-expect_count "$REMOTE_PAGE_QML" "AppTextField {" 13 \
+# 远端备份源目录 / 上传路径 / 上传名称 / 下载目标 / 注销密码 / 注销账户名 /
+# 原始归档「尝试恢复」的目标目录 / 恢复密码 = 15。
+expect_count "$REMOTE_PAGE_QML" "AppTextField {" 15 \
   "远程备份页的输入框都用共享 AppTextField"
 # PR #21：客户端连接之前**必须**有服务端传输身份的 pin。它不是口令（公钥与
 # 指纹都可以公开），但它是必填的连接配置：页面上有自己的输入框与明确的提交
@@ -588,8 +590,8 @@ expect_count "$REMOTE_CONTROLLER_H" "QString serverKeyPin() const" 1 \
 expect_count "$REMOTE_CONTROLLER_CPP" "backupproject::net::ParseServerKeyPin" 1 \
   "指纹的校验复用共享解析器（只认带前缀的两种写法）"
 expect_count "$REMOTE_CONTROLLER_CPP" \
-  "request.endpoint.server_key_pin = serverKeyPin()" 9 \
-  "九处提交点每一处都带上 pin（含远端备份与链恢复；漏一处就等于那条操作没有 pin）"
+  "request.endpoint.server_key_pin = serverKeyPin()" 10 \
+  "十处提交点每一处都带上 pin（含远端备份 / 链恢复 / 原始归档的尝试恢复；漏一处就等于那条操作没有 pin）"
 # 第二套 socket / 协议实现？GUI 这一侧只允许经 RemoteController 调共享客户端。
 # 断言只看代码行：注释里说明"这里没有 socket"是正常的。
 REMOTE_CODE_TMP="$TEST_STATE_DIR/remote-code.txt"
