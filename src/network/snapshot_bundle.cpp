@@ -37,6 +37,15 @@ bool IsSingleComponentName(const std::string& name) {
       name.find('\0') != std::string::npos) {
     return false;
   }
+  // 控制字符一律拒绝：成员名会变成缓存里的文件名、也会写进 .remote-index.tsv
+  // 与日志。TAB / LF / CR 会让"一行一个条目"的索引被注入第二行，其他控制字符
+  // 只会污染终端与日志。名字是机器生成的，正常只有可打印 ASCII。
+  for (const char character : name) {
+    const unsigned char value = static_cast<unsigned char>(character);
+    if (value < 0x20 || value == 0x7F) {
+      return false;
+    }
+  }
   return name.size() <= kSnapshotBundleMaxNameBytes;
 }
 

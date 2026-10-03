@@ -233,6 +233,10 @@ bool CheckMessageHeader(const unsigned char* raw, std::size_t size,
 
 // ---- 会话密钥 ----
 
+// 尽力清零（best-effort）：用 volatile 写，避免被优化掉；但**不声称**获得了
+// 形式化的内存保密性——C++ 里无法保证编译器/运行时不留下副本。
+void Zeroize(std::string* secret);
+
 struct SessionKeys {
   std::string c2s_enc;
   std::string c2s_mac;
@@ -274,9 +278,12 @@ bool DeriveSessionKeys(const std::string& shared_secret,
   for (const Request& request : requests) {
     if (!HkdfExpand(prk, std::string(request.info), request.length, request.out,
                     error_message)) {
+      Zeroize(&prk);
       return false;
     }
   }
+  // PRK 是所有会话密钥的母体：派生完立刻清掉本地副本（best-effort）。
+  Zeroize(&prk);
   return true;
 }
 
@@ -671,6 +678,15 @@ bool SecureChannel::DeriveKeys(const std::string& shared_secret,
   }
   client_finished_key_ = keys.client_finished;
   server_finished_key_ = keys.server_finished;
+  // 本地副本用完立刻清掉：密钥已经复制进成员，这里不留第二份。
+  Zeroize(&keys.c2s_enc);
+  Zeroize(&keys.c2s_mac);
+  Zeroize(&keys.c2s_nonce);
+  Zeroize(&keys.s2c_enc);
+  Zeroize(&keys.s2c_mac);
+  Zeroize(&keys.s2c_nonce);
+  Zeroize(&keys.client_finished);
+  Zeroize(&keys.server_finished);
   send_sequence_ = 0;
   receive_sequence_ = 0;
   established_ = true;
@@ -759,13 +775,15 @@ bool SecureChannel::HandshakeClient(int fd, const ServerKeyPin& pin,
   }
   Zeroize(&ephemeral_private);
 
-  const std::string shared_secret = dh_static + dh_ephemeral;
+  std::string shared_secret = dh_static + dh_ephemeral;
   Zeroize(&dh_static);
   Zeroize(&dh_ephemeral);
   if (!DeriveKeys(shared_secret, client_random, server_random, true,
                   error_message)) {
+    Zeroize(&shared_secret);
     return false;
   }
+  Zeroize(&shared_secret);
 
   const std::string server_hello(reinterpret_cast<const char*>(raw),
                                  sizeof(raw));
@@ -806,6 +824,9 @@ bool SecureChannel::HandshakeClient(int fd, const ServerKeyPin& pin,
                 "ServerFinished 校验失败（对端不持有会话密钥，或握手被改写）",
                 error_message);
   }
+  // 握手完成：Finished 密钥不再需要，立刻清掉（记录层用的是另外两把）。
+  Zeroize(&client_finished_key_);
+  Zeroize(&server_finished_key_);
   return true;
 }
 
@@ -874,13 +895,15 @@ bool SecureChannel::HandshakeServer(int fd, const TransportIdentity& identity,
   }
   Zeroize(&ephemeral_private);
 
-  const std::string shared_secret = dh_static + dh_ephemeral;
+  std::string shared_secret = dh_static + dh_ephemeral;
   Zeroize(&dh_static);
   Zeroize(&dh_ephemeral);
   if (!DeriveKeys(shared_secret, client_random, server_random, false,
                   error_message)) {
+    Zeroize(&shared_secret);
     return false;
   }
+  Zeroize(&shared_secret);
 
   const std::string client_hello(reinterpret_cast<const char*>(raw),
                                  sizeof(raw));
@@ -922,6 +945,9 @@ bool SecureChannel::HandshakeServer(int fd, const TransportIdentity& identity,
     return Fail(SecureTransportError::kIoError,
                 "发送 ServerFinished 失败：" + io_error, error_message);
   }
+  // 握手完成：Finished 密钥不再需要，立刻清掉（记录层用的是另外两把）。
+  Zeroize(&client_finished_key_);
+  Zeroize(&server_finished_key_);
   return true;
 }
 
