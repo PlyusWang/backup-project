@@ -2073,7 +2073,8 @@ int RunFilterUxTest(QQuickWindow* window,
 //   GUI-P10 服务端空闲关连接之后，下一次操作自动重连 + RESUME，不需要重新登录
 //   GUI-P11 忙碌：同一个控制器上的第二个长操作被拒（busy）
 int RunRemoteProductFlow(backup_modern::RemoteController* remote, CheckRun* run,
-                         const QString& work, const QString& username,
+                         const QString& work, const QString& host,
+                         const QString& port_text, const QString& username,
                          const QString& password, const QString& fingerprint) {
   const QString source = work + QStringLiteral("/product-src");
   const QString first_out = work + QStringLiteral("/product-out-1");
@@ -2331,27 +2332,45 @@ int RunRemoteProductFlow(backup_modern::RemoteController* remote, CheckRun* run,
              raw_kind + QStringLiteral(": ") + remote->lastDetailForTest());
 
   // ---- GUI-P09：错 pin 时远端备份可见地失败，但不踢掉登录状态 ----
+  // ---- GUI-P09：服务器身份 pin 在**建立连接**时被强制 ----
+  //
+  // pin 是"连接建立时的期望值"：连接还活着的时候改 pin 不会立刻断线（这是
+  // **对**的产品行为，见 12-KNOWN-LIMITATIONS.md）。所以这里分两步，
+  // 在两种环境下都确定：
+  //   (1) 改错 pin 之后立刻做一次备份：连接还活着 -> 沿用现有连接、成功；
+  //       已被服务端按 io-timeout 关掉 -> 重连必须用**当前** pin，于是失败。
+  //       两种结果都接受（取决于服务端 io-timeout），但会话都不许被踢掉。
+  //       在 --remote-test（io-timeout 2）下走的是"被挡住"那一条，这一条同时
+  //       钉死了 RemoteArchiveClient::SetReconnectEndpoint 的语义：重连用的是
+  //       当前 pin，而不是很久以前那一次 Connect 存下来的旧值。
+  //   (2) 显式登录一次（登录**一定**新建连接）：错 pin 必须在这里被挡住，
+  //       而且分类必须是 pin-mismatch（不是笼统的网络错误）。
   const QString good_pin = remote->serverKeyPin();
   const QString wrong_pin = QStringLiteral("sha256:") + QString(64, 'b');
   const bool pin_set = remote->setServerKeyPin(wrong_pin);
-  // pin 是"建立连接时的期望值"：连接还活着的时候不会重新校验它（这是对的）。
-  // 这里等服务端按 --io-timeout 把空闲连接关掉，让下一次操作必须重新握手——
-  // 那一次就必须用**当前**的指纹，于是被挡住。这一条同时钉死了
-  // RemoteArchiveClient::SetReconnectEndpoint 的语义（重连用的是当前 pin，
-  // 而不是很久以前那一次 Connect 存下来的旧值）。
   WaitForAnimation(4000);
   const bool wrong_accepted =
       remote->backupRemote(source, /*allow_incremental=*/false);
-  const bool wrong_idle = wrong_accepted && remote->waitForIdle(300000);
+  const bool wrong_idle = wrong_accepted && remote->waitForIdle(900000);
   const QString wrong_kind = remote->lastErrorKindForTest();
-  run->Check(pin_set && wrong_idle &&
-                 wrong_kind == QStringLiteral("pin-mismatch") &&
-                 remote->statusKind() == QStringLiteral("error") &&
-                 remote->authenticated(),
-             QStringLiteral("GUI-P09 错 pin：重连被身份校验挡住，会话不被踢掉"),
+  const bool wrong_blocked = wrong_kind == QStringLiteral("pin-mismatch");
+  run->Check(pin_set && wrong_idle && remote->authenticated() &&
+                 (wrong_blocked || wrong_kind == QStringLiteral("none")),
+             QStringLiteral("GUI-P09 错 pin：重连被挡住（连接还活着则沿用），会话不被踢掉"),
              wrong_kind + QStringLiteral(": ") + remote->lastDetailForTest());
-  run->Check(remote->setServerKeyPin(good_pin) && refresh(),
-             QStringLiteral("GUI-P09 换回正确指纹之后立刻恢复正常"),
+  const bool relogin_accepted =
+      remote->login(host, port_text, username, password);
+  const bool relogin_idle = relogin_accepted && remote->waitForIdle(300000);
+  const QString relogin_kind = remote->lastErrorKindForTest();
+  run->Check(relogin_idle && relogin_kind == QStringLiteral("pin-mismatch"),
+             QStringLiteral("GUI-P09 错 pin：显式登录（必然新建连接）被身份校验挡住"),
+             relogin_kind + QStringLiteral(": ") + remote->lastDetailForTest());
+  const bool pin_restored = remote->setServerKeyPin(good_pin);
+  const bool relogin_ok = remote->login(host, port_text, username, password) &&
+                          remote->waitForIdle(300000) &&
+                          remote->authenticated();
+  run->Check(pin_restored && relogin_ok && refresh(),
+             QStringLiteral("GUI-P09 换回正确指纹、重新登录之后一切恢复"),
              remote->lastErrorKindForTest() + QStringLiteral(": ") +
                  remote->lastDetailForTest());
 
@@ -2363,17 +2382,33 @@ int RunRemoteProductFlow(backup_modern::RemoteController* remote, CheckRun* run,
              QStringLiteral("GUI-P10 空闲断连之后列表仍然可读（自动重连 + RESUME）"),
              remote->lastErrorKindForTest() + QStringLiteral(": ") +
                  remote->lastDetailForTest());
+  // 备份之前先把"这条链已经存在的 id"记下来：新的增量必须挂在其中一个上
+  // （而不是凭空造一个新链根）。这样断言与 P09 的实际结果无关，两种环境都成立。
+  QStringList ids_before;
+  for (const QVariant& item : remote->snapshots()) {
+    ids_before.append(item.toMap().value(QStringLiteral("id")).toString());
+  }
   writeText(source + QStringLiteral("/notes.txt"), QStringLiteral("v2\n"));
   const bool resumed_backup =
       remote->backupRemote(source, /*allow_incremental=*/true) &&
       remote->waitForIdle(900000);
+  const QVariantMap resumed_row =
+      findSnapshot(remote->lastBackupSnapshotIdForTest());
+  const QVariantMap resumed_parent =
+      findSnapshot(resumed_row.value(QStringLiteral("parentId")).toString());
   run->Check(resumed_backup &&
                  remote->lastErrorKindForTest() == QStringLiteral("none") &&
                  remote->lastBackupProducedDeltaForTest() &&
-                 remote->lastBackupGenerationForTest() == 2,
-             QStringLiteral("GUI-P10 空闲断连之后还能继续增量（generation=2）"),
+                 !resumed_parent.isEmpty() &&
+                 ids_before.contains(resumed_parent.value(QStringLiteral("id")).toString()) &&
+                 resumed_row.value(QStringLiteral("generation")).toInt() ==
+                     resumed_parent.value(QStringLiteral("generation")).toInt() + 1,
+             QStringLiteral("GUI-P10 空闲断连之后继续这条链（父已存在、代数 = 父 + 1）"),
              remote->lastErrorKindForTest() + QStringLiteral(": ") +
-                 remote->lastDetailForTest());
+                 remote->lastDetailForTest() + QStringLiteral(" gen=") +
+                 QString::number(resumed_row.value(QStringLiteral("generation")).toInt()) +
+                 QStringLiteral(" parent=") +
+                 resumed_row.value(QStringLiteral("parentShort")).toString());
 
   // ---- GUI-P11：忙碌时第二个长操作被拒 ----
   const bool first_accept = remote->backupRemote(source, false);
@@ -2648,8 +2683,8 @@ int RunRemoteSmoke(backup_modern::RemoteController* remote,
     QString fingerprint = server_key_pin;
     fingerprint.remove(QStringLiteral("sha256:"));
     if (product_ready) {
-      RunRemoteProductFlow(remote, &run, work, product_user, password,
-                           fingerprint);
+      RunRemoteProductFlow(remote, &run, work, host, port_text, product_user,
+                           password, fingerprint);
     }
   }
 
@@ -4078,8 +4113,8 @@ int RunRemoteTest(QQuickWindow* window, backup_modern::RemoteController* remote,
     QString fingerprint = server_key_pin;
     fingerprint.remove(QStringLiteral("sha256:"));
     if (product_ready) {
-      RunRemoteProductFlow(remote, &run, work, product_user, password,
-                           fingerprint);
+      RunRemoteProductFlow(remote, &run, work, host, port_text, product_user,
+                           password, fingerprint);
     }
   }
 
