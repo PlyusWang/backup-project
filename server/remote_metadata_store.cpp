@@ -2,6 +2,8 @@
 
 #include "remote_metadata_store.h"
 
+#include "network_protocol.h"
+
 #include <sqlite3.h>
 #include <sys/stat.h>
 
@@ -160,6 +162,8 @@ const char* StoreResultName(StoreResult result) {
       return "ERROR";
     case StoreResult::kHasDependents:
       return "HAS_DEPENDENTS";
+    case StoreResult::kChainConflict:
+      return "CHAIN_CONFLICT";
   }
   return "UNKNOWN";
 }
@@ -303,6 +307,18 @@ bool RemoteMetadataStore::EnsureSchema(std::string* error_message) {
       statement += "lineage TEXT NOT NULL DEFAULT '';";
     }
     if (!Execute(statement, error_message)) {
+      Execute("ROLLBACK;", nullptr);
+      return false;
+    }
+    // 测试接缝：在补完这一列之后立刻失败，用来证明整个迁移（列 + 版本号 +
+    // 索引）会被一起回滚，而不是留下"加了一半列"的库。
+    if (!fail_migration_after_column_.empty() &&
+        fail_migration_after_column_ == name) {
+      fail_migration_after_column_.clear();
+      if (error_message != nullptr) {
+        *error_message = "injected migration failure after column " +
+                         std::string(name) + " (test seam)";
+      }
       Execute("ROLLBACK;", nullptr);
       return false;
     }
@@ -691,12 +707,143 @@ StoreResult RemoteMetadataStore::InsertSnapshot(
     }
     return StoreResult::kError;
   }
+  // ---- 链的边界条件：与 INSERT 在同一个互斥区间里重新校验 ----
+  //
+  // 服务端在 UPLOAD_BEGIN 时验过一次父，但写入发生在 UPLOAD_END——中间这段
+  // 时间里父可能被另一个连接删掉，或者另一个连接给它挂了孩子。只有把校验放到
+  // 这里（与 INSERT 同一个临界区、同一个事务），才能保证：
+  //   * 不会出现"父已删除、子还在"的孤儿（删除侧在同一把锁里查子节点）；
+  //   * 同一个父最多只有一个活着的孩子（线性链，不允许分叉）；
+  //   * 不会存下代数控过、本地引擎恢复不了的快照。
+  if (record.snapshot_kind == static_cast<std::uint16_t>(SnapshotKind::kIncremental)) {
+    if (record.parent_id.empty() || record.generation == 0) {
+      if (error_message != nullptr) {
+        *error_message = "an incremental snapshot needs a parent and a"
+                         " generation above zero";
+      }
+      return StoreResult::kChainConflict;
+    }
+    if (record.generation > kMaxRemoteChainGeneration) {
+      if (error_message != nullptr) {
+        *error_message = "generation " + std::to_string(record.generation) +
+                         " is beyond the restorable chain limit of " +
+                         std::to_string(kMaxRemoteChainGeneration);
+      }
+      return StoreResult::kChainConflict;
+    }
+    if (!Execute("BEGIN IMMEDIATE;", error_message)) {
+      return StoreResult::kError;
+    }
+    std::uint16_t parent_kind = 0;
+    std::uint64_t parent_generation = 0;
+    std::string parent_lineage;
+    {
+      Statement parent;
+      if (!Prepare("SELECT snapshot_kind, generation, lineage FROM snapshots"
+                   " WHERE id = ? AND user_id = ?;",
+                   parent.out(), error_message)) {
+        Execute("ROLLBACK;", nullptr);
+        return StoreResult::kError;
+      }
+      sqlite3_bind_text(parent.get(), 1, record.parent_id.c_str(),
+                        static_cast<int>(record.parent_id.size()),
+                        SQLITE_TRANSIENT);
+      sqlite3_bind_int64(parent.get(), 2,
+                         static_cast<sqlite3_int64>(record.user_id));
+      const int parent_code = sqlite3_step(parent.get());
+      if (parent_code == SQLITE_DONE) {
+        // 父不存在（或不属于这个用户，两者故意同一个答案）。
+        Execute("ROLLBACK;", nullptr);
+        if (error_message != nullptr) {
+          *error_message = "the parent snapshot no longer exists";
+        }
+        return StoreResult::kNotFound;
+      }
+      if (parent_code != SQLITE_ROW) {
+        if (error_message != nullptr) {
+          *error_message = "cannot read the parent snapshot: " + LastError();
+        }
+        Execute("ROLLBACK;", nullptr);
+        return StoreResult::kError;
+      }
+      parent_kind = static_cast<std::uint16_t>(sqlite3_column_int(parent.get(), 0));
+      parent_generation =
+          static_cast<std::uint64_t>(sqlite3_column_int64(parent.get(), 1));
+      parent_lineage = ColumnText(parent.get(), 2);
+    }
+    if (parent_kind != static_cast<std::uint16_t>(SnapshotKind::kFull) &&
+        parent_kind != static_cast<std::uint16_t>(SnapshotKind::kIncremental)) {
+      Execute("ROLLBACK;", nullptr);
+      if (error_message != nullptr) {
+        *error_message = "the parent row has an unknown snapshot kind";
+      }
+      return StoreResult::kChainConflict;
+    }
+    if (parent_lineage != record.lineage) {
+      Execute("ROLLBACK;", nullptr);
+      if (error_message != nullptr) {
+        *error_message = "the parent belongs to a different lineage";
+      }
+      return StoreResult::kChainConflict;
+    }
+    if (parent_generation + 1 != record.generation) {
+      Execute("ROLLBACK;", nullptr);
+      if (error_message != nullptr) {
+        *error_message = "the generation must be the parent generation plus one";
+      }
+      return StoreResult::kChainConflict;
+    }
+    {
+      // 线性链：父已经有孩子就不许再挂一个。
+      Statement children;
+      if (!Prepare("SELECT count(*) FROM snapshots"
+                   " WHERE user_id = ? AND parent_id = ?;",
+                   children.out(), error_message)) {
+        Execute("ROLLBACK;", nullptr);
+        return StoreResult::kError;
+      }
+      sqlite3_bind_int64(children.get(), 1,
+                         static_cast<sqlite3_int64>(record.user_id));
+      sqlite3_bind_text(children.get(), 2, record.parent_id.c_str(),
+                        static_cast<int>(record.parent_id.size()),
+                        SQLITE_TRANSIENT);
+      if (sqlite3_step(children.get()) != SQLITE_ROW) {
+        if (error_message != nullptr) {
+          *error_message = "cannot count the children: " + LastError();
+        }
+        Execute("ROLLBACK;", nullptr);
+        return StoreResult::kError;
+      }
+      if (sqlite3_column_int64(children.get(), 0) > 0) {
+        Execute("ROLLBACK;", nullptr);
+        if (error_message != nullptr) {
+          *error_message = "the parent already has a child; this build keeps"
+                           " remote lineages linear";
+        }
+        return StoreResult::kChainConflict;
+      }
+    }
+  } else {
+    // 完整快照：必须是链根。
+    if (!record.parent_id.empty() || record.generation != 0) {
+      if (error_message != nullptr) {
+        *error_message = "a full snapshot must not declare a parent and must"
+                         " have generation zero";
+      }
+      return StoreResult::kChainConflict;
+    }
+  }
+
   Statement statement;
   if (!Prepare("INSERT INTO snapshots"
                " (id, user_id, display_name, size_bytes, sha256, created_at,"
                "  storage_name, snapshot_kind, parent_id, generation, lineage)"
                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);",
                statement.out(), error_message)) {
+    if (record.snapshot_kind ==
+        static_cast<std::uint16_t>(SnapshotKind::kIncremental)) {
+      Execute("ROLLBACK;", nullptr);
+    }
     return StoreResult::kError;
   }
   sqlite3_bind_text(statement.get(), 1, record.snapshot_id.c_str(),
@@ -726,14 +873,26 @@ StoreResult RemoteMetadataStore::InsertSnapshot(
   sqlite3_bind_text(statement.get(), 11, record.lineage.c_str(),
                     static_cast<int>(record.lineage.size()), SQLITE_TRANSIENT);
   const int code = sqlite3_step(statement.get());
-  if (code == SQLITE_CONSTRAINT) {
-    return StoreResult::kAlreadyExists;
-  }
   if (code != SQLITE_DONE) {
+    if (record.snapshot_kind ==
+        static_cast<std::uint16_t>(SnapshotKind::kIncremental)) {
+      Execute("ROLLBACK;", nullptr);
+    }
+    if (code == SQLITE_CONSTRAINT) {
+      return StoreResult::kAlreadyExists;
+    }
     if (error_message != nullptr) {
       *error_message = "cannot insert the snapshot row: " + LastError();
     }
     return StoreResult::kError;
+  }
+  if (record.snapshot_kind ==
+      static_cast<std::uint16_t>(SnapshotKind::kIncremental)) {
+    // 校验与写入在同一个事务里：提交失败也要如实报错。
+    if (!Execute("COMMIT;", error_message)) {
+      Execute("ROLLBACK;", nullptr);
+      return StoreResult::kError;
+    }
   }
   return StoreResult::kOk;
 }

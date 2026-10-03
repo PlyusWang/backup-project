@@ -47,7 +47,14 @@ enum class StoreResult {
   // PR #21：这个快照还被别的快照当作父引用着，删掉它会让那些子快照
   // 永远无法恢复。删除必须依赖感知：先删叶子，再删祖先。
   kHasDependents,
+  // PR #21 审查修复：链的边界条件不成立。包括"父不存在（见 kNotFound）"
+  // 之外的四种：lineage 不同、代数不是父+1、父已经有活着的孩子（本产品是
+  // **线性链**，不允许分叉）、代数超过本地增量引擎能恢复的上限。
+  kChainConflict,
 };
+
+// 远端链允许的最大代数定义在 include/network_protocol.h（协议层面的常量，
+// 客户端与服务端共用同一个值；这里使用它但不再重复定义）。
 
 const char* StoreResultName(StoreResult result);
 
@@ -147,6 +154,15 @@ class RemoteMetadataStore {
   StoreResult FindUserById(std::int64_t user_id, RemoteUserRecord* out,
                            std::string* error_message);
 
+  // 插入一行快照。**链的边界条件在这个函数内部、与 INSERT 同一个互斥区间里
+  // 重新校验**（不是在调用方）：
+  //   * 增量：父必须仍然存在、属于同一个用户、lineage 相同、
+  //     generation == parent.generation + 1、不超过 kMaxRemoteChainGeneration，
+  //     并且父**还没有活着的孩子**（线性链，不允许分叉）；
+  //   * 完整快照：parent 必须为空、generation 必须为 0。
+  // 调用方在 UPLOAD_BEGIN 时也会校验一次，但那只是"早点给用户一个说法"：
+  // 真正的权威校验必须与写入原子，否则删除与上传并发时会留下"父没了、子还在"
+  // 的孤儿（TOCTOU）。返回 kNotFound 表示父不存在，kChainConflict 表示其余冲突。
   StoreResult InsertSnapshot(const RemoteSnapshotRecord& record,
                              std::string* error_message);
   StoreResult ListSnapshots(std::int64_t user_id,
@@ -188,6 +204,12 @@ class RemoteMetadataStore {
   // "DB 写入失败时最终 blob 必须被回滚"这条路径必须能真的被触发一次，
   // 而不是只写在注释里。产品代码里没有任何地方调用它。
   void FailNextInsertForTesting() { fail_next_insert_ = true; }
+  // 让迁移在**补完指定列之后**立刻失败（用于证明"迁移到一半"会被整体回滚）。
+  // 传入列名（snapshot_kind / parent_id / generation / lineage）；产品代码里
+  // 没有任何地方调用它。
+  void FailMigrationAfterColumnForTesting(const std::string& column_name) {
+    fail_migration_after_column_ = column_name;
+  }
   // 让下一次 DeleteUser 在提交之前失败：事务整体回滚，磁盘上的隔离动作
   // 必须由调用方撤回来。产品代码里没有任何地方调用它。
   void FailNextDeleteUserForTesting() { fail_next_delete_user_ = true; }
@@ -213,6 +235,7 @@ class RemoteMetadataStore {
   std::string path_;
   bool fail_next_insert_ = false;
   bool fail_next_delete_user_ = false;
+  std::string fail_migration_after_column_;
   // 保护 database_ 与 fail_next_insert_：worker 线程会并发进来。
   mutable std::mutex mutex_;
 };
