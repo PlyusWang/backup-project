@@ -274,6 +274,9 @@ bool RemoteArchiveClient::Connect(const RemoteEndpoint& endpoint,
     Fail(reason);
     return false;
   }
+  // 客户端侧握手整体预算：60 秒。对端即使持有正确的身份私钥，慢慢滴水同样
+  // 能把客户端挂住（审查轮缺陷 C）。
+  channel_.SetHandshakeTimeoutMs(60000);
   std::string handshake_error;
   if (!channel_.HandshakeClient(fd_, server_key_pin_, &handshake_error)) {
     const std::string reason = std::string("BPSEC1 握手失败（") +

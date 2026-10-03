@@ -181,6 +181,13 @@ class SecureChannel {
   bool HandshakeServer(int fd, const TransportIdentity& identity,
                        std::string* error_message);
 
+  // 握手的**整体**时间预算（毫秒），0 = 不设限。调用方必须在握手前设置：
+  // socket 上的 SO_RCVTIMEO 只约束单次 recv，对"每个超时周期挤 1 个字节"的
+  // 未认证对端无效（审查轮缺陷 C）。超时按 kIoError 处理，并且直接关连接。
+  void SetHandshakeTimeoutMs(std::uint64_t milliseconds) {
+    handshake_timeout_ms_ = milliseconds;
+  }
+
   bool established() const { return established_; }
   SecureTransportError last_error() const { return last_error_; }
   // 客户端：对端（服务端）这次握手实际出示的身份公钥，32 字节。
@@ -245,6 +252,8 @@ class SecureChannel {
   std::uint8_t receive_direction_ = 0;
   std::uint64_t send_sequence_ = 0;
   std::uint64_t receive_sequence_ = 0;
+  // 握手的整体预算（毫秒）。0 = 不设限，见 SetHandshakeTimeoutMs。
+  std::uint64_t handshake_timeout_ms_ = 0;
   std::string peer_public_key_;
   std::string peer_fingerprint_;
   std::string transcript_hash_;
