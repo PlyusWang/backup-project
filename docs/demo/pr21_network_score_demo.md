@@ -121,3 +121,75 @@ GUI 演示路径（约 3 分钟）：
 
 对应的自动化证据：backup-gui-modern --remote-test 的 GUI-P01..P12（见
 pr21-gui-closure-handoff.zip 里的 02-GUI-CONTRACT.txt / 10-ECS-GUI-E2E.txt）。
+
+本轮的无人值守验收再往前一步：--remote-acceptance 把上面这条演示路径真的
+跑一遍（本地隔离服务端与 ECS 真机各一次），并把 12 张**真实窗口**截图
+（1180x760 浅色 / 深色 + 900x700 窄窗口 + 两张整页总览）连同每个关键控件的
+真实几何（x / y / 宽 / 高 / 可见 / 可用）一起留下来，同时断言：不重叠、不越界、
+卡片内容在卡片内、恢复按钮在卡片内、策略分段控件在"远端备份"卡片内。
+截图与几何证据见 pr21-final-acceptance-handoff.zip（02-GUI-ACCEPTANCE.md /
+03-GEOMETRY-CHECKS.txt / 04-QML-WARNINGS.txt / screenshots/）。
+
+长操作进行中，页面上会直接显示"正在做什么"（remoteBusyText，文本来自控制器的
+busyAction），冲突操作同时变成不可用——不是只把按钮变灰，也不是画一条
+假的进度条。
+
+本轮的无人值守验收再往前一步：--remote-acceptance 把上面这条演示路径真的
+跑一遍（本地隔离服务端与 ECS 真机各一次），并把 12 张**真实窗口**截图
+（1180x760 浅色 / 深色 + 900x700 窄窗口 + 两张整页总览）连同每个关键控件的
+真实几何（x / y / 宽 / 高 / 可见 / 可用）一起留下来，同时断言：不重叠、不越界、
+卡片内容在卡片内、恢复按钮在卡片内、策略分段控件在"远端备份"卡片内。
+截图与几何证据见 pr21-final-acceptance-handoff.zip（02-GUI-ACCEPTANCE.md /
+03-GEOMETRY-CHECKS.txt / 04-QML-WARNINGS.txt / screenshots/）。
+
+长操作进行中，页面上会直接显示"正在做什么"（remoteBusyText，文本来自控制器的
+busyAction），冲突操作同时变成不可用——不是只把按钮变灰，也不是画一条
+假的进度条。
+
+本轮的无人值守验收再往前一步：--remote-acceptance 把上面这条演示路径真的
+跑一遍（本地隔离服务端与 ECS 真机各一次），并把 12 张**真实窗口**截图
+（1180x760 浅色 / 深色 + 900x700 窄窗口 + 两张整页总览）连同每个关键控件的
+真实几何（x / y / 宽 / 高 / 可见 / 可用）一起留下来，同时断言：不重叠、不越界、
+卡片内容在卡片内、恢复按钮在卡片内、策略分段控件在"远端备份"卡片内。
+截图与几何证据见 pr21-final-acceptance-handoff.zip（02-GUI-ACCEPTANCE.md /
+03-GEOMETRY-CHECKS.txt / 04-QML-WARNINGS.txt / screenshots/）。
+
+长操作进行中，页面上会直接显示"正在做什么"（remoteBusyText，文本来自控制器的
+busyAction），冲突操作同时变成不可用——不是只把按钮变灰，也不是画一条
+假的进度条。
+
+本轮的无人值守验收再往前一步：--remote-acceptance 把上面这条演示路径真的
+跑一遍（本地隔离服务端与 ECS 真机各一次），并把 12 张**真实窗口**截图
+（1180x760 浅色 / 深色 + 900x700 窄窗口 + 两张整页总览）连同每个关键控件的
+真实几何（x / y / 宽 / 高 / 可见 / 可用）一起留下来，同时断言：不重叠、不越界、
+卡片内容在卡片内、恢复按钮在卡片内、策略分段控件在"远端备份"卡片内。
+截图与几何证据见 pr21-final-acceptance-handoff.zip（02-GUI-ACCEPTANCE.md /
+03-GEOMETRY-CHECKS.txt / 04-QML-WARNINGS.txt / screenshots/）。
+
+长操作进行中，页面上会直接显示"正在做什么"（remoteBusyText，文本来自控制器的
+busyAction），冲突操作同时变成不可用——不是只把按钮变灰，也不是画一条
+假的进度条。
+
+本轮的无人值守验收再往前一步：--remote-acceptance 把上面这条演示路径真的
+跑一遍（本地隔离服务端与 ECS 真机各一次），并把 12 张**真实窗口**截图
+（1180x760 浅色 / 深色 + 900x700 窄窗口 + 两张整页总览）连同每个关键控件的
+真实几何（x / y / 宽 / 高 / 可见 / 可用）一起留下来，同时断言：不重叠、不越界、
+卡片内容在卡片内、恢复按钮在卡片内、策略分段控件在"远端备份"卡片内。
+截图与几何证据见 pr21-final-acceptance-handoff.zip（02-GUI-ACCEPTANCE.md /
+03-GEOMETRY-CHECKS.txt / 04-QML-WARNINGS.txt / screenshots/）。
+
+长操作进行中，页面上会直接显示"正在做什么"（remoteBusyText，文本来自控制器的
+busyAction），冲突操作同时变成不可用——不是只把按钮变灰，也不是画一条
+假的进度条。
+
+本轮的无人值守验收再往前一步：--remote-acceptance 把上面这条演示路径真的
+跑一遍（本地隔离服务端与 ECS 真机各一次），并把 12 张**真实窗口**截图
+（1180x760 浅色 / 深色 + 900x700 窄窗口 + 两张整页总览）连同每个关键控件的
+真实几何（x / y / 宽 / 高 / 可见 / 可用）一起留下来，同时断言：不重叠、不越界、
+卡片内容在卡片内、恢复按钮在卡片内、策略分段控件在"远端备份"卡片内。
+截图与几何证据见 pr21-final-acceptance-handoff.zip（02-GUI-ACCEPTANCE.md /
+03-GEOMETRY-CHECKS.txt / 04-QML-WARNINGS.txt / screenshots/）。
+
+长操作进行中，页面上会直接显示"正在做什么"（remoteBusyText，文本来自控制器的
+busyAction），冲突操作同时变成不可用——不是只把按钮变灰，也不是画一条
+假的进度条。
