@@ -8289,8 +8289,36 @@ int RunScheduleTest(backup_modern::ScheduleController* schedule,
     run.Check(schedule->statusMessage().contains(QStringLiteral("正在")),
               QStringLiteral("SCH-94 拒绝的理由告诉用户等这一轮结束"),
               schedule->statusMessage());
-    run.Check(read_bytes(store_path) == before,
-              QStringLiteral("SCH-95 被拒绝的保存没有改动 store 一个字节"));
+    // SCH-95：被拒绝的保存**没有落盘**。
+    //
+    // 这里刻意**不**比"store 字节完全不变"：后台评估线程是 store 的另一个合法
+    // 写者（managed 记录 / history），一次只有几字节源文件的小评估可以在毫秒级
+    // 跑完，正好落在两次读之间——那样测到的就不再是"保存被拒绝"，而是"后台线程
+    // 恰好没写"，机器一快就假红（实测连跑三次红了一次）。真正要钉死的不变式是
+    // **被拒绝的那一组值没有被写进 store**，所以这里直接读 store 文件本身：
+    // 计划仍然是旧值（5 / 7 / ustar），不是被拒绝的 9 / 4 / fast-ustar。
+    const QByteArray after = read_bytes(store_path);
+    {
+      backupproject::ScheduleStore probe(store_path.toStdString());
+      backupproject::ScheduleDocument document;
+      std::string load_error;
+      const bool loaded = probe.Load(&document, &load_error) ==
+                          backupproject::ScheduleLoadStatus::kLoaded;
+      run.Check(
+          loaded && document.config.interval_minutes == 5 &&
+              document.config.retain_count == 7 &&
+              document.config.pack_method ==
+                  backupproject::PackMethod::kUstar &&
+              !after.isEmpty(),
+          QStringLiteral("SCH-95 被拒绝的保存没有落盘（store 里仍然是旧计划）"),
+          QStringLiteral("loaded=%1 interval=%2 retain=%3 store=%4->%5 字节 %6")
+              .arg(loaded ? 1 : 0)
+              .arg(document.config.interval_minutes)
+              .arg(document.config.retain_count)
+              .arg(before.size())
+              .arg(after.size())
+              .arg(QString::fromStdString(load_error)));
+    }
     run.Check(schedule->intervalMinutes() == 5 && schedule->retainCount() == 7,
               QStringLiteral("SCH-96 内存里的计划也没有被改"),
               QString::number(schedule->intervalMinutes()) +
