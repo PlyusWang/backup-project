@@ -726,6 +726,13 @@ bool SecureChannel::HandshakeClient(int fd, const ServerKeyPin& pin,
     return Fail(SecureTransportError::kNoPinConfigured, std::string(),
                 error_message);
   }
+  // 整体预算（0 = 不设限）。客户端也要有：一个持有正确身份私钥、却慢慢滴水的
+  // 对端同样能把客户端挂住。
+  const std::int64_t handshake_deadline =
+      handshake_timeout_ms_ == 0
+          ? 0
+          : MonotonicMillis() +
+                static_cast<std::int64_t>(handshake_timeout_ms_);
 
   std::string client_random;
   std::string ephemeral_private;
@@ -746,7 +753,8 @@ bool SecureChannel::HandshakeClient(int fd, const ServerKeyPin& pin,
 
   unsigned char raw[kBssec1ServerHelloSize];
   bool closed = false;
-  if (!ReceiveAll(fd, raw, sizeof(raw), &closed, &io_error)) {
+  if (!ReceiveAll(fd, raw, sizeof(raw), &closed, &io_error,
+                  handshake_deadline)) {
     return Fail(SecureTransportError::kIoError,
                 closed ? "对端在 ServerHello 之前关闭了连接"
                        : "读取 ServerHello 失败：" + io_error,
@@ -827,7 +835,7 @@ bool SecureChannel::HandshakeClient(int fd, const ServerKeyPin& pin,
 
   unsigned char server_finished_raw[kBssec1FinishedSize];
   if (!ReceiveAll(fd, server_finished_raw, sizeof(server_finished_raw), &closed,
-                  &io_error)) {
+                  &io_error, handshake_deadline)) {
     return Fail(SecureTransportError::kIoError,
                 closed ? "对端在 ServerFinished 之前关闭了连接"
                        : "读取 ServerFinished 失败：" + io_error,
@@ -864,11 +872,19 @@ bool SecureChannel::HandshakeServer(int fd, const TransportIdentity& identity,
     return Fail(SecureTransportError::kStateError,
                 "服务端传输身份密钥没有配置好", error_message);
   }
+  // 整体预算（0 = 不设限）。服务端尤其需要：握手是**未认证**阶段，慢速滴水的
+  // 对端本来可以靠 SO_RCVTIMEO 只约束单次 recv 这点占住一个 worker。
+  const std::int64_t handshake_deadline =
+      handshake_timeout_ms_ == 0
+          ? 0
+          : MonotonicMillis() +
+                static_cast<std::int64_t>(handshake_timeout_ms_);
 
   unsigned char raw[kBssec1ClientHelloSize];
   bool closed = false;
   std::string io_error;
-  if (!ReceiveAll(fd, raw, sizeof(raw), &closed, &io_error)) {
+  if (!ReceiveAll(fd, raw, sizeof(raw), &closed, &io_error,
+                  handshake_deadline)) {
     return Fail(SecureTransportError::kIoError,
                 closed ? "客户端在 ClientHello 之前关闭了连接"
                        : "读取 ClientHello 失败：" + io_error,
@@ -937,7 +953,7 @@ bool SecureChannel::HandshakeServer(int fd, const TransportIdentity& identity,
 
   unsigned char client_finished_raw[kBssec1FinishedSize];
   if (!ReceiveAll(fd, client_finished_raw, sizeof(client_finished_raw), &closed,
-                  &io_error)) {
+                  &io_error, handshake_deadline)) {
     return Fail(SecureTransportError::kIoError,
                 closed ? "客户端在 ClientFinished 之前关闭了连接"
                        : "读取 ClientFinished 失败：" + io_error,

@@ -105,7 +105,8 @@ bool EnsureDirectory(const std::string& path, std::string* error_message) {
 }
 
 // secrets.env 的大小上限：它是几行配置，不是数据文件。没有上限就等于给
-// "读一个巨大的文件"留门（非普通文件在下面已经被拒，但普通文件也可能是 10 GiB）。
+// "读一个巨大的文件"留门（非普通文件在下面已经被拒，但普通文件也可能是 10
+// GiB）。
 constexpr std::size_t kMaxSecretFileBytes = 1024 * 1024;
 
 // 读 secrets.env 里的 BACKUP_TOKEN_SECRET。
@@ -135,8 +136,8 @@ bool ReadSecretFile(const std::string& path, std::string* secret,
       if (errno == ELOOP) {
         *error_message = "the secret file must not be a symbolic link: " + path;
       } else {
-        *error_message = "cannot open the secret file " + path + ": " +
-                         std::strerror(errno);
+        *error_message =
+            "cannot open the secret file " + path + ": " + std::strerror(errno);
       }
     }
     return false;
@@ -407,8 +408,7 @@ bool RemoteServer::Start(std::string* error_message) {
     line << "listening on " << config_.bind_address << ":" << bound_port_
          << " root=" << config_.root_directory
          << " workers=" << config_.worker_count
-         << " max_upload=" << config_.max_upload_bytes
-         << " bspec1=on"
+         << " max_upload=" << config_.max_upload_bytes << " bspec1=on"
          << " transport_fingerprint="
          << crypto::X25519Fingerprint(transport_identity_.public_key);
     Log(line.str());
@@ -537,10 +537,9 @@ bool RemoteServer::SendError(int fd, std::uint16_t opcode,
     }
     return false;
   }
-  if (!g_connection_channel->SendFrame(fd, opcode,
-                                       static_cast<std::uint32_t>(status),
-                                       request_id, std::string(),
-                                       error_message)) {
+  if (!g_connection_channel->SendFrame(
+          fd, opcode, static_cast<std::uint32_t>(status), request_id,
+          std::string(), error_message)) {
     return false;
   }
   return true;
@@ -559,10 +558,9 @@ bool RemoteServer::SendStatus(int fd, const FrameHeader& request, Status status,
     }
     return false;
   }
-  return g_connection_channel->SendFrame(fd, opcode,
-                                         static_cast<std::uint32_t>(status),
-                                         request.request_id, payload,
-                                         error_message);
+  return g_connection_channel->SendFrame(
+      fd, opcode, static_cast<std::uint32_t>(status), request.request_id,
+      payload, error_message);
 }
 
 bool RemoteServer::HandlePing(int fd, const FrameHeader& header,
@@ -778,8 +776,8 @@ bool RemoteServer::HandleResume(int fd, const FrameHeader& header,
   if (!VerifyToken(secret_, token, NowSeconds(), &parsed, &verify_error)) {
     // 失败原因只写日志：里面既没有 token 内容，也没有 secret。
     Log("resume rejected: " + verify_error);
-    return SendError(fd, header.opcode, header.request_id, Status::kUnauthorized,
-                     error_message);
+    return SendError(fd, header.opcode, header.request_id,
+                     Status::kUnauthorized, error_message);
   }
   // token 的签名说明"这是我们签发的"，但**不**说明"这个账户还在"：注销过的
   // 账户必须在这里被挡住。这一条正是"注销之后旧 token 立刻失效"的实现。
@@ -789,8 +787,8 @@ bool RemoteServer::HandleResume(int fd, const FrameHeader& header,
       static_cast<std::int64_t>(parsed.user_id), &user, &store_error);
   if (found == StoreResult::kNotFound) {
     Log("resume rejected: the account no longer exists");
-    return SendError(fd, header.opcode, header.request_id, Status::kUnauthorized,
-                     error_message);
+    return SendError(fd, header.opcode, header.request_id,
+                     Status::kUnauthorized, error_message);
   }
   if (found != StoreResult::kOk) {
     Log("cannot read the user row: " + store_error);
@@ -850,8 +848,7 @@ bool RemoteServer::HandleList(int fd, const FrameHeader& header,
     builder.AppendU64(record.generation);
     if (!builder.AppendString(record.parent_id, kMaxSnapshotIdBytes,
                               &build_error) ||
-        !builder.AppendString(record.lineage, kMaxLineageBytes,
-                              &build_error)) {
+        !builder.AppendString(record.lineage, kMaxLineageBytes, &build_error)) {
       Log("cannot encode a LIST entry: " + build_error);
       return SendError(fd, header.opcode, header.request_id,
                        Status::kInternalError, error_message);
@@ -1092,12 +1089,13 @@ bool RemoteServer::HandleUploadBegin(int fd, const FrameHeader& header,
     }
     RemoteSnapshotRecord parent;
     std::string parent_error;
-    const StoreResult parent_result = store_->FindSnapshot(
-        static_cast<std::int64_t>(context->user_id), parent_snapshot_id,
-        &parent, &parent_error);
+    const StoreResult parent_result =
+        store_->FindSnapshot(static_cast<std::int64_t>(context->user_id),
+                             parent_snapshot_id, &parent, &parent_error);
     if (parent_result == StoreResult::kNotFound) {
       // 不存在的父与"别人的父"是同一个答案：不允许按 id 探测别人的快照。
-      Log("rejecting an incremental upload: the parent snapshot does not exist");
+      Log("rejecting an incremental upload: the parent snapshot does not "
+          "exist");
       return SendError(fd, header.opcode, header.request_id, Status::kNotFound,
                        error_message);
     }
@@ -1680,10 +1678,9 @@ bool RemoteServer::AcquireDataLock(std::string* error_message) {
     const std::string hint =
         RemoteMaintenance::ReadLockHint(config_.root_directory);
     if (error_message != nullptr) {
-      *error_message =
-          "another process is already using the data directory " +
-          config_.root_directory +
-          (hint.empty() ? std::string() : " (" + hint + ")");
+      *error_message = "another process is already using the data directory " +
+                       config_.root_directory +
+                       (hint.empty() ? std::string() : " (" + hint + ")");
     }
     return false;
   }
@@ -1764,6 +1761,11 @@ bool RemoteServer::HandleFrame(int fd, const FrameHeader& header,
 bool RemoteServer::ServeConnection(int fd, std::string* error_message) {
   // 慢连接保护：读写在 io_timeout_seconds 之后超时返回，因此一个挂着不动的
   // 客户端最多占用一个 worker 这么久，不会永久占用。
+  //
+  // 审查轮更正：SO_RCVTIMEO 是**每次 recv** 的超时，对"每个超时周期挤 1 个
+  // 字节"的对端无效——那样一条未认证的连接可以把 worker 占住约 112 个超时
+  // 周期（默认 io_timeout 30 秒 → 接近一小时）。握手因此额外有一个整体预算，
+  // 见下面的 SetHandshakeTimeoutMs。
   timeval timeout;
   timeout.tv_sec = config_.io_timeout_seconds;
   timeout.tv_usec = 0;
@@ -1789,6 +1791,14 @@ bool RemoteServer::ServeConnection(int fd, std::string* error_message) {
   //
   // 失败就关连接：口令、token、用户名、快照元数据一个字节都不会以明文出现在
   // 网络上，也没有"握手失败就退回明文 BPNET1"的分支。
+  // 握手一共只有 112 个字节的往返，正常网络下几秒内一定完成；给两倍 IO 超时
+  // （下限 30 秒）作为整体预算，超了就按 IO 错误关连接。
+  std::uint64_t handshake_budget_seconds =
+      static_cast<std::uint64_t>(config_.io_timeout_seconds) * 2;
+  if (handshake_budget_seconds < 30) {
+    handshake_budget_seconds = 30;
+  }
+  channel.SetHandshakeTimeoutMs(handshake_budget_seconds * 1000);
   if (!channel.HandshakeServer(fd, transport_identity_, error_message)) {
     Log(std::string("BPSEC1 handshake failed: ") +
         (error_message != nullptr && !error_message->empty()
@@ -1840,7 +1850,8 @@ bool RemoteServer::ServeConnection(int fd, std::string* error_message) {
     // 隧道重启都属于这一类）。客户端必须如实报告失败，并且**不重发**。
     // 产品代码从不设置这个标志。
     if (fail_next_response_.exchange(false)) {
-      Log("injected: dropping the connection before answering a frame (test seam)");
+      Log("injected: dropping the connection before answering a frame (test "
+          "seam)");
       return finish(false);
     }
     if (!HandleFrame(fd, header, payload, &context, error_message)) {

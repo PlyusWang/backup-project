@@ -291,8 +291,15 @@ class PayloadReader {
 
 bool SendAll(int fd, const void* data, std::size_t size,
              std::string* error_message);
+// deadline_ms：**整体**截止时间（CLOCK_MONOTONIC 毫秒时间点），0 = 不设限。
+// 为什么需要它：SO_RCVTIMEO 只约束"单次 recv"，每 <timeout> 挤 1 个字节的对端
+// 可以让它永远不触发（审查轮缺陷 C）。给握手这类定长小消息传一个总预算，就能把
+// 一条连接的握手时间封顶；实际最多超出预算一个 recv 超时。
 bool ReceiveAll(int fd, void* data, std::size_t size, bool* closed_by_peer,
-                std::string* error_message);
+                std::string* error_message, std::int64_t deadline_ms = 0);
+
+// CLOCK_MONOTONIC 毫秒时间点；取不到时返回 0（调用方按"不设限"处理）。
+std::int64_t MonotonicMillis();
 
 // 发一帧（帧头 + payload）。payload 超上限时直接失败，不发送半个帧。
 bool SendFrame(int fd, std::uint16_t opcode, std::uint32_t status,
