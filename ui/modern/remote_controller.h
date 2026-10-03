@@ -222,10 +222,10 @@ class RemoteController : public QObject {
   // 操作顶掉；而"本次实际创建的是完整基线"这条信息必须在用户看着 Remote
   // Backup 区域时一直成立。kind 取值：""（还没做过）/ "full" / "incremental"
   // / "no-change"。summary 是给用户看的一句话。
-  Q_PROPERTY(QString backupSummary READ backupSummary NOTIFY backupSummaryChanged)
   Q_PROPERTY(
-      QString backupSummaryKind READ backupSummaryKind NOTIFY
-          backupSummaryChanged)
+      QString backupSummary READ backupSummary NOTIFY backupSummaryChanged)
+  Q_PROPERTY(QString backupSummaryKind READ backupSummaryKind NOTIFY
+                 backupSummaryChanged)
 
   // ---- 传输进度 ----
   // 刻意不叫 progressValue / percent：modern_gui_check.sh 里有一条"不许出现
