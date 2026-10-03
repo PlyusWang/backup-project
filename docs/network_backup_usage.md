@@ -261,6 +261,30 @@ scripts/backup-server-admin.sh 一起装到 ECS 的 bin/ 下。
   云端快照列表（类型 / 代数 / 父）与链恢复。GUI 与 CLI 走**同一个** core
   （RunRemoteBackup / RunRemoteRestore），GUI 侧不做任何增量判断；原始归档的
   上传/下载仍然单独放在"高级"区域，与产品级备份区分开。
+* 长操作进行中，远程页上会直接显示"现在正在做什么"（内容来自控制器的
+  busyAction，不是估算出来的进度），同时备份 / 恢复 / 删除 / 上传 / 刷新 /
+  退出登录等冲突操作在界面上全部不可用；控制器层的闸门另有回归（同一事件
+  循环回合里的第二个请求一定被拒）。
+* 长操作进行中，远程页上会直接显示"现在正在做什么"（内容来自控制器的
+  busyAction，不是估算出来的进度），同时备份 / 恢复 / 删除 / 上传 / 刷新 /
+  退出登录等冲突操作在界面上全部不可用；控制器层的闸门另有回归（同一事件
+  循环回合里的第二个请求一定被拒）。
+* 长操作进行中，远程页上会直接显示"现在正在做什么"（内容来自控制器的
+  busyAction，不是估算出来的进度），同时备份 / 恢复 / 删除 / 上传 / 刷新 /
+  退出登录等冲突操作在界面上全部不可用；控制器层的闸门另有回归（同一事件
+  循环回合里的第二个请求一定被拒）。
+* 长操作进行中，远程页上会直接显示"现在正在做什么"（内容来自控制器的
+  busyAction，不是估算出来的进度），同时备份 / 恢复 / 删除 / 上传 / 刷新 /
+  退出登录等冲突操作在界面上全部不可用；控制器层的闸门另有回归（同一事件
+  循环回合里的第二个请求一定被拒）。
+* 长操作进行中，远程页上会直接显示"现在正在做什么"（内容来自控制器的
+  busyAction，不是估算出来的进度），同时备份 / 恢复 / 删除 / 上传 / 刷新 /
+  退出登录等冲突操作在界面上全部不可用；控制器层的闸门另有回归（同一事件
+  循环回合里的第二个请求一定被拒）。
+* 长操作进行中，远程页上会直接显示"现在正在做什么"（内容来自控制器的
+  busyAction，不是估算出来的进度），同时备份 / 恢复 / 删除 / 上传 / 刷新 /
+  退出登录等冲突操作在界面上全部不可用；控制器层的闸门另有回归（同一事件
+  循环回合里的第二个请求一定被拒）。
 * token 在有效期内无法单独吊销（服务端无会话状态）；轮换
   BACKUP_TOKEN_SECRET 会让所有已签发 token 立即失效。唯一的例外是账户
   注销：账户行不存在之后，旧 token 在任何操作上都会被拒绝（每次操作都会
@@ -291,6 +315,48 @@ scripts/backup-server-admin.sh 一起装到 ECS 的 bin/ 下。
                                             #   含 --remote-test 的远程页合同自检
                                             #   （远端备份 / 增量 / 无变化 / 链恢复 /
                                             #    冷缓存 / 原始归档区分 / pin / 忙碌）
+    # PR #21 无人值守 GUI 验收：真实窗口截图（浅色 / 深色 / 900x700）+
+    #   关键控件几何断言 + 产品状态机（完整 / 增量 / 回退成完整基线 / 无变化 /
+    #   原始归档区分 / 冷缓存链恢复 / 错 pin / 空闲重连 + RESUME / 忙碌）
+    #   口令与指纹只走环境变量，不进 argv：
+    #     BACKUP_REMOTE_PASSWORD=<口令> BACKUP_REMOTE_PIN=<sha256:...> \
+    #     QT_QPA_PLATFORM=offscreen build/backup-gui-modern --remote-acceptance \
+    #       <输出目录> <地址> <端口> <用户名>
+    # PR #21 无人值守 GUI 验收：真实窗口截图（浅色 / 深色 / 900x700）+
+    #   关键控件几何断言 + 产品状态机（完整 / 增量 / 回退成完整基线 / 无变化 /
+    #   原始归档区分 / 冷缓存链恢复 / 错 pin / 空闲重连 + RESUME / 忙碌）
+    #   口令与指纹只走环境变量，不进 argv：
+    #     BACKUP_REMOTE_PASSWORD=<口令> BACKUP_REMOTE_PIN=<sha256:...> \
+    #     QT_QPA_PLATFORM=offscreen build/backup-gui-modern --remote-acceptance \
+    #       <输出目录> <地址> <端口> <用户名>
+    # PR #21 无人值守 GUI 验收：真实窗口截图（浅色 / 深色 / 900x700）+
+    #   关键控件几何断言 + 产品状态机（完整 / 增量 / 回退成完整基线 / 无变化 /
+    #   原始归档区分 / 冷缓存链恢复 / 错 pin / 空闲重连 + RESUME / 忙碌）
+    #   口令与指纹只走环境变量，不进 argv：
+    #     BACKUP_REMOTE_PASSWORD=<口令> BACKUP_REMOTE_PIN=<sha256:...> \
+    #     QT_QPA_PLATFORM=offscreen build/backup-gui-modern --remote-acceptance \
+    #       <输出目录> <地址> <端口> <用户名>
+    # PR #21 无人值守 GUI 验收：真实窗口截图（浅色 / 深色 / 900x700）+
+    #   关键控件几何断言 + 产品状态机（完整 / 增量 / 回退成完整基线 / 无变化 /
+    #   原始归档区分 / 冷缓存链恢复 / 错 pin / 空闲重连 + RESUME / 忙碌）
+    #   口令与指纹只走环境变量，不进 argv：
+    #     BACKUP_REMOTE_PASSWORD=<口令> BACKUP_REMOTE_PIN=<sha256:...> \
+    #     QT_QPA_PLATFORM=offscreen build/backup-gui-modern --remote-acceptance \
+    #       <输出目录> <地址> <端口> <用户名>
+    # PR #21 无人值守 GUI 验收：真实窗口截图（浅色 / 深色 / 900x700）+
+    #   关键控件几何断言 + 产品状态机（完整 / 增量 / 回退成完整基线 / 无变化 /
+    #   原始归档区分 / 冷缓存链恢复 / 错 pin / 空闲重连 + RESUME / 忙碌）
+    #   口令与指纹只走环境变量，不进 argv：
+    #     BACKUP_REMOTE_PASSWORD=<口令> BACKUP_REMOTE_PIN=<sha256:...> \
+    #     QT_QPA_PLATFORM=offscreen build/backup-gui-modern --remote-acceptance \
+    #       <输出目录> <地址> <端口> <用户名>
+    # PR #21 无人值守 GUI 验收：真实窗口截图（浅色 / 深色 / 900x700）+
+    #   关键控件几何断言 + 产品状态机（完整 / 增量 / 回退成完整基线 / 无变化 /
+    #   原始归档区分 / 冷缓存链恢复 / 错 pin / 空闲重连 + RESUME / 忙碌）
+    #   口令与指纹只走环境变量，不进 argv：
+    #     BACKUP_REMOTE_PASSWORD=<口令> BACKUP_REMOTE_PIN=<sha256:...> \
+    #     QT_QPA_PLATFORM=offscreen build/backup-gui-modern --remote-acceptance \
+    #       <输出目录> <地址> <端口> <用户名>
     bash scripts/final_gate.sh               # canonical final gate（全部套件）
     bash scripts/server_admin_test.sh       # ECS 本地管理工具的安全边界
     bash scripts/aliyun_network_e2e.sh      # 阿里云真实端到端（需要隧道前置条件）
