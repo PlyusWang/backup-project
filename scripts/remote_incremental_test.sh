@@ -53,11 +53,16 @@ if [ -z "$SQLITE_LIBRARY" ] || [ ! -f "$SQLITE_INCLUDE_DIR/sqlite3.h" ]; then
   record_fail "sqlite3 运行库/头文件" "找不到 libsqlite3.so 或 sqlite3.h"
 else
   CORE_OBJECTS="$(find build/src -name '*.o' 2>/dev/null | sort | tr '\n' ' ')"
-  STORE_OBJECT="$(find build/server -name 'remote_metadata_store.o' 2>/dev/null | head -1)"
+  # PR #21 红队审查轮：单元测试现在也起一个**真的**服务端（TCP 环回 + BPSEC1
+  # 握手 + 真 SQLite），所以编译它还要链上服务端对象。三个 *main.o 是三个
+  # 可执行文件的入口，必须排除（否则与测试自己的 main 冲突）。
+  STORE_OBJECT="$(find build/server/server -name '*.o' \
+    ! -name 'main.o' ! -name 'admin_main.o' ! -name 'keygen_main.o' \
+    2>/dev/null | sort | tr '\n' ' ')"
   UNIT_BIN="$TEST_ROOT/remote_chain_test"
   if g++ -std=c++17 -Wall -Wextra -Wpedantic -Iinclude \
       -I"$SQLITE_INCLUDE_DIR" -Itests/unit \
-      tests/unit/remote_chain_test.cpp $CORE_OBJECTS "$STORE_OBJECT" \
+      tests/unit/remote_chain_test.cpp $CORE_OBJECTS $STORE_OBJECT \
       "$SQLITE_LIBRARY" -pthread -o "$UNIT_BIN" \
       >"$TEST_ROOT/unit-build.log" 2>&1; then
     record_pass "A.remote_chain_test 编译"
@@ -328,21 +333,30 @@ else
   record_fail "B.11 找不到 R1 的 blob" "$R1BLOB"
 fi
 
-# 元数据落库的形状：kind / parent / generation / lineage。
-if command -v sqlite3 >/dev/null 2>&1; then
-  SHAPE="$(sqlite3 -readonly "$WORK/state/metadata.sqlite3" \
-    "SELECT snapshot_kind, generation, length(parent_id), length(lineage) FROM snapshots ORDER BY created_at;" 2>/dev/null | tr '\n' ' ')"
-  if [ "$SHAPE" = "0|0|0|64 1|1|32|64 1|2|32|64 " ]; then
-    record_pass "B.12 元数据形状正确（full gen0 / 两个增量各有父与 lineage）"
-  else
-    record_fail "B.12 元数据形状" "$SHAPE"
-  fi
-  VERSION="$(sqlite3 -readonly "$WORK/state/metadata.sqlite3" "PRAGMA user_version;" 2>/dev/null)"
-  if [ "$VERSION" = "2" ]; then
-    record_pass "B.12 schema 版本是 2"
-  else
-    record_fail "B.12 schema 版本" "$VERSION"
-  fi
+# 元数据落库的形状：直接看**产品自己的输出**。
+#
+# 原来这里用 sqlite3 CLI 查库，但 VM 上并不一定装了 sqlite3（没装时整段被静默
+# 跳过 —— 一条"永远不跑"的断言比没有断言更糟）。改成两条不依赖外部工具的检查：
+#   * remote list 的 KIND / GEN / PARENT 列（用户与老师看得见的产品契约）；
+#   * 服务端日志里发布的 kind/generation（服务端自己写下的事实）。
+run_remote list "${REMOTE[@]}" >"$WORK/list.txt" 2>&1
+# B.10 已经把叶子 R2 删掉了，所以这里应当只剩 R0 与 R1 两行——R2 的
+# kind/generation 由下面那条服务端日志断言覆盖（日志是当时写下的，不会被删除）。
+LIST_ROWS="$(grep -cE '^[0-9a-f]{32}' "$WORK/list.txt")"
+if grep -qE "full +0 +- +R0" "$WORK/list.txt" && \
+   grep -qE "incremental +1 +${R0_ID:0:12} +R1" "$WORK/list.txt" && \
+   [ "$LIST_ROWS" = "2" ] && \
+   ! grep -q "$R2_ID" "$WORK/list.txt"; then
+  record_pass "B.12 remote list 显示 full/gen0/无父 与增量的父/代数，且被删的 R2 已消失"
+else
+  record_fail "B.12 remote list 的链关系列" "rows=$LIST_ROWS $(grep -E 'full|incremental' "$WORK/list.txt" | tr '\n' ' ')"
+fi
+if grep -q "kind=0 generation=0" "$WORK/logs/server.log" && \
+   grep -q "kind=1 generation=1" "$WORK/logs/server.log" && \
+   grep -q "kind=1 generation=2" "$WORK/logs/server.log"; then
+  record_pass "B.12 服务端日志记录了 kind=0/1/1 与 generation=0/1/2"
+else
+  record_fail "B.12 服务端日志里的 kind/generation" "$(grep 'published' "$WORK/logs/server.log" | tail -3 | tr '\n' ' ')"
 fi
 
 kill -TERM "$SERVER_PID" 2>/dev/null
