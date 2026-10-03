@@ -958,6 +958,7 @@ RemoteOpResult RemoteController::RunOperation(
   // 身份指纹时，重连必须用新的那一份（否则界面说的"下一次连接生效"就是假的）。
   // 它不发字节、不动 token，会话与 RESUME 语义不变。
   client->SetReconnectEndpoint(request.endpoint);
+  result.backup_incremental_requested = request.allow_incremental;
   switch (request.kind) {
     case RemoteOpResult::Kind::kRegister:
       if (!client->connected() && !client->Connect(request.endpoint, &error)) {
@@ -1260,6 +1261,7 @@ void RemoteController::ApplyResult(const RemoteOpResult& result) {
       last_backup_generation_ = result.backup_generation;
       last_backup_baseline_reason_ =
           QString::fromStdString(result.backup_baseline_reason);
+      last_backup_incremental_requested_ = result.backup_incremental_requested;
       emit backupSummaryChanged();
       if (result.backup_no_changes) {
         set_summary(QStringLiteral("no-change"),
@@ -1286,27 +1288,29 @@ void RemoteController::ApplyResult(const RemoteOpResult& result) {
                       .arg(short_id, parent_short)
                       .arg(static_cast<qulonglong>(result.backup_generation))
                       .arg(size_text));
+      } else if (last_backup_incremental_requested_) {
+        // 用户点了“增量”，实际产出的却是一份完整基线：这是**兜底**，必须
+        // 明说“本次创建的是完整基线”，不能让用户以为增量成功了。core 的
+        // 英文理由不进这一行（它在技术详情里），用户看到的是中文结论。
+        set_summary(QStringLiteral("full"),
+                    QStringLiteral("本次创建的是完整基线：快照 %1，"
+                                   "本次上传 %2。")
+                        .arg(short_id, size_text));
+        SetStatus(QStringLiteral("success"), QStringLiteral("已创建完整基线"),
+                  QStringLiteral("云端没有可续的链，本次创建的是完整基线 %1，"
+                                 "上传 %2；下一次改过文件之后再点“增量”就是"
+                                 "真正的增量。")
+                      .arg(short_id, size_text));
       } else {
-        const QString reason = last_backup_baseline_reason_;
-        set_summary(
-            QStringLiteral("full"),
-            reason.isEmpty()
-                ? QStringLiteral("完整备份完成：快照 %1（完整基线，代数 0），"
+        // 用户选的就是“完整”：这是一次正常的完整备份，不是兜底。
+        set_summary(QStringLiteral("full"),
+                    QStringLiteral("完整备份完成：快照 %1（完整基线，代数 0），"
+                                   "本次上传 %2。")
+                        .arg(short_id, size_text));
+        SetStatus(QStringLiteral("success"), QStringLiteral("完整备份完成"),
+                  QStringLiteral("快照 %1 是一份完整基线（代数 0），"
                                  "本次上传 %2。")
-                      .arg(short_id, size_text)
-                : QStringLiteral("本次创建的是完整基线（%1）：快照 %2，"
-                                 "上传 %3。")
-                      .arg(reason, short_id, size_text));
-        SetStatus(QStringLiteral("success"),
-                  result.backup_rebuilt_full ? QStringLiteral("已创建完整基线")
-                                             : QStringLiteral("完整备份完成"),
-                  reason.isEmpty()
-                      ? QStringLiteral("本次创建的是完整基线（完整快照）%1，"
-                                       "上传 %2。")
-                            .arg(short_id, size_text)
-                      : QStringLiteral("引擎判断无法续链（%1），"
-                                       "本次创建的是完整基线 %2，上传 %3。")
-                            .arg(reason, short_id, size_text));
+                      .arg(short_id, size_text));
       }
       break;
     }

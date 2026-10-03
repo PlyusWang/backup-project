@@ -143,6 +143,10 @@ struct RemoteOpResult {
   std::uint64_t backup_chain_root_bytes = 0;
   std::string backup_baseline_reason;
   std::string backup_archive_name;
+  // 用户这次点的是不是“增量”。结论文案必须区分“用户就是要一份完整备份”和
+  // “用户点了增量、但云端没有可续的链，于是实际给了完整基线”——两者的
+  // 实际产物相同，但对用户说的话**不能**相同。
+  bool backup_incremental_requested = false;
 
   // ---- kRestore：产品级链恢复的结果 ----
   std::uint64_t restore_chain_length = 0;
@@ -226,6 +230,11 @@ class RemoteController : public QObject {
       QString backupSummary READ backupSummary NOTIFY backupSummaryChanged)
   Q_PROPERTY(QString backupSummaryKind READ backupSummaryKind NOTIFY
                  backupSummaryChanged)
+  // core 给出的“为什么这次不是增量”的原始理由（英文，来自共享 core）。
+  // 它只进默认折叠的“技术详情”：用户要的是结论，诊断信息不能丢，但也不该
+  // 摆在结论那一行。
+  Q_PROPERTY(QString backupBaselineReason READ backupBaselineReason NOTIFY
+                 backupSummaryChanged)
 
   // ---- 传输进度 ----
   // 刻意不叫 progressValue / percent：modern_gui_check.sh 里有一条"不许出现
@@ -283,6 +292,7 @@ class RemoteController : public QObject {
   // 与 status_* 的临时提示分开，见文件末尾的成员说明）。
   QString backupSummary() const { return backup_summary_; }
   QString backupSummaryKind() const { return backup_summary_kind_; }
+  QString backupBaselineReason() const { return last_backup_baseline_reason_; }
   bool transferActive() const { return transfer_active_; }
   QString transferPhaseText() const { return transfer_phase_text_; }
   qint64 bytesDone() const { return static_cast<qint64>(bytes_done_.load()); }
@@ -573,6 +583,8 @@ class RemoteController : public QObject {
   // 远端备份的事实"，不会被别的操作顺手清掉，直到用户改了输入或又做了一次。
   QString backup_summary_;
   QString backup_summary_kind_;
+  // 最近一次远端备份请求里用户选的策略（结论文案要用它区分“完整”与“兜底”）。
+  bool last_backup_incremental_requested_ = false;
   bool last_backup_produced_delta_ = false;
   bool last_backup_rebuilt_full_ = false;
   bool last_backup_no_changes_ = false;
