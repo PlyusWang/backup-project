@@ -431,8 +431,10 @@ bool SaveTransportIdentity(const std::string& path,
     }
     return false;
   }
-  const int flags =
-      O_WRONLY | O_CREAT | O_NOFOLLOW | (overwrite ? O_TRUNC : O_EXCL);
+  // O_NONBLOCK 的理由与 LoadTransportIdentity 相同：FIFO 上 open(O_WRONLY)
+  // 会等读者，先阻塞在 open 上就永远走不到 S_ISREG 检查（审查轮缺陷 B）。
+  const int flags = O_WRONLY | O_CREAT | O_NOFOLLOW | O_NONBLOCK |
+                    (overwrite ? O_TRUNC : O_EXCL);
   const int fd = ::open(path.c_str(), flags, 0600);
   if (fd < 0) {
     if (error_message != nullptr) {
@@ -453,6 +455,17 @@ bool SaveTransportIdentity(const std::string& path,
     ::close(fd);
     if (error_message != nullptr) {
       *error_message = path + " 不是普通文件，拒绝把私钥写进去";
+    }
+    return false;
+  }
+  // 确认是普通文件之后，把探测用的 O_NONBLOCK 清掉，再按正常语义写。
+  const int save_probe_flags = ::fcntl(fd, F_GETFL);
+  if (save_probe_flags < 0 ||
+      ::fcntl(fd, F_SETFL, save_probe_flags & ~O_NONBLOCK) != 0) {
+    const std::string reason = StrerrorText();
+    ::close(fd);
+    if (error_message != nullptr) {
+      *error_message = "无法恢复 " + path + " 的阻塞语义：" + reason;
     }
     return false;
   }
@@ -508,7 +521,10 @@ bool LoadTransportIdentity(const std::string& path, TransportIdentity* out,
     }
     return false;
   }
-  const int fd = ::open(path.c_str(), O_RDONLY | O_NOFOLLOW);
+  // O_NONBLOCK 先上：FIFO 上 open(O_RDONLY) 会等写者，S_ISREG 检查根本没机会
+  // 跑（审查轮缺陷 B：state/transport.key 被换成 FIFO 时服务端启动就卡死）。
+  // 普通文件上这个标志不影响读写，校验通过后立刻清掉。
+  const int fd = ::open(path.c_str(), O_RDONLY | O_NOFOLLOW | O_NONBLOCK);
   if (fd < 0) {
     if (error_message != nullptr) {
       *error_message = "无法打开传输身份密钥 " + path + "：" + StrerrorText();
@@ -528,6 +544,16 @@ bool LoadTransportIdentity(const std::string& path, TransportIdentity* out,
     ::close(fd);
     if (error_message != nullptr) {
       *error_message = path + " 不是普通文件（私钥文件不允许是软链接或设备）";
+    }
+    return false;
+  }
+  // 到这里已经确认是普通文件，把探测用的 O_NONBLOCK 清掉。
+  const int probe_flags = ::fcntl(fd, F_GETFL);
+  if (probe_flags < 0 || ::fcntl(fd, F_SETFL, probe_flags & ~O_NONBLOCK) != 0) {
+    const std::string reason = StrerrorText();
+    ::close(fd);
+    if (error_message != nullptr) {
+      *error_message = "无法恢复 " + path + " 的阻塞语义：" + reason;
     }
     return false;
   }
@@ -1086,6 +1112,20 @@ FrameReadStatus SecureChannel::ReceiveRecord(int fd, std::string* plaintext,
       *error_message = "记录声明的密文长度 " +
                        std::to_string(ciphertext_length) + " 超过上限 " +
                        std::to_string(kBssec1MaxPlaintextBytes);
+    }
+    established_ = false;
+    return FrameReadStatus::kCorruptStream;
+  }
+  // 接收方向的序号耗尽（审查轮缺陷 A）：发送侧已经拒绝发出 UINT64_MAX
+  // （见 SendFrame），接收侧也必须拒绝收下它——否则 receive_sequence_ += 1
+  // 会回绕到 0，同一会话里 seq=0 的记录就能被再接受一次（可重放）。
+  // 合规对端永远不会发出这个序号，所以这里对互操作性零影响。
+  if (sequence == 0xFFFFFFFFFFFFFFFFull) {
+    Fail(SecureTransportError::kReplayDetected,
+         "接收方向的记录序号耗尽（收到 UINT64_MAX，计数器不允许回绕）",
+         nullptr);
+    if (error_message != nullptr) {
+      *error_message = "接收方向的记录序号耗尽，拒绝回绕";
     }
     established_ = false;
     return FrameReadStatus::kCorruptStream;
