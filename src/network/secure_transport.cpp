@@ -591,9 +591,19 @@ bool LoadTransportIdentity(const std::string& path, TransportIdentity* out,
     }
     read_bytes += static_cast<std::size_t>(count);
   }
+  // 尾部这一个字节决定"文件是不是正好 32 字节"。EINTR 只重试：把它当成
+  // "没有多余字节"就等于让一次信号打断来放宽 exact-32 不变式（一个比 32
+  // 字节长的文件会被当成合法私钥收下）。
   char extra = 0;
-  const ssize_t tail = ::read(fd, &extra, 1);
-  if (tail < 0 && errno != EINTR) {
+  ssize_t tail = 0;
+  for (;;) {
+    tail = ::read(fd, &extra, 1);
+    if (tail < 0 && errno == EINTR) {
+      continue;
+    }
+    break;
+  }
+  if (tail < 0) {
     const std::string reason = StrerrorText();
     ::close(fd);
     if (error_message != nullptr) {
