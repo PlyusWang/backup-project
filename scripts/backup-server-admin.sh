@@ -23,6 +23,16 @@
 # 现在：路径错了就明确失败（fail closed），绝不创建空库；而且每次运行都会先打印
 # Host / Server root / Data root / Metadata DB / Service，让人一眼看出在看哪个实例。
 #
+# ---- 传输身份指纹（PR #21 UI closure）----
+#
+# 首页（banner 调用的 status）现在还会打印一行：
+#
+#   传输身份指纹: sha256:<64 位十六进制>
+#
+# 它就是客户端"服务器身份指纹（server-key）"要填的那一串，用户不用再去翻日志、
+# 翻部署脚本或者找 keygen。菜单第 5 项"服务器身份信息"会显示完整的 Fingerprint
+# 与 Public key（私钥不显示）。指纹一律由管理工具算，本脚本只负责显示。
+#
 # 用法（先 SSH 登录到 ECS，再在本机执行）：
 #
 #   ssh aliyun-ecs
@@ -239,6 +249,17 @@ snapshot_menu() {
   done
 }
 
+# ---- 服务器身份（只显示，不算指纹）----
+#
+# 指纹由 backup-server-admin / 共享的 LoadTransportIdentity + X25519Fingerprint
+# 算出来——shell 这一层**不重新实现**任何编码，也不读私钥文件的内容。它只把
+# 管理工具打印的那一页原样显示出来，"显示的指纹 == 服务端在用的身份"这条性质
+# 因此只有一份实现。
+identity_page() {
+  clear_screen
+  admin transport-identity
+}
+
 # ---- 主循环 ----
 
 while true; do
@@ -247,6 +268,7 @@ while true; do
   printf '  2. 备份文件管理\n'
   printf '  3. 存储概览\n'
   printf '  4. 刷新服务状态\n'
+  printf '  5. 服务器身份信息（客户端要填的指纹）\n'
   printf '  0. 退出\n\n'
   printf '请选择：'
   read -r choice || break
@@ -259,6 +281,10 @@ while true; do
       pause
       ;;
     4) ;;
+    5)
+      identity_page
+      pause
+      ;;
     0) break ;;
     *) ;;
   esac
