@@ -2,14 +2,14 @@
 
 #include "remote_metadata_store.h"
 
-#include "network_protocol.h"
-
 #include <sqlite3.h>
 #include <sys/stat.h>
 
 #include <cstring>
 #include <ctime>
 #include <utility>
+
+#include "network_protocol.h"
 
 namespace backupproject {
 namespace net {
@@ -18,9 +18,12 @@ namespace {
 // WAL 让读写并发不至于互相阻塞；synchronous=FULL 保证 commit 之后掉电也还在。
 // foundation 版本的写入量很小，用安全性换那点吞吐不值得反过来做。
 constexpr const char* kPragmaStatements[] = {
-    "PRAGMA journal_mode=WAL;",
-    "PRAGMA synchronous=FULL;",
-    "PRAGMA foreign_keys=ON;",
+    // busy_timeout 必须排在**最前面**：并发首次打开时，第二条连接若还没装上
+    // busy_timeout 就先执行 journal_mode=WAL（需要写锁），它会立刻拿到
+    // SQLITE_BUSY，表现为随机的 "database is locked" 假失败（审查轮实测
+    // 2 线程首次并发 Open 可复现，重试即成功）。
+    "PRAGMA busy_timeout=5000;", "PRAGMA journal_mode=WAL;",
+    "PRAGMA synchronous=FULL;",  "PRAGMA foreign_keys=ON;",
     "PRAGMA busy_timeout=5000;",
 };
 
@@ -117,8 +120,8 @@ RemoteSnapshotRecord ReadSnapshotRow(sqlite3_stmt* statement) {
   record.sha256 = ColumnText(statement, 4);
   record.created_at = sqlite3_column_int64(statement, 5);
   record.storage_name = ColumnText(statement, 6);
-  record.snapshot_kind = static_cast<std::uint16_t>(
-      sqlite3_column_int(statement, 7));
+  record.snapshot_kind =
+      static_cast<std::uint16_t>(sqlite3_column_int(statement, 7));
   record.parent_id = ColumnText(statement, 8);
   record.generation =
       static_cast<std::uint64_t>(sqlite3_column_int64(statement, 9));
@@ -228,7 +231,8 @@ bool RemoteMetadataStore::SnapshotColumnsPresent(
     }
     if (code != SQLITE_ROW) {
       if (error_message != nullptr) {
-        *error_message = "cannot read the snapshots table layout: " + LastError();
+        *error_message =
+            "cannot read the snapshots table layout: " + LastError();
       }
       return false;
     }
@@ -340,7 +344,8 @@ bool RemoteMetadataStore::EnsureSchema(std::string* error_message) {
 
 // 一个已经存在的库必须有的表。只验证它们**能读**，绝不 CREATE：
 // 管理工具在任何模式下都不负责建库、建表或升级 schema。
-constexpr const char* kRequiredTables[] = {"users", "snapshots", "deleted_users"};
+constexpr const char* kRequiredTables[] = {"users", "snapshots",
+                                           "deleted_users"};
 
 bool RemoteMetadataStore::VerifyExistingSchema(std::string* error_message) {
   // 版本不匹配就明确失败，而不是"顺手"把库升级成新 schema：那是一次写操作，
@@ -431,13 +436,13 @@ bool RemoteMetadataStore::Open(const std::string& path,
   return true;
 }
 
-bool RemoteMetadataStore::OpenExistingReadOnly(
-    const std::string& path, std::string* error_message) {
+bool RemoteMetadataStore::OpenExistingReadOnly(const std::string& path,
+                                               std::string* error_message) {
   return OpenExistingWithMode(path, /*writable=*/false, error_message);
 }
 
-bool RemoteMetadataStore::OpenExistingReadWrite(
-    const std::string& path, std::string* error_message) {
+bool RemoteMetadataStore::OpenExistingReadWrite(const std::string& path,
+                                                std::string* error_message) {
   return OpenExistingWithMode(path, /*writable=*/true, error_message);
 }
 
@@ -488,8 +493,8 @@ bool RemoteMetadataStore::OpenExistingWithMode(const std::string& path,
       sqlite3_close(database);
     }
     if (error_message != nullptr) {
-      *error_message = "cannot open the metadata database " + path + ": " +
-                       reason;
+      *error_message =
+          "cannot open the metadata database " + path + ": " + reason;
     }
     return false;
   }
@@ -715,11 +720,13 @@ StoreResult RemoteMetadataStore::InsertSnapshot(
   //   * 不会出现"父已删除、子还在"的孤儿（删除侧在同一把锁里查子节点）；
   //   * 同一个父最多只有一个活着的孩子（线性链，不允许分叉）；
   //   * 不会存下代数控过、本地引擎恢复不了的快照。
-  if (record.snapshot_kind == static_cast<std::uint16_t>(SnapshotKind::kIncremental)) {
+  if (record.snapshot_kind ==
+      static_cast<std::uint16_t>(SnapshotKind::kIncremental)) {
     if (record.parent_id.empty() || record.generation == 0) {
       if (error_message != nullptr) {
-        *error_message = "an incremental snapshot needs a parent and a"
-                         " generation above zero";
+        *error_message =
+            "an incremental snapshot needs a parent and a"
+            " generation above zero";
       }
       return StoreResult::kChainConflict;
     }
@@ -766,7 +773,8 @@ StoreResult RemoteMetadataStore::InsertSnapshot(
         Execute("ROLLBACK;", nullptr);
         return StoreResult::kError;
       }
-      parent_kind = static_cast<std::uint16_t>(sqlite3_column_int(parent.get(), 0));
+      parent_kind =
+          static_cast<std::uint16_t>(sqlite3_column_int(parent.get(), 0));
       parent_generation =
           static_cast<std::uint64_t>(sqlite3_column_int64(parent.get(), 1));
       parent_lineage = ColumnText(parent.get(), 2);
@@ -789,7 +797,8 @@ StoreResult RemoteMetadataStore::InsertSnapshot(
     if (parent_generation + 1 != record.generation) {
       Execute("ROLLBACK;", nullptr);
       if (error_message != nullptr) {
-        *error_message = "the generation must be the parent generation plus one";
+        *error_message =
+            "the generation must be the parent generation plus one";
       }
       return StoreResult::kChainConflict;
     }
@@ -817,8 +826,9 @@ StoreResult RemoteMetadataStore::InsertSnapshot(
       if (sqlite3_column_int64(children.get(), 0) > 0) {
         Execute("ROLLBACK;", nullptr);
         if (error_message != nullptr) {
-          *error_message = "the parent already has a child; this build keeps"
-                           " remote lineages linear";
+          *error_message =
+              "the parent already has a child; this build keeps"
+              " remote lineages linear";
         }
         return StoreResult::kChainConflict;
       }
@@ -827,8 +837,9 @@ StoreResult RemoteMetadataStore::InsertSnapshot(
     // 完整快照：必须是链根。
     if (!record.parent_id.empty() || record.generation != 0) {
       if (error_message != nullptr) {
-        *error_message = "a full snapshot must not declare a parent and must"
-                         " have generation zero";
+        *error_message =
+            "a full snapshot must not declare a parent and must"
+            " have generation zero";
       }
       return StoreResult::kChainConflict;
     }
@@ -863,8 +874,7 @@ StoreResult RemoteMetadataStore::InsertSnapshot(
   sqlite3_bind_text(statement.get(), 7, record.storage_name.c_str(),
                     static_cast<int>(record.storage_name.size()),
                     SQLITE_TRANSIENT);
-  sqlite3_bind_int(statement.get(), 8,
-                   static_cast<int>(record.snapshot_kind));
+  sqlite3_bind_int(statement.get(), 8, static_cast<int>(record.snapshot_kind));
   sqlite3_bind_text(statement.get(), 9, record.parent_id.c_str(),
                     static_cast<int>(record.parent_id.size()),
                     SQLITE_TRANSIENT);
@@ -1016,8 +1026,7 @@ StoreResult RemoteMetadataStore::DeleteSnapshot(std::int64_t user_id,
                  children.out(), error_message)) {
       return StoreResult::kError;
     }
-    sqlite3_bind_int64(children.get(), 1,
-                       static_cast<sqlite3_int64>(user_id));
+    sqlite3_bind_int64(children.get(), 1, static_cast<sqlite3_int64>(user_id));
     sqlite3_bind_text(children.get(), 2, snapshot_id.c_str(),
                       static_cast<int>(snapshot_id.size()), SQLITE_TRANSIENT);
     if (sqlite3_step(children.get()) != SQLITE_ROW) {
@@ -1124,8 +1133,8 @@ StoreResult RemoteMetadataStore::CountSnapshots(std::int64_t user_id,
   return StoreResult::kOk;
 }
 
-StoreResult RemoteMetadataStore::ListUsers(
-    std::vector<RemoteUserSummary>* out, std::string* error_message) {
+StoreResult RemoteMetadataStore::ListUsers(std::vector<RemoteUserSummary>* out,
+                                           std::string* error_message) {
   std::lock_guard<std::mutex> guard(mutex_);
   if (database_ == nullptr) {
     if (error_message != nullptr) {
@@ -1136,12 +1145,11 @@ StoreResult RemoteMetadataStore::ListUsers(
   // 列是逐个写出来的：口令相关的列一次都不出现在这条 SQL 里。管理工具
   // 因此不是"记得不要打印 hash"，而是根本拿不到 hash。
   Statement statement;
-  if (!Prepare(
-          "SELECT u.id, u.username, u.created_at, COUNT(s.id),"
-          " COALESCE(SUM(s.size_bytes), 0) FROM users u"
-          " LEFT JOIN snapshots s ON s.user_id = u.id"
-          " GROUP BY u.id, u.username, u.created_at ORDER BY u.id;",
-          statement.out(), error_message)) {
+  if (!Prepare("SELECT u.id, u.username, u.created_at, COUNT(s.id),"
+               " COALESCE(SUM(s.size_bytes), 0) FROM users u"
+               " LEFT JOIN snapshots s ON s.user_id = u.id"
+               " GROUP BY u.id, u.username, u.created_at ORDER BY u.id;",
+               statement.out(), error_message)) {
     return StoreResult::kError;
   }
   std::vector<RemoteUserSummary> parsed;
@@ -1197,8 +1205,9 @@ StoreResult RemoteMetadataStore::StorageOverview(RemoteStorageOverview* out,
   }
   {
     Statement statement;
-    if (!Prepare("SELECT COUNT(*), COALESCE(SUM(size_bytes), 0) FROM snapshots;",
-                 statement.out(), error_message) ||
+    if (!Prepare(
+            "SELECT COUNT(*), COALESCE(SUM(size_bytes), 0) FROM snapshots;",
+            statement.out(), error_message) ||
         sqlite3_step(statement.get()) != SQLITE_ROW) {
       if (error_message != nullptr && error_message->empty()) {
         *error_message = "cannot aggregate the snapshot rows: " + LastError();
@@ -1322,8 +1331,8 @@ StoreResult RemoteMetadataStore::DeleteUser(std::int64_t user_id,
                        static_cast<sqlite3_int64>(std::time(nullptr)));
     if (sqlite3_step(mark.get()) != SQLITE_DONE) {
       if (error_message != nullptr) {
-        *error_message = "cannot write the deleted user tombstone: " +
-                         LastError();
+        *error_message =
+            "cannot write the deleted user tombstone: " + LastError();
       }
       rollback();
       return StoreResult::kError;
