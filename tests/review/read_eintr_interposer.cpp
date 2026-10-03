@@ -12,10 +12,11 @@
 //
 // 覆盖是确定性的：不是"发一个信号试试看"，也不是 sleep 撞运气。
 
-#include <cerrno>
-#include <cstddef>
 #include <sys/syscall.h>
 #include <sys/types.h>
+
+#include <cerrno>
+#include <cstddef>
 
 // syscall() 在这台 glibc 上由 <unistd.h> 声明，而这个文件故意不包含它（见上），
 // 所以自己声明一次。签名与 glibc 的一致。

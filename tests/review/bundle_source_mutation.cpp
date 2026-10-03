@@ -281,9 +281,9 @@ bool Contains(const std::string& text, const char* needle) {
 // ---- 复现程序 ----
 
 enum class Action {
-  kInPlaceAhead,   // 改写 .bak 里**复制游标之后**的一个字节（同 inode、同长度）
+  kInPlaceAhead,  // 改写 .bak 里**复制游标之后**的一个字节（同 inode、同长度）
   kAtomicReplace,  // 原子 rename 覆盖 .manifest / .identity（同长度、不同内容）
-  kAppendTail,     // 在 .bak 复制期间往文件尾部追加字节（文件变长）
+  kAppendTail,  // 在 .bak 复制期间往文件尾部追加字节（文件变长）
 };
 
 enum class Expect { kOld, kNew };
@@ -307,7 +307,8 @@ const std::uint64_t kBakBytes = 32ull * 1024ull * 1024ull;
 const char kArchiveName[] = "remote-cccccccccccc-300-g0.bak";
 
 // 观察线程：等 .part 出现（= 第一遍结束），再按可证前置条件动手。
-void WatchAndMutate(const std::string& directory, const std::string& bundle_path,
+void WatchAndMutate(const std::string& directory,
+                    const std::string& bundle_path,
                     const std::string& target_path, Action action,
                     std::uint64_t bak_size, std::uint64_t trigger_bytes,
                     std::uint64_t replace_offset, CaseResult* result) {
@@ -379,12 +380,13 @@ void WatchAndMutate(const std::string& directory, const std::string& bundle_path
       result->guard_note = "找不到替换文件";
       return;
     }
-    result->acted = ::rename(replacement_path.c_str(), target_path.c_str()) == 0;
+    result->acted =
+        ::rename(replacement_path.c_str(), target_path.c_str()) == 0;
     result->guard_ok = result->acted;
-    result->guard_note =
-        "part_bytes=" + std::to_string(part_bytes) + "（< .bak 的 " +
-        std::to_string(bak_size) + "）时原子替换 " +
-        target_path.substr(target_path.rfind('/') + 1);
+    result->guard_note = "part_bytes=" + std::to_string(part_bytes) +
+                         "（< .bak 的 " + std::to_string(bak_size) +
+                         "）时原子替换 " +
+                         target_path.substr(target_path.rfind('/') + 1);
     return;
   }
 
@@ -434,8 +436,8 @@ CaseResult RunCase(const std::string& root, const std::string& case_name,
     result.guard_note = "写 .bak 失败";
     return result;
   }
-  const std::string manifest_body = "BPMANIFEST3 1\nentry-count=3\npayload=" +
-                                    std::string(64, 'm') + "\n";
+  const std::string manifest_body =
+      "BPMANIFEST3 1\nentry-count=3\npayload=" + std::string(64, 'm') + "\n";
   const std::string identity_body =
       "BPIDENT2\nsnapshot_id=cccccccccccccccccccccccccccccccc\n";
   if (!WriteFile(manifest_path, manifest_body) ||
@@ -471,8 +473,9 @@ CaseResult RunCase(const std::string& root, const std::string& case_name,
     }
   }
 
-  std::thread watcher(WatchAndMutate, directory, result.bundle_path, target_path,
-                      action, kBakBytes, trigger_bytes, replace_offset, &result);
+  std::thread watcher(WatchAndMutate, directory, result.bundle_path,
+                      target_path, action, kBakBytes, trigger_bytes,
+                      replace_offset, &result);
 
   backupproject::net::SnapshotBundleInfo info;
   std::string error;
@@ -522,8 +525,8 @@ void ExpectOldUnreadable(const std::string& case_name,
   Check(result.part_files == 0, case_name + " OLD 发布后没有 .part 残留");
   backupproject::net::SnapshotBundleInfo inspected;
   std::string error;
-  Check(backupproject::net::InspectSnapshotBundle(result.bundle_path, &inspected,
-                                                  &error),
+  Check(backupproject::net::InspectSnapshotBundle(result.bundle_path,
+                                                  &inspected, &error),
         case_name + " OLD 的材料包结构上仍然合法（Inspect 通过）", error);
   const std::string out = result.directory + "/out";
   Check(MakeDirectoryTree(out), case_name + " 建解包目录");
@@ -571,8 +574,9 @@ void ExpectOldGrowthDropped(const std::string& case_name,
   Check(ReadByteAt(extracted_bak, result.source_bak_size - 1, &last) &&
             last == PatternByte(result.source_bak_size - 1),
         case_name + " OLD 复制出来的前缀与原文件一致");
-  Note(case_name + " 观测：源文件在复制期间长了 1 MiB，OLD 仍然返回 true，解出来的 "
-                   ".bak 只有声明的 " +
+  Note(case_name +
+       " 观测：源文件在复制期间长了 1 MiB，OLD 仍然返回 true，解出来的 "
+       ".bak 只有声明的 " +
        std::to_string(result.source_bak_size) + " 字节（新尾巴被静默丢弃）。");
 }
 
@@ -594,11 +598,12 @@ void TestNormal() {
   const std::string bundle = directory + "/snapshot.bundle";
   backupproject::net::SnapshotBundleInfo info;
   std::string error;
-  Check(backupproject::net::BuildSnapshotBundle(directory, archive, bundle, &info,
-                                                &error),
+  Check(backupproject::net::BuildSnapshotBundle(directory, archive, bundle,
+                                                &info, &error),
         "正常路径：打包成功", error);
   Check(info.members.size() == 3, "正常路径：包头给出 3 个成员");
-  Check(PartFiles(directory, bundle).empty(), "正常路径：发布后没有 .part 残留");
+  Check(PartFiles(directory, bundle).empty(),
+        "正常路径：发布后没有 .part 残留");
 
   backupproject::net::SnapshotBundleInfo inspected;
   Check(backupproject::net::InspectSnapshotBundle(bundle, &inspected, &error),
@@ -607,7 +612,8 @@ void TestNormal() {
   const std::string out = directory + "/out";
   Check(MakeDirectoryTree(out), "正常路径：建解包目录");
   backupproject::net::SnapshotBundleInfo extracted;
-  Check(backupproject::net::ExtractSnapshotBundle(bundle, out, &extracted, &error),
+  Check(backupproject::net::ExtractSnapshotBundle(bundle, out, &extracted,
+                                                  &error),
         "正常路径：Extract 通过", error);
   Check(FilesIdentical(directory + "/" + archive, out + "/" + archive),
         "正常路径：解出来的 .bak 与源逐字节一致");
@@ -680,6 +686,7 @@ int main(int argc, char** argv) {
   }
 
   const int passed = g_checks - g_failures;
-  std::printf("bundle-source-mutation: %d/%d checks passed\n", passed, g_checks);
+  std::printf("bundle-source-mutation: %d/%d checks passed\n", passed,
+              g_checks);
   return g_failures == 0 ? 0 : 1;
 }

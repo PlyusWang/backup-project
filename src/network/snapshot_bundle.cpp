@@ -455,7 +455,8 @@ bool BuildSnapshotBundle(const std::string& repository_directory,
     //   SHA-256(实际复制进 bundle 的字节) == 第一遍声明的 SHA-256
     //
     // 这是本函数唯一正确的判据：mtime / inode / size 只能提高发现概率，不能
-    // 保证任何东西（见 tests/review/bundle_source_mutation.cpp 的 OLD/NEW 判别）。
+    // 保证任何东西（见 tests/review/bundle_source_mutation.cpp 的 OLD/NEW
+    // 判别）。
     crypto::Sha256 copied_hasher;
     std::uint64_t remaining = source_size;
     while (remaining > 0) {
@@ -528,9 +529,9 @@ bool BuildSnapshotBundle(const std::string& repository_directory,
       if (crypto::ToHex(copied_digest, sizeof(copied_digest)) !=
           members[index].sha256) {
         if (error_message != nullptr) {
-          *error_message =
-              sources[index].path +
-              " 在打包期间内容发生变化（实际复制进材料包的字节与第一遍摘要不符），已放弃";
+          *error_message = sources[index].path +
+                           " 在打包期间内容发生变化（实际复制进材料包的字节与第"
+                           "一遍摘要不符），已放弃";
         }
         ok = false;
       }
