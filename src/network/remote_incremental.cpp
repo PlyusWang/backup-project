@@ -104,8 +104,17 @@ bool HasBackupSuffix(const std::string& name) {
 //
 // 这个索引是**缓存层，不是信任来源**：它指向的每一份材料在使用前都要过
 // LoadVerifiedSnapshotIdentity（实际字节 + 两个副文件），链的父子关系还要
-// 过引擎自己的校验。索引丢了最多让下一次备份重新下载一遍；索引写错了只会
-// 让校验失败，不会让它信一份错的材料。
+// 过引擎自己的校验。索引丢了最多让下一次备份重新下载一遍。
+//
+// 边界（审查轮更正）：能写这个索引的本地攻击者**可以**让两份互相矛盾的映射
+// 里"后写的那行赢"，从而让某个 id 命中另一份同样合法的材料——根快照没有父子
+// 边可以交叉校验，EnsureChainMaterial 抓不到这一种（增量快照有父与代数，能
+// 抓到）。准确的说法是：索引写错**不会**让它信一份"没通过校验"的材料，但
+// **可以**让它信一份"通过校验、却不是服务端那个 id"的材料。缓存目录带
+// (fingerprint, user) 两层，跨账户命中不成立。
+// 索引长度上限：索引只是提示，超过它就整体当 cache miss。
+constexpr std::size_t kMaxRemoteIndexBytes = 4u * 1024u * 1024u;
+
 std::string RemoteIndexPath(const std::string& cache_directory) {
   return cache_directory + "/.remote-index.tsv";
 }
@@ -162,6 +171,13 @@ void LoadRemoteIndex(const std::string& cache_directory,
       break;
     }
     content.append(buffer, static_cast<std::size_t>(got));
+    // 索引只是提示：超大（或被人灌大）的索引整体当 cache miss 重新下载，
+    // 不为它把内存吃满（审查轮实测 8 MiB 索引能顶到约 40 MB RSS）。
+    if (content.size() > kMaxRemoteIndexBytes) {
+      ::close(fd);
+      index->clear();
+      return;
+    }
   }
   ::close(fd);
   std::size_t start = 0;
