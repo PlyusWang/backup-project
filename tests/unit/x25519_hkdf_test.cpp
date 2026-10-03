@@ -200,6 +200,53 @@ void TestX25519Symmetry() {
         "私钥推导公钥可重复");
 }
 
+// RFC 7748 §5 的低阶点黑名单：这些 u 坐标会让任何**clamp 过的**标量得到全零
+// 共享秘密（X25519 的标量是 8 的倍数，落在小子群里的点会被"吃掉"）。
+// 值的来源：p 与 p±1、0、1，以及 8 阶点的那两个 x 坐标；本轮独立审查用
+// Python big-int oracle（tests/review/x25519_oracle.py）逐个复算确认。
+void TestX25519LowOrderRejection() {
+  std::printf("[x25519] 低阶点黑名单必须全部被拒绝\n");
+  const char* low_order[] = {
+      "0000000000000000000000000000000000000000000000000000000000000000",
+      "0100000000000000000000000000000000000000000000000000000000000000",
+      "ecffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f",
+      "edffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f",
+      "eeffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f",
+      "e0eb7a7c3b41b8ae1656e3faf19fc46ada098deb9c32b1fd866205165f49b800",
+      "5f9c95bca3508c24b1d0b1559c83ef5b04445cc4581c8e86d8224eddd09f1157",
+  };
+  std::string private_key;
+  std::string public_key;
+  std::string error;
+  Check(X25519GenerateKeyPair(&private_key, &public_key, &error),
+        "生成用于黑名单测试的密钥对", error);
+  int rejected = 0;
+  for (const char* hex : low_order) {
+    const std::string u = Hex(hex);
+    std::string raw;
+    std::string ignored_error;
+    if (!X25519(private_key, u, &raw, &ignored_error)) {
+      // 原始接口对低阶点本身是合法运算，不该失败。
+      Check(false, std::string("原始 X25519 不该拒绝低阶点 ") + hex,
+            ignored_error);
+      continue;
+    }
+    Check(raw == std::string(32, '\0'),
+          std::string("低阶点 ") + std::string(hex).substr(0, 8) +
+              "… 的原始输出是全零");
+    std::string rejected_output;
+    std::string reject_error;
+    if (!X25519SharedSecret(private_key, u, &rejected_output, &reject_error) &&
+        rejected_output.empty()) {
+      rejected += 1;
+    } else {
+      Check(false, std::string("X25519SharedSecret 必须拒绝 ") + hex);
+    }
+  }
+  Check(rejected == 7, "7 个低阶点全部被 X25519SharedSecret 拒绝",
+        std::to_string(rejected) + "/7");
+}
+
 void TestX25519Parsing() {
   std::printf("[x25519] 文本解析与指纹\n");
   std::string private_key;
@@ -326,6 +373,7 @@ int main() {
   std::printf("x25519 / hkdf 单元测试\n");
   TestX25519KnownAnswers();
   TestX25519Symmetry();
+  TestX25519LowOrderRejection();
   TestX25519Parsing();
   TestHkdfKnownAnswers();
   TestHkdfProperties();
