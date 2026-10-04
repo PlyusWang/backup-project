@@ -24,6 +24,7 @@ CORE_SOURCES := src/core/archive_entry.cpp src/core/archive_pipeline.cpp \
                 src/crypto/random.cpp src/crypto/sha256.cpp \
                 src/crypto/sha512.cpp \
                 src/crypto/ed25519.cpp \
+                src/crypto/bpcert.cpp \
                 src/crypto/x25519.cpp src/crypto/hkdf.cpp \
                 src/filter/filter.cpp src/filter/filter_rule_builder.cpp
 
@@ -71,6 +72,7 @@ SERVER_CORE_SOURCES := src/network/network_protocol.cpp \
                        src/crypto/sha256.cpp \
                        src/crypto/sha512.cpp \
                        src/crypto/ed25519.cpp \
+                       src/crypto/bpcert.cpp \
                        src/crypto/hmac.cpp \
                        src/crypto/pbkdf2.cpp \
                        src/crypto/random.cpp \
