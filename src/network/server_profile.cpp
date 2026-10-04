@@ -66,9 +66,10 @@ bool Validate(const ServerProfile& profile, std::string* error_message) {
   }
   if (profile.identity == kIdentityCertificate) {
     if (profile.expected_server_id.empty()) {
-      SetError(error_message,
-               "签名身份（certificate）必须给出 expected_server_id："
-               "证书里必须出现这个名字，否则同一把根签发的另一台服务器也能冒充");
+      SetError(
+          error_message,
+          "签名身份（certificate）必须给出 expected_server_id："
+          "证书里必须出现这个名字，否则同一把根签发的另一台服务器也能冒充");
       return false;
     }
     if (!profile.server_key_pin.empty()) {
@@ -77,10 +78,10 @@ bool Validate(const ServerProfile& profile, std::string* error_message) {
                "同时配置会让人看不出到底在按哪条走");
       return false;
     }
-  } else if (profile.identity == kIdentityPin || profile.identity == kIdentitySsh) {
+  } else if (profile.identity == kIdentityPin ||
+             profile.identity == kIdentitySsh) {
     if (profile.server_key_pin.empty()) {
-      SetError(error_message,
-               "指纹身份（pin / ssh）必须给出 server_key_pin");
+      SetError(error_message, "指纹身份（pin / ssh）必须给出 server_key_pin");
       return false;
     }
     if (!profile.expected_server_id.empty() ||
@@ -156,8 +157,8 @@ bool ParseBpserverProfile(const std::string& text, ServerProfile* out,
       profile.host = value;
     } else if (key == "port") {
       if (!ParsePort(value, &profile.port)) {
-        SetError(error_message,
-                 "第 " + std::to_string(line_number) + " 行的 port 不合法：" + value);
+        SetError(error_message, "第 " + std::to_string(line_number) +
+                                    " 行的 port 不合法：" + value);
         return false;
       }
     } else if (key == "identity") {
@@ -172,8 +173,8 @@ bool ParseBpserverProfile(const std::string& text, ServerProfile* out,
       profile.ssh_target = value;
     } else {
       // 未知键一律报错：拼错的键名如果被忽略，用户会以为配置生效了。
-      SetError(error_message, "第 " + std::to_string(line_number) +
-                                  " 行是未知的键：" + key);
+      SetError(error_message,
+               "第 " + std::to_string(line_number) + " 行是未知的键：" + key);
       return false;
     }
   }

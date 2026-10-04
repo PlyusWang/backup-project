@@ -107,7 +107,7 @@ class Sha512 {
 
   std::uint64_t state_[8];
   unsigned char buffer_[kSha512BlockSize];
-  std::size_t buffer_size_;   // buffer_ 中待处理的字节数，恒 < 128
+  std::size_t buffer_size_;  // buffer_ 中待处理的字节数，恒 < 128
   std::uint64_t total_size_;  // 已吸收的字节数（比特长度 = ×8，调用方不必关心）
 };
 

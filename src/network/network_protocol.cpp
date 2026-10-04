@@ -488,8 +488,7 @@ bool ReceiveAll(int fd, void* data, std::size_t size, bool* closed_by_peer,
       waiter.events = POLLIN;
       waiter.revents = 0;
       const std::int64_t left = deadline_ms - now;
-      const int wait_ms =
-          static_cast<int>(left > 3600000 ? 3600000 : left);
+      const int wait_ms = static_cast<int>(left > 3600000 ? 3600000 : left);
       const int poll_result = ::poll(&waiter, 1, wait_ms);
       if (poll_result == 0) {
         if (error_message != nullptr) {

@@ -66,21 +66,21 @@ inline constexpr std::int64_t kBpcert1MaxValiditySeconds =
 // 结构化失败原因。0 是成功；调用方据此给用户不同的文案，而不是一句"失败"。
 enum class Bpcert1Error {
   kOk = 0,
-  kBadArgument,            // 空指针 / 编码侧字段不合法
-  kTruncated,              // 声明要读的字段超出实际长度
-  kOversized,              // 超过 4096 字节上限
-  kBadMagic,               // 不是 "BPCERT1"
-  kUnknownVersion,         // format_version 不认识
-  kUnsupportedAlgorithm,   // 公钥算法 / 签名算法不认识
-  kUnsupportedKeyUsage,    // key_usage 不是 SERVER_AUTH
-  kMalformedLength,        // 长度前缀为 0 或超过 128
-  kTrailingGarbage,        // 签名之后还有字节
-  kBadFieldValue,          // 字段本身不合法（标识符含控制字符、时间窗为负…）
-  kBadIssuerKeySize,       // 传入的签发者公钥不是 32 字节
-  kUntrustedIssuer,        // issuer_id 不在可信根列表里 / 根已吊销或过期
-  kSignatureInvalid,       // Ed25519 验签不通过
-  kNotYetValid,            // 还没生效（很可能是本机时钟不对）
-  kExpired,                // 已过期
+  kBadArgument,           // 空指针 / 编码侧字段不合法
+  kTruncated,             // 声明要读的字段超出实际长度
+  kOversized,             // 超过 4096 字节上限
+  kBadMagic,              // 不是 "BPCERT1"
+  kUnknownVersion,        // format_version 不认识
+  kUnsupportedAlgorithm,  // 公钥算法 / 签名算法不认识
+  kUnsupportedKeyUsage,   // key_usage 不是 SERVER_AUTH
+  kMalformedLength,       // 长度前缀为 0 或超过 128
+  kTrailingGarbage,       // 签名之后还有字节
+  kBadFieldValue,  // 字段本身不合法（标识符含控制字符、时间窗为负…）
+  kBadIssuerKeySize,  // 传入的签发者公钥不是 32 字节
+  kUntrustedIssuer,  // issuer_id 不在可信根列表里 / 根已吊销或过期
+  kSignatureInvalid,  // Ed25519 验签不通过
+  kNotYetValid,       // 还没生效（很可能是本机时钟不对）
+  kExpired,           // 已过期
 };
 
 const char* Bpcert1ErrorName(Bpcert1Error error);
@@ -94,7 +94,7 @@ struct Bpcert1 {
   std::uint64_t serial_number = 0;
   std::int64_t not_before = 0;
   std::int64_t not_after = 0;
-  std::string signature;          // 64 字节 Ed25519
+  std::string signature;  // 64 字节 Ed25519
 };
 
 // 标识符规则：1..128 字节、可打印 ASCII（0x20..0x7E）、不含 NUL。

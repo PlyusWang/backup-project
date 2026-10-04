@@ -31,8 +31,8 @@ namespace backupproject {
 namespace crypto {
 
 struct TrustedRoot {
-  std::string root_id;      // 与证书里的 issuer_id 匹配
-  std::string public_key;   // 32 字节 Ed25519 公钥
+  std::string root_id;          // 与证书里的 issuer_id 匹配
+  std::string public_key;       // 32 字节 Ed25519 公钥
   std::int64_t not_before = 0;  // 0 = 不限制
   std::int64_t not_after = 0;   // 0 = 不限制
   bool revoked = false;

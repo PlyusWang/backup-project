@@ -40,12 +40,12 @@ enum class Ed25519VerifyResult {
   kNonCanonicalPublicKey,  // y >= p，或最高位之外的编码不合法
   kInvalidPublicKey,       // 不在 edwards25519 上
   kSmallOrderPublicKey,    // 阶整除 8（torsion 子群），拒绝
-                           // 注意边界：混合阶（阶 = 8L）公钥**不会**在这里
-                           // 被拒，它会走到验签方程上失败。libsodium 的
-                           // is_valid_point 做的是更强的子群检查，本实现
-                           // 如实地不做那个承诺。
-  kNonCanonicalScalar,     // S >= L
-  kInvalidSignature,       // 验签方程不成立
+                         // 注意边界：混合阶（阶 = 8L）公钥**不会**在这里
+                         // 被拒，它会走到验签方程上失败。libsodium 的
+                         // is_valid_point 做的是更强的子群检查，本实现
+                         // 如实地不做那个承诺。
+  kNonCanonicalScalar,  // S >= L
+  kInvalidSignature,    // 验签方程不成立
 };
 
 const char* Ed25519VerifyResultName(Ed25519VerifyResult result);
@@ -60,9 +60,8 @@ bool Ed25519GenerateKeyPair(std::string* seed, std::string* public_key,
                             std::string* error_message);
 
 // 签名。message 可以为空（size == 0 合法）。成功时 *signature 是 64 字节。
-bool Ed25519Sign(const std::string& seed, const void* message,
-                 std::size_t size, std::string* signature,
-                 std::string* error_message);
+bool Ed25519Sign(const std::string& seed, const void* message, std::size_t size,
+                 std::string* signature, std::string* error_message);
 
 // 带原因的验签。message 可以为空。
 Ed25519VerifyResult Ed25519VerifyDetailed(const std::string& public_key,

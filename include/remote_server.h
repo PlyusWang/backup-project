@@ -38,13 +38,13 @@
 #include <condition_variable>
 #include <cstdint>
 #include <deque>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <string>
 #include <thread>
 #include <vector>
 
-#include <map>
 #include "crypto.h"
 #include "network_protocol.h"
 #include "secure_transport.h"
@@ -308,7 +308,7 @@ class RemoteServer {
   TransportIdentity transport_identity_;
   std::string last_error_;
 
-  // §33：失败节流表。按**用户名字符串**计数，不论该用户是否存在 —— 
+  // §33：失败节流表。按**用户名字符串**计数，不论该用户是否存在 ——
   // 对不存在的名字也限速，否则限速本身就成了「这个用户名存在吗」的探针。
   struct LoginThrottle {
     int consecutive_failures = 0;

@@ -69,7 +69,8 @@ bool TrustedRootStore::AddRoot(const TrustedRoot& root,
   return true;
 }
 
-const TrustedRoot* TrustedRootStore::FindRoot(const std::string& root_id) const {
+const TrustedRoot* TrustedRootStore::FindRoot(
+    const std::string& root_id) const {
   for (const TrustedRoot& root : roots_) {
     if (root.root_id == root_id) {
       return &root;
@@ -194,8 +195,9 @@ bool TrustedRootStore::LoadFromText(const std::string& text,
       } else if (number_count < 2) {
         if (!ParseSecondsStrict(extra, &numbers[number_count])) {
           if (error_message != nullptr) {
-            *error_message = "第 " + std::to_string(line_number) +
-                             " 行的时间戳不是合法整数（不限期必须显式写 unlimited）";
+            *error_message =
+                "第 " + std::to_string(line_number) +
+                " 行的时间戳不是合法整数（不限期必须显式写 unlimited）";
           }
           return false;
         }

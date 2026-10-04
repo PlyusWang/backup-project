@@ -318,8 +318,8 @@ Bpcert1Error Bpcert1Parse(const std::string& raw, Bpcert1* out) {
   off += 1;
 
   if (!Fits(off, kBpcert1PublicKeySize, size)) return Bpcert1Error::kTruncated;
-  const std::string server_public_key(
-      reinterpret_cast<const char*>(p + off), kBpcert1PublicKeySize);
+  const std::string server_public_key(reinterpret_cast<const char*>(p + off),
+                                      kBpcert1PublicKeySize);
   off += kBpcert1PublicKeySize;
 
   if (!Fits(off, 8, size)) return Bpcert1Error::kTruncated;
@@ -379,8 +379,8 @@ Bpcert1Error Bpcert1Parse(const std::string& raw, Bpcert1* out) {
   if (serial_number == 0) {
     return Bpcert1Error::kBadFieldValue;
   }
-  if (not_before_raw == 0 || not_after_raw == 0 ||
-      not_before_raw > kMaxInt64 || not_after_raw > kMaxInt64) {
+  if (not_before_raw == 0 || not_after_raw == 0 || not_before_raw > kMaxInt64 ||
+      not_after_raw > kMaxInt64) {
     return Bpcert1Error::kBadFieldValue;
   }
   const std::int64_t not_before = static_cast<std::int64_t>(not_before_raw);
@@ -443,9 +443,8 @@ bool Bpcert1CheckValidity(const Bpcert1& certificate,
     if (message != nullptr) {
       const bool far_future =
           certificate.not_before - now_unix_seconds > 24 * 60 * 60;
-      *message = far_future
-                     ? "证书生效时间在未来很久，本机系统时钟很可能不正确"
-                     : "证书尚未生效，请检查本机系统时钟";
+      *message = far_future ? "证书生效时间在未来很久，本机系统时钟很可能不正确"
+                            : "证书尚未生效，请检查本机系统时钟";
     }
     return false;
   }
@@ -454,9 +453,8 @@ bool Bpcert1CheckValidity(const Bpcert1& certificate,
     if (message != nullptr) {
       const bool far_past =
           now_unix_seconds - certificate.not_after > 24 * 60 * 60;
-      *message = far_past
-                     ? "证书已过期很久；若确定它刚签发，请检查本机系统时钟"
-                     : "证书已过期，需要重新签发";
+      *message = far_past ? "证书已过期很久；若确定它刚签发，请检查本机系统时钟"
+                          : "证书已过期，需要重新签发";
     }
     return false;
   }
@@ -486,7 +484,8 @@ std::string Bpcert1Describe(const Bpcert1& certificate) {
   text += " not_after=" + std::to_string(certificate.not_after);
   text += " issuer_id=" + certificate.issuer_id;
   if (certificate.server_public_key.size() == kBpcert1PublicKeySize) {
-    text += " key_sha256=" + Sha256Hex(certificate.server_public_key).substr(0, 16);
+    text +=
+        " key_sha256=" + Sha256Hex(certificate.server_public_key).substr(0, 16);
   }
   return text;
 }

@@ -14,8 +14,8 @@
 
 #include "incremental_backup.h"
 #include "remote_backup_client.h"
-#include "server_profile.h"
 #include "remote_incremental.h"
+#include "server_profile.h"
 #include "terminal_secret.h"
 
 namespace backupproject {

@@ -9,9 +9,9 @@
 // 参考：FIPS 180-4 §4.1.3（初始值）、§4.2.3（常量）、§5.1.2（消息填充）、
 //       §6.4（压缩函数）。
 
-#include "crypto.h"
-
 #include <cstring>
+
+#include "crypto.h"
 
 namespace backupproject {
 namespace crypto {
@@ -124,7 +124,8 @@ void Sha512::Update(const void* data, std::size_t size) {
 }
 
 void Sha512::Final(unsigned char out[kSha512DigestSize]) {
-  // FIPS 180-4 §5.1.2：先补 0x80，再补零到 112 (mod 128)，最后 16 字节大端比特长度。
+  // FIPS 180-4 §5.1.2：先补 0x80，再补零到 112 (mod 128)，最后 16
+  // 字节大端比特长度。
   const std::uint64_t total_bits = total_size_ * 8;
   const unsigned char pad = 0x80;
   Update(&pad, 1);
@@ -168,12 +169,10 @@ void Sha512::Transform(const unsigned char block[kSha512BlockSize]) {
   std::uint64_t h = state_[7];
 
   for (int t = 0; t < 80; ++t) {
-    const std::uint64_t big_s1 =
-        Rotr(e, 14) ^ Rotr(e, 18) ^ Rotr(e, 41);
+    const std::uint64_t big_s1 = Rotr(e, 14) ^ Rotr(e, 18) ^ Rotr(e, 41);
     const std::uint64_t ch = (e & f) ^ ((~e) & g);
     const std::uint64_t temp1 = h + big_s1 + ch + kK[t] + w[t];
-    const std::uint64_t big_s0 =
-        Rotr(a, 28) ^ Rotr(a, 34) ^ Rotr(a, 39);
+    const std::uint64_t big_s0 = Rotr(a, 28) ^ Rotr(a, 34) ^ Rotr(a, 39);
     const std::uint64_t maj = (a & b) ^ (a & c) ^ (b & c);
     const std::uint64_t temp2 = big_s0 + maj;
 

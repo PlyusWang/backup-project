@@ -10968,8 +10968,9 @@ int main(int argc, char* argv[]) {
       std::fprintf(stderr, "--screenshot 需要一个输出目录参数\n");
       return 2;
     }
-    const int result = CaptureScreenshots(window, &theme, &controller, &remote_controller,
-                                          arguments.at(screenshot_index + 1));
+    const int result =
+        CaptureScreenshots(window, &theme, &controller, &remote_controller,
+                           arguments.at(screenshot_index + 1));
     if (result != 0) {
       return result;
     }
