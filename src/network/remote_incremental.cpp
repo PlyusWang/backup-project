@@ -831,15 +831,118 @@ std::string SafeArchiveLeafName(const std::string& display_name,
   return leaf;
 }
 
+bool ContainsText(const std::string& haystack, const std::string& needle) {
+  return haystack.find(needle) != std::string::npos;
+}
+
+// 大小写不敏感的字面子串判断（ASCII 足够：被匹配的是本地核心自己的英文诊断串）。
+bool ContainsTextInsensitive(const std::string& haystack,
+                             const std::string& needle) {
+  if (needle.empty() || haystack.size() < needle.size()) {
+    return false;
+  }
+  for (std::size_t start = 0; start + needle.size() <= haystack.size();
+       ++start) {
+    std::size_t index = 0;
+    while (index < needle.size()) {
+      const unsigned char left =
+          static_cast<unsigned char>(haystack[start + index]);
+      const unsigned char right = static_cast<unsigned char>(needle[index]);
+      const unsigned char folded_left =
+          (left >= 'A' && left <= 'Z') ? static_cast<unsigned char>(left + 32)
+                                       : left;
+      const unsigned char folded_right =
+          (right >= 'A' && right <= 'Z') ? static_cast<unsigned char>(right + 32)
+                                         : right;
+      if (folded_left != folded_right) {
+        break;
+      }
+      ++index;
+    }
+    if (index == needle.size()) {
+      return true;
+    }
+  }
+  return false;
+}
+
+// 尽力而为地把内存里的口令抹掉：volatile 写让编译器不能把这个循环优化掉。
+void WipeString(std::string* text) {
+  if (text == nullptr || text->empty()) {
+    return;
+  }
+  volatile char* bytes = text->empty() ? nullptr : &(*text)[0];
+  for (std::size_t index = 0; index < text->size(); ++index) {
+    bytes[index] = 0;
+  }
+  text->clear();
+}
+
+// 本地恢复核心给出的原因 -> 稳定的英文前缀 + 可读原因。分类只看**核心自己的**
+// 诊断串，不猜、不看文件名：
+//
+//   * "Authentication failed"        HMAC 没过：密码错或容器头被改动；
+//   * "Payload checksum mismatch"    payload 字节与归档自己的声明不符（与密码无关，
+//                                    所以这一条可以如实说"已损坏"）；
+//   * 提到 "destination"             目标目录不符合本地恢复的契约。
+std::string DescribeLocalRestoreFailure(const std::string& restore_error) {
+  if (ContainsText(restore_error, "Authentication failed")) {
+    return "raw restore: authentication failed — 恢复密码错误，或备份完整性"
+           "校验失败（容器头被改动与密码错在密码学上无法区分）：" +
+           restore_error;
+  }
+  if (ContainsText(restore_error, "Payload checksum mismatch")) {
+    return "raw restore: corrupted archive — 备份归档已损坏或完整性校验失败"
+           "（payload 的实际 SHA-256 与归档自己的声明不符）：" +
+           restore_error;
+  }
+  // 文件长度与它自己头里声明的长度对不上（截断、被裁掉尾巴）：同样是"已损坏"，
+  // 而且这里同样与密码无关——不带密码的归档走的就是这两条判断。
+  if (ContainsText(restore_error,
+                   "Container payload size does not match the file size") ||
+      ContainsText(restore_error, "Truncated container header")) {
+    return "raw restore: corrupted archive — 备份归档已损坏或完整性校验失败"
+           "（文件长度与归档自己声明的长度不符，通常是被截断）：" +
+           restore_error;
+  }
+  if (ContainsTextInsensitive(restore_error, "destination")) {
+    return "raw restore: destination rejected — 目标目录不符合本地恢复的契约"
+           "（目标目录没有被改动）：" +
+           restore_error;
+  }
+  return "raw restore: 按本地格式恢复失败（目标目录没有被改动）：" +
+         restore_error;
+}
+
 }  // namespace
 
-bool RunRemoteRawRestore(const RemoteRawRestoreRequest& request,
-                         RemoteRawRestoreOutcome* outcome,
-                         std::string* error_message) {
+RemoteRawRestoreSession::~RemoteRawRestoreSession() { Abandon(); }
+
+void RemoteRawRestoreSession::Abandon() {
+  // Remove() 幂等，并且会立刻递归删掉整个工作目录（含下载下来的那份归档）。
+  workspace_.Remove();
+  archive_path_.clear();
+  archive_leaf_.clear();
+  downloaded_bytes_ = 0;
+  verified_sha256_.clear();
+  destination_directory_.clear();
+  WipeString(&restore_options_.password);
+  restore_options_ = RestoreOptions();
+  password_hint_.clear();
+  prepared_ = false;
+  requires_password_ = false;
+  legacy_v01_ = false;
+}
+
+bool RemoteRawRestoreSession::Prepare(const RemoteRawRestoreRequest& request,
+                                      RemoteRawRestoreOutcome* outcome,
+                                      std::string* error_message) {
   if (outcome == nullptr || request.client == nullptr) {
     SetError(error_message, "raw restore: the request is empty");
     return false;
   }
+  // 同一个会话对象被复用时，先把上一次那份字节清掉：一个会话只描述一次交互。
+  Abandon();
   *outcome = RemoteRawRestoreOutcome();
   if (request.destination_directory.empty()) {
     SetError(
@@ -854,101 +957,161 @@ bool RunRemoteRawRestore(const RemoteRawRestoreRequest& request,
 
   // 1) 唯一私有工作目录（mkdtemp，0700）。下载下来的归档住在里面，
   //    **不**落在目标目录里，也不使用任何固定名字（不是 <目标>.part 那种）。
-  //    守卫在任何返回路径上都会删掉整棵目录，所以失败时不会留下未经验证的
-  //    半份文件；成功时也不保留副本——远端那一份还在，用户要留一个本地副本
-  //    可以用界面上的"下载归档"另存。
-  TempDirectoryGuard workspace;
-  if (!workspace.Create(request.cache.cache_directory, "raw-restore-",
-                        error_message)) {
+  //    会话结束（成功 / 取消 / 致命失败 / 析构）时整棵目录都会被删掉，所以
+  //    失败时不会留下未经验证的半份文件；成功时也不保留副本——远端那一份还在，
+  //    用户要留一个本地副本可以用界面上的"下载归档"另存。
+  if (!workspace_.Create(request.cache.cache_directory, "raw-restore-",
+                         error_message)) {
     return false;
   }
 
   // 2) 下载。唯一命名的临时文件 + 长度与 SHA-256 校验 + 原子发布全部在既有
   //    客户端里完成：校验没过就一个字节都不会发布，"先发布再校验"不存在。
+  //    这是本会话**唯一**一次远端下载：错密码重试用的是这份字节。
   const std::string leaf =
       SafeArchiveLeafName(request.display_name, request.snapshot_id);
-  const std::string archive_path = workspace.Child(leaf);
+  archive_path_ = workspace_.Child(leaf);
   RemoteSnapshotInfo downloaded;
-  if (!request.client->DownloadArchiveFile(request.snapshot_id, archive_path,
-                                           /*allow_overwrite=*/false,
-                                           request.progress, &downloaded,
-                                           error_message)) {
+  ++download_count_;
+  if (!request.client->DownloadArchiveFile(
+          request.snapshot_id, archive_path_, /*allow_overwrite=*/false,
+          request.progress, &downloaded, error_message)) {
     SetError(error_message,
              "raw restore: download failed — 下载或校验失败，本地没有留下任何"
              "文件（目标目录没有被创建）：" +
                  (error_message == nullptr ? std::string() : *error_message));
+    Abandon();
     return false;
   }
+  archive_leaf_ = leaf;
+  downloaded_bytes_ = downloaded.size_bytes;
+  verified_sha256_ = downloaded.sha256;
   outcome->archive_name = leaf;
-  outcome->downloaded_bytes = downloaded.size_bytes;
-  outcome->verified_sha256 = downloaded.sha256;
+  outcome->downloaded_bytes = downloaded_bytes_;
+  outcome->verified_sha256 = verified_sha256_;
 
   // 3) 只按**内容**判断格式（magic）：文件名、扩展名一律不参与判断。随机文件
   //    即使显示名是 something.bak 也必须在这里被挡住。
-  const SnapshotFileKind kind = ClassifySnapshotFile(archive_path, nullptr);
+  const SnapshotFileKind kind = ClassifySnapshotFile(archive_path_, nullptr);
   ArchiveFileInfo info;
   std::string identify_error;
   const bool identified =
-      IdentifyArchiveFile(archive_path, &info, &identify_error);
+      IdentifyArchiveFile(archive_path_, &info, &identify_error);
 
   if (kind == SnapshotFileKind::kDelta) {
     // 单独的 delta：它属于某条链。原因由**既有**的链解析器给出，这里不另写
     // 一套"这算不算 delta"的判断。
     SnapshotChain chain;
     std::string chain_error;
-    ResolveSnapshotChain(workspace.path(), leaf, &chain, &chain_error);
+    ResolveSnapshotChain(workspace_.path(), leaf, &chain, &chain_error);
     SetError(error_message,
              "raw restore: delta needs its chain — 这是增量备份的一部分，"
              "不能脱离依赖链单独恢复（它需要同一序列里的父快照与配套材料）。"
              "请改用产品级“恢复”，它会自动取回整条依赖链。" +
                  (chain_error.empty() ? std::string()
                                       : " 引擎原因：" + chain_error));
+    Abandon();
     return false;
   }
   if (!identified) {
-    SetError(error_message,
-             "raw restore: not a supported archive — 该远端对象不是受支持的"
-             "备份归档（按内容识别，与文件名无关）。" +
-                 (identify_error.empty() ? std::string()
-                                         : " 原因：" + identify_error));
+    // 认得出 magic（这个文件**自称**是我们的容器）却读不出头：截断、字节被
+    // 改过，或者版本号比这个版本新。这与"根本不是备份归档"必须分开说——
+    // 把一份损坏的备份说成"随便一个文件"是在误导读原因的人。
+    if (kind != SnapshotFileKind::kUnknown) {
+      if (ContainsText(identify_error, "Unsupported container version")) {
+        SetError(error_message,
+                 "raw restore: unsupported version — 当前版本不支持该备份"
+                 "格式（" +
+                     identify_error + "）。");
+      } else {
+        SetError(error_message,
+                 "raw restore: corrupted archive — 备份归档已损坏或完整性"
+                 "校验失败（认得出归档格式，但头和它自己的声明对不上）：" +
+                     identify_error);
+      }
+    } else {
+      SetError(error_message,
+               "raw restore: not a supported archive — 该远端对象不是受支持的"
+               "备份归档（按内容识别，与文件名无关）。" +
+                   (identify_error.empty() ? std::string()
+                                           : " 原因：" + identify_error));
+    }
+    Abandon();
     return false;
   }
-  if (!info.password_hint.empty() && request.restore_options.password.empty()) {
-    // 加密归档没有密码时**明确失败**：不尝试绕过，也不假装成功。
+
+  // 4) 记住这次交互需要的全部状态。**口令不进会话**：它只在 Run() 调用期间存在，
+  //    用完立刻抹掉。目标目录与显示名不是秘密，留下来给"再输一次密码"用。
+  destination_directory_ = request.destination_directory;
+  restore_options_ = request.restore_options;
+  WipeString(&restore_options_.password);
+  password_hint_ = info.password_hint;
+  requires_password_ = !info.password_hint.empty();
+  legacy_v01_ = (info.kind == ArchiveFileInfo::Kind::kLegacyV01);
+  outcome->archive_format = legacy_v01_ ? "legacy-v0.1" : "v2-container";
+  prepared_ = true;
+  return true;
+}
+
+bool RemoteRawRestoreSession::Run(const std::string& password,
+                                  RemoteRawRestoreOutcome* outcome,
+                                  std::string* error_message) {
+  if (outcome == nullptr || !prepared_) {
+    SetError(error_message, "raw restore: the session is not prepared");
+    return false;
+  }
+  *outcome = RemoteRawRestoreOutcome();
+  outcome->archive_name = archive_leaf_;
+  outcome->downloaded_bytes = downloaded_bytes_;
+  outcome->verified_sha256 = verified_sha256_;
+  outcome->archive_format = legacy_v01_ ? "legacy-v0.1" : "v2-container";
+
+  if (requires_password_ && password.empty()) {
+    // 加密归档没有密码时**明确失败**：不尝试绕过，也不假装成功。会话保持有效，
+    // 调用方拿到密码之后可以直接再 Run 一次——不会重新下载。
     outcome->password_required = true;
     SetError(error_message, "raw restore: needs a password — 该归档已加密（" +
-                                info.password_hint +
+                                password_hint_ +
                                 "），请填写恢复密码后重试。");
     return false;
   }
 
-  // 4) 真正恢复的那一步是既有的本地核心：v2 容器走 RunRestorePipeline（它自带
+  // 5) 真正恢复的那一步是既有的本地核心：v2 容器走 RunRestorePipeline（它自带
   //    唯一暂存目录 + 全部成功之后才原子发布），legacy v0.1 走它自己的 reader。
   //    与 backupctl restore / GUI 的本地恢复是同一条分发。standalone 归档没有
   //    .manifest / .identity 副文件，所以这里**不能**走链入口（链入口要求身份
   //    副文件，那正是产品级链路才有的东西）。
+  RestoreOptions options = restore_options_;
+  options.password = password;
   BackupEngine engine;
   RestoreReport report;
   std::string restore_error;
   bool restored = false;
-  if (info.kind == ArchiveFileInfo::Kind::kContainerV2) {
-    restored = engine.Restore(archive_path, request.destination_directory,
-                              request.restore_options, &report, &restore_error);
-    outcome->archive_format = "v2-container";
+  if (legacy_v01_) {
+    restored =
+        engine.Restore(archive_path_, destination_directory_, &restore_error);
   } else {
-    restored = engine.Restore(archive_path, request.destination_directory,
-                              &restore_error);
-    outcome->archive_format = "legacy-v0.1";
+    restored = engine.Restore(archive_path_, destination_directory_, options,
+                              &report, &restore_error);
   }
+  // 口令用完立刻抹掉：它不落盘、不进日志、不进任何请求对象。
+  WipeString(&options.password);
   if (!restored) {
-    SetError(error_message,
-             "raw restore: 按本地格式恢复失败（目标目录没有被"
-             "改动）：" +
-                 restore_error);
+    SetError(error_message, DescribeLocalRestoreFailure(restore_error));
     return false;
   }
   outcome->restored_entries = report.restored_entries;
   return true;
+}
+
+bool RunRemoteRawRestore(const RemoteRawRestoreRequest& request,
+                         RemoteRawRestoreOutcome* outcome,
+                         std::string* error_message) {
+  RemoteRawRestoreSession session;
+  if (!session.Prepare(request, outcome, error_message)) {
+    return false;
+  }
+  return session.Run(request.restore_options.password, outcome, error_message);
 }
 
 }  // namespace net

@@ -14,7 +14,7 @@
 //                    + 恢复（产品级链恢复）/ 下载归档 / 删除。
 //                    列表里同时可能出现**三类**对象，它们一眼可分：
 //                      [原始归档]  手动上传的归档：没有链、没有代数、没有父；
-//                                  主操作是"尝试恢复"（下载后按本地格式独立
+//                                  主操作是"恢复"（下载后按本地格式独立
 //                                  恢复），不是链恢复。
 //                      [完整备份]  产品链根：代数 0，主操作是"恢复"。
 //                      [增量备份]  产品链成员：代数 N + 父快照前 12 位。
@@ -85,9 +85,11 @@ Item {
     property string pendingRestoreId: ""
     property string pendingRestoreName: ""
     property string draftRestorePath: ""
-    // ---- 原始归档的"尝试恢复"（与产品级链恢复是两套机制）----
+    // ---- 原始归档的"恢复"（与产品级链恢复是两套实现，但对用户是同一个动作）----
     // 原始归档没有链：先把那一个 blob 下载下来，再按本地备份格式独立恢复。
-    // 目标目录与（可选的）恢复密码都只活在这个对话框里；密码不落盘、不回读。
+    // 第一段只问目标目录；**只有** core 明确说"这份备份加密了"之后才出现密码
+    // 输入框（第二段）。目标目录与密码都只活在这个对话框里；密码不落盘、不回读、
+    // 不进日志，界面上永远是掩码。
     property string pendingRawRestoreId: ""
     property string pendingRawRestoreName: ""
     property string draftRawRestorePath: ""
@@ -153,30 +155,50 @@ Item {
         restoreDialog.open()
     }
 
-    // 原始归档：打开"尝试恢复"对话框。密码留空表示"没填"——只有那份归档
-    // 确实是加密的，core 才会要求它，这里不做任何猜测。
+    // 原始归档：打开"恢复"对话框（第一段：只问目标目录）。密码留空表示"没填"
+    // ——只有 core 真的说这份归档需要密码，界面才会要它，这里不做任何猜测。
     function requestRawRestore(snapshotId, name) {
         page.pendingRawRestoreId = snapshotId
         page.pendingRawRestoreName = name
         // 口令永远不预填（它只活在这一页的内存里）；目标目录保留上一次的选择，
         // 与产品级恢复对话框同一条行为：用户改了目录也会被记住。
         page.draftRawRestorePassword = ""
+        rawRestorePasswordField.text = ""
         rawRestoreFolderDialog.currentFolder =
             remote.fileDialogStartUrl(page.draftRawRestorePath)
         rawRestoreDialog.open()
     }
 
+    // 对话框的确认按钮：第一段是"开始恢复"，第二段是"继续恢复（用这次输入的
+    // 密码）"。两段是同一次交互——第二段不会重新下载那份归档。
     function confirmRawRestore() {
+        if (remote.rawRestoreAwaitingPassword) {
+            const password = page.draftRawRestorePassword
+            if (password === "")
+                return
+            // 输入框立刻清空：口令不在界面上多留一刻。提交的是上面这一份拷贝。
+            page.draftRawRestorePassword = ""
+            rawRestorePasswordField.text = ""
+            remote.restoreRawArchiveWithPassword(password)
+            return
+        }
         const target = page.pendingRawRestoreId
         const destination = page.draftRawRestorePath
-        const password = page.draftRawRestorePassword
         if (target === "" || destination === "")
             return
-        rawRestoreDialog.close()
+        remote.restoreRawArchive(target, destination, "")
+    }
+
+    // 关闭对话框并让控制器放下这次交互（临时归档立刻删掉）。取消 / 成功 /
+    // 致命失败三条路都走它。
+    function closeRawRestoreDialog(abandonInteraction) {
+        page.draftRawRestorePassword = ""
+        rawRestorePasswordField.text = ""
         page.pendingRawRestoreId = ""
         page.pendingRawRestoreName = ""
-        page.draftRawRestorePassword = ""
-        remote.restoreRawArchive(target, destination, password)
+        if (abandonInteraction)
+            remote.cancelRawRestore()
+        rawRestoreDialog.close()
     }
 
     // 策略当前值（SegmentedTabs 用的键）。
@@ -862,7 +884,7 @@ Item {
                         objectName: "remoteRestoreMechanismHint"
                         Layout.fillWidth: true
                         visible: page.rowCount > 0
-                        text: "「恢复」会自动取回完整依赖链并恢复此快照；「尝试恢复」只用于原始归档——先下载，再按本地备份格式独立恢复。"
+                        text: "三种备份都点「恢复」：完整备份 / 增量备份会自动取回整条依赖链；原始归档会先下载、校验，再按本地备份格式独立恢复。"
                         font.pixelSize: 15
                         color: theme.textSecondary
                         wrapMode: Text.WrapAnywhere
@@ -997,7 +1019,7 @@ Item {
                     Text {
                         objectName: "remoteUploadExplanation"
                         Layout.fillWidth: true
-                        text: "这是低层操作：把一个已经存在的 .bak 原样放到云端，与上面的“远端备份”不是一回事——它不参与增量链，也不会出现在链恢复里。上传之后，列表里那一条是【原始归档】：要取回来就用它的“尝试恢复”（下载后按本地格式独立恢复）或“下载归档”。"
+                        text: "这是低层操作：把一个已经存在的 .bak 原样放到云端，与上面的“远端备份”不是一回事——它不参与增量链，也不会出现在链恢复里。上传之后，列表里那一条是【原始归档】：要取回来就用它的“恢复”（下载后按本地格式独立恢复）或“下载归档”。"
                         font.pixelSize: 15
                         color: theme.textSecondary
                         wrapMode: Text.WrapAnywhere
@@ -1176,12 +1198,12 @@ Item {
         }
     }
 
-    // 原始归档"尝试恢复"的目标目录。选完只填进对话框，**不**立刻发起：
-    // 用户可能还要填恢复密码，一次点"尝试恢复"就够了。
+    // 原始归档恢复的目标目录。选完只填进对话框，**不**立刻发起：用户还要
+    // 点一次"恢复"才是明确意图。
     FolderDialog {
         id: rawRestoreFolderDialog
         objectName: "remoteRawRestoreFolderDialog"
-        title: "选择恢复原始归档到哪个目录"
+        title: "选择恢复到哪个目录"
         onAccepted: {
             const chosen = remote.localPathFromUrl(rawRestoreFolderDialog.selectedFolder)
             if (chosen !== "")
@@ -1189,7 +1211,14 @@ Item {
         }
     }
 
-    // 原始归档的"尝试恢复"。
+    // 恢复一份原始归档。对话框分两段，分界线是**控制器回来的事实**，不是猜测：
+    //
+    //   第一段（!rawRestoreDialog.passwordStage）：只问恢复到哪。用户点"恢复"
+    //     就是明确意图，程序立刻下载 -> 校验 SHA-256 -> 按内容识别 -> 交给既有
+    //     的本地恢复核心。没有加密的归档到这里就结束了，全程看不到密码框。
+    //   第二段（rawRestoreDialog.passwordStage）：core 明确回来说"这份备份是
+    //     加密的、需要密码"之后才出现。输入框是掩码，密码不进日志、不落盘；
+    //     重输密码用的是**同一份**已经下载并校验过的字节。
     //
     // 这一页只说三件事：恢复到哪、要不要密码、会走哪条路。它**不**解析归档、
     // 不解密、不解压：那些全部在共享的本地恢复核心（core）里，与 CLI 的
@@ -1202,6 +1231,17 @@ Item {
         padding: 18
         closePolicy: Popup.CloseOnEscape
 
+        readonly property bool passwordStage: remote.rawRestoreAwaitingPassword
+
+        // 关闭（Esc / 点对话框外面）也是一次"取消"：不能把"正等着输密码"的
+        // 交互和它的临时归档留在后台。cancelRawRestore 是幂等的——会话已经
+        // 结束（成功 / 致命失败）时它什么都不做；忙碌时它也不会去碰后台线程
+        // 正在用的那个会话。
+        onClosed: {
+            if (remote.rawRestoreAwaitingPassword && !remote.busy)
+                remote.cancelRawRestore()
+        }
+
         background: Rectangle {
             color: theme.surfaceElevated
             border.width: 1
@@ -1213,17 +1253,22 @@ Item {
             spacing: 10
 
             Text {
-                text: "尝试恢复原始归档"
+                objectName: "remoteRawRestoreTitle"
+                text: rawRestoreDialog.passwordStage
+                      ? "输入恢复密码"
+                      : "恢复原始归档"
                 color: theme.textPrimary
                 font.pixelSize: 16
                 font.weight: Font.DemiBold
             }
 
+            // ---------- 第一段：目标目录 ----------
             Text {
                 objectName: "remoteRawRestoreDialogText"
+                visible: !rawRestoreDialog.passwordStage
                 Layout.preferredWidth: 430
                 text: "目标：" + page.pendingRawRestoreName + "\n\n"
-                      + "会先下载这份归档并校验 SHA-256，再按本地备份格式尝试独立恢复。"
+                      + "会先下载这份归档并校验 SHA-256，再按本地备份格式恢复。"
                       + "原始归档不属于远端增量链：它没有父快照，也不会自动取回别的对象。"
                 color: theme.textSecondary
                 font.pixelSize: 15
@@ -1233,6 +1278,7 @@ Item {
             RowLayout {
                 Layout.fillWidth: true
                 spacing: 8
+                visible: !rawRestoreDialog.passwordStage
 
                 AppTextField {
                     id: rawRestoreTargetField
@@ -1253,15 +1299,58 @@ Item {
                 }
             }
 
+            Text {
+                objectName: "remoteRawRestoreBusyText"
+                visible: !rawRestoreDialog.passwordStage && remote.busy
+                text: "正在下载并校验这份归档…"
+                color: theme.textSecondary
+                font.pixelSize: 15
+                wrapMode: Text.WordWrap
+            }
+
+            // ---------- 第二段：密码 ----------
+            Text {
+                objectName: "remoteRawRestorePasswordPrompt"
+                visible: rawRestoreDialog.passwordStage
+                Layout.preferredWidth: 430
+                text: "此备份已加密，请输入恢复密码。\n\n"
+                      + "归档已经下载并通过 SHA-256 校验，输错密码可以直接重输，"
+                      + "不会重新下载。"
+                color: theme.textSecondary
+                font.pixelSize: 15
+                wrapMode: Text.WordWrap
+            }
+
+            Text {
+                objectName: "remoteRawRestoreDestinationEcho"
+                visible: rawRestoreDialog.passwordStage
+                Layout.fillWidth: true
+                text: "恢复到：" + remote.rawRestoreDestinationText
+                color: theme.textSecondary
+                font.pixelSize: 15
+                wrapMode: Text.WrapAnywhere
+            }
+
             AppTextField {
                 id: rawRestorePasswordField
                 objectName: "remoteRawRestorePasswordField"
+                visible: rawRestoreDialog.passwordStage
                 Layout.fillWidth: true
                 enabled: !remote.busy
                 echoMode: TextInput.Password
-                placeholderText: "恢复密码（只有加密归档才需要，可留空）"
+                placeholderText: "恢复密码"
                 text: page.draftRawRestorePassword
                 onTextEdited: page.draftRawRestorePassword = text
+            }
+
+            Text {
+                objectName: "remoteRawRestorePasswordError"
+                visible: rawRestoreDialog.passwordStage && text !== ""
+                Layout.preferredWidth: 430
+                text: remote.rawRestorePasswordError
+                color: theme.error
+                font.pixelSize: 15
+                wrapMode: Text.WordWrap
             }
 
             RowLayout {
@@ -1273,22 +1362,39 @@ Item {
                 AppButton {
                     objectName: "remoteRawRestoreCancelButton"
                     text: "取消"
-                    onClicked: {
-                        page.pendingRawRestoreId = ""
-                        page.pendingRawRestoreName = ""
-                        page.draftRawRestorePassword = ""
-                        rawRestoreDialog.close()
-                    }
+                    enabled: !remote.busy
+                    onClicked: page.closeRawRestoreDialog(true)
                 }
 
                 AppButton {
                     objectName: "remoteRawRestoreConfirmButton"
-                    text: "尝试恢复"
+                    text: rawRestoreDialog.passwordStage ? "继续恢复" : "恢复"
                     variant: "primary"
-                    enabled: !remote.busy && page.draftRawRestorePath !== ""
+                    enabled: !remote.busy
+                             && (rawRestoreDialog.passwordStage
+                                 ? page.draftRawRestorePassword !== ""
+                                 : page.draftRawRestorePath !== "")
                     onClicked: page.confirmRawRestore()
                 }
             }
+        }
+    }
+
+    // 一次原始归档恢复结束时收尾：还需要密码就留在对话框里切到第二段，
+    // 其余情况（成功 / 致命失败）关掉对话框——成功与失败都写在页面横幅上。
+    Connections {
+        target: remote
+
+        function onOperationFinished(kind, succeeded) {
+            if (kind !== "restore-raw")
+                return
+            if (remote.rawRestoreAwaitingPassword) {
+                // 用户上一次输的密码（如果有）立刻清掉：换一段重新输入。
+                page.draftRawRestorePassword = ""
+                rawRestorePasswordField.text = ""
+                return
+            }
+            page.closeRawRestoreDialog(false)
         }
     }
 
