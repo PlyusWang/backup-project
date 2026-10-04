@@ -568,8 +568,9 @@ expect_count "$REMOTE_PAGE_QML" "StatusBanner {" 1 \
   "远程备份页用共享 StatusBanner"
 # 地址 / 端口 / 用户名 / 服务器身份指纹 / 登录密码 / 注册密码 / 注册确认 /
 # 远端备份源目录 / 上传路径 / 上传名称 / 下载目标 / 注销密码 / 注销账户名 /
-# 原始归档「尝试恢复」的目标目录 / 恢复密码 = 15。
-expect_count "$REMOTE_PAGE_QML" "AppTextField {" 15 \
+# 原始归档「尝试恢复」的目标目录 / 恢复密码 = 15，
+# 加上 PR #22 的 SSH 主机 / 本地端口 = 17。
+expect_count "$REMOTE_PAGE_QML" "AppTextField {" 17 \
   "远程备份页的输入框都用共享 AppTextField"
 # PR #21：客户端连接之前**必须**有服务端传输身份的 pin。它不是口令（公钥与
 # 指纹都可以公开），但它是必填的连接配置：页面上有自己的输入框与明确的提交
@@ -579,12 +580,47 @@ expect_count "$REMOTE_PAGE_QML" 'objectName: "remoteServerKeyPinField"' 1 \
   "连接设置区有服务器身份指纹输入框"
 expect_count "$REMOTE_PAGE_QML" 'objectName: "remoteServerKeyPinApplyButton"' 1 \
   "指纹有明确的提交动作（「应用」按钮）"
+# PR #22：连接方式 / SSH 安全通道 / pin 应用反馈。这三块是这一轮的产品
+# 增量，QML 少了任何一个控件，界面上的"部署链路"就缺一角。
+expect_count "$REMOTE_PAGE_QML" 'objectName: "remoteConnectionModeTabs"' 1 \
+  "远程页有连接方式选择（SSH 安全通道 / 直接连接）"
+expect_count "$REMOTE_PAGE_QML" 'objectName: "remoteSshHostField"' 1 \
+  "远程页有 SSH 主机输入框"
+expect_count "$REMOTE_PAGE_QML" 'objectName: "remoteSshLocalPortField"' 1 \
+  "远程页有本地端口输入框（留空 = 自动分配）"
+expect_count "$REMOTE_PAGE_QML" 'objectName: "remoteTunnelStateText"' 1 \
+  "远程页有安全通道状态行"
+expect_count "$REMOTE_PAGE_QML" 'objectName: "remoteTunnelFailureText"' 1 \
+  "远程页有通道失败原因行（不是笼统的网络错误）"
+expect_count "$REMOTE_PAGE_QML" 'objectName: "remoteEnsureConnectionButton"' 1 \
+  "远程页有“建立连接”按钮"
+expect_count "$REMOTE_PAGE_QML" 'objectName: "remoteStopTunnelButton"' 1 \
+  "远程页有“关闭安全通道”按钮"
+expect_count "$REMOTE_PAGE_QML" 'objectName: "remoteServerKeyPinApplied"' 1 \
+  "远程页有 pin“已应用”的可见反馈行"
+expect_count "$REMOTE_PAGE_QML" 'objectName: "remoteServerKeyPinDirty"' 1 \
+  "远程页有“尚未应用”提示（输入框与生效值不一致时必须说出来）"
+# "应用"必须调用**会留下反馈**的那一个入口：旧实现只调 setServerKeyPin 并把
+# 返回值丢掉，于是点完"应用"界面上什么都不发生（人工验收发现的 UX bug）。
+expect_count "$REMOTE_PAGE_QML" 'remote.applyServerKeyPin' 2 \
+  "“应用”按钮与回车都走 applyServerKeyPin（有可见反馈）"
+expect_count "$REMOTE_PAGE_QML" 'remote.loginWithPin' 2 \
+  "登录（按钮 + 回车）走 loginWithPin：自动采用当前输入框里的指纹"
+expect_count "$REMOTE_PAGE_QML" 'remote.registerAccountWithPin' 1 \
+  "注册走 registerAccountWithPin：同样自动采用当前输入框里的指纹"
+expect_count "$REMOTE_PAGE_QML" 'remote.setServerKeyPin' 0 \
+  "页面上不再直接调用 setServerKeyPin（那条路径没有反馈）"
 expect_count "$REMOTE_PAGE_QML" 'objectName: "remoteServerKeyPinError"' 1 \
   "指纹输入框有自己的错误行"
-expect_count "$REMOTE_PAGE_QML" "remote.setServerKeyPin(" 2 \
-  "回车与「应用」两条路径都调用 remote.setServerKeyPin()"
-expect_count "$REMOTE_PAGE_QML" "remote.serverKeyPinError" 2 \
-  "指纹错误行绑到控制器的 serverKeyPinError（可见性 + 文本）"
+# PR #22 之前这里断言的是"回车与「应用」两条路径都调用 setServerKeyPin()"。
+# 那两条路径现在都走 applyServerKeyPin（见上面的两处断言），因为它们必须是
+# **有可见反馈**的那一个入口 —— 旧断言在这里已经失去意义，删掉而不是留一条
+# 永远为 0 的期望。
+# 可见性 + 文本 = 2；PR #22 起多一处：输入框与生效值不一致时那一行"尚未应用"
+# 的提示也必须让位给红色错误（两句话不能同时出现），所以它同样读
+# remote.serverKeyPinError = 3。
+expect_count "$REMOTE_PAGE_QML" "remote.serverKeyPinError" 3 \
+  "指纹错误行绑到控制器的 serverKeyPinError（可见性 + 文本 + 与"尚未应用"互斥）"
 expect_count "$REMOTE_CONTROLLER_H" "QString serverKeyPin() const" 1 \
   "控制器提供 serverKeyPin（界面回读 + 自检比对用同一个值）"
 expect_count "$REMOTE_CONTROLLER_CPP" "backupproject::net::ParseServerKeyPin" 1 \
@@ -641,8 +677,11 @@ expect_count "$REMOTE_CONTROLLER_CPP" "password_.fill(QChar(0))" 3 \
 # "我在登录还是在注册"，注册也只有一个密码框。这一节把新的信息架构钉成契约。
 # 账户区域是一个**分段控件**：一个圆角容器 + 两个等宽分段。人工验收的结论是
 # 两个各自独立的按钮看起来像"可以同时按"，不像"二选一"。
-expect_count "$REMOTE_PAGE_QML" "SegmentedTabs {" 2 \
-  "账户区域与远端备份策略都用共享的分段控件（不是各自独立的按钮）"
+# 账户区域（登录 / 注册）+ 远端备份策略 + PR #22 的连接方式
+# （SSH 安全通道 / 直接连接）= 3。三个都是"二选一"，所以继续用同一个共享控件，
+# 不新增第三种选择器。
+expect_count "$REMOTE_PAGE_QML" "SegmentedTabs {" 3 \
+  "账户区域 / 远端备份策略 / 连接方式都用共享的分段控件"
 expect_count "$REMOTE_PAGE_QML" 'objectName: "remoteAccountTabs"' 1 \
   "分段控件有 objectName（自动化要能点到它）"
 expect_count "$RESOURCE_FILE" "qml/components/SegmentedTabs.qml" 1 \
@@ -702,8 +741,11 @@ expect_count "$REMOTE_PAGE_QML" "两次输入的密码不一致" 1 \
 # 原始归档恢复的密码错误行）都用共享的 error 色：页面里没有第二套红色，也没有
 # 硬编码的 #ff0000。最后那一处是本轮新增的：错密码必须**就地**告诉用户，
 # 而不是弹一个通用失败框。
-expect_count "$REMOTE_PAGE_QML" "color: theme.error" 6 \
-  "六处错误行都用共享的 error 色"
+# 六处错误行（注册不一致 / 注册被拒 / 登录被拒 / 注销失败 / 服务器身份指纹 /
+# 原始归档恢复的密码错误行）+ PR #22 的"安全通道建立失败"原因行 = 7。
+# 页面里仍然没有第二套红色，也没有硬编码的 #ff0000。
+expect_count "$REMOTE_PAGE_QML" "color: theme.error" 7 \
+  "七处错误行都用共享的 error 色"
 expect_present "$REMOTE_PAGE_QML" "visible: page.registerPasswordMismatch" 1 \
   "错误行由「两次密码是否一致」这个计算属性驱动（改一个字符就更新）"
 expect_present "$REMOTE_PAGE_QML" "page.draftRegisterPassword !== page.draftConfirmPassword" 1 \
@@ -2828,8 +2870,13 @@ expect_missing "$SCHEDULE_PAGE_QML" '"保存计划"' \
 # 删除"，协议名、算法名、数据库名与传输层实现细节都不该出现在界面文案里。
 # 只看代码行：注释里写"这里没有 BPNET1 / token"正是这条约束的说明，
 # 不能把它自己判成违规（与上面 socket 那条用的是同一份去注释文本）。
+#
+# PR #22 起 "SSH" 从这张禁用表里**移出**：当前部署的服务端只监听它自己的回环
+# 地址，用户必须知道并填写一个 SSH 主机（~/.ssh/config 的别名）才能连上，
+# 所以它是这一页的产品词汇，而不是实现细节。真正属于实现细节的那些（协议名、
+# 算法名、数据库名、opcode、帧结构、token）一个都没有放回来。
 for jargon in "BPNET1" "PBKDF2" "HMAC" "SQLite" "opcode" "request_id" \
-              "FrameHeader" "kProtocolMagic" "SSH" "token"; do
+              "FrameHeader" "kProtocolMagic" "token"; do
   if grep -qF -- "$jargon" "$REMOTE_CODE_TMP"; then
     record_fail "远程备份页出现了开发者术语：$jargon"
   else

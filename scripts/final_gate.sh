@@ -1,6 +1,10 @@
 #!/usr/bin/env bash
 #
-# final_gate.sh —— PR #21 的 canonical final gate（含 PR #20 的全部套件）。
+# final_gate.sh —— PR #22 的 canonical final gate（含 PR #21 / #20 的全部套件）。
+#
+# PR #22 新增三个套件：ssh-tunnel（+ 消毒剂版）与 remote-connection-ux；
+# 另外 --remote-test 里的 C01..C07 也由 modern_gui 与 remote-connection-ux
+# 两条脚本各自断言了一遍（缺一条 ok 行就算失败，不允许"没跑到"被当成通过）。
 #
 #   bash scripts/final_gate.sh
 #
@@ -42,6 +46,13 @@ run() {
 }
 
 run lint bash scripts/lint.sh
+# PR #22：SshTunnelManager 的独立单元测试（进程生命周期 / 参数向量 / 就绪判定 /
+# 超时 / 回收）。它只链接 Qt6Core + Qt6Network，不构建整个 GUI，所以放在最前面：
+# 这一层出问题的话，后面所有网络套件都会以"看不懂的方式"红掉。
+run ssh-tunnel bash scripts/ssh_tunnel_manager_test.sh
+# 同一个套件在 ASan + UBSan 下再跑一遍：QProcess 生命周期与"在信号里析构"这类
+# 问题只有在消毒剂下才稳定复现。
+run ssh-tunnel-sanitize env SSH_TUNNEL_TEST_EXTRA_FLAGS="-g -O1 -fsanitize=address,undefined -fno-omit-frame-pointer" SSH_TUNNEL_TEST_SANITIZE=1 bash scripts/ssh_tunnel_manager_test.sh
 run secure-transport bash scripts/secure_transport_test.sh
 run remote-incremental bash scripts/remote_incremental_test.sh
 run secure-transport-sanitize env SECURE_TRANSPORT_TEST_EXTRA_FLAGS="-g -O1 -fsanitize=address,undefined -fno-omit-frame-pointer" bash scripts/secure_transport_test.sh
@@ -68,6 +79,9 @@ run server-admin bash scripts/server_admin_test.sh
 # 既有本地恢复核心）：RAW-R01..RAW-R05 五条由 --remote-test 里的真服务端走一遍，
 # 本脚本只断言那些条目真的跑了并且全部通过。
 run raw-archive-restore bash scripts/raw_archive_restore_test.sh
+# PR #22：连接层合同（C01..C07）。它跑的是真的 GUI 进程、真的 QML、真的按钮
+# 点击 —— 人工验收发现的"点了应用没反应"只有这一条路径能抓到。
+run remote-connection-ux bash scripts/remote_connection_ux_test.sh
 # 同一个入口在 ASan + UBSan 下跑边界输入（截断 / 任意字节 / 离谱的声明长度 /
 # 加密归档的三种情况 / 单独的 delta / 不存在的 id）：每一条都要求 fail-closed
 # 且消毒剂报告为 0。和 network-sanitize 一样必须排在 quality 之前。

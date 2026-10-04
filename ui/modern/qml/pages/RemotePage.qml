@@ -51,6 +51,16 @@ Item {
     // 它不是口令——公钥/指纹可以公开、可以抄进部署文档——但它是必填项：
     // 不填时客户端拒绝连接（不做"第一次见到谁就信谁"）。
     property string draftServerKeyPin: ""
+    // ---- PR #22 连接方式 ----
+    // 客户端怎么到达服务端。"ssh" = 由本程序管理一条 SSH 安全通道（默认，
+    // 因为当前部署的服务端只监听它自己的回环地址）；"direct" = 直连（高级，
+    // 逻辑与 PR #21 完全一样）。
+    property string draftConnectionMode: "ssh"
+    // ~/.ssh/config 里的别名（当前部署是 aliyun-ecs）或 user@host。
+    property string draftSshHost: ""
+    // 空 = 自动挑一个空闲回环端口。**不**默认写死 18765：那个端口很可能已经
+    // 被用户自己开的隧道占着，写死就会撞车。
+    property string draftSshLocalPort: ""
     // 注册标签页的两个口令草稿（登录标签页继续用 draftPassword）。
     property string draftRegisterPassword: ""
     property string draftConfirmPassword: ""
@@ -98,6 +108,22 @@ Item {
     // 真正的互斥在控制器里（busy_ 在提交任务之前同步置位）；这里只是可见性。
     readonly property bool canOperate: remote.authenticated && !remote.busy
     readonly property int rowCount: remote.snapshots.length
+    // 输入框里显示的指纹与**已经生效**的指纹不一致 = 尚未应用。
+    // 这条绑定就是"不要让输入框显示 A、控制器实际用 B 而界面毫无提示"的
+    // 那一条提示（§4）。
+    readonly property bool pinDirty:
+        page.draftServerKeyPin.trim() !== remote.appliedServerKeyPin
+    readonly property bool sshMode: page.draftConnectionMode === "ssh"
+    // 通道状态的颜色：建好了是绿的，失败是红的，正在动是黄的，没启动是灰的。
+    readonly property color tunnelColor:
+        remote.tunnelState === "ready" ? theme.success
+        : remote.tunnelState === "failed" ? theme.error
+        : (remote.tunnelState === "starting" || remote.tunnelState === "stopping")
+            ? theme.warning
+            : theme.textSecondary
+    // 通道状态左边那个圆点：只有"已建立"才实心。
+    readonly property string tunnelDot:
+        remote.tunnelState === "ready" ? "●" : "○"
 
     Component.onCompleted: {
         page.draftHost = remote.host
@@ -106,6 +132,11 @@ Item {
         // 调用方（CLI / 自检 harness）已经给过一个指纹就回填进来，界面上看到的
         // 永远是"现在真的会用哪一个"，而不是一个空框。
         page.draftServerKeyPin = remote.serverKeyPin
+        // 连接方式与 SSH 参数也回填：调用方（自检 / 命令行）已经配好的值要
+        // 出现在页面上，用户看到的永远是"现在真的会用哪一个"。
+        page.draftConnectionMode = remote.connectionMode
+        page.draftSshHost = remote.sshHost
+        page.draftSshLocalPort = remote.sshLocalPort
     }
 
     // ---------- 从列表发起的动作 ----------
@@ -212,7 +243,27 @@ Item {
         lines.push("服务器：" + remote.host + ":" + remote.portText)
         lines.push("账号：" + (remote.username === "" ? "（未填写）" : remote.username))
         lines.push("会话：" + remote.sessionText)
-        lines.push("服务器只监听本机回环地址，客户端通过部署时配置的安全通道访问它。")
+        lines.push("连接方式：" + (page.sshMode ? "SSH 安全通道" : "直接连接"))
+        if (page.sshMode) {
+            lines.push("SSH 主机：" + (remote.sshHost === "" ? "（未填写）" : remote.sshHost))
+            lines.push("通道状态：" + remote.tunnelState + "（" + remote.tunnelStateText + "）")
+            lines.push("本地端点：" + (remote.tunnelLocalEndpointText === ""
+                                       ? "（尚未分配）" : remote.tunnelLocalEndpointText))
+            if (remote.tunnelReady)
+                lines.push("远端端点：" + remote.tunnelRemoteEndpointText)
+            lines.push("通道进程：" + (remote.tunnelOwnedByApp
+                                       ? "由本程序启动（退出时会自动结束）"
+                                       : (remote.tunnelExternalReuse
+                                          ? "复用已存在的本地监听者（本程序不会结束它）"
+                                          : "本程序没有启动任何进程")))
+            if (remote.tunnelDiagnosticText !== "")
+                lines.push("ssh 诊断输出：" + remote.tunnelDiagnosticText)
+        }
+        // 这一行必须与**当前**连接方式一致：直连模式下写"通过 SSH 安全通道访问"
+        // 就是在技术详情里说假话（本轮审查抓到的 D2）。
+        lines.push(page.sshMode
+                   ? "服务端只监听它自己的回环地址；客户端通过上面这条 SSH 安全通道访问它。"
+                   : "直连模式：客户端直接连接上面的服务器地址与端口（没有经过任何隧道）。")
         if (remote.diagnosticText !== "")
             lines.push("最近一次失败的技术原因：" + remote.diagnosticText)
         // core 给出的“为什么这次不是增量”的原始理由（英文）：属于诊断，
@@ -287,6 +338,219 @@ Item {
                         color: theme.textSecondary
                     }
 
+                    // ---------- 连接方式（PR #22）----------
+                    // 服务端只监听它自己的回环地址，所以"客户端怎么到达它"必须
+                    // 是产品的一部分，而不是用户脑子里的一条备注。
+                    ColumnLayout {
+                        Layout.fillWidth: true
+                        Layout.topMargin: 4
+                        spacing: 6
+
+                        Text {
+                            text: "连接方式"
+                            font.pixelSize: 15
+                            color: theme.textSecondary
+                        }
+
+                        RowLayout {
+                            Layout.fillWidth: true
+                            spacing: 12
+
+                            SegmentedTabs {
+                                objectName: "remoteConnectionModeTabs"
+                                Layout.preferredWidth: 420
+                                enabled: !remote.busy
+                                currentKey: page.draftConnectionMode
+                                model: [
+                                    { "key": "ssh", "text": "SSH 安全通道（推荐）" },
+                                    { "key": "direct", "text": "直接连接（高级）" }
+                                ]
+                                onActivated: function (key) {
+                                    page.draftConnectionMode = key
+                                    remote.setConnectionMode(key)
+                                    // 换模式不动已经建立的通道，也不联网：
+                                    // 这是配置动作。页面把状态原样显示出来。
+                                    page.draftSshHost = remote.sshHost
+                                    page.draftSshLocalPort = remote.sshLocalPort
+                                }
+                            }
+
+                            Item { Layout.fillWidth: true }
+                        }
+                    }
+
+                    // ---------- SSH 安全通道（仅 SSH 模式）----------
+                    ColumnLayout {
+                        Layout.fillWidth: true
+                        visible: page.sshMode
+                        spacing: 6
+
+                        // 两个输入框各有自己的标签。
+                        //
+                        // 人工验收的结论：把"本地端口（留空 = 自动）"整句塞进
+                        // placeholder 会被 200px 的框截断，用户根本读不到"留空"
+                        // 是什么意思。所以标签写"本地端口（可选）"，placeholder
+                        // 只留"留空则自动选择"，并把框加宽到放得下整句提示。
+                        RowLayout {
+                            Layout.fillWidth: true
+                            spacing: 12
+
+                            ColumnLayout {
+                                Layout.fillWidth: true
+                                spacing: 4
+
+                                Text {
+                                    text: "SSH 主机"
+                                    font.pixelSize: 15
+                                    color: theme.textSecondary
+                                }
+
+                                AppTextField {
+                                    id: sshHostField
+                                    objectName: "remoteSshHostField"
+                                    Layout.fillWidth: true
+                                    enabled: !remote.busy
+                                    placeholderText: "例如 aliyun-ecs（~/.ssh/config 里的别名）"
+                                    text: page.draftSshHost
+                                    onTextEdited: {
+                                        page.draftSshHost = text
+                                        remote.sshHost = text
+                                    }
+                                }
+                            }
+
+                            ColumnLayout {
+                                Layout.preferredWidth: 240
+                                spacing: 4
+
+                                Text {
+                                    text: "本地端口（可选）"
+                                    font.pixelSize: 15
+                                    color: theme.textSecondary
+                                }
+
+                                AppTextField {
+                                    id: sshLocalPortField
+                                    objectName: "remoteSshLocalPortField"
+                                    Layout.fillWidth: true
+                                    enabled: !remote.busy
+                                    placeholderText: "留空则自动选择"
+                                    text: page.draftSshLocalPort
+                                    onTextEdited: {
+                                        page.draftSshLocalPort = text
+                                        remote.sshLocalPort = text
+                                    }
+                                }
+                            }
+                        }
+
+                        // 这段话只回答一个问题：上面两个框和下面两个框是什么关系。
+                        // 它们是同一条链路的**两端**，不是要填两套服务器地址。
+                        Text {
+                            Layout.fillWidth: true
+                            text: "连接链路：本机自动端口 → SSH 主机 → 远端服务地址和端口。"
+                                  + "本地端口留空时由程序自动选择。"
+                            font.pixelSize: 14
+                            color: theme.textSecondary
+                            wrapMode: Text.WrapAnywhere
+                        }
+
+                        Text {
+                            Layout.fillWidth: true
+                            text: "不会修改任何网络配置，也不会弱化 SSH 主机密钥校验。"
+                            font.pixelSize: 14
+                            color: theme.textSecondary
+                            wrapMode: Text.WrapAnywhere
+                        }
+
+                        // 状态行：普通用户只需要看懂这一句。
+                        RowLayout {
+                            Layout.fillWidth: true
+                            Layout.topMargin: 2
+                            spacing: 8
+
+                            Text {
+                                objectName: "remoteTunnelDot"
+                                text: page.tunnelDot
+                                font.pixelSize: 16
+                                color: page.tunnelColor
+                            }
+
+                            Text {
+                                objectName: "remoteTunnelStateText"
+                                Layout.fillWidth: true
+                                text: remote.tunnelStateText
+                                font.pixelSize: 16
+                                font.weight: Font.DemiBold
+                                color: page.tunnelColor
+                                wrapMode: Text.WrapAnywhere
+                            }
+                        }
+
+                        Text {
+                            objectName: "remoteTunnelEndpointText"
+                            Layout.fillWidth: true
+                            visible: remote.tunnelReady
+                            text: remote.tunnelOwnedByApp
+                                      ? ("本地 " + remote.tunnelLocalEndpointText
+                                         + "  →  " + remote.tunnelRemoteEndpointText
+                                         + "（本程序启动的 ssh，退出时会自动结束）")
+                                      : ("本地 " + remote.tunnelLocalEndpointText
+                                         + " 上已有一条隧道（不是本程序启动的，"
+                                         + "退出时不会结束它）")
+                            font.pixelSize: 14
+                            color: theme.textSecondary
+                            wrapMode: Text.WrapAnywhere
+                        }
+
+                        // 失败原因：一句可以照着做的中文，而不是"网络错误"。
+                        Text {
+                            objectName: "remoteTunnelFailureText"
+                            Layout.fillWidth: true
+                            visible: remote.tunnelFailureText !== ""
+                            text: remote.tunnelFailureText
+                            font.pixelSize: 15
+                            color: theme.error
+                            wrapMode: Text.WrapAnywhere
+                        }
+
+                        RowLayout {
+                            Layout.fillWidth: true
+                            Layout.topMargin: 2
+                            spacing: 12
+
+                            AppButton {
+                                objectName: "remoteEnsureConnectionButton"
+                                text: "建立连接"
+                                variant: "primary"
+                                enabled: !remote.busy
+                                onClicked: remote.ensureConnection(page.draftHost,
+                                                                   page.draftPort)
+                            }
+
+                            AppButton {
+                                objectName: "remoteStopTunnelButton"
+                                text: "关闭安全通道"
+                                enabled: !remote.busy && remote.tunnelState !== "stopped"
+                                onClicked: remote.stopTunnel()
+                            }
+
+                            Item { Layout.fillWidth: true }
+                        }
+                    }
+
+                    // 只有 SSH 模式需要这句话：直连模式下这两个框就是客户端要
+                    // 连的地方，不存在"先登录谁、再连谁"的歧义。
+                    Text {
+                        Layout.fillWidth: true
+                        Layout.topMargin: 6
+                        visible: page.sshMode
+                        text: "SSH 登录到服务器后，将连接这里填写的服务地址和端口。"
+                        font.pixelSize: 14
+                        color: theme.textSecondary
+                        wrapMode: Text.WrapAnywhere
+                    }
+
                     RowLayout {
                         Layout.fillWidth: true
                         spacing: 12
@@ -296,7 +560,10 @@ Item {
                             spacing: 4
 
                             Text {
-                                text: "服务器地址"
+                                // 同一个输入框，两种含义：SSH 模式下它是"隧道
+                                // 那头的服务在哪"，直连模式下它就是客户端要连的
+                                // 地方。标签跟着模式走，避免用户按错误的含义填。
+                                text: page.sshMode ? "远端服务地址" : "服务器地址"
                                 font.pixelSize: 15
                                 color: theme.textSecondary
                             }
@@ -319,11 +586,11 @@ Item {
                         }
 
                         ColumnLayout {
-                            Layout.preferredWidth: 170
+                            Layout.preferredWidth: 190
                             spacing: 4
 
                             Text {
-                                text: "端口"
+                                text: page.sshMode ? "远端服务端口" : "端口"
                                 font.pixelSize: 15
                                 color: theme.textSecondary
                             }
@@ -396,11 +663,14 @@ Item {
                                 text: page.draftServerKeyPin
                                 onTextEdited: {
                                     page.draftServerKeyPin = text
+                                    // 旧结论不能挂在新输入上：错误行与"✓ 已应用"
+                                    // 都立刻收起来，下面重新显示"尚未应用"。
                                     remote.clearServerKeyPinError()
+                                    remote.clearPinApplyState()
                                 }
                                 onAccepted: {
                                     if (!remote.busy)
-                                        remote.setServerKeyPin(page.draftServerKeyPin)
+                                        remote.applyServerKeyPin(page.draftServerKeyPin)
                                 }
                             }
 
@@ -408,7 +678,10 @@ Item {
                                 objectName: "remoteServerKeyPinApplyButton"
                                 text: "应用"
                                 enabled: !remote.busy
-                                onClicked: remote.setServerKeyPin(page.draftServerKeyPin)
+                                // PR #22：这里以前只是 setServerKeyPin，返回值
+                                // 被丢掉了 —— 用户点完"应用"界面上什么都不发生。
+                                // 现在它写一行看得见的结果。
+                                onClicked: remote.applyServerKeyPin(page.draftServerKeyPin)
                             }
                         }
 
@@ -428,6 +701,32 @@ Item {
                             text: remote.serverKeyPinError
                             color: theme.error
                             font.pixelSize: 15
+                            wrapMode: Text.WrapAnywhere
+                        }
+
+                        // "应用"的结果：必须是**看得见**的（PR #22 修掉的
+                        // 那个人工验收问题）。三种可能各有各的一句话：
+                        // 已应用 / 已是当前值 / 尚未应用（输入框改过但没提交）。
+                        Text {
+                            objectName: "remoteServerKeyPinApplied"
+                            Layout.fillWidth: true
+                            visible: remote.pinApplyMessage !== ""
+                            text: remote.pinApplyMessage
+                            color: theme.success
+                            font.pixelSize: 15
+                            font.weight: Font.DemiBold
+                            wrapMode: Text.WrapAnywhere
+                        }
+
+                        Text {
+                            objectName: "remoteServerKeyPinDirty"
+                            Layout.fillWidth: true
+                            // 输入框里是 A、真正生效的是 B 的时候必须说出来。
+                            visible: page.pinDirty && remote.serverKeyPinError === ""
+                                     && remote.pinApplyMessage === ""
+                            text: "尚未应用：登录 / 注册会直接采用这里填的指纹并自动生效。"
+                            color: theme.warning
+                            font.pixelSize: 14
                             wrapMode: Text.WrapAnywhere
                         }
                     }
@@ -488,7 +787,9 @@ Item {
                                 }
                                 onAccepted: {
                                     if (!remote.busy)
-                                        remote.login(page.draftHost, page.draftPort, page.draftUser, page.draftPassword)
+                                        remote.loginWithPin(page.draftHost, page.draftPort,
+                                                            page.draftUser, page.draftPassword,
+                                                            page.draftServerKeyPin)
                                 }
                             }
 
@@ -502,7 +803,11 @@ Item {
                                     text: "登录"
                                     variant: "primary"
                                     enabled: !remote.busy
-                                    onClicked: remote.login(page.draftHost, page.draftPort, page.draftUser, page.draftPassword)
+                                    // PR #22：登录前先把**当前输入框里的**
+                                    // 指纹自动提交掉。用户不需要记住"先应用再登录"。
+                                    onClicked: remote.loginWithPin(page.draftHost, page.draftPort,
+                                                                   page.draftUser, page.draftPassword,
+                                                                   page.draftServerKeyPin)
                                 }
 
                                 Text {
@@ -592,7 +897,10 @@ Item {
                                     text: "注册"
                                     variant: "primary"
                                     enabled: !remote.busy
-                                    onClicked: remote.registerAccount(page.draftHost, page.draftPort, page.draftUser, page.draftRegisterPassword, page.draftConfirmPassword)
+                                    onClicked: remote.registerAccountWithPin(page.draftHost, page.draftPort,
+                                                                             page.draftUser, page.draftRegisterPassword,
+                                                                             page.draftConfirmPassword,
+                                                                             page.draftServerKeyPin)
                                 }
 
                                 // 正常状态只给一句弱化的辅助文字；真的不一致时换成

@@ -65,6 +65,7 @@
 
 #include "remote_backup_client.h"
 #include "remote_incremental.h"
+#include "ssh_tunnel_manager.h"
 
 namespace backup_modern {
 
@@ -234,6 +235,63 @@ class RemoteController : public QObject {
   Q_PROPERTY(QString serverKeyPinError READ serverKeyPinError NOTIFY
                  serverKeyPinErrorChanged)
 
+  // ---- 连接方式与 SSH 安全通道（PR #22）----
+  //
+  // 当前部署里 backup-server 只监听 ECS 的 127.0.0.1:18765，公网没有开这个
+  // 端口、安全组也没有改。于是"连 127.0.0.1:18765"只有在**本机存在一条到
+  // ECS 的 SSH 端口转发**时才成立。PR #21 把这件事留给用户自己在另一个终端
+  // 里记着，人工验收的结果就是一句 connection refused，而产品一句话都没说。
+  //
+  // 所以连接方式成了产品的一部分：
+  //   ssh    —— GUI 自己起 ssh -N -L：本地随机回环端口 -> SSH 主机 -> 远端服务
+  //   direct —— 直连（高级）：逻辑与 PR #21 完全一样
+  //
+  // SSH 通道只是**传输层**。BPSEC1 握手与 server pin 校验一个字节都没有少，
+  // 仍然在隧道**里面**跑：OpenSSH 的 host key 与 BPSEC1 的 pin 是两层独立
+  // 证据，不是替代关系。
+  Q_PROPERTY(QString connectionMode READ connectionMode WRITE setConnectionMode
+                 NOTIFY connectionChanged)
+  // ~/.ssh/config 里的别名（当前部署是 aliyun-ecs）或 user@host。
+  Q_PROPERTY(
+      QString sshHost READ sshHost WRITE setSshHost NOTIFY connectionChanged)
+  // 本地端口：空 / "0" = 自动挑一个空闲回环端口（默认，避免与用户自己的
+  // 18765 撞车）。
+  Q_PROPERTY(QString sshLocalPort READ sshLocalPort WRITE setSshLocalPort NOTIFY
+                 connectionChanged)
+  // ssh 可执行文件：空 = 在 PATH 里找。
+  Q_PROPERTY(QString sshProgram READ sshProgram WRITE setSshProgram NOTIFY
+                 connectionChanged)
+  Q_PROPERTY(QString tunnelState READ tunnelState NOTIFY tunnelChanged)
+  Q_PROPERTY(QString tunnelStateText READ tunnelStateText NOTIFY tunnelChanged)
+  Q_PROPERTY(bool tunnelReady READ tunnelReady NOTIFY tunnelChanged)
+  Q_PROPERTY(bool tunnelBusy READ tunnelBusy NOTIFY tunnelChanged)
+  Q_PROPERTY(
+      QString tunnelFailureKind READ tunnelFailureKind NOTIFY tunnelChanged)
+  Q_PROPERTY(
+      QString tunnelFailureText READ tunnelFailureText NOTIFY tunnelChanged)
+  Q_PROPERTY(QString tunnelLocalEndpointText READ tunnelLocalEndpointText NOTIFY
+                 tunnelChanged)
+  Q_PROPERTY(QString tunnelRemoteEndpointText READ tunnelRemoteEndpointText
+                 NOTIFY tunnelChanged)
+  Q_PROPERTY(bool tunnelOwnedByApp READ tunnelOwnedByApp NOTIFY tunnelChanged)
+  Q_PROPERTY(
+      bool tunnelExternalReuse READ tunnelExternalReuse NOTIFY tunnelChanged)
+  Q_PROPERTY(QString tunnelDiagnosticText READ tunnelDiagnosticText NOTIFY
+                 tunnelChanged)
+
+  // ---- 服务器身份指纹：草稿 vs 已应用（PR #22）----
+  //
+  // serverKeyPin 是**已经生效**的那一个（appliedServerKeyPin 是它的别名，
+  // 页面用它做 dirty 判断）。用户点"应用"以后必须**看得见**结果：
+  // pinApplyState 是机器可读的 applied / unchanged / invalid，pinApplyMessage
+  // 是那一行绿色反馈。人工验收发现的"点了应用什么都不发生"就是这里缺的。
+  Q_PROPERTY(
+      QString appliedServerKeyPin READ serverKeyPin NOTIFY serverKeyPinChanged)
+  Q_PROPERTY(QString pinApplyState READ pinApplyState NOTIFY pinApplyChanged)
+  Q_PROPERTY(
+      QString pinApplyMessage READ pinApplyMessage NOTIFY pinApplyChanged)
+  Q_PROPERTY(bool pinApplyOk READ pinApplyOk NOTIFY pinApplyChanged)
+
   // ---- 会话 ----
   Q_PROPERTY(bool connected READ connected NOTIFY sessionChanged)
   Q_PROPERTY(bool authenticated READ authenticated NOTIFY sessionChanged)
@@ -359,6 +417,41 @@ class RemoteController : public QObject {
   QString loginError() const { return login_error_; }
   QString registerError() const { return register_error_; }
   QString serverKeyPinError() const { return server_key_pin_error_; }
+  // ---- 连接方式 / 通道（PR #22）----
+  QString connectionMode() const;
+  QString sshHost() const { return ssh_host_; }
+  QString sshLocalPort() const;
+  QString sshProgram() const { return ssh_program_; }
+  QString tunnelState() const;
+  QString tunnelStateText() const { return tunnel_.stateText(); }
+  bool tunnelReady() const { return tunnel_.IsReady(); }
+  bool tunnelBusy() const { return tunnel_.IsBusy(); }
+  QString tunnelFailureKind() const {
+    return tunnel_.state() == SshTunnelManager::State::kFailed
+               ? tunnel_.failureKindName()
+               : QString();
+  }
+  QString tunnelFailureText() const {
+    return tunnel_.state() == SshTunnelManager::State::kFailed
+               ? tunnel_.failureText()
+               : QString();
+  }
+  QString tunnelLocalEndpointText() const {
+    return tunnel_.localEndpointText();
+  }
+  QString tunnelRemoteEndpointText() const {
+    return tunnel_.remoteEndpointText();
+  }
+  bool tunnelOwnedByApp() const { return tunnel_.OwnsProcess(); }
+  bool tunnelExternalReuse() const { return tunnel_.IsExternalReuse(); }
+  QString tunnelDiagnosticText() const { return tunnel_.diagnosticText(); }
+  // ---- pin 应用反馈（PR #22）----
+  QString pinApplyState() const { return pin_apply_state_; }
+  QString pinApplyMessage() const { return pin_apply_message_; }
+  bool pinApplyOk() const {
+    return pin_apply_state_ == QStringLiteral("applied") ||
+           pin_apply_state_ == QStringLiteral("unchanged");
+  }
   bool rawRestoreAwaitingPassword() const { return raw_awaiting_password_; }
   QString rawRestorePasswordError() const { return raw_password_error_; }
   QString rawRestoreDestinationText() const { return raw_destination_text_; }
@@ -416,6 +509,71 @@ class RemoteController : public QObject {
   Q_INVOKABLE bool setServerKeyPin(const QString& pin);
   // 输入框一被编辑就清掉这一行：旧原因不能挂在新输入上。
   Q_INVOKABLE void clearServerKeyPinError();
+
+  // ---- "应用"按钮的可见反馈（PR #22，人工验收发现的 UX bug）----
+  //
+  // 旧实现里"应用"只调用 setServerKeyPin，控制器合法时返回 true，而 QML 把
+  // 返回值丢掉了 —— 于是用户点完"应用"，界面上**什么都没有发生**。
+  //
+  // applyServerKeyPin 是"应用"按钮该调的那一个：它做同样的校验与提交，另外
+  // 把结果落成一段**看得见**的反馈（pinApplyMessage + pinApplyState）：
+  //
+  //   合法且是新值，当前没有活动连接 -> applied   "✓ 已应用，将在下一次连接时
+  //                                               用于服务器身份校验"
+  //   合法且是新值，当前有活动连接   -> applied   "✓ 已应用；当前连接保持不变，
+  //                                               下次重连时生效"
+  //   合法但与已生效的完全相同       -> unchanged "✓ 已是当前服务器身份指纹"
+  //   不合法                         -> invalid   红色错误照旧写在输入框下面，
+  //                                               **上一次生效的 pin 一个字节
+  //                                               都不改**
+  //
+  // 它**只**改配置：不联网、不登录、不断开当前连接。这是配置动作，不是
+  // connection test。
+  //
+  // 返回值是机器可读的 "applied" / "unchanged" / "invalid"，供自检断言。
+  Q_INVOKABLE QString applyServerKeyPin(const QString& pin);
+  // 输入框被编辑时清掉上一次的绿色反馈：旧结论不能挂在新输入上。
+  Q_INVOKABLE void clearPinApplyState();
+
+  // ---- 连接方式与 SSH 安全通道（PR #22）----
+  //
+  // setConnectionMode 接受 "ssh" / "direct"；其它值被拒并返回 false。
+  // 切换模式不会自动联网，也不会杀掉正在用的通道 —— 它是配置动作。
+  Q_INVOKABLE bool setConnectionMode(const QString& mode);
+  // 下面三个是 Q_PROPERTY 的 WRITE 落点：它们只改配置，不联网、不动进程。
+  void setSshHost(const QString& host);
+  void setSshLocalPort(const QString& port_text);
+  void setSshProgram(const QString& program);
+  // 建立安全通道（ssh 模式）或明确告知直连模式不需要通道。
+  // 它**不**需要 pin：建通道是传输层的事，BPSEC1 的 pin 在真正连接时才用。
+  // 已经登录时顺带刷新一次列表 —— 这正是"用户点了建立连接之后能看到东西"。
+  Q_INVOKABLE bool ensureConnection(const QString& host,
+                                    const QString& port_text);
+  // 关掉**本程序启动的**通道。用户自己在外面开的隧道不会被结束。
+  Q_INVOKABLE void stopTunnel();
+
+  // ---- 登录 / 注册：自动采用当前输入框里的 pin（PR #22）----
+  //
+  // 人工验收里最常见的一条路径是：填 pin -> 填用户名密码 -> 直接点登录。
+  // 旧实现会用**上一次应用过的** pin（没有就是空），于是用户要么莫名其妙地
+  // 失败，要么以为自己填的已经生效了。这两个入口在提交之前先
+  // validate + commit 当前 draft pin，再开始网络操作：
+  //
+  //   填 pin -> 点登录        ✔ 现在就生效，不需要先点"应用"
+  //   填 pin -> 应用 -> 登录   ✔ 与上面完全等价
+  //
+  // pin 不合法时**一个字节都不发**：红色错误照旧贴在指纹输入框下面，
+  // 上一次生效的 pin 保持不变。
+  Q_INVOKABLE bool loginWithPin(const QString& host, const QString& port_text,
+                                const QString& username,
+                                const QString& password,
+                                const QString& base_pin);
+  Q_INVOKABLE bool registerAccountWithPin(const QString& host,
+                                          const QString& port_text,
+                                          const QString& username,
+                                          const QString& password,
+                                          const QString& confirm_password,
+                                          const QString& base_pin);
 
   // 文件对话框的 URL 互转与其它页面同一套实现。
   Q_INVOKABLE QString localPathFromUrl(const QUrl& url) const;
@@ -530,6 +688,38 @@ class RemoteController : public QObject {
     return last_raw_restore_archive_path_;
   }
   bool rawRestoreSessionAliveForTest() const { return raw_session_ != nullptr; }
+  // ---- PR #22：连接层自检需要读的结构化结果 ----
+  QString tunnelStateForTest() const { return tunnelState(); }
+  QString tunnelFailureKindForTest() const { return tunnelFailureKind(); }
+  QString tunnelLocalEndpointForTest() const {
+    return tunnel_.localEndpointText();
+  }
+  qint64 tunnelPidForTest() const { return tunnel_.processId(); }
+  bool tunnelOwnedForTest() const { return tunnel_.OwnsProcess(); }
+  bool tunnelExternalReuseForTest() const { return tunnel_.IsExternalReuse(); }
+  QString pinApplyStateForTest() const { return pin_apply_state_; }
+  // 上一次因为"要先建立安全通道"而被**挂起**的网络操作（空 = 没有挂起过）。
+  // 挂起是连接层的实现细节，界面看不到，但自检要能证明它真的发生过。
+  QString lastDeferredActionForTest() const { return last_deferred_action_; }
+  int deferredSubmitCountForTest() const { return deferred_submit_count_; }
+  // 等通道状态机稳定（不是 kStarting / kStopping）。自检用。
+  bool waitForTunnelIdle(int timeout_ms);
+  // 直接换一个 ssh 可执行文件（自检用它模拟"本机没有 ssh"），
+  // 走的是产品自己的"高级"配置项，不是测试专用的后门。
+  void setSshProgramForTest(const QString& program) {
+    ssh_program_ = program;
+    emit connectionChanged();
+  }
+  void setSshHostForTest(const QString& host) { setSshHost(host); }
+  void setSshLocalPortForTest(const QString& port_text) {
+    setSshLocalPort(port_text);
+  }
+  void setConnectionModeForTest(const QString& mode) {
+    setConnectionMode(mode);
+  }
+  // 故意杀掉**本程序启动的** ssh，用来验证 C12（通道死了 -> 下一次操作
+  // 自动重建 + RESUME）。返回是否真的发出了信号。
+  bool killOwnedTunnelForTest();
 
  signals:
   void endpointChanged();
@@ -540,6 +730,12 @@ class RemoteController : public QObject {
   void registerErrorChanged();
   void serverKeyPinChanged();
   void serverKeyPinErrorChanged();
+  // 连接方式 / SSH 主机 / 本地端口等连接配置发生变化。
+  void connectionChanged();
+  // 安全通道状态机、失败原因、本地端口或诊断文本发生变化。
+  void tunnelChanged();
+  // "应用"按钮的绿色反馈发生变化。
+  void pinApplyChanged();
   // 最近一次产品级备份的结论（完整 / 增量 / 无变化）发生变化。
   void backupSummaryChanged();
   // 原始归档恢复交互的状态（是否需要密码 / 上一次密码错没错）发生变化。
@@ -555,6 +751,9 @@ class RemoteController : public QObject {
   // 传输方向。用整数原子变量跨线程传，避免在后台线程碰 QString。
   enum class Phase { kNone = 0, kUpload = 1, kDownload = 2 };
 
+  // 客户端怎么到达服务端。见上面的属性说明。
+  enum class ConnectionMode { kSshTunnel = 0, kDirect = 1 };
+
   // 一条错误该出现在哪里。每个表单各有自己的错误行（登录 / 注册 / 注销
   // 对话框 / 连接设置里的服务器身份指纹），页面级操作用底部横幅。
   // 原始归档恢复交互的状态落地（会话、等待密码、密码错误、目标目录回显）。
@@ -566,6 +765,15 @@ class RemoteController : public QObject {
     kDeleteAccount,
     kServerKey,
     kBanner
+  };
+
+  // 一条"等通道就绪之后再发"的请求。字段刻意与提交点一一对应：request 里
+  // 已经带了 pin 与用户填的地址，flush 时只把 host/port 换成通道的本地端点。
+  struct DeferredRequest {
+    bool active = false;
+    RemoteRequest request;
+    QString action_text;
+    ErrorSurface surface = ErrorSurface::kBanner;
   };
 
   // 把一句话送到指定的错误容器（同一个容器里不重复发信号）。
@@ -591,6 +799,58 @@ class RemoteController : public QObject {
   // 提交前的统一闸门：busy 与"是否已登录"都在这里挡住，原因写进 surface。
   bool BeginOperation(const QString& action_text, bool need_login,
                       ErrorSurface surface = ErrorSurface::kBanner);
+
+  // ---- 连接层（PR #22）----
+  //
+  // 一条网络操作在真正提交之前要经过的**唯一**通道就是 Submit() 本身
+  // （见 .cpp）：直连直接提交；ssh 模式先确认通道真的还能用、而且仍然指向
+  // 当前填的那个远端服务，没好的话把这条请求挂起、去建通道，建好之后自动
+  // 把它接着发出去。
+  //
+  // 这样"填服务器/账号 -> 点登录"就真的能用：前置动作由系统自己补，而不是
+  // 又制造一个隐藏顺序（先建通道 -> 再应用 pin -> 再登录）。
+  //
+  // 通道参数是否仍然与当前填写的远端服务一致。地址改了就必须重建 ——
+  // 否则界面显示 B、实际却还走在通往 A 的隧道上。**纯函数**，不产生副作用。
+  bool TunnelMatchesEndpoint() const;
+  // 通道**此刻**是不是真的还能用。与 TunnelMatchesEndpoint 分开：
+  //
+  //   * 自有的 ssh：QProcess 的 finished / errorOccurred 已经把"死了"变成
+  //     状态机里的 failed，所以这里只读状态，不做任何探测；
+  //   * 外部**复用**的 listener：不是本进程启动的，没有信号可听，只能在
+  //     **真正要提交一次操作之前**当场问一次（有界的一次 connect）。它不在了
+  //     就**只解除借用**（绝不碰别人的进程），返回 false，让调用方去建自己的
+  //     通道 —— 这就是"外部隧道死掉之后下一次操作自动恢复"的全部机制。
+  //
+  // 刻意不是后台周期探测：空闲就不该产生 TCP 流量（见 ssh_tunnel_manager.h
+  // 顶部关于 ssh -L 的说明）。
+  bool TransportUsableForSubmit();
+  // 起一条通道（幂等：已经在建就什么都不做）。
+  bool StartTunnelForEndpoint(const QString& action_text);
+  void DeferRequest(const RemoteRequest& request, const QString& action_text,
+                    ErrorSurface surface);
+  // 通道就绪 -> 把挂起的那条请求接着发出去；通道失败 -> 用**通道的**原因
+  // 结束这次操作（而不是笼统的网络错误）。
+  void FlushDeferredRequest();
+  void FailDeferredRequest();
+  // 把 pin 的草稿提交成"已应用"。校验复用共享的 ParseServerKeyPin，不合法时
+  // 把红色原因写进输入框那一行，并且**一个字节都不改**上一次生效的值。
+  // 返回值："applied" / "unchanged" / "invalid"。setServerKeyPin 与
+  // applyServerKeyPin 都走它，登录 / 注册的自动提交也走它 —— "应用"这个动作
+  // 只有一份实现。
+  QString CommitServerKeyPin(const QString& pin);
+  void SetPinApplyFeedback(const QString& state, const QString& message);
+  // 把 "applied" / "unchanged" / "invalid" 落成那一段**看得见**的反馈。
+  // "应用"按钮与登录 / 注册的自动提交走的是同一个函数 —— 两条路径给出同一句
+  // 话，是结构性的，而不是靠两处文案恰好写得一样。
+  void PublishPinApplyFeedback(const QString& state);
+  // 只提交 host / port（不动 username_）：给"建立连接"用，它只需要地址。
+  void CommitHostPort(const QString& host, int port);
+  // 把一条请求真正交给后台线程。Submit() 负责"先解决传输层"，这里只负责发。
+  void DispatchRequest(const RemoteRequest& request);
+  // 通道状态机的落点：有请求在等就接着发 / 如实报失败；只是"建立连接"在等
+  // 就结束忙碌并给一句结论。
+  void OnTunnelStateChanged();
   // 提交一次后台操作。**调用前必须已经通过 BeginOperation**：busy_ 在提交之前
   // 同步置位，所以任何一个时刻只可能有一个 watcher 在跑，也就不存在"旧结果
   // 覆盖新状态"的窗口（async stale-result 的结构性防线）。
@@ -670,6 +930,29 @@ class RemoteController : public QObject {
   QString login_error_;
   QString register_error_;
   QString server_key_pin_error_;
+  // ---- PR #22：pin 的"应用"反馈 ----
+  QString pin_apply_state_;  // "" / "applied" / "unchanged" / "invalid"
+  QString pin_apply_message_;  // 绿色那一行；invalid 时为空（红字在输入框下）
+
+  // ---- PR #22：连接方式与 SSH 安全通道 ----
+  //
+  // 连接方式与通道配置。与 host / port / pin 一样**只存在于内存**：当前
+  // 部署的唯一事实来源是 ~/.ssh/config，产品不另造一套持久化。
+  ConnectionMode connection_mode_ = ConnectionMode::kSshTunnel;
+  QString ssh_host_ = QStringLiteral("aliyun-ecs");
+  // 0 = 自动挑一个空闲回环端口。
+  int ssh_local_port_ = 0;
+  QString ssh_program_;
+  SshTunnelManager tunnel_;
+  // 一条正在等通道就绪的请求（最多一条：busy_ 在提交之前就置位了）。
+  DeferredRequest deferred_;
+  QString last_deferred_action_;
+  int deferred_submit_count_ = 0;
+  // 只等通道、不等某一条请求（用户点了"建立连接"）。
+  bool tunnel_only_wait_ = false;
+  // BeginOperation 收到的错误落点：请求被挂起之后要用它把失败送回**原来的
+  // 那个表单**，而不是一律丢到页面底部的横幅里。
+  ErrorSurface pending_surface_ = ErrorSurface::kBanner;
 
   // 上一次连接尝试的结果。默认"不知道"：界面在真的试过之前什么都不说。
   RemoteReachability reachability_ = RemoteReachability::kUnknown;
