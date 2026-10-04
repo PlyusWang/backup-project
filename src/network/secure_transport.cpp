@@ -1099,6 +1099,14 @@ bool SecureChannel::HandshakeServerInternal(int fd,
                        : "读取 ClientHello 失败：" + io_error,
                 error_message);
   }
+  // 先把长度/magic/类型校验掉，**再**按版本分流。顺序不能反：反过来的话，
+  // 一个 magic 被改写、版本字节又恰好不是 1/2 的包会被报成"版本不支持"，
+  // 把"链路上有东西在改字节"说成了"对端版本太新"—— BPSEC1 的既有用例
+  // 正是靠这条分类来区分这两种情况的。
+  if (LoadU32(raw) != kBssec1Magic || raw[4] != kBssec1MessageClientHello) {
+    return Fail(SecureTransportError::kMalformedMessage,
+                "ClientHello 的 magic 或类型字段不合法", error_message);
+  }
   // 版本判别：客户端说 BPSEC2 就走证书握手；说 BPSEC1 时，若本服务端被
   // 配置为只接受证书身份，就直接拒绝 —— 这就是"拒绝降级"的落点。
   std::uint8_t version = kBssec1Version;
