@@ -184,6 +184,54 @@ time.sleep(3600)' "$PORT"
 )SH");
 }
 
+// 与 BindAndSleepBlock 同源，但**统计 accepted 连接次数**并把计数写进文件。
+//
+// SSH-U21 用它证明"进入 Ready 之后不再有任何周期 TCP 探测"：旧实现每 400ms
+// 探一次，计数会持续增长；新实现在 Ready 那一刻就把 probe 收掉，计数不再动。
+QString CountAcceptsBlock(const QString& counter_path) {
+  // 计数文件路径**内嵌**进脚本，而不是用 "$2"：替身 ssh 的第 2 个参数是
+  // "-o"，不是我们要的东西（第一版就是这么写错的，结果 python 拿到一个
+  // 非法路径、文件根本没建出来，而"两次都读到 -1"又恰好让"计数不增长"这条
+  // 断言假通过 —— 是 SSH-U21b 那条"建立阶段至少连过一次"把它抓出来的）。
+  //
+  // 路径来自 QTemporaryDir（/tmp/xxxx），不含单引号，放进单引号字面量是安全的。
+  QString script = QStringLiteral(R"SH(python3 -c 'import socket,sys,time
+port = int(sys.argv[1])
+counter = sys.argv[2]
+s = socket.socket()
+s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+s.bind(("127.0.0.1", port))
+s.listen(64)
+s.settimeout(0.2)
+n = 0
+with open(counter, "w") as f:
+    f.write("0")
+end = time.time() + 3600
+while time.time() < end:
+    try:
+        c, _ = s.accept()
+        n += 1
+        c.close()
+        with open(counter, "w") as f:
+            f.write(str(n))
+    except socket.timeout:
+        pass
+' "$PORT" '@COUNTER@'
+)SH");
+  script.replace(QStringLiteral("@COUNTER@"), counter_path);
+  return script;
+}
+
+int ReadCounter(const QString& path) {
+  QFile file(path);
+  if (!file.open(QIODevice::ReadOnly)) {
+    return -1;
+  }
+  bool ok = false;
+  const int value = QString::fromUtf8(file.readAll()).trimmed().toInt(&ok);
+  return ok ? value : -1;
+}
+
 QString ArgvFromLog(const QString& log_path) {
   QFile file(log_path);
   if (!file.open(QIODevice::ReadOnly)) {
@@ -756,6 +804,87 @@ int main(int argc, char* argv[]) {
           QStringLiteral("SSH-U18b 忽略 SIGTERM 之后仍被回收"), QString::number(pid));
     Check(stop_ms < 8000, QStringLiteral("SSH-U18c Stop 的等待是有界的"),
           QStringLiteral("%1 ms").arg(stop_ms));
+  }
+
+  // ---- SSH-U21：Ready 之后**不再有任何周期 TCP 探测**（blocker 回归）----
+  //
+  // 为什么这是一条必须存在的测试：ssh -L 的本地 listener 每接受一次连接，就
+  // 可能真的向 remote_host:remote_port 建一条 forwarded channel。一个空闲的
+  // GUI 如果每 400ms 去 connect 一次本地端口，就是在持续给 backup-server 制造
+  // 无意义的 TCP 连接 —— 那不是探测，那是流量。
+  //
+  // 判别力：这条断言在旧实现（2bc705f，Ready 后 400ms 探测）上**必须失败**
+  // —— 3 秒空闲会多出约 7 次 accept；在新实现上计数则完全不动。
+  {
+    const QString counter = dir + QStringLiteral("/accept-count.txt");
+    QFile::remove(counter);
+    const QString script = scenario(QStringLiteral("ssh-count.sh"),
+                                    QStringLiteral("count.log"),
+                                    CountAcceptsBlock(counter));
+    Check(!script.isEmpty(), QStringLiteral("SSH-U21 计数替身 ssh 写好"));
+    SshTunnelManager tunnel;
+    SshTunnelManager::Options options;
+    options.ssh_program = script;
+    options.ssh_target = QStringLiteral("fake-count");
+    options.ready_timeout_ms = 8000;
+    tunnel.Start(options);
+    const bool became_ready =
+        WaitFor([&tunnel] { return tunnel.IsReady(); }, 12000);
+    // 计数文件由替身自己写；等它出现再读，避免把"还没写"读成 0。
+    WaitFor([&counter] { return ReadCounter(counter) >= 0; }, 5000);
+    const int at_ready = ReadCounter(counter);
+    Check(became_ready, QStringLiteral("SSH-U21a 通道进入 Ready"),
+          QStringLiteral("state=%1 failure=%2")
+              .arg(static_cast<int>(tunnel.state()))
+              .arg(tunnel.failureKindName()));
+    Check(at_ready >= 1,
+          QStringLiteral("SSH-U21b 建立阶段确实连过本地端口（探测在这一段是必要的）"),
+          QStringLiteral("accepted=%1").arg(at_ready));
+    // 空闲 3 秒。Ready 之后本类不允许再发起任何 TCP 连接。
+    QElapsedTimer idle;
+    idle.start();
+    while (idle.elapsed() < 3000) {
+      QCoreApplication::processEvents(QEventLoop::AllEvents, 20);
+      QThread::msleep(20);
+    }
+    const int after_idle = ReadCounter(counter);
+    Check(after_idle == at_ready,
+          QStringLiteral("SSH-U21c Ready 之后空闲 3 秒：accepted 计数不再增长"),
+          QStringLiteral("ready=%1 after_idle=%2（差值 %3）")
+              .arg(at_ready)
+              .arg(after_idle)
+              .arg(after_idle - at_ready));
+    tunnel.Stop();
+  }
+
+  // ---- SSH-U22：外部复用的 listener 消失之后，一次性检查必须发现它 ----
+  //
+  // RemoteController::TransportUsableForSubmit 用的就是这个原语：**不**做后台
+  // 周期探测，只在真正要提交操作之前问一次。
+  {
+    QTcpServer external;
+    Check(external.listen(QHostAddress::LocalHost, 0),
+          QStringLiteral("SSH-U22 外部 listener 起得来"));
+    const int external_port = external.serverPort();
+    QString probe_error;
+    Check(SshTunnelManager::IsLoopbackPortOpen(external_port, 500, &probe_error),
+          QStringLiteral("SSH-U22a 活着的时候一次性检查通过"), probe_error);
+    SshTunnelManager tunnel;
+    SshTunnelManager::Options options;
+    options.ssh_program = dir + QStringLiteral("/no-such-ssh-binary");
+    options.ssh_target = QStringLiteral("external-died");
+    options.local_port = external_port;
+    tunnel.Start(options);
+    Check(tunnel.IsReady() && tunnel.IsExternalReuse(),
+          QStringLiteral("SSH-U22b 外部 listener 被复用"));
+    external.close();  // 别人的隧道没了（不是我们杀的）
+    QString gone_error;
+    Check(!SshTunnelManager::IsLoopbackPortOpen(external_port, 500, &gone_error),
+          QStringLiteral("SSH-U22c 消失之后一次性检查失败（stale Ready 不可能成立）"),
+          gone_error);
+    tunnel.Stop();
+    Check(tunnel.state() == State::kStopped,
+          QStringLiteral("SSH-U22d 解除借用之后回到 Stopped"));
   }
 
   // ---- 收尾：僵尸与孤儿 ----

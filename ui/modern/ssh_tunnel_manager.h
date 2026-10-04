@@ -18,8 +18,9 @@
 // 是：**transport / deployment utility**。它只负责把本地一个回环端口接到远端
 // 的 127.0.0.1:<remote_port>。
 //
-// 不是：密码学实现的一部分。BPSEC1 的握手、X25519、HKDF、AES-GCM、HMAC 全部
-// 照旧在**隧道里面**跑，pin 校验一个字节都没有少。OpenSSH 在身份上提供的是
+// 不是：密码学实现的一部分。BPSEC1 的握手、X25519、HKDF、AES-256-CTR +
+// HMAC-SHA256 全部 照旧在**隧道里面**跑，pin 校验一个字节都没有少。OpenSSH
+// 在身份上提供的是
 // **第二层**独立证据（SSH host key），与 BPSEC1 的 server pin 构成
 // defense-in-depth，而不是替代关系。
 //
@@ -45,9 +46,23 @@
 // 定时器 + 单调时钟截止时间（QElapsedTimer），既没有无限 sleep 也没有无限
 // 轮询。超时就 kTimeout，并把进程收干净。
 //
-// Ready 之后仍然以**低频异步探测**监视那条本地 listener（不是常驻连接，
-// 连上就立刻放手），连续 kLivenessFailureTolerance 次拒绝才判定通道已死 ——
-// 单次抖动不该让界面喊"通道断了"。
+// **进入 Ready 之后，本类不再发起任何 TCP 连接。**
+//
+// 这一条是硬的，理由不是"省一点开销"：ssh -L 的本地 listener 每接受一次连接，
+// 就可能真的向 remote_host:remote_port 建一条转发通道。一个空闲的 GUI 如果
+// 每 400ms 去 connect 一次本地端口，就会持续给 backup-server 制造无意义的
+// TCP 连接 —— 那不是探测，那是流量。
+//
+// 所以：
+//   * Starting 阶段用本地 TCP probe 判断 ssh 的 local listener 建好了没有
+//     （这是唯一需要探测的时刻），一旦 Ready 就 dispose 掉 probe 并停表；
+//   * **自有**的 ssh 死没死，由 QProcess 的 finished / errorOccurred，加上已经
+//     配好的 ServerAliveInterval / ServerAliveCountMax 判定 —— ssh 自己在
+//     对端不可达时会退出，信号随即到达；
+//   * 外部**复用**的 listener 不归本进程管，没有信号可听，于是由调用方在
+//     **真正要提交下一次操作之前**问一次（见 RemoteController 的
+//     TransportUsableForSubmit），也不是后台周期探测；
+//   * 服务端到底还能不能干活，由真正的 BPSEC1 / 业务请求回答。
 //
 // ---- 进程所有权 ----
 //
@@ -202,8 +217,12 @@ class SshTunnelManager : public QObject {
   bool stop_requested_ = false;
   // 建立阶段的探测次数上限（第二道闸门，第一道是单调截止时间）。
   int readiness_attempts_ = 0;
-  // Ready 之后连续探测失败的次数；成功一次就清零。
-  int liveness_failures_ = 0;
+  // 注意：这里**没有**"Ready 之后周期探测"的任何状态。
+  //
+  // Ready 之后本类不再发起 TCP 连接（见文件顶部），所以既没有探测定时器，
+  // 也没有"连续失败几次"的计数器 —— 自有 ssh 的死亡由 QProcess 的
+  // finished / errorOccurred 加 ServerAlive 判定，外部复用的 listener 由调用方
+  // 在提交操作之前问一次。
   // 自动端口撞车时的重挑次数（有界）。
   int auto_port_retries_ = 0;
   // 只允许一个 ssh 子进程存在：unique_ptr 让"换一个进程"必然是先放手旧的。

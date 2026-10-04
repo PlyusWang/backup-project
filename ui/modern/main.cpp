@@ -79,6 +79,7 @@
 #include <unistd.h>
 
 #include <QCoreApplication>
+#include <QCryptographicHash>
 #include <QDir>
 #include <QDirIterator>
 #include <QElapsedTimer>
@@ -3206,6 +3207,87 @@ int RunRemoteTunnelEcs(QQuickWindow* window,
                remote->tunnelStateForTest());
   }
 
+  // ---- C14d：外部隧道**死掉之后**下一次操作自动恢复 ----
+  //
+  // 放在 C12 之后：这时用户已经登录、会话有效，正好验证"恢复过程不需要重新
+  // 登录"。这一条盯的是**不许有 stale Ready**：外部 listener 不是本进程启动的，
+  // 没有 QProcess 信号可听，所以必须在真正提交一次操作之前**当场**问一次。
+  //
+  // 刻意**不**用后台周期探测解决 —— 那正是本轮 blocker：ssh -L 的本地 listener
+  // 每接受一次连接就可能真的向 ECS 建一条转发通道，空闲 GUI 不该制造这种流量。
+  {
+    int dead_port = 0;
+    QString pick_error;
+    run->Check(backup_modern::SshTunnelManager::PickFreeLoopbackPort(
+                   &dead_port, &pick_error),
+               QStringLiteral("C14d 前置：挑到一个空闲本地端口"), pick_error);
+    QProcess doomed;
+    doomed.setProgram(QStringLiteral("ssh"));
+    doomed.setArguments(
+        {QStringLiteral("-N"), QStringLiteral("-o"),
+         QStringLiteral("BatchMode=yes"), QStringLiteral("-o"),
+         QStringLiteral("ExitOnForwardFailure=yes"), QStringLiteral("-o"),
+         QStringLiteral("ConnectTimeout=10"), QStringLiteral("-L"),
+         QStringLiteral("127.0.0.1:%1:%2:%3")
+             .arg(dead_port)
+             .arg(host)
+             .arg(port_text),
+         QStringLiteral("--"), ssh_target});
+    doomed.start();
+    bool doomed_up = false;
+    for (int attempt = 0; attempt < 60 && !doomed_up; ++attempt) {
+      doomed_up = backup_modern::SshTunnelManager::IsLoopbackPortOpen(
+          dead_port, 200, nullptr);
+      if (!doomed_up) {
+        WaitForAnimation(250);
+      }
+    }
+    // 让 GUI 复用这条**别人的**隧道。
+    remote->setSshLocalPortForTest(QString::number(dead_port));
+    remote->ensureConnection(host, port_text);
+    remote->waitForTunnelIdle(60000);
+    const bool adopted =
+        remote->tunnelStateForTest() == QStringLiteral("ready") &&
+        remote->tunnelExternalReuseForTest() && !remote->tunnelOwnedForTest();
+    run->Check(adopted && doomed_up,
+               QStringLiteral(
+                   "C14d 前置：GUI 复用了用户自己的隧道（且不持有它的进程）"),
+               QStringLiteral("state=%1 reuse=%2 owned=%3")
+                   .arg(remote->tunnelStateForTest())
+                   .arg(remote->tunnelExternalReuseForTest() ? 1 : 0)
+                   .arg(remote->tunnelOwnedForTest() ? 1 : 0));
+
+    // 用户的隧道没了（**测试自己**杀掉它；GUI
+    // 从来没有拥有过它，也就无从杀它）。
+    doomed.kill();
+    doomed.waitForFinished(5000);
+    WaitForAnimation(500);
+
+    const int deferred_before = remote->deferredSubmitCountForTest();
+    const bool listed = remote->refreshList() && remote->waitForIdle(180000);
+    run->Check(
+        listed && remote->lastErrorKindForTest() == QStringLiteral("none"),
+        QStringLiteral("C14d 外部隧道消失之后，下一次操作自动恢复并成功"),
+        remote->lastErrorKindForTest() + QStringLiteral(": ") +
+            remote->lastDetailForTest());
+    run->Check(remote->authenticated(),
+               QStringLiteral("C14d-b 恢复过程不需要重新登录（会话仍然有效）"));
+    run->Check(remote->tunnelStateForTest() == QStringLiteral("ready") &&
+                   remote->tunnelOwnedForTest() &&
+                   remote->tunnelPidForTest() > 0,
+               QStringLiteral("C14d-c 恢复之后是**本程序自己**建立的安全通道"),
+               QStringLiteral("state=%1 owned=%2 pid=%3")
+                   .arg(remote->tunnelStateForTest())
+                   .arg(remote->tunnelOwnedForTest() ? 1 : 0)
+                   .arg(remote->tunnelPidForTest()));
+    run->Check(remote->deferredSubmitCountForTest() > deferred_before,
+               QStringLiteral("C14d-d 这次请求是被挂起之后自动接着发的"),
+               QStringLiteral("%1 -> %2")
+                   .arg(deferred_before)
+                   .arg(remote->deferredSubmitCountForTest()));
+    remote->setSshLocalPortForTest(QString());
+  }
+
   // ---- C13：关闭通道 -> 自有 ssh 进程被收掉，不留孤儿 ----
   {
     // 先清理本次检查建出来的每一个账户：ECS 上的**正式数据**必须回到
@@ -5392,6 +5474,55 @@ QString ObjectText(QQuickWindow* window, const char* object_name) {
   return object == nullptr ? QString() : object->property("text").toString();
 }
 
+// 这个控件**真的出现在窗口里**吗？
+//
+// ObjectVisible() 读的是 QML 的 visible 属性 —— 它只说明"这条绑定为真"，
+// 不说明它在不在可视范围内。PR22 的截图 harness 就是在这个区别上栽过一次：
+// 断言读的是属性、画面里却什么都没有（甚至整页空白），于是两张"不同状态"的
+// 截图逐字节相同。所以凡是"截图里必须看得见某句话"的断言，一律走这个几何
+// 检查：控件至少有一半面积落在窗口矩形内。
+bool ItemInViewport(QQuickWindow* window, QObject* object) {
+  auto* item = qobject_cast<QQuickItem*>(object);
+  if (item == nullptr || !item->isVisible() || window == nullptr) {
+    return false;
+  }
+  const QPointF corner = item->mapToItem(window->contentItem(), QPointF(0, 0));
+  const QRectF rect(corner, QSizeF(item->width(), item->height()));
+  if (rect.width() <= 0 || rect.height() <= 0) {
+    return false;
+  }
+  const QRectF viewport(0, 0, window->width(), window->height());
+  const QRectF shown = rect.intersected(viewport);
+  return shown.height() >= rect.height() / 2 && shown.width() > 0;
+}
+
+bool ObjectInViewport(QQuickWindow* window, const char* object_name) {
+  return ItemInViewport(
+      window, window->findChild<QObject*>(QString::fromLatin1(object_name)));
+}
+
+// 把 Remote 页滚到**真正的底部**。
+//
+// 不能写一个"足够大的数"（第一版就是 scrollTop(100000)）：ScrollView 的
+// contentY 在被程序直接赋值时不会像用户拖动那样自动夹住，结果整页滚出视野，
+// 抓出来是一张空白图。
+void ScrollRemotePageToBottom(QQuickWindow* window) {
+  auto* scroll =
+      window->findChild<QQuickItem*>(QStringLiteral("remotePageScroll"));
+  if (scroll == nullptr) {
+    return;
+  }
+  auto* flickable = qobject_cast<QQuickItem*>(
+      scroll->property("contentItem").value<QQuickItem*>());
+  if (flickable == nullptr) {
+    return;
+  }
+  const qreal content_height = flickable->property("contentHeight").toReal();
+  const qreal view_height = flickable->property("height").toReal();
+  flickable->setProperty("contentY",
+                         qMax<qreal>(0.0, content_height - view_height));
+}
+
 }  // namespace
 
 // C01..C07：不需要任何外部依赖。
@@ -5842,7 +5973,23 @@ int RunRemoteScreenshot(QQuickWindow* window,
                  qPrintable(remote->tunnelFailureText()));
     return 1;
   }
+  // 这一帧必须同时看得见两件事：通道状态行写着"安全通道已建立"，而账户区
+  // 仍然是**登录 / 注册两个标签页**（也就是"尚未登录"）。窗口只有 760 高，
+  // 不滚的话通道状态在屏幕外，抓出来和"登录之后"那一帧逐字节相同 —— 上一版
+  // 就是这么交付的（GPT 审查发现两张 PNG 的 sha256 一样）。
+  scrollTop(150);
+  const bool ready_frame_ok =
+      ObjectInViewport(window, "remoteTunnelStateText") &&
+      ObjectText(window, "remoteTunnelStateText")
+          .contains(QStringLiteral("已建立")) &&
+      ObjectInViewport(window, "remoteAccountTabs") && !remote->authenticated();
   if (!shot(QStringLiteral("remote-ssh-ready"))) {
+    return 1;
+  }
+  if (!ready_frame_ok) {
+    std::fprintf(stderr,
+                 "[screenshot-remote] ssh-ready 帧里没有同时出现"
+                 "「安全通道已建立」与「尚未登录」\n");
     return 1;
   }
 
@@ -5863,7 +6010,50 @@ int RunRemoteScreenshot(QQuickWindow* window,
                  qPrintable(remote->lastDetailForTest()));
     return 1;
   }
+  // 这一帧必须**看得见**登录已经成功：账户卡片上的"当前账户：<名字>"与
+  // "状态：已登录"。上一版只在内部断言 authenticated()，画面里却什么都没有
+  // —— 那也是 GPT 审查抓到的：两张 PNG 逐字节相同。
+  //
+  // 账户卡片就在指纹块下面（登录/注册标签页的位置），所以往下多滚一段。
+  scrollTop(360);
+  const bool login_frame_ok =
+      remote->authenticated() &&
+      ObjectInViewport(window, "remoteAccountText") &&
+      ObjectText(window, "remoteAccountText").contains(account) &&
+      ObjectInViewport(window, "remoteAccountStateText") &&
+      ObjectText(window, "remoteAccountStateText")
+          .contains(QStringLiteral("已登录"));
   if (!shot(QStringLiteral("remote-login-success"))) {
+    return 1;
+  }
+  if (!login_frame_ok) {
+    std::fprintf(stderr,
+                 "[screenshot-remote] login-success 帧里看不到"
+                 "「当前账户 / 已登录」（accountText=[%s] stateText=[%s]）\n",
+                 qPrintable(ObjectText(window, "remoteAccountText")),
+                 qPrintable(ObjectText(window, "remoteAccountStateText")));
+    return 1;
+  }
+
+  // 7.5) 先在这个隔离账户里放一份真实的远端备份。
+  //
+  // 为什么需要这一步：账号是全新的，云端一条备份都没有，于是"刷新列表成功"
+  // 的横幅会诚实地写"云端还没有备份"—— 那也是一个真结论，但它证明不了
+  // "列表被重新读回来了"。放一条进去之后，重连那一帧的横幅是
+  // "云端备份列表已更新 / 云端共 1 个备份"，列表里还有那一行。
+  const QString shot_source =
+      QDir::temp().filePath(QStringLiteral("pr22-shot-source"));
+  QDir().mkpath(shot_source);
+  WriteTestFile(shot_source + QStringLiteral("/shot.txt"),
+                QByteArray("pr22 screenshot source\n"));
+  const bool seeded =
+      remote->backupRemote(shot_source, /*allow_incremental=*/false) &&
+      remote->waitForIdle(300000) &&
+      !remote->lastBackupSnapshotIdForTest().isEmpty();
+  if (!seeded) {
+    std::fprintf(stderr,
+                 "[screenshot-remote] 无法在这个临时账号里放一份备份：%s\n",
+                 qPrintable(remote->lastDetailForTest()));
     return 1;
   }
 
@@ -5876,9 +6066,40 @@ int RunRemoteScreenshot(QQuickWindow* window,
                  qPrintable(remote->lastDetailForTest()));
     return 1;
   }
+  // 这一帧要给出**结论**，而不是让读者从"本地端口变了"去推断：卷到页面
+  // 底部，状态横幅上写着这次刷新的真实结果"云端备份列表已更新"，下面还有
+  // 列表自己的摘要行。两者都是控制器真的写进去的文本，不是画上去的。
+  ScrollRemotePageToBottom(window);
+  // StatusBanner 暴露的是 showsMessage / title / message，不是 text ——
+  // 与 --remote-test 里既有断言读的是同几个属性。
+  QObject* reconnect_banner =
+      window->findChild<QObject*>(QStringLiteral("remoteStatusBanner"));
+  const QString reconnect_banner_title =
+      reconnect_banner == nullptr
+          ? QString()
+          : reconnect_banner->property("title").toString();
+  // 关键在于 ItemInViewport：横幅必须**真的在这一帧的画面里**，
+  // 而不是"属性上写着有这句话"。
+  const bool reconnect_frame_ok =
+      reconnect_banner != nullptr &&
+      reconnect_banner->property("showsMessage").toBool() &&
+      ItemInViewport(window, reconnect_banner) &&
+      reconnect_banner_title.contains(QStringLiteral("云端备份列表已更新")) &&
+      remote->listSummary().contains(QStringLiteral("云端共")) &&
+      ObjectInViewport(window, "remoteListSummary") && remote->tunnelReady() &&
+      remote->tunnelOwnedForTest();
   if (!shot(QStringLiteral("remote-reconnected"))) {
     return 1;
   }
+  if (!reconnect_frame_ok) {
+    std::fprintf(stderr,
+                 "[screenshot-remote] reconnected 帧里看不到"
+                 "「云端备份列表已更新」（banner=[%s] summary=[%s]）\n",
+                 qPrintable(reconnect_banner_title),
+                 qPrintable(remote->listSummary()));
+    return 1;
+  }
+  scrollTop(0);
 
   // 9) 深色主题下的同一页（连接层的配色也要在两套主题下都读得清）。
   theme->setDark(true);
@@ -5886,6 +6107,44 @@ int RunRemoteScreenshot(QQuickWindow* window,
     return 1;
   }
   theme->setDark(false);
+
+  // 抓完立刻比对三张"结论帧"的字节：它们必须互不相同。
+  //
+  // 上一版交付的包里 remote-ssh-ready.png 与 remote-login-success.png 逐字节
+  // 相同（sha256 1cfc7359…），因为登录带来的变化全在窗口可视范围之外 ——
+  // 这个自检就是为了让那种情况**不可能**再悄悄通过。
+  {
+    const auto digest = [](const QString& name, QString* out) {
+      QFile file(name);
+      if (!file.open(QIODevice::ReadOnly)) {
+        return false;
+      }
+      const QByteArray bytes = file.readAll();
+      *out = QString::fromLatin1(
+          QCryptographicHash::hash(bytes, QCryptographicHash::Sha256).toHex());
+      return true;
+    };
+    QString ready_sha;
+    QString login_sha;
+    QString reconnect_sha;
+    const QString base = directory + QLatin1Char('/');
+    const bool ok =
+        digest(base + QStringLiteral("remote-ssh-ready.png"), &ready_sha) &&
+        digest(base + QStringLiteral("remote-login-success.png"), &login_sha) &&
+        digest(base + QStringLiteral("remote-reconnected.png"), &reconnect_sha);
+    std::printf("screenshot-sha: ready=%s login=%s reconnected=%s\n",
+                qPrintable(ready_sha), qPrintable(login_sha),
+                qPrintable(reconnect_sha));
+    if (!ok || ready_sha == login_sha || ready_sha == reconnect_sha ||
+        login_sha == reconnect_sha) {
+      std::fprintf(stderr,
+                   "[screenshot-remote] 三张结论帧必须互不相同"
+                   "（ready=%s login=%s reconnected=%s）\n",
+                   qPrintable(ready_sha), qPrintable(login_sha),
+                   qPrintable(reconnect_sha));
+      return 1;
+    }
+  }
 
   // 收尾：注销临时账号并关掉通道，ECS 上不留任何东西。
   remote->deleteAccount(password, account);
