@@ -87,3 +87,6 @@ Thumbs.db
 offline-roots/
 official-root-*.key
 *.root-key
+
+# 发布打包输出（scripts/stage-*-release.sh 生成），不进仓库。
+/dist/
