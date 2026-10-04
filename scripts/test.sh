@@ -1964,6 +1964,20 @@ expect_preview_matches_backup_at "PRV-40 SOCK-PATH-02 被排除的非法名 sock
   "$PSOCK" --exclude 'name:sock*'
 
 # PRV-41 超长 child path：长度是遍历阶段的硬边界（历史语义），即使规则会把它
+#
+# ⚠ 这条用例目前是红的，原因值得写在这里，免得下一个人重新推一遍：
+#   要断言的守卫是 kMaxArchivePathLength = 4096（include/archive_path.h:25），
+#   它**等于 PATH_MAX**。夹具只能用 chdir 逐级下钻去构造 >4096 的 archive path，
+#   但无论如何，那个夹具的**绝对**路径都至少是
+#       <仓库前缀> + 4097 + 溢出 + 文件名
+#   —— 对任何仓库位置都必然超过 PATH_MAX（前缀不可能为负）。
+#   所以这条用例只有在产品用 openat/fchdir 风格的**相对下钻**遍历时才可能成立；
+#   现在的失败信息是 "Failed to inspect path: <绝对路径>: File name too long"，
+#   说明遍历把完整绝对路径交给了 syscall。
+#   两种可能的收尾都需要单独评审：(a) 改遍历策略；(b) 明确写清"在当前遍历策略下
+#   这条端到端构造不可成立"。注意守卫本身有单元测试覆盖
+#   （tests/unit/backup_preview_test.cpp:1256），缺的只是这一段端到端构造。
+# PRV-41 超长 child path：长度是遍历阶段的硬边界（历史语义），即使规则会把它
 # 排除，也照样失败。用 chdir + 相对路径构造，任何一次 syscall 都不超 PATH_MAX。
 PLONG="$PG/too-long/src"
 rm -rf "$PG/too-long"; mkdir -p "$PLONG"
