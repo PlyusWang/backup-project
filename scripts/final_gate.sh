@@ -46,6 +46,21 @@ run() {
 }
 
 run lint bash scripts/lint.sh
+
+# PR #23：手写密码学原语与证书层的独立套件。四个都是纯 C++（不链接 Qt）、
+# 跑得快，而且是 BPSEC2 的地基 —— 放最前面，坏的时候报错最直白：
+#   sha512      官方向量 + 流式一致性 + sha512sum oracle
+#   ed25519     RFC 8032 官方向量 + cryptography/PyNaCl 双 oracle + OpenSSL 交叉验证
+#   bpcert      BPCERT1 六类畸形 + 单字节全扫描 + 20000 例 fuzz + python 独立拼字节
+#   cert-tool   离线根 0600 / 拒绝覆盖 / 空存储不信任 / 输出无私钥
+run sha512 bash scripts/sha512_test.sh
+run ed25519 bash scripts/ed25519_test.sh
+run bpcert bash scripts/bpcert_test.sh
+run cert-tool bash scripts/cert_tool_test.sh
+# 前两个再在 ASan + UBSan 下跑一遍：手写大整数与标量归约的越界/回绕问题
+# 只有消毒剂才稳定暴露（本项目已经在这个文件里真实抓到过两次）。
+run ed25519-sanitize env ED25519_TEST_EXTRA_FLAGS="-g -O1 -fsanitize=address,undefined -fno-omit-frame-pointer" ED25519_ORACLE_CASES=6 bash scripts/ed25519_test.sh
+run bpcert-sanitize env BPCERT_TEST_EXTRA_FLAGS="-g -O1 -fsanitize=address,undefined -fno-omit-frame-pointer" bash scripts/bpcert_test.sh
 # PR #22：SshTunnelManager 的独立单元测试（进程生命周期 / 参数向量 / 就绪判定 /
 # 超时 / 回收）。它只链接 Qt6Core + Qt6Network，不构建整个 GUI，所以放在最前面：
 # 这一层出问题的话，后面所有网络套件都会以"看不懂的方式"红掉。
