@@ -2993,6 +2993,246 @@ int RunRemoteProductFlow(backup_modern::RemoteController* remote, CheckRun* run,
 //   BACKUP_REMOTE_IDLE_WAIT   服务端空闲关连接的秒数（默认 5）
 //   BACKUP_REMOTE_SERVER_PID  本地自检时服务端的 pid：用它 SIGSTOP 造一个
 //                             **确定**的"长操作进行中"窗口，不靠 sleep 猜时间
+// C08..C14：需要一条**真实可用**的 SSH 目标（ECS）。
+//
+// 这一段只能在 scripts/pr22_ecs_e2e.sh 里跑：它要真的 ssh 出去。它验证的是
+// PR #22 的核心产品主张 —— "GUI 自己把当前部署需要的那条 SSH 隧道管起来"，
+// 以及"失败时说的是**哪一层**失败"。
+int RunRemoteTunnelEcs(QQuickWindow* window,
+                       backup_modern::RemoteController* remote, CheckRun* run,
+                       const QString& ssh_target, const QString& host,
+                       const QString& port_text, const QString& password,
+                       const QString& pin) {
+  run->prefix = "[remote-acceptance]";
+  window->setProperty("currentPage", 6);
+  WaitForAnimation(300);
+
+  const auto waitForTunnelState = [remote](const QString& wanted,
+                                           int timeout_ms) {
+    QElapsedTimer timer;
+    timer.start();
+    while (timer.elapsed() < timeout_ms) {
+      if (remote->tunnelStateForTest() == wanted) {
+        return true;
+      }
+      WaitForAnimation(100);
+    }
+    return remote->tunnelStateForTest() == wanted;
+  };
+  const auto waitForPidGone = [](qint64 pid, int timeout_ms) {
+    if (pid <= 0) {
+      return false;
+    }
+    QElapsedTimer timer;
+    timer.start();
+    while (timer.elapsed() < timeout_ms) {
+      if (!QFileInfo::exists(QStringLiteral("/proc/%1").arg(pid))) {
+        return true;
+      }
+      WaitForAnimation(100);
+    }
+    return !QFileInfo::exists(QStringLiteral("/proc/%1").arg(pid));
+  };
+
+  // ---- C08：SSH 认证失败 -> 明确失败，不把密码提示藏到后台 ----
+  {
+    remote->setConnectionModeForTest(QStringLiteral("ssh"));
+    remote->setSshHostForTest(QStringLiteral("no-such-user@") + ssh_target);
+    remote->ensureConnection(host, port_text);
+    remote->waitForTunnelIdle(120000);
+    run->Check(remote->tunnelFailureKindForTest() == QStringLiteral("ssh-auth"),
+               QStringLiteral("C08 SSH 认证失败 -> ssh-auth"),
+               remote->tunnelFailureKindForTest() + QStringLiteral(": ") +
+                   remote->tunnelDiagnosticText().left(200));
+    run->Check(
+        remote->tunnelFailureText().contains(QStringLiteral("ssh-agent")),
+        QStringLiteral("C08b 文案让用户去配置 SSH 密钥 / ssh-agent"),
+        remote->tunnelFailureText());
+    remote->stopTunnel();
+  }
+
+  // ---- C14：用户自己开的隧道只被复用，绝不被杀 ----
+  {
+    int external_port = 0;
+    QString pick_error;
+    run->Check(backup_modern::SshTunnelManager::PickFreeLoopbackPort(
+                   &external_port, &pick_error),
+               QStringLiteral("C14 前置：挑到一个空闲本地端口"), pick_error);
+    QProcess external;
+    external.setProgram(QStringLiteral("ssh"));
+    external.setArguments(
+        {QStringLiteral("-N"), QStringLiteral("-o"),
+         QStringLiteral("BatchMode=yes"), QStringLiteral("-o"),
+         QStringLiteral("ExitOnForwardFailure=yes"), QStringLiteral("-o"),
+         QStringLiteral("ConnectTimeout=10"), QStringLiteral("-L"),
+         QStringLiteral("127.0.0.1:%1:%2:%3")
+             .arg(external_port)
+             .arg(host)
+             .arg(port_text),
+         QStringLiteral("--"), ssh_target});
+    external.start();
+    bool external_up = false;
+    for (int attempt = 0; attempt < 60 && !external_up; ++attempt) {
+      external_up = backup_modern::SshTunnelManager::IsLoopbackPortOpen(
+          external_port, 200, nullptr);
+      if (!external_up) {
+        WaitForAnimation(250);
+      }
+    }
+    run->Check(
+        external_up,
+        QStringLiteral("C14 前置：外部隧道（用户自己开的 ssh -N -L）已经可用"),
+        QString::fromUtf8(external.readAllStandardError()).left(200));
+    if (external_up) {
+      remote->setSshHostForTest(ssh_target);
+      remote->setSshLocalPortForTest(QString::number(external_port));
+      remote->ensureConnection(host, port_text);
+      remote->waitForTunnelIdle(60000);
+      run->Check(remote->tunnelStateForTest() == QStringLiteral("ready") &&
+                     remote->tunnelExternalReuseForTest(),
+                 QStringLiteral("C14a 外部隧道被识别并复用（不再自己起一条）"),
+                 remote->tunnelStateForTest());
+      run->Check(remote->tunnelPidForTest() == 0,
+                 QStringLiteral("C14b 复用时本程序不持有任何进程"));
+      remote->stopTunnel();
+      WaitForAnimation(800);
+      run->Check(external.state() != QProcess::NotRunning,
+                 QStringLiteral("C14c 关闭安全通道没有杀掉用户自己的 ssh"));
+    }
+    external.kill();
+    external.waitForFinished(5000);
+    remote->setSshLocalPortForTest(QString());
+  }
+
+  // ---- C09：GUI 自己建立安全通道 -> Ready ----
+  {
+    remote->setSshHostForTest(ssh_target);
+    remote->ensureConnection(host, port_text);
+    remote->waitForTunnelIdle(120000);
+    run->Check(remote->tunnelStateForTest() == QStringLiteral("ready"),
+               QStringLiteral("C09 GUI 自己建立的 SSH 安全通道进入 ready"),
+               remote->tunnelFailureKindForTest() + QStringLiteral(": ") +
+                   remote->tunnelDiagnosticText().left(200));
+    run->Check(
+        remote->tunnelOwnedForTest() && remote->tunnelPidForTest() > 0,
+        QStringLiteral("C09b 这条通道由本程序启动（有 pid，退出时会回收）"),
+        QStringLiteral("pid=%1").arg(remote->tunnelPidForTest()));
+    run->Check(remote->tunnelLocalEndpointForTest().startsWith(
+                   QStringLiteral("127.0.0.1:")),
+               QStringLiteral("C09c 本地端点是回环地址"),
+               remote->tunnelLocalEndpointForTest());
+  }
+
+  // ---- C10：隧道通、pin 不对 -> pin-mismatch，不是"网络错误" ----
+  QString c10_account;
+  {
+    const QString account =
+        QStringLiteral("pr22-tunnel-%1")
+            .arg(QRandomGenerator::global()->bounded(1000000, 9999999));
+    c10_account = account;
+    const bool registered =
+        remote->registerAccount(host, port_text, account, password, password) &&
+        remote->waitForIdle(180000);
+    remote->logoutLocal();
+    remote->applyServerKeyPin(QStringLiteral("sha256:") +
+                              QString(64, QLatin1Char('0')));
+    const bool accepted = remote->login(host, port_text, account, password);
+    const bool finished = accepted && remote->waitForIdle(180000);
+    run->Check(
+        finished &&
+            remote->lastErrorKindForTest() == QStringLiteral("pin-mismatch"),
+        QStringLiteral("C10a 隧道已就绪但 BPSEC1 pin 不符 -> pin-mismatch"),
+        remote->lastErrorKindForTest() + QStringLiteral(": ") +
+            remote->lastDetailForTest());
+    run->Check(remote->tunnelStateForTest() == QStringLiteral("ready"),
+               QStringLiteral("C10b 失败的是身份校验那一层，隧道本身仍然完好"),
+               remote->tunnelStateForTest());
+    run->Check(
+        !remote->loginError().isEmpty() &&
+            remote->loginError() !=
+                QStringLiteral("无法连接到服务器，请稍后重试"),
+        QStringLiteral("C10c 登录表单给的是身份校验的说法，不是“稍后重试”"),
+        remote->loginError());
+    run->Check(registered, QStringLiteral("C10 前置：隔离测试账户已注册"));
+    // 恢复正确的 pin，后面的检查才有意义。
+    remote->applyServerKeyPin(pin);
+  }
+
+  // ---- C11：正确的隧道 + 正确的 pin -> 登录通过 ----
+  const QString account =
+      QStringLiteral("pr22-e2e-%1")
+          .arg(QRandomGenerator::global()->bounded(1000000, 9999999));
+  {
+    const bool registered =
+        remote->registerAccount(host, port_text, account, password, password) &&
+        remote->waitForIdle(180000);
+    const bool logged_in = remote->login(host, port_text, account, password) &&
+                           remote->waitForIdle(180000) &&
+                           remote->authenticated();
+    run->Check(registered && logged_in,
+               QStringLiteral("C11 正确的安全通道 + 正确的 pin -> 登录通过"),
+               remote->lastErrorKindForTest() + QStringLiteral(": ") +
+                   remote->lastDetailForTest());
+  }
+
+  // ---- C12：登录之后隧道断掉 -> 下一次操作自动重建 + RESUME ----
+  {
+    const int deferred_before = remote->deferredSubmitCountForTest();
+    const bool killed = remote->killOwnedTunnelForTest();
+    run->Check(killed,
+               QStringLiteral("C12 前置：确实杀掉了 GUI 自己的那条 ssh"));
+    run->Check(
+        waitForTunnelState(QStringLiteral("failed"), 20000),
+        QStringLiteral("C12a 通道状态变成 failed（进程死了就是要说出来）"),
+        remote->tunnelStateForTest());
+    const bool listed = remote->refreshList() && remote->waitForIdle(180000);
+    run->Check(
+        listed && remote->lastErrorKindForTest() == QStringLiteral("none"),
+        QStringLiteral("C12b 下一次 List 自动重建通道并 RESUME"),
+        remote->lastErrorKindForTest() + QStringLiteral(": ") +
+            remote->lastDetailForTest());
+    run->Check(remote->authenticated(),
+               QStringLiteral("C12c 不需要用户重新登录（会话仍然有效）"));
+    run->Check(
+        remote->deferredSubmitCountForTest() > deferred_before,
+        QStringLiteral("C12d 这一次请求确实是被挂起之后自动接着发出去的"),
+        QStringLiteral("%1 -> %2 [%3]")
+            .arg(deferred_before)
+            .arg(remote->deferredSubmitCountForTest())
+            .arg(remote->lastDeferredActionForTest()));
+    run->Check(remote->tunnelStateForTest() == QStringLiteral("ready") &&
+                   remote->tunnelOwnedForTest(),
+               QStringLiteral("C12e 重建之后的通道仍然由本程序拥有"),
+               remote->tunnelStateForTest());
+  }
+
+  // ---- C13：关闭通道 -> 自有 ssh 进程被收掉，不留孤儿 ----
+  {
+    // 先清理本次检查建出来的每一个账户：ECS 上的**正式数据**必须回到
+    // before，否则 scripts/pr22_ecs_e2e.sh 的 before == after 就不成立了。
+    if (remote->authenticated()) {
+      remote->deleteAccount(password, account);
+      remote->waitForIdle(300000);
+    }
+    if (!c10_account.isEmpty()) {
+      if (remote->login(host, port_text, c10_account, password) &&
+          remote->waitForIdle(180000)) {
+        remote->deleteAccount(password, c10_account);
+        remote->waitForIdle(300000);
+      }
+    }
+    const qint64 pid = remote->tunnelPidForTest();
+    remote->stopTunnel();
+    run->Check(
+        pid > 0 && waitForPidGone(pid, 15000),
+        QStringLiteral("C13 通道关闭之后自有的 ssh 进程消失（不留孤儿）"),
+        QStringLiteral("pid=%1").arg(pid));
+    remote->logoutLocal();
+  }
+
+  return 0;
+}
+
 int RunRemoteAcceptance(QQuickWindow* window,
                         backup_modern::RemoteController* remote,
                         backup_modern::BackupController* controller,
@@ -3026,6 +3266,18 @@ int RunRemoteAcceptance(QQuickWindow* window,
     if (ok && value > 1) {
       server_pid = value;
     }
+  }
+  // 连接方式由环境决定：
+  //   给了 BACKUP_REMOTE_SSH_TARGET -> SSH 安全通道（PR #22 的部署模型：
+  //     服务端只监听它自己的回环地址，客户端必须先把隧道建起来）
+  //   没给 -> 直连（PR #21 的老用法，端点本身可达）
+  const QString ssh_target_env =
+      qEnvironmentVariable("BACKUP_REMOTE_SSH_TARGET");
+  if (!ssh_target_env.isEmpty()) {
+    remote->setConnectionModeForTest(QStringLiteral("ssh"));
+    remote->setSshHostForTest(ssh_target_env);
+  } else {
+    remote->setConnectionModeForTest(QStringLiteral("direct"));
   }
   if (!QDir().mkpath(out_dir)) {
     std::fprintf(stderr, "[remote-acceptance] 无法创建输出目录 %s\n",
@@ -4733,6 +4985,23 @@ int RunRemoteAcceptance(QQuickWindow* window,
             remote->lastErrorKindForTest() + QStringLiteral(": ") +
                 remote->lastDetailForTest());
 
+  // ---- PR #22：C08..C14（SSH 安全通道的真实闭环）----
+  //
+  // 只有给了 SSH 目标才跑：没有它就退回"直连某个可达端点"的老用法，那些
+  // 检查会**明说跳过**，而不是假装通过。
+  {
+    const QString ssh_target = qEnvironmentVariable("BACKUP_REMOTE_SSH_TARGET");
+    if (ssh_target.isEmpty()) {
+      std::printf(
+          "[remote-acceptance]   ok   C08..C14 跳过：没有设置 "
+          "BACKUP_REMOTE_SSH_TARGET（本次是直连模式，没有 SSH 通道可测）\n");
+      ++run.passed;
+    } else {
+      RunRemoteTunnelEcs(window, remote, &run, ssh_target, host, port_text,
+                         password, pin);
+    }
+  }
+
   // ---- 几何报告落盘（给人工 / 评审看每个控件的真实坐标）----
   {
     QFile report(out_dir + QStringLiteral("/geometry-checks.txt"));
@@ -5053,6 +5322,576 @@ QString ExtractServerKeyPin(const QString& keygen_output) {
   return QStringLiteral("sha256:") + fingerprint.toLower();
 }
 
+// ---- PR #22：连接层自检（pin 应用 UX + SSH 安全通道）----
+//
+// 分两段，因为它们的依赖完全不同：
+//
+//   RunRemoteConnectionUx  —— C01..C07：**不需要 ECS、不需要能用的 SSH 目标**。
+//                             它验证的是"界面上的动作有没有可见结果"和"每一类
+//                             ssh 失败有没有自己的说法"，所以能进 final gate。
+//   RunRemoteTunnelEcs     —— C08..C14：需要一条真实可用的 SSH 目标（ECS），
+//                             由 scripts/pr22_ecs_e2e.sh 驱动。
+//
+// 这一组检查刻意**全部从界面对象发起**（写输入框的 text、发按钮的 clicked
+// 信号），而不是直接调用控制器：人工验收发现的第一个问题就是"按钮的 onClicked
+// 把返回值丢掉了"，只有从按钮那一条路走才可能抓到它。
+namespace {
+
+// 把一个文本输入框当成"用户敲进去了"：先设 text，再发 QML 的 textEdited 信号。
+// 只设 text 不会触发 onTextEdited，那样测的就不是用户的路径了。
+bool TypeIntoField(QQuickWindow* window, const char* object_name,
+                   const QString& text) {
+  QObject* field =
+      window->findChild<QObject*>(QString::fromLatin1(object_name));
+  if (field == nullptr) {
+    return false;
+  }
+  field->setProperty("text", text);
+  // TextField 的 textEdited 在不同 Qt 版本里带不带参数并不一致，两种都试。
+  // 只有"页面上的草稿真的变成了这个值"才算成功 —— 否则一条断言可能因为
+  // 输入根本没进去而**假通过**（这一条是实测踩出来的）。
+  if (QMetaObject::invokeMethod(field, "textEdited", Q_ARG(QString, text)) ||
+      QMetaObject::invokeMethod(field, "textEdited")) {
+    return true;
+  }
+  return false;
+}
+
+// 按钮按下：发 clicked 信号（AbstractButton 的标准信号），于是 QML 里的
+// onClicked 真的被执行。
+bool ClickButton(QQuickWindow* window, const char* object_name) {
+  QObject* button =
+      window->findChild<QObject*>(QString::fromLatin1(object_name));
+  if (button == nullptr) {
+    return false;
+  }
+  return QMetaObject::invokeMethod(button, "clicked");
+}
+
+bool ObjectVisible(QQuickWindow* window, const char* object_name) {
+  QObject* object =
+      window->findChild<QObject*>(QString::fromLatin1(object_name));
+  return object != nullptr && object->property("visible").toBool();
+}
+
+QString ObjectText(QQuickWindow* window, const char* object_name) {
+  QObject* object =
+      window->findChild<QObject*>(QString::fromLatin1(object_name));
+  return object == nullptr ? QString() : object->property("text").toString();
+}
+
+}  // namespace
+
+// C01..C07：不需要任何外部依赖。
+//
+// working_pin 是调用方已经配好的**正确** pin（C01 会把它改掉再改回来），
+// 所以这个函数结束之后控制器仍然处于"可以正常连接"的状态。
+int RunRemoteConnectionUx(QQuickWindow* window,
+                          backup_modern::RemoteController* remote,
+                          CheckRun* run, const QString& good_pin,
+                          const QString& host, const QString& port_text,
+                          const QString& username, const QString& password,
+                          const QString& source_dir) {
+  run->prefix = "[remote-test]";
+  // 先把页面切到 Remote 页：控件的 visible 绑定与这一页的 currentPage 有关。
+  window->setProperty("currentPage", 6);
+  WaitForAnimation(300);
+
+  const auto restore_pin = [remote, &good_pin]() {
+    remote->applyServerKeyPin(good_pin);
+  };
+
+  // C04 需要一份真实存在的源目录。**不**依赖前面的检查是否成功：没有就现造
+  // 一个，否则这条检查会因为"上一条挂了"而连带红掉，掩盖真正的原因。
+  if (!QFileInfo(source_dir).isDir()) {
+    QDir().mkpath(source_dir);
+    WriteTestFile(source_dir + QStringLiteral("/c04.txt"),
+                  QByteArray("pr22-c04\n"));
+  }
+
+  // 页面上必须真的有"连接方式 / SSH 主机 / 通道状态"这三件东西：PR #22 的
+  // 产品目标之一就是把部署链路摆到界面上，而不是继续留在文档里。
+  run->Check(
+      window->findChild<QObject*>(QStringLiteral("remoteConnectionModeTabs")) !=
+              nullptr &&
+          window->findChild<QObject*>(QStringLiteral("remoteSshHostField")) !=
+              nullptr &&
+          window->findChild<QObject*>(
+              QStringLiteral("remoteTunnelStateText")) != nullptr &&
+          window->findChild<QObject*>(
+              QStringLiteral("remoteEnsureConnectionButton")) != nullptr &&
+          window->findChild<QObject*>(
+              QStringLiteral("remoteStopTunnelButton")) != nullptr,
+      QStringLiteral(
+          "C00 连接方式 / SSH 主机 / 通道状态 / 建立连接按钮都在页面上"));
+
+  // ---- C01：合法 pin + 点"应用" -> 立刻有**看得见**的成功反馈 ----
+  {
+    // 先让"已经生效"的值是**另一个**合法指纹，否则这次点击的结果会是
+    // "unchanged"，整条断言就变成了同义反复。
+    const QString applied_before =
+        QStringLiteral("sha256:") + QString(64, QLatin1Char('1'));
+    remote->applyServerKeyPin(applied_before);
+    const QString pin = good_pin;
+    const bool typed = TypeIntoField(window, "remoteServerKeyPinField", pin);
+    const bool clicked = ClickButton(window, "remoteServerKeyPinApplyButton");
+    run->Check(typed && clicked,
+               QStringLiteral("C01a 在指纹框里输入合法 pin 并点“应用”"),
+               QStringLiteral("typed=%1 clicked=%2")
+                   .arg(typed ? 1 : 0)
+                   .arg(clicked ? 1 : 0));
+    run->Check(remote->serverKeyPin() == pin,
+               QStringLiteral("C01b 控制器采用了这个 pin"));
+    run->Check(!remote->pinApplyMessage().isEmpty() &&
+                   remote->pinApplyMessage().contains(QStringLiteral("已应用")),
+               QStringLiteral("C01c 反馈里出现“已应用”"),
+               remote->pinApplyMessage());
+    // 关键的一条：页面上那一行真的显示出来了 —— 这正是"点了应用什么都没
+    // 发生"那个 bug 的直接反例。
+    run->Check(ObjectVisible(window, "remoteServerKeyPinApplied") &&
+                   ObjectText(window, "remoteServerKeyPinApplied")
+                       .contains(QStringLiteral("已应用")),
+               QStringLiteral("C01d 页面上可见“✓ 已应用”"),
+               ObjectText(window, "remoteServerKeyPinApplied"));
+    // 这是配置动作，不是连接测试：不联网、不登录。
+    run->Check(!remote->busy() && !remote->authenticated(),
+               QStringLiteral("C01e 应用 pin 只改配置：不联网、不登录"));
+  }
+
+  // ---- C02：非法 pin -> 可见红色错误，上一次生效的 pin 一个字节都不改 ----
+  {
+    const QString before = remote->serverKeyPin();
+    TypeIntoField(window, "remoteServerKeyPinField",
+                  QStringLiteral("sha256:zz"));
+    ClickButton(window, "remoteServerKeyPinApplyButton");
+    run->Check(remote->serverKeyPin() == before,
+               QStringLiteral("C02a 非法 pin 不改变已经生效的指纹"),
+               QStringLiteral("before=%1 after=%2")
+                   .arg(before, remote->serverKeyPin()));
+    run->Check(!remote->serverKeyPinError().isEmpty(),
+               QStringLiteral("C02b 非法 pin 写下了自己的原因"),
+               remote->serverKeyPinError());
+    run->Check(ObjectVisible(window, "remoteServerKeyPinError"),
+               QStringLiteral("C02c 页面上可见红色错误行"),
+               ObjectText(window, "remoteServerKeyPinError"));
+    run->Check(
+        remote->pinApplyMessage().isEmpty() &&
+            !ObjectVisible(window, "remoteServerKeyPinApplied"),
+        QStringLiteral("C02d 非法时不显示“✓ 已应用”（两句话不能同时出现）"));
+    // 裸十六进制会被拒：公钥与指纹长度相同，混起来就会把指纹当公钥用。
+    TypeIntoField(window, "remoteServerKeyPinField",
+                  QStringLiteral("0123456789abcdef0123456789abcdef"
+                                 "0123456789abcdef0123456789abcdef"));
+    ClickButton(window, "remoteServerKeyPinApplyButton");
+    run->Check(remote->serverKeyPin() == before &&
+                   !remote->serverKeyPinError().isEmpty(),
+               QStringLiteral("C02e 不带前缀的裸十六进制同样被拒"),
+               remote->serverKeyPinError());
+    restore_pin();
+  }
+
+  // ---- C03：改 pin、不点"应用"、直接登录 -> 采用**当前输入框里的** pin ----
+  {
+    // 先故意让"已生效"的 pin 是一个错的，然后把输入框换成对的，直接登录。
+    const QString wrong_pin =
+        QStringLiteral("sha256:") + QString(64, QLatin1Char('0'));
+    const QString new_user =
+        QStringLiteral("gui-pin-%1")
+            .arg(QRandomGenerator::global()->bounded(1000000, 9999999));
+    remote->applyServerKeyPin(good_pin);
+    const bool registered =
+        remote->registerAccount(host, port_text, new_user, password,
+                                password) &&
+        remote->waitForIdle(120000) &&
+        remote->login(host, port_text, new_user, password) &&
+        remote->waitForIdle(120000) && remote->authenticated();
+    run->Check(registered, QStringLiteral("C03 前置：临时账号就绪"),
+               remote->lastErrorKindForTest() + QStringLiteral(": ") +
+                   remote->lastDetailForTest());
+
+    // (1) 把输入框改成错的，**不点应用**，直接登录 -> 必须以 pin-mismatch
+    // 失败。
+    //     这同时证明了"登录用的确实是输入框里那个值"。
+    TypeIntoField(window, "remoteServerKeyPinField", wrong_pin);
+    const bool wrong_accepted =
+        remote->loginWithPin(host, port_text, new_user, password, wrong_pin);
+    const bool wrong_finished = wrong_accepted && remote->waitForIdle(120000);
+    run->Check(
+        wrong_finished &&
+            remote->lastErrorKindForTest() == QStringLiteral("pin-mismatch"),
+        QStringLiteral(
+            "C03a 没点应用就登录：用的是**输入框里**的 pin（错 pin 立刻失败）"),
+        remote->lastErrorKindForTest() + QStringLiteral(": ") +
+            remote->loginError());
+
+    // (2) 把输入框改回正确的，**仍然不点应用**，直接登录 -> 自动提交并成功。
+    TypeIntoField(window, "remoteServerKeyPinField", good_pin);
+    const bool ok_accepted =
+        remote->loginWithPin(host, port_text, new_user, password, good_pin);
+    const bool ok_finished = ok_accepted && remote->waitForIdle(120000);
+    run->Check(
+        ok_finished && remote->authenticated() &&
+            remote->serverKeyPin() == good_pin,
+        QStringLiteral("C03b 不点应用直接登录：当前输入被自动采用并生效"),
+        remote->lastErrorKindForTest() + QStringLiteral(": ") +
+            remote->loginError());
+    run->Check(remote->pinApplyMessage().contains(QStringLiteral("已应用")),
+               QStringLiteral("C03c 自动提交同样给出“已应用”反馈"),
+               remote->pinApplyMessage());
+
+    // (3) 输入框里是不合法的 pin -> 一个字节都不发，登录表单看得见原因。
+    const QString before = remote->serverKeyPin();
+    const bool bad_accepted = remote->loginWithPin(
+        host, port_text, new_user, password, QStringLiteral("sha256:nothex"));
+    run->Check(!bad_accepted && remote->serverKeyPin() == before &&
+                   !remote->loginError().isEmpty(),
+               QStringLiteral("C03d 非法 pin 时登录被本地拒绝且生效值不变"),
+               remote->loginError());
+    remote->logoutLocal();
+    restore_pin();
+  }
+
+  // ---- C04：有活动连接时改 pin + 应用 -> 当前连接不被杀，下一次重连才换 ----
+  {
+    remote->applyServerKeyPin(good_pin);
+    const QString c04_user =
+        QStringLiteral("gui-c04-%1")
+            .arg(QRandomGenerator::global()->bounded(1000000, 9999999));
+    const bool ready = remote->registerAccount(host, port_text, c04_user,
+                                               password, password) &&
+                       remote->waitForIdle(120000) &&
+                       remote->login(host, port_text, c04_user, password) &&
+                       remote->waitForIdle(120000) && remote->authenticated();
+    run->Check(ready, QStringLiteral("C04 前置：临时账号就绪"),
+               remote->lastErrorKindForTest() + QStringLiteral(": ") +
+                   remote->lastDetailForTest());
+    // 发起一条**真的在跑**的操作，然后趁它还在跑的时候改成**另一个**合法
+    // 指纹。busy_ 是在提交之前同步置位的，所以这里的顺序是确定的。
+    // 这条操作在提交时已经拷走了当时的 pin，所以它必须继续用旧 pin 跑完 ——
+    // 这正是"当前连接保持不变"的可观察含义。
+    const QString new_pin =
+        QStringLiteral("sha256:") + QString(64, QLatin1Char('2'));
+    const bool started =
+        remote->backupRemote(source_dir, /*allow_incremental=*/false);
+    const bool was_busy = remote->busy();
+    const QString state = remote->applyServerKeyPin(new_pin);
+    run->Check(started && was_busy,
+               QStringLiteral("C04a 应用 pin 时确实有一条活动操作"));
+    run->Check(
+        state == QStringLiteral("applied") &&
+            remote->pinApplyMessage().contains(
+                QStringLiteral("当前连接保持不变")),
+        QStringLiteral("C04b 活动连接时给出“当前连接保持不变，下次重连时生效”"),
+        remote->pinApplyMessage());
+    const bool finished = remote->waitForIdle(180000);
+    run->Check(finished &&
+                   remote->lastErrorKindForTest() == QStringLiteral("none") &&
+                   !remote->lastBackupSnapshotIdForTest().isEmpty(),
+               QStringLiteral("C04c 当前操作没有被“应用”打断，正常完成"),
+               remote->lastErrorKindForTest() + QStringLiteral(": ") +
+                   remote->lastDetailForTest());
+    run->Check(remote->serverKeyPin() == new_pin,
+               QStringLiteral("C04d 新 pin 已经是生效值（下一次重连会用它）"));
+    remote->logoutLocal();
+  }
+
+  // ---- C05：找不到 ssh 命令 ----
+  {
+    remote->setConnectionMode(QStringLiteral("ssh"));
+    remote->setSshProgramForTest(QStringLiteral("/nonexistent/pr22-ssh"));
+    remote->setSshHostForTest(QStringLiteral("aliyun-ecs"));
+    remote->ensureConnection(host, port_text);
+    remote->waitForTunnelIdle(30000);
+    run->Check(
+        remote->tunnelFailureKindForTest() == QStringLiteral("ssh-missing"),
+        QStringLiteral("C05 找不到 ssh -> ssh-missing（不是“网络错误”）"),
+        remote->tunnelFailureKindForTest() + QStringLiteral(": ") +
+            remote->tunnelDiagnosticText());
+    run->Check(remote->tunnelFailureText().contains(QStringLiteral("ssh")),
+               QStringLiteral("C05b 失败原因里说清了是 ssh 命令的问题"),
+               remote->tunnelFailureText());
+    remote->stopTunnel();
+  }
+
+  // ---- C06：SSH 主机不存在 ----
+  {
+    remote->setSshProgramForTest(QString());
+    remote->setSshHostForTest(QStringLiteral("no-such-host.invalid"));
+    remote->ensureConnection(host, port_text);
+    remote->waitForTunnelIdle(60000);
+    run->Check(remote->tunnelFailureKindForTest() ==
+                   QStringLiteral("ssh-host-unreachable"),
+               QStringLiteral("C06 SSH 主机不存在 -> ssh-host-unreachable"),
+               remote->tunnelFailureKindForTest() + QStringLiteral(": ") +
+                   remote->tunnelDiagnosticText());
+    remote->stopTunnel();
+  }
+
+  // ---- C07：SSH host key 不被信任 -> fail closed（绝不偷偷放行）----
+  {
+    // 本机 known_hosts 里没有 localhost 的条目，而 BatchMode=yes 让 ssh 不能
+    // 交互式询问，于是它必须打印 "Host key verification failed." 并退出 255。
+    // 先确认这个前提真的成立，否则这条检查会自动变成"永远通过"。
+    QProcess precondition;
+    precondition.setProgram(QStringLiteral("ssh"));
+    precondition.setArguments(
+        {QStringLiteral("-o"), QStringLiteral("BatchMode=yes"),
+         QStringLiteral("-o"), QStringLiteral("ConnectTimeout=5"),
+         QStringLiteral("localhost"), QStringLiteral("true")});
+    precondition.start();
+    const bool precondition_ran = precondition.waitForStarted(10000) &&
+                                  precondition.waitForFinished(30000);
+    const QString precondition_err =
+        QString::fromUtf8(precondition.readAllStandardError());
+    if (!precondition_ran || !precondition_err.contains(QStringLiteral(
+                                 "Host key verification failed"))) {
+      std::printf(
+          "[remote-test]   ok   C07 跳过：本机 known_hosts 已经信任 "
+          "localhost（前提不成立，不假装通过）\n");
+      ++run->passed;
+    } else {
+      remote->setSshHostForTest(QStringLiteral("localhost"));
+      remote->ensureConnection(host, port_text);
+      remote->waitForTunnelIdle(60000);
+      run->Check(
+          remote->tunnelFailureKindForTest() == QStringLiteral("ssh-hostkey"),
+          QStringLiteral(
+              "C07 SSH host key 不被信任 -> ssh-hostkey（fail closed）"),
+          remote->tunnelFailureKindForTest() + QStringLiteral(": ") +
+              remote->tunnelDiagnosticText());
+      run->Check(
+          remote->tunnelFailureText().contains(QStringLiteral("身份校验失败")),
+          QStringLiteral("C07b 文案告诉用户去检查 SSH 配置，而不是重试"),
+          remote->tunnelFailureText());
+    }
+    remote->stopTunnel();
+    remote->setSshHostForTest(QStringLiteral("aliyun-ecs"));
+  }
+
+  // ---- C10 的前置：通道没建起来时，登录报的是**通道的**原因 ----
+  {
+    remote->setConnectionMode(QStringLiteral("ssh"));
+    remote->setSshHostForTest(QStringLiteral("no-such-host.invalid"));
+    const bool accepted = remote->login(host, port_text, username, password);
+    const bool finished = accepted && remote->waitForIdle(90000);
+    const QString kind = remote->lastErrorKindForTest();
+    run->Check(
+        finished && kind == QStringLiteral("ssh-host-unreachable") &&
+            remote->loginError() !=
+                QStringLiteral("无法连接到服务器，请稍后重试"),
+        QStringLiteral(
+            "C07c "
+            "隧道建不起来时，登录说的是通道的原因，不是“无法连接到服务器”"),
+        kind + QStringLiteral(": ") + remote->loginError());
+    remote->stopTunnel();
+    remote->setSshHostForTest(QStringLiteral("aliyun-ecs"));
+  }
+
+  // 直连模式留给后续自检（本地服务端就在 127.0.0.1 上）。
+  remote->setConnectionMode(QStringLiteral("direct"));
+  remote->applyServerKeyPin(good_pin);
+  return 0;
+}
+
+// --screenshot-remote：PR #22 的**真实状态**截图。
+//
+// 与 --screenshot 的区别：那一条拍的是"页面长什么样"，这一条拍的是"连接的
+// 每一层分别长什么样" —— 通道没启动 / 正在建 / 建好了 / 建失败 / pin 已应用 /
+// pin 不合法 / 登录成功 / 断线重连之后。每一张都先把产品**真的**驱动到那个
+// 状态再抓帧（走窗口自己的 grabWindow()，与用户看到的是同一条渲染路径），
+// 不是摆拍，也不是另画一张示意图。
+//
+// 需要 BACKUP_REMOTE_SSH_TARGET / BACKUP_REMOTE_PIN / BACKUP_REMOTE_PASSWORD
+// 三个环境变量：没有真实 SSH 目标就拍不出"通道已建立"这种状态。
+//
+// 口令永远不进画面：登录是直接调用控制器完成的，密码框始终是空的。
+int RunRemoteScreenshot(QQuickWindow* window,
+                        backup_modern::RemoteController* remote,
+                        backup_modern::AppTheme* theme,
+                        const QString& directory) {
+  const QString password = qEnvironmentVariable("BACKUP_REMOTE_PASSWORD");
+  const QString pin = qEnvironmentVariable("BACKUP_REMOTE_PIN");
+  const QString ssh_target = qEnvironmentVariable("BACKUP_REMOTE_SSH_TARGET");
+  if (password.isEmpty() || pin.isEmpty() || ssh_target.isEmpty()) {
+    std::fprintf(stderr,
+                 "[screenshot-remote] 需要 BACKUP_REMOTE_SSH_TARGET、"
+                 "BACKUP_REMOTE_PIN、BACKUP_REMOTE_PASSWORD\n");
+    return 2;
+  }
+  if (!QDir().mkpath(directory)) {
+    std::fprintf(stderr, "[screenshot-remote] 无法创建 %s\n",
+                 qPrintable(directory));
+    return 1;
+  }
+  const auto shot = [window, &directory](const QString& name) {
+    WaitForAnimation(400);
+    const QImage image = window->grabWindow();
+    if (image.isNull()) {
+      std::fprintf(stderr, "grabWindow() 返回空图像\n");
+      return false;
+    }
+    const QString path =
+        directory + QLatin1Char('/') + name + QStringLiteral(".png");
+    if (!image.save(path)) {
+      std::fprintf(stderr, "截图保存失败: %s\n", qPrintable(path));
+      return false;
+    }
+    std::printf("screenshot: %s\n", qPrintable(path));
+    return true;
+  };
+  const auto waitForState = [remote](const QString& wanted, int timeout_ms) {
+    QElapsedTimer timer;
+    timer.start();
+    while (timer.elapsed() < timeout_ms) {
+      if (remote->tunnelStateForTest() == wanted) {
+        return true;
+      }
+      WaitForAnimation(80);
+    }
+    return remote->tunnelStateForTest() == wanted;
+  };
+  const auto typePin = [window](const QString& text) {
+    QObject* field =
+        window->findChild<QObject*>(QStringLiteral("remoteServerKeyPinField"));
+    if (field != nullptr) {
+      field->setProperty("text", text);
+      if (!QMetaObject::invokeMethod(field, "textEdited",
+                                     Q_ARG(QString, text))) {
+        QMetaObject::invokeMethod(field, "textEdited");
+      }
+    }
+    QObject* button = window->findChild<QObject*>(
+        QStringLiteral("remoteServerKeyPinApplyButton"));
+    if (button != nullptr) {
+      QMetaObject::invokeMethod(button, "clicked");
+    }
+    WaitForAnimation(250);
+  };
+
+  theme->setDark(false);
+  window->setProperty("currentPage", 6);
+  QQuickItem* scroll =
+      window->findChild<QQuickItem*>(QStringLiteral("remotePageScroll"));
+  const auto scrollTop = [scroll](int y) {
+    if (scroll == nullptr) {
+      return;
+    }
+    QObject* flickable = qobject_cast<QObject*>(
+        scroll->property("contentItem").value<QQuickItem*>());
+    if (flickable != nullptr) {
+      flickable->setProperty("contentY", y);
+    }
+  };
+  scrollTop(0);
+
+  // 1) 全新状态：没有 pin、没有通道。
+  if (!shot(QStringLiteral("remote-connection-idle"))) {
+    return 1;
+  }
+
+  // 2) 合法 pin + 点"应用" -> 看得见的"✓ 已应用"。
+  //
+  // 往下滚一段：那一行结果就在指纹输入框的正下方，不滚的话会被窗口下沿切掉，
+  // 截图里就看不到 §26 要求必须看到的那一句"✓ 已应用"。
+  scrollTop(170);
+  typePin(pin);
+  if (!shot(QStringLiteral("remote-pin-applied"))) {
+    return 1;
+  }
+
+  // 3) 非法 pin -> 输入框下面的红色错误（已经生效的 pin 不变）。
+  typePin(QStringLiteral("sha256:zz"));
+  if (!shot(QStringLiteral("remote-pin-invalid"))) {
+    return 1;
+  }
+  typePin(pin);
+  scrollTop(0);
+
+  // 4) "正在建立安全通道…"：目标指向一个连不通、又不会立刻回错的地址，
+  //    这样窗口能稳定停在 starting 状态上被抓到。
+  remote->setConnectionModeForTest(QStringLiteral("ssh"));
+  remote->setSshHostForTest(QStringLiteral("10.255.255.1"));
+  remote->ensureConnection(QStringLiteral("127.0.0.1"),
+                           QStringLiteral("18765"));
+  waitForState(QStringLiteral("starting"), 15000);
+  if (!shot(QStringLiteral("remote-ssh-starting"))) {
+    return 1;
+  }
+  remote->stopTunnel();
+
+  // 5) 通道建立失败（主机名解析不了 -> 有自己的说法，不是"网络错误"）。
+  remote->setSshHostForTest(QStringLiteral("no-such-host.invalid"));
+  remote->ensureConnection(QStringLiteral("127.0.0.1"),
+                           QStringLiteral("18765"));
+  waitForState(QStringLiteral("failed"), 60000);
+  if (!shot(QStringLiteral("remote-ssh-failed"))) {
+    return 1;
+  }
+  remote->stopTunnel();
+
+  // 6) 通道已建立：GUI 自己起的 ssh，本地自动挑的端口 -> ECS 的回环地址。
+  remote->setSshHostForTest(ssh_target);
+  remote->ensureConnection(QStringLiteral("127.0.0.1"),
+                           QStringLiteral("18765"));
+  if (!waitForState(QStringLiteral("ready"), 120000)) {
+    std::fprintf(stderr,
+                 "[screenshot-remote] 安全通道没有在 120 秒内就绪：%s\n",
+                 qPrintable(remote->tunnelFailureText()));
+    return 1;
+  }
+  if (!shot(QStringLiteral("remote-ssh-ready"))) {
+    return 1;
+  }
+
+  // 7) 登录成功（走隧道 + BPSEC1 pin）。账户是隔离的临时账号，抓完就注销。
+  const QString account =
+      QStringLiteral("pr22-shot-%1")
+          .arg(QRandomGenerator::global()->bounded(1000000, 9999999));
+  const bool ready_account =
+      remote->registerAccount(QStringLiteral("127.0.0.1"),
+                              QStringLiteral("18765"), account, password,
+                              password) &&
+      remote->waitForIdle(180000) &&
+      remote->login(QStringLiteral("127.0.0.1"), QStringLiteral("18765"),
+                    account, password) &&
+      remote->waitForIdle(180000) && remote->authenticated();
+  if (!ready_account) {
+    std::fprintf(stderr, "[screenshot-remote] 临时账号没有就绪：%s\n",
+                 qPrintable(remote->lastDetailForTest()));
+    return 1;
+  }
+  if (!shot(QStringLiteral("remote-login-success"))) {
+    return 1;
+  }
+
+  // 8) 隧道断掉之后自动重建 + RESUME：抓的是"重建之后又能用了"这一刻。
+  remote->killOwnedTunnelForTest();
+  waitForState(QStringLiteral("failed"), 20000);
+  if (!remote->refreshList() || !remote->waitForIdle(180000) ||
+      remote->lastErrorKindForTest() != QStringLiteral("none")) {
+    std::fprintf(stderr, "[screenshot-remote] 断线重连没有成功：%s\n",
+                 qPrintable(remote->lastDetailForTest()));
+    return 1;
+  }
+  if (!shot(QStringLiteral("remote-reconnected"))) {
+    return 1;
+  }
+
+  // 9) 深色主题下的同一页（连接层的配色也要在两套主题下都读得清）。
+  theme->setDark(true);
+  if (!shot(QStringLiteral("remote-connection-dark"))) {
+    return 1;
+  }
+  theme->setDark(false);
+
+  // 收尾：注销临时账号并关掉通道，ECS 上不留任何东西。
+  remote->deleteAccount(password, account);
+  remote->waitForIdle(300000);
+  remote->logoutLocal();
+  remote->stopTunnel();
+  return 0;
+}
+
 int RunRemoteTest(QQuickWindow* window, backup_modern::RemoteController* remote,
                   backup_modern::BackupController* controller,
                   backup_modern::AppTheme* theme,
@@ -5234,6 +6073,10 @@ int RunRemoteTest(QQuickWindow* window, backup_modern::RemoteController* remote,
       return 1;
     }
   }
+  // (2.5) 本自检自己起了一个**本地**服务端并直连它，所以显式选择直连模式。
+  // 产品默认是 SSH 安全通道（当前部署的服务端只监听它自己的回环地址），
+  // 但这条自检里的服务端就在 127.0.0.1 上，没有、也不需要隧道。
+  remote->setConnectionModeForTest(QStringLiteral("direct"));
   // (3) 第一次连接之前交给控制器；控制器会用共享的 ParseServerKeyPin 再校验。
   if (!remote->setServerKeyPin(server_key_pin)) {
     std::fprintf(stderr, "[remote-test] 控制器不接受 keygen 打印的指纹：%s\n",
@@ -6502,6 +7345,13 @@ int RunRemoteTest(QQuickWindow* window, backup_modern::RemoteController* remote,
                            password, fingerprint);
     }
   }
+
+  // ---- PR #22：连接层（pin 应用 UX + SSH 安全通道的失败分层）----
+  //
+  // 放在最后：它会短暂地把连接方式切到 SSH 并制造几类 ssh 失败，结束前把
+  // 状态恢复成"直连 + 正确 pin"，所以不会影响前面任何一条断言。
+  RunRemoteConnectionUx(window, remote, &run, server_key_pin, host, port_text,
+                        user, password, work + QStringLiteral("/product-src"));
 
   std::printf("[remote-test] passed=%d failed=%d\n", run.passed, run.failed);
   if (run.failed != 0) {
@@ -9492,6 +10342,8 @@ int main(int argc, char* argv[]) {
       arguments.indexOf(QStringLiteral("--incremental-test"));
   const int screenshot_index =
       arguments.indexOf(QStringLiteral("--screenshot"));
+  const int screenshot_remote_index =
+      arguments.indexOf(QStringLiteral("--screenshot-remote"));
   const int self_test_index = arguments.indexOf(QStringLiteral("--self-test"));
   const int repository_test_index =
       arguments.indexOf(QStringLiteral("--repository-test"));
@@ -9595,10 +10447,11 @@ int main(int argc, char* argv[]) {
   const bool self_check_mode =
       smoke_test || path_test || close_guard_test || gui_contract_test ||
       preview_test_index >= 0 || incremental_test_index >= 0 ||
-      screenshot_index >= 0 || self_test_index >= 0 ||
-      repository_test_index >= 0 || realtime_test || backup_options_test ||
-      schedule_test || filter_ux_test || combo_hover_test || remote_test ||
-      remote_acceptance_index >= 0 || remote_smoke_index >= 0;
+      screenshot_index >= 0 || screenshot_remote_index >= 0 ||
+      self_test_index >= 0 || repository_test_index >= 0 || realtime_test ||
+      backup_options_test || schedule_test || filter_ux_test ||
+      combo_hover_test || remote_test || remote_acceptance_index >= 0 ||
+      remote_smoke_index >= 0;
   QString config_file_path = ResolveConfigFilePath(arguments);
   QString schedule_file_path = ResolveScheduleFilePath(arguments);
   QString realtime_file_path = ResolveRealtimeFilePath(arguments);
@@ -9815,6 +10668,14 @@ int main(int argc, char* argv[]) {
     return RunBackupOptionsTest(&controller, config_file_path);
   }
 
+  if (screenshot_remote_index >= 0) {
+    if (screenshot_remote_index + 1 >= arguments.size()) {
+      std::fprintf(stderr, "--screenshot-remote 需要一个输出目录参数\n");
+      return 2;
+    }
+    return RunRemoteScreenshot(window, &remote_controller, &theme,
+                               arguments.at(screenshot_remote_index + 1));
+  }
   if (screenshot_index >= 0) {
     if (screenshot_index + 1 >= arguments.size()) {
       std::fprintf(stderr, "--screenshot 需要一个输出目录参数\n");
