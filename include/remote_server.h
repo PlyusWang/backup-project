@@ -77,6 +77,12 @@ struct RemoteServerConfig {
   // token、用户名与快照元数据全部由 BPSEC1 保护，缺了它就没有任何一条可以
   // 安全服务的路径，因此不存在"不配密钥就退回明文"的分支。
   std::string transport_key_file_path;
+  // BPSEC2：服务器身份证书（BPCERT1 原始字节所在文件）。空 = 不出示证书，
+  // 只能走 BPSEC1（人工 pin）。
+  std::string certificate_file_path;
+  // 只接受 BPSEC2（签名身份）的客户端。收到 BPSEC1 的 ClientHello 直接拒绝，
+  // 这就是"拒绝降级"的开关；打开时必须同时配置证书。
+  bool require_bpsec2 = false;
   // 追加日志文件；空串表示只写 stderr。
   std::string log_file_path;
   std::uint64_t max_upload_bytes = kDefaultMaxUploadBytes;
