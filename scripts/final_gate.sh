@@ -64,6 +64,8 @@ run cert-tool bash scripts/cert_tool_test.sh
 run bpsec2 bash scripts/bpsec2_test.sh
 run server-profile bash scripts/server_profile_test.sh
 run bpsec2-loopback bash scripts/bpsec2_loopback_e2e.sh
+# 登录失败节流：真实服务端 + 真实客户端，断言锁定期间正确口令也被拒。
+run login-throttle bash scripts/login_throttle_test.sh
 # 前两个再在 ASan + UBSan 下跑一遍：手写大整数与标量归约的越界/回绕问题
 # 只有消毒剂才稳定暴露（本项目已经在这个文件里真实抓到过两次）。
 run ed25519-sanitize env ED25519_TEST_EXTRA_FLAGS="-g -O1 -fsanitize=address,undefined -fno-omit-frame-pointer" ED25519_ORACLE_CASES=6 bash scripts/ed25519_test.sh
