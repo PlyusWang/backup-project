@@ -24,6 +24,10 @@
 #include "remote_incremental.h"
 #include "secure_transport.h"
 
+#if defined(Q_OS_UNIX)
+#include <signal.h>  // 只给自检用的 killOwnedTunnelForTest
+#endif
+
 namespace backup_modern {
 namespace {
 
@@ -179,6 +183,10 @@ RemoteController::RemoteController(QObject* parent) : QObject(parent) {
   endpoint_.server_key_pin = serverKeyPin().toStdString();
   QObject::connect(&watcher_, &QFutureWatcher<RemoteOpResult>::finished, this,
                    &RemoteController::OnOperationFinished);
+  // 安全通道状态机的唯一落点：有请求在等它就接着发，只是"建立连接"在等就
+  // 结束忙碌。订阅放在构造函数里，保证**任何**状态变化都不会被漏掉。
+  QObject::connect(&tunnel_, &SshTunnelManager::stateChanged, this,
+                   &RemoteController::OnTunnelStateChanged);
 }
 
 RemoteController::~RemoteController() {
@@ -190,6 +198,10 @@ RemoteController::~RemoteController() {
     watcher_.waitForFinished();
   }
   client_.Disconnect();
+  // GUI 退出不允许留下孤儿 ssh -N：本程序启动的那一条在这里被有界地收掉
+  // （terminate → 有界等待 → 必要时 kill）。用户自己在外面开的隧道不属于
+  // 本对象，一个字节都不会动它。
+  tunnel_.Stop();
   // 尽力而为地擦掉口令。QString 可能因隐式共享留下副本，也没有 mlock，
   // 所以这只是缩小窗口，不是内存加密。
   password_.fill(QChar(0));
@@ -401,11 +413,39 @@ QString RemoteController::ClassifyFailure(const std::string& status_name,
   if (Contains(detail, "already exists")) {
     return QStringLiteral("target-exists");
   }
-  // 服务端身份 pin 不符：这是"连错服务器 / 服务器换了密钥"，不是网络抖动。
-  // 单独一类，界面才能给出"去找管理员核对指纹"这句话，而不是让人一直重试。
-  if (Contains(detail, "server-key-mismatch") || Contains(detail, "握手") ||
-      Contains(detail, "身份")) {
+  // ---- 连接层：失败必须分层报，不能全压成一句"网络错误"（PR #22）----
+  //
+  // 层次从下到上是：
+  //   本地/隧道 -> BPSEC1 握手 -> 服务端身份(pin) -> 账号口令 -> 服务端业务
+  // 每一层都有自己的一句话与自己的下一步动作。人工验收里"服务器暂时不可达"
+  // 这一句同时盖住了四五种完全不同的原因，用户无从下手。
+  //
+  // (1) 服务端身份 pin 不符：这是"连错服务器 / 服务器换了密钥"，不是网络抖动。
+  //     单独一类，界面才能给出"去找管理员核对指纹"这句话，而不是让人一直重试。
+  if (Contains(detail, "server-key-mismatch") ||
+      Contains(detail, "服务端传输身份公钥与本地 pin") ||
+      Contains(detail, "ServerHello 里的身份公钥与本地 pin") ||
+      Contains(detail, "与本地 pin 的指纹不一致")) {
     return QStringLiteral("pin-mismatch");
+  }
+  // (2) 根本没有 pin：本地配置缺失，与服务端无关。
+  if (Contains(detail, "no-server-key-pin") ||
+      Contains(detail, "没有配置服务端传输公钥")) {
+    return QStringLiteral("pin-missing");
+  }
+  // (3) 隧道通了、但 BPSEC1 握手失败。与"pin 不符"**分开**：前者是两端没能
+  //     就会话密钥达成一致（改过的字节、版本不匹配），后者是服务器身份不对。
+  //     两者要用户做的事完全不同。
+  if (Contains(detail, "BPSEC1") || Contains(detail, "握手") ||
+      Contains(detail, "X25519") || Contains(detail, "加密通道状态") ||
+      Contains(detail, "加密记录")) {
+    return QStringLiteral("handshake");
+  }
+  // (4) 端口拒绝连接。直连模式下这是"服务器没起 / 端口不对"；ssh 模式下
+  //     最常见的原因是**本地通道没起来**，所以文案要把两种可能都写出来。
+  if (Contains(detail, "cannot connect to") &&
+      Contains(detail, "Connection refused")) {
+    return QStringLiteral("connect-refused");
   }
   if (Contains(detail, "not connected") || Contains(detail, "cannot send") ||
       Contains(detail, "cannot read the response") ||
@@ -530,6 +570,38 @@ QString RemoteController::DescribeFailure(const QString& error_kind) {
   if (error_kind == QStringLiteral("rejected")) {
     return QStringLiteral("服务器拒绝了这个请求（两端版本可能不一致）。");
   }
+  // ---- PR #22：连接层的每一种失败各有各的说法与下一步 ----
+  //
+  // ssh-* / tunnel-not-ready 的文案只有一份，在 SshTunnelManager 里
+  // （FailureUserText）。这里按 kind 反查，避免同一个事实写两遍、改一处忘
+  // 一处。
+  const SshTunnelManager::Failure tunnel_failure =
+      SshTunnelManager::FailureFromKindName(error_kind);
+  if (tunnel_failure != SshTunnelManager::Failure::kNone) {
+    return SshTunnelManager::FailureUserText(tunnel_failure);
+  }
+  if (error_kind == QStringLiteral("tunnel-not-ready")) {
+    return QStringLiteral(
+        "安全通道还没有建立，所以这次操作没有发出去。"
+        "点“建立连接”先把 SSH 安全通道建起来，或者改用直连模式。");
+  }
+  if (error_kind == QStringLiteral("handshake")) {
+    return QStringLiteral(
+        "已经连上服务器，但 BPSEC1 安全握手没有通过：两端没有就会话密钥"
+        "达成一致（握手字节被改动、或两端版本不一致）。"
+        "这次操作一个字节都没有发出去，云端数据没有变化。");
+  }
+  if (error_kind == QStringLiteral("pin-missing")) {
+    return QStringLiteral(
+        "还没有配置服务器身份指纹，客户端拒绝连接（不做首次连接自动信任）。"
+        "请向服务器管理员索取 sha256:… 指纹并填进“服务器身份指纹”。");
+  }
+  if (error_kind == QStringLiteral("connect-refused")) {
+    return QStringLiteral(
+        "目标端口拒绝连接。如果服务端只监听它自己的回环地址，"
+        "请先用“SSH 安全通道”建立本地转发；直连模式下请确认服务端已经启动、"
+        "地址与端口正确。");
+  }
   if (error_kind == QStringLiteral("network")) {
     return QStringLiteral(
         "网络连接中断，这次操作没有完成；登录状态与云端数据都"
@@ -608,6 +680,24 @@ QString RemoteController::TitleForFailure(const QString& error_kind) {
   if (error_kind == QStringLiteral("rejected") ||
       error_kind == QStringLiteral("server")) {
     return QStringLiteral("服务器拒绝了请求");
+  }
+  // ---- PR #22：连接层的标题 ----
+  const SshTunnelManager::Failure tunnel_failure =
+      SshTunnelManager::FailureFromKindName(error_kind);
+  if (tunnel_failure != SshTunnelManager::Failure::kNone) {
+    return SshTunnelManager::FailureTitle(tunnel_failure);
+  }
+  if (error_kind == QStringLiteral("tunnel-not-ready")) {
+    return QStringLiteral("安全通道未启动");
+  }
+  if (error_kind == QStringLiteral("handshake")) {
+    return QStringLiteral("安全握手失败");
+  }
+  if (error_kind == QStringLiteral("pin-missing")) {
+    return QStringLiteral("没有配置服务器身份指纹");
+  }
+  if (error_kind == QStringLiteral("connect-refused")) {
+    return QStringLiteral("连接被拒绝");
   }
   if (error_kind == QStringLiteral("network")) {
     return QStringLiteral("网络连接中断");
@@ -1010,6 +1100,20 @@ QString RemoteController::SurfaceFailureMessage(RemoteOpResult::Kind kind,
   const bool server_side = error_kind == QStringLiteral("server") ||
                            error_kind == QStringLiteral("rejected") ||
                            error_kind == QStringLiteral("unknown");
+  // 连接层（隧道 / 握手 / 身份 / 端口拒绝）的失败**不**允许被压成
+  // "无法连接到服务器，请稍后重试"：那些原因各自都有明确得多的说法，
+  // 而"请稍后重试"恰好是用户最不该做的事（重试 100 次通道也不会自己起来）。
+  const bool connection_layer =
+      SshTunnelManager::FailureFromKindName(error_kind) !=
+          SshTunnelManager::Failure::kNone ||
+      error_kind == QStringLiteral("tunnel-not-ready") ||
+      error_kind == QStringLiteral("handshake") ||
+      error_kind == QStringLiteral("pin-missing") ||
+      error_kind == QStringLiteral("connect-refused") ||
+      error_kind == QStringLiteral("pin-mismatch");
+  if (connection_layer) {
+    return DescribeFailure(error_kind);
+  }
   switch (kind) {
     case RemoteOpResult::Kind::kLogin:
       // 账户枚举防护：用户不存在与密码错误回**同一句话**，界面不泄露账号是否存在。
@@ -1138,12 +1242,15 @@ bool RemoteController::BeginOperation(const QString& action_text,
   }
   last_error_kind_ = QStringLiteral("none");
   last_detail_.clear();
+  // 记住这条操作自己的错误落点：如果它因为"要先建安全通道"而被挂起，失败时
+  // 仍然要回到**触发它的那个表单**（登录框的错误就该写在登录框下面）。
+  pending_surface_ = surface;
   SetBusy(true, action_text);
   SetStatus(QStringLiteral("running"), action_text, QString());
   return true;
 }
 
-void RemoteController::Submit(const RemoteRequest& request) {
+void RemoteController::DispatchRequest(const RemoteRequest& request) {
   // 进度归零：新一次操作的百分比不能沿用上一次的。
   bytes_done_.store(0);
   bytes_total_.store(0);
@@ -1155,6 +1262,38 @@ void RemoteController::Submit(const RemoteRequest& request) {
   // 主线程在 OnOperationFinished 里读它，中间没有第二份拷贝。
   watcher_.setFuture(QtConcurrent::run(&RemoteController::RunOperation,
                                        &client_, request, this));
+}
+
+void RemoteController::Submit(const RemoteRequest& request) {
+  // 传输层的唯一闸门。直连模式与 PR #21 完全一样；SSH 模式先保证"本地有一个
+  // 能连上的端口"这件事成立，再把请求发出去。
+  //
+  // 调用点一个都不用改：所有提交都经过这里，所以不可能出现"某一条操作忘了
+  // 走隧道"这种漏网（那种漏网的症状恰好就是 connection refused）。
+  if (connection_mode_ == ConnectionMode::kDirect) {
+    DispatchRequest(request);
+    return;
+  }
+  if (TunnelMatchesEndpoint() && tunnel_.localPort() > 0) {
+    RemoteRequest dialed = request;
+    // 客户端拨的是**本地**那一段：127.0.0.1:<自动挑到的端口>。远端地址在
+    // ssh 的 -L 参数里，BPSEC1 的 pin 校验仍然在隧道里面照跑。
+    dialed.endpoint.host = std::string("127.0.0.1");
+    dialed.endpoint.port = static_cast<std::uint16_t>(tunnel_.localPort());
+    DispatchRequest(dialed);
+    return;
+  }
+  // 通道还没好（或者用户改了远端地址，旧通道已经不指向它了）：把这条请求
+  // 挂起，先建通道，建好之后自动接着发。用户不需要知道这个顺序。
+  DeferRequest(request, busy_action_, pending_surface_);
+  SetStatus(QStringLiteral("running"), busy_action_,
+            QStringLiteral("正在建立安全通道：%1 -> %2…")
+                .arg(ssh_host_, tunnelRemoteEndpointText()));
+  // 先收干净再按当前参数重来：地址改过时这一步是必须的，否则界面显示 B、
+  // 实际却还走在通往 A 的隧道上。
+  tunnel_.Stop();
+  emit tunnelChanged();
+  StartTunnelForEndpoint(busy_action_);
 }
 
 // ---- 后台线程：真正的网络调用全在这里 ----
@@ -2262,6 +2401,464 @@ void RemoteController::ApplyRawRestoreState(const RemoteOpResult& result) {
                               : result.message;
   }
   emit rawRestoreStateChanged();
+}
+
+// ================= PR #22：连接方式 / SSH 安全通道 / pin 应用反馈
+// =================
+//
+// 这一段的定位：它是"用户点了一下之后**看得见**发生了什么"的全部实现。
+// 两类问题都在这里收口：
+//
+//   1. "应用"没有任何反馈 —— 见 applyServerKeyPin / SetPinApplyFeedback。
+//   2. connection refused 说不出原因 —— 见 ConnectionMode + tunnel_ +
+//   分层归类。
+//
+// 它没有、也不会碰的东西：BPSEC1 的线格式、X25519 / HKDF / AES / HMAC、
+// remote metadata、增量语义。SSH 只是把 socket 送到服务端门口的那一段路。
+
+QString RemoteController::connectionMode() const {
+  return connection_mode_ == ConnectionMode::kSshTunnel
+             ? QStringLiteral("ssh")
+             : QStringLiteral("direct");
+}
+
+QString RemoteController::sshLocalPort() const {
+  return ssh_local_port_ > 0 ? QString::number(ssh_local_port_) : QString();
+}
+
+QString RemoteController::tunnelState() const {
+  switch (tunnel_.state()) {
+    case SshTunnelManager::State::kStopped:
+      return QStringLiteral("stopped");
+    case SshTunnelManager::State::kStarting:
+      return QStringLiteral("starting");
+    case SshTunnelManager::State::kReady:
+      return QStringLiteral("ready");
+    case SshTunnelManager::State::kFailed:
+      return QStringLiteral("failed");
+    case SshTunnelManager::State::kStopping:
+      return QStringLiteral("stopping");
+  }
+  return QStringLiteral("stopped");
+}
+
+bool RemoteController::setConnectionMode(const QString& mode) {
+  ConnectionMode next = connection_mode_;
+  if (mode == QStringLiteral("ssh")) {
+    next = ConnectionMode::kSshTunnel;
+  } else if (mode == QStringLiteral("direct")) {
+    next = ConnectionMode::kDirect;
+  } else {
+    // 不认识的模式明确拒绝，而不是悄悄当成直连 —— 那会让"我以为在用隧道"
+    // 变成一个说不清的 connection refused。
+    return false;
+  }
+  if (connection_mode_ == next) {
+    return true;
+  }
+  connection_mode_ = next;
+  // 只改配置：不联网、不登录、不断开正在跑的通道、也不杀进程。切换模式与
+  // "应用 pin"是同一类动作 —— 配置，不是连接测试。
+  emit connectionChanged();
+  return true;
+}
+
+void RemoteController::setSshHost(const QString& host) {
+  const QString text = host.trimmed();
+  if (ssh_host_ == text) {
+    return;
+  }
+  ssh_host_ = text;
+  emit connectionChanged();
+}
+
+void RemoteController::setSshLocalPort(const QString& port_text) {
+  const QString text = port_text.trimmed();
+  int value = 0;
+  if (!text.isEmpty() && text != QStringLiteral("0")) {
+    bool ok = false;
+    const int parsed = text.toInt(&ok);
+    // 这一项没有自己的错误行，所以非法输入**退回自动分配**而不是留着用不了
+    // 的数字：自动分配永远是安全的（它只挑空闲端口）。
+    value = (ok && parsed >= 1 && parsed <= 65535) ? parsed : 0;
+  }
+  if (ssh_local_port_ == value) {
+    return;
+  }
+  ssh_local_port_ = value;
+  emit connectionChanged();
+}
+
+void RemoteController::setSshProgram(const QString& program) {
+  const QString text = program.trimmed();
+  if (ssh_program_ == text) {
+    return;
+  }
+  ssh_program_ = text;
+  emit connectionChanged();
+}
+
+bool RemoteController::TunnelMatchesEndpoint() const {
+  if (!tunnel_.IsReady()) {
+    return false;
+  }
+  if (tunnel_.IsExternalReuse()) {
+    // 外部复用的监听者不是本程序启动的，它的转发目标不归本程序管，也无从
+    // 查询。复用的安全性由**下一层**保证：BPSEC1 的 pin 会验证隧道那头到底
+    // 是谁（§15 的 B 类）。所以这里不做"猜它转发到哪"的假判断。
+    return true;
+  }
+  const SshTunnelManager::Options& used = tunnel_.options();
+  return used.ssh_target == ssh_host_ &&
+         used.remote_host == QString::fromStdString(endpoint_.host) &&
+         used.remote_port == static_cast<int>(endpoint_.port) &&
+         used.local_port == ssh_local_port_ && used.ssh_program == ssh_program_;
+}
+
+bool RemoteController::StartTunnelForEndpoint(const QString& action_text) {
+  Q_UNUSED(action_text);
+  SshTunnelManager::Options options;
+  options.ssh_program = ssh_program_;
+  options.ssh_target = ssh_host_;
+  options.remote_host = QString::fromStdString(endpoint_.host);
+  options.remote_port = static_cast<int>(endpoint_.port);
+  options.local_port = ssh_local_port_;
+  // 返回 false = 请求没被受理（正在建 / 正在关）。调用方不需要额外处理：
+  // 状态机的下一次变化会走到 OnTunnelStateChanged。
+  const bool accepted = tunnel_.Start(options);
+  emit tunnelChanged();
+  return accepted;
+}
+
+void RemoteController::DeferRequest(const RemoteRequest& request,
+                                    const QString& action_text,
+                                    ErrorSurface surface) {
+  deferred_.active = true;
+  deferred_.request = request;
+  deferred_.action_text = action_text;
+  deferred_.surface = surface;
+  last_deferred_action_ = action_text;
+}
+
+void RemoteController::FlushDeferredRequest() {
+  if (!deferred_.active || !tunnel_.IsReady() || tunnel_.localPort() <= 0) {
+    return;
+  }
+  RemoteRequest request = deferred_.request;
+  const QString action = deferred_.action_text;
+  deferred_ = DeferredRequest();
+  request.endpoint.host = std::string("127.0.0.1");
+  request.endpoint.port = static_cast<std::uint16_t>(tunnel_.localPort());
+  ++deferred_submit_count_;
+  SetStatus(QStringLiteral("running"), action, QString());
+  DispatchRequest(request);
+}
+
+void RemoteController::FailDeferredRequest() {
+  if (!deferred_.active) {
+    return;
+  }
+  const ErrorSurface surface = deferred_.surface;
+  deferred_ = DeferredRequest();
+  last_error_kind_ = tunnel_.failureKindName();
+  last_detail_ = tunnel_.diagnosticText().toStdString();
+  SetBusy(false, QString());
+  ReportSurfaceError(surface, tunnel_.failureText());
+  if (surface != ErrorSurface::kBanner) {
+    // 表单里已经有原因了，横幅不能继续挂着"正在登录"这种过期状态。
+    SetIdleBaseline();
+  }
+  emit operationFinished(QStringLiteral("tunnel"), false);
+}
+
+void RemoteController::OnTunnelStateChanged() {
+  emit tunnelChanged();
+  if (tunnel_only_wait_) {
+    if (tunnel_.IsReady()) {
+      tunnel_only_wait_ = false;
+      SetBusy(false, QString());
+      SetStatus(
+          QStringLiteral("idle"), QStringLiteral("安全通道已建立"),
+          QStringLiteral("%1 -> %2（本程序启动的 ssh，退出时会自动结束）")
+              .arg(tunnel_.localEndpointText(), tunnel_.remoteEndpointText()));
+      // 已经登录的用户点"建立连接"，要看到的是**数据**，不是一句"通道好了"。
+      if (authenticated_) {
+        refreshList();
+      }
+      return;
+    }
+    if (tunnel_.state() == SshTunnelManager::State::kFailed) {
+      tunnel_only_wait_ = false;
+      last_error_kind_ = tunnel_.failureKindName();
+      last_detail_ = tunnel_.diagnosticText().toStdString();
+      SetBusy(false, QString());
+      ReportSurfaceError(ErrorSurface::kBanner, tunnel_.failureText());
+      return;
+    }
+  }
+  if (deferred_.active) {
+    if (tunnel_.IsReady()) {
+      FlushDeferredRequest();
+      return;
+    }
+    if (tunnel_.state() == SshTunnelManager::State::kFailed) {
+      FailDeferredRequest();
+      return;
+    }
+  }
+}
+
+bool RemoteController::ensureConnection(const QString& host,
+                                        const QString& port_text) {
+  ClearSurfaceError(ErrorSurface::kBanner);
+  // 只校验地址与端口：建通道是传输层的事，与用户名、口令、pin 都无关。
+  const QString trimmed_host = host.trimmed();
+  if (trimmed_host.isEmpty()) {
+    last_error_kind_ = QStringLiteral("validation");
+    ReportSurfaceError(ErrorSurface::kBanner,
+                       QStringLiteral("请输入服务器地址"));
+    return false;
+  }
+  bool port_ok = false;
+  const int port = port_text.trimmed().toInt(&port_ok);
+  if (!port_ok || port < 1 || port > 65535) {
+    last_error_kind_ = QStringLiteral("validation");
+    ReportSurfaceError(ErrorSurface::kBanner,
+                       QStringLiteral("端口要填 1 到 65535 之间的整数"));
+    return false;
+  }
+  CommitHostPort(trimmed_host, port);
+
+  if (connection_mode_ == ConnectionMode::kDirect) {
+    // 直连模式没有"通道"这个前置动作。如实说明，而不是假装做了一个动作。
+    SetStatus(QStringLiteral("idle"), QStringLiteral("直连模式"),
+              QStringLiteral("当前是直连模式，不需要安全通道；"
+                             "点“登录”会直接连接 %1:%2。")
+                  .arg(trimmed_host)
+                  .arg(port));
+    return true;
+  }
+  if (TunnelMatchesEndpoint() && tunnel_.localPort() > 0) {
+    SetStatus(QStringLiteral("idle"), QStringLiteral("安全通道已建立"),
+              QStringLiteral("%1 -> %2:%3")
+                  .arg(tunnel_.localEndpointText(), trimmed_host)
+                  .arg(port));
+    if (authenticated_) {
+      return refreshList();
+    }
+    return true;
+  }
+  if (busy_) {
+    last_error_kind_ = QStringLiteral("busy");
+    ReportSurfaceError(
+        ErrorSurface::kBanner,
+        QStringLiteral("正在%1，请等它结束后再试")
+            .arg(busy_action_.isEmpty() ? QStringLiteral("处理上一个请求")
+                                        : busy_action_));
+    return false;
+  }
+  SetBusy(true, QStringLiteral("正在建立安全通道"));
+  SetStatus(
+      QStringLiteral("running"), QStringLiteral("正在建立安全通道"),
+      QStringLiteral("SSH %1 -> %2:%3").arg(ssh_host_, trimmed_host).arg(port));
+  tunnel_only_wait_ = true;
+  // Stop() 是有界的同步操作，先做掉它，后面的 Start() 就一定能被受理
+  // （否则"上一个通道正在关闭"会让这次点击变成一次静默的 no-op）。
+  tunnel_.Stop();
+  emit tunnelChanged();
+  StartTunnelForEndpoint(QStringLiteral("正在建立安全通道"));
+  return true;
+}
+
+void RemoteController::stopTunnel() {
+  const bool waiting = deferred_.active || tunnel_only_wait_;
+  const ErrorSurface surface =
+      deferred_.active ? deferred_.surface : ErrorSurface::kBanner;
+  deferred_ = DeferredRequest();
+  tunnel_only_wait_ = false;
+  tunnel_.Stop();
+  emit tunnelChanged();
+  if (waiting) {
+    // 用户在等一次操作时手动关了通道：明确结束那次操作，而不是让它挂着。
+    last_error_kind_ = QStringLiteral("tunnel-not-ready");
+    SetBusy(false, QString());
+    ReportSurfaceError(surface, DescribeFailure(last_error_kind_));
+    return;
+  }
+  SetIdleBaseline();
+}
+
+QString RemoteController::CommitServerKeyPin(const QString& pin) {
+  // 与 setServerKeyPin 同一份校验与落点：解析器只有共享的那一个，界面不做
+  // 第二套"看起来对"的判断。
+  ClearSurfaceError(ErrorSurface::kServerKey);
+  const QString text = pin.trimmed();
+  if (text.isEmpty()) {
+    last_error_kind_ = QStringLiteral("validation");
+    ReportSurfaceError(
+        ErrorSurface::kServerKey,
+        QStringLiteral("请填写服务器身份指纹（向服务器管理员索取，"
+                       "形如 sha256: 开头的 64 位十六进制）"));
+    return QStringLiteral("invalid");
+  }
+  backupproject::net::ServerKeyPin parsed;
+  std::string parse_error;
+  if (!backupproject::net::ParseServerKeyPin(text.toStdString(), &parsed,
+                                             &parse_error)) {
+    last_error_kind_ = QStringLiteral("validation");
+    ReportSurfaceError(ErrorSurface::kServerKey,
+                       QStringLiteral("服务器身份指纹不合法：%1")
+                           .arg(QString::fromStdString(parse_error)));
+    std::fprintf(stderr, "[remote] 服务端 pin 不合法：%s\n",
+                 parse_error.c_str());
+    return QStringLiteral("invalid");
+  }
+  if (server_key_pin_ == text) {
+    return QStringLiteral("unchanged");
+  }
+  server_key_pin_ = text;
+  endpoint_.server_key_pin = server_key_pin_.toStdString();
+  emit serverKeyPinChanged();
+  return QStringLiteral("applied");
+}
+
+void RemoteController::SetPinApplyFeedback(const QString& state,
+                                           const QString& message) {
+  if (pin_apply_state_ == state && pin_apply_message_ == message) {
+    return;
+  }
+  pin_apply_state_ = state;
+  pin_apply_message_ = message;
+  emit pinApplyChanged();
+}
+
+void RemoteController::clearPinApplyState() {
+  if (pin_apply_state_.isEmpty() && pin_apply_message_.isEmpty()) {
+    return;
+  }
+  pin_apply_state_.clear();
+  pin_apply_message_.clear();
+  emit pinApplyChanged();
+}
+
+void RemoteController::PublishPinApplyFeedback(const QString& state) {
+  if (state == QStringLiteral("applied")) {
+    // "活动连接"= 此刻真的有一条 socket，或者有一条操作正在跑。已经登录但
+    // 空闲不算：BPNET1 是每次操作建立连接，下一次连接就会用上新 pin。
+    const bool active_connection = client_.connected() || busy_;
+    SetPinApplyFeedback(
+        QStringLiteral("applied"),
+        active_connection
+            ? QStringLiteral("✓ 已应用；当前连接保持不变，下次重连时生效")
+            : QStringLiteral("✓ 已应用，将在下一次连接时用于服务器身份校验"));
+    return;
+  }
+  if (state == QStringLiteral("unchanged")) {
+    // 重复提交同一个值不是一个"什么都没发生"：它本身就是一个确定的结果。
+    SetPinApplyFeedback(QStringLiteral("unchanged"),
+                        QStringLiteral("✓ 已是当前服务器身份指纹"));
+    return;
+  }
+  // 不合法：红色原因已经在输入框下面了，绿色那一行必须收起来 ——
+  // 不能同时显示"不合法"和"✓ 已应用"。
+  SetPinApplyFeedback(QStringLiteral("invalid"), QString());
+}
+
+QString RemoteController::applyServerKeyPin(const QString& pin) {
+  const QString state = CommitServerKeyPin(pin);
+  PublishPinApplyFeedback(state);
+  return state;
+}
+
+void RemoteController::CommitHostPort(const QString& host, int port) {
+  // 与 CommitEndpoint 同一份落点逻辑，但不动 username_：建通道时用户名不
+  // 属于这次动作的一部分。
+  if (endpoint_.host == host.toStdString() &&
+      endpoint_.port == static_cast<std::uint16_t>(port)) {
+    return;
+  }
+  endpoint_.host = host.toStdString();
+  endpoint_.port = static_cast<std::uint16_t>(port);
+  endpoint_.server_key_pin = serverKeyPin().toStdString();
+  emit endpointChanged();
+}
+
+bool RemoteController::registerAccountWithPin(const QString& host,
+                                              const QString& port_text,
+                                              const QString& username,
+                                              const QString& password,
+                                              const QString& confirm_password,
+                                              const QString& base_pin) {
+  const QString pin_state = CommitServerKeyPin(base_pin);
+  if (pin_state == QStringLiteral("invalid")) {
+    last_error_kind_ = QStringLiteral("validation");
+    ReportSurfaceError(
+        ErrorSurface::kRegister,
+        QStringLiteral("服务器身份指纹不合法，请先按上面的提示修正，再点注册"));
+    return false;
+  }
+  // 自动提交同样要给出"已应用"的可见结论（§4：登录 / 注册自动 commit 成功
+  // 之后界面上的状态也是"已应用"）。少了这一句，用户点完登录只会看到指纹框
+  // 还是老样子，又会以为自己填的没生效。
+  PublishPinApplyFeedback(pin_state);
+  return registerAccount(host, port_text, username, password, confirm_password);
+}
+
+bool RemoteController::loginWithPin(const QString& host,
+                                    const QString& port_text,
+                                    const QString& username,
+                                    const QString& password,
+                                    const QString& base_pin) {
+  // 提交之前先把**用户此刻看得见的那一个** pin 提交掉。人工验收里最自然的
+  // 路径就是"填 pin -> 填账号 -> 点登录"，旧实现会让这次登录用上一次的
+  // 值（没有就是空），于是要么莫名失败、要么用户以为填的已经生效了。
+  const QString pin_state = CommitServerKeyPin(base_pin);
+  if (pin_state == QStringLiteral("invalid")) {
+    // 一个字节都不发。红色原因已经贴在指纹输入框下面；这里再给一句"所以这次
+    // 登录没有开始"，否则用户会以为登录按钮坏了。
+    last_error_kind_ = QStringLiteral("validation");
+    ReportSurfaceError(
+        ErrorSurface::kLogin,
+        QStringLiteral("服务器身份指纹不合法，请先按上面的提示修正，再点登录"));
+    return false;
+  }
+  // 与"应用"按钮同一句话：这两条路径不能各说各的。
+  PublishPinApplyFeedback(pin_state);
+  return login(host, port_text, username, password);
+}
+
+bool RemoteController::waitForTunnelIdle(int timeout_ms) {
+  QEventLoop loop;
+  QTimer poll;
+  poll.setInterval(10);
+  QObject::connect(&poll, &QTimer::timeout, &loop, [this, &loop, timeout_ms] {
+    Q_UNUSED(timeout_ms);
+    if (!tunnel_.IsBusy()) {
+      loop.quit();
+    }
+  });
+  QTimer deadline;
+  deadline.setSingleShot(true);
+  QObject::connect(&deadline, &QTimer::timeout, &loop, &QEventLoop::quit);
+  poll.start();
+  deadline.start(timeout_ms < 1 ? 1 : timeout_ms);
+  loop.exec();
+  poll.stop();
+  return !tunnel_.IsBusy();
+}
+
+bool RemoteController::killOwnedTunnelForTest() {
+#if defined(Q_OS_UNIX)
+  const qint64 pid = tunnel_.processId();
+  if (pid <= 0) {
+    return false;
+  }
+  // 模拟"隧道在使用中被打断"：直接 SIGKILL 那条 ssh。产品代码里没有这条
+  // 路径，它只服务于自动化验证（C12）。
+  return ::kill(static_cast<pid_t>(pid), SIGKILL) == 0;
+#else
+  return false;
+#endif
 }
 
 }  // namespace backup_modern
