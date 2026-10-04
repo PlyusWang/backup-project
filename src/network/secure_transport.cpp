@@ -907,8 +907,8 @@ bool SecureChannel::HandshakeClientInternal(int fd, const ServerKeyPin* pin,
                          : "读取证书字节失败：" + io_error,
                   error_message);
     }
-    certificate_message.assign(
-        reinterpret_cast<const char*>(cert_header), sizeof(cert_header));
+    certificate_message.assign(reinterpret_cast<const char*>(cert_header),
+                               sizeof(cert_header));
     certificate_message.append(certificate_raw);
 
     // ---- 校验顺序：任一步失败即终止，不回退 pin、不回退 BPSEC1 ----
@@ -926,10 +926,10 @@ bool SecureChannel::HandshakeClientInternal(int fd, const ServerKeyPin* pin,
     const crypto::TrustedRoot* root =
         policy->roots.FindRoot(certificate.issuer_id);
     if (root == nullptr) {
-      return Fail(SecureTransportError::kCertificateUntrusted,
-                  "证书的签发者 " + certificate.issuer_id +
-                      " 不在本机可信根列表里",
-                  error_message);
+      return Fail(
+          SecureTransportError::kCertificateUntrusted,
+          "证书的签发者 " + certificate.issuer_id + " 不在本机可信根列表里",
+          error_message);
     }
     if (root->revoked) {
       return Fail(SecureTransportError::kCertificateUntrusted,
@@ -1023,8 +1023,8 @@ bool SecureChannel::HandshakeClientInternal(int fd, const ServerKeyPin* pin,
 
   const std::string client_finished =
       HmacTag(client_finished_key_, transcript_hash_);
-  const std::string finished_message = BuildFinished(
-      kBssec1MessageClientFinished, client_finished, version);
+  const std::string finished_message =
+      BuildFinished(kBssec1MessageClientFinished, client_finished, version);
   if (!SendAll(fd, finished_message.data(), finished_message.size(),
                &io_error)) {
     return Fail(SecureTransportError::kIoError,
@@ -1205,7 +1205,8 @@ bool SecureChannel::HandshakeServerInternal(int fd,
 
   const std::string client_hello(reinterpret_cast<const char*>(raw),
                                  sizeof(raw));
-  transcript_hash_ = Sha256Of(client_hello + server_hello + certificate_message);
+  transcript_hash_ =
+      Sha256Of(client_hello + server_hello + certificate_message);
 
   unsigned char client_finished_raw[kBssec1FinishedSize];
   if (!ReceiveAll(fd, client_finished_raw, sizeof(client_finished_raw), &closed,
@@ -1236,8 +1237,8 @@ bool SecureChannel::HandshakeServerInternal(int fd,
   const std::string client_finished = got_client_finished;
   const std::string server_finished =
       HmacTag(server_finished_key_, transcript_hash_ + client_finished);
-  const std::string finished_message = BuildFinished(
-      kBssec1MessageServerFinished, server_finished, version);
+  const std::string finished_message =
+      BuildFinished(kBssec1MessageServerFinished, server_finished, version);
   if (!SendAll(fd, finished_message.data(), finished_message.size(),
                &io_error)) {
     return Fail(SecureTransportError::kIoError,

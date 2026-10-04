@@ -123,13 +123,13 @@ enum class SecureTransportError {
   kWeakSharedSecret,  // 共享秘密全零（对端给了低阶点）
   kNoPinConfigured,  // 客户端没有配置服务端公钥/指纹（拒绝连接，不做 TOFU）
   // ---- BPSEC2（证书身份）。失败原因分开报，界面才能说清楚到底哪里不对。----
-  kCertificateMissing,      // 对端要用 BPSEC2，但服务端没有配置证书
-  kCertificateInvalid,      // 证书结构不合法，或根签名验不过
-  kCertificateUntrusted,    // 签发者不在可信根里（根为空 / 被吊销 / 时间越界）
+  kCertificateMissing,  // 对端要用 BPSEC2，但服务端没有配置证书
+  kCertificateInvalid,  // 证书结构不合法，或根签名验不过
+  kCertificateUntrusted,  // 签发者不在可信根里（根为空 / 被吊销 / 时间越界）
   kCertificateWrongServerId,  // 证书里的 server_id 与期望值不符
-  kCertificateExpired,      // 证书不在有效期内（含本机时钟不对的情形）
+  kCertificateExpired,  // 证书不在有效期内（含本机时钟不对的情形）
   kCertificateKeyMismatch,  // 证书认证的公钥 ≠ 握手里实际使用的身份公钥
-  kDowngradeRefused,        // 要求 BPSEC2 却收到 BPSEC1：拒绝降级
+  kDowngradeRefused,      // 要求 BPSEC2 却收到 BPSEC1：拒绝降级
   kRecordAuthentication,  // 记录层 tag 校验失败
   kReplayDetected,        // 记录序号不连续：重放、跳号或乱序
   kOversizedRecord,       // 记录长度超过上限

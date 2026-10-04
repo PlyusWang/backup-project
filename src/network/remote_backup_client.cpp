@@ -270,9 +270,8 @@ bool RemoteArchiveClient::Connect(const RemoteEndpoint& endpoint,
     net::ServerIdentityPolicy policy;
     if (!endpoint.trusted_roots_file.empty()) {
       std::string roots_error;
-      if (!crypto::TrustedRootStore::LoadFromFile(endpoint.trusted_roots_file,
-                                                  &policy.roots,
-                                                  &roots_error)) {
+      if (!crypto::TrustedRootStore::LoadFromFile(
+              endpoint.trusted_roots_file, &policy.roots, &roots_error)) {
         const std::string reason = "无法加载可信根文件：" + roots_error;
         ::close(fd_);
         fd_ = -1;
@@ -293,8 +292,8 @@ bool RemoteArchiveClient::Connect(const RemoteEndpoint& endpoint,
                                                  &certificate_error)) {
       const std::string reason =
           std::string("BPSEC2 签名身份握手失败（") +
-          SecureTransportErrorName(channel_.last_error()) +
-          "）：" + certificate_error;
+          SecureTransportErrorName(channel_.last_error()) + "）：" +
+          certificate_error;
       ::close(fd_);
       fd_ = -1;
       if (error_message != nullptr) {

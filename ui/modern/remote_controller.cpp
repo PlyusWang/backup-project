@@ -18,12 +18,12 @@
 // 代数、lineage、要不要 bootstrap 缓存）——它只把"源目录 + 策略"和
 // "目标快照 + 目标目录"交给这一层。
 #include "incremental_backup.h"
-#include "server_profile.h"
 #include "incremental_restore.h"
 #include "network_protocol.h"
 #include "remote_auth.h"
 #include "remote_incremental.h"
 #include "secure_transport.h"
+#include "server_profile.h"
 
 #if defined(Q_OS_UNIX)
 #include <signal.h>  // 只给自检用的 killOwnedTunnelForTest

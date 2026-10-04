@@ -103,16 +103,14 @@ inline void FeReduceWide8(const std::uint64_t t[8], Fe* out) {
   std::uint64_t r[6] = {0, 0, 0, 0, 0, 0};
   UInt128 carry = 0;
   for (int i = 0; i < 4; ++i) {
-    const UInt128 x =
-        static_cast<UInt128>(t[4 + i]) * 38 + carry;
+    const UInt128 x = static_cast<UInt128>(t[4 + i]) * 38 + carry;
     r[i] = static_cast<std::uint64_t>(x);
     carry = x >> 64;
   }
   r[4] = static_cast<std::uint64_t>(carry);
   carry = 0;
   for (int i = 0; i < 4; ++i) {
-    const UInt128 x =
-        static_cast<UInt128>(r[i]) + t[i] + carry;
+    const UInt128 x = static_cast<UInt128>(r[i]) + t[i] + carry;
     r[i] = static_cast<std::uint64_t>(x);
     carry = x >> 64;
   }
@@ -125,8 +123,8 @@ inline void FeReduceWide8(const std::uint64_t t[8], Fe* out) {
   carry = 0;
   for (int i = 0; i < 4; ++i) {
     const std::uint64_t hi = (i == 0) ? r[4] : ((i == 1) ? r[5] : 0ULL);
-    const UInt128 x = static_cast<UInt128>(r[i]) +
-                                static_cast<UInt128>(hi) * 38 + carry;
+    const UInt128 x =
+        static_cast<UInt128>(r[i]) + static_cast<UInt128>(hi) * 38 + carry;
     r[i] = static_cast<std::uint64_t>(x);
     carry = x >> 64;
   }
@@ -139,8 +137,7 @@ inline void FeAdd(Fe* out, const Fe& a, const Fe& b) {
   std::uint64_t v[4];
   std::uint64_t carry = 0;
   for (int i = 0; i < 4; ++i) {
-    const UInt128 x =
-        static_cast<UInt128>(a.v[i]) + b.v[i] + carry;
+    const UInt128 x = static_cast<UInt128>(a.v[i]) + b.v[i] + carry;
     v[i] = static_cast<std::uint64_t>(x);
     carry = static_cast<std::uint64_t>(x >> 64);
   }
@@ -430,8 +427,7 @@ void ScMulAdd(const std::uint64_t a[4], const std::uint64_t b[4],
   }
   UInt128 carry = 0;
   for (int i = 0; i < 4; ++i) {
-    const UInt128 x =
-        static_cast<UInt128>(t[i]) + c[i] + carry;
+    const UInt128 x = static_cast<UInt128>(t[i]) + c[i] + carry;
     t[i] = static_cast<std::uint64_t>(x);
     carry = x >> 64;
   }
@@ -473,7 +469,7 @@ void GeAdd(Ge* out, const Ge& p, const Ge& q) {
   FeMul(&b, t, u);
   FeMul(&t, p.T, q.T);
   FeMul(&c, t, D2());
-  FeMul(&d, p.Z, q.Z);        // D = 2*Z1*Z2
+  FeMul(&d, p.Z, q.Z);  // D = 2*Z1*Z2
   FeMulSmall(&d, d, 2);
   FeSub(&e, b, a);
   FeSub(&f, d, c);
@@ -696,9 +692,8 @@ bool Ed25519GenerateKeyPair(std::string* seed, std::string* public_key,
   return true;
 }
 
-bool Ed25519Sign(const std::string& seed, const void* message,
-                 std::size_t size, std::string* signature,
-                 std::string* error_message) {
+bool Ed25519Sign(const std::string& seed, const void* message, std::size_t size,
+                 std::string* signature, std::string* error_message) {
   if (signature == nullptr) {
     SetError(error_message, "输出签名指针为空");
     return false;
@@ -831,8 +826,9 @@ Ed25519VerifyResult Ed25519VerifyDetailed(const std::string& public_key,
   unsigned char right[32];
   GeEncode(left, sB);
   GeEncode(right, sum);
-  return std::memcmp(left, right, 32) == 0 ? Ed25519VerifyResult::kOk
-                                           : Ed25519VerifyResult::kInvalidSignature;
+  return std::memcmp(left, right, 32) == 0
+             ? Ed25519VerifyResult::kOk
+             : Ed25519VerifyResult::kInvalidSignature;
 }
 
 bool Ed25519Verify(const std::string& public_key, const void* message,
