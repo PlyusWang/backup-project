@@ -76,6 +76,7 @@ enum class Bpcert1Error {
   kTrailingGarbage,        // 签名之后还有字节
   kBadFieldValue,          // 字段本身不合法（标识符含控制字符、时间窗为负…）
   kBadIssuerKeySize,       // 传入的签发者公钥不是 32 字节
+  kUntrustedIssuer,        // issuer_id 不在可信根列表里 / 根已吊销或过期
   kSignatureInvalid,       // Ed25519 验签不通过
   kNotYetValid,            // 还没生效（很可能是本机时钟不对）
   kExpired,                // 已过期

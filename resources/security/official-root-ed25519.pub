@@ -1,0 +1,8 @@
+# backup-project 官方云端根公钥（Root-A）
+#
+# 这是 **公钥**。对应的私钥是离线根私钥，保存在仓库之外、权限 0600 的文件里，
+# 从不进入 Git / ECS / 制品 / ZIP / 日志，也从不经过命令行参数。
+# 轮换用：再加一行 Root-B，老证书在 Root-A 行被标成 revoked 之前仍然有效。
+#
+# 格式：<root-id> <public-key> [not_before] [not_after] [active|revoked]
+backup-project-official-root-a ed25519:0530792388326c3db8e0b60df197a94a3a549c888efdd0e6b254eac43aa66df9
