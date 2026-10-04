@@ -794,6 +794,64 @@ bool RemoteServer::HandleRegister(int fd, const FrameHeader& header,
   return SendStatus(fd, header, Status::kOk, std::string(), error_message);
 }
 
+// ---- §33：登录失败节流 ----
+//
+// 目标只有一个：让在线口令猜测变得不划算。三条设计约束：
+//   1. 计数按**用户名字符串**，而不是按 user_id —— 不存在的用户名也必须被
+//      限速，否则「这个用户名被限速了」本身就泄漏了「这个用户名存在」；
+//   2. 锁定期间**即使口令正确也拒绝** —— 否则攻击者只要在锁定窗口里碰对一次
+//      就绕过了节流；
+//   3. 表的大小必须有上界：攻击者可以用海量不同的用户名把内存撑爆，
+//      所以超过上限时先清理已过期的条目，仍然满就不再记录（降级而不是崩）。
+std::int64_t RemoteServer::LoginLockRemainingSeconds(
+    const std::string& username) {
+  if (config_.max_login_failures <= 0 || config_.login_lockout_seconds <= 0) {
+    return 0;
+  }
+  const std::int64_t now = NowSeconds();
+  std::lock_guard<std::mutex> guard(login_throttle_mutex_);
+  const auto found = login_throttle_.find(username);
+  if (found == login_throttle_.end()) {
+    return 0;
+  }
+  return found->second.locked_until > now ? found->second.locked_until - now : 0;
+}
+
+void RemoteServer::RecordLoginFailure(const std::string& username) {
+  if (config_.max_login_failures <= 0 || config_.login_lockout_seconds <= 0) {
+    return;
+  }
+  const std::int64_t now = NowSeconds();
+  std::lock_guard<std::mutex> guard(login_throttle_mutex_);
+  constexpr std::size_t kMaxTracked = 4096;
+  if (login_throttle_.find(username) == login_throttle_.end() &&
+      login_throttle_.size() >= kMaxTracked) {
+    for (auto it = login_throttle_.begin(); it != login_throttle_.end();) {
+      if (it->second.locked_until <= now) {
+        it = login_throttle_.erase(it);
+      } else {
+        ++it;
+      }
+    }
+    if (login_throttle_.size() >= kMaxTracked) {
+      Log("login throttle table is full, not tracking this username");
+      return;
+    }
+  }
+  LoginThrottle& entry = login_throttle_[username];
+  ++entry.consecutive_failures;
+  if (entry.consecutive_failures >= config_.max_login_failures) {
+    entry.locked_until = now + config_.login_lockout_seconds;
+    entry.consecutive_failures = 0;
+    Log("login throttle engaged for the supplied username for " +
+        std::to_string(config_.login_lockout_seconds) + "s");
+  }
+}
+
+void RemoteServer::ClearLoginFailures(const std::string& username) {
+  std::lock_guard<std::mutex> guard(login_throttle_mutex_);
+  login_throttle_.erase(username);
+}
 bool RemoteServer::HandleLogin(int fd, const FrameHeader& header,
                                const std::string& payload,
                                ConnectionContext* context,
@@ -811,6 +869,16 @@ bool RemoteServer::HandleLogin(int fd, const FrameHeader& header,
     return SendError(fd, header.opcode, header.request_id,
                      Status::kInvalidRequest, error_message);
   }
+  // §33：先看节流，而且放在查库**之前** —— 存在与不存在的用户名走同一条
+  // 限速路径，限速本身就不会变成「这个用户名存在吗」的探针。
+  const std::int64_t lock_remaining = LoginLockRemainingSeconds(username);
+  if (lock_remaining > 0) {
+    Log("login throttled: too many consecutive failures for the supplied"
+        " username, " + std::to_string(lock_remaining) +
+        "s remaining");
+    return SendError(fd, header.opcode, header.request_id,
+                     Status::kUnauthorized, error_message);
+  }
   RemoteUserRecord user;
   std::string store_error;
   const StoreResult result = store_->FindUser(username, &user, &store_error);
@@ -823,6 +891,7 @@ bool RemoteServer::HandleLogin(int fd, const FrameHeader& header,
     dummy.iterations = kPasswordIterations;
     bool ignored = false;
     VerifyPassword(password, dummy, &ignored, nullptr);
+    RecordLoginFailure(username);
     Log("login rejected: unknown user");
     return SendError(fd, header.opcode, header.request_id,
                      Status::kUnauthorized, error_message);
@@ -840,6 +909,7 @@ bool RemoteServer::HandleLogin(int fd, const FrameHeader& header,
                      Status::kInternalError, error_message);
   }
   if (!matches) {
+    RecordLoginFailure(username);
     Log("login rejected: wrong password for user id=" +
         std::to_string(user.user_id));
     return SendError(fd, header.opcode, header.request_id,
@@ -853,6 +923,7 @@ bool RemoteServer::HandleLogin(int fd, const FrameHeader& header,
     return SendError(fd, header.opcode, header.request_id,
                      Status::kInternalError, error_message);
   }
+  ClearLoginFailures(username);
   context->state = ConnectionState::kAuthenticated;
   context->user_id = static_cast<std::uint64_t>(user.user_id);
   context->username = user.username;
