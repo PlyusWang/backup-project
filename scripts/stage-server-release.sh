@@ -105,12 +105,25 @@ else
   echo "  FAIL backup-cert-tool --help" >&2
   FAILED=1
 fi
-# 包里不许出现私钥：按内容找"seed-hex"这类只属于根密钥文件的字段。
-if grep -rl "seed-hex" "$OUT_DIR" 2>/dev/null | grep -v "^$OUT_DIR/tools/backup-cert-tool$" | grep -q .; then
-  echo "  FAIL 包内出现了疑似私钥内容" >&2
+# 包里不许出现私钥。两条检查：
+#   1. 文件清单必须完全落在预期集合内（多一个文件就算问题 —— 这才是
+#      "有没有夹带东西"的直接证据）；
+#   2. 任何文件都不许含根密钥文件的行格式（^seed-hex: <64 位十六进制>$）。
+# 注意：二进制里出现 "seed-hex" 这个**字段名**是正常的（解析器要在里面），
+# 所以不能拿字段名当判据 —— 第一版就是这么误报的。
+UNEXPECTED="$(cd "$OUT_DIR" && find . -type f -printf '%P\n' | sort | grep -vE '^(bin/backup-server|bin/backup-server-admin|bin/backup-server-keygen|tools/backup-cert-tool|share/backup-project/official-root-ed25519[.]pub|share/backup-project/VERSION|docs/[A-Za-z0-9._-]+|BUILD-INFO[.]txt|MANIFEST[.]sha256)$' || true)"
+if [ -n "$UNEXPECTED" ]; then
+  echo "  FAIL 包内出现预期之外的文件：" >&2
+  printf '%s\n' "$UNEXPECTED" >&2
   FAILED=1
 else
-  echo "  PASS 包内没有私钥内容（只允许工具二进制里出现字段名）"
+  echo "  PASS 包内文件清单完全符合预期"
+fi
+if grep -rEl '^seed-hex: [0-9a-f]{64}$' "$OUT_DIR" 2>/dev/null | grep -q .; then
+  echo "  FAIL 包内出现了根密钥文件的内容" >&2
+  FAILED=1
+else
+  echo "  PASS 包内没有任何根密钥文件内容"
 fi
 
 echo "== 包内容 =="
