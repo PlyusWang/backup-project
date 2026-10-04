@@ -114,6 +114,8 @@ Item {
     readonly property bool pinDirty:
         page.draftServerKeyPin.trim() !== remote.appliedServerKeyPin
     readonly property bool sshMode: page.draftConnectionMode === "ssh"
+    // 官方云端：身份与地址都来自编译进二进制的 profile，界面上不需要任何输入。
+    readonly property bool officialMode: page.draftConnectionMode === "official"
     // 通道状态的颜色：建好了是绿的，失败是红的，正在动是黄的，没启动是灰的。
     readonly property color tunnelColor:
         remote.tunnelState === "ready" ? theme.success
@@ -362,6 +364,7 @@ Item {
                                 enabled: !remote.busy
                                 currentKey: page.draftConnectionMode
                                 model: [
+                                    { "key": "official", "text": "官方云端" },
                                     { "key": "ssh", "text": "SSH 安全通道（推荐）" },
                                     { "key": "direct", "text": "直接连接（高级）" }
                                 ]
@@ -376,6 +379,29 @@ Item {
                             }
 
                             Item { Layout.fillWidth: true }
+                        }
+                    }
+
+                    // ---------- 官方云端（仅官方模式）----------
+                    // 这一块**故意**只有一个标题和一句话：官方云端就是
+                    // 不需要用户填任何东西，所以界面上也不该出现任何输入框。
+                    ColumnLayout {
+                        Layout.fillWidth: true
+                        visible: page.officialMode
+                        spacing: 6
+
+                        Text {
+                            objectName: "remoteOfficialCloudName"
+                            text: remote.officialCloudName
+                            font.pixelSize: 18
+                            font.bold: true
+                            color: theme.textSecondary
+                        }
+
+                        Text {
+                            text: "服务器身份由官方根签发的证书自动校验；不需要配置隧道，也不需要核对任何指纹。"
+                            wrapMode: Text.WordWrap
+                            color: theme.textSecondary
                         }
                     }
 

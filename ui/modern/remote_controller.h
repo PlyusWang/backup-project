@@ -419,6 +419,7 @@ class RemoteController : public QObject {
   QString serverKeyPinError() const { return server_key_pin_error_; }
   // ---- 连接方式 / 通道（PR #22）----
   QString connectionMode() const;
+  QString officialCloudName() const;
   QString sshHost() const { return ssh_host_; }
   QString sshLocalPort() const;
   QString sshProgram() const { return ssh_program_; }
@@ -752,7 +753,12 @@ class RemoteController : public QObject {
   enum class Phase { kNone = 0, kUpload = 1, kDownload = 2 };
 
   // 客户端怎么到达服务端。见上面的属性说明。
-  enum class ConnectionMode { kSshTunnel = 0, kDirect = 1 };
+  // 官方云端（PR #23）：身份与地址都来自编译进二进制的 OfficialCloudProfile，
+  // 用户不需要填地址、端口、指纹或 server_id。
+  enum class ConnectionMode { kSshTunnel = 0, kDirect = 1, kOfficialCloud = 2 };
+
+  // 官方云端的显示名（QML 直接绑这一条，界面文案只有这一个来源）。
+  Q_PROPERTY(QString officialCloudName READ officialCloudName CONSTANT)
 
   // 一条错误该出现在哪里。每个表单各有自己的错误行（登录 / 注册 / 注销
   // 对话框 / 连接设置里的服务器身份指纹），页面级操作用底部横幅。

@@ -18,6 +18,7 @@
 // 代数、lineage、要不要 bootstrap 缓存）——它只把"源目录 + 策略"和
 // "目标快照 + 目标目录"交给这一层。
 #include "incremental_backup.h"
+#include "server_profile.h"
 #include "incremental_restore.h"
 #include "network_protocol.h"
 #include "remote_auth.h"
@@ -1270,6 +1271,18 @@ void RemoteController::Submit(const RemoteRequest& request) {
   //
   // 调用点一个都不用改：所有提交都经过这里，所以不可能出现"某一条操作忘了
   // 走隧道"这种漏网（那种漏网的症状恰好就是 connection refused）。
+  if (connection_mode_ == ConnectionMode::kOfficialCloud) {
+    const backupproject::net::ServerProfile& official =
+        backupproject::net::OfficialCloudProfile();
+    RemoteRequest directed = request;
+    directed.endpoint.host = official.host;
+    directed.endpoint.port = official.port;
+    directed.endpoint.identity_mode = "certificate";
+    directed.endpoint.expected_server_id = official.expected_server_id;
+    directed.endpoint.trusted_roots_file.clear();  // 空 = 内置官方根
+    DispatchRequest(directed);
+    return;
+  }
   if (connection_mode_ == ConnectionMode::kDirect) {
     DispatchRequest(request);
     return;
@@ -2387,7 +2400,15 @@ void RemoteController::ApplyRawRestoreState(const RemoteOpResult& result) {
 // 它没有、也不会碰的东西：BPSEC1 的线格式、X25519 / HKDF / AES / HMAC、
 // remote metadata、增量语义。SSH 只是把 socket 送到服务端门口的那一段路。
 
+QString RemoteController::officialCloudName() const {
+  return QString::fromStdString(
+      backupproject::net::OfficialCloudProfile().display_name);
+}
+
 QString RemoteController::connectionMode() const {
+  if (connection_mode_ == ConnectionMode::kOfficialCloud) {
+    return QStringLiteral("official");
+  }
   return connection_mode_ == ConnectionMode::kSshTunnel
              ? QStringLiteral("ssh")
              : QStringLiteral("direct");
@@ -2415,7 +2436,9 @@ QString RemoteController::tunnelState() const {
 
 bool RemoteController::setConnectionMode(const QString& mode) {
   ConnectionMode next = connection_mode_;
-  if (mode == QStringLiteral("ssh")) {
+  if (mode == QStringLiteral("official")) {
+    next = ConnectionMode::kOfficialCloud;
+  } else if (mode == QStringLiteral("ssh")) {
     next = ConnectionMode::kSshTunnel;
   } else if (mode == QStringLiteral("direct")) {
     next = ConnectionMode::kDirect;
