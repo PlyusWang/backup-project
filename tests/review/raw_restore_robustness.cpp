@@ -516,10 +516,13 @@ void CaseTruncatedArchive(const HarnessContext& context) {
                  truncated.size()),
          "truncated", "构造前提：一半长度、容器头仍然完整");
 
+  // 这一条现在必须落在"**认得出是我们的容器、但内容与自己的声明不符**"上，
+  // 而不是"随便一个不受支持的文件"：截断的归档仍然是归档，界面要如实说"已损
+  // 坏"（GUI 的 RAW-U08 就是这一条）。
   ExpectFailure(context, "truncated", "截断到一半的归档必须失败", path,
                 "truncated-control.bak", context.work + "/dest-truncated",
                 RestoreOptions(),
-                {"恢复失败", "not a supported archive", "长度"});
+                {"corrupted archive", "已损坏", "完整性"});
 }
 
 // ---- 用例 3：任意字节（显示名仍然以 .bak 结尾） ----
@@ -622,7 +625,8 @@ void CaseOversizedDeclaration(const HarnessContext& context) {
                   path, std::string("oversized-") + variant.name + ".bak",
                   context.work + "/dest-oversized-" + variant.name,
                   RestoreOptions(),
-                  {"恢复失败", "不是受支持的", "not a supported archive"});
+                  {"恢复失败", "已损坏", "corrupted archive",
+                   "not a supported archive"});
   }
 }
 
@@ -729,9 +733,124 @@ void CaseEncryptedArchive(const HarnessContext& context) {
          negative.ok ? std::string("竟然成功了")
                      : (negative.outcome.verified_sha256 + " / " +
                         negative.error));
+  // 可区分性的正面证据（GUI 文案就靠它）：payload 字节被改动时 payload_sha256
+  // 先在 HMAC 之前比对失败，所以这一条必须说"已损坏"，**不能**甩给密码。
+  Report(!negative.ok &&
+             Contains(negative.error, "corrupted archive") &&
+             !Contains(negative.error, "authentication failed"),
+         "encrypted",
+         "payload 被改动 -> 明确是“已损坏 / 完整性校验失败”，不甩给密码",
+         negative.error);
   if (!negative.ok) {
     CheckNoDestination("encrypted", dest_corrupted);
   }
+
+  // (d) 错密码：必须说"认证没过"（密码错**或**容器头被改动），而且不能说成
+  // "文件已损坏"——这两件事在密码学上不可区分，文案必须如实。
+  const std::string dest_wrong = context.work + "/dest-encrypted-wrong";
+  RestoreOptions wrong_options;
+  wrong_options.password = "definitely-not-the-password";
+  const RawRestoreRun wrong = RunRawRestore(
+      context, snapshot_id, "encrypted-control.bak", dest_wrong, wrong_options);
+  Report(!wrong.ok && Contains(wrong.error, "authentication failed") &&
+             !Contains(wrong.error, "corrupted archive"),
+         "encrypted",
+         "错密码 -> 明确是“认证没过”（密码错或容器头被改动），不说成已损坏",
+         wrong.ok ? std::string("竟然成功了") : wrong.error);
+  if (!wrong.ok) {
+    CheckNoDestination("encrypted", dest_wrong);
+  }
+}
+
+// ---- 用例 8：密码重试的会话（Prepare 一次 -> 错 -> 错 -> 对）----
+
+// GUI 的"错密码可以直接重输、不重新下载"走的就是这条路径。这里在消毒剂下把它
+// 完整走一遍：Prepare **一次**、Run 多次；每次失败都不碰目标目录，那份归档一直
+// 是同一个 inode（没有被重新下载），最后成功并清掉工作目录。
+void CasePasswordRetry(const HarnessContext& context) {
+  const std::string password = "raw-restore-robustness-retry";
+  const std::string encrypted_path = context.work + "/encrypted-retry.bak";
+  BackupOptions options;
+  options.encryption_method = EncryptionMethod::kAes256CtrHmacSha256;
+  options.password = password;
+  std::string error;
+  if (!RunBackupPipeline(context.source, encrypted_path, Filter(), options,
+                         &error)) {
+    Report(false, "password-retry", "构造前提：加密的 standalone 归档", error);
+    return;
+  }
+  std::string snapshot_id;
+  if (!UploadRawArchive(context.client, encrypted_path, "encrypted-retry.bak",
+                        &snapshot_id, &error)) {
+    Report(false, "password-retry", "上传加密归档", error);
+    return;
+  }
+  net::RemoteRawRestoreRequest request;
+  request.client = context.client;
+  request.cache.root_directory = context.work;
+  request.cache.cache_directory = context.cache;
+  request.snapshot_id = snapshot_id;
+  request.display_name = "encrypted-retry.bak";
+  request.destination_directory = context.work + "/dest-password-retry";
+  net::RemoteRawRestoreSession session;
+  net::RemoteRawRestoreOutcome outcome;
+  const bool prepared = session.Prepare(request, &outcome, &error);
+  Report(prepared, "password-retry", "Prepare：下载 + SHA-256 校验 + 识别",
+         error);
+  if (!prepared) {
+    return;
+  }
+  const std::string archive_path = session.archive_path_for_test();
+  struct stat before;
+  const bool stat_ok = ::stat(archive_path.c_str(), &before) == 0;
+  Report(session.download_count() == 1 && stat_ok, "password-retry",
+         "Prepare 之后：只下载了 1 次，那份归档在工作目录里", archive_path);
+
+  net::RemoteRawRestoreOutcome none;
+  std::string none_error;
+  const bool none_ok = session.Run(std::string(), &none, &none_error);
+  Report(!none_ok && none.password_required && session.prepared(),
+         "password-retry",
+         "没有密码：明确 password_required，而且会话保持有效", none_error);
+  CheckNoDestination("password-retry", request.destination_directory);
+
+  for (int attempt = 0; attempt < 2; ++attempt) {
+    net::RemoteRawRestoreOutcome wrong;
+    std::string wrong_error;
+    const bool wrong_ok = session.Run(
+        "wrong-password-" + std::to_string(attempt), &wrong, &wrong_error);
+    Report(!wrong_ok && Contains(wrong_error, "authentication failed") &&
+               !Contains(wrong_error, "corrupted archive"),
+           "password-retry",
+           "错密码报“认证没过”，不说成归档损坏（第 " +
+               std::to_string(attempt + 1) + " 次）",
+           wrong_error);
+    CheckNoDestination("password-retry", request.destination_directory);
+  }
+  struct stat after_wrong;
+  const bool still_there = ::stat(archive_path.c_str(), &after_wrong) == 0;
+  Report(still_there && session.download_count() == 1 &&
+             after_wrong.st_ino == before.st_ino &&
+             after_wrong.st_size == before.st_size,
+         "password-retry",
+         "两次错密码之后仍是**同一份**字节（同 inode 同长度），下载次数还是 1");
+
+  net::RemoteRawRestoreOutcome right;
+  std::string right_error;
+  const bool right_ok = session.Run(password, &right, &right_error);
+  Report(right_ok, "password-retry", "正确密码：恢复成功", right_error);
+  if (right_ok) {
+    std::string mismatch;
+    Report(TreesMatch(context.source, request.destination_directory, &mismatch),
+           "password-retry", "密码重试之后恢复出来的树与源树逐字节一致",
+           mismatch);
+    Report(session.download_count() == 1, "password-retry",
+           "整条交互只下载过一次（错密码重试用的是同一份字节）");
+  }
+  session.Abandon();
+  struct stat gone;
+  Report(::stat(archive_path.c_str(), &gone) != 0, "password-retry",
+         "Abandon 之后那份临时归档被删掉（收尾是 fail-closed）");
 }
 
 // ---- 用例 6：单独一份 delta ----
@@ -900,14 +1019,15 @@ int RunAll(int argc, char** argv) {
   CaseArbitraryBytes(context);
   CaseOversizedDeclaration(context);
   CaseEncryptedArchive(context);
+  CasePasswordRetry(context);
   CaseLoneDelta(context);
   CaseMissingSnapshot(context);
 
   // 收尾：失败与成功路径都不该在工作目录里留下私有的临时目录。
   const bool leftover = HasEntryWithPrefix(context.work, ".bp-work-") ||
-                        HasEntryWithPrefix(context.cache, ".raw-restore-");
+                        HasEntryWithPrefix(context.cache, "raw-restore-");
   Report(!leftover, "hygiene",
-         "工作目录与缓存目录里没有留下临时目录（.bp-work-* / .raw-restore-*）");
+         "工作目录与缓存目录里没有留下临时目录（.bp-work-* / raw-restore-*）");
 
   client.Logout(&error);
   client.Disconnect();

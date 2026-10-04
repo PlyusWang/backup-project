@@ -2338,7 +2338,7 @@ int RunRemoteProductFlow(backup_modern::RemoteController* remote, CheckRun* run,
                      "主操作=恢复"),
       delta_row.value(QStringLiteral("kindText")).toString());
 
-  // ---- RAW-R03：任意文件（显示名以 .bak 结尾）不能当成备份归档 ----
+  // ---- RAW-U07：任意文件（显示名以 .bak 结尾）不能当成备份归档 ----
   //
   // 它证明"格式由**内容**决定"：文件名、扩展名一律不参与判断。
   const QString raw_file = work + QStringLiteral("/gui-raw-archive.bin");
@@ -2354,12 +2354,13 @@ int RunRemoteProductFlow(backup_modern::RemoteController* remote, CheckRun* run,
       remote->waitForIdle(300000) &&
       remote->lastErrorKindForTest() == QStringLiteral("none");
   run->Check(raw_uploaded && refresh(),
-             QStringLiteral("RAW-R03 原始归档上传成功（低层 raw 操作）"),
+             QStringLiteral("RAW-U07 原始归档上传成功（低层 raw 操作）"),
              remote->lastErrorKindForTest() + QStringLiteral(": ") +
                  remote->lastDetailForTest());
   const QVariantMap raw_row = findByDisplayName(raw_name);
-  // 类型契约：raw 就是 raw —— badge 是"原始归档"、没有代数、没有父，
-  // 主操作叫"尝试恢复"（不是"恢复"，也不是禁用的按钮）。
+  // 类型契约：raw 就是 raw —— badge 是"原始归档"、没有代数、没有父，主操作
+  // 与产品级一样叫"恢复"。内部走哪条流水线由 badge 与说明行交代，**不**写进
+  // 按钮名字：把"这次能不能成"这种内部不确定性放进按钮是上一版的做法。
   run->Check(
       !raw_row.isEmpty() &&
           raw_row.value(QStringLiteral("kind")).toString() ==
@@ -2369,13 +2370,14 @@ int RunRemoteProductFlow(backup_modern::RemoteController* remote, CheckRun* run,
           !raw_row.value(QStringLiteral("generationVisible")).toBool() &&
           raw_row.value(QStringLiteral("parentShort")).toString().isEmpty() &&
           raw_row.value(QStringLiteral("restoreLabel")).toString() ==
-              QStringLiteral("尝试恢复") &&
-          raw_row.value(QStringLiteral("restoreLabel")).toString() !=
+              QStringLiteral("恢复") &&
+          raw_row.value(QStringLiteral("restoreLabel")).toString() ==
               root_row.value(QStringLiteral("restoreLabel")).toString() &&
+          raw_row.value(QStringLiteral("restorable")).toBool() &&
           !raw_row.value(QStringLiteral("typeNote")).toString().isEmpty(),
       QStringLiteral(
-          "RAW-R03/GUI-P08 原始归档：badge=原始归档、不显示代数与父、"
-          "主操作=尝试恢复（与产品级“恢复”不是同一个词）"),
+          "RAW-U07/GUI-P08 原始归档：badge=原始归档、不显示代数与父、"
+          "主操作=恢复（与产品级同一个词；上一版的“尝试…”文案已删除）"),
       raw_row.value(QStringLiteral("kindText")).toString() +
           QStringLiteral(" / ") +
           raw_row.value(QStringLiteral("typeNote")).toString());
@@ -2390,9 +2392,30 @@ int RunRemoteProductFlow(backup_modern::RemoteController* remote, CheckRun* run,
                    QDir::NoSort)
         .isEmpty();
   };
+  // 原始归档恢复的临时工作目录（<cache>/raw-restore-XXXXXX）。它是"这次交互
+  // 还留着那份已校验的归档"的直接证据：成功 / 取消之后必须为 0。
+  const QString raw_cache_dir =
+      QString::fromStdString(layout.cache_directory);
+  const auto rawWorkdirCount = [](const QString& cache_directory) {
+    return QDir(cache_directory)
+        .entryList(QStringList() << QStringLiteral("raw-restore-*"),
+                   QDir::Dirs | QDir::NoDotAndDotDot, QDir::NoSort)
+        .size();
+  };
+  // 临时归档的 (inode, 字节数)：错密码重试用的是**同一份**字节，所以这两个数
+  // 必须一模一样。inode 比"路径相同"强：重新下载一定会是新文件的 inode。
+  const auto rawArchiveIdentity = [](const QString& path) {
+    struct stat info;
+    if (path.isEmpty() || ::stat(path.toUtf8().constData(), &info) != 0) {
+      return QStringLiteral("(missing)");
+    }
+    return QStringLiteral("%1/%2")
+        .arg(static_cast<qulonglong>(info.st_ino))
+        .arg(static_cast<qulonglong>(info.st_size));
+  };
 
   // 绕过界面直接请求**链恢复**：共享 core 也必须拒绝（原始归档不是 BPSNAP1
-  // 材料包）。这与下面"尝试恢复"是两条不同的路，两条都要有明确结论。
+  // 材料包）。这与下面原始归档自己的恢复是两条不同的路，两条都要有明确结论。
   const bool chain_on_raw_accepted = remote->restoreSnapshot(
       raw_row.value(QStringLiteral("id")).toString(), raw_out);
   const bool chain_on_raw_idle =
@@ -2401,12 +2424,12 @@ int RunRemoteProductFlow(backup_modern::RemoteController* remote, CheckRun* run,
       chain_on_raw_idle &&
           remote->lastErrorKindForTest() == QStringLiteral("not-a-bundle") &&
           destinationUnused(raw_out),
-      QStringLiteral("RAW-R03 对原始归档做链恢复：明确诊断且目标目录为空"),
+      QStringLiteral("RAW-U07 对原始归档做链恢复：明确诊断且目标目录为空"),
       remote->lastErrorKindForTest() + QStringLiteral(": ") +
           remote->lastDetailForTest());
 
-  // "尝试恢复"：下载那一个 blob，按内容认出它不是备份归档 -> 明确失败，
-  // 目标目录仍然没有被创建。
+  // 恢复：下载那一个 blob，按内容认出它不是备份归档 -> 明确失败，
+  // 目标目录仍然没有被创建，而且**不**出现密码那一段（没有密码可要）。
   const bool raw_invalid_accepted = remote->restoreRawArchive(
       raw_row.value(QStringLiteral("id")).toString(), raw_out, QString());
   const bool raw_invalid_idle =
@@ -2414,13 +2437,15 @@ int RunRemoteProductFlow(backup_modern::RemoteController* remote, CheckRun* run,
   run->Check(
       raw_invalid_idle &&
           remote->lastErrorKindForTest() == QStringLiteral("raw-unsupported") &&
-          destinationUnused(raw_out),
-      QStringLiteral("RAW-R03 任意文件（显示名 .bak）：尝试恢复失败并"
-                     "说明“不是受支持的备份归档”，目标目录为空"),
+          !remote->lastRawRestorePasswordRequiredForTest() &&
+          !remote->rawRestoreSessionAliveForTest() &&
+          destinationUnused(raw_out) && rawWorkdirCount(raw_cache_dir) == 0,
+      QStringLiteral("RAW-U07 任意文件（显示名 .bak）：恢复失败并说明"
+                     "“不是受支持的备份归档”，不弹密码、目标目录为空"),
       remote->lastErrorKindForTest() + QStringLiteral(": ") +
           remote->lastDetailForTest());
 
-  // ---- RAW-R01：可独立恢复的完整 .bak（本项目自己的备份流水线生成）----
+  // ---- RAW-U01：可独立恢复的完整 .bak（本项目自己的备份流水线生成）----
   const QString standalone_src = work + QStringLiteral("/raw-standalone-src");
   const QString standalone_root = work + QStringLiteral("/raw-standalone");
   const QString standalone_bak =
@@ -2444,7 +2469,7 @@ int RunRemoteProductFlow(backup_modern::RemoteController* remote, CheckRun* run,
         backupproject::Filter(), backupproject::BackupOptions(),
         &pipeline_error);
     run->Check(built && QFileInfo::exists(standalone_bak),
-               QStringLiteral("RAW-R01 用产品自己的备份流水线生成一份独立的"
+               QStringLiteral("RAW-U01 用产品自己的备份流水线生成一份独立的"
                               "完整 .bak"),
                QString::fromStdString(pipeline_error));
   }
@@ -2454,7 +2479,7 @@ int RunRemoteProductFlow(backup_modern::RemoteController* remote, CheckRun* run,
       remote->waitForIdle(300000) &&
       remote->lastErrorKindForTest() == QStringLiteral("none");
   run->Check(standalone_uploaded && refresh(),
-             QStringLiteral("RAW-R01 独立 .bak 原始上传成功"),
+             QStringLiteral("RAW-U01 独立 .bak 原始上传成功"),
              remote->lastErrorKindForTest() + QStringLiteral(": ") +
                  remote->lastDetailForTest());
   const QVariantMap standalone_row = findByDisplayName(standalone_name);
@@ -2471,22 +2496,37 @@ int RunRemoteProductFlow(backup_modern::RemoteController* remote, CheckRun* run,
                      QStringLiteral("v2-container") &&
                  remote->lastRawRestoreEntriesForTest() > 0 &&
                  remote->lastRawRestoreDownloadedBytesForTest() > 0,
-             QStringLiteral("RAW-R01 原始归档：下载 -> SHA-256 校验 -> 交给"
-                            "既有本地恢复核心 -> 成功"),
+             QStringLiteral("RAW-U01 未加密的独立归档：只给目标目录 -> 下载 -> "
+                            "SHA-256 校验 -> 既有本地恢复核心 -> 成功"),
              remote->lastErrorKindForTest() + QStringLiteral(": ") +
                  remote->lastDetailForTest());
+  // 结论文案是正常产品语义的"恢复完成"；而且**没有**出现密码那一段。
+  run->Check(
+      remote->statusKind() == QStringLiteral("success") &&
+          remote->statusTitle() == QStringLiteral("恢复完成") &&
+          !remote->rawRestoreAwaitingPassword() &&
+          !remote->rawRestoreSessionAliveForTest() &&
+          remote->lastRawRestoreDownloadCountForTest() == 1 &&
+          rawWorkdirCount(raw_cache_dir) == 0,
+      QStringLiteral("RAW-U01 提示就是“恢复完成”（不是“尝试…成功”），"
+                     "全程没有密码那一段，临时归档已清理"),
+      remote->statusKind() + QStringLiteral("/") + remote->statusTitle() +
+          QStringLiteral("/awaiting=") +
+          QString::number(remote->rawRestoreAwaitingPassword() ? 1 : 0) +
+          QStringLiteral("/dirs=") +
+          QString::number(rawWorkdirCount(raw_cache_dir)));
   run->Check(treeMatches(standalone_src, standalone_out),
-             QStringLiteral("RAW-R01 恢复出来的目录与源目录逐字节一致"
+             QStringLiteral("RAW-U01 恢复出来的目录与源目录逐字节一致"
                             "（等价于 diff -r 通过）"));
   run->Check(
       !remote->lastRawRestoreSha256ForTest().isEmpty() &&
           remote->lastRawRestoreSha256ForTest().left(12) ==
               standalone_row.value(QStringLiteral("sha256Short")).toString(),
-      QStringLiteral("RAW-R01 恢复用的是**下载并校验过的字节**：摘要与"
+      QStringLiteral("RAW-U01 恢复用的是**下载并校验过的字节**：摘要与"
                      "列表里登记的一致"),
       remote->lastRawRestoreSha256ForTest());
 
-  // ---- RAW-R02：被篡改的归档 ----
+  // ---- RAW-U08：被篡改的归档（完整性）----
   const QString corrupted_bak = work + QStringLiteral("/raw-corrupted.bak");
   const QString corrupted_out = work + QStringLiteral("/raw-corrupted-out");
   QFile::remove(corrupted_bak);
@@ -2509,7 +2549,7 @@ int RunRemoteProductFlow(backup_modern::RemoteController* remote, CheckRun* run,
     }
     run->Check(
         copied && flipped,
-        QStringLiteral("RAW-R02 造一份被篡改的完整归档（改中间一个字节）"));
+        QStringLiteral("RAW-U08 造一份被篡改的完整归档（改中间一个字节）"));
   }
   const QString corrupted_name = QStringLiteral("raw-corrupted.bak");
   const bool corrupted_uploaded =
@@ -2517,7 +2557,7 @@ int RunRemoteProductFlow(backup_modern::RemoteController* remote, CheckRun* run,
       remote->waitForIdle(300000) &&
       remote->lastErrorKindForTest() == QStringLiteral("none");
   run->Check(corrupted_uploaded && refresh(),
-             QStringLiteral("RAW-R02 被篡改的归档上传成功（服务端只存字节）"),
+             QStringLiteral("RAW-U08 被篡改的归档上传成功（服务端只存字节）"),
              remote->lastErrorKindForTest() + QStringLiteral(": ") +
                  remote->lastDetailForTest());
   const QVariantMap corrupted_row = findByDisplayName(corrupted_name);
@@ -2526,14 +2566,18 @@ int RunRemoteProductFlow(backup_modern::RemoteController* remote, CheckRun* run,
       QString());
   const bool corrupted_idle = corrupted_accepted && remote->waitForIdle(900000);
   run->Check(corrupted_idle &&
-                 remote->lastErrorKindForTest() != QStringLiteral("none") &&
-                 destinationUnused(corrupted_out),
-             QStringLiteral("RAW-R02 被篡改的归档：校验失败、目标目录为空"
-                            "（没有半成品）"),
+                 remote->lastErrorKindForTest() ==
+                     QStringLiteral("raw-corrupt") &&
+                 !remote->lastRawRestorePasswordRequiredForTest() &&
+                 !remote->rawRestoreSessionAliveForTest() &&
+                 destinationUnused(corrupted_out) &&
+                 rawWorkdirCount(raw_cache_dir) == 0,
+             QStringLiteral("RAW-U08 被篡改的归档：明确是“已损坏 / 完整性"
+                            "校验失败”，**不**误报成需要密码，目标目录为空"),
              remote->lastErrorKindForTest() + QStringLiteral(": ") +
                  remote->lastDetailForTest());
 
-  // ---- RAW-R04：单独的 delta（缺少父链）----
+  // ---- RAW-U09：单独的 delta（缺少父链）----
   //
   // delta 从**已验证缓存**里按内容挑出来（不按文件名猜）：它就是远端 R1 的
   // 那一份。单独上传之后，它属于某条链这件事不会因为"只有它一个"而改变。
@@ -2557,7 +2601,7 @@ int RunRemoteProductFlow(backup_modern::RemoteController* remote, CheckRun* run,
   const bool delta_copied =
       !delta_material.isEmpty() && QFile::copy(delta_material, delta_alone_bak);
   run->Check(delta_copied,
-             QStringLiteral("RAW-R04 从已验证缓存里按内容取出 R1 的那份 delta"),
+             QStringLiteral("RAW-U09 从已验证缓存里按内容取出 R1 的那份 delta"),
              delta_material);
   const QString delta_alone_name = QStringLiteral("raw-delta-alone.bak");
   const bool delta_uploaded =
@@ -2566,7 +2610,7 @@ int RunRemoteProductFlow(backup_modern::RemoteController* remote, CheckRun* run,
       remote->waitForIdle(300000) &&
       remote->lastErrorKindForTest() == QStringLiteral("none");
   run->Check(delta_uploaded && refresh(),
-             QStringLiteral("RAW-R04 单独的 delta 上传成功"),
+             QStringLiteral("RAW-U09 单独的 delta 上传成功"),
              remote->lastErrorKindForTest() + QStringLiteral(": ") +
                  remote->lastDetailForTest());
   const QVariantMap delta_alone_row = findByDisplayName(delta_alone_name);
@@ -2579,14 +2623,17 @@ int RunRemoteProductFlow(backup_modern::RemoteController* remote, CheckRun* run,
       delta_alone_idle &&
           remote->lastErrorKindForTest() == QStringLiteral("raw-delta") &&
           remote->statusMessage().contains(QStringLiteral("增量")) &&
-          remote->statusMessage().contains(QStringLiteral("依赖链")) &&
-          destinationUnused(delta_alone_out),
-      QStringLiteral("RAW-R04 单独的 delta：明确说“这是增量备份，不能"
-                     "脱离依赖链单独恢复”，目标目录为空"),
+          remote->statusMessage().contains(QStringLiteral("父备份")) &&
+          !remote->lastRawRestorePasswordRequiredForTest() &&
+          !remote->rawRestoreSessionAliveForTest() &&
+          destinationUnused(delta_alone_out) &&
+          rawWorkdirCount(raw_cache_dir) == 0,
+      QStringLiteral("RAW-U09 单独的 delta：明确说“缺少父备份，无法单独"
+                     "恢复”，不弹密码、目标目录为空"),
       remote->lastErrorKindForTest() + QStringLiteral(": ") +
           remote->lastDetailForTest());
 
-  // ---- RAW-R05：加密的独立归档（正确密码 / 错误密码 / 没填密码）----
+  // ---- RAW-U02..U05 的构造前提：加密的独立归档 ----
   const QString encrypted_bak = standalone_root + QStringLiteral("/secret.bak");
   const QString encrypted_pw = QStringLiteral("PR21_RAW_ARCHIVE_PW_7k3");
   {
@@ -2599,7 +2646,7 @@ int RunRemoteProductFlow(backup_modern::RemoteController* remote, CheckRun* run,
         standalone_src.toStdString(), encrypted_bak.toStdString(),
         backupproject::Filter(), options, &pipeline_error);
     run->Check(built && QFileInfo::exists(encrypted_bak),
-               QStringLiteral("RAW-R05 造一份加密的独立 .bak（AES-256-CTR + "
+               QStringLiteral("RAW-U02 造一份加密的独立 .bak（AES-256-CTR + "
                               "HMAC-SHA256）"),
                QString::fromStdString(pipeline_error));
   }
@@ -2609,13 +2656,16 @@ int RunRemoteProductFlow(backup_modern::RemoteController* remote, CheckRun* run,
       remote->waitForIdle(300000) &&
       remote->lastErrorKindForTest() == QStringLiteral("none");
   run->Check(encrypted_uploaded && refresh(),
-             QStringLiteral("RAW-R05 加密归档上传成功"),
+             QStringLiteral("RAW-U02 加密归档上传成功"),
              remote->lastErrorKindForTest() + QStringLiteral(": ") +
                  remote->lastDetailForTest());
   const QVariantMap encrypted_row = findByDisplayName(encrypted_name);
   const QString encrypted_id =
       encrypted_row.value(QStringLiteral("id")).toString();
-  // (1) 没填密码：明确要求密码，不尝试绕过加密。
+  // ---- RAW-U02/U03/U04：加密归档的完整交互 ----
+  //
+  // 第一次点"恢复"只给目标目录；core 明确说需要密码之后才输入密码；错密码
+  // 之后**不重选目标目录、不重新下载**，直接再输一次。
   const QString encrypted_out_a = work + QStringLiteral("/raw-encrypted-out-a");
   const bool no_password_accepted =
       remote->restoreRawArchive(encrypted_id, encrypted_out_a, QString());
@@ -2625,38 +2675,194 @@ int RunRemoteProductFlow(backup_modern::RemoteController* remote, CheckRun* run,
       no_password_idle &&
           remote->lastErrorKindForTest() == QStringLiteral("raw-password") &&
           remote->lastRawRestorePasswordRequiredForTest() &&
+          remote->rawRestoreAwaitingPassword() &&
+          remote->rawRestoreSessionAliveForTest() &&
+          remote->rawRestoreDestinationText() == encrypted_out_a &&
+          // "还需要密码"不是一条错误：横幅是中性提示，不是 error。
+          remote->statusKind() != QStringLiteral("error") &&
           destinationUnused(encrypted_out_a),
-      QStringLiteral("RAW-R05 加密归档没填密码：明确要求密码，"
-                     "目标目录为空"),
+      QStringLiteral("RAW-U02 加密归档第一次只给目标目录：明确要求密码"
+                     "（不是整个操作失败退出），目标目录为空"),
       remote->lastErrorKindForTest() + QStringLiteral(": ") +
           remote->lastDetailForTest());
-  // (2) 错误密码：失败，且目标目录仍然为空。
-  const QString encrypted_out_b = work + QStringLiteral("/raw-encrypted-out-b");
-  const bool wrong_password_accepted = remote->restoreRawArchive(
-      encrypted_id, encrypted_out_b, QStringLiteral("wrong-password"));
+
+  // 那份归档已经下载并校验过：错密码重试用**同一份字节**。
+  const QString encrypted_archive_path =
+      remote->lastRawRestoreArchivePathForTest();
+  const QString encrypted_archive_before =
+      rawArchiveIdentity(encrypted_archive_path);
+  run->Check(!encrypted_archive_path.isEmpty() &&
+                 encrypted_archive_before != QStringLiteral("(missing)") &&
+                 remote->lastRawRestoreDownloadCountForTest() == 1,
+             QStringLiteral("RAW-U02 那份归档留在这次交互的临时目录里"
+                            "（只下载 1 次、已校验），等着输入密码"),
+             encrypted_archive_path + QStringLiteral(" ") +
+                 encrypted_archive_before);
+
+  // RAW-U04：错密码 —— 明确诊断、会话保留、目标目录仍为空。
+  const bool wrong_password_accepted =
+      remote->restoreRawArchiveWithPassword(QStringLiteral("wrong-password"));
   const bool wrong_password_idle =
       wrong_password_accepted && remote->waitForIdle(900000);
-  run->Check(wrong_password_idle &&
-                 remote->lastErrorKindForTest() != QStringLiteral("none") &&
-                 destinationUnused(encrypted_out_b),
-             QStringLiteral("RAW-R05 错误密码：恢复失败，目标目录为空"),
-             remote->lastErrorKindForTest() + QStringLiteral(": ") +
-                 remote->lastDetailForTest());
-  // (3) 正确密码：与本地恢复同一条密码流程 -> 成功。
-  const QString encrypted_out_c = work + QStringLiteral("/raw-encrypted-out-c");
+  const QString wrong_password_error = remote->rawRestorePasswordError();
+  run->Check(
+      wrong_password_idle &&
+          remote->lastErrorKindForTest() == QStringLiteral("raw-auth") &&
+          remote->rawRestoreAwaitingPassword() &&
+          remote->rawRestoreSessionAliveForTest() &&
+          !wrong_password_error.isEmpty() &&
+          wrong_password_error.contains(QStringLiteral("密码")) &&
+          wrong_password_error.contains(QStringLiteral("完整性")) &&
+          destinationUnused(encrypted_out_a) &&
+          rawWorkdirCount(raw_cache_dir) == 1,
+      QStringLiteral("RAW-U04 错误密码：明确说“密码错误，或备份完整性校验"
+                     "失败”，目标目录为空，交互与那份已校验的归档都保留"),
+      remote->lastErrorKindForTest() + QStringLiteral(": ") +
+          remote->lastDetailForTest() + QStringLiteral(" / ") +
+          wrong_password_error);
+  run->Check(
+      rawArchiveIdentity(remote->lastRawRestoreArchivePathForTest()) ==
+              encrypted_archive_before &&
+          remote->lastRawRestoreDownloadCountForTest() == 1,
+      QStringLiteral("RAW-U04 错密码重试**没有重新下载**：同一路径、同一 "
+                     "inode、下载次数仍然是 1"),
+      rawArchiveIdentity(remote->lastRawRestoreArchivePathForTest()) +
+          QStringLiteral(" vs ") + encrypted_archive_before +
+          QStringLiteral(" downloads=") +
+          QString::number(remote->lastRawRestoreDownloadCountForTest()));
+
+  // RAW-U03：正确密码（同一次交互、同一个目标目录）-> 成功。
   const bool right_password_accepted =
-      remote->restoreRawArchive(encrypted_id, encrypted_out_c, encrypted_pw);
+      remote->restoreRawArchiveWithPassword(encrypted_pw);
   const bool right_password_idle =
       right_password_accepted && remote->waitForIdle(900000);
   run->Check(right_password_accepted && right_password_idle &&
                  remote->lastErrorKindForTest() == QStringLiteral("none") &&
-                 remote->lastRawRestoreEntriesForTest() > 0,
-             QStringLiteral("RAW-R05 正确密码：按本地恢复同一条密码流程成功"),
+                 remote->lastRawRestoreEntriesForTest() > 0 &&
+                 remote->lastRawRestoreDownloadCountForTest() == 1 &&
+                 !remote->rawRestoreAwaitingPassword() &&
+                 remote->statusTitle() == QStringLiteral("恢复完成") &&
+                 rawWorkdirCount(raw_cache_dir) == 0,
+             QStringLiteral("RAW-U03 正确密码（不重选目标目录、不重新下载）："
+                            "恢复完成，临时归档已清理"),
              remote->lastErrorKindForTest() + QStringLiteral(": ") +
                  remote->lastDetailForTest());
+  run->Check(treeMatches(standalone_src, encrypted_out_a),
+             QStringLiteral("RAW-U03 加密归档恢复出来的目录与源目录逐字节一致"
+                            "（等价于 diff -r 通过）"));
+
+  // ---- RAW-U05：连续两个错密码，再输对 ----
+  const QString encrypted_out_b = work + QStringLiteral("/raw-encrypted-out-b");
+  const bool u5_started =
+      remote->restoreRawArchive(encrypted_id, encrypted_out_b, QString()) &&
+      remote->waitForIdle(600000);
+  const bool u5_wrong1 =
+      u5_started &&
+      remote->restoreRawArchiveWithPassword(QStringLiteral("wrong-one")) &&
+      remote->waitForIdle(900000);
+  const QString u5_kind1 = remote->lastErrorKindForTest();
+  const bool u5_alive1 = remote->rawRestoreSessionAliveForTest();
+  const bool u5_wrong2 =
+      u5_wrong1 &&
+      remote->restoreRawArchiveWithPassword(QStringLiteral("wrong-two")) &&
+      remote->waitForIdle(900000);
+  const QString u5_kind2 = remote->lastErrorKindForTest();
+  const QString u5_error_after_two = remote->rawRestorePasswordError();
+  const bool u5_right =
+      u5_wrong2 && remote->restoreRawArchiveWithPassword(encrypted_pw) &&
+      remote->waitForIdle(900000);
   run->Check(
-      treeMatches(standalone_src, encrypted_out_c),
-      QStringLiteral("RAW-R05 加密归档恢复出来的目录与源目录逐字节一致"));
+      u5_wrong1 && u5_kind1 == QStringLiteral("raw-auth") && u5_alive1 &&
+          u5_wrong2 && u5_kind2 == QStringLiteral("raw-auth") &&
+          u5_right && remote->lastErrorKindForTest() == QStringLiteral("none") &&
+          !remote->busy() && !u5_error_after_two.isEmpty() &&
+          remote->rawRestorePasswordError().isEmpty() &&
+          !remote->rawRestoreAwaitingPassword() &&
+          remote->lastRawRestoreEntriesForTest() > 0 &&
+          remote->lastRawRestoreDownloadCountForTest() == 1 &&
+          rawWorkdirCount(raw_cache_dir) == 0,
+      QStringLiteral("RAW-U05 连续两个错密码再输对：状态机不乱、busy 正常"
+                     "复位、密码错误行被清掉、全程只下载一次、最后成功"),
+      u5_kind1 + QStringLiteral("/") + u5_kind2 + QStringLiteral("/") +
+          remote->lastErrorKindForTest() + QStringLiteral(" downloads=") +
+          QString::number(remote->lastRawRestoreDownloadCountForTest()));
+  run->Check(treeMatches(standalone_src, encrypted_out_b),
+             QStringLiteral("RAW-U05 连续错密码之后最终恢复出来的树与源树"
+                            "逐字节一致"));
+
+  // ---- RAW-U06：在密码那一段取消 ----
+  const QString encrypted_out_c = work + QStringLiteral("/raw-encrypted-out-c");
+  const bool u6_started =
+      remote->restoreRawArchive(encrypted_id, encrypted_out_c, QString()) &&
+      remote->waitForIdle(600000);
+  const QString u6_archive = remote->lastRawRestoreArchivePathForTest();
+  const bool u6_pending = u6_started && remote->rawRestoreSessionAliveForTest() &&
+                          rawWorkdirCount(raw_cache_dir) == 1 &&
+                          QFileInfo::exists(u6_archive);
+  remote->cancelRawRestore();
+  run->Check(
+      u6_pending && !remote->rawRestoreSessionAliveForTest() &&
+          !remote->rawRestoreAwaitingPassword() &&
+          remote->rawRestorePasswordError().isEmpty() &&
+          remote->rawRestoreDestinationText().isEmpty() && !remote->busy() &&
+          !QFileInfo::exists(u6_archive) && rawWorkdirCount(raw_cache_dir) == 0 &&
+          remote->statusKind() == QStringLiteral("idle") &&
+          destinationUnused(encrypted_out_c),
+      QStringLiteral("RAW-U06 密码那一段取消：交互终止、临时归档删掉、"
+                     "busy 复位、目标目录不变"),
+      QStringLiteral("dirs=") + QString::number(rawWorkdirCount(raw_cache_dir)) +
+          QStringLiteral("/busy=") + QString::number(remote->busy() ? 1 : 0) +
+          QStringLiteral("/kind=") + remote->statusKind());
+
+  // ---- RAW-U10：下载 / SHA-256 校验失败（在本地恢复之前就失败）----
+  //
+  // 服务端只存字节：把**服务端那份 blob**改一个字节，声明的 SHA-256 就与实际
+  // 字节不符。客户端必须在下完那一刻拒绝，绝不交给本地恢复，也不出现密码段。
+  {
+    const QString blob_root = work + QStringLiteral("/data/users");
+    const QString blob_name =
+        encrypted_row.value(QStringLiteral("id")).toString() +
+        QStringLiteral(".bak");
+    QString blob_path;
+    QDirIterator iterator(blob_root, QStringList() << QStringLiteral("*.bak"),
+                          QDir::Files, QDirIterator::Subdirectories);
+    while (iterator.hasNext()) {
+      const QString candidate = iterator.next();
+      if (QFileInfo(candidate).fileName() == blob_name) {
+        blob_path = candidate;
+        break;
+      }
+    }
+    bool flipped = false;
+    if (!blob_path.isEmpty()) {
+      QFile blob(blob_path);
+      if (blob.open(QIODevice::ReadWrite) && blob.size() > 200) {
+        const qint64 offset = blob.size() / 2;
+        char original = 0;
+        if (blob.seek(offset) && blob.getChar(&original) && blob.seek(offset)) {
+          flipped = blob.putChar(static_cast<char>(original ^ 0x33));
+        }
+      }
+    }
+    run->Check(flipped,
+               QStringLiteral("RAW-U10 构造前提：把服务端那份 blob 改一个字节"
+                              "（它声明的摘要不再匹配实际字节）"),
+               blob_path);
+    const QString u10_out = work + QStringLiteral("/raw-download-broken-out");
+    const bool u10_accepted =
+        flipped && remote->restoreRawArchive(encrypted_id, u10_out, QString());
+    const bool u10_idle = u10_accepted && remote->waitForIdle(600000);
+    run->Check(
+        flipped && u10_idle &&
+            remote->lastErrorKindForTest() == QStringLiteral("raw-download") &&
+            !remote->lastRawRestorePasswordRequiredForTest() &&
+            !remote->rawRestoreSessionAliveForTest() &&
+            destinationUnused(u10_out) && rawWorkdirCount(raw_cache_dir) == 0,
+        QStringLiteral("RAW-U10 下载 / SHA-256 校验失败：本地恢复之前就失败，"
+                       "不出现密码段，目标目录为空"),
+        remote->lastErrorKindForTest() + QStringLiteral(": ") +
+            remote->lastDetailForTest());
+  }
 
   // ---- GUI-P09：错 pin 时远端备份可见地失败，但不踢掉登录状态 ----
   // ---- GUI-P09：服务器身份 pin 在**建立连接**时被强制 ----
@@ -3798,11 +4004,13 @@ int RunRemoteAcceptance(QQuickWindow* window,
           !raw_row.value(QStringLiteral("generationVisible")).toBool() &&
           raw_row.value(QStringLiteral("parentShort")).toString().isEmpty() &&
           raw_row.value(QStringLiteral("restoreLabel")).toString() ==
-              QStringLiteral("尝试恢复") &&
+              QStringLiteral("恢复") &&
+          raw_row.value(QStringLiteral("restoreLabel")).toString() ==
+              full_row.value(QStringLiteral("restoreLabel")).toString() &&
           raw_row.value(QStringLiteral("restorable")).toBool() &&
           !raw_row.value(QStringLiteral("typeNote")).toString().isEmpty(),
       QStringLiteral("ACC-13 原始归档：badge=原始归档、不显示代数与父、主操作="
-                     "尝试恢复（不是禁用的“恢复”）"),
+                     "恢复（与完整备份同一个词；上一版的“尝试…”文案已删除）"),
       raw_row.value(QStringLiteral("kindText")).toString() +
           QStringLiteral(" / ") +
           raw_row.value(QStringLiteral("typeNote")).toString());
@@ -3921,8 +4129,45 @@ int RunRemoteAcceptance(QQuickWindow* window,
   prepare(false);
   run.Check(scrollTo(firstByName("remoteSnapshotKindBadge"), 96),
             QStringLiteral("ACC-13 回到浅色并重新滚到列表"));
-  grab(QStringLiteral("remote-raw-light.png"), 1180, 760,
-       QStringLiteral("原始归档条目：badge=原始归档、主操作=尝试恢复（浅色）"));
+  // 原始归档那一行：badge=原始归档，主操作按钮上写的就是"恢复"。
+  // 三张卡片的主操作必须是同一个词——把"这次能不能成"的内部不确定性写进按钮
+  // 名字是上一版的做法。
+  {
+    QStringList restore_labels;
+    for (QQuickItem* button :
+         allByName(QStringLiteral("remoteSnapshotRestoreButton"))) {
+      if (button != nullptr) {
+        restore_labels.append(button->property("text").toString());
+      }
+    }
+    run.Check(restore_labels.size() >= 3 &&
+                  restore_labels.count(QStringLiteral("恢复")) ==
+                      restore_labels.size(),
+              QStringLiteral("ACC-13c 列表里每个主操作按钮都写“恢复”"
+                             "（原始归档 / 完整备份 / 增量备份用的是同一个词）"),
+              restore_labels.join(QStringLiteral(",")));
+  }
+  window->setWidth(1180);
+  window->setHeight(760);
+  WaitForAnimation(320);
+  run.Check(scrollTo(firstByName("remoteSnapshotKindBadge"), 96),
+            QStringLiteral("ACC-13c 卡片列表已滚进视野（浅色）"));
+  grab(QStringLiteral("raw-card-light.png"), 1180, 760,
+       QStringLiteral("原始归档卡片：badge=原始归档、主操作=恢复（浅色）"));
+  prepare(true);
+  window->setWidth(1180);
+  window->setHeight(760);
+  WaitForAnimation(320);
+  run.Check(scrollTo(firstByName("remoteSnapshotKindBadge"), 96),
+            QStringLiteral("ACC-13c 卡片列表已滚进视野（深色）"));
+  grab(QStringLiteral("raw-card-dark.png"), 1180, 760,
+       QStringLiteral("原始归档卡片：badge=原始归档、主操作=恢复（深色）"));
+  prepare(false);
+  window->setWidth(1180);
+  window->setHeight(760);
+  WaitForAnimation(320);
+  run.Check(scrollTo(firstByName("remoteSnapshotKindBadge"), 96),
+            QStringLiteral("ACC-13c 回到浅色"));
 
   // ---- ACC-13b：链恢复对原始归档必须被拒绝（绕过界面直接请求也是）----
   QDir(restore_b).removeRecursively();
@@ -3939,31 +4184,43 @@ int RunRemoteAcceptance(QQuickWindow* window,
       remote->lastErrorKindForTest() + QStringLiteral(": ") +
           remote->lastDetailForTest());
 
-  // ---- ACC-13c：原始归档的"尝试恢复"（下载 -> 校验 -> 既有本地恢复核心）----
+  // ---- ACC-13c：原始归档的"恢复"（第一段：只问目标目录）----
   //
-  // 这份 raw 归档就是上面用**产品引擎**生成的完整备份，所以它可以被独立
-  // 恢复：这正是"原始归档 ≠ 永远不可恢复"的产品语义。
+  // 这份 raw 归档就是上面用**产品引擎**生成的完整备份，而且**没有加密**：
+  // 用户点"恢复"只会看到目标目录，看不到密码框，也不会被再问一次
+  // "确定要恢复吗"——点"恢复"本身就是明确意图。
   const QString raw_restore_target = work + QStringLiteral("/raw-restore-out");
   QDir(raw_restore_target).removeRecursively();
   page->setProperty("draftRawRestorePath", raw_restore_target);
   const bool raw_dialog_invoked = QMetaObject::invokeMethod(
       page, "requestRawRestore", Q_ARG(QVariant, raw_id),
       Q_ARG(QVariant, raw_target_name));
-  WaitForAnimation(250);
+  WaitForAnimation(280);
   // Dialog 是 Popup（不是 QQuickItem），所以按 QObject 查；它里面的控件是
   // QQuickItem，按名字查得到。
   QObject* raw_dialog =
       window->findChild<QObject*>(QStringLiteral("remoteRawRestoreDialog"));
+  QQuickItem* raw_target_field = named("remoteRawRestoreTargetField");
+  QQuickItem* raw_password_field = named("remoteRawRestorePasswordField");
   run.Check(raw_dialog_invoked && raw_dialog != nullptr &&
                 raw_dialog->property("visible").toBool() &&
-                named("remoteRawRestoreTargetField") != nullptr &&
-                named("remoteRawRestorePasswordField") != nullptr,
-            QStringLiteral("ACC-13c “尝试恢复”对话框：目标目录 + 可选密码都在"
-                           "（密码框是 Password 回显）"),
-            raw_dialog == nullptr ? QStringLiteral("找不到对话框")
-                                  : QStringLiteral("ok"));
-  grab(QStringLiteral("remote-raw-restore-light.png"), 1180, 760,
-       QStringLiteral("原始归档“尝试恢复”对话框（浅色）"));
+                raw_target_field != nullptr && raw_target_field->isVisible() &&
+                (raw_password_field == nullptr ||
+                 !raw_password_field->isVisible()) &&
+                !remote->rawRestoreAwaitingPassword(),
+            QStringLiteral("ACC-13c 第一段只问目标目录：对话框里**没有**"
+                           "密码框（未加密的归档不该一上来就看到它）"),
+            raw_dialog == nullptr
+                ? QStringLiteral("找不到对话框")
+                : QStringLiteral("password_visible=%1 awaiting=%2")
+                      .arg(raw_password_field == nullptr
+                               ? QStringLiteral("(null)")
+                               : QString::number(raw_password_field->isVisible()
+                                                     ? 1
+                                                     : 0))
+                      .arg(remote->rawRestoreAwaitingPassword() ? 1 : 0));
+  grab(QStringLiteral("raw-restore-destination.png"), 1180, 760,
+       QStringLiteral("恢复对话框第一段：只有目标目录，没有密码框"));
   const bool raw_confirmed =
       QMetaObject::invokeMethod(page, "confirmRawRestore");
   const bool raw_restore_finished =
@@ -3974,11 +4231,14 @@ int RunRemoteAcceptance(QQuickWindow* window,
           remote->lastRawRestoreFormatForTest() ==
               QStringLiteral("v2-container") &&
           remote->lastRawRestoreEntriesForTest() > 0 &&
-          remote->lastRawRestoreDownloadedBytesForTest() > 0,
-      QStringLiteral("ACC-13c 原始归档“尝试恢复”：下载 -> SHA-256 校验 -> "
-                     "本地恢复核心 -> 成功"),
+          remote->lastRawRestoreDownloadedBytesForTest() > 0 &&
+          !remote->rawRestoreAwaitingPassword() &&
+          remote->statusTitle() == QStringLiteral("恢复完成"),
+      QStringLiteral("ACC-13c 未加密的原始归档：点一次“恢复”就成功（下载 -> "
+                     "SHA-256 校验 -> 本地恢复核心），结论是“恢复完成”"),
       remote->lastErrorKindForTest() + QStringLiteral(": ") +
-          remote->lastDetailForTest());
+          remote->lastDetailForTest() + QStringLiteral(" / ") +
+          remote->statusTitle());
   run.Check(treeMatches(source, raw_restore_target),
             QStringLiteral("ACC-13c 原始归档恢复出来的目录与源目录逐字节一致"
                            "（等价于 diff -r 通过）"));
@@ -3988,6 +4248,248 @@ int RunRemoteAcceptance(QQuickWindow* window,
             QStringLiteral("ACC-13c 恢复用的是下载并校验过的字节（摘要与列表"
                            "登记值一致）"),
             remote->lastRawRestoreSha256ForTest());
+  WaitForAnimation(300);
+  grab(QStringLiteral("raw-restore-success.png"), 1180, 760,
+       QStringLiteral("恢复完成（浅色）"));
+
+  // ---- ACC-13e：加密的原始归档：密码只在 core 说要的时候才出现 ----
+  //
+  // 密码是这次运行现场生成的 synthetic 值，只活在内存与归档里：不进 argv、
+  // 不进日志、不落盘、也不进截图（截图里只有掩码）。
+  const QString encrypted_raw_password =
+      QStringLiteral("RAW-UX-ACC-PW-%1")
+          .arg(QRandomGenerator::global()->bounded(1000000, 9999999));
+  const QString encrypted_raw_path =
+      work + QStringLiteral("/raw-encrypted-acceptance.bak");
+  QFile::remove(encrypted_raw_path);
+  {
+    backupproject::BackupOptions options;
+    options.encryption_method =
+        backupproject::EncryptionMethod::kAes256CtrHmacSha256;
+    options.password = encrypted_raw_password.toStdString();
+    std::string pipeline_error;
+    const bool built = backupproject::RunBackupPipeline(
+        source.toStdString(), encrypted_raw_path.toStdString(),
+        backupproject::Filter(), options, &pipeline_error);
+    run.Check(built && QFileInfo::exists(encrypted_raw_path),
+              QStringLiteral("ACC-13e 造一份加密的独立归档（AES-256-CTR + "
+                             "HMAC-SHA256）"),
+              QString::fromStdString(pipeline_error));
+  }
+  QStringList ids_before_encrypted;
+  for (const QVariant& item : remote->snapshots()) {
+    ids_before_encrypted.append(
+        item.toMap().value(QStringLiteral("id")).toString());
+  }
+  const QString encrypted_raw_name = QStringLiteral("raw-encrypted-acc.bak");
+  const bool encrypted_raw_uploaded =
+      remote->uploadArchive(encrypted_raw_path, encrypted_raw_name) &&
+      remote->waitForIdle(600000);
+  QString encrypted_raw_id;
+  QString encrypted_raw_display;
+  for (const QVariant& item : remote->snapshots()) {
+    const QVariantMap map = item.toMap();
+    const QString id = map.value(QStringLiteral("id")).toString();
+    if (!ids_before_encrypted.contains(id)) {
+      encrypted_raw_id = id;
+      encrypted_raw_display = map.value(QStringLiteral("name")).toString();
+    }
+  }
+  run.Check(encrypted_raw_uploaded && !encrypted_raw_id.isEmpty() &&
+                remote->lastErrorKindForTest() == QStringLiteral("none"),
+            QStringLiteral("ACC-13e 加密归档原始上传成功"),
+            remote->lastErrorKindForTest() + QStringLiteral(": ") +
+                remote->lastDetailForTest());
+  const QString encrypted_raw_out =
+      work + QStringLiteral("/raw-encrypted-acc-out");
+  QDir(encrypted_raw_out).removeRecursively();
+  page->setProperty("draftRawRestorePath", encrypted_raw_out);
+  const bool encrypted_dialog_invoked = QMetaObject::invokeMethod(
+      page, "requestRawRestore", Q_ARG(QVariant, encrypted_raw_id),
+      Q_ARG(QVariant, encrypted_raw_display));
+  WaitForAnimation(260);
+  const bool encrypted_stage_one_hidden =
+      raw_password_field == nullptr || !raw_password_field->isVisible();
+  const bool encrypted_confirmed =
+      QMetaObject::invokeMethod(page, "confirmRawRestore");
+  const bool encrypted_first_done =
+      encrypted_confirmed && remote->waitForIdle(600000);
+  const bool encrypted_password_stage =
+      encrypted_first_done && remote->rawRestoreAwaitingPassword();
+  const bool encrypted_field_visible =
+      raw_password_field != nullptr && raw_password_field->isVisible();
+  const int encrypted_echo_mode = raw_password_field == nullptr
+                                      ? -1
+                                      : raw_password_field->property("echoMode").toInt();
+  run.Check(
+      encrypted_dialog_invoked && encrypted_stage_one_hidden &&
+          encrypted_password_stage && encrypted_field_visible &&
+          // TextInput.Password == 2：输入的东西在界面上只有掩码。
+          encrypted_echo_mode == 2 &&
+          !QFileInfo::exists(encrypted_raw_out) &&
+          remote->lastErrorKindForTest() == QStringLiteral("raw-password"),
+      QStringLiteral("ACC-13e 加密归档：先只问目标目录 -> core 说要密码 -> "
+                     "才出现掩码密码框（目标目录仍为空）"),
+      QStringLiteral("awaiting=%1 echoMode=%2 target_exists=%3")
+          .arg(remote->rawRestoreAwaitingPassword() ? 1 : 0)
+          .arg(encrypted_echo_mode)
+          .arg(QFileInfo::exists(encrypted_raw_out) ? 1 : 0));
+  grab(QStringLiteral("raw-password-required.png"), 1180, 760,
+       QStringLiteral("加密归档：密码输入那一段（掩码）"));
+
+  // 错误密码：明确诊断、流程不关掉、目标目录仍然为空。
+  const QString encrypted_archive_path =
+      remote->lastRawRestoreArchivePathForTest();
+  const QString encrypted_archive_before = [&encrypted_archive_path]() {
+    struct stat info;
+    if (encrypted_archive_path.isEmpty() ||
+        ::stat(encrypted_archive_path.toUtf8().constData(), &info) != 0) {
+      return QStringLiteral("(missing)");
+    }
+    return QStringLiteral("%1/%2")
+        .arg(static_cast<qulonglong>(info.st_ino))
+        .arg(static_cast<qulonglong>(info.st_size));
+  }();
+  const QString wrong_synthetic = QStringLiteral("RAW-UX-synthetic-wrong");
+  page->setProperty("draftRawRestorePassword", wrong_synthetic);
+  if (raw_password_field != nullptr) {
+    raw_password_field->setProperty("text", wrong_synthetic);
+  }
+  WaitForAnimation(200);
+  const bool wrong_confirmed =
+      QMetaObject::invokeMethod(page, "confirmRawRestore");
+  const bool wrong_done = wrong_confirmed && remote->waitForIdle(900000);
+  const QString wrong_error = remote->rawRestorePasswordError();
+  run.Check(wrong_done && remote->rawRestoreAwaitingPassword() &&
+                !wrong_error.isEmpty() &&
+                wrong_error.contains(QStringLiteral("完整性")) &&
+                !QFileInfo::exists(encrypted_raw_out),
+            QStringLiteral("ACC-13e 错误密码：明确“密码错误，或备份完整性"
+                           "校验失败”，流程没有关掉，目标目录仍为空"),
+            remote->lastErrorKindForTest() + QStringLiteral(": ") +
+                wrong_error);
+  run.Check(
+      !encrypted_archive_path.isEmpty() &&
+          encrypted_archive_before != QStringLiteral("(missing)") &&
+          [&encrypted_archive_path]() {
+            struct stat info;
+            if (::stat(encrypted_archive_path.toUtf8().constData(), &info) != 0) {
+              return false;
+            }
+            return true;
+          }() &&
+          remote->lastRawRestoreDownloadCountForTest() == 1,
+      QStringLiteral("ACC-13e 错密码重试没有重新下载：那份归档还在同一个"
+                     "临时目录里，下载次数仍然是 1"),
+      encrypted_archive_path + QStringLiteral(" / downloads=") +
+          QString::number(remote->lastRawRestoreDownloadCountForTest()));
+  // 截图：错误提示 + 密码框里是可重新输入的掩码（synthetic 值，不是真密码）。
+  const QString again_synthetic = QStringLiteral("RAW-UX-synthetic-again");
+  page->setProperty("draftRawRestorePassword", again_synthetic);
+  if (raw_password_field != nullptr) {
+    raw_password_field->setProperty("text", again_synthetic);
+  }
+  WaitForAnimation(240);
+  grab(QStringLiteral("raw-wrong-password.png"), 1180, 760,
+       QStringLiteral("错误密码：错误提示 + 密码可重新输入（掩码）"));
+
+  // 正确密码：用同一份已校验的字节、同一个目标目录 -> 成功。
+  page->setProperty("draftRawRestorePassword", encrypted_raw_password);
+  if (raw_password_field != nullptr) {
+    raw_password_field->setProperty("text", encrypted_raw_password);
+  }
+  const bool right_confirmed =
+      QMetaObject::invokeMethod(page, "confirmRawRestore");
+  const bool right_done = right_confirmed && remote->waitForIdle(900000);
+  run.Check(
+      right_done && remote->lastErrorKindForTest() == QStringLiteral("none") &&
+          remote->lastRawRestoreEntriesForTest() > 0 &&
+          !remote->rawRestoreAwaitingPassword() &&
+          remote->lastRawRestoreDownloadCountForTest() == 1 &&
+          remote->rawRestorePasswordError().isEmpty() &&
+          treeMatches(source, encrypted_raw_out),
+      QStringLiteral("ACC-13e 正确密码（不重选目标目录、不重新下载）：恢复"
+                     "完成，恢复出来的树与源树逐字节一致"),
+      remote->lastErrorKindForTest() + QStringLiteral(": ") +
+          remote->lastDetailForTest());
+  if (raw_password_field != nullptr) {
+    raw_password_field->setProperty("text", QString());
+  }
+  page->setProperty("draftRawRestorePassword", QString());
+
+  // ---- ACC-13f：单独的 delta（缺父链）必须明确失败 ----
+  //
+  // delta 从**已验证缓存**里按内容挑（不按文件名猜）：它就是远端链里那一份。
+  {
+    backupproject::net::RemoteCacheLayout cache_layout;
+    std::string cache_error;
+    QString delta_material;
+    QString fingerprint_for_cache = pin;
+    fingerprint_for_cache.remove(QStringLiteral("sha256:"));
+    if (backupproject::net::PrepareRemoteCache(
+            std::string(), fingerprint_for_cache.toStdString(),
+            username.toStdString(), &cache_layout, &cache_error)) {
+      QDirIterator iterator(
+          QString::fromStdString(cache_layout.cache_directory),
+          QDir::Files | QDir::NoDotAndDotDot, QDirIterator::Subdirectories);
+      while (iterator.hasNext()) {
+        const QString candidate = iterator.next();
+        if (backupproject::ClassifySnapshotFile(candidate.toStdString(),
+                                                nullptr) ==
+            backupproject::SnapshotFileKind::kDelta) {
+          delta_material = candidate;
+          break;
+        }
+      }
+    }
+    const QString delta_alone_path = work + QStringLiteral("/acc-delta-alone.bak");
+    QFile::remove(delta_alone_path);
+    const bool delta_copied =
+        !delta_material.isEmpty() &&
+        QFile::copy(delta_material, delta_alone_path);
+    run.Check(delta_copied,
+              QStringLiteral("ACC-13f 从已验证缓存里按内容取出一份 delta"),
+              delta_material);
+    QStringList ids_before_delta;
+    for (const QVariant& item : remote->snapshots()) {
+      ids_before_delta.append(
+          item.toMap().value(QStringLiteral("id")).toString());
+    }
+    const QString delta_alone_name = QStringLiteral("acc-delta-alone.bak");
+    const bool delta_uploaded =
+        delta_copied &&
+        remote->uploadArchive(delta_alone_path, delta_alone_name) &&
+        remote->waitForIdle(600000);
+    QString delta_alone_id;
+    for (const QVariant& item : remote->snapshots()) {
+      const QString id = item.toMap().value(QStringLiteral("id")).toString();
+      if (!ids_before_delta.contains(id)) {
+        delta_alone_id = id;
+      }
+    }
+    const QString delta_alone_out = work + QStringLiteral("/acc-delta-alone-out");
+    QDir(delta_alone_out).removeRecursively();
+    const bool delta_accepted =
+        delta_uploaded && !delta_alone_id.isEmpty() &&
+        remote->restoreRawArchive(delta_alone_id, delta_alone_out, QString());
+    const bool delta_idle = delta_accepted && remote->waitForIdle(600000);
+    run.Check(
+        delta_idle &&
+            remote->lastErrorKindForTest() == QStringLiteral("raw-delta") &&
+            !remote->rawRestoreAwaitingPassword() &&
+            !QFileInfo::exists(delta_alone_out),
+        QStringLiteral("ACC-13f 单独的增量：明确“缺少父备份，无法单独恢复。"
+                       "请使用远端备份链中的“恢复””，不出密码段、目标目录"
+                       "没有被创建"),
+        remote->lastErrorKindForTest() + QStringLiteral(": ") +
+            remote->lastDetailForTest());
+    run.Check(scrollTo(named("remoteStatusBanner"), 300),
+              QStringLiteral("ACC-13f 失败原因那一行已滚进视野"));
+    grab(QStringLiteral("raw-delta-error.png"), 1180, 760,
+         QStringLiteral("单独增量缺父链时的可见失败（浅色）"));
+    run.Check(scrollTo(firstByName("remoteSnapshotKindBadge"), 110),
+              QStringLiteral("ACC-13f 回到列表"));
+  }
 
   // ---- ACC-13d：不是备份归档的 raw 对象（显示名仍是 .bak）必须明确失败 ----
   const QString invalid_raw_path = work + QStringLiteral("/not-an-archive.bak");
@@ -4022,6 +4524,7 @@ int RunRemoteAcceptance(QQuickWindow* window,
   run.Check(
       invalid_idle &&
           remote->lastErrorKindForTest() == QStringLiteral("raw-unsupported") &&
+          !remote->rawRestoreAwaitingPassword() &&
           !QFileInfo::exists(invalid_out),
       QStringLiteral("ACC-13d 随机文件（显示名 looks-like.bak）：按内容"
                      "识别 -> 明确失败，目标目录没有被创建"),
@@ -4029,8 +4532,8 @@ int RunRemoteAcceptance(QQuickWindow* window,
           remote->lastDetailForTest());
   run.Check(scrollTo(named("remoteStatusBanner"), 300),
             QStringLiteral("ACC-13d 失败原因那一行已滚进视野"));
-  grab(QStringLiteral("remote-raw-invalid-error.png"), 1180, 760,
-       QStringLiteral("原始归档不是备份归档时的可见失败（浅色）"));
+  grab(QStringLiteral("raw-unsupported.png"), 1180, 760,
+       QStringLiteral("随便一个文件不能恢复时的可见失败（浅色）"));
   run.Check(scrollTo(firstByName("remoteSnapshotKindBadge"), 110),
             QStringLiteral("ACC-13d 回到列表"));
 
@@ -5942,11 +6445,13 @@ int RunRemoteTest(QQuickWindow* window, backup_modern::RemoteController* remote,
                   objectByName("remoteRawRestoreFolderDialog") != nullptr &&
                   objectByName("remoteRawRestoreTargetField") != nullptr &&
                   objectByName("remoteRawRestorePasswordField") != nullptr &&
+                  objectByName("remoteRawRestorePasswordPrompt") != nullptr &&
+                  objectByName("remoteRawRestoreDestinationEcho") != nullptr &&
                   objectByName("remoteRawRestoreConfirmButton") != nullptr &&
                   objectByName("remoteRestoreMechanismHint") != nullptr,
               QStringLiteral("REMOTE-G01 远端备份区域：源目录选择器 / 策略 / "
-                             "备份按钮 / 结论行 / 目录对话框 / 原始归档的"
-                             "“尝试恢复”对话框（目标 + 密码）都在"));
+                             "备份按钮 / 结论行 / 目录对话框 / 恢复对话框的"
+                             "两段（目标目录 + 密码段）都在"));
     run.Check(objectByName("remoteSnapshotRestoreButton") != nullptr ||
                   remote->snapshotCountForTest() == 0,
               QStringLiteral("REMOTE-G01 快照卡片有独立的“恢复”主操作"));
