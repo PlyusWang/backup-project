@@ -34,8 +34,9 @@
 // 签名只覆盖 body；body 之外的任何字节都不参与验签，所以"尾部多余字节"
 // 必须由解析器拒绝，否则就会出现"同一张证书有两种字节表示"。
 //
-// 有效期策略：签发工具固定发 180 天；解析器只做格式合法性（窗口必须为正
-// 且不超过 10 年），时钟判断交给 Bpcert1CheckValidity，容差 ±5 分钟。
+// 有效期策略：签发工具**默认**发 180 天（--days 可调，上限 10 年）；解析器
+// 只做格式合法性（窗口必须为正且不超过 10 年），时钟判断交给
+// Bpcert1CheckValidity，容差 ±5 分钟。
 
 #ifndef BACKUP_PROJECT_INCLUDE_BPCERT_H_
 #define BACKUP_PROJECT_INCLUDE_BPCERT_H_

@@ -239,8 +239,10 @@ int main() {
             "ED-X05 S = L-1（规范但错误）-> invalid-signature");
     }
 
-    // y >= p：全 0xFF 的最高位会被掩掉变成 0x7F..FF = p-1（其实合法！）
-    // 所以用 y = p（= 2^255-19）的编码：低 255 位是 p，最高位 0。
+    // y >= p：全 0xFF 的最高位会被掩掉，得到 0x7F..FF = 2^255 - 1 = p + 18，
+    // 仍然 >= p，所以必须按"非规范编码"拒绝。
+    // （别把 0x7F..FF 写成 p-1：p-1 的编码是 ecff..ff7f，那个才是合法的。）
+    // 所以下面用 y = p（= 2^255-19）的编码：低 255 位是 p，最高位 0。
     {
       static const char* kPHex =
           "edffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f";
