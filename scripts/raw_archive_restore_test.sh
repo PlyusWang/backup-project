@@ -10,13 +10,21 @@
 #                                  GUI 本地恢复同一份实现)
 #
 # A 段（默认）：跑 Modern GUI 的 --remote-test。它自己起一个真的 backup-server，
-#   用 RemoteController 把下面五条真的走一遍，本脚本只断言"这些条目确实跑了、
+#   用 RemoteController 把下面这些真的走一遍，本脚本只断言"这些条目确实跑了、
 #   而且全部通过"：
-#     RAW-R01 可独立恢复的完整 .bak：下载 -> SHA-256 校验 -> 本地核心恢复 -> diff
-#     RAW-R02 被篡改的归档：失败，目标目录为空（没有半成品）
-#     RAW-R03 任意文件（显示名还是 .bak）：按内容识别 -> 明确失败，目标目录为空
-#     RAW-R04 单独的 delta：明确"不能脱离依赖链单独恢复"，目标目录为空
-#     RAW-R05 加密归档：没填密码 -> 明确要求密码；错密码 -> 失败；对密码 -> 成功
+#     RAW-U01 未加密的独立 .bak：只给目标目录 -> 下载 -> SHA-256 校验 ->
+#             本地核心恢复 -> diff；结论就是"恢复完成"，全程没有密码那一段
+#     RAW-U02 加密归档第一次只给目标目录：明确要求密码（不是整个操作失败退出），
+#             目标目录为空；那份归档留在这次交互的临时目录里
+#     RAW-U03 正确密码（不重选目标目录、不重新下载）：恢复成功 + diff
+#     RAW-U04 错误密码：明确"密码错误，或备份完整性校验失败"，目标目录为空，
+#             交互保留；重试没有重新下载（同一 inode、下载次数仍是 1）
+#     RAW-U05 连续两个错密码再输对：状态机不乱、busy 复位、最后成功
+#     RAW-U06 在密码那一段取消：交互终止、临时归档删掉、busy 复位、目标目录不变
+#     RAW-U07 任意文件（显示名还是 .bak）：按内容识别 -> 明确失败，不弹密码
+#     RAW-U08 被篡改的归档：明确是"已损坏 / 完整性校验失败"，**不**误报成缺密码
+#     RAW-U09 单独的 delta：明确"缺少父备份，无法单独恢复"，不弹密码
+#     RAW-U10 下载 / SHA-256 校验失败：本地恢复之前就失败，不出现密码段
 #
 # B 段（RAW_RESTORE_SANITIZE=1）：同一个入口在 ASan + UBSan 下跑**边界输入**。
 #   tests/review/raw_restore_robustness.cpp 是 Qt-free 的 harness，链 build-sanitize
@@ -186,7 +194,7 @@ fi
 
 # ---- A 段：产品路径（GUI --remote-test）-------------------------------------
 
-echo "[raw-restore] A 段：Qt/GUI 产品路径（--remote-test 里的 RAW-R01..R05）"
+echo "[raw-restore] A 段：Qt/GUI 产品路径（--remote-test 里的 RAW-U01..U10）"
 
 BUILD_LOG="/tmp/raw-restore-build.log"
 GUI="./build/backup-gui-modern"
@@ -216,15 +224,20 @@ export XDG_CONFIG_HOME="$STATE_DIR/xdg"
 mkdir -p "$XDG_CONFIG_HOME" "$STATE_DIR/state"
 
 LOG_FILE="$STATE_DIR/remote-test.log"
+# stdout 与 stderr **分开**收集：断言结果全部走 stdout，后台线程的诊断走
+# stderr；合并到同一个文件时两股输出会互相插入，把某一条 ok 行的开头吃掉
+# （本轮实测过一次：断言其实过了，行却数不出来）。分开之后逐条计数才是准的。
+DIAG_FILE="$STATE_DIR/remote-test.stderr"
 set +e
 QT_QPA_PLATFORM=offscreen QSG_RHI_BACKEND=software timeout 2400 \
   "$GUI" --remote-test \
   --config-file "$STATE_DIR/state/config.json" \
   --schedule-file "$STATE_DIR/state/schedule.json" \
   --realtime-file "$STATE_DIR/state/realtime.json" \
-  >"$LOG_FILE" 2>&1
+  >"$LOG_FILE" 2>"$DIAG_FILE"
 test_status=$?
 set -e
+echo "[raw-restore] 后台线程诊断（stderr）$(wc -l <"$DIAG_FILE") 行，留在 $DIAG_FILE"
 
 if [ "$test_status" != "0" ]; then
   record_fail "GUI --remote-test 退出码" "exit=$test_status"
@@ -243,7 +256,7 @@ case "$summary" in
     ;;
 esac
 
-# 五条 RAW-R 必须**真的跑过**：逐条数 ok 行，并把每一条的原文打在屏幕上。
+# 每条 RAW-U 必须**真的跑过**：逐条数 ok 行，并把每一条的原文打在屏幕上。
 check_raw() {
   local tag="$1"
   local label="$2"
@@ -257,16 +270,21 @@ check_raw() {
   fi
   grep "ok   $tag" "$LOG_FILE" | sed 's/^/      /' || true
 }
-check_raw "RAW-R01" "独立完整 .bak 的下载 -> 校验 -> 本地核心恢复" 5
-check_raw "RAW-R02" "被篡改的归档：失败且目标目录为空" 3
-check_raw "RAW-R03" "任意文件（.bak 显示名）：按内容识别后明确失败" 4
-check_raw "RAW-R04" "单独的 delta：不能脱离依赖链单独恢复" 3
-check_raw "RAW-R05" "加密归档：没密码 / 错密码 / 对密码三条路径" 6
+check_raw "RAW-U01" "未加密独立归档：一次“恢复”就成功 + diff + 结论“恢复完成”" 6
+check_raw "RAW-U02" "加密归档第一步：明确要求密码（交互保留、目标目录为空）" 4
+check_raw "RAW-U03" "正确密码：不重选目录、不重新下载 -> 成功 + diff" 2
+check_raw "RAW-U04" "错误密码：明确诊断、目标目录为空、重试不重新下载" 2
+check_raw "RAW-U05" "连续两个错密码再输对：状态机不乱、最后成功 + diff" 2
+check_raw "RAW-U06" "密码那一段取消：交互终止、临时归档删掉、busy 复位" 1
+check_raw "RAW-U07" "任意文件（.bak 显示名）：按内容识别后明确失败" 4
+check_raw "RAW-U08" "被篡改的归档：明确是损坏，不误报成缺密码" 3
+check_raw "RAW-U09" "单独的 delta：缺少父备份、不能单独恢复" 2
+check_raw "RAW-U10" "下载 / SHA-256 校验失败：本地恢复之前就失败" 2
 
-if grep -q "FAIL RAW-R" "$LOG_FILE"; then
-  record_fail "RAW-R 条目" "$(grep -m3 'FAIL RAW-R' "$LOG_FILE" | tr '\n' ' ')"
+if grep -q "FAIL RAW-U" "$LOG_FILE"; then
+  record_fail "RAW-U 条目" "$(grep -m3 'FAIL RAW-U' "$LOG_FILE" | tr '\n' ' ')"
 else
-  record_pass "没有任何 RAW-R 条目失败"
+  record_pass "没有任何 RAW-U 条目失败"
 fi
 
 # 界面类型契约也在同一个自检里（三种类型三个词）。
@@ -283,6 +301,6 @@ done
 cp "$LOG_FILE" "$OUT_DIR/raw-restore-gui.log"
 
 echo
-echo "---- RAW-R 逐条结果 ----"
-grep "RAW-R" "$LOG_FILE" | sed 's/^/  /' || true
+echo "---- RAW-U 逐条结果 ----"
+grep "RAW-U" "$LOG_FILE" | sed 's/^/  /' || true
 finish

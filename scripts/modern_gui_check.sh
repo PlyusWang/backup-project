@@ -590,8 +590,26 @@ expect_count "$REMOTE_CONTROLLER_H" "QString serverKeyPin() const" 1 \
 expect_count "$REMOTE_CONTROLLER_CPP" "backupproject::net::ParseServerKeyPin" 1 \
   "指纹的校验复用共享解析器（只认带前缀的两种写法）"
 expect_count "$REMOTE_CONTROLLER_CPP" \
-  "request.endpoint.server_key_pin = serverKeyPin()" 10 \
-  "十处提交点每一处都带上 pin（含远端备份 / 链恢复 / 原始归档的尝试恢复；漏一处就等于那条操作没有 pin）"
+  "request.endpoint.server_key_pin = serverKeyPin()" 11 \
+  "十一处提交点每一处都带上 pin（含远端备份 / 链恢复 / 原始归档恢复的第一次与重试；漏一处就等于那条操作没有 pin）"
+# PR #21 UI closure（第二轮）：三种类型（原始归档 / 完整备份 / 增量备份）的主操作
+# 都叫"恢复"。内部走哪条流水线由 badge 与说明行交代，**不**写进按钮名字——
+# 把"这次能不能成"这种内部不确定性放进按钮是上一版的做法，本轮删掉。
+if grep -rn "尝试恢复" ui/modern/qml ui/modern/remote_controller.h ui/modern/remote_controller.cpp >/dev/null 2>&1; then
+  record_fail "生产界面里又出现了“尝试恢复”（旧文案）：$(grep -rn '尝试恢复' ui/modern/qml ui/modern/remote_controller.h ui/modern/remote_controller.cpp | head -3 | tr '\n' ' ')"
+else
+  record_pass "生产 QML 与控制器里没有任何“尝试恢复”：三种类型的主操作统一是“恢复”"
+fi
+# 卡片按钮的文案来自控制器的 presentation model，不在这里另写一个词。
+expect_count "$REMOTE_CONTROLLER_CPP" 'item.insert(QStringLiteral("restoreLabel"), QStringLiteral("恢复"));' 1 \
+  "主操作文案由控制器统一下发（三种类型同一个词）"
+# 密码只有在 core 明确说"这份归档加密了"之后才出现：对话框有两段。
+expect_count "$REMOTE_PAGE_QML" 'readonly property bool passwordStage: remote.rawRestoreAwaitingPassword' 1 \
+  "恢复对话框的密码段由控制器回来的事实驱动（不是一上来就显示）"
+expect_count "$REMOTE_PAGE_QML" '"此备份已加密，请输入恢复密码。' 1 \
+  "密码段有明确的一句话（core 说要密码之后才可能看到）"
+expect_count "$REMOTE_PAGE_QML" '"继续恢复"' 1 \
+  "密码段的确认按钮是“继续恢复”"
 # 第二套 socket / 协议实现？GUI 这一侧只允许经 RemoteController 调共享客户端。
 # 断言只看代码行：注释里说明"这里没有 socket"是正常的。
 REMOTE_CODE_TMP="$TEST_STATE_DIR/remote-code.txt"
@@ -680,10 +698,12 @@ expect_missing "$REMOTE_PAGE_QML" "不会发送任何请求" \
   "页面不再写开发者式的说明"
 expect_count "$REMOTE_PAGE_QML" "两次输入的密码不一致" 1 \
   "不一致时明确写出「两次输入的密码不一致」"
-# 五处错误行（注册不一致 / 注册被拒 / 登录被拒 / 注销失败 / 服务器身份指纹）
-# 都用共享的 error 色：页面里没有第二套红色，也没有硬编码的 #ff0000。
-expect_count "$REMOTE_PAGE_QML" "color: theme.error" 5 \
-  "五处错误行都用共享的 error 色"
+# 六处错误行（注册不一致 / 注册被拒 / 登录被拒 / 注销失败 / 服务器身份指纹 /
+# 原始归档恢复的密码错误行）都用共享的 error 色：页面里没有第二套红色，也没有
+# 硬编码的 #ff0000。最后那一处是本轮新增的：错密码必须**就地**告诉用户，
+# 而不是弹一个通用失败框。
+expect_count "$REMOTE_PAGE_QML" "color: theme.error" 6 \
+  "六处错误行都用共享的 error 色"
 expect_present "$REMOTE_PAGE_QML" "visible: page.registerPasswordMismatch" 1 \
   "错误行由「两次密码是否一致」这个计算属性驱动（改一个字符就更新）"
 expect_present "$REMOTE_PAGE_QML" "page.draftRegisterPassword !== page.draftConfirmPassword" 1 \
