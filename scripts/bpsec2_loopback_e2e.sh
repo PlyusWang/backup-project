@@ -42,7 +42,11 @@ USER_NAME="bpsec2-user"
 ACCOUNT_PASSWORD="loopback-account-password"
 
 echo "[phase2] 构建（真实进程要用真二进制）"
-if ! make -j4 all cert-tool > "$WORK_DIR/build.log" 2>&1; then
+# 必须显式构建 server：backup-server-keygen 只有 server 目标会建，而下面
+# 生成传输身份密钥要用它。红队复核指出，第一版写的是 "make all cert-tool"，
+# 从干净树跑会在任何 BPSEC2 断言之前就红掉（passed=2 failed=5）—— 也就是说
+# "Phase 2 已通过"这个结论当时无法从提交的脚本复现。
+if ! make -j4 all server cert-tool > "$WORK_DIR/build.log" 2>&1; then
   record_fail "构建" "$(tail -3 "$WORK_DIR/build.log" | tr '\n' ' ')"
   echo "[phase2] passed=$PASS failed=$FAIL"
   exit 1

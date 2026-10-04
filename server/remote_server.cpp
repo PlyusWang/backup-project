@@ -323,6 +323,18 @@ bool RemoteServer::Configure(const RemoteServerConfig& config,
       }
       return false;
     }
+    if (!config.require_bpsec2) {
+      // 公网监听只允许签名身份，而且要**只**允许签名身份：只开证书却仍接受
+      // BPSEC1 的 pin 客户端，等于在公网上保留一条"人工指纹"的旧路。红队
+      // 复核用真实二进制验证过：不加这一条，pin 客户端在公网监听上仍能 ping 通。
+      if (error_message != nullptr) {
+        *error_message =
+            "--allow-public-bind requires --require-bpsec2: a public listener"
+            " must accept signed-identity clients only, otherwise the legacy"
+            " pin path stays reachable on the internet";
+      }
+      return false;
+    }
     if (config.public_bind_reason.empty()) {
       if (error_message != nullptr) {
         *error_message =
@@ -485,6 +497,14 @@ bool ReadWholeFile(const std::string& path, std::string* out,
   std::ostringstream buffer;
   buffer << input.rdbuf();
   *out = buffer.str();
+  // 上限先于解析：BPCERT1 本身有 4096 字节硬上限，先卡住长度就不必把一个
+  // 任意大的文件读进内存再被解析器拒绝（红队复核的 nit）。
+  if (out->size() > 4096) {
+    if (error_message != nullptr) {
+      *error_message = "文件超过 4096 字节上限：" + path;
+    }
+    return false;
+  }
   if (out->empty()) {
     if (error_message != nullptr) {
       *error_message = "文件是空的：" + path;
