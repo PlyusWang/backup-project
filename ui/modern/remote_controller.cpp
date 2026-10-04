@@ -1274,7 +1274,7 @@ void RemoteController::Submit(const RemoteRequest& request) {
     DispatchRequest(request);
     return;
   }
-  if (TunnelMatchesEndpoint() && tunnel_.localPort() > 0) {
+  if (TunnelMatchesEndpoint() && TransportUsableForSubmit()) {
     RemoteRequest dialed = request;
     // 客户端拨的是**本地**那一段：127.0.0.1:<自动挑到的端口>。远端地址在
     // ssh 的 -L 参数里，BPSEC1 的 pin 校验仍然在隧道里面照跑。
@@ -2486,6 +2486,35 @@ bool RemoteController::TunnelMatchesEndpoint() const {
          used.local_port == ssh_local_port_ && used.ssh_program == ssh_program_;
 }
 
+bool RemoteController::TransportUsableForSubmit() {
+  if (!tunnel_.IsReady() || tunnel_.localPort() <= 0) {
+    return false;
+  }
+  if (!tunnel_.IsExternalReuse()) {
+    // 自有的 ssh：死亡已经由 QProcess 的 finished / errorOccurred（配合
+    // ServerAliveInterval / ServerAliveCountMax）变成状态机里的 kFailed，
+    // 这里读状态就够了 —— 不再额外发一个 TCP 连接。
+    return true;
+  }
+  // 外部复用的 listener：不归本进程管，没有信号可听。**当场**问一次，
+  // 有界（300ms）。
+  QString probe_error;
+  if (SshTunnelManager::IsLoopbackPortOpen(tunnel_.localPort(), 300,
+                                           &probe_error)) {
+    return true;
+  }
+  // 用户自己那条隧道已经不在了。只解除借用：owned_ 一直是 false，
+  // Stop() 不会、也无法去碰别人的进程。
+  const int gone_port = tunnel_.localPort();
+  tunnel_.Stop();
+  emit tunnelChanged();
+  std::fprintf(stderr,
+               "[remote] 复用的本地通道 127.0.0.1:%d 已经不在了，"
+               "解除借用（没有结束任何外部进程），改由本程序建立安全通道\n",
+               gone_port);
+  return false;
+}
+
 bool RemoteController::StartTunnelForEndpoint(const QString& action_text) {
   Q_UNUSED(action_text);
   SshTunnelManager::Options options;
@@ -2609,7 +2638,7 @@ bool RemoteController::ensureConnection(const QString& host,
                   .arg(port));
     return true;
   }
-  if (TunnelMatchesEndpoint() && tunnel_.localPort() > 0) {
+  if (TunnelMatchesEndpoint() && TransportUsableForSubmit()) {
     SetStatus(QStringLiteral("idle"), QStringLiteral("安全通道已建立"),
               QStringLiteral("%1 -> %2:%3")
                   .arg(tunnel_.localEndpointText(), trimmed_host)

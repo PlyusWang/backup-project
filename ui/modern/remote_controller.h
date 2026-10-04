@@ -802,17 +802,29 @@ class RemoteController : public QObject {
 
   // ---- 连接层（PR #22）----
   //
-  // 一条网络操作在真正提交之前要经过的**唯一**通道：直连直接提交；ssh 模式
-  // 先确认通道已经 Ready（并且仍然指向当前填的那个远端服务），没好的话把这条
-  // 请求挂起、去建通道，建好之后自动把它接着发出去。
+  // 一条网络操作在真正提交之前要经过的**唯一**通道就是 Submit() 本身
+  // （见 .cpp）：直连直接提交；ssh 模式先确认通道真的还能用、而且仍然指向
+  // 当前填的那个远端服务，没好的话把这条请求挂起、去建通道，建好之后自动
+  // 把它接着发出去。
   //
   // 这样"填服务器/账号 -> 点登录"就真的能用：前置动作由系统自己补，而不是
   // 又制造一个隐藏顺序（先建通道 -> 再应用 pin -> 再登录）。
-  void SubmitWithTransport(const RemoteRequest& request,
-                           const QString& action_text, ErrorSurface surface);
+  //
   // 通道参数是否仍然与当前填写的远端服务一致。地址改了就必须重建 ——
-  // 否则界面显示 B、实际却还走在通往 A 的隧道上。
+  // 否则界面显示 B、实际却还走在通往 A 的隧道上。**纯函数**，不产生副作用。
   bool TunnelMatchesEndpoint() const;
+  // 通道**此刻**是不是真的还能用。与 TunnelMatchesEndpoint 分开：
+  //
+  //   * 自有的 ssh：QProcess 的 finished / errorOccurred 已经把"死了"变成
+  //     状态机里的 failed，所以这里只读状态，不做任何探测；
+  //   * 外部**复用**的 listener：不是本进程启动的，没有信号可听，只能在
+  //     **真正要提交一次操作之前**当场问一次（有界的一次 connect）。它不在了
+  //     就**只解除借用**（绝不碰别人的进程），返回 false，让调用方去建自己的
+  //     通道 —— 这就是"外部隧道死掉之后下一次操作自动恢复"的全部机制。
+  //
+  // 刻意不是后台周期探测：空闲就不该产生 TCP 流量（见 ssh_tunnel_manager.h
+  // 顶部关于 ssh -L 的说明）。
+  bool TransportUsableForSubmit();
   // 起一条通道（幂等：已经在建就什么都不做）。
   bool StartTunnelForEndpoint(const QString& action_text);
   void DeferRequest(const RemoteRequest& request, const QString& action_text,

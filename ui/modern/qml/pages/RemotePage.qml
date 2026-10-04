@@ -259,7 +259,11 @@ Item {
             if (remote.tunnelDiagnosticText !== "")
                 lines.push("ssh 诊断输出：" + remote.tunnelDiagnosticText)
         }
-        lines.push("服务端只监听它自己的回环地址；客户端通过 SSH 安全通道访问它。")
+        // 这一行必须与**当前**连接方式一致：直连模式下写"通过 SSH 安全通道访问"
+        // 就是在技术详情里说假话（本轮审查抓到的 D2）。
+        lines.push(page.sshMode
+                   ? "服务端只监听它自己的回环地址；客户端通过上面这条 SSH 安全通道访问它。"
+                   : "直连模式：客户端直接连接上面的服务器地址与端口（没有经过任何隧道）。")
         if (remote.diagnosticText !== "")
             lines.push("最近一次失败的技术原因：" + remote.diagnosticText)
         // core 给出的“为什么这次不是增量”的原始理由（英文）：属于诊断，

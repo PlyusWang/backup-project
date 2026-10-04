@@ -63,7 +63,7 @@ Remote 页新增"连接方式"，默认 **SSH 安全通道**：
 ### 这一层是什么、不是什么
 
 * **是** transport / deployment utility：把 socket 送到服务端门口。
-* **不是** 密码学实现的一部分：BPSEC1 的握手、X25519、HKDF、AES-GCM、HMAC 全部
+* **不是** 密码学实现的一部分：BPSEC1 的握手、X25519、HKDF、AES-256-CTR + HMAC-SHA256 全部
   照旧在隧道**里面**跑，server pin 校验一个字节都没有少。OpenSSH 的 host key 与
   BPSEC1 的 pin 是两层独立证据（defense-in-depth），不是替代关系。
 

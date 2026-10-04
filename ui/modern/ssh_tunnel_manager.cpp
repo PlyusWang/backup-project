@@ -27,12 +27,12 @@
 namespace backup_modern {
 namespace {
 
-// 连续这么多次探测都连不上才判定"通道死了"。单次抖动（对端刚好在重开端口、
-// 内核队列瞬时变化）不应该让界面喊"通道断了"。
-constexpr int kLivenessFailureTolerance = 4;
-// 建立阶段的探测间隔与次数上限。截止时间才是真正的闸门。
+// 建立阶段的探测间隔与次数上限。截止时间（单调时钟）才是真正的闸门。
+//
+// 刻意**没有** kReadyPollMs："Ready 之后还要不要继续探"这个问题的答案是
+// "不要" —— ssh -L 的本地 listener 每接受一次连接就可能真的向 ECS 建一条
+// 转发通道，空闲 GUI 周期性地去 connect 等于持续给 backup-server 制造连接。
 constexpr int kStartingPollMs = 120;
-constexpr int kReadyPollMs = 400;
 constexpr int kMaxReadinessAttempts = 400;
 // 自动端口撞车时最多重挑几次。
 constexpr int kMaxAutoPortRetries = 3;
@@ -391,10 +391,16 @@ void SshTunnelManager::SetState(State state) {
 }
 
 void SshTunnelManager::DisarmProbe() {
-  if (probe_ != nullptr) {
-    probe_->abort();
-    probe_.reset();
+  if (probe_ == nullptr) {
+    return;
   }
+  // 与 CloseProcess() 同理：这个函数会在 QTcpSocket 自己的 connected 信号栈上
+  // 被调用（进入 Ready 的那一刻），在那里同步析构 socket 会让 Qt 继续使用一块
+  // 已经释放的内存。先断开信号、再交给事件循环。
+  QTcpSocket* dying = probe_.release();
+  dying->disconnect(this);
+  dying->abort();
+  dying->deleteLater();
 }
 
 void SshTunnelManager::CloseProcess() {
@@ -442,7 +448,6 @@ void SshTunnelManager::Fail(Failure failure, const QString& detail) {
   external_reuse_ = false;
   local_port_ = 0;
   readiness_attempts_ = 0;
-  liveness_failures_ = 0;
   state_ = State::kFailed;
   emit stateChanged();
 }
@@ -472,7 +477,6 @@ void SshTunnelManager::Stop() {
   stderr_buffer_.clear();
   diagnostic_.clear();
   readiness_attempts_ = 0;
-  liveness_failures_ = 0;
   state_ = State::kStopped;
   emit stateChanged();
 }
@@ -509,7 +513,6 @@ bool SshTunnelManager::StartInternal(const Options& options) {
   diagnostic_.clear();
   failure_detail_.clear();
   readiness_attempts_ = 0;
-  liveness_failures_ = 0;
 
   QString target_error;
   if (!IsValidSshTarget(options_.ssh_target, &target_error)) {
@@ -633,19 +636,15 @@ bool SshTunnelManager::StartInternal(const Options& options) {
   connect(probe_.get(), &QTcpSocket::connected, this,
           &SshTunnelManager::OnProbeConnected);
   connect(probe_.get(), &QTcpSocket::errorOccurred, this,
-          [this](QAbstractSocket::SocketError) {
-            if (state_ != State::kReady) {
-              return;  // 建立阶段：错误就是"还没好"，下一个 tick 再试
-            }
-            // 已经 Ready：连续多少次连不上才算死，见
-            // kLivenessFailureTolerance。
-            ++liveness_failures_;
-            if (liveness_failures_ >= kLivenessFailureTolerance) {
-              Fail(Failure::kExited,
-                   QStringLiteral("本地端口 %1 已经不再接受连接")
-                       .arg(localEndpointText()));
-            }
+          [](QAbstractSocket::SocketError) {
+            // 建立阶段：连不上就是"还没好"，下一个 tick 再试；超时由
+            // OnPollTick 的截止时间判定。Ready 之后 probe_ 已经被销毁，
+            // 所以这里根本不会再有回调 —— 也就没有"后台探测"这回事。
           });
+  // stderr 由管道可读事件驱动地抽干：Ready 之后没有定时器了，不接这个信号
+  // 的话，一条话多的 ssh 会把管道缓冲区写满然后卡住。
+  connect(process_.get(), &QProcess::readyReadStandardError, this,
+          &SshTunnelManager::ReadStderrIntoDiagnostic);
 
   failure_ = Failure::kNone;
   state_ = State::kStarting;
@@ -692,25 +691,31 @@ void SshTunnelManager::ReadStderrIntoDiagnostic() {
 }
 
 void SshTunnelManager::OnProbeConnected() {
-  if (state_ == State::kStarting) {
-    // 真的连上了才算 Ready：进程活着不算证据。
-    poll_.setInterval(kReadyPollMs);
-    readiness_attempts_ = 0;
-    liveness_failures_ = 0;
-    failure_ = Failure::kNone;
-    state_ = State::kReady;
-    emit stateChanged();
-  } else if (state_ == State::kReady) {
-    // 活性探测成功：清零连续失败计数，然后立刻放手。
-    liveness_failures_ = 0;
+  if (state_ != State::kStarting) {
+    // Ready 之后不应该再有 probe 回调（probe_ 已经被销毁）；真出现了也只
+    // 说明有一条迟到的通知，什么都不做。
+    return;
   }
-  if (probe_ != nullptr) {
-    probe_->abort();
-  }
+  // 真的连上了才算 Ready：进程活着不算证据。
+  readiness_attempts_ = 0;
+  failure_ = Failure::kNone;
+  state_ = State::kReady;
+  // 停表 + 把 probe 整个销毁：从这一刻起本类**不再发起任何 TCP 连接**。
+  // 这是本轮修掉的 blocker —— 之前这里只是把间隔改成 400ms，于是空闲 GUI
+  // 每 400ms 就往本地转发端口 connect 一次，而 ssh -L 每接受一次连接就可能
+  // 真的向 ECS 建一条 forwarded channel，等于持续给 backup-server 送连接。
+  //
+  // DisarmProbe() 会在本函数的调用栈上（connected 信号里）把 probe_ 交给
+  // deleteLater，所以这一行必须是本函数最后一次碰 probe_。
+  poll_.stop();
+  emit stateChanged();
+  DisarmProbe();
 }
 
 void SshTunnelManager::OnPollTick() {
-  if (state_ != State::kStarting && state_ != State::kReady) {
+  // 这个定时器**只服务于建立阶段**。Ready 之后它已经被 OnProbeConnected
+  // 停掉；真跑到了这里也只可能是迟到的 tick，直接收摊。
+  if (state_ != State::kStarting) {
     poll_.stop();
     return;
   }
@@ -718,30 +723,24 @@ void SshTunnelManager::OnPollTick() {
   if (process_ != nullptr && process_->state() == QProcess::NotRunning) {
     // finished 信号会把状态推到 kFailed；这里是兜底，防止某些平台上信号
     // 顺序与定时器错开时状态卡在 kStarting。
-    if (state_ == State::kStarting) {
-      OnProcessFinished(process_->exitCode(), process_->exitStatus());
-    }
+    OnProcessFinished(process_->exitCode(), process_->exitStatus());
     return;
   }
-  if (state_ == State::kStarting) {
-    // 单调时钟 + 次数上限：两个都是**有界**的，没有无限轮询。
-    if (deadline_.elapsed() >= options_.ready_timeout_ms ||
-        readiness_attempts_ >= kMaxReadinessAttempts) {
-      const QString detail = SanitizeSshStderr(stderr_buffer_);
-      Fail(Failure::kTimeout,
-           detail.isEmpty()
-               ? QStringLiteral("在 %1 毫秒内本地端口没有变成可连接")
-                     .arg(options_.ready_timeout_ms)
-               : detail);
-      return;
-    }
-    ++readiness_attempts_;
+  // 单调时钟 + 次数上限：两个都是**有界**的，没有无限轮询。
+  if (deadline_.elapsed() >= options_.ready_timeout_ms ||
+      readiness_attempts_ >= kMaxReadinessAttempts) {
+    const QString detail = SanitizeSshStderr(stderr_buffer_);
+    Fail(Failure::kTimeout,
+         detail.isEmpty() ? QStringLiteral("在 %1 毫秒内本地端口没有变成可连接")
+                                .arg(options_.ready_timeout_ms)
+                          : detail);
+    return;
   }
+  ++readiness_attempts_;
   if (probe_ == nullptr) {
     return;
   }
-  // 重新发起一次探测（连上就 abort 放手）。连上/失败都走信号，
-  // 下一次 tick 再决定。
+  // 建立阶段才发起探测（连上就由 OnProbeConnected 收摊）。
   probe_->abort();
   probe_->connectToHost(QHostAddress::LocalHost,
                         static_cast<quint16>(local_port_));
