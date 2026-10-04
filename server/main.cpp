@@ -54,6 +54,10 @@ void PrintUsage(std::FILE* out, const char* program) {
       "                          不再需要人工核对指纹\n"
       "  --require-bpsec2        只接受 BPSEC2（签名身份）客户端：收到 BPSEC1\n"
       "                          的握手直接拒绝，不做降级。需要同时给出证书\n"
+      "  --allow-public-bind <理由>\n"
+      "                          允许监听非回环地址（官方云端直连用）。默认\n"
+      "                          仍然只允许 127.0.0.1；打开时必须同时给出\n"
+      "                          --bpsec2-cert-file，理由是给日志与事后审计的\n"
       "  --log-file <文件>       追加日志文件（默认只写 stderr）\n"
       "  --pid-file <文件>       PID 文件（同一个 root/db/port 只允许一个）\n"
       "  --workers <数量>        并发 worker 数，默认 4（1..64）\n"
@@ -211,6 +215,10 @@ int main(int argc, char* argv[]) {
       have_transport_key = true;
     } else if (name == "--bpsec2-cert-file") {
       config.certificate_file_path = value;
+    } else if (name == "--allow-public-bind") {
+      // 显式公网绑定：值是「一句话理由」，会写进启动日志与事后审计。
+      config.allow_public_bind = true;
+      config.public_bind_reason = value;
     } else if (name == "--log-file") {
       config.log_file_path = value;
     } else if (name == "--pid-file") {

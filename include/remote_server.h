@@ -83,6 +83,11 @@ struct RemoteServerConfig {
   // 只接受 BPSEC2（签名身份）的客户端。收到 BPSEC1 的 ClientHello 直接拒绝，
   // 这就是"拒绝降级"的开关；打开时必须同时配置证书。
   bool require_bpsec2 = false;
+  // PR #23：允许**公网**监听（--bind 不是 127.0.0.1）。默认 false，且必须
+  // 同时满足「配置了 BPSEC2 证书」与「给出一句话理由」，理由会写进启动日志。
+  // 没有这个开关时行为与过去完全一致：任何非回环地址一律 fail closed。
+  bool allow_public_bind = false;
+  std::string public_bind_reason;
   // 追加日志文件；空串表示只写 stderr。
   std::string log_file_path;
   std::uint64_t max_upload_bytes = kDefaultMaxUploadBytes;

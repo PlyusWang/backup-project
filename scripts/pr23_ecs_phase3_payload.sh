@@ -63,9 +63,18 @@ stop_server() {
 
 start_server() {
   local extra="$1"
+  # 绑定地址是参数：私网阶段固定 127.0.0.1，Phase 7 的公网阶段才传 0.0.0.0。
+  # （第一版把它写死成 127.0.0.1，于是 deploy-public 带着
+  #   --allow-public-bind 启动、却仍然只绑回环，看起来像"公网起不来"。）
+  set +u
+  local bind="$2"
+  set -u
+  if [ -z "$bind" ]; then
+    bind="127.0.0.1"
+  fi
   cd "$ROOT" || return 1
   # shellcheck disable=SC2086
-  nohup "$BIN/backup-server" --bind 127.0.0.1 --port 18765 \
+  nohup "$BIN/backup-server" --bind "$bind" --port 18765 \
     --root "$ROOT/data" --db "$ROOT/state/metadata.sqlite3" \
     --secret-file "$HOME/.config/backup-project-server/secrets.env" \
     --transport-key-file "$ROOT/state/transport.key" \
@@ -105,6 +114,25 @@ case "$PHASE" in
     install -m 644 "$INCOMING/server-identity.bpcert" "$CERT_DEST"
     stop_server
     PID="$(start_server "--bpsec2-cert-file $CERT_DEST --require-bpsec2")"
+    echo "STARTED_PID=$PID"
+    ;;
+
+  deploy-public)
+    # 与 deploy 相同，但**公网**绑定。只有在 Phase 6 审计通过、并且明确要
+    # 把官方云端直接暴露出去时才允许走到这里；理由是启动参数的一部分。
+    set +u
+    REASON="$4"
+    set -u
+    if [ -z "$REASON" ]; then
+      echo "deploy-public 需要第四个参数：公网绑定的理由" >&2
+      exit 2
+    fi
+    if [ ! -f "$CERT_DEST" ]; then
+      echo "公网绑定要求先装好证书（$CERT_DEST）" >&2
+      exit 1
+    fi
+    stop_server
+    PID="$(start_server "--bpsec2-cert-file $CERT_DEST --require-bpsec2 --allow-public-bind $REASON" "0.0.0.0")"
     echo "STARTED_PID=$PID"
     ;;
 

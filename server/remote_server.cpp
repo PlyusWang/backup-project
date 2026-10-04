@@ -291,15 +291,46 @@ bool RemoteServer::Configure(const RemoteServerConfig& config,
   // 环回地址——这是纵深防御的一部分，不是机密性的前提：把只该由隧道访问的
   // 端口直接暴露在共享网络上没有任何好处，所以这里继续 fail closed，
   // 不提供 --insecure / --allow-public 之类的开关。
+  // PR #23：默认规则不变（非回环一律拒绝），但多了一条**显式**例外：
+  // 官方云端要让用户不开隧道，就必须把 18765 暴露在公网上。这个例外必须
+  // 同时满足三件事，缺一不可：
+  //   1. 显式给 --allow-public-bind <理由>，理由是给日志和事后审计看的；
+  //   2. 配置了 BPSEC2 身份证书 —— 公网监听的正当性完全建立在「客户端能用
+  //      证书确认对端是谁」之上，没有证书就只是把端口裸奔出去；
+  //   3. 理由不能是空串（形式上的「我知道我在做什么」）。
+  // 没有这个开关时，0.0.0.0 / 127.0.0.2 / 192.168.x 的拒绝行为与过去逐字
+  // 相同，既有测试仍然断言这一点。
   if (config.bind_address != "127.0.0.1") {
-    if (error_message != nullptr) {
-      *error_message =
-          "--bind must be 127.0.0.1, not " + config.bind_address +
-          ": this version has no native TLS, so the server only accepts"
-          " loopback connections; reach a remote instance through an SSH"
-          " tunnel (ssh -N -L 18765:127.0.0.1:18765 <host>)";
+    if (!config.allow_public_bind) {
+      if (error_message != nullptr) {
+        *error_message =
+            "--bind must be 127.0.0.1, not " + config.bind_address +
+            ": this version has no native TLS, so the server only accepts"
+            " loopback connections; reach a remote instance through an SSH"
+            " tunnel (ssh -N -L 18765:127.0.0.1:18765 <host>)."
+            " To serve the official cloud directly on a public address,"
+            " pass --allow-public-bind <reason> together with"
+            " --bpsec2-cert-file.";
+      }
+      return false;
     }
-    return false;
+    if (config.certificate_file_path.empty()) {
+      if (error_message != nullptr) {
+        *error_message =
+            "--allow-public-bind requires --bpsec2-cert-file: a public"
+            " listener must authenticate itself with a signed identity,"
+            " otherwise clients have no way to tell who they are talking to";
+      }
+      return false;
+    }
+    if (config.public_bind_reason.empty()) {
+      if (error_message != nullptr) {
+        *error_message =
+            "--allow-public-bind requires a non-empty reason"
+            " (it is written to the startup log)";
+      }
+      return false;
+    }
   }
   if (config.root_directory.empty()) {
     if (error_message != nullptr) {
@@ -403,6 +434,17 @@ bool RemoteServer::Start(std::string* error_message) {
     store_.reset();
     data_lock_.reset();
     return false;
+  }
+  if (config_.bind_address != "127.0.0.1") {
+    // 公网监听必须在日志里留痕：出了事要能一眼看出当时是谁、以什么理由
+    // 把它开出去的。理由是启动参数里那句话，不是脚本猜的。
+    std::ostringstream public_line;
+    public_line << "WARNING: listening on a PUBLIC address "
+                << config_.bind_address << ":" << bound_port_
+                << " reason=" << config_.public_bind_reason
+                << " identity=bpsec2-certificate"
+                << " require_bpsec2=" << (config_.require_bpsec2 ? "yes" : "no");
+    Log(public_line.str());
   }
   {
     std::ostringstream line;
