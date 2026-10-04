@@ -2060,43 +2060,14 @@ void RemoteController::clearServerKeyPinError() {
 }
 
 bool RemoteController::setServerKeyPin(const QString& pin) {
-  // 重新提交先把上一次的原因清掉：这一行里留下的必须是这一次的结果。
-  ClearSurfaceError(ErrorSurface::kServerKey);
-  // 首尾空白丢掉：从终端复制 --server-key 那一行时经常带上空格。除此之外
-  // 一个字符都不改——大小写由共享解析器归一化，界面不做第二套"看起来对"的
-  // 判断（规则只有一份）。
-  const QString text = pin.trimmed();
-  if (text.isEmpty()) {
-    last_error_kind_ = QStringLiteral("validation");
-    ReportSurfaceError(
-        ErrorSurface::kServerKey,
-        QStringLiteral("请填写服务器身份指纹（向服务器管理员索取，"
-                       "形如 sha256: 开头的 64 位十六进制）"));
-    return false;
-  }
-  backupproject::net::ServerKeyPin parsed;
-  std::string parse_error;
-  if (!backupproject::net::ParseServerKeyPin(text.toStdString(), &parsed,
-                                             &parse_error)) {
-    last_error_kind_ = QStringLiteral("validation");
-    ReportSurfaceError(ErrorSurface::kServerKey,
-                       QStringLiteral("服务器身份指纹不合法：%1")
-                           .arg(QString::fromStdString(parse_error)));
-    // 终端上留一条原始原因（诊断用），界面上只出现上面那一句。
-    std::fprintf(stderr, "[remote] 服务端 pin 不合法：%s\n",
-                 parse_error.c_str());
-    return false;
-  }
-  if (server_key_pin_ == text) {
-    return true;
-  }
-  server_key_pin_ = text;
-  // 两个落点一起更新：request.endpoint 由 endpoint_ 拷贝而来，各个提交点再
-  // 显式带一次 pin（见头文件）。已经建立的连接不受影响——pin 只在握手时用，
-  // 下一次连接才会用到新值。
-  endpoint_.server_key_pin = server_key_pin_.toStdString();
-  emit serverKeyPinChanged();
-  return true;
+  // 只是"应用"的一个薄包装：合法（含"与当前完全相同"）返回 true。
+  //
+  // 这一层存在的意义是给**非界面**调用方（--remote-test / --remote-smoke 的
+  // 预置，以及 backupctl 同款语义）一个布尔返回值。校验与落点只有一份实现，
+  // 就是 CommitServerKeyPin —— 否则"应用"这条路径会有两套规则，而两套规则
+  // 迟早会漂移。modern_gui_check 里那条"指纹的校验复用共享解析器（期望 1 处）"
+  // 断言钉的正是这件事：它在本轮一度变成 2 处，说明我确实写重了一份。
+  return CommitServerKeyPin(pin) != QStringLiteral("invalid");
 }
 
 bool RemoteController::deleteAccount(const QString& password,
