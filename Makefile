@@ -22,6 +22,7 @@ CORE_SOURCES := src/core/archive_entry.cpp src/core/archive_pipeline.cpp \
                 src/compression/lzss.cpp src/crypto/aes.cpp \
                 src/crypto/des.cpp src/crypto/hmac.cpp src/crypto/pbkdf2.cpp \
                 src/crypto/random.cpp src/crypto/sha256.cpp \
+                src/crypto/x25519.cpp src/crypto/hkdf.cpp \
                 src/filter/filter.cpp src/filter/filter_rule_builder.cpp
 
 
@@ -68,7 +69,11 @@ SERVER_CORE_SOURCES := src/network/network_protocol.cpp \
                        src/crypto/sha256.cpp \
                        src/crypto/hmac.cpp \
                        src/crypto/pbkdf2.cpp \
-                       src/crypto/random.cpp
+                       src/crypto/random.cpp \
+                       src/crypto/aes.cpp \
+                       src/crypto/x25519.cpp \
+                       src/crypto/hkdf.cpp \
+                       src/network/secure_transport.cpp
 SERVER_SOURCES := server/main.cpp $(SERVER_CORE_SOURCES)
 # 服务端的目标文件放在 $(BUILD_DIR)/server/ 下，**不要**落在 $(BUILD_DIR)/src/。
 # 既有的测试脚本用 "find build/src -name '*.o'" 收集核心对象来链接单元测试，
@@ -93,7 +98,10 @@ FILESYSTEM_SOURCES := src/filesystem/file_system.cpp
 # CLI 与 Modern GUI 共用同一个 RemoteArchiveClient：桌面端只链接协议编解码与
 # 客户端，**不链接 SQLite**（元数据库只属于服务端进程）。
 CORE_SOURCES += src/network/network_protocol.cpp \
+                src/network/secure_transport.cpp \
                 src/network/remote_backup_client.cpp \
+                src/network/snapshot_bundle.cpp \
+                src/network/remote_incremental.cpp \
                 src/cli/remote_commands.cpp
 SOURCES := $(APP_SOURCES) $(CORE_SOURCES) $(FILESYSTEM_SOURCES)
 OBJECTS := $(patsubst %.cpp,$(BUILD_DIR)/%.o,$(SOURCES))
@@ -148,9 +156,23 @@ ADMIN_SOURCES := server/admin_main.cpp $(SERVER_CORE_SOURCES)
 ADMIN_OBJECTS := $(patsubst %.cpp,$(BUILD_DIR)/server/%.o,$(ADMIN_SOURCES))
 DEPENDS += $(ADMIN_OBJECTS:.o=.d)
 
-# 单独构建服务端（部署脚本用）。管理工具与服务端同属"服务器侧交付物"，
-# 所以同一条目标一起构建。
-server: $(SERVER_TARGET) $(ADMIN_TARGET)
+# ---- 服务端传输身份密钥工具（PR #21）----
+#
+# backup-server-keygen 生成 BPSEC1 的服务端长期身份密钥（32 字节 X25519 标量，
+# 0600 文件），并打印公钥与指纹供客户端 pin。它只在服务器本机运行，不监听端口。
+# 它和服务端共用同一份 secure_transport.cpp，不存在"密钥工具另写一套编码"。
+KEYGEN_TARGET := $(BUILD_DIR)/backup-server-keygen
+KEYGEN_SOURCES := server/keygen_main.cpp $(SERVER_CORE_SOURCES)
+KEYGEN_OBJECTS := $(patsubst %.cpp,$(BUILD_DIR)/server/%.o,$(KEYGEN_SOURCES))
+DEPENDS += $(KEYGEN_OBJECTS:.o=.d)
+
+$(KEYGEN_TARGET): $(KEYGEN_OBJECTS)
+	@mkdir -p $(BUILD_DIR)
+	$(CXX) $(CXXFLAGS) $(KEYGEN_OBJECTS) $(SQLITE_LIBRARY) -pthread -o $@
+
+# 单独构建服务端（部署脚本用）。管理工具、密钥工具与服务端同属"服务器侧
+# 交付物"，所以同一条目标一起构建。
+server: $(SERVER_TARGET) $(ADMIN_TARGET) $(KEYGEN_TARGET)
 
 $(SERVER_TARGET): $(SERVER_OBJECTS)
 	@mkdir -p $(BUILD_DIR)
@@ -210,10 +232,11 @@ debug:
 	@$(MAKE) BUILD_DIR=build-debug CXXFLAGS="$(CXXFLAGS) -g" all
 
 # AddressSanitizer + UndefinedBehaviorSanitizer build.
-# sanitize 是测试用的构建，所以顺带把测试夹具也建出来（脚本里的 sanitizer
-# 维度要跑它）。产品构建（all）里没有这一条。
+# sanitize 是测试用的构建，所以顺带把测试夹具与**服务器侧交付物**也建出来：
+# 脚本里的 sanitizer 维度要用 backup-server-keygen 生成传输身份密钥，
+# 只建 all 的话它不存在（PR #21 就是这么暴露出来的）。产品构建（all）里没有这一条。
 sanitize:
-	@$(MAKE) BUILD_DIR=build-sanitize CXXFLAGS="$(CXXFLAGS) -g -O1 -fsanitize=address,undefined -fno-omit-frame-pointer" all test-fixtures
+	@$(MAKE) BUILD_DIR=build-sanitize CXXFLAGS="$(CXXFLAGS) -g -O1 -fsanitize=address,undefined -fno-omit-frame-pointer" all test-fixtures server
 
 test: all
 	@bash scripts/test.sh

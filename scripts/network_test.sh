@@ -40,9 +40,22 @@ fi
 
 echo "[network-test] PR #20 remote backup suite$SAN_LABEL"
 
-# 服务端目标文件是测试的前置条件：先确保它们存在（也是零警告的证据）。
+# 前置条件：服务端目标文件、BPSEC1 传输层的目标文件、以及密钥工具都要在。
+# 任何一样缺失就整体构建一次（构建本来就是零警告的证据）。只检查
+# remote_server.o 是不够的：PR #21 之后单元测试还要链 secure_transport.o，
+# B 段还要用 backup-server-keygen 生成服务端身份密钥。
+NEED_BUILD=0
 if [ -z "$(find "$OBJ_ROOT/server" -name remote_server.o 2>/dev/null | head -1)" ]; then
-  echo "[network-test] $OBJ_ROOT/backup-server is missing; building first..."
+  NEED_BUILD=1
+fi
+if [ -z "$(find "$OBJ_ROOT" -name secure_transport.o 2>/dev/null | head -1)" ]; then
+  NEED_BUILD=1
+fi
+if [ ! -x "$OBJ_ROOT/backup-server-keygen" ]; then
+  NEED_BUILD=1
+fi
+if [ "$NEED_BUILD" = "1" ]; then
+  echo "[network-test] $OBJ_ROOT 下的服务端 / BPSEC1 产物不完整；先构建..."
   if [ "$OBJ_ROOT" = "build-sanitize" ]; then
     BUILD_CMD="make -j4 sanitize"
   else
@@ -86,16 +99,33 @@ NET_OBJECTS="$OBJ_ROOT/src/network/network_protocol.o"
 # 排除 main.o：单元测试有自己的 main，链接服务端的 main 会重复定义。
 # 排除 main.o（单元测试有自己的 main）与 crypto/*（那部分统一用
 # $OBJ_ROOT/src/crypto 下的目标文件，两处都链会重复定义）。
-# 排除 main.o（单元测试有自己的 main）、admin_main.o（管理工具自己的 main，
-# 链接进来会与单元测试的 main 重复定义）与 crypto/*（那部分统一用
-# $OBJ_ROOT/src/crypto 下的目标文件，两处都链会重复定义）。
+# 排除 main.o（单元测试有自己的 main）、admin_main.o / keygen_main.o（管理
+# 工具与密钥工具各自的 main，链接进来会与单元测试的 main 重复定义）与
+# crypto/*（那部分统一用 $OBJ_ROOT/src/crypto 下的目标文件，两处都链会重复
+# 定义）。keygen_main.o 是 PR #21 新增的：它与 admin_main.o 一样带着自己的
+# main()，不排除就链接不过。
 SERVER_ONLY="$(find "$OBJ_ROOT/server" -name '*.o' ! -name 'main.o' \
-  ! -name 'admin_main.o' ! -path '*/crypto/*' 2>/dev/null | sort | tr '\n' ' ')"
+  ! -name 'admin_main.o' ! -name 'keygen_main.o' ! -path '*/crypto/*' \
+  2>/dev/null | sort | tr '\n' ' ')"
 SERVER_AUTH_OBJ="$(find "$OBJ_ROOT/server" -name 'remote_auth.o' 2>/dev/null | head -1)"
 SERVER_STORE_OBJ="$(find "$OBJ_ROOT/server" -name 'remote_metadata_store.o' 2>/dev/null | head -1)"
+# BPSEC1（PR #21）缺的目标文件。服务端每个连接的第一步就是握手，单元测试里的
+# "客户端侧"也要自己握手，所以这些目标文件必须进链接。
+#
+# secure_transport.o（连同 network_protocol.o）已经由上面的 SERVER_ONLY 从
+# $OBJ_ROOT/server/src/network/ 带进来了——同一份产品源码、同一组编译参数。
+# 这里**不能**再列 $OBJ_ROOT/src/network/secure_transport.o：两份目标文件会
+# 撞成 multiple definition（链接期错误）。缺的是它依赖的三块密码学原语：
+# x25519 / hkdf / aes（sha256 / hmac / random 已经在 CRYPTO_OBJECTS 里）。
+#
+# 注意：它必须定义在 SERVER_OBJECTS **之前**——脚本开着 set -u，先用后定义
+# 会直接以"未绑定的变量"退出整个套件。
+SECURE_OBJECTS="$OBJ_ROOT/src/crypto/x25519.o $OBJ_ROOT/src/crypto/hkdf.o \
+$OBJ_ROOT/src/crypto/aes.o"
 # 客户端下载现在用 file_io 的 FileSink / PublishNoReplace / PublishReplacing 发布，
 # 所以单元测试也要把 file_io 的目标文件链进来（产品构建里它本来就在 CORE 里）。
-SERVER_OBJECTS="$SERVER_ONLY $OBJ_ROOT/src/network/remote_backup_client.o \
+SERVER_OBJECTS="$SERVER_ONLY $SECURE_OBJECTS \
+$OBJ_ROOT/src/network/remote_backup_client.o \
 $OBJ_ROOT/src/core/file_io.o"
 CRYPTO_OBJECTS="$OBJ_ROOT/src/crypto/sha256.o $OBJ_ROOT/src/crypto/hmac.o \
 $OBJ_ROOT/src/crypto/pbkdf2.o $OBJ_ROOT/src/crypto/random.o"
@@ -203,8 +233,30 @@ if [ -z "$PORT" ]; then
   PORT=20021
 fi
 
+# BPSEC1 的服务端长期传输身份：私钥只落在这个 0600 文件里（生成工具自带
+# O_EXCL + 0600 + O_NOFOLLOW）。客户端要用的 pin 不在这里手拼，而是从产品
+# 工具 --show 的输出里取——指纹由产品代码算，脚本只负责转发。
+if ./$OBJ_ROOT/backup-server-keygen --output "$CLI_WORK/transport.key" \
+    >"$CLI_WORK/keygen.txt" 2>&1; then
+  record_pass "B.0 backup-server-keygen 生成传输身份私钥"
+else
+  record_fail "B.0 backup-server-keygen 生成传输身份私钥" \
+    "$(head -1 "$CLI_WORK/keygen.txt")"
+fi
+SERVER_KEY_PIN="$(./$OBJ_ROOT/backup-server-keygen --show \
+  --key-file "$CLI_WORK/transport.key" \
+  | sed -n 's/.*--server-key \(sha256:[0-9a-f]\{64\}\).*/\1/p' | head -1)"
+if [ -n "$SERVER_KEY_PIN" ]; then
+  record_pass "B.0 keygen --show 输出可用的 sha256 pin"
+else
+  record_fail "B.0 keygen --show 输出" "没能从 --show 的输出里取到 sha256: 指纹"
+fi
+# 所有 remote 子命令都从这里自动带上 pin（等价于每条命令都写 --server-key）。
+export BACKUP_REMOTE_SERVER_KEY="$SERVER_KEY_PIN"
+
 SERVER_ARGS="--bind 127.0.0.1 --port $PORT --root $CLI_WORK/data \
 --db $CLI_WORK/state/metadata.sqlite3 --secret-file $CLI_WORK/secrets.env \
+--transport-key-file $CLI_WORK/transport.key \
 --pid-file $CLI_WORK/state/server.pid --log-file $CLI_WORK/logs/server.log --quiet"
 # shellcheck disable=SC2086
 ./$OBJ_ROOT/backup-server $SERVER_ARGS &
@@ -283,6 +335,19 @@ if grep -q "PING 正常" "$CLI_WORK/last.txt"; then
   record_pass "B.2 ping 输出可读"
 else
   record_fail "B.2 ping 输出可读" "$(head -1 "$CLI_WORK/last.txt")"
+fi
+
+# BPSEC1 不做 TOFU：没有 pin 时必须**明确失败**，而且要提示怎么配 --server-key，
+# 不能悄悄连上去（也没有明文回退这条路）。这里显式把环境变量从子进程里去掉。
+NO_PIN_CODE="$(env -u BACKUP_REMOTE_SERVER_KEY timeout --signal=KILL 300 \
+  ./$OBJ_ROOT/backupctl remote ping $REMOTE_OPTS \
+  >"$CLI_WORK/last.txt" 2>&1; echo $?)"
+if [ "$NO_PIN_CODE" != "0" ] \
+   && grep -q -- "--server-key" "$CLI_WORK/last.txt"; then
+  record_pass "B.2b 没有 pin 时 remote ping 非 0 退出并提示 --server-key（退出码 $NO_PIN_CODE）"
+else
+  record_fail "B.2b 没有 pin 时 remote ping" \
+    "退出码 $NO_PIN_CODE: $(head -1 "$CLI_WORK/last.txt")"
 fi
 
 check_remote_ok "B.3 注册用户 A" register --user "$USER_A"
@@ -422,7 +487,9 @@ record_pass "B.14 服务端优雅停止"
 SECOND_PORT=$((PORT + 1))
 ./$OBJ_ROOT/backup-server --bind 127.0.0.1 --port "$SECOND_PORT" \
   --root "$CLI_WORK/data2" --db "$CLI_WORK/state/metadata2.sqlite3" \
-  --secret-file "$CLI_WORK/secrets.env" --pid-file "$CLI_WORK/state/server2.pid" \
+  --secret-file "$CLI_WORK/secrets.env" \
+  --transport-key-file "$CLI_WORK/transport.key" \
+  --pid-file "$CLI_WORK/state/server2.pid" \
   --quiet >/dev/null 2>&1 &
 RACE_PID=$!
 kill -TERM "$RACE_PID" 2>/dev/null
@@ -451,6 +518,14 @@ head -c 32 /dev/urandom | sha256sum | cut -c1-64 \
   | sed 's/^/BACKUP_TOKEN_SECRET=/' > "$BOUND_WORK/secrets.env"
 chmod 600 "$BOUND_WORK/secrets.env"
 
+# BPSEC1 传输身份：C 段每一次服务端启动都必须带上 --transport-key-file，
+# 否则 main 会以"用法错误"提前退出，这一节要测的（地址 / secret 权限 /
+# 符号链接）就一条都测不到。
+if ! ./$OBJ_ROOT/backup-server-keygen --output "$BOUND_WORK/transport.key" \
+    >"$BOUND_WORK/keygen.txt" 2>&1; then
+  record_fail "C 生成传输身份密钥" "$(head -1 "$BOUND_WORK/keygen.txt")"
+fi
+
 # 找一个空闲端口。每次拒绝都用一个**新的**端口，这样"没有 listener"这条判别
 # 的对象是明确的：不是"系统里恰好没有别的监听"，而是"这个端口上没有被起过
 # listener"。
@@ -477,7 +552,8 @@ for address in 0.0.0.0 192.168.1.10 8.8.8.8 127.0.0.2; do
   refuse_out="$(timeout --signal=KILL 20 ./$OBJ_ROOT/backup-server \
     --bind "$address" --port "$BOUND_PORT" --root "$BOUND_WORK/data" \
     --db "$BOUND_WORK/state/metadata.sqlite3" \
-    --secret-file "$BOUND_WORK/secrets.env" --quiet 2>&1)"
+    --secret-file "$BOUND_WORK/secrets.env" \
+    --transport-key-file "$BOUND_WORK/transport.key" --quiet 2>&1)"
   refuse_code=$?
   if [ "$refuse_code" != "0" ] \
      && printf '%s' "$refuse_out" | grep -q "127.0.0.1"; then
@@ -504,7 +580,8 @@ BOUND_PORT="$(bound_port)" || BOUND_PORT=20361
 perm_out="$(timeout --signal=KILL 20 ./$OBJ_ROOT/backup-server --bind 127.0.0.1 \
   --port "$BOUND_PORT" --root "$BOUND_WORK/data" \
   --db "$BOUND_WORK/state/metadata.sqlite3" \
-  --secret-file "$BOUND_WORK/secrets.env" --quiet 2>&1)"
+  --secret-file "$BOUND_WORK/secrets.env" \
+  --transport-key-file "$BOUND_WORK/transport.key" --quiet 2>&1)"
 perm_code=$?
 if [ "$perm_code" != "0" ] \
    && printf '%s' "$perm_out" | grep -q "0600"; then
@@ -532,7 +609,8 @@ BOUND_PORT="$(bound_port)" || BOUND_PORT=20362
 link_out="$(timeout --signal=KILL 20 ./$OBJ_ROOT/backup-server --bind 127.0.0.1 \
   --port "$BOUND_PORT" --root "$BOUND_WORK/data" \
   --db "$BOUND_WORK/state/metadata.sqlite3" \
-  --secret-file "$BOUND_WORK/secrets-link.env" --quiet 2>&1)"
+  --secret-file "$BOUND_WORK/secrets-link.env" \
+  --transport-key-file "$BOUND_WORK/transport.key" --quiet 2>&1)"
 link_code=$?
 if [ "$link_code" != "0" ] && no_listener "$BOUND_PORT"; then
   record_pass "C.2 指向 secret 的符号链接被拒绝启动（退出码 $link_code）"
@@ -547,6 +625,7 @@ BOUND_PORT="$(bound_port)" || BOUND_PORT=20363
 ./$OBJ_ROOT/backup-server --bind 127.0.0.1 --port "$BOUND_PORT" \
   --root "$BOUND_WORK/data" --db "$BOUND_WORK/state/metadata.sqlite3" \
   --secret-file "$BOUND_WORK/secrets.env" \
+  --transport-key-file "$BOUND_WORK/transport.key" \
   --pid-file "$BOUND_WORK/state/server.pid" \
   --log-file "$BOUND_WORK/logs/server.log" --quiet \
   > "$BOUND_WORK/logs/start.log" 2>&1 &

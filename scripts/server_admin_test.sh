@@ -74,6 +74,40 @@ if [ ! -x "$ADMIN" ]; then
 fi
 record_pass "make all server 成功（warning $(grep -ci warning "$TEST_ROOT/build.log" || true) 条）"
 
+# ---- PR #21：BPSEC1 服务端身份密钥 + 客户端 pin ----
+# 服务端必须带 --transport-key-file 才能启动；客户端必须先知道服务端公钥指纹
+# （pin），没有就直接用法错误退出（不做 TOFU）。密钥只生成在测试自己的临时
+# 目录里，私钥内容不打印；pin 从 keygen 输出里读进环境变量，不写明文常量。
+# 这一段必须在**任何** backupctl remote 调用之前：pin 缺失时 remote 会以
+# 用法错误退出，那样下面"不认识 admin 子命令"之类的断言就会被 pin 错误顶掉。
+KEYGEN="./build/backup-server-keygen"
+# 与部署布局一致：身份私钥在 <server-root>/state/ 下（deploy_aliyun_server.sh
+# 就是把它装在 state/transport.key）。管理工具的"部署约定路径"因此也指向这里。
+TRANSPORT_KEY="$TEST_ROOT/state/transport.key"
+KEYGEN_OUT="$TEST_ROOT/keygen.out"
+if [ ! -x "$KEYGEN" ]; then
+  record_fail "backup-server-keygen 已构建" "$KEYGEN 不存在（make server 应该产出它）"
+  finish
+fi
+if ! "$KEYGEN" --output "$TRANSPORT_KEY" > "$KEYGEN_OUT" 2>&1; then
+  record_fail "生成服务端传输身份密钥" "$(head -2 "$KEYGEN_OUT" | tr '\n' ' ')"
+  finish
+fi
+KEY_MODE="$(stat -c '%a' "$TRANSPORT_KEY" 2>/dev/null || echo missing)"
+if [ "$KEY_MODE" = "600" ]; then
+  record_pass "服务端传输身份私钥已生成且权限 0600"
+else
+  record_fail "传输身份私钥权限" "期望 0600，实际 $KEY_MODE"
+  finish
+fi
+export BACKUP_REMOTE_SERVER_KEY="$(grep -oE 'sha256:[0-9a-f]{64}' "$KEYGEN_OUT" | head -1)"
+if [ -n "$BACKUP_REMOTE_SERVER_KEY" ]; then
+  record_pass "客户端 pin 已从 keygen 输出读入环境变量 BACKUP_REMOTE_SERVER_KEY（不打印、不写常量）"
+else
+  record_fail "客户端 pin" "keygen 输出里没有 sha256:<64 位十六进制> 指纹"
+  finish
+fi
+
 run_admin() {
   timeout --signal=KILL 120 "$ADMIN" --root "$DATA" --db "$DB" "$@" \
     >"$TEST_ROOT/admin.txt" 2>&1
@@ -103,6 +137,19 @@ if printf '%s' "$ADMIN_AS_SUBCOMMAND" | grep -q "未知的 remote 子命令"; th
   record_pass "backupctl remote 不认识 admin 子命令"
 else
   record_fail "backupctl remote admin" "居然被当成合法子命令"
+fi
+# PR #21：pin 是**必填项**。上面那条断言能继续成立，靠的正是它带了 pin
+# （环境变量），所以这里再用 env -u 摘掉 pin 证明：没有 pin 时命令在连接
+# 之前就以用法错误（退出码 2）失败，错误信息里能看到 --server-key。
+NO_PIN_CODE=0
+env -u BACKUP_REMOTE_SERVER_KEY timeout 60 ./build/backupctl remote \
+  ping --host 127.0.0.1 --port 1 > "$TEST_ROOT/no-pin.txt" 2>&1 \
+  || NO_PIN_CODE=$?
+if [ "$NO_PIN_CODE" = "2" ] && grep -q -- "--server-key" "$TEST_ROOT/no-pin.txt"; then
+  record_pass "没有 pin 时 remote 以用法错误退出（退出码 2，提示 --server-key）"
+else
+  record_fail "没有 pin 时的 remote" \
+    "退出码 $NO_PIN_CODE $(head -2 "$TEST_ROOT/no-pin.txt" | tr '\n' ' ')"
 fi
 
 # ---- 2. BPNET1 里没有 admin 操作码（运行时由 network_protocol_test 断言，
@@ -152,7 +199,8 @@ done
 [ -n "$PORT" ] || { record_fail "端口" "20150-20180 都被占用"; finish; }
 
 ./build/backup-server --bind 127.0.0.1 --port "$PORT" --root "$DATA" --db "$DB" \
-  --secret-file "$SECRET" --pid-file "$TEST_ROOT/state/server.pid" \
+  --secret-file "$SECRET" --transport-key-file "$TRANSPORT_KEY" \
+  --pid-file "$TEST_ROOT/state/server.pid" \
   --log-file "$LOG" --quiet > "$TEST_ROOT/logs/server-stderr.log" 2>&1 &
 SERVER_PID=$!
 ready=0
@@ -191,6 +239,69 @@ if [ "$setup_ok" = "1" ] && [ -n "$SNAP_A" ] && [ -n "$SNAP_B1" ] && [ -n "$SNAP
 else
   record_fail "准备数据" "$(head -1 "$TEST_ROOT/last.txt")"
   finish
+fi
+
+# ---- 4b. 传输身份指纹：首页就能抄到（PR #21 UI closure，问题 A）----
+#
+# 客户端的"服务器身份指纹（server-key）"是必填项，所以服务器本机的管理工具
+# 必须在**首页**把它显示出来，用户才抄得走。这里钉死三件事：
+#
+#   1. 首页（status，也就是菜单 banner 调用的那条命令）里就有
+#      "传输身份指纹: sha256:<64 位十六进制>"；
+#   2. 它和客户端用来连接**这个正在运行的服务端**的 pin 完全相同——这就是
+#      "显示的指纹 == 服务端在用的身份"的运行时证据（管理工具只读
+#      /proc/<pid>/cmdline 找到服务端实际加载的那把私钥）；
+#   3. 详细页（transport-identity）给出 Fingerprint 与 Public key，但**永远
+#      不打印私钥**：私钥文件的十六进制在这里单独算一份，必须一个字都搜不到。
+ADMIN_STATUS_CODE="$(run_admin status)"
+STATUS_FP="$(grep -oE 'sha256:[0-9a-f]{64}' "$TEST_ROOT/admin.txt" | head -1)"
+if [ "$ADMIN_STATUS_CODE" = "0" ] && [ "$STATUS_FP" = "$BACKUP_REMOTE_SERVER_KEY" ] \
+   && grep -q '^传输身份指纹: sha256:' "$TEST_ROOT/admin.txt"; then
+  record_pass "管理工具首页显示传输身份指纹，且与客户端连接该服务端用的 pin 完全一致"
+else
+  record_fail "管理工具首页的传输身份指纹" \
+    "exit=$ADMIN_STATUS_CODE 首页=$STATUS_FP pin=$BACKUP_REMOTE_SERVER_KEY"
+fi
+ADMIN_ID_CODE="$(run_admin transport-identity)"
+ADMIN_PUB="$(grep -oE 'hex:[0-9a-f]{64}' "$TEST_ROOT/admin.txt" | head -1)"
+KEYGEN_PUB="$(grep -oE 'hex:[0-9a-f]{64}' "$KEYGEN_OUT" | head -1)"
+if [ "$ADMIN_ID_CODE" = "0" ] && [ "$ADMIN_PUB" = "$KEYGEN_PUB" ] \
+   && grep -q '^Fingerprint:' "$TEST_ROOT/admin.txt" \
+   && grep -q '^Public key:' "$TEST_ROOT/admin.txt" \
+   && grep -qF "$BACKUP_REMOTE_SERVER_KEY" "$TEST_ROOT/admin.txt"; then
+  record_pass "服务器身份信息页：Fingerprint 与 Public key 都与 keygen 一致"
+else
+  record_fail "服务器身份信息页" \
+    "exit=$ADMIN_ID_CODE pub=$ADMIN_PUB keygen=$KEYGEN_PUB"
+fi
+PRIVATE_HEX="$(od -An -tx1 -v "$TRANSPORT_KEY" | tr -d ' \n')"
+if [ -n "$PRIVATE_HEX" ] \
+   && ! grep -qF "$PRIVATE_HEX" "$TEST_ROOT/admin.txt" \
+   && ! grep -qiE 'private key|BEGIN [A-Z ]*PRIVATE' "$TEST_ROOT/admin.txt"; then
+  record_pass "身份信息页只给公钥与指纹：私钥的 32 字节一次都没有出现"
+else
+  record_fail "身份信息页的私钥边界" "输出里出现了私钥材料或 private key 字样"
+fi
+# 读不到指纹不是"管理工具坏了"：明确说不可用 + 原因，其余输出照常，退出码仍是 0。
+UNREADABLE_CODE="$(run_admin --transport-key-file "$TEST_ROOT/state/missing.key" status)"
+if [ "$UNREADABLE_CODE" = "0" ] \
+   && grep -q '^传输身份指纹: 不可用' "$TEST_ROOT/admin.txt" \
+   && grep -q '原因:' "$TEST_ROOT/admin.txt" \
+   && grep -q '用户数：' "$TEST_ROOT/admin.txt"; then
+  record_pass "身份私钥读不到时：显示“不可用 + 原因”，菜单其余输出照常（退出码 0）"
+else
+  record_fail "身份私钥读不到时" \
+    "exit=$UNREADABLE_CODE $(head -3 "$TEST_ROOT/admin.txt" | tr '\n' ' ')"
+fi
+# 菜单首页（wrapper 的 banner）里也能看到这一行——用户看的就是这一屏。
+WRAPPER_HOME="$TEST_ROOT/wrapper-home.txt"
+BACKUP_SERVER_ROOT="$TEST_ROOT" timeout --signal=KILL 60 \
+  bash scripts/backup-server-admin.sh </dev/null > "$WRAPPER_HOME" 2>&1 || true
+if grep -q "^传输身份指纹: $BACKUP_REMOTE_SERVER_KEY" "$WRAPPER_HOME" \
+   && grep -q '5. 服务器身份信息' "$WRAPPER_HOME"; then
+  record_pass "菜单首页直接显示指纹，并且第 5 项就是“服务器身份信息”"
+else
+  record_fail "菜单首页" "$(head -8 "$WRAPPER_HOME" | tr '\n' ' ')"
 fi
 
 # ---- 5. list-users 正确 ----
@@ -325,9 +436,13 @@ else
 fi
 
 # 数据目录锁：同一个 root 上不允许起第二个服务端。
+# 第二个实例同样带上 --transport-key-file：PR #21 起缺这个参数会直接以用法
+# 错误退出，那样下面就会因为"参数不全"而不是"目录锁"退出——断言虽然还是
+# 检查 "already using the data directory"，但测的就不是锁了。
 SECOND_PORT=$((PORT + 1))
 ./build/backup-server --bind 127.0.0.1 --port "$SECOND_PORT" --root "$DATA" --db "$DB" \
-  --secret-file "$SECRET" --quiet > "$TEST_ROOT/logs/second.log" 2>&1 &
+  --secret-file "$SECRET" --transport-key-file "$TRANSPORT_KEY" \
+  --quiet > "$TEST_ROOT/logs/second.log" 2>&1 &
 SECOND_PID=$!
 sleep 1
 if kill -0 "$SECOND_PID" 2>/dev/null; then
@@ -596,6 +711,15 @@ if [ "$SRC_WRAP_OK" = "1" ] \
 else
   record_fail "源码树 wrapper 的逃生口" \
     "$(head -3 "$TEST_ROOT/wrapper-src-ok.txt" | tr '\n' ' ')"
+fi
+# 服务端已经停掉的情况下，指纹仍然看得到（退到部署约定路径），而且首页那一行
+# 与客户端 pin 是同一串——"抄指纹"这条流程不依赖服务端是否在运行。
+if grep -q "^传输身份指纹: $BACKUP_REMOTE_SERVER_KEY" \
+     "$TEST_ROOT/wrapper-src-ok.txt"; then
+  record_pass "服务端停止后：首页指纹仍然等于客户端 pin（部署约定路径）"
+else
+  record_fail "服务端停止后的首页指纹" \
+    "$(grep -m1 '传输身份指纹' "$TEST_ROOT/wrapper-src-ok.txt" | tr '\n' ' ')"
 fi
 
 finish
