@@ -21,6 +21,7 @@
 #include "file_io.h"
 #include "remote_backup_client.h"
 #include "remote_server.h"
+#include "remote_test_support.h"
 #include "test_support.h"
 
 namespace bp = backupproject;
@@ -129,6 +130,9 @@ struct Fixture {
   net::RemoteServerConfig config;
   std::string base;
   std::string root;
+  // PR #21：BPSEC1 的服务端身份私钥与客户端 pin 文本（同一次生成）。
+  std::string transport_key_file;
+  std::string pin;
 };
 
 bool SetupFixture(Fixture* fixture, const std::string& name) {
@@ -143,11 +147,21 @@ bool SetupFixture(Fixture* fixture, const std::string& name) {
                                "BACKUP_TOKEN_SECRET=" + secret + "\n", 0600)) {
     return false;
   }
+  // BPSEC1 身份密钥：服务端每个连接的第一步就是它，缺了 Start() 直接失败。
+  fixture->transport_key_file = fixture->base + "/transport.key";
+  net::TransportIdentity identity;
+  std::string identity_error;
+  if (!remote_test_support::PrepareTransportIdentity(
+          fixture->transport_key_file, &identity, &fixture->pin,
+          &identity_error)) {
+    return false;
+  }
   fixture->config.bind_address = "127.0.0.1";
   fixture->config.port = 0;
   fixture->config.root_directory = fixture->root;
   fixture->config.database_path = fixture->base + "/state/metadata.sqlite3";
   fixture->config.secret_file_path = fixture->base + "/secrets.env";
+  fixture->config.transport_key_file_path = fixture->transport_key_file;
   fixture->config.quiet = true;
   fixture->config.worker_count = 2;
   return true;
@@ -176,8 +190,20 @@ int main() {
     net::RemoteEndpoint endpoint;
     endpoint.host = "127.0.0.1";
     endpoint.port = server.bound_port();
+    // BPSEC1 不做 TOFU：没有 pin 的端点连不上，所以每次都带上 fixture 的 pin。
+    endpoint.server_key_pin = fixture.pin;
     test_support::Check(client.Connect(endpoint, &error), "CLI T1 连接成功",
                         error);
+    // 反过来也要钉死：没配 pin 的端点必须**连不上**（拒绝 TOFU），而不是悄悄
+    // 退回明文 BPNET1。
+    net::RemoteEndpoint unconfigured_endpoint = endpoint;
+    unconfigured_endpoint.server_key_pin.clear();
+    net::RemoteArchiveClient unconfigured;
+    std::string unconfigured_error;
+    test_support::Check(!unconfigured.Connect(unconfigured_endpoint,
+                                             &unconfigured_error),
+                        "CLI T1 没配 pin 的端点连接失败（不做 TOFU）",
+                        unconfigured_error);
     std::string software;
     std::uint16_t version = 0;
     std::uint64_t server_time = 0;
@@ -248,6 +274,8 @@ int main() {
     net::RemoteEndpoint endpoint;
     endpoint.host = "127.0.0.1";
     endpoint.port = server.bound_port();
+    // BPSEC1 不做 TOFU：没有 pin 的端点连不上，所以每次都带上 fixture 的 pin。
+    endpoint.server_key_pin = fixture.pin;
     client.Connect(endpoint, &error);
     const std::string username = "xfer-" + RandomHex(4);
     const std::string password = RandomHex(16);
@@ -339,6 +367,8 @@ int main() {
     net::RemoteEndpoint endpoint;
     endpoint.host = "127.0.0.1";
     endpoint.port = server.bound_port();
+    // BPSEC1 不做 TOFU：没有 pin 的端点连不上，所以每次都带上 fixture 的 pin。
+    endpoint.server_key_pin = fixture.pin;
     client.Connect(endpoint, &error);
     const std::string username = "fail-" + RandomHex(4);
     const std::string password = RandomHex(16);
@@ -410,6 +440,8 @@ int main() {
     net::RemoteEndpoint endpoint;
     endpoint.host = "127.0.0.1";
     endpoint.port = server.bound_port();
+    // BPSEC1 不做 TOFU：没有 pin 的端点连不上，所以每次都带上 fixture 的 pin。
+    endpoint.server_key_pin = fixture.pin;
     client.Connect(endpoint, &error);
     const std::string username = "pub-" + RandomHex(4);
     const std::string password = RandomHex(16);
@@ -534,6 +566,8 @@ int main() {
     net::RemoteEndpoint endpoint;
     endpoint.host = "127.0.0.1";
     endpoint.port = server.bound_port();
+    // BPSEC1 不做 TOFU：没有 pin 的端点连不上，所以每次都带上 fixture 的 pin。
+    endpoint.server_key_pin = fixture.pin;
     client.Connect(endpoint, &error);
     const std::string username = "upabort-" + RandomHex(4);
     const std::string password = RandomHex(16);
@@ -630,6 +664,8 @@ int main() {
     net::RemoteEndpoint endpoint;
     endpoint.host = "127.0.0.1";
     endpoint.port = server.bound_port();
+    // BPSEC1 不做 TOFU：没有 pin 的端点连不上，所以每次都带上 fixture 的 pin。
+    endpoint.server_key_pin = fixture.pin;
     client.Connect(endpoint, &error);
     const std::string username = "dnabort-" + RandomHex(4);
     const std::string password = RandomHex(16);

@@ -24,6 +24,7 @@
 #include "network_protocol.h"
 #include "remote_auth.h"
 #include "remote_server.h"
+#include "remote_test_support.h"
 #include "test_support.h"
 
 namespace bp = backupproject;
@@ -48,6 +49,10 @@ struct Fixture {
   std::string root;
   std::string database;
   std::string secret_file;
+  // PR #21：BPSEC1 的服务端长期身份私钥，以及客户端握手要用的 pin 文本
+  // （"sha256:<指纹>"）。两者来自同一次生成，所以 pin 一定对得上。
+  std::string transport_key_file;
+  std::string pin;
 };
 
 // 隔离的临时目录：root / db / secret 都在里面。
@@ -68,11 +73,22 @@ bool SetupFixture(Fixture* fixture, const std::string& name) {
                                "BACKUP_TOKEN_SECRET=" + secret + "\n", 0600)) {
     return false;
   }
+  // BPSEC1 身份密钥：每个 fixture 一套新的，同时拿到 identity 与 pin 文本。
+  // 服务端在 ServeConnection 的第一步就要用它，缺了它 Start() 直接失败。
+  fixture->transport_key_file = base + "/transport.key";
+  net::TransportIdentity identity;
+  std::string identity_error;
+  if (!remote_test_support::PrepareTransportIdentity(
+          fixture->transport_key_file, &identity, &fixture->pin,
+          &identity_error)) {
+    return false;
+  }
   fixture->config.bind_address = "127.0.0.1";
   fixture->config.port = 0;  // 内核分配端口，测试之间不抢
   fixture->config.root_directory = fixture->root;
   fixture->config.database_path = fixture->database;
   fixture->config.secret_file_path = fixture->secret_file;
+  fixture->config.transport_key_file_path = fixture->transport_key_file;
   fixture->config.quiet = true;
   return true;
 }
@@ -120,15 +136,33 @@ bool PeerClosed(int fd) {
   return got == 0;
 }
 
-net::FrameReadStatus RoundTrip(int fd, std::uint16_t opcode,
-                               std::uint64_t request_id,
+// 客户端侧 BPSEC1 握手。
+//
+// 失败时必须显式 shutdown(SHUT_RDWR)：服务端这时还等在 ServeConnection 的
+// 握手读上，不把这条连接关掉，worker.join() 会永远卡住。
+bool HandshakeClientOrShutdown(int fd, const std::string& pin,
+                               net::SecureChannel* channel,
+                               std::string* error) {
+  if (remote_test_support::HandshakeTestClient(fd, pin, channel, error)) {
+    return true;
+  }
+  ::shutdown(fd, SHUT_RDWR);
+  return false;
+}
+
+// 一次请求 / 响应往返。语义与 PR #20 的 net::SendFrame + net::ReceiveFrame
+// 完全相同，只是帧现在整个走在 BPSEC1 加密记录里。
+net::FrameReadStatus RoundTrip(net::SecureChannel* channel, int fd,
+                               std::uint16_t opcode, std::uint64_t request_id,
                                const std::string& payload,
                                net::FrameHeader* header,
                                std::string* response, std::string* error) {
-  if (!net::SendFrame(fd, opcode, 0, request_id, payload, error)) {
+  if (!remote_test_support::SendTestFrame(channel, fd, opcode, 0, request_id,
+                                          payload, error)) {
     return net::FrameReadStatus::kIoError;
   }
-  return net::ReceiveFrame(fd, header, response, error);
+  return remote_test_support::ReceiveTestFrame(channel, fd, header, response,
+                                               error);
 }
 
 std::string CredentialsPayload(const std::string& username,
@@ -197,6 +231,16 @@ int main() {
     test_support::Check(!server.Configure(config, &error),
                         "SRV T1 io-timeout=0 被拒绝");
     config.io_timeout_seconds = 30;
+    // PR #21：BPSEC1 的服务端身份密钥是**必填项**。空值必须被拒绝——产品里
+    // 没有"不配密钥就退回明文 BPNET1"的分支，所以这里也不能有默认值。
+    config.transport_key_file_path.clear();
+    error.clear();
+    test_support::Check(!server.Configure(config, &error),
+                        "SRV T1 transport-key-file 为空被拒绝");
+    test_support::Check(error.find("transport-key-file") != std::string::npos,
+                        "SRV T1 判别：拒绝理由里点名了 --transport-key-file",
+                        error);
+    config.transport_key_file_path = "/tmp/transport.key";
     error.clear();
     test_support::Check(server.Configure(config, &error),
                         "SRV T1 合法配置被接受", error);
@@ -342,11 +386,18 @@ int main() {
     const int client = ConnectToLoopback(server.bound_port());
     test_support::Check(client >= 0, "SRV T3 客户端连上监听端口");
 
+    // 服务端在说第一句 BPNET1 之前必须先完成 BPSEC1 握手；客户端在**主线程**
+    // 握手，服务端在 worker 线程里跑 ServeConnection，两边不会互相等死。
+    net::SecureChannel channel;
+    test_support::Check(
+        HandshakeClientOrShutdown(client, fixture.pin, &channel, &error),
+        "SRV T3 BPSEC1 握手完成", error);
+
     net::FrameHeader header;
     std::string response;
     const net::FrameReadStatus status =
-        RoundTrip(client, static_cast<std::uint16_t>(net::Opcode::kPing), 7,
-                  std::string(), &header, &response, &error);
+        RoundTrip(&channel, client, static_cast<std::uint16_t>(net::Opcode::kPing),
+                  7, std::string(), &header, &response, &error);
     test_support::Check(status == net::FrameReadStatus::kOk,
                         "SRV T3 PING 收到响应", error);
     test_support::Check(header.opcode ==
@@ -382,11 +433,15 @@ int main() {
     server.Start(&error);
     std::thread worker = ServeOneConnection(&server);
     const int client = ConnectToLoopback(server.bound_port());
+    net::SecureChannel channel;
+    test_support::Check(
+        HandshakeClientOrShutdown(client, fixture.pin, &channel, &error),
+        "SRV T4 BPSEC1 握手完成", error);
 
     net::FrameHeader header;
     std::string response;
     net::FrameReadStatus status = RoundTrip(
-        client, static_cast<std::uint16_t>(net::Opcode::kList), 11,
+        &channel, client, static_cast<std::uint16_t>(net::Opcode::kList), 11,
         std::string(), &header, &response, &error);
     test_support::Check(status == net::FrameReadStatus::kOk &&
                             header.status == static_cast<std::uint32_t>(
@@ -398,7 +453,7 @@ int main() {
     net::PayloadBuilder credentials;
     credentials.AppendString("night-user", net::kMaxUsernameBytes, &error);
     credentials.AppendString("secret-password", net::kMaxPasswordBytes, &error);
-    status = RoundTrip(client, static_cast<std::uint16_t>(net::Opcode::kLogin),
+    status = RoundTrip(&channel, client, static_cast<std::uint16_t>(net::Opcode::kLogin),
                        12, credentials.data(), &header, &response, &error);
     test_support::Check(status == net::FrameReadStatus::kOk &&
                             header.status == static_cast<std::uint32_t>(
@@ -408,7 +463,7 @@ int main() {
 
     error.clear();
     // 传输类操作码在第三个 commit 之前**如实**回答"不支持"。
-    status = RoundTrip(client,
+    status = RoundTrip(&channel, client,
                        static_cast<std::uint16_t>(net::Opcode::kUploadBegin),
                        17, std::string(), &header, &response, &error);
     test_support::Check(status == net::FrameReadStatus::kOk &&
@@ -418,7 +473,7 @@ int main() {
                         net::StatusName(header.status));
 
     error.clear();
-    status = RoundTrip(client, 9999, 13, std::string(), &header, &response,
+    status = RoundTrip(&channel, client, 9999, 13, std::string(), &header, &response,
                        &error);
     test_support::Check(status == net::FrameReadStatus::kOk &&
                             header.opcode == static_cast<std::uint16_t>(
@@ -429,16 +484,18 @@ int main() {
 
     error.clear();
     // 请求帧里的 status 必须是 0。
-    net::SendFrame(client, static_cast<std::uint16_t>(net::Opcode::kPing), 5,
-                   14, std::string(), &error);
-    status = net::ReceiveFrame(client, &header, &response, &error);
+    remote_test_support::SendTestFrame(
+        &channel, client, static_cast<std::uint16_t>(net::Opcode::kPing), 5, 14,
+        std::string(), &error);
+    status = remote_test_support::ReceiveTestFrame(&channel, client, &header,
+                                                  &response, &error);
     test_support::Check(status == net::FrameReadStatus::kOk &&
                             header.status == static_cast<std::uint32_t>(
                                                 net::Status::kInvalidRequest),
                         "SRV T4 请求帧带非 0 status 被拒绝");
 
     error.clear();
-    status = RoundTrip(client, static_cast<std::uint16_t>(net::Opcode::kPing),
+    status = RoundTrip(&channel, client, static_cast<std::uint16_t>(net::Opcode::kPing),
                        15, "unexpected", &header, &response, &error);
     test_support::Check(status == net::FrameReadStatus::kOk &&
                             header.status == static_cast<std::uint32_t>(
@@ -447,7 +504,7 @@ int main() {
 
     // 连接仍然可用：上面的错误都没有把连接打掉。
     error.clear();
-    status = RoundTrip(client, static_cast<std::uint16_t>(net::Opcode::kPing),
+    status = RoundTrip(&channel, client, static_cast<std::uint16_t>(net::Opcode::kPing),
                        16, std::string(), &header, &response, &error);
     test_support::Check(status == net::FrameReadStatus::kOk &&
                             header.status ==
@@ -468,6 +525,16 @@ int main() {
     server.Start(&error);
     std::thread worker = ServeOneConnection(&server);
     const int client = ConnectToLoopback(server.bound_port());
+    net::SecureChannel channel;
+    test_support::Check(
+        HandshakeClientOrShutdown(client, fixture.pin, &channel, &error),
+        "SRV T5 BPSEC1 握手完成", error);
+
+    // 这一节测的是"帧头本身非法时服务端怎么处理"。BPSEC1 把整个帧（含帧头）
+    // 当成记录的明文，所以畸形帧不能再明文写进 socket：那样写出来的是一条 tag
+    // 不对的记录，服务端在记录层就断连，帧头的判别根本走不到。改用
+    // channel.SendRecord()——它送出的是**合法记录的合法明文**，服务端解出来的
+    // 字节与 PR #20 里完全一样，测的仍然是原来那条产品路径。
 
     // 1) 错版本：回 UNSUPPORTED_VERSION，连接继续。
     net::FrameHeader header;
@@ -476,11 +543,14 @@ int main() {
     header.request_id = 21;
     header.payload_length = 0;
     std::string encoded = net::EncodeFrameHeader(header);
-    net::SendAll(client, encoded.data(), encoded.size(), &error);
+    error.clear();
+    test_support::Check(channel.SendRecord(client, encoded, &error),
+                        "SRV T5 夹具：错版本帧作为合法记录发出", error);
+    error.clear();
     net::FrameHeader response_header;
     std::string response;
-    net::FrameReadStatus status =
-        net::ReceiveFrame(client, &response_header, &response, &error);
+    net::FrameReadStatus status = remote_test_support::ReceiveTestFrame(
+        &channel, client, &response_header, &response, &error);
     test_support::Check(status == net::FrameReadStatus::kOk &&
                             response_header.opcode ==
                                 static_cast<std::uint16_t>(net::Opcode::kError) &&
@@ -496,19 +566,27 @@ int main() {
     header.request_id = 22;
     encoded = net::EncodeFrameHeader(header);
     error.clear();
-    net::SendAll(client, encoded.data(), encoded.size(), &error);
-    status = net::ReceiveFrame(client, &response_header, &response, &error);
+    test_support::Check(channel.SendRecord(client, encoded, &error),
+                        "SRV T5 夹具：reserved 非 0 的帧作为合法记录发出",
+                        error);
+    error.clear();
+    status = remote_test_support::ReceiveTestFrame(&channel, client,
+                                                   &response_header, &response,
+                                                   &error);
     test_support::Check(status == net::FrameReadStatus::kOk &&
                             response_header.status ==
                                 static_cast<std::uint32_t>(
                                     net::Status::kMalformedFrame),
                         "SRV T5 reserved 非 0 回 MALFORMED_FRAME", error);
 
-    // 3) 假 magic：必须断开。
+    // 3) 假 magic：必须断开。假 magic 与"记录被改坏"是两件事：这里记录本身
+    //    完好（tag 正确），坏的是记录里面的帧头，所以服务端必须按帧协议
+    //    kCorruptStream 处理并断连。
     std::string bad_magic = net::EncodeFrameHeader(header);
     bad_magic[0] = 'X';
     error.clear();
-    net::SendAll(client, bad_magic.data(), bad_magic.size(), &error);
+    test_support::Check(channel.SendRecord(client, bad_magic, &error),
+                        "SRV T5 夹具：假 magic 的帧作为合法记录发出", error);
     test_support::Check(PeerClosed(client),
                         "SRV T5 假 magic 之后服务端断开连接");
     ::close(client);
@@ -517,12 +595,17 @@ int main() {
     // 4) 超大长度：必须断开（新连接）。
     std::thread second_worker = ServeOneConnection(&server);
     const int client2 = ConnectToLoopback(server.bound_port());
+    net::SecureChannel second_channel;
+    test_support::Check(
+        HandshakeClientOrShutdown(client2, fixture.pin, &second_channel, &error),
+        "SRV T5 第二条连接 BPSEC1 握手完成", error);
     std::string huge = net::EncodeFrameHeader(header);
     for (int index = 24; index < 32; ++index) {
       huge[index] = static_cast<char>(0xFF);
     }
     error.clear();
-    net::SendAll(client2, huge.data(), huge.size(), &error);
+    test_support::Check(second_channel.SendRecord(client2, huge, &error),
+                        "SRV T5 夹具：超大长度的帧作为合法记录发出", error);
     test_support::Check(PeerClosed(client2),
                         "SRV T5 超大 payload 长度之后服务端断开连接");
     ::close(client2);
@@ -576,11 +659,18 @@ int main() {
         all_ok = false;
         continue;
       }
+      net::SecureChannel channel;
+      std::string round_error;
+      if (!HandshakeClientOrShutdown(client, fixture.pin, &channel,
+                                     &round_error)) {
+        all_ok = false;
+        ::close(client);
+        continue;
+      }
       net::FrameHeader header;
       std::string response;
-      std::string round_error;
       const net::FrameReadStatus status = RoundTrip(
-          client, static_cast<std::uint16_t>(net::Opcode::kPing), 31,
+          &channel, client, static_cast<std::uint16_t>(net::Opcode::kPing), 31,
           std::string(), &header, &response, &round_error);
       if (status != net::FrameReadStatus::kOk ||
           header.status != static_cast<std::uint32_t>(net::Status::kOk)) {
@@ -628,6 +718,10 @@ int main() {
     test_support::Check(server.Start(&error), "SRV T9 服务端启动", error);
     std::thread worker = ServeOneConnection(&server);
     const int client = ConnectToLoopback(server.bound_port());
+    net::SecureChannel channel;
+    test_support::Check(
+        HandshakeClientOrShutdown(client, fixture.pin, &channel, &error),
+        "SRV T9 BPSEC1 握手完成", error);
 
     // 用户名与口令全部运行时随机生成；口令不进任何断言文本。
     const std::string username = "night-" + RandomSecretHex().substr(0, 8);
@@ -639,7 +733,7 @@ int main() {
 
     error.clear();
     net::FrameReadStatus status = RoundTrip(
-        client, static_cast<std::uint16_t>(net::Opcode::kList), 40,
+        &channel, client, static_cast<std::uint16_t>(net::Opcode::kList), 40,
         std::string(), &header, &response, &error);
     test_support::Check(status == net::FrameReadStatus::kOk &&
                             header.status == static_cast<std::uint32_t>(
@@ -647,7 +741,7 @@ int main() {
                         "SRV T9 没登录就 LIST = UNAUTHORIZED", error);
 
     error.clear();
-    status = RoundTrip(client, static_cast<std::uint16_t>(net::Opcode::kRegister),
+    status = RoundTrip(&channel, client, static_cast<std::uint16_t>(net::Opcode::kRegister),
                        41, CredentialsPayload(username, password), &header,
                        &response, &error);
     test_support::Check(status == net::FrameReadStatus::kOk &&
@@ -656,7 +750,7 @@ int main() {
                         "SRV T9 注册成功", net::StatusName(header.status));
 
     error.clear();
-    status = RoundTrip(client, static_cast<std::uint16_t>(net::Opcode::kRegister),
+    status = RoundTrip(&channel, client, static_cast<std::uint16_t>(net::Opcode::kRegister),
                        42, CredentialsPayload(username, password), &header,
                        &response, &error);
     test_support::Check(status == net::FrameReadStatus::kOk &&
@@ -666,7 +760,7 @@ int main() {
                         net::StatusName(header.status));
 
     error.clear();
-    status = RoundTrip(client, static_cast<std::uint16_t>(net::Opcode::kRegister),
+    status = RoundTrip(&channel, client, static_cast<std::uint16_t>(net::Opcode::kRegister),
                        43, CredentialsPayload("a/b", password), &header,
                        &response, &error);
     test_support::Check(status == net::FrameReadStatus::kOk &&
@@ -675,7 +769,7 @@ int main() {
                         "SRV T9 非法用户名注册 = INVALID_REQUEST");
 
     error.clear();
-    status = RoundTrip(client, static_cast<std::uint16_t>(net::Opcode::kRegister),
+    status = RoundTrip(&channel, client, static_cast<std::uint16_t>(net::Opcode::kRegister),
                        44, CredentialsPayload("okname", "short"), &header,
                        &response, &error);
     test_support::Check(status == net::FrameReadStatus::kOk &&
@@ -685,7 +779,7 @@ int main() {
 
     error.clear();
     std::string trailing = CredentialsPayload(username, password) + "junk";
-    status = RoundTrip(client, static_cast<std::uint16_t>(net::Opcode::kRegister),
+    status = RoundTrip(&channel, client, static_cast<std::uint16_t>(net::Opcode::kRegister),
                        45, trailing, &header, &response, &error);
     test_support::Check(status == net::FrameReadStatus::kOk &&
                             header.status == static_cast<std::uint32_t>(
@@ -693,7 +787,7 @@ int main() {
                         "SRV T9 带尾部垃圾的凭证帧 = INVALID_REQUEST");
 
     error.clear();
-    status = RoundTrip(client, static_cast<std::uint16_t>(net::Opcode::kLogin),
+    status = RoundTrip(&channel, client, static_cast<std::uint16_t>(net::Opcode::kLogin),
                        46, CredentialsPayload(username, wrong_password), &header,
                        &response, &error);
     test_support::Check(status == net::FrameReadStatus::kOk &&
@@ -703,7 +797,7 @@ int main() {
                         net::StatusName(header.status));
 
     error.clear();
-    status = RoundTrip(client, static_cast<std::uint16_t>(net::Opcode::kLogin),
+    status = RoundTrip(&channel, client, static_cast<std::uint16_t>(net::Opcode::kLogin),
                        47, CredentialsPayload("no-such-user", password), &header,
                        &response, &error);
     test_support::Check(status == net::FrameReadStatus::kOk &&
@@ -712,7 +806,7 @@ int main() {
                         "SRV T9 不存在的用户与口令错误回答一致（不泄漏存在性）");
 
     error.clear();
-    status = RoundTrip(client, static_cast<std::uint16_t>(net::Opcode::kLogin),
+    status = RoundTrip(&channel, client, static_cast<std::uint16_t>(net::Opcode::kLogin),
                        48, CredentialsPayload(username, password), &header,
                        &response, &error);
     test_support::Check(status == net::FrameReadStatus::kOk &&
@@ -731,7 +825,7 @@ int main() {
                         "SRV T9 判别：token 里既没有用户名也没有口令");
 
     error.clear();
-    status = RoundTrip(client, static_cast<std::uint16_t>(net::Opcode::kRegister),
+    status = RoundTrip(&channel, client, static_cast<std::uint16_t>(net::Opcode::kRegister),
                        49, CredentialsPayload("another-user", password), &header,
                        &response, &error);
     test_support::Check(status == net::FrameReadStatus::kOk &&
@@ -740,7 +834,7 @@ int main() {
                         "SRV T9 登录之后再 REGISTER = INVALID_STATE");
 
     error.clear();
-    status = RoundTrip(client, static_cast<std::uint16_t>(net::Opcode::kList), 50,
+    status = RoundTrip(&channel, client, static_cast<std::uint16_t>(net::Opcode::kList), 50,
                        std::string(), &header, &response, &error);
     net::PayloadReader list_reader(response);
     std::uint32_t entries = 1;
@@ -753,7 +847,7 @@ int main() {
                         net::StatusName(header.status));
 
     error.clear();
-    status = RoundTrip(client, static_cast<std::uint16_t>(net::Opcode::kLogout),
+    status = RoundTrip(&channel, client, static_cast<std::uint16_t>(net::Opcode::kLogout),
                        51, std::string(), &header, &response, &error);
     test_support::Check(status == net::FrameReadStatus::kOk &&
                             header.status ==
@@ -761,7 +855,7 @@ int main() {
                         "SRV T9 LOGOUT 成功");
 
     error.clear();
-    status = RoundTrip(client, static_cast<std::uint16_t>(net::Opcode::kList), 52,
+    status = RoundTrip(&channel, client, static_cast<std::uint16_t>(net::Opcode::kList), 52,
                        std::string(), &header, &response, &error);
     test_support::Check(status == net::FrameReadStatus::kOk &&
                             header.status == static_cast<std::uint32_t>(
@@ -769,7 +863,7 @@ int main() {
                         "SRV T9 判别：LOGOUT 之后 LIST 回到 UNAUTHORIZED");
 
     error.clear();
-    status = RoundTrip(client, static_cast<std::uint16_t>(net::Opcode::kLogout),
+    status = RoundTrip(&channel, client, static_cast<std::uint16_t>(net::Opcode::kLogout),
                        53, std::string(), &header, &response, &error);
     test_support::Check(status == net::FrameReadStatus::kOk &&
                             header.status == static_cast<std::uint32_t>(
@@ -782,8 +876,13 @@ int main() {
     // 换一条连接重新登录：证明账号真的落在了 SQLite 里，而不是只在会话内存里。
     std::thread second_worker = ServeOneConnection(&server);
     const int again = ConnectToLoopback(server.bound_port());
+    net::SecureChannel again_channel;
+    test_support::Check(
+        HandshakeClientOrShutdown(again, fixture.pin, &again_channel, &error),
+        "SRV T9 第二条连接 BPSEC1 握手完成", error);
     error.clear();
-    status = RoundTrip(again, static_cast<std::uint16_t>(net::Opcode::kLogin), 54,
+    status = RoundTrip(&again_channel, again,
+                       static_cast<std::uint16_t>(net::Opcode::kLogin), 54,
                        CredentialsPayload(username, password), &header,
                        &response, &error);
     test_support::Check(status == net::FrameReadStatus::kOk &&

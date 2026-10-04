@@ -1,4 +1,4 @@
-# 远程备份使用说明（PR #20 Network Backup Foundation）
+# 远程备份使用说明（PR #21：BPSEC1 传输加密 + 远端增量）
 
 本文说明怎么用 backup-server + BPNET1 + backupctl remote 把本地已经生成并
 验证过的 .bak 归档送到远端（当前部署在阿里云 ECS），以及再取回来恢复。
@@ -24,24 +24,45 @@
 ## 2. 拓扑与传输加密
 
     backupctl / Modern GUI
+        |  BPSEC1（X25519 握手 + AES-256-CTR + HMAC-SHA256）  <- 机密性在这一层
         |  127.0.0.1:18765
-        |  SSH encrypted tunnel
+        |  SSH encrypted tunnel                                <- 部署层纵深防御
         v
     ECS 127.0.0.1:18765 -> backup-server
 
 * backup-server **只**绑 127.0.0.1，不绑 0.0.0.0，也不对外开放安全组。这是一条
   **硬约束**，不是默认值：Configure() 对任何非 127.0.0.1 的 --bind
   （0.0.0.0 / 私网地址 / 公网地址 / 127.0.0.2）都直接拒绝启动并说明原因，
-  没有 --insecure / --allow-public 之类的开关。理由是本版本没有原生 TLS：
-  既然机密性由 SSH 隧道提供，监听地址就只能是被隧道指向的那个环回地址。
+  没有 --insecure / --allow-public 之类的开关。理由与加密无关（业务流量的
+  机密性由 BPSEC1 提供，见 2.2）：只该由隧道访问的端口直接暴露在共享网络上
+  没有任何好处，所以这条 fail-closed 规则继续保留。
 * 本机用 SSH 隧道把 127.0.0.1:18765 转到 ECS 的 127.0.0.1:18765：
 
       ssh -o BatchMode=yes -o ExitOnForwardFailure=yes -N \
           -L 127.0.0.1:18765:127.0.0.1:18765 aliyun-ecs
 
-* **BPNET1 本身没有原生 TLS**：当前的传输机密性完全来自它跑在 SSH 隧道里。
-  代码结构把"连接 + 收发"限制在一个很小的接口上，将来替换成 TLS 不需要动
-  协议语义，但**本版本没有实现原生 TLS**，不要当成已有能力。
+* **BPNET1 的每一个字节都由 BPSEC1 保护**（PR #21）：整帧（含帧头里的
+  opcode / status / 长度）作为明文加密封装成记录，Encrypt-then-MAC，序号严格
+  递增抗重放。服务端有长期 X25519 身份密钥，客户端必须事先 pin 住它——没有
+  配置 pin 就拒绝连接，本项目**不做**"第一次见到谁就信谁"。
+* **BPSEC1 不是 TLS，也不与 TLS 兼容**：它是本项目自己实现的教学协议，
+  没有经过外部审计。安全性质、明确的非目标与已知限制见 docs/secure_transport.md。
+
+### 2.2 传输加密（BPSEC1）
+
+    服务端：backup-server-keygen --output <服务器上的私钥文件>   # 0600，只在本机
+    客户端：backupctl remote ... --server-key sha256:<指纹>
+            （或把同一个值放进环境变量 BACKUP_REMOTE_SERVER_KEY）
+
+* 服务端启动必须带 --transport-key-file <文件>（缺了直接以用法错误退出，
+  没有"不加密也能连"的模式）；私钥只在服务器上存在，不进 Git、不进日志、不进 ZIP。
+* 公钥与指纹不是秘密：backup-server-keygen --show --key-file <文件> 会打印
+  "sha256:<指纹>" 与 "hex:<公钥>" 两种可直接使用的 pin。
+* 每次 TCP 连接都会重新握手、重新派生会话密钥；连接断了重连就必须重新握手，
+  然后照旧用 RESUME 恢复 token 会话（连接与会话仍然是两件事，见 2.1）。
+* 握手失败、pin 不符、记录校验失败、重放/乱序：一律断连，并且**绝不**退回明文。
+  错误分类（server-key-mismatch / record-authentication-failed / ...）会原样
+  出现在 CLI 与 GUI 的错误信息里。
 
 ## 2.1 连接与会话是两件事
 
@@ -149,9 +170,9 @@ ECS，再在 ECS 本机运行 backup-server-admin：
     ./bin/backup-server-admin.sh          # 交互菜单（推荐）
     ./bin/backup-server-admin --help      # 子命令用法
 
-菜单三块：用户管理（列表 / 详情 / 删除用户及其全部备份）、备份文件管理
+菜单四块：用户管理（列表 / 详情 / 删除用户及其全部备份）、备份文件管理
 （按用户列出 / 详情 / 删除单个快照）、存储概览（用户数 / 快照总数 / blob 总
-大小 / 占用最多的用户），外加服务状态。
+大小 / 占用最多的用户）、**服务器身份信息**，外加服务状态。
 
 **每一次运行都会先打印"我在看哪个实例"**：
 
@@ -160,11 +181,26 @@ ECS，再在 ECS 本机运行 backup-server-admin：
     Data root:   /home/ubuntu/backup-project-server/data
     Metadata DB: /home/ubuntu/backup-project-server/state/metadata.sqlite3
     Service:     backup-server 正在运行（pid=… started_at=…）
+    传输身份指纹: sha256:<64 位小写十六进制>
+                  来源: 正在运行的 backup-server（pid …）加载的身份私钥
 
     用户数：12　快照数：0　blob 总大小：0 B　已注销账户：9
 
 路径一律显示 realpath 之后的绝对路径：脱离上下文的相对路径正是"看错实例"的
 温床（见下面那条 P0）。
+
+**传输身份指纹就在首页那一行上**（客户端要填的就是它）：
+
+* 它来自**当前真正在服役的那把身份私钥**：先看正在运行的 `backup-server` 命令行里的
+  `--transport-key-file`（只读 `/proc/<pid>/cmdline`，不发信号、不连端口），取不到才退到部署
+  约定路径 `<server-root>/state/transport.key`；
+* 读私钥用服务端与 `backup-server-keygen` 共用的同一个函数，算指纹也是同一个函数——这里
+  **没有**第二份 X25519 实现，所以"显示的指纹 == 服务端在用的身份"不是靠约定，
+  而是靠同一份代码；
+* 全程**只读**：不启动 / 不停止服务，不生成 / 不修改 / 不移动任何密钥文件；
+  读不到时只打印一行「传输身份指纹: 不可用」+ 原因，其余输出照常；
+* 菜单第 5 项「服务器身份信息」显示完整的 Fingerprint 与 Public key
+  （`transport-identity` 子命令），**永远不打印私钥**。
 
 **用户选择器：不会替你猜**（`show-user` / `list-snapshots` / `--user`）：
 
@@ -227,9 +263,65 @@ scripts/backup-server-admin.sh 一起装到 ECS 的 bin/ 下。
 
 ## 6. 当前限制
 
-* 原生 TLS 未实现，机密性依赖 SSH 隧道。
+* BPSEC1 是本项目手写的教学协议：不是 TLS、没有外部审计、没有形式化验证。
+  它提供机密性、完整性、服务端身份 pin、抗重放与每连接前向保密；
+  **不**声称与任何标准传输层兼容。
 * 没有 systemd / 守护进程化；服务端就是前台进程 + PID 文件。
-* 不支持断点续传（resume），也不支持远程块级增量（delta）。
+* 不支持断点续传（resume）：一次被中断的上传/下载会在服务端清理临时文件，
+  用户需要重新执行该命令。
+* 远端增量（PR #21）已经可用：remote backup / remote restore 会复用本地
+  增量引擎生成与恢复 delta 链，链关系（父 / 代数 / lineage）由服务端校验，
+  依赖感知删除保证链不会从中间断开。用法与限制见 docs/remote_incremental.md。
+* 同一套能力在 **Modern GUI** 的远程页上也有：远端备份（源目录 + 完整/增量）、
+  云端快照列表（类型 / 代数 / 父）与链恢复。GUI 与 CLI 走**同一个** core
+  （RunRemoteBackup / RunRemoteRestore），GUI 侧不做任何增量判断。
+* 云端列表里的对象有**三类**，界面上是三个词、一眼可分（判定只用服务端已有的
+  lineage 与 snapshot_kind，不按文件名猜）：
+
+      [原始归档]  lineage 为空：手动上传的归档。没有父、没有代数，
+                  主操作是「恢复」（下载 → SHA-256 校验 → 按本地格式独立恢复）
+      [完整备份]  lineage 非空、kind=full：链根，代数 0，主操作「恢复」
+      [增量备份]  kind=incremental：代数 N + 父快照前 12 位，主操作「恢复」
+
+  三种类型的主操作**都叫「恢复」**：用户不需要理解 raw / 产品级 / 链恢复这些
+  内部 pipeline 差异，那是类型 badge 与说明行要说的事。内部实现当然还是两条路：
+  产品级（完整 / 增量）自动取回整条依赖链（RunRemoteRestore）；原始归档走
+  **既有的**本地恢复核心（BackupEngine / RunRestorePipeline），不是链恢复。
+
+  原始归档的恢复对话框分两段，分界线是 core 给出的事实而不是猜测：
+
+      * 第一段只问目标目录。点「恢复」就是明确意图，不会再问一次"确定吗"；
+      * 只有 core 明确回来说"这份备份是加密的、需要密码"，才出现密码输入框
+        （掩码）。输错密码会明确说"密码错误，或备份完整性校验失败"，可以接着
+        重输——用的是**同一份已经下载并校验过的字节**，不会重新下载。
+
+  随机文件 / 损坏 / 版本不支持 / 单独的 delta / 下载校验失败都会**明确失败**
+  （各自一句可照做的中文，不是笼统的"恢复失败"），且不会在目标目录留下半成品。
+  上传/下载原始归档仍然单独放在"高级"区域。
+* 长操作进行中，远程页上会直接显示"现在正在做什么"（内容来自控制器的
+  busyAction，不是估算出来的进度），同时备份 / 恢复 / 删除 / 上传 / 刷新 /
+  退出登录等冲突操作在界面上全部不可用；控制器层的闸门另有回归（同一事件
+  循环回合里的第二个请求一定被拒）。
+* 长操作进行中，远程页上会直接显示"现在正在做什么"（内容来自控制器的
+  busyAction，不是估算出来的进度），同时备份 / 恢复 / 删除 / 上传 / 刷新 /
+  退出登录等冲突操作在界面上全部不可用；控制器层的闸门另有回归（同一事件
+  循环回合里的第二个请求一定被拒）。
+* 长操作进行中，远程页上会直接显示"现在正在做什么"（内容来自控制器的
+  busyAction，不是估算出来的进度），同时备份 / 恢复 / 删除 / 上传 / 刷新 /
+  退出登录等冲突操作在界面上全部不可用；控制器层的闸门另有回归（同一事件
+  循环回合里的第二个请求一定被拒）。
+* 长操作进行中，远程页上会直接显示"现在正在做什么"（内容来自控制器的
+  busyAction，不是估算出来的进度），同时备份 / 恢复 / 删除 / 上传 / 刷新 /
+  退出登录等冲突操作在界面上全部不可用；控制器层的闸门另有回归（同一事件
+  循环回合里的第二个请求一定被拒）。
+* 长操作进行中，远程页上会直接显示"现在正在做什么"（内容来自控制器的
+  busyAction，不是估算出来的进度），同时备份 / 恢复 / 删除 / 上传 / 刷新 /
+  退出登录等冲突操作在界面上全部不可用；控制器层的闸门另有回归（同一事件
+  循环回合里的第二个请求一定被拒）。
+* 长操作进行中，远程页上会直接显示"现在正在做什么"（内容来自控制器的
+  busyAction，不是估算出来的进度），同时备份 / 恢复 / 删除 / 上传 / 刷新 /
+  退出登录等冲突操作在界面上全部不可用；控制器层的闸门另有回归（同一事件
+  循环回合里的第二个请求一定被拒）。
 * token 在有效期内无法单独吊销（服务端无会话状态）；轮换
   BACKUP_TOKEN_SECRET 会让所有已签发 token 立即失效。唯一的例外是账户
   注销：账户行不存在之后，旧 token 在任何操作上都会被拒绝（每次操作都会
@@ -246,6 +338,8 @@ scripts/backup-server-admin.sh 一起装到 ECS 的 bin/ 下。
 
 ## 7. 测试
 
+    bash scripts/secure_transport_test.sh   # BPSEC1：官方向量 / 握手 / 线上字节
+                                            #   捕获 / 篡改矩阵 / pin 校验
     bash scripts/network_test.sh            # 单元 + 本地 CLI 端到端
                                             #   （含 remote_sequence_test：
                                             #    空闲超时 / 错误口令 × 6 /
@@ -254,6 +348,52 @@ scripts/backup-server-admin.sh 一起装到 ECS 的 bin/ 下。
     bash scripts/account_deletion_test.sh   # 账户注销端到端（真实服务端 + 磁盘）
     bash scripts/same_instance_truth_test.sh # 四源一致性（客户端/管理 CLI/DB/进程）
     bash scripts/aliyun_truth_matrix.sh      # ECS 真机三方真值矩阵
+    bash scripts/modern_gui_check.sh        # Modern GUI：页面 / 几何 / 0 QML 告警，
+                                            #   含 --remote-test 的远程页合同自检
+                                            #   （远端备份 / 增量 / 无变化 / 链恢复 /
+                                            #    冷缓存 / 原始归档区分 / pin / 忙碌）
+    # PR #21 无人值守 GUI 验收：真实窗口截图（浅色 / 深色 / 900x700）+
+    #   关键控件几何断言 + 产品状态机（完整 / 增量 / 回退成完整基线 / 无变化 /
+    #   原始归档区分 / 冷缓存链恢复 / 错 pin / 空闲重连 + RESUME / 忙碌）
+    #   口令与指纹只走环境变量，不进 argv：
+    #     BACKUP_REMOTE_PASSWORD=<口令> BACKUP_REMOTE_PIN=<sha256:...> \
+    #     QT_QPA_PLATFORM=offscreen build/backup-gui-modern --remote-acceptance \
+    #       <输出目录> <地址> <端口> <用户名>
+    # PR #21 无人值守 GUI 验收：真实窗口截图（浅色 / 深色 / 900x700）+
+    #   关键控件几何断言 + 产品状态机（完整 / 增量 / 回退成完整基线 / 无变化 /
+    #   原始归档区分 / 冷缓存链恢复 / 错 pin / 空闲重连 + RESUME / 忙碌）
+    #   口令与指纹只走环境变量，不进 argv：
+    #     BACKUP_REMOTE_PASSWORD=<口令> BACKUP_REMOTE_PIN=<sha256:...> \
+    #     QT_QPA_PLATFORM=offscreen build/backup-gui-modern --remote-acceptance \
+    #       <输出目录> <地址> <端口> <用户名>
+    # PR #21 无人值守 GUI 验收：真实窗口截图（浅色 / 深色 / 900x700）+
+    #   关键控件几何断言 + 产品状态机（完整 / 增量 / 回退成完整基线 / 无变化 /
+    #   原始归档区分 / 冷缓存链恢复 / 错 pin / 空闲重连 + RESUME / 忙碌）
+    #   口令与指纹只走环境变量，不进 argv：
+    #     BACKUP_REMOTE_PASSWORD=<口令> BACKUP_REMOTE_PIN=<sha256:...> \
+    #     QT_QPA_PLATFORM=offscreen build/backup-gui-modern --remote-acceptance \
+    #       <输出目录> <地址> <端口> <用户名>
+    # PR #21 无人值守 GUI 验收：真实窗口截图（浅色 / 深色 / 900x700）+
+    #   关键控件几何断言 + 产品状态机（完整 / 增量 / 回退成完整基线 / 无变化 /
+    #   原始归档区分 / 冷缓存链恢复 / 错 pin / 空闲重连 + RESUME / 忙碌）
+    #   口令与指纹只走环境变量，不进 argv：
+    #     BACKUP_REMOTE_PASSWORD=<口令> BACKUP_REMOTE_PIN=<sha256:...> \
+    #     QT_QPA_PLATFORM=offscreen build/backup-gui-modern --remote-acceptance \
+    #       <输出目录> <地址> <端口> <用户名>
+    # PR #21 无人值守 GUI 验收：真实窗口截图（浅色 / 深色 / 900x700）+
+    #   关键控件几何断言 + 产品状态机（完整 / 增量 / 回退成完整基线 / 无变化 /
+    #   原始归档区分 / 冷缓存链恢复 / 错 pin / 空闲重连 + RESUME / 忙碌）
+    #   口令与指纹只走环境变量，不进 argv：
+    #     BACKUP_REMOTE_PASSWORD=<口令> BACKUP_REMOTE_PIN=<sha256:...> \
+    #     QT_QPA_PLATFORM=offscreen build/backup-gui-modern --remote-acceptance \
+    #       <输出目录> <地址> <端口> <用户名>
+    # PR #21 无人值守 GUI 验收：真实窗口截图（浅色 / 深色 / 900x700）+
+    #   关键控件几何断言 + 产品状态机（完整 / 增量 / 回退成完整基线 / 无变化 /
+    #   原始归档区分 / 冷缓存链恢复 / 错 pin / 空闲重连 + RESUME / 忙碌）
+    #   口令与指纹只走环境变量，不进 argv：
+    #     BACKUP_REMOTE_PASSWORD=<口令> BACKUP_REMOTE_PIN=<sha256:...> \
+    #     QT_QPA_PLATFORM=offscreen build/backup-gui-modern --remote-acceptance \
+    #       <输出目录> <地址> <端口> <用户名>
     bash scripts/final_gate.sh               # canonical final gate（全部套件）
     bash scripts/server_admin_test.sh       # ECS 本地管理工具的安全边界
     bash scripts/aliyun_network_e2e.sh      # 阿里云真实端到端（需要隧道前置条件）

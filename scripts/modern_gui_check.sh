@@ -35,7 +35,10 @@
 #      RemoteController 走完 注册 / 登录 / 上传真实归档 / 列表 / 下载 / 删除 /
 #      退出登录，并断言密码回显模式、口令与 token 不落盘、忙碌时冲突请求被拒、
 #      页面提示不外泄、列表行显示名称 / 大小 / 时间、删除必须确认、两套主题
-#      下关键控件几何正常。
+#      下关键控件几何正常。PR #21 起这个真服务端必须带 BPSEC1 身份私钥
+#      （--transport-key-file）启动，客户端必须拿到它的公钥指纹 pin；构建一节
+#      因此同时断言 backup-server-keygen 存在，并断言缺这个参数时服务端以
+#      用法错误（2）退出。
 #
 # 所有 GUI 调用都带 --config-file 指向临时目录，并且导出临时 XDG_CONFIG_HOME：
 # AppTheme 的 QSettings 与 QStandardPaths 都跟着它走，测试绝不读写真实用户配置。
@@ -153,12 +156,39 @@ fi
 
 # 远程备份页的自检要真的起一个服务端进程：它就是与 network_test.sh、阿里云
 # 部署同一个 Makefile 目标产出的那个 backup-server，不是测试专用的假服务端。
-echo "[modern-gui] 1b) 构建 build/backup-server（--remote-test 需要真服务端）"
+# PR #21 起这个服务端**必须**带 --transport-key-file（BPSEC1 传输身份私钥：
+# 32 字节、0600）才能启动，而身份密钥只能用同一个 make server 目标产出的
+# backup-server-keygen 生成 / 查看。--remote-test 在它自己的临时目录里生成
+# 密钥、把公钥指纹（pin）给客户端用；私钥内容不经过这个脚本。
+echo "[modern-gui] 1b) 构建 build/backup-server 与 build/backup-server-keygen（--remote-test 需要真服务端）"
 make server 2>&1 | tee -a "$LOG_FILE" | tail -2
 if [[ -x "$ROOT_DIR/build/backup-server" ]]; then
   record_pass "backup-server 构建产物存在"
 else
   record_fail "backup-server 构建产物缺失"
+fi
+if [[ -x "$ROOT_DIR/build/backup-server-keygen" ]]; then
+  record_pass "backup-server-keygen 构建产物存在（生成 / 查看服务端身份密钥）"
+else
+  record_fail "backup-server-keygen 构建产物缺失（--remote-test 起服务端要用它生成身份密钥）"
+fi
+# 缺 --transport-key-file 时服务端必须**直接以用法错误（2）退出**，而不是
+# "先起来再说"。用端口 0 + 临时目录跑一次：即使这条契约坏了，也只会多出一个
+# 被 timeout 收走的进程，不碰任何真实实例，也不占固定端口。
+mkdir -p "$TEST_STATE_DIR/no-transport-key/data"
+set +e
+timeout 30 ./build/backup-server --bind 127.0.0.1 --port 0 \
+  --root "$TEST_STATE_DIR/no-transport-key/data" \
+  --db "$TEST_STATE_DIR/no-transport-key/state/metadata.sqlite3" \
+  --secret-file "$TEST_STATE_DIR/no-transport-key/secrets.env" \
+  > "$TEST_STATE_DIR/no-transport-key.log" 2>&1
+no_transport_key_status=$?
+set -e
+if [[ "$no_transport_key_status" -eq 2 ]] \
+   && grep -q -- '--transport-key-file' "$TEST_STATE_DIR/no-transport-key.log"; then
+  record_pass "缺少 --transport-key-file 时服务端以用法错误退出（退出码 2）"
+else
+  record_fail "缺少 --transport-key-file 的服务端行为（退出码 $no_transport_key_status，日志 $TEST_STATE_DIR/no-transport-key.log）"
 fi
 
 # offscreen 让没有显示器的环境也能真正把窗口建出来；
@@ -507,8 +537,9 @@ expect_count "$RESOURCE_FILE" "qml/components/RemoteSnapshotCard.qml" 1 \
 expect_count "$QML_DIR/Main.qml" 'objectName: "remoteNavItem"' 1 \
   "侧栏只有一个远程备份入口"
 # 明文常显的密码框在这一页是绝不允许出现的样子。
-# 登录密码 + 注册密码 + 注册确认密码 + 注销确认密码：四个都必须是密码回显。
-expect_count "$REMOTE_PAGE_QML" "echoMode: TextInput.Password" 4 \
+# 登录密码 + 注册密码 + 注册确认密码 + 注销确认密码 + 原始归档的恢复密码：
+# 五个都必须是密码回显。
+expect_count "$REMOTE_PAGE_QML" "echoMode: TextInput.Password" 5 \
   "远程备份页的四个密码框都是密码回显模式"
 # 删除必须经过确认：整页真正调用客户端删除的地方只有一处，
 # 而且列表行只发意图（一个信号声明 + 一个触发）。
@@ -531,14 +562,54 @@ expect_count "$REMOTE_PAGE_QML" "value: remote.progressRatio" 1 \
 expect_count "$REMOTE_PAGE_QML" "remote.transferActive" 1 \
   "进度只在真的有传输时出现"
 # 复用现有组件，而不是另起一套视觉。
-expect_count "$REMOTE_PAGE_QML" "AppCard {" 4 \
-  "远程备份页的四张卡片都用共享 AppCard"
+expect_count "$REMOTE_PAGE_QML" "AppCard {" 5 \
+  "远程备份页的五张卡片都用共享 AppCard（连接 / 远端备份 / 云端备份 / 高级 / 技术详情）"
 expect_count "$REMOTE_PAGE_QML" "StatusBanner {" 1 \
   "远程备份页用共享 StatusBanner"
-# 地址 / 端口 / 用户名 / 登录密码 / 注册密码 / 注册确认 / 上传路径 / 上传名称 /
-# 下载目标 / 注销密码 / 注销账户名 = 11。
-expect_count "$REMOTE_PAGE_QML" "AppTextField {" 11 \
+# 地址 / 端口 / 用户名 / 服务器身份指纹 / 登录密码 / 注册密码 / 注册确认 /
+# 远端备份源目录 / 上传路径 / 上传名称 / 下载目标 / 注销密码 / 注销账户名 /
+# 原始归档「尝试恢复」的目标目录 / 恢复密码 = 15。
+expect_count "$REMOTE_PAGE_QML" "AppTextField {" 15 \
   "远程备份页的输入框都用共享 AppTextField"
+# PR #21：客户端连接之前**必须**有服务端传输身份的 pin。它不是口令（公钥与
+# 指纹都可以公开），但它是必填的连接配置：页面上有自己的输入框与明确的提交
+# 动作，校验走共享解析器——界面里不许出现第二套"看起来像指纹"的判断。
+# 错误写在这个输入框下面那一行：不弹对话框，也不占用页面底部的横幅。
+expect_count "$REMOTE_PAGE_QML" 'objectName: "remoteServerKeyPinField"' 1 \
+  "连接设置区有服务器身份指纹输入框"
+expect_count "$REMOTE_PAGE_QML" 'objectName: "remoteServerKeyPinApplyButton"' 1 \
+  "指纹有明确的提交动作（「应用」按钮）"
+expect_count "$REMOTE_PAGE_QML" 'objectName: "remoteServerKeyPinError"' 1 \
+  "指纹输入框有自己的错误行"
+expect_count "$REMOTE_PAGE_QML" "remote.setServerKeyPin(" 2 \
+  "回车与「应用」两条路径都调用 remote.setServerKeyPin()"
+expect_count "$REMOTE_PAGE_QML" "remote.serverKeyPinError" 2 \
+  "指纹错误行绑到控制器的 serverKeyPinError（可见性 + 文本）"
+expect_count "$REMOTE_CONTROLLER_H" "QString serverKeyPin() const" 1 \
+  "控制器提供 serverKeyPin（界面回读 + 自检比对用同一个值）"
+expect_count "$REMOTE_CONTROLLER_CPP" "backupproject::net::ParseServerKeyPin" 1 \
+  "指纹的校验复用共享解析器（只认带前缀的两种写法）"
+expect_count "$REMOTE_CONTROLLER_CPP" \
+  "request.endpoint.server_key_pin = serverKeyPin()" 11 \
+  "十一处提交点每一处都带上 pin（含远端备份 / 链恢复 / 原始归档恢复的第一次与重试；漏一处就等于那条操作没有 pin）"
+# PR #21 UI closure（第二轮）：三种类型（原始归档 / 完整备份 / 增量备份）的主操作
+# 都叫"恢复"。内部走哪条流水线由 badge 与说明行交代，**不**写进按钮名字——
+# 把"这次能不能成"这种内部不确定性放进按钮是上一版的做法，本轮删掉。
+if grep -rn "尝试恢复" ui/modern/qml ui/modern/remote_controller.h ui/modern/remote_controller.cpp >/dev/null 2>&1; then
+  record_fail "生产界面里又出现了“尝试恢复”（旧文案）：$(grep -rn '尝试恢复' ui/modern/qml ui/modern/remote_controller.h ui/modern/remote_controller.cpp | head -3 | tr '\n' ' ')"
+else
+  record_pass "生产 QML 与控制器里没有任何“尝试恢复”：三种类型的主操作统一是“恢复”"
+fi
+# 卡片按钮的文案来自控制器的 presentation model，不在这里另写一个词。
+expect_count "$REMOTE_CONTROLLER_CPP" 'item.insert(QStringLiteral("restoreLabel"), QStringLiteral("恢复"));' 1 \
+  "主操作文案由控制器统一下发（三种类型同一个词）"
+# 密码只有在 core 明确说"这份归档加密了"之后才出现：对话框有两段。
+expect_count "$REMOTE_PAGE_QML" 'readonly property bool passwordStage: remote.rawRestoreAwaitingPassword' 1 \
+  "恢复对话框的密码段由控制器回来的事实驱动（不是一上来就显示）"
+expect_count "$REMOTE_PAGE_QML" '"此备份已加密，请输入恢复密码。' 1 \
+  "密码段有明确的一句话（core 说要密码之后才可能看到）"
+expect_count "$REMOTE_PAGE_QML" '"继续恢复"' 1 \
+  "密码段的确认按钮是“继续恢复”"
 # 第二套 socket / 协议实现？GUI 这一侧只允许经 RemoteController 调共享客户端。
 # 断言只看代码行：注释里说明"这里没有 socket"是正常的。
 REMOTE_CODE_TMP="$TEST_STATE_DIR/remote-code.txt"
@@ -570,8 +641,8 @@ expect_count "$REMOTE_CONTROLLER_CPP" "password_.fill(QChar(0))" 3 \
 # "我在登录还是在注册"，注册也只有一个密码框。这一节把新的信息架构钉成契约。
 # 账户区域是一个**分段控件**：一个圆角容器 + 两个等宽分段。人工验收的结论是
 # 两个各自独立的按钮看起来像"可以同时按"，不像"二选一"。
-expect_count "$REMOTE_PAGE_QML" "SegmentedTabs {" 1 \
-  "账户区域用共享的分段控件（不是两个独立按钮）"
+expect_count "$REMOTE_PAGE_QML" "SegmentedTabs {" 2 \
+  "账户区域与远端备份策略都用共享的分段控件（不是各自独立的按钮）"
 expect_count "$REMOTE_PAGE_QML" 'objectName: "remoteAccountTabs"' 1 \
   "分段控件有 objectName（自动化要能点到它）"
 expect_count "$RESOURCE_FILE" "qml/components/SegmentedTabs.qml" 1 \
@@ -627,10 +698,12 @@ expect_missing "$REMOTE_PAGE_QML" "不会发送任何请求" \
   "页面不再写开发者式的说明"
 expect_count "$REMOTE_PAGE_QML" "两次输入的密码不一致" 1 \
   "不一致时明确写出「两次输入的密码不一致」"
-# 四处错误行（注册不一致 / 注册被拒 / 登录被拒 / 注销失败）都用共享的 error 色：
-# 页面里没有第二套红色，也没有硬编码的 #ff0000。
-expect_count "$REMOTE_PAGE_QML" "color: theme.error" 4 \
-  "四处错误行都用共享的 error 色"
+# 六处错误行（注册不一致 / 注册被拒 / 登录被拒 / 注销失败 / 服务器身份指纹 /
+# 原始归档恢复的密码错误行）都用共享的 error 色：页面里没有第二套红色，也没有
+# 硬编码的 #ff0000。最后那一处是本轮新增的：错密码必须**就地**告诉用户，
+# 而不是弹一个通用失败框。
+expect_count "$REMOTE_PAGE_QML" "color: theme.error" 6 \
+  "六处错误行都用共享的 error 色"
 expect_present "$REMOTE_PAGE_QML" "visible: page.registerPasswordMismatch" 1 \
   "错误行由「两次密码是否一致」这个计算属性驱动（改一个字符就更新）"
 expect_present "$REMOTE_PAGE_QML" "page.draftRegisterPassword !== page.draftConfirmPassword" 1 \
@@ -649,6 +722,7 @@ expect_count "$REMOTE_PAGE_QML" "deleteAccountDialog.close()" 2 \
 #   * 登录失败 -> 登录表单下面（remoteLoginError）
 #   * 注册失败 -> 注册表单下面（remoteRegisterError）
 #   * 注销失败 -> 对话框内部（remoteDeleteAccountError）
+#   * 服务器身份指纹没填 / 写错 -> 那个输入框下面（remoteServerKeyPinError）
 #   * 页面级操作（上传 / 下载 / 刷新 / 删除云端备份）-> 页面底部横幅
 #
 # 旧实现把登录 / 注册的校验失败写进页面底部的横幅（甚至只打终端日志），于是

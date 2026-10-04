@@ -23,15 +23,31 @@
 //
 // 只读操作（列表 / 详情 / 概览）在服务端运行时照常可用。
 //
+// ---- 它显示什么（PR #21 UI closure：问题 A）----
+//
+// 每次运行都会打印一行 "传输身份指纹: sha256:…"。它来自**当前真正在服役的
+// 那把传输身份私钥**：优先用正在运行的 backup-server 命令行里那个
+// --transport-key-file（只读 /proc/<pid>/cmdline，不发信号、不连端口），
+// 读不到才退到部署约定路径 <server-root>/state/transport.key。读回私钥用的是
+// 服务端与 backup-server-keygen 共用的同一份 LoadTransportIdentity，指纹用的是
+// 同一份 X25519Fingerprint——这里不重新实现任何一套编码。
+//
+// 它**只读**：不启动 / 不停止服务，不生成 / 不修改 / 不移动任何密钥文件。
+// 读失败只是一行"不可用 + 原因"，菜单与其余输出照常。
+//
 // ---- 它不打印什么 ----
 //
-// 口令 salt / hash / token secret 一次都不出现在输出里。这不是"记得别打印"：
-// 本工具用到的查询（RemoteMetadataStore::ListUsers）根本不选那些列，而
-// 用户名/快照 id 之外的输入永远不会被拼进文件系统路径。
+// 私钥内容、口令 salt / hash / token secret 一次都不出现在输出里。这不是
+// "记得别打印"：本工具用到的查询（RemoteMetadataStore::ListUsers）根本不选
+// 那些列，而用户名/快照 id 之外的输入永远不会被拼进文件系统路径；身份私钥
+// 只被读进内存算公钥，算完立即清零。
 
+#include <dirent.h>
+#include <fcntl.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
+#include <cerrno>
 #include <climits>
 #include <cstdio>
 #include <cstdlib>
@@ -45,6 +61,8 @@
 #include "network_protocol.h"
 #include "remote_maintenance.h"
 #include "remote_metadata_store.h"
+#include "secure_transport.h"
+#include "x25519.h"
 
 namespace {
 
@@ -77,6 +95,9 @@ void PrintUsage(std::FILE* out, const char* program) {
       "  缺省布局（部署脚本安装的样子）：\n"
       "    <server-root>/data                 数据根（--root）\n"
       "    <server-root>/state/metadata.sqlite3  元数据库（--db）\n"
+      "    <server-root>/state/transport.key  "
+      "传输身份私钥（--transport-key-file，\n"
+      "                                       只读；默认自动定位，见下）\n"
       "  数据库必须**已经存在**：管理工具不会创建空库，路径不对就报错退出。\n"
       "\n"
       "只读命令（backup-server 运行时也可以用）：\n"
@@ -86,6 +107,18 @@ void PrintUsage(std::FILE* out, const char* program) {
       "  list-snapshots <用户选择器>              某个用户的备份列表\n"
       "  show-snapshot <快照 id>                  备份详情（含完整 SHA-256）\n"
       "  overview                                 存储概览\n"
+      "  transport-identity                       "
+      "传输身份公钥与指纹（首次配置用）\n"
+      "\n"
+      "传输身份指纹:\n"
+      "  每条命令的输出开头都会打印一行 \"传输身份指纹: "
+      "sha256:…\"，它就是客户端要填的\n"
+      "  “服务器身份指纹（server-key）”。读取顺序：--transport-key-file -> "
+      "正在运行的\n"
+      "  backup-server 实际加载的那把私钥（只读 /proc/<pid>/cmdline）-> "
+      "部署约定路径。\n"
+      "  读不到只显示 \"不可用 + "
+      "原因\"，不影响任何命令；私钥内容永远不会被打印。\n"
       "\n"
       "用户选择器（**不会替你猜**）：\n"
       "  id:<编号>        只按编号找，例如 id:23\n"
@@ -188,6 +221,9 @@ struct Options {
   std::string server_root;
   std::string root_directory;
   std::string database_path;
+  // 传输身份私钥（BPSEC1 server identity）。留空时按"正在运行的服务端 ->
+  // 部署约定路径"的顺序自动定位，见 LoadTransportIdentityForDisplay。
+  std::string transport_key_file;
   std::string command;
   std::vector<std::string> positional;
   std::string user_selector;
@@ -208,6 +244,187 @@ std::string ServerRootOf(const Options& options) {
   return data_root.substr(0, slash);
 }
 
+// ---- 传输身份（BPSEC1 server identity）：只读地显示指纹 ----
+//
+// 这一段存在的唯一理由是"首次配置流程"：客户端的"服务器身份指纹（server-key）"
+// 是必填项，用户必须能从服务器本机把它抄走。以前 admin 首页只有 Host /
+// Server root / Data root / Metadata DB / Service 五项，用户拿不到指纹，
+// 流程在第一步就断了。
+//
+// 显示的指纹必须**就是当前服务端在用的那一个身份**，因此读取顺序是：
+//
+//   1. 命令行显式给出的 --transport-key-file（调用方说了算）；
+//   2. 正在运行的 backup-server 真正加载的那把私钥——从 /proc/<pid>/cmdline
+//      里取出它的 --root 与 --transport-key-file，并要求 --root 与本实例的
+//      数据根一致。这是"屏幕上这一行 == 服务端现在用的身份"最直接的证据；
+//   3. 部署约定 <server-root>/state/transport.key（deploy 脚本的固定位置）。
+//
+// 全程只读：不开端口、不发信号、不启动/停止服务、不生成也不修改密钥文件。
+struct TransportIdentityReport {
+  bool available = false;
+  std::string key_path;  // 实际读的那份私钥文件
+  std::string source;  // 这个路径是怎么定下来的（给人看的说明）
+  std::string fingerprint;  // 64 位小写十六进制（available 时有效）
+  std::string public_key_hex;  // 32 字节公钥的十六进制（available 时有效）
+  std::string error;           // available 为假时的原因
+};
+
+std::string BaseNameOf(const std::string& path) {
+  const std::size_t slash = path.find_last_of('/');
+  return slash == std::string::npos ? path : path.substr(slash + 1);
+}
+
+// /proc 里的小文件：读失败或超过上界都返回 false，绝不部分相信。
+bool ReadSmallFile(const std::string& path, std::size_t limit,
+                   std::string* out) {
+  const int fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
+  if (fd < 0) {
+    return false;
+  }
+  std::string data;
+  char buffer[4096];
+  for (;;) {
+    const ssize_t count = ::read(fd, buffer, sizeof(buffer));
+    if (count < 0) {
+      if (errno == EINTR) {
+        continue;
+      }
+      ::close(fd);
+      return false;
+    }
+    if (count == 0) {
+      break;
+    }
+    if (data.size() + static_cast<std::size_t>(count) > limit) {
+      ::close(fd);
+      return false;
+    }
+    data.append(buffer, static_cast<std::size_t>(count));
+  }
+  ::close(fd);
+  *out = data;
+  return true;
+}
+
+bool ReadProcessArguments(long pid, std::vector<std::string>* arguments) {
+  std::string raw;
+  if (!ReadSmallFile("/proc/" + std::to_string(pid) + "/cmdline", 256 * 1024,
+                     &raw)) {
+    return false;
+  }
+  arguments->clear();
+  std::string current;
+  for (const char character : raw) {
+    if (character == '\0') {
+      if (!current.empty()) {
+        arguments->push_back(current);
+        current.clear();
+      }
+      continue;
+    }
+    current.push_back(character);
+  }
+  if (!current.empty()) {
+    arguments->push_back(current);
+  }
+  return !arguments->empty();
+}
+
+// 找正在运行的 backup-server，并取出它加载的身份私钥路径。只读 /proc。
+bool FindRunningServerTransportKey(const std::string& data_root, long* pid_out,
+                                   std::string* key_path,
+                                   std::string* root_text) {
+  DIR* proc = ::opendir("/proc");
+  if (proc == nullptr) {
+    return false;
+  }
+  const std::string wanted_root = AbsolutePath(data_root);
+  bool found = false;
+  while (struct dirent* entry = ::readdir(proc)) {
+    const std::string name = entry->d_name;
+    if (name.empty() || !IsAllDigits(name)) {
+      continue;
+    }
+    const long pid = std::strtol(name.c_str(), nullptr, 10);
+    if (pid <= 0) {
+      continue;
+    }
+    std::vector<std::string> arguments;
+    if (!ReadProcessArguments(pid, &arguments) || arguments.empty()) {
+      continue;
+    }
+    if (BaseNameOf(arguments[0]) != "backup-server") {
+      continue;
+    }
+    std::string process_root;
+    std::string process_key;
+    for (std::size_t index = 1; index < arguments.size(); ++index) {
+      if (arguments[index] == "--root" && index + 1 < arguments.size()) {
+        process_root = arguments[++index];
+      } else if (arguments[index] == "--transport-key-file" &&
+                 index + 1 < arguments.size()) {
+        process_key = arguments[++index];
+      }
+    }
+    if (process_root.empty() || process_key.empty()) {
+      continue;
+    }
+    if (AbsolutePath(process_root) != wanted_root) {
+      continue;
+    }
+    *pid_out = pid;
+    *key_path = process_key;
+    *root_text = process_root;
+    found = true;
+    break;
+  }
+  ::closedir(proc);
+  return found;
+}
+
+// 读一次传输身份，只为了显示。永远不返回"猜"的结果：读不到就 available=false
+// 并把原因带出来，调用方照着打印一行"不可用"。
+TransportIdentityReport LoadTransportIdentityForDisplay(
+    const Options& options) {
+  TransportIdentityReport report;
+  if (!options.transport_key_file.empty()) {
+    report.key_path = options.transport_key_file;
+    report.source = "命令行给出的 --transport-key-file";
+  } else {
+    long pid = 0;
+    std::string process_key;
+    std::string process_root;
+    if (FindRunningServerTransportKey(options.root_directory, &pid,
+                                      &process_key, &process_root)) {
+      report.key_path = process_key;
+      report.source = "正在运行的 backup-server（pid " + std::to_string(pid) +
+                      "）加载的身份私钥";
+    } else {
+      report.key_path = ServerRootOf(options) + "/state/transport.key";
+      report.source =
+          "部署约定路径 <server-root>/state/transport.key（没有发现正在运行的 "
+          "backup-server）";
+    }
+  }
+  backupproject::net::TransportIdentity identity;
+  std::string load_error;
+  if (!backupproject::net::LoadTransportIdentity(report.key_path, &identity,
+                                                 &load_error)) {
+    report.error = load_error;
+    return report;
+  }
+  report.available = true;
+  report.fingerprint =
+      backupproject::crypto::X25519Fingerprint(identity.public_key);
+  report.public_key_hex =
+      backupproject::crypto::X25519FormatKeyHex(identity.public_key);
+  // 私钥材料用完即弃：它没有被打印、没有被写进任何文件，也不留在内存里。
+  for (char& byte : identity.private_key) {
+    byte = '\0';
+  }
+  return report;
+}
+
 bool ParseOptions(int argc, char* argv[], Options* options,
                   std::string* error_message) {
   for (int index = 1; index < argc; ++index) {
@@ -216,7 +433,8 @@ bool ParseOptions(int argc, char* argv[], Options* options,
       return false;
     }
     if (name == "--server-root" || name == "--root" || name == "--db" ||
-        name == "--user" || name == "--confirm") {
+        name == "--user" || name == "--confirm" ||
+        name == "--transport-key-file") {
       if (index + 1 >= argc) {
         *error_message = name + " needs a value";
         return false;
@@ -230,6 +448,8 @@ bool ParseOptions(int argc, char* argv[], Options* options,
         options->database_path = value;
       } else if (name == "--user") {
         options->user_selector = value;
+      } else if (name == "--transport-key-file") {
+        options->transport_key_file = value;
       } else {
         options->confirm = value;
       }
@@ -454,9 +674,32 @@ int OpenAll(const Options& options, bool writable,
   return 0;
 }
 
+// 首页那一行指纹。成功时它**就是**客户端要填进"服务器身份指纹（server-key）"
+// 的那一串（sha256:<64 位十六进制>），用户可以直接抄。
+void PrintTransportFingerprintLine(const Options& options) {
+  const TransportIdentityReport identity =
+      LoadTransportIdentityForDisplay(options);
+  if (identity.available) {
+    std::printf("传输身份指纹: sha256:%s\n", identity.fingerprint.c_str());
+    std::printf("              来源: %s\n", identity.source.c_str());
+    return;
+  }
+  // 读不到指纹不是"管理工具坏了"：菜单、用户列表、存储概览都必须照常。
+  std::printf("传输身份指纹: 不可用\n");
+  std::printf("              原因: %s\n", identity.error.c_str());
+  std::printf(
+      "              期望的身份私钥: %s（可用 --transport-key-file "
+      "显式指定）\n",
+      AbsolutePath(identity.key_path).c_str());
+}
+
 // 每次运行都先把"我在看哪个实例"说清楚：主机、部署根、数据根、元数据库、
-// 服务状态（含 PID）。人工验收时这一块必须和下面的列表出现在同一屏里——脱离
-// 上下文的"还没有任何用户"是这次 P0 的直接诱因。
+// 服务状态（含 PID）、传输身份指纹。人工验收时这一块必须和下面的列表出现在
+// 同一屏里——脱离上下文的"还没有任何用户"是这次 P0 的直接诱因。
+//
+// 传输身份指纹（PR #21 UI closure，问题 A）放在这里就等于放在菜单首页上：
+// backup-server-admin.sh 的 banner 调用的正是 status。它只读、只显示公钥指纹，
+// 读不到也只是一行"不可用 + 原因"。
 void PrintIdentity(const Options& options, bool lock_held_by_this_run) {
   const std::string data_root = AbsolutePath(options.root_directory);
   std::printf("Host:        %s\n", HostName().c_str());
@@ -473,6 +716,39 @@ void PrintIdentity(const Options& options, bool lock_held_by_this_run) {
     DescribeServerState(data_root, &state);
   }
   std::printf("Service:     %s\n", state.c_str());
+  PrintTransportFingerprintLine(options);
+}
+
+// 服务器身份信息页：fingerprint + public key。**永远不打印私钥**：这里读的是
+// LoadTransportIdentity 解出来的公钥，私钥那份材料在函数返回前就被清零。
+int CommandTransportIdentity(const Options& options) {
+  const TransportIdentityReport identity =
+      LoadTransportIdentityForDisplay(options);
+  std::printf("BPSEC1 Server Identity\n");
+  std::printf("身份私钥文件: %s\n", AbsolutePath(identity.key_path).c_str());
+  std::printf("来源:         %s\n", identity.source.c_str());
+  std::printf("\n");
+  if (!identity.available) {
+    std::printf("Fingerprint:  不可用\n");
+    std::printf("Public key:   不可用\n");
+    std::fprintf(stderr, "读取传输身份失败：%s\n", identity.error.c_str());
+    std::fprintf(stderr,
+                 "提示：用 --transport-key-file <文件> 指定这个实例的身份私钥；"
+                 "本命令不会创建或修改任何密钥。\n");
+    return 1;
+  }
+  std::printf("Fingerprint:\n  sha256:%s\n\n", identity.fingerprint.c_str());
+  std::printf("Public key:\n  hex:%s\n\n", identity.public_key_hex.c_str());
+  std::printf(
+      "客户端 pin（二选一，填进客户端的“服务器身份指纹（server-key）”）:\n");
+  std::printf("  sha256:%s\n", identity.fingerprint.c_str());
+  std::printf("  hex:%s\n\n", identity.public_key_hex.c_str());
+  std::printf(
+      "提示：把上面的 Fingerprint 复制到 Modern GUI 的“服务器身份指纹"
+      "（server-key）”，点“应用”之后再登录或注册。\n");
+  std::printf(
+      "私钥不会显示：本命令只读公钥与指纹，不打印私钥内容，也不写任何文件。\n");
+  return 0;
 }
 
 // 统计块。实例身份由 main()
@@ -839,6 +1115,11 @@ int main(int argc, char* argv[]) {
   }
   if (options.command == "overview") {
     return CommandOverview(&store, options.root_directory);
+  }
+  // 服务器身份信息：只读，和 status 一样在服务端运行时可用。
+  if (options.command == "transport-identity" ||
+      options.command == "show-identity") {
+    return CommandTransportIdentity(options);
   }
   if (options.command == "show-user" || options.command == "list-snapshots") {
     std::string selector;

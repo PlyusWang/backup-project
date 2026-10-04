@@ -155,7 +155,8 @@ std::string RemoteStatusMessage(std::uint32_t status) {
     case Status::kAlreadyExists:
       return "名字已经被占用";
     case Status::kInvalidState:
-      return "当前连接状态不允许这个操作";
+      return "当前状态不允许这个操作（例如这个快照还有增量快照依赖它，"
+             "必须先删后代）";
     case Status::kTooLarge:
       return "超过服务端允许的大小";
     case Status::kIntegrityMismatch:
@@ -168,6 +169,9 @@ std::string RemoteStatusMessage(std::uint32_t status) {
       return "服务端认为这个帧不合法";
     case Status::kUnsupported:
       return "这个操作在当前构建里还不被支持";
+    case Status::kChainConflict:
+      return "远端增量链状态冲突（父快照已被删除、已经有别的增量挂在它下面，"
+             "或代数超过了可恢复的上限）";
   }
   return "未知错误";
 }
@@ -185,6 +189,9 @@ void RemoteArchiveClient::DisconnectSocket() {
     ::close(fd_);
     fd_ = -1;
   }
+  // 加密通道的会话密钥与记录序号随连接一起作废：下一条 TCP 连接必须重新
+  // 握手（每次连接一套新的密钥，不复用、不续用）。
+  channel_.Reset();
   // 连接没了，这条连接上的会话自然也没了；但 token 还在手里，可以在新连接
   // 上恢复（Authenticate/PrepareConnection 会做这件事）。
   authenticated_ = false;
@@ -247,7 +254,48 @@ bool RemoteArchiveClient::Connect(const RemoteEndpoint& endpoint,
   endpoint_ = endpoint;
   next_request_id_ = 1;
   authenticated_ = false;
+
+  // PR #21：TCP 连上之后的第一件事是 BPSEC1 握手，之后才谈 BPNET1 业务帧。
+  //
+  // 两条失败路径都是"直接失败"，没有第三条：
+  //   * pin 没配置或格式不对 -> 拒绝连接（不做 TOFU）；
+  //   * 握手失败（身份不符 / Finished 校验失败 / 对端根本不说 BPSEC1）
+  //     -> 关连接，**绝不**退回明文 BPNET1。
+  channel_.Reset();
+  std::string pin_error;
+  if (!ParseServerKeyPin(endpoint.server_key_pin, &server_key_pin_,
+                         &pin_error)) {
+    const std::string reason = "无法使用服务端传输身份 pin：" + pin_error;
+    ::close(fd_);
+    fd_ = -1;
+    if (error_message != nullptr) {
+      *error_message = reason;
+    }
+    Fail(reason);
+    return false;
+  }
+  // 客户端侧握手整体预算：60 秒。对端即使持有正确的身份私钥，慢慢滴水同样
+  // 能把客户端挂住（审查轮缺陷 C）。
+  channel_.SetHandshakeTimeoutMs(60000);
+  std::string handshake_error;
+  if (!channel_.HandshakeClient(fd_, server_key_pin_, &handshake_error)) {
+    const std::string reason = std::string("BPSEC1 握手失败（") +
+                               SecureTransportErrorName(channel_.last_error()) +
+                               "）：" + handshake_error;
+    ::close(fd_);
+    fd_ = -1;
+    if (error_message != nullptr) {
+      *error_message = reason;
+    }
+    Fail(reason);
+    return false;
+  }
   return true;
+}
+
+void RemoteArchiveClient::SetReconnectEndpoint(const RemoteEndpoint& endpoint) {
+  // 只改"下次重连的参数"。连接、会话、token 都不动（见头文件里的说明）。
+  endpoint_ = endpoint;
 }
 
 bool RemoteArchiveClient::PrepareConnection(std::string* error_message) {
@@ -341,8 +389,8 @@ bool RemoteArchiveClient::Request(Opcode opcode, const std::string& payload,
   }
   const std::uint64_t request_id = next_request_id_++;
   std::string io_error;
-  if (!SendFrame(fd_, static_cast<std::uint16_t>(opcode), 0, request_id,
-                 payload, &io_error)) {
+  if (!channel_.SendFrame(fd_, static_cast<std::uint16_t>(opcode), 0,
+                          request_id, payload, &io_error)) {
     Fail(io_error);
     if (error_message != nullptr) {
       *error_message = "cannot send the request: " + io_error;
@@ -351,7 +399,8 @@ bool RemoteArchiveClient::Request(Opcode opcode, const std::string& payload,
     DisconnectSocket();
     return false;
   }
-  const FrameReadStatus status = ReceiveFrame(fd_, header, response, &io_error);
+  const FrameReadStatus status =
+      channel_.ReceiveFrame(fd_, header, response, &io_error);
   if (status != FrameReadStatus::kOk) {
     Fail(io_error);
     if (error_message != nullptr) {
@@ -524,9 +573,19 @@ bool RemoteArchiveClient::List(std::vector<RemoteSnapshotInfo>* snapshots,
         !reader.ReadString(kMaxDisplayNameBytes, &info.display_name) ||
         !reader.ReadString(kSha256HexBytes, &info.sha256) ||
         !reader.ReadU64(&info.size_bytes) ||
-        !reader.ReadU64(&info.created_at)) {
+        !reader.ReadU64(&info.created_at) ||
+        !reader.ReadU16(&info.snapshot_kind) ||
+        !reader.ReadU64(&info.generation) ||
+        !reader.ReadString(kMaxSnapshotIdBytes, &info.parent_snapshot_id) ||
+        !reader.ReadString(kMaxLineageBytes, &info.lineage)) {
       if (error_message != nullptr) {
         *error_message = "cannot decode a LIST entry";
+      }
+      return false;
+    }
+    if (!IsKnownSnapshotKind(info.snapshot_kind)) {
+      if (error_message != nullptr) {
+        *error_message = "the LIST entry declares an unknown snapshot kind";
       }
       return false;
     }
@@ -548,6 +607,15 @@ bool RemoteArchiveClient::UploadArchiveFile(
     const std::string& local_path, const std::string& display_name,
     const RemoteProgressCallback& progress, RemoteSnapshotInfo* uploaded,
     std::string* error_message) {
+  // 低层 upload 命令保持原语义：一个独立的完整快照（full / generation 0）。
+  return UploadSnapshotFile(local_path, display_name, RemoteUploadOptions(),
+                            progress, uploaded, error_message);
+}
+
+bool RemoteArchiveClient::UploadSnapshotFile(
+    const std::string& local_path, const std::string& display_name,
+    const RemoteUploadOptions& options, const RemoteProgressCallback& progress,
+    RemoteSnapshotInfo* uploaded, std::string* error_message) {
   if (!RequireAuthenticated("upload", error_message)) {
     return false;
   }
@@ -592,6 +660,18 @@ bool RemoteArchiveClient::UploadArchiveFile(
   }
   begin.AppendU64(size);
   if (!begin.AppendString(sha256, kSha256HexBytes, &build_error)) {
+    ::close(source);
+    if (error_message != nullptr) {
+      *error_message = build_error;
+    }
+    return false;
+  }
+  // PR #21：链关系。字段顺序必须与服务端的解码顺序一致：
+  //   display_name -> size -> sha256 -> kind -> parent_id -> lineage
+  begin.AppendU16(options.snapshot_kind);
+  if (!begin.AppendString(options.parent_snapshot_id, kMaxSnapshotIdBytes,
+                          &build_error) ||
+      !begin.AppendString(options.lineage, kMaxLineageBytes, &build_error)) {
     ::close(source);
     if (error_message != nullptr) {
       *error_message = build_error;
@@ -677,12 +757,16 @@ bool RemoteArchiveClient::UploadArchiveFile(
   if (!reader.ReadString(kMaxSnapshotIdBytes, &info.snapshot_id) ||
       !reader.ReadString(kSha256HexBytes, &info.sha256) ||
       !reader.ReadU64(&info.size_bytes) || !reader.ReadU64(&created_at) ||
+      !reader.ReadU16(&info.snapshot_kind) ||
+      !reader.ReadU64(&info.generation) ||
+      !reader.ReadString(kMaxSnapshotIdBytes, &info.parent_snapshot_id) ||
       !reader.AtEnd()) {
     if (error_message != nullptr) {
       *error_message = "cannot decode the UPLOAD_END response";
     }
     return false;
   }
+  info.lineage = options.lineage;
   info.display_name = display_name;
   info.created_at = created_at;
   if (uploaded != nullptr) {

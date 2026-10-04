@@ -25,6 +25,19 @@
 // 诚实的边界：QString 可能因隐式共享留下副本，也没有 mlock，所以这是
 // "尽力而为的进程内保密"，不是内存加密，也不等于 native TLS。
 //
+// ---- 服务端身份（serverKeyPin）----
+//
+// 与 password 正相反：pin 是服务端的**公钥 / 公钥指纹**，不是秘密——它可以
+// 显示在界面上、可以抄进部署文档、也可以在内存里长期保留。它是"我要连的
+// 到底是哪一台服务器"的期望值：为空或格式不对时 RemoteArchiveClient::Connect()
+// **直接失败**（kNoPinConfigured，信息里是"没有配置服务端传输公钥/指纹"），
+// 客户端不做"第一次见到谁就信谁"。
+//
+// 它**不落盘**：本页的 host / port 本来就没有持久化落点（见下面端点的说明），
+// pin 与它们是同一类东西，不为了它单独新造一套配置系统。所以它只存在于内存，
+// 由调用方在**第一次连接之前**设置：界面上的"服务器身份指纹"输入框，
+// 或者 main.cpp 里 --remote-test / --remote-smoke 两条自检路径。
+//
 // ---- 并发 ----
 //
 // 同一个控制器同一时刻最多一个网络操作。busy_ 在**提交任务之前**同步置位，
@@ -46,10 +59,12 @@
 #include <QVariantList>
 #include <atomic>
 #include <cstdint>
+#include <memory>
 #include <string>
 #include <vector>
 
 #include "remote_backup_client.h"
+#include "remote_incremental.h"
 
 namespace backup_modern {
 
@@ -83,6 +98,18 @@ struct RemoteOpResult {
     kDelete,
     // 注销账户：服务端删除，不是"退出登录"。
     kDeleteAccount,
+    // PR #21 产品级远端增量：把**目录**备份到远端（完整或增量）——
+    // 对应 backupctl remote backup。与 kUpload（上传一个本地 .bak）是
+    // 两件事：那一条是低层 raw 归档操作，这一条走材料包 + 链。
+    kBackup,
+    // 产品级链恢复：把某个远端快照（连同它的依赖链）恢复到本地目录——
+    // 对应 backupctl remote restore。与 kDownload（下载一个 blob）也是
+    // 两件事。
+    kRestore,
+    // 原始归档的"单独恢复"（PR #21 UI closure）：下载那一个 blob，按**内容**
+    // 认出它是不是本机能独立恢复的归档，然后交给既有的本地恢复核心。
+    // 它**不是**链恢复：原始归档没有 lineage / parent / 副文件。
+    kRestoreRaw,
   };
 
   Kind kind = Kind::kList;
@@ -105,6 +132,51 @@ struct RemoteOpResult {
   backupproject::net::RemoteSnapshotInfo archive;
   std::uint64_t bytes_done = 0;
   std::uint64_t bytes_total = 0;
+
+  // ---- kBackup：产品级远端备份的结果（全部来自共享 core 的 outcome）----
+  //
+  // 关键的一条是"用户选的策略"与"这次实际产出的类型"**不是**同一件事：
+  // 允许增量但本地没有可信基线（或链太深、缓存不可信）时，core 会重建完整
+  // 基线。界面必须按 produced_delta / rebuilt_full_baseline 如实说，不能因为
+  // 用户点了"增量"就报"增量成功"。
+  bool backup_produced_delta = false;
+  bool backup_rebuilt_full = false;
+  bool backup_no_changes = false;
+  std::string backup_snapshot_id;
+  std::string backup_parent_snapshot_id;
+  std::uint64_t backup_generation = 0;
+  std::uint64_t backup_uploaded_bytes = 0;
+  std::uint64_t backup_chain_root_bytes = 0;
+  std::string backup_baseline_reason;
+  std::string backup_archive_name;
+  // 用户这次点的是不是“增量”。结论文案必须区分“用户就是要一份完整备份”和
+  // “用户点了增量、但云端没有可续的链，于是实际给了完整基线”——两者的
+  // 实际产物相同，但对用户说的话**不能**相同。
+  bool backup_incremental_requested = false;
+
+  // ---- kRestore：产品级链恢复的结果 ----
+  std::uint64_t restore_chain_length = 0;
+  std::uint64_t restore_delta_count = 0;
+  std::uint64_t restore_downloaded_bytes = 0;
+  std::uint64_t restore_reused_bytes = 0;
+  std::uint64_t restore_restored_entries = 0;
+
+  // ---- kRestoreRaw：原始归档单独恢复的结果 ----
+  std::uint64_t raw_downloaded_bytes = 0;
+  std::string raw_verified_sha256;
+  std::string raw_archive_format;
+  std::uint64_t raw_restored_entries = 0;
+  bool raw_password_required = false;
+  // 这次交互一共真正下载过几次（正常情况下是 1 次：错密码重试用的是同一份
+  // 已经校验过的字节）。自检据此证明没有偷偷重复下载。
+  int raw_download_count = 0;
+  // 那份归档在临时工作目录里的绝对路径（只给自检用：比较 inode 即可证明
+  // "再输一次密码"没有重新下载）。
+  std::string raw_archive_path;
+  // 需要"再输一次密码"时，这次交互的会话被交回主线程：页面据此从"选目标目录"
+  // 切到"输入恢复密码"，并且复用**同一份**字节。其它情况为空——成功即释放，
+  // 致命失败即放弃（工作目录随之删掉）。
+  std::shared_ptr<backupproject::net::RemoteRawRestoreSession> raw_session;
 };
 
 // 后台线程需要的全部输入。刻意做成一个值类型：后台线程只读它，
@@ -115,10 +187,29 @@ struct RemoteRequest {
   std::string username;
   std::string password;
   std::string local_path;
+  // kUpload：上传时用的显示名。
+  // kRestoreRaw：只用来给下载下来的临时文件起名（不可信输入，core 会降级成
+  // 单组件文件名）；它**不参与**任何格式判断。
   std::string display_name;
   std::string snapshot_id;
   std::string target_path;
   bool allow_overwrite = false;
+  // kBackup：源目录；allow_incremental 就是界面上的策略（false = Full，
+  // true = Incremental）。除此之外的一切（能不能续链、父是谁、代数、
+  // lineage、要不要 bootstrap 缓存）都由 core 决定，GUI 不参与。
+  std::string source_directory;
+  bool allow_incremental = false;
+  // kBackup：显示名留空时由 core 按链规则生成。
+  // kRestore：目标目录。kRestoreRaw：下载之后本地恢复的目标目录。
+  std::string restore_destination;
+  // kRestoreRaw：如果那份归档是加密的，这里是用户在界面上填的恢复密码。
+  // kRestore（链恢复）不需要它：增量链的外层信封由内层身份记录保护。
+  // 只在本对象的生命周期内存在：提交之后立刻被就地抹掉，不落盘、不进日志。
+  std::string restore_password;
+  // kRestoreRaw：非空表示这是"再输一次密码"的重试——沿用会话里已经下载并
+  // 校验过的那份字节与第一次选定的目标目录，snapshot_id / display_name 都不再
+  // 参与（它们已经固化在会话里）。
+  std::shared_ptr<backupproject::net::RemoteRawRestoreSession> raw_session;
 };
 
 class RemoteController : public QObject {
@@ -135,6 +226,13 @@ class RemoteController : public QObject {
   Q_PROPERTY(QString host READ host NOTIFY endpointChanged)
   Q_PROPERTY(QString portText READ portText NOTIFY endpointChanged)
   Q_PROPERTY(QString username READ username NOTIFY endpointChanged)
+  // 服务端传输身份 pin（"sha256:<64 位十六进制>" 或 "hex:<64 位十六进制>"）。
+  // 与地址 / 端口同属"连接配置"，但**没有默认值**：不填就不能连接。
+  Q_PROPERTY(QString serverKeyPin READ serverKeyPin NOTIFY serverKeyPinChanged)
+  // 这个输入框自己的错误行。没填、格式不对都写在这里：不弹对话框，也不占用
+  // 页面底部的横幅——与 loginError / registerError 是同一条规矩。
+  Q_PROPERTY(QString serverKeyPinError READ serverKeyPinError NOTIFY
+                 serverKeyPinErrorChanged)
 
   // ---- 会话 ----
   Q_PROPERTY(bool connected READ connected NOTIFY sessionChanged)
@@ -148,11 +246,29 @@ class RemoteController : public QObject {
   Q_PROPERTY(QString busyAction READ busyAction NOTIFY busyChanged)
 
   // ---- 云端备份列表 ----
-  // 每一项是 {id, name, sizeBytes, sizeText, createdText, sha256Short}：
-  // 页面只做展示，不再自己算大小与时间。
+  // 每一项是 {id, name, sizeBytes, sizeText, createdText, sha256Short} 加上
+  // PR #21 的链元数据 {kind, kindText, generation, parentId, parentShort,
+  // lineageShort, restorable, restoreHint}：页面只做展示，不再自己算大小、
+  // 时间，也不自己推断"这一条能不能恢复"。
   Q_PROPERTY(QVariantList snapshots READ snapshots NOTIFY snapshotsChanged)
   Q_PROPERTY(QString listSummary READ listSummary NOTIFY snapshotsChanged)
   Q_PROPERTY(bool listLoaded READ listLoaded NOTIFY snapshotsChanged)
+
+  // ---- 最近一次产品级远端备份的结论（给界面直接显示）----
+  //
+  // 为什么单独留一个属性，而不是只写进状态条：状态条是"临时提示"，会被下一次
+  // 操作顶掉；而"本次实际创建的是完整基线"这条信息必须在用户看着 Remote
+  // Backup 区域时一直成立。kind 取值：""（还没做过）/ "full" / "incremental"
+  // / "no-change"。summary 是给用户看的一句话。
+  Q_PROPERTY(
+      QString backupSummary READ backupSummary NOTIFY backupSummaryChanged)
+  Q_PROPERTY(QString backupSummaryKind READ backupSummaryKind NOTIFY
+                 backupSummaryChanged)
+  // core 给出的“为什么这次不是增量”的原始理由（英文，来自共享 core）。
+  // 它只进默认折叠的“技术详情”：用户要的是结论，诊断信息不能丢，但也不该
+  // 摆在结论那一行。
+  Q_PROPERTY(QString backupBaselineReason READ backupBaselineReason NOTIFY
+                 backupSummaryChanged)
 
   // ---- 传输进度 ----
   // 刻意不叫 progressValue / percent：modern_gui_check.sh 里有一条"不许出现
@@ -185,6 +301,23 @@ class RemoteController : public QObject {
   Q_PROPERTY(
       QString registerError READ registerError NOTIFY registerErrorChanged)
 
+  // ---- 原始归档恢复：密码只有在 core 说"这份归档加密了"之后才索要 ----
+  //
+  // 这三个属性描述**同一个交互**的状态，页面据此决定显示哪一段：
+  //   * rawRestoreAwaitingPassword = true：那份归档已经拿到手（下载 + SHA-256
+  //     校验 + 按内容识别都过了），core 明确要求密码。会话里的字节留着，用户
+  //     可以反复输密码重试，**不会**重新下载。
+  //   * rawRestorePasswordError
+  //   非空：上一次密码没通过（或归档完整性校验失败）。
+  //     页面要给出"重新输入"的动作，而不是把整个流程关掉。
+  //   * rawRestoreDestinationText：这次恢复的目标目录（回显，不让用户重选）。
+  Q_PROPERTY(bool rawRestoreAwaitingPassword READ rawRestoreAwaitingPassword
+                 NOTIFY rawRestoreStateChanged)
+  Q_PROPERTY(QString rawRestorePasswordError READ rawRestorePasswordError NOTIFY
+                 rawRestoreStateChanged)
+  Q_PROPERTY(QString rawRestoreDestinationText READ rawRestoreDestinationText
+                 NOTIFY rawRestoreStateChanged)
+
  public:
   explicit RemoteController(QObject* parent = nullptr);
   ~RemoteController() override;
@@ -193,6 +326,8 @@ class RemoteController : public QObject {
   QString host() const { return QString::fromStdString(endpoint_.host); }
   QString portText() const { return QString::number(endpoint_.port); }
   QString username() const { return username_; }
+  // 上一次被接受的服务器身份 pin（原样回读，供界面回填与自检比对）。
+  QString serverKeyPin() const { return server_key_pin_; }
   // 只是"此刻这条 socket 在不在"。它是短命的实现细节，界面上**不**允许
   // 把它渲染成一个常驻的"已连接 / 未连接"状态（见 serverReachabilityText）。
   bool connected() const { return client_.connected(); }
@@ -204,6 +339,11 @@ class RemoteController : public QObject {
   QVariantList snapshots() const { return snapshot_items_; }
   QString listSummary() const { return list_summary_; }
   bool listLoaded() const { return list_loaded_; }
+  // 最近一次产品级远端备份的结论（给 Remote Backup 区域常驻显示；
+  // 与 status_* 的临时提示分开，见文件末尾的成员说明）。
+  QString backupSummary() const { return backup_summary_; }
+  QString backupSummaryKind() const { return backup_summary_kind_; }
+  QString backupBaselineReason() const { return last_backup_baseline_reason_; }
   bool transferActive() const { return transfer_active_; }
   QString transferPhaseText() const { return transfer_phase_text_; }
   qint64 bytesDone() const { return static_cast<qint64>(bytes_done_.load()); }
@@ -218,6 +358,10 @@ class RemoteController : public QObject {
   QString deleteAccountError() const { return delete_account_error_; }
   QString loginError() const { return login_error_; }
   QString registerError() const { return register_error_; }
+  QString serverKeyPinError() const { return server_key_pin_error_; }
+  bool rawRestoreAwaitingPassword() const { return raw_awaiting_password_; }
+  QString rawRestorePasswordError() const { return raw_password_error_; }
+  QString rawRestoreDestinationText() const { return raw_destination_text_; }
   QString diagnosticText() const {
     return QString::fromStdString(last_detail_);
   }
@@ -262,12 +406,59 @@ class RemoteController : public QObject {
   Q_INVOKABLE void clearLoginError();
   Q_INVOKABLE void clearRegisterError();
 
+  // 设置服务器身份指纹（连接配置，不是口令）。
+  //
+  // 校验复用共享的 ParseServerKeyPin：只接受 "sha256:<64 位十六进制>" 与
+  // "hex:<64 位十六进制>" 两种写法；不带前缀的裸十六进制会被拒——公钥与指纹
+  // 长度相同，混起来就会把指纹当成公钥用。不合法时原因写进 serverKeyPinError
+  // 并返回 false（一个字节都不发，也不改动上一次被接受的值）；合法则保存并
+  // 返回 true。**下一次连接**（以及它之后的每一次）都会用这个新值。
+  Q_INVOKABLE bool setServerKeyPin(const QString& pin);
+  // 输入框一被编辑就清掉这一行：旧原因不能挂在新输入上。
+  Q_INVOKABLE void clearServerKeyPinError();
+
   // 文件对话框的 URL 互转与其它页面同一套实现。
   Q_INVOKABLE QString localPathFromUrl(const QUrl& url) const;
   // 选择器的起始位置：目录就用它本身，文件就用它所在目录，
   // 都没有（或不存在）时退回主目录。
   Q_INVOKABLE QUrl fileDialogStartUrl(const QString& path) const;
   Q_INVOKABLE QString suggestedDownloadName(const QString& display_name) const;
+
+  // ---- 产品级远端备份 / 链恢复（QML 入口）----
+  //
+  // 与 backupctl remote backup / remote restore 走**同一个** core：
+  //   QML -> RemoteController -> RunRemoteBackup / RunRemoteRestore
+  // GUI 只传"源目录 + 策略"和"目标快照 + 目标目录"，其余全部由 core 决定。
+  // 返回 false 表示请求没有被受理（输入不合法 / 忙碌 / 未登录 / 没有 pin），
+  // 此时页面上已经有原因。
+  Q_INVOKABLE bool backupRemote(const QString& source_directory,
+                                bool allow_incremental);
+  // 恢复某个远端快照（自动解析并下载整条依赖链）。snapshot_id 为空或目标目录
+  // 为空都在本地被拒，一个字节都不发。
+  Q_INVOKABLE bool restoreSnapshot(const QString& snapshot_id,
+                                   const QString& destination_directory);
+  // 恢复一份**原始归档**（lineage 为空的远端条目）——用户看到的按钮与产品级
+  // 一样叫"恢复"，区别只在实现：它下载那一个 blob，由 core 按**内容**认出格式，
+  // 再交给既有的本地恢复核心独立恢复；它不需要、也不使用任何远端依赖链。
+  // 随机文件、损坏归档、版本不支持、单独的 delta 都会明确失败，并且不会在目标
+  // 目录留下半成品。
+  //
+  // 密码只有在 core 明确说"这份归档加密了"之后才索要：第一次调用（password
+  // 留空）会以 rawRestoreAwaitingPassword = true 结束，界面切到密码那一段，
+  // 之后用 restoreRawArchiveWithPassword 重试——用的是同一份已经下载并校验过的
+  // 字节，不重新下载。
+  Q_INVOKABLE bool restoreRawArchive(const QString& snapshot_id,
+                                     const QString& destination_directory,
+                                     const QString& password);
+  // 用户在密码那一段点"继续恢复"：用**同一份已经下载并校验过的字节**再恢复
+  // 一次，不重新下载。目标目录沿用第一次选定的那一个。
+  Q_INVOKABLE bool restoreRawArchiveWithPassword(const QString& password);
+  // 用户在密码那一段取消：终止这次交互、清零口令、删掉临时归档。
+  // 目标目录不变（失败本来就不会碰它），状态回到空闲。
+  Q_INVOKABLE void cancelRawRestore();
+  // 用户改了源目录 / 策略或离开了这一页时清掉上一次的结论：旧结论挂在新输入上
+  // 会误导（"增量备份完成"是上一次的事）。
+  Q_INVOKABLE void clearBackupSummary();
 
   // ---- 仅供 main.cpp 的自动化测试使用（刻意不是 Q_INVOKABLE）----
   bool waitForIdle(int timeout_ms);
@@ -281,6 +472,64 @@ class RemoteController : public QObject {
   int progressCallbackCountForTest() const {
     return progress_callbacks_.load();
   }
+  // ---- 产品级远端备份 / 恢复：自检需要读的结构化结果 ----
+  bool lastBackupProducedDeltaForTest() const {
+    return last_backup_produced_delta_;
+  }
+  bool lastBackupRebuiltFullForTest() const {
+    return last_backup_rebuilt_full_;
+  }
+  bool lastBackupNoChangesForTest() const { return last_backup_no_changes_; }
+  QString lastBackupSnapshotIdForTest() const {
+    return last_backup_snapshot_id_;
+  }
+  qint64 lastBackupUploadedBytesForTest() const {
+    return static_cast<qint64>(last_backup_uploaded_bytes_);
+  }
+  qint64 lastBackupGenerationForTest() const {
+    return static_cast<qint64>(last_backup_generation_);
+  }
+  qint64 lastBackupChainRootBytesForTest() const {
+    return static_cast<qint64>(last_backup_chain_root_bytes_);
+  }
+  QString lastBackupBaselineReasonForTest() const {
+    return last_backup_baseline_reason_;
+  }
+  qint64 lastRestoreChainLengthForTest() const {
+    return static_cast<qint64>(last_restore_chain_length_);
+  }
+  qint64 lastRestoreDeltaCountForTest() const {
+    return static_cast<qint64>(last_restore_delta_count_);
+  }
+  qint64 lastRestoreDownloadedBytesForTest() const {
+    return static_cast<qint64>(last_restore_downloaded_bytes_);
+  }
+  qint64 lastRestoreEntriesForTest() const {
+    return static_cast<qint64>(last_restore_entries_);
+  }
+  // ---- 原始归档单独恢复（kRestoreRaw）：自检需要读的结构化结果 ----
+  QString lastRawRestoreSha256ForTest() const {
+    return last_raw_restore_sha256_;
+  }
+  QString lastRawRestoreFormatForTest() const {
+    return last_raw_restore_format_;
+  }
+  qint64 lastRawRestoreDownloadedBytesForTest() const {
+    return static_cast<qint64>(last_raw_restore_downloaded_bytes_);
+  }
+  qint64 lastRawRestoreEntriesForTest() const {
+    return static_cast<qint64>(last_raw_restore_entries_);
+  }
+  bool lastRawRestorePasswordRequiredForTest() const {
+    return last_raw_restore_password_required_;
+  }
+  int lastRawRestoreDownloadCountForTest() const {
+    return last_raw_restore_download_count_;
+  }
+  QString lastRawRestoreArchivePathForTest() const {
+    return last_raw_restore_archive_path_;
+  }
+  bool rawRestoreSessionAliveForTest() const { return raw_session_ != nullptr; }
 
  signals:
   void endpointChanged();
@@ -289,6 +538,12 @@ class RemoteController : public QObject {
   void deleteAccountErrorChanged();
   void loginErrorChanged();
   void registerErrorChanged();
+  void serverKeyPinChanged();
+  void serverKeyPinErrorChanged();
+  // 最近一次产品级备份的结论（完整 / 增量 / 无变化）发生变化。
+  void backupSummaryChanged();
+  // 原始归档恢复交互的状态（是否需要密码 / 上一次密码错没错）发生变化。
+  void rawRestoreStateChanged();
   void busyChanged();
   void snapshotsChanged();
   void progressChanged();
@@ -300,8 +555,18 @@ class RemoteController : public QObject {
   // 传输方向。用整数原子变量跨线程传，避免在后台线程碰 QString。
   enum class Phase { kNone = 0, kUpload = 1, kDownload = 2 };
 
-  // 一条错误该出现在哪里。三个表单各自有错误行，页面级操作用底部横幅。
-  enum class ErrorSurface { kLogin, kRegister, kDeleteAccount, kBanner };
+  // 一条错误该出现在哪里。每个表单各有自己的错误行（登录 / 注册 / 注销
+  // 对话框 / 连接设置里的服务器身份指纹），页面级操作用底部横幅。
+  // 原始归档恢复交互的状态落地（会话、等待密码、密码错误、目标目录回显）。
+  void ApplyRawRestoreState(const RemoteOpResult& result);
+
+  enum class ErrorSurface {
+    kLogin,
+    kRegister,
+    kDeleteAccount,
+    kServerKey,
+    kBanner
+  };
 
   // 把一句话送到指定的错误容器（同一个容器里不重复发信号）。
   void ReportSurfaceError(ErrorSurface surface, const QString& message);
@@ -369,8 +634,14 @@ class RemoteController : public QObject {
   static QString FormatTime(std::uint64_t unix_seconds);
 
   backupproject::net::RemoteArchiveClient client_;
+  // endpoint_.server_key_pin 与 server_key_pin_ 必须始终是同一个值：每一次
+  // 提交（request.endpoint = endpoint_ 的每一处）都要再显式带一次 pin，
+  // 少一处就等于那一条操作在"没有 pin"的情况下连接，会以 kNoPinConfigured
+  // 失败。见 .cpp 里 CommitEndpoint / setServerKeyPin / 各个提交点。
   backupproject::net::RemoteEndpoint endpoint_;
   QString username_;
+  // 服务器身份 pin：可以公开，但同样只存在于内存（不落盘，见文件顶部说明）。
+  QString server_key_pin_;
   // 只存在于内存；退出登录与析构时擦除。绝不落盘、绝不进日志。
   QString password_;
 
@@ -398,6 +669,7 @@ class RemoteController : public QObject {
   QString delete_account_error_;
   QString login_error_;
   QString register_error_;
+  QString server_key_pin_error_;
 
   // 上一次连接尝试的结果。默认"不知道"：界面在真的试过之前什么都不说。
   RemoteReachability reachability_ = RemoteReachability::kUnknown;
@@ -405,6 +677,41 @@ class RemoteController : public QObject {
   QString status_kind_ = QStringLiteral("idle");
   QString status_title_ = QStringLiteral("未登录");
   QString status_message_;
+
+  // ---- 最近一次产品级远端备份的结论 ----
+  //
+  // 与 status_* 分开存放：状态条是"临时提示"，这一组是"当前这一页关于上一次
+  // 远端备份的事实"，不会被别的操作顺手清掉，直到用户改了输入或又做了一次。
+  QString backup_summary_;
+  QString backup_summary_kind_;
+  // 最近一次远端备份请求里用户选的策略（结论文案要用它区分“完整”与“兜底”）。
+  bool last_backup_incremental_requested_ = false;
+  bool last_backup_produced_delta_ = false;
+  bool last_backup_rebuilt_full_ = false;
+  bool last_backup_no_changes_ = false;
+  QString last_backup_snapshot_id_;
+  std::uint64_t last_backup_uploaded_bytes_ = 0;
+  std::uint64_t last_backup_chain_root_bytes_ = 0;
+  std::uint64_t last_backup_generation_ = 0;
+  QString last_backup_baseline_reason_;
+  std::uint64_t last_restore_chain_length_ = 0;
+  std::uint64_t last_restore_delta_count_ = 0;
+  std::uint64_t last_restore_downloaded_bytes_ = 0;
+  std::uint64_t last_restore_entries_ = 0;
+  std::uint64_t last_raw_restore_downloaded_bytes_ = 0;
+  std::uint64_t last_raw_restore_entries_ = 0;
+  bool last_raw_restore_password_required_ = false;
+  QString last_raw_restore_sha256_;
+  QString last_raw_restore_format_;
+  // ---- 原始归档恢复交互（见上面的属性说明）----
+  // raw_session_ 非空 = 那份归档已经下载并校验过、正等着用户输入密码。
+  // 它是**唯一**持有临时工作目录所有权的地方：清掉它就等于删掉那份临时归档。
+  std::shared_ptr<backupproject::net::RemoteRawRestoreSession> raw_session_;
+  bool raw_awaiting_password_ = false;
+  QString raw_password_error_;
+  QString raw_destination_text_;
+  int last_raw_restore_download_count_ = 0;
+  QString last_raw_restore_archive_path_;
 };
 
 }  // namespace backup_modern

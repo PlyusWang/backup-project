@@ -163,6 +163,23 @@ StoreResult RemoteMaintenance::DeleteSnapshot(std::int64_t user_id,
     SetError(error_message, "cannot read the snapshot row: " + store_error);
     return StoreResult::kError;
   }
+  // PR #21：依赖感知删除。被别的快照当作 parent 引用的快照**不能删**：
+  // 删掉它会让所有后代快照永远无法恢复（链断在中间）。检查放在**动磁盘之前**，
+  // 而不是先把 blob 挪进 trash 再回滚。
+  std::uint64_t children = 0;
+  const StoreResult counted = store_->CountSnapshotChildren(
+      user_id, snapshot_id, &children, &store_error);
+  if (counted != StoreResult::kOk) {
+    SetError(error_message, "cannot count the dependent snapshots: " + store_error);
+    return StoreResult::kError;
+  }
+  if (children > 0) {
+    SetError(error_message, "snapshot " + snapshot_id + " still has " +
+                                std::to_string(children) +
+                                " dependent incremental snapshot(s); delete the"
+                                " descendants first");
+    return StoreResult::kHasDependents;
+  }
   // 纵深防御：storage_name 是服务端自己写进去的，但仍然确认它是个纯文件名。
   if (record.storage_name.empty() ||
       record.storage_name.find('/') != std::string::npos ||
@@ -215,6 +232,11 @@ StoreResult RemoteMaintenance::DeleteSnapshot(std::int64_t user_id,
                                 ? "the snapshot row disappeared during the"
                                   " delete"
                                 : store_error);
+    if (remove_result == StoreResult::kHasDependents) {
+      // 只读检查与这里之间不可能出现新的子节点（同一把元数据互斥锁 + 数据
+      // 目录锁），所以这条分支只是纵深防御。无论如何：blob 已经改回正式名字。
+      return StoreResult::kHasDependents;
+    }
     return remove_result == StoreResult::kNotFound ? StoreResult::kNotFound
                                                    : StoreResult::kError;
   }

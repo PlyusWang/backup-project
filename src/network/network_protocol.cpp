@@ -13,6 +13,7 @@
 
 #include <cerrno>
 #include <cstring>
+#include <ctime>
 
 namespace backupproject {
 namespace net {
@@ -168,6 +169,11 @@ void DecodeFrameHeaderFields(const unsigned char* data, std::size_t size,
 
 // ---- 名字表 ----
 
+bool IsKnownSnapshotKind(std::uint16_t kind) {
+  return kind == static_cast<std::uint16_t>(SnapshotKind::kFull) ||
+         kind == static_cast<std::uint16_t>(SnapshotKind::kIncremental);
+}
+
 bool IsKnownOpcode(std::uint16_t opcode) {
   switch (static_cast<Opcode>(opcode)) {
     case Opcode::kPing:
@@ -254,6 +260,8 @@ const char* StatusName(std::uint32_t status) {
       return "MALFORMED_FRAME";
     case Status::kUnsupported:
       return "UNSUPPORTED";
+    case Status::kChainConflict:
+      return "CHAIN_CONFLICT";
   }
   return "UNKNOWN_STATUS";
 }
@@ -441,14 +449,31 @@ bool SendAll(int fd, const void* data, std::size_t size,
   return true;
 }
 
+std::int64_t MonotonicMillis() {
+  struct timespec now;
+  if (::clock_gettime(CLOCK_MONOTONIC, &now) != 0) {
+    return 0;
+  }
+  return static_cast<std::int64_t>(now.tv_sec) * 1000 +
+         static_cast<std::int64_t>(now.tv_nsec / 1000000);
+}
+
 bool ReceiveAll(int fd, void* data, std::size_t size, bool* closed_by_peer,
-                std::string* error_message) {
+                std::string* error_message, std::int64_t deadline_ms) {
   if (closed_by_peer != nullptr) {
     *closed_by_peer = false;
   }
   char* cursor = static_cast<char*>(data);
   std::size_t remaining = size;
   while (remaining > 0) {
+    // 每次 recv 之前查一次整体预算：慢速滴水的对端（每个超时周期挤 1 个字节）
+    // 单靠 SO_RCVTIMEO 是拦不住的。
+    if (deadline_ms != 0 && MonotonicMillis() >= deadline_ms) {
+      if (error_message != nullptr) {
+        *error_message = "receive deadline exceeded";
+      }
+      return false;
+    }
     const ssize_t got = ::recv(fd, cursor, remaining, 0);
     if (got < 0) {
       if (errno == EINTR) {
