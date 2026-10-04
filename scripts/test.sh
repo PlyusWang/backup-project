@@ -892,10 +892,16 @@ expect_path_absent "UNSUP-03b no archive was left behind" "$TEST_ROOT/unsup/u03.
 # socket 没法用 mkfifo/ln 造，用一个后台 python 进程 bind 住再测；
 # 备份必须在它存在期间失败，所以这里 sleep 1 等它真的建出来。
 mkdir -p "$TEST_ROOT/unsup/with-socket"
+# bind 用**相对名字**：AF_UNIX 的 sun_path 只有 108 字节，而仓库路径
+# （课程根搬迁之后）已经 72 字符，再把 testdata/... 拼上去就超了 —— 现象是
+# python 直接抛 OSError: AF_UNIX path too long，测试连夹具都建不出来。
+# 先 chdir 进目录、再 bind('sock')，socket 仍然落在被备份的目录里
+# （语义不变），但传进 bind 的字符串只有 5 个字节。
 python3 -c "
-import socket, time
+import os, socket, time
+os.chdir('$TEST_ROOT/unsup/with-socket')
 handle = socket.socket(socket.AF_UNIX)
-handle.bind('$TEST_ROOT/unsup/with-socket/sock')
+handle.bind('sock')
 time.sleep(30)
 " &
 SOCKET_PID=$!
@@ -1662,7 +1668,7 @@ printf 'a\n' > "$PVSEM/real-src/a.txt"
 printf 'a\n' > "$PVSEM/sock-src/a.txt"
 printf 'b\n' > "$PVSEM/sock-src/sub/b.txt"
 ln -s "$PVSEM/real-src" "$PVSEM/link-src"
-python3 -c "import socket,sys; s=socket.socket(socket.AF_UNIX); s.bind(sys.argv[1])" \
+python3 -c "import os,socket,sys; os.chdir(os.path.dirname(sys.argv[1])); s=socket.socket(socket.AF_UNIX); s.bind(os.path.basename(sys.argv[1]))" \
   "$PVSEM/sock-src/sub/sock"
 "$BACKUPCTL" --config-file "$PREVIEW_CONFIG" config repository set "$PREVIEW_REPO" \
   >/dev/null 2>&1
@@ -1764,7 +1770,7 @@ expect_preview_parity_at "PRV-30b GUI 与 CLI 的顺序逐行一致（未排序�
 PWIN="$PVSEM/window-src"
 mkdir -p "$PWIN"
 for index in $(seq 1 300); do printf 'x' > "$PWIN/f$(printf '%03d' "$index").dat"; done
-python3 -c "import socket,sys; s=socket.socket(socket.AF_UNIX); s.bind(sys.argv[1])" \
+python3 -c "import os,socket,sys; os.chdir(os.path.dirname(sys.argv[1])); s=socket.socket(socket.AF_UNIX); s.bind(os.path.basename(sys.argv[1]))" \
   "$PWIN/zzz-socket"
 run_preview_cli "$PWIN"
 PVL_WIN_STATUS=$PREVIEW_CLI_STATUS
@@ -1922,7 +1928,7 @@ expect_preview_matches_backup_at "PRV-38 FILT-PATH-05b 被排除的 C:note.txt �
 PSOCK="$PG/socket"
 rm -rf "$PSOCK"; mkdir -p "$PSOCK"
 printf 'x\n' > "$PSOCK/keep.txt"
-python3 -c "import socket,sys; s=socket.socket(socket.AF_UNIX); s.bind(sys.argv[1])" \
+python3 -c "import os,socket,sys; os.chdir(os.path.dirname(sys.argv[1])); s=socket.socket(socket.AF_UNIX); s.bind(os.path.basename(sys.argv[1]))" \
   "$PSOCK/sock\bad"
 run_preview_cli "$PSOCK"
 PSOCK_PREVIEW=$PREVIEW_CLI_STATUS
