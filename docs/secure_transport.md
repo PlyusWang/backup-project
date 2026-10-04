@@ -199,3 +199,54 @@ BPSEC1 在**每个 256 KiB 的业务块**上做一次 AES-256-CTR 与一次 HMAC
   基于 32 位列运算/T 表的实现 —— 后者能把这几条数字再提高一个量级。
 * 内存侧没有代价：32 MiB 传输的常驻内存增长约 1.3 MB（见
   tests/unit/secure_transport_test.cpp 的 RSS_BOUND 一行）。
+---
+
+## BPSEC2：服务器签名身份（PR #23）
+
+上面描述的是 **BPSEC1**：客户端必须事先知道服务端身份公钥（人工 pin）。BPSEC2
+在同一套帧与记录层之上加一层**身份证书**，让官方云端的用户不需要知道、也不需要
+核对任何指纹。
+
+**线格式**：沿用同一个 magic（BPS1），版本从 1 提到 2，并在 ServerHello 之后
+新增一条 type=6 ServerCertificate 消息（12 字节定长头 + BPCERT1 证书字节，
+证书总长不超过 4096）：
+
+    ClientHello(v2) -> ServerHello(v2) -> ServerCertificate -> ClientFinished -> ServerFinished
+
+BPSEC1 的线格式**一个字节都没变**：BPSEC1 握手时 transcript 输入里的证书段是
+空串，结论与旧版逐字节相同（既有的 15 个 secure_transport 用例原样通过）。
+
+**transcript**：SHA256(ClientHello + ServerHello + ServerCertificate)，三条都用
+收到的原始字节。于是协议版本、认证方式、证书全部字节、证书签名、server_id、
+被认证的公钥、双方随机数与双方临时公钥**全被绑定** —— 任何一处被改，Finished
+必然对不上。
+
+**客户端的校验顺序**（任一步失败即终止；不回退 BPSEC1、不回退人工 pin、不 TOFU）：
+
+1. 帧头（magic / 类型 / **版本必须等于 2** / 精确长度）；
+2. 解析 BPCERT1（结构、版本、算法、用途、长度、尾部字节）；
+3. 按 issuer_id 在可信根里找根（空存储 = 什么都不信）；
+4. 根未被吊销、且在证书**签发时刻**有效；
+5. 用根公钥做 Ed25519 验签；
+6. 证书里的 server_id 与期望值逐字节相等；
+7. 有效期（正负 5 分钟容差；过期与尚未生效分别给文案）；
+8. **证书认证的公钥 == ServerHello 里实际使用的身份公钥**；
+9. 既有的 X25519 低阶点拒绝规则；
+10. 以上都过了才派生会话密钥、才发 ClientFinished。
+
+第 8 步是关键：少了它，攻击者可以拿一张真证书配一把自己的临时密钥。
+
+**服务端**：--bpsec2-cert-file <BPCERT1 文件> 出示身份证书；
+--require-bpsec2 只接受版本 2 的 ClientHello，收到版本 1 直接以
+bpsec1-downgrade-refused 拒绝（拒绝降级）。启动时会核对证书里的公钥就是本机
+transport.key 的公钥，不一致直接拒绝启动。
+
+**公网监听**：默认仍然只允许 127.0.0.1。要监听公网必须同时给出
+--allow-public-bind <理由>、--bpsec2-cert-file 与 --require-bpsec2 —— 三条
+缺一不可：公网监听的正当性完全建立在客户端能用证书确认对端是谁之上。
+
+错误码（界面据此给出不同文案）：server-certificate-missing / -invalid /
+-untrusted / -wrong-server-id / -expired / -key-mismatch /
+bpsec1-downgrade-refused。
+
+完整的现状地图、设计取舍与施工顺序见 docs/bpsec2-design.md。
