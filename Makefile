@@ -106,6 +106,7 @@ FILESYSTEM_SOURCES := src/filesystem/file_system.cpp
 # CLI 与 Modern GUI 共用同一个 RemoteArchiveClient：桌面端只链接协议编解码与
 # 客户端，**不链接 SQLite**（元数据库只属于服务端进程）。
 CORE_SOURCES += src/network/network_protocol.cpp \
+                   src/network/server_profile.cpp \
                 src/network/secure_transport.cpp \
                 src/network/remote_backup_client.cpp \
                 src/network/snapshot_bundle.cpp \
