@@ -258,6 +258,7 @@ void ScrollBackupPage(QQuickWindow* window, int content_y) {
 // 跳过；但仓库里明明有加密记录却找不到对话框就是缺陷，按失败处理。
 int CaptureScreenshots(QQuickWindow* window, backup_modern::AppTheme* theme,
                        backup_modern::BackupController* controller,
+                       backup_modern::RemoteController* remote,
                        const QString& directory) {
   if (!QDir().mkpath(directory)) {
     std::fprintf(stderr, "无法创建截图目录: %s\n", qPrintable(directory));
@@ -302,6 +303,30 @@ int CaptureScreenshots(QQuickWindow* window, backup_modern::AppTheme* theme,
         return 1;
       }
     }
+  }
+
+  // 服务器身份的三种模式各留一张（PR #23）：官方云端 / 自定义（SSH 通道）/
+  // 自定义（直连）。这三张图正是这个 PR 要证明的东西 —— 官方云端只显示名字
+  // 加一句话，主机、端口、指纹一个都不出现；自定义模式才需要用户填。
+  if (remote != nullptr) {
+    struct ModeShot {
+      const char* mode;
+      const char* name;
+    };
+    const ModeShot shots[3] = {{"official", "official-cloud"},
+                               {"ssh", "advanced-ssh-mode"},
+                               {"direct", "custom-server-profile"}};
+    for (const ModeShot& shot : shots) {
+      remote->setConnectionMode(QString::fromLatin1(shot.mode));
+      for (int dark = 0; dark < 2; ++dark) {
+        theme->setDark(dark == 1);
+        window->setProperty("currentPage", kPageCount - 1);
+        if (!grab(QString::fromLatin1(shot.name), dark == 1)) {
+          return 1;
+        }
+      }
+    }
+    remote->setConnectionMode(QStringLiteral("official"));
   }
 
   // 高级选项展开：备份页在"收起 / 展开"两种状态下各留一张图，
@@ -10943,7 +10968,7 @@ int main(int argc, char* argv[]) {
       std::fprintf(stderr, "--screenshot 需要一个输出目录参数\n");
       return 2;
     }
-    const int result = CaptureScreenshots(window, &theme, &controller,
+    const int result = CaptureScreenshots(window, &theme, &controller, &remote_controller,
                                           arguments.at(screenshot_index + 1));
     if (result != 0) {
       return result;
