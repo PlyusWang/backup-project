@@ -73,7 +73,7 @@ else
 fi
 check "私钥文件权限是 0600" test "$(stat -c %a "$KEY")" = "600"
 check "公钥文件已生成" test -s "$KEY.pub"
-if grep -q "^test-root-a ed25519:[0-9a-f][0-9a-f]*$" "$KEY.pub"; then
+if grep -q "^test-root-a ed25519:[0-9a-f][0-9a-f]* unlimited$" "$KEY.pub"; then
   record_pass "公钥文件格式可直接当可信根用"
 else
   record_fail "公钥文件格式可直接当可信根用" "$(cat "$KEY.pub")"
@@ -97,7 +97,7 @@ if run_capture "$WORK_DIR/root-info.out" "$TOOL" root-info --root-key "$KEY"; th
 else
   record_fail "root-info 退出码 0" "$(tail -2 "$WORK_DIR/root-info.out" | tr '\n' ' ')"
 fi
-PUBKEY_HEX="$(sed -n 's/^test-root-a ed25519:\([0-9a-f]*\)$/\1/p' "$KEY.pub")"
+PUBKEY_HEX="$(sed -n 's/^test-root-a ed25519:\([0-9a-f]*\).*$/\1/p' "$KEY.pub")"
 if grep -q "root_public_key    = ed25519:$PUBKEY_HEX" "$WORK_DIR/root-info.out"; then
   record_pass "root-info 输出的公钥与 .pub 一致"
 else
@@ -268,13 +268,73 @@ if g++ -std=c++17 -Wall -Wextra -Iinclude "$WORK_DIR/rootdump.cpp" \
   BUILTIN_KEY="$(sed -n 's/^root_public_key=//p' "$WORK_DIR/rootdump.out")"
   FILE_LINE="$(grep -v '^#' resources/security/official-root-ed25519.pub | grep -v '^$' | head -1)"
   FILE_ID="$(printf %s "$FILE_LINE" | cut -d' ' -f1)"
-  FILE_KEY="$(printf %s "$FILE_LINE" | awk '{print $NF}')"
+  FILE_KEY="$(printf %s "$FILE_LINE" | awk '{print $2}')"
   check "内置官方根只有一把" test "$(sed -n 's/^size=//p' "$WORK_DIR/rootdump.out")" = "1"
   check "内置根标识与资源文件一致" test "$BUILTIN_ID" = "$FILE_ID"
   check "内置根公钥与资源文件一致" test "$BUILTIN_KEY" = "$FILE_KEY"
 else
   record_fail "编译内置根检查程序" "$(tail -3 "$WORK_DIR/rootdump-build.log" | tr '\n' ' ')"
 fi
+
+# ---- 7b. 独立红队发现的四类问题的回归测试 ----
+# (a) 用法错误不得回显参数原值：--root-key-hex=<种子> 被整串回显，就等于把
+#     私钥写进了 stderr 与日志（这是红队唯一抓到的、对"私钥永不进日志"的
+#     字面反例）。这里用单 token 形式 + 两个位置各试一次。
+DUMMY_HEX="00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff"
+"$TOOL" root-info "--root-key-hex=$DUMMY_HEX" > "$WORK_DIR/echo1.out" 2>&1
+"$TOOL" "--root-key-hex=$DUMMY_HEX" > "$WORK_DIR/echo2.out" 2>&1
+if grep -q -F "$DUMMY_HEX" "$WORK_DIR/echo1.out" "$WORK_DIR/echo2.out"; then
+  record_fail "用法错误不回显参数原值" "种子被回显进了 stderr"
+else
+  record_pass "用法错误不回显参数原值（--root-key-hex=<值> 单 token 也不回显）"
+fi
+
+# (b) 根文件的时间戳必须严格是整数，且"不限期"必须显式写 unlimited：
+#     红队用 "not-a-number" 一个笔误就把"根 2033 年过期"变成了"永久有效"。
+KEY_SPEC="ed25519:$PUBKEY_HEX"
+printf 'test-root-a %s 1700000000 2000000000\n' "$KEY_SPEC" > "$WORK_DIR/root-window.roots"
+printf 'test-root-a %s 1700000000 not-a-number\n' "$KEY_SPEC" > "$WORK_DIR/root-typo.roots"
+printf 'test-root-a %s 1700000000\n' "$KEY_SPEC" > "$WORK_DIR/root-one.roots"
+printf 'test-root-a %s unlimited\n' "$KEY_SPEC" > "$WORK_DIR/root-unlimited.roots"
+if run_capture "$WORK_DIR/verify-window.out" "$TOOL" verify-server --cert "$CERT" --roots "$WORK_DIR/root-window.roots"; then
+  record_pass "根文件写两个整数 -> 正常参与信任判断"
+else
+  record_fail "根文件写两个整数 -> 正常参与信任判断" "$(tail -2 "$WORK_DIR/verify-window.out" | tr '\n' ' ')"
+fi
+if "$TOOL" verify-server --cert "$CERT" --roots "$WORK_DIR/root-typo.roots" > /dev/null 2>&1; then
+  record_fail "根文件时间戳写错必须直接报错" "竟然被当成不限期接受了"
+else
+  record_pass "根文件时间戳写错必须直接报错（不再静默变成不限期）"
+fi
+if "$TOOL" verify-server --cert "$CERT" --roots "$WORK_DIR/root-one.roots" > /dev/null 2>&1; then
+  record_fail "根文件只写一个时间戳必须报错" "竟然被当成不限期接受了"
+else
+  record_pass "根文件只写一个时间戳必须报错（不限期要显式写 unlimited）"
+fi
+if run_capture "$WORK_DIR/verify-unlimited.out" "$TOOL" verify-server --cert "$CERT" --roots "$WORK_DIR/root-unlimited.roots"; then
+  record_pass "根文件显式写 unlimited -> 接受"
+else
+  record_fail "根文件显式写 unlimited -> 接受" "$(tail -2 "$WORK_DIR/verify-unlimited.out" | tr '\n' ' ')"
+fi
+
+# (c) 内联的 32 个十六进制字符不许被当成 32 字节 ASCII 原样签进证书
+if "$TOOL" issue-server --root-key "$KEY" --server-id x \
+      --server-pubkey abababababababababababababababab --out "$WORK_DIR/ambig.bpcert" > /dev/null 2>&1; then
+  record_fail "32 字符的内联公钥必须被拒" "被当成 ASCII 原始字节接受并签进了证书"
+else
+  record_pass "32 字符的内联公钥必须被拒（消除同一输入两种读法）"
+fi
+
+# (d) 硬链接目标必须拒绝（O_NOFOLLOW 只挡符号链接）
+printf 'original-content\n' > "$WORK_DIR/hardlink-target"
+ln -f "$WORK_DIR/hardlink-target" "$WORK_DIR/hardlink-out"
+if "$TOOL" issue-server --root-key "$KEY" --server-id x \
+      --server-pubkey "$SERVER_PUB_HEX" --out "$WORK_DIR/hardlink-out" > /dev/null 2>&1; then
+  record_fail "硬链接目标必须拒绝" "竟然写了进去"
+else
+  record_pass "硬链接目标必须拒绝"
+fi
+check "拒绝硬链接时原文件未被改动" grep -q "^original-content$" "$WORK_DIR/hardlink-target"
 
 # ---- 8. 全部输出里都不含私钥内容 ----
 SEED="$(sed -n 's/^seed-hex: //p' "$KEY" | tr -d '[:space:]')"

@@ -5,7 +5,7 @@
 //   backup-cert-tool root-init     --root-key <path> --root-id <id>
 //   backup-cert-tool root-info     --root-key <path>
 //   backup-cert-tool issue-server  --root-key <path> --server-id <id>
-//                                  --server-pubkey <x25519:hex|@file> --out <path>
+//                                  --server-pubkey <hex:<64 位十六进制>|@file> --out <path>
 //                                  [--serial N] [--days N] [--not-before N]
 //   backup-cert-tool verify-server --cert <path> [--roots <file>]
 //                                  [--issuer-pub <hex>] [--now N]
@@ -76,7 +76,7 @@ void PrintUsage() {
       "  root-info      --root-key <path>\n"
       "                 读回根的信息（只输出公钥与指纹）。\n"
       "  issue-server   --root-key <path> --server-id <id>\n"
-      "                 --server-pubkey <x25519:hex|@file> --out <path>\n"
+      "                 --server-pubkey <hex:<64 位十六进制>|@file> --out <path>\n"
       "                 [--serial N] [--days N] [--not-before N]\n"
       "                 为已有服务器公钥签发身份证书（不改动任何私钥）。\n"
       "  verify-server  --cert <path> [--roots <file>] [--issuer-pub <hex>]\n"
@@ -114,6 +114,15 @@ bool ReadFile(const std::string& path, std::string* out,
 // 独占创建 + 精确权限。exclusive=false 时允许覆盖（用于公钥/证书这类公开文件）。
 bool WriteFile(const std::string& path, mode_t mode, const std::string& data,
                bool exclusive, std::string* error_message) {
+  // O_NOFOLLOW 只挡符号链接，挡不住硬链接：提前把目标做成硬链接，写进去就会
+  // 连带改到另一个路径上的文件。先 lstat 一次，链接数 > 1 直接拒绝。
+  struct stat existing;
+  if (::lstat(path.c_str(), &existing) == 0 && existing.st_nlink > 1) {
+    if (error_message != nullptr) {
+      *error_message = "目标文件有多个硬链接，拒绝写入：" + path;
+    }
+    return false;
+  }
   const int flags = O_WRONLY | O_CREAT | O_NOFOLLOW |
                     (exclusive ? O_EXCL : O_TRUNC);
   const int fd = ::open(path.c_str(), flags, mode);
@@ -145,6 +154,18 @@ bool WriteFile(const std::string& path, mode_t mode, const std::string& data,
     return false;
   }
   return true;
+}
+
+// 回显参数名时只保留 '=' 之前的部分，并且截断长度。
+// 原因：运维完全可能写成 --root-key-hex=<64 位种子>，整串回显就等于把私钥
+// 写进了 stderr 与日志 —— 这是"私钥永不进日志"这条承诺上唯一被抓到的反例。
+std::string RedactArgument(const std::string& raw) {
+  const std::size_t equal = raw.find('=');
+  std::string head = equal == std::string::npos ? raw : raw.substr(0, equal);
+  if (head.size() > 32) {
+    head = head.substr(0, 32) + "...";
+  }
+  return head;
 }
 
 std::string Trim(const std::string& text) {
@@ -224,7 +245,8 @@ bool LoadRootKey(const std::string& path, RootKey* out,
 bool ParseServerPublicKey(const std::string& text, std::string* out,
                           std::string* error_message) {
   std::string material = text;
-  if (!material.empty() && material[0] == '@') {
+  const bool from_file = !material.empty() && material[0] == '@';
+  if (from_file) {
     if (!ReadFile(material.substr(1), &material, error_message)) {
       return false;
     }
@@ -234,8 +256,10 @@ bool ParseServerPublicKey(const std::string& text, std::string* out,
   if (backupproject::crypto::X25519ParseKeyText(material, out, &parse_error)) {
     return true;
   }
-  // 也接受 32 字节原始二进制文件。
-  if (material.size() == backupproject::crypto::kBpcert1PublicKeySize) {
+  // 32 字节原始二进制**只**对 @文件 成立。内联的 32 个十六进制字符一律按
+  // "十六进制不完整"拒绝：否则同一段输入有两种读法，一个被截断的 64 位
+  // 十六进制公钥会被当成 ASCII 原样签进证书，而且看不出来。
+  if (from_file && material.size() == backupproject::crypto::kBpcert1PublicKeySize) {
     *out = material;
     return true;
   }
@@ -273,8 +297,10 @@ int CommandRootInit(const Options& options) {
   if (!WriteFile(path, 0600, key_text, true, &error)) {
     return Fail(error);
   }
+  // 显式写 unlimited：根的"不限期"必须是写出来的意图，不能靠省略字段表达。
   const std::string pub_text =
-      root_id + " " + backupproject::crypto::Ed25519FormatPublicKeyHex(public_key) + "\n";
+      root_id + " " + backupproject::crypto::Ed25519FormatPublicKeyHex(public_key) +
+      " unlimited\n";
   if (!WriteFile(path + ".pub", 0644, pub_text, false, &error)) {
     return Fail(error);
   }
@@ -509,11 +535,13 @@ int main(int argc, char** argv) {
   for (int i = 2; i < argc; ++i) {
     const std::string name = argv[i];
     if (name.size() < 3 || name.compare(0, 2, "--") != 0) {
-      std::fprintf(stderr, "错误：无法识别的参数 \"%s\"\n", name.c_str());
+      std::fprintf(stderr, "错误：无法识别的参数 \"%s\"\n",
+                   RedactArgument(name).c_str());
       return 2;
     }
     if (i + 1 >= argc) {
-      std::fprintf(stderr, "错误：参数 %s 缺少取值\n", name.c_str());
+      std::fprintf(stderr, "错误：参数 %s 缺少取值\n",
+                   RedactArgument(name).c_str());
       return 2;
     }
     options.values.emplace_back(name, argv[++i]);
@@ -540,7 +568,8 @@ int main(int argc, char** argv) {
     PrintUsage();
     return 0;
   }
-  std::fprintf(stderr, "错误：未知子命令 \"%s\"\n", options.command.c_str());
+  std::fprintf(stderr, "错误：未知子命令 \"%s\"\n",
+               RedactArgument(options.command).c_str());
   PrintUsage();
   return 2;
 }

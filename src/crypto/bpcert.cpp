@@ -431,8 +431,14 @@ Bpcert1Error Bpcert1VerifySignature(const std::string& raw,
 bool Bpcert1CheckValidity(const Bpcert1& certificate,
                           std::int64_t now_unix_seconds,
                           Bpcert1Error* error_result, std::string* message) {
-  const std::int64_t skew = kBpcert1ClockSkewSeconds;
-  if (now_unix_seconds + skew < certificate.not_before) {
+  // now ± 300 在 INT64 边界上会溢出，而有符号溢出是 UB。用 128 位中间量
+  // 做比较（与 ed25519.cpp 里同一个 __extension__ 写法）。
+  __extension__ typedef __int128 Wide;
+  const Wide now_wide = static_cast<Wide>(now_unix_seconds);
+  const Wide skew_wide = static_cast<Wide>(kBpcert1ClockSkewSeconds);
+  const Wide before_wide = static_cast<Wide>(certificate.not_before);
+  const Wide after_wide = static_cast<Wide>(certificate.not_after);
+  if (now_wide + skew_wide < before_wide) {
     if (error_result != nullptr) *error_result = Bpcert1Error::kNotYetValid;
     if (message != nullptr) {
       const bool far_future =
@@ -443,7 +449,7 @@ bool Bpcert1CheckValidity(const Bpcert1& certificate,
     }
     return false;
   }
-  if (now_unix_seconds > certificate.not_after + skew) {
+  if (now_wide > after_wide + skew_wide) {
     if (error_result != nullptr) *error_result = Bpcert1Error::kExpired;
     if (message != nullptr) {
       const bool far_past =

@@ -28,6 +28,18 @@ void SetError(std::string* error_message, const char* text) {
   }
 }
 
+// 严格解析 Unix 秒。strtoll 不带 endptr 检查会把 "not-a-number" 变成 0，
+// 而 0 在这份格式里是"不限期"—— 一个笔误就把"根 2033 年过期"变成"根永久
+// 有效"，这是实打实的 fail-open。所以：整串必须都是数字，否则报错。
+bool ParseSecondsStrict(const std::string& text, std::int64_t* out) {
+  if (text.empty()) return false;
+  char* end = nullptr;
+  const long long value = std::strtoll(text.c_str(), &end, 10);
+  if (end == nullptr || *end != '\0') return false;
+  *out = static_cast<std::int64_t>(value);
+  return true;
+}
+
 }  // namespace
 
 const char* TrustedRootStore::OfficialCloudRootId() {
@@ -171,18 +183,38 @@ bool TrustedRootStore::LoadFromText(const std::string& text,
     std::string extra;
     std::int64_t numbers[2] = {0, 0};
     int number_count = 0;
+    bool saw_unlimited = false;
     while (fields >> extra) {
       if (extra == "revoked") {
         root.revoked = true;
       } else if (extra == "active") {
         root.revoked = false;
+      } else if (extra == "unlimited") {
+        saw_unlimited = true;
       } else if (number_count < 2) {
-        numbers[number_count] = std::strtoll(extra.c_str(), nullptr, 10);
+        if (!ParseSecondsStrict(extra, &numbers[number_count])) {
+          if (error_message != nullptr) {
+            *error_message = "第 " + std::to_string(line_number) +
+                             " 行的时间戳不是合法整数（不限期必须显式写 unlimited）";
+          }
+          return false;
+        }
         ++number_count;
       } else {
         SetError(error_message, "根文件的字段太多，格式不认识");
         return false;
       }
+    }
+    // 有效期必须**显式**表达：要么两个整数，要么写 unlimited。
+    // 只写一个数字、或者什么都不写，都不再被当成"不限期"。
+    if (saw_unlimited && number_count != 0) {
+      SetError(error_message, "根文件里 unlimited 与时间戳不能同时出现");
+      return false;
+    }
+    if (!saw_unlimited && number_count != 2) {
+      SetError(error_message,
+               "根的有效期要么写成两个整数，要么显式写 unlimited");
+      return false;
     }
     root.not_before = numbers[0];
     root.not_after = numbers[1];

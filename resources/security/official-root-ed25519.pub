@@ -4,5 +4,8 @@
 # 从不进入 Git / ECS / 制品 / ZIP / 日志，也从不经过命令行参数。
 # 轮换用：再加一行 Root-B，老证书在 Root-A 行被标成 revoked 之前仍然有效。
 #
-# 格式：<root-id> <public-key> [not_before] [not_after] [active|revoked]
-backup-project-official-root-a ed25519:0530792388326c3db8e0b60df197a94a3a549c888efdd0e6b254eac43aa66df9
+# 格式：<root-id> <public-key> [not_before not_after | unlimited] [active|revoked]
+# 有效期必须**显式**写：要么两个 Unix 秒，要么写 unlimited。
+# 只写一个数字、或者什么都不写，都会被拒绝 —— 一个笔误不该把"根 2033 年
+# 过期"悄悄变成"根永久有效"。
+backup-project-official-root-a ed25519:0530792388326c3db8e0b60df197a94a3a549c888efdd0e6b254eac43aa66df9 unlimited
