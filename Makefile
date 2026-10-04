@@ -144,11 +144,21 @@ FIXTURE_OBJECTS := $(patsubst %.cpp,$(BUILD_DIR)/%.o,$(FIXTURE_SOURCES))
 FIXTURE_CORE_OBJECTS := $(patsubst %.cpp,$(BUILD_DIR)/%.o,$(CORE_SOURCES) $(FILESYSTEM_SOURCES))
 DEPENDS += $(FIXTURE_OBJECTS:.o=.d)
 
-.PHONY: all debug sanitize test test-fixtures server remote-sequence gui gui-modern gui-all cert-tool clean
+.PHONY: all client client-cli debug sanitize test test-fixtures server remote-sequence gui gui-modern gui-all cert-tool clean
 
 # 产品构建：三个产品产物（CLI + 服务端 + 测试夹具除外）。
 # archive-cli 是测试夹具，见上面的说明。
 all: $(TARGET) $(SERVER_TARGET)
+
+# 两端可以分开构建（PR #23 的发布脚本就靠这两个目标）：
+#   make client -> backupctl + 现代 GUI（QML）
+#   make server -> backup-server + 管理工具 + 密钥工具
+# all 的行为保持不变（仍然是 backupctl + backup-server）。
+client: $(TARGET) gui-modern
+
+# 没有 Qt 的构建机也要能出客户端 CLI：发布脚本会在 make client 失败时
+# 退到这条目标，并把原因写进构建报告，而不是假装 GUI 也打出来了。
+client-cli: $(TARGET)
 
 # ---- ECS 本地管理工具（PR #20 closure）----
 #
