@@ -116,7 +116,14 @@ PUBLIC_REASON="PR23-Phase7-official-cloud-direct: no tunnel, identity by BPSEC2 
 # 没退干净、新进程起不来，看起来像"公网起不来"）。
 if ssh "$ECS" "bash $SERVER_ROOT/deploy/incoming/pr23_ecs_phase3_payload.sh deploy-public $SERVER_ROOT $STAMP '$PUBLIC_REASON'"      > "$WORK_DIR/deploy-public.txt" 2>&1; then
   sleep 2
-  record_pass "B01 ECS 服务端已在 0.0.0.0:18765 监听"
+  # 必须**精确**匹配 0.0.0.0:18765。第一版这里只 grep 了 "18765"，于是
+  # 上一轮遗留的 127.0.0.1 监听也让它"通过"了 —— 一个只验证"有东西在听"
+  # 的断言，会把"根本没切过去"报成成功。
+  if ssh "$ECS" "ss -ltn | grep -q '0.0.0.0:18765'"; then
+    record_pass "B01 ECS 服务端已在 0.0.0.0:18765 监听"
+  else
+    record_fail "B01 ECS 服务端公网监听" "$(ssh "$ECS" "ss -ltn | grep 18765 || echo '没有任何 18765 监听'" 2>&1 | tr '\n' ' ')"
+  fi
 else
   record_fail "B01 ECS 服务端公网监听" "$(ssh "$ECS" "tail -3 $SERVER_ROOT/logs/server.log" 2>&1 | tr '\n' ' ')"
 fi
