@@ -69,6 +69,64 @@ bool Contains(const std::string& haystack, const char* needle) {
   return haystack.find(needle) != std::string::npos;
 }
 
+// 尽力而为地抹掉内存里的一份口令。std::string 也可能有副本（分配器、COW），
+// 所以这只是缩小窗口，不是内存加密——与 password_ 的擦除同一条边界。
+void WipeSecret(std::string* secret) {
+  if (secret == nullptr || secret->empty()) {
+    return;
+  }
+  volatile char* bytes = &(*secret)[0];
+  for (std::size_t index = 0; index < secret->size(); ++index) {
+    bytes[index] = 0;
+  }
+  secret->clear();
+}
+
+// 本地恢复核心的原始诊断串 -> 给用户看的"原因"。两件事：
+//
+//   1. 只留"为什么"那一句：core 的前缀（"raw restore: destination rejected —"）
+//      是给归类用的，不是给用户读的；
+//   2. 把本机临时工作目录（.../raw-restore-XXXXXX/xxx.bak）换成占位符：用户
+//      不需要、也不该在界面上看到本机的临时路径。
+QString SanitizeLocalRestoreReason(const std::string& detail) {
+  QString text = QString::fromStdString(detail);
+  const int dash = text.lastIndexOf(QStringLiteral("— "));
+  const int colon = text.lastIndexOf(QStringLiteral("："));
+  const int cut = dash >= 0 ? dash + 2 : (colon >= 0 ? colon + 1 : -1);
+  if (cut > 0) {
+    text = text.mid(cut);
+  }
+  int guard = 0;
+  while (guard++ < 8) {
+    const int at = text.indexOf(QStringLiteral("raw-restore-"));
+    if (at < 0) {
+      break;
+    }
+    // 码点直接写出来：QLatin1Char 只接受单字节，中文标点会变成 overflow 警告
+    // （而这个仓库的构建要求 0 警告）。
+    const QChar kFullwidthColon(0xFF1A);   // ：
+    const QChar kFullwidthCloseParen(0xFF09);  // ）
+    int begin = at;
+    while (begin > 0 && !text.at(begin - 1).isSpace() &&
+           text.at(begin - 1) != kFullwidthColon &&
+           text.at(begin - 1) != QLatin1Char('/')) {
+      --begin;
+    }
+    int end = at;
+    while (end < text.size() && !text.at(end).isSpace() &&
+           text.at(end) != kFullwidthCloseParen &&
+           text.at(end) != QLatin1Char(')')) {
+      ++end;
+    }
+    text.replace(begin, end - begin, QStringLiteral("(临时归档)"));
+  }
+  text = text.simplified();
+  if (text.size() > 160) {
+    text = text.left(160) + QStringLiteral("…");
+  }
+  return text;
+}
+
 // 把核心校验器给出的用户名原因翻译成用户看得懂的一句话。这里是**唯一**的
 // 翻译点：登录与注册共用它，所以两张表单不可能对同一段输入说出不同的话。
 //
@@ -317,6 +375,23 @@ QString RemoteController::ClassifyFailure(const std::string& status_name,
   if (Contains(detail, "raw restore: delta needs its chain")) {
     return QStringLiteral("raw-delta");
   }
+  // 密码错 / 归档损坏 / 版本不支持 / 目标目录契约：这四类由 core 用**它自己的**
+  // 诊断串区分（见 remote_incremental.cpp 的 DescribeLocalRestoreFailure），
+  // 不是 GUI 猜的。尤其是"密码错"与"payload 被改动"：后者在 HMAC 之前就被
+  // payload_sha256 拦下，所以可以如实分开说；而"密码错"与"容器头被改动"在
+  // 密码学上不可区分，raw-auth 的文案必须把两种可能都写出来。
+  if (Contains(detail, "raw restore: authentication failed")) {
+    return QStringLiteral("raw-auth");
+  }
+  if (Contains(detail, "raw restore: corrupted archive")) {
+    return QStringLiteral("raw-corrupt");
+  }
+  if (Contains(detail, "raw restore: unsupported version")) {
+    return QStringLiteral("raw-version");
+  }
+  if (Contains(detail, "raw restore: destination rejected")) {
+    return QStringLiteral("raw-destination");
+  }
   if (Contains(detail, "raw restore:")) {
     return QStringLiteral("raw-restore");
   }
@@ -401,31 +476,50 @@ QString RemoteController::DescribeFailure(const QString& error_kind) {
         "这一条不是远端备份链的材料包（它是原始归档上传）：不能用链恢复，"
         "请改用“下载归档”。");
   }
-  // ---- 原始归档单独恢复：三种失败各有各的动作 ----
+  // ---- 原始归档恢复：每一种失败各有各的动作 ----
+  //
+  // 面向用户的文案只有中文，不含内部错误码（那些留在诊断详情里）。
   if (error_kind == QStringLiteral("raw-unsupported")) {
     return QStringLiteral(
-        "该远端对象不是这个软件能独立恢复的备份归档（按内容识别，与文件名、"
-        "扩展名无关）。目标目录没有被创建，也没有留下任何文件。");
+        "该文件不是受支持的备份归档（按内容识别，与文件名、扩展名无关）。"
+        "目标目录没有被创建，也没有留下任何文件。");
   }
   if (error_kind == QStringLiteral("raw-password")) {
+    return QStringLiteral("这份备份已加密，请输入恢复密码。");
+  }
+  if (error_kind == QStringLiteral("raw-auth")) {
+    // core 只能证明"这把钥匙不对"：密码错、或者容器头被改过。不许只说前者。
+    return QStringLiteral("恢复密码错误，或备份完整性校验失败，请重新输入。");
+  }
+  if (error_kind == QStringLiteral("raw-corrupt")) {
     return QStringLiteral(
-        "这份归档是加密的：请填写恢复密码之后再点“尝试恢复”。没有密码"
-        "无法恢复，也不会绕过加密。");
+        "备份归档已损坏或完整性校验失败：它认得出是我们的备份格式，但内容与"
+        "它自己的声明不符，无法恢复。目标目录没有被改动。");
+  }
+  if (error_kind == QStringLiteral("raw-version")) {
+    return QStringLiteral(
+        "当前版本不支持该备份格式（归档是更新版本写出来的）。"
+        "请用生成它的那个版本恢复。");
+  }
+  if (error_kind == QStringLiteral("raw-destination")) {
+    return QStringLiteral(
+        "目标目录不能用于恢复：本地恢复要求它是一个不存在的位置，或者一个"
+        "空目录。目标目录没有被改动。");
   }
   if (error_kind == QStringLiteral("raw-delta")) {
     return QStringLiteral(
-        "这是一份增量备份，不能脱离依赖链单独恢复：它需要同一序列里的父快照"
-        "与配套材料。请改用产品级“恢复”，它会自动取回整条依赖链。");
+        "这是增量备份的一部分，缺少父备份，无法单独恢复。"
+        "请使用远端备份链中的“恢复”。");
   }
   if (error_kind == QStringLiteral("raw-download")) {
     return QStringLiteral(
-        "下载这份原始归档时失败（网络中断，或者字节没有通过 SHA-256 校验）："
+        "下载失败：网络中断，或者字节没有通过 SHA-256 校验。"
         "本地没有留下任何文件，可以直接再试一次。");
   }
   if (error_kind == QStringLiteral("raw-restore")) {
     return QStringLiteral(
-        "按本地备份格式恢复失败（归档损坏，或者它不是一份完整备份）。"
-        "目标目录没有被创建，也没有留下任何文件。");
+        "恢复失败：这份备份的内容与它自己的声明不一致。"
+        "目标目录没有被改动，也没有留下任何文件。");
   }
   if (error_kind == QStringLiteral("forbidden")) {
     return QStringLiteral("没有权限访问这个云端备份。");
@@ -647,16 +741,16 @@ void RemoteController::SetSnapshots(
     item.insert(QStringLiteral("parentShort"), parent.left(12));
     item.insert(QStringLiteral("lineageShort"),
                 QString::fromStdString(info.lineage).left(12));
-    // 主操作的文案：产品级是"恢复"（自动取回整条依赖链），原始归档是
-    // "尝试恢复"（下载之后按本地格式独立恢复；能不能恢复要看内容）。
-    item.insert(QStringLiteral("restoreLabel"), raw_archive
-                                                    ? QStringLiteral("尝试恢复")
-                                                    : QStringLiteral("恢复"));
+    // 主操作的文案：三种类型都叫"恢复"。用户不需要理解 raw / 产品级 / 链
+    // 恢复这些内部 pipeline 差异——那是三个 badge（原始归档 / 完整备份 /
+    // 增量备份）要说的事；按钮只表达意图。内部实现当然还是两条路，tooltip
+    // 里如实说明这一条会怎么做。
+    item.insert(QStringLiteral("restoreLabel"), QStringLiteral("恢复"));
     item.insert(
         QStringLiteral("restoreTooltip"),
         raw_archive
-            ? QStringLiteral("下载该归档，并尝试按本地备份格式独立恢复；"
-                             "原始归档不属于远端增量链。")
+            ? QStringLiteral("下载这份原始归档，按本地备份格式恢复。"
+                             "它不属于远端增量链，不会取回别的对象。")
             : QStringLiteral("自动获取完整依赖链并恢复此快照。"));
     // 卡片上那一句说明。raw 需要一句"它是什么"，产品级不需要。
     item.insert(QStringLiteral("typeNote"),
@@ -665,9 +759,10 @@ void RemoteController::SetSnapshots(
                             : QString());
     // 能不能点主操作：
     //   * 产品级（full / incremental）-> 由链语义决定，能恢复；
-    //   * raw -> 可以"尝试恢复"：能不能恢复要看内容，所以这里允许点击，
-    //     真正的失败（随机文件 / 损坏 / 单独的 delta / 缺密码）由 core 给出
-    //     明确原因，而不是在这里凭元数据猜。
+    //   * raw -> 也能恢复：能不能**成功**要看内容，所以这里允许点击，真正的
+    //     失败（随机文件 / 损坏 / 版本不支持 / 单独的 delta / 缺密码）由 core
+    //     给出明确原因，而不是在这里凭元数据猜，更不是把内部不确定性写进
+    //     按钮名字。
     item.insert(QStringLiteral("restorable"),
                 product_full || incremental || raw_archive);
     // restoreHint 只用于"这一条现在确实不能恢复"的情况（目前只剩产品级里
@@ -976,27 +1071,11 @@ QString RemoteController::SurfaceFailureMessage(RemoteOpResult::Kind kind,
       }
       break;
     case RemoteOpResult::Kind::kRestoreRaw:
-      if (error_kind == QStringLiteral("raw-unsupported")) {
-        return QStringLiteral(
-            "该远端对象不是这个软件能独立恢复的备份归档（按内容识别）："
-            "目标目录没有被创建，也没有留下任何文件");
-      }
-      if (error_kind == QStringLiteral("raw-delta")) {
-        return QStringLiteral(
-            "这是一份增量备份，不能脱离依赖链单独恢复：请改用产品级“恢复”");
-      }
-      if (error_kind == QStringLiteral("raw-password")) {
-        return QStringLiteral("这份归档是加密的：请填写恢复密码之后再试");
-      }
-      if (error_kind == QStringLiteral("raw-download")) {
-        return QStringLiteral(
-            "下载这份原始归档失败（网络中断或校验不通过）：本地没有留下任何文"
-            "件");
-      }
-      if (error_kind == QStringLiteral("raw-restore")) {
-        return QStringLiteral(
-            "按本地备份格式恢复失败：目标目录没有被创建，也没有留下任何文件");
-      }
+      // 原始归档恢复的每一种失败都**只有一处**中文文案：DescribeFailure。
+      // 这里刻意不再各写一份——两份文案是同一个事实的两次表述，改一处忘一处
+      // 就会让横幅和详情自相矛盾（本轮就抓到过这个漂移：横幅还在说"不能脱离
+      // 依赖链"，而详情里已经写明"缺少父备份"）。所以只有与类型无关的网络 /
+      // 服务端两种情形在这里特判，其余一律落回 fallback。
       if (network) {
         return QStringLiteral(
             "网络连接中断，这份原始归档没有被恢复；目标目录没有被改动");
@@ -1206,23 +1285,51 @@ RemoteOpResult RemoteController::RunOperation(
         result.ok = false;
         break;
       }
-      backupproject::net::RemoteRawRestoreRequest raw;
-      raw.client = client;
-      raw.cache = cache;
-      raw.snapshot_id = request.snapshot_id;
-      raw.display_name = request.display_name;
-      raw.destination_directory = request.restore_destination;
-      raw.restore_options.password = request.restore_password;
-      raw.progress = progress;
+      // 一次交互 = 一次 Prepare（下载 + SHA-256 校验 + 按内容识别）+ 一到多次
+      // Run（带密码重试）。需要密码时把这个会话交回主线程：用户下一次输入的
+      // 密码用的是**同一份**已经下载并校验过的字节，不重新下载。
+      std::shared_ptr<backupproject::net::RemoteRawRestoreSession> session =
+          request.raw_session;
+      if (session == nullptr) {
+        session =
+            std::make_shared<backupproject::net::RemoteRawRestoreSession>();
+        backupproject::net::RemoteRawRestoreRequest raw;
+        raw.client = client;
+        raw.cache = cache;
+        raw.snapshot_id = request.snapshot_id;
+        raw.display_name = request.display_name;
+        raw.destination_directory = request.restore_destination;
+        // 第一次请求**不带**密码：界面也是一开始只问目标目录——只有当 core
+        // 明确说"这份归档加密了"之后才向用户要密码。
+        raw.restore_options.password.clear();
+        raw.progress = progress;
+        backupproject::net::RemoteRawRestoreOutcome prepared;
+        if (!session->Prepare(raw, &prepared, &error)) {
+          result.ok = false;
+          // 会话只活在这次 Prepare 里：离开作用域就会删掉工作目录。
+          session.reset();
+          break;
+        }
+      }
       backupproject::net::RemoteRawRestoreOutcome outcome;
-      result.ok =
-          backupproject::net::RunRemoteRawRestore(raw, &outcome, &error);
+      result.ok = session->Run(request.restore_password, &outcome, &error);
       result.raw_password_required = outcome.password_required;
-      if (result.ok) {
-        result.raw_downloaded_bytes = outcome.downloaded_bytes;
-        result.raw_verified_sha256 = outcome.verified_sha256;
-        result.raw_archive_format = outcome.archive_format;
-        result.raw_restored_entries = outcome.restored_entries;
+      result.raw_downloaded_bytes = outcome.downloaded_bytes;
+      result.raw_verified_sha256 = outcome.verified_sha256;
+      result.raw_archive_format = outcome.archive_format;
+      result.raw_restored_entries = outcome.restored_entries;
+      result.raw_download_count = session->download_count();
+      result.raw_archive_path = session->archive_path_for_test();
+      if (outcome.password_required || !result.ok) {
+        // "还需要密码"（第一次问、或密码又输错了）时保留这次交互：那份归档与
+        // 已经选好的目标目录都要留着，用户可以接着输。其余失败一律放弃
+        // （工作目录立刻删掉），成功也一样——远端那一份还在。
+        const bool ask_again =
+            outcome.password_required ||
+            Contains(error, "raw restore: authentication failed");
+        if (ask_again) {
+          result.raw_session = session;
+        }
       }
       break;
     }
@@ -1239,6 +1346,18 @@ RemoteOpResult RemoteController::RunOperation(
     result.error_kind =
         ClassifyFailure(result.status_name, result.detail, result.kind);
     result.message = DescribeFailure(result.error_kind);
+    // 目标目录这一类失败：本地恢复自己给的那一句才是可照做的（"目录不为空"、
+    // "已经存在同名文件"…）。技术原话放在括号里当次要信息，主文案仍是中文
+    // 的一句话（见 §9F：用现有本地 Restore 的明确错误，而不是笼统的"恢复失败"）。
+    if (result.kind == RemoteOpResult::Kind::kRestoreRaw &&
+        (result.error_kind == QStringLiteral("raw-destination") ||
+         result.error_kind == QStringLiteral("raw-restore"))) {
+      const QString reason = SanitizeLocalRestoreReason(result.detail);
+      if (!reason.isEmpty()) {
+        result.message +=
+            QStringLiteral("（原因：") + reason + QStringLiteral("）");
+      }
+    }
   }
   return result;
 }
@@ -1276,6 +1395,14 @@ void RemoteController::ApplyResult(const RemoteOpResult& result) {
     // 已有连接，因此对"可达性"没有新证据。
     SetReachability(result.reachability);
   }
+  // 原始归档恢复是一次**多步交互**（下载 + 识别 -> 可能要密码 -> 恢复），
+  // 状态必须先落地：界面据此决定这次的结果是"一条错误"还是"还差一样东西"。
+  const bool raw_needs_password =
+      result.kind == RemoteOpResult::Kind::kRestoreRaw && !result.ok &&
+      result.raw_password_required && result.raw_session != nullptr;
+  if (result.kind == RemoteOpResult::Kind::kRestoreRaw) {
+    ApplyRawRestoreState(result);
+  }
   if (result.ok) {
     last_error_kind_ = QStringLiteral("none");
     last_detail_.clear();
@@ -1290,6 +1417,8 @@ void RemoteController::ApplyResult(const RemoteOpResult& result) {
           QString::fromStdString(result.raw_verified_sha256);
       last_raw_restore_format_ =
           QString::fromStdString(result.raw_archive_format);
+      last_raw_restore_downloaded_bytes_ = result.raw_downloaded_bytes;
+      last_raw_restore_entries_ = result.raw_restored_entries;
     }
     std::fprintf(
         stderr, "[remote] %s 没有完成：%s%s%s\n",
@@ -1297,6 +1426,14 @@ void RemoteController::ApplyResult(const RemoteOpResult& result) {
         result.status_name.empty() ? "" : result.status_name.c_str(),
         result.status_name.empty() ? "" : " ",
         result.detail.empty() ? "(没有更多信息)" : result.detail.c_str());
+    if (raw_needs_password) {
+      // 这不是失败，是"还差一样东西"。那份归档与目标目录都留着，页面切到
+      // 密码那一段；横幅只说下一步要做什么，不报错误——报错误会让用户以为
+      // 整个恢复已经完了。
+      SetStatus(QStringLiteral("idle"), QStringLiteral("需要恢复密码"),
+                QStringLiteral("这份备份已加密：请输入恢复密码之后再继续。"));
+      return;
+    }
     // 连接已经不可信时如实降级：不让界面继续显示"已登录"，否则用户会对着
     // 一个假的登录状态反复重试。
     // 会话要不要清掉，取决于**服务端说了什么**，而不是"网络有没有抖一下"：
@@ -1494,8 +1631,9 @@ void RemoteController::ApplyResult(const RemoteOpResult& result) {
       break;
     }
     case RemoteOpResult::Kind::kRestoreRaw:
-      // 原始归档的单独恢复：结论必须与产品级"恢复"分得开——它没有链，走的
-      // 也不是链恢复。这里如实说"下载了什么、按什么格式恢复的、恢复了多少条目"。
+      // 原始归档的恢复：对用户来说就是"恢复完成"——内部走的是哪条流水线
+      // （链 vs 单份归档）由列表里的类型 badge 说明，不写进结论里，更不写
+      // "尝试…成功"那种措辞（那是内部不确定性，不该出现在结果文案里）。
       last_raw_restore_downloaded_bytes_ = result.raw_downloaded_bytes;
       last_raw_restore_entries_ = result.raw_restored_entries;
       last_raw_restore_sha256_ =
@@ -1504,9 +1642,9 @@ void RemoteController::ApplyResult(const RemoteOpResult& result) {
           QString::fromStdString(result.raw_archive_format);
       last_raw_restore_password_required_ = result.raw_password_required;
       SetStatus(
-          QStringLiteral("success"), QStringLiteral("原始归档恢复完成"),
-          QStringLiteral("已下载并校验（SHA-256 %1…），按本地格式 %2 独立恢复，"
-                         "恢复了 %3 个条目。它不是远端备份链的一部分。")
+          QStringLiteral("success"), QStringLiteral("恢复完成"),
+          QStringLiteral("已下载并校验归档（SHA-256 %1…），按本地格式 %2 恢复，"
+                         "恢复了 %3 个条目。")
               .arg(QString::fromStdString(result.raw_verified_sha256).left(12),
                    QString::fromStdString(result.raw_archive_format))
               .arg(static_cast<qulonglong>(result.raw_restored_entries)));
@@ -2002,7 +2140,7 @@ bool RemoteController::restoreRawArchive(const QString& snapshot_id,
   const QString destination = destination_directory.trimmed();
   if (id.isEmpty()) {
     SetStatus(QStringLiteral("error"), QStringLiteral("没有选中云端备份"),
-              QStringLiteral("先在列表里选中一条原始归档，再点“尝试恢复”。"));
+              QStringLiteral("先在列表里选中一条原始归档，再点“恢复”。"));
     return false;
   }
   if (destination.isEmpty()) {
@@ -2012,10 +2150,18 @@ bool RemoteController::restoreRawArchive(const QString& snapshot_id,
   }
   // 密码**不是**必填项：只有那份归档确实是加密的，core 才会要求它。这里不做
   // 任何"看起来像密码"的猜测，也不把口令写进日志或状态文本。
-  if (!BeginOperation(QStringLiteral("正在下载原始归档并尝试恢复"),
+  if (!BeginOperation(QStringLiteral("正在下载并校验原始归档"),
                       /*need_login=*/true)) {
     return false;
   }
+  // 新的交互：上一次那个"正等着输密码"的会话立刻作废——它的临时归档被删掉，
+  // 页面回到"只问目标目录"的第一段。此时 busy_ 已经为真，后台线程不可能还拿着
+  // 那个会话（同一时刻只有一个操作）。
+  raw_session_.reset();
+  raw_awaiting_password_ = false;
+  raw_password_error_.clear();
+  raw_destination_text_.clear();
+  emit rawRestoreStateChanged();
   RemoteRequest request;
   request.kind = RemoteOpResult::Kind::kRestoreRaw;
   request.endpoint = endpoint_;
@@ -2037,7 +2183,85 @@ bool RemoteController::restoreRawArchive(const QString& snapshot_id,
     }
   }
   Submit(request);
+  // Submit 已经把请求**按值**拷进后台任务里了；本地这一份里的密码立刻抹掉：
+  // 它不留在主线程的任何对象里。
+  WipeSecret(&request.restore_password);
   return true;
+}
+
+bool RemoteController::restoreRawArchiveWithPassword(const QString& password) {
+  if (raw_session_ == nullptr) {
+    // 没有待输入的密码 = 这次交互已经结束了（成功 / 取消 / 致命失败）。
+    // 与其对着一个空会话重试，不如让用户重新点"恢复"。
+    SetStatus(QStringLiteral("error"), QStringLiteral("这次恢复已经结束"),
+              QStringLiteral("请重新点“恢复”，重新选择目标目录。"));
+    return false;
+  }
+  if (!BeginOperation(QStringLiteral("正在恢复原始归档"),
+                      /*need_login=*/true)) {
+    return false;
+  }
+  RemoteRequest request;
+  request.kind = RemoteOpResult::Kind::kRestoreRaw;
+  request.endpoint = endpoint_;
+  request.endpoint.server_key_pin = serverKeyPin().toStdString();
+  request.username = username_.toStdString();
+  request.restore_password = password.toStdString();
+  // 交互的其余部分全在会话里：哪个快照、恢复到哪、以及那份**已经下载并校验过
+  // 的字节**。所以这一次不会再下载一遍。
+  request.raw_session = raw_session_;
+  Submit(request);
+  WipeSecret(&request.restore_password);
+  return true;
+}
+
+void RemoteController::cancelRawRestore() {
+  if (raw_session_ == nullptr) {
+    return;  // 幂等：没有正在进行的交互
+  }
+  if (busy_) {
+    // 后台线程正拿着同一个会话在跑：这时**不能**碰它（会话不是线程安全的）。
+    // 界面上的取消按钮在忙碌时本来就是禁用的，这里是第二道闸门。
+    SetStatus(QStringLiteral("idle"), QStringLiteral("正在恢复"),
+              QStringLiteral("这一步结束之后才能取消。"));
+    return;
+  }
+  // 取消 = 终止这次交互：临时目录（以及里面那份已校验的归档）立刻删掉，
+  // 口令清零，界面回到空闲。目标目录本来就没有被改动过（失败即无副作用）。
+  raw_session_->Abandon();
+  raw_session_.reset();
+  raw_awaiting_password_ = false;
+  raw_password_error_.clear();
+  raw_destination_text_.clear();
+  emit rawRestoreStateChanged();
+  SetStatus(QStringLiteral("idle"), QStringLiteral("已取消恢复"),
+            QStringLiteral("这次恢复已经取消：临时下载的归档已经删掉，"
+                           "目标目录没有被改动。"));
+}
+
+void RemoteController::ApplyRawRestoreState(const RemoteOpResult& result) {
+  // 会话非空 = 这次交互还没结束，正等着用户输入密码。
+  raw_session_ = result.raw_session;
+  raw_awaiting_password_ = raw_session_ != nullptr;
+  last_raw_restore_download_count_ = result.raw_download_count;
+  last_raw_restore_archive_path_ =
+      QString::fromStdString(result.raw_archive_path);
+  if (raw_session_ != nullptr) {
+    // 回显**会话里的**目标目录：用户重输密码时不会再选一次，界面上的输入框
+    // 就算被改过也不能换一个地方恢复。
+    raw_destination_text_ =
+        QString::fromStdString(raw_session_->destination_directory());
+  } else {
+    raw_destination_text_.clear();
+  }
+  raw_password_error_.clear();
+  if (!result.ok && result.error_kind == QStringLiteral("raw-auth")) {
+    // 密码那一段自己的错误行：整个流程不关掉，用户直接再输一次。
+    raw_password_error_ = result.message.isEmpty()
+                              ? DescribeFailure(result.error_kind)
+                              : result.message;
+  }
+  emit rawRestoreStateChanged();
 }
 
 }  // namespace backup_modern

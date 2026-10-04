@@ -59,10 +59,12 @@
 #include <QVariantList>
 #include <atomic>
 #include <cstdint>
+#include <memory>
 #include <string>
 #include <vector>
 
 #include "remote_backup_client.h"
+#include "remote_incremental.h"
 
 namespace backup_modern {
 
@@ -165,6 +167,16 @@ struct RemoteOpResult {
   std::string raw_archive_format;
   std::uint64_t raw_restored_entries = 0;
   bool raw_password_required = false;
+  // 这次交互一共真正下载过几次（正常情况下是 1 次：错密码重试用的是同一份
+  // 已经校验过的字节）。自检据此证明没有偷偷重复下载。
+  int raw_download_count = 0;
+  // 那份归档在临时工作目录里的绝对路径（只给自检用：比较 inode 即可证明
+  // "再输一次密码"没有重新下载）。
+  std::string raw_archive_path;
+  // 需要"再输一次密码"时，这次交互的会话被交回主线程：页面据此从"选目标目录"
+  // 切到"输入恢复密码"，并且复用**同一份**字节。其它情况为空——成功即释放，
+  // 致命失败即放弃（工作目录随之删掉）。
+  std::shared_ptr<backupproject::net::RemoteRawRestoreSession> raw_session;
 };
 
 // 后台线程需要的全部输入。刻意做成一个值类型：后台线程只读它，
@@ -192,7 +204,12 @@ struct RemoteRequest {
   std::string restore_destination;
   // kRestoreRaw：如果那份归档是加密的，这里是用户在界面上填的恢复密码。
   // kRestore（链恢复）不需要它：增量链的外层信封由内层身份记录保护。
+  // 只在本对象的生命周期内存在：提交之后立刻被就地抹掉，不落盘、不进日志。
   std::string restore_password;
+  // kRestoreRaw：非空表示这是"再输一次密码"的重试——沿用会话里已经下载并
+  // 校验过的那份字节与第一次选定的目标目录，snapshot_id / display_name 都不再
+  // 参与（它们已经固化在会话里）。
+  std::shared_ptr<backupproject::net::RemoteRawRestoreSession> raw_session;
 };
 
 class RemoteController : public QObject {
@@ -284,6 +301,22 @@ class RemoteController : public QObject {
   Q_PROPERTY(
       QString registerError READ registerError NOTIFY registerErrorChanged)
 
+  // ---- 原始归档恢复：密码只有在 core 说"这份归档加密了"之后才索要 ----
+  //
+  // 这三个属性描述**同一个交互**的状态，页面据此决定显示哪一段：
+  //   * rawRestoreAwaitingPassword = true：那份归档已经拿到手（下载 + SHA-256
+  //     校验 + 按内容识别都过了），core 明确要求密码。会话里的字节留着，用户
+  //     可以反复输密码重试，**不会**重新下载。
+  //   * rawRestorePasswordError 非空：上一次密码没通过（或归档完整性校验失败）。
+  //     页面要给出"重新输入"的动作，而不是把整个流程关掉。
+  //   * rawRestoreDestinationText：这次恢复的目标目录（回显，不让用户重选）。
+  Q_PROPERTY(bool rawRestoreAwaitingPassword READ rawRestoreAwaitingPassword
+                 NOTIFY rawRestoreStateChanged)
+  Q_PROPERTY(QString rawRestorePasswordError READ rawRestorePasswordError NOTIFY
+                 rawRestoreStateChanged)
+  Q_PROPERTY(QString rawRestoreDestinationText READ rawRestoreDestinationText
+                 NOTIFY rawRestoreStateChanged)
+
  public:
   explicit RemoteController(QObject* parent = nullptr);
   ~RemoteController() override;
@@ -325,6 +358,9 @@ class RemoteController : public QObject {
   QString loginError() const { return login_error_; }
   QString registerError() const { return register_error_; }
   QString serverKeyPinError() const { return server_key_pin_error_; }
+  bool rawRestoreAwaitingPassword() const { return raw_awaiting_password_; }
+  QString rawRestorePasswordError() const { return raw_password_error_; }
+  QString rawRestoreDestinationText() const { return raw_destination_text_; }
   QString diagnosticText() const {
     return QString::fromStdString(last_detail_);
   }
@@ -400,16 +436,25 @@ class RemoteController : public QObject {
   // 为空都在本地被拒，一个字节都不发。
   Q_INVOKABLE bool restoreSnapshot(const QString& snapshot_id,
                                    const QString& destination_directory);
-  // "尝试恢复"一份**原始归档**（lineage 为空的远端条目）。
+  // 恢复一份**原始归档**（lineage 为空的远端条目）——用户看到的按钮与产品级
+  // 一样叫"恢复"，区别只在实现：它下载那一个 blob，由 core 按**内容**认出格式，
+  // 再交给既有的本地恢复核心独立恢复；它不需要、也不使用任何远端依赖链。
+  // 随机文件、损坏归档、版本不支持、单独的 delta 都会明确失败，并且不会在目标
+  // 目录留下半成品。
   //
-  // 与 restoreSnapshot 的区别是产品语义，不只是文案：它下载那一个 blob，
-  // 由 core 按**内容**认出格式，再交给既有的本地恢复核心独立恢复；
-  // 它不需要、也不使用任何远端依赖链。随机文件、损坏归档、单独的 delta 都会
-  // 明确失败，并且不会在目标目录留下半成品。
-  // password 只在归档确实是加密的时候才需要（留空表示"没填"）。
+  // 密码只有在 core 明确说"这份归档加密了"之后才索要：第一次调用（password
+  // 留空）会以 rawRestoreAwaitingPassword = true 结束，界面切到密码那一段，
+  // 之后用 restoreRawArchiveWithPassword 重试——用的是同一份已经下载并校验过的
+  // 字节，不重新下载。
   Q_INVOKABLE bool restoreRawArchive(const QString& snapshot_id,
                                      const QString& destination_directory,
                                      const QString& password);
+  // 用户在密码那一段点"继续恢复"：用**同一份已经下载并校验过的字节**再恢复
+  // 一次，不重新下载。目标目录沿用第一次选定的那一个。
+  Q_INVOKABLE bool restoreRawArchiveWithPassword(const QString& password);
+  // 用户在密码那一段取消：终止这次交互、清零口令、删掉临时归档。
+  // 目标目录不变（失败本来就不会碰它），状态回到空闲。
+  Q_INVOKABLE void cancelRawRestore();
   // 用户改了源目录 / 策略或离开了这一页时清掉上一次的结论：旧结论挂在新输入上
   // 会误导（"增量备份完成"是上一次的事）。
   Q_INVOKABLE void clearBackupSummary();
@@ -477,6 +522,13 @@ class RemoteController : public QObject {
   bool lastRawRestorePasswordRequiredForTest() const {
     return last_raw_restore_password_required_;
   }
+  int lastRawRestoreDownloadCountForTest() const {
+    return last_raw_restore_download_count_;
+  }
+  QString lastRawRestoreArchivePathForTest() const {
+    return last_raw_restore_archive_path_;
+  }
+  bool rawRestoreSessionAliveForTest() const { return raw_session_ != nullptr; }
 
  signals:
   void endpointChanged();
@@ -489,6 +541,8 @@ class RemoteController : public QObject {
   void serverKeyPinErrorChanged();
   // 最近一次产品级备份的结论（完整 / 增量 / 无变化）发生变化。
   void backupSummaryChanged();
+  // 原始归档恢复交互的状态（是否需要密码 / 上一次密码错没错）发生变化。
+  void rawRestoreStateChanged();
   void busyChanged();
   void snapshotsChanged();
   void progressChanged();
@@ -502,6 +556,9 @@ class RemoteController : public QObject {
 
   // 一条错误该出现在哪里。每个表单各有自己的错误行（登录 / 注册 / 注销
   // 对话框 / 连接设置里的服务器身份指纹），页面级操作用底部横幅。
+  // 原始归档恢复交互的状态落地（会话、等待密码、密码错误、目标目录回显）。
+  void ApplyRawRestoreState(const RemoteOpResult& result);
+
   enum class ErrorSurface {
     kLogin,
     kRegister,
@@ -645,6 +702,15 @@ class RemoteController : public QObject {
   bool last_raw_restore_password_required_ = false;
   QString last_raw_restore_sha256_;
   QString last_raw_restore_format_;
+  // ---- 原始归档恢复交互（见上面的属性说明）----
+  // raw_session_ 非空 = 那份归档已经下载并校验过、正等着用户输入密码。
+  // 它是**唯一**持有临时工作目录所有权的地方：清掉它就等于删掉那份临时归档。
+  std::shared_ptr<backupproject::net::RemoteRawRestoreSession> raw_session_;
+  bool raw_awaiting_password_ = false;
+  QString raw_password_error_;
+  QString raw_destination_text_;
+  int last_raw_restore_download_count_ = 0;
+  QString last_raw_restore_archive_path_;
 };
 
 }  // namespace backup_modern

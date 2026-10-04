@@ -6,10 +6,10 @@
 //   * 主视觉是用户看得懂的：名称、大小、创建时间，加上 PR #21 的链信息
 //     （完整 / 增量、代数、父快照前 12 位）；
 //   * 编号与摘要属于技术细节，放在页面里默认折叠的"技术详情"里；
-//   * 主操作按**类型**分成两个词（PR #21 UI closure）：
-//       - 产品级（完整备份 / 增量备份）-> "恢复"：自动取回整条依赖链再恢复；
-//       - 原始归档（lineage 为空）      -> "尝试恢复"：下载那一个 blob，按本地
-//         备份格式独立恢复。它没有链，也**不是**"永远不能恢复"。
+//   * 主操作三种类型都叫"恢复"（PR #21 UI closure 第二轮）：完整备份 / 增量
+//     备份走链（自动取回整条依赖链）；原始归档（lineage 为空）下载那一个 blob
+//     之后按本地备份格式独立恢复。内部实现是两条路，但那是**类型 badge** 与
+//     说明行要说的事——按钮只表达用户的意图，不表达"这次能不能成"。
 //     "下载归档"与"删除"是次级操作：前者只是把云端那个 blob 取回本地。
 //   * 三类的主类型 badge 必须是三个词（原始归档 / 完整备份 / 增量备份）：
 //     原始归档既没有父也没有"代数"可言，所以那两项在它这一行**不显示**。
@@ -32,7 +32,7 @@ Rectangle {
     // ---- PR #21 链信息 ----
     property string kindText: ""      // "原始归档" / "完整备份" / "增量备份"
     property string kindKey: ""       // "raw" / "full" / "incremental"
-    // 原始归档：不显示"代数"（它没有链），主操作文案是"尝试恢复"。
+    // 原始归档：不显示"代数"（它没有链）；主操作与产品级一样是"恢复"。
     property bool rawArchive: false
     property bool generationVisible: true
     property int generation: 0
@@ -76,8 +76,8 @@ Rectangle {
 
             AppButton {
                 objectName: "remoteSnapshotRestoreButton"
-                // "恢复" = 自动取回整条依赖链；"尝试恢复" = 下载之后按本地格式
-                // 独立恢复。两个词就是两种机制，用户不需要读说明也知道不一样。
+                // 文案来自控制器：三种类型的按钮都是"恢复"，由 badge 说明
+                // 这一条是什么类型、恢复会走哪条路。
                 text: card.restoreLabel
                 variant: "primary"
                 enabled: !card.busy && card.restorable
