@@ -7,6 +7,7 @@
 
 #include "network_protocol.h"
 
+#include <poll.h>
 #include <sys/socket.h>
 #include <sys/types.h>
 #include <unistd.h>
@@ -468,11 +469,43 @@ bool ReceiveAll(int fd, void* data, std::size_t size, bool* closed_by_peer,
   while (remaining > 0) {
     // 每次 recv 之前查一次整体预算：慢速滴水的对端（每个超时周期挤 1 个字节）
     // 单靠 SO_RCVTIMEO 是拦不住的。
-    if (deadline_ms != 0 && MonotonicMillis() >= deadline_ms) {
-      if (error_message != nullptr) {
-        *error_message = "receive deadline exceeded";
+    if (deadline_ms != 0) {
+      const std::int64_t now = MonotonicMillis();
+      if (now >= deadline_ms) {
+        if (error_message != nullptr) {
+          *error_message = "receive deadline exceeded";
+        }
+        return false;
       }
-      return false;
+      // 还要把"这一次 recv 最多能等多久"压到剩余预算之内。
+      // 只查上面的预算是不够的：recv 一阻塞就再也回不到这里，而 SO_RCVTIMEO
+      // 是**调用方**设置的 —— socketpair、忘了设超时的调用方、以及任何没有读
+      // 超时的 fd 都会让 recv 永久阻塞，整体握手预算就形同虚设。
+      // 这一条是 PR #23 写 BPSEC2 测试时真被挂住才发现的（客户端在等一条
+      // 对端根本不会发的 ServerHello，进程 0% CPU 卡死）。
+      struct pollfd waiter;
+      waiter.fd = fd;
+      waiter.events = POLLIN;
+      waiter.revents = 0;
+      const std::int64_t left = deadline_ms - now;
+      const int wait_ms =
+          static_cast<int>(left > 3600000 ? 3600000 : left);
+      const int poll_result = ::poll(&waiter, 1, wait_ms);
+      if (poll_result == 0) {
+        if (error_message != nullptr) {
+          *error_message = "receive deadline exceeded";
+        }
+        return false;
+      }
+      if (poll_result < 0) {
+        if (errno == EINTR) {
+          continue;
+        }
+        if (error_message != nullptr) {
+          *error_message = std::string("poll failed: ") + std::strerror(errno);
+        }
+        return false;
+      }
     }
     const ssize_t got = ::recv(fd, cursor, remaining, 0);
     if (got < 0) {

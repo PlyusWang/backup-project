@@ -24,6 +24,7 @@
 #include <fstream>
 #include <sstream>
 
+#include "bpcert.h"
 #include "crypto.h"
 #include "file_lock.h"
 #include "remote_auth.h"
@@ -427,6 +428,32 @@ bool RemoteServer::LoadSecret(std::string* error_message) {
   return true;
 }
 
+namespace {
+
+// 读整个文件。BPSEC2 的证书是几十到几百字节的公开材料，一次读完最简单。
+bool ReadWholeFile(const std::string& path, std::string* out,
+                   std::string* error_message) {
+  std::ifstream input(path, std::ios::binary);
+  if (!input) {
+    if (error_message != nullptr) {
+      *error_message = "打不开文件：" + path;
+    }
+    return false;
+  }
+  std::ostringstream buffer;
+  buffer << input.rdbuf();
+  *out = buffer.str();
+  if (out->empty()) {
+    if (error_message != nullptr) {
+      *error_message = "文件是空的：" + path;
+    }
+    return false;
+  }
+  return true;
+}
+
+}  // namespace
+
 bool RemoteServer::LoadTransportIdentityKey(std::string* error_message) {
   if (!LoadTransportIdentity(config_.transport_key_file_path,
                              &transport_identity_, error_message)) {
@@ -435,6 +462,46 @@ bool RemoteServer::LoadTransportIdentityKey(std::string* error_message) {
   // 只记指纹（公开信息），不记私钥。
   Log("BPSEC1 transport identity loaded, fingerprint=" +
       crypto::X25519Fingerprint(transport_identity_.public_key));
+
+  // BPSEC2：按配置加载服务器身份证书（里面只有公钥材料）。
+  if (!config_.certificate_file_path.empty()) {
+    std::string raw;
+    if (!ReadWholeFile(config_.certificate_file_path, &raw, error_message)) {
+      return false;
+    }
+    crypto::Bpcert1 certificate;
+    const crypto::Bpcert1Error parsed = crypto::Bpcert1Parse(raw, &certificate);
+    if (parsed != crypto::Bpcert1Error::kOk) {
+      if (error_message != nullptr) {
+        *error_message = std::string("服务器身份证书不合法：") +
+                         crypto::Bpcert1ErrorName(parsed);
+      }
+      return false;
+    }
+    // 这张证书必须**就是**给本机这把身份密钥签的。否则服务端会拿着一把对
+    // 不上的证书去握手，每个客户端都会拒绝，而真正的原因要到线上才看得出来
+    // —— 宁可在启动时直接失败。
+    if (certificate.server_public_key != transport_identity_.public_key) {
+      if (error_message != nullptr) {
+        *error_message =
+            "服务器身份证书里的公钥与本机 transport.key 不一致"
+            "（这张证书不是给这把密钥签的）";
+      }
+      return false;
+    }
+    transport_identity_.certificate = raw;
+    Log("BPSEC2 identity certificate loaded, server_id=" +
+        certificate.server_id + " issuer=" + certificate.issuer_id +
+        " serial=" + std::to_string(certificate.serial_number) +
+        " sha256=" + crypto::Bpcert1Fingerprint(raw));
+  }
+  if (config_.require_bpsec2 && transport_identity_.certificate.empty()) {
+    if (error_message != nullptr) {
+      *error_message =
+          "--require-bpsec2 需要同时用 --bpsec2-cert-file 给出服务器身份证书";
+    }
+    return false;
+  }
   return true;
 }
 
@@ -1799,8 +1866,14 @@ bool RemoteServer::ServeConnection(int fd, std::string* error_message) {
     handshake_budget_seconds = 30;
   }
   channel.SetHandshakeTimeoutMs(handshake_budget_seconds * 1000);
-  if (!channel.HandshakeServer(fd, transport_identity_, error_message)) {
-    Log(std::string("BPSEC1 handshake failed: ") +
+  // BPSEC2：配置成只接受签名身份时，服务端连 BPSEC1 的 ClientHello 都不接。
+  const bool handshake_ok =
+      config_.require_bpsec2
+          ? channel.HandshakeServerRequireCertificate(fd, transport_identity_,
+                                                      error_message)
+          : channel.HandshakeServer(fd, transport_identity_, error_message);
+  if (!handshake_ok) {
+    Log(std::string("BPSEC1/BPSEC2 handshake failed: ") +
         (error_message != nullptr && !error_message->empty()
              ? *error_message
              : std::string("unknown reason")));

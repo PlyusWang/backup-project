@@ -48,6 +48,12 @@ void PrintUsage(std::FILE* out, const char* program) {
       "  --transport-key-file <文件>\n"
       "                          BPSEC1 传输身份私钥（0600，32 字节）；必填，\n"
       "                          用 backup-server-keygen 生成\n"
+      "  --bpsec2-cert-file <文件>\n"
+      "                          服务器身份证书（BPCERT1，由离线根签发）；\n"
+      "                          给出后客户端可以用签名身份（BPSEC2）连接，\n"
+      "                          不再需要人工核对指纹\n"
+      "  --require-bpsec2        只接受 BPSEC2（签名身份）客户端：收到 BPSEC1\n"
+      "                          的握手直接拒绝，不做降级。需要同时给出证书\n"
       "  --log-file <文件>       追加日志文件（默认只写 stderr）\n"
       "  --pid-file <文件>       PID 文件（同一个 root/db/port 只允许一个）\n"
       "  --workers <数量>        并发 worker 数，默认 4（1..64）\n"
@@ -171,6 +177,11 @@ int main(int argc, char* argv[]) {
       config.quiet = true;
       continue;
     }
+    if (name == "--require-bpsec2") {
+      // 开关型选项：只接受签名身份（证书）客户端。
+      config.require_bpsec2 = true;
+      continue;
+    }
     if (index + 1 >= argc) {
       std::fprintf(stderr, "Error: %s needs a value.\n\n", name.c_str());
       PrintUsage(stderr, program);
@@ -198,6 +209,8 @@ int main(int argc, char* argv[]) {
     } else if (name == "--transport-key-file") {
       config.transport_key_file_path = value;
       have_transport_key = true;
+    } else if (name == "--bpsec2-cert-file") {
+      config.certificate_file_path = value;
     } else if (name == "--log-file") {
       config.log_file_path = value;
     } else if (name == "--pid-file") {

@@ -42,6 +42,7 @@
 #include <string>
 
 #include "network_protocol.h"
+#include "trusted_root_store.h"
 #include "x25519.h"
 
 namespace backupproject {
@@ -53,6 +54,12 @@ namespace net {
 inline constexpr std::uint32_t kBssec1Magic = 0x42505331u;
 inline constexpr std::uint8_t kBssec1Version = 1;
 
+// BPSEC2：在 BPSEC1 的帧与记录层**之上**加一层服务器身份证书认证。
+// 沿用同一个 magic（"BPS1"），版本升到 2，并新增一条 ServerCertificate
+// 消息。版本的判别点就在每条握手消息的固定位置，所以两边都不需要"猜对端
+// 说的是哪套协议"；官方云端模式只接受版本 2，收到版本 1 直接拒绝。
+inline constexpr std::uint8_t kBssec2Version = 2;
+
 // 目前唯一的密码套件：X25519 + HKDF-SHA256 + AES-256-CTR + HMAC-SHA256。
 inline constexpr std::uint16_t kBssec1SuiteX25519Aes256CtrHmacSha256 = 1;
 
@@ -61,11 +68,18 @@ inline constexpr std::uint8_t kBssec1MessageServerHello = 2;
 inline constexpr std::uint8_t kBssec1MessageClientFinished = 3;
 inline constexpr std::uint8_t kBssec1MessageServerFinished = 4;
 inline constexpr std::uint8_t kBssec1MessageRecord = 5;
+// BPSEC2 新增：服务器身份证书（变长 = 12 字节定长头 + 证书字节）。
+// 放在 ServerHello 之后、ClientFinished 之前 —— 客户端在派生任何会话密钥、
+// 发出任何已认证字节之前就完成身份判断。
+inline constexpr std::uint8_t kBssec2MessageServerCertificate = 6;
 
 inline constexpr std::size_t kBssec1HelloMagicSize = 4;
 inline constexpr std::size_t kBssec1ClientHelloSize = 72;
 inline constexpr std::size_t kBssec1ServerHelloSize = 104;
 inline constexpr std::size_t kBssec1FinishedSize = 40;
+// ServerCertificate 的定长头：magic 4 + type 1 + version 1 + reserved 2 +
+// 证书长度 4。
+inline constexpr std::size_t kBssec2CertificateHeaderSize = 12;
 inline constexpr std::size_t kBssec1RecordHeaderSize = 20;
 inline constexpr std::size_t kBssec1TagSize = 32;
 
@@ -108,6 +122,14 @@ enum class SecureTransportError {
   kAuthenticationFailed,  // Finished 校验失败（transcript 被改 / 密钥不一致）
   kWeakSharedSecret,  // 共享秘密全零（对端给了低阶点）
   kNoPinConfigured,  // 客户端没有配置服务端公钥/指纹（拒绝连接，不做 TOFU）
+  // ---- BPSEC2（证书身份）。失败原因分开报，界面才能说清楚到底哪里不对。----
+  kCertificateMissing,      // 对端要用 BPSEC2，但服务端没有配置证书
+  kCertificateInvalid,      // 证书结构不合法，或根签名验不过
+  kCertificateUntrusted,    // 签发者不在可信根里（根为空 / 被吊销 / 时间越界）
+  kCertificateWrongServerId,  // 证书里的 server_id 与期望值不符
+  kCertificateExpired,      // 证书不在有效期内（含本机时钟不对的情形）
+  kCertificateKeyMismatch,  // 证书认证的公钥 ≠ 握手里实际使用的身份公钥
+  kDowngradeRefused,        // 要求 BPSEC2 却收到 BPSEC1：拒绝降级
   kRecordAuthentication,  // 记录层 tag 校验失败
   kReplayDetected,        // 记录序号不连续：重放、跳号或乱序
   kOversizedRecord,       // 记录长度超过上限
@@ -140,11 +162,28 @@ struct ServerKeyPin {
 bool ParseServerKeyPin(const std::string& text, ServerKeyPin* out,
                        std::string* error_message);
 
+// ---- BPSEC2：客户端侧的服务端身份策略 ----
+
+// 用证书认证服务端时需要的全部输入。**没有** pin 字段：证书模式与 pin 模式
+// 是两条互斥的路，不存在"证书验不过就退回 pin"这种降级分支。
+struct ServerIdentityPolicy {
+  // 可信根。空存储 = 什么都不信（构造后必须先 AddRoot 或 LoadFrom*）。
+  crypto::TrustedRootStore roots;
+  // 期望的 server_id，必须与证书里的逐字节相等。
+  std::string expected_server_id;
+  // 校验时间（Unix 秒）。0 = 用系统时钟。
+  std::int64_t now_unix_seconds = 0;
+};
+
 // ---- 服务端长期身份密钥 ----
 
 struct TransportIdentity {
   std::string private_key;  // 32 字节 X25519 标量（已 clamp）
   std::string public_key;   // 32 字节 X25519 公钥
+  // BPSEC2：这张服务器身份证书（BPCERT1 原始字节，由离线根签发）。
+  // 空 = 不提供证书，只能走 BPSEC1。证书里只有公钥材料，可以自由分发；
+  // 私钥永远不在这里。
+  std::string certificate;
 };
 
 // OS CSPRNG 生成一对身份密钥。
@@ -177,9 +216,24 @@ class SecureChannel {
   bool HandshakeClient(int fd, const ServerKeyPin& pin,
                        std::string* error_message);
 
+  // BPSEC2 客户端握手：服务端必须出示由可信根签发的 BPCERT1 证书。
+  // 校验顺序（任一步失败即终止，且**不会**退回 pin 模式或明文）：
+  //   帧头 -> 解析证书 -> 在可信根里找 issuer -> 根签名 -> server_id ->
+  //   有效期 -> 用途 -> 证书公钥 == 握手里的身份公钥 -> 低阶点 -> 密钥派生。
+  bool HandshakeClientWithCertificate(int fd,
+                                      const ServerIdentityPolicy& policy,
+                                      std::string* error_message);
+
   // 服务端握手：使用长期身份私钥与一份新生成的临时密钥。
+  // identity.certificate 非空时同时接受 BPSEC1 与 BPSEC2 客户端。
   bool HandshakeServer(int fd, const TransportIdentity& identity,
                        std::string* error_message);
+
+  // 只接受 BPSEC2 的服务端握手（官方云端用）：收到 BPSEC1 的 ClientHello
+  // 直接以 kDowngradeRefused 拒绝，绝不将就。identity.certificate 必须非空。
+  bool HandshakeServerRequireCertificate(int fd,
+                                         const TransportIdentity& identity,
+                                         std::string* error_message);
 
   // 握手的**整体**时间预算（毫秒），0 = 不设限。调用方必须在握手前设置：
   // socket 上的 SO_RCVTIMEO 只约束单次 recv，对"每个超时周期挤 1 个字节"的
@@ -194,9 +248,15 @@ class SecureChannel {
   const std::string& peer_public_key() const { return peer_public_key_; }
   // 客户端：对端身份公钥的指纹（64 个小写十六进制字符）。
   const std::string& peer_fingerprint() const { return peer_fingerprint_; }
-  // 这次会话的握手 transcript 摘要（32
-  // 字节，SHA-256(ClientHello||ServerHello)），
-  // 只用于日志/测试断言，不能当密钥用。
+  // BPSEC2：对端证书里的 server_id（只在证书握手校验通过后才有值）。
+  const std::string& peer_server_id() const { return peer_server_id_; }
+  // BPSEC2：对端证书的 SHA-256 指纹（64 个小写十六进制字符）。
+  const std::string& peer_certificate_fingerprint() const {
+    return peer_certificate_fingerprint_;
+  }
+  // 这次会话的握手 transcript 摘要（32 字节）。BPSEC1 是
+  // SHA-256(ClientHello||ServerHello)；BPSEC2 还包含整张 ServerCertificate
+  // 消息的原始字节。只用于日志/测试断言，不能当密钥用。
   const std::string& transcript_hash() const { return transcript_hash_; }
   std::uint64_t send_sequence() const { return send_sequence_; }
   std::uint64_t receive_sequence() const { return receive_sequence_; }
@@ -226,6 +286,14 @@ class SecureChannel {
   void CorruptNextTagForTesting() { corrupt_next_tag_ = true; }
 
  private:
+  // 两条握手路径共用同一份实现：pin/policy 恰有一个非空，两者都空属于
+  // 编程错误（调用方只用下面两个公开入口，不会走到那里）。
+  bool HandshakeClientInternal(int fd, const ServerKeyPin* pin,
+                               const ServerIdentityPolicy* policy,
+                               std::string* error_message);
+  bool HandshakeServerInternal(int fd, const TransportIdentity& identity,
+                               bool require_certificate,
+                               std::string* error_message);
   bool DeriveKeys(const std::string& shared_secret,
                   const std::string& client_random,
                   const std::string& server_random, bool is_client,
@@ -256,6 +324,9 @@ class SecureChannel {
   std::uint64_t handshake_timeout_ms_ = 0;
   std::string peer_public_key_;
   std::string peer_fingerprint_;
+  // BPSEC2 专有：对端证书里的 server_id 与整张证书的 sha256。
+  std::string peer_server_id_;
+  std::string peer_certificate_fingerprint_;
   std::string transcript_hash_;
 };
 
