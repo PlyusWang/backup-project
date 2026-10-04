@@ -579,6 +579,36 @@ expect_count "$REMOTE_PAGE_QML" 'objectName: "remoteServerKeyPinField"' 1 \
   "连接设置区有服务器身份指纹输入框"
 expect_count "$REMOTE_PAGE_QML" 'objectName: "remoteServerKeyPinApplyButton"' 1 \
   "指纹有明确的提交动作（「应用」按钮）"
+# PR #22：连接方式 / SSH 安全通道 / pin 应用反馈。这三块是这一轮的产品
+# 增量，QML 少了任何一个控件，界面上的"部署链路"就缺一角。
+expect_count "$REMOTE_PAGE_QML" 'objectName: "remoteConnectionModeTabs"' 1 \
+  "远程页有连接方式选择（SSH 安全通道 / 直接连接）"
+expect_count "$REMOTE_PAGE_QML" 'objectName: "remoteSshHostField"' 1 \
+  "远程页有 SSH 主机输入框"
+expect_count "$REMOTE_PAGE_QML" 'objectName: "remoteSshLocalPortField"' 1 \
+  "远程页有本地端口输入框（留空 = 自动分配）"
+expect_count "$REMOTE_PAGE_QML" 'objectName: "remoteTunnelStateText"' 1 \
+  "远程页有安全通道状态行"
+expect_count "$REMOTE_PAGE_QML" 'objectName: "remoteTunnelFailureText"' 1 \
+  "远程页有通道失败原因行（不是笼统的网络错误）"
+expect_count "$REMOTE_PAGE_QML" 'objectName: "remoteEnsureConnectionButton"' 1 \
+  "远程页有“建立连接”按钮"
+expect_count "$REMOTE_PAGE_QML" 'objectName: "remoteStopTunnelButton"' 1 \
+  "远程页有“关闭安全通道”按钮"
+expect_count "$REMOTE_PAGE_QML" 'objectName: "remoteServerKeyPinApplied"' 1 \
+  "远程页有 pin“已应用”的可见反馈行"
+expect_count "$REMOTE_PAGE_QML" 'objectName: "remoteServerKeyPinDirty"' 1 \
+  "远程页有“尚未应用”提示（输入框与生效值不一致时必须说出来）"
+# "应用"必须调用**会留下反馈**的那一个入口：旧实现只调 setServerKeyPin 并把
+# 返回值丢掉，于是点完"应用"界面上什么都不发生（人工验收发现的 UX bug）。
+expect_count "$REMOTE_PAGE_QML" 'remote.applyServerKeyPin' 2 \
+  "“应用”按钮与回车都走 applyServerKeyPin（有可见反馈）"
+expect_count "$REMOTE_PAGE_QML" 'remote.loginWithPin' 2 \
+  "登录（按钮 + 回车）走 loginWithPin：自动采用当前输入框里的指纹"
+expect_count "$REMOTE_PAGE_QML" 'remote.registerAccountWithPin' 1 \
+  "注册走 registerAccountWithPin：同样自动采用当前输入框里的指纹"
+expect_count "$REMOTE_PAGE_QML" 'remote.setServerKeyPin' 0 \
+  "页面上不再直接调用 setServerKeyPin（那条路径没有反馈）"
 expect_count "$REMOTE_PAGE_QML" 'objectName: "remoteServerKeyPinError"' 1 \
   "指纹输入框有自己的错误行"
 expect_count "$REMOTE_PAGE_QML" "remote.setServerKeyPin(" 2 \
