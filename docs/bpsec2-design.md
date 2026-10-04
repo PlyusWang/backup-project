@@ -149,3 +149,64 @@ ServerCertificate 消息布局（大端，变长但有上限）：
 * **未完成**：§4 的 1-4 步都还没写 —— 也就是说今天的网络路径仍然是 BPSEC1 +
   人工 pin，证书还没有进入握手。本文的作用就是让这一段可以按图施工，
   而不是重新做一遍逆向。
+
+## 6. 两处先决条件（2026-10-05 侦察结论）
+
+### 6.1 服务端今天**拒绝**任何非回环绑定 —— 这是开放公网前必须先解决的政策冲突
+
+`server/remote_server.cpp` :286-299 的 `Configure()` 对 `--bind` 做的是
+**等值判断**：只要不是 `127.0.0.1`（`127.0.0.2` 也不行）就直接报错，并提示用户
+改用 `ssh -N -L`。`include/remote_server.h` :63-65 把这个规则写成硬约束，
+`docs/network_backup_usage.md` :33-42 也把它当"硬约束"讲。
+
+这条规则本身是对的：在只有"手工 pin + 明文端口"的年代，把 BPSEC1 端口直接
+暴露到公网，等于把握手暴露给全网。但 PR #23 的目标恰恰是"用户不需要开隧道"，
+所以两者必须在**同一个提交里一起解决**，而不是把某一侧悄悄改掉：
+
+* 新增**显式**的公网绑定开关（例如 `--allow-public-bind <理由文本>`），
+  默认仍然是拒绝；打开时必须同时满足"配置了 BPSEC2 证书"且
+  （建议）"`--require-bpsec2`"，否则拒绝启动；
+* 启动日志里必须写明"正在公网监听 + 为什么这样可以"；
+* 这条政策变更要有测试：不带开关时非回环绑定仍然失败（既有行为不能被
+  静默放宽），带开关但没有证书时也失败，带开关且有证书时才成功；
+* 顺序上仍然按 PR #23 的阶段执行：先在回环上把 BPSEC2 跑通，再审计防火墙
+  与安全组，最后才开放公网端口。
+
+### 6.2 GUI 一侧的既有约束（改 RemotePage 之前必须知道）
+
+* **没有任何远程设置的持久化**，而且这是被测试强制的：
+  `scripts/modern_gui_check.sh` :665-670 会在 `RemoteController.*` /
+  `RemotePage.qml` / `RemoteSnapshotCard.qml` 里出现
+  `QSettings` / `setValue(` / `QStandardPaths::writableLocation` 时判失败。
+  所以"官方云端"的地址与身份必须**编译进二进制**（放在
+  `include/remote_backup_client.h` :32-33 的 `kDefaultRemoteHost/Port` 旁边），
+  这样既不需要持久化，也不会碰这条断言；
+* 结构计数是精确匹配的，改 UI 会直接影响它们（都在 `modern_gui_check.sh`）：
+  `AppTextField {` = 17 (:573)、`AppCard {` = 5 (:565)、密码框 = 5 (:542)、
+  `SegmentedTabs {` = 3 (:683-684)、`remote.serverKeyPinError` = 3 (:622)、
+  `applyServerKeyPin` = 2、`loginWithPin` = 2、`registerAccountWithPin` = 1、
+  `setServerKeyPin` = 0 (:605-613)、
+  `request.endpoint.server_key_pin = serverKeyPin()` = 11 (:628-630)。
+  结论：官方云端/自定义服务器用**同一个** SegmentedTabs 的两个模型项实现
+  （计数仍是 3），SSH 区块与 pin 区块用 `visible:` 隐藏（控件数不变），
+  不要在 RemotePage 里新增文本输入框；
+* RemotePage 与控制器里有**术语禁令**（:2878-2885）：BPNET1、PBKDF2、HMAC、
+  SQLite、opcode、request_id、FrameHeader、kProtocolMagic、token 都不许出现
+  （"SSH" 是被**特意**从禁令里拿掉的）。用户可见文案用"官方云端 / 证书 /
+  服务器身份"这类词，不要出现"证书格式/根密钥/指纹算法"；
+* 截图走 `./build/backup-gui-modern --screenshot <dir>`（offscreen、
+  软件渲染、light/dark 两套、文件名 `<page>-<light|dark>.png`），
+  `--screenshot-remote <dir>` 另有 9 张固定状态帧；新增界面要让这两套
+  都能继续跑，而且 **QML 警告按失败处理**。
+
+### 6.3 客户端要改的挂点（侦察已确认行号）
+
+* `RemoteEndpoint`（`include/remote_backup_client.h` :35-47）今天只有
+  `server_key_pin`，需要加"身份模式 + 期望 server_id + 根来源"；
+* `RemoteController`：`enum ConnectionMode`
+  （`ui/modern/remote_controller.h` :755）加 `kOfficialCloud`；
+  `setConnectionMode`（`remote_controller.cpp` :2416-2435）加字符串映射；
+  `Submit()` 的传输门（:1267-1297）给官方模式走"直连、不开隧道"；
+  注入身份的位置与 `CommitServerKeyPin`（:2719-2720）同一处，
+  这样那 11 个 `request.endpoint.server_key_pin = serverKeyPin()` 调用点
+  一个都不用改。
