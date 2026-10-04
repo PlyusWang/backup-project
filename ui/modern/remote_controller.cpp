@@ -104,7 +104,7 @@ QString SanitizeLocalRestoreReason(const std::string& detail) {
     }
     // 码点直接写出来：QLatin1Char 只接受单字节，中文标点会变成 overflow 警告
     // （而这个仓库的构建要求 0 警告）。
-    const QChar kFullwidthColon(0xFF1A);   // ：
+    const QChar kFullwidthColon(0xFF1A);       // ：
     const QChar kFullwidthCloseParen(0xFF09);  // ）
     int begin = at;
     while (begin > 0 && !text.at(begin - 1).isSpace() &&
@@ -746,12 +746,11 @@ void RemoteController::SetSnapshots(
     // 增量备份）要说的事；按钮只表达意图。内部实现当然还是两条路，tooltip
     // 里如实说明这一条会怎么做。
     item.insert(QStringLiteral("restoreLabel"), QStringLiteral("恢复"));
-    item.insert(
-        QStringLiteral("restoreTooltip"),
-        raw_archive
-            ? QStringLiteral("下载这份原始归档，按本地备份格式恢复。"
-                             "它不属于远端增量链，不会取回别的对象。")
-            : QStringLiteral("自动获取完整依赖链并恢复此快照。"));
+    item.insert(QStringLiteral("restoreTooltip"),
+                raw_archive
+                    ? QStringLiteral("下载这份原始归档，按本地备份格式恢复。"
+                                     "它不属于远端增量链，不会取回别的对象。")
+                    : QStringLiteral("自动获取完整依赖链并恢复此快照。"));
     // 卡片上那一句说明。raw 需要一句"它是什么"，产品级不需要。
     item.insert(QStringLiteral("typeNote"),
                 raw_archive ? QStringLiteral(
@@ -1348,7 +1347,8 @@ RemoteOpResult RemoteController::RunOperation(
     result.message = DescribeFailure(result.error_kind);
     // 目标目录这一类失败：本地恢复自己给的那一句才是可照做的（"目录不为空"、
     // "已经存在同名文件"…）。技术原话放在括号里当次要信息，主文案仍是中文
-    // 的一句话（见 §9F：用现有本地 Restore 的明确错误，而不是笼统的"恢复失败"）。
+    // 的一句话（见 §9F：用现有本地 Restore
+    // 的明确错误，而不是笼统的"恢复失败"）。
     if (result.kind == RemoteOpResult::Kind::kRestoreRaw &&
         (result.error_kind == QStringLiteral("raw-destination") ||
          result.error_kind == QStringLiteral("raw-restore"))) {

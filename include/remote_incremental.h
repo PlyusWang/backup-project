@@ -160,8 +160,9 @@ bool RunRemoteRestore(RemoteArchiveClient* client,
 // 错误码当用户文案）：
 //
 //   raw restore: not a supported archive  按内容不是任何已知归档格式
-//   raw restore: corrupted archive        认得出是我们自己的容器，但字节与它自己
-//                                         的声明对不上（含 payload_sha256 不符）
+//   raw restore: corrupted archive 认得出是我们自己的容器，但字节与它自己
+//                                         的声明对不上（含 payload_sha256
+//                                         不符）
 //   raw restore: unsupported version      认得出容器，但版本号这个版本不支持
 //   raw restore: delta needs its chain    单独一个增量
 //   raw restore: needs a password         加密归档 + 没给密码

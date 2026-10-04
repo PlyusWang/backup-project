@@ -835,7 +835,8 @@ bool ContainsText(const std::string& haystack, const std::string& needle) {
   return haystack.find(needle) != std::string::npos;
 }
 
-// 大小写不敏感的字面子串判断（ASCII 足够：被匹配的是本地核心自己的英文诊断串）。
+// 大小写不敏感的字面子串判断（ASCII
+// 足够：被匹配的是本地核心自己的英文诊断串）。
 bool ContainsTextInsensitive(const std::string& haystack,
                              const std::string& needle) {
   if (needle.empty() || haystack.size() < needle.size()) {
@@ -852,8 +853,9 @@ bool ContainsTextInsensitive(const std::string& haystack,
           (left >= 'A' && left <= 'Z') ? static_cast<unsigned char>(left + 32)
                                        : left;
       const unsigned char folded_right =
-          (right >= 'A' && right <= 'Z') ? static_cast<unsigned char>(right + 32)
-                                         : right;
+          (right >= 'A' && right <= 'Z')
+              ? static_cast<unsigned char>(right + 32)
+              : right;
       if (folded_left != folded_right) {
         break;
       }
@@ -882,7 +884,8 @@ void WipeString(std::string* text) {
 // 诊断串，不猜、不看文件名：
 //
 //   * "Authentication failed"        HMAC 没过：密码错或容器头被改动；
-//   * "Payload checksum mismatch"    payload 字节与归档自己的声明不符（与密码无关，
+//   * "Payload checksum mismatch"    payload
+//   字节与归档自己的声明不符（与密码无关，
 //                                    所以这一条可以如实说"已损坏"）；
 //   * 提到 "destination"             目标目录不符合本地恢复的契约。
 std::string DescribeLocalRestoreFailure(const std::string& restore_error) {
@@ -1040,7 +1043,8 @@ bool RemoteRawRestoreSession::Prepare(const RemoteRawRestoreRequest& request,
     return false;
   }
 
-  // 4) 记住这次交互需要的全部状态。**口令不进会话**：它只在 Run() 调用期间存在，
+  // 4) 记住这次交互需要的全部状态。**口令不进会话**：它只在 Run()
+  // 调用期间存在，
   //    用完立刻抹掉。目标目录与显示名不是秘密，留下来给"再输一次密码"用。
   destination_directory_ = request.destination_directory;
   restore_options_ = request.restore_options;
@@ -1071,8 +1075,7 @@ bool RemoteRawRestoreSession::Run(const std::string& password,
     // 调用方拿到密码之后可以直接再 Run 一次——不会重新下载。
     outcome->password_required = true;
     SetError(error_message, "raw restore: needs a password — 该归档已加密（" +
-                                password_hint_ +
-                                "），请填写恢复密码后重试。");
+                                password_hint_ + "），请填写恢复密码后重试。");
     return false;
   }
 
