@@ -5347,12 +5347,24 @@ bool TypeIntoField(QQuickWindow* window, const char* object_name,
     return false;
   }
   field->setProperty("text", text);
-  // TextField 的 textEdited 在不同 Qt 版本里带不带参数并不一致，两种都试。
-  // 只有"页面上的草稿真的变成了这个值"才算成功 —— 否则一条断言可能因为
-  // 输入根本没进去而**假通过**（这一条是实测踩出来的）。
-  if (QMetaObject::invokeMethod(field, "textEdited", Q_ARG(QString, text)) ||
-      QMetaObject::invokeMethod(field, "textEdited")) {
-    return true;
+  // TextField 的 textEdited 在 QML 类型的元对象里是**无参**信号（实参由控件的
+  // text 属性承载），与 --gui-contract-test 里既有的写法保持一致。
+  //
+  // 先问 meta-object 有没有那个签名、再发，不要"两个都试"：失败的
+  // QMetaObject::invokeMethod 会打一条 "No such method
+  // ...::textEdited(QString)"， 而这个项目有一条硬断言是 **0 条 QML
+  // 运行期告警** —— 试错写法会把一条 本可以避免的告警直接带进 modern_gui
+  // 的失败列表（这一条是实测踩出来的）。
+  const QMetaObject* meta = field->metaObject();
+  const int no_arg = meta->indexOfSignal("textEdited()");
+  if (no_arg >= 0) {
+    return meta->method(no_arg).invoke(field, Qt::DirectConnection);
+  }
+  // 兜底：个别 Qt 版本的 textEdited 带一个 QString 参数。
+  const int with_arg = meta->indexOfSignal("textEdited(QString)");
+  if (with_arg >= 0) {
+    return meta->method(with_arg).invoke(field, Qt::DirectConnection,
+                                         Q_ARG(QString, text));
   }
   return false;
 }
@@ -5750,21 +5762,12 @@ int RunRemoteScreenshot(QQuickWindow* window,
     }
     return remote->tunnelStateForTest() == wanted;
   };
+  // 与自检共用同一套"用户动作"助手：输入框走 textEdited、按钮走 clicked，
+  // 两条都是 QML 里真正接的线（不共用的话，截图路径会自己长出一份"两个签名
+  // 都试"的写法，而那正是上面刚修掉的告警来源）。
   const auto typePin = [window](const QString& text) {
-    QObject* field =
-        window->findChild<QObject*>(QStringLiteral("remoteServerKeyPinField"));
-    if (field != nullptr) {
-      field->setProperty("text", text);
-      if (!QMetaObject::invokeMethod(field, "textEdited",
-                                     Q_ARG(QString, text))) {
-        QMetaObject::invokeMethod(field, "textEdited");
-      }
-    }
-    QObject* button = window->findChild<QObject*>(
-        QStringLiteral("remoteServerKeyPinApplyButton"));
-    if (button != nullptr) {
-      QMetaObject::invokeMethod(button, "clicked");
-    }
+    TypeIntoField(window, "remoteServerKeyPinField", text);
+    ClickButton(window, "remoteServerKeyPinApplyButton");
     WaitForAnimation(250);
   };
 
