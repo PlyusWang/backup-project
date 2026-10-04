@@ -1769,6 +1769,11 @@ shot_run() {
   expected="$expected settings-light settings-dark"
   expected="$expected remote-light remote-dark"
   expected="$expected backup-expanded-light backup-expanded-dark"
+  # PR #23：服务器身份的三种模式各一张。官方云端那张必须**看不出**任何
+  # 需要用户填的连接信息（主机/端口/指纹都隐藏），自定义两张才出现。
+  expected="$expected official-cloud-light official-cloud-dark"
+  expected="$expected advanced-ssh-mode-light advanced-ssh-mode-dark"
+  expected="$expected custom-server-profile-light custom-server-profile-dark"
   for extra in "$@"; do
     expected="$expected $extra"
   done
