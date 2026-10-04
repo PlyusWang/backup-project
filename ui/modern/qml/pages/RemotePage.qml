@@ -577,9 +577,12 @@ Item {
                         wrapMode: Text.WrapAnywhere
                     }
 
+                    // 官方云端不需要知道主机与端口（它们来自编译进二进制的
+                    // profile），所以官方模式下这一整行隐藏；用户名与密码仍然要填。
                     RowLayout {
                         Layout.fillWidth: true
                         spacing: 12
+                        visible: !page.officialMode
 
                         ColumnLayout {
                             Layout.fillWidth: true
@@ -665,10 +668,12 @@ Item {
                     // 服务器身份指纹：连接设置的一部分（地址 / 端口 / 用户名 /
                     // 指纹）。指纹错了就是一个输入问题，"应用"之后原因写在这
                     // 张表单自己的错误行里，不弹对话框，也不占用页面底部横幅。
+                    // 官方模式用证书认证，根本不比对指纹，所以整块隐藏。
                     ColumnLayout {
                         Layout.fillWidth: true
                         Layout.topMargin: 4
                         spacing: 4
+                        visible: !page.officialMode
 
                         Text {
                             text: "服务器身份指纹（server-key）"
