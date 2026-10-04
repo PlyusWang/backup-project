@@ -307,7 +307,8 @@ class RemoteController : public QObject {
   //   * rawRestoreAwaitingPassword = true：那份归档已经拿到手（下载 + SHA-256
   //     校验 + 按内容识别都过了），core 明确要求密码。会话里的字节留着，用户
   //     可以反复输密码重试，**不会**重新下载。
-  //   * rawRestorePasswordError 非空：上一次密码没通过（或归档完整性校验失败）。
+  //   * rawRestorePasswordError
+  //   非空：上一次密码没通过（或归档完整性校验失败）。
   //     页面要给出"重新输入"的动作，而不是把整个流程关掉。
   //   * rawRestoreDestinationText：这次恢复的目标目录（回显，不让用户重选）。
   Q_PROPERTY(bool rawRestoreAwaitingPassword READ rawRestoreAwaitingPassword
