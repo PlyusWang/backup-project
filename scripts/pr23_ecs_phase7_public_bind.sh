@@ -78,6 +78,13 @@ if try_start 18802 --allow-public-bind "phase7 自测"; then
 else
   record_pass "A02 有开关但没证书 -> 拒绝（公网监听必须有签名身份）"
 fi
+# 红队复核 F4：只开证书、不开 --require-bpsec2 时，公网监听上仍然留着
+# BPSEC1 pin 客户端那条老路。现在这条必须被拒。
+if try_start 18804 --allow-public-bind "phase7 自测" --bpsec2-cert-file "$WORK_DIR/server.bpcert"; then
+  record_fail "A02b 公网绑定但没开 --require-bpsec2 时必须拒绝" "竟然起来了（公网上还留着 pin 老路）"
+else
+  record_pass "A02b 公网绑定必须同时 --require-bpsec2 -> 拒绝"
+fi
 if try_start 18803 --allow-public-bind "phase7 自测" --bpsec2-cert-file "$WORK_DIR/server.bpcert" --require-bpsec2; then
   record_pass "A03 开关 + 证书 -> 允许监听 0.0.0.0"
 else
