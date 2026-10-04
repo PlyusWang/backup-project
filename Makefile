@@ -279,7 +279,10 @@ $(BUILD_DIR)/ui/desktop/%.o: ui/desktop/%.cpp
 # ---- 现代 GUI（Qt Quick / QML + Qt Concurrent）----
 # 和 Widgets GUI 完全并行：make gui 与 make gui-modern 各自构建各自的产物，
 # 默认的 make 依旧只构建 CLI，因此没有 Qt Quick 的环境也能编译核心。
-QT_QML_PACKAGES := Qt6Quick Qt6Qml Qt6QuickControls2 Qt6Concurrent
+# PR #22 起多了 Qt6Network：SSH 安全通道的就绪判定与活性探测用 QTcpSocket /
+# QTcpServer（"进程还活着"不等于"本地端口连得上"）。Qt6Network 与 Qt6Core
+# 同属 qt6-base-dev，没有引入新的系统依赖。
+QT_QML_PACKAGES := Qt6Quick Qt6Qml Qt6QuickControls2 Qt6Concurrent Qt6Network
 QT_QML_CFLAGS := $(patsubst -I%,-isystem %,$(shell pkg-config --cflags $(QT_QML_PACKAGES) 2>/dev/null))
 QT_QML_LIBS := $(shell pkg-config --libs $(QT_QML_PACKAGES) 2>/dev/null)
 
@@ -304,7 +307,7 @@ gui-modern: check-qt-qml $(MODERN_TARGET)
 check-qt-qml:
 	@pkg-config --exists $(QT_QML_PACKAGES) || { \
 		echo "未找到 Qt Quick / QML 开发包（需要 $(QT_QML_PACKAGES)）。"; \
-		echo "Ubuntu 上可执行: sudo apt-get install -y qt6-declarative-dev qt6-declarative-dev-tools qml6-module-qtquick qml6-module-qtquick-controls qml6-module-qtquick-layouts qml6-module-qtquick-dialogs qml6-module-qtquick-shapes"; \
+		echo "Ubuntu 上可执行: sudo apt-get install -y qt6-base-dev qt6-declarative-dev qt6-declarative-dev-tools qml6-module-qtquick qml6-module-qtquick-controls qml6-module-qtquick-layouts qml6-module-qtquick-dialogs qml6-module-qtquick-shapes"; \
 		exit 1; \
 	}
 	@test -x "$(MOC)" || { echo "找不到 moc，请确认 qt6-base-dev-tools 已安装。"; exit 1; }
