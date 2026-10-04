@@ -57,6 +57,13 @@ run sha512 bash scripts/sha512_test.sh
 run ed25519 bash scripts/ed25519_test.sh
 run bpcert bash scripts/bpcert_test.sh
 run cert-tool bash scripts/cert_tool_test.sh
+# PR #23 的 BPSEC2 与 profile 层。红队复核指出：bpsec2_loopback_e2e.sh 从来
+# 没被 final_gate 跑过（所以它"从干净树跑不过"这件事一直没被发现）。
+# 三个套件补上：协议层（含 10000 例 fuzz 与 BPSEC1 行为基线）、零配置 profile 层、
+# 以及真实进程的回环端到端。
+run bpsec2 bash scripts/bpsec2_test.sh
+run server-profile bash scripts/server_profile_test.sh
+run bpsec2-loopback bash scripts/bpsec2_loopback_e2e.sh
 # 前两个再在 ASan + UBSan 下跑一遍：手写大整数与标量归约的越界/回绕问题
 # 只有消毒剂才稳定暴露（本项目已经在这个文件里真实抓到过两次）。
 run ed25519-sanitize env ED25519_TEST_EXTRA_FLAGS="-g -O1 -fsanitize=address,undefined -fno-omit-frame-pointer" ED25519_ORACLE_CASES=6 bash scripts/ed25519_test.sh
