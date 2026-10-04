@@ -4247,7 +4247,30 @@ int RunRemoteAcceptance(QQuickWindow* window,
             QStringLiteral("ACC-13c 恢复用的是下载并校验过的字节（摘要与列表"
                            "登记值一致）"),
             remote->lastRawRestoreSha256ForTest());
-  WaitForAnimation(300);
+  // 结论那一行必须真的在截图里：先滚到状态横幅，并**读它的真实内容**再抓图。
+  // （上一版这里漏了滚动，抓出来的 PNG 与卡片列表那张逐字节相同——图在，但
+  // "恢复完成"四个字其实在视口外面。）
+  run.Check(scrollTo(named("remoteStatusBanner"), 300),
+            QStringLiteral("ACC-13c 结论横幅已滚进视野"));
+  WaitForAnimation(260);
+  {
+    QQuickItem* banner = named("remoteStatusBanner");
+    const QString banner_kind =
+        banner == nullptr ? QString() : banner->property("kind").toString();
+    const QString banner_title =
+        banner == nullptr ? QString() : banner->property("title").toString();
+    const QString banner_message =
+        banner == nullptr ? QString() : banner->property("message").toString();
+    run.Check(banner != nullptr && banner->isVisible() &&
+                  banner_kind == QStringLiteral("success") &&
+                  banner_title == QStringLiteral("恢复完成") &&
+                  banner_message.contains(QStringLiteral("恢复了")) &&
+                  !banner_message.contains(QStringLiteral("尝试")),
+              QStringLiteral("ACC-13c 界面上的结论就是“恢复完成”"
+                             "（success 色、正文说明恢复了多少条目）"),
+              banner_kind + QStringLiteral("/") + banner_title +
+                  QStringLiteral(" / ") + banner_message);
+  }
   grab(QStringLiteral("raw-restore-success.png"), 1180, 760,
        QStringLiteral("恢复完成（浅色）"));
 
