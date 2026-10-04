@@ -385,49 +385,79 @@ Item {
                         visible: page.sshMode
                         spacing: 6
 
-                        Text {
-                            text: "SSH 主机"
-                            font.pixelSize: 15
-                            color: theme.textSecondary
-                        }
-
+                        // 两个输入框各有自己的标签。
+                        //
+                        // 人工验收的结论：把"本地端口（留空 = 自动）"整句塞进
+                        // placeholder 会被 200px 的框截断，用户根本读不到"留空"
+                        // 是什么意思。所以标签写"本地端口（可选）"，placeholder
+                        // 只留"留空则自动选择"，并把框加宽到放得下整句提示。
                         RowLayout {
                             Layout.fillWidth: true
                             spacing: 12
 
-                            AppTextField {
-                                id: sshHostField
-                                objectName: "remoteSshHostField"
-                                Layout.preferredWidth: 320
-                                enabled: !remote.busy
-                                placeholderText: "例如 aliyun-ecs（~/.ssh/config 里的别名）"
-                                text: page.draftSshHost
-                                onTextEdited: {
-                                    page.draftSshHost = text
-                                    remote.sshHost = text
+                            ColumnLayout {
+                                Layout.fillWidth: true
+                                spacing: 4
+
+                                Text {
+                                    text: "SSH 主机"
+                                    font.pixelSize: 15
+                                    color: theme.textSecondary
+                                }
+
+                                AppTextField {
+                                    id: sshHostField
+                                    objectName: "remoteSshHostField"
+                                    Layout.fillWidth: true
+                                    enabled: !remote.busy
+                                    placeholderText: "例如 aliyun-ecs（~/.ssh/config 里的别名）"
+                                    text: page.draftSshHost
+                                    onTextEdited: {
+                                        page.draftSshHost = text
+                                        remote.sshHost = text
+                                    }
                                 }
                             }
 
-                            AppTextField {
-                                id: sshLocalPortField
-                                objectName: "remoteSshLocalPortField"
-                                Layout.preferredWidth: 200
-                                enabled: !remote.busy
-                                placeholderText: "本地端口（留空 = 自动）"
-                                text: page.draftSshLocalPort
-                                onTextEdited: {
-                                    page.draftSshLocalPort = text
-                                    remote.sshLocalPort = text
+                            ColumnLayout {
+                                Layout.preferredWidth: 240
+                                spacing: 4
+
+                                Text {
+                                    text: "本地端口（可选）"
+                                    font.pixelSize: 15
+                                    color: theme.textSecondary
+                                }
+
+                                AppTextField {
+                                    id: sshLocalPortField
+                                    objectName: "remoteSshLocalPortField"
+                                    Layout.fillWidth: true
+                                    enabled: !remote.busy
+                                    placeholderText: "留空则自动选择"
+                                    text: page.draftSshLocalPort
+                                    onTextEdited: {
+                                        page.draftSshLocalPort = text
+                                        remote.sshLocalPort = text
+                                    }
                                 }
                             }
+                        }
 
-                            Item { Layout.fillWidth: true }
+                        // 这段话只回答一个问题：上面两个框和下面两个框是什么关系。
+                        // 它们是同一条链路的**两端**，不是要填两套服务器地址。
+                        Text {
+                            Layout.fillWidth: true
+                            text: "连接链路：本机自动端口 → SSH 主机 → 远端服务地址和端口。"
+                                  + "本地端口留空时由程序自动选择。"
+                            font.pixelSize: 14
+                            color: theme.textSecondary
+                            wrapMode: Text.WrapAnywhere
                         }
 
                         Text {
                             Layout.fillWidth: true
-                            text: "安全通道由本程序启动：本地自动挑选一个空闲端口，经 SSH 转发到下面的远端服务地址。"
-                                  + "不会修改任何网络配置，也不会弱化 SSH 主机密钥校验。"
+                            text: "不会修改任何网络配置，也不会弱化 SSH 主机密钥校验。"
                             font.pixelSize: 14
                             color: theme.textSecondary
                             wrapMode: Text.WrapAnywhere
@@ -507,6 +537,18 @@ Item {
 
                             Item { Layout.fillWidth: true }
                         }
+                    }
+
+                    // 只有 SSH 模式需要这句话：直连模式下这两个框就是客户端要
+                    // 连的地方，不存在"先登录谁、再连谁"的歧义。
+                    Text {
+                        Layout.fillWidth: true
+                        Layout.topMargin: 6
+                        visible: page.sshMode
+                        text: "SSH 登录到服务器后，将连接这里填写的服务地址和端口。"
+                        font.pixelSize: 14
+                        color: theme.textSecondary
+                        wrapMode: Text.WrapAnywhere
                     }
 
                     RowLayout {
