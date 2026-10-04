@@ -94,6 +94,8 @@ const char* Bpcert1ErrorName(Bpcert1Error error) {
       return "bad-field-value";
     case Bpcert1Error::kBadIssuerKeySize:
       return "bad-issuer-key-size";
+    case Bpcert1Error::kUntrustedIssuer:
+      return "untrusted-issuer";
     case Bpcert1Error::kSignatureInvalid:
       return "signature-invalid";
     case Bpcert1Error::kNotYetValid:
@@ -130,6 +132,8 @@ const char* Bpcert1ErrorMessage(Bpcert1Error error) {
       return "证书字段取值不合法（标识符或时间窗）";
     case Bpcert1Error::kBadIssuerKeySize:
       return "签发者公钥长度不是 32 字节";
+    case Bpcert1Error::kUntrustedIssuer:
+      return "签发这张证书的根不在本机可信根列表里";
     case Bpcert1Error::kSignatureInvalid:
       return "证书签名无效：这张证书不是该根签发的";
     case Bpcert1Error::kNotYetValid:
