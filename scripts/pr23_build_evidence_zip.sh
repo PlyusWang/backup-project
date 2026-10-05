@@ -100,7 +100,13 @@ cat > "$STAGE_DIR/00-SUMMARY.md" <<'SUMMARY'
 
 ## 最终收口（closure round）
 
-* `scripts/test.sh` **PASS=269 FAIL=0**（closure 前是 266/1，唯一那条红的正是 PRV-41）；
+> **统计口径（canonical）**：`scripts/test.sh` 的正式结果一律取**完整 Final Gate 环境**下的跑法
+> —— GUI 已构建、GUI parity 已被执行。任何 `269/0` 都只是它的 **core/headless 子集**
+> （未构建 GUI 时），不是另一个最终结果。
+
+* `scripts/test.sh`（**canonical**：完整 Final Gate 环境，GUI 已构建，GUI parity 已执行）**PASS=279 FAIL=0**；
+  拆解：core/headless 子集 = **269/0**，GUI parity = **10/0**（**279 = 269 + 10**）。
+  closure 之前唯一红的就是 PRV-41（当时 headless 子集为 266/1）。
 * **PRV-41 复核结论：产品行为正确，红的是夹具。** 夹具把源目录放在
   `<repo>/testdata/preview/grammar/...`（前缀 110）下，而那条树形的守卫前缀预算
   只有 84，于是内核 `PATH_MAX` 的检查先于项目自己的长度守卫触发。
