@@ -45,7 +45,7 @@ code=$?
 set -e
 if [ "$code" = "0" ] || [ "$code" = "124" ]; then ci_pass "GUI 在 X11(xvfb) 下正常（退出码 $code）";
 else ci_fail "GUI 在 X11 下退出码 $code"; tail -30 /tmp/appimage-xvfb.log >&2; fi
-shots="$(ls /tmp/appimage-shots/*.png 2>/dev/null | wc -l)"
+shots="$(ls /tmp/appimage-shots/*.png 2>/dev/null | wc -l || true)"
 if [ "$shots" -ge 8 ]; then ci_pass "整页截图模式产出 $shots 张 PNG（登录页 / 官方云端等页面真的渲染了）";
 else ci_fail "截图只有 $shots 张"; tail -20 /tmp/appimage-xvfb.log >&2; fi
 qml_hits2="$(grep -cE '\.qml:[0-9]+:|is not installed|Type .* unavailable' /tmp/appimage-xvfb.log || true)"
@@ -61,7 +61,8 @@ expect_file "自带 QML 模块 QtQuick" "/tmp/appimage-extract/squashfs-root/usr
 expect_file "官方根公钥（公开材料）" "/tmp/appimage-extract/squashfs-root/usr/share/backup-project/official-root-ed25519.pub"
 
 ci_section "5. 二进制里不许出现开发机路径"
-dev_hits="$(grep -rIl '/home/pw-is-123\|/tmp/stage-\|/workspace/backup-project/build' /tmp/appimage-extract/squashfs-root/usr/bin 2>/dev/null | wc -l)"
+# 注意 pipefail：grep 无命中时返回 1，直接放进 $() 会让整个脚本在这里退出。
+dev_hits="$( { grep -rIl '/home/pw-is-123\|/tmp/stage-\|/workspace/backup-project/build' /tmp/appimage-extract/squashfs-root/usr/bin 2>/dev/null || true; } | wc -l)"
 if [ "$dev_hits" != "0" ]; then
   echo "  命中文件："
   grep -rIl '/home/pw-is-123\|/tmp/stage-\|/workspace/backup-project/build' /tmp/appimage-extract/squashfs-root/usr/bin 2>/dev/null | sed 's/^/    /'
