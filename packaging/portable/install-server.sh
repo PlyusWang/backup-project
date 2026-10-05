@@ -132,8 +132,12 @@ fi
 if [ ! -e "$PREFIX/etc/secrets.env" ]; then
   umask 007
   printf 'BACKUP_TOKEN_SECRET=%s\n' "$(head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n')" > "$PREFIX/etc/secrets.env"
-  chmod 0640 "$PREFIX/etc/secrets.env"
-  log "已生成随机 BACKUP_TOKEN_SECRET：$PREFIX/etc/secrets.env"
+  # 产品要求 secret 文件 0600（0400 也接受）：group/other 一律不允许。
+  if [ "$(id -u)" -eq 0 ] && [ "$MAKE_USER" -eq 1 ]; then
+    chown "$SVC_USER:$SVC_USER" "$PREFIX/etc/secrets.env" 2>/dev/null || true
+  fi
+  chmod 0600 "$PREFIX/etc/secrets.env"
+  log "已生成随机 BACKUP_TOKEN_SECRET：$PREFIX/etc/secrets.env（0600）"
 else
   log "secrets.env 已存在，保持不变"
 fi
