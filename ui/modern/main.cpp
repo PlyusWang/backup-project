@@ -5497,7 +5497,8 @@ bool ObjectVisible(QQuickWindow* window, const char* object_name) {
 // 通常挂在容器上（例如官方模式下被隐藏的整个指纹区块），只看控件自己的属性会
 // 把“用户其实看不到”误判成可见。
 bool EffectivelyVisible(QQuickWindow* window, const char* object_name) {
-  QObject* object = window->findChild<QObject*>(QString::fromLatin1(object_name));
+  QObject* object =
+      window->findChild<QObject*>(QString::fromLatin1(object_name));
   if (object == nullptr) {
     return false;
   }
@@ -5583,7 +5584,8 @@ void ScrollRemotePageToBottom(QQuickWindow* window) {
 // 它打的是编译进二进制的官方端点（真实 ECS），所以**不进 final gate**
 // （gate 不能依赖公网），由人工验收单独跑：
 //
-//   QT_QPA_PLATFORM=offscreen BACKUP_REMOTE_PASSWORD=... build/backup-gui-modern
+//   QT_QPA_PLATFORM=offscreen BACKUP_REMOTE_PASSWORD=...
+//   build/backup-gui-modern
 //     --official-acceptance <用户名> <输出.png> --config-file ...
 //
 // 口令只从环境变量读：不进 argv（进程列表对同机用户可见），也不进日志。
@@ -5653,10 +5655,11 @@ int RunOfficialAcceptance(QQuickWindow* window,
   // A07：再显式刷一次云端列表。登录成功之后的自动读列表是“顺带”的，这一条是
   // 人工验收要求的 refresh/list 本身成功（失败时 last_error_kind_ 不是 none）。
   const bool refreshed = remote->refreshList() && remote->waitForIdle(60000);
-  run.Check(refreshed && remote->lastErrorKindForTest() == QStringLiteral("none"),
-            QStringLiteral("A07 云端列表刷新（refresh/list）成功"),
-            remote->lastErrorKindForTest() + QStringLiteral(": ") +
-                remote->lastDetailForTest());
+  run.Check(
+      refreshed && remote->lastErrorKindForTest() == QStringLiteral("none"),
+      QStringLiteral("A07 云端列表刷新（refresh/list）成功"),
+      remote->lastErrorKindForTest() + QStringLiteral(": ") +
+          remote->lastDetailForTest());
   const int ssh_after = count_ssh();
   run.Check(ssh_before == ssh_after,
             QStringLiteral("A08 全程 ssh 进程数 delta = 0（没有偷偷开隧道）"),
@@ -5742,7 +5745,8 @@ int RunRemoteConnectionUx(QQuickWindow* window,
     const backupproject::net::ServerProfile official =
         backupproject::net::OfficialCloudProfile();
 
-    // ---- OFFICIAL-GUI-LOGIN-01：官方模式 + 空 pin，点真实 QML 的“登录”按钮 ----
+    // ---- OFFICIAL-GUI-LOGIN-01：官方模式 + 空 pin，点真实 QML 的“登录”按钮
+    // ----
     remote->setConnectionMode(QStringLiteral("official"));
     TypeIntoField(window, "remoteUserField", official_user);
     TypeIntoField(window, "remotePasswordField", password);
@@ -5750,94 +5754,104 @@ int RunRemoteConnectionUx(QQuickWindow* window,
     ClickButton(window, "remoteLoginButton");
     const backupproject::net::RemoteEndpoint login_sent =
         remote->lastDispatchedEndpointForTest();
-    run->Check(
-        remote->dispatchedRequestCountForTest() == login_before + 1,
-        QStringLiteral("OFFICIAL-GUI-LOGIN-01a 官方模式 + 空 pin：点“登录”确实发出"
-                       "了一次请求（没有被 pin 闸门挡在本地）"),
-        remote->lastErrorKindForTest() + QStringLiteral(": ") +
-            remote->loginError());
+    run->Check(remote->dispatchedRequestCountForTest() == login_before + 1,
+               QStringLiteral(
+                   "OFFICIAL-GUI-LOGIN-01a 官方模式 + 空 pin：点“登录”确实发出"
+                   "了一次请求（没有被 pin 闸门挡在本地）"),
+               remote->lastErrorKindForTest() + QStringLiteral(": ") +
+                   remote->loginError());
     run->Check(
         login_sent.identity_mode == "certificate" &&
             login_sent.host == official.host &&
             login_sent.port == official.port &&
             login_sent.expected_server_id == official.expected_server_id &&
             login_sent.trusted_roots_file.empty(),
-        QStringLiteral("OFFICIAL-GUI-LOGIN-01b 请求用的是 OfficialCloudProfile + "
-                       "certificate（空 trusted_roots_file = 内置官方根）"),
-        QString::fromStdString(login_sent.identity_mode + " " + login_sent.host +
-                               ":" + std::to_string(login_sent.port) + " id=" +
-                               login_sent.expected_server_id));
-    run->Check(!remote->loginError().contains(QStringLiteral("指纹")) &&
-                   remote->lastErrorKindForTest() != QStringLiteral("validation") &&
-                   remote->serverKeyPinError().isEmpty(),
-               QStringLiteral("OFFICIAL-GUI-LOGIN-01c 没有产生任何 server_key_pin "
-                              "validation error"),
-               remote->loginError() + QStringLiteral(" | ") +
-                   remote->serverKeyPinError());
-    run->Check(remote->serverKeyPin() == pin_before_official,
-               QStringLiteral("OFFICIAL-GUI-LOGIN-01d 官方登录没有提交、也没有读取"
-                              "隐藏的指纹输入"));
+        QStringLiteral(
+            "OFFICIAL-GUI-LOGIN-01b 请求用的是 OfficialCloudProfile + "
+            "certificate（空 trusted_roots_file = 内置官方根）"),
+        QString::fromStdString(login_sent.identity_mode + " " +
+                               login_sent.host + ":" +
+                               std::to_string(login_sent.port) +
+                               " id=" + login_sent.expected_server_id));
+    run->Check(
+        !remote->loginError().contains(QStringLiteral("指纹")) &&
+            remote->lastErrorKindForTest() != QStringLiteral("validation") &&
+            remote->serverKeyPinError().isEmpty(),
+        QStringLiteral("OFFICIAL-GUI-LOGIN-01c 没有产生任何 server_key_pin "
+                       "validation error"),
+        remote->loginError() + QStringLiteral(" | ") +
+            remote->serverKeyPinError());
+    run->Check(
+        remote->serverKeyPin() == pin_before_official,
+        QStringLiteral("OFFICIAL-GUI-LOGIN-01d 官方登录没有提交、也没有读取"
+                       "隐藏的指纹输入"));
 
     // ---- OFFICIAL-GUI-REGISTER-01：注册路径同样不得要求 pin ----
     TypeIntoField(window, "remoteRegisterPasswordField", password);
     TypeIntoField(window, "remoteRegisterConfirmField", password);
     const int register_before = remote->dispatchedRequestCountForTest();
     ClickButton(window, "remoteRegisterButton");
-    run->Check(
-        remote->dispatchedRequestCountForTest() == register_before + 1 &&
-            !remote->registerError().contains(QStringLiteral("指纹")),
-        QStringLiteral("OFFICIAL-GUI-REGISTER-01 官方模式 + 空 pin：注册同样不被"
-                       "指纹闸门挡住"),
-        remote->registerError());
+    run->Check(remote->dispatchedRequestCountForTest() == register_before + 1 &&
+                   !remote->registerError().contains(QStringLiteral("指纹")),
+               QStringLiteral(
+                   "OFFICIAL-GUI-REGISTER-01 官方模式 + 空 pin：注册同样不被"
+                   "指纹闸门挡住"),
+               remote->registerError());
 
     // ---- OFFICIAL-GUI-STALE-PIN-01：manual pin 的旧报错不得污染官方模式 ----
     remote->setConnectionMode(QStringLiteral("ssh"));
-    remote->applyServerKeyPin(QStringLiteral("sha256:") + QString(64, QLatin1Char('3')));
-    const bool pin_blocked = remote->loginWithPin(
-        host, port_text, official_user, password, QStringLiteral("sha256:nothex"));
+    remote->applyServerKeyPin(QStringLiteral("sha256:") +
+                              QString(64, QLatin1Char('3')));
+    const bool pin_blocked =
+        remote->loginWithPin(host, port_text, official_user, password,
+                             QStringLiteral("sha256:nothex"));
     const QString stale_error = remote->loginError();
     remote->setConnectionMode(QStringLiteral("official"));
     const int stale_before = remote->dispatchedRequestCountForTest();
     ClickButton(window, "remoteLoginButton");
-    run->Check(!pin_blocked && !stale_error.isEmpty() &&
-                   remote->dispatchedRequestCountForTest() == stale_before + 1 &&
-                   !remote->loginError().contains(QStringLiteral("指纹")),
-               QStringLiteral("OFFICIAL-GUI-STALE-PIN-01 先在 manual 模式制造 pin "
-                              "报错，切到官方云端之后它不再阻挡登录"),
-               QStringLiteral("blocked=") + (pin_blocked ? "1" : "0") +
-                   " stale=[" + stale_error + "] now=[" + remote->loginError() +
-                   "]");
+    run->Check(
+        !pin_blocked && !stale_error.isEmpty() &&
+            remote->dispatchedRequestCountForTest() == stale_before + 1 &&
+            !remote->loginError().contains(QStringLiteral("指纹")),
+        QStringLiteral("OFFICIAL-GUI-STALE-PIN-01 先在 manual 模式制造 pin "
+                       "报错，切到官方云端之后它不再阻挡登录"),
+        QStringLiteral("blocked=") + (pin_blocked ? "1" : "0") + " stale=[" +
+            stale_error + "] now=[" + remote->loginError() + "]");
 
     // ---- MANUAL-PIN-REGRESSION：官方模式的修复**没有**放松手动 pin 合同 ----
     // 空 pin 与畸形 pin 在本地就要挡住（一个字节都不发）。“well-formed 但错”的
-    // pin 只能在服务端被发现，那一条由 C03a（真实本地服务端 -> pin-mismatch）覆盖。
-    const auto must_block_locally = [&](const QString& label, const QString& mode,
+    // pin 只能在服务端被发现，那一条由 C03a（真实本地服务端 ->
+    // pin-mismatch）覆盖。
+    const auto must_block_locally = [&](const QString& label,
+                                        const QString& mode,
                                         const QString& pin_text,
                                         bool via_with_pin) {
       remote->setConnectionMode(mode);
       const int before = remote->dispatchedRequestCountForTest();
       bool accepted = false;
       if (via_with_pin) {
-        accepted = remote->loginWithPin(host, port_text, official_user, password,
-                                        pin_text);
+        accepted = remote->loginWithPin(host, port_text, official_user,
+                                        password, pin_text);
       } else {
         remote->clearServerKeyPinForTest();
         accepted = remote->login(host, port_text, official_user, password);
       }
-      run->Check(!accepted &&
-                     remote->dispatchedRequestCountForTest() == before &&
-                     remote->lastErrorKindForTest() == QStringLiteral("validation"),
-                 label,
-                 remote->lastErrorKindForTest() + QStringLiteral(": ") +
-                     remote->loginError());
+      run->Check(
+          !accepted && remote->dispatchedRequestCountForTest() == before &&
+              remote->lastErrorKindForTest() == QStringLiteral("validation"),
+          label,
+          remote->lastErrorKindForTest() + QStringLiteral(": ") +
+              remote->loginError());
     };
     must_block_locally(
-        QStringLiteral("MANUAL-PIN-REGRESSION-01 ssh + 空 pin：本地 fail closed，"
-                       "一个字节都不发"),
+        QStringLiteral(
+            "MANUAL-PIN-REGRESSION-01 ssh + 空 pin：本地 fail closed，"
+            "一个字节都不发"),
         QStringLiteral("ssh"), QString(), false);
     must_block_locally(
-        QStringLiteral("MANUAL-PIN-REGRESSION-02 direct + 空 pin：本地 fail closed，"
-                       "一个字节都不发"),
+        QStringLiteral(
+            "MANUAL-PIN-REGRESSION-02 direct + 空 pin：本地 fail closed，"
+            "一个字节都不发"),
         QStringLiteral("direct"), QString(), false);
     remote->applyServerKeyPin(good_pin);
     must_block_locally(
@@ -5845,8 +5859,9 @@ int RunRemoteConnectionUx(QQuickWindow* window,
                        "closed，一个字节都不发"),
         QStringLiteral("direct"), QStringLiteral("sha256:nothex"), true);
     must_block_locally(
-        QStringLiteral("MANUAL-PIN-REGRESSION-04 ssh + 畸形 pin：本地 fail closed，"
-                       "一个字节都不发"),
+        QStringLiteral(
+            "MANUAL-PIN-REGRESSION-04 ssh + 畸形 pin：本地 fail closed，"
+            "一个字节都不发"),
         QStringLiteral("ssh"), QStringLiteral("sha256:nothex"), true);
 
     // 收尾：关掉注入点，恢复 pin 与模式，后面的 C01.. 继续用真实网络跑。
@@ -11251,8 +11266,9 @@ int main(int argc, char* argv[]) {
 
   if (official_acceptance_index >= 0) {
     if (official_acceptance_index + 2 >= arguments.size()) {
-      std::fprintf(stderr,
-                   "--official-acceptance 需要 <用户名> 与 <输出 PNG> 两个参数\n");
+      std::fprintf(
+          stderr,
+          "--official-acceptance 需要 <用户名> 与 <输出 PNG> 两个参数\n");
       return 2;
     }
     return RunOfficialAcceptance(window, &remote_controller,

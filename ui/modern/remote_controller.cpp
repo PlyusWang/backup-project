@@ -1239,11 +1239,13 @@ bool RemoteController::BeginOperation(const QString& action_text,
   }
   // 连接之前必须有服务端身份 pin —— **但只有靠人工 pin 认服务器的模式才需要**。
   //
-  // PR #23 人工验收发现的 blocker：官方云端模式下“服务器身份指纹”输入区是隐藏的，
-  // 而这里无条件要求 server_key_pin_ 非空，于是官方用户被一句“还没有填写服务器
-  // 身份指纹”挡在门外。身份来源是互斥的两条路（见 remote_backup_client.h:48-57）：
-  // 证书模式根本不看 pin，所以官方模式不要求它；ssh / direct 仍然是 BPSEC1 +
-  // 人工 pin，一个字节都不放松。
+  // PR #23 人工验收发现的
+  // blocker：官方云端模式下“服务器身份指纹”输入区是隐藏的， 而这里无条件要求
+  // server_key_pin_ 非空，于是官方用户被一句“还没有填写服务器
+  // 身份指纹”挡在门外。身份来源是互斥的两条路（见
+  // remote_backup_client.h:48-57）： 证书模式根本不看
+  // pin，所以官方模式不要求它；ssh / direct 仍然是 BPSEC1 + 人工
+  // pin，一个字节都不放松。
   //
   // 没有 pin 时客户端会**直接拒绝连接**（不做首次连接自动信任），而那是一条
   // 协议级的底层原因，用户读不懂“我到底少做了什么”。与地址 / 端口 / 口令同一条
@@ -2860,7 +2862,8 @@ bool RemoteController::registerAccountWithPin(const QString& host,
                                               const QString& base_pin) {
   // 同 loginWithPin：官方云端不经过人工 pin（见那里的说明）。
   if (connection_mode_ == ConnectionMode::kOfficialCloud) {
-    return registerAccount(host, port_text, username, password, confirm_password);
+    return registerAccount(host, port_text, username, password,
+                           confirm_password);
   }
   const QString pin_state = CommitServerKeyPin(base_pin);
   if (pin_state == QStringLiteral("invalid")) {
