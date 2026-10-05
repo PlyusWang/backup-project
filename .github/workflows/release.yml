@@ -103,14 +103,7 @@ jobs:
       - name: install build tools + Qt6 + packaging tools
         run: |
           apt-get update
-          DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-            git ca-certificates g++ make pkg-config binutils file xz-utils \
-            python3 python3-pil \
-            qt6-base-dev qt6-base-dev-tools qt6-declarative-dev qt6-declarative-dev-tools \
-            qt6-qpa-plugins qml6-module-qtquick qml6-module-qtquick-controls \
-            qml6-module-qtquick-layouts qml6-module-qtquick-dialogs \
-            qml6-module-qtquick-window qml6-module-qtquick-shapes qml6-module-qtquick-templates
-            qml6-module-qtqml qml6-module-qtqml-workerscript
+          DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends git ca-certificates g++ make dpkg-dev pkg-config binutils file xz-utils python3 python3-pil qt6-base-dev qt6-base-dev-tools qt6-declarative-dev qt6-declarative-dev-tools qt6-qpa-plugins qml6-module-qtquick qml6-module-qtquick-controls qml6-module-qtquick-layouts qml6-module-qtquick-dialogs qml6-module-qtquick-window qml6-module-qtquick-shapes qml6-module-qtquick-templates qml6-module-qtqml qml6-module-qtqml-workerscript
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
       - name: container workspace ownership (git safe.directory)
         run: git config --global --add safe.directory "$GITHUB_WORKSPACE"

@@ -27,7 +27,7 @@ Debian 12。Windows / macOS / ARM64 没有构建也没有验证，不声称支�
     /usr/bin/backup-cert-tool           证书工具
     /usr/bin/backup-server-purge-data   显式删除数据的唯一入口
     /etc/backup-project-server/server.conf        配置（conffile）
-    /etc/backup-project-server/secrets.env        token secret（0640 root:backup-project）
+    /etc/backup-project-server/secrets.env        token secret（0600 backup-project）
     /var/lib/backup-project-server/data/          备份数据（0750 backup-project）
     /var/lib/backup-project-server/state/         元数据库 + 传输身份私钥
     /lib/systemd/system/backup-project-server.service
@@ -38,7 +38,7 @@ Debian 12。Windows / macOS / ARM64 没有构建也没有验证，不声称支�
 
 * 创建**专用系统用户** `backup-project`（`/usr/sbin/nologin`、无家目录登录）；
 * 创建 `data/` 与 `state/`（0750）并设好属主；
-* 生成**真正随机**的 `BACKUP_TOKEN_SECRET`（32 字节随机数的 sha256 十六进制，0640）；
+* 生成**真正随机**的 `BACKUP_TOKEN_SECRET`（32 字节随机数的 sha256 十六进制，**0600**）；
 * 用 `backup-server-keygen` 在**本机**生成传输身份私钥 `state/transport.key`（0600）；
 * `systemd` 重新加载；配置自检通过时启动并设为开机自启。
 
@@ -77,7 +77,7 @@ Debian 12。Windows / macOS / ARM64 没有构建也没有验证，不声称支�
     sudo systemctl restart backup-project-server
 
 `--check-config` 会检查：目录是否存在、secrets.env 里有没有 `BACKUP_TOKEN_SECRET`
-（长度 ≥ 16 字节，内容不打印）、transport.key 是否 32 字节且 0600、证书能否被
+（长度 ≥ 16 字节，且**权限必须是 0600 / 0400** —— 产品自己也会拒绝更宽的权限；内容不打印）、transport.key 是否 32 字节且 0600、证书能否被
 `backup-cert-tool inspect-server` 解析、以及公网绑定的三个前提。它**不打印任何
 秘密内容**。
 
