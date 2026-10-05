@@ -21,7 +21,7 @@ CONF=/etc/backup-project-server/server.conf
 ci_section "1. .deb 安装（容器里没有 systemd，postinst 必须照样成功）"
 # 用 apt install ./pkg.deb（真实用户的用法）：它会按 control 里的 Depends 解析依赖。
 expect_ok "apt-get update" apt-get update -qq
-expect_ok "apt-get install ./$(basename "$DEB")" apt-get install -y -qq "./$DEB"
+expect_ok "apt-get install ./$(basename "$DEB")" apt-get install -y -qq "$DEB"
 expect_ok "系统用户 backup-project 已创建" getent passwd backup-project
 expect_eq "backup-project 的 shell 不是交互式" "/usr/sbin/nologin" "$(getent passwd backup-project | cut -d: -f7)"
 expect_file "数据目录" "$INSTANCE/data"
@@ -80,7 +80,7 @@ BEFORE_DB="$(sha256sum "$INSTANCE/state/metadata.sqlite3" 2>/dev/null | cut -d' 
 BEFORE_KEY="$(sha256sum "$INSTANCE/state/transport.key" | cut -d' ' -f1)"
 BEFORE_SECRET="$(sha256sum /etc/backup-project-server/secrets.env | cut -d' ' -f1)"
 BEFORE_CONF_MODE="$(stat -c %a "$CONF")"
-expect_ok "同版本重装（模拟升级路径）" apt-get install -y -qq --reinstall "./$DEB"
+expect_ok "同版本重装（模拟升级路径）" apt-get install -y -qq --reinstall "$DEB"
 expect_eq "transport.key 未变化" "$BEFORE_KEY" "$(sha256sum "$INSTANCE/state/transport.key" | cut -d' ' -f1)"
 expect_eq "secrets.env 未变化" "$BEFORE_SECRET" "$(sha256sum /etc/backup-project-server/secrets.env | cut -d' ' -f1)"
 expect_eq "配置文件权限未变化（conffile 没被覆盖）" "$BEFORE_CONF_MODE" "$(stat -c %a "$CONF")"
