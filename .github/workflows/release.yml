@@ -76,9 +76,10 @@ jobs:
       - name: build release artifacts (server)
         run: bash packaging/build-release.sh --version "${{ needs.prepare.outputs.version }}" --only server
       - name: ELF / glibc contract
-        run: bash packaging/ci-elf-report.sh \
-               dist/server/bin/backup-server dist/server/bin/backup-server-admin \
-               dist/server/bin/backup-server-keygen dist/server/tools/backup-cert-tool
+        run: |
+          bash packaging/ci-elf-report.sh \
+            dist/server/bin/backup-server dist/server/bin/backup-server-admin \
+            dist/server/bin/backup-server-keygen dist/server/tools/backup-cert-tool
       - name: deb metadata
         run: |
           deb=$(ls dist/release/*/backup-project-server_*.deb)
