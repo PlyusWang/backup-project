@@ -703,9 +703,10 @@ class RemoteController : public QObject {
   // 挂起是连接层的实现细节，界面看不到，但自检要能证明它真的发生过。
   QString lastDeferredActionForTest() const { return last_deferred_action_; }
   int deferredSubmitCountForTest() const { return deferred_submit_count_; }
-  // ---- PR #23 人工验收修复：官方模式的回归要能断言“Submit() 到底把什么发出去了”
-  // （identity_mode 必须是 certificate，host / port / expected_server_id 必须来自内置
-  // OfficialCloudProfile）。官方 profile 指向真实 ECS，而 final gate **不能依赖公网**，
+  // ---- PR #23 人工验收修复：官方模式的回归要能断言“Submit()
+  // 到底把什么发出去了” （identity_mode 必须是 certificate，host / port /
+  // expected_server_id 必须来自内置 OfficialCloudProfile）。官方 profile
+  // 指向真实 ECS，而 final gate **不能依赖公网**，
   // 所以给一个只记录、不发送的注入点：
   //   * 打开后 DispatchRequest 记下请求端点就返回，一个字节都不发；
   //   * 这一次操作用一个明确的 "capture-only" **失败**结果收尾——不伪造
@@ -717,7 +718,9 @@ class RemoteController : public QObject {
   backupproject::net::RemoteEndpoint lastDispatchedEndpointForTest() const {
     return last_dispatched_endpoint_;
   }
-  int dispatchedRequestCountForTest() const { return dispatched_request_count_; }
+  int dispatchedRequestCountForTest() const {
+    return dispatched_request_count_;
+  }
   // 等通道状态机稳定（不是 kStarting / kStopping）。自检用。
   bool waitForTunnelIdle(int timeout_ms);
   // 直接换一个 ssh 可执行文件（自检用它模拟"本机没有 ssh"），
