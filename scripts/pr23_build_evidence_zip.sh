@@ -37,6 +37,12 @@ cp docs/bpsec2-design.md docs/release-layout.md \
    docs/client-quick-start.md docs/server-quick-start.md \
    docs/self-hosted-server.md "$STAGE_DIR/docs/" 2>/dev/null
 
+# Phase 7-9（公网直连）的结果汇总：不是原始终端日志，而是"命令 + 观测结果"，
+# 因为那三步是在解锁 ufw 之后一次性跑完的，原始输出留在会话记录里。
+if [ -f /tmp/pr23/phase7-9-results.md ]; then
+  cp /tmp/pr23/phase7-9-results.md "$STAGE_DIR/logs/phase7-9-results.md"
+fi
+
 for log in sha512 ed25519 bpcert cert_tool bpsec2 bpsec1c; do
   if [ -f "/tmp/pr23/$log.log" ]; then
     cp "/tmp/pr23/$log.log" "$STAGE_DIR/logs/$log.log"
