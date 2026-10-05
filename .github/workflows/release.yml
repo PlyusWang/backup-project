@@ -71,8 +71,8 @@ jobs:
       - name: baseline report
         run: |
           . /etc/os-release; echo "build_os=$PRETTY_NAME"
-          echo "build_glibc=$(ldd --version | head -1 | awk '{print $NF}')"
-          g++ --version | head -1
+          echo "build_glibc=$(ldd --version | awk 'NR==1 {print $NF}')"
+          g++ --version | awk 'NR==1'
       - name: build release artifacts (server)
         run: bash packaging/build-release.sh --version "${{ needs.prepare.outputs.version }}" --only server
       - name: ELF / glibc contract
@@ -115,7 +115,7 @@ jobs:
       - name: baseline report
         run: |
           . /etc/os-release; echo "build_os=$PRETTY_NAME"
-          echo "build_glibc=$(ldd --version | head -1 | awk '{print $NF}')"
+          echo "build_glibc=$(ldd --version | awk 'NR==1 {print $NF}')"
           echo "qt=$(qmake6 -query QT_VERSION)"
       - name: build release artifacts (client)
         run: bash packaging/build-release.sh --version "${{ needs.prepare.outputs.version }}" --only client
