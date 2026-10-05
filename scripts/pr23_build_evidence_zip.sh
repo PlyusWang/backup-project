@@ -10,7 +10,8 @@
 #                    bpsec2 / BPSEC1 基线 / Phase 2,4,5,6,7）
 #   cert/            生产证书 + 官方根公钥 + 用内置官方根验签的输出
 #   git/             分支提交清单、与基线的差异统计
-#   00-SUMMARY.md    阶段状态（含未完成项与原因）
+#   evidence/        PR #23 closure 结论（PRV-41 复核 + 最终收口）
+#   00-SUMMARY.md    阶段状态、closure 结论与已知限制
 #   MANIFEST.sha256  包内每个文件的 sha256
 #
 # 打包前会扫一遍暂存目录：出现根密钥文件的私钥行格式就直接失败，
@@ -35,7 +36,8 @@ mkdir -p "$STAGE_DIR/docs" "$STAGE_DIR/logs" "$STAGE_DIR/cert" "$STAGE_DIR/git"
 
 cp docs/bpsec2-design.md docs/release-layout.md \
    docs/client-quick-start.md docs/server-quick-start.md \
-   docs/self-hosted-server.md "$STAGE_DIR/docs/" 2>/dev/null
+   docs/self-hosted-server.md docs/pr23-prv41-closure.md \
+   "$STAGE_DIR/docs/" 2>/dev/null
 
 # Phase 7-9（公网直连）的结果汇总：不是原始终端日志，而是"命令 + 观测结果"，
 # 因为那三步是在解锁 ufw 之后一次性跑完的，原始输出留在会话记录里。
@@ -44,6 +46,17 @@ if [ -f /tmp/pr23/phase7-9-results.md ]; then
 fi
 
 for log in sha512 ed25519 bpcert cert_tool bpsec2 bpsec1c; do
+  if [ -f "/tmp/pr23/$log.log" ]; then
+    cp "/tmp/pr23/$log.log" "$STAGE_DIR/logs/$log.log"
+  fi
+done
+
+# PR #23 closure：evidence/ 放“结论 + 指向原始输出的坐标”，logs/ 放原始输出。
+mkdir -p "$STAGE_DIR/evidence"
+if [ -d /tmp/pr23/evidence ]; then
+  cp /tmp/pr23/evidence/*.md "$STAGE_DIR/evidence/" 2>/dev/null
+fi
+for log in prv41-closure test-suite-final final-gate-suites ecs-provenance public-smoke; do
   if [ -f "/tmp/pr23/$log.log" ]; then
     cp "/tmp/pr23/$log.log" "$STAGE_DIR/logs/$log.log"
   fi
@@ -81,21 +94,36 @@ cat > "$STAGE_DIR/00-SUMMARY.md" <<'SUMMARY'
 | 4 | ECS 本机 BPSEC2（内置官方根、零指纹） | 完成 | 6/6 |
 | 5 | 隧道内 BPSEC2 | 完成 | 6/6 |
 | 6 | 防火墙 / 安全组审计（含外部探测） | 完成 | 22/80 可达、18765 不可达 |
-| 7 | 开放公网 18765 | **未完成** | 主机侧可监听 0.0.0.0；安全组未放行 |
-| 8 | 无隧道公网直连 E2E（SSH delta=0） | **被阻塞** | 依赖阶段 7 |
-| 9 | 公网对抗 / 资源测试 | **被阻塞** | 依赖阶段 7 |
+| 7 | 开放公网 18765 | 完成 | 0.0.0.0:18765 监听 + 外部可达（安全组 + ufw 两处） |
+| 8 | 无隧道公网直连 E2E（SSH delta=0） | 完成 | 8/8，logs/public-smoke.log |
+| 9 | 公网对抗 / 资源测试 | 完成 | 8/8（PID 未变、限速仍生效） |
 
-## 未完成项与原因
+## 最终收口（closure round）
 
-* 阶段 7 的外部可达性被阿里云安全组挡住：
-  SECURITY_GROUP_AUTOMATION = UNAVAILABLE（仓库与制品里不允许放阿里云
-  AccessKey，ECS 上也没有任何凭据）。需要人工在控制台放行 18765/tcp，
-  之后重跑 scripts/pr23_ecs_phase7_public_bind.sh 即可判定。
-* 阶段 8/9 因此无法开始：没有公网可达性，"零 SSH 直连"就无法被真正证明 ——
-  这一条不会被含糊过去。
-* 客户端 GUI 重构（官方云端 / 自定义服务器 + 截图）尚未开始；但零配置的
-  语义层（OfficialCloudProfile + .bpserver）已经实现并测试（23/23）。
-* 服务端加固与登录限速（§32/§33）尚未开始。
+* `scripts/test.sh` **PASS=269 FAIL=0**（closure 前是 266/1，唯一那条红的正是 PRV-41）；
+* **PRV-41 复核结论：产品行为正确，红的是夹具。** 夹具把源目录放在
+  `<repo>/testdata/preview/grammar/...`（前缀 110）下，而那条树形的守卫前缀预算
+  只有 84，于是内核 `PATH_MAX` 的检查先于项目自己的长度守卫触发。
+  现在拆成两半、各自显式构造前缀：a) 项目守卫（短前缀 19）b) 内核路径上限
+  （长前缀 249）；两半都断言两侧退出码恰好 1、首行完全相同、报出的是那条
+  真的越界的路径、仓库里不留半个归档。详见 evidence/20-PRV41-CLOSURE.md。
+* **ECS 产品溯源 PASS**：closure 未改任何产品代码（`git diff 759679c..HEAD` 对
+  服务端构建输入为空），并且在目标机上用最终 HEAD 的源码子集重新构建，
+  sha256 = `afb68e5827eabaafec0acbf6092d889fccdc07257fcbad28ae34188d9e2c3b17`，
+  与运行中的二进制（`/proc/<pid>/exe`）逐字节一致，构建 0 warning。
+  详见 logs/ecs-provenance.log。
+
+## 已知限制（如实保留）
+
+* **证书吊销未实现**：TrustedRootStore 只有 active / revoked 两种**根**状态，
+  没有 CRL / OCSP，也没有单张服务器证书的吊销路径；轮换只能靠换根或换证书；
+* **没有 fd 相对（openat）遍历**：源目录的**绝对**路径超出 `PATH_MAX` 时，
+  遍历会以内核 `ENAMETOOLONG` 受控失败，而不是继续逐级下钻。本 PR 只登记
+  `FUTURE: fd-relative traversal / openat-based deep-path support`，不实现
+  （见 docs/pr23-prv41-closure.md）；
+* **开放公网需要两处人工动作**（阿里云安全组 + 主机 ufw），
+  SECURITY_GROUP_AUTOMATION = UNAVAILABLE：仓库与制品里不放任何阿里云凭据；
+* 服务器证书有效期 180 天，到期后需要重新签发并重启服务端。
 
 ## 安全边界（本次交付遵守）
 
