@@ -28,7 +28,8 @@ expect_file "数据目录" "$INSTANCE/data"
 expect_file "状态目录" "$INSTANCE/state"
 expect_mode "数据目录权限 0750" "$INSTANCE/data" "750"
 expect_file "secrets.env（随机生成）" /etc/backup-project-server/secrets.env
-expect_mode "secrets.env 权限 0640" /etc/backup-project-server/secrets.env "640"
+# 产品对 secret 文件的要求就是 0600（0400 也接受）——不是 0640。
+expect_mode "secrets.env 权限 0600" /etc/backup-project-server/secrets.env "600"
 secret_len="$(sed -n 's/^BACKUP_TOKEN_SECRET=//p' /etc/backup-project-server/secrets.env | tr -d '\n' | wc -c)"
 expect_eq "BACKUP_TOKEN_SECRET 长度 64" "64" "$secret_len"
 expect_file "传输身份私钥（本机生成）" "$INSTANCE/state/transport.key"
