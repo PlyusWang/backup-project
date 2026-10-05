@@ -1,0 +1,119 @@
+# Release packages —— 在干净容器里构建两个可以发给真实用户的产品族。
+#
+# 为什么必须在旧基线容器里构建：开发机是 Ubuntu 24.04（glibc 2.39），而生产
+# ECS 是 Ubuntu 22.04（glibc 2.35）。直接拿开发机的二进制上去会因为
+# "GLIBC_2.38 not found" 起不来（PR #20 真实踩过一次）。release 制品因此
+# 只在旧基线的干净容器里构建，基线本身写进 BUILD-INFO 与兼容性文档。
+#
+# 基线（选型证据见 docs/release-packaging.md）：
+#   server: ubuntu:20.04  -> glibc 2.31，无 Qt 依赖
+#   client: debian:12     -> glibc 2.36 + Qt 6.4.2
+#     客户端 GUI 使用 QtQuick.Dialogs 的 FolderDialog，它 Since: Qt 6.3；
+#     Ubuntu 22.04 只有 Qt 6.2.4，所以 22.04 不能作为客户端构建基线。
+#
+# 本 workflow **不创建 tag、不发布 GitHub Release**：tag 触发只是把设计留在这里
+# （v*），正式发布必须等人工 review。
+#
+# 第三方 Action 一律 pin 到 commit SHA，不用可变 tag。
+
+name: Release packages
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "验收用版本号（不会创建 tag、不会发布 Release）"
+        required: true
+        default: "0.0.0+g3871a8c"
+
+permissions:
+  contents: read
+
+env:
+  LC_ALL: C
+  TZ: UTC
+
+jobs:
+  baseline-server:
+    name: server baseline (ubuntu:20.04, glibc 2.31)
+    runs-on: ubuntu-24.04
+    container: ubuntu:20.04
+    steps:
+      - name: install build tools
+        run: |
+          apt-get update
+          DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            git ca-certificates g++ make libsqlite3-dev binutils file
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - name: baseline report
+        run: |
+          . /etc/os-release; echo "os=$PRETTY_NAME"
+          echo "glibc=$(ldd --version | head -1 | awk '{print $NF}')"
+          echo "gcc=$(g++ --version | head -1)"
+          echo "make=$(make --version | head -1)"
+          echo "sqlite_header=$(ls -1 /usr/include/sqlite3.h 2>/dev/null || echo none)"
+          echo "SOURCE_DATE_EPOCH=$(git log -1 --format=%ct)" >> "$GITHUB_ENV"
+          echo "SHORT_SHA=$(git rev-parse --short=12 HEAD)" >> "$GITHUB_ENV"
+      - name: make server cert-tool
+        run: |
+          make -j"$(nproc)" server cert-tool 2>&1 | tee /tmp/build-server.log
+          echo "warnings=$(grep -ci warning /tmp/build-server.log || true)"
+      - name: ELF contract (readelf/ldd)
+        run: bash packaging/ci-elf-report.sh build/backup-server build/backup-server-admin build/backup-server-keygen build/backup-cert-tool || true
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: baseline-server-ubuntu2004
+          path: |
+            build/backup-server
+            build/backup-server-admin
+            build/backup-server-keygen
+            build/backup-cert-tool
+            /tmp/build-server.log
+          if-no-files-found: error
+
+  baseline-client:
+    name: client baseline (debian:12, Qt 6.4 / glibc 2.36)
+    runs-on: ubuntu-24.04
+    container: debian:12
+    steps:
+      - name: install build tools + Qt6
+        run: |
+          apt-get update
+          DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            git ca-certificates g++ make pkg-config binutils file \
+            qt6-base-dev qt6-base-dev-tools qt6-declarative-dev qt6-declarative-dev-tools \
+            qt6-qpa-plugins qml6-module-qtquick qml6-module-qtquick-controls \
+            qml6-module-qtquick-layouts qml6-module-qtquick-dialogs \
+            qml6-module-qtquick-window qml6-module-qtquick-shapes qml6-module-qtqml-workerscript
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - name: baseline report
+        run: |
+          . /etc/os-release; echo "os=$PRETTY_NAME"
+          echo "glibc=$(ldd --version | head -1 | awk '{print $NF}')"
+          echo "gcc=$(g++ --version | head -1)"
+          echo "qt=$(qmake6 -query QT_VERSION 2>/dev/null || qtpaths6 --qt-version)"
+          echo "qt_libexecs=$(qtpaths6 --query QT_INSTALL_LIBEXECS)"
+          echo "SOURCE_DATE_EPOCH=$(git log -1 --format=%ct)" >> "$GITHUB_ENV"
+      - name: make client
+        run: |
+          make -j"$(nproc)" client 2>&1 | tee /tmp/build-client.log
+          echo "warnings=$(grep -ci warning /tmp/build-client.log || true)"
+      - name: GUI smoke (offscreen)
+        run: |
+          QT_QPA_PLATFORM=offscreen timeout 10 ./build/backup-gui-modern > /tmp/gui-smoke.log 2>&1
+          code=$?
+          echo "gui_exit=$code (124 = still running = ok)"
+          grep -ci "qml" /tmp/gui-smoke.log || true
+          cat /tmp/gui-smoke.log | head -20
+          ./build/backupctl --help | head -3
+      - name: ELF contract (readelf/ldd)
+        run: bash packaging/ci-elf-report.sh build/backupctl build/backup-gui-modern || true
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: baseline-client-debian12
+          path: |
+            build/backupctl
+            build/backup-gui-modern
+            /tmp/build-client.log
+            /tmp/gui-smoke.log
+          if-no-files-found: error
