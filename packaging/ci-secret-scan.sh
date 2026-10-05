@@ -9,6 +9,7 @@ set -Eeuo pipefail
 source "$(dirname "${BASH_SOURCE[0]}")/ci-lib.sh"
 
 REL="${1:?用法: ci-secret-scan.sh <release 目录>}"
+REL="$(cd "$REL" && pwd)"   # 后面会 cd 到别处，先用绝对路径钉住
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
 ci_section "解包所有制品"

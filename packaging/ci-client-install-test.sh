@@ -9,6 +9,7 @@ set -Eeuo pipefail
 source "$(dirname "${BASH_SOURCE[0]}")/ci-lib.sh"
 
 REL="${1:?用法: ci-client-install-test.sh <release 目录>}"
+REL="$(cd "$REL" && pwd)"   # 后面会 cd 到别处，先用绝对路径钉住
 DEB="$(ls "$REL"/backup-project-client_*.deb)"
 TARBALL="$(ls "$REL"/backup-project-client-*-linux-x86_64.tar.xz)"
 export QT_QPA_PLATFORM=offscreen

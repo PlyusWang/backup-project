@@ -9,6 +9,7 @@ set -Eeuo pipefail
 source "$(dirname "${BASH_SOURCE[0]}")/ci-lib.sh"
 
 REL="${1:?用法: ci-appimage-test.sh <release 目录>}"
+REL="$(cd "$REL" && pwd)"   # 后面会 cd 到别处，先用绝对路径钉住
 APPIMAGE="$(ls "$REL"/Backup-Project-Client-*-x86_64.AppImage)"
 # upload-artifact / download-artifact 不保留可执行位，所以这里补一次；真实用户
 # 拿到的 AppImage 也是 "chmod +x 之后再运行"，与 docs/install-client.md 一致。
