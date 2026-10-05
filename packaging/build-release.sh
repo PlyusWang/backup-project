@@ -324,7 +324,22 @@ EOF
   # shellcheck disable=SC2086
   depends="$(shlibs_depends "$tree/usr/bin/backupctl" $qt_libs 2>/dev/null || true)"
   [ -n "$depends" ] || die "dpkg-shlibdeps 没有算出依赖（拒绝手写依赖列表）"
-  log "  依赖（dpkg-shlibdeps）：$depends"
+  # 我们**自带** Qt，所以目标机不该被要求装发行版的 Qt 包：把 dpkg-shlibdeps
+  # 从"随包的 Qt 库"里推出来的 libqt6* / qt6-base-abi 去掉，只留下目标机必须
+  # 提供的系统库（libc / libstdc++ / X11 / xcb / GL / fontconfig 等）。
+  local filtered="" entry
+  local IFS=','
+  for entry in $depends; do
+    case "$entry" in
+      *libqt6*|*qt6-base-abi*) continue ;;
+    esac
+    filtered="${filtered:+$filtered, }$(printf '%s' "$entry" | sed -e 's/^ *//' -e 's/ *$//')"
+  done
+  unset IFS
+  depends="$filtered"
+  [ -n "$depends" ] || die "过滤掉自带的 Qt 之后依赖为空，说明推算出错了"
+  case "$depends" in *libqt6*|*qt6-base-abi*) die "依赖里仍残留发行版 Qt 包" ;; esac
+  log "  依赖（dpkg-shlibdeps，已去掉自带的 Qt）：$depends"
   build_deb packaging/client/deb "$tree" "$RELEASE_DIR/backup-project-client_${DEB_VERSION}_${ARCH}.deb" "$depends"
 }
 

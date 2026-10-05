@@ -1,0 +1,14 @@
+#!/bin/bash
+# backup-project-client postrm —— 只清理桌面数据库条目。
+#
+# 用户数据（备份、配置、缓存）在 $HOME 里，包从不创建也从不删除它们；
+# 连 purge 也一样。
+set -e
+case "${1:-remove}" in
+  remove|purge)
+    if command -v update-desktop-database >/dev/null 2>&1; then
+      update-desktop-database -q /usr/share/applications >/dev/null 2>&1 || true
+    fi
+    ;;
+esac
+exit 0

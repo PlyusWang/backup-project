@@ -1,0 +1,21 @@
+Package: backup-project-client
+Version: @VERSION@
+Section: utils
+Priority: optional
+Architecture: @ARCH@
+Depends: @DEPENDS@
+Installed-Size: @INSTALLED_SIZE@
+Maintainer: Backup Project <noreply@example.invalid>
+Homepage: https://github.com/PlyusWang/backup-project
+Description: Backup Project client (CLI and modern GUI)
+ Backup tool client: local archives plus remote backup to a Backup
+ Project server (BPNET1 over BPSEC1, optional BPSEC2 signed server
+ identity).
+ .
+ The package ships backupctl (CLI) and backup-project (Qt Quick GUI)
+ together with the Qt runtime and QML modules the GUI needs, installed
+ under /usr/lib/backup-project-client/. No Qt development packages are
+ required on the target machine.
+ .
+ Installing, upgrading and removing this package never touches user
+ data: configuration, caches and backups under $HOME are left alone.
