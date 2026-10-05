@@ -83,7 +83,7 @@ jobs:
         run: |
           deb=$(ls dist/release/*/backup-project-server_*.deb)
           dpkg-deb --info "$deb"
-          dpkg-deb --contents "$deb" | head -30
+          dpkg-deb --contents "$deb" | sed -n '1,30p'
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: server-artifacts
@@ -126,7 +126,7 @@ jobs:
           cd /tmp && rm -rf ext && mkdir ext && cd ext
           "$GITHUB_WORKSPACE/$appimage" --appimage-extract > /dev/null
           echo "platforms: $(ls squashfs-root/usr/plugins/platforms 2>/dev/null | tr '\n' ' ')"
-          echo "qml modules: $(ls squashfs-root/usr/qml 2>/dev/null | head -8 | tr '\n' ' ')"
+          echo "qml modules: $(ls squashfs-root/usr/qml 2>/dev/null | sed -n '1,8p' | tr '\n' ' ')"
           test -e squashfs-root/usr/plugins/platforms/libqxcb.so || { echo "缺少 xcb 平台插件"; exit 1; }
           test -e squashfs-root/usr/bin/backup-gui-modern || { echo "缺少 GUI"; exit 1; }
       - name: ELF / glibc contract
@@ -136,7 +136,7 @@ jobs:
           deb=$(ls dist/release/*/backup-project-client_*.deb)
           dpkg-deb --info "$deb"
           echo "--- 前 20 个文件 ---"
-          dpkg-deb --contents "$deb" | head -20
+          dpkg-deb --contents "$deb" | sed -n '1,20p'
           echo "--- 大小 ---"
           du -sh "$(ls -d dist/release/*/)"*
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2

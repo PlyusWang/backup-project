@@ -63,7 +63,7 @@ PREFIX="/tmp/client prefix/opt"
 rm -rf "/tmp/client prefix"
 mkdir -p "/tmp/client prefix"
 expect_ok "解包 tar.xz" tar -xf "$TARBALL" -C "/tmp/client prefix"
-TOP="$(ls -d "/tmp/client prefix"/*/ | head -1)"
+TOP="$(ls -d "/tmp/client prefix"/*/ | sed -n '1p')"
 expect_file "install.sh" "${TOP}install.sh"
 expect_ok "install.sh --prefix（路径含空格）" "${TOP}install.sh" --prefix "$PREFIX" --no-desktop
 expect_file "安装出的 backupctl" "$PREFIX/bin/backupctl"

@@ -29,7 +29,7 @@ ci_section "结构规则扫描"
 PATTERNS='-----BEGIN [A-Z ]*PRIVATE KEY|^seed-hex: [0-9a-f]{64}$|^BACKUP_TOKEN_SECRET=[0-9a-fA-F]{16,}$'
 hits="$(grep -rEl "$PATTERNS" "$WORK" 2>/dev/null | wc -l)"
 expect_eq "私钥/口令结构规则命中 = 0" "0" "$hits"
-if [ "$hits" != "0" ]; then grep -rEl "$PATTERNS" "$WORK" 2>/dev/null | head -5 >&2; fi
+if [ "$hits" != "0" ]; then grep -rEl "$PATTERNS" "$WORK" 2>/dev/null | sed -n '1,5p' >&2; fi
 
 key_files="$(find "$WORK" \( -name '*.key' -o -name 'secrets.env' -o -name '*.bpcert' \) | wc -l)"
 expect_eq "制品里没有 .key / secrets.env / .bpcert 文件" "0" "$key_files"

@@ -14,7 +14,7 @@ export APPIMAGE_EXTRACT_AND_RUN=1     # CI 里通常没有 FUSE，用解包运�
 export NO_AT_BRIDGE=1
 
 ci_section "环境：确认这台机器没有 Qt 开发包"
-qt_dev="$(dpkg -l 2>/dev/null | awk '/^ii/ && /qt6-.*dev/ {print $2}' | wc -l)"
+qt_dev="$(dpkg -l 2>/dev/null | awk '/^ii/ && /qt6-.*dev/ {print $2}' | wc -l)" 
 expect_eq "机器上没有 qt6-*-dev（AppImage 不该依赖它们）" "0" "$qt_dev"
 expect_file "AppImage 存在：$(basename "$APPIMAGE")" "$APPIMAGE"
 
