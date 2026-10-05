@@ -297,3 +297,55 @@ jobs:
           sudo rm -rf /var/lib/backup-project-server /etc/backup-project-server
           sudo userdel backup-project || true
           sudo groupdel backup-project || true
+  client-2204-probe:
+    name: client on Ubuntu 22.04 (expected unsupported — record why)
+    needs: [prepare, client]
+    runs-on: ubuntu-24.04
+    container: ubuntu:22.04
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: install runtime tools
+        run: |
+          apt-get update
+          DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            ca-certificates xz-utils file binutils python3 python3-pil xvfb xauth \
+            fonts-dejavu-core libx11-6 libxcb1 libxkbcommon-x11-0 libxcb-cursor0 \
+            libgl1 libegl1 libopengl0 libglx0 libgl1-mesa-dri libegl-mesa0 \
+            libfontconfig1 libfreetype6 libdbus-1-3 iproute2 procps
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - name: container workspace ownership (git safe.directory)
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: client-artifacts
+          path: incoming
+      - name: flatten + chmod
+        run: |
+          set -euo pipefail
+          mkdir -p rel
+          for sub in incoming/*/; do cp -a "$sub." rel/; done
+          find rel -maxdepth 1 -type f -exec cp -a {} rel/ \;
+          chmod 0755 rel/Backup-Project-Client-*-x86_64.AppImage
+          ls -l rel
+      - name: record the Ubuntu 22.04 boundary (this is expected to fail)
+        run: |
+          set -uo pipefail
+          appimage=$(ls rel/Backup-Project-Client-*-x86_64.AppImage)
+          echo "OS: $(. /etc/os-release; echo "$PRETTY_NAME")  glibc: $(ldd --version | awk 'NR==1 {print $NF}')"
+          set +e
+          APPIMAGE_EXTRACT_AND_RUN=1 QT_QPA_PLATFORM=offscreen timeout 30 "$appimage" > /tmp/2204.log 2>&1
+          code=$?
+          set -e
+          echo "exit=$code"
+          sed -n '1,12p' /tmp/2204.log
+          if [ "$code" = "0" ] || [ "$code" = "124" ]; then
+            echo "NOTE: 这个版本在 Ubuntu 22.04 上跑起来了 —— 那么兼容性文档要改成"支持"。"
+            exit 0
+          fi
+          echo "== Ubuntu 22.04 上确实跑不起来，下面是第一手原因 =="
+          grep -m3 -E "not found|cannot open shared object|GLIBC" /tmp/2204.log || true
+          echo "（客户端构建基线是 Debian 12 / glibc 2.36，且自带的 Qt 6.4 依赖 Debian 12 的系统库；"
+          echo "  因此 Ubuntu 22.04 不在客户端支持范围。详见 docs/install-client.md）"
+          exit 0
