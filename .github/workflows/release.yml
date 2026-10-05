@@ -173,10 +173,19 @@ jobs:
           version="${{ needs.prepare.outputs.version }}"
           out="dist/release/$version"
           mkdir -p "$out"
-          echo "--- incoming/client ---"; ls -la incoming/client
-          echo "--- incoming/server ---"; ls -la incoming/server
-          cp -a incoming/client/. "$out"/
-          cp -a incoming/server/. "$out"/
+          # upload-artifact 会把通配符匹配到的路径按"最外层公共前缀"保留下来，
+          # 于是下载下来的树里多一层版本目录（incoming/<product>/<version>/…）。
+          # 这里把每一层目录的内容都摊平复制到 out，同时也兼容直接放在根上的情况。
+          copy_tree() {
+            local root="$1" sub
+            for sub in "$root"/*/; do
+              [ -d "$sub" ] || continue
+              cp -a "$sub." "$out"/
+            done
+            find "$root" -maxdepth 1 -type f -exec cp -a {} "$out"/ \;
+          }
+          copy_tree incoming/client
+          copy_tree incoming/server
           echo "--- $out ---"; ls -la "$out"
           # 清单写到 out 之外再 mv 进来：重定向会在 find 之前就把 SHA256SUMS
           # 创建出来，否则清单会把自己也算进去（自校验必然失败）。
