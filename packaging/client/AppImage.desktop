@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Backup Project
+Name[zh_CN]=备份工具
+Comment=Back up files locally and to a cloud server
+Comment[zh_CN]=把文件备份到本地与云端服务器
+Exec=backup-project
+Icon=backup-project
+Terminal=false
+Categories=Utility;Archiving;FileTools;
