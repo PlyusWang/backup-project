@@ -1,7 +1,6 @@
 # BPSEC2 设计（BPSEC1 + 服务器身份证书）
 
-本文是 **施工图**，不是"已完成"的说明。已经实现的部分见
-`docs/release-layout.md` 与各模块头注释；BPSEC2 本身的状态写在文末。
+本文原本是 **施工图**，它已经按图施工完毕：§4 的 1-4 步全部实现、测试并部署，Phase 1–9 全部完成（状态见 §5）。下面的 §2 / §3 / §6 保留的是**实现之前的侦察记录**，其中出现的“今天”“尚未”都是写作当时的读数；最终状态以 §5 为准。
 
 ## 1. 目标与硬约束
 
@@ -125,7 +124,7 @@ ServerCertificate 消息布局（大端，变长但有上限）：
   签名身份（指定根文件）/ 手工 fingerprint（BPSEC1 原样）/ SSH 兼容；
 * 错误文案统一走 `SecureTransportErrorMessage`，新增"证书类"错误码。
 
-## 4. 施工顺序（下一步）
+## 4. 施工顺序（已全部实现）
 
 1. `secure_transport.h`：+`kBssec2Version`、+`kTypeServerCertificate`、
    +长度上限；`SecureTransportError` 增加证书类错误码与文案；
@@ -145,14 +144,23 @@ ServerCertificate 消息布局（大端，变长但有上限）：
 
 * 已完成并提交：SHA-512、Ed25519、BPCERT1、TrustedRootStore、backup-cert-tool、
   离线根 Root-A、以及为 ECS 现有 `transport.key` 签发并用**内置官方根**
-  验过的第一张生产证书（`verdict = TRUSTED`）；
-* **未完成**：§4 的 1-4 步都还没写 —— 也就是说今天的网络路径仍然是 BPSEC1 +
-  人工 pin，证书还没有进入握手。本文的作用就是让这一段可以按图施工，
-  而不是重新做一遍逆向。
+  验过的生产证书（`verdict = TRUSTED`）；
+* **已完成（closure 时的状态）**：§4 的 1-4 步全部实现并测试——
+  `SecureTransport` 进入 BPSEC2 分支（`type=6 ServerCertificate`，transcript =
+  `SHA256(CH + SH + Cert)`），服务端 `--bpsec2-cert-file` / `--require-bpsec2` 已上线，
+  `scripts/bpsec2_test.sh`、`scripts/bpsec2_loopback_e2e.sh`、Phase 8/9 全部绿；网络路径
+  **不再**是“BPSEC1 + 人工 pin”，也**不会**回退到它（fail closed）；
+* 因此 §2 / §3 / §6 保留为**实现前的侦察记录**：其中出现的“今天”“尚未”
+  都是写作当时的读数，最终状态以本节为准。
 
 ## 6. 两处先决条件（2026-10-05 侦察结论）
 
-### 6.1 服务端今天**拒绝**任何非回环绑定 —— 这是开放公网前必须先解决的政策冲突
+### 6.1 服务端曾**拒绝**任何非回环绑定 —— 已按下面的方案解决
+
+> **已完成**：新增了显式开关 `--allow-public-bind <理由文本>`（默认仍然拒绝，且必须同时
+> 配置 `--bpsec2-cert-file` 与 `--require-bpsec2`），启动日志会写明“正在公网监听 + 为什么这样可以”。
+> Phase 7 已用它开放 `0.0.0.0:18765`（同时需要安全组与主机 ufw 两处放行），
+> Phase 8/9 在公网上通过。下文保留当时的理由与要求。
 
 `server/remote_server.cpp` :286-299 的 `Configure()` 对 `--bind` 做的是
 **等值判断**：只要不是 `127.0.0.1`（`127.0.0.2` 也不行）就直接报错，并提示用户

@@ -72,7 +72,8 @@
 * 客户端侧的证书模式、@.bpserver` 解析、内置官方根都已经实现并有测试
   （`scripts/server_profile_test.sh` 23/23、`scripts/bpsec2_test.sh` 29/29、
   `scripts/bpsec2_loopback_e2e.sh` 17/17）；
-* **官方云端的公网端口目前还连不上**：主机侧已经能监听 `0.0.0.0:18765`，
-  但阿里云安全组入方向尚未放行 18765/tcp（见 `docs/release-layout.md` 与
-  Phase 6/7 的审计记录）。在这一步完成之前，"官方云端零配置直连"只能在
-  隧道内验证（Phase 5 已通过 6/6）。
+* **官方云端的公网端口已经打通**：`0.0.0.0:18765` 监听，安全组与主机 `ufw`
+  两处放行之后，公网直连已经端到端通过：Phase 8 **8/8**（内置官方根、零指纹、
+  ssh 进程 delta = 0）、Phase 9 **8/8**（公网对抗之后 PID 未变）。
+  注意**开公网要两处都做**：阿里云安全组入方向 + ECS 主机 `ufw`；只做一处会表现为
+  timeout（丢包）而不是 refused。详见 `docs/server-quick-start.md` 第 8 节。
