@@ -25,6 +25,11 @@ on:
         description: "验收用版本号（不会创建 tag、不会发布 Release）"
         required: true
         default: "0.0.0+g3871a8c"
+  # 开发分支上的推送触发：GitHub 只允许 dispatch 默认分支上的 workflow，而
+  # 本 PR 的 workflow 还在特性分支上，所以开发期用 push 触发同一份定义。
+  # 正式触发是 workflow_dispatch（人工）与 tag v*（人工 review 之后才打）。
+  push:
+    branches: ["feat/release-packaging"]
 
 permissions:
   contents: read
