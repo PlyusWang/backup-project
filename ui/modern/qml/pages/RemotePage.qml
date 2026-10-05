@@ -360,7 +360,7 @@ Item {
 
                             SegmentedTabs {
                                 objectName: "remoteConnectionModeTabs"
-                                Layout.preferredWidth: 420
+                                Layout.preferredWidth: 600
                                 enabled: !remote.busy
                                 currentKey: page.draftConnectionMode
                                 model: [
