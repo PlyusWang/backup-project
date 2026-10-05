@@ -163,6 +163,17 @@ case "$PHASE" in
       FAILED=1
     fi
     echo "VERIFY pid=$(cat "$PID_FILE" 2>/dev/null)"
+    # 主机防火墙的姿态：ufw 开着且默认 DROP 时，哪怕安全组放行了，从外部看到的
+    # 仍然是 timeout（丢包）而不是 refused —— 这个区别当初花了很久才定位到，
+    # 所以每次部署都把姿态打出来，别让人再去猜。两个配置文件都是世界可读的，
+    # 不需要 sudo。
+    if [ -r /etc/ufw/ufw.conf ] && grep -qi '^ENABLED=yes' /etc/ufw/ufw.conf; then
+      POLICY="$(grep -i '^DEFAULT_INPUT_POLICY' /etc/default/ufw 2>/dev/null | cut -d= -f2)"
+      echo "VERIFY ufw=enabled default_input=$POLICY"
+      echo "VERIFY ufw_hint=要放开公网端口必须另外执行: sudo ufw allow 18765/tcp"
+    else
+      echo "VERIFY ufw=disabled_or_absent"
+    fi
     exit "$FAILED"
     ;;
 
