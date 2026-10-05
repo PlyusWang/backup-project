@@ -1,0 +1,19 @@
+#!/bin/sh
+# AppRun —— AppImage 的入口。
+#
+#   ./Backup-Project-Client-<版本>-x86_64.AppImage                    # 启动 GUI
+#   ./Backup-Project-Client-<版本>-x86_64.AppImage backupctl --help  # 走命令行
+#
+# AppImage 自带 Qt 运行时与 QML 模块，目标机器不需要装 Qt。
+set -e
+HERE="${APPDIR:-$(dirname "$(readlink -f "$0")")}"
+case "${1:-}" in
+  backupctl)
+    shift
+    exec "$HERE/usr/bin/backupctl" "$@"
+    ;;
+  --cli-version)
+    exec "$HERE/usr/bin/backupctl" --help
+    ;;
+esac
+exec "$HERE/usr/bin/backup-gui-modern" "$@"

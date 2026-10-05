@@ -1,0 +1,18 @@
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=Backup Project
+Name[zh_CN]=备份工具
+GenericName=Backup tool
+GenericName[zh_CN]=备份工具
+Comment=Back up files locally and to a cloud server
+Comment[zh_CN]=把文件备份到本地与云端服务器
+Exec=/usr/bin/backup-project
+TryExec=/usr/bin/backup-project
+Terminal=false
+Categories=Utility;Archiving;FileTools;
+Keywords=backup;archive;restore;cloud;
+Keywords[zh_CN]=备份;归档;恢复;云端;
+# 仓库里没有正式的品牌图标资源（AppIcon.qml 是矢量绘制，不是图片资产），
+# 所以这里**不**放 Icon= 键：宁可只做最小集成，也不临时画一个假图标。
+# 将来有正式图标时补 Icon= 一行即可。
