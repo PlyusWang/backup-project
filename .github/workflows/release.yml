@@ -175,8 +175,11 @@ jobs:
           mkdir -p "$out"
           cp -a incoming/client/. "$out"/
           cp -a incoming/server/. "$out"/
+          # 清单写到 out 之外再 mv 进来：重定向会在 find 之前就把 SHA256SUMS
+          # 创建出来，否则清单会把自己也算进去（自校验必然失败）。
           ( cd "$out" && rm -f SHA256SUMS RELEASE-INFO.txt \
-            && find . -maxdepth 1 -type f -printf '%P\n' | LC_ALL=C sort | xargs -r sha256sum > SHA256SUMS )
+            && find . -maxdepth 1 -type f -printf '%P\n' | LC_ALL=C sort | xargs -r sha256sum > /tmp/release-sha256sums )
+          mv /tmp/release-sha256sums "$out/SHA256SUMS"
           cat "$out/SHA256SUMS"
           ( cd "$out" && sha256sum -c --quiet SHA256SUMS ) && echo "SHA256SUMS 自校验通过"
       - name: AppImage launch tests
