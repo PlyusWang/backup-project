@@ -1,0 +1,17 @@
+#!/bin/bash
+# backup-project-client postinst —— 只做桌面数据库刷新，别的一概不碰。
+#
+# 三条硬规矩：
+#   1. 不假设有终端、不假设有 DISPLAY、不假设 systemd 在跑；
+#   2. 不往 $HOME 写任何东西（用户数据不是包管理的对象）；
+#   3. 任何外部工具缺失都只是跳过，不让安装失败。
+set -e
+action="${1:-configure}"
+case "$action" in
+  configure)
+    if command -v update-desktop-database >/dev/null 2>&1; then
+      update-desktop-database -q /usr/share/applications >/dev/null 2>&1 || true
+    fi
+    ;;
+esac
+exit 0
