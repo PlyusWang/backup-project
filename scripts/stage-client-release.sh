@@ -99,7 +99,7 @@ else
   printf '%s\n' "$(git describe --tags --always --dirty 2>/dev/null || echo "$SHORT")" > "$OUT_DIR/share/backup-project/VERSION"
 fi
 
-CXX_VERSION="$(g++ --version | head -1)"
+CXX_VERSION="$(g++ --version | awk 'NR==1')"
 cat > "$OUT_DIR/BUILD-INFO.txt" <<EOF
 bundle            = client
 version           = ${VERSION_ARG:-$(git describe --tags --always 2>/dev/null || echo "$SHORT")}
@@ -131,12 +131,16 @@ else
   FAILED=1
 fi
 if [ "$WITH_GUI" -eq 1 ]; then
-  QT_QPA_PLATFORM=offscreen timeout 10 "$OUT_DIR/bin/backup-gui-modern" > /dev/null 2>&1
+  # 保留 GUI 的输出："启动即退出"如果只说退出码，排查要从头再来一遍。
+  QT_QPA_PLATFORM=offscreen timeout 10 "$OUT_DIR/bin/backup-gui-modern" \
+    > /tmp/stage-client-gui.log 2>&1
   GUI_CODE=$?
   if [ "$GUI_CODE" -eq 124 ] || [ "$GUI_CODE" -eq 0 ]; then
     echo "  PASS GUI 在 offscreen 下启动正常（退出码 $GUI_CODE，124 = 仍在运行）"
   else
     echo "  FAIL GUI 启动即退出，退出码 $GUI_CODE" >&2
+    echo "  --- GUI 输出（最后 25 行）---" >&2
+    tail -25 /tmp/stage-client-gui.log >&2 || true
     FAILED=1
   fi
 fi
