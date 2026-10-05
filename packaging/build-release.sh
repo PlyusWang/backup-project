@@ -60,6 +60,7 @@ for needed in \
   packaging/client/AppRun packaging/client/AppImage.desktop packaging/client/backup-project.desktop \
   packaging/client/make-icon.py packaging/client/wrappers/backupctl.sh packaging/client/wrappers/backup-project \
   packaging/server/server.conf packaging/server/launch-server.sh packaging/server/purge-data.sh \
+  packaging/server/tmpfiles.conf \
   packaging/server/backup-project-server.service packaging/server/deb/control.in \
   packaging/server/deb/postinst packaging/server/deb/prerm packaging/server/deb/postrm \
   packaging/server/wrappers/backup-server packaging/server/wrappers/backup-server-admin \
@@ -386,6 +387,8 @@ server_payload() {  # $1 = 目标树根
   install -m 0644 packaging/server/server.conf "$tree/etc/backup-project-server/server.conf"
   install -d -m 0755 "$tree/lib/systemd/system"
   install -m 0644 packaging/server/backup-project-server.service "$tree/lib/systemd/system/backup-project-server.service"
+  install -d -m 0755 "$tree/usr/lib/tmpfiles.d"
+  install -m 0644 packaging/server/tmpfiles.conf "$tree/usr/lib/tmpfiles.d/backup-project-server.conf"
 }
 
 pack_server_deb() {

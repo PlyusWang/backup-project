@@ -23,7 +23,8 @@ ci_section "1. 干净机器：确认没有 Qt 开发包"
 expect_eq "没有 qt6-*-dev" "0" "$(dpkg -l 2>/dev/null | awk '/^ii/ && /qt6-.*dev/ {print $2}' | wc -l)"
 
 ci_section "2. .deb 安装"
-expect_ok "dpkg -i $(basename "$DEB")" dpkg -i "$DEB"
+expect_ok "apt-get update" apt-get update -qq
+expect_ok "apt-get install ./$(basename "$DEB")（真实用户的用法）" apt-get install -y -qq "./$DEB"
 expect_file "/usr/bin/backupctl" /usr/bin/backupctl
 expect_file "/usr/bin/backup-project" /usr/bin/backup-project
 expect_file "/usr/share/applications/backup-project.desktop" /usr/share/applications/backup-project.desktop
@@ -45,7 +46,7 @@ expect_eq "GUI 运行期 QML 告警 = 0" "0" "$(grep -cE '\.qml:[0-9]+:|is not i
 expect_ok "非 root 用户也能跑 backupctl" runuser -u nobody -- /usr/bin/backupctl --help
 
 ci_section "4. 同版本重复安装（幂等）"
-expect_ok "dpkg -i 再装一次" dpkg -i "$DEB"
+expect_ok "再装一次（同版本重装）" apt-get install -y -qq --reinstall "./$DEB"
 expect_eq "用户配置哨兵还在" "user-config-sentinel" "$(cat "$USER_HOME/.config/backup-project/sentinel")"
 
 ci_section "5. 卸载：只删程序文件"
@@ -55,7 +56,7 @@ expect_eq "用户配置没被动过" "user-config-sentinel" "$(cat "$USER_HOME/.
 expect_eq "用户数据没被动过" "user-data-sentinel" "$(cat "$USER_HOME/.local/share/backup-project/sentinel")"
 
 ci_section "6. 重新安装"
-expect_ok "卸载后再装一次" dpkg -i "$DEB"
+expect_ok "卸载后再装一次" apt-get install -y -qq "./$DEB"
 expect_ok "重装后 backupctl --help" backupctl --help
 
 ci_section "7. portable tar.xz（不需要 root，装到含空格的路径）"

@@ -18,7 +18,9 @@ INSTANCE=/var/lib/backup-project-server
 CONF=/etc/backup-project-server/server.conf
 
 ci_section "1. .deb 安装（容器里没有 systemd，postinst 必须照样成功）"
-expect_ok "dpkg -i $(basename "$DEB")" dpkg -i "$DEB"
+# 用 apt install ./pkg.deb（真实用户的用法）：它会按 control 里的 Depends 解析依赖。
+expect_ok "apt-get update" apt-get update -qq
+expect_ok "apt-get install ./$(basename "$DEB")" apt-get install -y -qq "./$DEB"
 expect_ok "系统用户 backup-project 已创建" getent passwd backup-project
 expect_eq "backup-project 的 shell 不是交互式" "/usr/sbin/nologin" "$(getent passwd backup-project | cut -d: -f7)"
 expect_file "数据目录" "$INSTANCE/data"
@@ -58,6 +60,8 @@ fi
 ci_section "4. 装完真的能服务（手工启动 + 回环 ping）"
 PIN="$(backup-server-keygen --show --key-file "$INSTANCE/state/transport.key" | sed -n 's/.*--server-key //p' | sed -n '1p')"
 if [ -n "$PIN" ]; then ci_pass "拿到服务器身份指纹（不打印内容）"; else ci_fail "拿不到指纹"; fi
+# 非 systemd 环境没有 RuntimeDirectory，包里的 tmpfiles 片段描述的就是这个目录。
+install -d -o backup-project -g backup-project -m 0750 /run/backup-project-server
 runuser -u backup-project -- /usr/lib/backup-project-server/bin/launch-server.sh --config "$CONF" \
   > /tmp/server-run.log 2>&1 &
 SERVER_PID=$!
@@ -75,7 +79,7 @@ BEFORE_DB="$(sha256sum "$INSTANCE/state/metadata.sqlite3" 2>/dev/null | cut -d' 
 BEFORE_KEY="$(sha256sum "$INSTANCE/state/transport.key" | cut -d' ' -f1)"
 BEFORE_SECRET="$(sha256sum /etc/backup-project-server/secrets.env | cut -d' ' -f1)"
 BEFORE_CONF_MODE="$(stat -c %a "$CONF")"
-expect_ok "同版本重装（模拟升级路径）" dpkg -i "$DEB"
+expect_ok "同版本重装（模拟升级路径）" apt-get install -y -qq --reinstall "./$DEB"
 expect_eq "transport.key 未变化" "$BEFORE_KEY" "$(sha256sum "$INSTANCE/state/transport.key" | cut -d' ' -f1)"
 expect_eq "secrets.env 未变化" "$BEFORE_SECRET" "$(sha256sum /etc/backup-project-server/secrets.env | cut -d' ' -f1)"
 expect_eq "配置文件权限未变化（conffile 没被覆盖）" "$BEFORE_CONF_MODE" "$(stat -c %a "$CONF")"
@@ -91,6 +95,7 @@ ci_section "6. 卸载：数据必须留下"
 kill "$SERVER_PID" 2>/dev/null || true
 sleep 1
 expect_ok "dpkg -r backup-project-server" dpkg -r backup-project-server
+if dpkg -s backup-project-server 2>/dev/null | grep -q '^Status: install ok'; then ci_fail "包还处于已安装状态"; else ci_pass "包已移除"; fi
 if [ -e /usr/bin/backup-server ]; then ci_fail "程序文件仍在"; else ci_pass "程序文件已删除"; fi
 expect_file "卸载后数据目录仍在" "$INSTANCE/data"
 expect_file "卸载后传输身份私钥仍在" "$INSTANCE/state/transport.key"
