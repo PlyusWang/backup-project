@@ -1,0 +1,10 @@
+#!/bin/sh
+# /usr/bin/backup-server-admin-menu —— 交互式管理菜单（用户管理 / 备份管理 /
+# 存储概览 / 服务器身份信息）。
+#
+# 菜单脚本从"自己所在目录的上一级"推断实例根，包布局下那是 /usr/lib/...，
+# 所以这里显式给出 deb 的实例根；脚本自己会在路径不存在时 fail closed。
+set -e
+export BACKUP_SERVER_ROOT=/var/lib/backup-project-server
+export BACKUP_SERVER_ADMIN=/usr/lib/backup-project-server/bin/backup-server-admin
+exec /usr/lib/backup-project-server/bin/backup-server-admin.sh "$@"

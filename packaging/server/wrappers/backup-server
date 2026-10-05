@@ -1,0 +1,5 @@
+#!/bin/sh
+# /usr/bin/backup-server 与 /usr/bin/backup-project-server 是同一个入口：
+# 真正的启动逻辑在 /usr/lib/backup-project-server/bin/launch-server.sh
+# （严格解析 /etc/backup-project-server/server.conf）。
+exec /usr/lib/backup-project-server/bin/launch-server.sh "$@"

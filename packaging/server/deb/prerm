@@ -1,0 +1,17 @@
+#!/bin/bash
+# backup-project-server prerm —— 只在真正移除时停服务，升级时不动它
+# （升级期间停服务会让"新二进制坏了、服务也没了"这种状态变得可能）。
+set -e
+SERVICE=backup-project-server
+case "${1:-remove}" in
+  remove|purge)
+    if [ -d /run/systemd/system ] && command -v systemctl >/dev/null 2>&1; then
+      if command -v deb-systemd-invoke >/dev/null 2>&1; then
+        deb-systemd-invoke stop "$SERVICE.service" >/dev/null 2>&1 || true
+      else
+        systemctl stop "$SERVICE" >/dev/null 2>&1 || true
+      fi
+    fi
+    ;;
+esac
+exit 0

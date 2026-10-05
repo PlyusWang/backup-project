@@ -1,0 +1,18 @@
+#!/bin/sh
+# /usr/bin/backup-server-admin —— 本机管理工具。
+#
+# 它把包安装出来的实例路径作为默认值注入；管理员显式给了 --server-root /
+# --root / --db 时就不再注入（管理工具自己的解析优先级不受影响）。
+set -e
+BIN=/usr/lib/backup-project-server/bin/backup-server-admin
+ROOT=/var/lib/backup-project-server
+need_defaults=1
+for arg in "$@"; do
+  case "$arg" in
+    --server-root|--root|--db) need_defaults=0 ;;
+  esac
+done
+if [ "$need_defaults" -eq 1 ]; then
+  exec "$BIN" --server-root "$ROOT" --root "$ROOT/data" --db "$ROOT/state/metadata.sqlite3" "$@"
+fi
+exec "$BIN" "$@"

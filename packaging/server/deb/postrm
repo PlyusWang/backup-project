@@ -1,0 +1,27 @@
+#!/bin/bash
+# backup-project-server postrm —— 删除包**不会**删除用户数据。
+#
+# 这一点是有意的：/var/lib/backup-project-server 里是用户的云端备份、元数据库
+# 和服务器传输身份私钥。包管理器不该替用户决定它们的生死。真要清理只有一条
+# 路：管理员显式运行 backup-server-purge-data 并手打确认短语。
+set -e
+SERVICE=backup-project-server
+case "${1:-remove}" in
+  purge)
+    if [ -d /run/systemd/system ] && command -v systemctl >/dev/null 2>&1; then
+      systemctl daemon-reload >/dev/null 2>&1 || true
+      systemctl reset-failed "$SERVICE" >/dev/null 2>&1 || true
+    fi
+    echo "[backup-project-server] 已 purge 包文件；用户数据 / 配置 / 身份私钥全部保留："
+    echo "[backup-project-server]   /var/lib/backup-project-server   （备份数据、元数据库、传输身份私钥）"
+    echo "[backup-project-server]   /etc/backup-project-server      （server.conf、secrets.env）"
+    echo "[backup-project-server] 要删除数据请显式执行： sudo backup-server-purge-data --dry-run   然后去掉 --dry-run"
+    echo "[backup-project-server] 系统用户 backup-project 也保留（数据还在，删用户没有意义）。"
+    ;;
+  remove)
+    if [ -d /run/systemd/system ] && command -v systemctl >/dev/null 2>&1; then
+      systemctl daemon-reload >/dev/null 2>&1 || true
+    fi
+    ;;
+esac
+exit 0
