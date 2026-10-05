@@ -187,9 +187,11 @@ jobs:
           copy_tree incoming/client
           copy_tree incoming/server
           echo "--- $out ---"; ls -la "$out"
-          # 清单写到 out 之外再 mv 进来：重定向会在 find 之前就把 SHA256SUMS
-          # 创建出来，否则清单会把自己也算进去（自校验必然失败）。
-          ( cd "$out" && rm -f SHA256SUMS RELEASE-INFO.txt \
+          # RELEASE-INFO.txt 由两个构建作业各自产出（内容相同），这里保留其中一份；
+          # 只重算 SHA256SUMS。清单写到 out 之外再 mv 进来：重定向会在 find 之前
+          # 就把 SHA256SUMS 创建出来，否则清单会把自己也算进去（自校验必然失败）。
+          test -f "$out/RELEASE-INFO.txt" || { echo "缺少 RELEASE-INFO.txt"; exit 1; }
+          ( cd "$out" && rm -f SHA256SUMS \
             && find . -maxdepth 1 -type f -printf '%P\n' | LC_ALL=C sort | xargs -r sha256sum > /tmp/release-sha256sums )
           mv /tmp/release-sha256sums "$out/SHA256SUMS"
           cat "$out/SHA256SUMS"
