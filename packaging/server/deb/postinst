@@ -42,15 +42,17 @@ if [ ! -e "$CONF_DIR/secrets.env" ]; then
   umask 007
   secret_file="$(mktemp "$CONF_DIR/.secrets.env.XXXXXX")"
   printf 'BACKUP_TOKEN_SECRET=%s\n' "$(head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n')" > "$secret_file"
-  chown root:backup-project "$secret_file"
-  chmod 0640 "$secret_file"
+  # 产品对 secret 文件的要求是 0600（0400 也接受）—— group/other 一律不允许。
+  # 所以这里给服务用户本人 0600，而不是 root:backup-project 0640。
+  chown backup-project:backup-project "$secret_file"
+  chmod 0600 "$secret_file"
   mv "$secret_file" "$CONF_DIR/secrets.env"
-  log "已生成随机 BACKUP_TOKEN_SECRET：$CONF_DIR/secrets.env（0640 root:backup-project）"
+  log "已生成随机 BACKUP_TOKEN_SECRET：$CONF_DIR/secrets.env（0600 backup-project）"
 else
   log "secrets.env 已存在，保持不变：$CONF_DIR/secrets.env"
 fi
-chown root:backup-project "$CONF_DIR/secrets.env" 2>/dev/null || true
-chmod 0640 "$CONF_DIR/secrets.env" 2>/dev/null || true
+chown backup-project:backup-project "$CONF_DIR/secrets.env" 2>/dev/null || true
+chmod 0600 "$CONF_DIR/secrets.env" 2>/dev/null || true
 
 # ---- 4. 传输身份私钥（缺失才生成；私钥从不离开本机）----
 KEY="$INSTANCE_ROOT/state/transport.key"
@@ -98,7 +100,7 @@ if [ "$CONFIG_OK" -eq 1 ] && ! have_systemd; then
 fi
 
 # ---- 6. 收尾提示（含客户端要核对的身份指纹，私钥内容不显示）----
-log "监听地址：$(sed -n 's/^[[:space:]]*bind[[:space:]]*=[[:space:]]*//p' "$CONF_DIR/server.conf" | head -1):$(sed -n 's/^[[:space:]]*port[[:space:]]*=[[:space:]]*//p' "$CONF_DIR/server.conf" | head -1)"
+log "监听地址：$(sed -n 's/^[[:space:]]*bind[[:space:]]*=[[:space:]]*//p' "$CONF_DIR/server.conf" | sed -n '1p'):$(sed -n 's/^[[:space:]]*port[[:space:]]*=[[:space:]]*//p' "$CONF_DIR/server.conf" | sed -n '1p')"
 log "数据目录：$INSTANCE_ROOT/data    状态目录：$INSTANCE_ROOT/state"
 log "管理菜单：sudo backup-server-admin-menu"
 if [ -x "$LIB_DIR/bin/backup-server-keygen" ]; then
