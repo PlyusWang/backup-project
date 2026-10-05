@@ -605,9 +605,18 @@ expect_count "$REMOTE_PAGE_QML" 'objectName: "remoteServerKeyPinDirty"' 1 \
 expect_count "$REMOTE_PAGE_QML" 'remote.applyServerKeyPin' 2 \
   "“应用”按钮与回车都走 applyServerKeyPin（有可见反馈）"
 expect_count "$REMOTE_PAGE_QML" 'remote.loginWithPin' 2 \
-  "登录（按钮 + 回车）走 loginWithPin：自动采用当前输入框里的指纹"
+  "人工 pin 模式（ssh / direct）登录走 loginWithPin：自动采用当前输入框里的指纹"
 expect_count "$REMOTE_PAGE_QML" 'remote.registerAccountWithPin' 1 \
-  "注册走 registerAccountWithPin：同样自动采用当前输入框里的指纹"
+  "人工 pin 模式注册走 registerAccountWithPin：同样自动采用当前输入框里的指纹"
+# PR #23 人工验收修复：官方云端没有指纹输入框，必须走**不带 pin** 的入口。
+# 这两条断言与上面两条是同一个调用点的两半 —— 少了它们，谁把官方模式改回
+# *WithPin 都不会被门禁发现（那正是人工验收抓到的 blocker）。
+expect_count "$REMOTE_PAGE_QML" 'remote.login(' 2 \
+  "官方云端模式登录（按钮 + 回车）走不带 pin 的 login"
+expect_count "$REMOTE_PAGE_QML" 'remote.registerAccount(' 1 \
+  "官方云端模式注册走不带 pin 的 registerAccount"
+expect_count "$REMOTE_PAGE_QML" '官方云端（推荐）' 1 \
+  "官方云端是普通用户的推荐路径（SSH 降为兼容）"
 expect_count "$REMOTE_PAGE_QML" 'remote.setServerKeyPin' 0 \
   "页面上不再直接调用 setServerKeyPin（那条路径没有反馈）"
 expect_count "$REMOTE_PAGE_QML" 'objectName: "remoteServerKeyPinError"' 1 \
@@ -1769,6 +1778,11 @@ shot_run() {
   expected="$expected settings-light settings-dark"
   expected="$expected remote-light remote-dark"
   expected="$expected backup-expanded-light backup-expanded-dark"
+  # PR #23：服务器身份的三种模式各一张。官方云端那张必须**看不出**任何
+  # 需要用户填的连接信息（主机/端口/指纹都隐藏），自定义两张才出现。
+  expected="$expected official-cloud-light official-cloud-dark"
+  expected="$expected advanced-ssh-mode-light advanced-ssh-mode-dark"
+  expected="$expected custom-server-profile-light custom-server-profile-dark"
   for extra in "$@"; do
     expected="$expected $extra"
   done

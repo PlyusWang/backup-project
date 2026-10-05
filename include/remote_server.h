@@ -38,6 +38,7 @@
 #include <condition_variable>
 #include <cstdint>
 #include <deque>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -77,6 +78,22 @@ struct RemoteServerConfig {
   // token、用户名与快照元数据全部由 BPSEC1 保护，缺了它就没有任何一条可以
   // 安全服务的路径，因此不存在"不配密钥就退回明文"的分支。
   std::string transport_key_file_path;
+  // BPSEC2：服务器身份证书（BPCERT1 原始字节所在文件）。空 = 不出示证书，
+  // 只能走 BPSEC1（人工 pin）。
+  std::string certificate_file_path;
+  // 只接受 BPSEC2（签名身份）的客户端。收到 BPSEC1 的 ClientHello 直接拒绝，
+  // 这就是"拒绝降级"的开关；打开时必须同时配置证书。
+  bool require_bpsec2 = false;
+  // PR #23：允许**公网**监听（--bind 不是 127.0.0.1）。默认 false，且必须
+  // 同时满足「配置了 BPSEC2 证书」与「给出一句话理由」，理由会写进启动日志。
+  // 没有这个开关时行为与过去完全一致：任何非回环地址一律 fail closed。
+  bool allow_public_bind = false;
+  std::string public_bind_reason;
+  // §33：登录失败节流。同一个用户名连续失败达到 max_login_failures 之后，
+  // 接下来 login_lockout_seconds 秒内即使口令正确也拒绝；成功一次即清零。
+  // 0 = 关闭（公网部署不要关）。
+  int max_login_failures = 5;
+  int login_lockout_seconds = 60;
   // 追加日志文件；空串表示只写 stderr。
   std::string log_file_path;
   std::uint64_t max_upload_bytes = kDefaultMaxUploadBytes;
@@ -291,6 +308,17 @@ class RemoteServer {
   TransportIdentity transport_identity_;
   std::string last_error_;
 
+  // §33：失败节流表。按**用户名字符串**计数，不论该用户是否存在 ——
+  // 对不存在的名字也限速，否则限速本身就成了「这个用户名存在吗」的探针。
+  struct LoginThrottle {
+    int consecutive_failures = 0;
+    std::int64_t locked_until = 0;  // Unix 秒
+  };
+  std::int64_t LoginLockRemainingSeconds(const std::string& username);
+  void RecordLoginFailure(const std::string& username);
+  void ClearLoginFailures(const std::string& username);
+  std::mutex login_throttle_mutex_;
+  std::map<std::string, LoginThrottle> login_throttle_;
   std::mutex log_mutex_;
   std::mutex work_mutex_;
   std::condition_variable work_ready_;

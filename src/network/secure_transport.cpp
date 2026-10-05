@@ -152,12 +152,13 @@ bool IsHex64(const std::string& text) {
 // ---- 握手消息的构造与校验 ----
 
 std::string BuildClientHello(const std::string& client_random,
-                             const std::string& ephemeral_public) {
+                             const std::string& ephemeral_public,
+                             std::uint8_t version) {
   std::string out;
   out.reserve(kBssec1ClientHelloSize);
   AppendU32(&out, kBssec1Magic);
   out.push_back(static_cast<char>(kBssec1MessageClientHello));
-  out.push_back(static_cast<char>(kBssec1Version));
+  out.push_back(static_cast<char>(version));
   AppendU16(&out, kBssec1SuiteX25519Aes256CtrHmacSha256);
   out.append(client_random);
   out.append(ephemeral_public);
@@ -166,12 +167,13 @@ std::string BuildClientHello(const std::string& client_random,
 
 std::string BuildServerHello(const std::string& server_random,
                              const std::string& static_public,
-                             const std::string& ephemeral_public) {
+                             const std::string& ephemeral_public,
+                             std::uint8_t version) {
   std::string out;
   out.reserve(kBssec1ServerHelloSize);
   AppendU32(&out, kBssec1Magic);
   out.push_back(static_cast<char>(kBssec1MessageServerHello));
-  out.push_back(static_cast<char>(kBssec1Version));
+  out.push_back(static_cast<char>(version));
   AppendU16(&out, kBssec1SuiteX25519Aes256CtrHmacSha256);
   out.append(server_random);
   out.append(static_public);
@@ -179,21 +181,38 @@ std::string BuildServerHello(const std::string& server_random,
   return out;
 }
 
-std::string BuildFinished(std::uint8_t type, const std::string& tag) {
+std::string BuildFinished(std::uint8_t type, const std::string& tag,
+                          std::uint8_t version) {
   std::string out;
   out.reserve(kBssec1FinishedSize);
   AppendU32(&out, kBssec1Magic);
   out.push_back(static_cast<char>(type));
-  out.push_back(static_cast<char>(kBssec1Version));
+  out.push_back(static_cast<char>(version));
   AppendU16(&out, 0);
   out.append(tag);
+  return out;
+}
+
+// BPSEC2：ServerCertificate 消息 = 12 字节定长头 + 证书字节。
+// 头里的长度是**唯一**的长度来源，证书本身（BPCERT1）内部还有自己的长度
+// 前缀；解析器会把两者都校验一遍（多一层长度就必须多一层怀疑）。
+std::string BuildServerCertificateMessage(const std::string& certificate) {
+  std::string out;
+  out.reserve(kBssec2CertificateHeaderSize + certificate.size());
+  AppendU32(&out, kBssec1Magic);
+  out.push_back(static_cast<char>(kBssec2MessageServerCertificate));
+  out.push_back(static_cast<char>(kBssec2Version));
+  AppendU16(&out, 0);
+  AppendU32(&out, static_cast<std::uint32_t>(certificate.size()));
+  out.append(certificate);
   return out;
 }
 
 // 校验一条固定长度握手消息的公共前缀。失败时写 error_message 并分类。
 bool CheckMessageHeader(const unsigned char* raw, std::size_t size,
                         std::uint8_t expected_type, std::size_t expected_size,
-                        const char* what, SecureTransportError* error,
+                        std::uint8_t expected_version, const char* what,
+                        SecureTransportError* error,
                         std::string* error_message) {
   if (size != expected_size) {
     *error = SecureTransportError::kMalformedMessage;
@@ -219,10 +238,12 @@ bool CheckMessageHeader(const unsigned char* raw, std::size_t size,
     }
     return false;
   }
-  if (raw[5] != kBssec1Version) {
+  if (raw[5] != expected_version) {
     *error = SecureTransportError::kUnsupportedVersion;
     if (error_message != nullptr) {
-      *error_message = std::string(what) + " 的 BPSEC1 版本不被支持";
+      *error_message = std::string(what) + " 的协议版本不被支持（期望 " +
+                       std::to_string(expected_version) + "，实际 " +
+                       std::to_string(raw[5]) + "）";
     }
     return false;
   }
@@ -318,6 +339,20 @@ const char* SecureTransportErrorName(SecureTransportError error) {
       return "weak-shared-secret";
     case SecureTransportError::kNoPinConfigured:
       return "no-server-key-pin";
+    case SecureTransportError::kCertificateMissing:
+      return "server-certificate-missing";
+    case SecureTransportError::kCertificateInvalid:
+      return "server-certificate-invalid";
+    case SecureTransportError::kCertificateUntrusted:
+      return "server-certificate-untrusted";
+    case SecureTransportError::kCertificateWrongServerId:
+      return "server-certificate-wrong-server-id";
+    case SecureTransportError::kCertificateExpired:
+      return "server-certificate-expired";
+    case SecureTransportError::kCertificateKeyMismatch:
+      return "server-certificate-key-mismatch";
+    case SecureTransportError::kDowngradeRefused:
+      return "bpsec1-downgrade-refused";
     case SecureTransportError::kRecordAuthentication:
       return "record-authentication-failed";
     case SecureTransportError::kReplayDetected:
@@ -352,6 +387,20 @@ std::string SecureTransportErrorMessage(SecureTransportError error) {
     case SecureTransportError::kNoPinConfigured:
       return "没有配置服务端传输公钥/"
              "指纹，拒绝连接（本项目不做首次连接自动信任）";
+    case SecureTransportError::kCertificateMissing:
+      return "服务器没有配置身份证书，无法使用签名身份连接";
+    case SecureTransportError::kCertificateInvalid:
+      return "服务器身份证书无效：这张证书不是它声称的根签发的";
+    case SecureTransportError::kCertificateUntrusted:
+      return "签发这张服务器身份证书的根不在本机可信列表里";
+    case SecureTransportError::kCertificateWrongServerId:
+      return "服务器身份证书里的服务器名字不是这个云端";
+    case SecureTransportError::kCertificateExpired:
+      return "服务器身份证书不在有效期内（若本机时间不对，请先校正系统时钟）";
+    case SecureTransportError::kCertificateKeyMismatch:
+      return "服务器出示的证书与实际使用的身份密钥不是同一把";
+    case SecureTransportError::kDowngradeRefused:
+      return "服务器要求使用签名身份，对端却试图退回旧协议，已拒绝";
     case SecureTransportError::kRecordAuthentication:
       return "加密记录校验失败：数据在传输途中被修改过";
     case SecureTransportError::kReplayDetected:
@@ -662,6 +711,12 @@ void SecureChannel::Reset() {
   corrupt_next_tag_ = false;
   peer_public_key_.clear();
   peer_fingerprint_.clear();
+  // BPSEC2 的两个字段也必须一起清。红队复核指出第一版漏了它们：同一条
+  // SecureChannel 复用（Reset 之后再握手失败）时，peer_server_id() 会继续
+  // 报上一次那张证书的身份 —— 一个"陈旧身份"。今天没有生产调用方读它，
+  // 但这是典型的"等有人读的时候就晚了"的状态泄漏。
+  peer_server_id_.clear();
+  peer_certificate_fingerprint_.clear();
   transcript_hash_.clear();
 }
 
@@ -731,8 +786,33 @@ bool SecureChannel::DeriveKeys(const std::string& shared_secret,
 
 bool SecureChannel::HandshakeClient(int fd, const ServerKeyPin& pin,
                                     std::string* error_message) {
+  return HandshakeClientInternal(fd, &pin, nullptr, error_message);
+}
+
+bool SecureChannel::HandshakeClientWithCertificate(
+    int fd, const ServerIdentityPolicy& policy, std::string* error_message) {
+  return HandshakeClientInternal(fd, nullptr, &policy, error_message);
+}
+
+bool SecureChannel::HandshakeClientInternal(int fd, const ServerKeyPin* pin,
+                                            const ServerIdentityPolicy* policy,
+                                            std::string* error_message) {
   Reset();
-  if (!pin.has_key && pin.fingerprint_hex.empty()) {
+  const bool certificate_mode = policy != nullptr;
+  // 两条路互斥：证书模式完全不看 pin，pin 模式完全不看证书。
+  // 这里**没有**"证书验不过就退回 pin"的分支 —— 那种分支就是降级漏洞。
+  const std::uint8_t version =
+      certificate_mode ? kBssec2Version : kBssec1Version;
+  if (certificate_mode) {
+    if (policy->expected_server_id.empty()) {
+      return Fail(SecureTransportError::kCertificateWrongServerId,
+                  "证书模式必须先配置期望的 server_id", error_message);
+    }
+    if (policy->roots.empty()) {
+      return Fail(SecureTransportError::kCertificateUntrusted,
+                  "本机没有任何可信根，拒绝一切服务器身份", error_message);
+    }
+  } else if (!pin->has_key && pin->fingerprint_hex.empty()) {
     return Fail(SecureTransportError::kNoPinConfigured, std::string(),
                 error_message);
   }
@@ -754,7 +834,8 @@ bool SecureChannel::HandshakeClient(int fd, const ServerKeyPin& pin,
                 "生成握手随机数或临时密钥失败", error_message);
   }
 
-  const std::string hello = BuildClientHello(client_random, ephemeral_public);
+  const std::string hello =
+      BuildClientHello(client_random, ephemeral_public, version);
   std::string io_error;
   if (!SendAll(fd, hello.data(), hello.size(), &io_error)) {
     return Fail(SecureTransportError::kIoError,
@@ -772,8 +853,8 @@ bool SecureChannel::HandshakeClient(int fd, const ServerKeyPin& pin,
   }
   SecureTransportError header_error = SecureTransportError::kNone;
   if (!CheckMessageHeader(raw, sizeof(raw), kBssec1MessageServerHello,
-                          kBssec1ServerHelloSize, "ServerHello", &header_error,
-                          error_message)) {
+                          kBssec1ServerHelloSize, version, "ServerHello",
+                          &header_error, error_message)) {
     last_error_ = header_error;
     return false;
   }
@@ -790,17 +871,124 @@ bool SecureChannel::HandshakeClient(int fd, const ServerKeyPin& pin,
   const std::string server_ephemeral(reinterpret_cast<const char*>(raw + 72),
                                      kX25519Bytes);
 
-  // 服务端身份校验：pin 说什么就只接受什么。这里**没有** TOFU 分支。
   peer_public_key_ = server_static;
   peer_fingerprint_ = crypto::X25519Fingerprint(server_static);
-  if (pin.has_key) {
-    if (!ConstantTimeEquals(pin.public_key, server_static)) {
+
+  // BPSEC2：整张 ServerCertificate 消息（含 12 字节头）的原始字节要进
+  // transcript；BPSEC1 时它是空串，因此 transcript 与过去逐字节相同。
+  std::string certificate_message;
+  if (certificate_mode) {
+    unsigned char cert_header[kBssec2CertificateHeaderSize];
+    if (!ReceiveAll(fd, cert_header, sizeof(cert_header), &closed, &io_error,
+                    handshake_deadline)) {
+      return Fail(SecureTransportError::kIoError,
+                  closed ? "对端在 ServerCertificate 之前关闭了连接"
+                         : "读取 ServerCertificate 失败：" + io_error,
+                  error_message);
+    }
+    if (LoadU32(cert_header) != kBssec1Magic ||
+        cert_header[4] != kBssec2MessageServerCertificate ||
+        cert_header[5] != kBssec2Version || cert_header[6] != 0 ||
+        cert_header[7] != 0) {
+      return Fail(SecureTransportError::kMalformedMessage,
+                  "ServerCertificate 消息头不合法", error_message);
+    }
+    const std::uint32_t certificate_length = LoadU32(cert_header + 8);
+    if (certificate_length == 0 ||
+        certificate_length > crypto::kBpcert1MaxCertificateSize) {
+      return Fail(SecureTransportError::kCertificateInvalid,
+                  "证书长度超出 1..4096 的范围", error_message);
+    }
+    std::string certificate_raw(certificate_length, '\0');
+    if (!ReceiveAll(fd, &certificate_raw[0], certificate_raw.size(), &closed,
+                    &io_error, handshake_deadline)) {
+      return Fail(SecureTransportError::kIoError,
+                  closed ? "对端在证书传输过程中关闭了连接"
+                         : "读取证书字节失败：" + io_error,
+                  error_message);
+    }
+    certificate_message.assign(reinterpret_cast<const char*>(cert_header),
+                               sizeof(cert_header));
+    certificate_message.append(certificate_raw);
+
+    // ---- 校验顺序：任一步失败即终止，不回退 pin、不回退 BPSEC1 ----
+    // 1) 结构（含版本、算法、用途、长度、尾部字节）
+    crypto::Bpcert1 certificate;
+    const crypto::Bpcert1Error parse_result =
+        crypto::Bpcert1Parse(certificate_raw, &certificate);
+    if (parse_result != crypto::Bpcert1Error::kOk) {
+      return Fail(SecureTransportError::kCertificateInvalid,
+                  std::string("服务器身份证书结构不合法：") +
+                      crypto::Bpcert1ErrorName(parse_result),
+                  error_message);
+    }
+    // 2) 在可信根里按 issuer_id 找根（空存储在入口已经挡掉）
+    const crypto::TrustedRoot* root =
+        policy->roots.FindRoot(certificate.issuer_id);
+    if (root == nullptr) {
+      return Fail(
+          SecureTransportError::kCertificateUntrusted,
+          "证书的签发者 " + certificate.issuer_id + " 不在本机可信根列表里",
+          error_message);
+    }
+    if (root->revoked) {
+      return Fail(SecureTransportError::kCertificateUntrusted,
+                  "签发这张证书的根已被吊销", error_message);
+    }
+    if (root->not_before != 0 && certificate.not_before < root->not_before) {
+      return Fail(SecureTransportError::kCertificateUntrusted,
+                  "证书签发时该根尚未生效", error_message);
+    }
+    if (root->not_after != 0 && certificate.not_before > root->not_after) {
+      return Fail(SecureTransportError::kCertificateUntrusted,
+                  "证书签发时该根已过期", error_message);
+    }
+    // 3) 根签名
+    const crypto::Bpcert1Error signature_result =
+        crypto::Bpcert1VerifySignature(certificate_raw, root->public_key);
+    if (signature_result != crypto::Bpcert1Error::kOk) {
+      return Fail(SecureTransportError::kCertificateInvalid,
+                  std::string("证书签名无效：") +
+                      crypto::Bpcert1ErrorName(signature_result),
+                  error_message);
+    }
+    // 4) server_id 必须与期望值逐字节相等：挡住"同一把根签发的另一台服务器"
+    if (certificate.server_id != policy->expected_server_id) {
+      return Fail(SecureTransportError::kCertificateWrongServerId,
+                  "证书里的 server_id 是 " + certificate.server_id +
+                      "，与期望的 " + policy->expected_server_id + " 不一致",
+                  error_message);
+    }
+    // 5) 有效期（key_usage = SERVER_AUTH 已经由解析器强制校验）
+    const std::int64_t now = policy->now_unix_seconds != 0
+                                 ? policy->now_unix_seconds
+                                 : crypto::Bpcert1NowUnixSeconds();
+    crypto::Bpcert1Error validity_error = crypto::Bpcert1Error::kOk;
+    std::string validity_message;
+    if (!crypto::Bpcert1CheckValidity(certificate, now, &validity_error,
+                                      &validity_message)) {
+      return Fail(SecureTransportError::kCertificateExpired, validity_message,
+                  error_message);
+    }
+    // 6) 证书认证的公钥必须**就是**握手里实际使用的身份公钥。
+    //    少了这一步，攻击者可以拿一张真证书配一把自己的临时密钥。
+    if (!ConstantTimeEquals(certificate.server_public_key, server_static)) {
+      return Fail(SecureTransportError::kCertificateKeyMismatch,
+                  "证书认证的公钥与握手里实际使用的身份公钥不一致",
+                  error_message);
+    }
+    peer_server_id_ = certificate.server_id;
+    peer_certificate_fingerprint_ = crypto::Bpcert1Fingerprint(certificate_raw);
+  } else if (pin->has_key) {
+    // 服务端身份校验：pin 说什么就只接受什么。这里**没有** TOFU 分支。
+    if (!ConstantTimeEquals(pin->public_key, server_static)) {
       return Fail(SecureTransportError::kServerKeyMismatch,
                   "ServerHello 里的身份公钥与本地 pin 的公钥不同",
                   error_message);
     }
   }
-  if (LowerHex(pin.fingerprint_hex) != peer_fingerprint_) {
+  if (!certificate_mode &&
+      LowerHex(pin->fingerprint_hex) != peer_fingerprint_) {
     return Fail(SecureTransportError::kServerKeyMismatch,
                 "服务端身份公钥的指纹是 " + peer_fingerprint_ +
                     "，与本地 pin 的指纹不一致",
@@ -831,12 +1019,12 @@ bool SecureChannel::HandshakeClient(int fd, const ServerKeyPin& pin,
 
   const std::string server_hello(reinterpret_cast<const char*>(raw),
                                  sizeof(raw));
-  transcript_hash_ = Sha256Of(hello + server_hello);
+  transcript_hash_ = Sha256Of(hello + server_hello + certificate_message);
 
   const std::string client_finished =
       HmacTag(client_finished_key_, transcript_hash_);
   const std::string finished_message =
-      BuildFinished(kBssec1MessageClientFinished, client_finished);
+      BuildFinished(kBssec1MessageClientFinished, client_finished, version);
   if (!SendAll(fd, finished_message.data(), finished_message.size(),
                &io_error)) {
     return Fail(SecureTransportError::kIoError,
@@ -853,7 +1041,7 @@ bool SecureChannel::HandshakeClient(int fd, const ServerKeyPin& pin,
   }
   if (LoadU32(server_finished_raw) != kBssec1Magic ||
       server_finished_raw[4] != kBssec1MessageServerFinished ||
-      server_finished_raw[5] != kBssec1Version || server_finished_raw[6] != 0 ||
+      server_finished_raw[5] != version || server_finished_raw[6] != 0 ||
       server_finished_raw[7] != 0) {
     return Fail(SecureTransportError::kMalformedMessage,
                 "ServerFinished 消息格式不合法", error_message);
@@ -876,11 +1064,28 @@ bool SecureChannel::HandshakeClient(int fd, const ServerKeyPin& pin,
 
 bool SecureChannel::HandshakeServer(int fd, const TransportIdentity& identity,
                                     std::string* error_message) {
+  return HandshakeServerInternal(fd, identity, false, error_message);
+}
+
+bool SecureChannel::HandshakeServerRequireCertificate(
+    int fd, const TransportIdentity& identity, std::string* error_message) {
+  return HandshakeServerInternal(fd, identity, true, error_message);
+}
+
+bool SecureChannel::HandshakeServerInternal(int fd,
+                                            const TransportIdentity& identity,
+                                            bool require_certificate,
+                                            std::string* error_message) {
   Reset();
   if (identity.private_key.size() != kX25519Bytes ||
       identity.public_key.size() != kX25519Bytes) {
     return Fail(SecureTransportError::kStateError,
                 "服务端传输身份密钥没有配置好", error_message);
+  }
+  if (require_certificate && identity.certificate.empty()) {
+    return Fail(SecureTransportError::kCertificateMissing,
+                "本服务端被配置为只接受 BPSEC2，但没有加载身份证书",
+                error_message);
   }
   // 整体预算（0 = 不设限）。服务端尤其需要：握手是**未认证**阶段，慢速滴水的
   // 对端本来可以靠 SO_RCVTIMEO 只约束单次 recv 这点占住一个 worker。
@@ -900,10 +1105,40 @@ bool SecureChannel::HandshakeServer(int fd, const TransportIdentity& identity,
                        : "读取 ClientHello 失败：" + io_error,
                 error_message);
   }
+  // 先把长度/magic/类型校验掉，**再**按版本分流。顺序不能反：反过来的话，
+  // 一个 magic 被改写、版本字节又恰好不是 1/2 的包会被报成"版本不支持"，
+  // 把"链路上有东西在改字节"说成了"对端版本太新"—— BPSEC1 的既有用例
+  // 正是靠这条分类来区分这两种情况的。
+  if (LoadU32(raw) != kBssec1Magic || raw[4] != kBssec1MessageClientHello) {
+    return Fail(SecureTransportError::kMalformedMessage,
+                "ClientHello 的 magic 或类型字段不合法", error_message);
+  }
+  // 版本判别：客户端说 BPSEC2 就走证书握手；说 BPSEC1 时，若本服务端被
+  // 配置为只接受证书身份，就直接拒绝 —— 这就是"拒绝降级"的落点。
+  std::uint8_t version = kBssec1Version;
+  bool certificate_mode = false;
+  if (raw[5] == kBssec2Version) {
+    if (identity.certificate.empty()) {
+      return Fail(SecureTransportError::kCertificateMissing,
+                  "客户端要求 BPSEC2，但本服务端没有配置身份证书",
+                  error_message);
+    }
+    certificate_mode = true;
+    version = kBssec2Version;
+  } else if (raw[5] == kBssec1Version) {
+    if (require_certificate) {
+      return Fail(SecureTransportError::kDowngradeRefused,
+                  "本服务端只接受 BPSEC2（签名身份），拒绝 BPSEC1 降级握手",
+                  error_message);
+    }
+  } else {
+    return Fail(SecureTransportError::kUnsupportedVersion,
+                "ClientHello 的协议版本不被支持", error_message);
+  }
   SecureTransportError header_error = SecureTransportError::kNone;
   if (!CheckMessageHeader(raw, sizeof(raw), kBssec1MessageClientHello,
-                          kBssec1ClientHelloSize, "ClientHello", &header_error,
-                          error_message)) {
+                          kBssec1ClientHelloSize, version, "ClientHello",
+                          &header_error, error_message)) {
     last_error_ = header_error;
     return false;
   }
@@ -928,11 +1163,22 @@ bool SecureChannel::HandshakeServer(int fd, const TransportIdentity& identity,
                 "生成握手随机数或临时密钥失败", error_message);
   }
 
-  const std::string server_hello =
-      BuildServerHello(server_random, identity.public_key, ephemeral_public);
+  const std::string server_hello = BuildServerHello(
+      server_random, identity.public_key, ephemeral_public, version);
   if (!SendAll(fd, server_hello.data(), server_hello.size(), &io_error)) {
     return Fail(SecureTransportError::kIoError,
                 "发送 ServerHello 失败：" + io_error, error_message);
+  }
+  // BPSEC2：紧接着出示身份证书（里面只有公钥材料）。客户端会在派生任何
+  // 会话密钥之前把它验完。
+  std::string certificate_message;
+  if (certificate_mode) {
+    certificate_message = BuildServerCertificateMessage(identity.certificate);
+    if (!SendAll(fd, certificate_message.data(), certificate_message.size(),
+                 &io_error)) {
+      return Fail(SecureTransportError::kIoError,
+                  "发送 ServerCertificate 失败：" + io_error, error_message);
+    }
   }
 
   std::string dh_static;
@@ -959,7 +1205,8 @@ bool SecureChannel::HandshakeServer(int fd, const TransportIdentity& identity,
 
   const std::string client_hello(reinterpret_cast<const char*>(raw),
                                  sizeof(raw));
-  transcript_hash_ = Sha256Of(client_hello + server_hello);
+  transcript_hash_ =
+      Sha256Of(client_hello + server_hello + certificate_message);
 
   unsigned char client_finished_raw[kBssec1FinishedSize];
   if (!ReceiveAll(fd, client_finished_raw, sizeof(client_finished_raw), &closed,
@@ -971,7 +1218,7 @@ bool SecureChannel::HandshakeServer(int fd, const TransportIdentity& identity,
   }
   if (LoadU32(client_finished_raw) != kBssec1Magic ||
       client_finished_raw[4] != kBssec1MessageClientFinished ||
-      client_finished_raw[5] != kBssec1Version || client_finished_raw[6] != 0 ||
+      client_finished_raw[5] != version || client_finished_raw[6] != 0 ||
       client_finished_raw[7] != 0) {
     return Fail(SecureTransportError::kMalformedMessage,
                 "ClientFinished 消息格式不合法", error_message);
@@ -991,7 +1238,7 @@ bool SecureChannel::HandshakeServer(int fd, const TransportIdentity& identity,
   const std::string server_finished =
       HmacTag(server_finished_key_, transcript_hash_ + client_finished);
   const std::string finished_message =
-      BuildFinished(kBssec1MessageServerFinished, server_finished);
+      BuildFinished(kBssec1MessageServerFinished, server_finished, version);
   if (!SendAll(fd, finished_message.data(), finished_message.size(),
                &io_error)) {
     return Fail(SecureTransportError::kIoError,

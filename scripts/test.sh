@@ -892,10 +892,16 @@ expect_path_absent "UNSUP-03b no archive was left behind" "$TEST_ROOT/unsup/u03.
 # socket 没法用 mkfifo/ln 造，用一个后台 python 进程 bind 住再测；
 # 备份必须在它存在期间失败，所以这里 sleep 1 等它真的建出来。
 mkdir -p "$TEST_ROOT/unsup/with-socket"
+# bind 用**相对名字**：AF_UNIX 的 sun_path 只有 108 字节，而仓库路径
+# （课程根搬迁之后）已经 72 字符，再把 testdata/... 拼上去就超了 —— 现象是
+# python 直接抛 OSError: AF_UNIX path too long，测试连夹具都建不出来。
+# 先 chdir 进目录、再 bind('sock')，socket 仍然落在被备份的目录里
+# （语义不变），但传进 bind 的字符串只有 5 个字节。
 python3 -c "
-import socket, time
+import os, socket, time
+os.chdir('$TEST_ROOT/unsup/with-socket')
 handle = socket.socket(socket.AF_UNIX)
-handle.bind('$TEST_ROOT/unsup/with-socket/sock')
+handle.bind('sock')
 time.sleep(30)
 " &
 SOCKET_PID=$!
@@ -1662,7 +1668,7 @@ printf 'a\n' > "$PVSEM/real-src/a.txt"
 printf 'a\n' > "$PVSEM/sock-src/a.txt"
 printf 'b\n' > "$PVSEM/sock-src/sub/b.txt"
 ln -s "$PVSEM/real-src" "$PVSEM/link-src"
-python3 -c "import socket,sys; s=socket.socket(socket.AF_UNIX); s.bind(sys.argv[1])" \
+python3 -c "import os,socket,sys; os.chdir(os.path.dirname(sys.argv[1])); s=socket.socket(socket.AF_UNIX); s.bind(os.path.basename(sys.argv[1]))" \
   "$PVSEM/sock-src/sub/sock"
 "$BACKUPCTL" --config-file "$PREVIEW_CONFIG" config repository set "$PREVIEW_REPO" \
   >/dev/null 2>&1
@@ -1764,7 +1770,7 @@ expect_preview_parity_at "PRV-30b GUI 与 CLI 的顺序逐行一致（未排序�
 PWIN="$PVSEM/window-src"
 mkdir -p "$PWIN"
 for index in $(seq 1 300); do printf 'x' > "$PWIN/f$(printf '%03d' "$index").dat"; done
-python3 -c "import socket,sys; s=socket.socket(socket.AF_UNIX); s.bind(sys.argv[1])" \
+python3 -c "import os,socket,sys; os.chdir(os.path.dirname(sys.argv[1])); s=socket.socket(socket.AF_UNIX); s.bind(os.path.basename(sys.argv[1]))" \
   "$PWIN/zzz-socket"
 run_preview_cli "$PWIN"
 PVL_WIN_STATUS=$PREVIEW_CLI_STATUS
@@ -1922,7 +1928,7 @@ expect_preview_matches_backup_at "PRV-38 FILT-PATH-05b 被排除的 C:note.txt �
 PSOCK="$PG/socket"
 rm -rf "$PSOCK"; mkdir -p "$PSOCK"
 printf 'x\n' > "$PSOCK/keep.txt"
-python3 -c "import socket,sys; s=socket.socket(socket.AF_UNIX); s.bind(sys.argv[1])" \
+python3 -c "import os,socket,sys; os.chdir(os.path.dirname(sys.argv[1])); s=socket.socket(socket.AF_UNIX); s.bind(os.path.basename(sys.argv[1]))" \
   "$PSOCK/sock\bad"
 run_preview_cli "$PSOCK"
 PSOCK_PREVIEW=$PREVIEW_CLI_STATUS
@@ -1957,38 +1963,169 @@ fi
 expect_preview_matches_backup_at "PRV-40 SOCK-PATH-02 被排除的非法名 socket 不阻塞" \
   "$PSOCK" --exclude 'name:sock*'
 
-# PRV-41 超长 child path：长度是遍历阶段的硬边界（历史语义），即使规则会把它
-# 排除，也照样失败。用 chdir + 相对路径构造，任何一次 syscall 都不超 PATH_MAX。
-PLONG="$PG/too-long/src"
-rm -rf "$PG/too-long"; mkdir -p "$PLONG"
-python3 - "$PLONG" <<'PYEOF'
+# PRV-41 超长 child path：这是**两半**合同，必须分开构造、分开断言。
+#
+# 完整复核：docs/pr23-prv41-closure.md。要点：walker 把「源目录路径 + archive
+# 相对路径」拼成一个完整字符串交给 lstat（src/core/source_tree_walker.cpp:264/283），
+# 而长度守卫（:271）检查的是 **archive 相对路径**。设前缀 P、最深祖先的 archive
+# 长度为 A，则：
+#
+#     守卫触发  <=>  P <= 4094 - A
+#     内核先炸  <=>  P >= 4095 - A        （PATH_MAX 含结尾 NUL）
+#
+# 所以「哪一半先触发」完全由源目录前缀长度决定，两半都是**正确**行为：
+#   A. 前缀短 -> 报项目自己的 "Archive path too long"（历史 early 语义：
+#      长度在 lstat 与 Filter 之前就判死，规则排除也救不回来）；
+#   B. 前缀长 -> 报内核的 "Failed to inspect path: ...: File name too long"，
+#      受控失败。这是「当前没有 fd 相对遍历」的已知边界，不是回归。
+#
+# 之前那条用例把源目录放在 <repo>/testdata 下（前缀 110），落到了 B 那一侧，
+# 却按 A 去断言——这才是它一直红的原因，与产品行为无关。
+# 两半共用同一个树形，只有前缀不同：20 层 d×190 -> archive 3819，再 1 层 e×64
+# -> archive 3884，最深处一个 v×250 -> archive 4135 > 4096。于是：
+#     守卫要 stat 得到最深那层： prefix <= 4094 - 3884 = 210
+#     内核先炸：                prefix >= 211
+# 前缀不是「碰巧」的：短的那个放 /tmp（与仓库位置无关），长的那个用 240 字符
+# 目录名显式撑出来，两半的前缀长度都在下面被当作断言对象。
+PLEN_LOG="$PG/pathlen"
+rm -rf "$PLEN_LOG"; mkdir -p "$PLEN_LOG/repo"
+PLEN_REPO="$PLEN_LOG/repo"
+PLEN_CONFIG="$PLEN_LOG/config.json"
+PLEN_SHORT_BASE="/tmp/bp41-short"
+PLEN_LONG_BASE="/tmp/$(printf 'L%.0s' $(seq 1 240))"
+"$BACKUPCTL" --config-file "$PLEN_CONFIG" config repository set "$PLEN_REPO" \
+  >/dev/null 2>&1
+
+# 深到 >4096 的目录链只能逐级 chdir 建；也只能逐级 chdir 删 —— 整条路径既超出
+# PATH_MAX，rm -rf 自己也会 ENAMETOOLONG。
+remove_deep_chain() {
+  python3 - "$@" <<'PYEOF'
 import os, sys
-src = sys.argv[1]
-os.chdir(src)
-component = 'd' * 190
-relative = 0
-while relative < 3900:
-    os.makedirs(component, exist_ok=True)
-    os.chdir(component)
-    relative += 1 + len(component)
-open('v' * 200, 'w').write('x')
+def remove(path):
+    os.chdir(path)
+    for name in os.listdir('.'):
+        if os.path.islink(name) or not os.path.isdir(name):
+            os.remove(name)
+        else:
+            remove(name)
+    os.chdir('..')
+    os.rmdir(path)
+for target in sys.argv[1:]:
+    if not os.path.exists(target):
+        continue
+    try:
+        remove(target)
+    except OSError as error:
+        print('deep chain cleanup warning: %s' % error)
 PYEOF
-run_preview_cli "$PLONG" --exclude 'name:vvv*'
-PLONG_STATUS=$PREVIEW_CLI_STATUS
-set +e
-timeout --signal=KILL "$TIMEOUT_SECONDS" "$BACKUPCTL" --config-file "$PREVIEW_CONFIG" \
-  backup "$PLONG" --exclude 'name:vvv*' > "$PG/toolong-backup.log" 2>&1
-PLONG_BACKUP=$?
-set -e
-if [[ $PLONG_STATUS -eq 1 && $PLONG_BACKUP -eq 1 ]] &&
-   grep -qF "Archive path too long" "$PREVIEW_CLI_ERR" &&
-   grep -qF "Archive path too long" "$PG/toolong-backup.log"; then
-  record_pass "PRV-41 超长 child path 即使被排除也照样失败（历史 early 语义）"
+}
+
+# 建完打印 "<最深目录 archive 长度> <最深那个文件的 archive 长度>"：
+# 边界常量跟着树形算，不写死，改树形时不会变成一句谎话。
+make_deep_chain() {
+  python3 - "$1" <<'PYEOF'
+import os, sys
+a, levels, b, file_name_length = 190, 20, 64, 250
+src = os.path.join(sys.argv[1], 'src')
+os.makedirs(src, exist_ok=True)
+os.chdir(src)
+for _ in range(levels):
+    os.makedirs('d' * a, exist_ok=True)
+    os.chdir('d' * a)
+os.makedirs('e' * b, exist_ok=True)
+os.chdir('e' * b)
+open('v' * file_name_length, 'w').write('x')
+deepest = a + (levels - 1) * (a + 1) + 1 + b
+print('%d %d' % (deepest, deepest + 1 + file_name_length))
+PYEOF
+}
+
+# 上一次跑挂在半路留下的残骸要先清掉，否则 exist_ok 会接着用旧树。
+remove_deep_chain "$PLEN_SHORT_BASE" "$PLEN_LONG_BASE"
+mkdir -p "$PLEN_SHORT_BASE" "$PLEN_LONG_BASE"
+PLEN_SHORT_SHAPE="$(make_deep_chain "$PLEN_SHORT_BASE")"
+make_deep_chain "$PLEN_LONG_BASE" >/dev/null
+PLEN_DEEPEST="${PLEN_SHORT_SHAPE%% *}"
+PLEN_FILE="${PLEN_SHORT_SHAPE##* }"
+PLEN_GUARD_MAX=$((4094 - PLEN_DEEPEST))
+PLEN_SHORT_PREFIX=$(printf %s "$PLEN_SHORT_BASE/src" | wc -c)
+PLEN_LONG_PREFIX=$(printf %s "$PLEN_LONG_BASE/src" | wc -c)
+
+# 夹具前提本身就是一条断言：越界真的存在，且守卫确实有一个正的前缀预算。
+if [[ $PLEN_FILE -gt 4096 && $PLEN_GUARD_MAX -gt 0 ]]; then
+  record_pass "PRV-41 夹具前提：archive 路径 $PLEN_FILE > 4096，守卫前缀预算 $PLEN_GUARD_MAX > 0"
 else
-  record_fail "PRV-41 超长 child path 的历史 early 语义" \
-    "preview=$PLONG_STATUS[$(head -n 1 "$PREVIEW_CLI_ERR")] backup=$PLONG_BACKUP"
+  record_fail "PRV-41 夹具前提：archive 路径越界且守卫前缀预算为正" \
+    "deepest=$PLEN_DEEPEST file=$PLEN_FILE guard_max=$PLEN_GUARD_MAX"
 fi
-rm -rf "$PG/too-long"
+
+# 跑一侧：preview 与 backup 各一次，收起首行原文与退出码。
+# $1 = 标签，$2 = 源目录。
+PLEN_PREVIEW_STATUS=0
+PLEN_BACKUP_STATUS=0
+PLEN_PREVIEW_LINE=""
+PLEN_BACKUP_LINE=""
+plen_run() {
+  local label="$1" source="$2"
+  set +e
+  timeout --signal=KILL "$TIMEOUT_SECONDS" "$BACKUPCTL" --config-file "$PLEN_CONFIG" \
+    preview "$source" --exclude 'name:vvv*' \
+    >"$PLEN_LOG/$label.preview.out" 2>"$PLEN_LOG/$label.preview.err"
+  PLEN_PREVIEW_STATUS=$?
+  timeout --signal=KILL "$TIMEOUT_SECONDS" "$BACKUPCTL" --config-file "$PLEN_CONFIG" \
+    backup "$source" --exclude 'name:vvv*' \
+    >"$PLEN_LOG/$label.backup.out" 2>"$PLEN_LOG/$label.backup.err"
+  PLEN_BACKUP_STATUS=$?
+  set -e
+  PLEN_PREVIEW_LINE="$(head -n 1 "$PLEN_LOG/$label.preview.err")"
+  PLEN_BACKUP_LINE="$(head -n 1 "$PLEN_LOG/$label.backup.err")"
+}
+
+# 一条合同的完整形状：两侧都恰好以 1 失败（不是 124 超时、不是 >=128 被信号打死）、
+# 两侧同一句原文、原文里含必须出现的那一段、报出来的是那条真的越界的路径
+# （长度 > 4096），而且仓库里没有留下半个归档。
+# $1 = 用例名，$2 = 标签，$3 = 必须出现的片段，$4 = 首行最小长度。
+plen_check() {
+  local name="$1" label="$2" needle="$3" minlen="$4"
+  local repo_entries
+  repo_entries="$(ls -A "$PLEN_REPO" | wc -l)"
+  if [[ $PLEN_PREVIEW_STATUS -eq 1 && $PLEN_BACKUP_STATUS -eq 1 ]] &&
+     [[ "$PLEN_PREVIEW_LINE" == "$PLEN_BACKUP_LINE" ]] &&
+     [[ "$PLEN_PREVIEW_LINE" == *"$needle"* ]] &&
+     [[ ${#PLEN_PREVIEW_LINE} -ge $minlen ]] &&
+     [[ $repo_entries -eq 0 ]]; then
+    record_pass "$name"
+  else
+    record_fail "$name" \
+      "preview=$PLEN_PREVIEW_STATUS backup=$PLEN_BACKUP_STATUS repo=$repo_entries len=${#PLEN_PREVIEW_LINE} line=[$(printf %s "$PLEN_PREVIEW_LINE" | cut -c1-90)]"
+  fi
+}
+
+# A. 守卫：前缀必须 <= 预算，否则这一半根本走不到守卫。
+if [[ $PLEN_SHORT_PREFIX -le $PLEN_GUARD_MAX ]]; then
+  plen_run guard "$PLEN_SHORT_BASE/src"
+  plen_check "PRV-41a 超长 archive 路径报项目自己的长度错误（被规则排除也照样失败）" \
+    guard "Archive path too long" 4100
+else
+  record_fail "PRV-41a 夹具前提：短前缀必须 <= 守卫预算" \
+    "prefix=$PLEN_SHORT_PREFIX guard_max=$PLEN_GUARD_MAX source=$PLEN_SHORT_BASE/src"
+fi
+
+# B. 内核上限：前缀必须 > 预算，内核才有机会先报错。
+if [[ $PLEN_LONG_PREFIX -gt $PLEN_GUARD_MAX ]]; then
+  plen_run oslimit "$PLEN_LONG_BASE/src"
+  plen_check "PRV-41b 源目录路径超出 PATH_MAX 时受控失败（两侧同一句，不崩不挂）" \
+    oslimit "File name too long" 4100
+else
+  record_fail "PRV-41b 夹具前提：长前缀必须 > 守卫预算" \
+    "prefix=$PLEN_LONG_PREFIX guard_max=$PLEN_GUARD_MAX source=$PLEN_LONG_BASE/src"
+fi
+
+# FUTURE: fd-relative traversal / openat-based deep-path support
+#   把字符串递归换成 dirfd 递归（openat/fstatat/fdopendir），B 那一半才会变成
+#   「支持」而不是「受控失败」。本轮**不做**：它会同时改动 restore、增量与
+#   catalog 三处路径语义，属于独立评审的架构变更。
+remove_deep_chain "$PLEN_SHORT_BASE" "$PLEN_LONG_BASE"
 
 # L.6 单实例：preview 是产品命令，必须在进入扫描之前被同一把锁拒绝。
 # "只读所以可以并发"不是这个产品的规则。

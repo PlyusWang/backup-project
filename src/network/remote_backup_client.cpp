@@ -262,6 +262,49 @@ bool RemoteArchiveClient::Connect(const RemoteEndpoint& endpoint,
   //   * 握手失败（身份不符 / Finished 校验失败 / 对端根本不说 BPSEC1）
   //     -> 关连接，**绝不**退回明文 BPNET1。
   channel_.Reset();
+  channel_.SetHandshakeTimeoutMs(60000);
+
+  // BPSEC2：签名身份模式。证书与 pin 是两条互斥的路，这里一旦选定证书，
+  // 就不会再去看 pin（失败也不会回退）。
+  if (endpoint.identity_mode == "certificate") {
+    net::ServerIdentityPolicy policy;
+    if (!endpoint.trusted_roots_file.empty()) {
+      std::string roots_error;
+      if (!crypto::TrustedRootStore::LoadFromFile(
+              endpoint.trusted_roots_file, &policy.roots, &roots_error)) {
+        const std::string reason = "无法加载可信根文件：" + roots_error;
+        ::close(fd_);
+        fd_ = -1;
+        if (error_message != nullptr) {
+          *error_message = reason;
+        }
+        Fail(reason);
+        return false;
+      }
+    } else {
+      // 官方云端：根是编译进客户端的内置常量，用户侧零配置，也不存在
+      // "在旁边放一个根文件就能改信任"这种可能。
+      policy.roots = crypto::TrustedRootStore::OfficialCloudStore();
+    }
+    policy.expected_server_id = endpoint.expected_server_id;
+    std::string certificate_error;
+    if (!channel_.HandshakeClientWithCertificate(fd_, policy,
+                                                 &certificate_error)) {
+      const std::string reason =
+          std::string("BPSEC2 签名身份握手失败（") +
+          SecureTransportErrorName(channel_.last_error()) + "）：" +
+          certificate_error;
+      ::close(fd_);
+      fd_ = -1;
+      if (error_message != nullptr) {
+        *error_message = reason;
+      }
+      Fail(reason);
+      return false;
+    }
+    return true;
+  }
+
   std::string pin_error;
   if (!ParseServerKeyPin(endpoint.server_key_pin, &server_key_pin_,
                          &pin_error)) {
@@ -274,9 +317,8 @@ bool RemoteArchiveClient::Connect(const RemoteEndpoint& endpoint,
     Fail(reason);
     return false;
   }
-  // 客户端侧握手整体预算：60 秒。对端即使持有正确的身份私钥，慢慢滴水同样
-  // 能把客户端挂住（审查轮缺陷 C）。
-  channel_.SetHandshakeTimeoutMs(60000);
+  // 客户端侧握手整体预算：60 秒（上面已经设过）。对端即使持有正确的身份
+  // 私钥，慢慢滴水同样能把客户端挂住（审查轮缺陷 C）。
   std::string handshake_error;
   if (!channel_.HandshakeClient(fd_, server_key_pin_, &handshake_error)) {
     const std::string reason = std::string("BPSEC1 握手失败（") +
