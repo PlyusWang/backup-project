@@ -231,6 +231,21 @@ build_appdir() {
     die "linuxdeploy 失败"
   fi
   tail -12 "$WORK/linuxdeploy.log"
+
+  # linuxdeploy-plugin-qt 会按它自己的判断挑平台插件（默认通常只有 xcb）。
+  # 无显示环境（容器 / CI / 远程维护）要能启动**同一个** AppImage，所以把
+  # offscreen 与 minimal 补齐；缺了就直接补，而不是指望环境变量一定生效。
+  local qt_plugins plugin
+  qt_plugins="$(qtpaths6 --query QT_INSTALL_PLUGINS 2>/dev/null || qmake6 -query QT_INSTALL_PLUGINS 2>/dev/null || true)"
+  if [ -n "$qt_plugins" ] && [ -d "$qt_plugins/platforms" ]; then
+    install -d -m 0755 "$appdir/usr/plugins/platforms"
+    for plugin in libqoffscreen.so libqminimal.so; do
+      if [ ! -e "$appdir/usr/plugins/platforms/$plugin" ] && [ -e "$qt_plugins/platforms/$plugin" ]; then
+        cp -a "$qt_plugins/platforms/$plugin" "$appdir/usr/plugins/platforms/"
+        log "  补齐平台插件：$plugin"
+      fi
+    done
+  fi
 }
 
 pack_client_appimage() {
