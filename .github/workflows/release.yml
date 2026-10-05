@@ -109,7 +109,7 @@ jobs:
             qt6-base-dev qt6-base-dev-tools qt6-declarative-dev qt6-declarative-dev-tools \
             qt6-qpa-plugins qml6-module-qtquick qml6-module-qtquick-controls \
             qml6-module-qtquick-layouts qml6-module-qtquick-dialogs \
-            qml6-module-qtquick-window qml6-module-qtquick-shapes qml6-module-qtquick-templates \\
+            qml6-module-qtquick-window qml6-module-qtquick-shapes qml6-module-qtquick-templates
             qml6-module-qtqml qml6-module-qtqml-workerscript
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
       - name: container workspace ownership (git safe.directory)
@@ -216,8 +216,16 @@ jobs:
           sudo apt-get update -qq
           sudo apt-get install -y --no-install-recommends ./$deb
           sudo systemctl is-enabled backup-project-server
-          sudo systemctl is-active backup-project-server
-          sudo systemctl status backup-project-server --no-pager | head -20 || true
+          state=""
+          for i in $(seq 1 30); do
+            state="$(systemctl is-active backup-project-server || true)"
+            [ "$state" = "active" ] && break
+            sleep 1
+          done
+          echo "service state: $state"
+          sudo systemctl status backup-project-server --no-pager || true
+          sudo journalctl -u backup-project-server -n 80 --no-pager || true
+          test "$state" = "active"
       - name: 默认只监听回环，且服务真的活着
         run: |
           set -eu
