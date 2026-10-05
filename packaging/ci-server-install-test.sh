@@ -93,7 +93,15 @@ fi
 if pgrep -f 'backup-server --bind' > /dev/null; then ci_pass "重装没有把正在跑的服务打挂"; else
   ci_fail "重装过程中服务进程消失了"; tail -10 /tmp/server-run.log >&2; fi
 
-ci_section "6. 卸载：数据必须留下"
+ci_section "6. purge-data 需要显式确认（包还在的时候做）"
+deb_bin=/usr/lib/backup-project-server/bin/purge-data.sh
+expect_file "purge-data 入口存在" "$deb_bin"
+expect_ok "purge-data --dry-run 不删任何东西" "$deb_bin" --dry-run
+expect_fail "purge-data 没有确认短语时拒绝执行" bash -c "printf 'nope\n' | $deb_bin --config $CONF"
+expect_file "拒绝之后数据还在" "$INSTANCE/data"
+expect_file "拒绝之后私钥还在" "$INSTANCE/state/transport.key"
+
+ci_section "7. 卸载：数据必须留下"
 kill "$SERVER_PID" 2>/dev/null || true
 sleep 1
 expect_ok "dpkg -r backup-project-server" dpkg -r backup-project-server
@@ -104,12 +112,12 @@ expect_file "卸载后传输身份私钥仍在" "$INSTANCE/state/transport.key"
 expect_file "卸载后 secrets.env 仍在" /etc/backup-project-server/secrets.env
 expect_eq "卸载后 transport.key 内容未变" "$BEFORE_KEY" "$(sha256sum "$INSTANCE/state/transport.key" | cut -d' ' -f1)"
 
-ci_section "7. purge 包也不许删数据"
+ci_section "8. purge 包也不许删数据"
 expect_ok "dpkg --purge backup-project-server" dpkg --purge backup-project-server
 expect_file "purge 之后数据目录仍在" "$INSTANCE/data"
 expect_file "purge 之后私钥仍在" "$INSTANCE/state/transport.key"
 
-ci_section "8. portable tar.xz：--prefix（含空格）+ --no-systemd"
+ci_section "9. portable tar.xz：--prefix（含空格）+ --no-systemd"
 PREFIX="/tmp/server prefix/opt"
 rm -rf "/tmp/server prefix"; mkdir -p "/tmp/server prefix"
 expect_ok "解包 tar.xz" tar -xf "$TARBALL" -C "/tmp/server prefix"
@@ -130,18 +138,11 @@ if ss -ltn 2>/dev/null | grep '127.0.0.1:18999' > /dev/null; then ci_pass "porta
 kill "$PPORT_PID" 2>/dev/null || true
 sleep 1
 
-ci_section "9. portable 卸载（默认保留数据）"
+ci_section "10. portable 卸载（默认保留数据）"
 expect_ok "uninstall.sh --prefix" "${TOP}uninstall.sh" --prefix "$PREFIX"
 if [ -e "$PREFIX/bin/backup-server" ]; then ci_fail "portable 程序文件仍在"; else ci_pass "portable 程序文件已删除"; fi
 expect_file "portable 数据仍在" "$PREFIX/var/data"
 expect_file "portable 私钥仍在" "$PREFIX/var/state/transport.key"
 
-ci_section "10. purge-data 需要显式确认（在 deb 实例上）"
-deb_bin=/usr/lib/backup-project-server/bin/purge-data.sh
-if [ -x "$deb_bin" ]; then
-  expect_ok "purge-data --dry-run 不删任何东西" "$deb_bin" --dry-run
-  expect_fail "purge-data 没有确认短语时拒绝执行" bash -c "printf 'nope\n' | $deb_bin --config $CONF"
-  expect_file "拒绝之后数据还在" "$INSTANCE/data"
-fi
 
 ci_finish "server-install"
