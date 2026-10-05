@@ -55,8 +55,11 @@ done
 mkdir -p "$STAGE_DIR/evidence"
 if [ -d /tmp/pr23/evidence ]; then
   cp /tmp/pr23/evidence/*.md "$STAGE_DIR/evidence/" 2>/dev/null
+  # 人工验收的真实截图（PR #23 官方云端登录路径）也进证据包：
+  # 文字说“指纹区不存在”是一回事，一张真实窗口的 PNG 是另一回事。
+  cp /tmp/pr23/evidence/*.png "$STAGE_DIR/evidence/" 2>/dev/null
 fi
-for log in prv41-closure test-suite-final final-gate-suites ecs-provenance public-smoke; do
+for log in prv41-closure test-suite-final final-gate-suites ecs-provenance public-smoke official-acceptance; do
   if [ -f "/tmp/pr23/$log.log" ]; then
     cp "/tmp/pr23/$log.log" "$STAGE_DIR/logs/$log.log"
   fi
@@ -107,6 +110,12 @@ cat > "$STAGE_DIR/00-SUMMARY.md" <<'SUMMARY'
 * `scripts/test.sh`（**canonical**：完整 Final Gate 环境，GUI 已构建，GUI parity 已执行）**PASS=279 FAIL=0**；
   拆解：core/headless 子集 = **269/0**，GUI parity = **10/0**（**279 = 269 + 10**）。
   closure 之前唯一红的就是 PRV-41（当时 headless 子集为 266/1）。
+* **人工视觉验收发现并修复了一个 merge blocker**：官方云端模式仍然经过 manual-pin
+  校验，登录被一句“服务器身份指纹不合法”挡死。两层根因：QML 无条件走 `*WithPin`，
+  且 `BeginOperation` 无条件要求 pin 非空。修法是**控制器按模式分流**（官方模式不碰
+  人工 pin，ssh / direct 一个字都不放松），并补 10 条离线回归 + `--official-acceptance`
+  的真实窗口验收。证据：evidence/22-MANUAL-ACCEPTANCE-FIX.md、
+  evidence/official-cloud-manual-login.png、logs/official-acceptance.log。
 * **PRV-41 复核结论：产品行为正确，红的是夹具。** 夹具把源目录放在
   `<repo>/testdata/preview/grammar/...`（前缀 110）下，而那条树形的守卫前缀预算
   只有 84，于是内核 `PATH_MAX` 的检查先于项目自己的长度守卫触发。
