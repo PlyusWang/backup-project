@@ -1,0 +1,108 @@
+#!/bin/bash
+# backup-project-server postinst —— 首次安装与每次升级都会跑，必须幂等。
+#
+# 只做四件事：建系统用户、建目录与权限、缺失时生成随机 secret / 传输身份私钥、
+# 让 systemd 重新加载并（配置自检通过时）启动服务。
+#
+# 绝不覆盖任何已存在的文件：secrets.env / transport.key / metadata.sqlite3 /
+# data/ 与证书全部 preserve。升级不会重置用户，也不会造出第二个空数据库。
+set -e
+
+ACTION="${1:-configure}"
+INSTANCE_ROOT=/var/lib/backup-project-server
+CONF_DIR=/etc/backup-project-server
+LIB_DIR=/usr/lib/backup-project-server
+SERVICE=backup-project-server
+
+log() { echo "[backup-project-server] $*"; }
+warn() { echo "[backup-project-server] WARN: $*" >&2; }
+
+have_systemd() { [ -d /run/systemd/system ] && command -v systemctl >/dev/null 2>&1; }
+
+# ---- 1. 系统用户（system，无交互 shell，home 就是实例根）----
+if ! getent group backup-project >/dev/null 2>&1; then
+  addgroup --system backup-project
+  log "已创建系统组 backup-project"
+fi
+if ! getent passwd backup-project >/dev/null 2>&1; then
+  adduser --system --ingroup backup-project --home "$INSTANCE_ROOT" \
+    --no-create-home --shell /usr/sbin/nologin --gecos "Backup Project server" \
+    backup-project >/dev/null
+  log "已创建系统用户 backup-project（/usr/sbin/nologin，无家目录登录）"
+fi
+
+# ---- 2. 目录与权限 ----
+install -d -m 0750 -o backup-project -g backup-project "$INSTANCE_ROOT"
+install -d -m 0750 -o backup-project -g backup-project "$INSTANCE_ROOT/data"
+install -d -m 0750 -o backup-project -g backup-project "$INSTANCE_ROOT/state"
+install -d -m 0750 -o root -g backup-project "$CONF_DIR"
+
+# ---- 3. secret（缺失才生成，0600/0640，内容永不打印）----
+if [ ! -e "$CONF_DIR/secrets.env" ]; then
+  umask 007
+  secret_file="$(mktemp "$CONF_DIR/.secrets.env.XXXXXX")"
+  printf 'BACKUP_TOKEN_SECRET=%s\n' "$(head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n')" > "$secret_file"
+  chown root:backup-project "$secret_file"
+  chmod 0640 "$secret_file"
+  mv "$secret_file" "$CONF_DIR/secrets.env"
+  log "已生成随机 BACKUP_TOKEN_SECRET：$CONF_DIR/secrets.env（0640 root:backup-project）"
+else
+  log "secrets.env 已存在，保持不变：$CONF_DIR/secrets.env"
+fi
+chown root:backup-project "$CONF_DIR/secrets.env" 2>/dev/null || true
+chmod 0640 "$CONF_DIR/secrets.env" 2>/dev/null || true
+
+# ---- 4. 传输身份私钥（缺失才生成；私钥从不离开本机）----
+KEY="$INSTANCE_ROOT/state/transport.key"
+if [ ! -e "$KEY" ]; then
+  if command -v runuser >/dev/null 2>&1; then
+    runuser -u backup-project -- "$LIB_DIR/bin/backup-server-keygen" --output "$KEY" >/dev/null
+  else
+    su -s /bin/bash -c "'$LIB_DIR/bin/backup-server-keygen' --output '$KEY'" backup-project >/dev/null
+  fi
+  chmod 0600 "$KEY"
+  log "已在服务器本机生成传输身份私钥：$KEY（0600，不离开本机）"
+else
+  log "传输身份私钥已存在，保持不变：$KEY"
+fi
+chmod 0600 "$KEY" 2>/dev/null || true
+chown backup-project:backup-project "$KEY" 2>/dev/null || true
+
+# ---- 5. systemd ----
+if have_systemd; then
+  systemctl daemon-reload || true
+fi
+
+CONFIG_OK=0
+if "$LIB_DIR/bin/launch-server.sh" --check-config --config "$CONF_DIR/server.conf" >/tmp/backup-project-server-check.log 2>&1; then
+  CONFIG_OK=1
+else
+  warn "配置自检没有通过，服务不会被启动。详情："
+  sed 's/^/  /' /tmp/backup-project-server-check.log >&2 || true
+fi
+
+if [ "$CONFIG_OK" -eq 1 ] && have_systemd; then
+  if [ "$ACTION" = "configure" ]; then
+    systemctl enable "$SERVICE" >/dev/null 2>&1 || true
+    if systemctl restart "$SERVICE"; then
+      log "服务已启动：systemctl status $SERVICE"
+    else
+      warn "服务启动失败：journalctl -u $SERVICE -n 50"
+    fi
+  fi
+fi
+
+if [ "$CONFIG_OK" -eq 1 ] && ! have_systemd; then
+  log "当前环境没有 systemd（容器/CI）：跳过服务启动。手工启动："
+  log "  $LIB_DIR/bin/launch-server.sh --config $CONF_DIR/server.conf"
+fi
+
+# ---- 6. 收尾提示（含客户端要核对的身份指纹，私钥内容不显示）----
+log "监听地址：$(sed -n 's/^[[:space:]]*bind[[:space:]]*=[[:space:]]*//p' "$CONF_DIR/server.conf" | head -1):$(sed -n 's/^[[:space:]]*port[[:space:]]*=[[:space:]]*//p' "$CONF_DIR/server.conf" | head -1)"
+log "数据目录：$INSTANCE_ROOT/data    状态目录：$INSTANCE_ROOT/state"
+log "管理菜单：sudo backup-server-admin-menu"
+if [ -x "$LIB_DIR/bin/backup-server-keygen" ]; then
+  "$LIB_DIR/bin/backup-server-keygen" --show --key-file "$KEY" 2>/dev/null | sed -n 's/^\(.*指纹.*\)$/\1/p' | sed 's/^/[backup-project-server] /' || true
+fi
+log "公网直连不在本包的默认行为里：要开放请编辑 $CONF_DIR/server.conf（需要证书 + 理由 + require_bpsec2 = true），并自行在云安全组/防火墙放行 TCP。"
+exit 0
