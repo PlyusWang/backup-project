@@ -51,6 +51,25 @@ case "$ONLY" in all|client|server) ;; *) die_usage "--only 只接受 all / clien
 cd "$REPO_ROOT"
 require_clean_tree
 require_tool make g++ dpkg-deb tar xz sha256sum readelf awk stat file
+
+# 打包层依赖的文件必须先齐全：.gitignore 里有一条 "backupctl"（忽略构建产物），
+# 曾经把 packaging/client/wrappers/backupctl 静默吞掉，直到 CI 里 install 才报错。
+# 这里提前失败，并且把"少了哪个文件"直接说出来。
+for needed in \
+  packaging/lib/common.sh packaging/fetch-tools.sh packaging/tools.lock \
+  packaging/client/AppRun packaging/client/AppImage.desktop packaging/client/backup-project.desktop \
+  packaging/client/make-icon.py packaging/client/wrappers/backupctl.sh packaging/client/wrappers/backup-project \
+  packaging/server/server.conf packaging/server/launch-server.sh packaging/server/purge-data.sh \
+  packaging/server/backup-project-server.service packaging/server/deb/control.in \
+  packaging/server/deb/postinst packaging/server/deb/prerm packaging/server/deb/postrm \
+  packaging/server/wrappers/backup-server packaging/server/wrappers/backup-project-server \
+  packaging/server/wrappers/backup-server-admin packaging/server/wrappers/backup-server-admin-menu \
+  packaging/server/wrappers/backup-server-keygen packaging/server/wrappers/backup-cert-tool \
+  packaging/server/wrappers/backup-server-purge-data \
+  packaging/portable/install-client.sh packaging/portable/uninstall-client.sh \
+  packaging/portable/install-server.sh packaging/portable/uninstall.sh; do
+  [ -f "$needed" ] || die "打包层缺少文件：$needed（是不是被 .gitignore 吞了？）"
+done
 setup_reproducible_env
 [ -n "$VERSION" ] || VERSION="$(default_dev_version)"
 VERSION="$(validate_version "$VERSION")"
@@ -266,7 +285,7 @@ pack_client_deb() {
   for part in bin lib plugins qml; do
     [ -d "$WORK/appdir/usr/$part" ] && cp -a "$WORK/appdir/usr/$part" "$tree/usr/lib/backup-project-client/"
   done
-  install -m 0755 packaging/client/wrappers/backupctl "$tree/usr/bin/backupctl"
+  install -m 0755 packaging/client/wrappers/backupctl.sh "$tree/usr/bin/backupctl"
   install -m 0755 packaging/client/wrappers/backup-project "$tree/usr/bin/backup-project"
   install -m 0644 packaging/client/backup-project.desktop "$tree/usr/share/applications/backup-project.desktop"
   install -d -m 0755 "$tree/usr/lib/backup-project-client/share/backup-project"
