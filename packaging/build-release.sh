@@ -171,6 +171,15 @@ build_appdir() {
   write_build_info "$appdir/usr/share/backup-project" "client-appdir"
   printf '%s\n' "$VERSION" > "$appdir/usr/share/backup-project/VERSION"
 
+  # 图标要在 linuxdeploy **之前**就位：linuxdeploy 会按 desktop 文件的 Icon=
+  # 去 AppDir 里找图标文件，找不到就直接失败。图标本身来自仓库自己的
+  # AppIcon.qml（不是新画的品牌，见 make-icon.py）。
+  python3 packaging/client/make-icon.py "$appdir/backup-project.png" 256 > "$WORK/icon.log" 2>&1 || {
+    tail -5 "$WORK/icon.log" >&2; die "生成图标失败（需要 python3-pil）"; }
+  cat "$WORK/icon.log"
+  install -d -m 0755 "$appdir/usr/share/icons/hicolor/256x256/apps"
+  install -m 0644 "$appdir/backup-project.png" "$appdir/usr/share/icons/hicolor/256x256/apps/backup-project.png"
+
   if [ "$SKIP_APPIMAGE" -eq 1 ]; then
     log "--skip-appimage：只装我们的二进制，不打包 Qt 运行时"
     return 0
@@ -191,17 +200,14 @@ build_appdir() {
   export PATH="$WORK/bin:$PATH"
 
   log "== linuxdeploy + plugin-qt（带 Qt 运行时与 QML 模块）=="
-  if ! "$WORK/bin/linuxdeploy" --appdir "$appdir" --plugin qt --output appimage \
+  if ! "$WORK/bin/linuxdeploy" --appdir "$appdir" --plugin qt \
+       --desktop-file "$appdir/usr/share/applications/backup-project.desktop" \
+       --icon-file "$appdir/backup-project.png" --output appimage \
        > "$WORK/linuxdeploy.log" 2>&1; then
     tail -40 "$WORK/linuxdeploy.log" >&2
     die "linuxdeploy 失败"
   fi
   tail -12 "$WORK/linuxdeploy.log"
-
-  # appimagetool 要的图标：由仓库自己的 AppIcon.qml 矢量标记导出（不是新画的品牌）
-  python3 packaging/client/make-icon.py "$appdir/backup-project.png" 256 > "$WORK/icon.log" 2>&1 || {
-    tail -5 "$WORK/icon.log" >&2; die "生成图标失败（需要 python3-pil）"; }
-  cat "$WORK/icon.log"
 }
 
 pack_client_appimage() {
@@ -290,9 +296,14 @@ backup-project-client $VERSION
 随包分发的第三方组件：Qt $QT_VERSION（LGPL-3.0，动态链接，见 THIRD-PARTY-NOTICES.txt）。
 EOF
   gzip -9n -c "$tree/usr/share/doc/backup-project-client/copyright" > /dev/null 2>&1 || true
-  local depends
-  depends="$(shlibs_depends "$tree/usr/bin/backupctl" "$tree/usr/bin/backup-project" \
-              "$tree/usr/lib/backup-project-client/bin/backup-gui-modern" 2>/dev/null || true)"
+  # 依赖来自两处：CLI 自己链接的系统库，以及**随包的 Qt 库**各自链接的系统库
+  # （X11 / xcb / GL / fontconfig 这些不随包，必须由目标机器的发行版提供）。
+  # 不把 GUI 二进制直接交给 dpkg-shlibdeps：它链接的 Qt 是我们自己带的，
+  # dpkg 里查不到对应的包来源，会误报 "no dependency information found"。
+  local depends qt_libs
+  qt_libs="$(find "$tree/usr/lib/backup-project-client/lib" -name 'libQt6*.so.6*' -type f 2>/dev/null | LC_ALL=C sort | tr '\n' ' ')"
+  # shellcheck disable=SC2086
+  depends="$(shlibs_depends "$tree/usr/bin/backupctl" $qt_libs 2>/dev/null || true)"
   [ -n "$depends" ] || die "dpkg-shlibdeps 没有算出依赖（拒绝手写依赖列表）"
   log "  依赖（dpkg-shlibdeps）：$depends"
   build_deb packaging/client/deb "$tree" "$RELEASE_DIR/backup-project-client_${DEB_VERSION}_${ARCH}.deb" "$depends"

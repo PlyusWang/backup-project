@@ -271,10 +271,11 @@ jobs:
           set -eu
           KEY=$(sudo sha256sum /var/lib/backup-project-server/state/transport.key | cut -d' ' -f1)
           sudo apt-get remove -y backup-project-server
-          test -d /var/lib/backup-project-server/data
-          test -f /var/lib/backup-project-server/state/transport.key
+          sudo test -d /var/lib/backup-project-server/data
+          sudo test -f /var/lib/backup-project-server/state/transport.key
           sudo apt-get purge -y backup-project-server
-          test -d /var/lib/backup-project-server/data
+          sudo test -d /var/lib/backup-project-server/data
+          sudo test -f /var/lib/backup-project-server/state/transport.key
           [ "$KEY" = "$(sudo sha256sum /var/lib/backup-project-server/state/transport.key | cut -d' ' -f1)" ]
           sudo rm -rf /var/lib/backup-project-server /etc/backup-project-server
           sudo userdel backup-project || true
