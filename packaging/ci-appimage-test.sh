@@ -10,6 +10,9 @@ source "$(dirname "${BASH_SOURCE[0]}")/ci-lib.sh"
 
 REL="${1:?用法: ci-appimage-test.sh <release 目录>}"
 APPIMAGE="$(ls "$REL"/Backup-Project-Client-*-x86_64.AppImage)"
+# upload-artifact / download-artifact 不保留可执行位，所以这里补一次；真实用户
+# 拿到的 AppImage 也是 "chmod +x 之后再运行"，与 docs/install-client.md 一致。
+chmod 0755 "$APPIMAGE"
 export APPIMAGE_EXTRACT_AND_RUN=1     # CI 里通常没有 FUSE，用解包运行同一条路径
 export NO_AT_BRIDGE=1
 
