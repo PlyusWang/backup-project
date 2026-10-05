@@ -196,11 +196,14 @@ run_checks() {
     env_error "secret_file 里没有 BACKUP_TOKEN_SECRET：$SECRET_FILE"
   fi
   local secret_len
-  secret_len="$(sed -n 's/^BACKUP_TOKEN_SECRET=//p' "$SECRET_FILE" | head -1 | tr -d '\r\n' | wc -c)"
+  secret_len="$(sed -n 's/^BACKUP_TOKEN_SECRET=//p' "$SECRET_FILE" | sed -n '1p' | tr -d '\r\n' | wc -c)"
   if [ "$secret_len" -lt 16 ]; then
     env_error "BACKUP_TOKEN_SECRET 短于 16 字节（当前 $secret_len）"
   fi
   printf '[config]   %-14s BACKUP_TOKEN_SECRET 已存在（%s 字节，内容不显示）\n' "secret" "$secret_len"
+  local secret_mode
+  secret_mode="$(stat -c '%a' "$SECRET_FILE")"
+  case "$secret_mode" in 600|400) ;; *) env_error "secret_file 权限必须是 0600（0400 也接受，产品自己也会拒绝）：$SECRET_FILE 是 $secret_mode" ;; esac
   check_file "$TRANSPORT_KEY" "transport_key"
   local key_mode key_size
   key_mode="$(stat -c '%a' "$TRANSPORT_KEY")"
