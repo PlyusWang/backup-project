@@ -28,7 +28,8 @@ done
 
 ci_section "结构规则扫描"
 PATTERNS='-----BEGIN [A-Z ]*PRIVATE KEY|^seed-hex: [0-9a-f]{64}$|^BACKUP_TOKEN_SECRET=[0-9a-fA-F]{16,}$'
-hits="$(grep -rEl "$PATTERNS" "$WORK" 2>/dev/null | wc -l)"
+# pipefail：grep 无命中返回 1，必须显式吞掉，否则"没有私钥"反而会把脚本弄挂。
+hits="$( { grep -rEl "$PATTERNS" "$WORK" 2>/dev/null || true; } | wc -l)"
 expect_eq "私钥/口令结构规则命中 = 0" "0" "$hits"
 if [ "$hits" != "0" ]; then grep -rEl "$PATTERNS" "$WORK" 2>/dev/null | sed -n '1,5p' >&2; fi
 
@@ -40,7 +41,7 @@ raw="$(find "$WORK" -type f -size -64c -size +16c 2>/dev/null | while read -r f;
   if [ "$(stat -c %s "$f")" = "32" ]; then
     if LC_ALL=C grep -qP '^[\x00-\xff]{32}$' "$f" 2>/dev/null; then echo "$f"; fi
   fi
-done | grep -vE '/usr/share/|/docs/|/qml/|/lib/' | wc -l)"
+done | { grep -vE '/usr/share/|/docs/|/qml/|/lib/' || true; } | wc -l)"
 expect_eq "没有 32 字节裸密钥形状的文件" "0" "$raw"
 
 ci_finish "secret-scan"
