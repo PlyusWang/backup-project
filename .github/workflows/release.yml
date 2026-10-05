@@ -173,8 +173,11 @@ jobs:
           version="${{ needs.prepare.outputs.version }}"
           out="dist/release/$version"
           mkdir -p "$out"
+          echo "--- incoming/client ---"; ls -la incoming/client
+          echo "--- incoming/server ---"; ls -la incoming/server
           cp -a incoming/client/. "$out"/
           cp -a incoming/server/. "$out"/
+          echo "--- $out ---"; ls -la "$out"
           # 清单写到 out 之外再 mv 进来：重定向会在 find 之前就把 SHA256SUMS
           # 创建出来，否则清单会把自己也算进去（自校验必然失败）。
           ( cd "$out" && rm -f SHA256SUMS RELEASE-INFO.txt \
