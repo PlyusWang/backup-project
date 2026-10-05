@@ -65,8 +65,8 @@ log "版本 $VERSION（deb: $DEB_VERSION）架构 $ARCH"
 log "制品目录：$RELEASE_DIR"
 
 OS_PRETTY="$( . /etc/os-release 2>/dev/null && echo "$PRETTY_NAME" || echo unknown )"
-GLIBC_VERSION="$(ldd --version | head -1 | awk '{print $NF}')"
-CXX_VERSION="$(g++ --version | head -1)"
+GLIBC_VERSION="$(ldd --version | awk 'NR==1 {print $NF}')"
+CXX_VERSION="$(g++ --version | awk 'NR==1')"
 QT_VERSION="$(command -v qmake6 >/dev/null 2>&1 && qmake6 -query QT_VERSION || echo none)"
 COMMIT="$(git rev-parse HEAD)"
 TREE="$(git rev-parse HEAD^{tree})"
@@ -459,7 +459,7 @@ if [ "$hits" != "0" ]; then
   die "制品里发现了疑似私钥/口令内容（$hits 处）"
 fi
 log "  私钥扫描：0 命中"
-if find "$SCAN_TARGET" -name '*.key' -o -name 'secrets.env' | grep -q .; then
+if [ -n "$(find "$SCAN_TARGET" \( -name '*.key' -o -name 'secrets.env' \) -print -quit)" ]; then
   die "制品里出现了 .key / secrets.env 文件"
 fi
 log "  文件级检查：无 .key / secrets.env"

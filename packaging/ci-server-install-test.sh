@@ -56,17 +56,17 @@ else
 fi
 
 ci_section "4. 装完真的能服务（手工启动 + 回环 ping）"
-PIN="$(backup-server-keygen --show --key-file "$INSTANCE/state/transport.key" | sed -n 's/.*--server-key //p' | head -1)"
+PIN="$(backup-server-keygen --show --key-file "$INSTANCE/state/transport.key" | sed -n 's/.*--server-key //p' | sed -n '1p')"
 if [ -n "$PIN" ]; then ci_pass "拿到服务器身份指纹（不打印内容）"; else ci_fail "拿不到指纹"; fi
 runuser -u backup-project -- /usr/lib/backup-project-server/bin/launch-server.sh --config "$CONF" \
   > /tmp/server-run.log 2>&1 &
 SERVER_PID=$!
 for i in $(seq 1 40); do
-  ss -ltn 2>/dev/null | grep -q '127.0.0.1:18765' && break
+  ss -ltn 2>/dev/null | grep '127.0.0.1:18765' > /dev/null && break
   sleep 0.5
 done
-if ss -ltn 2>/dev/null | grep -q '127.0.0.1:18765'; then ci_pass "服务端在 127.0.0.1:18765 监听"; else ci_fail "服务端没有监听"; tail -20 /tmp/server-run.log >&2; fi
-if ! ss -ltn 2>/dev/null | grep -q '0.0.0.0:18765'; then ci_pass "没有监听 0.0.0.0（默认不是公网）"; else ci_fail "竟然监听了 0.0.0.0"; fi
+if ss -ltn 2>/dev/null | grep '127.0.0.1:18765' > /dev/null; then ci_pass "服务端在 127.0.0.1:18765 监听"; else ci_fail "服务端没有监听"; tail -20 /tmp/server-run.log >&2; fi
+if ! ss -ltn 2>/dev/null | grep '0.0.0.0:18765' > /dev/null; then ci_pass "没有监听 0.0.0.0（默认不是公网）"; else ci_fail "竟然监听了 0.0.0.0"; fi
 expect_ok "客户端回环 ping（真实 BPSEC1 握手）" backupctl remote ping --host 127.0.0.1 --port 18765 --server-key "$PIN"
 expect_ok "ping 能在干净环境里重复一次" backupctl remote ping --host 127.0.0.1 --port 18765 --server-key "$PIN"
 
@@ -106,7 +106,7 @@ ci_section "8. portable tar.xz：--prefix（含空格）+ --no-systemd"
 PREFIX="/tmp/server prefix/opt"
 rm -rf "/tmp/server prefix"; mkdir -p "/tmp/server prefix"
 expect_ok "解包 tar.xz" tar -xf "$TARBALL" -C "/tmp/server prefix"
-TOP="$(ls -d "/tmp/server prefix"/*/ | head -1)"
+TOP="$(ls -d "/tmp/server prefix"/*/ | sed -n '1p')"
 expect_file "install.sh" "${TOP}install.sh"
 expect_file "MANIFEST.sha256" "${TOP}MANIFEST.sha256"
 expect_ok "install.sh --prefix（含空格）--no-systemd" "${TOP}install.sh" --prefix "$PREFIX" --no-systemd --port 18999
@@ -115,11 +115,11 @@ expect_file "portable 管理员菜单" "$PREFIX/bin/backup-server-admin.sh"
 expect_file "portable 配置" "$PREFIX/etc/server.conf"
 expect_mode "portable transport.key 0600" "$PREFIX/var/state/transport.key" "600"
 expect_ok "portable --check-config" "$PREFIX/bin/launch-server.sh" --check-config --config "$PREFIX/etc/server.conf"
-PIN2="$("$PREFIX/bin/backup-server-keygen" --show --key-file "$PREFIX/var/state/transport.key" | sed -n 's/.*--server-key //p' | head -1)"
+PIN2="$("$PREFIX/bin/backup-server-keygen" --show --key-file "$PREFIX/var/state/transport.key" | sed -n 's/.*--server-key //p' | sed -n '1p')"
 "$PREFIX/bin/launch-server.sh" --config "$PREFIX/etc/server.conf" > /tmp/server-portable.log 2>&1 &
 PPORT_PID=$!
-for i in $(seq 1 40); do ss -ltn 2>/dev/null | grep -q '127.0.0.1:18999' && break; sleep 0.5; done
-if ss -ltn 2>/dev/null | grep -q '127.0.0.1:18999'; then ci_pass "portable 服务端在 127.0.0.1:18999 监听"; else ci_fail "portable 服务端没有监听"; tail -20 /tmp/server-portable.log >&2; fi
+for i in $(seq 1 40); do ss -ltn 2>/dev/null | grep '127.0.0.1:18999' > /dev/null && break; sleep 0.5; done
+if ss -ltn 2>/dev/null | grep '127.0.0.1:18999' > /dev/null; then ci_pass "portable 服务端在 127.0.0.1:18999 监听"; else ci_fail "portable 服务端没有监听"; tail -20 /tmp/server-portable.log >&2; fi
 kill "$PPORT_PID" 2>/dev/null || true
 sleep 1
 
