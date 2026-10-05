@@ -87,6 +87,18 @@ expect_ok() {
   fi
 }
 
+# PR #23 人工验收 blocker 的回归：官方云端**不能**经过人工 pin。
+# 自动测试当时没发现，是因为 C01..C07 全部在 ssh / direct 模式下跑。
+expect_ok "OFFICIAL-GUI-LOGIN-01a 官方模式 + 空 pin：登录没有被 pin 闸门挡住" "OFFICIAL-GUI-LOGIN-01a "
+expect_ok "OFFICIAL-GUI-LOGIN-01b 请求用 OfficialCloudProfile + certificate" "OFFICIAL-GUI-LOGIN-01b "
+expect_ok "OFFICIAL-GUI-LOGIN-01c 没有 server_key_pin validation error" "OFFICIAL-GUI-LOGIN-01c "
+expect_ok "OFFICIAL-GUI-LOGIN-01d 没有提交/读取隐藏的指纹输入" "OFFICIAL-GUI-LOGIN-01d "
+expect_ok "OFFICIAL-GUI-REGISTER-01 官方模式注册同样不被指纹闸门挡住" "OFFICIAL-GUI-REGISTER-01 "
+expect_ok "OFFICIAL-GUI-STALE-PIN-01 manual pin 的旧报错不再阻挡官方登录" "OFFICIAL-GUI-STALE-PIN-01 "
+expect_ok "MANUAL-PIN-REGRESSION-01 ssh + 空 pin 仍然 fail closed" "MANUAL-PIN-REGRESSION-01 "
+expect_ok "MANUAL-PIN-REGRESSION-02 direct + 空 pin 仍然 fail closed" "MANUAL-PIN-REGRESSION-02 "
+expect_ok "MANUAL-PIN-REGRESSION-03 direct + 畸形 pin 仍然 fail closed" "MANUAL-PIN-REGRESSION-03 "
+expect_ok "MANUAL-PIN-REGRESSION-04 ssh + 畸形 pin 仍然 fail closed" "MANUAL-PIN-REGRESSION-04 "
 expect_ok "C00 连接方式 / SSH 主机 / 通道状态 / 建立连接按钮在页面上" "C00 "
 expect_ok "C01a 输入合法 pin 并点“应用”" "C01a "
 expect_ok "C01b 控制器采用了这个 pin" "C01b "

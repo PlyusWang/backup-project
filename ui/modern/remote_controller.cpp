@@ -1207,6 +1207,13 @@ QString RemoteController::SurfaceFailureMessage(RemoteOpResult::Kind kind,
   }
   return fallback;
 }
+
+// 官方模式的登录路径曾经被人工 pin 挡死（PR #23 人工验收 blocker）：身份来源
+// 其实是**互斥的两条路**，而这里说的是“这个模式需不需要人工 pin”这唯一一件事。
+bool RemoteController::RequiresManualPin() const {
+  return connection_mode_ != ConnectionMode::kOfficialCloud;
+}
+
 bool RemoteController::BeginOperation(const QString& action_text,
                                       bool need_login, ErrorSurface surface) {
   if (busy_) {
@@ -1230,10 +1237,18 @@ bool RemoteController::BeginOperation(const QString& action_text,
             : DescribeFailure(last_error_kind_));
     return false;
   }
-  // 连接之前必须有服务端身份 pin：没有它客户端会**直接拒绝连接**（不做首次
-  // 连接自动信任），而那是一条协议级的底层原因，用户读不懂"我到底少做了什么"。
-  // 与地址 / 端口 / 口令同一条规矩：本地就挡住，一个字节都不发。
-  if (server_key_pin_.isEmpty()) {
+  // 连接之前必须有服务端身份 pin —— **但只有靠人工 pin 认服务器的模式才需要**。
+  //
+  // PR #23 人工验收发现的 blocker：官方云端模式下“服务器身份指纹”输入区是隐藏的，
+  // 而这里无条件要求 server_key_pin_ 非空，于是官方用户被一句“还没有填写服务器
+  // 身份指纹”挡在门外。身份来源是互斥的两条路（见 remote_backup_client.h:48-57）：
+  // 证书模式根本不看 pin，所以官方模式不要求它；ssh / direct 仍然是 BPSEC1 +
+  // 人工 pin，一个字节都不放松。
+  //
+  // 没有 pin 时客户端会**直接拒绝连接**（不做首次连接自动信任），而那是一条
+  // 协议级的底层原因，用户读不懂“我到底少做了什么”。与地址 / 端口 / 口令同一条
+  // 规矩：本地就挡住，一个字节都不发。
+  if (RequiresManualPin() && server_key_pin_.isEmpty()) {
     last_error_kind_ = QStringLiteral("validation");
     ReportSurfaceError(
         surface,
@@ -1252,6 +1267,25 @@ bool RemoteController::BeginOperation(const QString& action_text,
 }
 
 void RemoteController::DispatchRequest(const RemoteRequest& request) {
+  // 测试注入点（默认关闭，见头文件）：只记录这一次**真正要发出去**的请求端点，
+  // 一个字节都不发。官方 profile 指向真实 ECS，而 final gate 不能依赖公网，
+  // 所以官方模式的回归靠它来断言 identity_mode / host / expected_server_id。
+  // 收尾走的是**同一条**完成路径（ApplyResult + SetBusy(false) + 信号），
+  // 但结果明确标成 capture-only 失败：不伪造登录成功，也不更新可达性。
+  if (capture_dispatched_request_for_test_) {
+    last_dispatched_endpoint_ = request.endpoint;
+    ++dispatched_request_count_;
+    RemoteOpResult captured;
+    captured.kind = request.kind;
+    captured.ok = false;
+    captured.error_kind = QStringLiteral("capture-only");
+    captured.message =
+        QStringLiteral("自检注入点：请求已记录，未发送（capture-only）");
+    ApplyResult(captured);
+    SetBusy(false, QString());
+    emit operationFinished(KindName(captured.kind), captured.ok);
+    return;
+  }
   // 进度归零：新一次操作的百分比不能沿用上一次的。
   bytes_done_.store(0);
   bytes_total_.store(0);
@@ -2451,6 +2485,18 @@ bool RemoteController::setConnectionMode(const QString& mode) {
     return true;
   }
   connection_mode_ = next;
+
+  // 切进官方云端时，把人工 pin 那一套反馈收起来：官方模式既没有指纹输入框，
+  // 也不该残留上一轮 manual pin 的红色报错（人工验收：从 ssh/direct 切回官方
+  // 之后仍然看到“服务器身份指纹不合法”）。这里**只清 pin 相关的东西**：
+  // 真正的证书错误（签名失败 / server_id 不匹配 / 过期）是切过来之后、真的
+  // 尝试连接时才产生的，不会被这一段碰到。
+  if (next == ConnectionMode::kOfficialCloud) {
+    ClearSurfaceError(ErrorSurface::kServerKey);
+    clearPinApplyState();
+    ClearSurfaceError(ErrorSurface::kLogin);
+    ClearSurfaceError(ErrorSurface::kRegister);
+  }
   // 只改配置：不联网、不登录、不断开正在跑的通道、也不杀进程。切换模式与
   // "应用 pin"是同一类动作 —— 配置，不是连接测试。
   emit connectionChanged();
@@ -2812,6 +2858,10 @@ bool RemoteController::registerAccountWithPin(const QString& host,
                                               const QString& password,
                                               const QString& confirm_password,
                                               const QString& base_pin) {
+  // 同 loginWithPin：官方云端不经过人工 pin（见那里的说明）。
+  if (connection_mode_ == ConnectionMode::kOfficialCloud) {
+    return registerAccount(host, port_text, username, password, confirm_password);
+  }
   const QString pin_state = CommitServerKeyPin(base_pin);
   if (pin_state == QStringLiteral("invalid")) {
     last_error_kind_ = QStringLiteral("validation");
@@ -2832,6 +2882,15 @@ bool RemoteController::loginWithPin(const QString& host,
                                     const QString& username,
                                     const QString& password,
                                     const QString& base_pin) {
+  // PR #23 人工验收发现的 blocker：官方云端模式的身份来自内置
+  // OfficialCloudProfile + 内置官方根 + BPSEC2 证书，页面上**没有**指纹输入框。
+  // 这里必须先按模式分流：否则一个隐藏的空输入框会被当成“指纹不合法”，把官方
+  // 登录整条挡住（用户看到的就是“服务器身份指纹不合法，请先按上面的提示修正，
+  // 再点登录”）。分流放在控制器里而不是 QML 里 —— 语义由控制器保证，QML 以后
+  // 误调 *WithPin 也不会让官方模式走人工 pin。
+  if (connection_mode_ == ConnectionMode::kOfficialCloud) {
+    return login(host, port_text, username, password);
+  }
   // 提交之前先把**用户此刻看得见的那一个** pin 提交掉。人工验收里最自然的
   // 路径就是"填 pin -> 填账号 -> 点登录"，旧实现会让这次登录用上一次的
   // 值（没有就是空），于是要么莫名失败、要么用户以为填的已经生效了。
