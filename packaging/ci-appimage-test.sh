@@ -62,6 +62,12 @@ expect_file "官方根公钥（公开材料）" "/tmp/appimage-extract/squashfs-
 
 ci_section "5. 二进制里不许出现开发机路径"
 dev_hits="$(grep -rIl '/home/pw-is-123\|/tmp/stage-\|/workspace/backup-project/build' /tmp/appimage-extract/squashfs-root/usr/bin 2>/dev/null | wc -l)"
+if [ "$dev_hits" != "0" ]; then
+  echo "  命中文件："
+  grep -rIl '/home/pw-is-123\|/tmp/stage-\|/workspace/backup-project/build' /tmp/appimage-extract/squashfs-root/usr/bin 2>/dev/null | sed 's/^/    /'
+  echo "  命中内容（每条文件第一处）："
+  grep -rIoh '\S*\(/home/pw-is-123\|/tmp/stage-\|/workspace/backup-project/build\)\S*' /tmp/appimage-extract/squashfs-root/usr/bin 2>/dev/null | LC_ALL=C sort -u | sed -n '1,10p' | sed 's/^/    /'
+fi
 expect_eq "二进制内没有开发机路径" "0" "$dev_hits"
 
 ci_finish "appimage"
