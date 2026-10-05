@@ -16,6 +16,8 @@ export NO_AT_BRIDGE=1
 ci_section "环境：确认这台机器没有 Qt 开发包"
 qt_dev="$(dpkg -l 2>/dev/null | awk '/^ii/ && /qt6-.*dev/ {print $2}' | wc -l)" 
 expect_eq "机器上没有 qt6-*-dev（AppImage 不该依赖它们）" "0" "$qt_dev"
+qt_any="$(dpkg -l 2>/dev/null | awk '/^ii/ && /(libqt6|qml6-module)/ {print $2}' | wc -l)"
+expect_eq "机器上没有任何 Qt 运行时包（AppImage 自带 Qt）" "0" "$qt_any"
 expect_file "AppImage 存在：$(basename "$APPIMAGE")" "$APPIMAGE"
 
 ci_section "1. CLI 入口（AppImage 里的 backupctl）"
