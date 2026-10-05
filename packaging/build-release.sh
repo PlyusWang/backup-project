@@ -215,6 +215,9 @@ build_appdir() {
   # 告诉它去哪读 import 依赖；否则会出现"能构建、装到干净机器上缺 QML 模块"。
   export QML_SOURCES_PATHS="$REPO_ROOT/ui/modern/qml"
   export EXTRA_QT_MODULES="QtQuick;QtQml;QtQuick.Controls;QtQuick.Layouts;QtQuick.Dialogs;QtQuick.Window;QtNetwork;QtConcurrent"
+  # offscreen / minimal 平台插件也要带上：CI 与无显示环境（容器、远程维护）都要能
+  # 启动同一个 AppImage，而不是只支持有 X 的机器。每个插件只有几十 KB。
+  export EXTRA_QT_PLUGINS="platforms/libqoffscreen.so;platforms/libqminimal.so"
   export APPIMAGE_EXTRACT_AND_RUN=1
   export ARCH=x86_64
   export PATH="$WORK/bin:$PATH"
