@@ -44,6 +44,19 @@ struct RemoteEndpoint {
   // 本客户端不做"第一次见到谁就信谁"（TOFU）——否则中间人可以随便换密钥，
   // 传输加密就只剩一个好看的名字。
   std::string server_key_pin;
+
+  // ---- BPSEC2：签名身份（证书）----
+  //
+  // identity_mode == "certificate" 时走证书模式：server_key_pin 被**忽略**，
+  // 上面那个 pin 字段不再参与任何判断（两条路互斥 —— 没有"证书验不过就退回
+  // pin"的分支，那种分支就是降级漏洞）。其余取值按 pin 模式处理。
+  //
+  //   trusted_roots_file   可信根文件；**空 = 用编译进客户端的内置官方根**
+  //                        （官方云端就是这个用法，用户不需要任何配置）
+  //   expected_server_id   证书里必须出现的 server_id，逐字节比较
+  std::string identity_mode = "pin";
+  std::string trusted_roots_file;
+  std::string expected_server_id;
 };
 
 struct RemoteSnapshotInfo {

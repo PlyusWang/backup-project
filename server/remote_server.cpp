@@ -24,6 +24,7 @@
 #include <fstream>
 #include <sstream>
 
+#include "bpcert.h"
 #include "crypto.h"
 #include "file_lock.h"
 #include "remote_auth.h"
@@ -290,15 +291,58 @@ bool RemoteServer::Configure(const RemoteServerConfig& config,
   // 环回地址——这是纵深防御的一部分，不是机密性的前提：把只该由隧道访问的
   // 端口直接暴露在共享网络上没有任何好处，所以这里继续 fail closed，
   // 不提供 --insecure / --allow-public 之类的开关。
+  // PR #23：默认规则不变（非回环一律拒绝），但多了一条**显式**例外：
+  // 官方云端要让用户不开隧道，就必须把 18765 暴露在公网上。这个例外必须
+  // 同时满足三件事，缺一不可：
+  //   1. 显式给 --allow-public-bind <理由>，理由是给日志和事后审计看的；
+  //   2. 配置了 BPSEC2 身份证书 —— 公网监听的正当性完全建立在「客户端能用
+  //      证书确认对端是谁」之上，没有证书就只是把端口裸奔出去；
+  //   3. 理由不能是空串（形式上的「我知道我在做什么」）。
+  // 没有这个开关时，0.0.0.0 / 127.0.0.2 / 192.168.x 的拒绝行为与过去逐字
+  // 相同，既有测试仍然断言这一点。
   if (config.bind_address != "127.0.0.1") {
-    if (error_message != nullptr) {
-      *error_message =
-          "--bind must be 127.0.0.1, not " + config.bind_address +
-          ": this version has no native TLS, so the server only accepts"
-          " loopback connections; reach a remote instance through an SSH"
-          " tunnel (ssh -N -L 18765:127.0.0.1:18765 <host>)";
+    if (!config.allow_public_bind) {
+      if (error_message != nullptr) {
+        *error_message =
+            "--bind must be 127.0.0.1, not " + config.bind_address +
+            ": this version has no native TLS, so the server only accepts"
+            " loopback connections; reach a remote instance through an SSH"
+            " tunnel (ssh -N -L 18765:127.0.0.1:18765 <host>)."
+            " To serve the official cloud directly on a public address,"
+            " pass --allow-public-bind <reason> together with"
+            " --bpsec2-cert-file.";
+      }
+      return false;
     }
-    return false;
+    if (config.certificate_file_path.empty()) {
+      if (error_message != nullptr) {
+        *error_message =
+            "--allow-public-bind requires --bpsec2-cert-file: a public"
+            " listener must authenticate itself with a signed identity,"
+            " otherwise clients have no way to tell who they are talking to";
+      }
+      return false;
+    }
+    if (!config.require_bpsec2) {
+      // 公网监听只允许签名身份，而且要**只**允许签名身份：只开证书却仍接受
+      // BPSEC1 的 pin 客户端，等于在公网上保留一条"人工指纹"的旧路。红队
+      // 复核用真实二进制验证过：不加这一条，pin 客户端在公网监听上仍能 ping 通。
+      if (error_message != nullptr) {
+        *error_message =
+            "--allow-public-bind requires --require-bpsec2: a public listener"
+            " must accept signed-identity clients only, otherwise the legacy"
+            " pin path stays reachable on the internet";
+      }
+      return false;
+    }
+    if (config.public_bind_reason.empty()) {
+      if (error_message != nullptr) {
+        *error_message =
+            "--allow-public-bind requires a non-empty reason"
+            " (it is written to the startup log)";
+      }
+      return false;
+    }
   }
   if (config.root_directory.empty()) {
     if (error_message != nullptr) {
@@ -403,6 +447,17 @@ bool RemoteServer::Start(std::string* error_message) {
     data_lock_.reset();
     return false;
   }
+  if (config_.bind_address != "127.0.0.1") {
+    // 公网监听必须在日志里留痕：出了事要能一眼看出当时是谁、以什么理由
+    // 把它开出去的。理由是启动参数里那句话，不是脚本猜的。
+    std::ostringstream public_line;
+    public_line << "WARNING: listening on a PUBLIC address "
+                << config_.bind_address << ":" << bound_port_
+                << " reason=" << config_.public_bind_reason
+                << " identity=bpsec2-certificate"
+                << " require_bpsec2=" << (config_.require_bpsec2 ? "yes" : "no");
+    Log(public_line.str());
+  }
   {
     std::ostringstream line;
     line << "listening on " << config_.bind_address << ":" << bound_port_
@@ -427,6 +482,40 @@ bool RemoteServer::LoadSecret(std::string* error_message) {
   return true;
 }
 
+namespace {
+
+// 读整个文件。BPSEC2 的证书是几十到几百字节的公开材料，一次读完最简单。
+bool ReadWholeFile(const std::string& path, std::string* out,
+                   std::string* error_message) {
+  std::ifstream input(path, std::ios::binary);
+  if (!input) {
+    if (error_message != nullptr) {
+      *error_message = "打不开文件：" + path;
+    }
+    return false;
+  }
+  std::ostringstream buffer;
+  buffer << input.rdbuf();
+  *out = buffer.str();
+  // 上限先于解析：BPCERT1 本身有 4096 字节硬上限，先卡住长度就不必把一个
+  // 任意大的文件读进内存再被解析器拒绝（红队复核的 nit）。
+  if (out->size() > 4096) {
+    if (error_message != nullptr) {
+      *error_message = "文件超过 4096 字节上限：" + path;
+    }
+    return false;
+  }
+  if (out->empty()) {
+    if (error_message != nullptr) {
+      *error_message = "文件是空的：" + path;
+    }
+    return false;
+  }
+  return true;
+}
+
+}  // namespace
+
 bool RemoteServer::LoadTransportIdentityKey(std::string* error_message) {
   if (!LoadTransportIdentity(config_.transport_key_file_path,
                              &transport_identity_, error_message)) {
@@ -435,6 +524,46 @@ bool RemoteServer::LoadTransportIdentityKey(std::string* error_message) {
   // 只记指纹（公开信息），不记私钥。
   Log("BPSEC1 transport identity loaded, fingerprint=" +
       crypto::X25519Fingerprint(transport_identity_.public_key));
+
+  // BPSEC2：按配置加载服务器身份证书（里面只有公钥材料）。
+  if (!config_.certificate_file_path.empty()) {
+    std::string raw;
+    if (!ReadWholeFile(config_.certificate_file_path, &raw, error_message)) {
+      return false;
+    }
+    crypto::Bpcert1 certificate;
+    const crypto::Bpcert1Error parsed = crypto::Bpcert1Parse(raw, &certificate);
+    if (parsed != crypto::Bpcert1Error::kOk) {
+      if (error_message != nullptr) {
+        *error_message = std::string("服务器身份证书不合法：") +
+                         crypto::Bpcert1ErrorName(parsed);
+      }
+      return false;
+    }
+    // 这张证书必须**就是**给本机这把身份密钥签的。否则服务端会拿着一把对
+    // 不上的证书去握手，每个客户端都会拒绝，而真正的原因要到线上才看得出来
+    // —— 宁可在启动时直接失败。
+    if (certificate.server_public_key != transport_identity_.public_key) {
+      if (error_message != nullptr) {
+        *error_message =
+            "服务器身份证书里的公钥与本机 transport.key 不一致"
+            "（这张证书不是给这把密钥签的）";
+      }
+      return false;
+    }
+    transport_identity_.certificate = raw;
+    Log("BPSEC2 identity certificate loaded, server_id=" +
+        certificate.server_id + " issuer=" + certificate.issuer_id +
+        " serial=" + std::to_string(certificate.serial_number) +
+        " sha256=" + crypto::Bpcert1Fingerprint(raw));
+  }
+  if (config_.require_bpsec2 && transport_identity_.certificate.empty()) {
+    if (error_message != nullptr) {
+      *error_message =
+          "--require-bpsec2 需要同时用 --bpsec2-cert-file 给出服务器身份证书";
+    }
+    return false;
+  }
   return true;
 }
 
@@ -665,6 +794,64 @@ bool RemoteServer::HandleRegister(int fd, const FrameHeader& header,
   return SendStatus(fd, header, Status::kOk, std::string(), error_message);
 }
 
+// ---- §33：登录失败节流 ----
+//
+// 目标只有一个：让在线口令猜测变得不划算。三条设计约束：
+//   1. 计数按**用户名字符串**，而不是按 user_id —— 不存在的用户名也必须被
+//      限速，否则「这个用户名被限速了」本身就泄漏了「这个用户名存在」；
+//   2. 锁定期间**即使口令正确也拒绝** —— 否则攻击者只要在锁定窗口里碰对一次
+//      就绕过了节流；
+//   3. 表的大小必须有上界：攻击者可以用海量不同的用户名把内存撑爆，
+//      所以超过上限时先清理已过期的条目，仍然满就不再记录（降级而不是崩）。
+std::int64_t RemoteServer::LoginLockRemainingSeconds(
+    const std::string& username) {
+  if (config_.max_login_failures <= 0 || config_.login_lockout_seconds <= 0) {
+    return 0;
+  }
+  const std::int64_t now = NowSeconds();
+  std::lock_guard<std::mutex> guard(login_throttle_mutex_);
+  const auto found = login_throttle_.find(username);
+  if (found == login_throttle_.end()) {
+    return 0;
+  }
+  return found->second.locked_until > now ? found->second.locked_until - now : 0;
+}
+
+void RemoteServer::RecordLoginFailure(const std::string& username) {
+  if (config_.max_login_failures <= 0 || config_.login_lockout_seconds <= 0) {
+    return;
+  }
+  const std::int64_t now = NowSeconds();
+  std::lock_guard<std::mutex> guard(login_throttle_mutex_);
+  constexpr std::size_t kMaxTracked = 4096;
+  if (login_throttle_.find(username) == login_throttle_.end() &&
+      login_throttle_.size() >= kMaxTracked) {
+    for (auto it = login_throttle_.begin(); it != login_throttle_.end();) {
+      if (it->second.locked_until <= now) {
+        it = login_throttle_.erase(it);
+      } else {
+        ++it;
+      }
+    }
+    if (login_throttle_.size() >= kMaxTracked) {
+      Log("login throttle table is full, not tracking this username");
+      return;
+    }
+  }
+  LoginThrottle& entry = login_throttle_[username];
+  ++entry.consecutive_failures;
+  if (entry.consecutive_failures >= config_.max_login_failures) {
+    entry.locked_until = now + config_.login_lockout_seconds;
+    entry.consecutive_failures = 0;
+    Log("login throttle engaged for the supplied username for " +
+        std::to_string(config_.login_lockout_seconds) + "s");
+  }
+}
+
+void RemoteServer::ClearLoginFailures(const std::string& username) {
+  std::lock_guard<std::mutex> guard(login_throttle_mutex_);
+  login_throttle_.erase(username);
+}
 bool RemoteServer::HandleLogin(int fd, const FrameHeader& header,
                                const std::string& payload,
                                ConnectionContext* context,
@@ -682,6 +869,16 @@ bool RemoteServer::HandleLogin(int fd, const FrameHeader& header,
     return SendError(fd, header.opcode, header.request_id,
                      Status::kInvalidRequest, error_message);
   }
+  // §33：先看节流，而且放在查库**之前** —— 存在与不存在的用户名走同一条
+  // 限速路径，限速本身就不会变成「这个用户名存在吗」的探针。
+  const std::int64_t lock_remaining = LoginLockRemainingSeconds(username);
+  if (lock_remaining > 0) {
+    Log("login throttled: too many consecutive failures for the supplied"
+        " username, " + std::to_string(lock_remaining) +
+        "s remaining");
+    return SendError(fd, header.opcode, header.request_id,
+                     Status::kUnauthorized, error_message);
+  }
   RemoteUserRecord user;
   std::string store_error;
   const StoreResult result = store_->FindUser(username, &user, &store_error);
@@ -694,6 +891,7 @@ bool RemoteServer::HandleLogin(int fd, const FrameHeader& header,
     dummy.iterations = kPasswordIterations;
     bool ignored = false;
     VerifyPassword(password, dummy, &ignored, nullptr);
+    RecordLoginFailure(username);
     Log("login rejected: unknown user");
     return SendError(fd, header.opcode, header.request_id,
                      Status::kUnauthorized, error_message);
@@ -711,6 +909,7 @@ bool RemoteServer::HandleLogin(int fd, const FrameHeader& header,
                      Status::kInternalError, error_message);
   }
   if (!matches) {
+    RecordLoginFailure(username);
     Log("login rejected: wrong password for user id=" +
         std::to_string(user.user_id));
     return SendError(fd, header.opcode, header.request_id,
@@ -724,6 +923,7 @@ bool RemoteServer::HandleLogin(int fd, const FrameHeader& header,
     return SendError(fd, header.opcode, header.request_id,
                      Status::kInternalError, error_message);
   }
+  ClearLoginFailures(username);
   context->state = ConnectionState::kAuthenticated;
   context->user_id = static_cast<std::uint64_t>(user.user_id);
   context->username = user.username;
@@ -1799,8 +1999,14 @@ bool RemoteServer::ServeConnection(int fd, std::string* error_message) {
     handshake_budget_seconds = 30;
   }
   channel.SetHandshakeTimeoutMs(handshake_budget_seconds * 1000);
-  if (!channel.HandshakeServer(fd, transport_identity_, error_message)) {
-    Log(std::string("BPSEC1 handshake failed: ") +
+  // BPSEC2：配置成只接受签名身份时，服务端连 BPSEC1 的 ClientHello 都不接。
+  const bool handshake_ok =
+      config_.require_bpsec2
+          ? channel.HandshakeServerRequireCertificate(fd, transport_identity_,
+                                                      error_message)
+          : channel.HandshakeServer(fd, transport_identity_, error_message);
+  if (!handshake_ok) {
+    Log(std::string("BPSEC1/BPSEC2 handshake failed: ") +
         (error_message != nullptr && !error_message->empty()
              ? *error_message
              : std::string("unknown reason")));

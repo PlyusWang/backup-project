@@ -114,6 +114,8 @@ Item {
     readonly property bool pinDirty:
         page.draftServerKeyPin.trim() !== remote.appliedServerKeyPin
     readonly property bool sshMode: page.draftConnectionMode === "ssh"
+    // 官方云端：身份与地址都来自编译进二进制的 profile，界面上不需要任何输入。
+    readonly property bool officialMode: page.draftConnectionMode === "official"
     // 通道状态的颜色：建好了是绿的，失败是红的，正在动是黄的，没启动是灰的。
     readonly property color tunnelColor:
         remote.tunnelState === "ready" ? theme.success
@@ -358,11 +360,15 @@ Item {
 
                             SegmentedTabs {
                                 objectName: "remoteConnectionModeTabs"
-                                Layout.preferredWidth: 420
+                                Layout.preferredWidth: 600
                                 enabled: !remote.busy
                                 currentKey: page.draftConnectionMode
                                 model: [
-                                    { "key": "ssh", "text": "SSH 安全通道（推荐）" },
+                                    // PR #23：官方云端是普通用户的默认/推荐路径；SSH 安全
+                                    // 通道降为“兼容”（它仍然完全可用，只是不再是官方
+                                    // 用户需要理解的东西）。
+                                    { "key": "official", "text": "官方云端（推荐）" },
+                                    { "key": "ssh", "text": "SSH 安全通道（兼容）" },
                                     { "key": "direct", "text": "直接连接（高级）" }
                                 ]
                                 onActivated: function (key) {
@@ -376,6 +382,29 @@ Item {
                             }
 
                             Item { Layout.fillWidth: true }
+                        }
+                    }
+
+                    // ---------- 官方云端（仅官方模式）----------
+                    // 这一块**故意**只有一个标题和一句话：官方云端就是
+                    // 不需要用户填任何东西，所以界面上也不该出现任何输入框。
+                    ColumnLayout {
+                        Layout.fillWidth: true
+                        visible: page.officialMode
+                        spacing: 6
+
+                        Text {
+                            objectName: "remoteOfficialCloudName"
+                            text: remote.officialCloudName
+                            font.pixelSize: 18
+                            font.bold: true
+                            color: theme.textSecondary
+                        }
+
+                        Text {
+                            text: "服务器身份由官方根签发的证书自动校验；不需要配置隧道，也不需要核对任何指纹。"
+                            wrapMode: Text.WordWrap
+                            color: theme.textSecondary
                         }
                     }
 
@@ -551,9 +580,12 @@ Item {
                         wrapMode: Text.WrapAnywhere
                     }
 
+                    // 官方云端不需要知道主机与端口（它们来自编译进二进制的
+                    // profile），所以官方模式下这一整行隐藏；用户名与密码仍然要填。
                     RowLayout {
                         Layout.fillWidth: true
                         spacing: 12
+                        visible: !page.officialMode
 
                         ColumnLayout {
                             Layout.fillWidth: true
@@ -639,10 +671,12 @@ Item {
                     // 服务器身份指纹：连接设置的一部分（地址 / 端口 / 用户名 /
                     // 指纹）。指纹错了就是一个输入问题，"应用"之后原因写在这
                     // 张表单自己的错误行里，不弹对话框，也不占用页面底部横幅。
+                    // 官方模式用证书认证，根本不比对指纹，所以整块隐藏。
                     ColumnLayout {
                         Layout.fillWidth: true
                         Layout.topMargin: 4
                         spacing: 4
+                        visible: !page.officialMode
 
                         Text {
                             text: "服务器身份指纹（server-key）"
@@ -786,10 +820,18 @@ Item {
                                     remote.clearLoginError()
                                 }
                                 onAccepted: {
+                                    // PR #23 人工验收修复：官方云端没有指纹输入框，
+                                    // 必须走不带 pin 的入口；ssh / direct 继续走 *WithPin
+                                    // （保持“输入框里的值自动生效”这条 PR #22 语义）。
+                                    // 控制器自己也做了同样的分流 —— 这里只是让调用点
+                                    // 与当前模式的语义一致。
                                     if (!remote.busy)
-                                        remote.loginWithPin(page.draftHost, page.draftPort,
-                                                            page.draftUser, page.draftPassword,
-                                                            page.draftServerKeyPin)
+                                        page.officialMode
+                                            ? remote.login(page.draftHost, page.draftPort,
+                                                           page.draftUser, page.draftPassword)
+                                            : remote.loginWithPin(page.draftHost, page.draftPort,
+                                                                  page.draftUser, page.draftPassword,
+                                                                  page.draftServerKeyPin)
                                 }
                             }
 
@@ -805,9 +847,14 @@ Item {
                                     enabled: !remote.busy
                                     // PR #22：登录前先把**当前输入框里的**
                                     // 指纹自动提交掉。用户不需要记住"先应用再登录"。
-                                    onClicked: remote.loginWithPin(page.draftHost, page.draftPort,
-                                                                   page.draftUser, page.draftPassword,
-                                                                   page.draftServerKeyPin)
+                                    // PR #23：官方云端模式没有指纹框，走不带 pin 的入口；
+                                    // 人工 pin 模式（ssh / direct）保持“先自动提交再登录”。
+                                    onClicked: page.officialMode
+                                                   ? remote.login(page.draftHost, page.draftPort,
+                                                                  page.draftUser, page.draftPassword)
+                                                   : remote.loginWithPin(page.draftHost, page.draftPort,
+                                                                         page.draftUser, page.draftPassword,
+                                                                         page.draftServerKeyPin)
                                 }
 
                                 Text {
@@ -897,10 +944,15 @@ Item {
                                     text: "注册"
                                     variant: "primary"
                                     enabled: !remote.busy
-                                    onClicked: remote.registerAccountWithPin(page.draftHost, page.draftPort,
-                                                                             page.draftUser, page.draftRegisterPassword,
-                                                                             page.draftConfirmPassword,
-                                                                             page.draftServerKeyPin)
+                                    // PR #23：官方云端模式不走人工 pin。
+                                    onClicked: page.officialMode
+                                                   ? remote.registerAccount(page.draftHost, page.draftPort,
+                                                                            page.draftUser, page.draftRegisterPassword,
+                                                                            page.draftConfirmPassword)
+                                                   : remote.registerAccountWithPin(page.draftHost, page.draftPort,
+                                                                                  page.draftUser, page.draftRegisterPassword,
+                                                                                  page.draftConfirmPassword,
+                                                                                  page.draftServerKeyPin)
                                 }
 
                                 // 正常状态只给一句弱化的辅助文字；真的不一致时换成

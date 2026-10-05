@@ -129,6 +129,7 @@
 #include "schedule_frequency.h"
 #include "schedule_store.h"
 #include "scheduler_lock.h"
+#include "server_profile.h"
 
 namespace {
 
@@ -258,6 +259,7 @@ void ScrollBackupPage(QQuickWindow* window, int content_y) {
 // 跳过；但仓库里明明有加密记录却找不到对话框就是缺陷，按失败处理。
 int CaptureScreenshots(QQuickWindow* window, backup_modern::AppTheme* theme,
                        backup_modern::BackupController* controller,
+                       backup_modern::RemoteController* remote,
                        const QString& directory) {
   if (!QDir().mkpath(directory)) {
     std::fprintf(stderr, "无法创建截图目录: %s\n", qPrintable(directory));
@@ -302,6 +304,30 @@ int CaptureScreenshots(QQuickWindow* window, backup_modern::AppTheme* theme,
         return 1;
       }
     }
+  }
+
+  // 服务器身份的三种模式各留一张（PR #23）：官方云端 / 自定义（SSH 通道）/
+  // 自定义（直连）。这三张图正是这个 PR 要证明的东西 —— 官方云端只显示名字
+  // 加一句话，主机、端口、指纹一个都不出现；自定义模式才需要用户填。
+  if (remote != nullptr) {
+    struct ModeShot {
+      const char* mode;
+      const char* name;
+    };
+    const ModeShot shots[3] = {{"official", "official-cloud"},
+                               {"ssh", "advanced-ssh-mode"},
+                               {"direct", "custom-server-profile"}};
+    for (const ModeShot& shot : shots) {
+      remote->setConnectionMode(QString::fromLatin1(shot.mode));
+      for (int dark = 0; dark < 2; ++dark) {
+        theme->setDark(dark == 1);
+        window->setProperty("currentPage", kPageCount - 1);
+        if (!grab(QString::fromLatin1(shot.name), dark == 1)) {
+          return 1;
+        }
+      }
+    }
+    remote->setConnectionMode(QStringLiteral("official"));
   }
 
   // 高级选项展开：备份页在"收起 / 展开"两种状态下各留一张图，
@@ -5467,6 +5493,26 @@ bool ObjectVisible(QQuickWindow* window, const char* object_name) {
       window->findChild<QObject*>(QString::fromLatin1(object_name));
   return object != nullptr && object->property("visible").toBool();
 }
+// 有效可见性：自己的 visible 为真**且**所有祖先都可见。QML 里的 visible 绑定
+// 通常挂在容器上（例如官方模式下被隐藏的整个指纹区块），只看控件自己的属性会
+// 把“用户其实看不到”误判成可见。
+bool EffectivelyVisible(QQuickWindow* window, const char* object_name) {
+  QObject* object =
+      window->findChild<QObject*>(QString::fromLatin1(object_name));
+  if (object == nullptr) {
+    return false;
+  }
+  for (QObject* node = object; node != nullptr; node = node->parent()) {
+    const QVariant visible = node->property("visible");
+    if (visible.isValid() && !visible.toBool()) {
+      return false;
+    }
+    if (node == window) {
+      break;
+    }
+  }
+  return true;
+}
 
 QString ObjectText(QQuickWindow* window, const char* object_name) {
   QObject* object =
@@ -5525,6 +5571,143 @@ void ScrollRemotePageToBottom(QQuickWindow* window) {
 
 }  // namespace
 
+// ---- --official-acceptance：真实官方云端的 GUI 人工验收路径 ----
+//
+// PR #23 的正式合同是「官方云端 = OfficialCloudProfile + 内置官方根 + BPSEC2
+// 证书」：普通用户**不该看到、也不该被要求填写**服务器身份指纹。人工视觉验收
+// 发现当时的登录路径仍然经过 manual pin，被一句“服务器身份指纹不合法”挡死。
+// 这一条把**修好之后的那条路**在真实窗口上跑一遍，并留下一张 PNG（走窗口自己的
+// grabWindow()，与用户看到的是同一条渲染路径）：
+//
+//   官方云端（页面选中）-> 用户名 / 口令 -> 点“登录”-> 云端列表
+//
+// 它打的是编译进二进制的官方端点（真实 ECS），所以**不进 final gate**
+// （gate 不能依赖公网），由人工验收单独跑：
+//
+//   QT_QPA_PLATFORM=offscreen BACKUP_REMOTE_PASSWORD=...
+//   build/backup-gui-modern
+//     --official-acceptance <用户名> <输出.png> --config-file ...
+//
+// 口令只从环境变量读：不进 argv（进程列表对同机用户可见），也不进日志。
+int RunOfficialAcceptance(QQuickWindow* window,
+                          backup_modern::RemoteController* remote,
+                          const QString& username, const QString& out_png) {
+  const QString password = qEnvironmentVariable("BACKUP_REMOTE_PASSWORD");
+  if (password.isEmpty()) {
+    std::fprintf(stderr,
+                 "[official-acceptance] 需要环境变量 BACKUP_REMOTE_PASSWORD\n");
+    return 2;
+  }
+  const auto count_ssh = []() {
+    QProcess probe;
+    probe.start(QStringLiteral("pgrep"),
+                QStringList() << QStringLiteral("-c") << QStringLiteral("-x")
+                              << QStringLiteral("ssh"));
+    probe.waitForFinished(5000);
+    return QString::fromUtf8(probe.readAllStandardOutput()).trimmed().toInt();
+  };
+
+  CheckRun run;
+  run.prefix = "[official-acceptance]";
+  const int ssh_before = count_ssh();
+
+  // 页面有它自己的一份草稿状态（draftConnectionMode）—— 官方区块的 visible
+  // 绑定读的是 page.officialMode。用户点分段控件时 onActivated 会把这两边一起
+  // 改掉；这里等价地做同一件事，否则控制器已经是官方、页面还停在 ssh，
+  // 截图与可见性断言都会错。
+  remote->setConnectionMode(QStringLiteral("official"));
+  QObject* remote_page =
+      window->findChild<QObject*>(QStringLiteral("remotePage"));
+  if (remote_page != nullptr) {
+    remote_page->setProperty("draftConnectionMode", QStringLiteral("official"));
+  }
+  window->setProperty("currentPage", 6);
+  WaitForAnimation(500);
+  run.Check(EffectivelyVisible(window, "remoteOfficialCloudName"),
+            QStringLiteral("A01 官方云端已选中（页面上显示云端名字）"));
+  run.Check(!EffectivelyVisible(window, "remoteServerKeyPinField") &&
+                !EffectivelyVisible(window, "remoteSshHostField") &&
+                !EffectivelyVisible(window, "remoteHostField") &&
+                !EffectivelyVisible(window, "remotePortField"),
+            QStringLiteral("A02 官方模式下主机 / 端口 / 指纹三样都看不到"));
+  run.Check(EffectivelyVisible(window, "remoteUserField") &&
+                EffectivelyVisible(window, "remotePasswordField") &&
+                EffectivelyVisible(window, "remoteLoginButton"),
+            QStringLiteral("A03 用户名 / 密码 / 登录按钮仍然在页面上"));
+
+  TypeIntoField(window, "remoteUserField", username);
+  TypeIntoField(window, "remotePasswordField", password);
+  ClickButton(window, "remoteLoginButton");
+  const bool finished = remote->waitForIdle(120000);
+  run.Check(finished && remote->authenticated(),
+            QStringLiteral("A04 点“登录”之后真的登录成功（零指纹）"),
+            remote->lastErrorKindForTest() + QStringLiteral(": ") +
+                remote->loginError());
+  run.Check(remote->serverKeyPin().isEmpty(),
+            QStringLiteral("A05 全程没有配置过任何服务器身份指纹"),
+            remote->serverKeyPin());
+  // 登录成功之后控制器会自动读一次列表：等它落地，截图里才有“云端列表”。
+  remote->waitForIdle(60000);
+  WaitForAnimation(600);
+  run.Check(remote->authenticated() && remote->loginError().isEmpty(),
+            QStringLiteral("A06 登录态与云端列表都到位（截图里的可见状态）"),
+            remote->loginError());
+  // A07：再显式刷一次云端列表。登录成功之后的自动读列表是“顺带”的，这一条是
+  // 人工验收要求的 refresh/list 本身成功（失败时 last_error_kind_ 不是 none）。
+  const bool refreshed = remote->refreshList() && remote->waitForIdle(60000);
+  run.Check(
+      refreshed && remote->lastErrorKindForTest() == QStringLiteral("none"),
+      QStringLiteral("A07 云端列表刷新（refresh/list）成功"),
+      remote->lastErrorKindForTest() + QStringLiteral(": ") +
+          remote->lastDetailForTest());
+  const int ssh_after = count_ssh();
+  run.Check(ssh_before == ssh_after,
+            QStringLiteral("A08 全程 ssh 进程数 delta = 0（没有偷偷开隧道）"),
+            QStringLiteral("%1 -> %2").arg(ssh_before).arg(ssh_after));
+
+  // 一张图要同时证明四件事：官方云端被选中 / 指纹区不存在 / 已登录 / 云端列表。
+  // 默认 1180x760 装不下这一页，所以按真实 contentItem 的高度把窗口开高 ——
+  // 与 --screenshot-remote 的整页总览同一条做法（同一套 QML、同一条 grabWindow
+  // 路径），不是另画一份示意图。
+  QQuickItem* remote_scroll =
+      window->findChild<QQuickItem*>(QStringLiteral("remotePageScroll"));
+  if (remote_scroll != nullptr) {
+    QQuickItem* flickable =
+        remote_scroll->property("contentItem").value<QQuickItem*>();
+    if (flickable != nullptr) {
+      // 用 Flickable 自己的 contentHeight（contentItem 的高度在未显式设置时
+      // 等于视口高度，拿它算会得到“一屏高”，窗口根本不会变高）。
+      double content = flickable->property("contentHeight").toDouble();
+      if (content <= 0.0) {
+        content = flickable->height();
+      }
+      const int page_height = static_cast<int>(std::ceil(content)) + 16;
+      std::printf("[official-acceptance] contentHeight=%.1f page_height=%d\n",
+                  content, page_height);
+      if (page_height > 760 && page_height <= 1600) {
+        window->setWidth(1180);
+        window->setHeight(page_height);
+        WaitForAnimation(400);
+      }
+    }
+  }
+
+  const QImage image = window->grabWindow();
+  if (image.isNull() || !image.save(out_png)) {
+    std::fprintf(stderr, "[official-acceptance] 截图保存失败: %s\n",
+                 qPrintable(out_png));
+    return 1;
+  }
+  std::printf("[official-acceptance] screenshot: %s\n", qPrintable(out_png));
+  std::printf("[official-acceptance] passed=%d failed=%d\n", run.passed,
+              run.failed);
+  for (const QString& failure : run.failures) {
+    std::fprintf(stderr, "[official-acceptance] FAIL %s\n",
+                 qPrintable(failure));
+  }
+  return run.failed == 0 ? 0 : 1;
+}
+
 // C01..C07：不需要任何外部依赖。
 //
 // working_pin 是调用方已经配好的**正确** pin（C01 会把它改掉再改回来），
@@ -5539,6 +5722,155 @@ int RunRemoteConnectionUx(QQuickWindow* window,
   // 先把页面切到 Remote 页：控件的 visible 绑定与这一页的 currentPage 有关。
   window->setProperty("currentPage", 6);
   WaitForAnimation(300);
+
+  // ---- PR #23 人工验收 blocker 的回归：官方云端不该经过人工 pin ----
+  //
+  // 人工验收的真实路径是“官方云端 -> 用户名 / 口令 -> 登录”，而当时的实现无条件
+  // 走 *WithPin，把一个**隐藏的**空指纹框当成“指纹不合法”，官方用户被挡在门外。
+  // 自动测试当时没发现，是因为 C01..C07 **全部**在 ssh / direct 模式下跑 ——
+  // 没有任何一条用例走过 official 模式。
+  //
+  // 这一段用“只记录不发送”的注入点：官方 profile 指向真实 ECS，而 final gate
+  // 不能依赖公网。断言的是**本地合同**（有没有被 pin 闸门挡住、发出去的请求长
+  // 什么样），不是网络结果 —— 网络结果由人工验收与 Phase 8 负责。
+  {
+    remote->setCaptureDispatchedRequestForTest(true);
+    // 本段是**插在 C01..C07 前面**的：它们打的是本地服务端，对连接方式有
+    // 自己的期待（进这一节时是“直连”）。所以这里把进入时的模式存下来，
+    // 结束时原样恢复 —— 否则 C03 / C04 会顺着 SSH 通道打到真实 ECS，
+    // 以一次 BPSEC1 握手失败收场（本修复的第一版正是这么红的）。
+    const QString mode_before_official_block = remote->connectionMode();
+    const QString official_user = QStringLiteral("gui-official-01");
+    const QString pin_before_official = remote->serverKeyPin();
+    const backupproject::net::ServerProfile official =
+        backupproject::net::OfficialCloudProfile();
+
+    // ---- OFFICIAL-GUI-LOGIN-01：官方模式 + 空 pin，点真实 QML 的“登录”按钮
+    // ----
+    remote->setConnectionMode(QStringLiteral("official"));
+    TypeIntoField(window, "remoteUserField", official_user);
+    TypeIntoField(window, "remotePasswordField", password);
+    const int login_before = remote->dispatchedRequestCountForTest();
+    ClickButton(window, "remoteLoginButton");
+    const backupproject::net::RemoteEndpoint login_sent =
+        remote->lastDispatchedEndpointForTest();
+    run->Check(remote->dispatchedRequestCountForTest() == login_before + 1,
+               QStringLiteral(
+                   "OFFICIAL-GUI-LOGIN-01a 官方模式 + 空 pin：点“登录”确实发出"
+                   "了一次请求（没有被 pin 闸门挡在本地）"),
+               remote->lastErrorKindForTest() + QStringLiteral(": ") +
+                   remote->loginError());
+    run->Check(
+        login_sent.identity_mode == "certificate" &&
+            login_sent.host == official.host &&
+            login_sent.port == official.port &&
+            login_sent.expected_server_id == official.expected_server_id &&
+            login_sent.trusted_roots_file.empty(),
+        QStringLiteral(
+            "OFFICIAL-GUI-LOGIN-01b 请求用的是 OfficialCloudProfile + "
+            "certificate（空 trusted_roots_file = 内置官方根）"),
+        QString::fromStdString(login_sent.identity_mode + " " +
+                               login_sent.host + ":" +
+                               std::to_string(login_sent.port) +
+                               " id=" + login_sent.expected_server_id));
+    run->Check(
+        !remote->loginError().contains(QStringLiteral("指纹")) &&
+            remote->lastErrorKindForTest() != QStringLiteral("validation") &&
+            remote->serverKeyPinError().isEmpty(),
+        QStringLiteral("OFFICIAL-GUI-LOGIN-01c 没有产生任何 server_key_pin "
+                       "validation error"),
+        remote->loginError() + QStringLiteral(" | ") +
+            remote->serverKeyPinError());
+    run->Check(
+        remote->serverKeyPin() == pin_before_official,
+        QStringLiteral("OFFICIAL-GUI-LOGIN-01d 官方登录没有提交、也没有读取"
+                       "隐藏的指纹输入"));
+
+    // ---- OFFICIAL-GUI-REGISTER-01：注册路径同样不得要求 pin ----
+    TypeIntoField(window, "remoteRegisterPasswordField", password);
+    TypeIntoField(window, "remoteRegisterConfirmField", password);
+    const int register_before = remote->dispatchedRequestCountForTest();
+    ClickButton(window, "remoteRegisterButton");
+    run->Check(remote->dispatchedRequestCountForTest() == register_before + 1 &&
+                   !remote->registerError().contains(QStringLiteral("指纹")),
+               QStringLiteral(
+                   "OFFICIAL-GUI-REGISTER-01 官方模式 + 空 pin：注册同样不被"
+                   "指纹闸门挡住"),
+               remote->registerError());
+
+    // ---- OFFICIAL-GUI-STALE-PIN-01：manual pin 的旧报错不得污染官方模式 ----
+    remote->setConnectionMode(QStringLiteral("ssh"));
+    remote->applyServerKeyPin(QStringLiteral("sha256:") +
+                              QString(64, QLatin1Char('3')));
+    const bool pin_blocked =
+        remote->loginWithPin(host, port_text, official_user, password,
+                             QStringLiteral("sha256:nothex"));
+    const QString stale_error = remote->loginError();
+    remote->setConnectionMode(QStringLiteral("official"));
+    const int stale_before = remote->dispatchedRequestCountForTest();
+    ClickButton(window, "remoteLoginButton");
+    run->Check(
+        !pin_blocked && !stale_error.isEmpty() &&
+            remote->dispatchedRequestCountForTest() == stale_before + 1 &&
+            !remote->loginError().contains(QStringLiteral("指纹")),
+        QStringLiteral("OFFICIAL-GUI-STALE-PIN-01 先在 manual 模式制造 pin "
+                       "报错，切到官方云端之后它不再阻挡登录"),
+        QStringLiteral("blocked=") + (pin_blocked ? "1" : "0") + " stale=[" +
+            stale_error + "] now=[" + remote->loginError() + "]");
+
+    // ---- MANUAL-PIN-REGRESSION：官方模式的修复**没有**放松手动 pin 合同 ----
+    // 空 pin 与畸形 pin 在本地就要挡住（一个字节都不发）。“well-formed 但错”的
+    // pin 只能在服务端被发现，那一条由 C03a（真实本地服务端 ->
+    // pin-mismatch）覆盖。
+    const auto must_block_locally = [&](const QString& label,
+                                        const QString& mode,
+                                        const QString& pin_text,
+                                        bool via_with_pin) {
+      remote->setConnectionMode(mode);
+      const int before = remote->dispatchedRequestCountForTest();
+      bool accepted = false;
+      if (via_with_pin) {
+        accepted = remote->loginWithPin(host, port_text, official_user,
+                                        password, pin_text);
+      } else {
+        remote->clearServerKeyPinForTest();
+        accepted = remote->login(host, port_text, official_user, password);
+      }
+      run->Check(
+          !accepted && remote->dispatchedRequestCountForTest() == before &&
+              remote->lastErrorKindForTest() == QStringLiteral("validation"),
+          label,
+          remote->lastErrorKindForTest() + QStringLiteral(": ") +
+              remote->loginError());
+    };
+    must_block_locally(
+        QStringLiteral(
+            "MANUAL-PIN-REGRESSION-01 ssh + 空 pin：本地 fail closed，"
+            "一个字节都不发"),
+        QStringLiteral("ssh"), QString(), false);
+    must_block_locally(
+        QStringLiteral(
+            "MANUAL-PIN-REGRESSION-02 direct + 空 pin：本地 fail closed，"
+            "一个字节都不发"),
+        QStringLiteral("direct"), QString(), false);
+    remote->applyServerKeyPin(good_pin);
+    must_block_locally(
+        QStringLiteral("MANUAL-PIN-REGRESSION-03 direct + 畸形 pin：本地 fail "
+                       "closed，一个字节都不发"),
+        QStringLiteral("direct"), QStringLiteral("sha256:nothex"), true);
+    must_block_locally(
+        QStringLiteral(
+            "MANUAL-PIN-REGRESSION-04 ssh + 畸形 pin：本地 fail closed，"
+            "一个字节都不发"),
+        QStringLiteral("ssh"), QStringLiteral("sha256:nothex"), true);
+
+    // 收尾：关掉注入点，恢复 pin 与模式，后面的 C01.. 继续用真实网络跑。
+    remote->setCaptureDispatchedRequestForTest(false);
+    remote->applyServerKeyPin(good_pin);
+    remote->setConnectionMode(mode_before_official_block);
+    remote->clearLoginError();
+    remote->clearRegisterError();
+  }
 
   const auto restore_pin = [remote, &good_pin]() {
     remote->applyServerKeyPin(good_pin);
@@ -10606,6 +10938,8 @@ int main(int argc, char* argv[]) {
       arguments.indexOf(QStringLiteral("--screenshot"));
   const int screenshot_remote_index =
       arguments.indexOf(QStringLiteral("--screenshot-remote"));
+  const int official_acceptance_index =
+      arguments.indexOf(QStringLiteral("--official-acceptance"));
   const int self_test_index = arguments.indexOf(QStringLiteral("--self-test"));
   const int repository_test_index =
       arguments.indexOf(QStringLiteral("--repository-test"));
@@ -10930,6 +11264,17 @@ int main(int argc, char* argv[]) {
     return RunBackupOptionsTest(&controller, config_file_path);
   }
 
+  if (official_acceptance_index >= 0) {
+    if (official_acceptance_index + 2 >= arguments.size()) {
+      std::fprintf(
+          stderr,
+          "--official-acceptance 需要 <用户名> 与 <输出 PNG> 两个参数\n");
+      return 2;
+    }
+    return RunOfficialAcceptance(window, &remote_controller,
+                                 arguments.at(official_acceptance_index + 1),
+                                 arguments.at(official_acceptance_index + 2));
+  }
   if (screenshot_remote_index >= 0) {
     if (screenshot_remote_index + 1 >= arguments.size()) {
       std::fprintf(stderr, "--screenshot-remote 需要一个输出目录参数\n");
@@ -10943,8 +11288,9 @@ int main(int argc, char* argv[]) {
       std::fprintf(stderr, "--screenshot 需要一个输出目录参数\n");
       return 2;
     }
-    const int result = CaptureScreenshots(window, &theme, &controller,
-                                          arguments.at(screenshot_index + 1));
+    const int result =
+        CaptureScreenshots(window, &theme, &controller, &remote_controller,
+                           arguments.at(screenshot_index + 1));
     if (result != 0) {
       return result;
     }

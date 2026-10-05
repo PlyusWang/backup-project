@@ -124,7 +124,20 @@ SECURE_OBJECTS="$OBJ_ROOT/src/crypto/x25519.o $OBJ_ROOT/src/crypto/hkdf.o \
 $OBJ_ROOT/src/crypto/aes.o"
 # 客户端下载现在用 file_io 的 FileSink / PublishNoReplace / PublishReplacing 发布，
 # 所以单元测试也要把 file_io 的目标文件链进来（产品构建里它本来就在 CORE 里）。
-SERVER_OBJECTS="$SERVER_ONLY $SECURE_OBJECTS \
+# PR #23（BPSEC2）新增的依赖：服务端要解析 BPCERT1（bpcert.o）、建立根信任
+# （trusted_root_store.o），而 bpcert.o 自己用到的 SHA-512 与 Ed25519 验签原语也必须一起
+# 链进来。它们由 `make all` / `make sanitize` 落在 $OBJ_ROOT/src/crypto/ 下；上面的
+# SERVER_ONLY 那条 find 明确排除了 */crypto/*，所以这里必须显式列出。
+#
+# 漏了这一块的后果：remote_server_test / remote_transfer_test /
+# remote_client_test / remote_account_test / remote_sequence_test 五个单元测试在**干净构建**下链不过
+# （undefined reference to Bpcert1Parse）。残留的旧构建树会把它掩盖掉，所以必须
+# 在清空 build/ 之后验证。
+BPCERT_OBJECTS="$OBJ_ROOT/src/crypto/bpcert.o \
+$OBJ_ROOT/src/crypto/trusted_root_store.o \
+$OBJ_ROOT/src/crypto/sha512.o \
+$OBJ_ROOT/src/crypto/ed25519.o"
+SERVER_OBJECTS="$SERVER_ONLY $SECURE_OBJECTS $BPCERT_OBJECTS \
 $OBJ_ROOT/src/network/remote_backup_client.o \
 $OBJ_ROOT/src/core/file_io.o"
 CRYPTO_OBJECTS="$OBJ_ROOT/src/crypto/sha256.o $OBJ_ROOT/src/crypto/hmac.o \

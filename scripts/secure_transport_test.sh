@@ -45,8 +45,14 @@ trap 'rm -rf "$WORK_DIR"' EXIT
 CXX="${CXX:-g++}"
 EXTRA_FLAGS="${SECURE_TRANSPORT_TEST_EXTRA_FLAGS:-}"
 
+# BPSEC2 把证书层拉进了传输层：secure_transport.cpp 现在会调用
+# Bpcert1Parse / Bpcert1VerifySignature / TrustedRootStore。所以这个套件的
+# 链接清单必须带上它们，否则连不上（这是"改了产品代码要同步改测试链接清单"
+# 的正常代价，不是测试写错了）。
 CRYPTO_SOURCES="src/crypto/sha256.cpp src/crypto/hmac.cpp src/crypto/pbkdf2.cpp \
-src/crypto/aes.cpp src/crypto/random.cpp src/crypto/x25519.cpp src/crypto/hkdf.cpp"
+src/crypto/aes.cpp src/crypto/random.cpp src/crypto/x25519.cpp src/crypto/hkdf.cpp \
+src/crypto/sha512.cpp src/crypto/ed25519.cpp src/crypto/bpcert.cpp \
+src/crypto/trusted_root_store.cpp"
 NET_SOURCES="src/network/network_protocol.cpp src/network/secure_transport.cpp"
 # review-only 工具自己 #include src/network/secure_transport.cpp（要拿到匿名
 # 命名空间里的 CounterBlock / RecordTag），所以它们只链接 network_protocol.cpp。

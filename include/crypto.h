@@ -34,6 +34,10 @@ namespace crypto {
 inline constexpr std::size_t kSha256DigestSize = 32;
 // SHA-256 分组长度。HMAC 用它判断"密钥是否需要先哈希一次"。
 inline constexpr std::size_t kSha256BlockSize = 64;
+
+// SHA-512 摘要长度与分组长度（FIPS 180-4）。Ed25519 的哈希就是 SHA-512。
+inline constexpr std::size_t kSha512DigestSize = 64;
+inline constexpr std::size_t kSha512BlockSize = 128;
 // DES 密钥与分组长度（FIPS 46-3）。
 inline constexpr std::size_t kDesKeySize = 8;
 inline constexpr std::size_t kDesBlockSize = 8;
@@ -76,6 +80,39 @@ class Sha256 {
 
 std::string Sha256Raw(const std::string& data);  // 32 字节原始摘要
 std::string Sha256Hex(const std::string& data);  // 64 个小写十六进制字符
+
+// ---- SHA-512（FIPS 180-4，支持流式）----
+//
+// 与 Sha256 同一套接口形状：Update 可以任意切分，Final 只能调用一次。
+// 它存在的直接原因是 Ed25519（RFC 8032）内部用的就是 SHA-512。
+class Sha512 {
+ public:
+  Sha512();
+
+  // 追加数据。data == nullptr 或 size == 0 时不做任何事（空消息合法）。
+  void Update(const void* data, std::size_t size);
+
+  // 补位、写入 128 位大端 bit 长度并输出摘要。只能调用一次；调用后要继续用
+  // 请先 Reset。
+  void Final(unsigned char out[kSha512DigestSize]);
+
+  // 回到初始状态，等价于新建一个对象。
+  void Reset();
+
+  static void Digest(const void* data, std::size_t size,
+                     unsigned char out[kSha512DigestSize]);
+
+ private:
+  void Transform(const unsigned char block[kSha512BlockSize]);
+
+  std::uint64_t state_[8];
+  unsigned char buffer_[kSha512BlockSize];
+  std::size_t buffer_size_;  // buffer_ 中待处理的字节数，恒 < 128
+  std::uint64_t total_size_;  // 已吸收的字节数（比特长度 = ×8，调用方不必关心）
+};
+
+std::string Sha512Raw(const std::string& data);  // 64 字节原始摘要
+std::string Sha512Hex(const std::string& data);  // 128 个小写十六进制字符
 
 // ---- HMAC-SHA256（RFC 2104，支持流式）----
 // 构造时就把 ipad/opad 吸收进两个哈希状态，因此后续 Update 大 payload 不需要

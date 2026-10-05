@@ -419,6 +419,7 @@ class RemoteController : public QObject {
   QString serverKeyPinError() const { return server_key_pin_error_; }
   // ---- 连接方式 / 通道（PR #22）----
   QString connectionMode() const;
+  QString officialCloudName() const;
   QString sshHost() const { return ssh_host_; }
   QString sshLocalPort() const;
   QString sshProgram() const { return ssh_program_; }
@@ -702,6 +703,24 @@ class RemoteController : public QObject {
   // 挂起是连接层的实现细节，界面看不到，但自检要能证明它真的发生过。
   QString lastDeferredActionForTest() const { return last_deferred_action_; }
   int deferredSubmitCountForTest() const { return deferred_submit_count_; }
+  // ---- PR #23 人工验收修复：官方模式的回归要能断言“Submit()
+  // 到底把什么发出去了” （identity_mode 必须是 certificate，host / port /
+  // expected_server_id 必须来自内置 OfficialCloudProfile）。官方 profile
+  // 指向真实 ECS，而 final gate **不能依赖公网**，
+  // 所以给一个只记录、不发送的注入点：
+  //   * 打开后 DispatchRequest 记下请求端点就返回，一个字节都不发；
+  //   * 这一次操作用一个明确的 "capture-only" **失败**结果收尾——不伪造
+  //     登录成功（那会把 authenticated_ 变成假 true），也不更新可达性。
+  // 生产代码永远不设它（默认 false）。
+  void setCaptureDispatchedRequestForTest(bool capture_only) {
+    capture_dispatched_request_for_test_ = capture_only;
+  }
+  backupproject::net::RemoteEndpoint lastDispatchedEndpointForTest() const {
+    return last_dispatched_endpoint_;
+  }
+  int dispatchedRequestCountForTest() const {
+    return dispatched_request_count_;
+  }
   // 等通道状态机稳定（不是 kStarting / kStopping）。自检用。
   bool waitForTunnelIdle(int timeout_ms);
   // 直接换一个 ssh 可执行文件（自检用它模拟"本机没有 ssh"），
@@ -716,6 +735,13 @@ class RemoteController : public QObject {
   }
   void setConnectionModeForTest(const QString& mode) {
     setConnectionMode(mode);
+  }
+  // 自检用：把“已生效的 pin”清空。产品路径没有“清除指纹”这个动作 ——
+  // 这里只是为了让“manual pin 模式下空 pin 仍然 fail closed”可以被验证。
+  void clearServerKeyPinForTest() {
+    server_key_pin_.clear();
+    endpoint_.server_key_pin.clear();
+    emit serverKeyPinChanged();
   }
   // 故意杀掉**本程序启动的** ssh，用来验证 C12（通道死了 -> 下一次操作
   // 自动重建 + RESUME）。返回是否真的发出了信号。
@@ -752,7 +778,12 @@ class RemoteController : public QObject {
   enum class Phase { kNone = 0, kUpload = 1, kDownload = 2 };
 
   // 客户端怎么到达服务端。见上面的属性说明。
-  enum class ConnectionMode { kSshTunnel = 0, kDirect = 1 };
+  // 官方云端（PR #23）：身份与地址都来自编译进二进制的 OfficialCloudProfile，
+  // 用户不需要填地址、端口、指纹或 server_id。
+  enum class ConnectionMode { kSshTunnel = 0, kDirect = 1, kOfficialCloud = 2 };
+
+  // 官方云端的显示名（QML 直接绑这一条，界面文案只有这一个来源）。
+  Q_PROPERTY(QString officialCloudName READ officialCloudName CONSTANT)
 
   // 一条错误该出现在哪里。每个表单各有自己的错误行（登录 / 注册 / 注销
   // 对话框 / 连接设置里的服务器身份指纹），页面级操作用底部横幅。
@@ -797,6 +828,11 @@ class RemoteController : public QObject {
                                 const QString& error_kind,
                                 const QString& fallback) const;
   // 提交前的统一闸门：busy 与"是否已登录"都在这里挡住，原因写进 surface。
+  // 这个模式是否**必须**有人工 pin 才能连接。
+  //   * ssh / direct：BPSEC1 + 人工 pin，必须有；
+  //   * official：身份来自 OfficialCloudProfile + 内置官方根 + BPSEC2
+  //     证书（identity_mode = certificate，pin 被忽略），**不需要** pin。
+  bool RequiresManualPin() const;
   bool BeginOperation(const QString& action_text, bool need_login,
                       ErrorSurface surface = ErrorSurface::kBanner);
 
@@ -948,6 +984,10 @@ class RemoteController : public QObject {
   DeferredRequest deferred_;
   QString last_deferred_action_;
   int deferred_submit_count_ = 0;
+  // 见 setCaptureDispatchedRequestForTest：默认关闭，生产路径不受影响。
+  bool capture_dispatched_request_for_test_ = false;
+  backupproject::net::RemoteEndpoint last_dispatched_endpoint_;
+  int dispatched_request_count_ = 0;
   // 只等通道、不等某一条请求（用户点了"建立连接"）。
   bool tunnel_only_wait_ = false;
   // BeginOperation 收到的错误落点：请求被挂起之后要用它把失败送回**原来的

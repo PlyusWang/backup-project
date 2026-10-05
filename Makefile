@@ -22,6 +22,10 @@ CORE_SOURCES := src/core/archive_entry.cpp src/core/archive_pipeline.cpp \
                 src/compression/lzss.cpp src/crypto/aes.cpp \
                 src/crypto/des.cpp src/crypto/hmac.cpp src/crypto/pbkdf2.cpp \
                 src/crypto/random.cpp src/crypto/sha256.cpp \
+                src/crypto/sha512.cpp \
+                src/crypto/ed25519.cpp \
+                src/crypto/bpcert.cpp \
+                src/crypto/trusted_root_store.cpp \
                 src/crypto/x25519.cpp src/crypto/hkdf.cpp \
                 src/filter/filter.cpp src/filter/filter_rule_builder.cpp
 
@@ -67,6 +71,10 @@ SERVER_CORE_SOURCES := src/network/network_protocol.cpp \
                        server/remote_server.cpp \
                        src/platform/file_lock.cpp \
                        src/crypto/sha256.cpp \
+                       src/crypto/sha512.cpp \
+                       src/crypto/ed25519.cpp \
+                       src/crypto/bpcert.cpp \
+                       src/crypto/trusted_root_store.cpp \
                        src/crypto/hmac.cpp \
                        src/crypto/pbkdf2.cpp \
                        src/crypto/random.cpp \
@@ -98,6 +106,7 @@ FILESYSTEM_SOURCES := src/filesystem/file_system.cpp
 # CLI 与 Modern GUI 共用同一个 RemoteArchiveClient：桌面端只链接协议编解码与
 # 客户端，**不链接 SQLite**（元数据库只属于服务端进程）。
 CORE_SOURCES += src/network/network_protocol.cpp \
+                   src/network/server_profile.cpp \
                 src/network/secure_transport.cpp \
                 src/network/remote_backup_client.cpp \
                 src/network/snapshot_bundle.cpp \
@@ -136,11 +145,21 @@ FIXTURE_OBJECTS := $(patsubst %.cpp,$(BUILD_DIR)/%.o,$(FIXTURE_SOURCES))
 FIXTURE_CORE_OBJECTS := $(patsubst %.cpp,$(BUILD_DIR)/%.o,$(CORE_SOURCES) $(FILESYSTEM_SOURCES))
 DEPENDS += $(FIXTURE_OBJECTS:.o=.d)
 
-.PHONY: all debug sanitize test test-fixtures server remote-sequence gui gui-modern gui-all clean
+.PHONY: all client client-cli debug sanitize test test-fixtures server remote-sequence gui gui-modern gui-all cert-tool clean
 
 # 产品构建：三个产品产物（CLI + 服务端 + 测试夹具除外）。
 # archive-cli 是测试夹具，见上面的说明。
 all: $(TARGET) $(SERVER_TARGET)
+
+# 两端可以分开构建（PR #23 的发布脚本就靠这两个目标）：
+#   make client -> backupctl + 现代 GUI（QML）
+#   make server -> backup-server + 管理工具 + 密钥工具
+# all 的行为保持不变（仍然是 backupctl + backup-server）。
+client: $(TARGET) gui-modern
+
+# 没有 Qt 的构建机也要能出客户端 CLI：发布脚本会在 make client 失败时
+# 退到这条目标，并把原因写进构建报告，而不是假装 GUI 也打出来了。
+client-cli: $(TARGET)
 
 # ---- ECS 本地管理工具（PR #20 closure）----
 #
@@ -169,6 +188,24 @@ DEPENDS += $(KEYGEN_OBJECTS:.o=.d)
 $(KEYGEN_TARGET): $(KEYGEN_OBJECTS)
 	@mkdir -p $(BUILD_DIR)
 	$(CXX) $(CXXFLAGS) $(KEYGEN_OBJECTS) $(SQLITE_LIBRARY) -pthread -o $@
+
+# ---- 离线根与服务器身份证书工具（PR #23）----
+#
+# backup-cert-tool 管离线根私钥与服务器身份证书：root-init / root-info /
+# issue-server / verify-server / inspect-server。它和客户端、服务端共用同一份
+# bpcert.cpp + trusted_root_store.cpp —— 不存在"工具另写一套证书解析"。
+# 私钥只能从 --root-key <文件路径> 读：工具里没有任何命令行十六进制入口。
+CERT_TOOL_TARGET := $(BUILD_DIR)/backup-cert-tool
+CERT_TOOL_SOURCES := tools/cert_tool_main.cpp $(SERVER_CORE_SOURCES)
+CERT_TOOL_OBJECTS := $(patsubst %.cpp,$(BUILD_DIR)/server/%.o,$(CERT_TOOL_SOURCES))
+DEPENDS += $(CERT_TOOL_OBJECTS:.o=.d)
+
+$(CERT_TOOL_TARGET): $(CERT_TOOL_OBJECTS)
+	@mkdir -p $(BUILD_DIR)
+	$(CXX) $(CXXFLAGS) $(CERT_TOOL_OBJECTS) $(SQLITE_LIBRARY) -pthread -o $@
+
+# 证书工具是运维/离线工具，不进 all 与 server 的默认目标，单独显式构建。
+cert-tool: $(CERT_TOOL_TARGET)
 
 # 单独构建服务端（部署脚本用）。管理工具、密钥工具与服务端同属"服务器侧
 # 交付物"，所以同一条目标一起构建。

@@ -15,6 +15,7 @@
 #include "incremental_backup.h"
 #include "remote_backup_client.h"
 #include "remote_incremental.h"
+#include "server_profile.h"
 #include "terminal_secret.h"
 
 namespace backupproject {
@@ -30,6 +31,15 @@ struct RemoteOptions {
   std::string repository_directory;
   // 服务端 BPSEC1 身份 pin（"sha256:<指纹>" 或 "hex:<公钥>"）。
   std::string server_key;
+  // BPSEC2 签名身份：identity_mode == "certificate" 时用证书认证服务端，
+  // 此时 --server-key 不参与判断。
+  std::string identity_mode;
+  // --official-cloud：用编译进二进制的官方云端 profile（零配置）。
+  // 地址/端口仍然可以被 --host/--port 覆盖，这样自测可以把它指到隧道上，
+  // 而身份部分（证书模式 + 内置官方根 + expected_server_id）始终来自 profile。
+  bool official_cloud = false;
+  std::string trusted_roots_file;
+  std::string expected_server_id;
   // 远端 backup 的参数：策略、显示名、过滤规则（规则原文同时留给增量链的
   // identity —— 规则变了就必须重建基线，这是引擎的硬规则）。
   bool incremental = true;
@@ -68,11 +78,18 @@ void PrintRemoteUsageTo(std::ostream& output) {
          "  口令只从终端读取；自动测试用 BACKUP_REMOTE_PASSWORD 提供，\n"
          "  两者都不会被打印。默认端点 127.0.0.1:18765。\n"
          "\n"
-         "  所有 remote 子命令都需要 --server-key <sha256:指纹|hex:公钥>\n"
-         "  （也可以放在环境变量 BACKUP_REMOTE_SERVER_KEY 里）。BPNET1 的\n"
-         "  全部流量由 BPSEC1 加密，客户端必须事先知道服务端身份公钥；\n"
-         "  本项目不做首次连接自动信任。用下面的命令取得 pin：\n"
-         "      backup-server-keygen --show --key-file <身份私钥文件>\n";
+         "  --official-cloud 用编译进二进制的官方云端身份（零配置：不需要\n"
+         "                   --server-key，也不需要 --expected-server-id）\n"
+         "  身份有两种模式：\n"
+         "    * pin 模式（默认，BPSEC1）：--server-key <sha256:指纹|hex:公钥>\n"
+         "      （也可以放在环境变量 BACKUP_REMOTE_SERVER_KEY 里）。客户端\n"
+         "      必须事先知道服务端身份公钥，本项目不做首次连接自动信任。\n"
+         "      用下面的命令取得 pin：\n"
+         "          backup-server-keygen --show --key-file <身份私钥文件>\n"
+         "    * 证书模式（BPSEC2，签名身份）：--expected-server-id <名字>\n"
+         "      服务端出示由离线根签发的身份证书，客户端用可信根验签。\n"
+         "      [--trusted-roots <根文件>] 不给就用**内置官方根**（官方云端\n"
+         "      的用法：用户不需要知道、也不需要核对任何指纹）。\n";
 }
 
 bool TakeValue(const std::vector<std::string>& arguments, std::size_t* index,
@@ -151,6 +168,26 @@ bool ParseOptions(const std::vector<std::string>& arguments,
                      error_message)) {
         return false;
       }
+    } else if (token == "--identity-mode") {
+      if (!TakeValue(arguments, &index, token, &options->identity_mode,
+                     error_message)) {
+        return false;
+      }
+      if (options->identity_mode != "pin" &&
+          options->identity_mode != "certificate") {
+        *error_message = "--identity-mode 只能是 pin 或 certificate";
+        return false;
+      }
+    } else if (token == "--trusted-roots") {
+      if (!TakeValue(arguments, &index, token, &options->trusted_roots_file,
+                     error_message)) {
+        return false;
+      }
+    } else if (token == "--expected-server-id") {
+      if (!TakeValue(arguments, &index, token, &options->expected_server_id,
+                     error_message)) {
+        return false;
+      }
     } else if (token == "--confirm") {
       if (!TakeValue(arguments, &index, token, &options->confirm_username,
                      error_message)) {
@@ -158,6 +195,9 @@ bool ParseOptions(const std::vector<std::string>& arguments,
       }
     } else if (token == "--force") {
       options->force = true;
+    } else if (token == "--official-cloud") {
+      // 开关型：什么都不用填，身份来自编译进二进制的官方云端 profile。
+      options->official_cloud = true;
     } else if (token.size() > 2 && token[0] == '-' && token[1] == '-') {
       *error_message = "未知选项 " + token;
       return false;
@@ -173,6 +213,38 @@ bool ParseOptions(const std::vector<std::string>& arguments,
     if (from_environment != nullptr && from_environment[0] != '\0') {
       options->endpoint.server_key_pin = from_environment;
     }
+  }
+  // --official-cloud：身份部分**完全**来自编译进二进制的 profile —— 用户
+  // 不需要知道服务器地址、端口、server_id，也不需要任何指纹。地址与端口
+  // 允许被 --host/--port 覆盖（自测把它指到隧道上时用），身份不允许覆盖。
+  if (options->official_cloud) {
+    const backupproject::net::ServerProfile& official =
+        backupproject::net::OfficialCloudProfile();
+    options->identity_mode = official.identity;
+    options->expected_server_id = official.expected_server_id;
+    options->trusted_roots_file = official.trusted_roots_file;
+    if (host.empty()) {
+      host = official.host;
+    }
+    if (port.empty()) {
+      port = std::to_string(official.port);
+    }
+  }
+  // BPSEC2：签名身份（证书）。给了 --expected-server-id 就默认进证书模式，
+  // 也可以显式写 --identity-mode certificate。
+  if (!options->identity_mode.empty()) {
+    options->endpoint.identity_mode = options->identity_mode;
+  } else if (!options->expected_server_id.empty()) {
+    options->endpoint.identity_mode = "certificate";
+  }
+  options->endpoint.trusted_roots_file = options->trusted_roots_file;
+  options->endpoint.expected_server_id = options->expected_server_id;
+  if (options->endpoint.identity_mode == "certificate" &&
+      options->endpoint.expected_server_id.empty()) {
+    *error_message =
+        "证书模式（--identity-mode certificate）需要同时给出 "
+        "--expected-server-id <证书里的服务器名字>";
+    return false;
   }
   if (!host.empty()) {
     options->endpoint.host = host;
@@ -302,8 +374,11 @@ int RunRemoteCommand(const CliContext& context,
     return kCliExitUsageError;
   }
 
-  if (options.endpoint.server_key_pin.empty()) {
+  if (options.endpoint.identity_mode != "certificate" &&
+      options.endpoint.server_key_pin.empty()) {
     std::cerr << "Error: 缺少 --server-key <sha256:指纹|hex:公钥>。\n"
+                 "  （如果服务端配了签名身份证书，改用 --expected-server-id\n"
+                 "   <服务器名字> 走证书模式，就不需要指纹了。）\n"
                  "  BPSEC1 要求客户端事先知道服务端身份公钥，本项目不做首次\n"
                  "  连接自动信任（TOFU）。用下面的命令取得 pin：\n"
                  "      backup-server-keygen --show --key-file <身份私钥文件>\n"
