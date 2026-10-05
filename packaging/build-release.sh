@@ -75,13 +75,13 @@ setup_reproducible_env
 [ -n "$VERSION" ] || VERSION="$(default_dev_version)"
 VERSION="$(validate_version "$VERSION")"
 DEB_VERSION="$(deb_version_of "$VERSION")"
-ARCH="$(dpkg --print-architecture 2>/dev/null || echo amd64)"
+DEB_ARCH="$(dpkg --print-architecture 2>/dev/null || echo amd64)"
 
 RELEASE_DIR="$OUT_ROOT/$VERSION"
 WORK="$REPO_ROOT/dist/.packaging-work"
 rm -rf "$WORK" "$RELEASE_DIR"
 mkdir -p "$WORK" "$RELEASE_DIR"
-log "版本 $VERSION（deb: $DEB_VERSION）架构 $ARCH"
+log "版本 $VERSION（deb: $DEB_VERSION）架构 $DEB_ARCH"
 log "制品目录：$RELEASE_DIR"
 
 OS_PRETTY="$( . /etc/os-release 2>/dev/null && echo "$PRETTY_NAME" || echo unknown )"
@@ -108,7 +108,7 @@ build_os          = $OS_PRETTY
 build_glibc       = $GLIBC_VERSION
 compiler          = $CXX_VERSION
 qt_version        = $QT_VERSION
-architecture      = $ARCH
+architecture      = $DEB_ARCH
 source_date_epoch = $SOURCE_DATE_EPOCH
 build_timestamp   = $STAMP
 EOF
@@ -144,7 +144,7 @@ build_deb() {  # $1=deb_dir $2=tree $3=out $4=depends
   [ -f "$deb_dir/conffiles" ] && cp "$deb_dir/conffiles" "$root/DEBIAN/conffiles"
   local installed_size
   installed_size="$(( ( $(du -sk "$root" | awk '{print $1}') + 1023 ) / 1024 ))"
-  sed -e "s|@VERSION@|$DEB_VERSION|" -e "s|@ARCH@|$ARCH|" \
+  sed -e "s|@VERSION@|$DEB_VERSION|" -e "s|@ARCH@|$DEB_ARCH|" \
       -e "s|@DEPENDS@|$depends|" -e "s|@INSTALLED_SIZE@|$installed_size|" \
       "$deb_dir/control.in" > "$root/DEBIAN/control"
   ( cd "$root" && find . -type f ! -path './DEBIAN/*' -printf '%P\n' | LC_ALL=C sort | xargs -r md5sum > DEBIAN/md5sums )
@@ -219,11 +219,10 @@ build_appdir() {
   # 启动同一个 AppImage，而不是只支持有 X 的机器。每个插件只有几十 KB。
   export EXTRA_QT_PLUGINS="platforms/libqoffscreen.so;platforms/libqminimal.so"
   export APPIMAGE_EXTRACT_AND_RUN=1
-  export ARCH=x86_64
   export PATH="$WORK/bin:$PATH"
 
   log "== linuxdeploy + plugin-qt（带 Qt 运行时与 QML 模块）=="
-  if ! "$WORK/bin/linuxdeploy" --appdir "$appdir" --plugin qt \
+  if ! ARCH=x86_64 "$WORK/bin/linuxdeploy" --appdir "$appdir" --plugin qt \
        --desktop-file "$appdir/usr/share/applications/backup-project.desktop" \
        --icon-file "$appdir/backup-project.png" --output appimage \
        > "$WORK/linuxdeploy.log" 2>&1; then
@@ -359,7 +358,7 @@ EOF
   [ -n "$depends" ] || die "过滤掉自带的 Qt 之后依赖为空，说明推算出错了"
   case "$depends" in *libqt6*|*qt6-base-abi*) die "依赖里仍残留发行版 Qt 包" ;; esac
   log "  依赖（dpkg-shlibdeps，已去掉自带的 Qt）：$depends"
-  build_deb packaging/client/deb "$tree" "$RELEASE_DIR/backup-project-client_${DEB_VERSION}_${ARCH}.deb" "$depends"
+  build_deb packaging/client/deb "$tree" "$RELEASE_DIR/backup-project-client_${DEB_VERSION}_${DEB_ARCH}.deb" "$depends"
 }
 
 # ============================================================
@@ -438,7 +437,7 @@ EOF
   # adduser 是 Essential:yes，但显式写上更清楚；systemd 只在真机安装时需要。
   depends="$depends, adduser, init-system-helpers (>= 1.51)"
   log "  依赖（dpkg-shlibdeps）：$depends"
-  build_deb "$tmp_deb_dir" "$tree" "$RELEASE_DIR/backup-project-server_${DEB_VERSION}_${ARCH}.deb" "$depends"
+  build_deb "$tmp_deb_dir" "$tree" "$RELEASE_DIR/backup-project-server_${DEB_VERSION}_${DEB_ARCH}.deb" "$depends"
 }
 
 pack_server_tarball() {
@@ -493,7 +492,7 @@ log "== SHA256SUMS 与 RELEASE-INFO.txt =="
   echo "commit        = $COMMIT"
   echo "tree          = $TREE"
   echo "branch        = $BRANCH"
-  echo "architecture  = $ARCH (linux x86_64)"
+  echo "architecture  = $DEB_ARCH (linux x86_64)"
   echo "build_os      = $OS_PRETTY"
   echo "build_glibc   = $GLIBC_VERSION"
   echo "compiler      = $CXX_VERSION"
