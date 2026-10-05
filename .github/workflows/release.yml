@@ -1,20 +1,21 @@
-# Release packages —— 在干净容器里构建两个可以发给真实用户的产品族。
+# Release packages —— 在旧基线的干净容器里构建两个可以发给真实用户的产品族，
+# 并在干净机器上做安装 / 升级 / 卸载验收。
 #
-# 为什么必须在旧基线容器里构建：开发机是 Ubuntu 24.04（glibc 2.39），而生产
-# ECS 是 Ubuntu 22.04（glibc 2.35）。直接拿开发机的二进制上去会因为
-# "GLIBC_2.38 not found" 起不来（PR #20 真实踩过一次）。release 制品因此
-# 只在旧基线的干净容器里构建，基线本身写进 BUILD-INFO 与兼容性文档。
+# 为什么必须在旧基线容器里构建：开发机是 Ubuntu 24.04（glibc 2.39），生产 ECS 是
+# Ubuntu 22.04（glibc 2.35）。直接用开发机的二进制上去会因为 "GLIBC_2.38 not
+# found" 起不来（PR #20 真实踩过一次）。
 #
-# 基线（选型证据见 docs/release-packaging.md）：
-#   server: ubuntu:20.04  -> glibc 2.31，无 Qt 依赖
-#   client: debian:12     -> glibc 2.36 + Qt 6.4.2
-#     客户端 GUI 使用 QtQuick.Dialogs 的 FolderDialog，它 Since: Qt 6.3；
+# 基线（证据见 docs/release-packaging.md）：
+#   server: ubuntu:20.04 -> glibc 2.31，无 Qt 依赖
+#   client: debian:12    -> glibc 2.36 + Qt 6.4.2
+#     客户端 GUI 使用 QtQuick.Dialogs 的 FolderDialog（Since: Qt 6.3），
 #     Ubuntu 22.04 只有 Qt 6.2.4，所以 22.04 不能作为客户端构建基线。
 #
 # 本 workflow **不创建 tag、不发布 GitHub Release**：tag 触发只是把设计留在这里
-# （v*），正式发布必须等人工 review。
+# （v*），正式发布必须等人工 review。第三方 Action 一律 pin 到 commit SHA。
 #
-# 第三方 Action 一律 pin 到 commit SHA，不用可变 tag。
+# 开发期触发：特性分支上的 push。GitHub 只允许 dispatch 默认分支上的 workflow，
+# 所以 PR 还没合并之前用 push 触发同一份定义。
 
 name: Release packages
 
@@ -23,11 +24,8 @@ on:
     inputs:
       version:
         description: "验收用版本号（不会创建 tag、不会发布 Release）"
-        required: true
-        default: "0.0.0+g3871a8c"
-  # 开发分支上的推送触发：GitHub 只允许 dispatch 默认分支上的 workflow，而
-  # 本 PR 的 workflow 还在特性分支上，所以开发期用 push 触发同一份定义。
-  # 正式触发是 workflow_dispatch（人工）与 tag v*（人工 review 之后才打）。
+        required: false
+        default: ""
   push:
     branches: ["feat/release-packaging"]
 
@@ -39,53 +37,72 @@ env:
   TZ: UTC
 
 jobs:
-  baseline-server:
-    name: server baseline (ubuntu:20.04, glibc 2.31)
+  prepare:
+    name: version
+    runs-on: ubuntu-24.04
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - id: v
+        run: |
+          v="${{ inputs.version }}"
+          if [ -z "$v" ]; then v="0.0.0+g$(git rev-parse --short=7 HEAD)"; fi
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+          echo "release version: $v (no tag is created)"
+
+  server:
+    name: build server (ubuntu:20.04, glibc 2.31)
+    needs: prepare
     runs-on: ubuntu-24.04
     container: ubuntu:20.04
+    defaults:
+      run:
+        shell: bash
     steps:
       - name: install build tools
         run: |
           apt-get update
           DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-            git ca-certificates g++ make libsqlite3-dev binutils file
+            git ca-certificates g++ make libsqlite3-dev binutils file xz-utils python3
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
       - name: baseline report
         run: |
-          . /etc/os-release; echo "os=$PRETTY_NAME"
-          echo "glibc=$(ldd --version | head -1 | awk '{print $NF}')"
-          echo "gcc=$(g++ --version | head -1)"
-          echo "make=$(make --version | head -1)"
-          echo "sqlite_header=$(ls -1 /usr/include/sqlite3.h 2>/dev/null || echo none)"
-          echo "SOURCE_DATE_EPOCH=$(git log -1 --format=%ct)" >> "$GITHUB_ENV"
-          echo "SHORT_SHA=$(git rev-parse --short=12 HEAD)" >> "$GITHUB_ENV"
-      - name: make server cert-tool
+          . /etc/os-release; echo "build_os=$PRETTY_NAME"
+          echo "build_glibc=$(ldd --version | head -1 | awk '{print $NF}')"
+          g++ --version | head -1
+      - name: build release artifacts (server)
+        run: bash packaging/build-release.sh --version "${{ needs.prepare.outputs.version }}" --only server
+      - name: ELF / glibc contract
+        run: bash packaging/ci-elf-report.sh \
+               dist/server/bin/backup-server dist/server/bin/backup-server-admin \
+               dist/server/bin/backup-server-keygen dist/server/tools/backup-cert-tool
+      - name: deb metadata
         run: |
-          make -j"$(nproc)" server cert-tool 2>&1 | tee /tmp/build-server.log
-          echo "warnings=$(grep -ci warning /tmp/build-server.log || true)"
-      - name: ELF contract (readelf/ldd)
-        run: bash packaging/ci-elf-report.sh build/backup-server build/backup-server-admin build/backup-server-keygen build/backup-cert-tool || true
+          deb=$(ls dist/release/*/backup-project-server_*.deb)
+          dpkg-deb --info "$deb"
+          dpkg-deb --contents "$deb" | head -30
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          name: baseline-server-ubuntu2004
-          path: |
-            build/backup-server
-            build/backup-server-admin
-            build/backup-server-keygen
-            build/backup-cert-tool
-            /tmp/build-server.log
+          name: server-artifacts
+          path: dist/release/*/backup-project-server*
           if-no-files-found: error
 
-  baseline-client:
-    name: client baseline (debian:12, Qt 6.4 / glibc 2.36)
+  client:
+    name: build client (debian:12, Qt 6.4 / glibc 2.36)
+    needs: prepare
     runs-on: ubuntu-24.04
     container: debian:12
+    defaults:
+      run:
+        shell: bash
     steps:
-      - name: install build tools + Qt6
+      - name: install build tools + Qt6 + packaging tools
         run: |
           apt-get update
           DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-            git ca-certificates g++ make pkg-config binutils file \
+            git ca-certificates g++ make pkg-config binutils file xz-utils \
+            python3 python3-pil \
             qt6-base-dev qt6-base-dev-tools qt6-declarative-dev qt6-declarative-dev-tools \
             qt6-qpa-plugins qml6-module-qtquick qml6-module-qtquick-controls \
             qml6-module-qtquick-layouts qml6-module-qtquick-dialogs \
@@ -93,32 +110,84 @@ jobs:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
       - name: baseline report
         run: |
-          . /etc/os-release; echo "os=$PRETTY_NAME"
-          echo "glibc=$(ldd --version | head -1 | awk '{print $NF}')"
-          echo "gcc=$(g++ --version | head -1)"
-          echo "qt=$(qmake6 -query QT_VERSION 2>/dev/null || qtpaths6 --qt-version)"
-          echo "qt_libexecs=$(qtpaths6 --query QT_INSTALL_LIBEXECS)"
-          echo "SOURCE_DATE_EPOCH=$(git log -1 --format=%ct)" >> "$GITHUB_ENV"
-      - name: make client
+          . /etc/os-release; echo "build_os=$PRETTY_NAME"
+          echo "build_glibc=$(ldd --version | head -1 | awk '{print $NF}')"
+          echo "qt=$(qmake6 -query QT_VERSION)"
+      - name: build release artifacts (client)
+        run: bash packaging/build-release.sh --version "${{ needs.prepare.outputs.version }}" --only client
+      - name: AppImage content check
         run: |
-          make -j"$(nproc)" client 2>&1 | tee /tmp/build-client.log
-          echo "warnings=$(grep -ci warning /tmp/build-client.log || true)"
-      - name: GUI smoke (offscreen)
+          appimage=$(ls dist/release/*/Backup-Project-Client-*-x86_64.AppImage)
+          echo "appimage=$appimage bytes=$(stat -c %s "$appimage")"
+          cd /tmp && rm -rf ext && mkdir ext && cd ext
+          "$GITHUB_WORKSPACE/$appimage" --appimage-extract > /dev/null
+          echo "platforms: $(ls squashfs-root/usr/plugins/platforms 2>/dev/null | tr '\n' ' ')"
+          echo "qml modules: $(ls squashfs-root/usr/qml 2>/dev/null | head -8 | tr '\n' ' ')"
+          test -e squashfs-root/usr/plugins/platforms/libqxcb.so || { echo "缺少 xcb 平台插件"; exit 1; }
+          test -e squashfs-root/usr/bin/backup-gui-modern || { echo "缺少 GUI"; exit 1; }
+      - name: ELF / glibc contract
+        run: bash packaging/ci-elf-report.sh dist/client/bin/backupctl dist/client/bin/backup-gui-modern
+      - name: deb metadata
         run: |
-          QT_QPA_PLATFORM=offscreen timeout 10 ./build/backup-gui-modern > /tmp/gui-smoke.log 2>&1
-          code=$?
-          echo "gui_exit=$code (124 = still running = ok)"
-          grep -ci "qml" /tmp/gui-smoke.log || true
-          cat /tmp/gui-smoke.log | head -20
-          ./build/backupctl --help | head -3
-      - name: ELF contract (readelf/ldd)
-        run: bash packaging/ci-elf-report.sh build/backupctl build/backup-gui-modern || true
+          deb=$(ls dist/release/*/backup-project-client_*.deb)
+          dpkg-deb --info "$deb"
+          echo "--- 前 20 个文件 ---"
+          dpkg-deb --contents "$deb" | head -20
+          echo "--- 大小 ---"
+          du -sh "$(ls -d dist/release/*/)"*
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          name: baseline-client-debian12
+          name: client-artifacts
           path: |
-            build/backupctl
-            build/backup-gui-modern
-            /tmp/build-client.log
-            /tmp/gui-smoke.log
+            dist/release/*/Backup-Project-Client-*
+            dist/release/*/backup-project-client*
+          if-no-files-found: error
+
+  bundle:
+    name: bundle + clean-container install tests
+    needs: [prepare, client, server]
+    runs-on: ubuntu-24.04
+    container: debian:12
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - name: install tools
+        run: |
+          apt-get update
+          DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            ca-certificates xz-utils file binutils python3 python3-pil             xvfb xauth libfuse2 qt6-qpa-plugins libxcb-cursor0
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: client-artifacts
+          path: incoming/client
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: server-artifacts
+          path: incoming/server
+      - name: assemble release directory
+        run: |
+          set -e
+          version="${{ needs.prepare.outputs.version }}"
+          out="dist/release/$version"
+          mkdir -p "$out"
+          cp -a incoming/client/. "$out"/
+          cp -a incoming/server/. "$out"/
+          ( cd "$out" && rm -f SHA256SUMS RELEASE-INFO.txt \
+            && find . -maxdepth 1 -type f -printf '%P\n' | LC_ALL=C sort | xargs -r sha256sum > SHA256SUMS )
+          cat "$out/SHA256SUMS"
+          ( cd "$out" && sha256sum -c --quiet SHA256SUMS ) && echo "SHA256SUMS 自校验通过"
+      - name: AppImage launch tests
+        run: bash packaging/ci-appimage-test.sh "dist/release/${{ needs.prepare.outputs.version }}"
+      - name: client deb install (clean debian:12)
+        run: bash packaging/ci-client-install-test.sh "dist/release/${{ needs.prepare.outputs.version }}"
+      - name: server deb install (clean debian:12, no systemd)
+        run: bash packaging/ci-server-install-test.sh "dist/release/${{ needs.prepare.outputs.version }}"
+      - name: secret scan on final artifacts
+        run: bash packaging/ci-secret-scan.sh "dist/release/${{ needs.prepare.outputs.version }}"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: release-bundle
+          path: dist/release/**
           if-no-files-found: error
