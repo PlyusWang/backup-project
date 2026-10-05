@@ -108,6 +108,14 @@ class ServerFixture {
     if (!SetupFixture(&fixture_, name)) {
       return false;
     }
+    // §33 的生产默认值（5 次失败 -> 锁 60 秒）会让 SEQ-1 的最后一条断言
+    // （「六次错误口令之后同一条连接还能正常登录」）与产品合同直接冲突：锁定期间
+    // **正确口令也拒绝**（否则攻击者只要在锁定窗口里碰对一次就绕过了节流）。
+    // 本套件测的是「一条连接上的请求 / 响应序列」，不是节流语义；节流由
+    // scripts/login_throttle_test.sh 专门覆盖（7/7，含「锁定期间正确口令也拒绝」）。
+    // 所以这里**显式关掉节流**，而不是把 SEQ-1 的断言改成一句更弱的话。
+    // （max_login_failures <= 0 表示不计数，见 server/remote_server.cpp:808/821。）
+    fixture_.config.max_login_failures = 0;
     if (!server_.Configure(fixture_.config, &error_)) {
       return false;
     }
