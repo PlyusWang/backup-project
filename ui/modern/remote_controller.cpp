@@ -27,6 +27,8 @@
 
 #if defined(Q_OS_UNIX)
 #include <signal.h>  // 只给自检用的 killOwnedTunnelForTest
+
+#include "format_bytes.h"
 #endif
 
 namespace backup_modern {
@@ -272,20 +274,9 @@ QString RemoteController::progressText() const {
 // ---- 格式化：列表与进度都只展示这两样的结果 ----
 
 QString RemoteController::FormatSize(std::uint64_t bytes) {
-  const double value = static_cast<double>(bytes);
-  if (bytes < 1024ull) {
-    return QStringLiteral("%1 字节").arg(static_cast<qulonglong>(bytes));
-  }
-  if (bytes < 1024ull * 1024ull) {
-    return QStringLiteral("%1 KiB").arg(
-        QString::number(value / 1024.0, 'f', 1));
-  }
-  if (bytes < 1024ull * 1024ull * 1024ull) {
-    return QStringLiteral("%1 MiB").arg(
-        QString::number(value / (1024.0 * 1024.0), 'f', 1));
-  }
-  return QStringLiteral("%1 GiB").arg(
-      QString::number(value / (1024.0 * 1024.0 * 1024.0), 'f', 2));
+  // 进度与列表都走全产品唯一的格式化规则（include/format_bytes.h）：
+  // 以前这里对小于 1 KiB 的值说“字节”、其余说 KiB/MiB，而备份页说 B/KB。
+  return QString::fromStdString(backupproject::FormatByteSize(bytes));
 }
 
 QString RemoteController::FormatTime(std::uint64_t unix_seconds) {

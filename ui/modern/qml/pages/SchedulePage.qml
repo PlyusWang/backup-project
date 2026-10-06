@@ -47,11 +47,11 @@ Item {
 
     readonly property var strategyKeys: ["full", "incremental"]
     // 与手动 / 实时页用同一组词（人工验收：不要一处 Full、一处完整快照）。
-    readonly property var strategyLabels: ["完整备份", "增量备份"]
+    readonly property var strategyLabels: controller.optionStrategyLabels
     readonly property var packKeys: ["mypack", "ustar", "fast-ustar"]
-    readonly property var packLabels: ["MyPack（推荐）", "USTAR（兼容格式）", "Fast USTAR（兼容格式）"]
+    readonly property var packLabels: controller.optionPackLabels
     readonly property var compressionKeys: ["none", "huffman", "lzss-huffman"]
-    readonly property var compressionLabels: ["不压缩", "Huffman", "LZSS + Huffman"]
+    readonly property var compressionLabels: controller.optionCompressionLabels
 
     // 频率单位来自控制器（背后是共享核心的分钟边界），界面不自己定义单位表。
     readonly property var frequencyUnits: schedule.frequencyUnits()

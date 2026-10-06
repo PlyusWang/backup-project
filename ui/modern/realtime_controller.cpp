@@ -21,6 +21,7 @@
 #include "backup_controller.h"
 #include "backup_option_keys.h"
 #include "filter.h"
+#include "format_bytes.h"
 
 namespace backup_modern {
 
@@ -68,15 +69,10 @@ QString FormatLocalTime(std::int64_t seconds) {
       .toString(QStringLiteral("yyyy-MM-dd HH:mm:ss"));
 }
 
+// 与备份管理页共用同一份格式化规则：以前这里写 2 位小数、
+// 备份管理页写 1 位，同一份归档在两个页面显示不同。
 QString FormatSize(std::uint64_t bytes) {
-  const double value = static_cast<double>(bytes);
-  if (bytes >= 1024ull * 1024ull) {
-    return QStringLiteral("%1 MB").arg(value / (1024.0 * 1024.0), 0, 'f', 2);
-  }
-  if (bytes >= 1024ull) {
-    return QStringLiteral("%1 KB").arg(value / 1024.0, 0, 'f', 1);
-  }
-  return QStringLiteral("%1 B").arg(static_cast<qulonglong>(bytes));
+  return QString::fromStdString(backupproject::FormatByteSize(bytes));
 }
 
 QString ChangeText(qulonglong added, qulonglong removed, qulonglong modified,

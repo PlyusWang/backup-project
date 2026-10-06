@@ -106,6 +106,21 @@ class BackupController : public QObject {
   // 三个 status* 属性是分开的：kind 决定 banner 的颜色和图标，
   // title 与 message 是两行文案。用不透明的字符串而不是 C++ enum，
   // 是为了让 QML 直接做判断，将来加一种状态也不必注册新类型。
+  // 备份选项的显示名（手动 / 自动 / 实时三个页面共用）。
+  //
+  // 为什么放在这里：三个页面各自写了一份，而且手动页写 "MyPack"、
+  // 另两页写 "MyPack（推荐）"，同一个下拉在不同页面显示不同文字。
+  // 文案属于 GUI 层，所以不进共享核心；键与合法组合仍然由
+  // backup_mode.h / backup_option_keys.h 的真值表决定（CLI 与 GUI 同一张）。
+  //
+  // 顺序与对应的 key 一一对应，QML 侧用 indexOf(key) 取下标。
+  Q_PROPERTY(
+      QStringList optionStrategyLabels READ optionStrategyLabels CONSTANT)
+  Q_PROPERTY(QStringList optionPackLabels READ optionPackLabels CONSTANT)
+  Q_PROPERTY(
+      QStringList optionCompressionLabels READ optionCompressionLabels CONSTANT)
+  Q_PROPERTY(
+      QStringList optionEncryptionLabels READ optionEncryptionLabels CONSTANT)
   Q_PROPERTY(bool busy READ busy NOTIFY busyChanged)
   Q_PROPERTY(QString statusKind READ statusKind NOTIFY statusChanged)
   Q_PROPERTY(QString statusTitle READ statusTitle NOTIFY statusChanged)
@@ -166,6 +181,10 @@ class BackupController : public QObject {
     archive_deleted_observer_ = observer;
   }
 
+  QStringList optionStrategyLabels() const;
+  QStringList optionPackLabels() const;
+  QStringList optionCompressionLabels() const;
+  QStringList optionEncryptionLabels() const;
   bool busy() const { return busy_; }
   QString statusKind() const { return status_kind_; }
   QString statusTitle() const { return status_title_; }

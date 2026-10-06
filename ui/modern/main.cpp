@@ -75,6 +75,7 @@
 // 这些开关让没有显示器的环境也能验证界面：离屏平台插件把窗口真正建出来，
 // 自检再切一遍页面、换一次主题、跑一次备份恢复，不需要人盯着屏幕。
 
+#include <qqml.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
@@ -95,6 +96,7 @@
 #include <QProcess>
 #include <QQmlApplicationEngine>
 #include <QQmlContext>
+#include <QQmlEngine>
 #include <QQuickItem>
 #include <QQuickStyle>
 #include <QQuickWindow>

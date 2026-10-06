@@ -44,11 +44,11 @@ Item {
     property bool technicalExpanded: false
 
     readonly property var strategyKeys: ["full", "incremental"]
-    readonly property var strategyLabels: ["完整备份", "增量备份"]
+    readonly property var strategyLabels: controller.optionStrategyLabels
     readonly property var packKeys: ["mypack", "ustar", "fast-ustar"]
-    readonly property var packLabels: ["MyPack（推荐）", "USTAR（兼容格式）", "Fast USTAR（兼容格式）"]
+    readonly property var packLabels: controller.optionPackLabels
     readonly property var compressionKeys: ["none", "huffman", "lzss-huffman"]
-    readonly property var compressionLabels: ["不压缩", "Huffman", "LZSS + Huffman"]
+    readonly property var compressionLabels: controller.optionCompressionLabels
 
     // 备份方式的短解释：只解释当前选中的那一种，避免两个术语同时出现。
     // 措辞与自动备份页逐字一致（人工验收：三个页面统一产品语言）。

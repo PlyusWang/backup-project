@@ -43,17 +43,19 @@ Item {
     property bool passwordValidationRequested: false
 
     // 显示名与键分开放：下拉里给人看的是显示名，交给 C++ 的始终是键。
-    readonly property var strategyLabels: ["完整备份", "增量备份"]
+    // 显示名只有一份来源（backup_option_labels.h，通过 main.cpp 注册的
+    // controller 的 option*Labels 属性）：手动 / 自动 / 实时三个页面共用同一组文字。
+    // 以前手动页写 "MyPack"、另两页写 "MyPack（推荐）"，下拉里看到的文字
+    // 会随页面不同而不同；键仍然由各页自己列出，与展示名一一对应。
+    readonly property var strategyLabels: controller.optionStrategyLabels
     readonly property var strategyKeys: ["full", "incremental"]
-    readonly property var packLabels: ["MyPack", "USTAR", "Fast USTAR"]
+    readonly property var packLabels: controller.optionPackLabels
     readonly property var packKeys: ["mypack", "ustar", "fast-ustar"]
-    readonly property var compressionLabels: ["不压缩", "Huffman", "LZSS + Huffman"]
+    readonly property var compressionLabels: controller.optionCompressionLabels
     readonly property var compressionKeys: ["none", "huffman", "lzss-huffman"]
     // 加密的显示顺序固定为：不加密 -> AES -> DES。DES 是课程用的旧算法，
     // 名字后面必须挂着这个标记，免得有人在真实数据上误选它。
-    readonly property var encryptionLabels: ["不加密",
-                                             "AES-256-CTR + HMAC-SHA256",
-                                             "DES-CBC + HMAC-SHA256（教学 / 旧算法）"]
+    readonly property var encryptionLabels: controller.optionEncryptionLabels
     readonly property var encryptionKeys: ["none",
                                            "aes-256-ctr-hmac-sha256",
                                            "des-cbc-hmac-sha256"]
