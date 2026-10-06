@@ -2,12 +2,18 @@
 # backup-project-server postrm —— 删除包**不会**删除用户数据。
 #
 # 这一点是有意的：/var/lib/backup-project-server 里是用户的云端备份、元数据库
-# 和服务器传输身份私钥。包管理器不该替用户决定它们的生死。真要清理只有一条
-# 路：管理员显式运行 backup-server-purge-data 并手打确认短语。
+# 和服务器传输身份私钥。包管理器不该替用户决定它们的生死。真要清理只有两条路：
+#   1. 卸载之前用包自带的 backup-server-purge-data（prerm 会在那时提醒）；
+#   2. 包已经卸了，就按 docs/install-server.md 的「手工清理残留数据」手工做。
+# 这里**不能**再建议用户去跑 backup-server-purge-data —— purge 之后那个命令
+# 已经随包一起删掉了，提示一条不存在的命令比不提示更糟。
 set -e
 SERVICE=backup-project-server
+CACHE_DIR=/var/cache/backup-project-server
 case "${1:-remove}" in
   purge)
+    # 回滚材料是"包的缓存"，包都没了就一定没用了，这里删掉。
+    rm -rf "$CACHE_DIR"
     if [ -d /run/systemd/system ] && command -v systemctl >/dev/null 2>&1; then
       systemctl daemon-reload >/dev/null 2>&1 || true
       systemctl reset-failed "$SERVICE" >/dev/null 2>&1 || true
@@ -15,10 +21,13 @@ case "${1:-remove}" in
     echo "[backup-project-server] 已 purge 包文件；用户数据 / 配置 / 身份私钥全部保留："
     echo "[backup-project-server]   /var/lib/backup-project-server   （备份数据、元数据库、传输身份私钥）"
     echo "[backup-project-server]   /etc/backup-project-server      （server.conf、secrets.env）"
-    echo "[backup-project-server] 要删除数据请显式执行： sudo backup-server-purge-data --dry-run   然后去掉 --dry-run"
     echo "[backup-project-server] 系统用户 backup-project 也保留（数据还在，删用户没有意义）。"
+    echo "[backup-project-server] 注意：backup-server-purge-data 已经随包删掉了，purge 之后调用它只会得到"
+    echo "[backup-project-server] command not found。现在要删数据，请按 docs/install-server.md 的"
+    echo "[backup-project-server] 「手工清理残留数据」一节操作（或重新装回本包，用 purge-data 删完再卸载）。"
     ;;
   remove)
+    rm -rf "$CACHE_DIR"
     if [ -d /run/systemd/system ] && command -v systemctl >/dev/null 2>&1; then
       systemctl daemon-reload >/dev/null 2>&1 || true
     fi
