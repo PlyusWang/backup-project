@@ -1288,9 +1288,13 @@ else
 fi
 # 没有被排除的 socket 不是"某一行的标签"，而是整次预览的失败：三个前端都必须
 # 走同一条 blocked 语义，而不是一边给警告、一边报成功。
+# GUI 侧的预览/验收代码在 ui/modern/dev_harnesses.cpp（main.cpp 只留启动路径），
+# 所以这一条两个文件都认。判据没有放松：符号必须出现在 GUI 的**代码**里，
+# 只在注释里提到它不算。
 if grep -qF 'kSelectionBlocked' "$ROOT_DIR/src/core/backup_preview.cpp" \
    && grep -qF 'kSelectionBlocked' "$ROOT_DIR/src/cli/cli_commands.cpp" \
-   && grep -qF 'kSelectionBlocked' "$ROOT_DIR/ui/modern/main.cpp"; then
+   && { grep -qF 'kSelectionBlocked' "$ROOT_DIR/ui/modern/main.cpp" \
+        || grep -qF 'kSelectionBlocked' "$ROOT_DIR/ui/modern/dev_harnesses.cpp"; }; then
   record_pass "未排除的 socket 走 blocked 语义（核心 / CLI / GUI 一致）"
 else
   record_fail "未排除的 socket 的 blocked 语义不完整"

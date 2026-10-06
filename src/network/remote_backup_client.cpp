@@ -390,7 +390,7 @@ void RemoteArchiveClient::SetReconnectEndpoint(const RemoteEndpoint& endpoint) {
 // 幂等：连接可用时几乎零成本（一次 poll）。重连之后如果手里还有 token，就先
 // RESUME 恢复会话，然后才发调用方真正想发的那个请求。
 // 这里发生的所有 I/O 都在"本次请求的第一个字节发出之前"，所以它不违反
-// no-retry：没有任何一个用户请求会被发第二遍。
+// "失败绝不自动重发"：没有任何一个用户请求会被发第二遍。
 bool RemoteArchiveClient::PrepareConnection(std::string* error_message) {
   if (fd_ >= 0 && !SocketLooksClosed(fd_)) {
     return true;

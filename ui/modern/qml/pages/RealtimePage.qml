@@ -78,6 +78,12 @@ Item {
         ? "增量备份：首次建立完整基线，之后只保存变化，更节省空间。"
         : "完整备份：每次生成一份可以独立恢复的完整备份。"
 
+    // 最近备份的空状态：只告诉用户"接下来会发生什么"，不解释 marker。
+    // 这一句必须整串待在一行：静态契约按整串匹配，所以放在缩进最浅的
+    // 页面根上，而不是塞进深层布局里的 Text。
+    readonly property string snapshotEmptyHint:
+        "还没有实时备份。启用后，文件发生变化时会在这里看到新的备份版本。"
+
     // 草稿与已保存配置是否一致。只用来提示"这次改动还没生效"，
     // 不参与任何"能不能保存"的判断 —— 那个判断在共享核心里。
     // 每个字段都与控制器当前值比一遍，数字按文本比：用户把 500 写成 "0500"
@@ -945,13 +951,13 @@ Item {
                         // 普通 UI 讲"响应延迟 / 最长等待"，
                         // 需要对着文档或源码排查的人在这一层能拿到原名。
                         Text {
+                            // 中文标签只在这里对上 CLI 的英文名，排查的人能
+                            // 在这里找到 debounce_ms 与 max_wait_ms。
                             objectName: "realtimeDelayTermText"
                             visible: page.technicalExpanded
                             Layout.fillWidth: true
-                            // 中文标签只在这里对上 CLI 的英文名，排查的人能
-                            // 在这里找到 debounce_ms 与 max_wait_ms。
-                            text: "响应延迟对应 Debounce（debounce_ms），" +
-                                  "最长等待对应 Max wait（max_wait_ms）。"
+                            text: "响应延迟对应 Debounce（debounce_ms），"
+                                  + "最长等待对应 Max wait（max_wait_ms）。"
                             font.pixelSize: 14
                             color: theme.textSecondary
                             wrapMode: Text.WordWrap
@@ -1023,9 +1029,7 @@ Item {
                         objectName: "realtimeSnapshotEmptyText"
                         Layout.fillWidth: true
                         visible: realtime.snapshots.length === 0
-                        text: "还没有实时备份。" +
-                              "启用后，文件发生变化时" +
-                              "会在这里看到新的备份版本。"
+                        text: page.snapshotEmptyHint
                         font.pixelSize: 15
                         color: theme.textSecondary
                         wrapMode: Text.WordWrap

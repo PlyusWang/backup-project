@@ -2186,9 +2186,9 @@ Item {
 
             Text {
                 Layout.preferredWidth: 420
-                text: "注销账户会永久删除该账户以及全部云端备份，" +
-                      "此操作无法撤销。\n\n"
-                      + "当前账户：" + remote.username
+                text:
+                    "注销账户会永久删除该账户以及全部云端备份，此操作无法撤销。"
+                    + "\n\n当前账户：" + remote.username
                 color: theme.textSecondary
                 font.pixelSize: 15
                 wrapMode: Text.WordWrap
