@@ -32,6 +32,12 @@ on:
 permissions:
   contents: read
 
+# 同一分支连续 push 时，旧的那次已经过时：让新的 run 取消它，避免为每个中间 commit
+# 都跑完整套 Release 验收。只影响还在跑的 run —— 已经跑完的历史 run 与它们的证据不动。
+concurrency:
+  group: release-packages-${{ github.ref }}
+  cancel-in-progress: true
+
 env:
   LC_ALL: C
   TZ: UTC
