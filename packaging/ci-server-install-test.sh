@@ -38,6 +38,17 @@ expect_eq "transport.key 是 32 字节" "32" "$(stat -c %s "$INSTANCE/state/tran
 expect_file "配置文件" "$CONF"
 expect_eq "默认只监听回环" "127.0.0.1" "$(sed -n 's/^bind = //p' "$CONF")"
 
+ci_section "1.1 maintainer scripts 必须真的进到包里（preinst 曾经漏装过）"
+for script in preinst postinst prerm postrm; do
+  expect_file "/var/lib/dpkg/info/backup-project-server.$script" "/var/lib/dpkg/info/backup-project-server.$script"
+done
+expect_ok "preinst 可执行" test -x /var/lib/dpkg/info/backup-project-server.preinst
+if grep -q "rollback" /var/lib/dpkg/info/backup-project-server.preinst; then
+  ci_pass "preinst 是回滚材料那一版（不是空壳）"
+else
+  ci_fail "preinst 里没有回滚逻辑"
+fi
+
 ci_section "2. 命令入口齐全（含管理员菜单）"
 for cmd in backup-server backup-project-server backup-server-admin backup-server-admin-menu \
            backup-server-keygen backup-cert-tool backup-server-purge-data; do
