@@ -342,21 +342,34 @@ EOF
   # shellcheck disable=SC2086
   depends="$(shlibs_depends "$tree/usr/bin/backupctl" $qt_libs 2>/dev/null || true)"
   [ -n "$depends" ] || die "dpkg-shlibdeps 没有算出依赖（拒绝手写依赖列表）"
-  # 我们**自带** Qt，所以目标机不该被要求装发行版的 Qt 包：把 dpkg-shlibdeps
-  # 从"随包的 Qt 库"里推出来的 libqt6* / qt6-base-abi 去掉，只留下目标机必须
-  # 提供的系统库（libc / libstdc++ / X11 / xcb / GL / fontconfig 等）。
-  local filtered="" entry
+  # 我们**自带**了 Qt 及其依赖（ICU、glib、brotli…）。凡是我们随包提供 soname 的
+  # 组件，都不该出现在 Depends 里 —— 否则会出现"在只有别的 ICU 版本的发行版上
+  # 装不上，但装上了本来能跑"这种自相矛盾的状态（Ubuntu 22.04 就是这样）。
+  # 做法：把随包 .so 逐个用 dpkg -S 映射回提供它的包，然后从 Depends 里剔除。
+  local bundled_pkgs="" so pkg
+  while IFS= read -r so; do
+    [ -n "$so" ] || continue
+    pkg="$(dpkg -S "/usr/lib/x86_64-linux-gnu/$so" 2>/dev/null | sed -n 's/:.*//p' | sed -n '1p')"
+    [ -n "$pkg" ] && bundled_pkgs="$bundled_pkgs $pkg"
+  done < <(find "$tree/usr/lib/backup-project-client/lib" -name '*.so*' -printf '%f\n' 2>/dev/null | LC_ALL=C sort -u)
+  log "  随包组件（从 Depends 中剔除）：$(printf '%s' "$bundled_pkgs" | tr ' ' '\n' | sed '/^$/d' | LC_ALL=C sort -u | tr '\n' ' ')"
+  # 原来那条"去掉发行版 Qt"的规则保留：Qt 也在随包清单里，但显式写出来更清楚。
+
+  local filtered="" entry pkgname skip
   local IFS=','
   for entry in $depends; do
-    case "$entry" in
-      *libqt6*|*qt6-base-abi*) continue ;;
-    esac
-    filtered="${filtered:+$filtered, }$(printf '%s' "$entry" | sed -e 's/^ *//' -e 's/ *$//')"
+    pkgname="$(printf '%s' "$entry" | sed -e 's/^ *//' -e 's/ *(\(.*\) *$//')"
+    skip=0
+    case "$pkgname" in *libqt6*|*qt6-base-abi*) skip=1 ;; esac
+    case " $bundled_pkgs " in *" $pkgname "*) skip=1 ;; esac
+    [ "$skip" = "1" ] && continue
+    filtered="${filtered:+$filtered, }$pkgname"
   done
   unset IFS
   depends="$filtered"
   [ -n "$depends" ] || die "过滤掉自带的 Qt 之后依赖为空，说明推算出错了"
   case "$depends" in *libqt6*|*qt6-base-abi*) die "依赖里仍残留发行版 Qt 包" ;; esac
+  log "  剩余依赖都是目标机必须提供的系统库"
   log "  依赖（dpkg-shlibdeps，已去掉自带的 Qt）：$depends"
   build_deb packaging/client/deb "$tree" "$RELEASE_DIR/backup-project-client_${DEB_VERSION}_${DEB_ARCH}.deb" "$depends"
 }
