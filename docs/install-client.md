@@ -10,7 +10,7 @@
 | Debian 12（bookworm） | **支持**（构建基线） |
 | Ubuntu 24.04 LTS | **支持**（已实测） |
 | Ubuntu 23.10 / 23.04 | 应该可以（glibc ≥ 2.36），本轮未实测 |
-| Ubuntu 22.04 LTS | **不支持**：GUI 用到 Qt 6.3 才有的 `FolderDialog`，而 22.04 只带 Qt 6.2.4 |
+| Ubuntu 22.04 LTS | **支持（运行时）**：包自带 Qt 6.4，AppImage 与 .deb 都在 22.04 上实测通过 |
 | Windows / macOS / ARM64 | **不支持**（没有构建、也没有验证过，不声称支持） |
 
 架构：**linux x86_64**。
@@ -79,12 +79,23 @@ Qt 运行时和 QML 模块都在 AppImage 里，目标机器不需要装 Qt，�
 自建服务器请用 **SSH 安全通道** 或 **直接连接**，并按
 [客户端快速上手](client-quick-start.md) 填服务器地址与身份指纹。
 
+## 4.5 关于 Ubuntu 22.04（此前写错，在这里更正）
+
+本文早先的版本把客户端在 Ubuntu 22.04 上写成“不支持”，理由是“GUI 需要 Qt 6.3
+才有的 FolderDialog”。这个结论只对“用系统 Qt 在 22.04 上构建”成立，对发行包不成立：
+发行包自带 Qt 6.4.2 和它需要的依赖（含 ICU 72），所以在 22.04 上照样跑得起来。
+CI 里有一个专门作业在干净的 ubuntu:22.04 容器里验证：AppImage 启动正常、
+安装 .deb、GUI 起得来、QML 告警 0。
+
+构建基线仍然是 Debian 12（22.04 的 Qt 6.2.4 缺 FolderDialog，不能当构建机），
+但运行时没有这个问题。
+
 ## 5. 出问题先看这里
 
 | 现象 | 原因 | 处理 |
 |---|---|---|
 | 启动即退出，提示 `libQt6Core.so.6: cannot open shared object file` | 用的是旧包或手工搬了二进制 | 用同一个 .deb/AppImage 里的成套文件，不要单独拷二进制 |
-| `GLIBC_2.36 not found` | 目标发行版比构建基线旧（例如 Ubuntu 22.04） | 换 Debian 12 / Ubuntu 23.04+；或自己从源码构建 |
+| `GLIBC_2.36 not found` | 目标发行版比构建基线旧（glibc < 2.36，例如 Ubuntu 20.04） | 换 Debian 12 / Ubuntu 22.04+；或自己从源码构建 |
 | `QtQuick.Dialogs is not installed` | 用的是系统 Qt 而不是包里的 Qt | 用 AppImage，或确认 `/usr/lib/backup-project-client/qml` 存在 |
 | 界面能开但选择目录没有反应 | 缺平台插件（xcb） | 反馈时附上 `QT_DEBUG_PLUGINS=1` 的输出 |
 
