@@ -9,6 +9,7 @@
 
 namespace backupproject {
 
+// 不变量：MakeDevice(Major(d), Minor(d)) == d，设备号必须能原样往返。
 std::uint32_t DeviceMajor(std::uint64_t device) {
   return static_cast<std::uint32_t>(major(static_cast<dev_t>(device)));
 }

@@ -1,6 +1,6 @@
 // incremental_restore.h
 //
-// PR #18：把"任意一个 restore point"恢复出来。
+// 把"任意一个 restore point"恢复出来。
 //
 // 用户只需要选一份快照（完整或增量），依赖链由这里解析：
 //
@@ -13,7 +13,7 @@
 //   * 不允许环、不允许自指、链深度有上界；
 //   * 整条链必须属于同一个 generation（同一个 Full baseline）。
 //
-// restore 仍然沿用 PR #17 的原子原则：先完整恢复到 staging，全部成功之后才
+// restore 仍然沿用同一套原子原则：先完整恢复到 staging，全部成功之后才
 // 发布成 destination。任何失败都不会留下半个目标目录。
 //
 // 本文件是纯 C++17：不依赖 Qt，也不依赖任何第三方库。

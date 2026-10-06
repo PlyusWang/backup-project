@@ -1,4 +1,37 @@
 // filter_rule_model.cpp
+// 职责：过滤规则页的视图模型。它是"规则草稿列表"的唯一来源，对外提供三类
+// 东西：
+//   * rules_：QML 直接绑定的展示行（动作、条件摘要、明细、DSL 文本）；
+//   * 表单翻译：DraftFromForm / dslForForm / summaryForForm / validateForm，
+//     把 QML 的表单 map 翻成 backupproject::FilterRuleDraft；
+//   * 预览：把源目录加上当前草稿交给共享核心跑一遍，结果摊平成 QVariantMap。
+//
+// 职责边界：本文不定义筛选语义，也不实现匹配或扫描。规则文本由
+// FilterRuleBuilder 序列化、由 Filter::AddRule 裁决；预览由
+// backupproject::PreviewBackupSelection 完成（CLI 预览用的是同一个函数），
+// 所以"GUI 预览与 CLI 预览给出不同集合"在结构上不可能发生。
+//
+// 数据流：
+//   QML 表单 -> DraftFromForm -> drafts_（唯一来源）
+//            -> SyncController / RebuildRules -> 控制器 + 展示行
+//            -> requestPreview -> QtConcurrent 线程 -> ScanPreview
+//            -> watcher_.finished -> preview_items_ -> previewChanged
+//
+// 不变量：
+//   * drafts_ 是唯一来源，控制器与 rules_ 都是它的投影：任何改动都整体重放
+//     （见 SyncController），既没有索引映射，也不会出现两边顺序不同；
+//   * setRules 要么整体成功、要么一条都不改（先在副本上校验完再替换）；
+//   * last_error_ 为空表示现在没有错误；失败路径必须同时清掉上一份预览结果，
+//     绝不把已经过期的结果摆在错误信息旁边。
+//
+// 线程与生命周期：drafts_ / rules_ / preview_* 只由 GUI 线程访问；后台线程
+// 只拿到 source_path 与 drafts 的值拷贝，不接触任何成员；结果经
+// QFutureWatcher 回到 GUI 线程之后才写入。controller_ 是可空的弱引用（对象
+// 不属于本类），生命周期由外部保证。
+//
+// 失败语义：对外方法都不抛异常。表单类方法失败时返回空串或空 map，并把原因
+// 写进出参 error；setRules / addRule 返回 false，并通过 lastError 属性把中文
+// 原因送到界面。
 #include "filter_rule_model.h"
 
 #include <QDateTime>
@@ -24,6 +57,8 @@ namespace bp = backupproject;
 // 生成的草稿一律交给 FilterRuleBuilder 序列化、由 Filter::AddRule 最终裁决。
 
 // type 的 7 个取值，字符串与 DSL 逐字一致（见 docs/filter_usage.md 12.3）。
+// type 枚举 -> 稳定键。键同时是 DSL 取值与 QML 下拉框的 key，改动它等于
+// 改动规则语法：已保存的规则会解析失败，因此这里只做翻译，不做归一化。
 const char* TypeText(bp::RuleTypeValue type) {
   switch (type) {
     case bp::RuleTypeValue::kFile:
@@ -46,6 +81,8 @@ const char* TypeText(bp::RuleTypeValue type) {
 
 // 表单文本 -> type。未知取值返回 false，由调用方报错：以后核心再添类型而界面
 // 没跟上时，会明确失败，而不是静默按"普通文件"生成一条看起来正常的规则。
+// 稳定键 -> type 枚举。未知取值返回 false 而不是退回 kFile：界面用一个
+// 看不懂的值生成一条看似正常的"普通文件"规则，比直接报错危险得多。
 bool TypeFromText(const QString& text, bp::RuleTypeValue* type) {
   if (text == "file") {
     *type = bp::RuleTypeValue::kFile;
@@ -68,6 +105,8 @@ bool TypeFromText(const QString& text, bp::RuleTypeValue* type) {
 }
 
 // 明细 / 摘要里的比较运算符文本。
+// 数值比较 -> 显示文本。这些文本同时是 size 表单的键（kSizeCompares 直接
+// 用它们当 key），所以不能为了好看改成"<="以外的写法。
 const char* CompareText(bp::RuleSizeCompare compare) {
   switch (compare) {
     case bp::RuleSizeCompare::kLess:
@@ -89,6 +128,8 @@ const char* CompareText(bp::RuleSizeCompare compare) {
 // uid / gid 的比较运算符用独立的一组键（eq/lt/le/gt/ge/range），不复用 size 的
 // 符号键：size 的表单键就是符号本身，已经定型。空值按"等于"处理，与
 // FilterClauseDraft 的默认值一致。
+// uid / gid 的比较键 -> 枚举，未知取值返回 false（见 IdValueFromForm 的
+// fail-closed 说明）。空值按"等于"处理，与 FilterClauseDraft 的默认值一致。
 bool IdCompareFromText(const QString& text, bp::RuleSizeCompare* compare) {
   if (text.isEmpty() || text == "eq") {
     *compare = bp::RuleSizeCompare::kEqual;
@@ -115,6 +156,10 @@ bool IdCompareFromText(const QString& text, bp::RuleSizeCompare* compare) {
 // C++ 之前，谁都来不及拒绝它——最后生成一条与用户所写完全不同的规则。
 // 这里逐字符累加并**在乘之前**夹住上界（result > (max - digit) / 10），
 // 所以"非法"与"溢出"都是明确的失败，不会回绕。
+// 前置条件：form 里的 key 是用户在输入框里敲的原文，本函数负责 trim、
+// 判空与逐字符转数字。
+// 后置条件：成功时写 *value；失败时只写 *error_message，不动 *value。
+// 溢出判定与乘前夹紧已在下面说明，这里是整个表单里唯一解析 size 数字的地方。
 bool SizeValueFromForm(const QVariantMap& form, const QString& key,
                        std::uint64_t* value, QString* error_message) {
   const QString text = form.value(key).toString().trimmed();
@@ -151,6 +196,8 @@ bool SizeValueFromForm(const QVariantMap& form, const QString& key,
 // uid / gid 的表单值是十进制文本。这里只做"文本 -> uint32"的转换：超范围或非
 // 数字明确报错，绝不截断——把 uid:4294967296 截成 uid:0（root）会静默变成一条
 // 完全不同的规则；真正的语法裁决仍然在 Filter::AddRule 里。
+// 失败契约与 SizeValueFromForm 相同。区别是这里借用 QString::toUInt：非数字、
+// 负号与超出 uint32 的值都会让它把 ok 置为 false，正是 uid / gid 要的语义。
 bool IdValueFromForm(const QVariantMap& form, const QString& key,
                      std::uint32_t* value, QString* error_message) {
   const QString text = form.value(key).toString();
@@ -206,7 +253,11 @@ QString IdDetail(const char* field, std::uint32_t low, std::uint32_t high,
 }
 
 // mtime 的类型键（today/yesterday/last_days/day/day_range）-> 枚举。
-// 未知取值明确失败：核心以后再加时间形态时，界面没跟上会报错而不是静默落成"今天"。
+// 未知取值明确失败：核心以后再加时间形态时，
+// 界面没跟上会报错而不是静默落成"今天"。
+// mtime 类型键 -> 枚举，未知取值返回 false（采用 fail-closed，理由同
+// TypeFromText）：核心以后新增时间形态而界面没跟上时会明确报错，而不是
+// 静默落成"今天"。
 bool MtimeKindFromText(const QString& text, bp::RuleMtimeKind* kind) {
   if (text == "today") {
     *kind = bp::RuleMtimeKind::kToday;
@@ -226,6 +277,8 @@ bool MtimeKindFromText(const QString& text, bp::RuleMtimeKind* kind) {
 
 // "最近 N 天"的天数：这里只做"文本 -> int"的转换；天数必须大于 0、不能超过
 // 核心的上限，这些裁决全部在 FilterRuleBuilder 与 Filter::AddRule 里。
+// "最近 N 天"的 N 只做整数转换；N 必须大于 0、不能超过核心的上限，这些裁决
+// 全部留给 FilterRuleBuilder 与 Filter::AddRule，界面不复制一遍业务规则。
 bool DaysBackFromForm(const QVariantMap& form, const QString& key, int* value,
                       QString* error_message) {
   const QString text = form.value(key).toString();
@@ -243,6 +296,8 @@ bool DaysBackFromForm(const QVariantMap& form, const QString& key, int* value,
 }
 
 // 给界面用的紧凑明细：field = value（不含动作）。纯展示，不参与匹配。
+// 每条子句一行的紧凑明细，纯展示、不参与匹配。它只复述草稿里的字段值，
+// 不去查询真实文件，所以列表滚动时没有 I/O，也不会因为源目录变化而变样。
 QString ClauseDetail(const bp::FilterClauseDraft& clause) {
   switch (clause.field) {
     case bp::RuleField::kName:
@@ -298,10 +353,15 @@ QString ClauseDetail(const bp::FilterClauseDraft& clause) {
 
 // 预览里的文件大小也走全产品唯一的格式化规则：以前这里是整数截断的
 // “KB / MB”，而实际除的是 1024。
+// 预览里的大小也走全产品唯一的格式化函数：以前这里是整数截断的 KB/MB，
+// 而实际除的是 1024，同一份数据在预览和归档列表上显示成两个值。
 QString FormatSize(std::uint64_t bytes) {
   return QString::fromStdString(backupproject::FormatByteSize(bytes));
 }
 
+// 单位键 -> 枚举。注意这里会默默兜底：不认识的键
+// 一律变成 KB。它安全的前提是调用方只喂 kUnits 表里的取值；如果哪天键来自
+// 持久化数据，这里必须改成返回 bool，否则规则会悄悄换一个数量级。
 bp::RuleSizeUnit UnitFromText(const QString& text) {
   if (text == "B") return bp::RuleSizeUnit::kByte;
   if (text == "MB") return bp::RuleSizeUnit::kMega;
@@ -309,6 +369,8 @@ bp::RuleSizeUnit UnitFromText(const QString& text) {
   return bp::RuleSizeUnit::kKilo;
 }
 
+// 运算符键 -> 枚举，同样带兜底（默认 kGreaterEqual，即 QML 下拉框的默认项）。
+// 兜底的安全性同样依赖调用方只传 kSizeCompares 里的键。
 bp::RuleSizeCompare CompareFromText(const QString& text) {
   if (text == "<") return bp::RuleSizeCompare::kLess;
   if (text == "<=") return bp::RuleSizeCompare::kLessEqual;
@@ -322,6 +384,8 @@ bp::RuleSizeCompare CompareFromText(const QString& text) {
 
 // 预览条目的类型名。socket 在归档格式里没有对应表示（见 tree_scanner.h），
 // 标签直接把后果写出来，而不是让它看起来像一个能备份的条目。
+// 预览行的类型名。硬链接单独成类：它由扫描层为去重生成，并不是源目录里
+// 真实存在的条目类型，把它并进"普通文件"会让预览与实际归档内容对不上。
 QString PreviewTypeLabel(bp::EntryType type) {
   switch (type) {
     case bp::EntryType::kDirectory:
@@ -350,6 +414,10 @@ QString PreviewTypeLabel(bp::EntryType type) {
 // 只有三种取值，因为遍历的判定就是三选一：没有被排除的 socket 不让遍历继续
 // 走下去（真实 Backup 也会在它上面失败），所以它不是某一行的标签，而是整次
 // 预览的失败原因——见 FilterRuleModel::ScanPreview 的错误分支。
+// 判定 -> 界面文案。这里只做措辞，判定本身（进入归档 / 目录被剪 / 被排除）
+// 来自核心，界面不重新推算一遍。
+// 枚举里没有"socket 被跳过"这一项：未排除的 socket 会让整次预览失败，
+// 所以它是错误分支，而不是某一行上的标签。
 QString PreviewTag(const bp::PreviewItem& item) {
   switch (item.disposition) {
     case bp::PreviewDisposition::kDirectoryPruned:
@@ -366,8 +434,12 @@ QString PreviewTag(const bp::PreviewItem& item) {
 
 }  // namespace
 
+// 构造：只建立 watcher 与 finished 之间的这一次连接，不主动扫描——预览永远
+// 由用户操作触发。回调必定在 GUI 线程执行（QFutureWatcher 的契约），因此
+// 下面直接读写成员，不需要加锁。
 FilterRuleModel::FilterRuleModel(BackupController* controller, QObject* parent)
     : QObject(parent), controller_(controller) {
+  // 结果到达后先复位 busy，再决定是"补跑最新一次"还是"落地这次结果"。
   connect(&watcher_, &QFutureWatcher<PreviewOutcome>::finished, this, [this]() {
     const PreviewOutcome outcome = watcher_.result();
     preview_busy_ = false;
@@ -404,6 +476,8 @@ FilterRuleModel::FilterRuleModel(BackupController* controller, QObject* parent)
   });
 }
 
+// 面板顶部的规则汇总：所有草稿拼成一句句"包含/排除 ..."。没有任何规则时
+// 明确说明"将备份全部内容"，而不是留一片空白让人猜。
 QString FilterRuleModel::summaryText() const {
   QStringList parts;
   for (const bp::FilterRuleDraft& draft : drafts_) {
@@ -415,6 +489,8 @@ QString FilterRuleModel::summaryText() const {
   return parts.join(QStringLiteral("；"));
 }
 
+// 当前全部规则的 DSL 原文，一行一条，供用户复制或排查。序列化失败的草稿
+// 直接跳过——能显示出来的每一行都是真的能被核心接受的。
 QString FilterRuleModel::dslText() const {
   QStringList lines;
   for (const bp::FilterRuleDraft& draft : drafts_) {
@@ -428,6 +504,13 @@ QString FilterRuleModel::dslText() const {
   return lines.join(QStringLiteral("\n"));
 }
 
+// QML 表单 -> 草稿。这是界面侧唯一的输入关口，因此所有翻译都在这里收口：
+// 字段名、type、单位、运算符、mtime 形态、uid/gid 数值，任何一项不认识都
+// 返回 false 并给出中文原因，绝不退回默认值生成一条"看起来对"的规则。
+//
+// 副作用：只写 *draft 与 *error，不碰任何成员，因此可以在 QML 的属性绑定
+// 里被反复调用（预览文本就是这么更新的）。
+// 最后一步会调用 ValidateRule 让真实核心复核一遍，界面层不自己宣布合法。
 bool FilterRuleModel::DraftFromForm(const QVariantMap& form,
                                     bp::FilterRuleDraft* draft,
                                     QString* error) const {
@@ -436,6 +519,8 @@ bool FilterRuleModel::DraftFromForm(const QVariantMap& form,
     return false;
   };
 
+  // action 只有 "exclude" 是排除，其余（含空）都按包含处理：QML 下拉框的
+  // 默认项就是包含，这里不做隐式反转。
   const QString action = form.value(QStringLiteral("action")).toString();
   const QString field = form.value(QStringLiteral("field")).toString();
   draft->action = action == QStringLiteral("exclude")
@@ -579,6 +664,8 @@ bool FilterRuleModel::DraftFromForm(const QVariantMap& form,
       // 以后 RuleField 再添取值而这里忘了补分支时，会带着字段名明确失败。
       return fail(QStringLiteral("未知字段：") + field);
   }
+  // 表单一次只描述一个子句；多子句规则只能从高级入口进来。先清空再放入，
+  // 这样调用方复用同一个 draft 时不会把上一次的子句带进来。
   draft->clauses.clear();
   draft->clauses.push_back(clause);
   std::string message;
@@ -589,6 +676,8 @@ bool FilterRuleModel::DraftFromForm(const QVariantMap& form,
   return true;
 }
 
+// 六个下拉框的全部取值都在这里产出，QML 侧不硬编码任何选项文本。
+// 这里也刻意不做缓存：选项是常量表，重建一次的开销远小于维护失效逻辑。
 QVariantMap FilterRuleModel::editorOptions() const {
   // ---- 条件类型 ----
   //
@@ -719,6 +808,8 @@ QVariantMap FilterRuleModel::editorOptions() const {
     mtime_kinds.push_back(option);
   }
 
+  // 表结构与 QML 的绑定一一对应；新增一个字段 / 类型 / 单位时只改上面六个
+  // 数组即可，六个下拉框会一起更新。
   QVariantMap options;
   options.insert(QStringLiteral("fields"), fields);
   options.insert(QStringLiteral("types"), types);
@@ -729,6 +820,9 @@ QVariantMap FilterRuleModel::editorOptions() const {
   return options;
 }
 
+// 从保存下来的 include / exclude 文本列表重建草稿（打开设置页、应用预设时
+// 用）。每一条都按 raw_dsl 处理：存下来的就是 DSL 原文，不再反过来猜它当初
+// 是哪个表单字段填出来的。
 bool FilterRuleModel::setRules(const QStringList& include_rules,
                                const QStringList& exclude_rules) {
   // 先在**副本**上全部校验通过，再整体替换：半份新规则比旧规则更糟——
@@ -770,6 +864,8 @@ bool FilterRuleModel::setRules(const QStringList& include_rules,
   return true;
 }
 
+// 取出某一动作下的全部 DSL 文本（保存设置时用）。除 "exclude" 以外的
+// action 都按 include 处理，与 DraftFromForm 的默认值规则保持一致。
 QStringList FilterRuleModel::rulesForAction(const QString& action) const {
   const bool want_include = action != QStringLiteral("exclude");
   QStringList texts;
@@ -783,6 +879,7 @@ QStringList FilterRuleModel::rulesForAction(const QString& action) const {
   return texts;
 }
 
+// 表单实时预览用：非法草稿返回空串，由 QML 决定"还没填完"怎么显示。
 QString FilterRuleModel::dslForForm(const QVariantMap& form) const {
   bp::FilterRuleDraft draft;
   QString error;
@@ -792,6 +889,7 @@ QString FilterRuleModel::dslForForm(const QVariantMap& form) const {
   return QString::fromStdString(dsl);
 }
 
+// 表单实时预览的人话版本，与 dslForForm 走同一条草稿构造路径。
 QString FilterRuleModel::summaryForForm(const QVariantMap& form) const {
   bp::FilterRuleDraft draft;
   QString error;
@@ -799,6 +897,7 @@ QString FilterRuleModel::summaryForForm(const QVariantMap& form) const {
   return QString::fromStdString(bp::Summarize(draft));
 }
 
+// 只回答"能不能加"：合法返回空串，否则返回中文原因（可直接显示在表单下方）。
 QString FilterRuleModel::validateForm(const QVariantMap& form) const {
   bp::FilterRuleDraft draft;
   QString error;
@@ -806,6 +905,8 @@ QString FilterRuleModel::validateForm(const QVariantMap& form) const {
   return QString();
 }
 
+// 追加一条表单规则。顺序是"先翻译、再入库、最后同步投影"：翻译失败时
+// drafts_ 一个字节都没变，不需要回滚。
 bool FilterRuleModel::addRule(const QVariantMap& form) {
   bp::FilterRuleDraft draft;
   QString error;
@@ -821,6 +922,8 @@ bool FilterRuleModel::addRule(const QVariantMap& form) {
   return true;
 }
 
+// 追加一条手写 DSL 规则。与 addRule 的差别是不经过表单翻译，直接校验原文；
+// 校验走的是真实 Filter，因此高级入口与表单入口的合法性标准完全一致。
 bool FilterRuleModel::addAdvancedRule(const QString& action,
                                       const QString& dsl) {
   const bp::FilterAction filter_action = action == QStringLiteral("exclude")
@@ -842,6 +945,8 @@ bool FilterRuleModel::addAdvancedRule(const QString& action,
   return true;
 }
 
+// 校验一段手写 DSL，不改变任何状态。单独开一个 const 方法是为了让"边打字
+// 边校验"和"确认添加"走同一条判定路径，不会出现能校验通过却添加失败。
 QString FilterRuleModel::validateDsl(const QString& action,
                                      const QString& dsl) const {
   const bp::FilterAction filter_action = action == QStringLiteral("exclude")
@@ -855,11 +960,14 @@ QString FilterRuleModel::validateDsl(const QString& action,
   return QString();
 }
 
+// 越界索引返回 false 而不是抛异常：QML 侧的索引来自列表选中项，删除与
+// 选中之间存在天然的时序窗口，这里必须能容忍过期索引。
 bool FilterRuleModel::isAdvancedRule(int index) const {
   if (index < 0 || index >= static_cast<int>(drafts_.size())) return false;
   return !drafts_[static_cast<std::size_t>(index)].raw_dsl.empty();
 }
 
+// 删除一条规则。越界索引是静默无操作：调用方可能持有已经失效的选中项。
 void FilterRuleModel::removeRule(int index) {
   if (index < 0 || index >= static_cast<int>(drafts_.size())) return;
   drafts_.erase(drafts_.begin() + index);
@@ -868,6 +976,9 @@ void FilterRuleModel::removeRule(int index) {
   emit rulesChanged();
 }
 
+// 上移 / 下移一条规则，delta 通常是 -1 或 +1。
+// index 与 target 都必须落在范围内才交换：只做一次 std::swap，不做旋转，
+// 因此越界时宁可什么都不做，也不会把别的规则挪位。
 void FilterRuleModel::moveRule(int index, int delta) {
   const int target = index + delta;
   if (index < 0 || index >= static_cast<int>(drafts_.size())) return;
@@ -878,6 +989,8 @@ void FilterRuleModel::moveRule(int index, int delta) {
   emit rulesChanged();
 }
 
+// 清空全部规则，等价于"备份所有内容"。同样要同步控制器与展示行，否则界面
+// 已经空了、控制器里还留着旧规则。
 void FilterRuleModel::clearRules() {
   drafts_.clear();
   SyncController();
@@ -885,6 +998,10 @@ void FilterRuleModel::clearRules() {
   emit rulesChanged();
 }
 
+// 拼出可以直接粘贴到 shell 的参数串。值一律加单引号、选项名不加：规则里
+// 常有 '*'、'?'、空格（name:my report.txt），不加引号会被 shell 吃掉。
+// 这里只做展示，不负责转义单引号本身——含单引号的规则粘出去要用户自己改，
+// 与其在界面里做半套 shell 转义，不如让文本保持所见即所得。
 QString FilterRuleModel::cliArguments() const {
   QStringList parts;
   for (const std::string& arg : bp::CliArguments(drafts_)) {
@@ -896,12 +1013,15 @@ QString FilterRuleModel::cliArguments() const {
   return parts.join(QStringLiteral(" "));
 }
 
+// 清空错误。内容没变时不发信号：QML 的属性绑定会被无意义地重算一遍。
 void FilterRuleModel::clearError() {
   if (last_error_.isEmpty()) return;
   last_error_.clear();
   emit lastErrorChanged();
 }
 
+// 设置错误，同样做了去重。注意它只记录，不清预览结果——清理由调用方决定：
+// 表单校验失败时保留上一次预览是合理的，扫描失败时才必须清。
 void FilterRuleModel::SetError(const QString& message) {
   if (last_error_ == message) return;
   last_error_ = message;
@@ -910,6 +1030,8 @@ void FilterRuleModel::SetError(const QString& message) {
 
 // 规则列表是唯一来源，控制器只是它的投影：每次改动都整体重放一遍，
 // 这样两边的顺序与内容不可能不一致，也不需要索引映射。
+// 控制器只认 DSL 文本、不认草稿，所以这里做一次整体重放：先清空再按顺序
+// 重新添加，顺序与 drafts_ 逐条对应。
 void FilterRuleModel::SyncController() {
   if (controller_ == nullptr) return;
   controller_->clearFilterRules();
@@ -923,6 +1045,8 @@ void FilterRuleModel::SyncController() {
   }
 }
 
+// 把 drafts_ 投影成 QML 绑定的 rules_。整表重建而不是增量更新：规则数量是
+// 个位数，重建的代价可以忽略，换来的是"界面永远等于 drafts_"这条不变量。
 void FilterRuleModel::RebuildRules() {
   rules_.clear();
   for (const bp::FilterRuleDraft& draft : drafts_) {
@@ -953,6 +1077,8 @@ void FilterRuleModel::RebuildRules() {
   }
 }
 
+// 预览入口。恢复模式（restore_path 非空）不重新筛选，直接给出说明性错误：
+// 恢复的是已经归档的内容，再筛一遍只会误导用户以为恢复会重新选文件。
 void FilterRuleModel::requestPreview(const QString& source_path,
                                      const QString& restore_path) {
   if (source_path.isEmpty()) {
@@ -962,9 +1088,12 @@ void FilterRuleModel::requestPreview(const QString& source_path,
     return;
   }
   clearError();
-  // 记下最新一次请求；正在扫描时不排队第二次，等当前这次结束立刻用最新参数重扫。
+  // 记下最新一次请求；正在扫描时不排队第二次，
+  // 等当前这次结束立刻用最新参数重扫。
   pending_source_ = source_path;
   pending_drafts_ = drafts_;
+  // 正在扫描时只记下"还有新请求"，不排队：用户连点刷新时真正想要的是最后
+  // 那一次的结果，中间态没有展示价值。
   if (preview_busy_) {
     preview_pending_ = true;
     return;
@@ -972,12 +1101,16 @@ void FilterRuleModel::requestPreview(const QString& source_path,
   StartScan(pending_source_, pending_drafts_);
 }
 
+// 启动一次后台扫描。走到这里 preview_pending_ 一定已经复位，busy 由本函数
+// 置位，因此"busy 为真但没有人会复位它"的状态不存在。
 void FilterRuleModel::StartScan(
     const QString& source_path,
     const std::vector<backupproject::FilterRuleDraft>& drafts) {
   preview_busy_ = true;
   preview_pending_ = false;
   emit previewChanged();
+  // 值捕获是刻意的：后台线程只拿到字符串与草稿副本，不捕获 this，所以窗口
+  // 销毁、模型析构都不会与扫描线程打架；结果经 watcher_ 回到 GUI 线程。
   watcher_.setFuture(QtConcurrent::run([source_path, drafts]() {
     return ScanPreview(source_path, drafts, kPreviewLimit);
   }));
@@ -986,6 +1119,9 @@ void FilterRuleModel::StartScan(
 // 扫描本身在共享核心 backupproject::PreviewBackupSelection 里（CLI 预览用的是
 // 同一个函数），这里只把结果翻成 QML 能绑定的 QVariantMap。所以"GUI 预览与
 // CLI 预览看到不同的集合"在结构上不可能发生——两边是同一次调用。
+// 扫描线程里的全部工作。本函数是静态的、不访问任何成员，因此可以安全地在
+// 后台线程运行；它唯一的输入是路径与草稿副本，唯一的输出是纯数据的结构体。
+// limit 为 0 时退回核心的默认条目上限，避免把"不限制"解释成"扫描全部"。
 FilterRuleModel::PreviewOutcome FilterRuleModel::ScanPreview(
     const QString& source_path, const std::vector<bp::FilterRuleDraft>& drafts,
     int limit) {

@@ -1,6 +1,7 @@
 // BackupOptionsPanel.qml
 //
-// 备份页的「高级选项」折叠面板：打包格式 / 压缩 / 加密，以及加密时才出现的密码输入。
+// 备份页的「高级选项」折叠面板：打包格式 / 压缩 / 加密，
+// 以及加密时才出现的密码输入。
 //
 // 为什么默认收起：此前的产品行为是"选一个源目录、点开始备份"，
 // 默认取值（mypack + 不压缩 + 不加密）必须与那套行为完全一致 ——
@@ -8,8 +9,12 @@
 //
 // 分工：QML 只持有"用户选了哪一个"的字符串键（mypack / ustar / none …），
 // 键到枚举的映射、密码的校验与实际使用全部在 C++ 控制器里。
-// 界面不解释数字枚举，也不自己拼算法展示文案（备份记录里的展示文案由 C++ 给出）。
+// 界面不解释数字枚举，也不自己拼算法展示文案
+// （备份记录里的展示文案由 C++ 给出）。
 
+// 数据流是单向的：面板 -> 调用方。面板不修改控制器状态，也不把控制器的
+// 当前值回填到自己身上（回填会让用户的选择被后台刷新覆盖）；每次打开
+// 页面用的都是这里的默认值。
 import QtQuick
 import QtQuick.Layouts
 
@@ -37,14 +42,20 @@ Item {
     readonly property string confirmPassword: confirmField.text
 
     // "当前输入合不合法"与"该不该把错误显示出来"是两件事，所以分开：
-    // validationMessage 一直实时算，这个开关只在用户真的点过一次"开始备份"之后才置真。
-    // 于是刚选上 AES、还没输入时不会先红一片；而成功提交后 clearPasswords()
-    // 会把它复位，红色提示随之消失 —— 那一次的密码是程序主动清的，不是用户输错了。
+    // validationMessage 一直实时算，这个开关只在用户真的点过一次
+    // "开始备份"之后才置真。于是刚选上 AES、还没输入时不会先红一片；
+    // 而成功提交后 clearPasswords() 会把它复位，红色提示随之消失
+    // —— 那一次的密码是程序主动清的，不是用户输错了。
     property bool passwordValidationRequested: false
 
+    // 不变量：*Keys 与 *Labels 是按下标一一对应的两个数组（labels 由
+    // backup_controller.cpp 的 option*Labels 提供，keys 在这里列出）。下面
+    // onActivated 用 currentIndex 查 keys，两个数组一旦顺序不一致，提交给
+    // 核心的就是另一个算法，而界面上显示的还是用户选的那个。
     // 显示名与键分开放：下拉里给人看的是显示名，交给 C++ 的始终是键。
     // 显示名只有一份来源（backup_option_labels.h，通过 main.cpp 注册的
-    // controller 的 option*Labels 属性）：手动 / 自动 / 实时三个页面共用同一组文字。
+    // controller 的 option*Labels 属性）：手动 / 自动 / 实时三个页面
+    // 共用同一组文字。
     // 以前手动页写 "MyPack"、另两页写 "MyPack（推荐）"，下拉里看到的文字
     // 会随页面不同而不同；键仍然由各页自己列出，与展示名一一对应。
     readonly property var strategyLabels: controller.optionStrategyLabels
@@ -60,17 +71,25 @@ Item {
                                            "aes-256-ctr-hmac-sha256",
                                            "des-cbc-hmac-sha256"]
 
-    readonly property int strategyIndex: Math.max(0, panel.strategyKeys.indexOf(panel.strategyKey))
-    readonly property int packIndex: Math.max(0, panel.packKeys.indexOf(panel.packKey))
-    readonly property int compressionIndex: Math.max(0, panel.compressionKeys.indexOf(panel.compressionKey))
-    readonly property int encryptionIndex: Math.max(0, panel.encryptionKeys.indexOf(panel.encryptionKey))
+    // indexOf 找不到时返回 -1（例如 C++ 给回一个本地没有的键），
+    // Math.max(0, ...) 把它夹回 0：界面退化成显示第一项，而不是让 ComboBox
+    // 停在 -1 上出现空选择。
+    readonly property int strategyIndex:
+        Math.max(0, panel.strategyKeys.indexOf(panel.strategyKey))
+    readonly property int packIndex:
+        Math.max(0, panel.packKeys.indexOf(panel.packKey))
+    readonly property int compressionIndex:
+        Math.max(0, panel.compressionKeys.indexOf(panel.compressionKey))
+    readonly property int encryptionIndex:
+        Math.max(0, panel.encryptionKeys.indexOf(panel.encryptionKey))
 
     // 收起时的一行摘要：直接用当前选中项的显示名拼，和下拉里看到的完全一致。
     // 策略排在最前：它是"这次备份是什么"，另外三个是"怎么写"。
-    readonly property string summaryText: panel.strategyLabels[panel.strategyIndex] + " · "
-                                          + panel.packLabels[panel.packIndex] + " · "
-                                          + panel.compressionLabels[panel.compressionIndex] + " · "
-                                          + panel.encryptionLabels[panel.encryptionIndex]
+    readonly property string summaryText:
+        panel.strategyLabels[panel.strategyIndex] + " · "
+        + panel.packLabels[panel.packIndex] + " · "
+        + panel.compressionLabels[panel.compressionIndex] + " · "
+        + panel.encryptionLabels[panel.encryptionIndex]
 
     // 增量策略的说明。刻意把两件容易被误解的事说清楚：
     // 第一次会建完整基线，以及增量 v1 只支持 MyPack。
@@ -92,7 +111,8 @@ Item {
     readonly property bool strategyEncryptionCombinationAllowed:
         panel.strategyKey !== "incremental" || panel.encryptionKey === "none"
     readonly property bool strategyCombinationAllowed:
-        panel.strategyPackCombinationAllowed && panel.strategyEncryptionCombinationAllowed
+        panel.strategyPackCombinationAllowed
+            && panel.strategyEncryptionCombinationAllowed
     readonly property string strategyEncryptionHelper:
         panel.strategyKey === "incremental"
             ? "增量 v1 不支持加密，加密方式已固定为 none。"
@@ -103,7 +123,8 @@ Item {
     // 那会把"我什么时候选的加密"变成一个谜）。
     property bool strategyResetEncryptionNotice: false
     onStrategyKeyChanged: {
-        if (panel.strategyKey === "incremental" && panel.encryptionKey !== "none") {
+        if (panel.strategyKey === "incremental"
+            && panel.encryptionKey !== "none") {
             panel.encryptionKey = "none"
             panel.strategyResetEncryptionNotice = true
         } else if (panel.strategyKey !== "incremental") {
@@ -124,17 +145,21 @@ Item {
         if (panel.compressionKey === "huffman")
             return "基于字符频率的无损压缩。"
         if (panel.compressionKey === "lzss-huffman")
-            return "先利用重复片段，再进行 Huffman 编码；通常更适合重复较多的数据。"
+            return "先利用重复片段，再进行 Huffman 编码；"
+                + "通常更适合重复较多的数据。"
         return ""
     }
 
     readonly property bool encryptionSelected: panel.encryptionKey !== "none"
-    // "手写实现 + 未经专业审计"这两件事必须写在用户做选择的地方，而不是只写在文档里：
-    // 选了加密却不知道这一点，是这一页最大的风险。
-    readonly property string encryptionDisclaimer: panel.encryptionSelected
-                                                   ? "本项目的密码学实现为课程手写实现，未经专业密码学审计，不应用于真实敏感数据。"
-                                                   : ""
-    readonly property bool legacyEncryptionSelected: panel.encryptionKey === "des-cbc-hmac-sha256"
+    // "手写实现 + 未经专业审计"这两件事必须写在用户做选择的地方，
+    // 而不是只写在文档里：选了加密却不知道这一点，是这一页最大的风险。
+    readonly property string encryptionDisclaimer:
+        panel.encryptionSelected
+        ? "本项目的密码学实现为课程手写实现，"
+          + "未经专业密码学审计，不应用于真实敏感数据。"
+        : ""
+    readonly property bool legacyEncryptionSelected:
+        panel.encryptionKey === "des-cbc-hmac-sha256"
 
     // 密码规则只有两条：非空、两次一致。长度 / 复杂度是核心没有的要求，
     // 界面不自己发明，也不假装检查过。
@@ -148,10 +173,12 @@ Item {
             return "两次输入的密码不一致"
         return ""
     }
-    readonly property bool passwordAcceptable: !panel.passwordControlsVisible
-                                               || panel.validationMessage.length === 0
+    readonly property bool passwordAcceptable:
+        !panel.passwordControlsVisible
+        || panel.validationMessage.length === 0
 
-    // 清的是输入框本身 —— password / confirmPassword 是它 text 的 readonly 绑定，
+    // 清的是输入框本身 —— password / confirmPassword 是它 text 的
+    // readonly 绑定，所以不存在"清了一处、另一处还留着"的可能。
     // 所以不存在"清了一处、另一处还留着"的可能。
     //
     // 顺带把"已请求过校验"复位：清空是成功提交之后的动作，不是用户输错了，
@@ -162,12 +189,16 @@ Item {
         panel.passwordValidationRequested = false
     }
 
-    // 用户按下"开始备份"时才请求校验。单独给一个函数而不是让 BackupPage 直接写属性，
+    // 用户按下"开始备份"时才请求校验。单独给一个函数而不是让
+    // BackupPage 直接写属性，是为了让"什么算一次提交尝试"只有面板自己知道。
     // 是为了让"什么算一次提交尝试"只有面板自己知道。
     function requestPasswordValidation() {
         panel.passwordValidationRequested = true
     }
 
+    // 加密方式切换的两个方向处理方式不同：切回 none 时清掉密码（留着会让
+    // "这次到底用没用密码"含糊），切到另一种加密时保留已输入的密码，只复位
+    // "已请求校验"，避免把上一次的红色错误继承过来。
     onEncryptionKeyChanged: {
         if (panel.encryptionKey === "none") {
             // 切回"不加密"：留着上一次的密码没有用处，还会让
@@ -175,12 +206,15 @@ Item {
             panel.clearPasswords()
         } else {
             // 切到（或切换到另一种）加密方式时只复位"已尝试提交"，
-            // 不清已经输入的密码 —— 清不清密码是既有行为，本轮不扩大语义。
+            // 不清已经输入的密码 —— 清不清密码是既有行为，这里不扩大语义。
             // 重点是别把上一次的红色错误继承过来。
             panel.passwordValidationRequested = false
         }
     }
 
+    // 面板高度完全由卡片内容决定：card 只锚了上 / 左 / 右（不锚 bottom），
+    // 所以它的高度就是 implicitHeight，展开与收起会自动改变整页布局，
+    // 这里不需要也不应该写死高度。
     implicitHeight: card.implicitHeight
 
     AppCard {
@@ -213,7 +247,8 @@ Item {
                     text: panel.summaryText
                     font.pixelSize: 16
                     color: theme.textPrimary
-                    // 连 DES 的长名字算进来后仍可能超出窄窗口，这里用省略号收尾：
+                    // 连 DES 的长名字算进来后仍可能超出窄窗口，
+                    // 这里用省略号收尾：宁可少显示几个字，也不让页面横向溢出。
                     // 宁可少显示几个字，也不让页面横向溢出。
                     elide: Text.ElideRight
                 }
@@ -252,7 +287,8 @@ Item {
                         model: panel.strategyLabels
                         currentIndex: panel.strategyIndex
                         enabled: !controller.busy
-                        onActivated: panel.strategyKey = panel.strategyKeys[currentIndex]
+                        onActivated: panel.strategyKey =
+                            panel.strategyKeys[currentIndex]
                     }
 
                     Text {
@@ -261,7 +297,9 @@ Item {
                         visible: text.length > 0
                         text: panel.strategyHelper
                         font.pixelSize: 15
-                        color: panel.strategyPackCombinationAllowed ? theme.textSecondary : theme.error
+                        color: panel.strategyPackCombinationAllowed
+                            ? theme.textSecondary
+                            : theme.error
                         wrapMode: Text.WordWrap
                     }
                 }
@@ -278,8 +316,8 @@ Item {
                     }
 
                     // 控件宽度统一按最长的那个显示名取（DES 那一条约 390px）：
-                    // 加密方式必须在收起状态下也能完整读到“教学 / 旧算法”这几个字，
-                    // 被省略号截掉的警示等于没有。
+                    // 加密方式必须在收起状态下也能完整读到“教学 / 旧算法”
+                    // 这几个字，被省略号截掉的警示等于没有。
                     AppComboBox {
                         objectName: "packSelector"
                         Layout.fillWidth: true
@@ -287,7 +325,8 @@ Item {
                         model: panel.packLabels
                         currentIndex: panel.packIndex
                         enabled: !controller.busy
-                        onActivated: panel.packKey = panel.packKeys[currentIndex]
+                        onActivated: panel.packKey =
+                            panel.packKeys[currentIndex]
                     }
 
                     Text {
@@ -319,7 +358,8 @@ Item {
                         model: panel.compressionLabels
                         currentIndex: panel.compressionIndex
                         enabled: !controller.busy
-                        onActivated: panel.compressionKey = panel.compressionKeys[currentIndex]
+                        onActivated: panel.compressionKey =
+                            panel.compressionKeys[currentIndex]
                     }
 
                     Text {
@@ -350,9 +390,12 @@ Item {
                         Layout.maximumWidth: 420
                         model: panel.encryptionLabels
                         currentIndex: panel.encryptionIndex
-                        // 增量 v1 不支持加密：选项直接置灰，而不是让用户选完才被拒绝。
-                        enabled: !controller.busy && panel.strategyKey !== "incremental"
-                        onActivated: panel.encryptionKey = panel.encryptionKeys[currentIndex]
+                        // 增量 v1 不支持加密：选项直接置灰，
+                        // 而不是让用户选完才被拒绝。
+                        enabled: !controller.busy
+                            && panel.strategyKey !== "incremental"
+                        onActivated: panel.encryptionKey =
+                            panel.encryptionKeys[currentIndex]
                     }
 
                     // 增量下的那一句原因（含"刚从加密切过来"的提示）。它不是
@@ -365,8 +408,9 @@ Item {
                               ? "增量 v1 不支持加密，加密方式已复位为 none。"
                               : panel.strategyEncryptionHelper
                         font.pixelSize: 15
-                        color: panel.strategyEncryptionCombinationAllowed ? theme.textSecondary
-                                                                          : theme.error
+                        color: panel.strategyEncryptionCombinationAllowed
+                            ? theme.textSecondary
+                            : theme.error
                         wrapMode: Text.WordWrap
                     }
 
@@ -433,8 +477,9 @@ Item {
                         enabled: !controller.busy
                     }
 
-                    // 提示只在"用户真的点过一次开始备份"之后才出现：刚选上 AES 还没输入时
-                    // 不该先报错，成功提交清空密码之后也不该立刻跳成"密码不能为空"。
+                    // 提示只在"用户真的点过一次开始备份"之后才出现：
+                    // 刚选上 AES 还没输入时不该先报错，
+                    // 成功提交清空密码之后也不该立刻跳成"密码不能为空"。
                     // 一旦请求过校验，文案仍然实时跟随 validationMessage 更新，
                     // 用户边改边看到它从"不能为空"变成"两次不一致"再消失。
                     Text {

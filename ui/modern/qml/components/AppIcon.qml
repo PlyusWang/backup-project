@@ -4,19 +4,32 @@
 // 之所以不用 SVG 文件，是因为 QML 的 Image 不能方便地按主题重新着色；
 // 直接用 Canvas 画就能跟随 theme 的颜色绑定，切主题不需要换图片。
 
+// 绘制生命周期：属性变化 -> requestPaint() -> onPaint 一次性重画全部路径。
+// Canvas 没有局部重绘的概念，所以每个 case 都要自己 beginPath，不能依赖
+// 上一条路径的残留状态。
+//
+// 所有 case 共用的前提：坐标系已被 ctx.scale 缩放到 18x18，颜色来自 color
+// 属性，线宽来自 size —— case 内部只允许出现路径坐标，不再改这些设置。
 import QtQuick
 
 Canvas {
     id: icon
 
+    // 唯一输入。默认空串什么都不画，所以先把 AppIcon 放上去当占位是安全的；
+    // 拼错名字只会在界面上留一个空位，不会有任何报错。color / size 有默认值，
+    // 调用点通常只写 name。
     property string name: ""
     property color color: theme.textPrimary
     property int size: 18
 
+    // width 与 height 都绑到同一个 size，两个方向的缩放系数因此相同 ——
+    // 即使调用点只写了 size，图标也不会被拉变形。
     width: size
     height: size
     antialiasing: true
 
+    // 三个属性都必须显式驱动重画：onPaint 不会因为属性变化自动重跑，少了
+    // 任何一条绑定，切主题或换名字时都会保留上一帧的像素。
     // 颜色或图标名变化时重画；Canvas 不会自动跟踪依赖。
     onColorChanged: requestPaint()
     onNameChanged: requestPaint()
@@ -27,12 +40,16 @@ Canvas {
         ctx.clearRect(0, 0, width, height)
         ctx.strokeStyle = color
         ctx.fillStyle = color
+        // 线宽随尺寸缩放但有下限 1.2：更细的线在小尺寸下会被抗锯齿抹成
+        // 一层灰雾，"图标一变小就消失"是这里最容易踩的坑。
         ctx.lineWidth = Math.max(1.2, size / 12)
         ctx.lineCap = "round"
         ctx.lineJoin = "round"
 
         // 统一在 18x18 的逻辑坐标系里描述路径，再按实际尺寸缩放，
         // 这样同一个图标在 16 / 18 / 20 px 下比例一致。
+        // save/restore 包住整套缩放：Canvas 的上下文状态在多次 onPaint 之间
+        // 是保留的，不还原会让缩放逐次累乘，图标越来越小。
         ctx.save()
         ctx.scale(width / 18, height / 18)
 
@@ -106,6 +123,8 @@ Canvas {
             ctx.lineTo(12.3, 10.7)
             ctx.stroke()
             break
+        // 八条射线按 45 度均分，端点用 cos/sin 现算，圆心 (9,9) 就是 18x18
+        // 逻辑坐标系的中心。
         case "sun":
             ctx.beginPath()
             ctx.arc(9, 9, 3.4, 0, Math.PI * 2)
@@ -128,12 +147,14 @@ Canvas {
             var moon_gap = 5.2
             var moon_half_gap = moon_gap / 2
             var cusp = Math.atan2(
-                Math.sqrt(moon_radius * moon_radius - moon_half_gap * moon_half_gap),
+                Math.sqrt(
+                    moon_radius * moon_radius - moon_half_gap * moon_half_gap),
                 moon_half_gap)
             // 月牙左右不对称，外圆圆心右移半个宽度，整体才是居中的。
             var moon_center_x = 9 + (moon_radius - moon_half_gap) / 2
             ctx.beginPath()
-            ctx.arc(moon_center_x, 9, moon_radius, cusp, Math.PI * 2 - cusp, false)
+            ctx.arc(
+                moon_center_x, 9, moon_radius, cusp, Math.PI * 2 - cusp, false)
             ctx.arc(moon_center_x + moon_gap, 9, moon_radius, Math.PI + cusp,
                     Math.PI - cusp, true)
             ctx.closePath()
@@ -170,6 +191,9 @@ Canvas {
         case "maximize":
             ctx.strokeRect(4.8, 4.8, 8.4, 8.4)
             break
+        // 最大化按钮的"还原"态：前景矩形 + 右上角露出的一条边，表示两个
+        // 叠放的窗口。它与 "maximize" 由调用方按窗口状态二选一
+        // （Main.qml 里的标题栏按钮）。
         case "restore-window":
             ctx.strokeRect(3.6, 6.4, 8, 8)
             ctx.beginPath()
@@ -181,7 +205,8 @@ Canvas {
             ctx.stroke()
             break
         case "settings":
-            // 齿轮：一个中心圆 + 八根径向短齿。18x18 下再画齿形轮廓就糊成一团了。
+            // 齿轮：一个中心圆 + 八根径向短齿。
+            // 18x18 下再画齿形轮廓就糊成一团了。
             ctx.beginPath()
             ctx.arc(9, 9, 3.1, 0, Math.PI * 2)
             ctx.stroke()
@@ -248,9 +273,13 @@ Canvas {
             ctx.closePath()
             ctx.stroke()
             break
+        // 认不出的名字落到这里：什么都不画。新增图标只加 case 是不够的，
+        // 调用点也要跟着加；拼错名字不会有任何报错。
         default:
             break
         }
+        // 与上面的 ctx.save() 配对：restore 之后上下文回到进入 onPaint 时的
+        // 状态，下一帧从干净状态开始。
         ctx.restore()
     }
 }

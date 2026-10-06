@@ -24,13 +24,18 @@ constexpr int kUnitCount = static_cast<int>(sizeof(kUnits) / sizeof(kUnits[0]));
 
 }  // namespace
 
+// 表是唯一真值：下拉框顺序与 LargestExactFrequencyUnit 的搜索方向都来自它。
 int FrequencyUnitCount() { return kUnitCount; }
 
+// 越界返回第一个单位而不是崩溃或返回空引用：index 来自 QML，模型变化后可能
+// 已经过期，给一个合法值是这里更安全的选择。
 const FrequencyUnit& FrequencyUnitAt(int index) {
   if (index < 0 || index >= kUnitCount) return kUnits[0];
   return kUnits[index];
 }
 
+// 返回指向静态表的指针（调用方不得释放或修改）。找不到返回 nullptr 而不是
+// 回退到分钟 —— unit key 来自配置文件，未知值必须报错而不是猜。
 const FrequencyUnit* FindFrequencyUnit(const std::string& key) {
   for (const FrequencyUnit& unit : kUnits) {
     if (key == unit.key) return &unit;
@@ -47,6 +52,8 @@ const FrequencyUnit& LargestExactFrequencyUnit(std::uint32_t interval_minutes) {
   return kUnits[0];
 }
 
+// 三段校验的顺序不能换：先用“分钟上界”卡住数值（任何单位下的合法值都不会
+// 超过它），再用除法规避溢出，最后才检查下界。
 bool ParseFrequency(const std::string& value_text, const std::string& unit_key,
                     std::uint32_t* interval_minutes,
                     std::string* error_message) {
@@ -79,6 +86,7 @@ bool ParseFrequency(const std::string& value_text, const std::string& unit_key,
   // 乘之前先除：value * unit->minutes 不会溢出，也不需要 128 位中间量。
   // 这一步同时是"超最大值"的唯一判据——比先乘再看结果可靠得多，因为
   // 先乘就已经回绕了。
+  // 先除后乘：这一步同时是“超上限”的唯一判据，先乘的话结果已经回绕了。
   if (value > bp::kMaxIntervalMinutes / unit->minutes) {
     if (error_message != nullptr) {
       *error_message = "备份频率超出范围：每 " + value_text + " " +

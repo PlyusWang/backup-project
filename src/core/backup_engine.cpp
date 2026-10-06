@@ -25,7 +25,11 @@ void SetError(std::string* error_message, const std::string& text) {
 
 }  // namespace
 
+// 线程与互斥：引擎之间没有共享状态，但同一个目标路径上的并发调用没有保护 ——
+// 互斥由上层负责（GUI 侧是 OperationGate），这里不重复实现第二套。
 // 引擎本身没有状态，默认构造即可。
+// 唯一的成员 file_system_ 也是无状态工具对象，Reader/Writer 都是每次调用
+// 现构造的局部变量，所以调用之间没有要清理的中间状态。
 BackupEngine::BackupEngine() = default;
 
 // 打包流程：验源目录 → 交给 ArchiveWriter。
@@ -113,6 +117,7 @@ bool BackupEngine::Restore(const std::string& archive_file,
   ArchiveFileInfo info;
   if (IdentifyArchiveFile(archive_file, &info, nullptr) &&
       info.kind == ArchiveFileInfo::Kind::kContainerV2) {
+    // 旧签名没有密码入口：加密容器在这里明确失败，而不是被当成坏文件。
     const RestoreOptions no_password;
     return RunRestorePipeline(archive_file, destination_directory, no_password,
                               nullptr, error_message);

@@ -78,7 +78,7 @@ namespace backup_modern {
 //
 // 为什么不直接用 client_.connected()：BPNET1 是"每次操作建立连接"，那个
 // 布尔值既短命又容易被读成"服务器健康状态"。旧界面把"还没有试过连接"
-// 写成"未连接"，人工验收时被理解成"服务器挂了 / 隧道断了"。
+// 写成"未连接"，容易被理解成"服务器挂了 / 隧道断了"。
 enum class RemoteReachability {
   kUnknown = 0,
   kReachable = 1,
@@ -99,7 +99,7 @@ struct RemoteOpResult {
     kDelete,
     // 注销账户：服务端删除，不是"退出登录"。
     kDeleteAccount,
-    // PR #21 产品级远端增量：把**目录**备份到远端（完整或增量）——
+    // 产品级远端增量：把**目录**备份到远端（完整或增量）——
     // 对应 backupctl remote backup。与 kUpload（上传一个本地 .bak）是
     // 两件事：那一条是低层 raw 归档操作，这一条走材料包 + 链。
     kBackup,
@@ -107,7 +107,7 @@ struct RemoteOpResult {
     // 对应 backupctl remote restore。与 kDownload（下载一个 blob）也是
     // 两件事。
     kRestore,
-    // 原始归档的"单独恢复"（PR #21 UI closure）：下载那一个 blob，按**内容**
+    // 原始归档的"单独恢复"：下载那一个 blob，按**内容**
     // 认出它是不是本机能独立恢复的归档，然后交给既有的本地恢复核心。
     // 它**不是**链恢复：原始归档没有 lineage / parent / 副文件。
     kRestoreRaw,
@@ -222,7 +222,7 @@ class RemoteController : public QObject {
   // 用户名密码合不合规，都在那一次调用里判完，不存在"先写一半再登录"的
   // 中间态。这里回读的是**上一次真正生效**的那一组值。
   //
-  // 本轮不做持久化：config.json 里只有仓库路径，没有自然落点，就不为了三个
+  // 不做持久化：config.json 里只有仓库路径，没有自然落点，就不为了三个
   // 字段新造一套配置系统（见 06-KNOWN-LIMITATIONS.md）。
   Q_PROPERTY(QString host READ host NOTIFY endpointChanged)
   Q_PROPERTY(QString portText READ portText NOTIFY endpointChanged)
@@ -235,16 +235,16 @@ class RemoteController : public QObject {
   Q_PROPERTY(QString serverKeyPinError READ serverKeyPinError NOTIFY
                  serverKeyPinErrorChanged)
 
-  // ---- 连接方式与 SSH 安全通道（PR #22）----
+  // ---- 连接方式与 SSH 安全通道 ----
   //
   // 当前部署里 backup-server 只监听 ECS 的 127.0.0.1:18765，公网没有开这个
   // 端口、安全组也没有改。于是"连 127.0.0.1:18765"只有在**本机存在一条到
-  // ECS 的 SSH 端口转发**时才成立。PR #21 把这件事留给用户自己在另一个终端
-  // 里记着，人工验收的结果就是一句 connection refused，而产品一句话都没说。
+  // ECS 的 SSH 端口转发**时才成立。以前这件事留给用户自己在另一个终端
+  // 里记着，结果就是一句 connection refused，而产品一句话都没说。
   //
   // 所以连接方式成了产品的一部分：
   //   ssh    —— GUI 自己起 ssh -N -L：本地随机回环端口 -> SSH 主机 -> 远端服务
-  //   direct —— 直连（高级）：逻辑与 PR #21 完全一样
+  //   direct —— 直连（高级）：逻辑与既有直连行为完全一样
   //
   // SSH 通道只是**传输层**。BPSEC1 握手与 server pin 校验一个字节都没有少，
   // 仍然在隧道**里面**跑：OpenSSH 的 host key 与 BPSEC1 的 pin 是两层独立
@@ -279,12 +279,12 @@ class RemoteController : public QObject {
   Q_PROPERTY(QString tunnelDiagnosticText READ tunnelDiagnosticText NOTIFY
                  tunnelChanged)
 
-  // ---- 服务器身份指纹：草稿 vs 已应用（PR #22）----
+  // ---- 服务器身份指纹：草稿 vs 已应用 ----
   //
   // serverKeyPin 是**已经生效**的那一个（appliedServerKeyPin 是它的别名，
   // 页面用它做 dirty 判断）。用户点"应用"以后必须**看得见**结果：
   // pinApplyState 是机器可读的 applied / unchanged / invalid，pinApplyMessage
-  // 是那一行绿色反馈。人工验收发现的"点了应用什么都不发生"就是这里缺的。
+  // 是那一行绿色反馈。"点了应用什么都不发生"就是这里缺的。
   Q_PROPERTY(
       QString appliedServerKeyPin READ serverKeyPin NOTIFY serverKeyPinChanged)
   Q_PROPERTY(QString pinApplyState READ pinApplyState NOTIFY pinApplyChanged)
@@ -305,7 +305,7 @@ class RemoteController : public QObject {
 
   // ---- 云端备份列表 ----
   // 每一项是 {id, name, sizeBytes, sizeText, createdText, sha256Short} 加上
-  // PR #21 的链元数据 {kind, kindText, generation, parentId, parentShort,
+  // 链元数据 {kind, kindText, generation, parentId, parentShort,
   // lineageShort, restorable, restoreHint}：页面只做展示，不再自己算大小、
   // 时间，也不自己推断"这一条能不能恢复"。
   Q_PROPERTY(QVariantList snapshots READ snapshots NOTIFY snapshotsChanged)
@@ -417,7 +417,7 @@ class RemoteController : public QObject {
   QString loginError() const { return login_error_; }
   QString registerError() const { return register_error_; }
   QString serverKeyPinError() const { return server_key_pin_error_; }
-  // ---- 连接方式 / 通道（PR #22）----
+  // ---- 连接方式 / 通道 ----
   QString connectionMode() const;
   QString officialCloudName() const;
   QString sshHost() const { return ssh_host_; }
@@ -446,7 +446,7 @@ class RemoteController : public QObject {
   bool tunnelOwnedByApp() const { return tunnel_.OwnsProcess(); }
   bool tunnelExternalReuse() const { return tunnel_.IsExternalReuse(); }
   QString tunnelDiagnosticText() const { return tunnel_.diagnosticText(); }
-  // ---- pin 应用反馈（PR #22）----
+  // ---- pin 应用反馈 ----
   QString pinApplyState() const { return pin_apply_state_; }
   QString pinApplyMessage() const { return pin_apply_message_; }
   bool pinApplyOk() const {
@@ -511,7 +511,7 @@ class RemoteController : public QObject {
   // 输入框一被编辑就清掉这一行：旧原因不能挂在新输入上。
   Q_INVOKABLE void clearServerKeyPinError();
 
-  // ---- "应用"按钮的可见反馈（PR #22，人工验收发现的 UX bug）----
+  // ---- "应用"按钮的可见反馈 ----
   //
   // 旧实现里"应用"只调用 setServerKeyPin，控制器合法时返回 true，而 QML 把
   // 返回值丢掉了 —— 于是用户点完"应用"，界面上**什么都没有发生**。
@@ -536,7 +536,7 @@ class RemoteController : public QObject {
   // 输入框被编辑时清掉上一次的绿色反馈：旧结论不能挂在新输入上。
   Q_INVOKABLE void clearPinApplyState();
 
-  // ---- 连接方式与 SSH 安全通道（PR #22）----
+  // ---- 连接方式与 SSH 安全通道 ----
   //
   // setConnectionMode 接受 "ssh" / "direct"；其它值被拒并返回 false。
   // 切换模式不会自动联网，也不会杀掉正在用的通道 —— 它是配置动作。
@@ -553,9 +553,9 @@ class RemoteController : public QObject {
   // 关掉**本程序启动的**通道。用户自己在外面开的隧道不会被结束。
   Q_INVOKABLE void stopTunnel();
 
-  // ---- 登录 / 注册：自动采用当前输入框里的 pin（PR #22）----
+  // ---- 登录 / 注册：自动采用当前输入框里的 pin ----
   //
-  // 人工验收里最常见的一条路径是：填 pin -> 填用户名密码 -> 直接点登录。
+  // 最常见的一条路径是：填 pin -> 填用户名密码 -> 直接点登录。
   // 旧实现会用**上一次应用过的** pin（没有就是空），于是用户要么莫名其妙地
   // 失败，要么以为自己填的已经生效了。这两个入口在提交之前先
   // validate + commit 当前 draft pin，再开始网络操作：
@@ -689,7 +689,7 @@ class RemoteController : public QObject {
     return last_raw_restore_archive_path_;
   }
   bool rawRestoreSessionAliveForTest() const { return raw_session_ != nullptr; }
-  // ---- PR #22：连接层自检需要读的结构化结果 ----
+  // ---- 连接层自检需要读的结构化结果 ----
   QString tunnelStateForTest() const { return tunnelState(); }
   QString tunnelFailureKindForTest() const { return tunnelFailureKind(); }
   QString tunnelLocalEndpointForTest() const {
@@ -703,7 +703,7 @@ class RemoteController : public QObject {
   // 挂起是连接层的实现细节，界面看不到，但自检要能证明它真的发生过。
   QString lastDeferredActionForTest() const { return last_deferred_action_; }
   int deferredSubmitCountForTest() const { return deferred_submit_count_; }
-  // ---- PR #23 人工验收修复：官方模式的回归要能断言“Submit()
+  // ---- 官方模式的回归要能断言“Submit()
   // 到底把什么发出去了” （identity_mode 必须是 certificate，host / port /
   // expected_server_id 必须来自内置 OfficialCloudProfile）。官方 profile
   // 指向真实 ECS，而 final gate **不能依赖公网**，
@@ -778,7 +778,7 @@ class RemoteController : public QObject {
   enum class Phase { kNone = 0, kUpload = 1, kDownload = 2 };
 
   // 客户端怎么到达服务端。见上面的属性说明。
-  // 官方云端（PR #23）：身份与地址都来自编译进二进制的 OfficialCloudProfile，
+  // 官方云端：身份与地址都来自编译进二进制的 OfficialCloudProfile，
   // 用户不需要填地址、端口、指纹或 server_id。
   enum class ConnectionMode { kSshTunnel = 0, kDirect = 1, kOfficialCloud = 2 };
 
@@ -836,7 +836,7 @@ class RemoteController : public QObject {
   bool BeginOperation(const QString& action_text, bool need_login,
                       ErrorSurface surface = ErrorSurface::kBanner);
 
-  // ---- 连接层（PR #22）----
+  // ---- 连接层 ----
   //
   // 一条网络操作在真正提交之前要经过的**唯一**通道就是 Submit() 本身
   // （见 .cpp）：直连直接提交；ssh 模式先确认通道真的还能用、而且仍然指向
@@ -966,11 +966,11 @@ class RemoteController : public QObject {
   QString login_error_;
   QString register_error_;
   QString server_key_pin_error_;
-  // ---- PR #22：pin 的"应用"反馈 ----
+  // ---- pin 的"应用"反馈 ----
   QString pin_apply_state_;  // "" / "applied" / "unchanged" / "invalid"
   QString pin_apply_message_;  // 绿色那一行；invalid 时为空（红字在输入框下）
 
-  // ---- PR #22：连接方式与 SSH 安全通道 ----
+  // ---- 连接方式与 SSH 安全通道 ----
   //
   // 连接方式与通道配置。与 host / port / pin 一样**只存在于内存**：当前
   // 部署的唯一事实来源是 ~/.ssh/config，产品不另造一套持久化。

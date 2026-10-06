@@ -1,6 +1,6 @@
 // file_system.h
 //
-// Sprint 1 的本地文件系统层：路径检查、建目录、递归复制目录树、
+// 本地文件系统层：路径检查、建目录、递归复制目录树、
 // 逐字节复制普通文件都在这里。只认普通目录和普通文件，软链接、FIFO、
 // 设备、socket 一律明确拒绝；权限与时间戳的保存由归档层负责
 // （见 docs/format/archive_v0.1.md），这一层只提供文件系统原语。
@@ -14,7 +14,7 @@ namespace backupproject {
 
 // 对 POSIX 文件系统原语（lstat / opendir / open / read / write / mkdir）
 // 做一层薄封装：错误信息统一格式，并用 RAII 保证出错时 fd 和 DIR*
-// 也能自动关闭。独立成类是为了复制逻辑能单独测试、后续 Sprint 好复用。
+// 也能自动关闭。独立成类是为了复制逻辑能单独测试、后续功能好复用。
 class FileSystem {
  public:
   // lstat 之后对路径的分类，各函数靠它决定走哪条分支。

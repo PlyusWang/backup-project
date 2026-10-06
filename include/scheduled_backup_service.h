@@ -46,7 +46,7 @@ enum class ScheduleEvaluationStatus {
   kDisabled,
   // 还没到点。
   kNotDue,
-  // 到点了，但源目录与上一份成功快照没有差别 —— 这是本 PR 的核心语义：
+  // 到点了，但源目录与上一份成功快照没有差别 —— 这是本服务的核心语义：
   // 只有真的发生变化才建立新副本。
   kSkippedNoChanges,
   kCreatedSnapshot,
@@ -98,7 +98,7 @@ struct ScheduleEvaluationResult {
   std::int64_t next_run_time_sec = 0;
   std::uint64_t retention_deleted = 0;
   std::uint64_t retention_failed = 0;
-  // PR #18：因为被"要保留的 restore point"依赖而留下来、没有删掉的祖先数量。
+  // 因为被"要保留的 restore point"依赖而留下来、没有删掉的祖先数量。
   // 这些不算可见的还原点，但少了它们链就断了，所以必须如实计数，
   // 否则"为什么还留着这么旧的快照"在界面上说不清。
   std::uint64_t retention_dependency_retained = 0;
@@ -125,7 +125,7 @@ void ApplyScheduleEnableTransition(ScheduleDocument* document, bool was_enabled,
 
 // schedule-manifest.dat 里那份源清单到底能不能用。
 //
-// 这是本 PR 最重要的一条不变式：**manifest 只有在能证明它属于当前仓库里一份
+// 这是本模块最重要的一条不变式：**manifest 只有在能证明它属于当前仓库里一份
 // 真实存在的、仍然归本 scheduler 管理的快照时才有意义**。单独一份 manifest
 // 只说明"上次扫描到的源状态"，它证明不了仓库里还有与它对应的那份备份。
 enum class ScheduleBaselineStatus {
@@ -207,12 +207,12 @@ class ScheduledBackupService {
 
   // 同一条评估流程，但**跳过"还没到点"这一条**。
   //
-  // 这是"立即检查并运行"的语义，也是 §56 人工验收里连点几次的那个按钮：
+  // 这是"立即检查并运行"的语义，也是 §56 里连点几次的那个按钮：
   // 忽略时间表，现在就检查一遍。它**不是**强制备份——没有变化照样 skip，
   // 仍然不调用 BackupEngine、不产生 .bak。
   //
-  // 之所以必须是产品入口而不是测试后门：人工验收和 GUI 的"立即检查并运行"
-  // 都要用它，缺了它就只能干等一个完整周期，而那正好掩盖了变化检测本身。
+  // 之所以必须是产品入口而不是测试后门：产品的"立即检查并运行"入口
+  // 必须用它，缺了它就只能干等一个完整周期，而那正好掩盖了变化检测本身。
   bool EvaluateNow(std::int64_t now_sec, ScheduleEvaluationResult* result,
                    std::string* error_message);
 

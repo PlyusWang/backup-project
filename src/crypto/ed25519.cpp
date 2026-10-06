@@ -17,6 +17,20 @@
 //   * 验签只做公开数据运算；签名里对秘密标量用掩码选择，没有提前退出；
 //   * 与项目其它手写原语一致：教学实现，未经形式化验证与第三方审计。
 
+// 文件结构：匿名命名空间里由下往上依次是域运算（Fe）、标量运算（Sc）、
+// 点运算（Ge），之后才是公开 API；三层都不用动态分配与异常。
+//
+// 失败语义：公开 API 返回 bool 或
+// Ed25519VerifyResult，
+// 失败时不留半截输出——输出参数要么被赋成完整结果，要么被清空。
+// error_message 全部可选。
+//
+// 线程安全：本文件没有可变的全局状态，预计算常量都是函数内
+// static（C++11 起初始化线程安全，之后只读），
+// 因此公开函数可被多线程并发调用。
+//
+// 秘密材料只存在于栈上，返回前 memset 尽力清零；这是尽力而为：
+// 编译器有权消除对即将离开作用域的数组的写入。
 #include "ed25519.h"
 
 #include <cstring>
@@ -34,10 +48,17 @@ namespace {
 // "ISO C++ does not support __int128"，而本仓库要求 0 warning。
 __extension__ typedef unsigned __int128 UInt128;
 
+// 域元素 mod p，4 个 64 位 limb，
+// little-endian（v[0] 是最低位）。对外可见的值保持在 [0, p)
+// 的规范区间，只有 FeMul 内部的 8 limb 中间量允许超出。
+//
+// Fe 不是安全容器：没有清零、没有拷贝控制，别把它当秘密类型来用。
 struct Fe {
   std::uint64_t v[4];
 };
 
+// p = 2^255 - 19，按 limb 从低到高书写。抄错一个 nibble
+// 不会编译失败，只会让全部结果一起错，只有 RFC 8032 测试向量能发现。
 constexpr std::uint64_t kP[4] = {0xFFFFFFFFFFFFFFEDULL, 0xFFFFFFFFFFFFFFFFULL,
                                  0xFFFFFFFFFFFFFFFFULL, 0x7FFFFFFFFFFFFFFFULL};
 
@@ -83,6 +104,8 @@ inline void FeCondSubP(std::uint64_t v[4]) {
 }
 
 // v + carry*2^256 ≡ v + carry*38 (mod p)，然后再规范一次。
+// 两轮就够：carry*38 最多再产生一个进位，第二轮的进位必然为 0。
+// 末尾连做两次 FeCondSubP，让结果无条件落入 [0, p)。
 inline void FeReduceCarry(std::uint64_t v[4], std::uint64_t carry) {
   for (int round = 0; round < 2 && carry != 0; ++round) {
     UInt128 x = static_cast<UInt128>(v[0]) + static_cast<UInt128>(carry) * 38;
@@ -99,6 +122,12 @@ inline void FeReduceCarry(std::uint64_t v[4], std::uint64_t carry) {
 }
 
 // 8 limb（512 位，t[7] 的高位必须为 0）归约 mod p。
+// 前置条件：t[7] 的最高位为 0（乘积最大 2^510 量级，512
+// 位放得下）。
+//
+// 折两次的理由：第一次把 2^256 == 38 (mod p) 作用到高 4 limb
+// 上，会产生新的 limb4/limb5；第二次把这两个小 limb 折回去，
+// 剩下的溢出才小到能被 FeReduceCarry 一次处理干净。
 inline void FeReduceWide8(const std::uint64_t t[8], Fe* out) {
   std::uint64_t r[6] = {0, 0, 0, 0, 0, 0};
   UInt128 carry = 0;
@@ -246,6 +275,9 @@ inline void FeFromBytesMasked(Fe* out, const unsigned char in[32]) {
 }
 
 // 读入并要求 canonical（value < p）。
+// 返回值必须检查：false 表示编码 >= p，
+// 也就是同一个域元素存在第二种字节表示；不检查就等于允许可延展编码，
+// 公钥指纹与缓存键都会失效。
 inline bool FeFromBytesCanonical(Fe* out, const unsigned char in[32]) {
   FeFromBytesMasked(out, in);
   std::uint64_t borrow = 0;
@@ -360,6 +392,11 @@ inline void ScCondSubL(std::uint64_t v[4]) {
 }
 
 // 512 位 little-endian -> mod L。固定 512 轮。
+// 不变量：每轮结束 acc < L。左移一位后 acc < 2L，所以一次条件减 L
+// 就足以回到 [0, L)，不需要循环减法——这是固定 512 轮能成立的前提。
+//
+// 轮数固定、不提前结束：输入是秘密标量时，比特长度本身就是关于
+// nonce 的信息。
 void ScReduce512(const unsigned char in[64], std::uint64_t out[4]) {
   std::uint64_t acc[4] = {0, 0, 0, 0};
   for (int i = 511; i >= 0; --i) {
@@ -382,6 +419,8 @@ void ScReduce32(const unsigned char in[32], std::uint64_t out[4]) {
   ScReduce512(wide, out);
 }
 
+// RFC 8032 §5.1.7 要求验签时检查 S < L。不查会留下签名延展性：
+// 攻击者把合法签名的 S 加上 L，就得到一个不同却同样能通过的签名。
 bool ScIsCanonical(const unsigned char in[32]) {
   std::uint64_t v[4];
   for (int i = 0; i < 4; ++i) {
@@ -447,6 +486,16 @@ void ScMulAdd(const std::uint64_t a[4], const std::uint64_t b[4],
 
 // ---------------- edwards25519 点（扩展坐标） ----------------
 
+// 扩展坐标点 (X : Y : Z : T)：x = X/Z、y = Y/Z、T = XY/Z，
+// 满足 a = -1 的 twisted Edwards 方程。
+//
+// 不变量：Z 永不为 0（本文件从不产生射影无穷远点），仿射点用 Z = 1，
+// 恒等元是 (0, 1, 1, 0)。
+//
+// 坐标不唯一：同一个点有无穷多种表示，比较字段之前必须用 GeEncode
+// 归一化，或用 GeIsIdentity 做仿射化比较。
+//
+// Ge 是纯值类型（4 个 Fe、无堆分配），可以随意拷贝赋值，不存在所有权问题。
 struct Ge {
   Fe X, Y, Z, T;
 };
@@ -459,6 +508,11 @@ void GeIdentity(Ge* p) {
 }
 
 // a = -1 twisted Edwards 的完备加法（add-2008-hwcd-3）。P == Q 时同样成立。
+// 完备公式的价值：P == Q、P == -Q、任一点为恒等元都不需要分支，
+// 倍点直接复用同一段代码（见 GeDouble）。
+//
+// 别名安全：所有输入都在写 out 之前读进临时量，因此 out 可以与 p 或 q
+// 是同一个对象。
 void GeAdd(Ge* out, const Ge& p, const Ge& q) {
   Fe a, b, c, d, e, f, g, h, t, u;
   FeSub(&t, p.Y, p.X);
@@ -524,6 +578,12 @@ bool GeIsSmallOrder(const Ge& p) {
   return GeIsIdentity(t);
 }
 
+// 压缩编码布局（RFC 8032 §5.1.2）：32 字节 = y 的
+// little-endian，最高位放 x 的最低位（符号位）；T 不参与编码，
+// 解码侧由 x*y 重算。
+//
+// x = 0 且符号位为 1 是非规范编码，解码侧必须显式拒绝（见
+// GeDecode）。
 void GeEncode(unsigned char out[32], const Ge& p) {
   Fe z_inv, x, y;
   FeInvert(&z_inv, p.Z);
@@ -534,9 +594,28 @@ void GeEncode(unsigned char out[32], const Ge& p) {
       static_cast<unsigned char>(out[31] | (FeIsNegative(x) ? 0x80 : 0x00));
 }
 
+// 三态而不是 bool：kNonCanonical 是字节编码不合法（y >=
+// p，或 x = 0 且符号位为 1），kNotOnCurve 是这个 y
+// 在曲线上没有对应点。
+//
+// 验签把它们映射成不同的 Ed25519VerifyResult，
+// 方便区分编码问题与数据被篡改。
 enum class DecodeResult { kOk, kNonCanonical, kNotOnCurve };
 
 // RFC 8032 §5.1.3
+// 步骤（每一步都能对着 RFC 8032 §5.1.3 复核）：
+//
+//   1. 取符号位，解出 y 并要求规范（y < p）；
+//
+//   2. 令 u = y^2 - 1、v = d*y^2 + 1，x 的候选为 x =
+//   (u/v)^((p+3)/8)；
+//
+//   3. 校验 v*x^2 == u，不等则改试 x*sqrt(-1)，
+//   仍不等就是点不在曲线上；
+//
+//   4. 按符号位决定是否取 -x，最后补齐 Z = 1、T = x*y。
+//
+// 失败时 out 一个字节都不写，调用方可以安全地先解码再决定是否使用。
 DecodeResult GeDecode(const unsigned char in[32], Ge* out) {
   const std::uint64_t sign = (in[31] >> 7) & 1ULL;
   Fe y;
@@ -608,6 +687,11 @@ void GeScalarMulBase(Ge* out, const unsigned char scalar[32]) {
 }
 
 // RFC 8032 §5.1.5 的标量夹紧。
+// 三步的效果：清掉最低 3 位（吸收 cofactor 8 带来的小阶分量）、
+// 清最高位、置位第 254 位，得到 2^254 <= a < 2^255 且 a
+// 是 8的倍数。
+//
+// 这是夹紧而不是校验：任何 32 字节输入都会被接受，不会失败。
 void ClampScalar(unsigned char a[32]) {
   a[0] = static_cast<unsigned char>(a[0] & 248);
   a[31] = static_cast<unsigned char>(a[31] & 127);
@@ -646,6 +730,11 @@ const char* Ed25519VerifyResultName(Ed25519VerifyResult result) {
   return "unknown";
 }
 
+// 前置条件：seed 恰好 32 字节、public_key 非空；后置条件：
+// 成功时是 32 字节压缩点编码，失败时被清空（不留下上一次的内容）。
+//
+// 派生过程：h = SHA-512(seed)，前 32 字节夹紧得到标量 a，公钥
+// A= a*B；h 的后 32 字节是签名用的 prefix，本函数用不到。
 bool Ed25519PublicKeyFromSeed(const std::string& seed, std::string* public_key,
                               std::string* error_message) {
   if (public_key == nullptr) {
@@ -673,6 +762,11 @@ bool Ed25519PublicKeyFromSeed(const std::string& seed, std::string* public_key,
   return true;
 }
 
+// 原子性：先取随机种子并算出公钥，两步都成功了才写 *seed；任何一步失败，
+// 两个输出都是空串，不会留下一对不匹配的密钥。
+//
+// 随机源是 OS CSPRNG（见 crypto.h 的 RandomBytes），
+// 它失败就直接返回 false，绝不回落到时间戳一类的弱随机源。
 bool Ed25519GenerateKeyPair(std::string* seed, std::string* public_key,
                             std::string* error_message) {
   if (seed == nullptr || public_key == nullptr) {
@@ -692,6 +786,16 @@ bool Ed25519GenerateKeyPair(std::string* seed, std::string* public_key,
   return true;
 }
 
+// 确定性签名（RFC 8032 §5.1.6）：nonce r =
+// SHA-512(prefix || M)，完全由私钥与消息决定，不消耗随机数。
+//
+// 为什么这样设计：ECDSA 的历史事故几乎都来自随机 nonce 重复或可预测，
+// 而重复即泄漏私钥；确定性 nonce 从根上去掉了这个失败模式。
+//
+// 流程：A = a*B；R = r*B；k = SHA-512(R || A || M)
+// mod L；S = (r + k*a) mod L；输出 64 字节 = R || S。
+//
+// 签名在进入函数时先清空，失败不留半截结果；h、a、rh、kh 返回前尽力清零。
 bool Ed25519Sign(const std::string& seed, const void* message, std::size_t size,
                  std::string* signature, std::string* error_message) {
   if (signature == nullptr) {
@@ -765,6 +869,23 @@ bool Ed25519Sign(const std::string& seed, const void* message, std::size_t size,
   return true;
 }
 
+// 检查顺序是有意排列的，每一条都对应一个可被攻击者利用的编码自由度：
+//
+//   1. 长度：公钥 32、签名 64，不符直接失败；
+//
+//   2. 先查 S 的规范性（S < L），此时还没做任何群运算；
+//
+//   3. 解公钥 A：区分非规范编码 / 不在曲线上 / 小阶；
+//
+//   4. 解 R：任何失败都归入签名无效（R 的编码问题就是签名问题）；
+//
+//   5. 计算 k = SHA-512(R || A || M) mod L，比较 [S]B
+//   与 R + [k]A 的编码。
+//
+// 用 GeEncode 之后的字节相等代替坐标比较：编码规范且唯一，
+// 字节相等同时证明了两个点相等与表示合法。
+//
+// 本函数不写 error_message、不抛异常，失败原因全部由枚举承载。
 Ed25519VerifyResult Ed25519VerifyDetailed(const std::string& public_key,
                                           const void* message, std::size_t size,
                                           const std::string& signature) {
@@ -845,6 +966,8 @@ bool Ed25519Verify(const std::string& public_key, const void* message,
   return false;
 }
 
+// 指纹 = sha256(公钥) 的小写十六进制，用于日志、配置与界面里的人工比对；
+// 长度不对时返回空串，调用方必须自己判空——空指纹不能被当成匹配。
 std::string Ed25519Fingerprint(const std::string& public_key) {
   if (public_key.size() != kEd25519PublicKeySize) {
     return std::string();
@@ -852,6 +975,11 @@ std::string Ed25519Fingerprint(const std::string& public_key) {
   return Sha256Hex(public_key);
 }
 
+// 接受的文本格式：ed25519: 前缀 + 64 位十六进制，或纯 64
+// 位十六进制（前缀可选，解析前剥掉）。
+//
+// 失败语义与其它解析函数一致：out 先清空，任一步不合法就返回 false
+// 并给出原因，绝不尽力解析出半个公钥。
 bool Ed25519ParsePublicKeyText(const std::string& text, std::string* out,
                                std::string* error_message) {
   if (out == nullptr) {

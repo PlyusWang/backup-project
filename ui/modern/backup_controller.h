@@ -40,7 +40,7 @@ namespace backup_modern {
 // Filter / FilterAction，不必到处加限定名。
 using Filter = backupproject::Filter;
 using FilterAction = backupproject::FilterAction;
-// PR #18：策略与触发方式是 Qt 无关的共享核心类型，别名只为少写限定名。
+// 策略与触发方式是 Qt 无关的共享核心类型，别名只为少写限定名。
 using BackupStrategy = backupproject::BackupStrategy;
 using BackupTrigger = backupproject::BackupTrigger;
 
@@ -217,7 +217,7 @@ class BackupController : public QObject {
   Q_INVOKABLE bool addFilterRule(const QString& action, const QString& rule);
   // 按界面列表顺序删除：先 include，后 exclude。
   Q_INVOKABLE bool removeFilterRule(int index);
-  // 清空所有规则：回到"没有筛选"的 PR #8 行为。
+  // 清空所有规则：回到"没有筛选"的既有行为。
   Q_INVOKABLE void clearFilterRules();
 
   // ---- 产品入口 ----
@@ -230,7 +230,7 @@ class BackupController : public QObject {
   // 界面不再要求用户填写归档完整路径。
   // 产物是 v2 container：界面展示的 uid / gid / symlink / FIFO 只有 v2 装得下，
   // v0.1 会把它们丢掉或者直接失败。
-  // 这个入口保持 PR #15 的行为一字不变，等价于 MyPack + 不压缩 + 不加密。
+  // 这个入口保持既有行为一字不变，等价于 MyPack + 不压缩 + 不加密。
   Q_INVOKABLE bool startBackup();
   // 带显式算法选择的备份入口。三个 key 的取值见本文件顶部的映射表；
   // 未知 key、以及"选了加密但密码为空 / 两次不一致"都在启动后台线程之前失败。
@@ -240,7 +240,7 @@ class BackupController : public QObject {
                                           const QString& encryption_key,
                                           const QString& password,
                                           const QString& confirm_password);
-  // PR #18：带策略的入口。strategy_key 取 "full" / "incremental"。
+  // 带策略的入口。strategy_key 取 "full" / "incremental"。
   // startBackupWithOptions 就是它加 "full"，旧调用方一字不改。
   //
   // 组合是否被支持只问共享核心的 IsSupportedBackupMode，界面不自己判断：
@@ -341,10 +341,10 @@ class BackupController : public QObject {
     backupproject::RestoreOptions restore_options;
     // true 时恢复走带 options 的 v2 入口。只有"用户真的输入了恢复密码"这一条
     // 路径会把它置 true；false 时走按 magic 分流的旧入口，legacy v0.1 与未加密
-    // 的 v2 都靠它，行为与 PR #15 完全一致。
+    // 的 v2 都靠它，保持既有行为完全一致。
     bool restore_is_v2 = false;
 
-    // ---- PR #18：增量备份 ----
+    // ---- 增量备份 ----
     //
     // 策略是备份的第二个维度，不是第二种操作：kind 仍然是 kBackup，
     // 后台线程只是改走增量引擎。仓库、快照名与规则原文一起带过去，

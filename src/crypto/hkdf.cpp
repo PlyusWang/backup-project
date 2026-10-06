@@ -19,6 +19,9 @@ void SetError(std::string* error_message, const std::string& text) {
 
 }  // namespace
 
+// 输出固定 32 字节（HashLen），与 ikm 长度无关，且是覆盖式写 prk 而不是追加。
+// 唯一的失败是输出指针为空；HMAC 层没有失败路径，所以这里不需要为“算出
+// 一半”准备回滚语义。
 bool HkdfExtract(const std::string& salt, const std::string& ikm,
                  std::string* prk, std::string* error_message) {
   if (prk == nullptr) {
@@ -37,6 +40,11 @@ bool HkdfExtract(const std::string& salt, const std::string& ikm,
   return true;
 }
 
+// RFC 5869 §2.3：T(i) = HMAC(prk, T(i-1) | info | i)，计数器从 1 开始且只占
+// 一个字节，所以输出上限 255 * 32 字节是格式本身的硬上限，不是实现限制。
+// 每轮新建 HmacSha256 而不是复用：本项目的手写 HMAC 没有 Reset 语义，
+// 重建的开销可以忽略（prk 只有 32 字节）。
+// 最后一块可能只取前 need 字节，previous 本身仍是完整的 32 字节摘要。
 bool HkdfExpand(const std::string& prk, const std::string& info,
                 std::size_t length, std::string* okm,
                 std::string* error_message) {
@@ -72,6 +80,8 @@ bool HkdfExpand(const std::string& prk, const std::string& info,
   return true;
 }
 
+// 两段式的组合入口：Extract 把任意长度的输入压成定长 PRK，Expand 再按
+// info 派生所需长度。这里不做额外校验 —— 两段各自在自己的入口验过了。
 bool Hkdf(const std::string& salt, const std::string& ikm,
           const std::string& info, std::size_t length, std::string* okm,
           std::string* error_message) {

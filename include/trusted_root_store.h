@@ -1,6 +1,6 @@
 // include/trusted_root_store.h
 //
-// TrustedRootStore —— "我到底信哪几把根"的唯一出处（PR #23 Phase 1）。
+// TrustedRootStore —— "我到底信哪几把根"的唯一出处。
 //
 // 设计要点：
 //   * 存储是**一个向量**，不是"一把写死的根"：官方根要能轮换

@@ -2,7 +2,7 @@
 //
 // 源树的**内容摘要**（content identity）。
 //
-// 为什么要有单独一层：变化检测要回答"这个文件到底变了吗"。PR #17 的
+// 为什么要有单独一层：变化检测要回答"这个文件到底变了吗"。既有的
 // metadata-first manifest 用的是 size + mtime，它的已知盲区是
 // same-size + same-mtime 的人为 in-place rewrite。
 //

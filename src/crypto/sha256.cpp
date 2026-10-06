@@ -7,6 +7,13 @@
 //     bit 计数（按 2^64 取模，和标准一致），因此在 32 位平台上也不会提前截断。
 //   * 常量表全部写在源码里，没有魔数来自外部文件。
 
+// 本文件同时承载两个职责：SHA-256 实现，以及 crypto 命名空间共用的
+// ToHex / FromHex（它们与算法无关，但只有一份实现，放在这里省一个 TU）。
+// 它**不是**安全边界：没做常量时间处理，也不用于口令哈希 —— 口令走
+// PBKDF2-HMAC-SHA256，秘密比较走 ConstantTimeEquals。摘要相等与否由调用方
+// 用定长比较判定，本层只负责算出字节。
+// 正确性以 FIPS 180-4 的官方测试向量为准；除长度外不做任何输入合法性假设，
+// 超长输入只是慢，不会溢出（长度字段按 2^64 回绕）。
 #include <cstring>
 
 #include "crypto.h"
@@ -41,6 +48,8 @@ inline std::uint32_t RotateRight(std::uint32_t value, unsigned bits) {
   return (value >> bits) | (value << (32u - bits));
 }
 
+// 解析接受大小写，**输出**一律小写：摘要文本要能按字节比较，两种写法混用
+// 会让同一份内容出现两个不相等的字符串。
 int HexValue(char c) {
   if (c >= '0' && c <= '9') return c - '0';
   if (c >= 'a' && c <= 'f') return c - 'a' + 10;
@@ -50,10 +59,15 @@ int HexValue(char c) {
 
 }  // namespace
 
+// 构造即"已吸收 0 字节"的状态：之后任意切分的 Update 序列，结果与一次性
+// Hash 逐字节相同。
 Sha256::Sha256() : state_{}, buffer_{}, buffer_size_(0), total_bits_(0) {
   std::memcpy(state_, kInitialState, sizeof(state_));
 }
 
+// 处理一个 64 字节分组。w[64] 放在栈上而不是成员里：它是本分组的一次性
+// 中间量，进不了对象状态，也不该在两次 Transform 之间被保留。
+// block 按大端解释，与主机字节序无关 —— 这是标准的字节序要求。
 void Sha256::Transform(const unsigned char block[kSha256BlockSize]) {
   std::uint32_t w[64];
   for (std::size_t i = 0; i < 16; ++i) {
@@ -106,6 +120,11 @@ void Sha256::Transform(const unsigned char block[kSha256BlockSize]) {
   state_[7] += h;
 }
 
+// 流式吸收：先把上次残留的不足一组的尾部补齐，再整块处理，最后把余数留在
+// buffer_ 里（长度恒 < 64）。任意切分与一次性输入等价，这是流式归档依赖的
+// 性质。
+// 注意 (data == nullptr, size > 0) 会被静默忽略：本函数把它当成"没有数据"
+// 而不是参数错误，调用方传空指针会得到一份内容错误但不报错的摘要。
 void Sha256::Update(const void* data, std::size_t size) {
   if (data == nullptr || size == 0) return;
   const unsigned char* p = static_cast<const unsigned char*>(data);
@@ -135,6 +154,8 @@ void Sha256::Update(const void* data, std::size_t size) {
   }
 }
 
+// 只能调用一次：它不重置 state_，再次调用等于在补位后的状态上继续吸收，
+// 没有标准含义。摘要按大端写出（32 字节）。
 void Sha256::Final(unsigned char out[kSha256DigestSize]) {
   if (out == nullptr) return;
   // 先记下真实长度：下面的补位会继续走 Update，从而让 total_bits_ 变大。
@@ -169,6 +190,8 @@ void Sha256::Hash(const void* data, std::size_t size,
   hasher.Final(out);
 }
 
+// 原始字节版本：返回值可能含 NUL，不能当 C 字符串或文本用；需要文本时用
+// Sha256Hex（64 个小写十六进制字符，即 manifest 与 CLI 里的那种形式）。
 std::string Sha256Raw(const std::string& data) {
   unsigned char digest[kSha256DigestSize];
   Sha256::Hash(data.data(), data.size(), digest);
@@ -181,6 +204,8 @@ std::string Sha256Hex(const std::string& data) {
   return ToHex(digest, sizeof(digest));
 }
 
+// 两个返回空串的分支（data 为空、size 大到会溢出 max_size）与"输入本来就是
+// 空的"无法区分，所以调用方不能把空串当成"校验通过"。
 std::string ToHex(const unsigned char* data, std::size_t size) {
   static const char kDigits[] = "0123456789abcdef";
   std::string out;
@@ -194,6 +219,8 @@ std::string ToHex(const unsigned char* data, std::size_t size) {
   return out;
 }
 
+// 全有或全无：解析完才写回 *out，失败（奇数长度、含非十六进制字符、out 为
+// 空指针）时调用方的旧值原样保留，可以放心复用。
 bool FromHex(const std::string& hex, std::string* out) {
   if (out == nullptr) return false;
   if (hex.size() % 2 != 0) return false;

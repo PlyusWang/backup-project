@@ -1,6 +1,6 @@
 // include/remote_commands.h
 //
-// PR #20：backupctl remote 子命令。
+// backupctl remote 子命令。
 //
 // 与其他子命令同构：解析参数 -> 调用共享核心 -> 翻译结果。
 // 这里没有自己的 socket：CLI 与 Modern GUI 用的是同一个 RemoteArchiveClient。

@@ -1,6 +1,39 @@
 // incremental_backup.cpp
 //
 // 见 include/incremental_backup.h。
+//
+// 模块职责：增量策略的**决策与落地**。回答三个问题，并把答案写成文件：
+//   1. 有没有可信基线？（自动挑一份，或验证调用方指定的那一份）
+//   2. 源树变了没有？（强 manifest 的内容摘要对比，不是 size+mtime）
+//   3. 变了什么？（added / modified / metadata-only / removed）
+// 产出要么是一份完整基线快照，要么是一份挂在父快照上的 delta，要么什么都不写。
+//
+// 不负责什么：
+//   * 不做扫描本身（BuildStrongSourceManifest 在 source_manifest.cpp）；
+//   * 不做 delta 的字节布局（WriteDeltaFile / ReadDeltaEnvelope 在
+//     incremental_delta.cpp）；
+//   * 不做恢复侧的 delta 应用（incremental_restore.cpp）；
+//   * 不命名快照：snapshot_file_name 由调用方（BackupCatalog）给出。
+//
+// 数据流：扫描 -> 强 manifest（内容身份）-> 找基线并逐项验证 -> DiffManifests
+// -> 变化路径 + 祖先闭包 + hardlink 组扩张 -> ArchiveEntry -> 归档写入 ->
+// 两个副文件（.manifest 记录源状态，.identity 声明这份快照属于哪条链）。
+//
+// 关键不变量：
+//   * 副文件只在快照本体发布成功之后才写；本轮失败则撤回本轮创建的文件；
+//   * 写出去的 delta 的父一定存在，且链深不超过 kMaxDeltaChainDepth；
+//   * 一份快照的 manifest_digest 必须被信封、身份副文件、manifest 副文件
+//     三方同时认可，任何一处对不上都等于"没有可信基线"。
+//
+// 失败语义：返回 false + error_message，不抛异常。回滚只删本轮创建的文件，
+// 绝不碰仓库里既有的东西；回滚本身失败也不会掩盖最初的那个错误。
+//
+// 威胁模型：仓库目录里的内容一律当作**不可信输入**。delta 信封里的
+// parent_file_name 来自磁盘，落地前必须过 BackupCatalog::Resolve（单组件、
+// 仓库直接子项、普通文件、非软链接）；任何"相信声明值"的捷径都是漏洞。
+//
+// 线程与生命周期：除一个默认空的测试回调外没有全局状态，函数之间不共享
+// 缓存；同一仓库上的并发写由调用方的锁负责，本文件自己不加锁。
 
 #include "incremental_backup.h"
 
@@ -28,16 +61,23 @@ namespace backupproject {
 
 namespace {
 
+// 本文件统一的失败协议：返回 false，原因写进可选的 error_message
+// （允许为 nullptr）。所有错误文本都是英文，会被 CLI/GUI/日志原样转发。
 void SetError(std::string* error_message, const std::string& text) {
   if (error_message != nullptr) *error_message = text;
 }
 
+// errno 文本的组装点。调用方必须在失败当刻把 errno 当参数传进来：
+// strerror 对未知取值可能返回 nullptr，所以这里还要兜一层。
 std::string ErrnoText(int error_number) {
   const char* text = ::strerror(error_number);
   return text == nullptr ? std::string("errno ") + std::to_string(error_number)
                          : std::string(text);
 }
 
+// 所有来自磁盘或来自调用方的名字的第一道闸：单组件、不含 NUL、不是
+// "."/".."。它只保证"拼出来的路径不会跑出目录"，不保证文件存在、
+// 也不保证是本产品的归档——那两件事分别由 Catalog 与 ClassifySnapshotFile 管。
 bool IsPlainSingleComponentName(const std::string& name) {
   if (name.empty() || name == "." || name == "..") return false;
   if (name.find('/') != std::string::npos) return false;
@@ -46,6 +86,8 @@ bool IsPlainSingleComponentName(const std::string& name) {
   return true;
 }
 
+// 纯字符串拼接，不做规范化、不解析软链接。安全性来自调用方：进来的 name
+// 都先过了 IsPlainSingleComponentName，因此这里不可能拼出带 ".." 的路径。
 std::string JoinPath(const std::string& directory, const std::string& name) {
   if (directory.empty()) return name;
   if (directory.back() == '/') return directory + name;
@@ -53,6 +95,13 @@ std::string JoinPath(const std::string& directory, const std::string& name) {
 }
 
 // 只读整个文件（manifest 副文件有大小上界）。
+// 只读整个文件（manifest 副文件有大小上界）。
+//
+// 只读、且不跟随软链接：O_NOFOLLOW 让"仓库里的 .manifest 被换成指向别处的
+// 链接"直接失败，而不是把别处的文件内容当成源清单读进来。
+// fstat 之后再核对类型与大小：st_size 是读之前的快照，所以按它一次 resize、
+// 循环读满，最后用 filled != size 判定截断——短读不重试到底就等于读了一份
+// 被悄悄截断的清单，那会让"没有变化"的结论建立在不完整的数据上。
 bool ReadWholeFile(const std::string& path, std::string* text,
                    std::string* error_message) {
   const int fd = ::open(path.c_str(), O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
@@ -97,6 +146,8 @@ bool ReadWholeFile(const std::string& path, std::string* text,
   return true;
 }
 
+// 临时文件名带 pid：足以区分同机器上不同进程的并发写；同进程内对同一路径
+// 的并发写会撞上 O_EXCL 直接失败——静默互相覆盖才是更坏的结果。
 // 写 manifest 副文件：唯一临时文件 + fsync + rename，权限 0600。
 bool WriteManifestFile(const std::string& path, const std::string& text,
                        std::string* error_message) {
@@ -141,6 +192,8 @@ bool WriteManifestFile(const std::string& path, const std::string& text,
     SetError(error_message, "Cannot flush " + temp + ": " + message);
     return false;
   }
+  // rename 在同一文件系统内是原子的：读者要么看到旧的完整内容，要么看到新的
+  // 完整内容。rename 失败时删掉临时文件，目标路径保持原样（绝不半途截断它）。
   if (::rename(temp.c_str(), path.c_str()) != 0) {
     const std::string message = ErrnoText(errno);
     ::unlink(temp.c_str());
@@ -152,6 +205,15 @@ bool WriteManifestFile(const std::string& path, const std::string& text,
 
 // 把 manifest 条目映射成"要写进 payload 的 ArchiveEntry"。路径与元数据来自
 // 这一次的真实扫描（manifest 是同一套扫描器产出的）。
+// 把 manifest 条目映射成"要写进 payload 的 ArchiveEntry"。路径与元数据全部
+// 来自这一次的真实扫描；manifest 只是同一套扫描器的产物，不引入第二份真相。
+//
+// 三件必须做的事：
+//   * 源根 "." 永远进 payload——delta 应用之后根目录自己的 metadata 要有人负责；
+//   * 变化路径的所有祖先目录都进 payload（展开逻辑在下面）；
+//   * 设上 expected_content_digest / expect_source_unchanged：写侧边写边算，
+//     写完与 manifest 的期望值核对，扫描与读取之间的竞态因此不会静默漏掉。
+// 输出顺序沿用 manifest 的顺序（即 archive_path 升序），调用方不必再排。
 bool BuildChangedEntries(const std::string& source_directory,
                          const std::vector<std::string>& changed_paths,
                          const std::vector<ManifestEntry>& current,
@@ -244,6 +306,8 @@ namespace {
 //       → 合并之后 group 被拆开，peer 留着老内容
 //
 // 所以"组里任何一个成员变了"必须扩张成"整组成员都进 changed set"。
+// 复杂度 O(n)：每个被触及的路径都要扫一遍全部条目。n 是有效备份集合的规模，
+// 而且这条路径只在真的有变化时才走，所以刻意不做索引化。
 std::vector<std::string> HardlinkGroupOf(
     const std::vector<ManifestEntry>& entries,
     const std::string& archive_path) {
@@ -269,6 +333,8 @@ std::vector<std::string> HardlinkGroupOf(
 }
 
 // 把 changed set 扩张到"所有被触及的 hardlink group 的全部当前成员"。
+// 只扩张"当前仍然存在"的成员：已经消失的旧成员留在 tombstone 那一侧，
+// 不能因为组扩张又被拉回 payload。最后排序，让同一份输入产出同样的 delta。
 void ExpandHardlinkGroups(const std::vector<ManifestEntry>& current,
                           std::vector<std::string>* changed_paths) {
   std::vector<std::string> expanded = *changed_paths;
@@ -306,6 +372,15 @@ std::string SerializeSnapshotIdentity(const std::string& snapshot_file_name,
 
 // 快照已经写出来之后，两个副文件必须一起成功；任何一个失败就把本轮写下的
 // 东西全部撤回。只撤自己刚创建的那些：这里不碰任何既有文件。
+// 发布顺序固定：先 manifest，后 identity。两个文件不是一次 rename 写完的，
+// 所以崩溃可能留下"只有 manifest"的状态——那时
+// LoadVerifiedSnapshotIdentity 会因为身份副文件缺失给出
+// sidecars_verified = false，结论是"没有可信基线"，多建一份完整快照。
+// 反过来（先 identity）没有这个性质：identity 声明了 manifest_digest，
+// 却可能配上一份根本不存在的 manifest。
+//
+// 回滚只做一件事：unlink 本轮刚写出来的文件，仓库里原有的东西一个不碰——
+// 这里的失败不代表它们有问题。
 bool PublishSnapshotSidecars(
     const std::string& repository_directory,
     const std::string& snapshot_file_name, const std::string& snapshot_path,
@@ -345,6 +420,8 @@ bool PublishSnapshotSidecars(
 }
 
 // ---- 测试接缝（进程内、默认空）----
+// 本文件唯一的全局状态，默认空指针：产品的任何路径都不会注册它，
+// 因此生产行为与没有这个接缝时完全一致。
 void (*g_manifest_built_hook)(void*) = nullptr;
 void* g_manifest_built_hook_context = nullptr;
 
@@ -356,6 +433,10 @@ void SetIncrementalManifestBuiltHookForTesting(void (*hook)(void* context),
   g_manifest_built_hook_context = context;
 }
 
+// 加密在这里是**明确拒绝**而不是"暂未实现"：BKPINC1 外层信封（parent 绑定
+// 与 tombstone 列表）是明文，内层容器的 HMAC 覆盖不到它，接受一个加密 delta
+// 等于接受一组未经认证的路径指令。拒绝必须发生在建基线之前——否则用户先
+// 拿到一份看着可用的基线，第二次才炸。
 bool IsSupportedIncrementalEncryption(EncryptionMethod encryption) {
   return encryption == EncryptionMethod::kNone;
 }
@@ -368,6 +449,8 @@ std::string UnsupportedIncrementalEncryptionReason() {
       "encrypted backups.");
 }
 
+// USTAR 表达不了 tombstone 与 parent dependency，硬套只会产出恢复语义对不上
+// 的链，所以这条组合也只放行 MyPack。
 bool IsSupportedIncrementalPack(PackMethod pack) {
   return pack == PackMethod::kMyPack;
 }
@@ -378,6 +461,9 @@ std::string UnsupportedIncrementalPackReason() {
          "incremental chain built on it could not be applied correctly.";
 }
 
+// 副文件名的构造点。后缀常量在本文件里有两处（这里与 SplitSidecarName）：
+// 一处负责生成、一处负责识别，改动必须同时改——不一致会让副文件要么变成
+// 永远清不掉的孤儿，要么被误判成主文件。
 std::string SnapshotManifestFileName(const std::string& snapshot_file_name) {
   return snapshot_file_name + ".manifest";
 }
@@ -406,12 +492,18 @@ namespace {
 //
 // BPIDENT1 仍然读得出来，但结果是"没有绑定"——调用方必须把它当成不可信基线
 // （多建一份完整快照，绝不错误跳过）。升级语义因此是单向安全的。
+// 文件头是格式的硬边界：解析先比头，再谈字段，所以旧文件不会被硬塞进新规则。
+// 版本号只认 2：将来要加字段就抬到 3，让旧读侧明确失败，
+// 而不是"多出来的字段被忽略、语义静默变化"。
 constexpr const char* kIdentityV1Header = "BPIDENT1\n";
 constexpr const char* kIdentityV2Header = "BPIDENT2\n";
 constexpr std::uint64_t kIdentityVersion2 = 2;
 
 // 字符串字段的转义只作用于反斜杠、换行、回车、TAB：这几个字符出现在文件名里
 // 会让行式格式失去意义，其余字节（含 UTF-8）原样保留。
+// 只转义会让行式格式失去意义的四个字符；UTF-8 与其余字节原样保留，
+// 文件名因此"原样进、原样出"，不做任何编码转换。转义是单射的：
+// 反斜杠与 'n' 两个字符分别写出来之后，不会再被误读成换行。
 std::string EscapeIdentityField(const std::string& value) {
   std::string out;
   out.reserve(value.size());
@@ -436,6 +528,9 @@ std::string EscapeIdentityField(const std::string& value) {
   return out;
 }
 
+// 只接受上面那四种转义；未知转义（例如 "\x"）一律失败，而不是"原样保留
+// 反斜杠"——非规范形式会让同一个文件名有多种合法编码，那样"两份副文件内容
+// 相同"这种比较就失去意义了。
 bool UnescapeIdentityField(const std::string& text, std::string* value) {
   value->clear();
   value->reserve(text.size());
@@ -466,6 +561,8 @@ bool UnescapeIdentityField(const std::string& text, std::string* value) {
   return true;
 }
 
+// 一份身份副文件的解析结果。version 决定后面哪些字段有意义：version 1 的
+// 记录没有三件绑定，调用方必须把它当成不可信基线。
 struct SnapshotIdentityRecord {
   std::uint64_t version = 1;
   // version 2 才有意义的三件绑定。
@@ -478,6 +575,9 @@ struct SnapshotIdentityRecord {
   std::string strategy_identity;
 };
 
+// 只写 v2：字段顺序固定、每行一个 key=value、以换行结尾。写侧的字段集合与
+// 读侧的规则必须完全相等——读侧对缺字段与多字段都报错。
+// 这里不做校验：摘要是否合法由调用方保证（它们都出自本文件的摘要函数）。
 std::string SerializeSnapshotIdentity(const std::string& snapshot_file_name,
                                       const std::string& snapshot_id,
                                       const std::string& manifest_digest,
@@ -495,6 +595,13 @@ std::string SerializeSnapshotIdentity(const std::string& snapshot_file_name,
   return out;
 }
 
+// 严格解析。三条规则合起来，让"解析成功"等价于"这份记录自洽且完整"：
+//   * 每个 key 恰好出现一次（下面的 seen_* 计数器）——重复 key 会让"后者
+//     覆盖前者"与"前者胜出"两种实现给出不同结果，这里直接拒绝；
+//   * 未知 key 报错而不是忽略：未来的字段可能改变语义，装作没看见最危险；
+//   * v1 与 v2 的字段集合严格互斥（v1 带绑定字段、v2 缺绑定字段都报错），
+//     版本号是声明，不是提示。
+// 空行被跳过而不是报错：尾部换行是写侧的常态，不值得为它失败。
 bool ParseSnapshotIdentity(const std::string& text,
                            SnapshotIdentityRecord* record,
                            std::string* error_message) {
@@ -638,6 +745,10 @@ bool ParseSnapshotIdentity(const std::string& text,
 
 }  // namespace
 
+// 从磁盘读一份基线 manifest。名字先过单组件检查再拼路径：调用方可能拿着
+// 用户给的名字进来，路径拼接之前必须已经排除 '/' 与 ".."。
+// 这里只做结构解析、不校验归属；需要归属判断的调用方走
+// LoadVerifiedSnapshotIdentity，那里才有"副文件与磁盘事实逐项对上"。
 bool LoadSnapshotManifest(const std::string& repository_directory,
                           const std::string& snapshot_file_name,
                           std::vector<ManifestEntry>* entries,
@@ -658,6 +769,8 @@ namespace {
 
 // 读一份快照的身份副文件。缺失 / 解析失败都只是"没有绑定"：返回 false，
 // 原因写进 reason。它不是错误——旧仓库里本来就可能没有这个文件。
+// 只区分"读到并解析成功"与"任何原因没拿到"：调用方只需要知道能不能用，
+// 具体原因写进 reason 供诊断。
 bool ReadIdentityRecord(const std::string& repository_directory,
                         const std::string& snapshot_file_name,
                         SnapshotIdentityRecord* record, std::string* reason) {
@@ -680,6 +793,18 @@ bool ReadIdentityRecord(const std::string& repository_directory,
 
 }  // namespace
 
+// 信任判断的唯一入口。顺序是硬的：
+//   1. BackupCatalog::Resolve：仓库的直接子项、普通文件、非软链接；
+//   2. ClassifySnapshotFile：分不出类型就是失败，不认识的文件不能当身份；
+//   3. 实际字节验证：delta 走 VerifyDeltaPayload，完整快照走
+//      VerifyFullSnapshotPayload——只读 header 拿到的是**声明值**，换掉 payload
+//      它照样成立，而"照样成立"正是坏快照被当成可信身份的来源；
+//   4. snapshot_id 取自刚验证过的字节，用来发现"文件被换过"；
+//   5. 两个副文件：缺失、版本旧、与磁盘事实对不上都**不是**错误，
+//      返回 true 但 sidecars_verified = false，调用方据此跳过这份候选；
+//   6. manifest_entries 只在两个副文件都验证通过之后才填：调用方拿到的条目
+//      与已验证的归属是同一份，不存在"先读条目、再验归属"的中间窗口。
+// 返回 false 表示"这份文件不能用作可信身份"，原因在 error_message 里。
 bool LoadVerifiedSnapshotIdentity(const std::string& repository_directory,
                                   const std::string& snapshot_file_name,
                                   SnapshotIdentity* identity,
@@ -801,6 +926,9 @@ bool LoadVerifiedSnapshotIdentity(const std::string& repository_directory,
   return true;
 }
 
+// 候选按文件名倒序 = 最新的在前（Catalog 生成的名字带时间戳，字典序即时间序）。
+// 第一份"磁盘事实自洽、身份三件又对得上"的候选胜出；任何一条不满足就
+// continue 看下一份，绝不回头放宽条件。
 bool FindIncrementalBaseline(const std::string& repository_directory,
                              const std::string& source_path,
                              const std::string& repository_identity,
@@ -883,6 +1011,10 @@ bool FindIncrementalBaseline(const std::string& repository_directory,
   return false;
 }
 
+// 只读信封（信封自带摘要，至少自洽），所以它回答的是"谁**声称**依赖谁"。
+// 完整归档返回空父名 = 链底；分不出类型的文件返回 false，不给猜测的答案。
+// 只有"图的形状"类问题可以用它（例如某个候选还有没有后代）；任何"把它当成
+// baseline / parent / 恢复链成员"的判断都必须走 LoadVerifiedSnapshotIdentity。
 bool SnapshotParentOf(const std::string& repository_directory,
                       const std::string& snapshot_file_name,
                       std::string* parent_file_name,
@@ -906,6 +1038,11 @@ bool SnapshotParentOf(const std::string& repository_directory,
   return true;
 }
 
+// 沿 parent 一路往上数，直到完整快照或超过上界。visited 兼作环检测：成环会
+// 让"数到链底"永远不成立，必须显式报错而不是死循环。
+// 注意语义：depth 是这份快照**下面**已有的 delta 个数；超过
+// kMaxDeltaChainDepth 时函数仍然返回 true（调用方只需要知道"越界了"），
+// 所以调用点必须写 >=，不能写 ==。
 bool SnapshotDeltaDepth(const std::string& repository_directory,
                         const std::string& snapshot_file_name,
                         std::size_t* depth, std::string* error_message) {
@@ -938,6 +1075,17 @@ bool SnapshotDeltaDepth(const std::string& repository_directory,
   }
 }
 
+// 输入是"调用方原本打算按最旧优先淘汰的候选"，输出是"真正能删的那些"。
+//
+// 两阶段：
+//   1. 可见集合 = 最新 retain_count 个（候选最旧在前，所以取尾部）；
+//   2. 从可见集合出发沿 parent 做闭包，把被依赖的祖先一并保住，并把"被保留
+//      的祖先"与"可见点"分开放——诊断要能说清为什么多留了几份。
+//
+// fail-closed：只要有一条必须保留的链走不完整（自己坏了、payload 与声明不符、
+// 深度越界、成环）就置 dependency_uncertain 并把 remove 清空。删除不可逆，
+// 而"哪些更老的候选可能是它的祖先"此时没有答案——宁可不回收。
+// 只有 candidates 里的名字会进 remove：用户手工建的备份不属于本计划，不碰。
 bool PlanDependencyAwareRetention(
     const std::string& repository_directory,
     const std::vector<std::string>& candidates_oldest_first,
@@ -1045,6 +1193,19 @@ bool PlanDependencyAwareRetention(
   return true;
 }
 
+// 一次增量备份的完整流水线，步骤编号与下面的注释一一对应：
+//   1. 扫描当前源树，得到强 manifest（内容身份）与它的摘要；
+//   2. 找基线：调用方给的名字优先，否则按身份自动挑一份；
+//   3. 没有可信基线 -> 建完整 baseline（绝不写指向不存在父亲的 delta）；
+//   4. 与基线比较；没有有效变化就什么都不写；
+//   4b. hardlink 组扩张；
+//   5. 写 delta（removed 变 tombstone，其余进 payload）并发布两个副文件。
+//
+// 几个容易踩的点：
+//   * 即使基线是调用方明确指定的，也必须重新逐项验证——"文件还在"远远不够；
+//   * 挂新 delta 之前先问链深：与其产出"创建成功、恢复才发现链太深"的快照，
+//     不如老实再建一份完整基线；
+//   * outcome 在入口就复位，失败路径上调用方看到的永远是"什么都没做"。
 bool RunIncrementalBackup(const std::string& source_directory,
                           const std::string& repository_directory,
                           const std::string& snapshot_file_name,
@@ -1305,6 +1466,9 @@ bool RunIncrementalBackup(const std::string& source_directory,
 
 // ---- 依赖图 ----
 
+// 只从"读得出来的直接子项快照"建边：坏文件、缺失的父、环都不会让整次调用
+// 失败，它们只是不贡献边。用途是"删这份快照会不会让谁变成孤儿"，少一条边
+// 只会更保守；而让整次列出失败，连保守的答案都拿不到。
 bool FindReachableDescendants(const std::string& repository_directory,
                               const std::string& snapshot_file_name,
                               std::vector<std::string>* descendants,
@@ -1356,9 +1520,11 @@ bool FindReachableDescendants(const std::string& repository_directory,
 
 // ---- 副文件生命周期 ----
 
+// 删除一份快照时要一并带走的文件清单。这是一个**闭集**：新增一种副文件必须
+// 同时更新这里与 SplitSidecarName，否则新副文件会变成永久孤儿。
 std::vector<std::string> SnapshotSidecarFileNames(
     const std::string& snapshot_file_name) {
-  // PR #19：realtime marker 也是这份快照拥有的 sidecar，删除时跟着走。
+  // realtime marker 也是这份快照拥有的 sidecar，删除时跟着走。
   // 常量在这里写字面量而不是 include realtime_backup_service.h，是为了让
   // incremental_backup 不反向依赖 realtime 模块；两边都只认 ".realtime"。
   return {SnapshotManifestFileName(snapshot_file_name),
@@ -1370,7 +1536,7 @@ namespace {
 
 constexpr const char* kManifestSuffix = ".manifest";
 constexpr const char* kIdentitySuffix = ".identity";
-// PR #19：realtime marker（BPREALTIME1）。只有 <managed .bak>.realtime 才算。
+// realtime marker（BPREALTIME1）。只有 <managed .bak>.realtime 才算。
 constexpr const char* kRealtimeSuffix = ".realtime";
 
 // name 是不是**本项目的**一份快照的副文件名；是的话把主文件名写进 *base。
@@ -1379,6 +1545,8 @@ constexpr const char* kRealtimeSuffix = ".realtime";
 // 只要没有同名 base 就会被当成孤儿删掉——而仓库的边界是"只管自己的 backup
 // artifacts"。所以剥掉后缀之后，base 还必须过 BackupCatalog 的唯一命名规则
 // （单组件 + .bak 结尾）。
+// 后缀先行、剥完再验证 base：反过来（先验证 base 再剥后缀）没法处理
+// "notes.manifest" 这种 base 本身就不合法的名字。
 bool SplitSidecarName(const std::string& name, std::string* base) {
   const std::size_t manifest_len = ::strlen(kManifestSuffix);
   const std::size_t identity_len = ::strlen(kIdentitySuffix);
@@ -1405,6 +1573,8 @@ bool SplitSidecarName(const std::string& name, std::string* base) {
 }
 
 // 主文件还在吗（直接子项、普通文件、非软链接）。
+// 用 lstat 且要求普通文件：软链接不算"主文件还在"，于是它的副文件会被判成
+// 孤儿清掉——链接指向的东西不归本仓库管理，宁可少留也不顺着链接走。
 bool SnapshotFileExists(const std::string& repository_directory,
                         const std::string& base_name) {
   if (base_name.empty() || base_name == "." || base_name == "..") return false;
@@ -1416,6 +1586,10 @@ bool SnapshotFileExists(const std::string& repository_directory,
 
 }  // namespace
 
+// 扫仓库目录，找出"副文件在、对应 .bak 不在"的名字（升序）。只读，不做任何
+// 破坏性动作：普通 List 用它出诊断。
+// readdir 用 nullptr 同时表示"读完"和"出错"，只能靠 errno 区分——把读错误
+// 当成 EOF 会让一次扫描悄悄漏掉一部分副文件。errno 因此必须在每次调用前清零。
 bool FindOrphanSidecars(const std::string& repository_directory,
                         std::vector<std::string>* orphan_file_names,
                         std::string* error_message) {
@@ -1460,6 +1634,9 @@ bool FindOrphanSidecars(const std::string& repository_directory,
   return true;
 }
 
+// 显式清理。尽力而为：单个文件删不掉只记进 diagnostics，不影响其余文件，
+// 也不把整次调用判成失败——返回 false 只留给"连仓库目录都打不开"。
+// removed_file_names 只记录真正删掉的，调用方据此报数。
 bool CleanOrphanSidecars(const std::string& repository_directory,
                          std::vector<std::string>* removed_file_names,
                          std::vector<std::string>* diagnostics,

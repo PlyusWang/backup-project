@@ -1,6 +1,6 @@
 // include/remote_server.h
 //
-// PR #20：远程备份服务端（backup-server）。
+// 远程备份服务端（backup-server）。
 //
 // 定位：**存储后端 + 传输边界**。它负责
 //
@@ -84,7 +84,7 @@ struct RemoteServerConfig {
   // 只接受 BPSEC2（签名身份）的客户端。收到 BPSEC1 的 ClientHello 直接拒绝，
   // 这就是"拒绝降级"的开关；打开时必须同时配置证书。
   bool require_bpsec2 = false;
-  // PR #23：允许**公网**监听（--bind 不是 127.0.0.1）。默认 false，且必须
+  // 允许**公网**监听（--bind 不是 127.0.0.1）。默认 false，且必须
   // 同时满足「配置了 BPSEC2 证书」与「给出一句话理由」，理由会写进启动日志。
   // 没有这个开关时行为与过去完全一致：任何非回环地址一律 fail closed。
   bool allow_public_bind = false;
@@ -130,7 +130,7 @@ struct ConnectionContext {
   std::uint64_t upload_received = 0;
   int upload_fd = -1;
 
-  // PR #21：这次上传要登记的链关系。UPLOAD_BEGIN 时校验并定下来，
+  // 这次上传要登记的链关系。UPLOAD_BEGIN 时校验并定下来，
   // UPLOAD_END 发布时写进元数据。generation 由**服务端**按父的 generation
   // 推导（父 + 1），客户端没有机会自己填一个数。
   std::uint16_t upload_kind = 0;

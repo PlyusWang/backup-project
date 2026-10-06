@@ -6,6 +6,9 @@
 // 列表数据只来自 controller.backupRecords。每一项都不带 archive 完整路径：
 // 恢复与删除都只传 file name，由 BackupCatalog 自己解析并校验。
 
+// 页面不持有数据：controller.backupRecords 是唯一来源，刷新 / 恢复 / 删除
+// 都由控制器发起，这里只把状态画出来、把点击转成调用。所以页面重建不会
+// 丢状态 —— 状态本来就不在这一层。
 import QtQuick
 import QtQuick.Controls.Basic
 import QtQuick.Layouts
@@ -23,6 +26,9 @@ Item {
         anchors.fill: parent
         clip: true
         contentWidth: availableWidth
+        // StopAtBounds 只能设在 ScrollView 内部的 contentItem 上，Qt 没有把
+        // 这个属性透出来，所以在 Component.onCompleted 里取一次。目的是让
+        // 内容不足一屏时不产生橡皮筋回弹。
         Component.onCompleted: {
             if (pageScroll.contentItem)
                 pageScroll.contentItem.boundsBehavior = Flickable.StopAtBounds
@@ -32,6 +38,9 @@ Item {
 
         ColumnLayout {
             id: column
+            // 居中但保留最小边距：宽窗口下按剩余空间平分，窄窗口下退化成
+            // 左右各 32px（与上面 width 的 availableWidth - 64 配对）。
+            // 宽度上限 1400 是为了超宽屏上不把一行文字拉得太长。
             x: Math.max(32, (pageScroll.availableWidth - width) / 2)
             y: 20
             width: Math.min(pageScroll.availableWidth - 64, 1400)
@@ -64,7 +73,9 @@ Item {
                         spacing: 4
 
                         Text {
-                            text: controller.repositoryConfigured ? "当前备份仓库" : "尚未配置备份仓库"
+                            text: controller.repositoryConfigured
+                                   ? "当前备份仓库"
+                                  : "尚未配置备份仓库"
                             font.pixelSize: 16
                             font.weight: Font.DemiBold
                             color: theme.textSecondary
@@ -81,8 +92,12 @@ Item {
                         }
                     }
 
-                    // 配好仓库不等于不能再改：配置还在、目录被删掉，或者单纯想换个位置，
-                    // 都会走到这里。换仓库统一在设置页完成，这一页只发跳转意图，
+                    // 三个按钮按状态互斥：配好仓库显示"更改仓库 + 刷新"，
+                    // 否则只显示"前往设置"。刷新还要受 busy 约束：
+                    // 目录扫描与写归档不能并行。
+                    // 配好仓库不等于不能再改：配置还在、目录被删掉，
+                    // 或者单纯想换个位置，都会走到这里。
+                    // 换仓库统一在设置页完成，这一页只发跳转意图，
                     // 所以"无法读取备份仓库"时用户也能直接过去处理。
                     AppButton {
                         objectName: "changeRepositoryButton"
@@ -120,6 +135,8 @@ Item {
                 AppIcon { name: "refresh"; size: 16; color: theme.accent }
                 Text {
                     objectName: "catalogBusyText"
+                    // catalogBusy 与 backup 的 busy 是控制器里两个独立标志：
+                    // 刷新列表不会被误当成"备份正在进行"。
                     text: "正在刷新备份列表……"
                     font.pixelSize: 15
                     color: theme.textSecondary
@@ -131,6 +148,8 @@ Item {
             // 不去覆盖一次刚成功的备份 / 恢复提示。
             AppCard {
                 Layout.fillWidth: true
+                // 列表读取失败走自己的错误通道 catalogError：它不会被"备份
+                // 成功"之类的全局提示覆盖，两者可以同时可见。
                 visible: controller.catalogError.length > 0
 
                 ColumnLayout {
@@ -160,6 +179,9 @@ Item {
             }
 
             Text {
+                // "暂无备份"的四个条件缺一不可：已配置仓库、不在刷新中、没有
+                // 错误、列表为空。少了 catalogBusy 会在每次刷新时闪一下空表，
+                // 少了 catalogError 会把"读不出来"说成"没有"。
                 objectName: "catalogEmptyText"
                 Layout.fillWidth: true
                 Layout.topMargin: 8
@@ -175,6 +197,10 @@ Item {
             Repeater {
                 model: controller.backupRecords
 
+                // modelData 是 C++ 传来的 QVariantMap：字段可能整体缺失（例如
+                // v1 归档没有 pipeline 元数据），所以每一项都做一次带默认值的
+                // 强制转换，缺键时退化成空串 / 0 / false，而不是把 undefined
+                // 绑进界面。
                 delegate: BackupRecordCard {
                     required property var modelData
 
@@ -189,17 +215,24 @@ Item {
                     // 卡片因此不会显示任何算法名（也不会显示 v2 的三个文案）。
                     hasPipelineMethods: Boolean(modelData["hasPipelineMethods"])
                     packMethodText: String(modelData["packMethodText"] || "")
-                    compressionMethodText: String(modelData["compressionMethodText"] || "")
-                    encryptionMethodText: String(modelData["encryptionMethodText"] || "")
+                    compressionMethodText: String(
+                        modelData["compressionMethodText"] || "")
+                    encryptionMethodText: String(
+                        modelData["encryptionMethodText"] || "")
                     passwordRequired: Boolean(modelData["passwordRequired"])
                     // 来源与计划变化摘要来自 ScheduleStore（不是文件名解析）：
                     // 手动备份不会被自动淘汰，"这条是谁建的"必须一眼看得出来。
-                    originText: schedule.originForFile(String(modelData["fileName"] || ""))
-                    scheduledChangesText: schedule.changesForFile(String(modelData["fileName"] || ""))
+                    originText: schedule.originForFile(
+                        String(modelData["fileName"] || ""))
+                    scheduledChangesText: schedule.changesForFile(
+                        String(modelData["fileName"] || ""))
                     busy: controller.busy || controller.catalogBusy
                 }
             }
 
+            // pageScope 必须与 Main.qml 的 dismissTransientMessage 分支字符串
+            // 一致（"management"），否则离开这一页时这条提示不会被消费，回到
+            // 页面还会再看到一次。
             StatusBanner {
                 objectName: "managementStatusBanner"
                 Layout.fillWidth: true

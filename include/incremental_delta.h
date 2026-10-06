@@ -1,6 +1,6 @@
 // incremental_delta.h
 //
-// PR #18：增量 delta 的磁盘格式（BKPINC1）。
+// 增量 delta 的磁盘格式（BKPINC1）。
 //
 // ---- 为什么要一个新的顶层格式 ----
 //
@@ -168,7 +168,7 @@ bool ExtractDeltaPayload(const std::string& delta_file,
 
 // 读内层 container 的 header：不需要密码、不抽取 payload、不触碰内容。
 //
-// 恢复路径用它确认"这份 delta 的 payload 没有被加密"。PR #18 v1 的合同是
+// 恢复路径用它确认"这份 delta 的 payload 没有被加密"。v1 的合同是
 // Incremental + encryption 明确拒绝，创建路径由共享校验拦住；读侧要有同一条
 // 合同，因为旧版本写出来的加密 delta 的**明文外层信封**（parent / tombstones）
 // 并不受内层 HMAC 覆盖，接受它等于接受一组未经认证的路径指令。

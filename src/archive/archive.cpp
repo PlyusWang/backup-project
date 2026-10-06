@@ -19,6 +19,15 @@
 //      任何一步失败都不留下残留文件；
 //   2. 读侧两阶段：preflight 只看不写，结构合法之后才创建 destination；
 //   3. 数值边界：宁可用减法比较，也不写 position + size 这种可能溢出的表达式。
+//
+// 磁盘布局（Archive Format v0.1，全部 little-endian，字段顺序即 offset 顺序）：
+//   全局 header 24 字节：magic[8] "BKPARCH\0" + version u16 + flags u16 +
+//     header_size u32 + entry_count u64（先写 0，全部条目写完再回填）
+//   entry header 32 字节：type u8（1=目录, 2=普通文件）+ reserved0 u8 +
+//     reserved1 u16 + path_length u32 + mode u32（只含 0777）+ mtime_nsec u32 +
+//     mtime_sec u64（i64 的补码）+ payload_size u64；紧跟 path_length 字节的
+//     路径（无 NUL 结尾），再紧跟 payload_size 字节的文件内容（目录恒为 0）
+// entry 顺序是深度优先的前序：父目录一定先于它的孩子出现，读侧依赖这一点。
 
 #include "archive.h"
 
@@ -87,6 +96,9 @@ std::string Describe(int error_number, const std::string& action,
 }
 
 // fd / DIR* 的 RAII：任何提前 return 都会自动关闭。
+// fd 的 RAII 包装。Release() 交出所有权（调用方负责 close，用于"close 的返回值
+// 必须检查"的场合），Reset() 关掉当前的再接管新的；拷贝被删除，
+// 因此不会有第二个对象同时持有同一个 fd。
 class ScopedFd {
  public:
   ScopedFd() = default;
@@ -160,6 +172,9 @@ void AppendU64LE(std::string* out, std::uint64_t value) {
 // “它们太小，不值得为每个格式模块各留一份”）：这里再拄一套就是
 // 第二份事实来源。读法完全一致：字段不完整就直接失败。
 // pread 的薄封装：EINTR 重试，返回实际读到的字节数，出错返回 -1。
+// 返回值是实际读到的字节数，可能小于请求长度（短读）：调用方必须按返回值
+// 判断是否读满，不能假定一次 pread 就拿到全部数据。EINTR 在这里重试，
+// 因此调用方不必自己处理信号打断。
 ssize_t ReadAt(int fd, void* buffer, std::size_t size, std::uint64_t offset) {
   unsigned char* cursor = static_cast<unsigned char*>(buffer);
   std::size_t remaining = size;
@@ -307,6 +322,9 @@ EntryMetadata MetadataOf(const struct stat& info) {
 
 // entry header 的字段顺序与宽度见 docs/format/archive_v0.1.md；
 // 顺序写错或漏掉一个字段，读侧就会整片错位。
+// mtime_sec 先转成无符号再按 LE 写：负时间戳（1970 之前）在补码表示下往返
+// 一致。mode 在 MetadataOf 里已经掩过 0777，这里不再重复掩码，
+// 但 header 的总长必须正好 32 字节，否则读侧会整片错位。
 void BuildEntryHeader(std::uint8_t type, std::uint32_t path_length,
                       const EntryMetadata& metadata, std::uint64_t payload_size,
                       std::string* out) {
@@ -331,6 +349,8 @@ void BuildEntryHeader(std::uint8_t type, std::uint32_t path_length,
 // 全局 header：magic + version + flags + header_size + entry_count。
 // entry_count 先写 0 占位，扫完源目录再回填，避免为了数文件先扫两遍
 // 或者把整棵树的信息都攒在内存里。
+// 24 字节的全局 header 一次写出；entry_count 此时还不知道，先写 0 占位，
+// 扫描结束后由 PatchU64 回填，避免为了数条目先把目录树扫两遍。
 bool WriteGlobalHeader(ArchiveOutput* output, std::string* error_message) {
   std::string header;
   header.append(reinterpret_cast<const char*>(kMagic), sizeof(kMagic));
@@ -346,6 +366,9 @@ bool WriteGlobalHeader(ArchiveOutput* output, std::string* error_message) {
 }
 
 // 全局 header 的解码结果。
+// 全局 header 的解码结果。刻意只有这三项：preflight 与 InspectHeader 都只
+// 需要它们，entry 层面的信息在读侧另行解析，避免这个结构演化成"半个归档
+// 模型"——那会让两处解析逻辑互相牵制。
 struct GlobalHeaderFields {
   std::uint16_t format_version = 0;
   std::uint16_t flags = 0;
@@ -413,6 +436,11 @@ bool DecodeGlobalHeader(const unsigned char* header, std::size_t size,
 bool ValidateArchivePath(const std::string& path, bool is_first_entry,
                          std::uint8_t type, std::string* error_message);
 
+// 写侧与读侧共用 ValidateArchivePath 不是"顺手抽象"：只有读侧检查的话，
+// 写侧就会产出自己读不回来的归档。is_first_entry 用 entry_count == 0 判断，
+// 因为第一条 entry 永远是源目录本身（"."）。
+// 计数器只在整条前缀写成功之后自增，回填进全局 header 的数字因此恒等于
+// 实际写出的 entry 条数。
 bool WriteEntryPrefix(ArchiveOutput* output, std::uint8_t type,
                       const std::string& archive_path,
                       const EntryMetadata& metadata, std::uint64_t payload_size,
@@ -442,6 +470,9 @@ bool WriteEntryPrefix(ArchiveOutput* output, std::uint8_t type,
 }
 
 // 普通文件的 payload 必须流式照抄：固定 64 KiB 缓冲，绝不把文件读进内存。
+// 源文件的内容边读边写，固定 64 KiB 缓冲。这是 v0.1 的 TOCTOU 边界：
+// 不做快照、不加文件锁，只保证"读完再比对一次 stat"，
+// 因此打包期间被改写的文件会让整次备份失败，而不是被静默收进归档。
 bool WriteFilePayload(ArchiveOutput* output, const std::string& disk_path,
                       const struct stat& initial_info,
                       std::string* error_message) {
@@ -560,6 +591,9 @@ bool WriteRegularFileEntry(ArchiveOutput* output, const std::string& disk_path,
   return WriteFilePayload(output, disk_path, info, error_message);
 }
 
+// 递归的每一步都重新 lstat，不沿用父层读到的 stat：条目可能在递归过程中
+// 被替换（这正是 v0.1 不做快照的代价），重新取一次能让错误尽早暴露。
+// 目录条目的 payload 恒为 0：目录的内容就是它的孩子条目，不重复存。
 // 递归写目录：先写目录自己的 entry（这样读侧能拿到目录的 mode / mtime），
 // 再按文件名排序写 children。排序让同样的源每次产出同样的归档，便于比对。
 bool WriteDirectoryTree(ArchiveOutput* output,
@@ -687,6 +721,10 @@ bool WriteDirectoryTree(ArchiveOutput* output,
 
 // ---- 读侧：先 preflight 校验，再动磁盘 ----
 
+// preflight 的产物：一条 entry 在内存里的完整描述，也是第二阶段唯一的输入。
+// payload_offset 是归档文件内的**绝对偏移**，指向这条 entry 的内容起点；
+// 第二阶段只按它 pread，不再重新解析 header，因此"校验过的结构"与
+// "实际执行的读写"描述的是同一份数据。它不持久化，生命周期仅限一次 Extract。
 struct ParsedEntry {
   std::string path;
   std::uint8_t type = 0;
@@ -786,6 +824,9 @@ bool ValidateArchivePath(const std::string& path, bool is_first_entry,
 //   * 读满 entry_count 之后必须正好 EOF，多一个字节都算失败。
 // 宽松解析能让更多"坏样本"通过，但代价是用户拿到一个不完整的恢复结果
 // 却以为成功了——对备份工具来说这个代价太大。
+// 内存上界：只按实际读到的 entry 增长，绝不按 header 声明的 entry_count
+// 预分配——一个声称有 2^64 条 entry 的头如果拿去 reserve，进程会当场 OOM。
+// fd 必须是已打开的只读句柄；函数全部用 pread，不依赖文件位置。
 bool PreflightArchive(int fd, const std::string& archive_path,
                       std::uint64_t file_size,
                       std::vector<ParsedEntry>* entries,
@@ -995,6 +1036,10 @@ bool PreflightArchive(int fd, const std::string& archive_path,
 //   * 目录的元数据按深度从深到浅恢复，root 最后。
 // 反过来做就会遇到"0555 的目录里写不进文件""父目录 mtime 被子项覆盖"这类
 // 只在特定输入下才暴露的问题。
+// 用 O_EXCL 创建，内容写完并 close 之后才设元数据。失败时已经写了一半的
+// 目标文件会留在磁盘上（v0.1 不回滚已完成的条目），但错误信息里带着具体路径。
+// 这与写侧"失败就删掉半成品归档"的策略不同，是刻意的：恢复目录是用户的
+// 产物，删掉它比留下它更危险。
 bool ExtractRegularFile(int archive_fd, const ParsedEntry& entry,
                         const std::string& disk_path,
                         std::string* error_message) {
@@ -1050,6 +1095,8 @@ bool ExtractRegularFile(int archive_fd, const ParsedEntry& entry,
 
 // 恢复 mode 与 mtime。文件在内容写完、close 之后再调用；
 // 目录要等所有子项都建完，否则子项创建会把 mtime 又改掉。
+// chmod / utimensat 失败即整次恢复失败：元数据是这个归档承诺的一部分，
+// 悄悄降级会让用户拿到一个"看起来成功、权限却不对"的恢复结果。
 bool ApplyMetadata(const std::string& disk_path, const ParsedEntry& entry,
                    std::string* error_message) {
   if (::chmod(disk_path.c_str(), static_cast<mode_t>(entry.mode)) != 0) {
@@ -1089,10 +1136,16 @@ std::size_t ArchivePathDepth(const std::string& path) {
 bool ArchiveWriter::Write(const std::string& source_directory,
                           const std::string& archive_file,
                           std::string* error_message) const {
-  // 没有筛选规则：等价于一个空 Filter，行为与 PR #8 完全一致。
+  // 没有筛选规则：等价于一个空 Filter，与“不带任何规则”的既有行为完全一致。
   return Write(source_directory, archive_file, nullptr, error_message);
 }
 
+// 打包主流程。顺序是契约的一部分，每一步都必须先于下一步成立：
+//   1. 参数非空 -> 2. lstat 源必须是目录 -> 3. 拓扑检查（归档不能落在源里）
+//   -> 4. 归档文件必须不存在 -> 5. 必要时补建父目录 -> 6. open(O_EXCL) 再写。
+// 所有校验都在创建任何文件之前完成，因此非法输入保证 0 文件系统改动；
+// 而一旦开始写，任何一步失败都会 unlink 掉半成品归档：目录里留一个坏 .bak
+// 比什么都不留更危险，用户会默认它是可用的备份。
 bool ArchiveWriter::Write(const std::string& source_directory,
                           const std::string& archive_file, const Filter* filter,
                           std::string* error_message) const {
@@ -1186,6 +1239,10 @@ bool ArchiveWriter::Write(const std::string& source_directory,
   return true;
 }
 
+// 恢复主流程：preflight 全部通过之后才创建 destination。第二阶段不再做结构
+// 校验（那是 preflight 的职责），所以这里的失败只可能来自磁盘：空间不足、
+// 权限不够、路径被外部改动。这类失败会留下已完成的部分且不回滚——v0.1 不做
+// 事务，但错误信息会写清是哪一步、哪个路径失败。
 bool ArchiveReader::Extract(const std::string& archive_file,
                             const std::string& destination_directory,
                             std::string* error_message) const {
@@ -1307,6 +1364,9 @@ bool ArchiveReader::Extract(const std::string& archive_file,
 // 它和 preflight 共用 DecodeGlobalHeader，所以"能被列出来"和"能被恢复"在
 // header 这一层上永远是一致的；但 entry、payload、路径、EOF 这些它一概不看，
 // 因此它的成功不构成"归档可用"的证据。
+// 快速摘要入口。先按 magic 分流：v2 容器（BKPCNT2）走
+// InspectContainerFile，v0.1 归档走本文件的 DecodeGlobalHeader；
+// 两条路各自调用自己那份解码实现，这里不复制任何字段解析逻辑。
 bool ArchiveReader::InspectHeader(const std::string& archive_file,
                                   ArchiveSummary* summary,
                                   std::string* error_message) const {

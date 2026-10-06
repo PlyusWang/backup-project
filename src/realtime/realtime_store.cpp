@@ -1,6 +1,25 @@
 // realtime_store.cpp
 //
 // 见 include/realtime_store.h。
+// 模块职责：realtime 配置的磁盘读写与加载期校验——把 RealtimeConfig 序列化成
+// 一份人可读、可 diff 的 JSON，再把它安全地读回来。
+//
+// 边界（不负责什么）：不做文件事件监听、不做 debounce 计时、不做备份调度；
+// 也不决定“哪些选项组合合法”——那份答案的唯一来源是 backup_option_keys.h
+// 里的共享真值表。
+//
+// 数据流：Save(config) -> 校验 -> 拼 JSON 文本 -> 原子替换落盘；
+// Load(&config) -> 读整份文件 -> ParseJson -> 逐字段强类型取值 -> 校验 ->
+// 调用方拿到一份通过产品级校验的配置（或者一个明确的失败原因）。
+//
+// 失败语义：Load 用 RealtimeLoadStatus 三态区分“没有配置文件”与“配置文件坏
+// 了”：前者可以走默认值，后者必须让用户看到原因。Save 失败时不改动原文件。
+//
+// 不变量：写出去的字节必须能被本文件的 Load 原样读回；长度与取值在写之前、
+// 读之后各校验一次；任何一步不过都整体失败，绝不部分接受。
+//
+// 安全边界：磁盘上的文件按不可信输入对待——O_NOFOLLOW 打开、必须是普通文件、
+// 有长度上限、逐字段强类型解析、解析后再跑一次完整校验。
 
 #include "realtime_store.h"
 
@@ -38,6 +57,8 @@ std::string ErrnoText(int error_number) {
                          : std::string(text);
 }
 
+// 所有来自磁盘或命令行的字符串都要过这一关：长度上限挡住内存放大，NUL 检查
+// 挡住“std::string 里藏着 C 字符串看不见的后半截”这类语义分叉。
 bool IsBoundedString(const std::string& value) {
   if (value.size() > kMaxRealtimeStringBytes) return false;
   return value.find('\0') == std::string::npos;
@@ -63,6 +84,8 @@ std::string CanonicalOrAbsolute(const std::string& path) {
   return StripTrailingSlashes(path);
 }
 
+// 路径包含判定必须按“组件边界”比较，不能拿字符串前缀：/data 与 /data2 不是
+// 祖孙关系。root == "/" 单独处理，因为空前缀会让任何绝对路径都命中。
 bool IsSameOrDescendant(const std::string& candidate, const std::string& root) {
   if (candidate == root) return true;
   if (root == "/") return !candidate.empty() && candidate[0] == '/';
@@ -71,6 +94,8 @@ bool IsSameOrDescendant(const std::string& candidate, const std::string& root) {
   return candidate[root.size()] == '/';
 }
 
+// 用 lstat 而不是 stat：调用方要能区分“不是目录”和“是个指向别处的符号链接”，
+// 后者在 realtime 里一律拒绝。失败时 error_message 带上 errno 文本。
 bool LstatIsDirectory(const std::string& path, bool* is_directory,
                       bool* is_symlink, std::string* error_message) {
   struct stat info;
@@ -83,6 +108,8 @@ bool LstatIsDirectory(const std::string& path, bool* is_directory,
   return true;
 }
 
+// 把规则数组折叠成一个字符串，专供 identity 摘要使用；分隔符必须是 '\n'，
+// 否则 ["ab"] 与 ["a","b"] 会折叠出同一个摘要。
 std::string KeyOfRuleList(const std::vector<std::string>& rules) {
   std::string out;
   for (const std::string& rule : rules) {
@@ -94,6 +121,11 @@ std::string KeyOfRuleList(const std::vector<std::string>& rules) {
 
 }  // namespace
 
+// 判定源目录与仓库目录的关系：相等、谁在谁里面、还是无关。这是 realtime 的
+// 硬边界：重叠意味着“备份写出的文件又触发下一次备份”。
+// 两个路径都不要求存在：realpath 成功就用归一化结果，失败就退回“去掉尾部斜杠
+// 的路径”，所以 kUnknown 只有“路径为空”一种来源——调用方必须当失败处理，
+// 不能当成“没重叠”继续跑。
 RealtimePathOverlap ClassifyPathOverlap(const std::string& source_path,
                                         const std::string& repository_path,
                                         std::string* detail) {
@@ -119,6 +151,9 @@ RealtimePathOverlap ClassifyPathOverlap(const std::string& source_path,
   return RealtimePathOverlap::kNone;
 }
 
+// 用产品自己的 Filter 编译规则，顺序固定为“先 include 再 exclude”；优先级语义
+// 完全由 Filter 决定，这里不复制一份（两份规则迟早会分叉）。
+// 任一规则编译失败就整体失败：半个 Filter 不能拿去做备份。
 bool BuildRealtimeFilter(const RealtimeConfig& config, Filter* filter,
                          std::string* error_message) {
   if (filter == nullptr) {
@@ -140,6 +175,12 @@ bool BuildRealtimeFilter(const RealtimeConfig& config, Filter* filter,
   return true;
 }
 
+// 这是 realtime 配置唯一的语义校验点：Save、Load、enable 都调它，能走通的配置
+// 在三条路径上含义一致。校验范围：版本、trigger、路径长度、debounce 与
+// max_wait 的区间与相互关系、retain_count、规则条数与规则能否编译、策略组合
+// 是否存在。它不访问文件系统，所以 disabled 状态下允许保存一个暂时不存在的
+// source（enable 前的那道完整校验才要求目录真的存在）。失败时 error_message
+// 是给用户看的原因，调用方不要吞掉它。
 bool ValidateRealtimeConfig(const RealtimeConfig& config,
                             std::string* error_message) {
   if (config.version != kRealtimeConfigVersion) {
@@ -147,6 +188,8 @@ bool ValidateRealtimeConfig(const RealtimeConfig& config,
                                 std::to_string(config.version));
     return false;
   }
+  // trigger 必须是 realtime：这份配置文件只描述实时任务，别把计划任务的配置
+  // 塞进来（那会让“这一轮是谁触发的”变成需要猜的字段）。
   if (config.trigger != BackupTrigger::kRealtime) {
     SetError(error_message, "A realtime config must have trigger = realtime");
     return false;
@@ -174,6 +217,8 @@ bool ValidateRealtimeConfig(const RealtimeConfig& config,
                  std::to_string(config.max_wait_ms));
     return false;
   }
+  // 两个窗口的关系也要校验：max_wait 是“最多攒多久”，比 debounce 还短的话
+  // 配置在语义上自相矛盾——引擎侧只能二选一，不如在这里拒绝。
   if (config.max_wait_ms < config.debounce_ms) {
     SetError(error_message,
              "Realtime max wait must not be smaller than the debounce window");
@@ -229,6 +274,11 @@ bool ValidateRealtimeConfig(const RealtimeConfig& config,
   return true;
 }
 
+// enable 的门槛比 Save 高：Save 只保证“这份配置本身合法”，enable 还要保证
+// “这台机器现在真的跑得起来”：源目录存在、不是符号链接、真的是目录，仓库
+// 能被建起来且不是符号链接，两者路径不重叠。任何一项不过都不写配置文件，
+// 也不会留下半个状态。
+// 输出 repository_identity 是给 identity 摘要用的逻辑身份，与本地路径无关。
 bool ValidateRealtimeForEnable(const RealtimeConfig& config,
                                const std::string& repository_path,
                                std::string* error_message,
@@ -255,6 +305,8 @@ bool ValidateRealtimeForEnable(const RealtimeConfig& config,
     return false;
   }
 
+  // 用产品的目录管理接口确保仓库布局存在：它会补齐缺失的目录并校验既有布局，
+  // 所以“仓库目录还不存在”在这里是允许的。
   BackupCatalog catalog;
   std::string normalized_repository;
   if (!catalog.EnsureRepository(repository_path, error_message)) {
@@ -307,11 +359,18 @@ bool ValidateRealtimeForEnable(const RealtimeConfig& config,
   return true;
 }
 
+// file_path_ 是对象的全部状态：不做内存缓存，每次 Load 都重新读盘，因此多个
+// 实例/多个进程之间不会读到彼此的陈旧副本。
 RealtimeStore::RealtimeStore(std::string file_path)
     : file_path_(std::move(file_path)) {}
 
 namespace {
 
+// 一次性读进整份文件，任何一步不过都返回 false：O_NOFOLLOW 拒绝符号链接
+// （否则读的来源可能被换掉），fstat + S_ISREG 要求普通文件，长度要在上限内。
+// 按 st_size 预分配后循环读，EINTR 重试；读到 EOF 但字节数不足，按“文件被
+// 截断”处理，而不是把半份内容交给调用方——半份 JSON 的解析错误信息会误导人。
+// close 失败同样算失败：它可能意味着数据其实没落到盘上。
 bool ReadWholeFile(const std::string& path, std::string* text,
                    std::string* error_message) {
   const int fd = ::open(path.c_str(), O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
@@ -356,6 +415,9 @@ bool ReadWholeFile(const std::string& path, std::string* text,
   return true;
 }
 
+// 字段取值辅助：字段必须存在、类型必须完全正确，不做任何隐式转换（字符串 "1"
+// 不是数字，0/1 不是 bool）。调用方前面已经用 RequireExactFields 确认过字段集
+// 合，所以这里的“缺失”等同于文件被改坏，直接失败。
 bool RealtimeRequireString(const JsonValue& object, const char* key,
                            const std::string& what, std::string* value,
                            std::string* error_message) {
@@ -372,6 +434,8 @@ bool RealtimeRequireString(const JsonValue& object, const char* key,
   return true;
 }
 
+// bool 不接受 0/1 或 "true" 这类近似写法：配置文件由本程序写出，出现近似值
+// 就说明它被手改过（或者来自不认识的版本）。
 bool RealtimeRequireBool(const JsonValue& object, const char* key,
                          const std::string& what, bool* value,
                          std::string* error_message) {
@@ -384,6 +448,8 @@ bool RealtimeRequireBool(const JsonValue& object, const char* key,
   return true;
 }
 
+// 上界由调用方显式给出，避免同一字段的上限在两处各写一份；负值一律拒绝，
+// 数字类型本身由共享 parser 保证是整数（它不接受小数点与指数）。
 bool RealtimeRequireUint(const JsonValue& object, const char* key,
                          const std::string& what, std::uint32_t maximum,
                          std::uint32_t* value, std::string* error_message) {
@@ -401,6 +467,9 @@ bool RealtimeRequireUint(const JsonValue& object, const char* key,
   return true;
 }
 
+// 规则数组：先清空再填，因为调用方可能在同一个 config 上重复 Load。
+// 条目数上限在解析时就挡住，免得一个超大数组先被完整收进内存再被拒绝；
+// 每条必须是长度受限、无 NUL 的字符串，元素类型不符即整体失败。
 bool RealtimeRequireRuleList(const JsonValue& object, const char* key,
                              const std::string& what,
                              std::vector<std::string>* rules,
@@ -476,6 +545,9 @@ void AppendJsonStringBody(std::string* out, const std::string& value) {
   }
 }
 
+// 手写 JSON 的写侧小工具。AppendStringField 只写“缩进 + "key": "value"”，结尾
+// 逗号留给调用方：这样在末尾追加字段时不用回头改上一行（手写 JSON 最容易
+// 出错的地方就是逗号）。AppendRules 的 last 参数把“最后一行不加逗号”显式化。
 void AppendStringField(std::string* out, const char* key,
                        const std::string& value) {
   *out += "    \"";
@@ -503,6 +575,14 @@ void AppendRules(std::string* out, const char* key,
 
 }  // namespace
 
+// 三态返回，调用方必须按语义分开处理：
+//   kMissing  文件不存在——可以走默认配置；
+//   kLoaded   文件存在、解析通过、且已过完 ValidateRealtimeConfig；
+//   kError    文件存在但读不进来、解析失败或校验不过——绝不能当成默认值。
+//
+// 先用 lstat 探一次存在性，才能把 ENOENT 与其它错误分开（EACCES、ELOOP 都
+// 是真错误）；文件随后仍按不可信输入打开，所以这里的存在性检查只是分类，
+// 不构成“已确认安全”。
 RealtimeLoadStatus RealtimeStore::Load(RealtimeConfig* config,
                                        std::string* error_message) const {
   if (config == nullptr) {
@@ -530,6 +610,9 @@ RealtimeLoadStatus RealtimeStore::Load(RealtimeConfig* config,
     SetError(error_message, "Invalid realtime config: " + json_error);
     return RealtimeLoadStatus::kError;
   }
+  // 字段集合必须精确匹配：少一个字段、多一个未知字段都拒绝。
+  // 未知字段通常意味着文件来自更新的版本或被人手改过；静默忽略它，用户会以为
+  // 那个字段生效了。
   if (!RequireExactFields(
           root,
           {"version", "enabled", "trigger", "source_path", "debounce_ms",
@@ -623,17 +706,27 @@ RealtimeLoadStatus RealtimeStore::Load(RealtimeConfig* config,
                                &config->exclude_rules, error_message)) {
     return RealtimeLoadStatus::kError;
   }
+  // 结构解析通过 ≠ 语义合法：文件可能被人改成一个“类型对、取值非法”的组合，
+  // （Save 也调用它），因此“存进去的”和“读回来的”受同一套约束。
   if (!ValidateRealtimeConfig(*config, error_message)) {
     return RealtimeLoadStatus::kError;
   }
   return RealtimeLoadStatus::kLoaded;
 }
 
+// 先校验再落盘：写出去的每一个字段都已经过 ValidateRealtimeConfig，所以磁盘上
+// 不可能出现一份“看起来能读、跑起来才发现不行”的配置。
+// 文本按固定顺序拼、4 空格缩进：它是人可读、可 diff 的文件，字段顺序属于可读性
+// 契约，不要随意重排（字符串与规则数组共用同一套转义实现）。
 bool RealtimeStore::Save(const RealtimeConfig& config,
                          std::string* error_message) const {
   if (error_message != nullptr) error_message->clear();
   if (!ValidateRealtimeConfig(config, error_message)) return false;
 
+  // 磁盘布局（realtime.json，UTF-8，一行一个字段，顺序固定）：
+  //   version / enabled / trigger / source_path / debounce_ms / max_wait_ms
+  //   / retain_count / strategy / pack / compression / encryption
+  //   / include_rules / exclude_rules
   std::string out = "{\n";
   out += "    \"version\": " + std::to_string(config.version) + ",\n";
   out += std::string("    \"enabled\": ") +
@@ -654,6 +747,7 @@ bool RealtimeStore::Save(const RealtimeConfig& config,
   out += "    \"encryption\": \"" +
          std::string(EncryptionMethodKey(config.encryption_method)) + "\",\n";
   AppendRules(&out, "include_rules", config.include_rules, false);
+  // exclude_rules 必须是最后一行：AppendRules 的 last=true 决定不写尾逗号。
   AppendRules(&out, "exclude_rules", config.exclude_rules, true);
   out += "}\n";
 
@@ -667,6 +761,12 @@ bool RealtimeStore::Save(const RealtimeConfig& config,
   return true;
 }
 
+// job identity = “这套 realtime 配置在语义上还是不是同一件事”。
+// 因此只收语义字段：源身份、仓库身份、过滤规则、策略与流水线；enabled 与
+// debounce / max_wait / retain_count 这些“调参”不进摘要——否则改一下去抖就
+// 会让历史和 retention 认不出这是同一个 job。
+// canonical 串带 "BPREALTIMEJOB1" 版本前缀：摘要格式一改就换前缀，避免新旧
+// 摘要被当成同一种东西；每行以 '\n' 结尾、字段名带 '='，拼接不会有歧义。
 std::string RealtimeJobIdentityDigest(const RealtimeConfig& config,
                                       const std::string& repository_identity,
                                       const std::string& source_path) {

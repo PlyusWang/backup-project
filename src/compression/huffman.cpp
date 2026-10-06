@@ -23,6 +23,10 @@
 // 边界：空输入 → original_size = 0、bit_count = 0、256 个码长全 0、没有
 // bitstream；只出现 1 种符号 → 该符号码长固定为 1（0 bit 读不出任何东西，也会
 // 让解码端无法确定符号）。失败时 *output 保持原样，只有 *error_message 被写。
+// 线程模型：本文件没有全局可变状态，也没有 static 缓存；每个函数只读写自己
+// 的参数，因此不同 reader / sink / output 之间可以并发调用，同一个对象则不行。
+// 失败契约：失败时返回 false，并在 error_message 非空时写入中文原因；
+// *output 只在成功路径上被整体赋值，失败时调用方手里的旧值不会被改动。
 
 #include <algorithm>
 #include <array>
@@ -70,12 +74,24 @@ std::uint64_t ReadLittleEndian64(const unsigned char* data,
   return value;
 }
 
+// 磁盘布局（全部 little-endian，共 276 字节；无对齐要求，逐字段读取）：
+//   offset  size  field
+//   0       4     magic "HUF1"
+//   4       8     original_size  解压后的字节数
+//   12      256   lengths[256]   每个符号的码长（0..32），0 表示不出现
+//   268     8     bit_count      bitstream 的比特数，不含末尾 padding
+// 头部之后紧跟 ceil(bit_count / 8) 字节净荷。流的总长必须精确等于
+// 276 + ceil(bit_count / 8)：多一个字节或少一个字节都算格式错误。
 struct HuffmanHeader {
   std::uint64_t original_size = 0;
   std::uint64_t bit_count = 0;
   std::array<std::uint32_t, kSymbolCount> lengths{};
 };
 
+// 纯结构解析：按固定偏移取字段，不做任何合法性判断（判断在
+// ValidateHuffmanHeader 里）。输入是**未信任的解压输入**，因此每次读取都以
+// size >= kHuffmanHeaderSize 为前提，bytes 与 size 必须描述同一块缓冲区。
+// 多字节字段一律按 little-endian 解释，不假设主机字节序。
 bool ParseHuffmanHeader(const unsigned char* bytes, std::size_t size,
                         HuffmanHeader* header) {
   if (size < kHuffmanHeaderSize) {
@@ -93,6 +109,9 @@ bool ParseHuffmanHeader(const unsigned char* bytes, std::size_t size,
 }
 
 // 头部自洽性。四条检查都不需要解压，坏流在分配内存之前就被挡掉。
+// 校验强度说明：Kraft 和 <= 2^32 只保证"码长组合没有超订"，并不要求它正好
+// 用满整个码空间（允许不完整的码表）。因此逐比特解码必须自己处理"读到 32
+// bit 仍无匹配"的情况，不能假定输入一定能解出符号。
 bool ValidateHuffmanHeader(const HuffmanHeader& header,
                            std::string* error_message) {
   std::size_t used = 0;
@@ -138,6 +157,8 @@ bool ValidateHuffmanHeader(const HuffmanHeader& header,
 }
 
 // bit_count 对应的净荷字节数。用除法算上取整，避免 bit_count + 7 溢出。
+// 这是编码端与解码端共用的唯一定义：(bit_count + 7) / 8 这类写法在
+// bit_count 接近 uint64 上限时会溢出，从而接受一个长度错误的流。
 std::uint64_t PayloadBytesFor(std::uint64_t bit_count) {
   return bit_count / 8 + (bit_count % 8 != 0 ? 1 : 0);
 }
@@ -145,6 +166,10 @@ std::uint64_t PayloadBytesFor(std::uint64_t bit_count) {
 // 标准 Huffman 建树，只保留每个叶子的深度（即码长）。
 // 权重相同时比较"子树里最小的符号"：这个值在同一次建树里互不相同，所以堆的
 // 比较是全序，输出与 std::priority_queue 的内部实现无关。
+// 节点之间用 vector 下标互相引用，不用指针也不用 shared_ptr：树只在这一次
+// 建树里活着，push_back 只发生在尾部，已有下标不会失效，也不引入所有权问题。
+// node.left < 0 是叶子判据；叶子的 min_symbol 就是符号本身，内部节点的
+// min_symbol 是两个孩子里的较小者，仅用于打破权重平局。
 void BuildRawCodeLengths(
     const std::array<std::uint64_t, kSymbolCount>& frequency,
     std::array<std::uint32_t, kSymbolCount>* lengths) {
@@ -255,6 +280,10 @@ void LimitCodeLengths(const std::array<std::uint64_t, kSymbolCount>& frequency,
   }
 }
 
+// 码长的唯一权威入口：空输入 / 单符号 / 常规三种情况都在这里分流，
+// 建树与上限修正只是它的两步内部实现。调用方不应绕过它直接调
+// BuildRawCodeLengths——那会让空输入与单符号这两条边界静默缺失，
+// 产出的头部随后会被解码端拒绝。
 void BuildCodeLengths(const std::array<std::uint64_t, kSymbolCount>& frequency,
                       std::array<std::uint32_t, kSymbolCount>* lengths) {
   lengths->fill(0);
@@ -279,6 +308,9 @@ void BuildCodeLengths(const std::array<std::uint64_t, kSymbolCount>& frequency,
 
 // canonical 分配需要的三张表：每个码长段有多少个码字、段内第一个码字、
 // 段内第一个符号在 sorted_symbols 里的下标。symbols 按 (码长, 符号) 升序。
+// 三张辅助表都以码长为下标（1..32，下标 0 永不使用）；sorted_symbols 是按
+// (码长, 符号) 升序排好的符号序列，解码时用 first_index 直接定位段首，
+// 因此每条码字的查找是 O(1)，不需要在候选符号里线性搜索。
 struct CanonicalTable {
   std::array<std::uint32_t, kMaxCodeLength + 1> length_count{};
   std::array<std::uint32_t, kMaxCodeLength + 1> first_code{};
@@ -327,6 +359,9 @@ CanonicalTable BuildCanonicalTable(
 // bit_count = Σ frequency[s] * length[s]。frequency 是 uint64、length 最多 32，
 // 乘积可能溢出；一个回绕后的 bit_count 会让编码器写出一个自己都读不回来的流，
 // 所以这里必须查。
+// 计算过程本身也要防溢出：limit 取"还能再加多少个 length"的上界，
+// 比较通过才做乘法。把检查放在乘法之前，而不是算完再判断结果是否变小，
+// 是因为回绕后的值没有任何可识别的特征。
 bool ComputeBitCount(const std::array<std::uint64_t, kSymbolCount>& frequency,
                      const std::array<std::uint32_t, kSymbolCount>& lengths,
                      std::uint64_t* bit_count, std::string* error_message) {
@@ -350,6 +385,9 @@ bool ComputeBitCount(const std::array<std::uint64_t, kSymbolCount>& frequency,
 }
 
 // 顺序读完整条输入，攒出频次表与原始长度。
+// 只顺序读一遍且不保留输入字节，所以统计阶段的内存占用与输入大小无关；
+// 频次用 uint64，单个符号出现 2^64 次在物理上不可能。失败时 frequency 与
+// total 的内容未定义，调用方应整体放弃这次编码，而不是拿半份频次继续。
 bool CountFrequency(SequentialReader* reader,
                     std::array<std::uint64_t, kSymbolCount>* frequency,
                     std::uint64_t* total, std::string* error_message) {
@@ -371,6 +409,11 @@ bool CountFrequency(SequentialReader* reader,
   return true;
 }
 
+// 头部先在内存里拼成完整的 276 字节，再一次性交给 sink：sink 可能是文件，
+// 半截头部写出去之后没有任何补救手段；单次 Write 要么在写出任何字节之前
+// 失败，要么把整块交给下层。
+// header.size() 的自检是最后一道保险——字段顺序或宽度写错时立刻失败，
+// 而不是产出一个连自己都读不回来的流。
 bool WriteHeader(const std::array<std::uint32_t, kSymbolCount>& lengths,
                  std::uint64_t original_size, std::uint64_t bit_count,
                  ByteSinkAdapter* sink, std::string* error_message) {
@@ -390,6 +433,10 @@ bool WriteHeader(const std::array<std::uint32_t, kSymbolCount>& lengths,
 }
 
 // 编码主体：body_reader 从头顺序提供 original_size 个字节。
+// 两遍式编码的代价是输入被读两遍，换来的是与输入大小无关的内存占用：
+// 频次统计阶段不保存输入字节，这里再逐块重读一次。
+// 失败语义：sink 上可能已经留下了本流的部分字节（头部或半截比特流），
+// 本函数不回滚；调用方必须丢弃整个输出，不能把失败结果当成截断的流使用。
 bool EncodeCore(std::uint64_t original_size,
                 const std::array<std::uint64_t, kSymbolCount>& frequency,
                 SequentialReader* body_reader, ByteSinkAdapter* sink,
@@ -439,6 +486,9 @@ bool EncodeCore(std::uint64_t original_size,
 
 // 从 reader 的当前位置读 276 字节头部并做全部头部级校验，同时检查"流长度
 // 必须精确等于 276 + ceil(bit_count/8)"。不解码、不分配。
+// 只在 reader 的当前位置读取，返回时 reader 停在净荷开头（偏移由调用方用
+// Discard 自行推进）。reader->remaining() 在这里被当作"本流还剩多少字节"，
+// 所以调用方必须先把它定位到流起点，否则长度检查会得出错误结论。
 bool ReadHeaderAt(SequentialReader* reader, HuffmanHeader* header,
                   std::uint64_t* payload_bytes, std::string* error_message) {
   unsigned char bytes[kHuffmanHeaderSize];
@@ -463,6 +513,10 @@ bool ReadHeaderAt(SequentialReader* reader, HuffmanHeader* header,
 
 // 解码主体：从 reader 的当前位置（头部已经读过）解出 header.original_size 个
 // 字节写进 sink。
+// 输出按 kStreamBufferSize 分块写进 sink，不在内存里攒下 original_size
+// 字节：被篡改成 original_size = 2^40 的头部不会触发 1 TiB 的分配，
+// 它会在读到流尾时以"bitstream 提前结束"失败。
+// 解出的字节数由 header.original_size 精确控制，多一个少一个都算失败。
 bool DecodeBody(SequentialReader* reader, ByteSinkAdapter* sink,
                 const HuffmanHeader& header, std::string* error_message) {
   const CanonicalTable table = BuildCanonicalTable(header.lengths, nullptr);
@@ -524,6 +578,10 @@ bool DecodeBody(SequentialReader* reader, ByteSinkAdapter* sink,
 
 }  // namespace
 
+// 内存 -> 内存：输入是完整明文串，输出是完整的 HUF1 流。
+// 成功时 *output 被整体赋值；失败时 *output 保持调用前的值不变（结果先写在
+// 局部变量里，最后一步才 move 出去），error_message 被写成中文原因。
+// output == nullptr 是调用方的编程错误，用错误码而不是崩溃来报告。
 bool HuffmanCompress(const std::string& input, std::string* output,
                      std::string* error_message) {
   if (output == nullptr) {
@@ -551,6 +609,9 @@ bool HuffmanCompress(const std::string& input, std::string* output,
   return true;
 }
 
+// 内存 -> 内存的解压。除了 DecodeBody 的逐比特校验，这里还复核
+// result.size() == original_size：解码循环以保证产量为终止条件，这次复核
+// 是对接口承诺的检查，而不是对循环的重复。
 bool HuffmanDecompress(const std::string& input, std::string* output,
                        std::string* error_message) {
   if (output == nullptr) {
@@ -578,6 +639,9 @@ bool HuffmanDecompress(const std::string& input, std::string* output,
   return true;
 }
 
+// 只读头部、不解压：容器层需要在打开一条流之前就知道它的 original_size 与
+// payload_bytes，用来校验长度、排版后续流。*info 在入口被重置，
+// 因此失败时它是全零，而不是上一次调用的残留值。
 bool HuffmanReadStreamInfo(const std::string& input_file,
                            std::uint64_t input_offset, HuffmanStreamInfo* info,
                            std::string* error_message) {
@@ -608,6 +672,10 @@ bool HuffmanReadStreamInfo(const std::string& input_file,
   return true;
 }
 
+// 文件 -> 文件：input_file 会被完整读两遍（见 EncodeCore）。若源文件在这
+// 期间被改写，产出的流就是两次读取的混合体；本层不做一致性校验，
+// 需要一致性的调用方要自己保证读取期间源文件不被修改。
+// original_size / stream_bytes 只在成功时写入，允许传 nullptr。
 bool HuffmanCompressStream(const std::string& input_file, FileSink* sink,
                            std::uint64_t* original_size,
                            std::uint64_t* stream_bytes,
@@ -651,6 +719,10 @@ bool HuffmanCompressStream(const std::string& input_file, FileSink* sink,
   return true;
 }
 
+// 文件 -> 文件：input_offset 是流在文件里的起点（通常是容器头部之后的偏移）。
+// expected_original_size 来自容器 header，与流内声明做交叉校验：两者不一致
+// 时在写出任何数据之前失败，避免产出一份长度对不上的解压结果。
+// 失败时 sink 里可能已经有部分解压数据，调用方应丢弃整个输出。
 bool HuffmanDecompressStream(const std::string& input_file,
                              std::uint64_t input_offset, FileSink* sink,
                              std::uint64_t expected_original_size,
@@ -699,6 +771,9 @@ bool HuffmanDecompressStream(const std::string& input_file,
   return true;
 }
 
+// 探测入口：只跑 ReadHeaderAt（magic + 全部头部自洽性 + 精确流长度），
+// 不解压、不分配与 original_size 成比例的内存。返回 true 只说明"头部像
+// HUF1"，不构成"这段数据一定能解压成功"的保证。
 bool LooksLikeHuffman(const std::string& data) {
   SequentialReader reader;
   reader.OpenMemory(&data);

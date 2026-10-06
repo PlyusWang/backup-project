@@ -11,6 +11,14 @@
 //
 // 轮密钥扩展只在构造/调用时做一次；Aes256 对象析构时会清零轮密钥。
 
+// 内存卫生：轮密钥等价于密钥本身，所有含密钥的中间量（轮密钥、state、
+// keystream、counter）用完都用 SecureZero（volatile 写）清零，编译器不能把
+// 这个写优化掉。这只保证"本进程内不再留下可被后续代码读到的副本"，
+// 不承诺防住 core dump 或换页到磁盘。
+//
+// 失败语义：构造函数不抛异常也不 abort。密钥长度非法时对象停在 invalid，
+// 块操作输出全 0、CTR 变成空操作，由调用方查 valid() 决定怎么办 —— 容器解析
+// 到坏密钥时应该返回错误码，而不是让整个进程倒下。
 #include <cstring>
 
 #include "crypto.h"
@@ -78,6 +86,7 @@ constexpr unsigned char kRoundConstants[15] = {0x01, 0x02, 0x04, 0x08, 0x10,
 constexpr std::size_t kMaxRoundKeyBytes = 240;
 constexpr int kMaxRounds = 14;
 
+// 用 volatile 指针写：保证编译器不把"写完就没人读"的清零整段删掉。
 void SecureZero(void* data, std::size_t size) {
   volatile unsigned char* p = static_cast<volatile unsigned char*>(data);
   while (size-- > 0) *p++ = 0;
@@ -91,6 +100,9 @@ inline unsigned char Xtime(unsigned char value) {
 }
 
 // GF(2^8) 上的通用乘法，用于逆列混合里的乘 9/11/13/14。
+// 逐比特的移位相加（俄罗斯农民乘法），不用 256 字节的 log / antilog 表：
+// 没有查表就没有 cache-timing 侧信道。它只出现在逆列混合里，不在 CTR 的
+// 热路径上，慢一点可以接受。
 unsigned char Multiply(unsigned char a, unsigned char b) {
   unsigned char result = 0;
   for (int i = 0; i < 8; ++i) {
@@ -121,6 +133,8 @@ void ShiftRows(unsigned char state[kAesBlockSize]) {
   }
 }
 
+// ShiftRows 的逆：行 r 循环右移 r 字节。先把整行取到临时数组再写回，
+// 避免边读边写同一行。
 void InverseShiftRows(unsigned char state[kAesBlockSize]) {
   unsigned char row[4];
   for (std::size_t r = 1; r < 4; ++r) {
@@ -131,6 +145,8 @@ void InverseShiftRows(unsigned char state[kAesBlockSize]) {
   }
 }
 
+// 每列左乘固定矩阵。sum 是四个字节的异或，用它把 a0^a1 那几项化简成
+// "a ^ sum ^ Xtime(...)"，省掉一半多项式乘法。先取快照再写回。
 void MixColumns(unsigned char state[kAesBlockSize]) {
   for (std::size_t c = 0; c < 4; ++c) {
     unsigned char* column = state + 4 * c;
@@ -151,6 +167,8 @@ void MixColumns(unsigned char state[kAesBlockSize]) {
   }
 }
 
+// 逆矩阵系数 14 / 11 / 13 / 9，没有 Xtime 的化简形式，只能老老实实做
+// 四次 Multiply；先取快照的原因同上。
 void InverseMixColumns(unsigned char state[kAesBlockSize]) {
   for (std::size_t c = 0; c < 4; ++c) {
     unsigned char* column = state + 4 * c;
@@ -174,6 +192,10 @@ void InverseMixColumns(unsigned char state[kAesBlockSize]) {
 }
 
 // 密钥扩展（FIPS 197 5.2）。返回轮数；key_size 不是 16/24/32 时返回 -1。
+// 轮密钥按 FIPS 197 5.2 展开成一维字节数组：第 r 轮的 16 字节就是
+// round_keys + 16 * r，所以调用方统一按 kMaxRoundKeyBytes（240）准备缓冲区
+// 就够了，不必按密钥长度分支。失败：key_size 不是 16 / 24 / 32 时返回 -1，
+// 且不写任何输出。
 int ExpandKey(const unsigned char* key, std::size_t key_size,
               unsigned char round_keys[kMaxRoundKeyBytes]) {
   if (key_size != 16 && key_size != 24 && key_size != 32) return -1;
@@ -209,6 +231,8 @@ int ExpandKey(const unsigned char* key, std::size_t key_size,
   return rounds;
 }
 
+// FIPS 197 图 11 的直译：首轮 AddRoundKey，中间 rounds-1 轮做完整变换，
+// 最后一轮省掉 MixColumns。state 只在栈上，返回前清零。
 void EncryptBlockRaw(const unsigned char round_keys[kMaxRoundKeyBytes],
                      int rounds, const unsigned char in[kAesBlockSize],
                      unsigned char out[kAesBlockSize]) {
@@ -250,6 +274,9 @@ void DecryptBlockRaw(const unsigned char round_keys[kMaxRoundKeyBytes],
 }
 
 // 自由函数用的薄封装：长度非法时返回空串。
+// 自由函数入口（crypto.h 的 Aes256BlockEncrypt / Aes128BlockDecrypt 等）给
+// 测试与 CLI 一个"没有对象生命周期"的调用方式。失败用**空串**表达，而不是
+// 抛异常或输出全 0：空串不可能被误当成一个合法的 16 字节密文。
 std::string AesSingleBlock(const std::string& key, const std::string& block16,
                            bool decrypt) {
   if (block16.size() != kAesBlockSize) return std::string();
@@ -274,6 +301,8 @@ std::string AesSingleBlock(const std::string& key, const std::string& block16,
 
 }  // namespace
 
+// 构造即校验：长度不是 32 字节时 valid_ 保持 false，之后所有块操作输出全 0。
+// 轮密钥数组先整体清零再展开，不会把未初始化字节当成密钥用。
 Aes256::Aes256(const std::string& key32)
     : round_keys_{}, rounds_(0), valid_(false) {
   // 这里刻意不用 assert：容器解析到坏密钥时应当返回错误码，而不是让进程 abort。
@@ -285,8 +314,11 @@ Aes256::Aes256(const std::string& key32)
   valid_ = true;
 }
 
+// 析构清零：轮密钥等价于密钥本身，不能跟着内存分配器回流到堆里。
 Aes256::~Aes256() { SecureZero(round_keys_, sizeof(round_keys_)); }
 
+// invalid 时输出全 0 而不是留着调用方的旧数据：整块读取时"可预测的 0"
+// 比"上一轮留下的字节"安全得多。
 void Aes256::EncryptBlock(const unsigned char in[kAesBlockSize],
                           unsigned char out[kAesBlockSize]) const {
   if (!valid_) {
@@ -325,6 +357,11 @@ std::string Aes128BlockDecrypt(const std::string& key16,
   return AesSingleBlock(key16, block16, true);
 }
 
+// CTR：counter 块整体当一个大端整数递增，每个 counter 加密一次得到 16 字节
+// 密钥流，再与数据异或。keystream_pos_ 初始化成 kAesBlockSize，表示"手上没有
+// 可用的密钥流"，第一次 Process 会先生成一块。
+// 失败语义与 Aes256 一致：密钥或 IV 长度不对就停在 invalid，Process 变成
+// 空操作，不产生任何输出也不报错。
 Aes256Ctr::Aes256Ctr(const std::string& key32, const std::string& iv16)
     : cipher_(key32),
       counter_{},
@@ -341,6 +378,9 @@ Aes256Ctr::~Aes256Ctr() {
   SecureZero(keystream_, sizeof(keystream_));
 }
 
+// 从最低位字节往前找第一个不进位的位置。CTR 的计数器在**同一密钥下**不允许
+// 回绕：回绕意味着密钥流重复，两段明文异或就能互相暴露。本函数不阻止回绕
+// （128 位空间实际用不完），由调用方保证一段数据内的计数值不会绕回来。
 void Aes256Ctr::IncrementCounter() {
   // 大端整数自增，128 位整体回绕（计数器空间足够大，实际不会走到回绕）。
   for (std::size_t i = kAesBlockSize; i-- > 0;) {
@@ -349,11 +389,16 @@ void Aes256Ctr::IncrementCounter() {
   }
 }
 
+// 先加密当前 counter 再自增：这一块密钥流属于"自增之前"那个计数值，
+// 顺序反了就会和标准实现整整错开一块。
 void Aes256Ctr::GenerateKeystream() {
   cipher_.EncryptBlock(counter_, keystream_);
   IncrementCounter();
 }
 
+// 流式接口：可以按任意切分反复调用，跨调用的密钥流位置由 keystream_pos_
+// 记住，不需要调用方补齐块边界。输出**追加**到 out；data / out 为空或
+// size == 0 时静默返回（那不是错误），invalid 时同样什么都不做。
 void Aes256Ctr::Process(const void* data, std::size_t size, std::string* out) {
   if (!valid_ || out == nullptr || data == nullptr || size == 0) return;
   const unsigned char* p = static_cast<const unsigned char*>(data);
@@ -375,6 +420,8 @@ void Aes256Ctr::Process(const void* data, std::size_t size, std::string* out) {
   }
 }
 
+// 一次性 CTR：加解密是同一个函数（异或自反）。密钥 / IV 长度非法时返回空串，
+// 与 AesSingleBlock 保持同一种失败表达。
 std::string Aes256CtrCrypt(const std::string& key32, const std::string& iv16,
                            const std::string& data) {
   Aes256Ctr ctr(key32, iv16);

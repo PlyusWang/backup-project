@@ -1,5 +1,36 @@
-// src/network/remote_metadata_store.cpp
+// server/remote_metadata_store.cpp
 
+// 实现层职责：把 RemoteMetadataStore 的每个公开方法翻译成一条或一组 SQLite
+// 语句，并负责"元数据与磁盘 blob 的一致性"里属于元数据的那一半。
+//
+// 本文件**不负责**：
+//   * 生成或校验 storage_name —— 磁盘文件名由服务端上层决定，这里只当字符串
+//     存取；
+//   * blob 的写入与删除顺序 —— 那是 remote_server / remote_maintenance 的
+//     publish / quarantine 流程，这里只保证行级事实的原子性；
+//   * 口令的哈希与比对 —— salt / hash / iterations 原样存取，校验在
+//     remote_auth.cpp；
+//   * 协议编解码 —— StoreResult 到协议状态码的映射在 remote_server.cpp。
+//
+// 数据流：客户端 UPLOAD_END -> 上层构造 RemoteSnapshotRecord -> 本文件的
+// InsertSnapshot（链约束的权威校验点）-> snapshots 表；列表 / 详情 / 删除
+// 反向读回同一组列。
+//
+// 关键不变量：
+//   1. 列顺序就是磁盘布局。kSnapshotColumns 的书写顺序、ReadSnapshotRow 的
+//      下标、CREATE TABLE 与 ALTER TABLE 的列序三者必须一致；只改其中一处不会
+//      编译报错，只会让读回来的字段整体错位。
+//   2. SQL 一律预编译加绑定参数。全文没有把**值**拼进 SQL 文本；拼接只用于
+//      编译期常量（列名、表名、pragma）。
+//   3. 实例方法必须在 Open 成功之后调用；未打开时统一返回 kError 并写明
+//      "the metadata store is not open"，绝不空指针解引用。
+//   4. 公开方法在入口取同一把 mutex_，因此进程内的"查-改-写"序列是串行的；
+//      跨进程的竞争交给 SQLite 的写锁加 busy_timeout。
+//
+// 失败语义：可预期的业务结果用 StoreResult 表达（kNotFound / kAlreadyExists /
+// kHasDependents / kChainConflict），只有"内部坏了"才是 kError。error_message
+// 仅在 kError 时有意义，它的文案只进服务端日志，不回给客户端——里面可能带
+// 磁盘路径与 SQLite 细节。
 #include "remote_metadata_store.h"
 
 #include <sqlite3.h>
@@ -17,6 +48,9 @@ namespace {
 
 // WAL 让读写并发不至于互相阻塞；synchronous=FULL 保证 commit 之后掉电也还在。
 // foundation 版本的写入量很小，用安全性换那点吞吐不值得反过来做。
+// 下面这组 pragma 在每次打开连接时整体重放：除 journal_mode 外都是连接级
+// 设置，不写数据库文件，重放因此是幂等的；"这条连接的语义"也就只有一处定义，
+// 服务端路径与只读管理工具路径共享同一份。
 constexpr const char* kPragmaStatements[] = {
     // busy_timeout 必须排在**最前面**：并发首次打开时，第二条连接若还没装上
     // busy_timeout 就先执行 journal_mode=WAL（需要写锁），它会立刻拿到
@@ -27,6 +61,9 @@ constexpr const char* kPragmaStatements[] = {
     "PRAGMA busy_timeout=5000;",
 };
 
+// 建表语句按"父表先于子表"排列：users 必须先于 snapshots 建好，否则
+// foreign_keys=ON 之下那条外键会指向一个还不存在的表。整个数组在同一个事务里
+// 顺序执行，中间任何一条失败都会回滚，因此不会留下半张 schema。
 constexpr const char* kSchemaStatements[] = {
     "CREATE TABLE IF NOT EXISTS users ("
     "  id INTEGER PRIMARY KEY,"
@@ -44,7 +81,7 @@ constexpr const char* kSchemaStatements[] = {
     "  sha256 TEXT NOT NULL,"
     "  created_at INTEGER NOT NULL,"
     "  storage_name TEXT NOT NULL,"
-    // PR #21 的链元数据。parent_id 用空串表示"没有父"，不用 NULL：
+    // 链元数据。parent_id 用空串表示"没有父"，不用 NULL：
     // 少一种边界状态，SQL 与绑定参数都少一处分支。
     "  snapshot_kind INTEGER NOT NULL DEFAULT 0,"
     "  parent_id TEXT NOT NULL DEFAULT '',"
@@ -59,23 +96,26 @@ constexpr const char* kSchemaStatements[] = {
     "  deleted_at INTEGER NOT NULL"
     ");",
     "CREATE INDEX IF NOT EXISTS snapshots_by_user"
+    // 列表查询固定按 (user_id, created_at) 过滤加排序，这个复合索引让它走索引
+    // 扫描而不是全表扫。id 排在最后是为了让同一毫秒创建的两行也有确定顺序，
+    // 列表因此稳定、可复现——分页或对比两次刷新时才不会莫名换位。
     "  ON snapshots(user_id, created_at, id);",
 };
 
-// 依赖感知删除要按 (user_id, parent_id) 找子节点。这个索引引用 PR #21 才加的
-// 列，所以**必须**等列补齐之后再建：旧库上先建索引会以
+// 依赖感知删除要按 (user_id, parent_id) 找子节点。这个索引引用后加的列，
+// 所以**必须**等列补齐之后再建：旧库上先建索引会以
 // "no such column: parent_id" 失败，整个迁移就会回滚。
 constexpr const char* kChainIndexStatements[] = {
     "CREATE INDEX IF NOT EXISTS snapshots_by_parent"
     "  ON snapshots(user_id, parent_id);",
 };
 
-// PR #21：schema 1 -> 2 加入远端增量链元数据（snapshot_kind / parent_id /
+// schema 1 -> 2 加入远端增量链元数据（snapshot_kind / parent_id /
 // generation / lineage）。版本号就是 PRAGMA user_version。
 //
 // 迁移规则（这也是"绝不 DROP TABLE、绝不清库"的兑现方式）：
 //   * 只做 ALTER TABLE ADD COLUMN 与 CREATE INDEX IF NOT EXISTS；
-//   * 旧的 PR #20 行一律留成"legacy standalone full"：snapshot_kind=0、
+//   * 旧版写出的行一律留成"legacy standalone full"：snapshot_kind=0、
 //     parent_id=''、generation=0、lineage=''——DEFAULT 子句就是它们的值，
 //     不需要 UPDATE，也就不存在"迁移一半改了半张表"的中间态；
 //   * 整个迁移在一个 BEGIN IMMEDIATE 事务里，任何一步失败都 ROLLBACK；
@@ -90,6 +130,10 @@ constexpr int kLegacySchemaVersion = 1;
 constexpr const char* kChainColumnNames[] = {"snapshot_kind", "parent_id",
                                              "generation", "lineage"};
 
+// 把一列的文本取成 std::string 的**拷贝**。必须拷贝：语句一旦 finalize 或者
+// 再 step 一次，sqlite3_column_text 返回的指针就失效了。
+// NULL 与零长度在这里被归成同一个空串——本 schema 里两者语义相同（旧行升级后
+// parent_id / lineage 是空串，NOT NULL 列也不允许 NULL），因此不再区分。
 std::string ColumnText(sqlite3_stmt* statement, int index) {
   const unsigned char* text = sqlite3_column_text(statement, index);
   const int bytes = sqlite3_column_bytes(statement, index);
@@ -100,6 +144,8 @@ std::string ColumnText(sqlite3_stmt* statement, int index) {
                      static_cast<std::size_t>(bytes));
 }
 
+// 与 ColumnText 同构，只是走 blob 接口：salt / hash 是二进制，任何按文本读取
+// 都会在第一个 0 字节处截断。空 blob 同样映射成空串。
 std::string ColumnBlob(sqlite3_stmt* statement, int index) {
   const void* data = sqlite3_column_blob(statement, index);
   const int bytes = sqlite3_column_bytes(statement, index);
@@ -110,6 +156,11 @@ std::string ColumnBlob(sqlite3_stmt* statement, int index) {
                      static_cast<std::size_t>(bytes));
 }
 
+// 全文件唯一的行解码点：SELECT 出来的列按下标映射到结构体字段，下标与
+// kSnapshotColumns 的书写顺序一一对应（0=id …… 10=lineage）。两边任何一处
+// 改动都必须同时改另一处，否则不会报错、只会整体错位。
+// size_bytes / generation 是无符号语义，这里借 int64 中转：SQLite 的 INTEGER
+// 本身就是有符号 64 位，而本产品的存储上限远达不到 2^63 字节。
 RemoteSnapshotRecord ReadSnapshotRow(sqlite3_stmt* statement) {
   RemoteSnapshotRecord record;
   record.snapshot_id = ColumnText(statement, 0);
@@ -129,6 +180,8 @@ RemoteSnapshotRecord ReadSnapshotRow(sqlite3_stmt* statement) {
   return record;
 }
 
+// 所有读路径共用一份列清单：列表、详情、删除前回读必须投影出**同样的列序**，
+// 否则 ReadSnapshotRow 的下标就不再成立。新增列只能追加到末尾。
 constexpr const char* kSnapshotColumns =
     "id, user_id, display_name, size_bytes, sha256, created_at, storage_name,"
     " snapshot_kind, parent_id, generation, lineage";
@@ -144,6 +197,9 @@ class Statement {
   }
   Statement(const Statement&) = delete;
   Statement& operator=(const Statement&) = delete;
+  // out() 是给 sqlite3_prepare_v2 写回句柄用的接缝，get() 用于 bind / step。
+  // 语句不可拷贝，也不提供 reset 复用：本文件的语句都是一次性的，
+  // 复用会让"上一次绑定的参数残留"变成静默的错误来源。
   sqlite3_stmt** out() { return &statement_; }
   sqlite3_stmt* get() const { return statement_; }
 
@@ -153,6 +209,9 @@ class Statement {
 
 }  // namespace
 
+// 只给日志与测试断言用。返回的是稳定的英文标识串，不要本地化、不要改字面量
+// （测试按这些字符串匹配）。switch 覆盖了当前全部枚举值，末尾的 UNKNOWN 是给
+// "以后新增了枚举却忘了改这里"留的兜底，而不是可达的正常路径。
 const char* StoreResultName(StoreResult result) {
   switch (result) {
     case StoreResult::kOk:
@@ -173,8 +232,13 @@ const char* StoreResultName(StoreResult result) {
 
 RemoteMetadataStore::RemoteMetadataStore() = default;
 
+// 析构只做一件事：Close()。Close 是幂等的（见它的定义），所以"从没打开过就
+// 析构"与"正常关闭后再析构"走同一条路，析构函数因此不必检查状态、也不会抛。
 RemoteMetadataStore::~RemoteMetadataStore() { Close(); }
 
+// 取**本连接**最近一次失败的英文原因。sqlite3_errmsg 的返回值只在下一次调用
+// 同一连接上的 SQLite API 之前有效，所以这里立刻拷成 std::string；调用方必须
+// 在持有 mutex_ 的区间内调用它，否则读到的是别的线程留下的原因。
 std::string RemoteMetadataStore::LastError() const {
   if (database_ == nullptr) {
     return "database is not open";
@@ -183,6 +247,10 @@ std::string RemoteMetadataStore::LastError() const {
   return message != nullptr ? std::string(message) : std::string("unknown");
 }
 
+// 编译一条 SQL。长度传 -1 表示"读到字符串结尾"，尾指针传 nullptr 表示不关心
+// 剩余部分：因此调用方必须保证 sql 里只有一条语句，多余的会被静默忽略。
+// 返回的句柄在 database_ 关闭之前一直有效，由 Statement 负责 finalize；
+// 这里不校验绑定参数的个数，绑错位置要到 step 时才会暴露。
 bool RemoteMetadataStore::Prepare(const std::string& sql,
                                   sqlite3_stmt** statement,
                                   std::string* error_message) {
@@ -197,6 +265,9 @@ bool RemoteMetadataStore::Prepare(const std::string& sql,
   return true;
 }
 
+// 执行不需要结果集的语句：pragma、DDL、BEGIN / COMMIT / ROLLBACK。
+// sqlite3_exec 的错误串由 SQLite 自己分配，必须用 sqlite3_free 释放；
+// 下面所有分支都覆盖到了，包括成功路径上 message 仍是 nullptr 的情况。
 bool RemoteMetadataStore::Execute(const std::string& sql,
                                   std::string* error_message) {
   char* message = nullptr;
@@ -216,6 +287,8 @@ bool RemoteMetadataStore::Execute(const std::string& sql,
 }
 
 // snapshots 表当前实际有哪些列。迁移只补**缺的**列，因此可以重复执行。
+// 输出参数 columns 先清空再填充：调用方会复用它，残留的旧列名会让迁移误判
+// "这一列已经存在"，从而跳过本该执行的 ALTER。
 bool RemoteMetadataStore::SnapshotColumnsPresent(
     std::vector<std::string>* columns, std::string* error_message) {
   columns->clear();
@@ -242,6 +315,12 @@ bool RemoteMetadataStore::SnapshotColumnsPresent(
   return true;
 }
 
+// 建库与迁移的唯一入口，只在服务端的可写打开路径上被调用。
+// 版本 0 = 全新库（建表即可），1 = 旧版写出的库（补 4 个链列），
+// 2 = 当前版本；其它版本一律拒绝打开，而不是"尽力而为"——用未知 schema 读写
+// 比直接失败危险得多。
+// 事务用 BEGIN IMMEDIATE 而不是 BEGIN：立刻拿写锁，这样两个进程同时首次打开
+// 时只有一个能执行迁移，另一个要么等待、要么在 busy_timeout 之后明确失败。
 bool RemoteMetadataStore::EnsureSchema(std::string* error_message) {
   for (const char* pragma : kPragmaStatements) {
     if (!Execute(pragma, error_message)) {
@@ -300,6 +379,9 @@ bool RemoteMetadataStore::EnsureSchema(std::string* error_message) {
     if (present) {
       continue;
     }
+    // ALTER TABLE ... ADD COLUMN 带 NOT NULL 时必须给 DEFAULT：SQLite 会用
+    // 默认值回填已有行，旧行立刻满足新列的非空约束，不需要额外的 UPDATE，
+    // 也就不存在"迁移做到一半、半张表是旧值"的中间态。
     std::string statement = "ALTER TABLE snapshots ADD COLUMN ";
     if (std::string(name) == "snapshot_kind") {
       statement += "snapshot_kind INTEGER NOT NULL DEFAULT 0;";
@@ -333,6 +415,9 @@ bool RemoteMetadataStore::EnsureSchema(std::string* error_message) {
       return false;
     }
   }
+  // 版本号与 schema 变更在**同一个事务**里提交：user_version 一旦变成 2，
+  // 四个列和那个索引就一定都已经在了。反过来，回滚会把版本号一起退回，
+  // 于是下次启动会重试整个迁移（迁移本身幂等）。
   if (!Execute("PRAGMA user_version=" + std::to_string(kSchemaVersion) + ";",
                error_message) ||
       !Execute("COMMIT;", error_message)) {
@@ -344,13 +429,15 @@ bool RemoteMetadataStore::EnsureSchema(std::string* error_message) {
 
 // 一个已经存在的库必须有的表。只验证它们**能读**，绝不 CREATE：
 // 管理工具在任何模式下都不负责建库、建表或升级 schema。
+// 这里的表名是编译期常量、不含任何用户输入，所以字符串拼接不构成注入面；
+// 用户输入永远只走绑定参数。
 constexpr const char* kRequiredTables[] = {"users", "snapshots",
                                            "deleted_users"};
 
 bool RemoteMetadataStore::VerifyExistingSchema(std::string* error_message) {
   // 版本不匹配就明确失败，而不是"顺手"把库升级成新 schema：那是一次写操作，
   // 而只读命令完全可能正在 backup-server 运行时执行。
-  // PR #21 的迁移只发生在服务端启动路径（EnsureSchema）；管理工具面对一个
+  // 迁移只发生在服务端启动路径（EnsureSchema）；管理工具面对一个
   // 还没迁移过的旧库时必须拒绝工作，而不是自己动手升级。
   {
     Statement statement;
@@ -373,6 +460,8 @@ bool RemoteMetadataStore::VerifyExistingSchema(std::string* error_message) {
       return false;
     }
   }
+  // 只 Prepare 加 step 一次 count(*)：能编译、能执行就说明表存在且可读。
+  // 不比较行数，也不做任何写入——走到这条路径的读者可能正与服务端并发。
   for (const char* table : kRequiredTables) {
     Statement statement;
     const std::string sql = std::string("SELECT count(*) FROM ") + table + ";";
@@ -394,6 +483,12 @@ bool RemoteMetadataStore::VerifyExistingSchema(std::string* error_message) {
   return true;
 }
 
+// 服务端启动路径：打开（不存在就创建）并确保 schema 是当前版本，这里是本文件
+// 唯一允许建库的地方。任何一步失败都会把这半开的连接关掉、把 database_ 复位成
+// nullptr，因此返回 false 之后对象仍处于"未打开"这个合法状态，
+// 调用方可以安全地重试或者直接析构。
+// SQLITE_OPEN_FULLMUTEX 是第二层保险：即便将来有人在锁外误用连接，
+// SQLite 自己也会串行化，而不是产生数据竞争。
 bool RemoteMetadataStore::Open(const std::string& path,
                                std::string* error_message) {
   std::lock_guard<std::mutex> guard(mutex_);
@@ -436,6 +531,8 @@ bool RemoteMetadataStore::Open(const std::string& path,
   return true;
 }
 
+// 两个具名入口只做一件事：把 writable 这个布尔量固化成两条**产品承诺**。
+// 调用方读代码时看到的是"我只是看看"或者"我要改数据"，而不是一个裸的 true。
 bool RemoteMetadataStore::OpenExistingReadOnly(const std::string& path,
                                                std::string* error_message) {
   return OpenExistingWithMode(path, /*writable=*/false, error_message);
@@ -457,6 +554,9 @@ bool RemoteMetadataStore::OpenExistingWithMode(const std::string& path,
   }
   // 先自己看一眼：文件必须存在、必须是普通文件。这样错误信息能说清"是哪个
   // 路径不对"，而不是把 SQLite 的 "unable to open database file" 原样抛出去。
+  // 先 stat 再 open 之间有一个理论上的 TOCTOU 窗口，但这里的后果可控：
+  // 文件若在这两步之间被删掉，下面的 open 只会失败（刻意不带 CREATE），
+  // 不会有任何写操作落到错误的位置。
   struct stat info;
   if (::stat(path.c_str(), &info) != 0) {
     if (error_message != nullptr) {
@@ -530,6 +630,11 @@ bool RemoteMetadataStore::OpenExistingWithMode(const std::string& path,
   return true;
 }
 
+// 幂等：可以在任何状态下反复调用（析构、显式关闭、失败清理都走它）。
+// 这里只调 sqlite3_close 而不检查返回值，因为本文件所有语句都由 Statement 在
+// 离开作用域时 finalize，不存在未释放的句柄；反过来说，若真有句柄泄漏，
+// sqlite3_close 会返回 SQLITE_BUSY 并保留连接，那种情况必须让测试暴露出来，
+// 而不是靠这里的重试掩盖。
 void RemoteMetadataStore::Close() {
   std::lock_guard<std::mutex> guard(mutex_);
   if (database_ != nullptr) {
@@ -539,6 +644,11 @@ void RemoteMetadataStore::Close() {
   path_.clear();
 }
 
+// 注册一个新账户。前置条件：password.salt / hash 的长度必须等于 remote_auth
+// 约定的长度——长度不对说明上游被改坏了，这里直接拒绝而不是"先存进去再说"，
+// 因为一条长度错误的记录会让这个账户以后所有登录都失败。
+// kAlreadyExists 同时覆盖 UNIQUE(username) 与主键冲突两种情况：对调用方来说
+// "这个名字已存在"和"这一次没写进去"是同一件事。
 StoreResult RemoteMetadataStore::CreateUser(const std::string& username,
                                             const PasswordRecord& password,
                                             std::int64_t created_at,
@@ -592,6 +702,9 @@ StoreResult RemoteMetadataStore::CreateUser(const std::string& username,
                      static_cast<sqlite3_int64>(next_user_id));
   sqlite3_bind_text(statement.get(), 2, username.c_str(),
                     static_cast<int>(username.size()), SQLITE_TRANSIENT);
+  // 所有绑定都用 SQLITE_TRANSIENT：SQLite 会自己拷一份数据，调用方传入的
+  // std::string 在 step 之前析构也不会留下悬垂指针（SQLITE_STATIC 才要求
+  // 调用方保证生命周期，这里没有那个必要，也不值得冒那个风险）。
   sqlite3_bind_blob(statement.get(), 3, password.salt.data(),
                     static_cast<int>(password.salt.size()), SQLITE_TRANSIENT);
   sqlite3_bind_blob(statement.get(), 4, password.hash.data(),
@@ -616,6 +729,10 @@ StoreResult RemoteMetadataStore::CreateUser(const std::string& username,
   return StoreResult::kOk;
 }
 
+// 按用户名查账户（登录路径）。kNotFound 是**正常结果**而不是错误：用户不存在
+// 与口令不对必须由调用方给出同一个外部答复，否则就成了用户名枚举接口。
+// out 允许为 nullptr（只做存在性探测）；命中时密码字段原样返回，是否匹配由
+// remote_auth 用 constant-time 比较判定，本层不做任何判断。
 StoreResult RemoteMetadataStore::FindUser(const std::string& username,
                                           RemoteUserRecord* out,
                                           std::string* error_message) {
@@ -657,6 +774,9 @@ StoreResult RemoteMetadataStore::FindUser(const std::string& username,
   return StoreResult::kOk;
 }
 
+// 按 id 查账户：会话令牌里带的是 subject（id），不是用户名。与 FindUser 分成
+// 两个入口，是因为它们查的是不同的唯一键——用户名可能被管理员重建，
+// 而 id 一旦分配就永不重用（见 CreateUser 的分配规则与 deleted_users 墓碑）。
 StoreResult RemoteMetadataStore::FindUserById(std::int64_t user_id,
                                               RemoteUserRecord* out,
                                               std::string* error_message) {
@@ -696,6 +816,17 @@ StoreResult RemoteMetadataStore::FindUserById(std::int64_t user_id,
   return StoreResult::kOk;
 }
 
+// 写入一行快照，并在写入的同一临界区里重新校验整条链的约束。
+//
+// 事务边界刻意分成两种：
+//   * 增量：BEGIN IMMEDIATE -> 读父 -> 查兄弟 -> INSERT -> COMMIT 是一个
+//     事务，任何一步失败都 ROLLBACK，于是"并发删除把父删掉"和"并发上传挂
+//     第二个孩子"都会被写锁挡住，不会留下孤儿或分叉；
+//   * 完整快照：只有一条 INSERT，SQLite 的隐式事务本身就保证原子性，
+//     不需要显式 BEGIN / COMMIT（多开一个事务只会多一次 fsync）。
+//
+// 读父与查兄弟都用 user_id 与 id 一起做条件：别人的快照在这里与不存在的快照
+// 得到完全相同的答案，客户端无法凭返回码的差别去探测别的租户有哪些 id。
 StoreResult RemoteMetadataStore::InsertSnapshot(
     const RemoteSnapshotRecord& record, std::string* error_message) {
   std::lock_guard<std::mutex> guard(mutex_);
@@ -846,11 +977,16 @@ StoreResult RemoteMetadataStore::InsertSnapshot(
   }
 
   Statement statement;
-  if (!Prepare("INSERT INTO snapshots"
-               " (id, user_id, display_name, size_bytes, sha256, created_at,"
-               "  storage_name, snapshot_kind, parent_id, generation, lineage)"
-               " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);",
-               statement.out(), error_message)) {
+  if (!Prepare(
+          "INSERT INTO snapshots"
+          " (id, user_id, display_name, size_bytes, sha256, created_at,"
+          "  storage_name, snapshot_kind, parent_id, generation, lineage)"
+          // 绑定顺序必须与上面的列清单及其类型一一对应：SQLite 的类型是动态的，
+          // 把一个 11
+          // 个占位符的语句绑错位置通常不会报错，只会静默写进错误的值。
+          // generation 与 size_bytes 都是无符号语义，绑定前显式转成 int64。
+          " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);",
+          statement.out(), error_message)) {
     if (record.snapshot_kind ==
         static_cast<std::uint16_t>(SnapshotKind::kIncremental)) {
       Execute("ROLLBACK;", nullptr);
@@ -899,6 +1035,8 @@ StoreResult RemoteMetadataStore::InsertSnapshot(
   if (record.snapshot_kind ==
       static_cast<std::uint16_t>(SnapshotKind::kIncremental)) {
     // 校验与写入在同一个事务里：提交失败也要如实报错。
+    // COMMIT 也可能失败（磁盘满、fsync 失败）：那时事务仍然开着，
+    // 必须显式 ROLLBACK，否则这条连接会一直持有写锁，让后续所有调用超时。
     if (!Execute("COMMIT;", error_message)) {
       Execute("ROLLBACK;", nullptr);
       return StoreResult::kError;
@@ -907,6 +1045,11 @@ StoreResult RemoteMetadataStore::InsertSnapshot(
   return StoreResult::kOk;
 }
 
+// 列出某个用户的全部快照，按 (created_at, id) 升序——这是**展示顺序**，
+// 也保证了父一定排在子前面，调用方据此渲染链。
+// 注意：这里直接往 out 里 push_back，中途失败时 out 里会留下已经读到的部分
+// 内容，调用方在 kError 时必须丢弃 out（ListUsers 用局部 vector 保证了失败时
+// 不动 out，两者的失败语义并不相同）。
 StoreResult RemoteMetadataStore::ListSnapshots(
     std::int64_t user_id, std::vector<RemoteSnapshotRecord>* out,
     std::string* error_message) {
@@ -943,6 +1086,9 @@ StoreResult RemoteMetadataStore::ListSnapshots(
   return StoreResult::kOk;
 }
 
+// 按 (user_id, id) 取一行。条件里同时带 user_id 有两个作用：让"别人的 id"与
+// "不存在的 id"返回同一个 kNotFound（不可探测），以及让查询走上
+// snapshots_by_user 的索引前缀，避免任何跨租户的读路径。
 StoreResult RemoteMetadataStore::FindSnapshot(std::int64_t user_id,
                                               const std::string& snapshot_id,
                                               RemoteSnapshotRecord* out,
@@ -980,6 +1126,12 @@ StoreResult RemoteMetadataStore::FindSnapshot(std::int64_t user_id,
   return StoreResult::kOk;
 }
 
+// 删除一行快照，并把被删掉的那行回填给调用方——磁盘上的 blob 要靠它的
+// storage_name 才能定位。
+// 顺序是：回读整行 -> 查有没有子节点 -> DELETE。回读与删除在同一个 mutex_ 区间
+// 里，因此不存在"查到 A 的行、删掉 B 的行"这种窗口；即使本进程之外的写者在
+// 这两步之间抢先删掉了同一行，最后那条 DELETE 也只影响 0 行，由
+// sqlite3_changes() 捕获并报 kError，绝不假装成功。
 StoreResult RemoteMetadataStore::DeleteSnapshot(std::int64_t user_id,
                                                 const std::string& snapshot_id,
                                                 RemoteSnapshotRecord* removed,
@@ -1016,7 +1168,7 @@ StoreResult RemoteMetadataStore::DeleteSnapshot(std::int64_t user_id,
     }
     existing = ReadSnapshotRow(select.get());
   }
-  // PR #21：依赖感知删除的**最后一道闸门**。调用方（RemoteMaintenance）在动
+  // 依赖感知删除的**最后一道闸门**。调用方（RemoteMaintenance）在动
   // 磁盘之前就已经查过一次子节点；这里再查一次，是为了让"绕过调用方直接删"
   // 也不可能造成断链——删除一个还有子节点的快照会让那些子快照永远无法恢复。
   {
@@ -1061,6 +1213,9 @@ StoreResult RemoteMetadataStore::DeleteSnapshot(std::int64_t user_id,
     }
     return StoreResult::kError;
   }
+  // 能走到这里说明这一行一定还在（本进程内由 mutex_ 串行化），changes() 不是
+  // 1 就意味着有本进程之外的写者动过它——这是"数据被并发的管理工具改动"的
+  // 明确信号，必须报错让上层停下来，而不是当成"已经删过了"。
   if (sqlite3_changes(database_) != 1) {
     if (error_message != nullptr) {
       *error_message = "the snapshot row disappeared during the delete";
@@ -1073,6 +1228,9 @@ StoreResult RemoteMetadataStore::DeleteSnapshot(std::int64_t user_id,
   return StoreResult::kOk;
 }
 
+// 删除前的依赖检查。DeleteSnapshot 内部也会查一次，这里是给**调用方**用的：
+// 运维工具需要在动磁盘之前就告诉操作者"删不了，先删这 N 个后代"，
+// 而不是先把 blob 挪进隔离区、失败了再回滚回来。
 StoreResult RemoteMetadataStore::CountSnapshotChildren(
     std::int64_t user_id, const std::string& snapshot_id, std::uint64_t* out,
     std::string* error_message) {
@@ -1104,6 +1262,8 @@ StoreResult RemoteMetadataStore::CountSnapshotChildren(
   return StoreResult::kOk;
 }
 
+// 某个用户当前的快照条数。用于配额检查和"删除前先告诉用户会删掉多少"，
+// 不参与链的正确性判断（链的约束在 InsertSnapshot 与 DeleteSnapshot 里）。
 StoreResult RemoteMetadataStore::CountSnapshots(std::int64_t user_id,
                                                 std::uint64_t* out,
                                                 std::string* error_message) {
@@ -1133,6 +1293,10 @@ StoreResult RemoteMetadataStore::CountSnapshots(std::int64_t user_id,
   return StoreResult::kOk;
 }
 
+// 管理视图：每个账户一行汇总。LEFT JOIN 保证"一个快照都没有的用户"也会出现
+// 在结果里（COUNT 为 0、SUM 由 COALESCE 兜成 0），否则管理员会以为账户没建上。
+// 结果先攒在局部 vector 里，全部读完才赋给 out：中途失败时 out 保持原样，
+// 不会留下半张列表。
 StoreResult RemoteMetadataStore::ListUsers(std::vector<RemoteUserSummary>* out,
                                            std::string* error_message) {
   std::lock_guard<std::mutex> guard(mutex_);
@@ -1180,6 +1344,9 @@ StoreResult RemoteMetadataStore::ListUsers(std::vector<RemoteUserSummary>* out,
   return StoreResult::kOk;
 }
 
+// 三个互相独立的 COUNT / SUM 查询拼出概览。刻意**不**放进一个事务：这是只读的
+// 展示数据，允许三次查询之间恰好有一次提交落进来（总数与字节数因此可能差一条
+// 记录），为此去拿写锁反而会干扰正在上传的客户端。
 StoreResult RemoteMetadataStore::StorageOverview(RemoteStorageOverview* out,
                                                  std::string* error_message) {
   std::lock_guard<std::mutex> guard(mutex_);
@@ -1195,6 +1362,8 @@ StoreResult RemoteMetadataStore::StorageOverview(RemoteStorageOverview* out,
     if (!Prepare("SELECT COUNT(*) FROM users;", statement.out(),
                  error_message) ||
         sqlite3_step(statement.get()) != SQLITE_ROW) {
+      // 只在 Prepare 没写过错的时候补写错误：一旦 Prepare 失败，
+      // error_message 里已经有更具体的原因，不能被这里的通用文案覆盖掉。
       if (error_message != nullptr && error_message->empty()) {
         *error_message = "cannot count the user rows: " + LastError();
       }
@@ -1238,6 +1407,12 @@ StoreResult RemoteMetadataStore::StorageOverview(RemoteStorageOverview* out,
   return StoreResult::kOk;
 }
 
+// 注销账户：同一个事务里先删该用户的全部 snapshots 行，再删 users 行，
+// 最后写一条 deleted_users 墓碑。顺序不能反——foreign_keys=ON 之下先删 users
+// 会撞上外键约束，那条外键就是这个顺序的护栏。
+// 墓碑有两个作用：审计（这个 id 确实注销过）与"id 永不重用"的依据。
+// 事务之外没有副作用，任何一步失败都只是 ROLLBACK；磁盘上的 blob 由调用方在
+// 拿到 kOk 之后才去处理。
 StoreResult RemoteMetadataStore::DeleteUser(std::int64_t user_id,
                                             std::uint64_t* removed_snapshots,
                                             std::uint64_t* removed_bytes,
@@ -1278,6 +1453,8 @@ StoreResult RemoteMetadataStore::DeleteUser(std::int64_t user_id,
   }
   {
     Statement remove;
+    // 先聚合再删：回给调用方的"删掉了多少条 / 多少字节"必须是**删除前**的
+    // 事实，删完之后再统计就什么都查不到了。
     if (!Prepare("DELETE FROM snapshots WHERE user_id = ?;", remove.out(),
                  error_message)) {
       rollback();
@@ -1294,6 +1471,9 @@ StoreResult RemoteMetadataStore::DeleteUser(std::int64_t user_id,
   }
   {
     Statement remove;
+    // 用户行不存在时整个事务回滚（连上面已经删掉的 snapshots 行一起退回）：
+    // 一次"看起来删掉了一半"的部分成功，会让调用方误以为磁盘上的隔离也该
+    // 保留。
     if (!Prepare("DELETE FROM users WHERE id = ?;", remove.out(),
                  error_message)) {
       rollback();
@@ -1320,6 +1500,8 @@ StoreResult RemoteMetadataStore::DeleteUser(std::int64_t user_id,
   {
     // 墓碑：id 从此不再被分配。时间戳只是给人看的审计信息。
     Statement mark;
+    // INSERT OR REPLACE：墓碑表的主键就是 user id，对同一个 id 重复注销
+    // （理论上不该发生，id 只在分配后使用一次）也必须幂等而不是报错。
     if (!Prepare("INSERT OR REPLACE INTO deleted_users (id, deleted_at)"
                  " VALUES (?, ?);",
                  mark.out(), error_message)) {
@@ -1338,6 +1520,8 @@ StoreResult RemoteMetadataStore::DeleteUser(std::int64_t user_id,
       return StoreResult::kError;
     }
   }
+  // 测试接缝放在 COMMIT 之前：注入的失败必须走**和真实失败同一条**回滚路径，
+  // 否则被测试到的那个分支就不是产品分支。
   if (fail_next_delete_user_) {
     fail_next_delete_user_ = false;
     if (error_message != nullptr) {

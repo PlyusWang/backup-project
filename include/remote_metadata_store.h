@@ -1,6 +1,6 @@
 // include/remote_metadata_store.h
 //
-// PR #20：远程快照的 SQLite 元数据库。
+// 远程快照的 SQLite 元数据库。
 //
 // 只存**元数据**，不存字节：blob 永远是磁盘上的文件，SQLite 里只有它的
 // 名字、长度、SHA-256 和归属。这样"文件在、记录不在"和"记录在、文件不在"
@@ -44,10 +44,10 @@ enum class StoreResult {
   kNotFound,
   kAlreadyExists,
   kError,
-  // PR #21：这个快照还被别的快照当作父引用着，删掉它会让那些子快照
+  // 这个快照还被别的快照当作父引用着，删掉它会让那些子快照
   // 永远无法恢复。删除必须依赖感知：先删叶子，再删祖先。
   kHasDependents,
-  // PR #21 审查修复：链的边界条件不成立。包括"父不存在（见 kNotFound）"
+  // 链的边界条件。包括"父不存在（见 kNotFound）"
   // 之外的四种：lineage 不同、代数不是父+1、父已经有活着的孩子（本产品是
   // **线性链**，不允许分叉）、代数超过本地增量引擎能恢复的上限。
   kChainConflict,
@@ -75,7 +75,7 @@ struct RemoteSnapshotRecord {
   // 服务端生成的磁盘文件名（<snapshot_id>.bak）。永远不来自客户端。
   std::string storage_name;
 
-  // ---- PR #21：远端增量链 ----
+  // ---- 远端增量链 ----
   //
   // 0 = full（链根，generation 0、没有父），1 = incremental（必须有父）。
   std::uint16_t snapshot_kind = 0;
@@ -125,7 +125,7 @@ class RemoteMetadataStore {
   //
   // 管理与诊断工具用它：路径写错时必须明确失败，而不是让 SQLite 悄悄建一个
   // 空库——那样"这个实例还没有任何用户"和"你指的是另一个实例"在界面上一模一样，
-  // 人工验收会得出完全错误的结论（本轮 P0 就是这么发生的）。
+  // 就会得出完全错误的结论。
   //
   // 打开方式显式分成两个入口，因为"只读"与"可写"是两种相反的产品承诺，
   // 不能藏在同一个 OpenExisting() 里：

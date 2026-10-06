@@ -1,10 +1,40 @@
-// src/network/remote_server.cpp
+// server/remote_server.cpp
 //
 // backup-server 的监听、帧循环与连接状态机。见 include/remote_server.h。
 //
 // 这一层刻意不碰归档格式：它只管"把一段有名字、有长度、有 SHA-256 的字节
 // 安全地存下来"。归档语义属于 BackupEngine，不属于这里。
 
+// 状态机（ConnectionContext 一个连接一份，不跨连接共享）：
+//
+//   CONNECTED --REGISTER--> CONNECTED（注册只建账户，不建立会话）
+//   CONNECTED --LOGIN / RESUME--> AUTHENTICATED
+//   AUTHENTICATED --UPLOAD_BEGIN--> UPLOAD_IN_PROGRESS
+//   UPLOAD_IN_PROGRESS --UPLOAD_END--> AUTHENTICATED
+//   UPLOAD_IN_PROGRESS --任何失败 / 断连--> AUTHENTICATED（AbortUpload）
+//   AUTHENTICATED --DOWNLOAD_BEGIN--> DOWNLOAD_IN_PROGRESS
+//   DOWNLOAD_IN_PROGRESS --DOWNLOAD_END / 失败--> AUTHENTICATED
+//   AUTHENTICATED --LOGOUT / 账户被注销--> CONNECTED
+//
+// 状态不匹配的请求一律回 kInvalidState，不做"猜调用方本来想干什么"的兼容。
+//
+// 线程模型：主线程跑 accept（Run），worker_count 个固定线程各自服务一条连接；
+// 一条连接从握手到关闭只由同一个 worker 线程处理，所以 ConnectionContext 与
+// 加密通道都不需要加锁。跨线程共享的只有：SQLite（store_ 内部一把互斥锁）、
+// 登录节流表（login_throttle_mutex_）、日志（log_mutex_）、任务队列
+// （work_mutex_ / work_ready_ / slot_free_）与几个 atomic 标志。
+//
+// 磁盘布局（每一段都由服务端生成，客户端字符串从不参与拼接）：
+//
+//   <root>/.backup-server.lock                  数据目录独占 flock
+//   <root>/users/<uid>/<snapshot-id>.bak        已发布的不可变 blob
+//   <root>/users/<uid>/tmp/<snapshot-id>.part   上传中的临时文件，0600
+//   <root>/users/<uid>/trash/...                待物理删除的 blob
+//   <root>/trash/account-<uid>.<rand>.deleted   账户注销的隔离目录
+//
+// 失败语义：处理函数返回 false = 这条连接必须断开（帧流或资源已经不可信）；
+// 返回 true = 错误帧已经发出，帧循环可以继续。错误响应的 payload 恒为空，
+// 具体原因只进服务端日志，免得把内部路径与 errno 泄漏给客户端。
 #include "remote_server.h"
 
 #include <arpa/inet.h>
@@ -53,10 +83,20 @@ thread_local SecureChannel* g_connection_channel = nullptr;
 // Run() 的轮询间隔：让 Stop() 最迟 200 ms 内生效，同时不空转。
 constexpr int kPollIntervalMs = 200;
 
+// 服务端的墙钟秒（Unix epoch）。token 过期、快照时间戳、登录锁定时长都用它，
+// 因此它受系统时钟调整影响：把时钟往回调会让已经过期的 token 重新可用。
+// 单调时钟（steady_clock）只用于超时等待，不用于任何对外可见的时间戳。
 std::uint64_t NowSeconds() {
   return static_cast<std::uint64_t>(::time(nullptr));
 }
 
+// 逐级创建目录（等价于 mkdir -p），权限一律 0700。
+//
+// 边界：它不解析符号链接、不做 realpath、也不清理路径里的 ".."；传进来的路径
+// 必须是服务端自己拼出来的（见 UserDirectory）。EEXIST 视为成功，是为了容忍
+// 两个线程同时创建同一级目录；但路径已存在且不是目录时必须失败——把这种情况
+// 当成功，错误现场会被推迟到后面的 open()，离真正的原因更远。
+// 返回 false 时 error_message 一定被填，调用方据此记日志并回 kInternalError。
 bool EnsureDirectory(const std::string& path, std::string* error_message) {
   if (path.empty()) {
     if (error_message != nullptr) {
@@ -123,6 +163,9 @@ constexpr std::size_t kMaxSecretFileBytes = 1024 * 1024;
 //   * 必须是普通文件；
 //   * group / other 位一个都不能有：0600 与 0400 都接受，0640 / 0644 / 0660 /
 //     0666 一律拒绝——secret 落在别人的可读范围里就等于泄漏。
+// secrets.env 的格式是极简的 KEY=VALUE：逐行找第一个
+// BACKUP_TOKEN_SECRET=，容忍 CRLF，不做引号 / 转义 / 变量展开，也不认
+// "export " 前缀。它只被这一个进程读，因此不需要通用 env 语法。
 bool ReadSecretFile(const std::string& path, std::string* secret,
                     std::string* error_message) {
   if (path.empty()) {
@@ -238,6 +281,8 @@ bool ReadSecretFile(const std::string& path, std::string* secret,
 
 }  // namespace
 
+// 状态名只用于日志与诊断：它是观测文本，不是协议字段，客户端从不解析。
+// 新增状态时必须在这里补分支，否则会打印出 UNKNOWN_STATE。
 const char* ConnectionStateName(ConnectionState state) {
   switch (state) {
     case ConnectionState::kConnected:
@@ -252,6 +297,8 @@ const char* ConnectionStateName(ConnectionState state) {
   return "UNKNOWN_STATE";
 }
 
+// request_counts_ 是"收到的请求数"的测试观测点：按 opcode 下标索引的 256 个
+// 原子计数器。产品路径只写不读，测试用它证明客户端不会静默重发请求。
 RemoteServer::RemoteServer() {
   // std::atomic 的默认构造在 C++17 里不保证清零：显式初始化。
   for (std::size_t index = 0; index < 256; ++index) {
@@ -267,8 +314,18 @@ std::uint64_t RemoteServer::request_count_for_testing(
   return request_counts_[opcode].load();
 }
 
+// 析构走 Stop()，这也是"Run() 还在跑时销毁对象是 UB"的由来：Stop() 会关掉
+// Run() 正在使用的 listener。Stop() 内部的 run_in_progress_ 检查只是一道防
+// 误用的闸门，那种情况下它什么都不拆，资源要靠 Run() 自己收。
 RemoteServer::~RemoteServer() { Stop(); }
 
+// 配置校验：纯检查，不产生副作用（唯一的写入是最后那句 config_ = config），
+// 因此可以反复调用，也只有它成功之后 Start() 才有意义。
+//
+// 这里拒绝的每一条都是"启动之后就没法安全运行"的配置：空 bind、非
+// dotted-quad 的地址、空 root / db / secret / transport key、worker 数越界、
+// IO 超时越界、上传上限为 0。校验失败时给的是可以直接照做的原因，
+// 而不是一句 "invalid config"。
 bool RemoteServer::Configure(const RemoteServerConfig& config,
                              std::string* error_message) {
   if (config.bind_address.empty()) {
@@ -286,12 +343,12 @@ bool RemoteServer::Configure(const RemoteServerConfig& config,
   }
   // 只允许监听 127.0.0.1，而且是**相等**判断（127.0.0.2 之类同样拒绝）。
   //
-  // PR #21 起，BPNET1 的每一个字节都由 BPSEC1 加密（见 secure_transport.h），
+  // BPNET1 的每一个字节都由 BPSEC1 加密（见 secure_transport.h），
   // 机密性不再依赖 SSH 隧道；隧道降级为部署层的纵深防御。监听地址仍然只能是
   // 环回地址——这是纵深防御的一部分，不是机密性的前提：把只该由隧道访问的
   // 端口直接暴露在共享网络上没有任何好处，所以这里继续 fail closed，
   // 不提供 --insecure / --allow-public 之类的开关。
-  // PR #23：默认规则不变（非回环一律拒绝），但多了一条**显式**例外：
+  // 默认规则不变（非回环一律拒绝），但多了一条**显式**例外：
   // 官方云端要让用户不开隧道，就必须把 18765 暴露在公网上。这个例外必须
   // 同时满足三件事，缺一不可：
   //   1. 显式给 --allow-public-bind <理由>，理由是给日志和事后审计看的；
@@ -388,6 +445,14 @@ bool RemoteServer::Configure(const RemoteServerConfig& config,
   return true;
 }
 
+// 把服务端从"未启动"推进到"可以 Run()"：建目录 -> 抢数据目录锁 -> 读 secret
+// 与身份密钥 -> 开元数据库 -> 建维护层 -> 建监听 socket。
+//
+// 顺序不能换：锁必须先于任何写盘拿到（否则两个进程会同时写同一批文件），
+// 元数据库必须先于 maintenance_ 打开（维护层复用的就是这一个连接）。
+// 任何一步失败都从当前位置往回释放已经拿到的资源并返回 false：Start() 要么
+// 完整成功，要么不留下半开状态，调用方不需要也无法做部分回滚。
+// 它不 accept 任何连接：接受连接是 Run() 的事。
 bool RemoteServer::Start(std::string* error_message) {
   if (running()) {
     if (error_message != nullptr) {
@@ -429,6 +494,8 @@ bool RemoteServer::Start(std::string* error_message) {
     data_lock_.reset();
     return false;
   }
+  // store_ 是进程内唯一的 SQLite 连接：worker 线程通过它内部那把互斥锁串行
+  // 访问，所以这里没有连接池，也不存在写-写竞争。
   store_.reset(new RemoteMetadataStore());
   if (!store_->Open(config_.database_path, error_message)) {
     store_.reset();
@@ -472,6 +539,8 @@ bool RemoteServer::Start(std::string* error_message) {
   return true;
 }
 
+// secret_ 常驻进程内存：签发与校验 token 的每一次 HMAC 都要用它，因此不做
+// "用完即清"。它来自 0600 的 secrets.env，绝不进日志、绝不进错误信息。
 bool RemoteServer::LoadSecret(std::string* error_message) {
   if (!ReadSecretFile(config_.secret_file_path, &secret_, error_message)) {
     return false;
@@ -486,6 +555,9 @@ bool RemoteServer::LoadSecret(std::string* error_message) {
 namespace {
 
 // 读整个文件。BPSEC2 的证书是几十到几百字节的公开材料，一次读完最简单。
+// 注意：4096 的检查发生在整份内容已经在内存里之后——它挡住的是"把任意大的
+// 文件交给 BPCERT1 解析器"，而不是内存峰值。证书是公开材料且只有几百字节，
+// 这个取舍是刻意的（真要限制峰值就得先 fstat 再按大小分配）。
 bool ReadWholeFile(const std::string& path, std::string* out,
                    std::string* error_message) {
   std::ifstream input(path, std::ios::binary);
@@ -517,6 +589,12 @@ bool ReadWholeFile(const std::string& path, std::string* out,
 
 }  // namespace
 
+// 组装服务端身份：BPSEC1 长期私钥（必填）+ 可选的 BPSEC2 身份证书。
+//
+// 证书不是另一把密钥，它是对同一把 transport key 的签名声明，所以必须检查
+// 证书里的公钥与 transport.key 一致：不一致时每个客户端都会在握手阶段拒绝
+// 本机，真正的原因却只有启动日志看得到——宁可在启动时直接失败。
+// require_bpsec2 与证书是一组："只收签名身份"却没有证书等于谁都连不上。
 bool RemoteServer::LoadTransportIdentityKey(std::string* error_message) {
   if (!LoadTransportIdentity(config_.transport_key_file_path,
                              &transport_identity_, error_message)) {
@@ -568,6 +646,11 @@ bool RemoteServer::LoadTransportIdentityKey(std::string* error_message) {
   return true;
 }
 
+// 只在 Start() 里被调用一次（单线程），因此 listener_fd_ / bound_port_ 的写入
+// 不需要同步。SO_REUSEADDR 是为了让刚重启的服务端能立刻重绑处于 TIME_WAIT 的
+// 端口，它不允许两个进程同时监听同一个地址。
+// port == 0 时端口由内核分配，getsockname 把真实端口回填到 bound_port_，测试
+// 靠它拿临时端口。任何一步失败都 close(fd) 后返回，不留半开的 socket。
 bool RemoteServer::OpenListener(std::string* error_message) {
   const int fd = ::socket(AF_INET, SOCK_STREAM, 0);
   if (fd < 0) {
@@ -632,6 +715,11 @@ void RemoteServer::Stop() {
     return;
   }
   RequestStop();
+  // 释放顺序是刻意的：先让 accept 停下来（关 listener），再释放 store_；
+  // pending_ 清空与 worker join 放在中间，因为走到这里要么 Run() 已经返回
+  // （它自己 join 过全部 worker），要么 Run() 从未运行过。
+  // 维护层与数据目录锁最后释放：锁一放，backup-server-admin 就能动这个目录，
+  // 所以必须在确认没有任何 worker 之后。
   if (listener_fd_ >= 0) {
     ::close(listener_fd_);
     listener_fd_ = -1;
@@ -656,14 +744,21 @@ void RemoteServer::Stop() {
   data_lock_.reset();
 }
 
+// 唯一允许与 Run() 并发调用的入口（例如另一个线程或信号处理路径）：只置一个
+// atomic 标志，不碰 fd、不碰线程、不碰数据库。它只是"请求"，真正的收尾在
+// Run() 的返回路径上完成。
 void RemoteServer::RequestStop() { stop_requested_.store(true); }
 
+// store_ 可能还没建起来（测试可以在 Start() 之前调用），所以先判空。
 void RemoteServer::FailNextAccountDeleteForTesting() {
   if (store_ != nullptr) {
     store_->FailNextDeleteUserForTesting();
   }
 }
 
+// 错误帧回填请求的 opcode（未知 opcode 才用 kError）：客户端的 Request 正是靠
+// request_id 与本字段把响应和请求配对，配不上就不会去猜是哪条命令失败了。
+// 返回 false 表示连错误帧都发不出去，帧循环必须据此断开连接。
 bool RemoteServer::SendError(int fd, std::uint16_t opcode,
                              std::uint64_t request_id, Status status,
                              std::string* error_message) {
@@ -684,6 +779,9 @@ bool RemoteServer::SendError(int fd, std::uint16_t opcode,
   return true;
 }
 
+// 成功响应的统一出口：opcode 用请求的 opcode（客户端据此知道这是哪条命令的
+// 答复），request_id 原样回填。未识别的 opcode 统一落成 ERROR 帧，避免把一个
+// 任意数值原样回显给对端。payload 由调用方保证不超过 1 MiB（帧层还会再查）。
 bool RemoteServer::SendStatus(int fd, const FrameHeader& request, Status status,
                               const std::string& payload,
                               std::string* error_message) {
@@ -702,6 +800,10 @@ bool RemoteServer::SendStatus(int fd, const FrameHeader& request, Status status,
       payload, error_message);
 }
 
+// PING 是唯一既不需要会话也不需要口令的操作码：HandleFrame 在状态检查之前就
+// 处理它，只要求 payload 为空。用途是探活与版本协商（协议版本、服务端软件名、
+// 服务端墙钟），所以它不查账户、不碰数据库、不产生任何持久化副作用。
+// 响应字段顺序即线上顺序：string software, u16 version, u64 server_time。
 bool RemoteServer::HandlePing(int fd, const FrameHeader& header,
                               std::string* error_message) {
   PayloadBuilder builder;
@@ -721,6 +823,9 @@ namespace {
 // 解 REGISTER / LOGIN 的 payload：用户名 + 口令，且不允许尾部多余字节。
 // 尾部有垃圾说明客户端与服务端的字段理解已经不一致，必须明确拒绝，
 // 而不是"读到自己要的就当成功"。
+// REGISTER 与 LOGIN 共用它，因此两者的字段布局永远是同一个：解码顺序即
+// username, password（u16 长度前缀 + 原始字节）。口令在这里只被搬进内存，
+// 绝不进日志；上限来自协议层的 kMaxUsernameBytes / kMaxPasswordBytes。
 bool DecodeCredentials(const std::string& payload, std::string* username,
                        std::string* password, std::string* error_message) {
   PayloadReader reader(payload);
@@ -749,6 +854,13 @@ bool DecodeCredentials(const std::string& payload, std::string* username,
 
 }  // namespace
 
+// 语义：建账户。它不建立会话——成功后客户端还要再走一次 LOGIN 才拿到 token，
+// 所以这里不改 ConnectionContext 的 state。
+//
+// 口令只以 PBKDF2 记录（salt + hash + iterations）落库，服务端无法反推出口令，
+// 迭代次数由服务端决定，客户端没有任何字段能影响它。用户名唯一性由数据库的
+// UNIQUE 约束兜底：并发注册同一个名字时输的一方得到 kAlreadyExists，
+// 而不是覆盖前一个账户的口令。
 bool RemoteServer::HandleRegister(int fd, const FrameHeader& header,
                                   const std::string& payload,
                                   ConnectionContext* context,
@@ -813,6 +925,9 @@ bool RemoteServer::HandleRegister(int fd, const FrameHeader& header,
 //      就绕过了节流；
 //   3. 表的大小必须有上界：攻击者可以用海量不同的用户名把内存撑爆，
 //      所以超过上限时先清理已过期的条目，仍然满就不再记录（降级而不是崩）。
+// 只读查询：返回剩余锁定秒数，0 表示没锁（或节流被配置关掉了）。
+// 调用方无论锁没锁都回同一句 kUnauthorized 文案，所以"这个用户名正在被锁定"
+// 不会通过响应内容泄漏出去。
 std::int64_t RemoteServer::LoginLockRemainingSeconds(
     const std::string& username) {
   if (config_.max_login_failures <= 0 || config_.login_lockout_seconds <= 0) {
@@ -828,6 +943,10 @@ std::int64_t RemoteServer::LoginLockRemainingSeconds(
                                           : 0;
 }
 
+// 记一次失败：连续失败达到 max_login_failures 时置 locked_until 并把计数清零
+// （窗口结束后重新从 0 开始计数，而不是"解锁即再锁"）。表满时先清掉已过期的
+// 条目，仍然满就不记录——宁可少限速一个名字，也不能让攻击者用海量用户名把
+// 服务端内存撑爆。
 void RemoteServer::RecordLoginFailure(const std::string& username) {
   if (config_.max_login_failures <= 0 || config_.login_lockout_seconds <= 0) {
     return;
@@ -859,10 +978,19 @@ void RemoteServer::RecordLoginFailure(const std::string& username) {
   }
 }
 
+// 登录成功即删条目：节流只针对连续失败，成功一次就把计数清零。
 void RemoteServer::ClearLoginFailures(const std::string& username) {
   std::lock_guard<std::mutex> guard(login_throttle_mutex_);
   login_throttle_.erase(username);
 }
+// 登录成功 = 服务端签发一枚带 HMAC 与过期时间的 token（12 小时），并把这条
+// 连接推进到 kAuthenticated。服务端不保存会话表：token 的有效性完全由签名与
+// 时间决定，所以"账户被注销"要靠 RejectIfAccountMissing 这类回查兜底。
+//
+// 三条路径必须给客户端不可区分的答案：用户名不存在、口令错误、被节流，全部回
+// kUnauthorized；前两者还要付出同等代价的 PBKDF2（对不存在的用户名用全零的
+// salt/hash 假记录跑一次），让响应时间不泄漏账户是否存在。
+// token 只出现在这一条响应里：不写日志、不进 last_error、不落盘。
 bool RemoteServer::HandleLogin(int fd, const FrameHeader& header,
                                const std::string& payload,
                                ConnectionContext* context,
@@ -950,6 +1078,10 @@ bool RemoteServer::HandleLogin(int fd, const FrameHeader& header,
   return SendStatus(fd, header, Status::kOk, builder.data(), error_message);
 }
 
+// LOGOUT 是"这条连接上的会话结束"：服务端没有会话表，它清掉的是内存里的
+// ConnectionContext（state 回 kConnected，user_id / username 归零）。
+// 它无法让那枚 token 在别处失效——真正的失效机制是 token 的 12 小时有效期，
+// 以及账户注销之后的回查。
 bool RemoteServer::HandleLogout(int fd, const FrameHeader& header,
                                 ConnectionContext* context,
                                 std::string* error_message) {
@@ -966,6 +1098,9 @@ bool RemoteServer::HandleLogout(int fd, const FrameHeader& header,
   return SendStatus(fd, header, Status::kOk, std::string(), error_message);
 }
 
+// 断线重连：客户端拿旧 token 在一条新连接上换回会话。校验包含 HMAC 与过期
+// 时间（VerifyToken），通过之后不续期、不换发新 token，只把连接状态推进到
+// kAuthenticated；这枚 token 还能用多久仍然由它自己的过期时间决定。
 bool RemoteServer::HandleResume(int fd, const FrameHeader& header,
                                 const std::string& payload,
                                 ConnectionContext* context,
@@ -1013,6 +1148,14 @@ bool RemoteServer::HandleResume(int fd, const FrameHeader& header,
   return SendStatus(fd, header, Status::kOk, std::string(), error_message);
 }
 
+// 列出当前用户的全部快照（按服务端元数据的顺序，不分页）。
+// 响应布局即线上顺序：u32 count，然后每条 snapshot_id, display_name,
+// sha256, size_bytes, created_at, kind, generation, parent_id, lineage
+// （与 network_protocol.h 里 kList 的定义一致）。
+//
+// 链关系只被原样搬运，服务端不替客户端解释父链：客户端要自己沿 parent 走。
+// 两条上限缺一不可：条目数超过 kMaxListEntries 直接拒绝；逐条累加后一旦整帧
+// 会超过 1 MiB 也拒绝——绝不发一个超限的帧让对端去截断。
 bool RemoteServer::HandleList(int fd, const FrameHeader& header,
                               ConnectionContext* context,
                               std::string* error_message) {
@@ -1054,7 +1197,7 @@ bool RemoteServer::HandleList(int fd, const FrameHeader& header,
     }
     builder.AppendU64(record.size_bytes);
     builder.AppendU64(static_cast<std::uint64_t>(record.created_at));
-    // PR #21：链元数据。客户端据此自己走父链，服务端不替它解释链。
+    // 链元数据。客户端据此自己走父链，服务端不替它解释链。
     builder.AppendU16(record.snapshot_kind);
     builder.AppendU64(record.generation);
     if (!builder.AppendString(record.parent_id, kMaxSnapshotIdBytes,
@@ -1078,6 +1221,9 @@ namespace {
 
 // rename 的持久性要靠父目录 fsync 才算完整：只 fsync 文件本身，
 // 掉电后可能留下"文件内容在、目录项没落盘"的状态。
+// 失败被刻意忽略：调用点都在 rename 成功之后，此刻把一次目录 fsync 失败升级
+// 成致命错误，只会让一个已经可见的文件被回滚；它影响的仅仅是掉电后的持久性
+// 窗口（可能丢刚发布的那条目录项），不影响运行期的一致性。
 void FsyncDirectory(const std::string& path) {
   const int fd = ::open(path.c_str(), O_RDONLY | O_DIRECTORY);
   if (fd < 0) {
@@ -1089,12 +1235,18 @@ void FsyncDirectory(const std::string& path) {
 
 }  // namespace
 
+// 路径布局的唯一定义处：<root>/users/<十进制 uid>。子目录 tmp/ 放上传临时
+// 文件、trash/ 放待物理删除的 blob，都由 EnsureUserDirectory 一次建好。
+// 这里只做字符串拼接，所以路径里不可能出现 ".." 或用户提供的任何片段。
 std::string RemoteServer::UserDirectory(std::int64_t user_id) const {
   // 磁盘路径永远只由服务端生成：数字 user id + 服务端生成的 snapshot id。
   // 客户端给的用户名与显示名一次都不参与拼接。
   return config_.root_directory + "/users/" + std::to_string(user_id);
 }
 
+// 幂等：UPLOAD_BEGIN / DOWNLOAD_BEGIN 每次都会调用它，重复调用只是多几次 stat。
+// tmp/ 与 trash/ 是上传与删除两条路径各自的中间态目录，必须先于任何 open()
+// 存在，否则第一次上传就会以 ENOENT 失败。
 bool RemoteServer::EnsureUserDirectory(std::int64_t user_id,
                                        std::string* directory,
                                        std::string* error_message) {
@@ -1110,6 +1262,9 @@ bool RemoteServer::EnsureUserDirectory(std::int64_t user_id,
   return true;
 }
 
+// 128 位 CSPRNG 随机数转 32 位十六进制：不可猜测，因此它不能当枚举 id 的
+// 起点；唯一性靠两层兜底——临时文件用 O_EXCL 创建，元数据表对
+// (user_id, snapshot_id) 有唯一约束。
 bool RemoteServer::GenerateSnapshotId(std::string* snapshot_id,
                                       std::string* error_message) {
   std::string raw;
@@ -1125,6 +1280,10 @@ bool RemoteServer::GenerateSnapshotId(std::string* snapshot_id,
   return true;
 }
 
+// 循环写直到写完：write() 允许短写，返回 0 在普通文件上意味着磁盘或文件系统
+// 出了问题，两者都不能当成"写完了"；EINTR 只重试不报错。
+// 返回 false 时调用方必须走 AbortUpload（删掉临时文件），不能让半截 blob 留下。
+// fail_next_write_ 是测试注入点，产品代码不设置它。
 bool RemoteServer::WriteAll(int fd, const char* data, std::size_t size,
                             std::string* error_message) {
   if (fail_next_write_) {
@@ -1163,6 +1322,10 @@ void RemoteServer::FailNextMetadataInsertForTesting() {
   }
 }
 
+// 只清内存状态，不碰磁盘：发布成功之后临时文件已经被 rename 成正式名字，这时
+// 再删就等于删掉刚发布的 blob。失败路径要的是 AbortUpload。
+// 状态回到 kAuthenticated 而不是 kConnected：会话仍然有效，只是这次传输结束。
+// 摘要器用整体赋值复位（Sha256 只能 Final 一次，没有 reset）。
 void RemoteServer::ResetUploadState(ConnectionContext* context) {
   context->upload_display_name.clear();
   context->upload_declared_size = 0;
@@ -1175,6 +1338,8 @@ void RemoteServer::ResetUploadState(ConnectionContext* context) {
   context->state = ConnectionState::kAuthenticated;
 }
 
+// 顺序：先关 fd 再 unlink（让"文件已经不可写"立刻成立），最后复位状态。
+// unlink 失败只记一行警告：错误已经发生，删不掉临时文件不该掩盖原始错误。
 void RemoteServer::AbortUpload(ConnectionContext* context) {
   if (context->upload_fd >= 0) {
     ::close(context->upload_fd);
@@ -1189,6 +1354,9 @@ void RemoteServer::AbortUpload(ConnectionContext* context) {
   ResetUploadState(context);
 }
 
+// 只关句柄与清下载状态，token / 会话一概不动：下载失败不是"退出登录"。
+// 状态只在 kDownloadInProgress 时回落，避免把正在上传的连接错误地拉回
+// kAuthenticated（上传与下载共用同一个 state 字段）。
 void RemoteServer::CloseDownload(ConnectionContext* context) {
   if (context->download_fd >= 0) {
     ::close(context->download_fd);
@@ -1203,6 +1371,8 @@ void RemoteServer::CloseDownload(ConnectionContext* context) {
   }
 }
 
+// 它只碰 ConnectionContext，不关 fd：fd 的 owner 是 worker（见 WorkerLoop），
+// 这样"连接没了"与"会话状态清了"两件事各自只有一个负责人。
 void RemoteServer::CleanupConnection(ConnectionContext* context) {
   // 两个都要做：客户端半路断开时上传要删临时文件、下载要关句柄。
   if (context->state == ConnectionState::kUploadInProgress ||
@@ -1212,6 +1382,22 @@ void RemoteServer::CleanupConnection(ConnectionContext* context) {
   CloseDownload(context);
 }
 
+// 一次上传的协商阶段：定下名字、长度、摘要与链关系，并创建临时文件。真正的
+// 数据在 UPLOAD_CHUNK 里来，发布在 UPLOAD_END 里做。
+//
+// 字段解码顺序必须与客户端 PayloadBuilder 的顺序逐字一致：
+//   display_name, declared_size, declared_sha256,
+//   snapshot_kind, parent_snapshot_id, lineage
+// 少一个或多一个字节都算 malformed：尾部多出字段说明两端的字段理解已经分叉，
+// 这时"读到自己要的就当成功"只会把错误推到更难查的地方。
+//
+// 这里不信任客户端声明的任何东西：display_name / sha256 / lineage 过校验器；
+// parent 必须是本用户的、已存在的快照（不存在的父与别人的父回同一个 kNotFound，
+// 因此这个接口不能用来探测别人的 id）；generation 完全由服务端按
+// parent.generation + 1 推导，客户端没有字段可以自己填。
+//
+// 状态迁移只在最后一步发生：前面每一条失败路径都还没创建文件、也还没改 state，
+// 因此不需要回滚。
 bool RemoteServer::HandleUploadBegin(int fd, const FrameHeader& header,
                                      const std::string& payload,
                                      ConnectionContext* context,
@@ -1237,7 +1423,7 @@ bool RemoteServer::HandleUploadBegin(int fd, const FrameHeader& header,
       !reader.ReadU16(&snapshot_kind) ||
       !reader.ReadString(kMaxSnapshotIdBytes, &parent_snapshot_id) ||
       !reader.ReadString(kMaxLineageBytes, &lineage) || !reader.AtEnd()) {
-    // 旧客户端（PR #20）的 UPLOAD_BEGIN 少了后面三个字段：这里会因为
+    // 旧客户端的 UPLOAD_BEGIN 少了后面三个字段：这里会因为
     // 读不到 / 有尾巴而拒绝。这是刻意的——加密与链元数据一起上线，
     // 不存在"勉强接受旧格式"的分支。
     Log("rejecting a malformed UPLOAD_BEGIN: " + reader.error_message());
@@ -1251,8 +1437,8 @@ bool RemoteServer::HandleUploadBegin(int fd, const FrameHeader& header,
     return SendError(fd, header.opcode, header.request_id,
                      Status::kInvalidRequest, error_message);
   }
-  // lineage：完整快照**允许为空**——空串表示这一份不属于任何链（PR #20 时代
-  // 上传的旧数据与低层 remote upload 都是这一类）。非空时必须是 64 位十六进
+  // lineage：完整快照**允许为空**——空串表示这一份不属于任何链（旧版上传
+  // 的数据与低层 remote upload 都是这一类）。非空时必须是 64 位十六进
   // 制；增量则**必须**带一个合法的链标识：没有链标识的增量在语义上不存在。
   if (!IsKnownSnapshotKind(snapshot_kind)) {
     Log("rejecting UPLOAD_BEGIN with an unknown snapshot kind");
@@ -1270,7 +1456,7 @@ bool RemoteServer::HandleUploadBegin(int fd, const FrameHeader& header,
     return SendError(fd, header.opcode, header.request_id,
                      Status::kInvalidRequest, error_message);
   }
-  // ---- PR #21：链关系校验。全部由服务端做，客户端说什么都要在这里过一遍 ----
+  // ---- 链关系校验。全部由服务端做，客户端说什么都要在这里过一遍 ----
   //
   //   full          parent 必须为空、generation 恒为 0（新链的根）
   //   incremental   parent 必须已经存在、属于**同一个用户**、lineage 相同；
@@ -1373,6 +1559,10 @@ bool RemoteServer::HandleUploadBegin(int fd, const FrameHeader& header,
   return SendStatus(fd, header, Status::kOk, std::string(), error_message);
 }
 
+// 数据块：写进临时文件，同时把同一份字节喂给摘要器（顺序读一遍就同时完成
+// 落盘与校验）。写得进去不等于被接受——累计长度一旦超过声明的 size，立刻
+// AbortUpload 并结束这次上传：临时文件删掉、连接回到 kAuthenticated，之后的
+// UPLOAD_END 会因为状态不对被拒。
 bool RemoteServer::HandleUploadChunk(int fd, const FrameHeader& header,
                                      const std::string& payload,
                                      ConnectionContext* context,
@@ -1413,6 +1603,16 @@ bool RemoteServer::HandleUploadChunk(int fd, const FrameHeader& header,
   return SendStatus(fd, header, Status::kOk, std::string(), error_message);
 }
 
+// 发布阶段：先自证收到的东西是对的（长度与 SHA-256 都要与 UPLOAD_BEGIN 声明的
+// 一致），再按 fsync -> close -> rename -> 目录 fsync -> SQLite 的顺序落盘。
+//
+// 崩溃一致性不变量：blob 先可见、元数据后写。反过来会出现"记录在、文件不在"，
+// 那种状态会让 LIST 出来的快照下载失败；而先写 blob 的窗口里崩溃只会留下一个
+// 没有任何记录指向的孤儿文件——它不会被 LIST 列出，只占磁盘。所以 DB 写失败时
+// 要把已经 rename 出去的 blob 删掉（并再 fsync 一次目录），而那次 unlink 失败
+// 只记警告：一致性已经由元数据侧保证了。
+//
+// 摘要器只能 Final 一次，所以这里在副本上收尾：失败路径还要靠原对象复位状态。
 bool RemoteServer::HandleUploadEnd(int fd, const FrameHeader& header,
                                    const std::string& payload,
                                    ConnectionContext* context,
@@ -1555,6 +1755,14 @@ bool RemoteServer::HandleUploadEnd(int fd, const FrameHeader& header,
   return SendStatus(fd, header, Status::kOk, builder.data(), error_message);
 }
 
+// 下载的协商阶段：只回元数据（显示名、SHA-256、长度），一个数据字节都不发；
+// 数据由客户端用 DOWNLOAD_CHUNK 一份一份来取。这样"客户端要下到哪"与"服务端
+// 怎么读盘"解耦，客户端可以随时中止而不需要服务端猜。
+//
+// 打开 blob 之前有三道检查：storage_name 必须是规范文件名（纵深防御，防路径
+// 拼接）、文件必须存在、大小必须与元数据一致。任何一条不过都回 kNotFound——
+// 对客户端来说"记录在但文件不在"属于服务端内部问题，没必要也不应该区分。
+// 用 fstat 而不是 stat：检查与读取必须针对同一个 fd，中间不会被换掉。
 bool RemoteServer::HandleDownloadBegin(int fd, const FrameHeader& header,
                                        const std::string& payload,
                                        ConnectionContext* context,
@@ -1645,6 +1853,11 @@ bool RemoteServer::HandleDownloadBegin(int fd, const FrameHeader& header,
   return SendStatus(fd, header, Status::kOk, builder.data(), error_message);
 }
 
+// 顺序读一个块（不超过 256 KiB）并原样装进响应 payload。请求 payload 必须为
+// 空：偏移量由服务端自己维护（download_sent），客户端不能指定——没有随机读，
+// 也就没有"用偏移量去探测别人的数据"这条路。
+// 空 payload 是流结束的信号（读到的字节数为 0），客户端据此停止循环；累计发送
+// 数超过元数据声明的长度说明磁盘上的文件被换过，直接中止这次下载。
 bool RemoteServer::HandleDownloadChunk(int fd, const FrameHeader& header,
                                        const std::string& payload,
                                        ConnectionContext* context,
@@ -1689,6 +1902,9 @@ bool RemoteServer::HandleDownloadChunk(int fd, const FrameHeader& header,
   return SendStatus(fd, header, Status::kOk, chunk, error_message);
 }
 
+// 客户端说"我不要了，收尾吧"。sent != size 是允许的（客户端可以提前中止），
+// 只记一行日志：真实原因在对端，服务端这里没有可执行的补救动作。
+// 服务端不复核摘要——摘要在 BEGIN 里已经给出，由客户端在发布之前自己验。
 bool RemoteServer::HandleDownloadEnd(int fd, const FrameHeader& header,
                                      const std::string& payload,
                                      ConnectionContext* context,
@@ -1712,6 +1928,10 @@ bool RemoteServer::HandleDownloadEnd(int fd, const FrameHeader& header,
   return SendStatus(fd, header, Status::kOk, std::string(), error_message);
 }
 
+// 删一个快照。真正的顺序（先挪进 trash 变不可见 -> 删元数据行 -> 失败改回
+// 名字 -> 物理 unlink）全在 RemoteMaintenance 里，因为 backup-server-admin
+// 走的是同一份实现：管理员没有第二条能绕过依赖检查的删除路径。
+// 还有后代的快照回 kInvalidState 而不是内部错误：这是"当前状态不允许"。
 bool RemoteServer::HandleDelete(int fd, const FrameHeader& header,
                                 const std::string& payload,
                                 ConnectionContext* context,
@@ -1762,6 +1982,15 @@ bool RemoteServer::HandleDelete(int fd, const FrameHeader& header,
   return SendStatus(fd, header, Status::kOk, std::string(), error_message);
 }
 
+// 注销账户：不可逆，所以要口令二次确认——一个被捡到的 token 不足以删号。
+// 目标账户只能是 token 所属的那个 user_id：载荷里只有口令，协议里没有任何
+// 字段能指定"删谁"，删别人的账户在这条路径上不可表达。
+//
+// 服务端动作分三步：把 users/<uid>/ 原子改名成隔离目录（一步就让全部字节
+// 不可见）-> 在一个事务里删掉该用户的全部元数据 -> 物理删除隔离目录。
+// 失败时隔离动作会被回滚，数据与元数据都还在，所以这里如实回 kInternalError，
+// 绝不假装删除成功。成功之后这条连接的会话立刻失效；别的连接上那些签名仍然
+// 有效的旧 token 会在下一次操作时被 RejectIfAccountMissing 挡掉。
 bool RemoteServer::HandleDeleteAccount(int fd, const FrameHeader& header,
                                        const std::string& payload,
                                        ConnectionContext* context,
@@ -1846,6 +2075,9 @@ bool RemoteServer::HandleDeleteAccount(int fd, const FrameHeader& header,
   return SendStatus(fd, header, Status::kOk, std::string(), error_message);
 }
 
+// 代价是每个数据操作一次按主键的 SQLite 点查，换来的是"注销立即生效"。
+// 返回 true 时错误帧已经发出，调用方只能直接 return true：不能继续做事，
+// 也不能再发第二帧。
 bool RemoteServer::RejectIfAccountMissing(int fd, const FrameHeader& header,
                                           ConnectionContext* context,
                                           std::string* error_message) {
@@ -1873,6 +2105,10 @@ bool RemoteServer::RejectIfAccountMissing(int fd, const FrameHeader& header,
   return true;
 }
 
+// flock 绑定在打开的 fd 上：进程崩溃或被杀时内核自动释放，所以不会留下需要
+// 人工清理的 stale 锁文件（这正是它比 pid 文件可靠的地方）。
+// 抢不到时把锁文件里的提示（谁、什么时候、在做什么）附在错误里，让运维一眼
+// 看出是"服务端正在跑"还是"管理工具正在做破坏性操作"。
 bool RemoteServer::AcquireDataLock(std::string* error_message) {
   data_lock_.reset(new backupproject::FileLock());
   const std::string path =
@@ -1901,6 +2137,13 @@ bool RemoteServer::AcquireDataLock(std::string* error_message) {
   return false;
 }
 
+// 单帧的分发点。返回值是连接级语义：true = 这一帧处理完了，帧循环继续；
+// false = 帧流或资源已经不可信，ServeConnection 必须断开这条连接。
+//
+// 进 switch 之前的三道帧级校验对每个 opcode 都成立：opcode 必须已知、请求帧的
+// status 字段必须为 0（它是响应字段）、PING 的 payload 必须为空。业务状态检查
+// 由各个处理函数自己做（例如"没登录就不能 UPLOAD_BEGIN"），所以这里的 switch
+// 只是一张路由表。
 bool RemoteServer::HandleFrame(int fd, const FrameHeader& header,
                                const std::string& payload,
                                ConnectionContext* context,
@@ -1969,6 +2212,18 @@ bool RemoteServer::HandleFrame(int fd, const FrameHeader& header,
                    error_message);
 }
 
+// 这是"一个 worker 线程的全部工作"：完成 BPSEC1/BPSEC2 握手，然后一直处理帧
+// 直到对端关闭或出错。它不关 fd（worker 负责），但保证在返回之前把会话状态
+// 收干净——finish 包住了每一条返回路径。
+//
+// 读结果的处置分三类：kClosed 是正常结束（返回 true）；kCorruptStream 与
+// kIoError 说明帧流或连接已经不可信（返回 false，断开）；kInvalidFrame 则是
+// "magic 与长度自洽、内容不合法"，流位置仍然完好，所以回一个错误帧继续服务。
+// 客户端收到 kUnsupportedVersion / kMalformedFrame 之后能自己决定是否降级，
+// 而不必整条连接重来。
+//
+// 握手与业务帧走的是同一个加密通道：g_connection_channel 在这条连接上一直是
+// 它，没有任何一处会退回明文。
 bool RemoteServer::ServeConnection(int fd, std::string* error_message) {
   // 慢连接保护：读写在 io_timeout_seconds 之后超时返回，因此一个挂着不动的
   // 客户端最多占用一个 worker 这么久，不会永久占用。
@@ -1998,7 +2253,7 @@ bool RemoteServer::ServeConnection(int fd, std::string* error_message) {
     return result;
   };
 
-  // PR #21：任何业务帧之前先完成 BPSEC1 握手。
+  // 任何业务帧之前先完成 BPSEC1 握手。
   //
   // 失败就关连接：口令、token、用户名、快照元数据一个字节都不会以明文出现在
   // 网络上，也没有"握手失败就退回明文 BPNET1"的分支。
@@ -2080,6 +2335,16 @@ bool RemoteServer::ServeConnection(int fd, std::string* error_message) {
   }
 }
 
+// 主线程的循环：accept + 把新连接排进 pending_，由固定数量的 worker 消费。
+// 并发上限就是 worker_count，不存在"每来一个连接新建一个线程"的路径。
+//
+// 背压：busy_workers_ 已经等于 worker_count 时，accept 循环在 slot_free_ 上
+// 等待，新连接留在 listen backlog 里（超出的由内核拒绝），而不是无限建线程
+// 或者把连接堆在内存里。
+//
+// 停止序列（顺序有意义）：置 stop_requested_ -> shutdown 掉 pending_ 里还没被
+// 取走的连接（让阻塞在 recv 的 worker 也能退出）-> notify_all 唤醒所有 worker
+// -> join -> 清 workers_ -> 清 run_in_progress_。之后 Stop() 才能安全拆除。
 bool RemoteServer::Run(std::string* error_message) {
   if (!running()) {
     if (error_message != nullptr) {
@@ -2174,6 +2439,13 @@ bool RemoteServer::Run(std::string* error_message) {
   return ok;
 }
 
+// 取任务用的是带超时的 wait_for 而不是 wait：即使某次 notify 丢了，worker 也会
+// 在 kPollIntervalMs 之后自己醒一次，从而保证停止请求最多延迟这么久生效。
+// pending_ 为空且没有停止请求时继续等，有停止请求就退出。
+//
+// busy_workers_ 与 slot_free_ 是一对：每个连接在开始服务之前 +1，服务结束之后
+// -1 并 notify 一次，Run() 正是靠这个计数实现背压。ServeConnection 的返回值只
+// 表示"这条连接是怎么结束的"，不影响 worker 继续取下一个任务。
 void RemoteServer::WorkerLoop() {
   for (;;) {
     int client = -1;
@@ -2204,6 +2476,11 @@ void RemoteServer::WorkerLoop() {
   }
 }
 
+// 日志格式：[backup-server <墙钟秒>] message。stderr 用 fputs + fflush 立即刷出
+// （崩溃时最后几行还在），日志文件每次追加都重新 open：不长驻句柄，也就不会
+// 因为句柄泄漏而静默丢掉后续日志。整条日志在 log_mutex_ 内组装并写出，因此
+// 多线程并发写不会互相穿插。纪律：调用方只传已经脱敏的内容，secret / token /
+// 口令一律不进来。
 void RemoteServer::Log(const std::string& message) {
   std::ostringstream line;
   line << "[backup-server " << NowSeconds() << "] " << message << "\n";

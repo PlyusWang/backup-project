@@ -7,6 +7,12 @@
 // 路径长度校验、同样的剪枝与 socket 语义。搬动时只做了一件事——把
 // "把事实变成 ArchiveEntry" 留给消费者。
 
+// 本文件只负责"遍历 + 判定 + 报错"：不读任何文件正文、不编码 hardlink、
+// 不构造 ArchiveEntry、不决定预览窗口与展示方式——那些留给消费者，于是
+// Preview 与 Backup 共享同一份事实（决策顺序是合同，见头文件的顺序图）。
+//
+// 单线程、无全局可变状态；Walker 持有的 filter / names / visitor / faults
+// 全是非拥有指针，生命周期只覆盖一次 WalkSourceTree 调用。
 #include "source_tree_walker.h"
 
 #include <dirent.h>
@@ -28,12 +34,18 @@
 namespace backupproject {
 namespace {
 
+// 失败文案的唯一格式："<动作>: <磁盘路径>: <strerror>"。预览与真实备份必须
+// 逐字一致，调用方（GUI / CLI）直接转述 failure.message、不重新拼装，
+// 否则同一个磁盘错误在两条路径上会变成两种说法。
 std::string Describe(int error_number, const std::string& action,
                      const std::string& path) {
   return action + ": " + path + ": " + std::strerror(error_number);
 }
 
 // 测试注入：返回 0 表示照常调用真实 syscall。
+// 只在测试里非空。注入的失败与真实 syscall 失败在下游走完全同一条路径：
+// 调用方不能、也不需要区分"这次是注入的"，一旦能区分，测的就不是生产路径。
+// 生产代码一律用默认的 nullptr。
 int InjectedErrno(const SourceWalkFaults* faults, SourceWalkSyscall call,
                   const std::string& disk_path) {
   if (faults == nullptr || faults->fail_syscall == nullptr) return 0;
@@ -42,6 +54,12 @@ int InjectedErrno(const SourceWalkFaults* faults, SourceWalkSyscall call,
 
 // lstat 的 st_mode -> EntryType，连同其余 metadata 一起快照。
 // 失败只可能是"这个类型我们表示不了"（kUnsupportedType）。
+// mode 只保留 07777：setuid / setgid / sticky 是归档必须保存的事实，文件
+// 类型位不进 facts——类型由 EntryType 表达，两处都存会让"mode 说是目录、
+// type 说是文件"这种矛盾状态成为可能。
+//
+// size 只对普通文件填充：软链接的 st_size 是链接目标的长度，不是内容长
+// 度。消费侧（tree_scanner 的 ReadLinkTarget）把 0 当作"未知"并回退到上限。
 bool FactsOf(const struct stat& info, SourceEntryFacts* facts) {
   facts->mode = static_cast<std::uint32_t>(info.st_mode) & 07777u;
   facts->uid = static_cast<std::uint32_t>(info.st_uid);
@@ -55,6 +73,8 @@ bool FactsOf(const struct stat& info, SourceEntryFacts* facts) {
   facts->dev_major = 0;
   facts->dev_minor = 0;
 
+  // 设备号只在字符 / 块设备上解析：DeviceMajor / DeviceMinor 是写入侧与恢复
+  // 侧共用的同一份拆分逻辑，其它类型保持 0，避免出现"看起来有设备号"的假事实。
   if (S_ISDIR(info.st_mode)) {
     facts->type = EntryType::kDirectory;
   } else if (S_ISREG(info.st_mode)) {
@@ -80,6 +100,9 @@ bool FactsOf(const struct stat& info, SourceEntryFacts* facts) {
   return true;
 }
 
+// 遍历器本体。一次 Walk 对应一个实例：不 new、不持有 fd、不缓存目录内容，
+// 失败一律用返回值 + SourceWalkFailure 表达，不抛异常、不跨调用复用状态——
+// 每次遍历都重新问一次文件系统，两次结果不同只能是磁盘变了。
 class Walker {
  public:
   Walker(const Filter* filter, UserDirectoryCache* names,
@@ -122,6 +145,9 @@ class Walker {
   }
 
  private:
+  // 统一填 failure 并返回 false，于是调用点可以写 "return Fail(...)"：
+  // 原因只有一处装配，不会有某条分支忘了填。failure 允许为 nullptr（只关心
+  // 返回值的调用方），此时仍然返回 false，绝不静默变成成功。
   bool Fail(SourceWalkFailure* failure, SourceWalkFailureKind kind,
             const std::string& message, const std::string& disk_path,
             const std::string& archive_path) {
@@ -137,7 +163,7 @@ class Walker {
   // 一条 entry 已经确定**会进入归档**之后，才要求它的 archive path 满足完整
   // grammar。
   //
-  // 时机是这一轮修的东西：把完整 IsValidArchivePath 提到 Filter 之前，会让
+  // 时机很关键：把完整 IsValidArchivePath 提到 Filter 之前，会让
   // "本来会被规则排除、因此根本不会进归档"的条目也提前阻塞整次备份/预览——
   // 那是新的语义，不是历史语义。历史 Backup 是"Filter 先决定它进不进，
   // 进了才校验路径"。
@@ -165,6 +191,8 @@ class Walker {
   }
 
   // 交给消费者的那一次调用。消费者失败时把它的原文原样带出去。
+  // visitor_ 已在 WalkSourceTree 挡过 nullptr，这里可以直接解引用。消费者
+  // 的原文原样带出、不加任何前缀：那句话会被直接显示给用户。
   bool Visit(const std::string& disk_path, const std::string& archive_path,
              const SourceEntryFacts& facts, SourceEntryDecision decision,
              SourceWalkFailure* failure) {
@@ -227,6 +255,9 @@ class Walker {
           disk_directory, archive_path);
     }
 
+    // 先把名字全部收进内存再递归：目录流必须在递归之前关闭，否则每深一层就
+    // 多占一个 DIR*，深目录树会把 fd 耗光。errno 先清零、readdir 返回 nullptr
+    // 时再看 errno，是区分"已读完"与"读失败"的唯一可靠写法。
     std::vector<std::string> names;
     int readdir_error = 0;
     while (true) {
@@ -267,7 +298,7 @@ class Walker {
 
       // 历史语义：路径长度是**遍历/构造**阶段的硬边界，在 lstat 与 Filter 之前
       // 就已经判死。一个超长的 child path 即使后来会被规则排除，真实 Backup
-      // 历史上也会在这里失败——本轮不顺手改这条。
+      // 历史上也会在这里失败——这里保持既有语义，不做改动。
       if (child_archive.size() > kMaxArchivePathLength) {
         return Fail(failure, SourceWalkFailureKind::kInvalidArchivePath,
                     "Archive path too long: " + child_archive, child_disk,
@@ -386,6 +417,8 @@ class Walker {
     facts->group_name = names_->GroupName(facts->gid);
   }
 
+  // 四个非拥有指针：filter 可以为空（等价于没有任何规则），names / visitor /
+  // faults 必须由调用方保证在这次 Walk 期间存活。Walker 不可拷贝、不跨线程。
   const Filter* filter_ = nullptr;
   UserDirectoryCache* names_ = nullptr;
   SourceTreeVisitor* visitor_ = nullptr;
@@ -394,6 +427,12 @@ class Walker {
 
 }  // namespace
 
+// 唯一入口。failure 先被整体清零：调用方复用一个结构体反复调用时，不会读到
+// 上一次留下的 kind / message。visitor 为空是内部错误（kConsumerFailed），
+// 不是"什么都不做就成功"——静默成功会让调用方以为树里本来就没有条目。
+//
+// UserDirectoryCache 每次调用新建：uid / gid 到名字的映射不跨调用缓存，宁可
+// 在同一次遍历里重复解析，也不让两次备份对同一棵树给出不同的名字。
 bool WalkSourceTree(const std::string& source_directory, const Filter* filter,
                     SourceTreeVisitor* visitor, SourceWalkFailure* failure,
                     const SourceWalkFaults* faults) {

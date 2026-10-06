@@ -18,7 +18,7 @@
 //   *** 已知盲区：same-size + same-mtime 的人为 in-place rewrite ***
 //   *** 逃得过这一版变化检测。这不是密码学意义上的完整性校验。 ***
 //
-// 未来的 Incremental / Realtime 可以强化这一点；本 PR 不声称能做到。
+// 未来的 Incremental / Realtime 可以强化这一点；本版本不声称能做到。
 //
 // 本文件是纯 C++17：不依赖 Qt，也不依赖任何第三方库。
 
@@ -227,7 +227,7 @@ inline constexpr std::size_t kMaxManifestBindingBytes = 4096u;
 
 // 写出 version 2。binding 必须完整（三个字段非空、名字是合法的单组件名、
 // 长度有限、不含 NUL），否则返回空串——宁可什么都不写，也不写一份归属不明的
-// manifest 出去，那恰好是本次修复要消灭的状态。
+// manifest 出去，那恰好是这套绑定校验要消灭的状态。
 std::string SerializeManifest(const std::vector<ManifestEntry>& entries,
                               const ManifestBinding& binding);
 

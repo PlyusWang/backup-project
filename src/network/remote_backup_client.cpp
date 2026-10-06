@@ -1,5 +1,24 @@
 // src/network/remote_backup_client.cpp
 
+// 模块职责：把"一次远程操作"翻译成 BPNET1 的请求序列，并守住三条不变量：
+//   * 网络上没有明文 —— 每条 TCP 连接先做 BPSEC1/BPSEC2 握手，失败即断开；
+//   * 不重发 —— 请求一旦写出，失败就如实上报，绝不自动重试（写失败时对端
+//     完全可能已经执行了它）；
+//   * 不破坏本地已有文件 —— 下载先写唯一命名的临时文件，长度与 SHA-256 都对
+//     得上才原子发布。
+//
+// 它不负责：归档格式（.bak 的字节由上层引擎产生）、增量链的计算、凭据持久化。
+// 本类只认"名字 + 长度 + SHA-256"，服务端在这一层的理解与它一致。
+//
+// 数据流（上传）：HashFile 算摘要 -> UPLOAD_BEGIN(名字, 长度, 摘要, 链关系) ->
+// UPLOAD_CHUNK x N -> UPLOAD_END -> 用响应填 RemoteSnapshotInfo。
+// 数据流（下载）：DOWNLOAD_BEGIN -> DOWNLOAD_CHUNK 直到空 payload -> FileSink
+// 临时文件 -> 校验长度与摘要 -> PublishNoReplace / PublishReplacing ->
+// DOWNLOAD_END。
+//
+// 线程与生命周期：一条连接一个实例，实例内的状态（fd_ / channel_ / token_）
+// 全部不做同步，调用方必须串行调用；要并发就各自持有实例。token 只活在内存
+// 里，Disconnect() 是唯一会主动丢弃它的本地动作。
 #include "remote_backup_client.h"
 
 #include <arpa/inet.h>
@@ -40,6 +59,9 @@ std::string ParentDirectoryOf(const std::string& path) {
   return path.substr(0, slash);
 }
 
+// 与 ParentDirectoryOf 配对使用，同样只做字符串切分：不解析 ".."、不解析符号
+// 链接、不做 realpath。目标路径来自用户参数，这里只用它算出"临时文件该放在
+// 哪个目录、用什么前缀"，真正的原子发布由内核的 link / renameat2 保证。
 std::string BaseNameOf(const std::string& path) {
   const std::size_t slash = path.rfind('/');
   if (slash == std::string::npos) {
@@ -48,6 +70,9 @@ std::string BaseNameOf(const std::string& path) {
   return path.substr(slash + 1);
 }
 
+// 只接受普通文件：目录、FIFO、设备文件这类"看起来能读"的东西会把后面的流式
+// 读取拖住，或者给出一个不稳定的长度。这里取到的大小随后作为 UPLOAD_BEGIN 的
+// declared_size，由服务端逐字节对照。
 bool StatRegularFile(const std::string& path, std::uint64_t* size,
                      std::string* error_message) {
   struct stat info;
@@ -70,6 +95,10 @@ bool StatRegularFile(const std::string& path, std::uint64_t* size,
 }
 
 // 第一遍：流式算 SHA-256（只占一个块的内存）。
+// 第一遍读文件：只算摘要，不写任何东西，内存占用固定为一个块。
+// 这一遍与真正发送的那一遍用的是两个独立的 fd，因此两遍之间文件被改写是可能
+// 的；兜底在服务端——它按收到的字节重算 SHA-256，对不上就回
+// kIntegrityMismatch 并删掉临时文件，不会有半个快照被发布。
 bool HashFile(const std::string& path, std::string* sha256_hex,
               std::string* error_message) {
   const int fd = ::open(path.c_str(), O_RDONLY);
@@ -108,9 +137,12 @@ bool HashFile(const std::string& path, std::string* sha256_hex,
 // 这条连接的对端是不是已经关了？只做零等待的探测（poll + MSG_PEEK）。
 //
 // 为什么必须有这一步：服务端会在 io_timeout 之后主动关掉空闲连接，而客户端
-// 手里的 fd 依然"有效"——往里写不会立刻报错，响应却永远不会来。人工验收看到
-// 的"奇数次失败、偶数次有响应"就是它：失败那一次之后客户端把 token 一起丢了，
-// 下一次只能重新登录，于是又"好"了一次。
+// 手里的 fd 依然“有效”——往里写不会立刻报错，响应却永远不会来。表现出来
+// 就是“奇数次失败、偶数次有响应”：失败那一次之后客户端把 token 一起丢了，
+// 下一次只能重新登录，于是又“好”了一次。
+// MSG_PEEK 只"看"不取：这次探测不会吃掉后续帧的任何字节，所以它可以在任意
+// 两次请求之间安全调用。判不准时一律返回 false（当成连接可用），把结论留给
+// 接下来的收发——那样至少还能拿到一个 errno。
 bool SocketLooksClosed(int fd) {
   pollfd entry;
   entry.fd = fd;
@@ -140,6 +172,9 @@ bool SocketLooksClosed(int fd) {
 
 }  // namespace
 
+// 协议状态码到用户可见文案的唯一来源（CLI 与 GUI 都走这里）。
+// 注意：上层的会话管理靠这段文本反查状态码来区分"会话失效"与"网络故障"
+// （见 ResumeSession），所以改动文案会牵动控制器的判断逻辑与相关测试。
 std::string RemoteStatusMessage(std::uint32_t status) {
   switch (static_cast<Status>(status)) {
     case Status::kOk:
@@ -180,10 +215,15 @@ RemoteArchiveClient::RemoteArchiveClient() = default;
 
 RemoteArchiveClient::~RemoteArchiveClient() { Disconnect(); }
 
+// last_error_ 保留最近一次失败的协议层原始原因（英文），供日志与测试使用；
+// 它不会被主动清空，只有下一次失败会覆盖它。
 void RemoteArchiveClient::Fail(const std::string& reason) {
   last_error_ = reason;
 }
 
+// 关掉 TCP 连接并把加密通道复位：会话密钥与记录序号随连接一起作废，下一条
+// 连接必须重新握手（每次连接一套新密钥，不复用、不续用）。fd_ 置 -1 是"没有
+// 连接"的唯一表示，PrepareConnection 依赖它判断要不要重连。
 void RemoteArchiveClient::DisconnectSocket() {
   if (fd_ >= 0) {
     ::close(fd_);
@@ -197,6 +237,8 @@ void RemoteArchiveClient::DisconnectSocket() {
   authenticated_ = false;
 }
 
+// 明确放弃会话：连接与 token 一起丢掉。token 只存在于内存里，所以这里没有
+// 任何与磁盘有关的清理动作。
 void RemoteArchiveClient::Disconnect() {
   DisconnectSocket();
   // token 只活在内存里：明确放弃会话时就丢掉，绝不写文件。
@@ -205,6 +247,11 @@ void RemoteArchiveClient::Disconnect() {
   }
 }
 
+// 建连 + 握手。它不动 token：调用方可能只是想换一条连接继续用同一个会话
+// （PrepareConnection 会在返回之后自己发 RESUME）。
+// 超时设的是 SO_RCVTIMEO / SO_SNDTIMEO，也就是每次 recv/send 的超时，而不是
+// 整份文件传输的整体预算；真正有整体预算的只有握手（channel_ 内部 deadline）。
+// 两条身份路径（pin 与 certificate）互斥：一旦选定证书模式就不会再看 pin。
 bool RemoteArchiveClient::Connect(const RemoteEndpoint& endpoint,
                                   std::string* error_message) {
   // 只换连接，不动 token：重连之后可能还要用它恢复会话。
@@ -255,7 +302,7 @@ bool RemoteArchiveClient::Connect(const RemoteEndpoint& endpoint,
   next_request_id_ = 1;
   authenticated_ = false;
 
-  // PR #21：TCP 连上之后的第一件事是 BPSEC1 握手，之后才谈 BPNET1 业务帧。
+  // TCP 连上之后的第一件事是 BPSEC1 握手，之后才谈 BPNET1 业务帧。
   //
   // 两条失败路径都是"直接失败"，没有第三条：
   //   * pin 没配置或格式不对 -> 拒绝连接（不做 TOFU）；
@@ -340,6 +387,10 @@ void RemoteArchiveClient::SetReconnectEndpoint(const RemoteEndpoint& endpoint) {
   endpoint_ = endpoint;
 }
 
+// 幂等：连接可用时几乎零成本（一次 poll）。重连之后如果手里还有 token，就先
+// RESUME 恢复会话，然后才发调用方真正想发的那个请求。
+// 这里发生的所有 I/O 都在"本次请求的第一个字节发出之前"，所以它不违反
+// no-retry：没有任何一个用户请求会被发第二遍。
 bool RemoteArchiveClient::PrepareConnection(std::string* error_message) {
   if (fd_ >= 0 && !SocketLooksClosed(fd_)) {
     return true;
@@ -375,6 +426,9 @@ bool RemoteArchiveClient::PrepareConnection(std::string* error_message) {
   return true;
 }
 
+// 只有服务端明确回 kUnauthorized 才丢 token（那才是"会话真的失效了"）；
+// 其他失败（超时、断连、对端重启）一律保留 token，让用户的下一次操作自己
+// 重连。失败时给出的文案用的是共享的状态文案，控制器据此分类。
 bool RemoteArchiveClient::ResumeSession(std::string* error_message) {
   if (token_.empty()) {
     if (error_message != nullptr) {
@@ -417,6 +471,17 @@ bool RemoteArchiveClient::ResumeSession(std::string* error_message) {
   return false;
 }
 
+// 所有请求的唯一出口：prepare -> 分配 request_id -> 发送 -> 收响应 ->
+// 校验配对。
+//
+// 失败分级（每一条都决定连接与 token 的命运）：
+//   * 发送失败 / 读响应失败：连接不可信，关掉连接但保留 token，并且不重发——
+//     已经写出去的那半个请求，对端可能已经执行了；
+//   * 响应的 request_id 与请求不符：协议级错乱或串话，直接 Disconnect()
+//     （连 token 一起丢），因为无法判断对端到底是谁；
+//   * 对端回了非 kOk：记录 last_status_，连接与 token 都保留，由调用方
+//     （例如 RESUME 的调用者）自己决定要不要丢会话。
+// 成功时 response 是服务端 payload 的原始字节，由各个方法自己解码。
 bool RemoteArchiveClient::Request(Opcode opcode, const std::string& payload,
                                   FrameHeader* header, std::string* response,
                                   std::string* error_message) {
@@ -486,6 +551,9 @@ bool RemoteArchiveClient::RequireAuthenticated(const std::string& what,
   return false;
 }
 
+// 不需要会话（服务端在状态检查之前就处理它），因此它是"服务端还活着吗、它说的
+// 是哪一版协议"的探针。响应必须完整解码到末尾，多一个字节都算失败：版本协商
+// 不能建在"读到自己要的就算成功"上。
 bool RemoteArchiveClient::Ping(std::string* software,
                                std::uint16_t* protocol_version,
                                std::uint64_t* server_time,
@@ -541,6 +609,8 @@ bool RemoteArchiveClient::Register(const std::string& username,
                  error_message);
 }
 
+// 口令只作为请求 payload 的一部分经过加密通道：不进日志、不进 last_error，
+// 返回值里也没有任何与口令相关的内容。
 bool RemoteArchiveClient::Login(const std::string& username,
                                 const std::string& password,
                                 std::string* error_message) {
@@ -576,6 +646,9 @@ bool RemoteArchiveClient::Login(const std::string& username,
   return true;
 }
 
+// 语义上是"本地会话结束"：无论服务端是否接受，本地 token 都会被丢掉。这样即使
+// 服务端已经不可达，用户也能明确地退出登录。云端数据不受影响——真正删除云端
+// 数据的是 DeleteAccount。
 bool RemoteArchiveClient::Logout(std::string* error_message) {
   if (!RequireAuthenticated("logout", error_message)) {
     return false;
@@ -589,6 +662,10 @@ bool RemoteArchiveClient::Logout(std::string* error_message) {
   return ok;
 }
 
+// 逐条严格解码：条目数由服务端给（上限 kMaxListEntries），任何一条字段缺失、
+// 长度超限或 kind 未知，整次调用就失败——不做"跳过坏条目继续"，那样会把一份
+// 不完整的列表当成完整的交给用户。解析结果先放进局部 vector，全部成功之后才
+// 写入 *snapshots，失败不会留下半份列表。
 bool RemoteArchiveClient::List(std::vector<RemoteSnapshotInfo>* snapshots,
                                std::string* error_message) {
   if (!RequireAuthenticated("list", error_message)) {
@@ -654,6 +731,17 @@ bool RemoteArchiveClient::UploadArchiveFile(
                             progress, uploaded, error_message);
 }
 
+// 两遍读是协议决定的：UPLOAD_BEGIN 必须在发送任何数据之前给出长度与摘要，所以
+// 第一遍只能扫描算 SHA-256，第二遍才分块发送。代价是读两次盘，换来的是上传
+// 期间内存里只有一个块，而不是整份归档。
+//
+// 事务边界是连接：UPLOAD_BEGIN 被接受之后，任何本地失败（读文件出错、文件被
+// 截短、发块失败）都关掉 socket，让服务端从这里读到 EOF 并删掉上传临时文件。
+// token 保留——本地文件出错不是"退出登录"。
+//
+// 大小有两道彼此独立的闸：客户端是 kDefaultMaxUploadBytes（发送任何字节之前的
+// 早退），服务端是 --max-upload-bytes（权威值）。progress 在开始、每个块之后
+// 被调用，bytes_done 单调不减。
 bool RemoteArchiveClient::UploadSnapshotFile(
     const std::string& local_path, const std::string& display_name,
     const RemoteUploadOptions& options, const RemoteProgressCallback& progress,
@@ -708,7 +796,7 @@ bool RemoteArchiveClient::UploadSnapshotFile(
     }
     return false;
   }
-  // PR #21：链关系。字段顺序必须与服务端的解码顺序一致：
+  // 链关系。字段顺序必须与服务端的解码顺序一致：
   //   display_name -> size -> sha256 -> kind -> parent_id -> lineage
   begin.AppendU16(options.snapshot_kind);
   if (!begin.AppendString(options.parent_snapshot_id, kMaxSnapshotIdBytes,
@@ -817,6 +905,16 @@ bool RemoteArchiveClient::UploadSnapshotFile(
   return true;
 }
 
+// 下载事务：BEGIN 之后服务端处于 DOWNLOAD_IN_PROGRESS，客户端无论在哪一步失败
+// 都要显式发一次 DOWNLOAD_END（服务端允许提前结束），或者直接断连——两条路径
+// 服务端都会把状态清回"已认证"。download_active 记录的就是"事务开始了没有"，
+// 而不是"数据收完了没有"。
+//
+// 中间产物是目标目录里唯一命名的临时文件（FileSink::OpenTemp，mkstemp 0600），
+// 校验（长度 + SHA-256）发生在 fsync/close 之后、发布之前，所以只要发布成功，
+// 目标文件一定是完整的。失败时的收尾顺序固定：先 Abandon() 删掉自己的临时
+// 文件，再 end_download_transaction()；收尾用的错误变量是独立的，调用方拿到
+// 的永远是那个原始本地错误。
 bool RemoteArchiveClient::DownloadArchiveFile(
     const std::string& snapshot_id, const std::string& target_path,
     bool allow_overwrite, const RemoteProgressCallback& progress,
@@ -1016,6 +1114,8 @@ bool RemoteArchiveClient::DownloadArchiveFile(
   return true;
 }
 
+// 服务端会拒绝删除还有增量后代的快照（kInvalidState），并在文案里说明要先删
+// 后代。客户端不做本地预判，把判断权留给唯一的权威。
 bool RemoteArchiveClient::Delete(const std::string& snapshot_id,
                                  std::string* error_message) {
   if (!RequireAuthenticated("delete", error_message)) {
@@ -1035,6 +1135,8 @@ bool RemoteArchiveClient::Delete(const std::string& snapshot_id,
                  error_message);
 }
 
+// 只有成功才丢会话：失败（例如口令不对）时连接与会话都保持原样，用户可以重试
+// 或继续用别的命令。
 bool RemoteArchiveClient::DeleteAccount(const std::string& password,
                                         std::string* error_message) {
   if (!RequireAuthenticated("delete-account", error_message)) {

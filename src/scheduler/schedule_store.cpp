@@ -1,4 +1,44 @@
 // schedule_store.cpp
+//
+// 模块职责：定时备份的**唯一**持久化入口。把 ScheduleConfig、运行状态
+// （next_run / last_success / baseline）、受管快照名录与 history 落成一份
+// schedule.json；把"上一份成功快照对应的源清单"落成同目录的
+// schedule-manifest.dat；并提供两者的原子读写与删除。
+//
+// 不负责什么：
+//   * 不做调度决策（下一轮该不该跑、错过的窗口怎么补）——那是
+//     ScheduledBackupService 的职责，本文件只如实存"下一次几点"；
+//   * 不解析归档、不读 .bak 的内容，只用单组件文件名引用它们；
+//   * 不写第二套产品组合校验，一律委托 backup_option_keys.h 的共享表；
+//   * 不猜路径：构造函数只接受调用方算好的路径，不读 HOME/XDG/QSettings。
+//
+// 数据流（写侧）：调用方改 ScheduleDocument → Save() 做结构校验与各项上界
+// 检查 → SerializeScheduleDocument() 手写 JSON →
+// WriteFileAtomicallyReplacing() 以 0600 权限做 temp + fsync + rename。
+// 读侧反着走：ReadWholeFile() → ParseJson() → 逐字段严格解析 →
+// ScheduleDocument。字段集合是双向完全相等的，多一个少一个都报错。
+//
+// 关键不变量（违反任一条即拒绝写入，绝不落一份读不回来的文件）：
+//   * 字符串字段长度 <= kMaxScheduleStringBytes 且不含 NUL 字节；
+//   * managed_snapshots.size() <= kMaxRetainCount、
+//     history.size() <= kMaxHistoryEntries（读侧上界不得比写侧更严）；
+//   * 每个 file_name（含 baseline）都是单组件、以 .bak 结尾的归档名——
+//     路径越界的判断只在 BackupCatalog 里，本文件绝不擅自放宽；
+//   * trigger 恒为 kScheduled：realtime 有它自己的 store（realtime.json）。
+//
+// 失败语义：全部走 "bool / 状态码 + 可选的 std::string* error_message"，
+// 不抛异常。Load() 用三态区分"文件不在"（kMissing，调用方走默认配置）与
+// "文件在但读不懂"（kError，绝不静默回退到默认配置）。Save() 失败时不写盘，
+// 磁盘上原有的文件保持原样。
+//
+// 安全边界：这两个文件里没有密码（计划任务不接受加密），但它们记录了用户的
+// 目录结构，所以固定落 0600 文件权限；所有路径只做拼接与 lstat，建目录时
+// 不跟随软链接，也绝不把 state 里的名字当成可信路径直接使用。
+//
+// 线程与生命周期：本类是纯数据 + 路径，构造后路径不再变化（Load/Save 全是
+// const），因此多个实例可以并存。但**同一个 schedule.json 上不允许并发写**：
+// 调用方必须先通过 lock_file_path() 上的 flock 选出唯一 runner。
+// 本文件自己不做任何加锁。
 
 #include "schedule_store.h"
 
@@ -23,10 +63,16 @@
 namespace backupproject {
 namespace {
 
+// 本文件统一的失败协议：函数返回 false 或错误状态，原因写进可选的
+// error_message。所有 *error_message 参数都允许为 nullptr——只要"成没成"
+// 的调用方不必先造一个字符串。错误文本一律英文：它会被 CLI、GUI 与日志
+// 原样转发，本地化在更外层做，core 里不掺语言判断。
 void SetError(std::string* error_message, const std::string& text) {
   if (error_message != nullptr) *error_message = text;
 }
 
+// errno 文本的组装点。调用方必须在**失败当刻**把 errno 作为参数传进来：
+// 这里不会再读全局 errno，因为中间的字符串拼接可能已经覆盖了它。
 std::string Describe(int error_number, const std::string& action,
                      const std::string& path) {
   return action + ": " + path + ": " + std::strerror(error_number);
@@ -39,6 +85,8 @@ bool IsAsciiSpace(char character) {
          character == '\r' || character == '\f' || character == '\v';
 }
 
+// std::string 可以合法地装 NUL 字节，而下游任何 c_str() 或系统调用都会在
+// 那里截断。长度检查因此必须和这一条同时做，只查 size() 是不够的。
 bool ContainsNul(const std::string& value) {
   return value.find('\0') != std::string::npos;
 }
@@ -63,6 +111,9 @@ std::string ParentDirectoryOf(const std::string& path) {
 //
 // 目录权限 0700：里面放的是 schedule.json + manifest，前者已经是 0600，
 // 目录没有理由是 0755 让同机器上任何人都能列出来。
+// 探测用 lstat 而不是 stat：一个指向别处的软链接必须在这里被判成"不是
+// 目录"而拒绝，否则 mkdir -p 会把文件写进链接指向的位置。递归的终止条件
+// 就是函数开头那三行（空 / "." / "/"），ParentDirectoryOf 保证每层都更短。
 bool MakeDirectories(const std::string& path, std::string* error_message) {
   if (path.empty() || path == "." || path == "/") return true;
 
@@ -86,6 +137,18 @@ bool MakeDirectories(const std::string& path, std::string* error_message) {
   return true;
 }
 
+// 读一个"要么不存在、要么完整读进来"的配置/清单文件。
+//
+// missing 是独立于返回值的第三态：文件不存在不算错误，调用方据此走"首次
+// 运行"的分支；只有"存在但读不了"才返回 false。
+//
+// 边界处理：
+//   * 先用 lstat 挡掉非普通文件（目录、FIFO、软链接）——既避免 open 卡在
+//     FIFO 上，也避免顺着链接读到仓库之外；
+//   * 上界查两次：lstat 的 st_size 只是读之前的快照，文件完全可能在读取
+//     过程中被追加，所以每读一块都再查一次，内存绝不无界增长；
+//   * read 返回 0 才是 EOF，EINTR 只重试不算失败；
+//   * 每条失败路径都先 close(fd) 再返回，不泄漏描述符。
 bool ReadWholeFile(const std::string& path, std::size_t maximum_bytes,
                    std::string* data, bool* missing,
                    std::string* error_message) {
@@ -144,6 +207,8 @@ bool ReadWholeFile(const std::string& path, std::size_t maximum_bytes,
 // 与 BackupCatalog 的规则保持一致：不含 '/' 与 '\\'、不是 "." / ".."、
 // 不含 NUL、以 .bak 结尾。Catalog 仍然会在 Resolve / Delete 时再校验一次，
 // 这里提前拦是为了"一个坏掉的 state 不会变成一串奇怪的系统调用"。
+// size <= 4 让 ".bak" 本身成为非法名字：剥掉后缀之后必须还剩内容，
+// 否则 "..bak" 这类名字能靠后缀判断蒙混过去。
 bool IsSingleComponentArchiveName(const std::string& file_name) {
   if (file_name.empty()) return false;
   if (file_name == "." || file_name == "..") return false;
@@ -154,12 +219,18 @@ bool IsSingleComponentArchiveName(const std::string& file_name) {
   return file_name.compare(file_name.size() - 4, 4, ".bak") == 0;
 }
 
+// 写盘与读盘共用同一条有界性判断：长度上界防"一份配置撑爆解析与日志"，
+// NUL 检查防"字符串在 c_str() 处被截断成另一个路径"。
 bool IsBoundedString(const std::string& value, std::size_t maximum) {
   return value.size() <= maximum && !ContainsNul(value);
 }
 
 }  // namespace
 
+// 规则顺序被原样保留：Filter 按加入顺序求值，include 与 exclude 谁覆盖谁
+// 是既有产品语义，这里不归一化、不去重、不排序。
+// 每条规则都真的走 Filter::AddRule，因此"配置里存的规则"与"CLI 敲进去的
+// 规则"是同一套语法、同一套报错，不存在"存得下但解析不了"的中间态。
 bool BuildScheduleFilter(const ScheduleConfig& config, Filter* filter,
                          std::string* error_message) {
   if (filter == nullptr) {
@@ -186,12 +257,16 @@ bool BuildScheduleFilter(const ScheduleConfig& config, Filter* filter,
   return true;
 }
 
+// 纯结构校验：只回答"这份配置本身合不合法"，不碰文件系统、不看仓库，
+// 因此 CLI 的选项校验、GUI 的"保存计划"与调度前的检查可以共用它。
+// 顺序是先判作用域再判组合：先回答"这份文件该不该由本 store 执行"，
+// 再回答"这个组合能不能跑"，两条错误信息不会互相掩盖。
 bool ValidateScheduleConfig(const ScheduleConfig& config,
                             std::string* error_message) {
   // 这份 store 的作用域：它只装 scheduled 触发。Realtime 有它自己的 store
-  // （realtime.json，见 PR #19）。
+  // （realtime.json）。
   //
-  // 为什么这条判断必须存在：PR #19 之后共享矩阵里 Realtime × {Full,
+  // 为什么这条判断必须存在：共享矩阵里 Realtime × {Full,
   // Incremental} 两格都是"支持"，只问矩阵的话，一份手改成
   // "trigger": "realtime" 的 schedule.json 会被 schedule 路径当成合法配置
   // 执行——那不是"换了个触发方式"，而是"这份文件根本不该被执行"。
@@ -258,6 +333,8 @@ bool ValidateScheduleConfig(const ScheduleConfig& config,
       return false;
     }
   }
+  // 规则语法也要先过一遍：一份存得下、但 Filter 解析不了的配置，会在启用时
+  // 甚至下一次定时触发时才炸——那时用户早已离开设置页，错误来得太晚。
   Filter filter;
   return BuildScheduleFilter(config, &filter, error_message);
 }
@@ -268,6 +345,8 @@ namespace {
 //
 // 两条路径（源目录、仓库）用的是同一段判断，报错文案只换主语：绝不写两遍，
 // 免得某一天只修好了其中一份。
+// 软链接被单独拒绝，而不是"跟随它再判断"：仓库与源目录都是长期配置，
+// 跟随链接会让"配置里写的路径"与"实际被写入/备份的路径"不是同一个东西。
 bool RequireRealDirectory(const std::string& path, const char* what,
                           std::string* error_message) {
   if (path.empty()) {
@@ -313,6 +392,8 @@ bool ParseBoundedScheduleNumber(const std::string& text, std::uint32_t minimum,
     SetError(error_message, option + " needs a number");
     return false;
   }
+  // 手写十进制解析而不用 strtoul/from_chars：两者都接受前导正负号，或者按
+  // "尽可能长的前缀"截断——"12abc" 会被解析成 12，正是要收掉的那类漂移。
   std::uint64_t result = 0;
   for (const char character : trimmed) {
     if (character < '0' || character > '9') {
@@ -360,6 +441,11 @@ bool ValidateScheduleForEnable(const ScheduleConfig& config,
                               error_message);
 }
 
+// ---- 运行结果的字符串键 ----
+//
+// 这四个 key 是**磁盘格式的一部分**（写进 schedule.json 的 history[].result），
+// 改名等于让历史文件读不回来：只能新增，不能重命名。
+// Key 与 Text 分工：Key 进文件、Text 进界面，两者不许互换。
 const char* ScheduleRunResultKey(ScheduleRunResult result) {
   switch (result) {
     case ScheduleRunResult::kSuccessCreated:
@@ -388,6 +474,8 @@ const char* ScheduleRunResultText(ScheduleRunResult result) {
   return "Failed";
 }
 
+// 未知 key 一律返回 false，由调用方报错；不做"不认识就当 failed"的兜底——
+// 静默归类会把一份格式错误的文件变成一条看起来正常的历史记录。
 bool ParseScheduleRunResultKey(const std::string& key,
                                ScheduleRunResult* result) {
   if (result == nullptr) return false;
@@ -412,9 +500,17 @@ bool ParseScheduleRunResultKey(const std::string& key,
 }
 
 // ---- 序列化 ----
+//
+// 手写 JSON 而不是引入第三方库：字段集合很小，而这里的顺序就是磁盘布局，
+// 需要完全可控——同一个 ScheduleDocument 必须永远序列化成同一串字节，
+// 否则"配置没改"也会被外层的文本比对判成改动。
+// 缩进固定 2 空格、每字段独占一行：这文件既要给人看，也要给 diff 看。
 
 namespace {
 
+// 下面这组 Append*Field 的 last 参数决定行尾是逗号还是换行：JSON 不允许
+// 尾随逗号，而"谁是最后一个字段"只有调用点知道，所以由调用方显式传。
+// 缩进由调用方先写一次（字段可以不在行首时用它），函数只负责字段本身。
 void AppendIndent(std::string* out, int depth) {
   out->append(static_cast<std::size_t>(depth) * 2, ' ');
 }
@@ -455,6 +551,8 @@ void AppendBoolField(std::string* out, const char* name, bool value,
   *out += last ? "\n" : ",\n";
 }
 
+// 空数组写成单行 "[]"，非空才展开多行：既让 diff 稳定，也让"没有规则"
+// 与"有规则"在文件里一眼可分。
 void AppendStringArrayField(std::string* out, const char* name,
                             const std::vector<std::string>& values, int depth,
                             bool last) {
@@ -476,6 +574,8 @@ void AppendStringArrayField(std::string* out, const char* name,
   *out += last ? "]\n" : "],\n";
 }
 
+// 四个计数字段恒定写出（0 也写）。读侧因此可以要求字段完全相等：
+// "少一个字段"与"这个值是 0"必须是两件不同的事。
 void AppendChangeFields(std::string* out, const ChangeSummary& changes,
                         int depth) {
   AppendIndent(out, depth);
@@ -488,6 +588,8 @@ void AppendChangeFields(std::string* out, const ChangeSummary& changes,
   AppendNumberField(out, "metadata_changed", changes.metadata_changed, false);
 }
 
+// 名录项的字段顺序同样是磁盘布局：只允许在末尾追加字段并提升 version，
+// 不允许重排、改名或省略。
 void AppendSnapshotField(std::string* out,
                          const ScheduledSnapshotRecord& record, int depth,
                          bool last) {
@@ -511,6 +613,8 @@ void AppendSnapshotField(std::string* out,
   *out += last ? "}\n" : "},\n";
 }
 
+// diagnostic 是这里唯一一段自由文本，由 WriteJsonString 负责转义，
+// 因此换行与引号不会破坏 JSON 结构；它的上界与"不许含密码"由写侧保证。
 void AppendHistoryField(std::string* out, const ScheduleHistoryEntry& entry,
                         int depth, bool last) {
   AppendIndent(out, depth);
@@ -534,6 +638,13 @@ void AppendHistoryField(std::string* out, const ScheduleHistoryEntry& entry,
 
 }  // namespace
 
+// 唯一的序列化入口。三条硬规则：
+//   * version 恒为 1 且是第一个字段——读侧先看版本，再决定其余字段怎么解；
+//   * config / state 下的字段集合与读侧的 k*Fields 列表必须逐字对应，
+//     增删字段要两边同时改，否则自己写的文件自己读不回来；
+//   * managed_snapshots / history 即使为空也写出来（"[]"），
+//     不靠"字段缺失即空数组"这种隐式约定。
+// 输出以换行结尾："文件末尾有没有换行"不构成版本差异。
 std::string SerializeScheduleDocument(const ScheduleDocument& document) {
   std::string out;
   out += "{\n";
@@ -639,9 +750,19 @@ std::string SerializeScheduleDocument(const ScheduleDocument& document) {
 //
 // 字段集合是"完全相等"的：少一个报 missing，多一个报 unknown。
 // 现场手改出来的、我们不认识的字段不会被静默忽略。
+//
+// 另外两条贯穿整个解析层的规则：
+//   * 解析只看文本、不碰文件系统——所以 schedule show 能把一份非法配置原样
+//     展示出来，而不是先被环境（目录不存在、仓库没配）挡住；
+//   * 任何失败都让 *document 保持默认值：调用方拿到的一定是"全有或全无"，
+//     不存在半份文件内容 + 半份默认值的混合体。
 
 namespace {
 
+// 这几张字段表就是本文件的 schema，字段名必须与 SerializeScheduleDocument
+// 写出的名字逐字一致；RequireExactFields 用它们同时判 missing 与 unknown。
+// 唯一的兼容口子是 kStateOptionalFields（历史版本追加的三个 baseline 字段），
+// 而且它只减不增：以后新增字段应提升 version，不要再开第二个可选列表。
 const std::vector<const char*> kRootFields = {"version", "config", "state"};
 const std::vector<const char*> kConfigFields = {
     "enabled",          "trigger",       "strategy",     "source_path",
@@ -650,7 +771,7 @@ const std::vector<const char*> kConfigFields = {
 const std::vector<const char*> kStateFields = {
     "next_run_time_sec", "last_success_time_sec", "last_manifest_entry_count",
     "managed_snapshots", "history"};
-// baseline 是在 review-fix 这一轮追加的。上一版写出的 schedule.json 没有这
+// baseline 是后来追加的字段。旧版写出的 schedule.json 没有这
 // 三个字段，它必须仍然读得进来（缺 baseline = 不知道 manifest 属于哪份快照
 // = 下一轮重建基线快照，语义上恰好就是安全的那个默认）。但"不在这两个列表
 // 里的 key"照样报 unknown，"kStateFields 里少一个"照样报 missing。
@@ -666,6 +787,8 @@ const std::vector<const char*> kHistoryFields = {
     "archive_file_name", "added",          "removed",         "modified",
     "metadata_changed",  "diagnostic"};
 
+// 解析错误的统一形状 "Invalid schedule store: <位置>: field '<key>' ..."。
+// 位置用 state.managed_snapshots[3] 这类路径式写法，用户能直接定位到字段。
 bool BadField(const std::string& what, const char* key,
               const std::string& detail, std::string* error_message) {
   SetError(error_message, "Invalid schedule store: " + what + ": field '" +
@@ -675,6 +798,7 @@ bool BadField(const std::string& what, const char* key,
 
 // 可选字符串字段：完全不出现就保持默认（空串），出现了就必须是合法字符串。
 // 只有 kStateOptionalFields 里的字段会走这里。
+// 可选的只是"允许缺失"，不是"允许不合法"：出现了就按完整规则校验。
 bool RequireOptionalString(const JsonValue& object, const char* key,
                            const std::string& what, std::string* out,
                            std::string* error_message) {
@@ -687,6 +811,10 @@ bool RequireOptionalString(const JsonValue& object, const char* key,
   return true;
 }
 
+// 四个计数各有上界（kMaxManifestEntries），但刻意**不**交叉校验
+// added+removed+modified 是否等于名录项的 entry_count：两者由不同的扫描
+// 路径产出，强行相等会让扫描口径一改，历史文件就集体读不回来。
+// 这里只保证每个数值本身可用。
 bool ParseChangeFields(const JsonValue& object, const std::string& what,
                        ChangeSummary* changes, std::string* error_message) {
   if (!RequireUint64(object, "added", what, kMaxManifestEntries,
@@ -705,6 +833,10 @@ bool ParseChangeFields(const JsonValue& object, const std::string& what,
                        &changes->metadata_changed, error_message);
 }
 
+// config 段：先要求字段集合完全相等，再逐字段解析。枚举一律走 Parse*Key
+// （精确匹配字符串），不做大小写折叠、不接受别名；未知取值直接报错而不是
+// 回落到默认值——静默回落会把一份写错的配置变成一份"看着正常、行为不同"
+// 的计划，用户永远不会发现。
 bool ParseConfig(const JsonValue& root, ScheduleConfig* config,
                  std::string* error_message) {
   const JsonValue* object = nullptr;
@@ -788,6 +920,8 @@ bool ParseConfig(const JsonValue& root, ScheduleConfig* config,
         error_message);
   }
 
+  // 规则条数与单条长度在这里再查一遍：Save() 侧查过，但读进来的文件可能
+  // 根本没过过 Save()（手改、别的版本写的），读侧不能假设它守规矩。
   if (!RequireStringArray(*object, "include_rules", "config",
                           &config->include_rules, error_message)) {
     return false;
@@ -825,6 +959,10 @@ bool ParseConfig(const JsonValue& root, ScheduleConfig* config,
   return true;
 }
 
+// 名录项：file_name 必须是"单组件 + .bak"的归档名，因为它随后会被交给
+// BackupCatalog 去 Resolve/Delete——本文件绝不放行带 '/'、'\' 或 ".." 的值。
+// entry_count / archive_size 的上界取 1<<62 而不是 uint64 的最大值：
+// 这两个数还会参与界面上的加法与格式化，留出余量，避免在别处回绕。
 bool ParseSnapshot(const JsonValue& value, const std::string& what,
                    ScheduledSnapshotRecord* record,
                    std::string* error_message) {
@@ -885,6 +1023,9 @@ bool ParseSnapshot(const JsonValue& value, const std::string& what,
   return true;
 }
 
+// history 项：archive_file_name 允许为空（失败的那一轮没有产物），但非空时
+// 同样必须是可管理的归档名。diagnostic 是有界的自由文本，写它的调用方
+// 负责不把密码放进去——那是 schedule_store.h 里写死的硬约束。
 bool ParseHistoryEntry(const JsonValue& value, const std::string& what,
                        ScheduleHistoryEntry* entry,
                        std::string* error_message) {
@@ -943,6 +1084,10 @@ bool ParseHistoryEntry(const JsonValue& value, const std::string& what,
   return true;
 }
 
+// state 段：三个数值字段必填，baseline 三件套可选（缺失 = 没记录过基线）。
+// 两个数组的上界与 Save() 侧一致（kMaxRetainCount / kMaxHistoryEntries）：
+// 读侧一旦比写侧更严，就会出现"自己写的文件自己读不回来"，
+// 而 Save() 的上界又与调用方真正会产出的长度绑定（见 schedule_store.h）。
 bool ParseState(const JsonValue& root, ScheduleState* state,
                 std::string* error_message) {
   const JsonValue* object = nullptr;
@@ -1037,6 +1182,9 @@ bool ParseState(const JsonValue& root, ScheduleState* state,
   return true;
 }
 
+// 版本闸门放在最前面：version 不认识就直接失败，绝不做"尽力解析"。
+// 未来版本写出的文件里，我们读不懂的字段很可能改变语义，猜着用比拒绝危险。
+// 解析在局部 loaded 上完成，全部成功后才 move 进 *document，避免半成品。
 bool ParseDocument(const std::string& text, ScheduleDocument* document,
                    std::string* error_message) {
   JsonValue root;
@@ -1070,9 +1218,15 @@ bool ParseDocument(const std::string& text, ScheduleDocument* document,
 
 // ---- ScheduleStore ----
 
+// 构造函数只保存路径，不做任何 I/O：对象可以自由拷贝、放进容器，
+// 真正的读写全部发生在 Load/Save/LoadManifest/SaveManifest 里，且都是 const。
 ScheduleStore::ScheduleStore(std::string schedule_file_path)
     : schedule_file_path_(std::move(schedule_file_path)) {}
 
+// manifest 的路径由 schedule.json 派生：先剥掉末尾的 ".json" 再拼
+// "-manifest.dat"。派生规则只有这一处，所以"配置放哪"与"清单放哪"
+// 不可能分叉。副作用是 "a.json" 与 "a" 会派生出同一个 manifest 路径，
+// 调用方不该把这两个路径当成两份互不相干的计划。
 std::string ScheduleStore::manifest_file_path() const {
   std::string base = schedule_file_path_;
   const std::string suffix = ".json";
@@ -1083,10 +1237,19 @@ std::string ScheduleStore::manifest_file_path() const {
   return base + "-manifest.dat";
 }
 
+// 锁文件与数据文件分开：flock 需要一个长期稳定的 fd，而不是数据文件本身
+// （原子替换会把数据文件的 inode 换掉，锁也就跟着丢了）。
+// 这个文件只有 flock 语义，内容永远为空，也不属于任何快照的副文件。
 std::string ScheduleStore::lock_file_path() const {
   return schedule_file_path_ + ".lock";
 }
 
+// 读配置。三种结果各有明确语义：
+//   kLoaded  —— *document 是文件内容的忠实映射；
+//   kMissing —— 文件不存在，*document 保持默认值（disabled、每小时、留 12）；
+//   kError   —— 文件在但不可用：*document 同样是默认值，但调用方**必须**把
+//               error_message 报出去，不许假装这是首次运行。
+// 进函数先复位 *document：失败路径上不会留下上一次调用的残留。
 ScheduleLoadStatus ScheduleStore::Load(ScheduleDocument* document,
                                        std::string* error_message) const {
   if (error_message != nullptr) error_message->clear();
@@ -1119,6 +1282,14 @@ ScheduleLoadStatus ScheduleStore::Load(ScheduleDocument* document,
   return ScheduleLoadStatus::kLoaded;
 }
 
+// 保存配置。步骤顺序是刻意的：
+//   1. 结构校验（ValidateScheduleConfig）——一份"写下去就读不回来"的配置
+//      比一次明确的失败糟得多；
+//   2. 名录 / history / baseline 的上界与命名检查——这些字段不在
+//      ValidateScheduleConfig 的职责里（它只管 config），必须单独把住；
+//   3. 建父目录，覆盖"首次运行"与"应用配置目录被清空过"两种情况；
+//   4. 原子替换：临时文件 + fsync + rename，权限固定 0600。
+// 失败语义：任何一步失败都不写盘，磁盘上原有的文件保持原样。
 bool ScheduleStore::Save(const ScheduleDocument& document,
                          std::string* error_message) const {
   if (error_message != nullptr) error_message->clear();
@@ -1184,6 +1355,9 @@ bool ScheduleStore::Save(const ScheduleDocument& document,
       schedule_file_path_, SerializeScheduleDocument(document), error_message);
 }
 
+// 两个方向都是纯字段搬运，不做任何规范化或补全：这里是"我以为 baseline
+// 是谁"与"文件自己说属于谁"之间唯一的桥。任何一边偷偷填空，都会让
+// SameBaselineBinding 的"空即不一致"结论失效。
 ManifestBinding BindingOf(const ScheduleBaseline& baseline) {
   ManifestBinding binding;
   binding.snapshot_file_name = baseline.snapshot_file_name;
@@ -1200,6 +1374,8 @@ ScheduleBaseline BaselineOf(const ManifestBinding& binding) {
   return baseline;
 }
 
+// 逐字段比较而不是比较序列化后的整体文本：字段顺序与书写形式不该参与
+// 归属判断，只有三个语义值都相同才算同一对。
 bool SameBaselineBinding(const ScheduleBaseline& baseline,
                          const ManifestBinding& binding) {
   // version 1 的 manifest 没有归属信息。空 binding 与空 baseline 都是
@@ -1211,6 +1387,10 @@ bool SameBaselineBinding(const ScheduleBaseline& baseline,
          baseline.source_path == binding.source_path;
 }
 
+// 读源清单。kMissing 同时覆盖"从来没写过"与"文件被删了"——两者都等于
+// **没有可信基线**，调用方据此重建完整基线快照，而不是假装没有变化。
+// kError（文件在但坏了）同样不可信，区别只在于调用方要把 error_message
+// 记进诊断，不能假装无事发生。
 ScheduleStore::ManifestLoadStatus ScheduleStore::LoadManifest(
     std::vector<ManifestEntry>* entries, ManifestBinding* binding,
     std::string* error_message) const {
@@ -1257,6 +1437,10 @@ ScheduleStore::ManifestLoadStatus ScheduleStore::LoadManifest(
   return ManifestLoadStatus::kLoaded;
 }
 
+// 写源清单。归属（快照名 + 仓库 identity + 源路径）必须完整且合法，否则
+// 拒绝写入：一份"不知道自己属于谁"的 manifest 会被读侧判成不可信，
+// 落盘只是占地方，还会让下一轮误以为"仓库里有清单可查"。
+// 序列化、字节上界、原子替换三层依次把关，最后一步才碰磁盘。
 bool ScheduleStore::SaveManifest(const std::vector<ManifestEntry>& entries,
                                  const ManifestBinding& binding,
                                  std::string* error_message) const {
@@ -1305,6 +1489,10 @@ bool ScheduleStore::SaveManifest(const std::vector<ManifestEntry>& entries,
                                       error_message);
 }
 
+// 删除源清单（例如重建基线之前先作废旧清单）。语义是幂等的：文件本来就
+// 不存在（ENOENT）也算成功——"让这个文件不存在"这个后置条件已经满足。
+// 这里不做目录 fsync：最坏情况是崩溃后旧清单还在，而它带着完整 binding，
+// 读侧与当前 baseline 一比就会发现对不上，结论仍然是"没有可信基线"。
 bool ScheduleStore::RemoveManifest(std::string* error_message) const {
   if (error_message != nullptr) error_message->clear();
   if (schedule_file_path_.empty()) {

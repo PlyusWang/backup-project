@@ -116,7 +116,7 @@ QVariantMap RecordToVariant(const backupproject::BackupRecord& record) {
                                           : QString());
   // 只表示"恢复这份归档需要密码"。列表阶段没有、也不该有密码。
   item.insert(QStringLiteral("passwordRequired"), record.password_required);
-  // PR #18：快照种类与依赖链状态。界面据此显示"完整 / 增量"、父快照，
+  // 快照种类与依赖链状态。界面据此显示"完整 / 增量"、父快照，
   // 以及在链断掉时如实说明"这份现在恢复不了"，而不是等用户点了才失败。
   item.insert(QStringLiteral("recordKind"), record.incremental_delta
                                                 ? QStringLiteral("delta")
@@ -143,8 +143,8 @@ QVariantList RecordsToVariantList(
 
 // ---- 展示文案表：只回答"界面上怎么叫" ----
 //
-// PR #16 时这三张表同时承担了"key <-> enum 映射"和"中文展示文案"两件事，
-// 于是 CLI 想用同一套 key 就只能再抄一遍。PR #17 把映射提取到 Qt 无关的
+// 这三张表曾经同时承担"key <-> enum 映射"和"中文展示文案"两件事，
+// 于是 CLI 想用同一套 key 就只能再抄一遍。现在映射提取到 Qt 无关的
 // 共享核心 include/backup_option_keys.h：
 //
 //   CLI、ScheduleStore、Modern GUI 读的是同一张表。
@@ -627,7 +627,7 @@ bool BackupController::saveRepositoryPath(const QString& path) {
 
 // ---- 备份 / 恢复 / 删除 ----
 
-// 旧入口 = MyPack + 不压缩 + 不加密。保留它是为了让 PR #15 的自动测试、
+// 旧入口 = MyPack + 不压缩 + 不加密。保留它是为了让既有的自动测试、
 // main.cpp 的自测链路、以及任何还没更新的调用方一字不改地继续工作。
 bool BackupController::startBackup() {
   return startBackupWithOptions(QStringLiteral("mypack"),
@@ -635,7 +635,7 @@ bool BackupController::startBackup() {
                                 QString(), QString());
 }
 
-// 旧入口 = full 策略。行为与 PR #17 完全一致。
+// 旧入口 = full 策略。行为与带算法选择的入口完全一致。
 bool BackupController::startBackupWithOptions(const QString& pack_key,
                                               const QString& compression_key,
                                               const QString& encryption_key,
@@ -865,7 +865,7 @@ bool BackupController::startManagedRestore(const QString& file_name,
     return false;
   }
   // 辨认失败不在这里拦：那个坏文件应该由真正的恢复路径给出它自己的诊断，
-  // 免得同一个文件出现两套措辞。行为与 PR #15 一致。
+  // 免得同一个文件出现两套措辞。保持既有行为不变。
   OperationRequest request;
   request.kind = Kind::kRestore;
   request.first_path = QString::fromStdString(archive_path);
@@ -1146,7 +1146,7 @@ OperationOutcome BackupController::RunOperation(OperationRequest request) {
              // （产品一直能恢复历史 v0.1，这条能力不因为增量而消失）。
              backupproject::ClassifySnapshotFile(first, nullptr) !=
                  backupproject::SnapshotFileKind::kUnknown) {
-    // PR #18：GUI 的恢复也走依赖链入口 —— 目标是一份完整快照时行为与以前
+    // GUI 的恢复也走依赖链入口 —— 目标是一份完整快照时行为与以前
     // 完全一致，是 delta 时自动把 base 与中间层一起应用。
     backupproject::RestoreReport report;
     outcome.succeeded = backupproject::RestoreSnapshotChain(

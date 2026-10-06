@@ -2,6 +2,28 @@
 //
 // 见 include/realtime_backup_service.h。
 
+// 模块职责：把"一次已经稳定的 realtime 触发"落成一次真实备份，并为产出的快照
+// 写下可验证的归属。这里只做编排：Full 走 BackupEngine，Incremental 走
+// RunIncrementalBackup，淘汰走 BackupCatalog::DeleteSnapshots。
+//
+// 明确不做：不监听文件系统、不决定何时触发、不自己实现扫描 / 打包 / 压缩 /
+// 加密。那些都在 watcher、trigger 与 archive 层。
+//
+// 数据流：RealtimeEventSummary -> RunRealtimeBackupOnce -> .bak 归档
+//   -> LoadVerifiedSnapshotIdentity（只信实际字节）-> <snapshot>.realtime
+//   -> RunRealtimeRetention（依赖感知淘汰）。归属只有 per-snapshot marker
+//   一个来源，没有中央可变 state 文件，因此不存在"监听目录时状态文件改到
+//   自己"的回环。
+//
+// 不变量：marker 的 snapshot_id 必须等于从归档字节算出的 verified id；一份
+//   marker 只属于同名 .bak；archive 先发布，marker 后发布。
+//
+// 失败边界：全部函数返回 bool + error_message，不抛异常。归档写成而 marker
+//   写失败时降级为"成功 + warning"，并放弃破坏性 retention：宁可少删，也不能
+//   在归属不可信时删。
+//
+// 线程：本文件没有跨调用的全局状态（唯一例外是测试开关），也不缓存 fd；
+//   并发调用需要调用方自己串行化。
 #include "realtime_backup_service.h"
 
 #include <dirent.h>
@@ -29,24 +51,38 @@ namespace backupproject {
 
 namespace {
 
+// 统一的错误出口：error_message 允许为 null（有的调用方不关心原因），但所有
+// 公开函数都遵守"返回 false 时，若给了 error_message 就填上人能读懂的原因"
+// 这条契约，调用方据此决定是重试、降级报 warning，还是中断整次备份。
 void SetError(std::string* error_message, const std::string& text) {
   if (error_message != nullptr) *error_message = text;
 }
 
+// strerror 返回进程内静态缓冲，多线程下会被覆盖，所以立刻拷进 std::string，
+// 绝不把 const char* 存下来延迟使用。理论上它也可能返回 null，那时退化成
+// "errno N"，宁可少信息也不要空指针解引用。
 std::string ErrnoText(int error_number) {
   const char* text = ::strerror(error_number);
   return text == nullptr ? std::string("errno ") + std::to_string(error_number)
                          : std::string(text);
 }
 
+// 只拼接，不做规范化、不解析 ".."：调用方必须保证 name 已经是单组件名字
+// （见 IsManagedBackupFileName），否则这里就是一条路径穿越通道。
 std::string JoinPath(const std::string& directory, const std::string& name) {
   if (directory.empty()) return name;
   if (directory.back() == '/') return directory + name;
   return directory + "/" + name;
 }
 
+// 测试接缝：让下一次 marker 发布故意失败，用来验证"归档成功 + marker 失败"
+// 这条降级路径（成功但带 warning，且不执行破坏性 retention）。进程级变量，
+// 只有测试会设置，生产路径永远读到 false。
 bool g_marker_write_failure_for_testing = false;
 
+// marker 是逐行的 key=value 文本，换行就是记录分隔符。POSIX 路径可以含换行
+// 与反斜杠，写入前必须转义，否则一个带换行的值能把后面几行"伪造"成别的
+// 字段。转义表刻意保持最小：反斜杠、\n、\r、\t，其余字节原样透传。
 std::string EscapeField(const std::string& value) {
   std::string out;
   out.reserve(value.size());
@@ -71,6 +107,9 @@ std::string EscapeField(const std::string& value) {
   return out;
 }
 
+// 转义的反向操作，比写侧严格：不认识的转义序列、结尾孤立的反斜杠一律返回
+// false。宽松解码会把坏字节变成另一个合法值，读侧拿到的就不是磁盘上的真实
+// 内容了。
 bool UnescapeField(const std::string& text, std::string* value) {
   value->clear();
   value->reserve(text.size());
@@ -100,6 +139,8 @@ bool UnescapeField(const std::string& text, std::string* value) {
   return true;
 }
 
+// 一条记录固定是 key=value 加换行；值先转义再拼接。AppendNumber 只是把整数
+// 转成十进制文本走同一条路径，保证写出来的东西读侧能原样解析回来。
 void AppendField(std::string* out, const char* key, const std::string& value) {
   *out += key;
   *out += "=";
@@ -111,6 +152,9 @@ void AppendNumber(std::string* out, const char* key, std::uint64_t value) {
   AppendField(out, key, std::to_string(value));
 }
 
+// 手写十进制解析，不用 strtoull：后者会接受前导空白、'+' 与 "0x" 前缀，
+// 还用 ERANGE 而不是返回值表示溢出。marker 里的数字要么全是数字要么拒绝；
+// 溢出在乘之前用 (UINT64_MAX - digit) / 10 判断，不依赖回绕行为。
 bool ParseUint64(const std::string& text, std::uint64_t* value) {
   if (text.empty() || text.size() > 20) return false;
   std::uint64_t result = 0;
@@ -124,6 +168,8 @@ bool ParseUint64(const std::string& text, std::uint64_t* value) {
   return true;
 }
 
+// 只接受可选的 '-' 前缀：不接受 '+'、空白，也不接受 -2^63（magnitude 上限
+// 取 INT64_MAX）。可解析的范围窄一点没关系，宽一点才是风险。
 bool ParseInt64(const std::string& text, std::int64_t* value) {
   if (text.empty()) return false;
   bool negative = false;
@@ -140,6 +186,11 @@ bool ParseInt64(const std::string& text, std::int64_t* value) {
   return true;
 }
 
+// 读一份 marker 文件。仓库目录是用户可写的，所以按不可信输入对待：O_NOFOLLOW
+// 阻止别人用符号链接把读取引到别处；fstat + S_ISREG 确认是普通文件；先按
+// kMaxRealtimeMarkerBytes 卡大小上限，避免被超大文件撑爆内存。读取循环处理
+// EINTR 与短读，最后要求 fstat 的大小与实际读到的字节数一致，少一个字节就
+// 算 truncated —— 半份内容比没有内容更危险。
 bool ReadWholeFile(const std::string& path, std::string* text,
                    std::string* error_message) {
   const int fd = ::open(path.c_str(), O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
@@ -187,10 +238,17 @@ void SetRealtimeMarkerWriteFailureForTesting(bool fail) {
   g_marker_write_failure_for_testing = fail;
 }
 
+// marker 与它描述的归档同名，只加后缀：归属关系写进文件名本身，于是"找某份
+// 快照的 marker"是一次字符串拼接，而不是去解析某个索引文件。
 std::string RealtimeMarkerFileName(const std::string& snapshot_file_name) {
   return snapshot_file_name + kRealtimeMarkerSuffix;
 }
 
+// 判断一个目录项是不是本项目的 marker，并回填它描述的 .bak 名字。
+// 三层过滤缺一不可：长度必须大于后缀（".realtime" 本身不是 marker）、后缀
+// 必须匹配、去掉后缀后必须是受管理的备份文件名。第三条是安全边界：仓库里
+// 用户自己放的 notes.realtime / report.realtime / foo.txt.realtime 都不算
+// "我们的"，不会被列出，更不会被 retention 删掉。
 bool IsRealtimeMarkerFileName(const std::string& file_name,
                               std::string* snapshot_file_name) {
   const std::size_t suffix_len = ::strlen(kRealtimeMarkerSuffix);
@@ -207,6 +265,13 @@ bool IsRealtimeMarkerFileName(const std::string& file_name,
   return true;
 }
 
+// 序列化结果就是磁盘格式：首行固定 header，其后每行一个 key=value，字段顺序
+// 由这里决定并与 ParseRealtimeMarker 的 kRequired 表一一对应。值是文本，所以
+// 空值也会写出来（写侧永远写全 17 个 key，读侧要求全在）。
+//
+// 兼容性约束：解析器对未知 key 直接拒绝，因此这个格式不是前向兼容的。加字段
+// 要么同时升级 header 版本号，要么保证旧版本永远不会读到新 marker；只加字段
+// 不改版本会让老程序把新 marker 判成坏数据。
 std::string SerializeRealtimeMarker(const RealtimeMarker& marker) {
   std::string out = kRealtimeMarkerHeader;
   AppendField(&out, "snapshot_file_name", marker.snapshot_file_name);
@@ -231,6 +296,18 @@ std::string SerializeRealtimeMarker(const RealtimeMarker& marker) {
   return out;
 }
 
+// 严格白名单解析，任何一处可疑都返回 false，绝不"尽力解析"：header 必须逐
+// 字节匹配；每行必须有 '='；未知 key 拒绝；同一个 key 出现两次也拒绝（否则
+// 后一个值会静默覆盖前一个）；kRequired 里的 17 个 key 一个都不能少。
+//
+// 每个值都做类型校验：摘要必须正好 64 个十六进制字符（IsContentDigest）、
+// 枚举 key 必须能被 ParseXxxKey 认出来、布尔只能是 "0"/"1"、计数必须能按
+// 无符号十进制解析。
+//
+// 收尾还有两道语义检查：snapshot_file_name 必须是受管理的备份名（否则会被
+// JoinPath 当成路径拼接），outcome_kind 必须是四个已知取值之一。全部通过才
+// 算可信；调用方拿到 false 时必须把这份 marker 当不可信数据，既不显示成
+// 正常记录，更不能据此做删除。
 bool ParseRealtimeMarker(const std::string& text, RealtimeMarker* marker,
                          std::string* error_message) {
   if (marker == nullptr) {
@@ -404,6 +481,17 @@ bool ParseRealtimeMarker(const std::string& text, RealtimeMarker* marker,
   return true;
 }
 
+// 发布 marker，语义是"要么完整可见，要么完全不存在"。
+//
+// 1) 先序列化，再用自己的 parser 回读一遍：写出去的东西自己都读不回来时
+//    宁可不写。一份坏 marker 会让快照在列表里变成"不可验证"，比没有更糟。
+// 2) 写同目录临时文件 <path>.tmp（先 unlink 上次可能残留的那份），O_EXCL
+//    创建、权限 0600，避免两个写者交错写同一个文件。
+// 3) fsync + close 之后才 rename 覆盖目标：rename 在同一文件系统内原子，
+//    于是崩溃只会留下 .tmp，不会留下半截 marker。
+// 4) 任何一步失败都 unlink 临时文件再返回 false，由调用方降级处理。这里不
+//    fsync 父目录：掉电最坏的结果是 marker 消失（归档仍在，只是没人认领），
+//    而不是出现一份半截的、看起来可信的 marker。
 bool WriteRealtimeMarker(const std::string& repository_directory,
                          const RealtimeMarker& marker,
                          std::string* error_message) {
@@ -470,6 +558,10 @@ bool WriteRealtimeMarker(const std::string& repository_directory,
   return true;
 }
 
+// 读单份 marker，并确认它确实属于请求的那份快照。两道校验：入参先过
+// IsManagedBackupFileName（JoinPath 不做净化，这里是唯一的路径边界），读完
+// 再比对 marker 里的 snapshot_file_name —— 把 B 的 marker 复制成 A 的名字，
+// 不会让 A 因此变得可信。
 bool LoadRealtimeMarker(const std::string& repository_directory,
                         const std::string& snapshot_file_name,
                         RealtimeMarker* marker, std::string* error_message) {
@@ -492,6 +584,16 @@ bool LoadRealtimeMarker(const std::string& repository_directory,
   return true;
 }
 
+// 列出仓库里全部 realtime 快照，并尽量给出"这一条能不能信"的结论。
+//
+// 流程：BackupCatalog::List 取受管理的 .bak 全表 -> readdir 并排序，逐个识别
+// marker 名 -> LoadRealtimeMarker（严格解析）-> LoadVerifiedSnapshotIdentity
+// 从实际归档字节算出 id 与 marker 比对 -> 与 catalog 记录 JOIN 补大小/mtime。
+//
+// 失败语义是这里最要紧的一点：返回 false 只表示目录级失败（catalog 读不了、
+// opendir/readdir 出错）。单份 marker 坏了只是那条记录 verified=false 并带上
+// diagnostic，仍然返回给调用方，让上层自己决定"跳过这一份"还是"这轮什么都
+// 别删"。
 bool ListRealtimeSnapshots(const std::string& repository_directory,
                            std::vector<RealtimeSnapshotRecord>* records,
                            std::string* error_message) {
@@ -601,6 +703,22 @@ bool ListRealtimeSnapshots(const std::string& repository_directory,
   return true;
 }
 
+// 对"当前 job 自己的"实时快照做一次依赖感知淘汰。返回 true 不代表删了东西，
+// 只代表这一轮得出了确定结论，结论写在 result 里；返回 false 仅用于 result
+// 为空这种编程错误——retention 的任何不顺利都不该把整次备份判成失败。
+//
+// 每一步的取舍：
+//   1) 先列快照。列不出来 -> uncertain + 什么都不删：不删只是留垃圾，误删
+//      是不可恢复的。
+//   2) 只要有一份 marker 无法验证，整轮 no-op：归属都判断不了就做破坏性操作
+//      等于把"不确定"变成"可能删错"。
+//   3) 只把 job_identity 与当前配置相同的快照当候选；别的 job（换过源、换过
+//      算法）建的快照是别人的东西，不自动淘汰，用户仍可手工删。
+//   4) 候选数不超过保留数就直接结束；否则交给 PlanDependencyAwareRetention
+//      算 keep_visible / keep_ancestors / remove，删除交给 DeleteSnapshots
+//      （descendants-first，先后代后祖先，链不会被删断）。
+//   5) remove 为空但不确定标志为 false 是正常结果，不是警告：最新恢复点依赖
+//      全部祖先，这一轮本来就没有可删的。
 bool RunRealtimeRetention(const std::string& repository_directory,
                           const std::string& job_identity,
                           std::uint32_t retain_count,
@@ -687,6 +805,22 @@ bool RunRealtimeRetention(const std::string& repository_directory,
   return true;
 }
 
+// 执行一次已经稳定的 realtime 触发。events 只描述事件层面发生了什么（计数、
+// 溢出、是否需要 resync），它不会被当成"改了几个文件"——真正的变更统计来自
+// 增量引擎返回的 ChangeSummary。
+//
+// 顺序与失败语义：
+//   1) 先 ValidateRealtimeConfig；配置不合法直接 kFailed，不碰仓库。
+//   2) 算三个身份摘要：source（哪棵树）、filter（哪套规则）、job（配置组合）。
+//      job_identity 是归属键，retention 只淘汰与它相同的快照，所以它必须与
+//      watcher/store 用同一套算法算出来，否则会认不出自己的快照。
+//   3) 编译 Filter（共享 BuildRealtimeFilter，规则编译只有这一处实现），
+//      再 EnsureRepository —— 自动触发可以顺手把仓库布局补齐。
+//   4) Full 走 BackupEngine；Incremental 走 RunIncrementalBackup，baseline /
+//      delta / no-change 三选一由它决定。no-changes 直接返回：什么都没写，
+//      也就没有 marker、没有 retention。
+//   5) 写完归档先验证身份再写 marker；marker 失败降级为成功 + warning；
+//      最后做 retention。每一步的具体理由见对应代码块上方的注释。
 bool RunRealtimeBackupOnce(const RealtimeConfig& config,
                            const std::string& repository_path,
                            const std::string& repository_identity,
@@ -792,6 +926,9 @@ bool RunRealtimeBackupOnce(const RealtimeConfig& config,
   // 快照真的写出来了才填名字：调用方（CLI / GUI）要用它去 list / restore。
   outcome->snapshot_file_name = snapshot_file_name;
 
+  // marker 只记录"从归档字节验证过的"身份，不采信 header 或 envelope 的声明值：
+  // 声明值可以被写坏，字节不会。验证失败是硬错误（不能把不可信的东西写成
+  // realtime 快照），但归档保留 —— 它仍可 list / restore / 手工删除。
   // ---- marker：必须绑定**实际 archive bytes** ----
   SnapshotIdentity identity;
   std::string identity_error;
@@ -807,6 +944,9 @@ bool RunRealtimeBackupOnce(const RealtimeConfig& config,
     return false;
   }
 
+  // 字段来源分三类，别混：snapshot_id 来自刚才的字节验证；created_time_sec /
+  // event_count / 溢出与 resync 标志来自本次触发，是"当时发生了什么"的取证；
+  // added/removed/modified/metadata_changed 只对增量有意义，Full 时保持 0。
   RealtimeMarker marker;
   marker.snapshot_file_name = snapshot_file_name;
   marker.snapshot_id = identity.snapshot_id;
@@ -853,7 +993,10 @@ bool RunRealtimeBackupOnce(const RealtimeConfig& config,
   }
   outcome->marker_written = true;
 
-  // ---- retention：复用 PR #18 的依赖感知计划 + descendants-first 删除 ----
+  // retention 是尽力而为的收尾：它失败不影响"备份已经成功"这个结论，只把原因
+  // 追加进 diagnostic 让用户知道旧版本没清干净。注意它只在 marker 写成功之后
+  // 才执行 —— 没有 marker 就没有可信归属，也就不能删任何东西。
+  // ---- retention：复用共享的依赖感知计划 + descendants-first 删除 ----
   RealtimeRetentionResult retention;
   std::string retention_error;
   if (RunRealtimeRetention(repository_path, job_identity, config.retain_count,
