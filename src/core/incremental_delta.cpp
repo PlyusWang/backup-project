@@ -719,63 +719,9 @@ bool ReadDeltaEnvelope(const std::string& delta_file, DeltaEnvelope* envelope,
              "Cannot open delta " + delta_file + ": " + ErrnoText(errno));
     return false;
   }
-  unsigned char header[kDeltaFixedHeaderSize] = {0};
-  std::size_t filled = 0;
-  while (filled < sizeof(header)) {
-    const ssize_t got = ::read(fd, header + filled, sizeof(header) - filled);
-    if (got < 0) {
-      if (errno == EINTR) continue;
-      const std::string text = ErrnoText(errno);
-      ::close(fd);
-      SetError(error_message, "Cannot read delta header: " + text);
-      return false;
-    }
-    if (got == 0) break;
-    filled += static_cast<std::size_t>(got);
-  }
-  if (filled < sizeof(header)) {
-    ::close(fd);
-    SetError(error_message, "Invalid delta: the fixed header is truncated");
-    return false;
-  }
-  if (!LooksLikeDelta(header, sizeof(header))) {
-    ::close(fd);
-    SetError(error_message,
-             "Invalid delta: wrong magic (this file is not a BKPINC1 delta)");
-    return false;
-  }
-  const std::uint16_t version =
-      static_cast<std::uint16_t>(header[8] | (header[9] << 8));
-  const std::uint16_t fixed_size =
-      static_cast<std::uint16_t>(header[10] | (header[11] << 8));
-  const std::uint32_t envelope_len =
-      static_cast<std::uint32_t>(header[12]) |
-      (static_cast<std::uint32_t>(header[13]) << 8) |
-      (static_cast<std::uint32_t>(header[14]) << 16) |
-      (static_cast<std::uint32_t>(header[15]) << 24);
-  std::uint64_t payload_len = 0;
-  for (int index = 0; index < 8; ++index) {
-    payload_len |= static_cast<std::uint64_t>(header[16 + index])
-                   << (8 * index);
-  }
-  if (version != kDeltaFormatVersion || fixed_size != kDeltaFixedHeaderSize) {
-    ::close(fd);
-    SetError(error_message,
-             "Invalid delta: unsupported format version or header size");
-    return false;
-  }
-  if (envelope_len == 0 || envelope_len > kMaxDeltaEnvelopeBytes) {
-    ::close(fd);
-    SetError(error_message, "Invalid delta: implausible envelope length");
-    return false;
-  }
-  if (payload_len == 0 || !IsAllowedStreamSize(payload_len)) {
-    ::close(fd);
-    SetError(error_message, "Invalid delta: implausible payload length");
-    return false;
-  }
-
-  // 文件长度必须正好等于 header + envelope + payload：多一个字节都不接受。
+  // 定长头的规则只有一份实现（ReadDeltaLayout）：magic / version /
+  // header size / envelope 上界 / payload 上界 / 文件长度必须正好等于三段之和。
+  // 这里再把它拄一遍就会出现第二套校验强度。
   struct stat info;
   if (::fstat(fd, &info) != 0) {
     const std::string text = ErrnoText(errno);
@@ -783,14 +729,19 @@ bool ReadDeltaEnvelope(const std::string& delta_file, DeltaEnvelope* envelope,
     SetError(error_message, "Cannot stat delta: " + text);
     return false;
   }
-  const std::uint64_t expected =
-      static_cast<std::uint64_t>(kDeltaFixedHeaderSize) + envelope_len +
-      payload_len;
-  if (static_cast<std::uint64_t>(info.st_size) != expected) {
+  DeltaLayout layout;
+  if (!ReadDeltaLayout(fd, static_cast<std::uint64_t>(info.st_size), &layout,
+                       error_message)) {
     ::close(fd);
-    SetError(error_message,
-             "Invalid delta: file size does not match the declared envelope "
-             "and payload lengths");
+    return false;
+  }
+  const std::uint32_t envelope_len = layout.envelope_len;
+  // ReadDeltaLayout 用 pread（不动文件偏移），而下面读信封走的是顺序 read，
+  // 所以必须显式把偏移摆到定长头之后。
+  if (::lseek(fd, static_cast<off_t>(kDeltaFixedHeaderSize), SEEK_SET) < 0) {
+    const std::string text = ErrnoText(errno);
+    ::close(fd);
+    SetError(error_message, "Cannot seek to the delta envelope: " + text);
     return false;
   }
 
