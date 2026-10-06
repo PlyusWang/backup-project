@@ -19,8 +19,9 @@
 
 升级过程做的是：停服务 → 替换包内文件 → `daemon-reload` → 重新自检配置 →
 启动服务。包的 `prerm` 在**升级**时不停服务，停与启由 systemd 的重启完成，
-所以不会出现"二进制换了、服务没起来"的中间态；即使新二进制起不来，systemd 会
-留在 failed 状态并保留 `journalctl` 日志，旧版本随时可以用同一个 `.deb` 装回去。
+所以不会出现「二进制换了、服务没起来」的中间态。新版本如果起不来（配置自检失败 /
+没进入 active / 回环端口没监听），`postinst` 会**自动把程序载荷换回升级前的版本**、
+重启并验证，然后把这次升级报成失败 —— 见第 5 节与第 6 节。
 
 升级**不会**发生的事：
 
@@ -49,21 +50,43 @@
 
 ## 5. 回滚
 
-    sudo apt install ./backup-project-server_<旧版本>_amd64.deb
+**升级失败时不用你动手**：`postinst` 会先把程序载荷换回升级前的版本、重启并验证，然后带着
+非零退出码失败（`packaging/ci-upgrade-rollback-test.sh` 就是这条路径的验收）。它用的是
+`preinst` 在升级前留下的材料 `/var/cache/backup-project-server/rollback/`：只含二进制、
+入口脚本、unit 与 tmpfiles 片段，来源是 dpkg 的旧包文件清单，每个文件都带 sha256 / 权限 /
+属主。恢复时逐个校验 sha256，而且**只碰程序载荷** —— `/etc/backup-project-server` 与
+`/var/lib/backup-project-server` 里的用户状态一个字节都不动。
 
-包升级是可逆的：旧 `.deb` 还在就能装回去，数据从未被升级过程改动，所以回滚
-只需要换二进制。回滚后确认：
+手工回滚（想主动退版本时）还是同一条路：
+
+    sudo apt install --reinstall ./backup-project-server_<旧版本>_amd64.deb
+
+包升级是可逆的：旧 `.deb` 还在就能装回去，数据从未被升级过程改动，所以回滚只需要换二进制。
+回滚后确认：
 
     sha256sum /var/lib/backup-project-server/state/transport.key
     sudo systemctl status backup-project-server
 
 ## 6. 升级失败怎么办
 
+0. **先看 `apt` / `dpkg` 的退出码**：失败升级一定返回非零。`postinst` 的输出里有失败原因、
+   回滚结果与当前服务状态：回滚成功会打印 `ROLLBACK OK`，回滚失败会明确写
+   `rollback result = FAILED`，不会伪装成功；
 1. **服务起不来**：`sudo journalctl -u backup-project-server -n 100 --no-pager`；
    先跑 `sudo backup-project-server --check-config`（配置问题会直接指出来）；
-2. **配置自检不过**：服务不会被启动，也不会被"半启动"。修好配置再
+2. **配置自检不过**：服务不会被启动，也不会被「半启动」。修好配置再
    `sudo systemctl restart backup-project-server`；
-3. **数据看着不对**：先停服务，再用第 1 节的归档恢复
+3. **回滚之后 dpkg 说装的是新版本**：这是 Debian 的边界 —— maintainer script 没有事务回滚，
+   解包时元数据就已经记成新版本（状态 `half-configured`），而磁盘上跑的是回滚后的旧版本。
+   让元数据与载荷一致：
+
+       sudo apt install --reinstall ./backup-project-server_<当前真正在跑的版本>_amd64.deb
+
+   在没做这件事之前，`sudo dpkg --configure -a` 会被 `postinst` 拒绝（fail closed），
+   以免把「其实装的是旧版本」悄悄算成升级成功；
+4. **升级前旧服务本来就没在跑**：`preinst` 不会留回滚材料（没有「可运行的旧版本」可言）。
+   这时 `postinst` 会明确说明，并按第 3 条的方式重装；
+5. **数据看着不对**：先停服务，再用第 1 节的归档恢复
    （`sudo systemctl stop backup-project-server`，解包覆盖 `/var/lib/backup-project-server`，
    `chown -R backup-project:backup-project`，再启）。
 

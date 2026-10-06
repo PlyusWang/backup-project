@@ -155,6 +155,9 @@ unit 的加固是**逐项评估**过的，不是"全打开"：
 升级**不会**：动 `data/`、`state/`、`secrets.env`、`server.conf`（conffile 若被你改过，
 dpkg 会问你怎么办）、重置用户、重新生成身份私钥、造第二个数据库。
 
+当升级失败时（配置自检不过 / 服务起不来 / 端口没进入监听），`postinst` 会**先自动回滚**、
+再带着非零退出码失败 —— 细节见 7.1。
+
 升级前稳妥做法：
 
     sudo backup-server-admin status            # 先看一眼
@@ -167,16 +170,79 @@ dpkg 会问你怎么办）、重置用户、重新生成身份私钥、造第二
     sudo systemctl status backup-project-server
     sudo backup-server-admin status
 
+### 7.1 升级失败会自动回滚（不用你手工救）
+
+升级开始前，`preinst` 会在**旧服务确实在跑**（`systemctl is-active` = active）的前提下，
+把**程序载荷**复制一份到 `/var/cache/backup-project-server/rollback/`：
+
+    /usr/lib/backup-project-server/...        服务端二进制、启动器、管理工具、purge-data
+    /usr/bin/backup-server 等入口的包装脚本
+    /lib/systemd/system/backup-project-server.service
+    /usr/lib/tmpfiles.d/backup-project-server.conf
+
+来源是 dpkg 自己的旧包文件清单（不猜路径、不搜目录），材料里记着每个文件的 sha256 /
+权限 / 属主。升级之后如果出现下面任意一种情况：
+
+1. 配置自检失败（`backup-project-server --check-config`）；
+2. `systemctl restart` 之后服务没有进入 active；
+3. 配置里的回环端口（默认 `127.0.0.1:18765`）没有进入监听；
+
+`postinst` 会逐个校验回滚材料的 sha256，把程序载荷换回升级前的版本、`daemon-reload`、
+重启服务并**再次验证**，然后把这次升级报成失败（`apt` / `dpkg` 返回非零）。
+
+回滚的对象**只有程序载荷**：`/etc/backup-project-server`（`server.conf`、`secrets.env`）
+与 `/var/lib/backup-project-server`（`data/`、`state/`、`transport.key`、数据库）一个字节
+都不会被碰。材料放在 `/var/cache`（FHS 里就是「可再生、删掉不丢用户状态」的缓存），
+升级成功立刻删除，卸载 / purge 也删除，平时手工删掉它没有任何副作用。
+
+**为什么升级仍然算失败**：Debian 的 maintainer script 没有事务回滚，`dpkg` 在解包时就已经
+把元数据记成新版本了。所以回滚之后 `dpkg -s` 会显示新版本号、状态是 `half-configured`，
+而磁盘上跑的是旧版本 —— 这是有意的：升级必须被报成失败，而不是看起来成功了。要让元数据
+与载荷一致：
+
+    sudo apt install --reinstall ./backup-project-server_<上一个可用版本>_amd64.deb
+
+在这件事做完之前，如果又跑 `sudo dpkg --configure -a`，`postinst` 会明确拒绝报告成功并
+退出非零（fail closed），不会把「其实装的是旧版本」悄悄变成「升级成功」。
+
+**首次安装失败**没有旧版本可回滚：安装返回失败并打印原因，但**不会**重新生成
+`secrets.env` 与 `transport.key`；修好之后重装会继续用第一次生成的那份。
+
 ## 8. 卸载（数据不会被删）
 
     sudo apt remove backup-project-server     # 删程序文件
     sudo apt purge backup-project-server      # 仍然保留数据与配置
 
-输出会明确告诉你数据在哪里。真要删数据，只有一条路，而且要手打确认短语：
+输出会明确告诉你数据在哪里，卸载时的 `prerm` 也会再提醒一次。真要删数据只有一条路，
+而且**必须在包还没卸载时做**（`backup-server-purge-data` 是包提供的命令，`apt remove` 之后
+就没了），还要手打确认短语：
 
     sudo backup-server-purge-data --dry-run   # 先看要删什么
     sudo backup-server-purge-data             # 需要输入 DELETE ALL BACKUP DATA
     sudo backup-server-purge-data --include-identity   # 连身份私钥一起删（会让所有 pin 失效）
+
+### 8.1 手工清理残留数据（包已经卸载之后）
+
+`backup-server-purge-data` 是**包提供的**命令：`apt remove` 之后就没了。所以想连数据一起
+清掉，要在包还在的时候做（`prerm` 会在卸载时提醒你）：
+
+    sudo backup-server-purge-data --dry-run            # 先看要删什么
+    sudo backup-server-purge-data                      # 需要手打 DELETE ALL BACKUP DATA
+    sudo backup-server-purge-data --include-identity   # 连身份私钥一起删（会让所有 pin 失效）
+
+包已经 purge 掉、只剩数据时，按下面手工做（先确认服务没在跑）：
+
+    sudo systemctl stop backup-project-server 2>/dev/null || true
+    sudo rm -rf /var/lib/backup-project-server/data                  # 所有备份 blob（不可逆）
+    sudo rm -f  /var/lib/backup-project-server/state/metadata.sqlite3*
+    sudo rm -f  /var/lib/backup-project-server/state/transport.key   # 删了它，所有客户端 pin 失效
+    sudo rm -rf /var/lib/backup-project-server                       # 实例根（含证书等）
+    sudo rm -rf /etc/backup-project-server                           # server.conf 与 secrets.env
+    sudo rm -rf /var/cache/backup-project-server                     # 升级回滚缓存
+    sudo userdel backup-project; sudo groupdel backup-project        # 数据没了，用户也没必要留
+
+purge 之后 `backup-server-purge-data` 不存在了，所以 `postrm` 不会再建议你去跑它 ——
+它只告诉你数据还在哪里，并指向这一节。
 
 ## 9. 自托管（自己的根）
 
