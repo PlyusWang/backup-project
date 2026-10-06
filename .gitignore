@@ -90,3 +90,6 @@ official-root-*.key
 
 # 发布打包输出（scripts/stage-*-release.sh 生成），不进仓库。
 /dist/
+
+# 打包工具缓存（默认在 dist/ 下，这里兜底）
+/packaging/.tools/

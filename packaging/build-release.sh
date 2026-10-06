@@ -206,7 +206,7 @@ build_appdir() {
   fi
 
   bash packaging/fetch-tools.sh > "$WORK/fetch-tools.log" 2>&1 || { tail -20 "$WORK/fetch-tools.log" >&2; die "打包工具下载/校验失败"; }
-  local tools="$PACKAGING_DIR/.tools"
+  local tools="$REPO_ROOT/dist/.tools"
   mkdir -p "$WORK/bin"
   install -m 0755 "$tools/linuxdeploy-x86_64.AppImage" "$WORK/bin/linuxdeploy"
   install -m 0755 "$tools/linuxdeploy-plugin-qt-x86_64.AppImage" "$WORK/bin/linuxdeploy-plugin-qt"
@@ -222,9 +222,11 @@ build_appdir() {
   export PATH="$WORK/bin:$PATH"
 
   log "== linuxdeploy + plugin-qt（带 Qt 运行时与 QML 模块）=="
-  if ! ARCH=x86_64 "$WORK/bin/linuxdeploy" --appdir "$appdir" --plugin qt \
+  # 在 $WORK 里运行：linuxdeploy --output appimage 会在当前目录留下一个
+  # Backup_Project-x86_64.AppImage，放在仓库根上会让"工作树干净"这条门禁失败。
+  if ! ( cd "$WORK" && ARCH=x86_64 "$WORK/bin/linuxdeploy" --appdir "$appdir" --plugin qt \
        --desktop-file "$appdir/usr/share/applications/backup-project.desktop" \
-       --icon-file "$appdir/backup-project.png" --output appimage \
+       --icon-file "$appdir/backup-project.png" --output appimage ) \
        > "$WORK/linuxdeploy.log" 2>&1; then
     tail -40 "$WORK/linuxdeploy.log" >&2
     die "linuxdeploy 失败"
@@ -254,7 +256,7 @@ build_appdir() {
 
 pack_client_appimage() {
   local appdir="$WORK/appdir"
-  local tools="$PACKAGING_DIR/.tools"
+  local tools="$REPO_ROOT/dist/.tools"
   local out="$RELEASE_DIR/Backup-Project-Client-$VERSION-x86_64.AppImage"
   log "== appimagetool =="
   # AppDir 里的 BUILD-INFO/MANIFEST 必须反映最终内容：Qt 是 linuxdeploy 之后
