@@ -180,6 +180,21 @@ dpkg 会问你怎么办）、重置用户、重新生成身份私钥、造第二
     /lib/systemd/system/backup-project-server.service
     /usr/lib/tmpfiles.d/backup-project-server.conf
 
+**快照是升级的前置条件（fail closed）**：上面那份材料先建在 `rollback.tmp.<pid>/` 里，
+逐项自检（manifest 非空、version 非空、条目数一致、每条路径都在载荷白名单里、每个
+regular file 的 sha256 对得上）通过之后，才**原子换入** `rollback/`。只要这一步有任何
+问题 —— 读不到旧包文件清单、复制失败、manifest 写不下去、自检不过、一个文件都没有 ——
+`preinst` 就返回非零，`dpkg` 因此**在解包之前**中止这次升级：
+
+    [backup-project-server] preinst: ERROR: rollback snapshot preparation failed: ...
+    [backup-project-server] preinst: ERROR: upgrade aborted before unpack
+    [backup-project-server] preinst: ERROR:   old service was active（...）
+    [backup-project-server] preinst: ERROR:   existing runnable installation left untouched（...）
+
+也就是说：**旧服务本来在跑的时候，快照建不起来就不升级** —— 不会出现"新二进制覆盖了
+旧版本、然后又起不来"。反过来，旧服务升级前本来就没在跑时没有这个前提：不做快照、
+允许升级，只是不承诺回滚到"可运行旧版本"。
+
 来源是 dpkg 自己的旧包文件清单（不猜路径、不搜目录），材料里记着每个文件的 sha256 /
 权限 / 属主。升级之后如果出现下面任意一种情况：
 
