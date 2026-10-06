@@ -1,5 +1,19 @@
 // schedule_controller.cpp
 
+// 本文件是 QML 与"定时备份共享核心"之间的桥（依赖方向见头文件）。这里只有
+// 三类东西：把 QML 输入翻译成核心参数、把核心结论翻译成界面文案、以及调度器
+// 自己的生命周期（timer / runner 锁 / 在飞评估）。
+//
+// 明确不做的事：判断"到没到点"（IsScheduleDue）、扫描源目录、retention、删归
+// 档、对比 manifest、维护 managed 快照列表——这些都在共享核心，GUI 与
+// backupctl 用的是同一份实现。
+//
+// 线程模型：document_ 与所有成员只由 GUI 线程访问；评估跑在 QtConcurrent 线程
+// （RunEvaluation 是静态函数，只接收值拷贝的参数），跨线程只回传一个
+// ScheduleOutcome 值对象。所以这里没有互斥锁，也**不允许**后台线程碰 this。
+//
+// 挂起（config_invalid_）= 停 tick + 放开 runner 锁 + 不写盘 + 不重试，唯一的
+// 恢复入口是用户重新保存一份合法配置。
 #include "schedule_controller.h"
 
 #include <QDateTime>
@@ -30,6 +44,8 @@ const char kSuccess[] = "success";
 const char kWarning[] = "warning";
 const char kError[] = "error";
 
+// 展示用格式化：秒数 <= 0 表示"还没有这个时间"（核心用 0 当哨兵），显示成
+// "尚未运行"而不是 1970-01-01。核心给的是 Unix 秒，本地时区只在这里参与。
 QString FormatLocalTime(std::int64_t seconds) {
   if (seconds <= 0) return QStringLiteral("尚未运行");
   return QDateTime::fromSecsSinceEpoch(static_cast<qint64>(seconds))
@@ -41,6 +57,9 @@ QString FormatSize(std::uint64_t bytes) {
   return QString::fromStdString(backupproject::FormatByteSize(bytes));
 }
 
+// 变化摘要的唯一格式。实参顺序与占位符顺序**不一致**（added、modified、
+// removed），因为 %2 在文案里是"修改"——改这里必须同时核对文案，否则数字会
+// 串位。三个调用点（首次快照 / 变化 / 历史）共用它，同一个数字在哪儿都一样。
 QString ChangeText(qulonglong added, qulonglong removed, qulonglong modified,
                    qulonglong metadata_changed) {
   return QStringLiteral("+%1 新增 · ~%2 修改 · -%3 删除 · %4 元数据变化")
@@ -52,6 +71,9 @@ QString ChangeText(qulonglong added, qulonglong removed, qulonglong modified,
 
 }  // namespace
 
+// 构造只做连接与常量设置，**不做任何 I/O**：读盘走 start() / reload()，测试
+// 因此可以只 new 一个控制器而不碰磁盘。config_manager_ 与 store_ 都是由路径
+// 构造的值成员，构造它们同样不读文件。
 ScheduleController::ScheduleController(QString schedule_file_path,
                                        const QString& config_file_path,
                                        BackupController* backup_controller,
@@ -86,6 +108,8 @@ ScheduleController::ScheduleController(QString schedule_file_path,
   }
 }
 
+// 析构只释放 runner 锁，不等待也不取消可能在飞的评估（那次写盘照样会完成）。
+// 正常退出时 main.cpp 在事件循环结束后才销毁控制器。
 ScheduleController::~ScheduleController() {
   // 析构时释放 runner 锁：flock 随 fd 关闭自动释放，这里显式做一次，
   // 让"谁持有锁"在代码里也是清楚的。
@@ -94,6 +118,12 @@ ScheduleController::~ScheduleController() {
 
 // ---- 读盘 ----
 
+// 从磁盘重建两份内存状态：config.json 里的仓库路径（与手动备份同一个文件）与
+// 计划存储（ScheduleStore）。
+//
+// 坏文件只如实报告，不自动改写、不删除、不猜默认值：读不懂 = 计划不能用，于是
+// 明确挂起（SetConfigInvalid），而不是显示成"未启用"——两者对用户的含义完全
+// 不同。文件不存在不算错误，给一份默认配置。
 void ScheduleController::LoadFromDisk() {
   config_loaded_ = false;
   load_error_.clear();
@@ -125,7 +155,8 @@ void ScheduleController::LoadFromDisk() {
     return;
   }
   if (loaded == backupproject::ScheduleLoadStatus::kMissing) {
-    // 从来没配过不是错误：给一份默认（disabled）配置，界面显示的是同一套默认值。
+    // 从来没配过不是错误：给一份默认（disabled）配置，
+    // 界面显示的是同一套默认值。
     document_ = backupproject::ScheduleDocument{};
   } else {
     document_ = std::move(document);
@@ -141,6 +172,14 @@ void ScheduleController::LoadFromDisk() {
 
 // ---- runner 锁 ----
 
+// runner 锁决定"这个计划现在由谁跑"，状态迁移是：
+//
+//   Disabled(未启用) -> 释放锁、停 tick
+//   Invalid(配置坏)  -> 释放锁、停 tick（挂起优先于一切）
+//   Waiting(锁在别的进程手里) -> 保留 tick，每秒非阻塞重试
+//   Holding -> 启动 tick，正常评估
+//
+// 只有"已启用 + 配置有效 + 持有锁"三条同时成立才会真正评估。
 void ScheduleController::ApplyRunnerLock() {
   const bool should_run =
       document_.config.enabled && config_loaded_ && !config_invalid_;
@@ -178,6 +217,8 @@ void ScheduleController::ApplyRunnerLock() {
   if (!tick_.isActive()) tick_.start();
 }
 
+// 幂等。挂起的两个直接动作是"停掉 1 Hz 的 timer"和"放开 runner 锁"：不跑任何
+// 东西却占着锁，只会让"这份计划由谁在跑"得到一个假答案。
 void ScheduleController::SetConfigInvalid(bool invalid) {
   if (config_invalid_ == invalid) return;
   config_invalid_ = invalid;
@@ -202,6 +243,9 @@ void ScheduleController::SetRunnerMessage(const QString& text) {
 
 // ---- tick ----
 
+// 1 Hz 的"醒来一次"。到点与否问的是共享核心的 IsScheduleDue，QTimer 不参与
+// 任何业务判断。时间用 std::time(nullptr)：墙上时钟回跳只让这一轮晚一点，前跳
+// 则立刻触发——对"到点就跑"来说，这两种表现都是用户期待的。
 void ScheduleController::Tick() {
   // 挂起时 tick 已经被停掉，这里再挡一次：即使 timer 真的又响了一次，
   // 也绝不会有第二次完整校验，更不会有第二次备份。
@@ -268,6 +312,12 @@ void ScheduleController::OnArchiveDeleted(const QString& file_name) {
   emit stateChanged();
 }
 
+// 提交一次评估。所有"现在不能跑"的原因（忙 / 未配仓库 / 手动操作在跑 / 拿不到
+// 闸门）都合并成同一个动作：置 pending_ 立刻返回，多次到期 coalesce 成一次，
+// 绝不排无限队列、绝不并发写盘。
+//
+// 闸门在这里申请、由 OnEvaluationFinished 释放，持有期覆盖整个评估。参数在提交
+// 前拷贝成值，后台线程因此完全不接触 this。
 void ScheduleController::Submit(bool force) {
   if (busy_) {
     // 忙碌期间来的多个到期事件 coalesce 成一次，绝不排无限队列。
@@ -334,6 +384,11 @@ void ScheduleController::Submit(bool force) {
                                        store_path, repository, force));
 }
 
+// 后台线程入口：**静态函数**，编译期就保证它拿不到 this。它按当时的仓库与自己
+// 新建的 ScheduleStore 做一次完整评估，只返回纯值类型的结果。
+//
+// force = true 走 EvaluateNow（"立即检查并运行"），否则走 Evaluate（正常到期
+// 判断）；两者在核心里共用同一套写盘与 retention 逻辑。
 ScheduleOutcome ScheduleController::RunEvaluation(const QString& store_path,
                                                   const QString& repository,
                                                   bool force) {
@@ -370,6 +425,8 @@ ScheduleOutcome ScheduleController::RunEvaluation(const QString& store_path,
   outcome.metadata_changed = result.changes.metadata_changed;
   outcome.next_run_sec = result.next_run_time_sec;
 
+  // 核心状态到界面结果的映射。switch 覆盖全部枚举且不写 default：核心以后新增
+  // 一种状态，这里会编译报错，而不是悄悄落进"其他 = 失败"。
   switch (result.status) {
     case backupproject::ScheduleEvaluationStatus::kDisabled:
     case backupproject::ScheduleEvaluationStatus::kNotDue:
@@ -397,6 +454,12 @@ ScheduleOutcome ScheduleController::RunEvaluation(const QString& store_path,
   return outcome;
 }
 
+// 评估结束（GUI 线程）。顺序有讲究：先放开评估闸门，再 SetBusy(false)——后面的
+// ApplyRunnerLock / DrainPending 都可能再次提交，而 SetBusy 会触发
+// BackupController 侧的补跑，闸门还握着的话这些提交会全被当成"忙"。
+//
+// 状态条按信息量从高到低逐级判断，最后一定落到某一条：错误 > 配置挂起 >
+// 未到时间 > 无变化 > 淘汰告警 > 成功 > 失败。
 void ScheduleController::OnEvaluationFinished() {
   const ScheduleOutcome outcome = watcher_.result();
   last_succeeded_ = outcome.succeeded;
@@ -469,6 +532,8 @@ void ScheduleController::OnEvaluationFinished() {
   } else {
     ApplyRunnerLock();
   }
+  // operationFinished 是自动化测试与 QML 的完成信号；挂起期间积压的 pending 没
+  // 有意义（配置不合法，补跑一次也只是再失败一次），所以下面直接丢掉。
   emit operationFinished(last_succeeded_);
   // 挂起期间积压的 pending 没有意义：配置不合法，补跑一次也只是再失败一次。
   if (!config_invalid_) DrainPending();
@@ -476,6 +541,9 @@ void ScheduleController::OnEvaluationFinished() {
 
 // ---- 对外入口 ----
 
+// 显式（重新）启动：先清挂起标志再读盘，于是"用户点了重新载入"总能按文件的
+// 实际状态重新决定是否挂起，可重复调用。stop() 是干净的拆除：停 tick、放开
+// 锁、不碰磁盘。
 void ScheduleController::start() {
   // 显式（重新）启动是恢复挂起的入口之一：用户点了"重新载入"，就该老实
   // 重新读一次盘。LoadFromDisk 会按文件的实际状态重新决定是否挂起。
@@ -526,6 +594,8 @@ QVariantList ScheduleController::frequencyUnits() const {
   return units;
 }
 
+// 值 × 单位 -> 分钟，再交给同一个 saveConfig：换算只有一份
+// （schedule_frequency.cpp），界面的"每 2 小时"与 backupctl 的 120 是同一件事。
 bool ScheduleController::saveConfigFromFrequencyText(
     bool enabled, const QString& source_path, const QString& value_text,
     const QString& unit_key, const QString& retain_text,
@@ -578,6 +648,15 @@ bool ScheduleController::saveConfigFromText(
                     include_rules, exclude_rules, strategy_key);
 }
 
+// 唯一的保存路径：QML 的两个文本入口与 C++ 测试最终都落到这里。
+//
+// 顺序不能变：先在副本 config 上做完全部解析与校验，通过之后才动 document_ 与
+// 磁盘——失败时内存与文件都保持原样，不存在"存了一半"的中间态。
+//
+// 加密在这里被强制成 kNone，理由由核心的 UnattendedEncryptionDisabledReason
+// 提供：无人值守任务没有安全的持久密钥来源，不是"暂时隐藏一个选项"。
+//
+// 保存成功 = 磁盘上有一份合法配置 = 挂起理由消失，这是唯一的自动恢复点。
 bool ScheduleController::saveConfig(bool enabled, const QString& source_path,
                                     int interval_minutes, int retain_count,
                                     const QString& pack_key,
@@ -703,6 +782,9 @@ bool ScheduleController::setEnabled(bool enabled) {
                     excludeRules());
 }
 
+// 备份管理页的 JOIN：file_name -> 来源。只读计划存储自己的 managed 名单，
+// BackupCatalog 完全不知道 scheduler 存在；**不解析文件名**——文件名永远不是
+// ownership 的真相来源。
 QString ScheduleController::originForFile(const QString& file_name) const {
   if (file_name.isEmpty()) return QString();
   for (const backupproject::ScheduledSnapshotRecord& record :
@@ -716,6 +798,8 @@ QString ScheduleController::originForFile(const QString& file_name) const {
   return QStringLiteral("手动备份");
 }
 
+// 变化摘要只对 managed 的计划快照有意义（手动备份没有"相对上一版"这回事），
+// 于是这里返回空串让界面隐藏该列。名单受 retain 上限约束，线性查找足够。
 QString ScheduleController::changesForFile(const QString& file_name) const {
   if (file_name.isEmpty()) return QString();
   for (const backupproject::ScheduledSnapshotRecord& record :
@@ -728,6 +812,9 @@ QString ScheduleController::changesForFile(const QString& file_name) const {
   return QString();
 }
 
+// 界面即时校验：临时建一个只含这条规则的 Filter，用的就是备份路径上那一份
+// grammar。成功返回空串（QML 判空即通过），失败返回核心给的原文、不二次翻译，
+// 免得界面与 backupctl 对同一条规则给出不同结论。
 QString ScheduleController::validateRule(const QString& action,
                                          const QString& rule) const {
   Filter filter;
@@ -742,6 +829,9 @@ QString ScheduleController::validateRule(const QString& action,
   return QString::fromStdString(error);
 }
 
+// "立即检查并运行"：先挡掉四种不可能成功的状态（挂起 / 未加载 / 未启用 / 不持
+// 锁），再 Submit(force=true)。force 只跳过"到没到点"，不跳过 pending 合并与
+// 闸门——手动操作在跑时，立即运行同样要排队，不能并发。
 bool ScheduleController::runNow() {
   if (config_invalid_) {
     SetStatus(kError, QStringLiteral("计划配置不合法，定时备份已挂起"),
@@ -766,6 +856,9 @@ bool ScheduleController::runNow() {
   return true;
 }
 
+// 补跑积压的那一次。pending_force_ 是"或"累积的：合并进来的一批事件里只要有一
+// 次是用户点的立即运行，补跑就是 forced。先清标志再 Submit，避免补跑期间新到
+// 的到期事件被这次清空吞掉。
 void ScheduleController::DrainPending() {
   if (!pending_) return;
   if (busy_) return;
@@ -792,6 +885,9 @@ void ScheduleController::SetStatus(const QString& kind, const QString& title,
   emit statusChanged();
 }
 
+// 自动化测试的同步点：跑一个嵌套事件循环，每 10 ms 看一次 busy_ / pending_，
+// 超时（guard）即退出，返回**真实最终状态**——超时不会被伪装成成功。嵌套事件
+// 循环会重入其他槽函数，所以它只适合测试，不放进产品路径。
 bool ScheduleController::waitForIdle(int timeout_ms) {
   QEventLoop loop;
   QTimer poll;
@@ -813,6 +909,8 @@ QString ScheduleController::localPathFromUrl(const QUrl& url) const {
   return url.toLocalFile();
 }
 
+// 起点优先用当前路径（存在且是目录时），否则退回用户主目录：不"猜一个相近路
+// 径"，对话框打开在哪儿必须可预期。QML 侧传进来的是 file:// URL。
 QUrl ScheduleController::directoryDialogStartUrl(const QString& path) const {
   const QFileInfo info(path);
   if (!path.isEmpty() && info.exists() && info.isDir()) {
@@ -877,8 +975,8 @@ QStringList ScheduleController::excludeRules() const {
 }
 
 QString ScheduleController::supportedModeText() const {
-  // 面向用户的一句话能力说明。以前那句还写着"后续将扩展增量策略"，那是 PR #18
-  // 之前的实情；现在增量已经是计划路径上真实支持的一种方式，继续留着就是误导。
+  // 面向用户的一句话能力说明。旧文案写着"后续将扩展增量策略"，
+  // 而增量现在已经是计划路径上真实支持的一种方式，继续留着就是误导。
   return QStringLiteral("当前支持：定时触发；备份方式可选完整备份或增量备份。");
 }
 
@@ -914,6 +1012,8 @@ QString ScheduleController::lastResultText() const {
   return text;
 }
 
+// 计划快照 -> QVariantList，字段名是 QML 的显示合同（fileName / sizeText…），
+// 顺序就是存储里的顺序：不在这里排序或过滤，界面看到的就是磁盘上的状态。
 QVariantList ScheduleController::managedSnapshots() const {
   QVariantList list;
   for (const backupproject::ScheduledSnapshotRecord& record :
@@ -941,6 +1041,8 @@ QVariantList ScheduleController::managedSnapshots() const {
   return list;
 }
 
+// 运行历史 -> QVariantList：resultKey 给样式、resultText 给人看，两者都来自
+// 共享核心的映射函数，不在这里拼字符串。
 QVariantList ScheduleController::history() const {
   QVariantList list;
   for (const backupproject::ScheduleHistoryEntry& entry :

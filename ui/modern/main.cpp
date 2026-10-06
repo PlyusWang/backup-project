@@ -44,7 +44,7 @@
 //                                       删除。 口令只从环境变量
 //                                       BACKUP_REMOTE_PASSWORD 读，不进 argv
 //   --remote-acceptance <输出目录> <地址> <端口> <用户名>
-//                                       PR #21 无人值守 GUI 最终验收：抓真实
+//                                       无人值守 GUI 最终验收：抓真实
 //                                       窗口截图（浅色 / 深色 / 窄窗口）、读
 //                                       关键控件的真实几何并断言不重叠不越界，
 //                                       并把完整 / 增量 / 回退成完整基线 /
@@ -59,12 +59,13 @@
 //                                       飞时被拒绝、结束后放行
 //   --gui-contract-test                 验证首页三张卡片的按钮几何，以及
 //                                       "临时提示只属于产生它的页面"这条契约
-//   --incremental-test <源> <仓库>      PR #18 GUI/CLI parity：走真实控制器
+//   --incremental-test <源> <仓库>      GUI/CLI parity：走真实控制器
 //                                       入口跑 baseline / no-change / delta /
 //                                       依赖链恢复，按固定格式打印结果
 //   --combo-hover-test                  共享下拉的 hover 残留回归：真的把指针
-//                                       移到某一行、再移走，断言灰底严格跟着指针
-//                                       来去，关掉重开也不留痕迹
+//                                       移到某一行、再移走，
+//                                       断言灰底严格跟着指针来去，
+//                                       关掉重开也不留痕迹
 //   --filter-ux-test                    三页 parity：同一个普通表单输入
 //                                       （条件类型 + 取值）在备份页 /
 //                                       自动备份页 / 实时备份页生成同一条
@@ -74,6 +75,27 @@
 //
 // 这些开关让没有显示器的环境也能验证界面：离屏平台插件把窗口真正建出来，
 // 自检再切一遍页面、换一次主题、跑一次备份恢复，不需要人盯着屏幕。
+//
+// 自检的统一约定（改这些自检之前先读这一段）：
+//
+//   * 退出码：0 = 全部断言通过；1 = 有断言失败或环境不满足（临时目录建不出来、
+//     目标控件找不到）；2 = 命令行用法错误（缺参数、参数解析失败）。脚本只依赖
+//     退出码判断成败，人工排查时再看 stderr。
+//   * stdout 是给脚本解析的接口：key=value 行、passed=/failed= 汇总行、与
+//     backupctl 逐字比对的输出格式都算契约，改措辞等于改接口。
+//   * stderr 只放失败原因，而且取核心 / 控制器给出的原文，不翻译也不包装 ——
+//     脚本看到的失败原因与用户在界面上看到的是同一句话。
+//   * 数据隔离：输入一律造在临时目录里，存储位置由 --config-file /
+//     --schedule-file / --realtime-file 覆盖；远端自检用随机账号并在结束前
+//     注销。任何一条自检都不许读写用户的真实配置与真实仓库。
+//   * 断言只打在真实入口上：QML 属性绑定、真实按钮的 clicked 信号、控制器
+//     公开方法。谁在自检里复制一份实现，测出来的就只是那份复制品。
+//   * 线程模型：自检自身全程在 GUI 线程（QML 对象只能在 GUI 线程访问），
+//     备份 / 恢复由控制器派发到 QtConcurrent；等任务结束一律走
+//     waitForIdle() / waitForCatalogIdle() 或带超时的 processEvents 循环，
+//     不 sleep 猜时间，也不把事件循环占死。
+//   * 几何与颜色断言前先等动画结束（WaitForAnimation）：过渡帧的位置与
+//     透明度都没稳定，直接断言会得到随机失败的结论。
 
 #include <qqml.h>
 #include <sys/stat.h>
@@ -152,6 +174,9 @@ void MessageHandler(QtMsgType type, const QMessageLogContext& context,
     std::fprintf(stdout, "%s\n", qPrintable(message));
     return;
   }
+  // 判据只能是消息文本：Qt 把 binding loop、类型错误、模块缺失都归在 Warning，
+  // 没有可用的独立类别。宁可宽进（普通警告被误计），也不能漏 —— 漏掉一条
+  // binding loop 就等于这一轮自检白跑。
   const bool looks_like_qml =
       message.contains(QStringLiteral(".qml")) ||
       message.contains(QStringLiteral("QML")) ||
@@ -174,6 +199,9 @@ void MessageHandler(QtMsgType type, const QMessageLogContext& context,
 // 用事件循环等，而不是空转：等待期间合成器还要处理帧回调，
 // 把主线程占死反而会让动画停在原地。
 void WaitForAnimation(int milliseconds) {
+  // 可重入，但只能在 GUI 线程调用：QEventLoop 绑定当前线程，换个线程跑只会
+  // 等一个永远不会派发的信号。等待到期即返回，不是错误；后置条件（动画确已
+  // 结束）由调用方自己再断言。
   QEventLoop loop;
   QTimer::singleShot(milliseconds, &loop, &QEventLoop::quit);
   loop.exec();
@@ -259,6 +287,10 @@ void ScrollBackupPage(QQuickWindow* window, int content_y) {
 // 额外状态只改测试期的属性（panel.expanded / dialog.visible），产品 QML
 // 一行不动，抓完立刻还原。未加密仓库里没有恢复密码对话框是正常的，那一轮直接
 // 跳过；但仓库里明明有加密记录却找不到对话框就是缺陷，按失败处理。
+// 失败语义：任何一步失败都返回 1。截图是文档与验收的证据，少一张等于证据链
+// 断了；"少抓一张继续跑"会让人对着不完整的图集得出错误结论。
+// 副作用：会改主题（AppTheme::setDark）与当前页（currentPage 属性），调用方
+// 需要时自行恢复；只在开发期开关 --screenshot 下被调用。
 int CaptureScreenshots(QQuickWindow* window, backup_modern::AppTheme* theme,
                        backup_modern::BackupController* controller,
                        backup_modern::RemoteController* remote,
@@ -308,8 +340,8 @@ int CaptureScreenshots(QQuickWindow* window, backup_modern::AppTheme* theme,
     }
   }
 
-  // 服务器身份的三种模式各留一张（PR #23）：官方云端 / 自定义（SSH 通道）/
-  // 自定义（直连）。这三张图正是这个 PR 要证明的东西 —— 官方云端只显示名字
+  // 服务器身份的三种模式各留一张：官方云端 / 自定义（SSH 通道）/
+  // 自定义（直连）。这三张图正是要证明的东西 —— 官方云端只显示名字
   // 加一句话，主机、端口、指纹一个都不出现；自定义模式才需要用户填。
   if (remote != nullptr) {
     struct ModeShot {
@@ -439,6 +471,9 @@ int ApplyFilterArguments(backup_modern::BackupController* controller,
 //
 // 输出格式与 backupctl preview 一致（包含 truncated 时的 Note 行），
 // 因此脚本可以直接 diff；差异一定意味着两个前端真的不一致。
+// 退出码与 CLI 对齐：2 = 规则本身非法（用法错误），1 = 预览超时或"按当前规则
+// 备份必然失败"（选择被阻塞），0 = 正常。脚本据此区分"命令写错了"与"这次
+// 备份真的做不成"。
 int RunPreviewTest(backup_modern::FilterRuleModel* model, const QString& source,
                    const QStringList& arguments) {
   // 规则按命令行顺序进：一条规则内部的 compound AND 由 DSL 自己表达，
@@ -672,6 +707,18 @@ int RunRepositoryTest(backup_modern::BackupController* controller,
                  qPrintable(archive_path));
     return 1;
   }
+  // 下面读的就是 v2 容器的磁盘布局（偏移单位为字节，整数字段 little-endian，
+  // 完整定义见 docs/format/archive_v2_container.md）：
+  //   0..7   magic "BKPCNT2\0"（第 8 个字节是 NUL，所以只能按字节比）
+  //   8..9   container version（u16，当前恒为 2）
+  //   10..11 header size（u16，当前恒为 160）
+  //   12     pack method id（1 字节，0 = MyPack）
+  //   13     compression id（1 字节，0 = None）
+  //   14     encryption id（1 字节，0 = None）
+  //   15     flags / reserved（本测试不解释，留 0）
+  //   16..23 entry count（u64，应与归档内真实条目数一致）
+  // 这些值还会与 IdentifyArchiveFile() 的结论交叉核对：两条独立路径给出同一个
+  // 答案才算数 —— 只看一条，写入端与解析端一起错也照样通过。
   const unsigned container_version = ReadLeU16(container_header, 8);
   const unsigned container_header_size = ReadLeU16(container_header, 10);
   const unsigned pack_id = static_cast<unsigned char>(container_header.at(12));
@@ -783,6 +830,8 @@ int RunRepositoryTest(backup_modern::BackupController* controller,
 // 界面上“浏览”按钮选完目录走的就是 controller.localPathFromUrl()，
 // 所以这里测的正是 QML 侧实际使用的那条转换。
 int RunPathTest(backup_modern::BackupController* controller) {
+  // 用例是刻意挑的：空格、中文、# 与 % 分别会在 QUrl 编码、shell 引用、
+  // 本地文件 URL 解析三处出问题，而纯英文路径一条都碰不到。
   int failures = 0;
   const QStringList cases = {
       QStringLiteral("/tmp/normal"),   QStringLiteral("/tmp/with space"),
@@ -955,6 +1004,9 @@ int RunCloseGuardTest(QQuickWindow* window,
   window->show();
   WaitForAnimation(50);
 
+  // close() 被 onClosing 拒绝时窗口仍保持可见；但真实桌面环境里焦点可能已经
+  // 离开，而下面两段还要往这扇窗口送事件，所以显式 show() 并等一帧，让它回到
+  // "用户正在用它"的状态。
   // ---- 2) 实时触发：realtime.libraryBusy ----
   //
   // 真的跑一次实时备份（enabled=true 会 attach + 合成一次 resync），再用真实
@@ -1106,7 +1158,7 @@ int RunCloseGuardTest(QQuickWindow* window,
 
 // ---- --backup-options-test ----
 //
-// PR #16 的自动化检查：算法 key 与 enum 的映射、四种算法组合的真实备份、
+// 自动化检查：算法 key 与 enum 的映射、四种算法组合的真实备份、
 // 密码校验、未知 key、加密恢复、目录字段，以及密码不落盘。
 //
 // 它只做两件事：布置场景、对着产物与控制器状态断言。key 解析、密码校验、
@@ -1133,7 +1185,7 @@ const backupproject::EncryptionMethod kUntouchedEncryptionMethod =
 // 断言计数。所有检查只累加、不提前返回：中途退出会让后面的检查永远不执行，
 // 一次运行就只能看到一个失败。
 struct CheckRun {
-  // 输出前缀。默认值保持 PR #16 的既有输出不变，定时备份自检会换成 [schedule]。
+  // 输出前缀。默认值保持 既有输出不变，定时备份自检会换成 [schedule]。
   const char* prefix = "[backup-options]";
   int passed = 0;
   int failed = 0;
@@ -1326,7 +1378,7 @@ QString FlattenRecord(const QVariantMap& record) {
   return text;
 }
 
-// --backup-options-test：走真实控制器入口跑完 PR #16 的全部功能断言。
+// --backup-options-test：走真实控制器入口跑完全部功能断言。
 // 命令行没有、也不会有 --password：密码一旦能从 argv 传进来，就会出现在
 // ps 输出与 shell 历史里，所以这里只用文件里写死的测试密码。
 //
@@ -1334,7 +1386,7 @@ QString FlattenRecord(const QVariantMap& record) {
 // 并且保留 QTemporaryDir 供人工进去看产物。
 // ---- --gui-contract-test ----
 //
-// 人工验收发现的两类 GUI 契约。断言的是 QML 的真实几何与真实绑定结果：
+// 两类 GUI 契约。断言的是 QML 的真实几何与真实绑定结果：
 // 不截图、不做像素比对，也不匹配文案本身。
 //
 // HOME-01..04 首页三张卡片的按钮必须完整落在卡片内（并且有正的底边距），三张
@@ -1347,7 +1399,7 @@ QString FlattenRecord(const QVariantMap& record) {
 // 非当前页整体不可见，用 visible 永远测不出"这一页会不会显示这条消息"。
 // ---- --combo-hover-test ----
 //
-// 共享 AppComboBox 下拉行的状态回归（三轮人工验收都栽在同一个坑的不同形态上）。
+// 共享 AppComboBox 下拉行的状态回归（同一个坑的不同形态）。
 //
 //   第一轮：hover 底色绑到 control.highlightedIndex（常驻索引）
 //   第二轮：改成"键盘高亮 + highlightedIndex"，但 highlightedIndex 会被鼠标改脏
@@ -1362,6 +1414,8 @@ int RunComboHoverTest(QQuickWindow* window, backup_modern::AppTheme* theme) {
   CheckRun run;
   run.prefix = "[combo-hover]";
 
+  // 底色不写死 RGB：hover / keyboard 两种颜色都从 AppTheme 读。写死的话，
+  // 即使 QML 换了颜色、主题改错，断言也照样通过。
   const QColor hover_color = theme->property("hover").value<QColor>();
   const QColor keyboard_color = theme->property("accentSoft").value<QColor>();
   run.Check(hover_color.isValid() && keyboard_color.isValid(),
@@ -1402,7 +1456,7 @@ int RunComboHoverTest(QQuickWindow* window, backup_modern::AppTheme* theme) {
     return 1;
   }
 
-  // 复现人工验收截图：当前已选择项 = “路径”，鼠标划过“文件类型”。
+  // 复现截图场景：当前已选择项 = “路径”，鼠标划过“文件类型”。
   const QVariantList model = combo->property("model").toList();
   QStringList labels;
   for (const QVariant& item : model) {
@@ -1420,6 +1474,9 @@ int RunComboHoverTest(QQuickWindow* window, backup_modern::AppTheme* theme) {
   combo->setProperty("currentIndex", path_index);
   WaitForAnimation(100);
 
+  // 行只能沿可视项树收集：Repeater 的委托 QObject 父对象为空，不在窗口的
+  // QObject 树里，findChildren 找不到它们。每行带模型下标（index 属性），
+  // 收集后按下标排序，断言里就能用"第几行"说话，不依赖遍历顺序。
   const auto collectRows = [list]() {
     QList<QPair<int, QQuickItem*>> rows;
     std::function<void(QQuickItem*)> walk = [&](QQuickItem* item) {
@@ -1461,6 +1518,8 @@ int RunComboHoverTest(QQuickWindow* window, backup_modern::AppTheme* theme) {
     return hoverOpacity(row) > 0.01 || keyboardOpacity(row) > 0.01 ||
            base.alpha() > 0;
   };
+  // 覆盖层 opacity 的判据是 > 0.01 而不是 == 1：层是用动画淡入淡出的，
+  // 等待结束时可能停在 0.98 之类的中间值。
   const auto rowsWhere =
       [&](const QList<QPair<int, QQuickItem*>>& rows,
           const std::function<qreal(const QPair<int, QQuickItem*>&)>& opacity) {
@@ -1494,6 +1553,10 @@ int RunComboHoverTest(QQuickWindow* window, backup_modern::AppTheme* theme) {
   const auto listIndex = [list]() {
     return list->property("currentIndex").toInt();
   };
+  // 指针事件自己造：offscreen 平台没有真实指针，QTest::mouseMove 也无从产生
+  // hover。把 QHoverEvent 直接送给窗口，走的仍是 QQuickWindow 正常的事件分发
+  // 路径（含 hovered 属性与 hover 覆盖层的更新）。old_pos 不能省：它描述
+  // "从哪来"，控件用它判断指针是进入还是离开。
   const auto movePointerTo = [window](const QPointF& pos,
                                       const QPointF& old_pos) {
     QHoverEvent hover(QEvent::HoverMove, pos, pos, old_pos);
@@ -1502,6 +1565,9 @@ int RunComboHoverTest(QQuickWindow* window, backup_modern::AppTheme* theme) {
   const auto centerOf = [](QQuickItem* item) {
     return item->mapToScene(QPointF(item->width() / 2.0, item->height() / 2.0));
   };
+  // 按键成对发送（press + release），并且送给窗口而不是某个控件：这样才会
+  // 经过真实的焦点链，被 ComboBox / ListView 的默认按键处理看到 —— 直接调
+  // QML 函数验证不了"真实桌面上收不收得到事件"这一类缺陷。
   const auto sendKey = [window](int key) {
     QKeyEvent press(QEvent::KeyPress, key, Qt::NoModifier);
     QCoreApplication::sendEvent(window, &press);
@@ -1583,8 +1649,7 @@ int RunComboHoverTest(QQuickWindow* window, backup_modern::AppTheme* theme) {
           .arg(retained_list));
   run.Check(!keyboardActive() && hoverRows(rows).isEmpty() &&
                 keyboardRows(rows).isEmpty(),
-            QStringLiteral(
-                "Mouse 3 索引留在那一行，但视觉上没有任何底色（人工验收截图）"),
+            QStringLiteral("Mouse 3 索引留在那一行，但视觉上没有任何底色"),
             QStringLiteral("hover 行=%1 键盘行=%2 模式=%3 | %4")
                 .arg(hoverRows(rows).join(QStringLiteral(",")),
                      keyboardRows(rows).join(QStringLiteral(",")))
@@ -1833,6 +1898,8 @@ int RunFilterUxTest(QQuickWindow* window,
   };
   // 页面下标 = Main.qml 里 StackLayout 的顺序（0 首页 / 1 备份 / 2 自动备份 /
   // 3 备份管理 / 4 设置 / 5 实时备份），不是侧栏导航的顺序。
+  // 三条用例共用下面同一段断言代码：某一页换了控件名、默认值或错误文案，都会
+  // 在同一个断言上失败，不会留下"只测过备份页"的盲区。
   const PageCase kCases[] = {
       {"备份页", 1, QStringLiteral("filter"), manual_model, QString(),
        QString()},
@@ -2047,6 +2114,8 @@ int RunFilterUxTest(QQuickWindow* window,
     WaitForAnimation(60);
   }
 
+  // parity 比的是规则**文本**（交给核心的那条 DSL），不是模型对象、也不是界面
+  // 上的文案：文本才是三个前端与核心之间的契约，比对象相等是自证。
   // ---- parity：三处最终拿到的是同一组规则文本 ----
   const QStringList manual_include =
       manual_model->rulesForAction(QStringLiteral("include"));
@@ -2119,6 +2188,10 @@ int RunRemoteProductFlow(backup_modern::RemoteController* remote, CheckRun* run,
                          const QString& work, const QString& host,
                          const QString& port_text, const QString& username,
                          const QString& password, const QString& fingerprint) {
+  // 这一段自检被 --remote-test（自己起服务端）与 --remote-smoke（打真实端点）
+  // 共用，所以除了协议本身不能对服务端做任何假设；所有路径都从 work 这个本次
+  // 运行的临时目录派生，跑完即弃，不在磁盘上留状态。
+  // 失败一律用 Check 记账而不是提前 return：一次运行要暴露尽可能多的缺陷。
   const QString source = work + QStringLiteral("/product-src");
   const QString first_out = work + QStringLiteral("/product-out-1");
   const QString cold_out = work + QStringLiteral("/product-out-2");
@@ -2152,6 +2225,9 @@ int RunRemoteProductFlow(backup_modern::RemoteController* remote, CheckRun* run,
 
   // 目录树逐字节比较（相对路径 + 内容）。恢复会把源目录本身作为一层放进去，
   // 所以两种形状都接受：<dst>/... 或 <dst>/<source 名>/...
+  // 目录比较用 (相对路径 -> 字节) 的整表相等，而不是逐个文件比对：少一个文件、
+  // 多一个文件、内容差一个字节都算不同。空表永远不算匹配，免得"两边都没有
+  // 文件"被误判成恢复成功。
   const auto collectTree = [](const QString& root) {
     QMap<QString, QByteArray> files;
     QDirIterator iterator(root, QDir::Files | QDir::NoDotAndDotDot,
@@ -2171,6 +2247,9 @@ int RunRemoteProductFlow(backup_modern::RemoteController* remote, CheckRun* run,
     const QMap<QString, QByteArray> b = collectTree(right);
     return !a.isEmpty() && a == b;
   };
+  // 恢复结果有两种合法形状：<dst>/... 与 <dst>/<源目录名>/...。归档里带不带
+  // 源目录这一层由核心决定，自检不该把某一种当成契约；两种都接受，但内容必须
+  // 逐字节一致。
   const auto treeMatches = [&sameTree](const QString& left,
                                        const QString& right) {
     if (sameTree(left, right)) {
@@ -2180,6 +2259,7 @@ int RunRemoteProductFlow(backup_modern::RemoteController* remote, CheckRun* run,
         right + QStringLiteral("/") + QFileInfo(left).fileName();
     return QFileInfo(nested).isDir() && sameTree(left, nested);
   };
+  // 按 id 找行，不按下标：列表顺序不是契约，多一条快照就会静默看错对象。
   const auto findSnapshot = [remote](const QString& id) {
     for (const QVariant& item : remote->snapshots()) {
       const QVariantMap map = item.toMap();
@@ -2198,10 +2278,14 @@ int RunRemoteProductFlow(backup_modern::RemoteController* remote, CheckRun* run,
     }
     return QVariantMap();
   };
+  // 列表刷新的"成功"是三个条件同时成立：请求被接受、任务真的跑完、错误类是
+  // none。只看返回值会把"被接受但后台失败"当成成功。
   const auto refresh = [remote]() {
     return remote->refreshList() && remote->waitForIdle(120000) &&
            remote->lastErrorKindForTest() == QStringLiteral("none");
   };
+  // 目录可能不存在（上一次失败提前返回过），所以先判断再删，不把"删不存在的
+  // 东西"当成失败。
   const auto removeTree = [](const QString& path) {
     QDir directory(path);
     if (directory.exists()) {
@@ -2209,6 +2293,8 @@ int RunRemoteProductFlow(backup_modern::RemoteController* remote, CheckRun* run,
     }
   };
 
+  // allow_incremental=false 就是界面上"完整"那一段的真实参数：控制器据此
+  // 拒绝复用任何已有链，产物必须是一份自洽的完整基线。
   // ---- GUI-P01：策略 = 完整 ----
   remote->clearBackupSummary();
   const bool full_accepted =
@@ -2263,6 +2349,8 @@ int RunRemoteProductFlow(backup_modern::RemoteController* remote, CheckRun* run,
       QStringLiteral("gen=%1 parent=%2")
           .arg(delta_row.value(QStringLiteral("generation")).toInt())
           .arg(delta_row.value(QStringLiteral("parentShort")).toString()));
+  // 增量必须显著更小，否则"改一个小文件只传差异"这个承诺就没被证明；阈值取
+  // 1/4 而不是"小一点"，是为了避开压缩与分块对齐带来的噪声。
   run->Check(root_bytes > 0 &&
                  remote->lastBackupUploadedBytesForTest() * 4 < root_bytes,
              QStringLiteral("GUI-P02 增量字节远小于完整基线"),
@@ -2270,6 +2358,8 @@ int RunRemoteProductFlow(backup_modern::RemoteController* remote, CheckRun* run,
                  .arg(remote->lastBackupUploadedBytesForTest())
                  .arg(root_bytes));
 
+  // "没有变化"要看两件事：控制器的结论（no-changes 与页面文案）和列表行数
+  // 不变。只测前者会漏掉"没建快照但列表多了一行"这种情况。
   // ---- GUI-P03：源目录没有变化 -> 不创建快照 ----
   const int count_before = remote->snapshotCountForTest();
   const bool nochange_accepted =
@@ -2288,6 +2378,8 @@ int RunRemoteProductFlow(backup_modern::RemoteController* remote, CheckRun* run,
                  .arg(count_before)
                  .arg(remote->snapshotCountForTest()));
 
+  // 换一个全新的源目录：链能不能续由**云端清单**决定，与本地状态无关。这里要
+  // 证明的是没有可信基线时如实回落成完整，并且页面按实际类型说话。
   // ---- GUI-P04：第一次就选"增量"，但云端没有可续的链 ----
   const QString fresh = work + QStringLiteral("/product-fresh");
   QDir().mkpath(fresh);
@@ -2304,6 +2396,9 @@ int RunRemoteProductFlow(backup_modern::RemoteController* remote, CheckRun* run,
              remote->backupSummary() + QStringLiteral(" / ") +
                  remote->lastErrorKindForTest());
 
+  // 只传目标快照 id，父链由服务端登记的 lineage 推导 —— 调用方不需要、也不该
+  // 知道链有多长。断言 chainLength / deltaCount 是为了证明真的走了链，而不是
+  // "恰好内容对得上"。
   // ---- GUI-P06：只给目标快照就能恢复整条链 ----
   const bool restore_accepted = remote->restoreSnapshot(delta_id, first_out);
   const bool restore_idle = restore_accepted && remote->waitForIdle(900000);
@@ -2317,6 +2412,8 @@ int RunRemoteProductFlow(backup_modern::RemoteController* remote, CheckRun* run,
   run->Check(treeMatches(source, first_out),
              QStringLiteral("GUI-P06 恢复出来的目录与源目录逐字节一致"));
 
+  // 冷缓存用产品自己的 PrepareRemoteCache 算出目录再删，不猜路径：缓存位置
+  // 一旦改变，这个自检要么跟着变、要么立刻失败，不会静默地测了个空。
   // ---- GUI-P07：冷缓存 ----
   backupproject::net::RemoteCacheLayout layout;
   std::string cache_error;
@@ -2341,6 +2438,8 @@ int RunRemoteProductFlow(backup_modern::RemoteController* remote, CheckRun* run,
   //
   // 列表里同时存在"产品链成员"和"手动上传的原始归档"时，用户必须一眼看得出
   // 区别。类型只来自服务端元数据（lineage / snapshot_kind），不按文件名猜。
+  // 类型只来自服务端元数据（lineage / snapshot_kind），不按文件名猜：显示名是
+  // 用户给的标签，改个名字不该改变一条记录的类型。
   run->Check(!root_row.isEmpty() &&
                  root_row.value(QStringLiteral("kind")).toString() ==
                      QStringLiteral("full") &&
@@ -2412,6 +2511,8 @@ int RunRemoteProductFlow(backup_modern::RemoteController* remote, CheckRun* run,
           raw_row.value(QStringLiteral("typeNote")).toString());
 
   // 目标目录必须保持"没有被碰过"：失败不能留下半成品。
+  // 失败路径的统一判据：目标目录要么不存在，要么存在但为空。"留下半成品"是
+  // 最糟的失败形态 —— 用户看到一堆文件，以为恢复成功了。
   const auto destinationUnused = [](const QString& path) {
     if (!QFileInfo::exists(path)) {
       return true;
@@ -2424,6 +2525,8 @@ int RunRemoteProductFlow(backup_modern::RemoteController* remote, CheckRun* run,
   // 原始归档恢复的临时工作目录（<cache>/raw-restore-XXXXXX）。它是"这次交互
   // 还留着那份已校验的归档"的直接证据：成功 / 取消之后必须为 0。
   const QString raw_cache_dir = QString::fromStdString(layout.cache_directory);
+  // 计数是"有没有残留"的可观测证据，比"代码里写了会清理"强。成功、取消、
+  // 失败三条收尾路径都要求它为 0。
   const auto rawWorkdirCount = [](const QString& cache_directory) {
     return QDir(cache_directory)
         .entryList(QStringList() << QStringLiteral("raw-restore-*"),
@@ -2432,6 +2535,8 @@ int RunRemoteProductFlow(backup_modern::RemoteController* remote, CheckRun* run,
   };
   // 临时归档的 (inode, 字节数)：错密码重试用的是**同一份**字节，所以这两个数
   // 必须一模一样。inode 比"路径相同"强：重新下载一定会是新文件的 inode。
+  // 用 (inode, size) 而不是路径判"还是不是同一份字节"：重新下载一定会得到新
+  // inode，所以这个断言才真的能证明"错密码重试没有重新下载"。
   const auto rawArchiveIdentity = [](const QString& path) {
     struct stat info;
     if (path.isEmpty() || ::stat(path.toUtf8().constData(), &info) != 0) {
@@ -2444,6 +2549,8 @@ int RunRemoteProductFlow(backup_modern::RemoteController* remote, CheckRun* run,
 
   // 绕过界面直接请求**链恢复**：共享 core 也必须拒绝（原始归档不是 BPSNAP1
   // 材料包）。这与下面原始归档自己的恢复是两条不同的路，两条都要有明确结论。
+  // 绕过界面直接请求链恢复：界面挡住的入口，共享 core 也必须挡住 —— 否则
+  // "安全边界只在 UI 层"就成了真的漏洞。
   const bool chain_on_raw_accepted = remote->restoreSnapshot(
       raw_row.value(QStringLiteral("id")).toString(), raw_out);
   const bool chain_on_raw_idle =
@@ -2501,6 +2608,7 @@ int RunRemoteProductFlow(backup_modern::RemoteController* remote, CheckRun* run,
                               "完整 .bak"),
                QString::fromStdString(pipeline_error));
   }
+  // 上传时显式给显示名：服务端只存字节，名字是给人看的标签，不参与格式判断。
   const QString standalone_name = QStringLiteral("raw-standalone-full.bak");
   const bool standalone_uploaded =
       remote->uploadArchive(standalone_bak, standalone_name) &&
@@ -2542,6 +2650,8 @@ int RunRemoteProductFlow(backup_modern::RemoteController* remote, CheckRun* run,
                  QString::number(remote->rawRestoreAwaitingPassword() ? 1 : 0) +
                  QStringLiteral("/dirs=") +
                  QString::number(rawWorkdirCount(raw_cache_dir)));
+  // 内容一致是最终判据：前面那些状态断言只能说明流程走完了，不能说明恢复出来
+  // 的字节是对的。
   run->Check(treeMatches(standalone_src, standalone_out),
              QStringLiteral("RAW-U01 恢复出来的目录与源目录逐字节一致"
                             "（等价于 diff -r 通过）"));
@@ -2553,6 +2663,8 @@ int RunRemoteProductFlow(backup_modern::RemoteController* remote, CheckRun* run,
                      "列表里登记的一致"),
       remote->lastRawRestoreSha256ForTest());
 
+  // 篡改点选在文件中部而不是头部：改头可能先被识别成"另一种格式"，那就测不到
+  // 完整性校验这一层了。翻转一位之后，声明的摘要必然对不上实际字节。
   // ---- RAW-U08：被篡改的归档（完整性）----
   const QString corrupted_bak = work + QStringLiteral("/raw-corrupted.bak");
   const QString corrupted_out = work + QStringLiteral("/raw-corrupted-out");
@@ -2578,6 +2690,8 @@ int RunRemoteProductFlow(backup_modern::RemoteController* remote, CheckRun* run,
         copied && flipped,
         QStringLiteral("RAW-U08 造一份被篡改的完整归档（改中间一个字节）"));
   }
+  // 服务端不做内容校验（它只保存字节），所以篡改过的归档能正常上传 —— 这正是
+  // 要复现的真实处境：坏字节是在下载之后、本地恢复之前被发现的。
   const QString corrupted_name = QStringLiteral("raw-corrupted.bak");
   const bool corrupted_uploaded =
       remote->uploadArchive(corrupted_bak, corrupted_name) &&
@@ -2622,6 +2736,8 @@ int RunRemoteProductFlow(backup_modern::RemoteController* remote, CheckRun* run,
       }
     }
   }
+  // 单独上传一份 delta：它属于某条链这个事实不会因为"只有它一个"而改变，
+  // 所以恢复必须明确说"缺少父备份"，而不是当成一个损坏的普通文件。
   const QString delta_alone_bak = work + QStringLiteral("/raw-delta-alone.bak");
   const QString delta_alone_out = work + QStringLiteral("/raw-delta-alone-out");
   QFile::remove(delta_alone_bak);
@@ -2661,6 +2777,8 @@ int RunRemoteProductFlow(backup_modern::RemoteController* remote, CheckRun* run,
           remote->lastDetailForTest());
 
   // ---- RAW-U02..U05 的构造前提：加密的独立归档 ----
+  // 加密参数：AES-256-CTR 负责机密性、HMAC-SHA256 负责完整性，两者用同一口令
+  // 派生出的密钥。口令只活在这个函数的内存里，绝不进 argv、也不落盘。
   const QString encrypted_bak = standalone_root + QStringLiteral("/secret.bak");
   const QString encrypted_pw = QStringLiteral("PR21_RAW_ARCHIVE_PW_7k3");
   {
@@ -2779,6 +2897,8 @@ int RunRemoteProductFlow(backup_modern::RemoteController* remote, CheckRun* run,
                             "（等价于 diff -r 通过）"));
 
   // ---- RAW-U05：连续两个错密码，再输对 ----
+  // 连续两个错密码再输对：要证明状态机不坏 —— 仍停在"等密码"、busy 已复位、
+  // 上一次的错误行被清掉，而且全程只下载一次。
   const QString encrypted_out_b = work + QStringLiteral("/raw-encrypted-out-b");
   const bool u5_started =
       remote->restoreRawArchive(encrypted_id, encrypted_out_b, QString()) &&
@@ -2818,6 +2938,8 @@ int RunRemoteProductFlow(backup_modern::RemoteController* remote, CheckRun* run,
                             "逐字节一致"));
 
   // ---- RAW-U06：在密码那一段取消 ----
+  // 取消：交互立即终止，那份已经下载并校验过的临时归档必须删掉；留着会变成
+  // 磁盘上一份带密文的残留文件，还会被下一次恢复复用。
   const QString encrypted_out_c = work + QStringLiteral("/raw-encrypted-out-c");
   const bool u6_started =
       remote->restoreRawArchive(encrypted_id, encrypted_out_c, QString()) &&
@@ -2848,6 +2970,8 @@ int RunRemoteProductFlow(backup_modern::RemoteController* remote, CheckRun* run,
   // 服务端只存字节：把**服务端那份 blob**改一个字节，声明的 SHA-256 就与实际
   // 字节不符。客户端必须在下完那一刻拒绝，绝不交给本地恢复，也不出现密码段。
   {
+    // 绕过 API 直接改服务端磁盘上的那份 blob：这是构造"声明的 SHA-256 与
+    // 实际字节不符"的唯一可靠办法 —— 走上传接口的话，服务端会重算摘要。
     const QString blob_root = work + QStringLiteral("/data/users");
     const QString blob_name =
         encrypted_row.value(QStringLiteral("id")).toString() +
@@ -2907,6 +3031,9 @@ int RunRemoteProductFlow(backup_modern::RemoteController* remote, CheckRun* run,
   //       当前 pin，而不是很久以前那一次 Connect 存下来的旧值。
   //   (2) 显式登录一次（登录**一定**新建连接）：错 pin 必须在这里被挡住，
   //       而且分类必须是 pin-mismatch（不是笼统的网络错误）。
+  // pin 在**建立连接**时校验，因此：连接还活着时改 pin 不会踢掉当前会话
+  // （下一次连接才生效）；而显式 login 必然新建连接，所以一定被挡。
+  // 这正是要的行为：身份校验失败就拒绝，但不要顺手毁掉已登录的状态。
   const QString good_pin = remote->serverKeyPin();
   const QString wrong_pin = QStringLiteral("sha256:") + QString(64, 'b');
   const bool pin_set = remote->setServerKeyPin(wrong_pin);
@@ -2942,6 +3069,8 @@ int RunRemoteProductFlow(backup_modern::RemoteController* remote, CheckRun* run,
   // ---- GUI-P10：空闲被服务端关掉之后自动重连 + RESUME ----
   // --remote-test 起服务端时用的是 --io-timeout 2；这里等它把空闲连接关掉。
   WaitForAnimation(4000);
+  // 服务端按自己的 io-timeout 关掉空闲连接（先等够 4s 确保它真的发生），
+  // 之后用户不该需要重新登录：控制器要自动重连并 RESUME 会话。
   const bool after_idle = refresh() && remote->authenticated();
   run->Check(
       after_idle,
@@ -2982,6 +3111,8 @@ int RunRemoteProductFlow(backup_modern::RemoteController* remote, CheckRun* run,
 
   // ---- GUI-P11：忙碌时第二个长操作被拒 ----
   const bool first_accept = remote->backupRemote(source, false);
+  // 忙碌闸门在控制器层：第一个长操作在飞时，第二个必须立刻被拒（既不排队，
+  // 也不并发跑两份），"同一控制器同一时刻只有一个远端操作"才是硬保证。
   const bool second_accept = remote->backupRemote(source, false);
   const QString busy_kind = remote->lastErrorKindForTest();
   run->Check(
@@ -2992,6 +3123,8 @@ int RunRemoteProductFlow(backup_modern::RemoteController* remote, CheckRun* run,
   remote->waitForIdle(900000);
 
   // ---- 清理：注销临时账号（正式数据不受影响）----
+  // 清理承诺：临时账号连同它的快照一起注销，正式账号的数据一个字节都不动。
+  // 注销之后本地必须立刻回到"未认证"，不留过期会话继续用。
   const bool deleted = remote->deleteAccount(password, username) &&
                        remote->waitForIdle(300000) && !remote->authenticated();
   run->Check(deleted, QStringLiteral("GUI-P12 临时账号已注销（正式数据不动）"),
@@ -3000,7 +3133,7 @@ int RunRemoteProductFlow(backup_modern::RemoteController* remote, CheckRun* run,
   return 0;
 }
 
-// ---- --remote-acceptance：PR #21 无人值守 GUI 最终验收 ----
+// ---- --remote-acceptance：无人值守 GUI 最终验收 ----
 //
 // 与 --remote-test / --remote-smoke 的区别：那两个验的是"链路能不能走通"，
 // 这一个验的是"人打开这一页会看到什么"，并且把看到的东西留下来：
@@ -3025,7 +3158,7 @@ int RunRemoteProductFlow(backup_modern::RemoteController* remote, CheckRun* run,
 // C08..C14：需要一条**真实可用**的 SSH 目标（ECS）。
 //
 // 这一段只能在 scripts/pr22_ecs_e2e.sh 里跑：它要真的 ssh 出去。它验证的是
-// PR #22 的核心产品主张 —— "GUI 自己把当前部署需要的那条 SSH 隧道管起来"，
+// 核心产品主张 —— "GUI 自己把当前部署需要的那条 SSH 隧道管起来"，
 // 以及"失败时说的是**哪一层**失败"。
 int RunRemoteTunnelEcs(QQuickWindow* window,
                        backup_modern::RemoteController* remote, CheckRun* run,
@@ -3048,6 +3181,8 @@ int RunRemoteTunnelEcs(QQuickWindow* window,
     }
     return remote->tunnelStateForTest() == wanted;
   };
+  // 用 /proc/<pid> 消失判断进程结束，而不是 waitpid：这条 ssh 可能是本进程的
+  // 子进程，也可能不是（外部隧道），"要不要为它收尸"不该影响这里的结论。
   const auto waitForPidGone = [](qint64 pid, int timeout_ms) {
     if (pid <= 0) {
       return false;
@@ -3065,6 +3200,8 @@ int RunRemoteTunnelEcs(QQuickWindow* window,
 
   // ---- C08：SSH 认证失败 -> 明确失败，不把密码提示藏到后台 ----
   {
+    // SSH 认证失败必须被识别成 ssh-auth，文案也要指路 ssh-agent / 密钥：
+    // 笼统的"连接失败"会把用户引向查网络，而真正的问题在凭据。
     remote->setConnectionModeForTest(QStringLiteral("ssh"));
     remote->setSshHostForTest(QStringLiteral("no-such-user@") + ssh_target);
     remote->ensureConnection(host, port_text);
@@ -3082,6 +3219,8 @@ int RunRemoteTunnelEcs(QQuickWindow* window,
 
   // ---- C14：用户自己开的隧道只被复用，绝不被杀 ----
   {
+    // 场景：用户自己已经开了一条 ssh -N -L。GUI 要能**识别并复用**它，而不是
+    // 再起一条；关闭安全通道时也绝不能杀掉用户自己的进程。
     int external_port = 0;
     QString pick_error;
     run->Check(backup_modern::SshTunnelManager::PickFreeLoopbackPort(
@@ -3135,6 +3274,8 @@ int RunRemoteTunnelEcs(QQuickWindow* window,
 
   // ---- C09：GUI 自己建立安全通道 -> Ready ----
   {
+    // GUI 自建通道：状态机 Idle -> Starting -> Ready，进程由本程序持有并在
+    // 退出时回收；本地端点必须是回环地址（安全边界：转发端口不对外暴露）。
     remote->setSshHostForTest(ssh_target);
     remote->ensureConnection(host, port_text);
     remote->waitForTunnelIdle(120000);
@@ -3153,6 +3294,7 @@ int RunRemoteTunnelEcs(QQuickWindow* window,
   }
 
   // ---- C10：隧道通、pin 不对 -> pin-mismatch，不是"网络错误" ----
+  // 这个账号在 C10 里被封杀、在收尾时还要被注销，所以账号名提到块外保存。
   QString c10_account;
   {
     const QString account =
@@ -3188,6 +3330,8 @@ int RunRemoteTunnelEcs(QQuickWindow* window,
   }
 
   // ---- C11：正确的隧道 + 正确的 pin -> 登录通过 ----
+  // 用例账号一律带随机后缀：重复或并行运行不会撞名，"注册失败"因此一定是
+  // 真问题，而不是上一次运行留下的同名账号。
   const QString account =
       QStringLiteral("pr22-e2e-%1")
           .arg(QRandomGenerator::global()->bounded(1000000, 9999999));
@@ -3241,9 +3385,11 @@ int RunRemoteTunnelEcs(QQuickWindow* window,
   // 登录"。这一条盯的是**不许有 stale Ready**：外部 listener 不是本进程启动的，
   // 没有 QProcess 信号可听，所以必须在真正提交一次操作之前**当场**问一次。
   //
-  // 刻意**不**用后台周期探测解决 —— 那正是本轮 blocker：ssh -L 的本地 listener
+  // 刻意**不**用后台周期探测解决 —— 那正是要避免的：ssh -L 的本地 listener
   // 每接受一次连接就可能真的向 ECS 建一条转发通道，空闲 GUI 不该制造这种流量。
   {
+    // 复用之后杀掉用户的隧道（模拟它自然消失）：下一次操作必须自动恢复，而且
+    // 恢复出来的是**本程序自己**建立的通道（有 pid、退出时可回收）。
     int dead_port = 0;
     QString pick_error;
     run->Check(backup_modern::SshTunnelManager::PickFreeLoopbackPort(
@@ -3331,6 +3477,8 @@ int RunRemoteTunnelEcs(QQuickWindow* window,
         remote->waitForIdle(300000);
       }
     }
+    // 退出不留孤儿：stopTunnel() 之后自有 ssh 的进程必须真的消失，而不是只把
+    // 状态改回 idle。pid 为 0 说明从来没起过进程，同样算失败。
     const qint64 pid = remote->tunnelPidForTest();
     remote->stopTunnel();
     run->Check(
@@ -3378,9 +3526,9 @@ int RunRemoteAcceptance(QQuickWindow* window,
     }
   }
   // 连接方式由环境决定：
-  //   给了 BACKUP_REMOTE_SSH_TARGET -> SSH 安全通道（PR #22 的部署模型：
+  //   给了 BACKUP_REMOTE_SSH_TARGET -> SSH 安全通道（当前部署的模型：
   //     服务端只监听它自己的回环地址，客户端必须先把隧道建起来）
-  //   没给 -> 直连（PR #21 的老用法，端点本身可达）
+  //   没给 -> 直连（老用法，端点本身可达）
   const QString ssh_target_env =
       qEnvironmentVariable("BACKUP_REMOTE_SSH_TARGET");
   if (!ssh_target_env.isEmpty()) {
@@ -4026,8 +4174,7 @@ int RunRemoteAcceptance(QQuickWindow* window,
   run.Check(!ids_before.contains(root_id),
             QStringLiteral("ACC-06 列表里多了一条新的完整快照"));
   // 用户选的就是“完整”：这一行必须说“完整备份完成”，不能写成“兜底建基线”，
-  // 也不能把 core 的英文理由摆在结论里（本轮 GUI
-  // 验收正是在这里发现过一个缺陷）。
+  // 也不能把 core 的英文理由摆在结论里（这里出过这个缺陷）。
   run.Check(
       remote->backupSummary().startsWith(QStringLiteral("完整备份完成")) &&
           remote->backupSummaryKind() == QStringLiteral("full"),
@@ -4408,7 +4555,7 @@ int RunRemoteAcceptance(QQuickWindow* window,
               incremental_row.value(QStringLiteral("kindText")).toString(),
       QStringLiteral("ACC-13 三种类型是三个不同的词（原始归档绝不能显示成"
                      "“完整”）"));
-  // 三种类型**同屏**：这是用户最重要的一张人工验收图，所以三类必须真的同时
+  // 三种类型**同屏**：这是用户最重要的一张验收图，所以三类必须真的同时
   // 落在视口里，而不是"截图里有其中两种"。为了让列表拿到真实几何，先把窗口开高
   // 一点并滚到列表（这不是"改造界面"，与 remote-idle-overview-* 同一条做法：
   // 只是把窗口开高，让本来就存在的内容同屏）。
@@ -5059,6 +5206,8 @@ int RunRemoteAcceptance(QQuickWindow* window,
   run.Check(scrollTo(named("remoteBackupButton"), 200),
             QStringLiteral("ACC-16 忙碌状态截图：备份按钮与列表卡片同屏"));
   if (server_pid > 0) {
+    // SIGSTOP 冻住服务端，让长操作"跑不完"，忙碌态才有稳定的观察窗口；抓完
+    // 再 SIGCONT 放行，绝不把服务端留在暂停状态。
     busy_shot = grab(QStringLiteral("remote-busy-light.png"), 1180, 760,
                      QStringLiteral("长操作进行中：冲突操作不可用（浅色）"));
     run.Check(remote->busy(),
@@ -5070,6 +5219,8 @@ int RunRemoteAcceptance(QQuickWindow* window,
         "[remote-acceptance] 没有 BACKUP_REMOTE_SERVER_PID："
         "忙碌截图 NOT PRODUCED\n");
   }
+  // 放行之后必须自己回到空闲：少了这条，前面"忙碌时界面不可用"的结论可能只是
+  // 因为服务端被冻住，而不是闸门真的起了作用。
   const bool busy_finished = remote->waitForIdle(300000);
   run.Check(busy_finished && !remote->busy() && remote->authenticated(),
             QStringLiteral("ACC-16 长操作结束后回到空闲，会话仍然有效"),
@@ -5078,6 +5229,8 @@ int RunRemoteAcceptance(QQuickWindow* window,
 
   // ---- 清理：两个临时账号都注销（正式数据一个字节都不动）----
   remote->logoutLocal();
+  // 收尾：两个临时账号都要注销。失败提前 return 的路径走不到这里，所以自动化
+  // 脚本还得靠账号名里的随机后缀避免长期残留。
   const bool fallback_deleted =
       remote->login(host, port_text, fallback_user, password) &&
       remote->waitForIdle(180000) &&
@@ -5095,11 +5248,13 @@ int RunRemoteAcceptance(QQuickWindow* window,
             remote->lastErrorKindForTest() + QStringLiteral(": ") +
                 remote->lastDetailForTest());
 
-  // ---- PR #22：C08..C14（SSH 安全通道的真实闭环）----
+  // ---- C08..C14（SSH 安全通道的真实闭环）----
   //
   // 只有给了 SSH 目标才跑：没有它就退回"直连某个可达端点"的老用法，那些
   // 检查会**明说跳过**，而不是假装通过。
   {
+    // SSH 通道那一段只在给了目标主机时才跑（需要有机器能 ssh 进去）。跳过时明确
+    // ++passed 并打一行说明，免得被读成"测过了且通过"。
     const QString ssh_target = qEnvironmentVariable("BACKUP_REMOTE_SSH_TARGET");
     if (ssh_target.isEmpty()) {
       std::printf(
@@ -5114,6 +5269,8 @@ int RunRemoteAcceptance(QQuickWindow* window,
 
   // ---- 几何报告落盘（给人工 / 评审看每个控件的真实坐标）----
   {
+    // 几何报告落成文本：截图能说明"好不好看"，但"有没有重叠 / 越界"要看数字，
+    // 评审时把这份报告与 PNG 对着看。
     QFile report(out_dir + QStringLiteral("/geometry-checks.txt"));
     if (report.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
       report.write(
@@ -5128,6 +5285,8 @@ int RunRemoteAcceptance(QQuickWindow* window,
       report.write("\n");
     }
   }
+  // 汇总行同时报通过 / 失败 / 抓图数量：张数是证据完整性的指标，脚本据此判断
+  // 这一次运行有没有产出完整图集。
   std::printf("[remote-acceptance] passed=%d failed=%d shots=%d\n", run.passed,
               run.failed, shots);
   for (const QString& failure : run.failures) {
@@ -5174,13 +5333,15 @@ int RunRemoteSmoke(backup_modern::RemoteController* remote,
   std::printf("[remote-smoke] endpoint=%s:%s user=%s\n", qPrintable(host),
               qPrintable(port_text), qPrintable(username));
 
-  // PR #21：连接之前必须把服务端的传输身份 pin 交给控制器——没有它
+  // 连接之前必须把服务端的传输身份 pin 交给控制器——没有它
   // RemoteArchiveClient::Connect() 直接失败（kNoPinConfigured），客户端不做
   // "第一次见到谁就信谁"。--remote-smoke 打的是调用方给的真实端点，所以 pin
   // 也从调用方来：与 backupctl remote 用同一个环境变量
   // BACKUP_REMOTE_SERVER_KEY（pin 不是秘密，但与口令一样不进 argv）。
   // 缺了它这里就**明确失败**：否则下面每一条都会以"连接被拒绝"红掉，看不出
   // 真正的原因。
+  // 指纹只从环境变量读，而且必须有：没有指纹客户端就拒绝连接（fail-closed）。
+  // 不进 argv，是因为进程参数会出现在 ps 输出里。
   const QString server_key_pin =
       qEnvironmentVariable("BACKUP_REMOTE_SERVER_KEY").trimmed();
   if (server_key_pin.isEmpty()) {
@@ -5206,6 +5367,8 @@ int RunRemoteSmoke(backup_modern::RemoteController* remote,
   if (!temp.isValid()) {
     return 1;
   }
+  // 整条 smoke 在自己的临时目录里造仓库、源目录与下载目标，跑完即弃：不碰任何
+  // 用户目录，也不需要调用方预先准备文件。
   const QString work = temp.filePath(QStringLiteral("smoke"));
   QDir().mkpath(work + QStringLiteral("/repo"));
   QDir().mkpath(work + QStringLiteral("/source"));
@@ -5221,6 +5384,8 @@ int RunRemoteSmoke(backup_modern::RemoteController* remote,
   run.Check(controller->saveRepositoryPath(work + QStringLiteral("/repo")),
             QStringLiteral("SMOKE-00 备份仓库已配置"));
   controller->setSourcePath(work + QStringLiteral("/source"));
+  // 归档由产品流水线自己生成，而不是随便造一个文件：smoke 要证明的是"GUI 做出来
+  // 的东西能原样上云再取回"，输入越真实结论越有意义。
   const bool started = controller->startBackupWithOptions(
       QStringLiteral("mypack"), QStringLiteral("none"), QStringLiteral("none"),
       QString(), QString());
@@ -5255,6 +5420,8 @@ int RunRemoteSmoke(backup_modern::RemoteController* remote,
       remote->registerAccount(host, port_text, username, password, password);
   // waitForIdle 只说明后台任务结束了，不说明它成功：必须同时看 error_kind，
   // 否则第二次跑（账号已存在）会把服务端的拒绝说成"注册成功"。
+  // 注册可能因为"账号已存在"失败 —— 重复运行 smoke 时这是正常的，所以明确接受
+  // name-taken 这一种；其它错误照旧算失败。
   const bool register_ok =
       register_accepted && remote->waitForIdle(120000) &&
       remote->lastErrorKindForTest() == QStringLiteral("none");
@@ -5282,6 +5449,8 @@ int RunRemoteSmoke(backup_modern::RemoteController* remote,
   for (const QVariant& item : remote->snapshots()) {
     ids_before.append(item.toMap().value(QStringLiteral("id")).toString());
   }
+  // 用前后两次 id 列表的差集判断"哪一条是这次上传的"：列表顺序不是契约，
+  // 直接取第一条会在别人刚上传过东西时看错对象。
   std::printf("[remote-smoke] list_before=%d\n",
               static_cast<int>(ids_before.size()));
 
@@ -5302,6 +5471,8 @@ int RunRemoteSmoke(backup_modern::RemoteController* remote,
   run.Check(!uploaded_id.isEmpty(),
             QStringLiteral("SMOKE-05 列表里出现刚上传的那一条"));
 
+  // 第三个参数是"是否允许覆盖"：目标此刻还不存在，传 false 走的就是产品默认
+  // 那条"不覆盖已有文件"的路径。
   const QString target = work + QStringLiteral("/out/downloaded.bak");
   run.Check(remote->downloadArchive(uploaded_id, target, false) &&
                 remote->waitForIdle(300000) &&
@@ -5309,6 +5480,8 @@ int RunRemoteSmoke(backup_modern::RemoteController* remote,
             QStringLiteral("SMOKE-06 下载成功"),
             remote->lastErrorKindForTest() + QStringLiteral(": ") +
                 remote->lastDetailForTest());
+  // 逐字节比对，并且确认没有 .part 残留：下载必须"要么完整可见、要么完全
+  // 不存在"，目标路径上留半个文件是最坏的形态。
   QFile local(archive_path);
   QFile fetched(target);
   const bool identical = local.open(QIODevice::ReadOnly) &&
@@ -5318,6 +5491,8 @@ int RunRemoteSmoke(backup_modern::RemoteController* remote,
       identical && !QFileInfo::exists(target + QStringLiteral(".part")),
       QStringLiteral("SMOKE-07 下载回来的字节与上传的一致，且没有 .part 残留"));
 
+  // 删除之后列表要回到上传之前的样子（条数相同且不含该 id）：只断言"返回成功"
+  // 会漏掉"服务端删了但列表缓存没刷"。
   run.Check(remote->deleteSnapshot(uploaded_id) &&
                 remote->waitForIdle(180000) &&
                 remote->lastErrorKindForTest() == QStringLiteral("none"),
@@ -5347,6 +5522,8 @@ int RunRemoteSmoke(backup_modern::RemoteController* remote,
                 remote->lastDetailForTest());
 
   // ---- SMOKE-11：注销账户（不可撤销的服务端删除）----
+  // 注销要把账号名再打一遍：名字对不上就在本地拒绝，连请求都不发。它是防误删的
+  // 最后一道闸门，必须在会话还有效的时候就挡住。
   run.Check(!remote->deleteAccount(password, QStringLiteral("not-this-user")) &&
                 remote->lastErrorKindForTest() ==
                     QStringLiteral("confirm-mismatch") &&
@@ -5360,6 +5537,8 @@ int RunRemoteSmoke(backup_modern::RemoteController* remote,
       remote->lastErrorKindForTest() + QStringLiteral(": ") +
           remote->lastDetailForTest());
   // login() 返回 true 只表示"请求被受理"：必须等后台任务结束之后再断言。
+  // 注销之后原账号必须登不上：服务端的账号行真的没了，而不是只有客户端把会话
+  // 清掉。
   const bool relogin_accepted =
       remote->login(host, port_text, username, password);
   const bool relogin_idle = remote->waitForIdle(120000);
@@ -5373,6 +5552,8 @@ int RunRemoteSmoke(backup_modern::RemoteController* remote,
 
   // ---- 产品级远端备份 / 链恢复：与 --remote-test 共用同一段断言 ----
   {
+    // 产品级流程（GUI-P01..P12）用独立账号：它自己建链、自己注销，与前面
+    // SMOKE-01..12 用的账号互不干扰。
     const QString product_user =
         QStringLiteral("gui-prod-%1")
             .arg(QRandomGenerator::global()->bounded(1000000, 9999999));
@@ -5401,6 +5582,8 @@ int RunRemoteSmoke(backup_modern::RemoteController* remote,
     }
     return 1;
   }
+  // 成功标记：脚本用它区分"真的全过"与"退出码恰好为 0"（例如参数解析提前
+  // 返回）。失败时只打 FAIL 明细，绝不打这一行。
   std::printf("[remote-smoke] REMOTE_SMOKE_PASS\n");
   return 0;
 }
@@ -5411,6 +5594,9 @@ int RunRemoteSmoke(backup_modern::RemoteController* remote,
 // 也就是产品文档里让用户复制的那一行。找不到、长度不够或者不是十六进制一律
 // 返回空串，让调用方**明确失败**：拿一个"猜出来的"指纹去连接，错误会出现在
 // 握手那一层，比在这里说清楚难懂得多。
+// 从 backup-server-keygen 的输出里抠出 "--server-key sha256:<64 hex>"：这是运维
+// 把指纹抄进环境变量的正常路径，所以解析必须严格 —— 长度或字符集不符就返回
+// 空串（fail-closed），绝不"尽力猜一个"。
 QString ExtractServerKeyPin(const QString& keygen_output) {
   const QString marker = QStringLiteral("--server-key sha256:");
   const int at = keygen_output.indexOf(marker);
@@ -5432,7 +5618,7 @@ QString ExtractServerKeyPin(const QString& keygen_output) {
   return QStringLiteral("sha256:") + fingerprint.toLower();
 }
 
-// ---- PR #22：连接层自检（pin 应用 UX + SSH 安全通道）----
+// ---- 连接层自检（pin 应用 UX + SSH 安全通道）----
 //
 // 分两段，因为它们的依赖完全不同：
 //
@@ -5443,12 +5629,15 @@ QString ExtractServerKeyPin(const QString& keygen_output) {
 //                             由 scripts/pr22_ecs_e2e.sh 驱动。
 //
 // 这一组检查刻意**全部从界面对象发起**（写输入框的 text、发按钮的 clicked
-// 信号），而不是直接调用控制器：人工验收发现的第一个问题就是"按钮的 onClicked
-// 把返回值丢掉了"，只有从按钮那一条路走才可能抓到它。
+// 信号），而不是直接调用控制器：从按钮那一条路走，才可能抓到"按钮的
+// onClicked 把返回值丢掉了"这类问题。
 namespace {
 
 // 把一个文本输入框当成"用户敲进去了"：先设 text，再发 QML 的 textEdited 信号。
 // 只设 text 不会触发 onTextEdited，那样测的就不是用户的路径了。
+// 往输入框里"打字"：先改 text 属性，再按该控件真实存在的那个 textEdited 信号
+// 形态触发一次（QML TextField 暴露无参版本，有的控件是带 QString 的），让绑定
+// 与校验逻辑和用户手输时走同一条路径。
 bool TypeIntoField(QQuickWindow* window, const char* object_name,
                    const QString& text) {
   QObject* field =
@@ -5481,6 +5670,8 @@ bool TypeIntoField(QQuickWindow* window, const char* object_name,
 
 // 按钮按下：发 clicked 信号（AbstractButton 的标准信号），于是 QML 里的
 // onClicked 真的被执行。
+// 点按钮 = 发它的 clicked 信号。找不到控件返回 false 而不是静默成功：
+// "按钮不存在"与"按钮点了没反应"是两类不同的缺陷，必须能区分。
 bool ClickButton(QQuickWindow* window, const char* object_name) {
   QObject* button =
       window->findChild<QObject*>(QString::fromLatin1(object_name));
@@ -5498,6 +5689,10 @@ bool ObjectVisible(QQuickWindow* window, const char* object_name) {
 // 有效可见性：自己的 visible 为真**且**所有祖先都可见。QML 里的 visible 绑定
 // 通常挂在容器上（例如官方模式下被隐藏的整个指纹区块），只看控件自己的属性会
 // 把“用户其实看不到”误判成可见。
+// 沿 QObject 父链逐级检查 visible，直到窗口为止：StackLayout / Loader 里的整页
+// 不可见时，子控件自己的 visible 仍是 true，只看它会把"别的页面上的控件"当成
+// 可见。父链用 QObject::parent() 而不是 item 父项，因为要断言的就是 QML 声明的
+// 那条可见性链。
 bool EffectivelyVisible(QQuickWindow* window, const char* object_name) {
   QObject* object =
       window->findChild<QObject*>(QString::fromLatin1(object_name));
@@ -5525,10 +5720,12 @@ QString ObjectText(QQuickWindow* window, const char* object_name) {
 // 这个控件**真的出现在窗口里**吗？
 //
 // ObjectVisible() 读的是 QML 的 visible 属性 —— 它只说明"这条绑定为真"，
-// 不说明它在不在可视范围内。PR22 的截图 harness 就是在这个区别上栽过一次：
+// 不说明它在不在可视范围内。截图 harness 就是在这个区别上栽过一次：
 // 断言读的是属性、画面里却什么都没有（甚至整页空白），于是两张"不同状态"的
 // 截图逐字节相同。所以凡是"截图里必须看得见某句话"的断言，一律走这个几何
 // 检查：控件至少有一半面积落在窗口矩形内。
+// "在视口里"的判据：控件可见、几何为正，且与窗口矩形的交集至少覆盖它高度的
+// 一半。只露一条边不算 —— 那种状态下用户点不到，截图里也看不清。
 bool ItemInViewport(QQuickWindow* window, QObject* object) {
   auto* item = qobject_cast<QQuickItem*>(object);
   if (item == nullptr || !item->isVisible() || window == nullptr) {
@@ -5554,6 +5751,8 @@ bool ObjectInViewport(QQuickWindow* window, const char* object_name) {
 // 不能写一个"足够大的数"（第一版就是 scrollTop(100000)）：ScrollView 的
 // contentY 在被程序直接赋值时不会像用户拖动那样自动夹住，结果整页滚出视野，
 // 抓出来是一张空白图。
+// 滚到底：远端页比一屏高，底部那些区域（原始归档 / 状态横幅）不滚就永远在视口
+// 外，几何断言会以"找不到控件"的形式假失败。
 void ScrollRemotePageToBottom(QQuickWindow* window) {
   auto* scroll =
       window->findChild<QQuickItem*>(QStringLiteral("remotePageScroll"));
@@ -5573,18 +5772,18 @@ void ScrollRemotePageToBottom(QQuickWindow* window) {
 
 }  // namespace
 
-// ---- --official-acceptance：真实官方云端的 GUI 人工验收路径 ----
+// ---- --official-acceptance：真实官方云端的 GUI 验收路径 ----
 //
-// PR #23 的正式合同是「官方云端 = OfficialCloudProfile + 内置官方根 + BPSEC2
-// 证书」：普通用户**不该看到、也不该被要求填写**服务器身份指纹。人工视觉验收
-// 发现当时的登录路径仍然经过 manual pin，被一句“服务器身份指纹不合法”挡死。
+// 正式合同是「官方云端 = OfficialCloudProfile + 内置官方根 + BPSEC2
+// 证书」：普通用户**不该看到、也不该被要求填写**服务器身份指纹。曾经的登录
+// 路径仍然要经过 manual pin，被一句“服务器身份指纹不合法”挡死。
 // 这一条把**修好之后的那条路**在真实窗口上跑一遍，并留下一张 PNG（走窗口自己的
 // grabWindow()，与用户看到的是同一条渲染路径）：
 //
 //   官方云端（页面选中）-> 用户名 / 口令 -> 点“登录”-> 云端列表
 //
 // 它打的是编译进二进制的官方端点（真实 ECS），所以**不进 final gate**
-// （gate 不能依赖公网），由人工验收单独跑：
+// （gate 不能依赖公网），所以手动单独跑：
 //
 //   QT_QPA_PLATFORM=offscreen BACKUP_REMOTE_PASSWORD=...
 //   build/backup-gui-modern
@@ -5600,6 +5799,8 @@ int RunOfficialAcceptance(QQuickWindow* window,
                  "[official-acceptance] 需要环境变量 BACKUP_REMOTE_PASSWORD\n");
     return 2;
   }
+  // 官方云端模式不允许出现任何 SSH 通道：跑之前数一遍系统里的 ssh 进程，跑完
+  // 再数一遍，数量变多就说明这个模式偷偷起了隧道。
   const auto count_ssh = []() {
     QProcess probe;
     probe.start(QStringLiteral("pgrep"),
@@ -5617,6 +5818,8 @@ int RunOfficialAcceptance(QQuickWindow* window,
   // 绑定读的是 page.officialMode。用户点分段控件时 onActivated 会把这两边一起
   // 改掉；这里等价地做同一件事，否则控制器已经是官方、页面还停在 ssh，
   // 截图与可见性断言都会错。
+  // 控制器与界面上的分段控件都设成 official，模拟用户选了"官方云端"：只设
+  // 控制器不设界面，就测不到"这一页真的不显示主机 / 端口 / 指纹"。
   remote->setConnectionMode(QStringLiteral("official"));
   QObject* remote_page =
       window->findChild<QObject*>(QStringLiteral("remotePage"));
@@ -5637,6 +5840,8 @@ int RunOfficialAcceptance(QQuickWindow* window,
                 EffectivelyVisible(window, "remoteLoginButton"),
             QStringLiteral("A03 用户名 / 密码 / 登录按钮仍然在页面上"));
 
+  // 只填用户名与密码就点登录：官方模式对用户唯一可见的身份就是这两项，指纹由
+  // 产品内置的信任根提供，用户既不填也看不到。
   TypeIntoField(window, "remoteUserField", username);
   TypeIntoField(window, "remotePasswordField", password);
   ClickButton(window, "remoteLoginButton");
@@ -5655,7 +5860,7 @@ int RunOfficialAcceptance(QQuickWindow* window,
             QStringLiteral("A06 登录态与云端列表都到位（截图里的可见状态）"),
             remote->loginError());
   // A07：再显式刷一次云端列表。登录成功之后的自动读列表是“顺带”的，这一条是
-  // 人工验收要求的 refresh/list 本身成功（失败时 last_error_kind_ 不是 none）。
+  // 要求 refresh/list 本身成功（失败时 last_error_kind_ 不是 none）。
   const bool refreshed = remote->refreshList() && remote->waitForIdle(60000);
   run.Check(
       refreshed && remote->lastErrorKindForTest() == QStringLiteral("none"),
@@ -5671,6 +5876,8 @@ int RunOfficialAcceptance(QQuickWindow* window,
   // 默认 1180x760 装不下这一页，所以按真实 contentItem 的高度把窗口开高 ——
   // 与 --screenshot-remote 的整页总览同一条做法（同一套 QML、同一条 grabWindow
   // 路径），不是另画一份示意图。
+  // 整页截图：先读内容高度，只有确实超出一屏（且没超出合理范围）时才把窗口拉
+  // 高，否则会得到一张底下大段空白的图。
   QQuickItem* remote_scroll =
       window->findChild<QQuickItem*>(QStringLiteral("remotePageScroll"));
   if (remote_scroll != nullptr) {
@@ -5695,6 +5902,8 @@ int RunOfficialAcceptance(QQuickWindow* window,
   }
 
   const QImage image = window->grabWindow();
+  // 截图失败即整个验收失败：这张官方云端截图是验收证据，缺了它这一轮
+  // 就没有可交付的结论。
   if (image.isNull() || !image.save(out_png)) {
     std::fprintf(stderr, "[official-acceptance] 截图保存失败: %s\n",
                  qPrintable(out_png));
@@ -5725,17 +5934,19 @@ int RunRemoteConnectionUx(QQuickWindow* window,
   window->setProperty("currentPage", 6);
   WaitForAnimation(300);
 
-  // ---- PR #23 人工验收 blocker 的回归：官方云端不该经过人工 pin ----
+  // ---- 官方云端不该经过人工 pin 的回归 ----
   //
-  // 人工验收的真实路径是“官方云端 -> 用户名 / 口令 -> 登录”，而当时的实现无条件
+  // 真实路径是“官方云端 -> 用户名 / 口令 -> 登录”，而早期实现无条件
   // 走 *WithPin，把一个**隐藏的**空指纹框当成“指纹不合法”，官方用户被挡在门外。
-  // 自动测试当时没发现，是因为 C01..C07 **全部**在 ssh / direct 模式下跑 ——
+  // 自动测试没有覆盖到，是因为 C01..C07 **全部**在 ssh / direct 模式下跑 ——
   // 没有任何一条用例走过 official 模式。
   //
   // 这一段用“只记录不发送”的注入点：官方 profile 指向真实 ECS，而 final gate
   // 不能依赖公网。断言的是**本地合同**（有没有被 pin 闸门挡住、发出去的请求长
-  // 什么样），不是网络结果 —— 网络结果由人工验收与 Phase 8 负责。
+  // 什么样），不是网络结果 —— 网络结果不在这一段断言。
   {
+    // 打开请求捕获：每个被真正派发出去的请求都会留下 endpoint 记录并让计数器
+    // +1。"本地就被挡住"的判据正是"计数器没动"，所以这一段结束时必须关掉。
     remote->setCaptureDispatchedRequestForTest(true);
     // 本段是**插在 C01..C07 前面**的：它们打的是本地服务端，对连接方式有
     // 自己的期待（进这一节时是“直连”）。所以这里把进入时的模式存下来，
@@ -5744,6 +5955,8 @@ int RunRemoteConnectionUx(QQuickWindow* window,
     const QString mode_before_official_block = remote->connectionMode();
     const QString official_user = QStringLiteral("gui-official-01");
     const QString pin_before_official = remote->serverKeyPin();
+    // 官方 profile 是唯一的信任来源：host / port / expected_server_id 全部取自
+    // 它，断言也对着它比 —— 任何一处被本地默认值顶替都会在这里露出来。
     const backupproject::net::ServerProfile official =
         backupproject::net::OfficialCloudProfile();
 
@@ -5824,6 +6037,8 @@ int RunRemoteConnectionUx(QQuickWindow* window,
     // 空 pin 与畸形 pin 在本地就要挡住（一个字节都不发）。“well-formed 但错”的
     // pin 只能在服务端被发现，那一条由 C03a（真实本地服务端 ->
     // pin-mismatch）覆盖。
+    // manual 模式（ssh / direct）的 fail-closed 回归：没有可信指纹时必须在本地
+    // 就拒绝，一个字节都不发。判据是请求计数不变 + 错误类为 validation。
     const auto must_block_locally = [&](const QString& label,
                                         const QString& mode,
                                         const QString& pin_text,
@@ -5867,6 +6082,8 @@ int RunRemoteConnectionUx(QQuickWindow* window,
         QStringLiteral("ssh"), QStringLiteral("sha256:nothex"), true);
 
     // 收尾：关掉注入点，恢复 pin 与模式，后面的 C01.. 继续用真实网络跑。
+    // 恢复现场：关掉捕获、装回正确指纹、切回原来的模式并清掉两种错误行，
+    // 免得后面的用例读到这一段留下的状态。
     remote->setCaptureDispatchedRequestForTest(false);
     remote->applyServerKeyPin(good_pin);
     remote->setConnectionMode(mode_before_official_block);
@@ -5874,19 +6091,23 @@ int RunRemoteConnectionUx(QQuickWindow* window,
     remote->clearRegisterError();
   }
 
+  // 下面每个代码块都会改指纹，结尾统一调它复位：漏掉一处的后果是后续用例在
+  // 一个错的信任根上跑，失败信息还会指向别处。
   const auto restore_pin = [remote, &good_pin]() {
     remote->applyServerKeyPin(good_pin);
   };
 
   // C04 需要一份真实存在的源目录。**不**依赖前面的检查是否成功：没有就现造
   // 一个，否则这条检查会因为"上一条挂了"而连带红掉，掩盖真正的原因。
+  // 源目录缺失时才造一个：这个函数既被自检调用（目录由自检准备好），也被别的
+  // 入口调用，不能无条件往里写文件。
   if (!QFileInfo(source_dir).isDir()) {
     QDir().mkpath(source_dir);
     WriteTestFile(source_dir + QStringLiteral("/c04.txt"),
                   QByteArray("pr22-c04\n"));
   }
 
-  // 页面上必须真的有"连接方式 / SSH 主机 / 通道状态"这三件东西：PR #22 的
+  // 页面上必须真的有"连接方式 / SSH 主机 / 通道状态"这三件东西：
   // 产品目标之一就是把部署链路摆到界面上，而不是继续留在文档里。
   run->Check(
       window->findChild<QObject*>(QStringLiteral("remoteConnectionModeTabs")) !=
@@ -5906,6 +6127,8 @@ int RunRemoteConnectionUx(QQuickWindow* window,
   {
     // 先让"已经生效"的值是**另一个**合法指纹，否则这次点击的结果会是
     // "unchanged"，整条断言就变成了同义反复。
+    // 先让一个**别的** pin 生效，才能证明"应用"真的改了生效值，而不是恰好
+    // 与默认值相同。
     const QString applied_before =
         QStringLiteral("sha256:") + QString(64, QLatin1Char('1'));
     remote->applyServerKeyPin(applied_before);
@@ -5937,6 +6160,8 @@ int RunRemoteConnectionUx(QQuickWindow* window,
 
   // ---- C02：非法 pin -> 可见红色错误，上一次生效的 pin 一个字节都不改 ----
   {
+    // 非法输入不改变已经生效的指纹：这一条比"报错"更重要 —— 改了就等于把用户
+    // 从一个能用的信任根切到不可用的状态。
     const QString before = remote->serverKeyPin();
     TypeIntoField(window, "remoteServerKeyPinField",
                   QStringLiteral("sha256:zz"));
@@ -5970,6 +6195,8 @@ int RunRemoteConnectionUx(QQuickWindow* window,
   // ---- C03：改 pin、不点"应用"、直接登录 -> 采用**当前输入框里的** pin ----
   {
     // 先故意让"已生效"的 pin 是一个错的，然后把输入框换成对的，直接登录。
+    // 错 pin 的失败必须是 pin-mismatch，而不是 credentials：两者文案完全不同，
+    // 混起来会把"服务器换了身份"误导成"密码错了"。
     const QString wrong_pin =
         QStringLiteral("sha256:") + QString(64, QLatin1Char('0'));
     const QString new_user =
@@ -6031,6 +6258,8 @@ int RunRemoteConnectionUx(QQuickWindow* window,
   // ---- C04：有活动连接时改 pin + 应用 -> 当前连接不被杀，下一次重连才换 ----
   {
     remote->applyServerKeyPin(good_pin);
+    // 有活动操作时应用新指纹：不能打断当前连接，只能对下一次重连生效，并把这个
+    // 事实明确告诉用户。
     const QString c04_user =
         QStringLiteral("gui-c04-%1")
             .arg(QRandomGenerator::global()->bounded(1000000, 9999999));
@@ -6075,6 +6304,8 @@ int RunRemoteConnectionUx(QQuickWindow* window,
   // ---- C05：找不到 ssh 命令 ----
   {
     remote->setConnectionMode(QStringLiteral("ssh"));
+    // 把 ssh 可执行文件指到不存在的路径：失败原因必须区分成 ssh-missing，
+    // 而不是笼统的网络错误。
     remote->setSshProgramForTest(QStringLiteral("/nonexistent/pr22-ssh"));
     remote->setSshHostForTest(QStringLiteral("aliyun-ecs"));
     remote->ensureConnection(host, port_text);
@@ -6109,6 +6340,8 @@ int RunRemoteConnectionUx(QQuickWindow* window,
     // 本机 known_hosts 里没有 localhost 的条目，而 BatchMode=yes 让 ssh 不能
     // 交互式询问，于是它必须打印 "Host key verification failed." 并退出 255。
     // 先确认这个前提真的成立，否则这条检查会自动变成"永远通过"。
+    // C07 的前提是本机 known_hosts **没有**信任 localhost；如果已经信任，这条
+    // 用例无法构造，于是明确跳过并 ++passed，而不是假装通过。
     QProcess precondition;
     precondition.setProgram(QStringLiteral("ssh"));
     precondition.setArguments(
@@ -6170,7 +6403,7 @@ int RunRemoteConnectionUx(QQuickWindow* window,
   return 0;
 }
 
-// --screenshot-remote：PR #22 的**真实状态**截图。
+// --screenshot-remote：**真实状态**截图。
 //
 // 与 --screenshot 的区别：那一条拍的是"页面长什么样"，这一条拍的是"连接的
 // 每一层分别长什么样" —— 通道没启动 / 正在建 / 建好了 / 建失败 / pin 已应用 /
@@ -6230,6 +6463,8 @@ int RunRemoteScreenshot(QQuickWindow* window,
   // 与自检共用同一套"用户动作"助手：输入框走 textEdited、按钮走 clicked，
   // 两条都是 QML 里真正接的线（不共用的话，截图路径会自己长出一份"两个签名
   // 都试"的写法，而那正是上面刚修掉的告警来源）。
+  // 输入指纹并点"应用"，等界面把反馈渲染出来再抓图；三步合成一个动作，避免
+  // 每个抓图点重复一遍。
   const auto typePin = [window](const QString& text) {
     TypeIntoField(window, "remoteServerKeyPinField", text);
     ClickButton(window, "remoteServerKeyPinApplyButton");
@@ -6278,6 +6513,8 @@ int RunRemoteScreenshot(QQuickWindow* window,
   // 4) "正在建立安全通道…"：目标指向一个连不通、又不会立刻回错的地址，
   //    这样窗口能稳定停在 starting 状态上被抓到。
   remote->setConnectionModeForTest(QStringLiteral("ssh"));
+  // 10.255.255.1 是不可路由地址：连接会停在 starting 状态足够久，才能抓到
+  // "正在建立安全通道"那一帧。
   remote->setSshHostForTest(QStringLiteral("10.255.255.1"));
   remote->ensureConnection(QStringLiteral("127.0.0.1"),
                            QStringLiteral("18765"));
@@ -6288,6 +6525,7 @@ int RunRemoteScreenshot(QQuickWindow* window,
   remote->stopTunnel();
 
   // 5) 通道建立失败（主机名解析不了 -> 有自己的说法，不是"网络错误"）。
+  // .invalid 是保留域名，DNS 必然失败：这一帧要的是"通道建立失败"的界面。
   remote->setSshHostForTest(QStringLiteral("no-such-host.invalid"));
   remote->ensureConnection(QStringLiteral("127.0.0.1"),
                            QStringLiteral("18765"));
@@ -6312,6 +6550,8 @@ int RunRemoteScreenshot(QQuickWindow* window,
   // 不滚的话通道状态在屏幕外，抓出来和"登录之后"那一帧逐字节相同 —— 上一版
   // 就是这么交付的（GPT 审查发现两张 PNG 的 sha256 一样）。
   scrollTop(150);
+  // 抓图之外还断言这一帧的内容：安全通道必须显示"已建立"，而且此时**尚未
+  // 登录**。只存一张图不断言，图里是什么就只能靠人看。
   const bool ready_frame_ok =
       ObjectInViewport(window, "remoteTunnelStateText") &&
       ObjectText(window, "remoteTunnelStateText")
@@ -6375,6 +6615,8 @@ int RunRemoteScreenshot(QQuickWindow* window,
   // 的横幅会诚实地写"云端还没有备份"—— 那也是一个真结论，但它证明不了
   // "列表被重新读回来了"。放一条进去之后，重连那一帧的横幅是
   // "云端备份列表已更新 / 云端共 1 个备份"，列表里还有那一行。
+  // 截图要展示"云端已经有一份备份"的状态，所以先在这个临时账号里真跑一次远端
+  // 备份：假数据造出来的列表与真实布局不一样，图就没有说服力。
   const QString shot_source =
       QDir::temp().filePath(QStringLiteral("pr22-shot-source"));
   QDir().mkpath(shot_source);
@@ -6392,6 +6634,8 @@ int RunRemoteScreenshot(QQuickWindow* window,
   }
 
   // 8) 隧道断掉之后自动重建 + RESUME：抓的是"重建之后又能用了"这一刻。
+  // 杀掉自己起的 ssh，制造"连接断了"的真实场景：下一次操作必须自动重连并刷新
+  // 列表，界面给出"列表已更新"的提示，而不是让用户重新登录。
   remote->killOwnedTunnelForTest();
   waitForState(QStringLiteral("failed"), 20000);
   if (!remote->refreshList() || !remote->waitForIdle(180000) ||
@@ -6403,6 +6647,7 @@ int RunRemoteScreenshot(QQuickWindow* window,
   // 这一帧要给出**结论**，而不是让读者从"本地端口变了"去推断：卷到页面
   // 底部，状态横幅上写着这次刷新的真实结果"云端备份列表已更新"，下面还有
   // 列表自己的摘要行。两者都是控制器真的写进去的文本，不是画上去的。
+  // 断线重连的提示在页面底部，先滚下去再抓"已重连"那一帧。
   ScrollRemotePageToBottom(window);
   // StatusBanner 暴露的是 showsMessage / title / message，不是 text ——
   // 与 --remote-test 里既有断言读的是同几个属性。
@@ -6414,6 +6659,8 @@ int RunRemoteScreenshot(QQuickWindow* window,
           : reconnect_banner->property("title").toString();
   // 关键在于 ItemInViewport：横幅必须**真的在这一帧的画面里**，
   // 而不是"属性上写着有这句话"。
+  // 这一帧的判据同样不只是"图存下来了"：横幅必须属于当前页（showsMessage）、
+  // 落在视口内、文案是"云端备份列表已更新"，而且通道重新由本程序持有。
   const bool reconnect_frame_ok =
       reconnect_banner != nullptr &&
       reconnect_banner->property("showsMessage").toBool() &&
@@ -6437,6 +6684,8 @@ int RunRemoteScreenshot(QQuickWindow* window,
 
   // 9) 深色主题下的同一页（连接层的配色也要在两套主题下都读得清）。
   theme->setDark(true);
+  // 同一状态再抓一张深色：主题算页面的一部分，亮色下正常不代表深色下也正常，
+  // 评审时两张图要一起看。
   if (!shot(QStringLiteral("remote-connection-dark"))) {
     return 1;
   }
@@ -6448,6 +6697,8 @@ int RunRemoteScreenshot(QQuickWindow* window,
   // 相同（sha256 1cfc7359…），因为登录带来的变化全在窗口可视范围之外 ——
   // 这个自检就是为了让那种情况**不可能**再悄悄通过。
   {
+    // 三张结论帧必须互不相同，用 SHA-256 比字节而不是靠文件大小或肉眼。图完全
+    // 一样说明某一帧其实没渲染出新状态（抓早了），那张"证据"是假的。
     const auto digest = [](const QString& name, QString* out) {
       QFile file(name);
       if (!file.open(QIODevice::ReadOnly)) {
@@ -6481,6 +6732,8 @@ int RunRemoteScreenshot(QQuickWindow* window,
   }
 
   // 收尾：注销临时账号并关掉通道，ECS 上不留任何东西。
+  // 收尾：注销临时账号并停掉安全通道。前面任何一步 return 1 都会跳过这里，
+  // 所以自动化脚本仍要接受"可能残留一个临时账号"。
   remote->deleteAccount(password, account);
   remote->waitForIdle(300000);
   remote->logoutLocal();
@@ -6509,6 +6762,8 @@ int RunRemoteTest(QQuickWindow* window, backup_modern::RemoteController* remote,
   };
   // "这一页会不会显示这条提示"——读的是 StatusBanner 的 showsMessage，
   // 与它此刻是不是当前页无关。
+  // 页面提示的判据用 showsMessage（"这一页该不该显示这条消息"），不是 visible：
+  // StackLayout 里非当前页整体不可见，用 visible 永远测不出"会不会显示"。
   const auto pageShows = [&objectByName](const char* banner_name,
                                          const QString& title) {
     QObject* banner = objectByName(banner_name);
@@ -6527,6 +6782,8 @@ int RunRemoteTest(QQuickWindow* window, backup_modern::RemoteController* remote,
     return a.readAll() == b.readAll();
   };
   // 目录里每个文件的完整内容。用来证明"这一段时间里那个目录一个字节都没变"。
+  // 把整个状态目录拍成 (路径 -> 字节) 的快照，用来断言"这一段没往磁盘上写任何
+  // 东西"（口令 / token 不落盘）。比 mtime 可靠：读操作也会动 mtime。
   const auto snapshotDirectory = [](const QString& directory) {
     QMap<QString, QByteArray> files;
     if (directory.isEmpty() || !QFileInfo(directory).isDir()) {
@@ -6565,11 +6822,15 @@ int RunRemoteTest(QQuickWindow* window, backup_modern::RemoteController* remote,
     return 1;
   }
   const QString work = temp.filePath(QStringLiteral("remote"));
+  // 一次运行的全部产物都落在这个临时树里：data = 服务端 blob，state = 密钥 /
+  // 数据库 / 日志，repo 与 source = 本地备份，out = 下载目标。跑完整体删除。
   for (const char* part : {"", "/data", "/state", "/repo", "/source", "/out"}) {
     QDir().mkpath(work + QString::fromLatin1(part));
   }
 
   // token secret：随机内容，只落在 0600 的文件里。测试既不读它、也不打印它。
+  // 服务端的 token 签名密钥每次现生成（32 字节随机数），权限 0600：它只用于这
+  // 一次自检，不落进仓库，也不复用固定测试值。
   const QString secret_file = work + QStringLiteral("/state/secrets.env");
   {
     QFile secret(secret_file);
@@ -6595,7 +6856,7 @@ int RunRemoteTest(QQuickWindow* window, backup_modern::RemoteController* remote,
     return 1;
   }
 
-  // ---- 服务端传输身份（PR #21 起是必填项）----
+  // ---- 服务端传输身份（必填项）----
   //
   // 两件事必须成对出现，少一件这条自检就跑不下去：
   //   * 服务端必须带 --transport-key-file（缺了它以用法错误退出，起不来）；
@@ -6605,6 +6866,8 @@ int RunRemoteTest(QQuickWindow* window, backup_modern::RemoteController* remote,
   // pin 只从 backup-server-keygen 的输出里取，这里**不**自己算指纹：工具的
   // 打印格式就是产品给用户的格式，测试再算一份等于验了一份第二实现。
   // 私钥内容既不读也不打印，它只活在这次自检的临时目录里。
+  // 传输身份密钥与指纹都由 backup-server-keygen 现生成："客户端连接前必须配好
+  // 指纹"这条约束在这里被验证 —— 没有 keygen 就没有指纹，自检直接失败。
   const QString keygen_binary = QCoreApplication::applicationDirPath() +
                                 QStringLiteral("/backup-server-keygen");
   if (!QFileInfo::exists(keygen_binary)) {
@@ -6615,10 +6878,14 @@ int RunRemoteTest(QQuickWindow* window, backup_modern::RemoteController* remote,
                  qPrintable(keygen_binary));
     return 1;
   }
+  // 密钥文件放在临时 state 目录里：服务端用它做传输身份，客户端只拿它的指纹。
+  // 私钥不出这个目录，跑完随临时树一起删除。
   const QString transport_key_file =
       work + QStringLiteral("/state/transport.key");
   // keygen 的失败必须**明确**报出来（退出码 + stderr）：静默继续只会让后面
   // 每一条断言都以"连接被拒绝"这种看不懂的方式红掉。
+  // 失败原因要带上退出码与 stderr：keygen 是外部进程，"异常结束"与"正常退出但
+  // 返回非 0"是两种不同的故障，混起来分不清是缺参数还是密钥写不进去。
   const auto keygenFailure = [](QProcess& process) {
     return QStringLiteral("退出码 %1；stderr：%2")
         .arg(process.exitStatus() == QProcess::NormalExit
@@ -6629,6 +6896,8 @@ int RunRemoteTest(QQuickWindow* window, backup_modern::RemoteController* remote,
   QString server_key_pin;
   {
     // (1) 生成 0600 的身份私钥。路径在临时目录里，所以不会撞上任何真实身份。
+    // 第一步：生成服务端传输身份密钥（--output）。失败就没有指纹可用，整个
+    // 自检失去意义，直接返回。
     QProcess keygen;
     keygen.setProgram(keygen_binary);
     keygen.setArguments({QStringLiteral("--output"), transport_key_file});
@@ -6642,6 +6911,8 @@ int RunRemoteTest(QQuickWindow* window, backup_modern::RemoteController* remote,
       return 1;
     }
     // (2) 打印公钥与指纹；其中一行就是产品给用户的 --server-key。
+    // 第二步：把公钥打印出来，用 "--server-key" 那一行做客户端信任根。TOFU 由
+    // 人来完成一次，之后客户端只认这个指纹。
     QProcess keygen_show;
     keygen_show.setProgram(keygen_binary);
     keygen_show.setArguments({QStringLiteral("--show"),
@@ -6672,6 +6943,8 @@ int RunRemoteTest(QQuickWindow* window, backup_modern::RemoteController* remote,
   // (2.5) 本自检自己起了一个**本地**服务端并直连它，所以显式选择直连模式。
   // 产品默认是 SSH 安全通道（当前部署的服务端只监听它自己的回环地址），
   // 但这条自检里的服务端就在 127.0.0.1 上，没有、也不需要隧道。
+  // 服务端只监听 127.0.0.1，所以用 direct 模式，不把 SSH 通道那一层牵进来；
+  // 通道自己的用例在 RunRemoteConnectionUx / RunRemoteTunnelEcs 里。
   remote->setConnectionModeForTest(QStringLiteral("direct"));
   // (3) 第一次连接之前交给控制器；控制器会用共享的 ParseServerKeyPin 再校验。
   if (!remote->setServerKeyPin(server_key_pin)) {
@@ -6683,12 +6956,14 @@ int RunRemoteTest(QQuickWindow* window, backup_modern::RemoteController* remote,
       "[remote-test] 服务器身份指纹已配置（取自 backup-server-keygen "
       "--show）\n");
 
+  // 服务端日志既是排障材料，也是"内核分配了哪个端口"的唯一来源 —— 端口写 0 让
+  // 内核挑，避免与开发机上已有服务撞车。
   const QString log_file = work + QStringLiteral("/state/server.log");
   QProcess server;
   server.setProgram(server_binary);
   // --io-timeout 2：服务端会在 2 秒空闲之后关掉连接。产品默认是 30 秒，机制
   // 完全相同，但这样 GUI 自检就能在几秒内覆盖"空闲被关掉 -> 第一次操作仍然
-  // 成功"这条路径（人工验收的奇偶失败就是它）。
+  // 成功"这条路径（这里出现过奇偶失败）。
   // 端口先给 0（内核分配），拿到真实端口之后 CASE D 会用**同一个端口**重启
   // 服务端，验证"服务端回来了，客户端自己重连并恢复会话"。
   QStringList server_arguments = {
@@ -6698,12 +6973,16 @@ int RunRemoteTest(QQuickWindow* window, backup_modern::RemoteController* remote,
       QStringLiteral("--root"), work + QStringLiteral("/data"),
       QStringLiteral("--db"), work + QStringLiteral("/state/metadata.sqlite3"),
       QStringLiteral("--secret-file"), secret_file,
-      // 传输身份私钥：PR #21 起服务端没有它就以用法错误退出。
+      // 传输身份私钥：服务端没有它就以用法错误退出。
       QStringLiteral("--transport-key-file"), transport_key_file,
       QStringLiteral("--pid-file"), work + QStringLiteral("/state/server.pid"),
       QStringLiteral("--log-file"), log_file, QStringLiteral("--quiet")};
+  // io-timeout 故意调成 2 秒：空闲断连 -> 自动重连 -> RESUME 那条路径要能在一次
+  // 自检里被触发，否则它永远不会被测到。
   server.setArguments(server_arguments);
   // 无论从哪条 return 出去，服务端都要被收走，不留孤儿进程。
+  // RAII 收尾：无论从哪条路径返回（包括中途 return 1），服务端进程都要被
+  // terminate -> kill 收掉，绝不留孤儿。
   struct ServerGuard {
     QProcess* process;
     ~ServerGuard() {
@@ -6720,6 +6999,8 @@ int RunRemoteTest(QQuickWindow* window, backup_modern::RemoteController* remote,
 
   // 端口交给内核分配（--port 0）：服务端把真正绑到的端口写进日志文件，
   // 所以这里不需要自己探测端口，也就不会在 GUI 代码里出现第二套 socket 逻辑。
+  // 从日志里等 "listening on 127.0.0.1:<port>"：端口是内核分配的，只能等它自己
+  // 说出来。超时即判失败，不猜端口、也不 sleep 固定时长。
   int port = 0;
   QElapsedTimer clock;
   clock.start();
@@ -6748,6 +7029,7 @@ int RunRemoteTest(QQuickWindow* window, backup_modern::RemoteController* remote,
     return 1;
   }
   // 只绑环回：这条与部署约束是同一条。
+  // 再确认一次进程还活着：日志里出现 listening 之后立刻退出，也会走到这里。
   run.Check(server.state() == QProcess::Running,
             QStringLiteral("REMOTE-00 服务端进程存活"));
 
@@ -6755,6 +7037,8 @@ int RunRemoteTest(QQuickWindow* window, backup_modern::RemoteController* remote,
   const QString port_text = QString::number(port);
 
   // ---- REMOTE-01：页面与导航 ----
+  // 控件一律按 objectName 找：objectName 是 QML 与自检之间的契约，改名就会在
+  // 这里立刻失败，而不是让某条断言静默地测了个空。
   QQuickItem* page = itemByName("remotePage");
   QObject* nav_item = objectByName("remoteNavItem");
   run.Check(page != nullptr && nav_item != nullptr,
@@ -6768,6 +7052,7 @@ int RunRemoteTest(QQuickWindow* window, backup_modern::RemoteController* remote,
             QStringLiteral("REMOTE-01 离开之后这一页确实不再显示"));
 
   // ---- REMOTE-02：密码框是密码回显模式 ----
+  // 密码框必须是掩码回显（echoMode=2）：这是"口令不回显"唯一可自动断言的形式。
   QObject* password_field = objectByName("remotePasswordField");
   // TextInput.Password == 2：明文常显是这一页绝不允许出现的样子。
   run.Check(password_field != nullptr &&
@@ -6779,6 +7064,8 @@ int RunRemoteTest(QQuickWindow* window, backup_modern::RemoteController* remote,
                       .arg(password_field->property("echoMode").toInt()));
   // 注册标签页的两个密码框同样必须是密码回显模式。对象的存在性与可见性无关，
   // 所以这里不需要先切到注册标签。
+  // 注册表单有输入与确认两个密码框，两个都必须是掩码：只给其中一个设掩码很容易
+  // 漏掉，而漏掉的那个会把口令显示在屏幕上。
   QObject* register_password_field =
       objectByName("remoteRegisterPasswordField");
   QObject* register_confirm_field = objectByName("remoteRegisterConfirmField");
@@ -6830,7 +7117,7 @@ int RunRemoteTest(QQuickWindow* window, backup_modern::RemoteController* remote,
             QStringLiteral("REMOTE-02 账户区域是一个分段的登录 / 注册控件，"
                            "两张表单各自带着自己的错误行"));
   // 冗余状态文本：账户卡片已经说了"当前账户"和"状态：已登录"，页面上不允许
-  // 再有第三行重复同一个事实（人工验收点名的那一行）。
+  // 再有第三行重复同一个事实。
   run.Check(objectByName("remoteSessionText") == nullptr &&
                 objectByName("remoteAccountStateText") != nullptr,
             QStringLiteral("REMOTE-02 页面里没有第三行重复的登录状态文本"));
@@ -6911,6 +7198,8 @@ int RunRemoteTest(QQuickWindow* window, backup_modern::RemoteController* remote,
                 QFileInfo(realtime_file_path).absolutePath() == state_directory,
             QStringLiteral("REMOTE-11 三个隔离配置文件在同一个状态目录里"),
             state_directory);
+  // 状态目录快照：注册 / 登录 / 备份 / 下载几段结束之后都要与它比对，证明会话与
+  // 口令只活在内存里。
   const QMap<QString, QByteArray> state_before =
       snapshotDirectory(state_directory);
 
@@ -6921,6 +7210,7 @@ int RunRemoteTest(QQuickWindow* window, backup_modern::RemoteController* remote,
   // 一致"，而且控制器不能进入忙碌状态、上一次生效的地址也不能被这次输入改掉。
   // 地址故意指向 TEST-NET-1；同时记下"调用之前"生效的端点，用来证明这次被拒
   // 的输入连 endpoint 都没有改（更不可能发请求）。
+  // 本地校验失败不许动任何状态：端点、横幅、忙碌位保持原样，一个字节都不发。
   const QString endpoint_before_host = remote->host();
   const QString endpoint_before_port = remote->portText();
   const QString banner_before_mismatch = remote->statusTitle();
@@ -6929,7 +7219,7 @@ int RunRemoteTest(QQuickWindow* window, backup_modern::RemoteController* remote,
                               QStringLiteral("local-only-check"), password,
                               password + QStringLiteral("x"));
   const QString mismatch_kind = remote->lastErrorKindForTest();
-  // 错误必须出现在**触发它的那张表单**里（人工验收："点了没反应"的根因就是
+  // 错误必须出现在**触发它的那张表单**里（"点了没反应"的根因就是
   // 校验失败只写了页面底部的横幅，甚至只打了终端日志）。
   const QString mismatch_row = remote->registerError();
   run.Check(
@@ -6987,6 +7277,8 @@ int RunRemoteTest(QQuickWindow* window, backup_modern::RemoteController* remote,
   //      次一个字节都没有发出去"。下面紧跟一条正向对照，证明这条判别式真的
   //      能区分"发了"和"没发"。
   {
+    // 三张表单（登录 / 注册 / 注销）的非法输入用例表。每条都要同时满足四件事：
+    // 被拒、原因只落在自己那张表单的错误行上、横幅不动、没有进入忙碌状态。
     struct ValidationCase {
       const char* label;
       int surface;  // 0=登录 1=注册 2=注销
@@ -7064,6 +7356,8 @@ int RunRemoteTest(QQuickWindow* window, backup_modern::RemoteController* remote,
          QStringLiteral("当前密码至少需要 8 个字符"),
          QStringLiteral("validation")},
     };
+    // 逐条跑：先清掉三种错误行，记下横幅，再调用**真实入口**。others_clean 是
+    // 关键 —— 登录失败不该在注册表单上留下任何字。
     for (const ValidationCase& item : cases) {
       remote->clearLoginError();
       remote->clearRegisterError();
@@ -7104,6 +7398,8 @@ int RunRemoteTest(QQuickWindow* window, backup_modern::RemoteController* remote,
     }
     // 正向对照：合法输入必须真的被受理（busy 立刻置位）。没有这一条，上面那句
     // "busy 还是 false 就说明没发出去"只是一个没有被检验过的断言。
+    // 正向对照：合法输入必须立刻受理并进入忙碌，否则"非法输入被拒"可能只是因为
+    // 这条路根本不工作。
     const bool positive_accepted =
         remote->login(good_host, good_port, good_user, good_password);
     const bool positive_busy = remote->busy();
@@ -7168,7 +7464,7 @@ int RunRemoteTest(QQuickWindow* window, backup_modern::RemoteController* remote,
 
   // ---- REMOTE-18：用户名校验的**原因**必须与真实失败原因一致 ----
   //
-  // 人工验收发现的最后一处 UX mismatch：输入 "W"（1 个字符）时，核心校验器给的
+  // 一处 UX mismatch：输入 "W"（1 个字符）时，核心校验器给的
   // 原因是长度，GUI 却显示"用户名只能包含字母、数字、点、下划线或减号"——把
   // "太短"说成了"字符不合法"，用户会被引到错误的修法上。
   //
@@ -7180,6 +7476,8 @@ int RunRemoteTest(QQuickWindow* window, backup_modern::RemoteController* remote,
   //
   // 非法行还要断言"没发请求"：busy 仍为 false、页面横幅逐字未变。
   {
+    // 用户名校验要证明两层一致：核心的 ValidateUsername 给出原因枚举，界面文案
+    // 必须是同一句话。表里覆盖边界值（2/3/64/65）与那一个纯数字名。
     using backupproject::net::UsernameValidation;
     struct UsernameCase {
       const char* label;
@@ -7192,7 +7490,7 @@ int RunRemoteTest(QQuickWindow* window, backup_modern::RemoteController* remote,
     const UsernameCase cases[] = {
         {"空", QString(), UsernameValidation::kEmpty,
          QStringLiteral("请输入用户名")},
-        {"1 个字符（人工验收的那一个）", QStringLiteral("W"),
+        {"1 个字符（边界用例）", QStringLiteral("W"),
          UsernameValidation::kTooShort,
          QStringLiteral("用户名长度需要为 3～64 个字符")},
         {"2 个字符", QStringLiteral("ab"), UsernameValidation::kTooShort,
@@ -7213,6 +7511,8 @@ int RunRemoteTest(QQuickWindow* window, backup_modern::RemoteController* remote,
     for (const UsernameCase& item : cases) {
       std::string reason_error;
       // 核心校验器：原因由它决定，界面只负责翻译。
+      // 先问核心要原因，再让登录 / 注册各走一遍：同一条输入必须得到同一个结论。
+      // 只测界面会把"界面比核心更严"这种不一致放过去。
       const UsernameValidation reason = backupproject::net::ValidateUsername(
           item.username.toStdString(), &reason_error);
       bool ok = reason == item.expect_reason;
@@ -7278,6 +7578,8 @@ int RunRemoteTest(QQuickWindow* window, backup_modern::RemoteController* remote,
   }
 
   // ---- REMOTE-06：用真实引擎生成一份归档并上传 ----
+  // 造源目录：12 个小文件 + 子目录里一个中文名大文件。中文名要经过 shell、URL
+  // 与归档格式三层，是最容易在某一层被改写的一类输入。
   const QString source = work + QStringLiteral("/source");
   for (int index = 0; index < 12; ++index) {
     QFile file(QStringLiteral("%1/note-%2.txt").arg(source).arg(index));
@@ -7301,6 +7603,8 @@ int RunRemoteTest(QQuickWindow* window, backup_modern::RemoteController* remote,
   run.Check(backup_started && controller->waitForIdle(180000),
             QStringLiteral("REMOTE-06 用真实备份引擎生成一份本地归档"));
   // 目录扫描跑在后台线程上：等它结束再取文件名（管理页也是这么刷新的）。
+  // 目录扫描是异步的：先等它空闲，列表为空时再主动刷新一次（第一次扫描可能在
+  // 备份结束前就跑完了），然后才按 fileName 取产物路径。
   QElapsedTimer catalog_clock;
   const auto waitForCatalog = [controller, &catalog_clock]() {
     catalog_clock.start();
@@ -7325,6 +7629,7 @@ int RunRemoteTest(QQuickWindow* window, backup_modern::RemoteController* remote,
             QStringLiteral("REMOTE-06 归档文件存在"), archive_path);
 
   // 配置与归档都已经定型：从这里开始，网络操作不该再往状态目录写任何字节。
+  // 传输前再拍一次状态目录：上传 / 下载 / 删除都不该往里面写任何东西。
   const QMap<QString, QByteArray> state_before_transfer =
       snapshotDirectory(state_directory);
 
@@ -7341,6 +7646,8 @@ int RunRemoteTest(QQuickWindow* window, backup_modern::RemoteController* remote,
                 .arg(remote->progressCallbackCountForTest()));
 
   // ---- REMOTE-07：列表内容与列表行 ----
+  // 这个账号是全新注册的，列表里应当**恰好**一条：多一条说明列表没按账号隔离，
+  // 少一条说明上传没有真的落进服务端。
   run.Check(remote->snapshotCountForTest() == 1,
             QStringLiteral("REMOTE-07 云端列表里正好有一条"),
             QString::number(remote->snapshotCountForTest()));
@@ -7590,7 +7897,7 @@ int RunRemoteTest(QQuickWindow* window, backup_modern::RemoteController* remote,
   run.Check(remote->statusScope() == QStringLiteral("remote"),
             QStringLiteral("REMOTE-13 退出登录的提示仍属于 remote 页"));
 
-  // ---- REMOTE-15：人工验收场景的回归（本轮修复的四个缺陷）----
+  // ---- REMOTE-15：四个已修复缺陷的回归 ----
   //
   // CASE A 连续四次错误口令：每次都要有确定结果（可见错误 + 未登录），
   //        不允许静默、不允许卡 busy。
@@ -7737,7 +8044,7 @@ int RunRemoteTest(QQuickWindow* window, backup_modern::RemoteController* remote,
           remote->lastDetailForTest());
   // 注销失败必须在**对话框自己的错误行**里留下可见原因，而且**只**在对话框
   // 里：页面底部的横幅是页面级操作的地盘，对话框里的失败不许外溢到那里
-  // （人工验收见过同一个原因同时出现在两处）。
+  // （同一个原因不许同时出现在两处）。
   run.Check(!wrong_delete_error.isEmpty() &&
                 wrong_delete_error ==
                     QStringLiteral(
@@ -7780,11 +8087,11 @@ int RunRemoteTest(QQuickWindow* window, backup_modern::RemoteController* remote,
 
   // ---- REMOTE-16：服务端侧账户已经不存在时，GUI 不允许继续显示"已登录" ----
   //
-  // 这一条对应人工验收里最刺眼的那个矛盾：屏幕上写着"当前账户：xxx /
+  // 这一条对应最刺眼的那个矛盾：屏幕上写着"当前账户：xxx /
   // 状态：已登录"， 而同一台服务器上的真值（管理工具 /
   // 数据库）根本没有这个用户。会话必须是
-  // **服务端确认过的**：只要服务端说这个会话不再有效，界面就必须立刻回到未登录，
-  // 不能靠本机的一个布尔量继续声称"已登录"。
+  // **服务端确认过的**：只要服务端说这个会话不再有效，
+  // 界面就必须立刻回到未登录，不能靠本机的一个布尔量继续声称"已登录"。
   {
     const QString truth_user =
         QStringLiteral("gui-truth-%1")
@@ -7840,7 +8147,7 @@ int RunRemoteTest(QQuickWindow* window, backup_modern::RemoteController* remote,
             QStringLiteral(" session=") + remote->sessionText());
   }
 
-  // ---- REMOTE-17b：重复注册的反馈（人工验收第 5 条）----
+  // ---- REMOTE-17b：重复注册的反馈 ----
   //
   // 同一个用户名注册第二次必须被服务端拒绝，而且界面上要看得见"该用户名已被
   // 使用"；同时**原来的账户不能被换掉**：原口令还能登进去，第二个口令不能。
@@ -7891,7 +8198,7 @@ int RunRemoteTest(QQuickWindow* window, backup_modern::RemoteController* remote,
 
   // ---- 产品级远端备份 / 链恢复（GUI 路径）----
   //
-  // 这一节是 PR #21 的 GUI 闭环：QML 上的"远端备份"区域与快照卡片上的"恢复"
+  // 这一节是 GUI 闭环：QML 上的"远端备份"区域与快照卡片上的"恢复"
   // 必须真的能走完整条链路，而不是只有 CLI 能用。
   {
     const auto objectByName = [window](const char* name) -> QObject* {
@@ -7942,7 +8249,7 @@ int RunRemoteTest(QQuickWindow* window, backup_modern::RemoteController* remote,
     }
   }
 
-  // ---- PR #22：连接层（pin 应用 UX + SSH 安全通道的失败分层）----
+  // ---- 连接层（pin 应用 UX + SSH 安全通道的失败分层）----
   //
   // 放在最后：它会短暂地把连接方式切到 SSH 并制造几类 ssh 失败，结束前把
   // 状态恢复成"直连 + 正确 pin"，所以不会影响前面任何一条断言。
@@ -8239,7 +8546,7 @@ int RunGuiContractTest(QQuickWindow* window,
 
 // ---- --incremental-test <source> <repository> ----
 //
-// PR #18 的 GUI/CLI parity 自检。它走**真实的控制器入口**
+// GUI/CLI parity 自检。它走**真实的控制器入口**
 // （startBackupWithStrategy + 依赖链恢复），并把每一步的结果按固定格式打印：
 //
 //     step1 kind=full-baseline reason=<yes|no>
@@ -9947,7 +10254,7 @@ int RunScheduleTest(backup_modern::ScheduleController* schedule,
             QStringLiteral("SCH-35 CLI 与 GUI 的 schedule.json 严格同路径"),
             QString::fromStdString(backupproject::DefaultScheduleFilePath()));
 
-  // 10) review-fix：仓库在运行期被改掉之后，下一次评估必须写到新仓库去。
+  // 10) 仓库在运行期被改掉之后，下一次评估必须写到新仓库去。
   //
   // 这一段只能在这里测：它依赖 BackupController::repositoryPathChanged 这个
   // 真实信号，而不是"重新构造一个控制器"。
@@ -9979,7 +10286,7 @@ int RunScheduleTest(backup_modern::ScheduleController* schedule,
               QStringLiteral("SCH-45 仓库切回 A"));
   }
 
-  // 11) review-fix：首次启用把下一次运行排在一个完整周期之后。
+  // 11) 首次启用把下一次运行排在一个完整周期之后。
   //
   // 必须走一次真正的 disabled -> enabled，否则 ApplyScheduleEnableTransition
   // 按设计就是 no-op（保存配置不该把时间表往后推）。
@@ -10005,7 +10312,7 @@ int RunScheduleTest(backup_modern::ScheduleController* schedule,
               QString::number(delta));
   }
 
-  // 12) review-fix：baseline 被删掉之后必须重建，而不是因为 manifest 相同就
+  // 12) baseline 被删掉之后必须重建，而不是因为 manifest 相同就
   // skip。
   {
     const QStringList names = ArchiveNames(repository);
@@ -10829,7 +11136,7 @@ int RunScheduleTest(backup_modern::ScheduleController* schedule,
     }
   }
 
-  // ---- PR #18：策略往返 ----
+  // ---- 策略往返 ----
   //
   // 计划页的策略选择必须真的落到配置里，而且用的 key 与
   // backupctl schedule set --strategy 完全相同。这里只钉"界面这一层"的往返：

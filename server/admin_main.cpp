@@ -23,7 +23,7 @@
 //
 // 只读操作（列表 / 详情 / 概览）在服务端运行时照常可用。
 //
-// ---- 它显示什么（PR #21 UI closure：问题 A）----
+// ---- 它显示什么 ----
 //
 // 每次运行都会打印一行 "传输身份指纹: sha256:…"。它来自**当前真正在服役的
 // 那把传输身份私钥**：优先用正在运行的 backup-server 命令行里那个
@@ -42,6 +42,18 @@
 // 那些列，而用户名/快照 id 之外的输入永远不会被拼进文件系统路径；身份私钥
 // 只被读进内存算公钥，算完立即清零。
 
+//
+// ---- 一次运行的顺序（也是失败时的短路顺序）----
+//
+//   ParseOptions -> [破坏性命令：抢数据目录锁] -> 打开**已存在**的数据库 ->
+//   打印实例身份 -> 接上维护层日志 -> 分发命令
+//
+// 锁必须在打开数据库之前抢到：服务端在跑的时候要尽早拒绝，而不是先开库再
+// 发现数据目录正在被写。打开数据库一律不 CREATE（见 OpenAll），否则路径写
+// 错会悄悄造出一个空库，把"看错实例"伪装成"这个实例没有用户"。
+//
+// 退出码是脚本接口：0 成功 / 1 失败或被拒绝 / 2 用法错误。
+//
 #include <dirent.h>
 #include <fcntl.h>
 #include <sys/stat.h>
@@ -86,6 +98,10 @@ using backupproject::net::RemoteUserRecord;
 using backupproject::net::RemoteUserSummary;
 using backupproject::net::StoreResult;
 
+// 用法文本本身就是 CLI 契约：三道破坏性闸门（--confirm 必须与目标一致、
+// 服务端必须已停止、用户选择器必须显式）都在这里写明。--help/-h 走到这里
+// 时 out 是 stdout、退出码 0；参数错误时 out 是 stderr、退出码 2——脚本因此
+// 分得清"用户想看帮助"和"命令写错了"。
 void PrintUsage(std::FILE* out, const char* program) {
   std::fprintf(
       out,
@@ -139,6 +155,9 @@ void PrintUsage(std::FILE* out, const char* program) {
       program);
 }
 
+// 时间展示统一用本地时区：运维看到的是服务器上的挂钟时间。unix_seconds <= 0
+// 视为"没有记录"（库里是 NULL/0），显示 "-" 而不是 1970 年。任何一步失败
+// 都退化成 "-"，不抛异常、不影响整条命令的输出。
 std::string FormatTime(std::int64_t unix_seconds) {
   if (unix_seconds <= 0) {
     return "-";
@@ -163,8 +182,8 @@ std::string FormatSize(std::uint64_t bytes) {
 
 // 把路径变成"可以直接粘贴进终端"的绝对路径：存在时解析符号链接，不存在时
 // 退化成"目录的 realpath + 文件名"。所有面向用户的路径都过这一层，避免界面上
-// 出现 "data"/"state/metadata.sqlite3" 这种脱离上下文的相对路径——人工验收正是
-// 因为看不出"这是哪一个库"而把空库读成了"ECS 里没有用户"。
+// 出现 "data"/"state/metadata.sqlite3" 这种脱离上下文的相对路径——看不出
+// "这是哪一个库"就会把空库读成"ECS 里没有用户"。
 std::string AbsolutePath(const std::string& path) {
   if (path.empty()) {
     return path;
@@ -202,6 +221,8 @@ std::string HostName() {
   return std::string(buffer);
 }
 
+// 全部字段都是值类型，解析完成之后只读：运行期没有任何一处会改配置，因此
+// 命令实现不必考虑"参数中途变了怎么办"。
 struct Options {
   // 部署根目录（<server-root>/bin 的上一级）。用于在界面上说清"我在看哪个
   // 实例"：--root 默认是 <server-root>/data，--db 默认是
@@ -218,7 +239,8 @@ struct Options {
   std::string confirm;
 };
 
-// 这个实例的部署根：显式给了就用，否则按约定从数据目录推（<server-root>/data）。
+// 这个实例的部署根：显式给了就用，
+// 否则按约定从数据目录推（<server-root>/data）。
 // 定义放在 Options 之后：它要用到那个结构体。
 std::string ServerRootOf(const Options& options) {
   if (!options.server_root.empty()) {
@@ -248,6 +270,9 @@ std::string ServerRootOf(const Options& options) {
 //   3. 部署约定 <server-root>/state/transport.key（deploy 脚本的固定位置）。
 //
 // 全程只读：不开端口、不发信号、不启动/停止服务、不生成也不修改密钥文件。
+// available 为假时只有 error 有意义，其余字段可能只是"打算读的那个路径"
+// （用来打印"期望的身份私钥"）。这个结构体里**没有**私钥字段：私钥只存在
+// 于 LoadTransportIdentityForDisplay 的栈上，算完公钥立即清零。
 struct TransportIdentityReport {
   bool available = false;
   std::string key_path;  // 实际读的那份私钥文件
@@ -294,6 +319,9 @@ bool ReadSmallFile(const std::string& path, std::size_t limit,
   return true;
 }
 
+// /proc/<pid>/cmdline 是 NUL 分隔的参数表（末尾也有一个 NUL）。空参数跳过：
+// 这里只关心 --root / --transport-key-file 这类开关，空串不携带信息。
+// 进程可能在读取期间退出，读失败就返回 false，绝不把半份参数表交给调用方。
 bool ReadProcessArguments(long pid, std::vector<std::string>* arguments) {
   std::string raw;
   if (!ReadSmallFile("/proc/" + std::to_string(pid) + "/cmdline", 256 * 1024,
@@ -319,6 +347,10 @@ bool ReadProcessArguments(long pid, std::vector<std::string>* arguments) {
 }
 
 // 找正在运行的 backup-server，并取出它加载的身份私钥路径。只读 /proc。
+// 只按 basename(argv[0]) == "backup-server" 认进程，还要求它自己声明的
+// --root 与本次管理的数据根一致（都解析成绝对路径后比较）：一台机器上跑多个
+// 实例时，只有指向同一份数据的那个进程才算数，第一个匹配即返回。
+// 全程只读 /proc：不 ptrace、不发信号、不连端口，也不改动任何密钥文件。
 bool FindRunningServerTransportKey(const std::string& data_root, long* pid_out,
                                    std::string* key_path,
                                    std::string* root_text) {
@@ -372,6 +404,10 @@ bool FindRunningServerTransportKey(const std::string& data_root, long* pid_out,
 
 // 读一次传输身份，只为了显示。永远不返回"猜"的结果：读不到就 available=false
 // 并把原因带出来，调用方照着打印一行"不可用"。
+// 三级定位：命令行给的路径 -> 正在运行的服务端加载的那把 -> 部署约定路径。
+// 顺序本身就是优先级：越靠前越能证明"屏幕上这一行就是本实例正在用的身份"。
+// 每次调用重新读一遍，不缓存：密钥可能刚被轮换，缓存会让显示与事实不符。
+// 私钥读完立刻清零，从未被打印、写盘或在内存里长期驻留。
 TransportIdentityReport LoadTransportIdentityForDisplay(
     const Options& options) {
   TransportIdentityReport report;
@@ -413,6 +449,11 @@ TransportIdentityReport LoadTransportIdentityForDisplay(
   return report;
 }
 
+// 手写解析，规则只有三条：带值的开关写成 "名字 值"；第一个非开关 token 是
+// 命令，其余都是位置参数；命令之前出现未知开关即用法错误。--help/-h 返回
+// false 且错误串为空，调用方据此打印帮助并以 0 退出。
+// 只给 --server-root 时按部署约定推出 --root / --db，显式给出的永远优先；
+// 三个都缺才算用法错误——管理工具不会猜数据目录在哪。
 bool ParseOptions(int argc, char* argv[], Options* options,
                   std::string* error_message) {
   for (int index = 1; index < argc; ++index) {
@@ -482,6 +523,8 @@ bool ParseOptions(int argc, char* argv[], Options* options,
 
 // 只读地把数据目录的锁试一遍：抢到就说明没有 backup-server 持有它（随即释放），
 // 抢不到就是 kBusy。锁文件里的 pid/时间只是给人看的提示。
+// 这是**探测**而不是占位：抢到锁立刻释放，所以它只回答"此刻有没有人持有"。
+// 返回 false 表示"忙"或"无法判断"，调用方不能把它当成"没在运行"。
 bool DescribeServerState(const std::string& root_directory, std::string* text) {
   FileLock probe;
   std::string error;
@@ -503,6 +546,9 @@ bool DescribeServerState(const std::string& root_directory, std::string* text) {
 }
 
 // 破坏性操作的闸门：真抢锁并**持有**它。
+// 与探测不同，这里真抢锁并一直持有到进程结束（FileLock 是 main 的栈对象）。
+// 进程即使被 kill，内核也会释放 flock，不会留下需要人工清理的锁状态。
+// 这条闸门只在"服务端也用同一个锁文件"时才有意义——它确实用的是同一份实现。
 bool AcquireDestructiveLock(const std::string& root_directory, FileLock* lock,
                             std::string* error_message) {
   std::string lock_error;
@@ -543,6 +589,9 @@ std::string StripSnapshotPrefix(const std::string& text) {
 //
 // require_explicit（删除操作用 true）：裸输入一律拒绝——删除是不可逆的，不能让
 // 一个"23 到底是编号还是用户名"的疑问决定删掉哪个账户。
+// 后置条件：成功时 *user_id 与 *username 来自**同一条**用户记录（不会出现 id
+// 取自 A、用户名取自 B）。失败时 error_message 一定是能直接展示给用户的句子。
+// 纯数字输入限制 18 位，避免 strtoll 溢出后变成另一个编号。
 bool ResolveUser(RemoteMetadataStore* store, const std::string& selector_text,
                  bool require_explicit, std::int64_t* user_id,
                  std::string* username, std::string* error_message) {
@@ -631,20 +680,23 @@ bool ResolveUser(RemoteMetadataStore* store, const std::string& selector_text,
   return true;
 }
 
+// store 与 maintenance 都由调用方持有（main 的栈对象），这里只做初始化。
+// maintenance.ready() 为假说明维护层没配置好，破坏性操作绝不能那样继续。
 int OpenAll(const Options& options, bool writable, RemoteMetadataStore* store,
             RemoteMaintenance* maintenance, std::string* error_message) {
   // **fail closed**：只打开已经存在的数据库。
   //
   // 管理工具没有"初始化一个新实例"的语义。以前这里用的是 store->Open()，它带
   // SQLITE_OPEN_CREATE：路径写错时 SQLite 会悄悄建一个空库，于是"这个实例还
-  // 没有用户"和"你看的是另一个实例"在屏幕上完全一样——人工验收因此得出了
-  // "ECS 上没有任何用户"的错误结论（而 GUI 显示的 Wjy 已登录其实是真的）。
+  // 没有用户"和"你看的是另一个实例"在屏幕上完全一样——只看屏幕就会得出
+  // "ECS 上没有任何用户"的错误结论（而 GUI 显示的登录状态其实是真的）。
   //
   // 打开方式由命令决定，不共用一个"能读也能写"的连接：
   //   * 只读命令走 SQLITE_OPEN_READONLY：backup-server 正在运行也能安全查询，
   //     而且这条连接根本写不了库（以前它会在打开时 EnsureSchema——BEGIN
   //     IMMEDIATE + CREATE TABLE + PRAGMA user_version，那是写事务）；
-  //   * 破坏性命令走可写连接：调用方**已经**先拿到数据目录锁，证明服务端已停止。
+  //   * 破坏性命令走可写连接：调用方**已经**先拿到数据目录锁，
+  //     证明服务端已停止。
   // 两条路都不 CREATE、不建表。
   const bool opened =
       writable
@@ -681,12 +733,14 @@ void PrintTransportFingerprintLine(const Options& options) {
 }
 
 // 每次运行都先把"我在看哪个实例"说清楚：主机、部署根、数据根、元数据库、
-// 服务状态（含 PID）、传输身份指纹。人工验收时这一块必须和下面的列表出现在
-// 同一屏里——脱离上下文的"还没有任何用户"是这次 P0 的直接诱因。
+// 服务状态（含 PID）、传输身份指纹。这一块必须和下面的列表出现在
+// 同一屏里——脱离上下文的"还没有任何用户"正是误判的直接诱因。
 //
-// 传输身份指纹（PR #21 UI closure，问题 A）放在这里就等于放在菜单首页上：
+// 传输身份指纹放在这里就等于放在菜单首页上：
 // backup-server-admin.sh 的 banner 调用的正是 status。它只读、只显示公钥指纹，
 // 读不到也只是一行"不可用 + 原因"。
+// lock_held_by_this_run 为真表示锁已经在本次进程手里：这时再去探测必然是
+// busy，而 busy 的正是自己，所以要如实说"锁由本次管理操作持有"。
 void PrintIdentity(const Options& options, bool lock_held_by_this_run) {
   const std::string data_root = AbsolutePath(options.root_directory);
   std::printf("Host:        %s\n", HostName().c_str());
@@ -708,6 +762,8 @@ void PrintIdentity(const Options& options, bool lock_held_by_this_run) {
 
 // 服务器身份信息页：fingerprint + public key。**永远不打印私钥**：这里读的是
 // LoadTransportIdentity 解出来的公钥，私钥那份材料在函数返回前就被清零。
+// 首次配置用：fingerprint 与 hex 公钥都打出来，客户端填任一种形式即可。
+// 读不到身份时返回 1（脚本可据此判断），但不会创建或修改任何密钥文件。
 int CommandTransportIdentity(const Options& options) {
   const TransportIdentityReport identity =
       LoadTransportIdentityForDisplay(options);
@@ -741,6 +797,9 @@ int CommandTransportIdentity(const Options& options) {
 // 统计块。实例身份由 main()
 // 统一在最前面打印一次：这一版**不再**在这里重复打印， 否则
 // status（菜单首页就是它）会把身份块显示两遍。
+// 菜单首页调用的就是它（backup-server-admin.sh 的 banner 走的是 status），
+// 所以这里只输出一行总量；实例身份由 main() 统一在前面打印一次，不重复。
+// 统计失败只打印原因，命令本身仍然成功：status 必须始终可用。
 void PrintStatus(RemoteMetadataStore* store) {
   RemoteStorageOverview overview;
   std::string error;
@@ -756,6 +815,9 @@ void PrintStatus(RemoteMetadataStore* store) {
   }
 }
 
+// 列宽固定（%-6s / %-24s 等），对齐由终端按显示宽度处理，管理工具不假设
+// locale。查询走 RemoteMetadataStore::ListUsers，它不选口令相关的列。
+// 空列表是**成功**：返回 0，只打印一句"还没有任何用户"。
 int CommandListUsers(RemoteMetadataStore* store) {
   std::vector<RemoteUserSummary> users;
   std::string error;
@@ -781,6 +843,9 @@ int CommandListUsers(RemoteMetadataStore* store) {
   return 0;
 }
 
+// 先解析选择器（裸输入可能有歧义，在这里就会被拒绝），再分别查记录、备份
+// 数、备份列表——三次独立查询，任一次失败都返回 1 并说明是哪一步失败。
+// 占用空间由备份列表求和得到，不额外引入一条聚合查询路径。
 int CommandShowUser(RemoteMetadataStore* store, const std::string& selector) {
   std::int64_t user_id = 0;
   std::string username;
@@ -862,6 +927,10 @@ int CommandListSnapshots(RemoteMetadataStore* store,
   return PrintSnapshotTable(snapshots);
 }
 
+// 快照 id 先过共享校验器（32 位十六进制，允许可选的 snapshot: 前缀）。
+// id 全局唯一，但查询接口必须带 user_id，所以这里逐用户查：宁可多几次读，
+// 也不新增一条"没有 user_id 过滤"的查询路径。命中即返回。
+// 输出包含完整 SHA-256，供人工比对归档。
 int CommandShowSnapshot(RemoteMetadataStore* store,
                         const std::string& snapshot_id_text) {
   // 允许写成 snapshot:<32 位十六进制>：前缀只是为了和用户选择器看起来一致，
@@ -902,6 +971,9 @@ int CommandShowSnapshot(RemoteMetadataStore* store,
   return 1;
 }
 
+// 存储概览：总量 + 服务状态 + 占用最多的 5 个用户。前 5 名用就地选择排序：
+// 用户量级很小，为它引入一个排序依赖不划算。
+// ListUsers 失败不算命令失败——总量已经打出来了，缺的只是排行。
 int CommandOverview(RemoteMetadataStore* store,
                     const std::string& root_directory) {
   RemoteStorageOverview overview;
@@ -948,6 +1020,11 @@ int CommandOverview(RemoteMetadataStore* store,
   return 0;
 }
 
+// 闸门顺序是有意的，从最便宜、最不可能出错的检查开始：
+//   1. 快照 id 语法 -> 2. --confirm 必须逐字符等于快照 id ->
+//   3. 用户选择器必须是显式的 id:/name:（删除场景一律拒绝裸输入）->
+//   4. RemoteMaintenance::DeleteSnapshot 负责磁盘与元数据的一致性。
+// 本函数自己不动文件系统：事务语义全在维护层，失败时磁盘与元数据保持原样。
 int CommandDeleteSnapshot(RemoteMetadataStore* store,
                           RemoteMaintenance* maintenance,
                           const Options& options,
@@ -985,6 +1062,11 @@ int CommandDeleteSnapshot(RemoteMetadataStore* store,
   return 0;
 }
 
+// 确认串必须写成 "DELETE <用户名>#<编号>"：编号与用户名同时出现，同名账户
+// 看这一行就能分辨，而一个 y 键按不出这种不可逆操作。
+// 顺序上要注意：确认串是**解析出唯一账户之后**才算出来的，不存在"先删再
+// 确认"的窗口。删除范围（备份与 blob）由 RemoteMaintenance::DeleteAccount
+// 负责，成功时回报清理掉的快照数与字节数。
 int CommandDeleteUser(RemoteMetadataStore* store,
                       RemoteMaintenance* maintenance, const Options& options,
                       const std::string& selector, std::string* error_message) {
@@ -1023,6 +1105,12 @@ int CommandDeleteUser(RemoteMetadataStore* store,
 
 }  // namespace
 
+// 入口只做编排，不含任何查询逻辑：解析参数 -> 破坏性命令先抢锁 -> 打开已有
+// 数据库 -> 打印实例身份 -> 把维护层日志接到 stderr -> 分发命令。
+// 顺序上有两个要点：锁在开库之前（尽早拒绝并发写），身份在开库之后
+// （要打印绝对路径与传输身份，这两样都得先知道数据根）。
+// stdout 只留给人看的表格与结果，日志和错误全走 stderr，脚本可以放心把
+// stdout 重定向到文件。
 int main(int argc, char* argv[]) {
   const char* program =
       (argc > 0 && argv[0] != nullptr) ? argv[0] : "backup-server-admin";
@@ -1038,6 +1126,7 @@ int main(int argc, char* argv[]) {
     return 2;
   }
 
+  // 破坏性命令只有这两条；其余命令一律用只读连接，服务端运行时也能安全执行。
   const bool destructive =
       options.command == "delete-snapshot" || options.command == "delete-user";
 
@@ -1052,6 +1141,8 @@ int main(int argc, char* argv[]) {
     }
   }
 
+  // store / maintenance 都是栈对象：没有所有权转移，也没有全局状态，进程退出
+  // 即释放。maintenance 由 OpenAll 用同一个数据根构造，之后不再改。
   RemoteMetadataStore store;
   RemoteMaintenance maintenance;
   std::string open_error;
@@ -1084,6 +1175,8 @@ int main(int argc, char* argv[]) {
     std::fprintf(stderr, "[admin] %s\n", message.c_str());
   });
 
+  // 位置参数取用器：缺参数时返回 false，由调用方打印用法并以 2 退出——用法
+  // 错误与运行期失败（返回 1）必须能被脚本区分开。
   const auto require_argument = [&options](std::size_t index,
                                            std::string* out) {
     if (options.positional.size() <= index) {
@@ -1093,6 +1186,8 @@ int main(int argc, char* argv[]) {
     return true;
   };
 
+  // 分发是一串线性 if：每个命令的参数形状都不同，表驱动反而要把"怎么取参数"
+  // 也塞进表里，不划算。
   if (options.command == "status") {
     PrintStatus(&store);
     return 0;
@@ -1108,6 +1203,7 @@ int main(int argc, char* argv[]) {
       options.command == "show-identity") {
     return CommandTransportIdentity(options);
   }
+  // 这两条命令共用同一种用户选择器：show-user 看详情，list-snapshots 看列表。
   if (options.command == "show-user" || options.command == "list-snapshots") {
     std::string selector;
     if (!require_argument(0, &selector)) {

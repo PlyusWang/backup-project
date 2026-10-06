@@ -23,8 +23,8 @@ Item {
         anchors.fill: parent
         clip: true
         contentWidth: availableWidth
-        // 到顶/到底后继续滚不再被拉出去再弹回：ScrollView 的滚动主体是 Flickable，
-        // 显式设成 StopAtBounds（默认是 DragAndOvershootBounds）。
+        // 到顶/到底后继续滚不再被拉出去再弹回：ScrollView 的滚动主体是
+        // Flickable，显式设成 StopAtBounds（默认是 DragAndOvershootBounds）。
         // contentItem 由样式在运行期提供、静态类型是 Item，所以只能运行期赋值。
         Component.onCompleted: {
             if (pageScroll.contentItem)
@@ -86,7 +86,9 @@ Item {
                             text: "浏览"
                             enabled: !controller.busy
                             onClicked: {
-                                sourceDialog.currentFolder = controller.directoryDialogStartUrl(controller.sourcePath)
+                                sourceDialog.currentFolder =
+                                    controller.directoryDialogStartUrl(
+                                        controller.sourcePath)
                                 sourceDialog.open()
                             }
                         }
@@ -104,7 +106,9 @@ Item {
                     spacing: 6
 
                     Text {
-                        text: controller.repositoryConfigured ? "当前备份仓库" : "尚未配置备份仓库"
+                        text: controller.repositoryConfigured
+                               ? "当前备份仓库"
+                              : "尚未配置备份仓库"
                         font.pixelSize: 16
                         font.weight: Font.DemiBold
                         color: theme.textSecondary
@@ -130,8 +134,9 @@ Item {
                     }
 
                     // 仓库配好之后同样要留一个修改入口：上面就是当前路径，
-                    // 但"换仓库"统一发生在设置页 —— 这一页不直接编辑 repositoryPath，
-                    // 也不复制 SettingsPage 的保存逻辑，否则同一套校验会有两份实现。
+                    // 但"换仓库"统一发生在设置页 —— 这一页不直接编辑
+                    // repositoryPath，也不复制 SettingsPage 的保存逻辑，
+                    // 否则同一套校验会有两份实现。
                     AppButton {
                         objectName: "changeRepositoryButton"
                         visible: controller.repositoryConfigured
@@ -179,23 +184,29 @@ Item {
                     objectName: "startBackupButton"
                     text: "开始备份"
                     variant: "primary"
-                    // busy 时禁用：整个程序只有一个控制器，天然保证同一时刻只有一个操作。
-                    // 密码为空或两次不一致时不再直接把按钮禁用 —— 那样用户根本没有
-                    // "再点一次提交、然后才看到错误"的机会。校验改成点击时请求：
-                    // 面板先亮出错误，合法才真的调用控制器。
+                    // busy 时禁用：整个程序只有一个控制器，
+                    // 天然保证同一时刻只有一个操作。
+                    // 密码为空或两次不一致时不再直接把按钮禁用 ——
+                    // 那样用户根本没有"再点一次提交、然后才看到错误"的机会。
+                    // 校验改成点击时请求：面板先亮出错误，
+                    // 合法才真的调用控制器。
                     // 规则仍然只有那两条，判定也仍然只写在面板里。
                     // 增量 + 非 MyPack 是核心明确拒绝的组合：界面直接禁用，
                     // 并在策略说明里讲清原因，而不是让用户点了才看到失败。
-                    enabled: !controller.busy && panel.strategyCombinationAllowed
-                    // 三个算法一律传冻结的字符串键；密码与确认密码原样交给控制器，
-                    // 界面不在这里做任何加工（不加盐、不截断、不拼进任何路径）。
+                    enabled: !controller.busy
+                              && panel.strategyCombinationAllowed
+                    // 三个算法一律传冻结的字符串键；
+                    // 密码与确认密码原样交给控制器，界面不在这里做任何加工
+                    // （不加盐、不截断、不拼进任何路径）。
                     //
-                    // 顺序是刻意的：先请求校验 -> 不合法就 return（完全不碰控制器，
-                    // 错误提示由面板自己显示）-> 合法才提交。只有控制器真的收下了
-                    // 这次任务（返回 true —— 此时 Start() 已经把 OperationRequest
+                    // 顺序是刻意的：先请求校验 -> 不合法就 return
+                    // （完全不碰控制器，错误提示由面板自己显示）
+                    // -> 合法才提交。只有控制器真的收下了这次任务
+                    // （返回 true —— 此时 Start() 已经把 OperationRequest
                     // 的值拷贝交给 QtConcurrent）才清空两个密码框并收起提示。
-                    // 控制器同步失败时（没选源目录、没配仓库、未知 key）密码保留，
-                    // 用户改完可以直接再点一次；这里也不动 encryptionKey。
+                    // 控制器同步失败时（没选源目录、没配仓库、未知 key）
+                    // 密码保留，用户改完可以直接再点一次；
+                    // 这里也不动 encryptionKey。
                     onClicked: {
                         panel.requestPasswordValidation()
 
@@ -267,7 +278,8 @@ Item {
         onAccepted: {
             // 转换交给 QUrl::toLocalFile()：中文、空格、# 与 % 都能原样还原；
             // 手写去掉 file:// 前缀会把 percent-encoding 留在路径里。
-            const chosen = controller.localPathFromUrl(sourceDialog.selectedFolder)
+            const chosen =
+                controller.localPathFromUrl(sourceDialog.selectedFolder)
             if (chosen !== "")
                 controller.sourcePath = chosen
         }

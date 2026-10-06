@@ -261,6 +261,12 @@ std::string SourceBaseName(const std::string& source_directory) {
 
 }  // namespace
 
+// 语法层面的"这是不是一个由本系统管理的归档文件名"：不写错误信息、不碰磁盘。
+// 拒绝规则与 ValidateFileName 一致（空、"."、".."、含 '/' 或 '\'、含内嵌
+// NUL），另加"扩展名必须是 .bak"。
+// 区别在用途：调用方（realtime 的 marker 路径、增量 delta 的父快照名）先用它
+// 把名字钉死，再拼接成真实路径——JoinPath 不做净化，这里就是那条路径上唯一
+// 的名字边界，所以判断只能收紧，不能放松。
 bool IsManagedBackupFileName(const std::string& file_name) {
   if (file_name.empty() || file_name == "." || file_name == "..") return false;
   if (file_name.find('/') != std::string::npos) return false;
@@ -269,6 +275,13 @@ bool IsManagedBackupFileName(const std::string& file_name) {
   return HasBackupExtension(file_name);
 }
 
+// 仓库的持久化身份：仓库路径的规范化形式，会写进 schedule / realtime 的存储，
+// 用来判断"这次要备份的仓库是不是当初绑定的那一个"。
+// 优先 realpath（展开全部软链接、消掉 "." 与 ".."），失败时退回去掉尾斜杠的
+// 原样文本：仓库可能还不存在（EnsureRepository 创建之前就会被问到），这时
+// realpath 必然失败，退回至少保证同一串输入得到同一串输出。
+// 因为会落盘，这个值必须稳定，不能掺入时间戳或临时路径；它只用于相等比较与
+// 展示，拼路径一律走校验之后的形式，不拿它当安全判断。
 std::string RepositoryIdentity(const std::string& repository_path) {
   if (repository_path.empty()) return std::string();
   const std::string normalized = StripTrailingSlashes(repository_path);
@@ -407,7 +420,7 @@ bool BackupCatalog::List(const std::string& repository,
     //
     // 先认格式：IdentifyArchiveFile 只看 magic，就能把 legacy v0.1 与 v2
     // container 分开，而且不需要密码就能读出 v2 的三个算法 id。
-    // PR #18：先按 magic 分出增量 delta。
+    // 先按 magic 分出增量 delta。
     //
     // 顺序很重要：delta 既不是 legacy v0.1、也不是 v2 container，
     // 直接走 IdentifyArchiveFile 会被归到"认不出来"，而它其实是一份**完好**的
@@ -813,7 +826,8 @@ bool BackupCatalog::DeleteSnapshots(
     //     必须单独验，本文件早期版本的注释漏了它；
     //   * unlink 本身不跟随软链接（删的是链接本身，不是它指向的目标），也不会
     //     删目录（会以 EISDIR 失败）。
-    // 因此在这个时间窗里把最后一段换成别的东西，最坏结果是仓库内少了一个软链接。
+    // 因此在这个时间窗里把最后一段换成别的东西，
+    // 最坏结果是仓库内少了一个软链接。
     // 但校验之后文件系统若被并发改写（包括把某个祖先目录换成软链接），上面的
     // 结论就不再成立——那属于 backup_catalog.h
     // 顶部列出的、当前不提供防护的范围。

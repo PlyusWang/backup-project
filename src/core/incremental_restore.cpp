@@ -2,6 +2,19 @@
 //
 // 见 include/incremental_restore.h。
 
+// 本文件实现"恢复到任意一个 restore point"：解析 Full → Δ1 → … → ΔN 的依赖
+// 链，按顺序应用，最后原子地发布到 destination。
+//
+// 职责边界（刻意不越界）：
+//   * 不解析归档 / 容器的字节格式：base 与每个 delta 的 payload 都交给既有的
+//     RunRestorePipeline，本文件只处理"已经落地的两棵目录树"；
+//   * 不做认证：加密的 delta 在解析阶段就被拒绝，而不是"先解开再验"；
+//   * 不合并进活跃目录：destination 必须不存在或为空。
+//
+// 失败语义：任何一步失败都返回 false 且 destination 一个字节都不动；中间产物
+// 在退出前尽力删除。error_message 只是允许为 nullptr 的诊断出参，绝不能当状态
+// 机用（见 RestoreSnapshotChain 的 delta_failed）。本文件是同步单线程代码，
+// 调用方保证同一个 destination 不会被并发恢复。
 #include "incremental_restore.h"
 
 #include <dirent.h>
@@ -28,16 +41,21 @@ namespace backupproject {
 
 namespace {
 
+// error_message 是可选出参：诊断文本永远不决定控制流，失败与否只看返回值。
 void SetError(std::string* error_message, const std::string& text) {
   if (error_message != nullptr) *error_message = text;
 }
 
+// strerror 对未知 errno 可能返回 nullptr，直接拼字符串会在最需要信息的崩溃
+// 现场再崩一次，所以这里兜底成 "errno N"。
 std::string ErrnoText(int error_number) {
   const char* text = ::strerror(error_number);
   return text == nullptr ? std::string("errno ") + std::to_string(error_number)
                          : std::string(text);
 }
 
+// notes 是"尽力而为但没做到"的清单（chown / chmod / 设备节点…）：给用户核对
+// 用，不影响返回码，也不会把一次成功的恢复算成失败。
 void AddNote(RestoreReport* report, const std::string& note) {
   if (report != nullptr) report->notes.push_back(note);
 }
@@ -49,6 +67,11 @@ std::string JoinPath(const std::string& directory, const std::string& name) {
 }
 
 // 递归删除（staging / overlay 的清理用）。不存在视为成功。
+// 全程 lstat，绝不 follow：指向 / 的软链接只会被 unlink 掉自己，不会被递归
+// 进去。ENOENT 视为成功，所以清理是幂等的——重跑不会因为"上一轮已经删干净"
+// 而失败。
+//
+// 失败是尽力而为的：继续删完剩下的条目，最后返回 false 让调用方知道有残留。
 bool RemoveTree(const std::string& path) {
   struct stat info;
   if (::lstat(path.c_str(), &info) != 0) {
@@ -70,6 +93,8 @@ bool RemoveTree(const std::string& path) {
   return ok;
 }
 
+// destination 的预检之一。打不开目录是**错误**，不是"当作空"：把非空目录误判
+// 成空会让后面的合并 / rename 直接覆盖用户数据，这里必须 fail-closed。
 bool IsDirectoryEmpty(const std::string& path, bool* empty,
                       std::string* error_message) {
   DIR* directory = ::opendir(path.c_str());
@@ -111,6 +136,11 @@ void SortDeepestFirst(std::vector<std::string>* paths) {
 // 这一步与"从归档恢复"是不同的操作：这里合并的是两棵**已经落地**的目录树，
 // 所以它不需要、也不应该重新实现归档格式里的任何东西。
 
+// 一次 delta 合并的上下文，生命周期 = 一个 delta：每轮循环新建，hardlink 表
+// 随之重建。也就是说跨 delta 共享的 inode 不保证被重新链接起来，这是刻意的
+// 边界——要保证它就得读完整条链的 inode 表，代价远大于收益。
+//
+// report 是非拥有指针，允许为 nullptr；其余字段只由本线程访问。
 struct MergeContext {
   RestoreReport* report = nullptr;
   // (st_dev, st_ino) -> 已经合并过去的目标路径。用来保持 hardlink 拓扑：
@@ -119,6 +149,13 @@ struct MergeContext {
   std::uint64_t merged_entries = 0;
 };
 
+// 逐块复制普通文件正文。用 O_NOFOLLOW 打开源：overlay 是我们自己刚恢复出来
+// 的树，这里"理论上"不可能是软链接，但理论上不是安全边界——真被塞进一个链接
+// 时，宁可打开失败也不要跟着它去读别的文件。
+//
+// 读写都处理 EINTR 与短写；close 的错误也要报——延迟写错误只在 close 时浮现，
+// 漏掉它等于把一次写失败报成成功。失败时目标可能只写了一半，但调用链会中止
+// 整次恢复并丢弃 staging，不会有半截文件被发布出去。
 bool CopyFileContents(const std::string& from, const std::string& to,
                       std::string* error_message) {
   const int in_fd = ::open(from.c_str(), O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
@@ -173,6 +210,11 @@ bool CopyFileContents(const std::string& from, const std::string& to,
 
 // 尽力而为地把 metadata 搬过去。ownership 搬不动不是失败：非 root 进程本来
 // 就改不了任意属主，既有的 recover 路径也是这么处理的（如实记录，不假装）。
+// "尽力而为"是合同的一部分：本函数没有返回值，任何一步失败都不会中断恢复
+// ——用户要的是把文件拿回来，不是把 mode 一位不差地拿回来。
+//
+// 两类失败分开处理：EPERM 是当前权限模型不允许（非 root 改属主），属于预期
+// 之内，计进 report->skipped_ownership；其它 errno 是异常，进 notes 供排查。
 void ApplyMetadataBestEffort(const std::string& path, const struct stat& info,
                              bool is_symlink, MergeContext* context) {
   if (is_symlink) {
@@ -240,6 +282,10 @@ bool EnsureRemoved(const std::string& path, std::string* error_message) {
 bool MergeNode(const std::string& source_path, const std::string& target_path,
                MergeContext* context, std::string* error_message);
 
+// 把一个目录合并进 staging。mkdir 用 0700 只是**临时**权限：真实 mode 由最后
+// 那次 ApplyMetadataBestEffort 贴回去，中间这段时间里内容不该被别的用户读到。
+// 子项先合、目录 metadata 最后贴（贴早了会被子项创建改掉 mtime）。递归深度受
+// 归档路径长度上限间接约束（每层至少 '/' + 1 字节），不会无界增长。
 bool MergeDirectory(const std::string& source_path,
                     const std::string& target_path, const struct stat& info,
                     MergeContext* context, std::string* error_message) {
@@ -290,6 +336,16 @@ bool MergeDirectory(const std::string& source_path,
   return true;
 }
 
+// 单个条目的合并：按 lstat 的真实类型分派，绝不 follow 软链接。每种类型的失败
+// 语义都是明确写出来的，不是笼统的 false：
+//   * 目录 / 软链接 / 普通文件 / FIFO 失败 → 返回 false，整次恢复中止；
+//   * 设备节点 mknod 失败 → 记一条 note 并返回 true：非 root 本来就造不出设备
+//     节点，为此失败等于把"把用户数据拿回来"这件事一起否掉；
+//   * 未知类型 → 记 note 跳过，返回 true。
+//
+// 普通文件先查 hardlink 表：st_nlink > 1 且这对 (st_dev, st_ino) 已经合并过，
+// 就直接 link 到第一个已合并的路径，原来共享 inode 的条目之后仍然共享。新建
+// 任何目标之前都先 EnsureRemoved，因为它可能是另一种类型。
 bool MergeNode(const std::string& source_path, const std::string& target_path,
                MergeContext* context, std::string* error_message) {
   struct stat info;
@@ -381,6 +437,8 @@ bool MergeNode(const std::string& source_path, const std::string& target_path,
   return true;
 }
 
+// 遍历 overlay 的顶层子项，逐个 MergeNode 到 staging。overlay 根自己的
+// metadata 不在这里处理——它对应"源根"，由调用方在合并结束后单独贴一次。
 bool MergeTree(const std::string& source_directory,
                const std::string& target_directory, MergeContext* context,
                std::string* error_message) {
@@ -406,6 +464,18 @@ bool MergeTree(const std::string& source_directory,
 
 }  // namespace
 
+// 解析 target 的依赖链：从目标出发沿 parent_file_name 上溯，遇到完整快照
+// （kContainer）即停止，返回 base 在前的顺序。
+//
+// 输入信任级别：target_file_name 来自界面 / CLI，parent_file_name 来自不可信
+// 信封，而两者落地的方式只有一条——BackupCatalog::Resolve（单组件名字、仓库
+// 直接子项、普通文件、非软链接）。名字合法**不等于**它是这个仓库里的一份快照。
+//
+// 三条硬性不变量：
+//   1) 链上不允许重复文件（环 / 自指）：visited 线性查重，链长有上界所以不必
+//      上哈希表；
+//   2) 父绑定必须三件事同时成立：文件身份、snapshot_id、manifest_digest；
+//   3) 整条链属于同一个 generation：底部的完整快照必须就是 delta 声明的那个。
 bool ResolveSnapshotChain(const std::string& repository_directory,
                           const std::string& target_file_name,
                           SnapshotChain* chain, std::string* error_message) {
@@ -496,6 +566,8 @@ bool ResolveSnapshotChain(const std::string& repository_directory,
       }
     }
 
+    // 上溯的顺序是"目标在前、base 在后"，所以先收集再整体反转；names 与 files
+    // 一一对应，必须同步反转，否则错误信息会指向错误的文件名。
     reversed_files.push_back(path);
     reversed_names.push_back(current);
 
@@ -555,6 +627,14 @@ bool ResolveSnapshotChain(const std::string& repository_directory,
   return true;
 }
 
+// 面向调用方的唯一入口：解析链 → 恢复 base → 逐个应用 delta → 原子发布。
+//
+// destination 的预检是"不存在，或存在但是空目录"。这不是洁癖：只有一次 rename
+// 才能保证"要么旧内容原样、要么新内容完整"，合并进一个非空目录做不到这点。
+//
+// 全过程只写三个临时路径（staging / overlay / inner_container），名字带 pid
+// 后缀且与 destination 同目录：既保证 rename 落在同一文件系统内，又让不同进程
+// 不会互相覆盖。进入时先清理同名残留（上次崩溃留下的），退出时再清一次。
 bool RestoreSnapshotChain(const std::string& repository_directory,
                           const std::string& target_file_name,
                           const std::string& destination_directory,
@@ -603,6 +683,8 @@ bool RestoreSnapshotChain(const std::string& repository_directory,
   RemoveTree(overlay);
   ::unlink(inner_container.c_str());
 
+  // do/while(false) 只用来做"带 break 的单出口"：任何一步失败都跳到末尾的统一
+  // 清理，最终只有 ok == true 才代表 destination 真的被发布了。
   bool ok = false;
   // “这一轮 delta 失败了”必须由这个布尔量表达，**不能**去读 error_message：
   // error_message 是可选的诊断出参（允许 nullptr），拿它当状态机会在
@@ -616,6 +698,10 @@ bool RestoreSnapshotChain(const std::string& repository_directory,
       break;
     }
     // 2) 逐个 delta 应用。
+    // index 从 1 开始：files[0] 是 base，已经整棵恢复进 staging。每个 delta 都
+    // 解到一个全新的 overlay 再合并，绝不在 staging 上直接解包——这样"解到一半
+    // 失败"不会污染已经正确的部分，tombstone 看到的也一定是 base 应用完的真实
+    // 状态。
     for (std::size_t index = 1; index < chain.files.size(); ++index) {
       const std::string& delta = chain.files[index];
       DeltaEnvelope envelope;
@@ -658,6 +744,8 @@ bool RestoreSnapshotChain(const std::string& repository_directory,
       if (delta_failed) break;
 
       // 2b) 覆盖新增/修改/类型变化。
+      // 每个 delta 一个全新的 MergeContext：hardlink 表只在这一次合并内有意义；
+      // merged_entries 则累加进 report，让"这次恢复写了多少条目"是个总量。
       MergeContext context;
       context.report = report;
       if (!MergeTree(overlay, staging, &context, error_message)) break;
@@ -678,6 +766,8 @@ bool RestoreSnapshotChain(const std::string& repository_directory,
     // 3) 发布。destination 已存在（空目录）时先删掉，保证 rename 是原子的。
     struct stat target_info;
     if (::lstat(destination_directory.c_str(), &target_info) == 0) {
+      // destination 存在时上面已确认它是空目录：先 rmdir 再 rename，替换才是
+      // 纯粹的一次 rename（对非空目录 rename 会得到 ENOTEMPTY）。
       if (::rmdir(destination_directory.c_str()) != 0) {
         SetError(error_message,
                  "Cannot replace the destination: " + ErrnoText(errno));
@@ -697,6 +787,8 @@ bool RestoreSnapshotChain(const std::string& repository_directory,
     ok = true;
   } while (false);
 
+  // 成功与失败都走这里。staging 在发布成功后已被 rename 搬走；overlay 与中间
+  // 容器一定还在。返回值不检查：残留只占磁盘，下一次恢复进入时会再清一次。
   RemoveTree(staging);
   RemoveTree(overlay);
   ::unlink(inner_container.c_str());

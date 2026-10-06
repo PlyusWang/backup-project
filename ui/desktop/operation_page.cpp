@@ -3,6 +3,18 @@
 // 页面本体：搭界面、选择目录、把任务丢给
 // QtConcurrent，然后在任务结束时更新状态。
 
+// 职责：备份/恢复页的界面搭建、路径选择、筛选规则收集，
+// 以及把一次操作交给后台线程并展示结果。同一个类被实例化两次，kind_
+// 决定它是备份页还是恢复页，全部文案与字段含义都按它分支。
+//
+// 边界：不复制核心的校验与业务规则——路径是否合法、拓扑能否成立由
+// BackupEngine 判断，筛选规则语法由核心 Filter 验证，
+// 界面只负责收集与显示。
+//
+// 线程模型：所有 QWidget 操作都在 GUI 线程；RunOperation
+// 跑在 QtConcurrent 的线程池里，只拿到一份按值拷贝的请求。
+// 请求与结果都是值语义，两个线程之间因此不需要加锁；watcher_ 以
+// this 为上下文对象，页面析构时自动断开，后台任务不会回调到已销毁的控件。
 #include "operation_page.h"
 
 #include <QAbstractItemView>
@@ -290,6 +302,9 @@ void OperationPage::ChoosePath(int field_index) {
   target->setText(chosen);
 }
 
+// 规则在**加入列表的那一刻**就验证：用核心 Filter 试加一次，
+// 失败只更新状态文字、不写进列表。因此列表里的每一项都是已被核心接受过的规则，
+// 后面的收集与启动都不再重复校验。
 void OperationPage::AddFilterRule(bool exclude) {
   if (filter_edit_ == nullptr || filter_list_ == nullptr) {
     return;
@@ -299,6 +314,9 @@ void OperationPage::AddFilterRule(bool exclude) {
     return;
   }
   // 语法只在这里验一次，用的是核心的 Filter：与 CLI、归档层完全同一份实现。
+  // probe 只做语法验证，验完即弃；它不参与真正的备份——真正的 Filter
+  // 在后台线程里用同一批规则重建（见 RunOperation），
+  // 因为界面线程的对象不能跨线程共享。
   backupproject::Filter probe;
   std::string error_message;
   const backupproject::FilterAction action =
@@ -322,9 +340,15 @@ void OperationPage::RemoveSelectedFilterRule() {
   if (row < 0) {
     return;
   }
+  // takeItem 只把条目从列表里摘下来，所有权交给调用方，必须自己
+  // delete——这是 Qt 里最容易被漏掉的一处泄漏。row <
+  // 0（没有选中项）在上面已经提前返回。
   delete filter_list_->takeItem(row);
 }
 
+// 列表项的显示文本自带 “include: ” / “exclude: ” 前缀，
+// 这里按前缀把两类规则分开收集，顺序就是用户添加的顺序。
+// 前缀是这对函数的内部约定：改文案必须同时改收集逻辑，否则规则会被静默漏掉。
 QStringList OperationPage::CollectFilterRules(bool exclude) const {
   QStringList rules;
   if (filter_list_ == nullptr) {
@@ -431,6 +455,9 @@ void OperationPage::UpdateControlStates() {
   action_button_->setEnabled(editable && !action_blocked_);
 }
 
+// 由 MainWindow 在另一页开始或结束时调用，
+// 实现两个页面之间的互斥（备份与恢复不能同时跑）。它只影响按钮可用性，
+// 不会打断已经在跑的任务。
 void OperationPage::SetActionBlocked(bool blocked) {
   action_blocked_ = blocked;
   UpdateControlStates();

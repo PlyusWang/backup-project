@@ -7,6 +7,15 @@
 //
 // 回退路径是真实存在的需求：老内核（< 3.17）没有 getrandom，容器里也可能被
 // seccomp 拦成 EPERM。两条路径都失败时必须显式失败，绝不能返回未初始化内存。
+// 职责与边界：把内核 CSPRNG 的字节原样交给调用方。不做编码、派生或清零：
+// 不 base64/hex、不做 HKDF；“这些字节当密钥还是 IV”由调用方决定。
+//
+// 数据流：长度 -> RandomBytes -> getrandom(2) -> 失败回退 /dev/urandom ->
+// std::string（长度恰好等于请求值，可能含 '\0'，必须按 size() 使用）。
+//
+// 失败语义：返回 false 且不抛异常，*out 已被清空；error_message 里同时带
+// 上两条路径的失败原因，绝不返回未初始化内存。
+// 线程：无全局状态、无锁，每次调用自开自关 fd，可从任意线程并发调用。
 
 #include <fcntl.h>
 #include <unistd.h>
@@ -24,14 +33,19 @@ namespace backupproject {
 namespace crypto {
 namespace {
 
+// 必须在失败点之后立刻调用：errno 只在下一次库调用之前有效。
 std::string ErrnoMessage(const char* what) {
   return std::string(what) + " 失败: " + std::strerror(errno);
 }
 
 // 每次 getrandom 调用最多要 1 MiB：内核单次调用的上限是 32 MiB，分片调用既
 // 不会触发上限，也方便在 EINTR 之后从断点继续。
+// 分片还有一个好处：EINTR 重试时只重取被打断的那一片，已填充的前缀不作废。
+// flags 传 0 表示阻塞到熵池就绪为止，不会返回质量未达标的字节。
 constexpr std::size_t kGetrandomChunk = 1024 * 1024;
 
+// 前置条件：buffer 至少有 size 字节。读到 EOF 也按失败处理 —— /dev/urandom
+// 不该有“文件末尾”，出现只能说明这个设备被换掉了，继续用会交出差的数据。
 bool ReadFromUrandom(std::size_t size, unsigned char* buffer,
                      std::string* error_message) {
   // O_CLOEXEC：避免随机数 fd 泄漏给 fork/exec 出来的子进程。
@@ -105,6 +119,8 @@ bool RandomBytesFromUrandom(std::size_t size, std::string* out,
   return true;
 }
 
+// 两条路径都失败时把两条原因一起报出来：只说“getrandom 失败”会把用户引向
+// “内核太老”，而真实原因常常是回退路径也不可用（容器里没挂 /dev）。
 bool RandomBytes(std::size_t size, std::string* out,
                  std::string* error_message) {
   if (error_message != nullptr) error_message->clear();

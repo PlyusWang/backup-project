@@ -1,6 +1,29 @@
 // src/network/remote_incremental.cpp
 //
 // 远端增量闭环的实现。设计约束见 include/remote_incremental.h。
+// 模块职责：把“本地增量引擎 + 服务端元数据 + 本地缓存”编成一个可恢复的闭环：
+// 续链、上传、按链恢复，以及不依赖链的 raw 恢复会话。
+//
+// 边界（不负责什么）：不做 TLS/HMAC/分帧/重传（remote_backup_client），不做
+// delta 编码（incremental_backup）、不做归档格式与容器布局（archive 层）。
+//
+// 数据流（备份）：List -> FindRemoteLineageHead -> EnsureChainMaterial 把父材料
+// 拉进缓存，再让引擎产出 delta/full，打包后上传，再核对服务端登记的父与代数。
+// 数据流（恢复）：ResolveRemoteChain 解析 base->head，逐份取回材料并交叉校验，
+// 最后交给 RestoreSnapshotChain 原子发布到目标目录。
+//
+// 不变量一：服务端 snapshot id（随机数）与归档自己的 identity（payload 摘要 /
+// 信封自摘要）是两套标识，谁也推不出另一个；靠缓存索引对应，索引只是提示。
+// 不变量二：任何进入恢复流程的材料都必须先过 LoadVerifiedSnapshotIdentity，
+// 索引命中不等于可信——索引错了最多让它多下一份，不会让它信一份坏材料。
+//
+// 失败语义：全部入口返回 bool + error_message，失败时不留下半份材料（bundle 与
+// 未验证的缓存文件都会被删掉）；调用方拿到 false 必须放弃本次操作。
+//
+// 安全边界：服务端元数据是不可信输入——显示名会被降级成单组件文件名，索引行
+// 要做形状校验；raw 恢复在一份 mkdtemp 出来的 0700 私有目录里工作。
+// 线程与生命周期：RemoteRawRestoreSession 由单线程独占使用，Abandon() 幂等；
+// 会话的析构一定会放弃整棵工作目录，所以“忘了清理”不会留下未验证的文件。
 
 #include "remote_incremental.h"
 
@@ -39,6 +62,7 @@ namespace {
 
 constexpr const char* kRemoteArchivePrefix = "remote-";
 
+// errno 必须立刻转成文本：后续任何一次函数调用都可能把它覆盖掉。
 std::string StrerrorText() { return std::string(std::strerror(errno)); }
 
 void SetError(std::string* error_message, const std::string& text) {
@@ -47,6 +71,8 @@ void SetError(std::string* error_message, const std::string& text) {
   }
 }
 
+// 逐级 mkdir(0700)：缓存与工作目录都不允许同机其他用户读，0700 是刻意的。
+// EEXIST 视为成功（并发创建或已存在都正常），最后再用 stat 确认它真的是目录。
 bool EnsureDirectoryTree(const std::string& path, std::string* error_message) {
   if (path.empty()) {
     SetError(error_message, "目录路径为空");
@@ -89,10 +115,14 @@ bool EnsureDirectoryTree(const std::string& path, std::string* error_message) {
   return true;
 }
 
+// 缓存路径里只用指纹的前 16 个十六进制字符，纯粹是为了目录名短一点；
+// 完整指纹仍然参与 repository_identity，所以它不是安全边界的替代。
 std::string FirstSixteen(const std::string& text) {
   return text.size() <= 16 ? text : text.substr(0, 16);
 }
 
+// 缓存里的材料只认受管归档名：'.bak' 结尾、大小写敏感、长度必须大于 4；
+// 真正的信任判断在 LoadVerifiedSnapshotIdentity，这里只筛名字形状。
 bool HasBackupSuffix(const std::string& name) {
   return name.size() > 4 && name.compare(name.size() - 4, 4, ".bak") == 0;
 }
@@ -117,6 +147,7 @@ bool HasBackupSuffix(const std::string& name) {
 // 索引长度上限：索引只是提示，超过它就整体当 cache miss。
 constexpr std::size_t kMaxRemoteIndexBytes = 4u * 1024u * 1024u;
 
+// 索引是缓存目录里的隐藏文件，与归档材料分开命名，避免和 .bak 命名空间相撞。
 std::string RemoteIndexPath(const std::string& cache_directory) {
   return cache_directory + "/.remote-index.tsv";
 }
@@ -127,6 +158,8 @@ std::string RemoteIndexPath(const std::string& cache_directory) {
 //   * server id：32 个小写十六进制字符（服务端生成 id 的格式）；
 //   * 归档名：受管的单组件 .bak 名字，且不含任何控制字符（否则会破坏
 //     "一行一条"的格式，或者变成换行/制表符注入）。
+// 归档名是否受管由 IsManagedBackupFileName 裁决——那份命名约定只有一处实现，
+// 这里不另写一份正则，否则两处约定迟早会分叉。
 bool IsCanonicalIndexEntry(const std::string& snapshot_id,
                            const std::string& archive_name) {
   if (snapshot_id.size() != 32) {
@@ -151,6 +184,9 @@ bool IsCanonicalIndexEntry(const std::string& snapshot_id,
   return true;
 }
 
+// 读不到、读一半出错、超过上限：一律当成“索引是空的”返回（函数不报错）。
+// 调用方对“读不到”和“本来就没有”的处理完全相同：重新下载一份，宁可慢也不能
+// 信一份坏索引。文件名必须是单组件、受管名字，形状不对的行直接忽略。
 void LoadRemoteIndex(const std::string& cache_directory,
                      std::map<std::string, std::string>* index) {
   index->clear();
@@ -205,6 +241,9 @@ void LoadRemoteIndex(const std::string& cache_directory,
   }
 }
 
+// 写侧用 .part-<pid> + O_EXCL 建唯一临时文件，再 rename 发布：并发写不会撞。
+// 任何写出错都 unlink 临时文件：半截索引会让下一次把行解析成别的意思。
+// 写之前再过滤一次形状（防止内存里混进脏数据），索引里只会有受管条目。
 bool SaveRemoteIndex(const std::string& cache_directory,
                      const std::map<std::string, std::string>& index,
                      std::string* error_message) {
@@ -267,6 +306,8 @@ bool SaveRemoteIndex(const std::string& cache_directory,
   return true;
 }
 
+// 读-改-写整个索引。保存失败被刻意忽略：索引只是缓存，写不进去最多让下一次
+// 多下载一份材料，绝不能因此让一次备份失败。
 void RememberSnapshotInIndex(const std::string& cache_directory,
                              const std::string& snapshot_id,
                              const std::string& archive_name) {
@@ -281,6 +322,9 @@ void RememberSnapshotInIndex(const std::string& cache_directory,
 }
 
 // 缓存里这个名字的归档是不是一份**验证通过**的材料。
+// 三个条件缺一不可：受管名字、真实存在的普通文件、身份与副文件都验证通过。
+// 用 stat 而不是 lstat 是刻意的：普通文件判断已经挡住了目录，这里只是防呆；
+// 真正的信任判断是 LoadVerifiedSnapshotIdentity 加 identity.sidecars_verified。
 bool CacheHasVerifiedArchive(const std::string& cache_directory,
                              const std::string& archive_name) {
   if (!HasBackupSuffix(archive_name)) {
@@ -300,6 +344,9 @@ bool CacheHasVerifiedArchive(const std::string& cache_directory,
 
 // 在缓存目录里找"这份远端快照的本地材料"。先查索引（它给出名字），再让
 // LoadVerifiedSnapshotIdentity 用**实际字节与副文件**确认这份材料可信。
+// 只回答“缓存里有没有”，找不到不是错误（返回 true + found=false）。
+// 索引指向的材料如果已经不在、或验证不过，就当作 cache miss 让调用方重下，
+// 而不是相信一个陈旧的索引条目。error_message 目前保留给将来的失败区分。
 bool ScanCacheForSnapshot(const std::string& cache_directory,
                           const std::string& snapshot_id,
                           std::string* archive_name, bool* found,
@@ -324,6 +371,10 @@ bool ScanCacheForSnapshot(const std::string& cache_directory,
 }
 
 // 下载 + 解包 + 验证一份远端快照的材料，把它放进缓存目录。
+// 命中即返回；未命中才下载到 incoming-<id>-<pid>.bundle，用 pid 避免并发撞名。
+// 下载本身已经验过长度与 SHA-256（客户端只在通过之后才发布目标文件）。
+// 解包后还要用归档自己的字节与副文件再验一遍：服务端说它是谁不算数。
+// 验证不过就把刚解出来的每个成员从缓存里撤掉，绝不留下来路不明的材料。
 bool FetchSnapshotMaterial(RemoteArchiveClient* client,
                            const RemoteCacheLayout& cache,
                            const std::string& snapshot_id,
@@ -413,6 +464,11 @@ bool FetchSnapshotMaterial(RemoteArchiveClient* client,
 }
 
 // 把整条链（base -> head）的材料准备到本地缓存，并返回 head 的本地名字。
+// 把整条链（base -> head）的材料备齐到本地缓存，并返回 head 的本地归档名。
+// 步骤：List 全量元数据 -> ResolveRemoteChain 解析父子 -> 逐份 Fetch。
+// 最后做交叉校验：服务端元数据负责“去哪里找”，归档信封负责“这是什么”，
+// 两者对不上（元数据被改、缓存里混进同名文件）就在恢复之前失败。
+// 任何一跳失败即整体失败，不会留下“半条链”让调用方以为可以开始恢复。
 bool EnsureChainMaterial(RemoteArchiveClient* client,
                          const RemoteCacheLayout& cache,
                          const std::string& target_snapshot_id,
@@ -489,6 +545,11 @@ bool EnsureChainMaterial(RemoteArchiveClient* client,
 
 }  // namespace
 
+// 缓存布局：<root>/<指纹前16>/<用户名>。root 省略时落在应用配置目录下。
+// 两级隔离的意义：换一个服务端、换一个账户，缓存都不会串（跨账户命中不成立）。
+// 指纹长度必须是 64：拿不到完整指纹时宁可失败，也不要造一个“看起来像”的目录。
+// repository_identity 是逻辑身份（"remote:<指纹>:<用户名>"），与路径无关，
+// 所以另一台机器上传的同一条链能被这台机器认出来并续上。
 bool PrepareRemoteCache(const std::string& root_directory,
                         const std::string& server_fingerprint,
                         const std::string& username, RemoteCacheLayout* layout,
@@ -520,11 +581,17 @@ bool PrepareRemoteCache(const std::string& root_directory,
   return EnsureDirectoryTree(layout->cache_directory, error_message);
 }
 
+// lineage = 源目录身份 + 仓库逻辑身份：换源目录或换账户就是另一条链。
+// 同一个源目录在另一台机器上算出的 lineage 相同，所以那里能接着续链。
 std::string RemoteLineageId(const RemoteCacheLayout& layout,
                             const std::string& source_directory) {
   return SourceIdentityDigest(source_directory, layout.repository_identity);
 }
 
+// 从服务端快照列表按 parent 指针回溯到根，再反转成 base -> head 的顺序。
+// 深度上限 kMaxDeltaChainDepth + 1（链底 full + 若干 delta）：超了就失败，
+// 否则一个被改坏的 parent 环会把内存和时间吃光（这条判断同时也是防环的）。
+// 最后检查元数据自洽：根无父且 generation 0，之后每跳父指向前一个、代数 +1。
 bool ResolveRemoteChain(const std::vector<RemoteSnapshotInfo>& snapshots,
                         const std::string& target_snapshot_id,
                         std::vector<RemoteSnapshotInfo>* chain,
@@ -583,6 +650,10 @@ bool ResolveRemoteChain(const std::vector<RemoteSnapshotInfo>& snapshots,
   return true;
 }
 
+// head = 属于该 lineage、且没有被任何其它快照当作父引用过的最新快照。
+// 比较键依次是 created_at、generation、snapshot_id：末尾那个兜底让结果确定，
+// 时间戳相同时不会随服务端返回顺序变化（否则同一条链会随机续到不同的父）。
+// 服务端只允许删叶子，所以 tip 被删掉后它的父会重新成为 head，续链就接在那里。
 bool FindRemoteLineageHead(const std::vector<RemoteSnapshotInfo>& snapshots,
                            const std::string& lineage, RemoteSnapshotInfo* head,
                            std::string* reason) {
@@ -623,6 +694,12 @@ bool FindRemoteLineageHead(const std::vector<RemoteSnapshotInfo>& snapshots,
   return true;
 }
 
+// 三步：1) 找远端 head；2) 让既有引擎决定这次是 delta 还是完整基线；
+// 3) 打包上传，再核对服务端登记的父与代数。
+// 没有 head（或调用方不允许增量）时给引擎一个“不受管”的基线名，按公开契约
+// 引擎会强制产出一份完整 baseline，而不是去找缓存里可能已经过期的旧基线。
+// 上传后必须核对服务端返回的父与代数：服务端按父推导，对不上就是元数据出错，
+// 如实报错而不是把这次备份当成成功（宁可让用户重跑一次）。
 bool RunRemoteBackup(const RemoteBackupRequest& request,
                      RemoteBackupOutcome* outcome, std::string* error_message) {
   if (outcome == nullptr || request.client == nullptr) {
@@ -763,6 +840,9 @@ bool RunRemoteBackup(const RemoteBackupRequest& request,
   return true;
 }
 
+// 先把整条链的材料拉进缓存，再交给既有的 RestoreSnapshotChain：真正应用字节的
+// 只有那一处，它会再验一遍每一跳的字节、副文件绑定与父子关系，然后原子发布。
+// downloaded_bytes 只统计本次真正下载的字节：命中缓存的部分不计入。
 bool RunRemoteRestore(RemoteArchiveClient* client,
                       const RemoteCacheLayout& cache,
                       const std::string& snapshot_id,
@@ -814,6 +894,8 @@ namespace {
 // 这里把它降成一个单组件文件名：只保留 [A-Za-z0-9._-]，长度截断；结果为空、
 // 或本身就是 "." / ".." 时用 snapshot id 兜底。名字只在一个刚 mkdtemp 出来的
 // 0700 目录里使用，所以既不会变成路径，也不会跟随任何预先放好的符号链接。
+// 长度截断到 120 个字符，避免超长名字撞上文件系统限制；结果只在一份刚建好的
+// 0700 目录里当文件名用，所以不需要再考虑目录穿越（前缀路径已被丢弃）。
 std::string SafeArchiveLeafName(const std::string& display_name,
                                 const std::string& snapshot_id) {
   std::string leaf;
@@ -840,12 +922,16 @@ std::string SafeArchiveLeafName(const std::string& display_name,
   return leaf;
 }
 
+// 用本地恢复核心自己的英文诊断串做分类：这是脆弱的接口，所以只用来把消息
+// 说得更准确，绝不用来当安全判断（文案一改，判断就会静默失效）。
 bool ContainsText(const std::string& haystack, const std::string& needle) {
   return haystack.find(needle) != std::string::npos;
 }
 
 // 大小写不敏感的字面子串判断（ASCII
 // 足够：被匹配的是本地核心自己的英文诊断串）。
+// 大小写不敏感的子串判断（ASCII 折叠）：被匹配的是本地核心的英文诊断串。
+// 手写而不是引入正则/本地化库：诊断串是英文，ASCII 折叠足够且没有依赖。
 bool ContainsTextInsensitive(const std::string& haystack,
                              const std::string& needle) {
   if (needle.empty() || haystack.size() < needle.size()) {
@@ -878,6 +964,8 @@ bool ContainsTextInsensitive(const std::string& haystack,
 }
 
 // 尽力而为地把内存里的口令抹掉：volatile 写让编译器不能把这个循环优化掉。
+// 这只缩短“口令在进程内存里停留的时间窗”，不是密码学保证：字符串可能已经被
+// 换页、被复制或被编译器搬走，产品能做的只是尽早清零。
 void WipeString(std::string* text) {
   if (text == nullptr || text->empty()) {
     return;
@@ -897,6 +985,8 @@ void WipeString(std::string* text) {
 //   字节与归档自己的声明不符（与密码无关，
 //                                    所以这一条可以如实说"已损坏"）；
 //   * 提到 "destination"             目标目录不符合本地恢复的契约。
+// 分类只依据核心自己的诊断串，不猜文件名、不看扩展名：文件名是用户可控的。
+// 最后一条兜底原样带上核心原因，不改写，避免丢掉排查细节。
 std::string DescribeLocalRestoreFailure(const std::string& restore_error) {
   if (ContainsText(restore_error, "Authentication failed")) {
     return "raw restore: authentication failed — 恢复密码错误，或备份完整性"
@@ -928,8 +1018,12 @@ std::string DescribeLocalRestoreFailure(const std::string& restore_error) {
 
 }  // namespace
 
+// 析构即放弃会话：清理不依赖调用方记得调用 Abandon，“忘了清理”不可能发生。
 RemoteRawRestoreSession::~RemoteRawRestoreSession() { Abandon(); }
 
+// 幂等：Remove() 本身幂等，重复调用只是再清一遍状态。
+// 清空全部会话状态并抹掉口令副本；失败路径也会走到这里，不会留下半个会话。
+// 工作目录整棵递归删除（含下载下来的那份归档），目标目录从不放在里面。
 void RemoteRawRestoreSession::Abandon() {
   // Remove() 幂等，并且会立刻递归删掉整个工作目录（含下载下来的那份归档）。
   workspace_.Remove();
@@ -946,6 +1040,12 @@ void RemoteRawRestoreSession::Abandon() {
   legacy_v01_ = false;
 }
 
+// 会话进入 prepared 状态，或者以 Abandon 收场：不存在“半准备好”的中间态。
+// 复用同一个会话对象时先 Abandon：一个会话只描述一次交互。
+// 下载只做一次（错密码重试不再下载）：字节留在会话的私有工作目录里。
+// 格式只按内容（magic）判断，文件名与扩展名一律不参与——随机文件即使叫
+// something.bak 也必须在这里被挡住；单独的 delta 直接拒绝并指向产品级恢复。
+// 认得出 magic 却读不出头、以及根本不是归档，是两种不同的诊断，必须分开说。
 bool RemoteRawRestoreSession::Prepare(const RemoteRawRestoreRequest& request,
                                       RemoteRawRestoreOutcome* outcome,
                                       std::string* error_message) {
@@ -1066,6 +1166,11 @@ bool RemoteRawRestoreSession::Prepare(const RemoteRawRestoreRequest& request,
   return true;
 }
 
+// 前置条件：Prepare 成功过。密码缺失不算会话失败——返回 password_required 让
+// 调用方补密码后再调一次 Run（不会重新下载）。
+// legacy v0.1 与 v2 容器走两条不同的既有恢复入口：standalone 归档没有 .manifest
+// / .identity 副文件，所以这里不能走链入口（那正是产品级链路才有的东西）。
+// 口令用完立刻从 options 副本里抹掉：它不落盘、不进日志、不进任何请求对象。
 bool RemoteRawRestoreSession::Run(const std::string& password,
                                   RemoteRawRestoreOutcome* outcome,
                                   std::string* error_message) {
@@ -1116,6 +1221,8 @@ bool RemoteRawRestoreSession::Run(const std::string& password,
   return true;
 }
 
+// 一次性会话的便捷包装：Prepare + Run，失败时也不会有会话留在半路。
+// 需要“先问密码、再恢复”的调用方请直接用 RemoteRawRestoreSession。
 bool RunRemoteRawRestore(const RemoteRawRestoreRequest& request,
                          RemoteRawRestoreOutcome* outcome,
                          std::string* error_message) {

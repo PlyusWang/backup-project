@@ -2,9 +2,9 @@
 //
 // 打包 / 压缩 / 加密三组选项的 key 与 enum 的唯一映射表。
 //
-// 为什么要有这个文件：PR #16 的 Modern GUI 已经把这三张表写在自己的
-// BackupController 里，CLI 当时还没有 v2 选项，ScheduleStore 也还不存在。
-// 本 PR 之后有三类调用方需要同一份映射：
+// 为什么要有这个文件：Modern GUI 的 BackupController 里写了一份自己的
+// 拷贝，CLI 与 ScheduleStore 也各需要一份，三处必须永远一致。
+// 需要同一份映射的调用方有三类：
 //
 //   CLI        （--pack / --compression / --encryption）
 //   Modern GUI （界面下拉框）

@@ -5,6 +5,17 @@
 // 这一层的职责被刻意压到最小：解析参数、调用共享核心、把结果翻译成人能读的
 // 输出与退出码。它不实现筛选语法、不拼归档路径、不算 next run、不做 retention，
 // 也不读密码以外的任何输入。
+//
+// 退出码契约（由 app/backupctl.cpp 转交给 shell）：
+//   0 成功；1 业务失败；2 用法错误；3 另一个实例已在运行。
+// 用法错误与业务失败分开，脚本才能区分"参数写错了"与"环境/数据不允许"。
+//
+// 输出约定：正常结果走 stdout，诊断走 stderr。成功路径上的 stdout 形状
+// （键名、列顺序、单行一字段）是给脚本解析的接口，改动等于改接口。
+//
+// 状态所有权：本文件不持有任何持久状态，每个子命令自己加载、用完即丢，
+// 不缓存、不长驻，因此子命令之间没有隐含的顺序依赖。
+// 密码只从 /dev/tty 读，永不来自 argv / 环境变量 / 管道：见 terminal_secret。
 
 #include <signal.h>
 #include <sys/stat.h>
@@ -43,6 +54,9 @@ void PrintError(const std::string& text) {
   std::cerr << "Error: " << text << '\n';
 }
 
+// 用法错误的统一形状：先一句话说清哪一条 argv 不合法，再打印完整 usage。
+// 每次都打 usage 是刻意的：这一层的选项组合多，逐条列比让用户翻文档快。
+// 返回值恒为 2，调用点不需要自己判断。
 int UsageError(const CliContext& context, const std::string& text) {
   PrintError(text);
   std::cerr << '\n';
@@ -60,6 +74,8 @@ bool TakeValue(const std::vector<std::string>& arguments, std::size_t* index,
   }
   *index += 1;
   *value = arguments[*index];
+  // index 只在这里前进：调用方的循环变量因此天然跳过已经消费的值，
+  // 不需要在每个调用点重复 ++index。
   return true;
 }
 
@@ -82,6 +98,10 @@ bool MarkSingleOption(bool* seen, const std::string& option,
   return true;
 }
 
+// 把 epoch 秒渲染成本地时区的 "YYYY-MM-DD HH:MM:SS"，固定宽度，
+// schedule show / history 靠这个宽度对齐列。
+// 两个哨兵值：<=0（从未发生过）-> "never"；localtime_r / strftime 失败
+// -> "?"。都不抛异常：这是一条展示路径，不值得让整条命令失败。
 std::string FormatLocalTime(std::int64_t seconds) {
   if (seconds <= 0) return std::string("never");
   const std::time_t value = static_cast<std::time_t>(seconds);
@@ -101,6 +121,8 @@ std::string FormatSize(std::uint64_t bytes) {
   return backupproject::FormatByteSize(bytes);
 }
 
+// 空集合渲染成 "(none)" 而不是空串：配置里"没有规则"和"这一行没打印"
+// 必须在输出上分得开，否则用户会把"没排除任何东西"读成"全被排除了"。
 std::string JoinRules(const std::vector<std::string>& rules) {
   if (rules.empty()) return std::string("(none)");
   std::string joined;
@@ -113,6 +135,8 @@ std::string JoinRules(const std::vector<std::string>& rules) {
 
 // 路径的最后一段。"a/b.bak" -> "b.bak"、"b.bak" -> "b.bak"。
 // 只用于把 Catalog 给出的路径缩成一个可读的文件名，不参与任何安全判断。
+// 只按 '/' 切分，不做任何路径规范化：Catalog 给出的路径已经是规范形式，
+// 这里也不需要（更不该）调用 realpath 之类的重型解析。
 std::string BaseNameOf(const std::string& path) {
   const std::size_t slash = path.rfind('/');
   if (slash == std::string::npos) return path;
@@ -121,6 +145,11 @@ std::string BaseNameOf(const std::string& path) {
 
 // ---- 共享核心的薄封装 ----
 
+// 从 config.json 读备份仓库路径，是 backup / restore / repository / schedule
+// 这些业务子命令的统一前置条件：没有仓库就没有产品备份这回事。
+//
+// 三态处理：kError（文件在但读不动或内容非法）直接失败；kMissing 与
+// "字段为空"合并成同一句可照做的提示，告诉用户该跑哪条命令去设置。
 bool LoadRepositoryPath(const CliContext& context, std::string* repository,
                         std::string* error_message) {
   repository->clear();
@@ -149,6 +178,11 @@ bool LoadRepositoryPath(const CliContext& context, std::string* repository,
   return true;
 }
 
+// 读 schedule store。返回 true 但 status==kMissing 表示"文件还不存在"：
+// 此时给一份默认（disabled、字段为空）的文档，show / set 在一台新机器上
+// 也能给出完整的一屏输出，而不是报错。
+// 只有 kError（文件在但读不动 / JSON 坏了）才返回 false —— 那种情况下
+// 用默认值继续，会把用户的配置悄悄覆盖掉。
 bool LoadScheduleDocument(const CliContext& context, ScheduleDocument* document,
                           ScheduleLoadStatus* status,
                           std::string* error_message) {
@@ -170,6 +204,9 @@ bool LoadScheduleDocument(const CliContext& context, ScheduleDocument* document,
   return true;
 }
 
+// 全文件唯一的时间来源：同一次命令里的"现在"必须一致，否则同一条输出里
+// 会出现两个不同的基准（例如 next run 与 history 的时间戳对不上）。
+// 用 ::time 而不是 steady_clock：这里要的是墙上时间，它会被 NTP 调整。
 std::int64_t NowSeconds() { return static_cast<std::int64_t>(::time(nullptr)); }
 
 bool SaveScheduleDocument(const CliContext& context,
@@ -195,6 +232,9 @@ const char* ConfigLoadStatusText(ConfigLoadStatus status) {
 
 // ---- 用法 ----
 
+// usage 是产品说明书，也是**用户可见文案**。三处刻意的措辞：归档由程序在
+// 仓库里命名（没有给路径的入口）、preview 只读且不需要仓库、密码只从
+// /dev/tty 读。output 是参数而不是直接写 cout：错误路径要把它送到 stderr。
 void PrintCliUsage(const std::string& program_name, std::ostream& output) {
   output
       << "Usage:\n"
@@ -324,6 +364,11 @@ void PrintCliUsage(const std::string& program_name, std::ostream& output) {
 // 任意路径的 direct archive（以及它默认产出的 legacy v0.1）不是产品功能：
 // 那是归档格式的测试夹具（tests/tools/archive_cli.cpp）负责的事。产品 CLI
 // 与产品 GUI 都不再暴露"把备份写到哪就是哪"这个能力。
+// 参数解析的契约，也是这一层的核心不变量：
+//   * 未知选项、缺少值、重复的单值选项、越界的数字一律是用法错误 2，
+//     绝不"忽略不认识的东西"——脚本里的拼写错误必须立刻可见；
+//   * --include / --exclude 边解析边喂给真实的 Filter，语法裁决只有一处；
+//   * 规则原文按 include / exclude 分开留存，它是增量链 identity 的一部分。
 int RunBackupCommand(const CliContext& context,
                      const std::vector<std::string>& arguments) {
   if (arguments.empty()) {
@@ -411,6 +456,9 @@ int RunBackupCommand(const CliContext& context,
       }
       continue;
     }
+    // --encryption 在这一步只记录"用户要加密"，真正的口令在解析循环结束
+    // 之后才从 /dev/tty 读：解析阶段不能有交互式副作用，否则任何一条早退
+    // 的错误路径都会先卡在密码提示上。
     if (option == "--encryption") {
       if (!MarkSingleOption(&saw_encryption, option, &error_message)) {
         return UsageError(context, error_message);
@@ -431,6 +479,9 @@ int RunBackupCommand(const CliContext& context,
     return UsageError(context, "unknown option '" + option + "'");
   }
 
+  // 顺序说明：组合校验（IsSupportedBackupOptionCombination）在这一步之后，
+  // 而 EnsureRepository 可能已经创建了仓库目录、密码也已经问过。也就是说
+  // "组合不支持"这类用法错误 2 有可能在产生副作用之后才报出来。
   // 仓库是业务模型的一部分：没有仓库就没有"产品备份"这回事。
   std::string repository;
   if (!LoadRepositoryPath(context, &repository, &error_message)) {
@@ -452,6 +503,8 @@ int RunBackupCommand(const CliContext& context,
   }
 
   BackupCatalog catalog;
+  // EnsureRepository 是幂等的"确保存在"：目录不存在就创建。所有会写归档
+  // 的路径都先过它，因此"仓库可用"这一个判断只有一份实现。
   if (!catalog.EnsureRepository(repository, &error_message)) {
     PrintError(error_message);
     return kCliExitOperationFailed;
@@ -485,7 +538,12 @@ int RunBackupCommand(const CliContext& context,
     return UsageError(context, reason);
   }
 
+  // 归档的**名字**（单组件）与**路径**（绝对）分开保存：面向用户的输出、
+  // schedule 记录、远端快照都只认名字，路径只在本地读写时用。
   const std::string file_name = BaseNameOf(archive_path);
+  // 增量与全量走共享引擎的两个入口，但**输出契约不同**：增量必须报告这一
+  // 轮建的到底是基线还是 delta（用户要的是增量，结果可能是兜底的完整基线），
+  // 全量的结果则是确定的。
   if (strategy == BackupStrategy::kIncremental) {
     // 增量：baseline / delta / 无变化三选一，由共享引擎决定并如实报告。
     IncrementalOutcome outcome;
@@ -527,6 +585,8 @@ int RunBackupCommand(const CliContext& context,
     return kCliExitSuccess;
   }
 
+  // 非增量路径：engine.Backup 拿到的已经是仓库内的完整路径，命名规则一行
+  // 都没有复制到这里 —— 复制一份就等于有了第二套命名规则。
   BackupEngine engine;
   if (!engine.Backup(source_directory, archive_path, filter, options,
                      &error_message)) {
@@ -557,6 +617,9 @@ int RunBackupCommand(const CliContext& context,
 //
 // 只接受 --include / --exclude。--pack / --compression / --encryption 属于
 // "怎么写归档"，与"选哪些条目"无关：允许它们只会让人以为这条命令会执行备份。
+// 参数解析只认 --include / --exclude，出现别的选项直接是用法错误，
+// 而不是"收下但忽略"：预览的输出会被当成"这份规则会备份什么"的证据，
+// 任何它能接受、备份却不接受的选项都会让这份证据失真。
 int RunPreviewCommand(const CliContext& context,
                       const std::vector<std::string>& arguments) {
   if (arguments.empty()) {
@@ -625,6 +688,9 @@ int RunPreviewCommand(const CliContext& context,
                  "was validated, "
               << listed_matching_count << " matching item(s) listed below.\n";
   }
+  // 逐个打印时再过滤一次 included：窗口里可能装着被排除或被剪枝的条目
+  // （它们占用窗口容量但不该出现在结果里），所以打印出来的行数等于
+  // listed_matching_count，而它与 included_count 一般不同。
   for (const PreviewItem& item : preview.items) {
     if (!item.included) continue;
     std::cout << item.archive_path << '\n';
@@ -638,6 +704,9 @@ int RunPreviewCommand(const CliContext& context,
 // 拒绝空串、"."、".."、含 '/' 或 '\\'、内嵌 NUL、不以 .bak 结尾，并且要求
 // 解析结果确实是仓库的直接子项、普通文件、非软链接。产品 CLI 不再接受任意
 // 绝对路径——那同样属于测试夹具。
+// 恢复的硬约束是**先识别、后选路**。IdentifyArchiveFile 只看文件头 magic：
+// 它的失败不在这里报错（识别不出来不等于恢复不了，让真正的恢复路径给出
+// 更准确的诊断），只有它明确说"需要密码"时才去 /dev/tty 问一次。
 int RunRestoreCommand(const CliContext& context,
                       const std::vector<std::string>& arguments) {
   if (arguments.size() != 2) {
@@ -664,6 +733,9 @@ int RunRestoreCommand(const CliContext& context,
 
   ArchiveFileInfo info;
   std::string identify_error;
+  // wants_password 的语义是"归档自己声明了 password_hint"，不是"用户想输
+  // 密码"。判错的两个方向都不可接受：多问一次会让未加密归档的恢复凭空多
+  // 一步；少问一次会让加密归档的恢复在 core 里失败，而用户以为流程走完了。
   const bool wants_password =
       IdentifyArchiveFile(archive_path, &info, &identify_error) &&
       !info.password_hint.empty();
@@ -687,11 +759,13 @@ int RunRestoreCommand(const CliContext& context,
   //     内部走的就是同一个恢复路径，行为与以前一致；是 delta 时自动把 base
   //     与中间层一起应用，用户只需要选 restore point。
   //   * 其它（legacy v0.1 等）—— 这些格式没有"链"的概念，走按 magic 分流的
-  //     既有入口。它们的行为与 PR #17 一字不变：产品 CLI 一直能恢复历史 v0.1
+  //     既有入口。它们的行为一字不变：产品 CLI 一直能恢复历史 v0.1
   //     归档，这条能力不能因为新增了增量而消失。
   const SnapshotFileKind snapshot_kind =
       ClassifySnapshotFile(archive_path, nullptr);
   bool restored = false;
+  // 两条路径的失败语义一致：返回 false 时 error_message 一定已经填好。
+  // report 只在链恢复路径里被填，下面读它之前已经确认 restored 为真。
   RestoreReport report;
   if (snapshot_kind == SnapshotFileKind::kUnknown) {
     BackupEngine engine;
@@ -705,11 +779,15 @@ int RunRestoreCommand(const CliContext& context,
         RestoreSnapshotChain(repository, file_name, destination_directory,
                              options, &report, &error_message);
   }
+  // 口令用完立刻清零：它在本进程里只活到这里，任何一条退出路径都不该
+  // 带着明文口令离开（包括下面那条失败路径）。
   for (char& character : secret) character = '\0';
   if (!restored) {
     PrintError(error_message);
     return kCliExitOperationFailed;
   }
+  // 成功也要说清"哪些步骤被跳过了"：非 root 改不了属主，这是尽力而为，
+  // 静默跳过会让用户以为权限被完整恢复了。
   std::cout << "Restore completed successfully.\n";
   if (!report.notes.empty()) {
     // 尽力而为的步骤（例如非 root 改不了属主）如实说出来，不假装完整。
@@ -722,6 +800,9 @@ int RunRestoreCommand(const CliContext& context,
 
 namespace {
 
+// 变化摘要的唯一格式：schedule show / history / run 三处共用同一份实现，
+// 同一份数据在三个子命令里必须长得一样（脚本按列切分就靠这个）。
+// 四个计数分别对应新增 / 删除 / 内容变化 / 只有元数据变化，顺序固定。
 std::string ChangeSummaryText(const ChangeSummary& changes) {
   return "+" + std::to_string(changes.added) + " added, -" +
          std::to_string(changes.removed) + " removed, ~" +
@@ -729,6 +810,9 @@ std::string ChangeSummaryText(const ChangeSummary& changes) {
          std::to_string(changes.metadata_changed) + " metadata";
 }
 
+// 一次评估的完整报告，字段顺序就是"用户要回答的问题"的顺序：结果 -> 变化
+// -> 归档名 -> 首次 / 基线重置的说明 -> retention -> 下次时间 -> 诊断。
+// now_sec 目前用不上，保留参数是为了让调用点的"这一轮发生在何时"语义完整。
 void PrintEvaluation(const ScheduleEvaluationResult& result,
                      std::int64_t now_sec) {
   std::cout << "Scheduled evaluation: "
@@ -766,6 +850,9 @@ void PrintEvaluation(const ScheduleEvaluationResult& result,
   (void)now_sec;
 }
 
+// 只读：不创建 store、不碰仓库、不写任何文件。文件不存在也照样成功（0），
+// 因为"还没配过计划"是正常状态而不是错误。
+// 历史只打印最后一条，完整历史走 `schedule history`，避免这一屏无限增长。
 int ScheduleShow(const CliContext& context) {
   ScheduleDocument document;
   ScheduleLoadStatus status = ScheduleLoadStatus::kMissing;
@@ -829,6 +916,11 @@ int ScheduleShow(const CliContext& context) {
   return kCliExitSuccess;
 }
 
+// 读-改-写的合并语义，不变量是"要么整份配置被合法地写下去，要么一个字节
+// 都不写"。三条保证：
+//   1. 选项先全部收进局部变量再统一并进配置，所以 --clear-filters 写在
+//      --include 之前还是之后，结果完全相同；
+//   2. 规则总数（存下来的 + 这次给的）不能超过 kMaxScheduleRules。
 int ScheduleSet(const CliContext& context,
                 const std::vector<std::string>& arguments) {
   if (arguments.empty()) {
@@ -901,7 +993,7 @@ int ScheduleSet(const CliContext& context,
       continue;
     }
     if (option == "--strategy") {
-      // PR #18：计划也支持增量策略。解析失败不回退：写进配置的必须正是用户
+      // 计划也支持增量策略。解析失败不回退：写进配置的必须正是用户
       // 要的那一个，而"支不支持这个组合"由共享的 ValidateScheduleConfig
       // （也就是 IsSupportedBackupMode 那张真值表）在后面统一回答。
       if (!MarkSingleOption(&saw_strategy, option, &error)) {
@@ -953,8 +1045,8 @@ int ScheduleSet(const CliContext& context,
         return UsageError(context, "unknown encryption method '" + value + "'");
       }
       if (method != EncryptionMethod::kNone) {
-        // 无人值守的定时任务没有安全的持久密钥来源。明确拒绝，绝不落盘明文密码，
-        // 也绝不静默降级成不加密。
+        // 无人值守的定时任务没有安全的持久密钥来源。
+        // 明确拒绝，绝不落盘明文密码，也绝不静默降级成不加密。
         return UsageError(
             context,
             "the scheduled backup supports --encryption none only: "
@@ -1003,6 +1095,8 @@ int ScheduleSet(const CliContext& context,
 
   // 规则语法在这里就用真实的 Filter 校验一遍：配置里存的规则与命令行的规则
   // 走的是同一套解析，写不进去的规则也读不出来。
+  // ValidateScheduleConfig 还管跨字段的合法性（source 为空、策略与算法的
+  // 组合、规则条数），所以它是保存之前的最后一道闸门。
   if (!ValidateScheduleConfig(config, &error)) {
     return UsageError(context, error);
   }
@@ -1037,6 +1131,9 @@ int ScheduleSet(const CliContext& context,
   return kCliExitSuccess;
 }
 
+// enable 与 disable 共用一条路径，差别只在参数。**只有 enable 做完整校验**：
+// disable 必须是永远可用的刹车，一份写坏了的配置也要能被关掉。
+// 校验用的函数与 GUI 调用的是同一个（ValidateScheduleForEnable）。
 int ScheduleToggle(const CliContext& context, bool enabled) {
   ScheduleDocument document;
   ScheduleLoadStatus status = ScheduleLoadStatus::kMissing;
@@ -1068,6 +1165,8 @@ int ScheduleToggle(const CliContext& context, bool enabled) {
     PrintError(error);
     return kCliExitOperationFailed;
   }
+  // 输出必须交代"谁在跑它"：计划不是后台服务，没有 watch / GUI 在运行时，
+  // 即使到点也不会发生任何事。
   std::cout << "Scheduled backup " << (enabled ? "enabled" : "disabled")
             << ".\n";
   if (enabled) {
@@ -1078,6 +1177,9 @@ int ScheduleToggle(const CliContext& context, bool enabled) {
   return kCliExitSuccess;
 }
 
+// "立即运行"= EvaluateNow（忽略 due time），但**不**忽略变化检测：源目录
+// 没有变化时仍然是 kSkippedNoChanges，不会退化成一次强制全量备份。
+// 因此这个子命令返回 0 也可能意味着"什么都没有创建"。
 int ScheduleRun(const CliContext& context) {
   std::string repository;
   std::string error;
@@ -1093,7 +1195,7 @@ int ScheduleRun(const CliContext& context) {
   // "立即运行"的前提是这份计划**确实被启用了**。以前这里会走到
   // EvaluateNow -> kDisabled 然后退出 0：脚本会把"其实什么都没做"当成成功，
   // 而 GUI 的 runNow() 在同样的情况下是明确的拒绝。同一件事两个前端给不同
-  // 结论，正是本轮要收掉的边界，所以判断放在这里、结论是失败。
+  // 结论，正是要消除的不一致，所以判断放在这里、结论是失败。
   {
     ScheduleDocument document;
     ScheduleLoadStatus status = ScheduleLoadStatus::kMissing;
@@ -1111,6 +1213,8 @@ int ScheduleRun(const CliContext& context) {
   }
 
   ScheduleStore store(context.schedule_file_path);
+  // 与 watch 抢同一把锁：两个进程同时评估同一份计划会各写一份快照，
+  // 而它们读到的 next_run 与 baseline 都是同一个旧值。
   SchedulerLock lock;
   if (!lock.Acquire(store.lock_file_path(), &error)) {
     PrintError(error);
@@ -1128,12 +1232,17 @@ int ScheduleRun(const CliContext& context) {
   PrintEvaluation(result, now);
   // 配置不合法（计划被挂起）与"这一轮失败"是两回事，但对命令的调用者来说
   // 都是"这次运行没有成功"，所以退出码相同：非 0。
+  // 退出码只表达"这次运行有没有成功"，不表达"创建了什么"：
+  // kSkippedNoChanges 算成功 —— 计划按预期判断出"这一轮不需要备份"。
   return (result.status == ScheduleEvaluationStatus::kFailed ||
           result.status == ScheduleEvaluationStatus::kConfigInvalid)
              ? kCliExitOperationFailed
              : kCliExitSuccess;
 }
 
+// 只读。列宽靠**手写空格填充**而不是 printf 的宽度标志：结果列是变长的
+// 枚举名，对齐只能建立在"等宽字体 + 固定列宽 32"这个假设上，
+// 表头与数据行共用同一个宽度值。
 int ScheduleHistory(const CliContext& context) {
   ScheduleDocument document;
   ScheduleLoadStatus status = ScheduleLoadStatus::kMissing;
@@ -1166,10 +1275,16 @@ int ScheduleHistory(const CliContext& context) {
   return kCliExitSuccess;
 }
 
+// 信号处理器唯一的共享状态。sig_atomic_t + volatile 是 POSIX 对"在处理器
+// 里写、在主循环里读"的最低要求；处理器本身只做一次赋值，不调用任何
+// async-signal-safe 之外的函数（printf / malloc 在信号上下文里都是 UB）。
 volatile sig_atomic_t g_watch_stop = 0;
 
 void HandleWatchStop(int) { g_watch_stop = 1; }
 
+// 前台守护循环。它不是常驻服务：进程退出（Ctrl+C / SIGTERM）调度就停止，
+// 这也是 usage 反复强调"计划只在程序运行时生效"的原因。
+// 一轮 = 重读仓库 -> Evaluate -> 打印非 NotDue 的结果 -> 睡到下次时间点。
 int ScheduleWatch(const CliContext& context) {
   std::string repository;
   std::string error;
@@ -1246,6 +1361,8 @@ int ScheduleWatch(const CliContext& context) {
     }
     if (wait_seconds < 1) wait_seconds = 1;
     if (wait_seconds > 30) wait_seconds = 30;
+    // 上限 30 秒不是为了省 CPU，而是让 Ctrl+C 的响应延迟有界：
+    // sleep 被信号打断后，循环条件会立刻看到 g_watch_stop。
     ::sleep(static_cast<unsigned>(wait_seconds));
   }
 
@@ -1256,6 +1373,10 @@ int ScheduleWatch(const CliContext& context) {
 
 }  // namespace
 
+// 子命令分发。两条通用规则在这一层统一执行，子命令里不再各写一遍：
+//   * 不认识的子命令是用法错误；
+//   * 除 set 之外，任何多余的位置参数都是用法错误 —— `schedule show extra`
+//     静默忽略 extra，会让脚本里的一个拼写错误看起来完全成功。
 int RunScheduleCommand(const CliContext& context,
                        const std::vector<std::string>& arguments) {
   if (arguments.empty()) {
@@ -1296,6 +1417,9 @@ int RunScheduleCommand(const CliContext& context,
 
 namespace {
 
+// 归档**类型**以内容识别为准（recognized_archive 来自 magic sniff），
+// 不看扩展名也不看文件名：用户把 .bak 改了名也不影响这里的判断。
+// format_version 是归档自己声明的版本号，2 就是产品级的 v2 容器。
 std::string KindText(const BackupRecord& record) {
   if (!record.recognized_archive) return "unreadable";
   return record.format_version == 2 ? "container-v2" : "legacy-v0.1";
@@ -1308,6 +1432,9 @@ std::string PipelineText(const BackupRecord& record) {
          EncryptionMethodKey(record.encryption_method);
 }
 
+// 只读列表。三件事在这里合成一屏：Catalog 的归档记录、ScheduleStore 的
+// ownership、以及仓库里的孤儿副文件。三者各自的真相来源独立，这里只做
+// 展示，不修复任何不一致 —— 修复必须由用户或 retention 显式发起。
 int RepositoryList(const CliContext& context) {
   std::string repository;
   std::string error;
@@ -1328,8 +1455,13 @@ int RepositoryList(const CliContext& context) {
   ScheduleLoadStatus status = ScheduleLoadStatus::kMissing;
   std::string schedule_error;
   LoadScheduleDocument(context, &document, &status, &schedule_error);
+  // 这里**故意**忽略读失败：schedule store 坏了只影响 origin 这一列的显示，
+  // 不该让"列出仓库内容"这个只读操作失败。全部退化成 manual 是安全的默认值，
+  // 因为 ownership 的真相来源本来就是 schedule store 而不是文件名。
 
   std::cout << "Repository: " << repository << "\n";
+  // 行数就是归档数：不可识别的文件也算一行（KindText 会说 unreadable），
+  // 列表不做过滤，否则用户会以为仓库里少了一个文件。
   std::cout << "Archives:   " << records.size() << "\n";
   // 孤儿副文件只报告、不清理：列表是只读操作，破坏性动作必须由用户显式发起
   // （或者由 retention 在明确的淘汰轮次里做）。
@@ -1367,6 +1499,9 @@ int RepositoryList(const CliContext& context) {
   return kCliExitSuccess;
 }
 
+// 删除本身是 Catalog 的职责（它知道 .bak / .manifest / .identity 的命名
+// 规则），这一层只把诊断转成 Warning 并同步 schedule store。顺序不可换：
+// 先删文件再让 schedule 忘记它，反过来会留下没人管的孤儿记录。
 int RepositoryDelete(const CliContext& context, const std::string& file_name) {
   std::string repository;
   std::string error;
@@ -1382,6 +1517,9 @@ int RepositoryDelete(const CliContext& context, const std::string& file_name) {
   }
   // 副文件清理失败不是"删除失败"，但绝不能静默：用户以为 .bak 没了就干净了，
   // 而仓库里还留着它的 .manifest / .identity。
+  // diagnostics 不是错误，而是"副文件没删掉"：主文件已经删成功，
+  // 但必须逐条说出来 —— 仓库里留着 .manifest / .identity 会影响后续的
+  // 链解析与 retention，用户得知道去手工清理。
   for (const std::string& note : diagnostics) {
     std::cout << "Warning: " << note << "\n";
   }
@@ -1412,6 +1550,9 @@ int RepositoryDelete(const CliContext& context, const std::string& file_name) {
 
 }  // namespace
 
+// 参数个数的两种错法分开报（"没给"与"给多了"），因为用户要做的事不同：
+// 前者是漏了参数，后者通常是脚本里的变量展开错了。多给的参数会回显出来，
+// 用户才能看出到底是哪一段展开多了。
 int RunRepositoryCommand(const CliContext& context,
                          const std::vector<std::string>& arguments) {
   if (arguments.empty()) {
@@ -1447,6 +1588,8 @@ int RunRepositoryCommand(const CliContext& context,
 
 namespace {
 
+// 只读地回显配置的**解析结果**，不是文件原文：Status 是 ConfigLoadStatus，
+// 其中 missing 表示文件还没被创建过，与"文件在但字段为空"是两件事。
 int ConfigRepositoryShow(const CliContext& context) {
   if (context.config_file_path.empty()) {
     PrintError("Cannot locate the application config file");
@@ -1473,6 +1616,9 @@ int ConfigRepositoryShow(const CliContext& context) {
   return kCliExitSuccess;
 }
 
+// 只有这条命令会写 config.json。它构造的是一份**全新的默认 AppConfig**，
+// 而不是先 Load 再改一个字段 —— 眼下 AppConfig 只有 backup_repository_path
+// 这一个字段所以等价，将来一旦新增字段，这里必须改成先读后写。
 int ConfigRepositorySet(const CliContext& context, const std::string& path) {
   if (context.config_file_path.empty()) {
     PrintError("Cannot locate the application config file");
@@ -1499,6 +1645,9 @@ int ConfigRepositorySet(const CliContext& context, const std::string& path) {
 
 }  // namespace
 
+// 契约：调用方必须至少传一个参数（arguments[0] 是子命令名），而这一点在这
+// 里没有被检查 —— app/backupctl.cpp 在 `backupctl config` 时会传出空 vector，
+// 于是 arguments[0] 是越界读。修法是在这里补一次 empty() 检查。
 int RunConfigCommand(const CliContext& context,
                      const std::vector<std::string>& arguments) {
   if (arguments[0] == "repository" && arguments.size() >= 2) {

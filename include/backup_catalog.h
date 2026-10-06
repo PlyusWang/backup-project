@@ -104,7 +104,7 @@ struct BackupRecord {
   // recognized_archive 为 false 时的原因；为 true 时为空。
   std::string diagnostic;
 
-  // ---- PR #18：快照种类与依赖链 ----
+  // ---- 快照种类与依赖链 ----
   //
   // 一份 delta 不是"坏归档"，它是另一种快照：有独立 magic，自己带着父身份。
   // catalog 必须先按 magic 分类，否则一份完好的 delta 会被报成"认不出来"。
@@ -220,7 +220,7 @@ class BackupCatalog {
   // 竞态的完整防护。更强的本地对抗边界可用 dirfd + openat/openat2/unlinkat
   // 实现，本版本未采用。
   //
-  // PR #18 起，删除还是**依赖感知**的：任何还有可达后代（还活着、读得出来的
+  // 删除还是**依赖感知**的：任何还有可达后代（还活着、读得出来的
   // 子快照）的快照都会被拒绝——删掉一个祖先等于让那些后代永远不可恢复，
   // 那不是"少留一份"，是数据丢失。要一次删掉一整条已经计划好的链，用
   // DeleteSnapshots。

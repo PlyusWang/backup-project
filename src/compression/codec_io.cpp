@@ -2,6 +2,21 @@
 //
 // 见 codec_io.h。
 
+// 本文件是 codec_io.h 里那几组 I/O 原语的实现。huffman.cpp / lzss.cpp 只用
+// 这些原语，不直接碰 FileSource / FileSink，也不自己管理缓冲。
+//
+// 职责边界：这里只搬运字节与比特，不认识任何压缩格式的语义 —— 哪个字节是
+// token、哪几位是 padding，全部由调用方按自己的格式解释。
+//
+// 借用关系（生命周期）：ByteSinkAdapter 借用外部的 FileSink 或 std::string；
+// SequentialReader 借用 FileSource 或 std::string；BitWriter 与 RollingHistory
+// 再借用 ByteSinkAdapter，BitReader 借用 SequentialReader。这些指针一律不持有
+// 所有权、不负责释放，调用方必须保证被借用对象活过整条编解码流程；链条上
+// 任何一环提前析构，剩下的对象就是悬垂指针。
+//
+// 失败语义：bool 接口失败时**不回滚**已经写出去、已经读进来的字节，调用方
+// 一旦看到 false 就必须放弃整条流，不能把半截输出当成合法结果。
+// error_message 允许为 nullptr，失败时覆盖写，成功时不保证被清空。
 #include "codec_io.h"
 
 #include <cstring>
@@ -11,18 +26,23 @@ namespace compression {
 
 namespace {
 
+// 所有诊断的唯一出口：error_message 允许为空（自测与"只关心成败"的调用方
+// 常这么传），所以每个失败分支都必须经过这里，而不是直接解引用。
 void SetError(std::string* error_message, const std::string& text) {
   if (error_message != nullptr) {
     *error_message = text;
   }
 }
 
+// Discard 的跳读缓冲：内存占用与"要丢多少字节"无关，恒为 64 KiB。
 constexpr std::size_t kDiscardBufferSize = 64 * 1024;
 
 }  // namespace
 
 // ---- ByteSinkAdapter -------------------------------------------------------
 
+// 切到文件后端（并清掉可能残留的内存后端与计数）。sink 只被借用：
+// 本对象不 delete 它，调用方要保证它活到最后一次 Write 之后。
 bool ByteSinkAdapter::OpenFile(FileSink* sink, std::string* error_message) {
   if (sink == nullptr) {
     SetError(error_message, "codec: sink 是空指针");
@@ -34,12 +54,16 @@ bool ByteSinkAdapter::OpenFile(FileSink* sink, std::string* error_message) {
   return true;
 }
 
+// 内存后端是**追加**语义：不清空 out，多次编码可以拼进同一个字符串。
+// out 同样只被借用，而且必须活过本对象。
 void ByteSinkAdapter::OpenMemory(std::string* out) {
   file_ = nullptr;
   memory_ = out;
   bytes_written_ = 0;
 }
 
+// size == 0 视为成功且不计入 bytes_written()，调用方不必为"空块"特判。
+// 两种后端互斥且内存优先；两个都没打开属于内部错误，不是用户输入错误。
 bool ByteSinkAdapter::Write(const void* data, std::size_t size,
                             std::string* error_message) {
   if (size == 0) {
@@ -63,6 +87,9 @@ bool ByteSinkAdapter::Write(const void* data, std::size_t size,
 
 // ---- SequentialReader ------------------------------------------------------
 
+// 打开即"从头开始"：先 Close() 复位全部游标，同一个对象可以反复复用。
+// total_size_ 只在打开时取一次快照：解码期间文件被外部追加或截断，都不该
+// 改变我们对"还剩多少"的判断。
 bool SequentialReader::OpenFile(const std::string& path,
                                 std::string* error_message) {
   Close();
@@ -74,6 +101,8 @@ bool SequentialReader::OpenFile(const std::string& path,
   return true;
 }
 
+// data 为 nullptr 等价于空流（remaining() == 0）。指针只被借用，
+// 调用方必须保证它活过整个读取过程。
 void SequentialReader::OpenMemory(const std::string* data) {
   Close();
   memory_ = data;
@@ -81,6 +110,7 @@ void SequentialReader::OpenMemory(const std::string* data) {
   buffer_.assign(kStreamBufferSize, 0);
 }
 
+// 幂等：重复 Close、"打开后立刻 Close"都是合法状态，所有计数器归零。
 void SequentialReader::Close() {
   file_.Close();
   memory_ = nullptr;
@@ -91,6 +121,7 @@ void SequentialReader::Close() {
   consumed_ = 0;
 }
 
+// 饱和减法：consumed_ 不会超过 total_size_，真超了也只报 0，不返回负数。
 std::uint64_t SequentialReader::remaining() const {
   return total_size_ > consumed_ ? total_size_ - consumed_ : 0;
 }
@@ -98,6 +129,7 @@ std::uint64_t SequentialReader::remaining() const {
 // 只在缓冲区彻底用空时调用：此时 consumed_ 正好等于"已经从后端取走的字节数"，
 // 所以文件后端可以安全地从 consumed_ 继续读。
 bool SequentialReader::Refill(std::string* error_message) {
+  // 缓冲在第一次落地时才分配：空流或只读几个字节的调用不会白占 256 KiB。
   if (buffer_.size() < kStreamBufferSize) {
     buffer_.assign(kStreamBufferSize, 0);
   }
@@ -131,6 +163,9 @@ bool SequentialReader::Refill(std::string* error_message) {
   return true;
 }
 
+// 短读语义：中途 EOF 直接返回 false，但已经拷进 out 的字节**不清零**，
+// 调用方只能把这次读取整体当成失败。正常 EOF 不写 error_message（是不是
+// 错误由格式层判断），只有真正的 I/O 错误才留下诊断。
 bool SequentialReader::ReadExact(void* out, std::size_t size,
                                  std::string* error_message) {
   unsigned char* bytes = static_cast<unsigned char*>(out);
@@ -153,6 +188,7 @@ bool SequentialReader::ReadExact(void* out, std::size_t size,
   return true;
 }
 
+// 单字节版本供比特层按需拉取：一次只消费 1 字节，缓冲区里剩下的留给下一次。
 bool SequentialReader::ReadByte(std::uint8_t* out, std::string* error_message) {
   if (buffer_offset_ >= buffer_size_) {
     if (!Refill(error_message)) {
@@ -164,6 +200,8 @@ bool SequentialReader::ReadByte(std::uint8_t* out, std::string* error_message) {
   return true;
 }
 
+// 用跳读而不是 seek：内存后端没有 seek，文件后端也用 ReadAt 顺序推进，
+// 两条路的 consumed_ 语义这才完全一致。代价是必须真的读一遍被丢掉的字节。
 bool SequentialReader::Discard(std::uint64_t bytes,
                                std::string* error_message) {
   std::vector<unsigned char> scratch(kDiscardBufferSize);
@@ -181,6 +219,10 @@ bool SequentialReader::Discard(std::uint64_t bytes,
 
 // ---- BitWriter -------------------------------------------------------------
 
+// 前置条件：code 只占低 length 位（本函数不做掩码，多出来的高位会被一起
+// 移进累加器）。比特序是 MSB-first：先写的比特落在字节的高位。
+// accumulator_ 里的历史位**故意**不清：取字节时只取低 buffered_bits_ 那几位，
+// 残留位永远不会落进输出，所以不需要每次掩码。
 bool BitWriter::WriteBits(std::uint32_t code, std::uint32_t length,
                           std::string* error_message) {
   if (length == 0) {
@@ -205,6 +247,8 @@ bool BitWriter::WriteBits(std::uint32_t code, std::uint32_t length,
   return true;
 }
 
+// 结束一条比特流的唯一合法方式：把不足一字节的部分补 0 写出去。不调用它就
+// 会丢掉最后几个比特；重复调用是安全的（buffered_bits_ 已经是 0）。
 bool BitWriter::Flush(std::string* error_message) {
   if (buffered_bits_ == 0) {
     return true;
@@ -225,6 +269,8 @@ bool BitWriter::Flush(std::string* error_message) {
 
 // ---- BitReader -------------------------------------------------------------
 
+// bit_count 是硬上界：读满这么多比特就停，后面多出来的字节留给下一段格式
+// （LZH1 的外层头部就在内层 HUF1 流前面）。reader 只借用，不拥有。
 void BitReader::Open(SequentialReader* reader, std::uint64_t bit_count) {
   reader_ = reader;
   bit_count_ = bit_count;
@@ -233,6 +279,8 @@ void BitReader::Open(SequentialReader* reader, std::uint64_t bit_count) {
   bits_left_ = 0;
 }
 
+// 两种 false 的含义不同：比特预算用完（正常结束，不写 error_message）与底层
+// 字节流提前结束（写 error_message）。由调用方按语法判断哪一种是错误。
 bool BitReader::ReadBit(std::uint32_t* bit, std::string* error_message) {
   if (consumed_ >= bit_count_) {
     return false;
@@ -252,6 +300,8 @@ bool BitReader::ReadBit(std::uint32_t* bit, std::string* error_message) {
 
 // ---- RollingHistory --------------------------------------------------------
 
+// window 必须是 2 的幂：环形下标用 & mask_ 而不是 %，这是热路径上的取模
+// 消除。ring_ 清零表示"历史里全是 0"。尺寸在打开时定死，中途不再分配。
 bool RollingHistory::Open(ByteSinkAdapter* sink, std::size_t window,
                           std::string* error_message) {
   if (sink == nullptr) {
@@ -271,6 +321,8 @@ bool RollingHistory::Open(ByteSinkAdapter* sink, std::size_t window,
   return true;
 }
 
+// 唯一的写入口：先入环形历史再进输出缓冲，所以 match 取到的历史一定是当前
+// 时刻最新的。输出攒够 kStreamBufferSize 才下发，减少 syscall 次数。
 bool RollingHistory::Emit(std::uint8_t value, std::string* error_message) {
   ring_[static_cast<std::size_t>(produced_) & mask_] = value;
   produced_ += 1;
@@ -284,10 +336,13 @@ bool RollingHistory::Emit(std::uint8_t value, std::string* error_message) {
   return true;
 }
 
+// Push 与 CopyMatch 共用 Emit：字面量与 match 走同一条"入历史 + 出缓冲"的路。
 bool RollingHistory::Push(std::uint8_t value, std::string* error_message) {
   return Emit(value, error_message);
 }
 
+// 前置条件由格式层保证：1 <= distance <= window 且 distance <= produced_。
+// 违反时读到的只是清零后的历史，这里不做检查 —— 检查发生在 token 解析处。
 bool RollingHistory::CopyMatch(std::size_t distance, std::size_t length,
                                std::string* error_message) {
   for (std::size_t index = 0; index < length; ++index) {
@@ -301,6 +356,7 @@ bool RollingHistory::CopyMatch(std::size_t distance, std::size_t length,
   return true;
 }
 
+// 解码结束时必须调用，否则输出缓冲里最后不足一块的数据不会交给 sink。
 bool RollingHistory::Flush(std::string* error_message) {
   if (out_.empty()) {
     return true;

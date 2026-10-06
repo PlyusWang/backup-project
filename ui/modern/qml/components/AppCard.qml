@@ -9,7 +9,8 @@ import QtQuick
 Rectangle {
     id: card
 
-    // radius 直接用 Rectangle 自带的属性，调用方写 AppCard { radius: ... } 就能覆盖；
+    // radius 直接用 Rectangle 自带的属性，
+    // 调用方写 AppCard { radius: ... } 就能覆盖；
     // 不需要再声明一个同名属性（那会被 QML 判成“同一属性被赋值两次”）。
     property int padding: 18
 
@@ -30,7 +31,8 @@ Rectangle {
         const items = inner.children
         for (let i = 0; i < items.length; ++i) {
             if (items[i].visible)
-                content_height = Math.max(content_height, items[i].implicitHeight)
+                content_height = Math.max(
+                    content_height, items[i].implicitHeight)
         }
         return content_height + padding * 2
     }

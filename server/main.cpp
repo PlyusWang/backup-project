@@ -1,4 +1,4 @@
-// src/server/main.cpp
+// server/main.cpp
 //
 // backup-server 的进程入口。
 //
@@ -8,6 +8,18 @@
 // 与桌面前端的边界：backup-server 是**独立服务进程**，不参与 desktop 的
 // 单实例锁（那把锁约束的是 backupctl / Classic GUI / Modern GUI 三个前端），
 // 但它自己有 PID 文件：同一个 root/db/port 上不允许起第二个实例。
+// 进程模型：单进程、多线程——main 线程只负责启动、等待与收尾，连接处理在
+// RemoteServer 的 worker 线程里，所以这里的全局状态都遵循"启动前初始化、
+// 停止后失效"。
+//
+// 安全边界：本文件只决定"监听参数是什么"。监听地址、证书与是否强制
+// BPSEC2 的裁决在 RemoteServer::Configure 里——只有那里能看到密钥与
+// 证书的加载结果，所以 --allow-public-bind 的"缺一不可"不在这里校验。
+//
+// 不变量：每个 root/db/port 组合最多一个活着的实例（PID 文件 + /proc 复核）；
+// 只有 Run() 成功返回才可能返回 0；任何失败路径都不会留下 PID 文件。
+// 失败语义：所有错误都走 stderr + 非 0 退出码，不抛异常——进程入口没有
+// 上层可以承接异常，异常逃出 main 只会变成 std::terminate 与 core dump。
 
 #include <fcntl.h>
 #include <sys/stat.h>
@@ -26,6 +38,9 @@
 
 namespace {
 
+// 信号处理器与主线程之间唯一的共享状态。处理器只调用 RequestStop()（写一个
+// 原子标志），不碰其它成员；Run() 返回后主线程立刻清空它，避免停止流程里
+// 再来的信号访问到已经析构的 server。
 backupproject::net::RemoteServer* g_server = nullptr;
 
 // 信号处理器里只做一次原子写：不分配、不打印、不碰文件系统。
@@ -81,6 +96,9 @@ void PrintUsage(std::FILE* out, const char* program) {
 }
 
 // 严格解析无符号十进制：不接受空串、符号、前后缀垃圾、溢出。
+// 上界判断写成 maximum - digit 的形式，避免 value * 10 + digit 先溢出；
+// 命令行是不可信输入，这里解析出的数值随后会当作尺寸/上界使用，所以宁可
+// 拒绝也不能截断。
 bool ParseUnsigned(const std::string& text, std::uint64_t maximum,
                    std::uint64_t* out) {
   if (text.empty() || text.size() > 20) {
@@ -101,6 +119,10 @@ bool ParseUnsigned(const std::string& text, std::uint64_t maximum,
   return true;
 }
 
+// PID 文件是普通文件，内容可能陈旧、被别人覆盖或只写了一半，所以一律按
+// "尽力解析"处理：读不到、不是数字、不是正数都返回 -1，表示"没有可用的
+// pid 线索"而不是"发生错误"。真正的存活判定交给 IsRunningServer，它只看
+// /proc，不信任这个数字。
 long ReadPidFile(const std::string& path) {
   std::FILE* file = std::fopen(path.c_str(), "r");
   if (file == nullptr) {
@@ -122,6 +144,9 @@ long ReadPidFile(const std::string& path) {
 
 // 判断一个 pid 是不是还活着的 backup-server。
 // 只读取 /proc/<pid>/comm，不发送任何信号——绝不"随便杀一个 PID"。
+// 判不准时一律偏向"还活着"：进程存在但名字读不到、或 comm 读空都返回
+// true。代价是极端情况下拒绝启动，收益是绝不会有两个进程同时写同一个
+// SQLite 元数据库和同一个 root 目录。
 bool IsRunningServer(long pid) {
   const std::string directory = "/proc/" + std::to_string(pid);
   struct stat info;
@@ -142,6 +167,9 @@ bool IsRunningServer(long pid) {
   return std::strstr(buffer, "backup-server") != nullptr;
 }
 
+// 写入 "<pid>\n" 后故意不关 fd：fd 一直开到进程退出，由 main 统一 close +
+// unlink。PID 文件只是诊断手段与软互斥（"读 + 查 /proc + 写"之间有固有
+// TOCTOU 窗口），真正的并发一致性由服务层的 SQLite/root 语义保证。
 bool WritePidFile(const std::string& path, int* out_fd, std::string* error) {
   const int fd = ::open(path.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
   if (fd < 0) {
@@ -165,6 +193,11 @@ bool WritePidFile(const std::string& path, int* out_fd, std::string* error) {
 
 }  // namespace
 
+// 进程入口。结构固定为四段：解析参数 → 处理 PID 文件 → Configure/Start →
+// Run 到停止再收尾。任何一段失败都走同一条清理路径（关 fd、删 PID 文件），
+// 所以每个 return 都必须自己保证"没有留下半启动的 server"。
+//
+// 退出码：0 = 正常停止；1 = 运行期失败（含"已有实例在跑"）；2 = 用法错误。
 int main(int argc, char* argv[]) {
   const char* program =
       (argc > 0 && argv[0] != nullptr) ? argv[0] : "backup-server";
@@ -175,6 +208,9 @@ int main(int argc, char* argv[]) {
   bool have_secret = false;
   bool have_transport_key = false;
 
+  // 手写解析而不用 getopt：需要区分"开关型选项"与"取值型选项"，而且未知
+  // 选项必须明确失败而不是被静默忽略——静默忽略会让打错的
+  // --require-bpsec2 变成"服务照常启动但不强制签名身份"，那是安全降级。
   for (int index = 1; index < argc; ++index) {
     const std::string name = argv[index];
     if (name == "--help" || name == "-h") {
@@ -266,6 +302,9 @@ int main(int argc, char* argv[]) {
     }
   }
 
+  // 四个必填项用独立的 bool 记录，而不是看字符串是否为空：空串是合法取值，
+  // 只有"压根没给这个选项"才算缺参。缺参按用法错误处理（退出码 2），并且
+  // 在写 PID 文件之前就返回，不会留下垃圾文件。
   if (!have_root || !have_db || !have_secret || !have_transport_key) {
     std::fprintf(stderr,
                  "Error: --root, --db, --secret-file and --transport-key-file"
@@ -275,6 +314,8 @@ int main(int argc, char* argv[]) {
   }
 
   // PID 文件：先确认没有另一个还在跑的 backup-server，再写自己的。
+  // 顺序不能颠倒：先读旧文件 → 用 /proc 复核 → 才写自己的。反过来会在
+  // "另一个实例正在启动"时覆盖掉对方的 pid，让真正的占用者失去诊断线索。
   int pid_fd = -1;
   if (!pid_file_path.empty()) {
     const long existing = ReadPidFile(pid_file_path);
@@ -292,6 +333,10 @@ int main(int argc, char* argv[]) {
     }
   }
 
+  // 生命周期分两步是为了区分"参数/密钥错误"（退出码 2）与"运行期失败"
+  // （退出码 1）：Configure 只做校验与准备（加载传输私钥、证书、打开元数据
+  // 库），Start 才 bind 端口、起 worker 线程。任一失败都必须回滚 PID 文件，
+  // 否则下次启动会被自己留下的文件挡住。
   backupproject::net::RemoteServer server;
   g_server = &server;
   std::string error;
@@ -308,6 +353,9 @@ int main(int argc, char* argv[]) {
     return 1;
   }
 
+  // 信号只在 Start 之后安装：启动过程中（还在加载密钥/建库）收到 SIGTERM
+  // 时希望进程按默认语义直接终止，而不是进入"半初始化的优雅停止"。处理器
+  // 只做一次原子写，真正的停止发生在 Run() 返回之后的主线程里。
   struct sigaction action;
   std::memset(&action, 0, sizeof(action));
   action.sa_handler = HandleStopSignal;
@@ -319,6 +367,8 @@ int main(int argc, char* argv[]) {
   // 对端已经关掉的连接上继续写会得到 SIGPIPE：忽略它，让 send() 返回 EPIPE。
   ::signal(SIGPIPE, SIG_IGN);
 
+  // Run 阻塞到 RequestStop()（信号或内部致命错误）为止；返回后必须无条件
+  // Stop()——它是幂等的，负责 join worker 并释放端口。
   const bool ok = server.Run(&error);
   server.Stop();
   g_server = nullptr;

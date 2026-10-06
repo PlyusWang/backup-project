@@ -1,6 +1,6 @@
 // include/remote_auth.h
 //
-// PR #20：远程备份的用户认证原语。
+// 远程备份的用户认证原语。
 //
 // 两件事，都不依赖 SQLite，也不依赖 socket：
 //

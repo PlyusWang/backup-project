@@ -1,6 +1,6 @@
 // realtime_store.h
 //
-// PR #19：Realtime Trigger 的配置存储。
+// Realtime Trigger 的配置存储。
 //
 // 为什么不是 ScheduleStore 的第三个模式：Scheduled 是**时间**触发的状态机，
 // Realtime 是**文件事件**触发的状态机。两者共享 Strategy / Catalog / Filter /

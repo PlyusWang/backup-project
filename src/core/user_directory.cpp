@@ -1,6 +1,9 @@
 // user_directory.cpp
 //
 // 见 user_directory.h。
+// 职责：把 uid / gid 反查成名字，只用于展示与归档元数据，不参与任何权限判定。
+// 失败语义：查不到与查询失败都返回 false 并把名字留成空串，调用方按“名字未知”
+// 处理；这里不抛异常，也不会因为一次 NSS 抖动中断整个备份。
 
 #include "user_directory.h"
 
@@ -37,6 +40,9 @@ std::size_t InitialBufferSize(int sysconf_hint) {
 
 }  // namespace
 
+// 前置条件：out 非空；uid 会被窄化成 uid_t。除了返回值没有别的错误通道——
+// *out 为空串就表示“名字未知”，ERANGE 重试到上限也归入这一类：调用点都在
+// 尽力补全元数据的路径上，不该让一次 NSS 抖动中断整次备份。
 bool LookupUserName(std::uint32_t uid, std::string* out) {
   if (out == nullptr) {
     return false;
@@ -95,6 +101,9 @@ bool LookupGroupName(std::uint32_t gid, std::string* out) {
   return false;
 }
 
+// 缓存的是结果本身（包括空串这种负结果），而且进程内永不失效：NSS 记录在运行
+// 期被改动时这里会一直返回第一次看到的值。返回的是表内元素的 const 引用，
+// 生命周期与 cache 对象相同；本类没有加锁，不能跨线程共享同一个实例。
 const std::string& UserDirectoryCache::UserName(std::uint32_t uid) {
   const auto found = users_.find(uid);
   if (found != users_.end()) {

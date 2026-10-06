@@ -26,6 +26,8 @@ namespace compression {
 inline constexpr std::size_t kStreamBufferSize = 256 * 1024;
 
 // ---- 字节写：文件或内存 -----------------------------------------------------
+// 生命周期：本文件里的类都只**借用**外部传入的 sink / reader / 字符串指针，
+// 不持有所有权也不释放；被借用对象的存活期必须覆盖整个编解码过程。
 class ByteSinkAdapter {
  public:
   ByteSinkAdapter() = default;

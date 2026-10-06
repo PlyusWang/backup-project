@@ -11,6 +11,15 @@
 // 读侧仍然是"白名单式"判断：不认识的 type、非 0 的保留字段、越界的长度、
 // 多出来的尾巴字节全部拒绝。宽松解析能让更多坏样本通过，代价是用户拿到一份
 // 不完整的恢复结果却以为成功了。
+// 本文件只负责 MyPack v2 的**字节编解码**：写侧把 ArchiveEntry 拼成
+// [global header][entry header][path][link][payload]…，读侧把它解回
+// PackedEntry（偏移 + 长度）。它不做路径合法性裁决（archive_path.cpp 里
+// 唯一一份实现）、不做压缩与加密（pack_stream / container 层的事）、也不把
+// payload 落盘（PackedStreamReader 的第二阶段按需抽取）。
+// 线程与所有权：所有函数都是自包含的纯变换，不持有全局可变状态（除了给
+// 测试用的计数器），因此可以并发调用；sink 与 entries 由调用方拥有，本文件
+// 不 delete 也不 close 它们。失败一律返回 false + error_message，写坏的
+// 半成品由 FileSink 的 owns_path 兜底，不在这里 unlink。
 
 #include <fcntl.h>
 #include <sys/stat.h>
@@ -53,8 +62,24 @@ constexpr unsigned char kMagic[8] = {'B', 'K', 'P', 'A', 'R', 'C', 'H', '\0'};
 constexpr std::size_t kGlobalMagicSize = sizeof(kMagic);
 constexpr std::size_t kGlobalReservedSize = 8;
 
+// ---- wire format（little-endian、固定宽度，不用结构体直写）----
+//
+// 全局 header（32 字节）：magic(8) | version(2) | flags(2) | header_size(4) |
+//   entry_count(8) | reserved(8)
+//
+// entry header（64 字节，字段顺序就是磁盘布局）：
+//   0 type | 1 flags | 2 reserved0(2) | 4 path_length | 8 link_length
+//   12 mode | 16 uid | 20 gid | 24 mtime_nsec | 28 mtime_sec
+//   36 payload_size | 44 dev_major | 48 dev_minor | 52 reserved(12)
+//
+// 每条 entry 的布局：[entry header][path][link][payload]，payload 只有普通
+// 文件有、长度正好是 payload_size。reserved 必须真的为 0——它是"将来扩展"
+// 的握手：旧读者要拒绝新格式，而不是把未知位当垃圾读过去。字段顺序是契约，
+// 改一个必须同时改 docs/format/archive_v2_container.md。
 // ---- 写侧 -----------------------------------------------------------------
 
+// 逐字段手拼而不是整块 memcpy：结构体布局受 padding、对齐和主机字节序影响，
+// 归档必须与编译器/主机无关。本函数只产出字符串，不碰 sink，也就没有半写状态。
 void EncodeGlobalHeader(std::uint64_t entry_count, std::string* out) {
   out->clear();
   out->append(reinterpret_cast<const char*>(kMagic), kGlobalMagicSize);
@@ -92,12 +117,19 @@ void EncodeEntryHeader(const ArchiveEntry& entry, std::uint64_t payload_size,
 }
 
 // 这条 entry 在流里带多少 payload。
+// 只有普通文件带 payload：目录、软链接、硬链接、FIFO、设备的全部信息都在
+// entry header + path + link 里。payload_size 是**唯一**决定这条 entry 后面
+// 跟多少字节的字段，读侧不信其它任何字段。
 std::uint64_t PayloadSizeOf(const ArchiveEntry& entry) {
   return entry.type == EntryType::kRegularFile ? entry.size : 0;
 }
 
 // 写侧对每条 entry 的语义自检：格式允许的组合是固定的，任何"不可能组合"
 // 都应该在写出去之前就失败，而不是产出一个读侧必然拒绝的归档。
+// 为什么写侧也要校验：读侧会拒绝的形状必须在写出去之前就失败，否则用户拿到
+// 的是"备份成功"却恢复不了。检查项与读侧 DecodeEntryHeader **故意重复**：
+// 两侧的信任来源不同（写侧信 Scanner，读侧信字节），共用一份反而会让某一边
+// 的边界悄悄漂移。错误信息带 archive_path，能直接定位到出问题的路径。
 bool ValidateEntryForWriting(const ArchiveEntry& entry, bool is_first,
                              std::string* error_message) {
   if (entry.type == EntryType::kSocket) {
@@ -169,6 +201,11 @@ bool ValidateEntryForWriting(const ArchiveEntry& entry, bool is_first,
 //
 // 反过来：完整备份不带期望摘要，那时**一次哈希都不做**。给每条路径白算一遍
 // 全量 SHA-256 只是让 Full + MyPack 变慢，换不来任何判断。
+// O_NOFOLLOW 不是装饰：扫描之后源路径可能被换成软链接，这时必须失败，而不是
+// 顺着链接去读别的文件。fstat 复查用 raw_fd 而不是路径，避免"复查时路径已经
+// 指向另一个文件"这种 TOCTOU。entry.size 是扫描时的快照：文件变长不读（多出
+// 来的字节不属于这次快照），变短才报错。失败时不回滚已写进 sink 的字节——
+// 调用方拿到 false 会整份丢弃这个 sink。
 bool WriteRegularPayload(const std::string& disk_path,
                          const ArchiveEntry& entry, FileSink* sink,
                          std::string* error_message) {
@@ -232,6 +269,9 @@ bool WriteRegularPayload(const std::string& disk_path,
       }
     }
   }
+  // 摘要核对是第三层保护，只在增量路径上生效（expected_content_digest 非空）。
+  // 计数器供测试断言"完整备份真的没有白算哈希"；摘要不一致就是源在 manifest
+  // 与 payload 之间被改写，整次打包失败，绝不发布这份快照。
   if (ok && verify_digest) {
     ++g_digest_verification_count;
     unsigned char digest[crypto::kSha256DigestSize];
@@ -252,6 +292,9 @@ bool WriteRegularPayload(const std::string& disk_path,
 // FIFO / 字符设备 / 块设备没有正文，身份只能靠"类型 + 设备号 + metadata"
 // 表达。强 manifest 与真正写 entry header 之间隔着一次 payload 构建，这里做
 // 最后一次 lstat 比对——只看 size/mtime 对这三种类型等于没看。
+// 用 lstat 而不是 stat：要的是条目自身（软链接就是链接本身）。FIFO 不比较设备
+// 号（st_rdev 对 FIFO 无意义），只比类型与 mode/uid/gid。这些条目在归档里的
+// 全部身份就是这几个字段，"plan 与 payload 之间被改掉"必须在这里挡住。
 bool VerifySpecialSourceUnchanged(const ArchiveEntry& entry,
                                   std::string* error_message) {
   struct stat info;
@@ -289,11 +332,20 @@ bool VerifySpecialSourceUnchanged(const ArchiveEntry& entry,
 }
 
 // ---- 读侧 -----------------------------------------------------------------
+// 读侧分工：Decode* 只做"字节 → 字段"的还原与范围检查，ScanMyPackV2 负责
+// 编排（游标推进、路径注册、跨条目约束）。输入是不可信字节流——归档可能来自
+// 网络对端或被本地篡改——所以每个长度都要做减法越界检查、每个枚举都走白名单，
+// 任何"不认识"都拒绝，不做尽力解析。
 
+// 读侧真正要用到的只有 entry_count：其余字段在 DecodeGlobalHeader 里校验完就
+// 丢掉，留着它们只会让"解出来了但没人用"的东西看起来可信。
 struct GlobalHeaderFields {
   std::uint64_t entry_count = 0;
 };
 
+// 先比 magic 再解字段：magic 不匹配说明这根本不是 MyPack 流（多半是 USTAR），
+// 报"版本不支持"会误导排障。version / flags / header_size 三者任一不符即拒绝，
+// 不做兼容猜测。
 bool DecodeGlobalHeader(const unsigned char* block, std::size_t size,
                         const std::string& archive_path,
                         GlobalHeaderFields* fields,
@@ -344,6 +396,9 @@ bool DecodeGlobalHeader(const unsigned char* block, std::size_t size,
   return true;
 }
 
+// 类型的数值就是磁盘契约（见 archive_entry.h 第 2 节与格式文档），不能改。
+// 未知 id 一律拒绝，绝不回落到"普通文件"——回落会把一条被篡改的 entry 变成
+// 用户看得见的垃圾文件，比直接失败危险得多。
 bool TypeFromId(std::uint8_t id, EntryType* type) {
   switch (id) {
     case 1:
@@ -373,6 +428,10 @@ bool TypeFromId(std::uint8_t id, EntryType* type) {
 }
 
 // 读一条 entry header，并把"类型与其它字段是否自洽"一并查完。
+// 全部字段先解到局部变量，最后才写进 *entry：任何一步失败时调用方手里的 entry
+// 保持"未被改动"，不会拿到半份字段。reserved / flags / reserved0 必须为 0。
+// payload_size 在这里只做范围校验，真正的边界检查在 ScanMyPackV2 里按游标做—
+// 只有那里才知道文件还剩多少字节。
 bool DecodeEntryHeader(const unsigned char* block, const std::string& hint,
                        ArchiveEntry* entry, std::uint64_t* payload_size,
                        std::uint32_t* path_length, std::uint32_t* link_length,
@@ -441,6 +500,9 @@ bool DecodeEntryHeader(const unsigned char* block, const std::string& hint,
   }
   // 类型与其它字段的自洽性：目录/FIFO/设备不带 link 也不带 payload，
   // 软链接/硬链接必须带 link 但 payload 为 0，普通文件不带 link。
+  // 这些规则由格式定义（docs 第 3.3 节），读侧必须查：一旦"目录带 payload"这种
+  // 自相矛盾的 entry 被放过，后面所有 entry 的偏移都会整体错位，错误会以"文件
+  // 内容莫名其妙"的形式暴露，比在这里直接拒绝难排查得多。
   switch (type) {
     case EntryType::kDirectory:
     case EntryType::kFifo:
@@ -493,6 +555,12 @@ void ResetMyPackDigestVerificationCountForTesting() {
   g_digest_verification_count = 0;
 }
 
+// 前置条件：entries 非空，且 entries[0] 是 archive_path == "." 的目录（Scanner
+// 的契约，也是格式规则）。协议：global header → 逐条 [entry header][path][link]
+// [payload]，顺序写、不 seek、不回填——条目数在开头就知道，不需要 v0.1 那种
+// 事后 patch。ArchivePathRegistry 保证父目录先出现且路径不重复，与读侧共用
+// 同一份规则，"写得出"因此蕴含"读得回"。失败时 sink 里的半成品由 owns_path
+// 兜底，本函数不 unlink 任何东西。
 bool WriteMyPackV2(const std::vector<ArchiveEntry>& entries, FileSink* sink,
                    std::string* error_message) {
   if (sink == nullptr) {
@@ -550,6 +618,9 @@ bool WriteMyPackV2(const std::vector<ArchiveEntry>& entries, FileSink* sink,
     // **期望的那些字节**（entry.link_target 来自 manifest），同时再 readlink
     // 一次核对源没变——只信"写的是期望值"而不看源，会把"manifest 之后有人
     // 改过这个链接"变成一条静默的陈旧记录。readlink 不 follow，路径安全。
+    // link_buffer 正好能装下 kMaxLinkLength 字节再加一个 NUL：readlink 不补
+    // 结尾 NUL，所以长度只能取返回值；目标比缓冲区长时 readlink 会截断，
+    // 那种截断会立刻以 actual_target != entry.link_target 的形式失败。
     if (entry.type == EntryType::kSymlink &&
         !entry.expected_content_digest.empty()) {
       if (ContentDigestOfBytes(entry.link_target) !=
@@ -593,6 +664,12 @@ bool WriteMyPackV2(const std::vector<ArchiveEntry>& entries, FileSink* sink,
   return true;
 }
 
+// 两阶段读的第一阶段（preflight）：完整走一遍流、逐条校验，全部通过才把条目表
+// 交出去；此时 payload 一个字节都还没落盘，所以坏归档不会污染目标目录。返回的
+// PackedEntry 只记 (data_offset, data_size)，内容留给第二阶段按需抽取，内存里
+// 不驻留文件正文。entries->clear() 保证重入或失败时不残留上一次的结果。跨条目
+// 约束（父目录先出现、路径不重复、硬链接目标存在）也在这里一次查完，抽查式的
+// "用到再校验"会让坏归档在恢复中途才失败。
 bool ScanMyPackV2(const FileSource& source, std::vector<PackedEntry>* entries,
                   std::uint64_t* entry_count, std::string* error_message) {
   const std::string& archive_path = source.path();
@@ -613,6 +690,8 @@ bool ScanMyPackV2(const FileSource& source, std::vector<PackedEntry>* entries,
   }
 
   entries->clear();
+  // 注册表与 declared 是两套索引：前者管"路径不能重复、父目录必须先出现"，
+  // 后者在全部条目解完之后用来裁决硬链接目标（目标可以在流后面才出现）。
   ArchivePathRegistry registry(/*require_parent_first=*/true);
   // hardlink 目标必须在整条流里都存在，所以先把"路径 -> 类型"记下来，
   // 等全部条目解完再统一校验。
@@ -620,6 +699,8 @@ bool ScanMyPackV2(const FileSource& source, std::vector<PackedEntry>* entries,
   std::vector<std::size_t> hardlinks;
 
   std::uint64_t cursor = mypack_v2::kGlobalHeaderSize;
+  // cursor 是不带符号的绝对偏移，全程只加不减；"还够不够"的判断一律写成
+  // need > size - cursor，绝不算 cursor + need（会回绕成"够"）。
   unsigned char entry_block[mypack_v2::kEntryHeaderSize];
   for (std::uint64_t index = 0; index < fields.entry_count; ++index) {
     // "还够不够读下一条 header"用减法判断，避免 cursor + size 溢出。
@@ -648,6 +729,9 @@ bool ScanMyPackV2(const FileSource& source, std::vector<PackedEntry>* entries,
       SetError(error_message, "Truncated entry path: " + hint);
       return false;
     }
+    // path 与 link 一次读进来再切片：两条长度各自有上界（1..4096 / 0..4096），
+    // 不会造成大分配；切片按长度做而不找 '\0'——路径里允许出现什么字节由
+    // archive_path.cpp 裁决，不由 C 字符串语义决定。
     std::string names(static_cast<std::size_t>(metadata_size), '\0');
     if (metadata_size > 0 &&
         !source.ReadAt(cursor, &names[0], names.size(), error_message)) {
@@ -675,6 +759,8 @@ bool ScanMyPackV2(const FileSource& source, std::vector<PackedEntry>* entries,
       return false;
     }
 
+    // data_offset 是 payload 在文件里的绝对偏移。record.entry.size 被显式改成
+    // payload_size，让消费者只看到"普通文件的真实正文长度"。
     PackedEntry record;
     record.entry = entry;
     record.data_offset = cursor;
@@ -691,6 +777,8 @@ bool ScanMyPackV2(const FileSource& source, std::vector<PackedEntry>* entries,
 
   // 读满 entry_count 条之后必须正好到文件末尾：不接受 trailing bytes，
   // 也不"忽略尾巴"。
+  // 严格到"多一个字节都算坏"是有意的：容忍尾巴等于容忍"写入者与读取者对格式
+  // 的理解不一致"，而那种不一致会在恢复时以数据错位的形式才暴露出来。
   if (cursor != file_size) {
     SetError(error_message,
              "Unexpected trailing bytes in archive: " + archive_path);
@@ -705,6 +793,8 @@ bool ScanMyPackV2(const FileSource& source, std::vector<PackedEntry>* entries,
 
   // 硬链接目标必须真的存在，而且必须是一条普通文件条目：指向目录、软链接
   // 或另一条硬链接都是坏数据。恢复时要保证目标先被创建。
+  // 放在全部条目解完之后才查，是因为硬链接目标可以出现在流的后面；它必须已经
+  // 在 declared 里，而且必须是一条普通文件。
   for (const std::size_t index : hardlinks) {
     const std::string& target = (*entries)[index].entry.link_target;
     const auto found = declared.find(target);

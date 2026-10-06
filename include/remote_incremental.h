@@ -1,6 +1,6 @@
 // include/remote_incremental.h
 //
-// PR #21：远端增量备份与恢复的**产品闭环**（客户端侧）。
+// 远端增量备份与恢复的**产品闭环**（客户端侧）。
 //
 // 这一层不重新实现任何增量算法：变化的判断、delta 的生成、链的校验、恢复的
 // 应用，全部交给既有的本地增量核心（include/incremental_backup.h /
@@ -130,7 +130,7 @@ bool RunRemoteRestore(RemoteArchiveClient* client,
                       RemoteRestoreOutcome* outcome,
                       std::string* error_message);
 
-// ---- 原始归档的"单独恢复"（PR #21 UI closure）----
+// ---- 原始归档的"单独恢复" ----
 //
 // 远端对象分两类，恢复机制**不是**同一套：
 //

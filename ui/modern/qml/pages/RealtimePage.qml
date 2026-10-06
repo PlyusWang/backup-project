@@ -4,7 +4,8 @@
 //
 // 页面按"用户先要看什么"分五层，而不是把控制器状态一次铺开：
 //   1. 常用设置 —— 启用状态、备份目录、备份方式、保留版本、保存设置
-//   2. 高级设置 —— 响应延迟、最长等待、打包、压缩、筛选规则、加密说明（默认折叠）
+//   2. 高级设置 —— 响应延迟、最长等待、打包、压缩、
+//      筛选规则、加密说明（默认折叠）
 //   3. 运行状态 —— 先给一句结论，再给必要的错误说明
 //   4. 技术详情 —— 控制器给出的原始状态，排查问题时才展开（默认折叠）
 //   5. 最近备份 —— 实时触发创建出来的备份版本
@@ -17,6 +18,15 @@
 // 业务值一律来自 realtime（RealtimeController）与 theme：数字按**文本**交给
 // 共享核心解析，运行状态只做显示层翻译；"该不该监听 / 该不该备份 / 某个选项
 // 支不支持"都不在这一层判断。
+// 这一页的属性分两类，界线不能模糊：
+//   * draft* 是本页的临时输入（用户正在编辑的内容），只在点"保存设置"或
+//     控制器配置发生变化时才同步；
+//   * realtime.* 是控制器给出的已保存配置与运行事实，页面只读。
+// 页面不缓存配置副本、不判断合法性：saveConfigFromText 把原始文本交给共享
+// 核心，由核心校验并回传面向用户的原因。
+//
+// 交互控件都带稳定的 objectName（realtime 前缀）：GUI 测试按名字定位，改名
+// 等于改测试契约，要同步改测试。折叠区是纯视图状态，不进配置、不落盘。
 
 import QtQuick
 import QtQuick.Controls.Basic
@@ -29,8 +39,12 @@ Item {
     id: page
 
     // draft 语义与自动备份页一致：输入框里的是草稿，点"保存设置"才写进控制器。
+    // 草稿是"正在编辑的一套配置"的快照，不与控制器双向绑定：编辑过程中控制器
+    // 仍按已保存配置监听，页面上的改动只有点保存才生效。
     property bool draftEnabled: realtime.enabled
     property string draftSource: realtime.sourcePath
+    // 数字草稿一律保持字符串：QML 的 Number/parseInt 会把 "12abc" 变成 12，
+    // 而共享核心要求整串都是数字。保留用户原样输入，报错信息才对得上。
     property string draftDebounce: String(realtime.debounceMs)
     property string draftMaxWait: String(realtime.maxWaitMs)
     property string draftRetain: String(realtime.retainCount)
@@ -43,21 +57,32 @@ Item {
     property bool advancedExpanded: false
     property bool technicalExpanded: false
 
+    // keys 是与核心约定的取值，labels 是给人看的文案（来自控制器）。两个数组
+    // 必须同序等长：下拉框只认下标，下标再经 keys 还原成取值，一旦错位就会把
+    // "增量"存成"完整"。labels 由控制器给，保证三个页面用词一致。
     readonly property var strategyKeys: ["full", "incremental"]
     readonly property var strategyLabels: controller.optionStrategyLabels
+    // 打包方式同样按下标映射，取值是核心认得的 PackMethod key；三种方式共享
+    // 同一份 ArchiveEntry，差别只在 wire format，不改变谁参与备份。
     readonly property var packKeys: ["mypack", "ustar", "fast-ustar"]
     readonly property var packLabels: controller.optionPackLabels
+    // 压缩发生在打包之后："none" 只是压缩层直通，不代表不打成归档。
     readonly property var compressionKeys: ["none", "huffman", "lzss-huffman"]
     readonly property var compressionLabels: controller.optionCompressionLabels
 
     // 备份方式的短解释：只解释当前选中的那一种，避免两个术语同时出现。
-    // 措辞与自动备份页逐字一致（人工验收：三个页面统一产品语言）。
+    // 措辞与自动备份页逐字一致（三个页面统一产品语言）。
+    // 判定用下标而不是取值字符串：下标 1 就是 strategyKeys 的第二个元素。这是
+    // 页面与控制器之间唯一的下标约定，改 keys 顺序必须同时改这里。
     readonly property string strategyHelper: page.draftStrategyIndex === 1
         ? "增量备份：首次建立完整基线，之后只保存变化，更节省空间。"
         : "完整备份：每次生成一份可以独立恢复的完整备份。"
 
     // 草稿与已保存配置是否一致。只用来提示"这次改动还没生效"，
     // 不参与任何"能不能保存"的判断 —— 那个判断在共享核心里。
+    // 每个字段都与控制器当前值比一遍，数字按文本比：用户把 500 写成 "0500"
+    // 时这里显示"改动尚未保存"是刻意的——页面不做规范化，也不替核心判断这个
+    // 值合不合法。这里的结论只影响提示，不参与"能不能保存"。
     readonly property bool draftDirty: page.draftEnabled !== realtime.enabled
         || page.draftSource !== realtime.sourcePath
         || page.draftDebounce !== String(realtime.debounceMs)
@@ -65,18 +90,25 @@ Item {
         || page.draftRetain !== String(realtime.retainCount)
         || page.strategyKeys[page.draftStrategyIndex] !== realtime.strategyKey
         || page.packKeys[page.draftPackIndex] !== realtime.packKey
-        || page.compressionKeys[page.draftCompressionIndex] !== realtime.compressionKey
+        || page.compressionKeys[page.draftCompressionIndex]
+           !== realtime.compressionKey
         || ruleEditor.rulesSignature !== page.savedRulesSignature
 
+    // 用控制器状态覆盖全部草稿。触发点有两个：页面完成加载，以及 savedSignature
+    // 变化（保存成功，或别的入口改了同一份 store）。因此"控制器一变就丢弃未保存
+    // 的编辑"是有意行为：页面始终以已保存配置为准，避免用户拿着过期草稿去保存。
     function syncFromController() {
         page.draftEnabled = realtime.enabled
         page.draftSource = realtime.sourcePath
         page.draftDebounce = String(realtime.debounceMs)
         page.draftMaxWait = String(realtime.maxWaitMs)
         page.draftRetain = String(realtime.retainCount)
-        page.draftStrategyIndex = Math.max(0, page.strategyKeys.indexOf(realtime.strategyKey))
-        page.draftPackIndex = Math.max(0, page.packKeys.indexOf(realtime.packKey))
-        page.draftCompressionIndex = Math.max(0, page.compressionKeys.indexOf(realtime.compressionKey))
+        page.draftStrategyIndex =
+            Math.max(0, page.strategyKeys.indexOf(realtime.strategyKey))
+        page.draftPackIndex =
+            Math.max(0, page.packKeys.indexOf(realtime.packKey))
+        page.draftCompressionIndex =
+            Math.max(0, page.compressionKeys.indexOf(realtime.compressionKey))
         // 落盘配置里的规则读进共享编辑器（校验仍然走共享 builder）。读不懂时
         // 编辑器会显示共享核心给出的原因，这里不吞掉它。
         ruleEditor.loadRules(realtime.includeRules, realtime.excludeRules)
@@ -84,11 +116,18 @@ Item {
 
     // 已保存配置里的规则文本，用作"改动尚未保存"的比较基准。分隔符与编辑器
     // 的 rulesSignature 一致，两边是同一套拼接方式。
-    readonly property string savedRulesSignature: realtime.includeRules.join("\n")
+    // 规则文本用换行连接、包含与排除两组之间用 NUL 分隔：规则内容本身不可能含
+    // NUL，于是这个签名不会把不同的两组拼成同一个串。拼接方式必须与
+    // FilterRuleEditor 的 rulesSignature 完全一致，否则 draftDirty 会永远为真。
+    readonly property string savedRulesSignature:
+        realtime.includeRules.join("\n")
         + "\u0000" + realtime.excludeRules.join("\n")
 
     // 已保存配置的"指纹"：它一变就说明控制器那边的配置换了（保存成功，或者
     // 有人用 backupctl realtime set 改了同一份 store），草稿跟着重置。
+    // 逐字段拼出的指纹，只用来发现"控制器那边的配置换了"。它不做严格语义比较
+    // （例如规则列表按 "," 连接，理论上存在拼接歧义），因为用途只是变化检测：
+    // 误报的代价是多重置一次草稿，漏报的代价才是用户用旧草稿覆盖新配置。
     readonly property string savedSignature: [
         realtime.enabled, realtime.sourcePath, realtime.debounceMs,
         realtime.maxWaitMs, realtime.retainCount, realtime.strategyKey,
@@ -97,6 +136,8 @@ Item {
     ].join("|")
     onSavedSignatureChanged: syncFromController()
 
+    // 首次进入页面时用控制器状态初始化草稿；与下面的 savedSignature 监听一起，
+    // 保证草稿始终是"当前已保存配置"的副本。
     Component.onCompleted: syncFromController()
 
     // ---------- 运行状态：显示层翻译 ----------
@@ -106,12 +147,19 @@ Item {
     // watch_degraded / watch_recovered / config_error / failed）。这里只把它
     // 翻译成一句人话，不新增判断条件：什么时候算"在监听"、什么时候算"不可用"，
     // 事实全部来自控制器；watchStateText 里那句人类可读的原因也是控制器给的。
+    // 纯翻译函数：输入是控制器的 phaseKey 与监听状态，输出只有展示用的
+    // glyph / tone / title / detail，没有副作用，也不写回控制器。判断顺序是有意
+    // 的：config_error 与 failed 排在最前（它们盖掉其它一切），其次是监听降级，
+    // 最后才是各种"正在进行"。兜底分支给中性状态而不是报错：控制器将来新增
+    // phaseKey 时，页面最坏显示成"未启用"，不会白屏。
     function runStateFor(phaseKey, watchDegraded, watchStateText) {
         if (phaseKey === "config_error")
-            return { glyph: "⚠", tone: "error", title: "实时备份已暂停", detail: "" }
+            return { glyph: "⚠", tone: "error",
+                     title: "实时备份已暂停", detail: "" }
         if (phaseKey === "failed")
             return { glyph: "⚠", tone: "error", title: "上一次实时备份没有成功",
-                     detail: "失败原因见页面下方的提示；处理之后重新保存设置即可继续。" }
+                     detail: "失败原因见页面下方的提示；" +
+                             "处理之后重新保存设置即可继续。" }
         if (watchDegraded || phaseKey === "watch_degraded")
             return { glyph: "⚠", tone: "warning", title: "监听暂时不可用",
                      detail: watchStateText }
@@ -125,8 +173,10 @@ Item {
             return { glyph: "●", tone: "ok", title: "刚刚完成一次备份",
                      detail: "新的实时备份已经写入备份仓库。" }
         if (phaseKey === "retention_warning")
-            return { glyph: "⚠", tone: "warning", title: "备份已完成，旧版本没有清理完",
-                     detail: "新的备份已经写入；保留策略这一次没有全部执行成功。" }
+            return { glyph: "⚠", tone: "warning",
+                     title: "备份已完成，旧版本没有清理完",
+                     detail: "新的备份已经写入；" +
+                             "保留策略这一次没有全部执行成功。" }
         if (phaseKey === "no_changes")
             return { glyph: "●", tone: "ok", title: "正在监听",
                      detail: "刚才的变化已经检查过，没有需要新备份的内容。" }
@@ -136,12 +186,16 @@ Item {
         if (phaseKey === "watching")
             return { glyph: "●", tone: "ok", title: "正在监听",
                      detail: "文件变化后会自动备份。" }
-        return { glyph: "●", tone: "idle", title: "未启用", detail: "尚未开始实时监听。" }
+        return { glyph: "●", tone: "idle",
+                 title: "未启用", detail: "尚未开始实时监听。" }
     }
 
     readonly property var runState: page.runStateFor(realtime.phaseKey,
                                                     realtime.watchDegraded,
                                                     realtime.watchStateText)
+    // tone 是展示层自己的词汇表（ok / busy / warning / error / idle），到主题色
+    // 的映射集中在这里。未知 tone 退回 textDisabled：新增 tone 时不会出现没有
+    // 颜色的控件。
     readonly property color runStateColor: {
         const tone = page.runState.tone
         if (tone === "ok")
@@ -154,6 +208,8 @@ Item {
             return theme.error
         return theme.textDisabled
     }
+    // 拆成四个标量属性而不是把 runState 对象直接绑到 Text 上：标量绑定的依赖
+    // 追踪更精确，runState 重算时只有真正用到的那个属性触发刷新。
     readonly property string runStateGlyph: page.runState.glyph
     readonly property string runStateTitle: page.runState.title
     readonly property string runStateDetail: page.runState.detail
@@ -164,15 +220,21 @@ Item {
         anchors.fill: parent
         clip: true
         contentWidth: availableWidth
+        // contentItem 要等组件完成之后才存在，boundsBehavior 只能在这里设：内容
+        // 不足一屏时禁止拖动回弹，滚动条也不会在半屏内容上出现。
         Component.onCompleted: {
             if (pageScroll.contentItem)
                 pageScroll.contentItem.boundsBehavior = Flickable.StopAtBounds
         }
+        // 文字一律靠 wrapMode 换行，不需要横向滚动；隐藏水平条同时避免窄窗口里
+        // 出现横向位移把布局撑歪。
         ScrollBar.horizontal.policy: ScrollBar.AlwaysOff
         ScrollBar.vertical.policy: ScrollBar.AsNeeded
 
         ColumnLayout {
             id: column
+            // 内容宽度上限 1400、窄窗口留 32 边距：max/min 兜住负宽度，
+            // 宽屏上也不会把一行文字拉到难以阅读的长度。
             x: Math.max(32, (pageScroll.availableWidth - width) / 2)
             y: 20
             width: Math.min(pageScroll.availableWidth - 64, 1400)
@@ -190,7 +252,10 @@ Item {
             Text {
                 objectName: "realtimeSubtitleText"
                 Layout.fillWidth: true
-                text: "文件发生变化后会自动创建备份，省去手动操作。程序关闭期间不会监听；"
+                // 副标题点明：关掉程序就不再监听，重开后会补上这段时间的变化。
+                // 这是用户最容易误解的一点；机制放在「技术详情」里。
+                text: "文件发生变化后会自动创建备份，" +
+                      "省去手动操作。程序关闭期间不会监听；"
                       + "重新打开后会自动同步这段时间的变化。"
                 font.pixelSize: 17
                 color: theme.textSecondary
@@ -215,11 +280,15 @@ Item {
                         Text {
                             text: "●"
                             font.pixelSize: 18
-                            color: page.draftEnabled ? theme.success : theme.textDisabled
+                            color: page.draftEnabled
+                                    ? theme.success
+                                   : theme.textDisabled
                         }
 
                         Text {
-                            text: page.draftEnabled ? "实时备份已启用" : "实时备份已停用"
+                            text: page.draftEnabled
+                                   ? "实时备份已启用"
+                                  : "实时备份已停用"
                             font.pixelSize: 18
                             font.weight: Font.DemiBold
                             color: theme.textPrimary
@@ -235,6 +304,9 @@ Item {
                         Item { Layout.fillWidth: true }
 
                         AppButton {
+                            // 该按钮只翻转草稿，不直接调控制器：启用属于配置，
+                            // 要与目录、策略一起提交，避免出现半生效状态。
+                            // libraryBusy 时禁用，避免与正在跑的备份抢配置。
                             objectName: "realtimeEnabledToggle"
                             text: page.draftEnabled ? "停用" : "启用"
                             variant: page.draftEnabled ? "secondary" : "primary"
@@ -260,18 +332,24 @@ Item {
                             objectName: "realtimeSourceField"
                             Layout.fillWidth: true
                             enabled: !realtime.libraryBusy
-                            placeholderText: "输入目录路径，或点击“选择目录”选择"
+                            placeholderText: "输入目录路径，" +
+                                             "或点击“选择目录”选择"
                             text: page.draftSource
                             onTextEdited: page.draftSource = text
                         }
 
                         AppButton {
+                            // 起始目录由控制器算：QML 不手拼 file:// 前缀，
+                            // 选中的 URL 也要经 localPathFromUrl 转回本地路径，
+                            // 转换失败时保留原草稿。
                             objectName: "browseRealtimeSourceButton"
                             text: "选择目录"
                             iconName: "folder"
                             enabled: !realtime.libraryBusy
                             onClicked: {
-                                sourceDialog.currentFolder = realtime.directoryDialogStartUrl(page.draftSource)
+                                sourceDialog.currentFolder =
+                                    realtime.directoryDialogStartUrl(
+                                        page.draftSource)
                                 sourceDialog.open()
                             }
                         }
@@ -279,7 +357,11 @@ Item {
 
                     Text {
                         Layout.fillWidth: true
-                        text: "备份目录与备份仓库不能互相包含，否则备份写出的归档会被当成下一次变化。"
+                        // 解释为什么不能拿同一个目录当仓库：实时监听会把新写
+                        // 出的归档当成新的变化，形成自我触发的备份风暴；真正
+                        // 的校验在共享核心里，这里只提前讲清原因。
+                        text: "备份目录与备份仓库不能互相包含，" +
+                              "否则备份写出的归档会被当成下一次变化。"
                         font.pixelSize: 14
                         color: theme.textSecondary
                         wrapMode: Text.WordWrap
@@ -294,6 +376,9 @@ Item {
                     }
 
                     AppComboBox {
+                        // model 用控制器标签，currentIndex 用草稿下标；只在
+                        // 用户主动选择（onActivated）时写草稿。用
+                        // onCurrentIndexChanged 会把同步动作当成用户输入。
                         id: strategyBox
                         objectName: "realtimeStrategyCombo"
                         implicitWidth: 200
@@ -329,6 +414,8 @@ Item {
                             color: theme.textSecondary
                         }
                         AppTextField {
+                            // 保留数也是文本草稿：核心按整数解析并施加上下限，
+                            // 页面不 clamp，免得用户误以为输入被接受了。
                             id: retainField
                             objectName: "realtimeRetainField"
                             implicitWidth: 110
@@ -357,6 +444,9 @@ Item {
                             // 三个数字按**文本**交给 C++：QML 的 parseInt 会把
                             // "12abc" 悄悄变成 12，而 backupctl 会明确拒绝它。
                             // 解析规则只有一份，在共享核心里。
+                            // 一次调用提交整份配置：全部字段校验通过后才落盘，
+                            // 不存在"目录存了、策略没存"的中间态；规则文本来自
+                            // 共享编辑器，失败原因由控制器写进状态栏。
                             onClicked: realtime.saveConfigFromText(
                                 page.draftEnabled,
                                 page.draftSource,
@@ -364,7 +454,8 @@ Item {
                                 page.draftMaxWait,
                                 page.draftRetain,
                                 page.packKeys[page.draftPackIndex],
-                                page.compressionKeys[page.draftCompressionIndex],
+                                page.compressionKeys[
+                                    page.draftCompressionIndex],
                                 ruleEditor.includeRuleTexts,
                                 ruleEditor.excludeRuleTexts,
                                 page.strategyKeys[page.draftStrategyIndex])
@@ -396,17 +487,21 @@ Item {
 
                         Text {
                             Layout.fillWidth: true
-                            text: "延迟、打包、压缩与筛选规则，一般保持默认即可。"
+                            text: "延迟、打包、压缩与筛选规则，" +
+                                  "一般保持默认即可。"
                             font.pixelSize: 15
                             color: theme.textSecondary
                             elide: Text.ElideRight
                         }
 
                         AppButton {
+                            // 折叠只是视图状态：不写配置、不落盘，重新进入时
+                            // 回到默认样子。
                             objectName: "realtimeAdvancedToggle"
                             text: page.advancedExpanded ? "收起 ▾" : "展开 ▸"
                             variant: "flat"
-                            onClicked: page.advancedExpanded = !page.advancedExpanded
+                            onClicked: page.advancedExpanded =
+                                !page.advancedExpanded
                         }
                     }
 
@@ -414,6 +509,9 @@ Item {
                     // 收起时它们的 visible 都是 false（不只是"父级看不见"），
                     // 展开后可见可交互。折叠状态不持久化。
                     ColumnLayout {
+                        // 折叠区内的控件各自绑定 visible，而不只依赖父级隐藏：
+                        // 渲染上父级不可见已足够，但 GUI 测试与无障碍遍历读
+                        // 的是控件自己的 visible，两边要一致。
                         id: advancedSection
                         objectName: "realtimeAdvancedSection"
                         Layout.fillWidth: true
@@ -425,8 +523,8 @@ Item {
                             Layout.fillWidth: true
                             spacing: 4
 
-                            // 主标签只用中文：英文术语（Debounce）退到「技术详情」
-                            // 与源码注释里，普通用户不需要看见它。
+                            // 主标签只用中文：英文术语（Debounce）退到
+                            // 「技术详情」与源码注释里，普通用户不需要看见它。
                             Text {
                                 text: "响应延迟"
                                 font.pixelSize: 16
@@ -438,6 +536,7 @@ Item {
                                 spacing: 8
 
                                 AppTextField {
+                                    // 编辑只改草稿，保存时才重建监听。
                                     id: debounceField
                                     objectName: "realtimeDebounceField"
                                     visible: page.advancedExpanded
@@ -456,7 +555,10 @@ Item {
 
                             Text {
                                 Layout.fillWidth: true
-                                text: "文件停止变化多久后开始备份。默认 500 毫秒。"
+                                // 只讲用户能观察到的行为：debounce 的计时起点与
+                                // 上下限都在共享核心里，页面不重复定义语义。
+                                text: "文件停止变化多久后开始备份。" +
+                                      "默认 500 毫秒。"
                                 font.pixelSize: 14
                                 color: theme.textSecondary
                                 wrapMode: Text.WordWrap
@@ -479,6 +581,8 @@ Item {
                                 spacing: 8
 
                                 AppTextField {
+                                    // 与响应延迟配套：max_wait >= debounce，
+                                    // 页面不做交叉校验。
                                     id: maxWaitField
                                     objectName: "realtimeMaxWaitField"
                                     visible: page.advancedExpanded
@@ -497,7 +601,11 @@ Item {
 
                             Text {
                                 Layout.fillWidth: true
-                                text: "文件持续写入时，最多等这么久就先备份一次。默认 5 秒。"
+                                // 文件一直被写时 debounce 等不到稳定，没有它
+                                // 就永远不会触发备份；默认值也来自核心。
+                                text: "文件持续写入时，" +
+                                      "最多等这么久就先备份一次。" +
+                                      "默认 5 秒。"
                                 font.pixelSize: 14
                                 color: theme.textSecondary
                                 wrapMode: Text.WordWrap
@@ -518,6 +626,8 @@ Item {
                                     color: theme.textSecondary
                                 }
                                 AppComboBox {
+                                    // 参与 job_identity：换掉后旧快照不再自动
+                                    // 淘汰（仍可手工删除），只是归属变了。
                                     id: packBox
                                     objectName: "realtimePackCombo"
                                     visible: page.advancedExpanded
@@ -525,7 +635,8 @@ Item {
                                     enabled: !realtime.libraryBusy
                                     model: page.packLabels
                                     currentIndex: page.draftPackIndex
-                                    onActivated: page.draftPackIndex = currentIndex
+                                    onActivated: page.draftPackIndex =
+                                        currentIndex
                                 }
                             }
 
@@ -538,6 +649,8 @@ Item {
                                     color: theme.textSecondary
                                 }
                                 AppComboBox {
+                                    // 压缩方式也参与 job_identity：换掉后旧快照
+                                    // 不再自动淘汰，内容本身不变。
                                     id: compressionBox
                                     objectName: "realtimeCompressionCombo"
                                     visible: page.advancedExpanded
@@ -545,7 +658,8 @@ Item {
                                     enabled: !realtime.libraryBusy
                                     model: page.compressionLabels
                                     currentIndex: page.draftCompressionIndex
-                                    onActivated: page.draftCompressionIndex = currentIndex
+                                    onActivated: page.draftCompressionIndex =
+                                        currentIndex
                                 }
                             }
 
@@ -561,14 +675,20 @@ Item {
                         FilterRuleEditor {
                             id: ruleEditor
                             ruleModel: realtimeFilterRuleModel
+                            // 三个页面共用这个组件：规则模型由控制器注入，
+                            // objectPrefix 决定测试用 objectName 前缀，busy 与
+                            // 页面其它控件共用同一个 libraryBusy 门；规则语法、
+                            // 校验与错误文案都在共享 builder 里。
                             objectPrefix: "realtime"
                             busy: realtime.libraryBusy
                             heading: "筛选规则"
-                            intro: "只有符合条件的文件会参与备份。如果同时命中包含和排除规则，以排除规则为准。"
+                            intro: "只有符合条件的文件会参与备份。" +
+                                   "如果同时命中包含和排除规则，" +
+                                   "以排除规则为准。"
                             Layout.fillWidth: true
                         }
 
-                        // ---- 加密：一句弱提示，不再摆一个永远点不动的下拉框 ----
+                        // ---- 加密：一句弱提示，不再摆永远点不动的下拉框 ----
                         RowLayout {
                             Layout.fillWidth: true
                             spacing: 8
@@ -591,6 +711,8 @@ Item {
                         // 说明来自控制器（控制器读的是核心里那句唯一来源），
                         // 页面不复制一份字面量。
                         Text {
+                            // 文案来自控制器：来源只有核心一处。
+                            // 页面复制一份字面量就会在两处漂移。
                             objectName: "realtimeEncryptionNote"
                             visible: page.advancedExpanded
                             Layout.fillWidth: true
@@ -660,11 +782,15 @@ Item {
                     // 配置不可用是**持续状态**，与状态栏里那一句瞬时提示不同：
                     // 只要理由还在，这行就一直亮着。
                     Text {
+                        // 配置不可用是持续状态：核心不会自动改配置、不会自动
+                        // 重试（fail-closed），这行一直亮到用户重新保存成功。
                         objectName: "realtimeConfigErrorText"
                         Layout.fillWidth: true
                         visible: realtime.phaseKey === "config_error"
-                        text: "实时备份已挂起：落盘配置不可用或源目录/仓库当前无法使用。"
-                              + "程序不会自动修改它，也不会自动重试；请修正后重新保存。"
+                        text: "实时备份已挂起：" +
+                              "落盘配置不可用或源目录/仓库当前无法使用。" +
+                              "程序不会自动修改它，也不会自动重试；" +
+                              "请修正后重新保存。"
                         font.pixelSize: 15
                         color: theme.error
                         wrapMode: Text.WordWrap
@@ -703,11 +829,15 @@ Item {
                             objectName: "realtimeTechnicalToggle"
                             text: page.technicalExpanded ? "收起 ▾" : "展开 ▸"
                             variant: "flat"
-                            onClicked: page.technicalExpanded = !page.technicalExpanded
+                            onClicked: page.technicalExpanded =
+                                !page.technicalExpanded
                         }
                     }
 
                     ColumnLayout {
+                        // 技术详情展示控制器的原始状态：phase、监听目录数、
+                        // 待处理事件、溢出与最近事件。这一层允许出现英文术语
+                        // 与字段名，方便对着文档或 backupctl 输出排查。
                         id: technicalSection
                         objectName: "realtimeTechnicalSection"
                         Layout.fillWidth: true
@@ -728,8 +858,10 @@ Item {
                             objectName: "realtimeRunScopeText"
                             visible: page.technicalExpanded
                             Layout.fillWidth: true
-                            text: "实时监听只在“本程序运行期间”生效：关掉程序就不再监听，"
-                                  + "重开时会先做一次重新同步，把关掉那段时间的变化补上。"
+                            text: "实时监听只在“本程序运行期间”生效：" +
+                                  "关掉程序就不再监听，" +
+                                  "重开时会先做一次重新同步，" +
+                                  "把关掉那段时间的变化补上。"
                             font.pixelSize: 14
                             color: theme.textSecondary
                             wrapMode: Text.WordWrap
@@ -770,7 +902,8 @@ Item {
                             Text {
                                 objectName: "realtimePendingCountText"
                                 visible: page.technicalExpanded
-                                text: "待处理事件数：" + realtime.pendingEventCount
+                                text: "待处理事件数："
+                                      + realtime.pendingEventCount
                                 font.pixelSize: 14
                                 color: theme.textSecondary
                             }
@@ -808,13 +941,17 @@ Item {
                             wrapMode: Text.WordWrap
                         }
 
-                        // 英文术语只在这里出现一次：普通 UI 讲"响应延迟 / 最长等待"，
+                        // 英文术语只在这里出现一次：
+                        // 普通 UI 讲"响应延迟 / 最长等待"，
                         // 需要对着文档或源码排查的人在这一层能拿到原名。
                         Text {
                             objectName: "realtimeDelayTermText"
                             visible: page.technicalExpanded
                             Layout.fillWidth: true
-                            text: "响应延迟对应 Debounce（debounce_ms），最长等待对应 Max wait（max_wait_ms）。"
+                            // 中文标签只在这里对上 CLI 的英文名，排查的人能
+                            // 在这里找到 debounce_ms 与 max_wait_ms。
+                            text: "响应延迟对应 Debounce（debounce_ms），" +
+                                  "最长等待对应 Max wait（max_wait_ms）。"
                             font.pixelSize: 14
                             color: theme.textSecondary
                             wrapMode: Text.WordWrap
@@ -831,14 +968,19 @@ Item {
                         }
 
                         Text {
+                            // 仓库路径来自控制器；未配置时用错误色提示。
+                            // 页面不猜默认仓库，也不因此禁用整页。
                             objectName: "realtimeRepositoryText"
                             visible: page.technicalExpanded
                             Layout.fillWidth: true
                             text: realtime.repositoryConfigured
                                   ? "备份仓库：" + realtime.repositoryPath
-                                  : "备份仓库：尚未配置（请在设置页选择仓库目录）"
+                                  : "备份仓库：尚未配置" +
+                                    "（请在设置页选择仓库目录）"
                             font.pixelSize: 14
-                            color: realtime.repositoryConfigured ? theme.textSecondary : theme.error
+                            color: realtime.repositoryConfigured
+                                    ? theme.textSecondary
+                                   : theme.error
                             wrapMode: Text.WordWrap
                         }
                     }
@@ -871,6 +1013,8 @@ Item {
                             text: "刷新"
                             iconName: "refresh"
                             enabled: !realtime.libraryBusy
+                            // 只手动刷新、不轮询：列表要为每条验证归档身份，
+                            // 是实打实的 IO，定时刷新会让磁盘一直忙。
                             onClicked: realtime.refreshSnapshots()
                         }
                     }
@@ -879,7 +1023,9 @@ Item {
                         objectName: "realtimeSnapshotEmptyText"
                         Layout.fillWidth: true
                         visible: realtime.snapshots.length === 0
-                        text: "还没有实时备份。启用后，文件发生变化时会在这里看到新的备份版本。"
+                        text: "还没有实时备份。" +
+                              "启用后，文件发生变化时" +
+                              "会在这里看到新的备份版本。"
                         font.pixelSize: 15
                         color: theme.textSecondary
                         wrapMode: Text.WordWrap
@@ -887,6 +1033,9 @@ Item {
 
                     Repeater {
                         objectName: "realtimeSnapshotList"
+                        // 列表数据全部来自控制器：每条都经过"marker 与归档
+                        // 是否对得上"的验证；verified 为假的记录也照列，
+                        // 并带上 diagnostic。页面不判断策略、不拼大小与时间。
                         model: realtime.snapshots
                         delegate: ColumnLayout {
                             required property var modelData
@@ -897,11 +1046,13 @@ Item {
                                 Layout.fillWidth: true
                                 spacing: 8
 
-                                // 来源 badge：文案直接用控制器给的分类（完整快照 /
-                                // 增量基线 / 增量），页面不自己判断策略。
+                                // 来源 badge：文案直接用控制器给的分类
+                                // （完整快照 /增量基线 / 增量），
+                                // 页面不自己判断策略。
                                 Rectangle {
                                     implicitWidth: badgeLabel.implicitWidth + 16
-                                    implicitHeight: badgeLabel.implicitHeight + 6
+                                    implicitHeight: badgeLabel.implicitHeight
+                                                    + 6
                                     radius: 6
                                     color: theme.accentSoft
 
@@ -916,13 +1067,17 @@ Item {
 
                                 Text {
                                     Layout.fillWidth: true
-                                    text: modelData["createdText"] + "  ·  " + modelData["sizeText"]
+                                    // 格式化只有一份实现，这里只做拼接。
+                                    text: modelData["createdText"]
+                                          + "  ·  " + modelData["sizeText"]
                                     font.pixelSize: 15
                                     color: theme.textPrimary
                                     elide: Text.ElideRight
                                 }
 
                                 Text {
+                                    // 验证不过的记录不隐藏，只标红并显示诊断，
+                                    // 让用户看到坏在哪，而不是以为它消失了。
                                     visible: !modelData["verified"]
                                     text: modelData["verifiedText"]
                                     font.pixelSize: 14
@@ -932,7 +1087,8 @@ Item {
 
                             Text {
                                 Layout.fillWidth: true
-                                text: modelData["archiveName"] + "  ·  " + modelData["basisText"]
+                                text: modelData["archiveName"]
+                                      + "  ·  " + modelData["basisText"]
                                       + "  ·  " + modelData["packText"] + " / "
                                       + modelData["compressionText"]
                                       + "  ·  事件 " + modelData["eventCount"]
@@ -956,6 +1112,9 @@ Item {
 
             // 实时页的状态来自 RealtimeController，只有这一页绑定它；pageScope
             // 仍然写全，让"临时提示只属于产生它的页面"这条契约在五处保持一致。
+            // 瞬时提示按页面归属：pageScope 与 scope 都写 realtime，
+            // 别的页面的提示不会粘到这一页。运行状态卡讲"现在
+            // 怎么样"，这条横幅讲"刚才那次操作的结果"。
             StatusBanner {
                 objectName: "realtimeStatusBanner"
                 Layout.fillWidth: true
@@ -971,11 +1130,16 @@ Item {
     }
 
     FolderDialog {
+        // 目录选择器给的是 URL；转换不出本地路径时（用户取消
+        // 或不是本地目录）什么都不改，不能把草稿清空。
         id: sourceDialog
         objectName: "realtimeSourceFolderDialog"
         title: "选择实时备份的备份目录"
+        // 选中后只把路径写进草稿：真正生效仍要等用户点"保存设置"，与手输路径走
+        // 同一条提交路径。
         onAccepted: {
-            const chosen = realtime.localPathFromUrl(sourceDialog.selectedFolder)
+            const chosen =
+                realtime.localPathFromUrl(sourceDialog.selectedFolder)
             if (chosen !== "")
                 page.draftSource = chosen
         }

@@ -91,8 +91,8 @@ class ScheduleController : public QObject,
   Q_PROPERTY(
       QString frequencyUnitKey READ frequencyUnitKey NOTIFY configChanged)
   Q_PROPERTY(int retainCount READ retainCount NOTIFY configChanged)
-  // PR #18：strategyKey 这一条 PR #17 就已经留好了，本轮只是让它真的能被
-  // 界面选择与保存（下面两个 saveConfig* 各多一个 strategy_key）。
+  // strategyKey 这一条早就留好了，现在让它真的能被界面选择与保存
+  // （下面两个 saveConfig* 各多一个 strategy_key）。
   Q_PROPERTY(QString packKey READ packKey NOTIFY configChanged)
   Q_PROPERTY(QString compressionKey READ compressionKey NOTIFY configChanged)
   Q_PROPERTY(QString encryptionKey READ encryptionKey NOTIFY configChanged)

@@ -1,5 +1,13 @@
 // scheduled_backup_service.cpp
 
+// 边界：本文件是"该不该跑、跑了算不算成功"的决策层。扫描、打包、加密与
+// 写归档分别在 source_manifest / BackupEngine / RunIncrementalBackup 里，
+// 索引与路径校验在 BackupCatalog 里；这里只把它们按正确顺序串起来，并把
+// 结果翻译成状态 + 诊断 + 历史。
+// 持久化：state 与 history 都由 ScheduleStore 写进 schedule.json。下面那些
+// *StatusKey 字符串是磁盘上的稳定词汇，只能追加，不能改名。
+// 线程约束：本类自身不加锁，一次 Evaluate 由 UI 线程之外的执行器调用；
+// store_ 与 document 都按调用栈传递，不跨线程共享。
 #include "scheduled_backup_service.h"
 
 #include <sys/stat.h>
@@ -25,6 +33,9 @@ void SetError(std::string* error_message, const std::string& text) {
   if (error_message != nullptr) *error_message = text;
 }
 
+// 归档路径是 POSIX 风格、只用 '/' 分隔的字符串（仓库布局的一部分），所以
+// 这里按字符找最后一个 '/'，而不走 std::filesystem::path —— 后者在 Windows
+// 上会把 '\' 也当分隔符，从而改变 basename 的含义。
 std::string BaseNameOf(const std::string& path) {
   const std::size_t slash = path.rfind('/');
   if (slash == std::string::npos) return path;
@@ -84,13 +95,16 @@ bool BaselineIsManaged(const ScheduleDocument& document) {
 }
 
 // 注意：原来这里有一个 OldestManagedIndex()，retention 直接用它挑"最旧的一份"。
-// PR #18 之后"删哪一份"不再是一个局部决定——必须先算出依赖安全的删除集合
+// “删哪一份”不再是一个局部决定——必须先算出依赖安全的删除集合
 // （见 PlanDependencyAwareRetention），所以那条"找最旧"的逻辑搬进了计划函数，
 // 排序规则（时间相同按 file_name）一字未变。这里刻意不再留一个没人用的副本：
 // 两处排序规则共存，早晚会有一处先改。
 
 }  // namespace
 
+// 状态键：给日志、测试与 GUI 用的**稳定**词汇，会被外部脚本匹配，改名等于
+// 破坏兼容，新增状态只能追加。兜底返回 "failed" 而不是空串：认不出的状态
+// 必须表现为失败，不能表现为"什么都没发生"。
 const char* ScheduleEvaluationStatusKey(ScheduleEvaluationStatus status) {
   switch (status) {
     case ScheduleEvaluationStatus::kDisabled:
@@ -159,6 +173,8 @@ ScheduleEvaluationStatus StatusForRetention(bool retention_ok) {
                       : ScheduleEvaluationStatus::kCreatedWithRetentionWarning;
 }
 
+// 与 Text 版本成对：键用于机器匹配，文案用于界面。当前仓库内除测试外没有
+// 调用方，但它是这套状态词汇的一半，删掉会让"键"与"文案"不再对称。
 const char* ScheduleBaselineStatusKey(ScheduleBaselineStatus status) {
   switch (status) {
     case ScheduleBaselineStatus::kMissing:
@@ -196,6 +212,9 @@ std::string ScheduleBaselineStatusText(ScheduleBaselineStatus status) {
   return "No baseline snapshot has been recorded yet";
 }
 
+// 判定"记下的 baseline 现在还算不算数"。三个纯字符串比较（快照名非空、
+// 仓库身份、源路径）刻意排在所有文件系统动作之前：绝大多数失效原因不碰
+// 磁盘就能定性，也避免在挂载点丢失时去做昂贵的 Resolve。
 ScheduleBaselineStatus EvaluateScheduleBaseline(
     const ScheduleDocument& document, const std::string& repository_path,
     std::string* error_message) {
@@ -247,6 +266,9 @@ ScheduleBaselineStatus EvaluateScheduleBaseline(
   return ScheduleBaselineStatus::kValid;
 }
 
+// 处理 enabled 的 false -> true 跳变：从这一刻起重新计时。两个提前返回都
+// 不能少 —— 停用时不动时间表（保留用户上次的排期），已经启用时不重置，
+// 否则每次评估都会把 next_run 推后一个周期，计划永远不到点。
 void ApplyScheduleEnableTransition(ScheduleDocument* document, bool was_enabled,
                                    std::int64_t now_sec) {
   if (document == nullptr) return;
@@ -260,6 +282,9 @@ ScheduledBackupService::ScheduledBackupService(std::string repository_path,
                                                ScheduleStore* store)
     : repository_path_(std::move(repository_path)), store_(store) {}
 
+// 换仓库只换路径，不动任何 state：baseline 里记着 repository_identity，换库
+// 之后 EvaluateScheduleBaseline 会判成 kRepositoryChanged 并重建基线，这里
+// 不需要（也不应该）替用户清理记录。
 void ScheduledBackupService::SetRepositoryPath(std::string repository_path) {
   repository_path_ = std::move(repository_path);
 }
@@ -298,7 +323,7 @@ bool ScheduledBackupService::RunRetention(ScheduleDocument* document,
   BackupCatalog catalog;
   const std::size_t retain = document->config.retain_count;
 
-  // PR #18：删除集合必须先过依赖检查。
+  // 删除集合必须先过依赖检查。
   //
   // "删最旧的"对 Full 是安全的，对依赖链不是：删掉某个 delta 的祖先会让它
   // 以及它所有后代都无法恢复，而列表上看起来只是"少了一份旧快照"。
@@ -448,6 +473,8 @@ bool ScheduledBackupService::RunRetention(ScheduleDocument* document,
   return true;
 }
 
+// 两个入口只差一个 force：force 只跳过"到点了吗"，enabled 状态、配置合法性
+// 与仓库可用性照旧全部检查 —— "立即备份"不绕过任何一致性判定。
 bool ScheduledBackupService::Evaluate(std::int64_t now_sec,
                                       ScheduleEvaluationResult* result,
                                       std::string* error_message) {
@@ -460,6 +487,10 @@ bool ScheduledBackupService::EvaluateNow(std::int64_t now_sec,
   return EvaluateInternal(now_sec, /*force=*/true, result, error_message);
 }
 
+// 一轮评估的完整流程（顺序即语义）：停用 -> 未到点 -> 自愈与仓库可用性 ->
+// 配置合法性 -> 扫描 -> 基线判定 -> 增量或全量 -> 登记 -> manifest ->
+// retention -> state -> history。每一步"失败"在原处决定这轮算失败还是算
+// 挂起，见各段注释。
 bool ScheduledBackupService::EvaluateInternal(std::int64_t now_sec, bool force,
                                               ScheduleEvaluationResult* result,
                                               std::string* error_message) {
@@ -501,6 +532,10 @@ bool ScheduledBackupService::EvaluateInternal(std::int64_t now_sec, bool force,
     return true;
   }
 
+  // 失败收尾的唯一出口：除提前 return 之外的失败都必须经过它，才能同时做到
+  // 三件事 —— 记为 kFailed、推进 next_run、追加一条 history。推进 next_run
+  // 是关键：坏配置或坏仓库如果原地重试，会变成每个 tick 一次的完整校验加
+  // 新线程。Save 失败不改变结论，只追加到 diagnostic 里。
   auto finish_failed = [&](const std::string& diagnostic) {
     result->status = ScheduleEvaluationStatus::kFailed;
     result->diagnostic = diagnostic;
@@ -593,7 +628,8 @@ bool ScheduledBackupService::EvaluateInternal(std::int64_t now_sec, bool force,
   // 任何一份快照装得下 M2。三个文件无法原子一起提交，所以必须让 manifest 带着
   // 自己的归属，靠"这一对是否配套"来判定，而不是靠"两边分别看起来都还行"。
   //
-  // 配套不上一律按"没有可信基线"处理：重建一份完整快照。多建一份，绝不错误跳过。
+  // 配套不上一律按"没有可信基线"处理：重建一份完整快照。
+  // 多建一份，绝不错误跳过。
   std::string baseline_error;
   const ScheduleBaselineStatus baseline_status =
       EvaluateScheduleBaseline(document, repository_path_, &baseline_error);
@@ -629,7 +665,7 @@ bool ScheduledBackupService::EvaluateInternal(std::int64_t now_sec, bool force,
     baseline_usable = true;
   }
 
-  // ---- PR #18：增量策略的结论由共享增量引擎给出 ----
+  // ---- 增量策略的结论由共享增量引擎给出 ----
   //
   // 这里刻意**不**用 metadata-first 的比较来决定增量要不要写：内容身份必须
   // 是真实摘要，否则 same-size + same-mtime 的改写会被漏掉，而漏掉的那一次
@@ -706,7 +742,7 @@ bool ScheduledBackupService::EvaluateInternal(std::int64_t now_sec, bool force,
     }
   } else if (!incremental_mode) {
     // 没有可信基线：这一轮产出一份**完整基线快照**。
-    // 多建一份完整备份，绝不漏变化——这正是本 PR 的核心语义。
+    // 多建一份完整备份，绝不漏变化——这正是这条路径的核心语义。
     const bool had_baseline =
         !document.state.baseline.snapshot_file_name.empty();
     result->first_snapshot = !had_baseline;
