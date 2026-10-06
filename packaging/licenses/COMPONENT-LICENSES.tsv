@@ -1,0 +1,47 @@
+# packaging/licenses/COMPONENT-LICENSES.tsv
+#
+# 人工核对过的"组件 -> 上游 / 归一化许可 / 再分发要求"对照表。**只写经得起查的东西**：
+# 许可字段仍然以构建容器里那个包自带的机器可读 copyright 为准（生成时逐个读），
+# 这张表只负责把同一个上游的多个 soname 归到一起、并把许可名写成人能读的形式。
+#
+# 匹配方式：按 soname 前缀（跨发行版稳定；Debian 12 与 Ubuntu 24.04 的包名后缀不同，
+# 例如 libqt6core6 vs libqt6core6t64，所以**不能**按包名匹配）。
+#
+# 字段：soname_prefix | upstream | license_summary | redistribution_note
+libQt6|Qt 6（qtbase / qtdeclarative）|LGPL-3.0-only 或 GPL-2.0-only（本发行包按 LGPL-3.0 这一支使用）|动态链接、未修改的上游二进制；随包提供版权与许可文本，库文件可被用户替换
+libicu|ICU（unicode-org）|MIT（Copyright © Unicode, Inc.）|保留版权与许可声明
+libXau|X.Org（libXau）|X11/MIT（Open Group）|保留版权与许可声明
+libXdmcp|X.Org（libXdmcp）|X11/MIT（Open Group）|保留版权与许可声明
+libb2|BLAKE2（libb2）|CC0-1.0|保留声明；CC0 无署名要求，仍随包附上
+libbrotli|Brotli|MIT|保留版权与许可声明
+libbsd|libbsd|BSD-3-clause|保留版权与许可声明
+libcap|libcap|BSD-3-clause（另有 GPL-2 可选）|保留版权与许可声明
+libdbus-1|D-Bus|AFL-2.1（另有 GPL-2+ 可选）|保留版权与许可声明 + AFL-2.1 文本
+libdouble-conversion|double-conversion|BSD-3-clause|保留版权与许可声明
+libgcrypt|Libgcrypt|LGPL-2.1-or-later|动态链接；随包提供许可文本
+libglib-2.0|GLib|LGPL-2.1-or-later|动态链接；随包提供许可文本
+libgomp|GCC（OpenMP 运行库）|GPL-3.0-or-later WITH GCC-exception-3.1|随包提供 GPL-3 与例外文本
+libgraphite2|Graphite2|LGPL-2.1-or-later（另有 MPL-1.1 / GPL-2+ 可选）|动态链接；随包提供许可文本
+libgssapi_krb5|MIT Kerberos|MIT|保留版权与许可声明
+libk5crypto|MIT Kerberos|MIT|保留版权与许可声明
+libkrb5|MIT Kerberos|MIT|保留版权与许可声明
+libkrb5support|MIT Kerberos|MIT|保留版权与许可声明
+libkeyutils|keyutils|GPL-2.0-or-later（库为 LGPL-2.1+）|动态链接；随包提供许可文本
+liblz4|LZ4|BSD-2-clause|保留版权与许可声明
+liblzma|XZ Utils|public domain（个别文件 LGPL-2.1+/GPL-2+）|随包提供该包的 copyright
+libmd|libmd|BSD-3-clause|保留版权与许可声明
+libmd4c|MD4C|Expat（MIT）|保留版权与许可声明
+libpcre2-16|PCRE2|BSD-3-clause-Cambridge（含 binary-library exception）|保留版权与许可声明
+libpcre2-8|PCRE2|BSD-3-clause-Cambridge（含 binary-library exception）|保留版权与许可声明
+libpng16|libpng|libpng-2.0|保留版权与许可声明
+libproxy|libproxy|LGPL-2.1-or-later|动态链接；随包提供许可文本
+libsystemd|systemd（libsystemd）|LGPL-2.1-or-later|动态链接；随包提供许可文本
+libxcb|XCB|MIT|保留版权与许可声明
+libxkbcommon|libxkbcommon|MIT|保留版权与许可声明
+libzstd|Zstandard|BSD-3-clause（另有 GPL-2 可选）|保留版权与许可声明
+libfreetype|FreeType|FTL（FreeType License）|保留版权与许可声明
+libfontconfig|fontconfig|MIT-style（Keith Packard）|保留版权与许可声明
+libharfbuzz|HarfBuzz|MIT|保留版权与许可声明
+libexpat|Expat|MIT|保留版权与许可声明
+libjpeg|libjpeg-turbo|BSD-3-clause（BSD-BY-LC-NE）+ IJG|保留版权与许可声明
+zlib|zlib|Zlib|保留版权与许可声明

@@ -51,6 +51,15 @@ for tool in backupctl backup-gui-modern; do
   ln -sf "$LIB_ROOT/bin/$tool" "$PREFIX/bin/$tool"
 done
 
+# 第三方许可材料：随 portable 安装一起保留（发布二进制时必须随包提供给用户）
+if [ -f "$SRC_DIR/THIRD-PARTY-NOTICES.txt" ]; then
+  install -d -m 0755 "$LIB_ROOT/doc"
+  install -m 0644 "$SRC_DIR/THIRD-PARTY-NOTICES.txt" "$LIB_ROOT/doc/"
+  [ -f "$SRC_DIR/LICENSE-INVENTORY.md" ] && install -m 0644 "$SRC_DIR/LICENSE-INVENTORY.md" "$LIB_ROOT/doc/"
+  [ -d "$SRC_DIR/licenses" ] && { rm -rf "$LIB_ROOT/doc/licenses"; cp -a "$SRC_DIR/licenses" "$LIB_ROOT/doc/"; }
+  log "已随安装保留第三方许可材料：$LIB_ROOT/doc/"
+fi
+
 if [ "$NO_DESKTOP" -eq 0 ] && [ -f "$SRC_DIR/packaging/client/backup-project.desktop" ]; then
   APPDIR="${XDG_DATA_HOME:-$HOME/.local/share}/applications"
   mkdir -p "$APPDIR"

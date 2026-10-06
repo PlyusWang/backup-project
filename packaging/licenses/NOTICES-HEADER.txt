@@ -1,0 +1,29 @@
+THIRD-PARTY NOTICES —— 随本发行包分发的第三方组件
+======================================================================
+
+本发行包**动态链接并随包分发**了下列第三方共享库（清单与逐文件判定来源见同目录的
+LICENSE-INVENTORY.md；每个组件自己的版权与许可声明在 licenses/<提供包>/copyright，
+必需的许可长文本在 licenses/*.txt）。
+
+写法上只说工程事实：这些库是**未修改的上游二进制**，以**动态链接**方式使用，
+**版权与许可材料随包提供**。本文件不对法律风险作任何断言。
+
+1) Qt 6 —— LGPL-3.0-only 或 GPL-2.0-only，本发行包按 LGPL-3.0 这一支使用。
+   以动态库形式提供（lib/ 或 AppDir 的 usr/lib），用户可替换：deb 直接替换文件，
+   AppImage 可 --appimage-extract 后替换再打包。
+   许可文本 licenses/LGPL-3.txt；源码 https://download.qt.io/official_releases/qt/
+
+2) GCC 运行库（libgomp / libstdc++ / libgcc_s）—— GPL-3.0-or-later WITH
+   GCC-exception-3.1。文本 licenses/GPL-3.txt 与
+   licenses/GCC-Runtime-Library-Exception-3.1.txt。
+
+3) ICU、glib、dbus、gcrypt、systemd、xcb、xkbcommon、harfbuzz、freetype、
+   fontconfig、libpng、libjpeg-turbo、brotli、b2、double-conversion、pcre2、
+   graphite2、krb5、keyutils、zstd、lz4、lzma、libbsd、libmd、libcap、proxy、
+   libXau、libXdmcp、zlib —— 各自的版权与许可声明在 licenses/<提供包>/copyright。
+
+4) 构建期工具（**不随包分发**）：linuxdeploy、linuxdeploy-plugin-qt、appimagetool
+   （均 MIT）—— 版本 / 来源 URL / sha256 见 packaging/tools.lock。
+
+5) 本项目自身：上游仓库当前**没有**项目级 LICENSE 文件，本发行包不对项目自身代码的
+   许可作任何声明或推断（OWNER_DECISION_REQUIRED）。

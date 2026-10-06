@@ -1,0 +1,17 @@
+THIRD-PARTY NOTICES —— Backup Project Server（.deb / portable tar.xz）
+======================================================================
+
+本服务端发行包**不重新分发任何第三方二进制**：包内只有本项目自己构建的可执行文件
+（backup-server / backup-server-admin / backup-server-keygen / backup-cert-tool）、
+shell 包装器与启动器、systemd unit、配置模板与文档。
+
+它运行所需的第三方运行库全部由**目标机的发行版**提供，并在 Debian 控制文件里以
+依赖形式声明（例如 libc6、libstdc++6、libsqlite3-0）；这些库不由本包分发，因此也
+不需要在本包里附上它们的许可文本。
+
+服务端二进制依赖（构建容器内用 dpkg-shlibdeps 算出，见包的 Depends 字段）：
+
+    libc6, libgcc-s1, libsqlite3-0, libstdc++6, adduser, init-system-helpers
+
+本项目自身：上游仓库当前**没有**项目级 LICENSE 文件，本包不对项目自身代码的许可
+作任何声明或推断（OWNER_DECISION_REQUIRED）。
