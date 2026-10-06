@@ -914,9 +914,19 @@ bool ExtractDeltaPayload(const std::string& delta_file,
     }
     remaining -= static_cast<std::uint64_t>(got);
   }
-  if (::close(in_fd) != 0 || ::close(out_fd) != 0) {
+  // 两个 fd 都必须尝试关闭：`close(in) != 0 || close(out) != 0` 会在
+  // 第一个 close 失败时跳过第二个。诊断只保留第一次失败的 errno。
+  int saved_error = 0;
+  if (::close(in_fd) != 0) {
+    saved_error = errno;
+  }
+  if (::close(out_fd) != 0 && saved_error == 0) {
+    saved_error = errno;
+  }
+  if (saved_error != 0) {
     ::unlink(container_file.c_str());
-    SetError(error_message, "Cannot close during payload extraction");
+    SetError(error_message, "Cannot close during payload extraction: " +
+                                ErrnoText(saved_error));
     return false;
   }
   return true;

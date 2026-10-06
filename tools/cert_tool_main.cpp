@@ -26,6 +26,7 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -65,6 +66,50 @@ struct Options {
     return fallback;
   }
 };
+
+// 严格的十进制整数解析：整个字符串必须被完全消费，且不得溢出。
+//
+// 为什么不能用 strtoll(..., nullptr, 10)：它把 "abc" 读成 0，把 "12abc" 读成 12，
+// 并且正负号可以重复。在这里那不是宽松，而是静默地把用户的笔误
+// 变成一个看起来合法的证书（2026 年签发一张 1970 年就过期的证书）。
+bool ParseDecimalU64(const std::string& text, std::uint64_t* out,
+                     std::string* error_message) {
+  if (out == nullptr) return false;
+  if (text.empty()) {
+    if (error_message != nullptr) *error_message = "空字符串不是合法的数字";
+    return false;
+  }
+  std::uint64_t value = 0;
+  for (const char digit : text) {
+    if (digit < '0' || digit > '9') {
+      if (error_message != nullptr) {
+        *error_message = "只接受十进制非负整数，实际是 '" + text + "'";
+      }
+      return false;
+    }
+    const std::uint64_t digit_value = static_cast<std::uint64_t>(digit - '0');
+    if (value > (UINT64_MAX - digit_value) / 10u) {
+      if (error_message != nullptr) *error_message = "数字超出 uint64 范围";
+      return false;
+    }
+    value = value * 10u + digit_value;
+  }
+  *out = value;
+  return true;
+}
+
+// 时间戳与天数是 int64 语义（负数在协议层会被拒绝），这里只做上限校验。
+bool ParseDecimalI64(const std::string& text, std::int64_t* out,
+                     std::string* error_message) {
+  std::uint64_t magnitude = 0;
+  if (!ParseDecimalU64(text, &magnitude, error_message)) return false;
+  if (magnitude > static_cast<std::uint64_t>(INT64_MAX)) {
+    if (error_message != nullptr) *error_message = "数字超出 int64 范围";
+    return false;
+  }
+  *out = static_cast<std::int64_t>(magnitude);
+  return true;
+}
 
 void PrintUsage() {
   std::printf(
@@ -363,22 +408,34 @@ int CommandIssueServer(const Options& options) {
     return Fail(error);
   }
   const std::int64_t now = backupproject::crypto::Bpcert1NowUnixSeconds();
-  certificate.not_before = options.Has("--not-before")
-                               ? std::strtoll(options.Get("--not-before").c_str(),
-                                              nullptr, 10)
-                               : now;
-  const std::int64_t days = options.Has("--days")
-                                ? std::strtoll(options.Get("--days").c_str(),
-                                               nullptr, 10)
-                                : 180;
+  certificate.not_before = now;
+  if (options.Has("--not-before")) {
+    std::string number_error;
+    if (!ParseDecimalI64(options.Get("--not-before"), &certificate.not_before,
+                         &number_error)) {
+      return Fail("--not-before 不合法：" + number_error);
+    }
+  }
+  std::int64_t days = 180;
+  if (options.Has("--days")) {
+    std::string number_error;
+    if (!ParseDecimalI64(options.Get("--days"), &days, &number_error)) {
+      return Fail("--days 不合法：" + number_error);
+    }
+  }
   if (days <= 0 || days > 3650) {
     return Fail("--days 必须在 1..3650 之间");
   }
   certificate.not_after = certificate.not_before + days * 24 * 60 * 60;
   certificate.serial_number =
-      options.Has("--serial")
-          ? std::strtoull(options.Get("--serial").c_str(), nullptr, 10)
-          : static_cast<std::uint64_t>(certificate.not_before);
+      static_cast<std::uint64_t>(certificate.not_before);
+  if (options.Has("--serial")) {
+    std::string number_error;
+    if (!ParseDecimalU64(options.Get("--serial"),
+                         &certificate.serial_number, &number_error)) {
+      return Fail("--serial 不合法：" + number_error);
+    }
+  }
   if (certificate.serial_number == 0) {
     return Fail("序列号不能为 0（--serial 显式给了 0？）");
   }
@@ -460,10 +517,13 @@ int CommandVerifyServer(const Options& options) {
   std::printf("issuer_id          = %s\n", certificate.issuer_id.c_str());
   std::printf("certificate_sha256 = %s\n",
               backupproject::crypto::Bpcert1Fingerprint(raw).c_str());
-  const std::int64_t now = options.Has("--now")
-                               ? std::strtoll(options.Get("--now").c_str(),
-                                              nullptr, 10)
-                               : backupproject::crypto::Bpcert1NowUnixSeconds();
+  std::int64_t now = backupproject::crypto::Bpcert1NowUnixSeconds();
+  if (options.Has("--now")) {
+    std::string number_error;
+    if (!ParseDecimalI64(options.Get("--now"), &now, &number_error)) {
+      return Fail("--now 不合法：" + number_error);
+    }
+  }
   Bpcert1Error window = Bpcert1Error::kOk;
   std::string window_message;
   const bool in_window = backupproject::crypto::Bpcert1CheckValidity(

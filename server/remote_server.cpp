@@ -621,6 +621,14 @@ bool RemoteServer::OpenListener(std::string* error_message) {
 }
 
 void RemoteServer::Stop() {
+  // 生命周期合同（见头文件）：Stop() 不得与 Run() 并发。Run() 自己会
+  // shutdown pending 连接并 join 全部 worker，而 Stop() 会把 store_ / listener_fd_ 拆掉。
+  // 两者交叉的话，worker 会在用着 store_ / listener 的时候被拆掉。
+  // Run() 还在跑就调 Stop() 是调用方的错：这里直接返回，不做任何拆除，
+  // 让 Run() 自己把 worker 收干净（RequestStop() 仍然是唯一线程安全的停止入口）。
+  if (run_in_progress_.load()) {
+    return;
+  }
   RequestStop();
   if (listener_fd_ >= 0) {
     ::close(listener_fd_);
@@ -2061,7 +2069,9 @@ bool RemoteServer::ServeConnection(int fd, std::string* error_message) {
       return finish(false);
     }
     if (!HandleFrame(fd, header, payload, &context, error_message)) {
-      Log("connection terminated: " + *error_message);
+      if (error_message != nullptr) {
+        Log("connection terminated: " + *error_message);
+      }
       return finish(false);
     }
   }
@@ -2074,6 +2084,9 @@ bool RemoteServer::Run(std::string* error_message) {
     }
     return false;
   }
+  // 标记“Run() 正在执行”：Stop() 在这段时间里不做任何拆除（见头文件的
+  // 生命周期合同）。下面的收尾路径与异常路径都要清掉它。
+  run_in_progress_.store(true);
   worker_count_ = config_.worker_count;
   for (std::size_t index = 0; index < worker_count_; ++index) {
     workers_.push_back(std::thread(&RemoteServer::WorkerLoop, this));
@@ -2150,6 +2163,8 @@ bool RemoteServer::Run(std::string* error_message) {
     }
   }
   workers_.clear();
+  // 到这里 worker 已经全部停下来，Stop() 可以安全地做最终清理了。
+  run_in_progress_.store(false);
   if (!ok && error_message != nullptr) {
     Log("run loop stopped: " + *error_message);
   }

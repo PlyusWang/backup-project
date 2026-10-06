@@ -104,7 +104,9 @@ NET_OBJECTS="$OBJ_ROOT/src/network/network_protocol.o"
 # crypto/*（那部分统一用 $OBJ_ROOT/src/crypto 下的目标文件，两处都链会重复
 # 定义）。keygen_main.o 是 PR #21 新增的：它与 admin_main.o 一样带着自己的
 # main()，不排除就链接不过。
+# cert_tool_main.o 同理：离线根 / 服务器证书工具也带着自己的 main()。
 SERVER_ONLY="$(find "$OBJ_ROOT/server" -name '*.o' ! -name 'main.o' \
+  ! -name 'cert_tool_main.o' \
   ! -name 'admin_main.o' ! -name 'keygen_main.o' ! -path '*/crypto/*' \
   2>/dev/null | sort | tr '\n' ' ')"
 SERVER_AUTH_OBJ="$(find "$OBJ_ROOT/server" -name 'remote_auth.o' 2>/dev/null | head -1)"

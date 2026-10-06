@@ -677,8 +677,19 @@ bool RealtimeStore::Save(const RealtimeConfig& config,
     }
     written += static_cast<std::size_t>(got);
   }
-  if (::fsync(fd) != 0 || ::close(fd) != 0) {
-    const std::string message = ErrnoText(errno);
+  // fsync 与 close 必须**各自**尝试：`fsync(fd) != 0 || close(fd) != 0` 会在
+  // fsync 失败时短路掉 close，每失败一次泄漏一个 fd（ENOSPC/EIO 正是会连续
+  // 失败的那种场景）。saved_error 只记第一次失败的原因，后面的清理步骤不得
+  // 改写它。
+  int saved_error = 0;
+  if (::fsync(fd) != 0) {
+    saved_error = errno;
+  }
+  if (::close(fd) != 0 && saved_error == 0) {
+    saved_error = errno;
+  }
+  if (saved_error != 0) {
+    const std::string message = ErrnoText(saved_error);
     ::unlink(temp.c_str());
     SetError(error_message, "Cannot flush " + temp + ": " + message);
     return false;

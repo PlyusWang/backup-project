@@ -243,7 +243,16 @@ bool SaveRemoteIndex(const std::string& cache_directory,
     }
     written += static_cast<std::size_t>(got);
   }
-  if (::fsync(fd) != 0 || ::close(fd) != 0) {
+  // fsync 与 close 必须各自尝试：短路会在 fsync 失败时跳掉 close，
+  // 每失败一次泄漏一个 fd。saved_error 只记第一次失败。
+  int saved_error = 0;
+  if (::fsync(fd) != 0) {
+    saved_error = errno;
+  }
+  if (::close(fd) != 0 && saved_error == 0) {
+    saved_error = errno;
+  }
+  if (saved_error != 0) {
     ::unlink(part.c_str());
     SetError(error_message, "缓存索引落盘失败");
     return false;

@@ -197,7 +197,19 @@ bool InotifyWatcher::AddDirectory(int fd, const std::string& path, bool is_root,
   for (const std::string& name : children) {
     const std::string child = JoinPath(path, name);
     struct stat child_info;
-    if (::lstat(child.c_str(), &child_info) != 0) continue;  // 刚好被删掉
+    if (::lstat(child.c_str(), &child_info) != 0) {
+      // 只有 ENOENT 才是“这一层在这一瞬间被删了”这种可以忽略的竞态。
+      // EACCES / ELOOP / ENAMETOOLONG / EIO 等一律硬失败：把它当成“刚好被删”
+      // 会让整棵子树静默地不被 watch，而 BuildWatches 仍然报成功——
+      // 正是头文件承诺要避免的“假装健康”。
+      const int saved_errno = errno;
+      if (saved_errno != ENOENT) {
+        SetError(error_message, "Cannot inspect " + child + ": " +
+                                    ErrnoText(saved_errno));
+        return false;
+      }
+      continue;
+    }
     if (!S_ISDIR(child_info.st_mode)) continue;  // 软链接不 follow
     if (!AddDirectory(fd, child, false, watches, index, error_message)) {
       return false;
