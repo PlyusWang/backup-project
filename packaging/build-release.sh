@@ -190,6 +190,9 @@ build_appdir() {
   done
   write_build_info "$appdir/usr/share/backup-project" "client-appdir"
   printf '%s\n' "$VERSION" > "$appdir/usr/share/backup-project/VERSION"
+  # 第三方许可材料：在**构建容器里**按实际随包的 .so 生成（见 packaging/licenses/）
+  bash packaging/licenses/build-materials.sh "$appdir/usr/lib" \
+    "$appdir/usr/share/doc/backup-project-client" "backup-project-client"
 
   # 图标要在 linuxdeploy **之前**就位：linuxdeploy 会按 desktop 文件的 Icon=
   # 去 AppDir 里找图标文件，找不到就直接失败。图标本身来自仓库自己的
@@ -287,6 +290,11 @@ pack_client_tarball() {
   install -m 0755 packaging/portable/uninstall-client.sh "$tree/uninstall.sh"
   install -m 0644 packaging/client/backup-project.desktop "$tree/packaging/client/"
   install -m 0755 packaging/portable/uninstall-client.sh "$tree/packaging/portable/"
+  # 第三方许可材料：tar 解开就在根上（同时给 share/doc 一份，安装后也能找到）
+  bash packaging/licenses/build-materials.sh "$appdir/usr/lib" "$tree" "backup-project-client"
+  mkdir -p "$tree/share/doc/backup-project-client"
+  cp -a "$tree/THIRD-PARTY-NOTICES.txt" "$tree/LICENSE-INVENTORY.md" "$tree/licenses" \
+    "$tree/share/doc/backup-project-client/"
   write_build_info "$tree" client
   write_manifest "$tree" > /dev/null
   tar_reproducible "$RELEASE_DIR/backup-project-client-$VERSION-linux-x86_64.tar.xz" "$stage_root" "$top"
@@ -313,6 +321,8 @@ pack_client_deb() {
   for doc in docs/client-quick-start.md docs/release-layout.md docs/secure_transport.md docs/install-client.md docs/release-packaging.md; do
     [ -f "$doc" ] && install -m 0644 "$doc" "$tree/usr/share/doc/backup-project-client/"
   done
+  bash packaging/licenses/build-materials.sh "$tree/usr/lib/backup-project-client/lib" \
+    "$tree/usr/share/doc/backup-project-client" "backup-project-client"
   write_build_info "$tree/usr/share/doc/backup-project-client" client
   write_manifest "$tree/usr/share/doc/backup-project-client" > /dev/null
   cat > "$WORK/third-party-notices-client.txt" <<EOF
@@ -372,7 +382,20 @@ EOF
   depends="$filtered"
   [ -n "$depends" ] || die "过滤掉自带的 Qt 之后依赖为空，说明推算出错了"
   case "$depends" in *libqt6*|*qt6-base-abi*) die "依赖里仍残留发行版 Qt 包" ;; esac
-  log "  剩余依赖都是目标机必须提供的系统库"
+  # 语义自检（回归）：Depends 里不许出现任何"我们自己随包提供了它的库"的发行版包；
+  # 同时必需的底层系统依赖必须还在。按语义检查，不是断言条目数 —— 以后依赖合理
+  # 变化（例如 Qt 版本升级带来新的系统库）不该误报。
+  local d
+  local IFS=','
+  for d in $depends; do
+    d="$(printf '%s' "$d" | sed -e 's/^ *//' -e 's/ *$//' | sed -e 's/ *(.*$//')"
+    case " $bundled_pkgs " in
+      *" $d "*) unset IFS; die "Depends 里出现了我们自己随包的库：$d" ;;
+    esac
+  done
+  unset IFS
+  case "$depends" in *libc6*) : ;; *) die "Depends 里缺少 libc6（系统依赖不该被过滤掉）" ;; esac
+  log "  剩余依赖都是目标机必须提供的系统库（且不含任何随包组件）"
   log "  依赖（dpkg-shlibdeps，已去掉自带的 Qt）：$depends"
   build_deb packaging/client/deb "$tree" "$RELEASE_DIR/backup-project-client_${DEB_VERSION}_${DEB_ARCH}.deb" "$depends"
 }
@@ -429,6 +452,9 @@ pack_server_deb() {
   log "== 服务端 .deb =="
   rm -rf "$tree"; mkdir -p "$tree"
   server_payload "$tree"
+  # 服务端不重新分发任何第三方二进制：只带一份说明这件事的声明
+  install -m 0644 packaging/licenses/SERVER-NOTICES.txt \
+    "$tree/usr/share/doc/backup-project-server/THIRD-PARTY-NOTICES.txt"
   write_build_info "$tree/usr/share/doc/backup-project-server" server
   write_manifest "$tree/usr/share/doc/backup-project-server" > /dev/null
   cat > "$tree/usr/share/doc/backup-project-server/copyright" <<EOF
@@ -476,6 +502,7 @@ pack_server_tarball() {
   install -m 0755 packaging/portable/uninstall.sh "$tree/packaging/portable/"
   install -m 0755 packaging/portable/install-server.sh "$tree/packaging/portable/"
   rm -rf "$tree/portable-root"
+  install -m 0644 packaging/licenses/SERVER-NOTICES.txt "$tree/THIRD-PARTY-NOTICES.txt"
   write_build_info "$tree" server
   write_manifest "$tree" > /dev/null
   tar_reproducible "$RELEASE_DIR/backup-project-server-$VERSION-linux-x86_64.tar.xz" "$stage_root" "$top"
