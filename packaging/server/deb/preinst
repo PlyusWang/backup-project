@@ -9,56 +9,101 @@
 # dpkg 自己只备份 conffile（*.dpkg-old / *.dpkg-new），既不保留被替换掉的旧二进制，
 # 也不提供事务回滚；所以"能恢复的旧版本"只能由我们在第 1 步抓下来。
 #
+# 两种场景，语义**故意不同**：
+#
+#   A. 旧服务升级前是 active：回滚快照是升级的**前置条件**。快照没完整、安全地建立起来
+#      （文件清单读不到 / 复制失败 / manifest 写不了 / 自检不过 / 单个文件都没有），
+#      preinst 就返回非零 —— dpkg 会因此**在解包之前**中止这次升级，旧版本原封不动。
+#      宁可这次升级不做，也不能"把原本能跑的服务变成跑不起来"。
+#
+#   B. 旧服务升级前不是 active：不制作快照、允许升级，也**不承诺**回滚到"可运行旧版本"
+#      —— 本来就没有已确认在跑的旧服务。
+#
+# 快照怎么建（原子性）：
+#   * 先在 $CACHE_DIR/rollback.tmp.$$ 里建全，再自检；
+#   * 自检项：manifest 非空、version 非空、条目数一致、每条路径都在载荷白名单里、
+#     每个 regular file 的 sha256 与 manifest 一致；
+#   * 自检通过后写 snapshot-ready 标记，再**原子换入** $CACHE_DIR/rollback/（mv）；
+#   * 任何一步失败：删掉 tmp、**不留半成品**、exit 非零（升级在解包前中止）。
+#   失败时绝不留下一个"看起来有效"的 rollback/ 让 postinst 误用。
+#
 # 抓什么、绝不抓什么：
 #   * 来源 = dpkg 的旧包文件清单（provenance 明确：不猜路径、不搜目录）；
-#   * 只有旧服务确实 active 时才抓 —— 否则没有"可运行版本"，也不该假装能恢复；
-#   * 只抓程序载荷：/usr/lib/backup-project-server、/usr/bin 的包装器、unit、
-#     tmpfiles 片段；
+#   * 只抓程序载荷：/usr/lib/backup-project-server、/usr/bin 的包装器、unit、tmpfiles 片段；
 #   * 绝不碰 /etc（conffile 归 dpkg 管，用户改过的 server.conf 更不许覆盖）；
 #   * 绝不碰 /var/lib/backup-project-server（备份数据、元数据库、transport.key）
 #     与 /etc/backup-project-server/secrets.env —— 它们是用户状态，不是回滚对象；
 #   * 不抓 /usr/share/doc 与 /usr/lib/backup-project-server/share/doc（文档不是运行时载荷）。
-# 落点 /var/cache/backup-project-server/rollback/：FHS 里 /var/cache 就是"可再生、
-# 删掉不丢用户状态"的缓存；升级成功由 postinst 删除，卸载/清除由 postrm 删除。
+# 落点 /var/cache/backup-project-server/：FHS 里 /var/cache 就是"可再生、删掉不丢用户
+# 状态"的缓存；升级成功由 postinst 删除，卸载/清除由 postrm 删除。
 set -e
 
 ACTION="${1:-}"
 PKG=backup-project-server
 CACHE_DIR=/var/cache/backup-project-server
 ROLLBACK_DIR="$CACHE_DIR/rollback"
-TREE="$ROLLBACK_DIR/tree"
-MANIFEST="$ROLLBACK_DIR/manifest"
+TMP_DIR="$CACHE_DIR/rollback.tmp.$$"
 
 # 只有 upgrade 需要旧版本恢复材料；install / abort-upgrade / triggered 什么都不做。
 [ "$ACTION" = "upgrade" ] || exit 0
 
 log()  { echo "[backup-project-server] preinst: $*"; }
 warn() { echo "[backup-project-server] preinst: WARN: $*" >&2; }
+err()  { echo "[backup-project-server] preinst: ERROR: $*" >&2; }
 
 have_systemd() { [ -d /run/systemd/system ] && command -v systemctl >/dev/null 2>&1; }
 
-# ---- 1. 旧服务在跑吗？没在跑就没有"可运行版本"可言 ----
+cleanup_tmp() { rm -rf "$TMP_DIR" 2>/dev/null || true; }
+trap cleanup_tmp EXIT
+
+# ---- 场景 B：旧服务不是 active → 不做快照，允许升级 ----
 if ! have_systemd || ! systemctl is-active --quiet "$PKG"; then
-  log "升级前旧服务不是 active：不留回滚材料（失败时也不会假装能恢复）。"
+  log "升级前旧服务不是 active：不制作回滚快照（升级继续；失败时不会假装能回滚到可运行版本）。"
   exit 0
 fi
 
+# ---- 场景 A：快照是升级前置条件，任何一步失败都在解包前中止 ----
+abort_before_unpack() {
+  err "rollback snapshot preparation failed: $1"
+  err "upgrade aborted before unpack"
+  err "  old service was active（升级前 $PKG 是 active，所以这次升级必须先有可恢复的旧载荷）"
+  err "  existing runnable installation left untouched（旧程序文件与用户状态都还在，dpkg 不解包新版本）"
+  err "  修好上面的原因后重试： sudo apt install --reinstall ./<要升级的 .deb>"
+  err "  想放弃这次升级：什么都不用做，当前安装仍然是可运行的那一份。"
+  cleanup_tmp
+  exit 1
+}
+
+# 0. 缓存目录必须是目录，而且真的能写 —— 快照放不下就不该开始升级。
+if [ -e "$CACHE_DIR" ] && [ ! -d "$CACHE_DIR" ]; then
+  abort_before_unpack "$CACHE_DIR 已存在但不是目录"
+fi
+if ! mkdir -p "$CACHE_DIR" 2>/dev/null; then
+  abort_before_unpack "创建缓存目录失败：$CACHE_DIR"
+fi
+if ! chmod 0700 "$CACHE_DIR" 2>/dev/null; then
+  abort_before_unpack "设置缓存目录权限失败：$CACHE_DIR"
+fi
+if ! rm -rf "$TMP_DIR" 2>/dev/null; then
+  abort_before_unpack "清理上一次残留的临时快照失败：$TMP_DIR"
+fi
+if ! mkdir -p "$TMP_DIR/tree" 2>/dev/null; then
+  abort_before_unpack "创建临时快照目录失败：$TMP_DIR"
+fi
+
+# 1. 旧版本号 + 旧包文件清单（provenance）
 OLD_VERSION="$(dpkg-query -W -f '${Version}' "$PKG" 2>/dev/null || true)"
+[ -n "$OLD_VERSION" ] || abort_before_unpack "读不到当前安装的版本号（dpkg-query -W $PKG）"
 
-# ---- 2. 旧包文件清单（provenance）----
-LIST="$(mktemp)"
+LIST="$TMP_DIR/pkg-filelist"
 if ! dpkg-query -L "$PKG" > "$LIST" 2>/dev/null; then
-  warn "读不到 $PKG 的文件清单：准备不了回滚材料。升级继续，但失败时无法自动恢复。"
-  rm -f "$LIST"
-  exit 0
+  abort_before_unpack "dpkg-query -L $PKG 失败（拿不到旧包文件清单）"
 fi
 
-# ---- 3. 只复制程序载荷 ----
-rm -rf "$ROLLBACK_DIR"
-mkdir -p "$TREE"
-: > "$MANIFEST.tmp"
+# 2. 只复制程序载荷
+MANIFEST="$TMP_DIR/manifest"
+: > "$MANIFEST"
 count=0
-failed=0
 while IFS= read -r path; do
   [ -n "$path" ] || continue
   # 路径白名单：postinst 恢复时会用同一份白名单再校验一次。
@@ -70,28 +115,63 @@ while IFS= read -r path; do
   if [ -L "$path" ]; then :; elif [ -d "$path" ]; then continue; fi
   if [ ! -e "$path" ] && [ ! -L "$path" ]; then continue; fi
   rel="${path#/}"
-  mkdir -p "$TREE/$(dirname "$rel")" || { failed=1; break; }
-  cp -a "$path" "$TREE/$rel" || { failed=1; break; }        # -a：权限/属主/时间/符号链接
+  mkdir -p "$TMP_DIR/tree/$(dirname "$rel")" || abort_before_unpack "创建快照子目录失败：$rel"
+  cp -a "$path" "$TMP_DIR/tree/$rel" || abort_before_unpack "复制程序文件失败：$path"
   if [ -L "$path" ]; then
-    printf 'link\t-\t-\t-\t%s\t%s\n' "$(readlink "$path")" "$path" >> "$MANIFEST.tmp" || { failed=1; break; }
+    printf 'link\t-\t-\t-\t%s\t%s\n' "$(readlink "$path")" "$path" >> "$MANIFEST" || abort_before_unpack "写 manifest 失败：$path"
   else
     printf 'file\t%s\t%s\t%s\t%s\t%s\n' \
       "$(stat -c '%a' "$path")" "$(stat -c '%U' "$path")" "$(stat -c '%G' "$path")" \
-      "$(sha256sum "$path" | cut -d' ' -f1)" "$path" >> "$MANIFEST.tmp" || { failed=1; break; }
+      "$(sha256sum "$path" | cut -d' ' -f1)" "$path" >> "$MANIFEST" || abort_before_unpack "写 manifest 失败：$path"
   fi
   count=$((count + 1))
 done < "$LIST"
-rm -f "$LIST"
+[ "$count" -gt 0 ] || abort_before_unpack "旧包里没有任何程序载荷文件（清单为空）"
 
-if [ "$failed" -ne 0 ] || [ "$count" -eq 0 ]; then
-  warn "回滚材料没有准备成功（失败=$failed，已复制=$count 个文件）：升级继续，失败时无法自动恢复。"
-  rm -rf "$ROLLBACK_DIR"
-  exit 0
+# 3. 自检：manifest 非空、version 非空、条目数一致、路径仍白名单、regular file 的 sha256 一致
+verify_snapshot() {
+  [ -s "$MANIFEST" ] || { err "自检：manifest 是空的"; return 1; }
+  [ -n "$OLD_VERSION" ] || { err "自检：version 是空的"; return 1; }
+  local type mode owner group hash path src actual n=0
+  while IFS=$'\t' read -r type mode owner group hash path; do
+    [ -n "${path:-}" ] || continue
+    case "$path" in
+      /usr/lib/backup-project-server/*|/usr/bin/*|/usr/lib/tmpfiles.d/*|/lib/systemd/system/*|/usr/lib/systemd/system/*) ;;
+      *) err "自检：路径不在载荷白名单里：$path"; return 1 ;;
+    esac
+    src="$TMP_DIR/tree/${path#/}"
+    if [ "$type" = "link" ]; then
+      [ -L "$src" ] || { err "自检：快照里缺少符号链接：$path"; return 1; }
+    else
+      [ -f "$src" ] || { err "自检：快照里缺少文件：$path"; return 1; }
+      actual="$(sha256sum "$src" | cut -d' ' -f1)"
+      [ "$actual" = "$hash" ] || { err "自检：sha256 不一致：$path"; return 1; }
+    fi
+    n=$((n + 1))
+  done < "$MANIFEST"
+  [ "$n" -gt 0 ] || { err "自检：有效条目为 0"; return 1; }
+  [ "$n" = "$count" ] || { err "自检：条目数不一致（$n != $count）"; return 1; }
+  return 0
+}
+verify_snapshot || abort_before_unpack "快照自检没有通过（manifest / version / 条目数 / 路径白名单 / sha256）"
+
+# 4. 元信息 + ready 标记（先写在 tmp 里，跟着快照一起原子换入）
+printf '%s\n' "$OLD_VERSION" > "$TMP_DIR/version" || abort_before_unpack "写 version 失败"
+date -u +%Y-%m-%dT%H:%M:%SZ > "$TMP_DIR/captured-at" || abort_before_unpack "写 captured-at 失败"
+printf 'files=%s\nversion=%s\n' "$count" "$OLD_VERSION" > "$TMP_DIR/snapshot-ready" || abort_before_unpack "写 snapshot-ready 失败"
+
+# 5. 原子换入：要么整体生效，要么完全不存在
+if [ -e "$ROLLBACK_DIR" ]; then
+  rm -rf "$ROLLBACK_DIR" || abort_before_unpack "清理上一次的回滚材料失败：$ROLLBACK_DIR"
+fi
+if ! mv -T "$TMP_DIR" "$ROLLBACK_DIR" 2>/dev/null; then
+  mv "$TMP_DIR" "$ROLLBACK_DIR" 2>/dev/null || abort_before_unpack "原子换入回滚材料失败：$TMP_DIR -> $ROLLBACK_DIR"
 fi
 
-mv "$MANIFEST.tmp" "$MANIFEST"
-printf '%s\n' "$OLD_VERSION" > "$ROLLBACK_DIR/version"
-date -u +%Y-%m-%dT%H:%M:%SZ > "$ROLLBACK_DIR/captured-at"
-chmod 0700 "$CACHE_DIR" "$ROLLBACK_DIR"
-log "已准备回滚材料：$count 个程序文件（升级前版本 $OLD_VERSION）→ $ROLLBACK_DIR"
+# 6. 换入后再确认一次：现在生效的就是这次升级要用的那一份
+if [ ! -s "$ROLLBACK_DIR/manifest" ] || [ ! -s "$ROLLBACK_DIR/version" ] || [ ! -f "$ROLLBACK_DIR/snapshot-ready" ]; then
+  abort_before_unpack "换入后的回滚材料不完整：$ROLLBACK_DIR"
+fi
+
+log "SNAPSHOT_READY = YES：$count 个程序文件（升级前版本 $OLD_VERSION）→ $ROLLBACK_DIR（自检通过）"
 exit 0

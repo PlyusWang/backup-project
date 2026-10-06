@@ -40,9 +40,15 @@ dpkg_version()  { dpkg-query -W -f '${Version}' "$PKG" 2>/dev/null || true; }
 conf_value() { sed -n "s|^[[:space:]]*$1[[:space:]]*=[[:space:]]*||p" "$CONF_DIR/server.conf" | sed -n '1p'; }
 
 # ---------------------------------------------------------------- 回滚材料
-# preinst 写、这里读。只认"这次升级之前那个版本"的材料：陈旧材料一律不用。
+# preinst 写、这里读。三个条件缺一不可：
+#   * snapshot-ready —— preinst 只在快照**完整且自检通过**时才写这个标记；
+#     没有它说明材料来路不明（半成品/上一次的残留），宁可不回滚也不拿它覆盖正在运行的程序；
+#   * version 必须等于这次升级之前那个版本（陈旧材料一律不用）；
+#   * manifest / tree 必须存在且非空。
 rollback_available() {
-  [ -f "$ROLLBACK_DIR/manifest" ] || return 1
+  [ -f "$ROLLBACK_DIR/snapshot-ready" ] || return 1
+  [ -s "$ROLLBACK_DIR/manifest" ] || return 1
+  [ -s "$ROLLBACK_DIR/version" ] || return 1
   [ -d "$ROLLBACK_DIR/tree" ] || return 1
   [ -n "$OLD_VERSION" ] || return 1
   [ "$(sed -n '1p' "$ROLLBACK_DIR/version" 2>/dev/null || true)" = "$OLD_VERSION" ] || return 1
@@ -169,7 +175,8 @@ fail_and_maybe_rollback() {
   fi
 
   if ! rollback_available; then
-    err "没有版本匹配的回滚材料（升级前旧服务不是 active，或材料已被清理）：不会用陈旧材料覆盖当前载荷。"
+    err "没有可用的回滚材料：要么升级前旧服务不是 active（preinst 因此没有做快照），要么材料已被提交或清理。"
+    err "不会用陈旧 / 不完整的材料去覆盖当前载荷。"
     err "请修复后重装： sudo apt install --reinstall ./<上一个可用版本的 .deb>"
     exit 1
   fi
@@ -260,7 +267,7 @@ else
 fi
 
 if [ "$ACTION" != "configure" ]; then
-  log "action=$ACTION：文件已更新，这里不做服务动作。"
+  log "action=$ACTION：不是 configure，这里不做服务动作。"
   exit 0
 fi
 
