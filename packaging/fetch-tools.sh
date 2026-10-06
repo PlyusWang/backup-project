@@ -9,7 +9,10 @@
 set -Eeuo pipefail
 source "$(dirname "${BASH_SOURCE[0]}")/lib/common.sh"
 
-TOOLS_DIR="$PACKAGING_DIR/.tools"
+# 默认放在 dist/ 下面：那是构建产物目录（已在 .gitignore 里），不会污染工作树。
+# 打包脚本对"工作树必须干净"是硬要求，构建过程中往仓库里写文件会直接让下一次
+# 构建拒绝运行（第一次就是这么挂的）。
+TOOLS_DIR="$REPO_ROOT/dist/.tools"
 while [ $# -gt 0 ]; do
   case "$1" in
     --dir) TOOLS_DIR="$2"; shift 2 ;;
