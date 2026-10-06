@@ -36,9 +36,17 @@
 **Qt 6.2.4**（`qt6-declarative 6.2.4+dfsg-3ubuntu1`）。也就是说 22.04 上
 GUI 会直接报 `FolderDialog is not a type`。
 
-**结论**：客户端构建基线取 **Debian 12（Qt 6.4.2 / glibc 2.36）**；
-Ubuntu 22.04 不在客户端支持范围内（这一点写在 `docs/install-client.md` 里，
-并用"干净 22.04 容器里装不上/跑不起来"的实测记录在 COMPATIBILITY.md 中留证）。
+**结论**：客户端**构建**基线取 **Debian 12（Qt 6.4.2 / glibc 2.36）** ——
+Ubuntu 22.04 不能当构建机（它的 Qt 6.2.4 缺 FolderDialog）。
+
+但**运行时**是另一回事：发行包自带 Qt 6.4.2 与它的依赖（包括 ICU 72），
+所以在 Ubuntu 22.04 上跑得起来。CI 里有一个作业在干净的 ubuntu:22.04 容器里
+实测：AppImage 启动正常、.deb 装得上、GUI 起得来、QML 告警 0。
+
+（本轮早些时候这里写过“22.04 不支持”，那是把 libicu*.so.72 当成系统依赖了 ——
+它其实在 AppImage 里。同一轮修掉的另一个问题是 .deb 的 Depends：dpkg-shlibdeps
+会为我们**自己随包**的库 declare 发行版包，于是出现“在 22.04 上装不上、但装上了
+本来能跑”的矛盾；现在随包 .so 会逐个映射回提供包并从 Depends 中剔除。）
 
 ## 3. 构建入口
 
@@ -104,7 +112,8 @@ client=debian:12），再做干净机器安装验收（debian:12 容器 + Ubuntu
 
 * 架构只有 x86_64；没有 ARM64、没有 Windows、没有 macOS（未构建、未验证，因此
   不声称支持）；
-* 客户端不支持 Ubuntu 22.04（Qt 6.2.4 缺 `FolderDialog`，见第 2 节）；
+* Ubuntu 22.04 只能作为客户端**运行**环境（已验证），不能作为**构建**基线
+  （Qt 6.2.4 缺 FolderDialog，见第 2 节）；
 * 上游仓库**没有 LICENSE 文件**：发行包的 `copyright` 如实记录这一点，不替权利人
   补许可证；正式对外发布前应由权利人决定许可证；
 * 桌面集成是最小的：仓库没有正式图标资源，所以 `.desktop` 里不放 `Icon=`；
