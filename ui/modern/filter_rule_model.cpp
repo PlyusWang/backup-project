@@ -11,6 +11,7 @@
 #include <string>
 
 #include "backup_preview.h"
+#include "format_bytes.h"
 
 namespace backup_modern {
 namespace {
@@ -295,10 +296,10 @@ QString ClauseDetail(const bp::FilterClauseDraft& clause) {
   return QString();
 }
 
+// 预览里的文件大小也走全产品唯一的格式化规则：以前这里是整数截断的
+// “KB / MB”，而实际除的是 1024。
 QString FormatSize(std::uint64_t bytes) {
-  if (bytes < 1024) return QString::number(bytes) + " B";
-  if (bytes < 1024 * 1024) return QString::number(bytes / 1024) + " KB";
-  return QString::number(bytes / (1024 * 1024)) + " MB";
+  return QString::fromStdString(backupproject::FormatByteSize(bytes));
 }
 
 bp::RuleSizeUnit UnitFromText(const QString& text) {

@@ -19,6 +19,7 @@
 
 #include "backup_engine.h"
 #include "backup_option_keys.h"
+#include "format_bytes.h"
 #include "incremental_backup.h"
 #include "incremental_restore.h"
 
@@ -40,22 +41,10 @@ const char kScopeBackup[] = "backup";
 const char kScopeSettings[] = "settings";
 const char kScopeManagement[] = "management";
 
-// 文件大小的展示文本。格式化放在 C++ 这层，QML 不需要自己实现一套单位换算。
+// 文件大小的展示文本。格式规则只有一份（include/format_bytes.h），
+// Qt 这层只把 std::string 转成 QString；QML 不实现单位换算。
 QString FormatSize(std::uint64_t bytes) {
-  constexpr double kKilo = 1024.0;
-  constexpr double kMega = kKilo * 1024.0;
-  constexpr double kGiga = kMega * 1024.0;
-  const double value = static_cast<double>(bytes);
-  if (value < kKilo) {
-    return QStringLiteral("%1 B").arg(static_cast<qulonglong>(bytes));
-  }
-  if (value < kMega) {
-    return QStringLiteral("%1 KB").arg(value / kKilo, 0, 'f', 1);
-  }
-  if (value < kGiga) {
-    return QStringLiteral("%1 MB").arg(value / kMega, 0, 'f', 1);
-  }
-  return QStringLiteral("%1 GB").arg(value / kGiga, 0, 'f', 2);
+  return QString::fromStdString(backupproject::FormatByteSize(bytes));
 }
 
 // 归档文件自身的 mtime。archive v0.1 里没有 created_at 这类字段，
@@ -358,6 +347,36 @@ BackupController::BackupController(const QString& config_file_path,
 
 // 相等就不发信号：QML 的双向绑定会把输入框的值再写回来一次，
 // 少了这个判断会来回触发，形成绑定环。
+// 选项显示名：手动 / 自动 / 实时三个页面共用这一份。以前各页自己
+// 写一份，而且手动页漏了“推荐 / 兼容格式”这两条取舍提示。
+//
+// 顺序与 QML 侧列出的 key 一一对应：strategy 对 full / incremental，
+// pack 对 mypack / ustar / fast-ustar，compression 对 none / huffman /
+// lzss-huffman， encryption 对 none / aes-256-ctr-hmac-sha256 /
+// des-cbc-hmac-sha256。
+QStringList BackupController::optionStrategyLabels() const {
+  return {QStringLiteral("完整备份"), QStringLiteral("增量备份")};
+}
+
+QStringList BackupController::optionPackLabels() const {
+  // “推荐 / 兼容格式”是给用户看的取舍提示：MyPack 是本项目自有格式
+  // （增量链只支持它），另两种是通用格式。三个页面都必须看到同一条提示。
+  return {QStringLiteral("MyPack（推荐）"), QStringLiteral("USTAR（兼容格式）"),
+          QStringLiteral("Fast USTAR（兼容格式）")};
+}
+
+QStringList BackupController::optionCompressionLabels() const {
+  return {QStringLiteral("不压缩"), QStringLiteral("Huffman"),
+          QStringLiteral("LZSS + Huffman")};
+}
+
+QStringList BackupController::optionEncryptionLabels() const {
+  // 不加密 -> AES -> DES。DES 后面必须挂着“教学 / 旧算法”标记，
+  // 免得有人在真实数据上误选它。
+  return {QStringLiteral("不加密"), QStringLiteral("AES-256-CTR + HMAC-SHA256"),
+          QStringLiteral("DES-CBC + HMAC-SHA256（教学 / 旧算法）")};
+}
+
 void BackupController::setSourcePath(const QString& path) {
   if (source_path_ == path) {
     return;

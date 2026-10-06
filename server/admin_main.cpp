@@ -58,6 +58,7 @@
 
 #include "admin_selector.h"
 #include "file_lock.h"
+#include "format_bytes.h"
 #include "network_protocol.h"
 #include "remote_maintenance.h"
 #include "remote_metadata_store.h"
@@ -155,22 +156,9 @@ std::string FormatTime(std::int64_t unix_seconds) {
   return std::string(buffer);
 }
 
+// 展示层的字节数格式只有一份实现（include/format_bytes.h），这里只做转发。
 std::string FormatSize(std::uint64_t bytes) {
-  static const char* kUnits[] = {"B", "KiB", "MiB", "GiB", "TiB"};
-  double value = static_cast<double>(bytes);
-  std::size_t unit = 0;
-  while (value >= 1024.0 && unit + 1 < sizeof(kUnits) / sizeof(kUnits[0])) {
-    value /= 1024.0;
-    ++unit;
-  }
-  char buffer[64];
-  if (unit == 0) {
-    std::snprintf(buffer, sizeof(buffer), "%llu B",
-                  static_cast<unsigned long long>(bytes));
-  } else {
-    std::snprintf(buffer, sizeof(buffer), "%.1f %s", value, kUnits[unit]);
-  }
-  return std::string(buffer);
+  return backupproject::FormatByteSize(bytes);
 }
 
 // 把路径变成"可以直接粘贴进终端"的绝对路径：存在时解析符号链接，不存在时

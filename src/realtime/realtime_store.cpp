@@ -19,6 +19,7 @@
 
 #include "backup_catalog.h"
 #include "backup_option_keys.h"
+#include "file_io.h"
 #include "incremental_delta.h"
 #include "simple_json.h"
 #include "source_digest.h"
@@ -656,48 +657,11 @@ bool RealtimeStore::Save(const RealtimeConfig& config,
   AppendRules(&out, "exclude_rules", config.exclude_rules, true);
   out += "}\n";
 
-  const std::string temp = file_path_ + ".tmp";
-  ::unlink(temp.c_str());
-  const int fd =
-      ::open(temp.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
-  if (fd < 0) {
-    SetError(error_message, "Cannot create " + temp + ": " + ErrnoText(errno));
-    return false;
-  }
-  std::size_t written = 0;
-  while (written < out.size()) {
-    const ssize_t got = ::write(fd, out.data() + written, out.size() - written);
-    if (got < 0) {
-      if (errno == EINTR) continue;
-      const std::string message = ErrnoText(errno);
-      ::close(fd);
-      ::unlink(temp.c_str());
-      SetError(error_message, "Cannot write " + temp + ": " + message);
-      return false;
-    }
-    written += static_cast<std::size_t>(got);
-  }
-  // fsync 与 close 必须**各自**尝试：`fsync(fd) != 0 || close(fd) != 0` 会在
-  // fsync 失败时短路掉 close，每失败一次泄漏一个 fd（ENOSPC/EIO 正是会连续
-  // 失败的那种场景）。saved_error 只记第一次失败的原因，后面的清理步骤不得
-  // 改写它。
-  int saved_error = 0;
-  if (::fsync(fd) != 0) {
-    saved_error = errno;
-  }
-  if (::close(fd) != 0 && saved_error == 0) {
-    saved_error = errno;
-  }
-  if (saved_error != 0) {
-    const std::string message = ErrnoText(saved_error);
-    ::unlink(temp.c_str());
-    SetError(error_message, "Cannot flush " + temp + ": " + message);
-    return false;
-  }
-  if (::rename(temp.c_str(), file_path_.c_str()) != 0) {
-    const std::string message = ErrnoText(errno);
-    ::unlink(temp.c_str());
-    SetError(error_message, "Cannot publish " + file_path_ + ": " + message);
+  // 发布走共享的原子替换写入（src/core/file_io.cpp）：唯一临时文件 +
+  // fsync + rename + 父目录 fsync。以前这里自己写了一套（固定的 <file>.tmp、
+  // 不 fsync 父目录），而 schedule_store 当时就警告过：两份各自演化的写法
+  // 迟早会有一份漏掉某条边界。
+  if (!WriteFileAtomicallyReplacing(file_path_, out, error_message)) {
     return false;
   }
   return true;

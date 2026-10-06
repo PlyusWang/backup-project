@@ -121,6 +121,7 @@ run config_manager bash scripts/config_manager_test.sh
 run crypto bash scripts/crypto_test.sh
 run file_io bash scripts/file_io_test.sh
 run cleanup-contract bash scripts/cleanup_contract_test.sh
+run format-bytes bash scripts/format_bytes_test.sh
 run filter_metadata bash scripts/filter_metadata_test.sh
 run filter_rule_builder bash scripts/filter_rule_builder_test.sh
 run filter_rule_builder_int bash scripts/filter_rule_builder_int_test.sh

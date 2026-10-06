@@ -28,6 +28,7 @@
 #include "cli_app.h"
 #include "config_manager.h"
 #include "filter.h"
+#include "format_bytes.h"
 #include "incremental_backup.h"
 #include "incremental_restore.h"
 #include "schedule_store.h"
@@ -94,8 +95,10 @@ std::string FormatLocalTime(std::int64_t seconds) {
   return std::string(buffer);
 }
 
+// 与服务端管理工具、Modern GUI 共用同一份格式化规则：以前这里只报裸字节，
+// 同一份归档在 CLI 与 GUI 里看起来就不一样。
 std::string FormatSize(std::uint64_t bytes) {
-  return std::to_string(bytes) + " B";
+  return backupproject::FormatByteSize(bytes);
 }
 
 std::string JoinRules(const std::vector<std::string>& rules) {

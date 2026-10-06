@@ -17,6 +17,7 @@
 #include "backup_mode.h"
 #include "backup_option_keys.h"
 #include "filter.h"
+#include "format_bytes.h"
 #include "schedule_frequency.h"
 
 namespace backup_modern {
@@ -35,8 +36,9 @@ QString FormatLocalTime(std::int64_t seconds) {
       .toString(QStringLiteral("yyyy-MM-dd HH:mm:ss"));
 }
 
+// 计划历史里的大小与其他页面同一套规则：以前这里只报裸字节。
 QString FormatSize(std::uint64_t bytes) {
-  return QStringLiteral("%1 B").arg(static_cast<qulonglong>(bytes));
+  return QString::fromStdString(backupproject::FormatByteSize(bytes));
 }
 
 QString ChangeText(qulonglong added, qulonglong removed, qulonglong modified,

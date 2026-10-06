@@ -21,6 +21,7 @@
 #include "archive_path.h"
 #include "backup_catalog.h"
 #include "container_format.h"
+#include "file_io.h"
 #include "incremental_backup.h"
 
 namespace backupproject {
@@ -683,9 +684,14 @@ bool RestoreSnapshotChain(const std::string& repository_directory,
         break;
       }
     }
-    if (::rename(staging.c_str(), destination_directory.c_str()) != 0) {
-      SetError(error_message,
-               "Cannot publish the restored tree: " + ErrnoText(errno));
+    // 发布走项目共用的原子替换原语：单次 rename（目标已经在上面处理
+    // 成不存在），成功之后同步父目录，与 PublishNoReplace /
+    // WriteFileAtomicallyReplacing 保持同一条 durability 策略。
+    //
+    // rename 一旦成功，destination 就已经真实发布了：这里不做任何
+    // “失败就把 destination 删掉”的补救，那只会把一次成功的恢复变成
+    // 数据丢失。
+    if (!PublishReplacing(staging, destination_directory, error_message)) {
       break;
     }
     ok = true;
