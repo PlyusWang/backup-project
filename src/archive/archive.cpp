@@ -41,6 +41,7 @@
 #include <vector>
 
 #include "archive_entry.h"
+#include "byte_order.h"
 #include "container_format.h"
 #include "file_system.h"
 #include "filter.h"
@@ -155,59 +156,9 @@ void AppendU64LE(std::string* out, std::uint64_t value) {
   }
 }
 
-// 读侧：字段不完整就直接失败，绝不读到一半继续用。
-bool ReadU8(const unsigned char* data, std::size_t size, std::size_t* offset,
-            std::uint8_t* out) {
-  if (*offset + 1 > size) {
-    return false;
-  }
-  *out = data[*offset];
-  *offset += 1;
-  return true;
-}
-
-bool ReadU16LE(const unsigned char* data, std::size_t size, std::size_t* offset,
-               std::uint16_t* out) {
-  if (*offset + 2 > size) {
-    return false;
-  }
-  std::uint16_t value = 0;
-  for (int i = 0; i < 2; ++i) {
-    value |= static_cast<std::uint16_t>(data[*offset + i]) << (8 * i);
-  }
-  *offset += 2;
-  *out = value;
-  return true;
-}
-
-bool ReadU32LE(const unsigned char* data, std::size_t size, std::size_t* offset,
-               std::uint32_t* out) {
-  if (*offset + 4 > size) {
-    return false;
-  }
-  std::uint32_t value = 0;
-  for (int i = 0; i < 4; ++i) {
-    value |= static_cast<std::uint32_t>(data[*offset + i]) << (8 * i);
-  }
-  *offset += 4;
-  *out = value;
-  return true;
-}
-
-bool ReadU64LE(const unsigned char* data, std::size_t size, std::size_t* offset,
-               std::uint64_t* out) {
-  if (*offset + 8 > size) {
-    return false;
-  }
-  std::uint64_t value = 0;
-  for (int i = 0; i < 8; ++i) {
-    value |= static_cast<std::uint64_t>(data[*offset + i]) << (8 * i);
-  }
-  *offset += 8;
-  *out = value;
-  return true;
-}
-
+// 读侧的定长解码用共享的 include/byte_order.h（它的文件头就写着
+// “它们太小，不值得为每个格式模块各留一份”）：这里再拄一套就是
+// 第二份事实来源。读法完全一致：字段不完整就直接失败。
 // pread 的薄封装：EINTR 重试，返回实际读到的字节数，出错返回 -1。
 ssize_t ReadAt(int fd, void* buffer, std::size_t size, std::uint64_t offset) {
   unsigned char* cursor = static_cast<unsigned char*>(buffer);
