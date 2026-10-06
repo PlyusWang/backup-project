@@ -193,6 +193,20 @@ jobs:
           # RELEASE-INFO.txt 由两个构建作业各自产出（内容相同），这里保留其中一份；
           # 只重算 SHA256SUMS。清单写到 out 之外再 mv 进来：重定向会在 find 之前
           # 就把 SHA256SUMS 创建出来，否则清单会把自己也算进去（自校验必然失败）。
+          # 两个构建作业各写了一份 RELEASE-INFO.txt，内容只在 build_os / compiler /
+          # qt_version 上有区别。直接留一份会把客户端写成"Ubuntu 20.04 构建"——
+          # 所以在这里合并：公共字段一份，两边的构建环境各列一段。
+          client_info="$(ls incoming/client/*/RELEASE-INFO.txt 2>/dev/null | sed -n '1p')"
+          server_info="$(ls incoming/server/*/RELEASE-INFO.txt 2>/dev/null | sed -n '1p')"
+          if [ -n "$client_info" ] && [ -n "$server_info" ]; then
+            {
+              grep -vE '^(build_os|build_glibc|compiler|qt_version)' "$client_info"
+              echo "--- client build ---"
+              grep -E '^(build_os|build_glibc|compiler|qt_version)' "$client_info"
+              echo "--- server build ---"
+              grep -E '^(build_os|build_glibc|compiler|qt_version)' "$server_info"
+            } > "$out/RELEASE-INFO.txt"
+          fi
           test -f "$out/RELEASE-INFO.txt" || { echo "缺少 RELEASE-INFO.txt"; exit 1; }
           ( cd "$out" && rm -f SHA256SUMS \
             && find . -maxdepth 1 -type f -printf '%P\n' | LC_ALL=C sort | xargs -r sha256sum > /tmp/release-sha256sums )
