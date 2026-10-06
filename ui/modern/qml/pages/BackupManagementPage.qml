@@ -222,10 +222,12 @@ Item {
                     passwordRequired: Boolean(modelData["passwordRequired"])
                     // 来源与计划变化摘要来自 ScheduleStore（不是文件名解析）：
                     // 手动备份不会被自动淘汰，"这条是谁建的"必须一眼看得出来。
-                    originText: schedule.originForFile(
-                        String(modelData["fileName"] || ""))
-                    scheduledChangesText: schedule.changesForFile(
-                        String(modelData["fileName"] || ""))
+                    // 这两个调用连同实参必须保持在同一行：静态契约按整串匹配，
+                    // 拆行还会让 qmllint 对 schedule 的放行规则一起失效。
+                    originText:
+                    schedule.originForFile(String(modelData["fileName"] || ""))
+                    scheduledChangesText:
+                    schedule.changesForFile(String(modelData["fileName"] || ""))
                     busy: controller.busy || controller.catalogBusy
                 }
             }
