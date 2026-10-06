@@ -346,23 +346,37 @@ jobs:
           find rel -maxdepth 1 -type f -exec cp -a {} rel/ \;
           chmod 0755 rel/Backup-Project-Client-*-x86_64.AppImage
           ls -l rel
-      - name: record the Ubuntu 22.04 boundary (this is expected to fail)
+      - name: AppImage on Ubuntu 22.04（必须能跑：AppImage 自带 Qt 与它的依赖）
         run: |
-          set -uo pipefail
-          appimage=$(ls rel/Backup-Project-Client-*-x86_64.AppImage)
+          set -euo pipefail
+          appimage="$(ls rel/Backup-Project-Client-*-x86_64.AppImage)"
           echo "OS: $(. /etc/os-release; echo "$PRETTY_NAME")  glibc: $(ldd --version | awk 'NR==1 {print $NF}')"
           set +e
           APPIMAGE_EXTRACT_AND_RUN=1 QT_QPA_PLATFORM=offscreen timeout 30 "$appimage" > /tmp/2204.log 2>&1
           code=$?
           set -e
-          echo "exit=$code"
-          sed -n '1,12p' /tmp/2204.log
-          if [ "$code" = "0" ] || [ "$code" = "124" ]; then
-            echo "NOTE: 这个版本在 Ubuntu 22.04 上跑起来了 —— 那么兼容性文档要改成"支持"。"
-            exit 0
-          fi
-          echo "== Ubuntu 22.04 上确实跑不起来，下面是第一手原因 =="
-          grep -m3 -E "not found|cannot open shared object|GLIBC" /tmp/2204.log || true
-          echo "（客户端构建基线是 Debian 12 / glibc 2.36，且自带的 Qt 6.4 依赖 Debian 12 的系统库；"
-          echo "  因此 Ubuntu 22.04 不在客户端支持范围。详见 docs/install-client.md）"
-          exit 0
+          echo "appimage_exit=$code"
+          case "$code" in
+            0|124) echo "PASS: AppImage 在 Ubuntu 22.04 上启动正常（退出码 $code；自带 Qt 6.4 与 ICU）" ;;
+            *) sed -n '1,12p' /tmp/2204.log; echo "FAIL: AppImage 在 22.04 上没起来"; exit 1 ;;
+          esac
+          qml="$(grep -cE '\.qml:[0-9]+:|is not installed' /tmp/2204.log || true)"
+          echo "qml_warnings=$qml"
+          test "$qml" = "0"
+      - name: client .deb on Ubuntu 22.04（Depends 不许要我们自带的那些库）
+        run: |
+          set -euo pipefail
+          deb="$(ls rel/backup-project-client_*.deb)"
+          apt-get update -qq
+          apt-get install -y -qq "./$deb"
+          dpkg -s backup-project-client | grep '^Version:'
+          backupctl --help > /dev/null
+          set +e
+          QT_QPA_PLATFORM=offscreen timeout 20 /usr/bin/backup-project > /tmp/2204deb.log 2>&1
+          code=$?
+          set -e
+          echo "deb_gui_exit=$code"
+          case "$code" in
+            0|124) echo "PASS: .deb 在 Ubuntu 22.04 上装得上、GUI 也能起" ;;
+            *) sed -n '1,12p' /tmp/2204deb.log; echo "FAIL: .deb 在 22.04 上起来了但 GUI 没起"; exit 1 ;;
+          esac
