@@ -603,6 +603,11 @@ bool RestoreSnapshotChain(const std::string& repository_directory,
   ::unlink(inner_container.c_str());
 
   bool ok = false;
+  // “这一轮 delta 失败了”必须由这个布尔量表达，**不能**去读 error_message：
+  // error_message 是可选的诊断出参（允许 nullptr），拿它当状态机会在
+  // 传 nullptr 时失效：tombstone 循环只 break 掉内层，外层照样把未完成的
+  // staging 发布成 destination，于是一次失败的恢复被报成成功。
+  bool delta_failed = false;
   do {
     // 1) base：走既有的完整恢复路径（它自己也是 staging + 原子发布的写法）。
     if (!RunRestorePipeline(chain.files.front(), staging, options, report,
@@ -628,11 +633,15 @@ bool RestoreSnapshotChain(const std::string& repository_directory,
       for (const std::string& relative : tombstones) {
         // 语法在解析信封时就验过了（IsValidDeltaTombstone）；这里再验一次是
         // 纵深防御：应用路径不该假设"调用方一定先解析过"。
-        if (!IsValidDeltaTombstone(relative, error_message)) break;
+        if (!IsValidDeltaTombstone(relative, error_message)) {
+          delta_failed = true;
+          break;
+        }
         std::string path;
         bool exists = false;
         if (!ResolveUnderRootNoSymlinkAncestors(staging, relative, &path,
                                                 &exists, error_message)) {
+          delta_failed = true;
           break;
         }
         // 中间组件不存在 = 这条路径现在不存在，没有东西要删。
@@ -641,10 +650,11 @@ bool RestoreSnapshotChain(const std::string& repository_directory,
         // FIFO / 设备删节点，目录递归删（RemoveTree 全程 lstat，不 follow）。
         if (!RemoveTree(path)) {
           SetError(error_message, "Cannot apply a tombstone: " + path);
+          delta_failed = true;
           break;
         }
       }
-      if (error_message != nullptr && !error_message->empty()) break;
+      if (delta_failed) break;
 
       // 2b) 覆盖新增/修改/类型变化。
       MergeContext context;
@@ -662,7 +672,7 @@ bool RestoreSnapshotChain(const std::string& repository_directory,
       }
       RemoveTree(overlay);
     }
-    if (error_message != nullptr && !error_message->empty()) break;
+    if (delta_failed) break;
 
     // 3) 发布。destination 已存在（空目录）时先删掉，保证 rename 是原子的。
     struct stat target_info;

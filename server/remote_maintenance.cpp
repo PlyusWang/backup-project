@@ -226,7 +226,8 @@ StoreResult RemoteMaintenance::DeleteSnapshot(std::int64_t user_id,
     // 回滚：把文件改回正式名字，一切照旧。
     Log("the metadata delete failed; restoring the blob: " + store_error);
     if (::rename(pending_path.c_str(), final_path.c_str()) != 0) {
-      Log("warning: the rollback rename failed; the blob is left in trash");
+      Log("warning: the rollback rename failed; the blob is left in trash: " +
+          StrerrorText());
     }
     SetError(error_message, remove_result == StoreResult::kNotFound
                                 ? "the snapshot row disappeared during the"
@@ -314,7 +315,7 @@ StoreResult RemoteMaintenance::DeleteAccount(std::int64_t user_id,
           store_error);
       if (::rename(quarantine.c_str(), directory.c_str()) != 0) {
         Log("warning: the rollback rename failed; the account data is left in"
-            " the root trash");
+            " the root trash: " + StrerrorText());
       }
     }
     SetError(error_message, result == StoreResult::kNotFound

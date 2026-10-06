@@ -894,5 +894,79 @@ int main() {
     server.Stop();
   }
 
+
+  test_support::Section("SRV 10. 生命周期合同：RequestStop / Run / Stop");
+  {
+    Fixture fixture;
+    SetupFixture(&fixture, "srv-lifecycle");
+    net::RemoteServer server;
+    std::string error;
+    server.Configure(fixture.config, &error);
+    test_support::Check(server.Start(&error), "SRV T10 服务端启动", error);
+
+    // 合同：Run() 就是 worker 池的 owner，它返回之前自己 join 全部 worker。
+    // RequestStop() 是唯一允许与 Run() 并发的入口。
+    std::string run_error;
+    bool run_result = false;
+    std::atomic<bool> run_returned{false};
+    std::thread runner([&server, &run_error, &run_result, &run_returned] {
+      run_result = server.Run(&run_error);
+      run_returned.store(true);
+    });
+
+    // 确定性地证明服务器确实在接收连接（而不是“大概已经跑起来了”）：
+    // 它同时也是下一步“与 Run() 并发调 Stop()”的前提。
+    bool served = false;
+    for (int attempt = 0; attempt < 200 && !served; ++attempt) {
+      const int client = ConnectToLoopback(server.bound_port());
+      if (client < 0) {
+        ::usleep(10000);
+        continue;
+      }
+      net::SecureChannel channel;
+      std::string handshake_error;
+      served = HandshakeClientOrShutdown(client, fixture.pin, &channel,
+                                        &handshake_error);
+      ::close(client);
+      if (!served) {
+        ::usleep(10000);
+      }
+    }
+    test_support::Check(served, "SRV T10 服务器在运行中真的接收了一条连接（重试直到成功）");
+
+    // 防误用的闸：Run() 还在跑的时候调 Stop() 不得拆掉
+    // store_ / listener（那样 worker 会在用着它们的时候被拆）。
+    server.Stop();
+    test_support::Check(server.running(),
+                        "SRV T10 Run() 期间的 Stop() 不拆除监听 socket");
+    server.RequestStop();
+    runner.join();
+    test_support::Check(run_returned.load() && run_result,
+                        "SRV T10 RequestStop 之后 Run() 正常返回",
+                        run_error);
+
+    // Run() 返回之后 Stop() 才是正当调用；且可以重复调。
+    server.Stop();
+    server.Stop();
+    test_support::Check(!server.running(),
+                        "SRV T10 Run() 返回后 Stop() 释放了监听 socket（重复调用安全）");
+
+    // 析构函数调 Stop()：已经安全停下来的对象销毁不得出问题。
+  }
+  {
+    Fixture fixture;
+    SetupFixture(&fixture, "srv-lifecycle-dtor");
+    net::RemoteServer scoped;
+    std::string error;
+    scoped.Configure(fixture.config, &error);
+    const bool started = scoped.Start(&error);
+    test_support::Check(started, "SRV T10 第二个实例启动", error);
+    const std::uint16_t port = scoped.bound_port();
+    scoped.RequestStop();
+    scoped.Stop();
+    test_support::Check(!scoped.running() && port != 0,
+                        "SRV T10 没调 Run() 时 RequestStop + Stop 安全");
+  }
+
   return test_support::Finish("remote_server_test");
 }
