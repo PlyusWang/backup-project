@@ -45,15 +45,22 @@ wait_active() {
   return 1
 }
 
-# 用户状态的五个指纹：传输身份私钥、token secret、配置、元数据库、data 目录内容。
+# 用户状态的字节指纹：传输身份私钥、token secret、配置、data 目录内容。
+# **不包含元数据库**：SQLite 在服务重启周期里会重写自己的 header / 日志（本地
+# targeted test 实测：同一载荷同一数据，停服务后两次测量的 sha256 就不同），
+# 所以 DB 断言的是逻辑状态（db_logical），字节哈希只作为信息打印。
 state_fingerprint() {
-  printf 'key=%s\nsecret=%s\nconf=%s\ndb=%s\ndata=%s\n' \
+  printf 'key=%s\nsecret=%s\nconf=%s\ndata=%s\n' \
     "$(hash_of "$INSTANCE/state/transport.key")" \
     "$(hash_of /etc/backup-project-server/secrets.env)" \
     "$(hash_of "$CONF")" \
-    "$(hash_of "$INSTANCE/state/metadata.sqlite3")" \
     "$(hash_of "$SENTINEL")"
 }
+
+# 元数据库：逻辑状态用产品自己的管理工具读。
+admin() { backup-server-admin --server-root /var/lib/backup-project-server "$@" 2>&1; }
+db_logical() { admin list-users | grep -vE '^(Host:|Server root:|Data root:|Metadata DB:|Service:|传输身份指纹:| +来源:)' | sed 's/[[:space:]]*$//'; }
+db_bytes() { hash_of "$INSTANCE/state/metadata.sqlite3"; }
 fp_field() { printf '%s\n' "$FP_A" | sed -n "s/^$1=//p"; }
 
 # 造一个"载荷不同 / 版本号更高"的包：$4=yes 时把服务端二进制换成 exit 7 的 stub。
@@ -96,9 +103,28 @@ expect_ok "回环端口 127.0.0.1:18765 在监听" port_listening
 install -o backup-project -g backup-project -m 0640 /dev/null "$SENTINEL"
 printf 'user data must survive an automatic rollback\n' > "$SENTINEL"
 
+# 客户端制品：回环 ping 用它，"注册一个真实用户"也用它（那是元数据库里真正的行）。
+HAVE_CLIENT=0
+if [ -n "$CLIENT_REL" ]; then
+  CLIENT_DEB="$(ls "$CLIENT_REL"/backup-project-client_*.deb)"
+  expect_ok "安装客户端制品（ping 与注册用）" apt-get install -y -qq --no-install-recommends "$CLIENT_DEB"
+  HAVE_CLIENT=1
+fi
+
 VERSION_A="$(dpkg-query -W -f '${Version}' backup-project-server)"
 EXEC_A="$(hash_of "$BIN")"
 FP_A="$(state_fingerprint)"
+PIN="$(backup-server-keygen --show --key-file "$INSTANCE/state/transport.key" | sed -n 's/.*--server-key //p' | sed -n '1p')"
+if [ -n "$PIN" ]; then ci_pass "拿到服务器身份指纹（不打印内容）"; else ci_fail "拿不到指纹"; fi
+if [ "$HAVE_CLIENT" -eq 1 ]; then
+  expect_ok "安装后回环 ping" backupctl remote ping --host 127.0.0.1 --port 18765 --server-key "$PIN"
+  expect_ok "注册一个真实用户（升级失败前的元数据库基线）" \
+    env BACKUP_REMOTE_PASSWORD=rollback-probe-password-1 backupctl remote register \
+    --user rollback-probe --host 127.0.0.1 --port 18765 --server-key "$PIN"
+fi
+DB_LOGICAL_A="$(db_logical)"
+DB_BYTES_A="$(db_bytes)"
+log "元数据库逻辑状态：$(printf '%s' "$DB_LOGICAL_A" | tr '\n' '|' | cut -c1-120)"
 log "版本 A = $VERSION_A"
 log "服务端二进制 sha256 = $EXEC_A"
 printf '%s\n' "$FP_A" | sed 's/^/  A /'
@@ -148,7 +174,9 @@ expect_file "回滚标记（rolled-back）存在" "$CACHE/rollback/rolled-back"
 expect_eq "transport.key 未变" "$(fp_field key)" "$(hash_of "$INSTANCE/state/transport.key")"
 expect_eq "secrets.env 未变" "$(fp_field secret)" "$(hash_of /etc/backup-project-server/secrets.env)"
 expect_eq "server.conf 未变（conffile 没被回滚覆盖）" "$(fp_field conf)" "$(hash_of "$CONF")"
-expect_eq "元数据库未变" "$(fp_field db)" "$(hash_of "$INSTANCE/state/metadata.sqlite3")"
+expect_file "元数据库仍然在（不是被删掉或重建）" "$INSTANCE/state/metadata.sqlite3"
+expect_eq "元数据库逻辑状态未变（升级前注册的用户还在）" "$DB_LOGICAL_A" "$(db_logical)"
+log "DB 字节哈希（信息性，不做断言）：before=${DB_BYTES_A:0:16} after=$(db_bytes | cut -c1-16) —— SQLite 打开/关闭会重写 header"
 expect_eq "data 目录内容未变" "$(fp_field data)" "$(hash_of "$SENTINEL")"
 expect_eq "用户状态指纹整体未变" "$FP_A" "$(state_fingerprint)"
 
@@ -162,11 +190,7 @@ log "失败升级证据：failure injected = exit 7 stub / install exit = $UPGRA
 
 # ================================================================ 5. 回滚后仍然可用
 ci_section "5. 回滚之后本机服务端仍然真的可用（回环 ping，真实 BPSEC1 握手）"
-if [ -n "$CLIENT_REL" ]; then
-  CLIENT_DEB="$(ls "$CLIENT_REL"/backup-project-client_*.deb)"
-  expect_ok "安装客户端制品（ping 用）" apt-get install -y -qq --no-install-recommends "$CLIENT_DEB"
-  PIN="$(backup-server-keygen --show --key-file "$INSTANCE/state/transport.key" | sed -n 's/.*--server-key //p' | sed -n '1p')"
-  if [ -n "$PIN" ]; then ci_pass "拿到服务器身份指纹（不打印内容）"; else ci_fail "拿不到指纹"; fi
+if [ "$HAVE_CLIENT" -eq 1 ]; then
   expect_ok "回滚后 backupctl remote ping" backupctl remote ping --host 127.0.0.1 --port 18765 --server-key "$PIN"
   expect_ok "ping 可重复" backupctl remote ping --host 127.0.0.1 --port 18765 --server-key "$PIN"
 else
