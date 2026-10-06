@@ -147,6 +147,65 @@ expect_ok "服务 active" wait_active
 expect_eq "二进制回到 A" "$EXEC_A" "$(hash_of "$BIN")"
 expect_eq "用户状态指纹不变" "$FP_A" "$(state_fingerprint)"
 
+# ================================================================ 3.5 快照失败必须中止升级
+ci_section "3.5 旧服务 active 但快照准备失败：升级必须在解包前中止（fail closed）"
+
+EXEC_BEFORE="$(hash_of "$BIN")"
+KEY_BEFORE="$(hash_of "$INSTANCE/state/transport.key")"
+SECRET_BEFORE="$(hash_of /etc/backup-project-server/secrets.env)"
+CONF_BEFORE="$(hash_of "$CONF")"
+DATA_BEFORE="$(hash_of "$SENTINEL")"
+DB_LOGICAL_BEFORE="$(db_logical)"
+VERSION_BEFORE="$(dpkg-query -W -f '${Version}' backup-project-server)"
+dpkg-query -W -f '${Status}\n' backup-project-server > "$WORK/status-before.txt"
+
+# 故障注入：真实文件系统层面的确定性故障 —— 缓存路径被一个普通文件占住，
+# 快照不可能安全建立。不需要任何只给测试用的产品钩子：生产代码里没有开关、
+# 没有环境变量后门，注入只是"把一个真实路径变成一个真实的不可能条件"。
+rm -rf "$CACHE"
+if : > "$CACHE" 2>/dev/null && [ -f "$CACHE" ]; then
+  ci_pass "已注入：缓存路径被普通文件占住（确定性，不依赖磁盘满）"
+else
+  ci_fail "故障注入失败（建不出占位文件）"
+fi
+
+SNAPSHOT_FAIL_DEB="$WORK/snapshot-fail.deb"
+VERSION_SF="${VERSION_A}+snapshotfail1"
+mk_deb "$REAL_DEB" "$SNAPSHOT_FAIL_DEB" "$VERSION_SF" yes
+expect_ok "版本号排序：$VERSION_SF > $VERSION_A" dpkg --compare-versions "$VERSION_SF" gt "$VERSION_A"
+
+set +e
+SF_OUT="$(dpkg -i "$SNAPSHOT_FAIL_DEB" 2>&1)"
+SF_CODE=$?
+set -e
+printf '%s\n' "$SF_OUT" | sed 's/^/  | /'
+printf '%s\n' "$SF_OUT" > "$WORK/snapshot-fail.log"
+
+if [ "$SF_CODE" -ne 0 ]; then ci_pass "dpkg -i 返回非零（exit $SF_CODE）：升级在解包前被中止"; else ci_fail "快照建不起来却仍然升级了（fail-open）"; fi
+expect_contains "输出报告快照准备失败" "$WORK/snapshot-fail.log" "rollback snapshot preparation failed"
+expect_contains "输出报告升级在解包前中止" "$WORK/snapshot-fail.log" "upgrade aborted before unpack"
+expect_contains "输出说明升级前旧服务是 active" "$WORK/snapshot-fail.log" "old service was active"
+expect_contains "输出说明旧安装原封不动" "$WORK/snapshot-fail.log" "existing runnable installation left untouched"
+
+expect_eq "新版本没有被解包：dpkg 元数据仍然是 A" "$VERSION_BEFORE" "$(dpkg-query -W -f '${Version}' backup-project-server)"
+dpkg-query -W -f '${Status}\n' backup-project-server > "$WORK/status-after.txt"
+expect_eq "dpkg 状态没有被改坏（与失败前一致）" "$(cat "$WORK/status-before.txt")" "$(cat "$WORK/status-after.txt")"
+expect_eq "服务端二进制仍然是 A（sha256）" "$EXEC_BEFORE" "$(hash_of "$BIN")"
+expect_ok "旧服务仍然 active" wait_active
+expect_ok "端口仍然在监听" port_listening
+expect_eq "transport.key 未变" "$KEY_BEFORE" "$(hash_of "$INSTANCE/state/transport.key")"
+expect_eq "secrets.env 未变" "$SECRET_BEFORE" "$(hash_of /etc/backup-project-server/secrets.env)"
+expect_eq "server.conf 未变" "$CONF_BEFORE" "$(hash_of "$CONF")"
+expect_eq "data 未变" "$DATA_BEFORE" "$(hash_of "$SENTINEL")"
+expect_eq "元数据库逻辑状态未变" "$DB_LOGICAL_BEFORE" "$(db_logical)"
+if [ -e "$CACHE/rollback" ]; then ci_fail "失败时留下了 rollback/ 材料（半成品不许被当成有效材料）"; else ci_pass "失败时没有留下 rollback/ 材料"; fi
+if [ -n "$(ls -d "$CACHE"/rollback.tmp.* 2>/dev/null || true)" ]; then ci_fail "失败时留下了临时快照目录"; else ci_pass "失败时没有留下 rollback.tmp.* 残留"; fi
+if [ "$HAVE_CLIENT" -eq 1 ]; then
+  expect_ok "中止升级后回环 ping 仍然通过" backupctl remote ping --host 127.0.0.1 --port 18765 --server-key "$PIN"
+fi
+
+# 清掉注入：修好之后快照必须照常建立（SNAPSHOT_READY = YES 由下一节的升级日志验证）
+expect_ok "清掉故障注入" rm -f "$CACHE"
 # ================================================================ 4. 失败升级
 ci_section "4. 故意坏掉的版本 B：升级必须失败，并且必须自动回滚"
 BROKEN_DEB="$WORK/upgrade-broken.deb"
@@ -163,6 +222,7 @@ printf '%s\n' "$UPGRADE_OUT" | sed 's/^/  | /'
 printf '%s\n' "$UPGRADE_OUT" > "$WORK/broken-upgrade.log"
 
 if [ "$UPGRADE_CODE" -ne 0 ]; then ci_pass "升级命令返回失败（exit $UPGRADE_CODE）"; else ci_fail "升级命令居然成功了（exit 0）：失败升级被伪装成成功"; fi
+expect_contains "升级前快照自检通过（SNAPSHOT_READY = YES）" "$WORK/broken-upgrade.log" "SNAPSHOT_READY = YES"
 expect_contains "postinst 明确报告升级失败" "$WORK/broken-upgrade.log" "升级失败"
 expect_contains "postinst 报告发生了自动回滚" "$WORK/broken-upgrade.log" "ROLLBACK OK"
 expect_contains "postinst 告诉管理员怎么让 dpkg 元数据一致" "$WORK/broken-upgrade.log" "--reinstall"
