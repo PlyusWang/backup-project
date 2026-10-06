@@ -643,9 +643,8 @@ bool ResolveUser(RemoteMetadataStore* store, const std::string& selector_text,
   return true;
 }
 
-int OpenAll(const Options& options, bool writable,
-            RemoteMetadataStore* store, RemoteMaintenance* maintenance,
-            std::string* error_message) {
+int OpenAll(const Options& options, bool writable, RemoteMetadataStore* store,
+            RemoteMaintenance* maintenance, std::string* error_message) {
   // **fail closed**：只打开已经存在的数据库。
   //
   // 管理工具没有"初始化一个新实例"的语义。以前这里用的是 store->Open()，它带
@@ -660,9 +659,9 @@ int OpenAll(const Options& options, bool writable,
   //   * 破坏性命令走可写连接：调用方**已经**先拿到数据目录锁，证明服务端已停止。
   // 两条路都不 CREATE、不建表。
   const bool opened =
-      writable ? store->OpenExistingReadWrite(options.database_path, error_message)
-               : store->OpenExistingReadOnly(options.database_path,
-                                             error_message);
+      writable
+          ? store->OpenExistingReadWrite(options.database_path, error_message)
+          : store->OpenExistingReadOnly(options.database_path, error_message);
   if (!opened) {
     return -1;
   }

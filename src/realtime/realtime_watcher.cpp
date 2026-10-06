@@ -204,8 +204,8 @@ bool InotifyWatcher::AddDirectory(int fd, const std::string& path, bool is_root,
       // 正是头文件承诺要避免的“假装健康”。
       const int saved_errno = errno;
       if (saved_errno != ENOENT) {
-        SetError(error_message, "Cannot inspect " + child + ": " +
-                                    ErrnoText(saved_errno));
+        SetError(error_message,
+                 "Cannot inspect " + child + ": " + ErrnoText(saved_errno));
         return false;
       }
       continue;

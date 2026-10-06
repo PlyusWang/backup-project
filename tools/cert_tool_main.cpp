@@ -5,7 +5,8 @@
 //   backup-cert-tool root-init     --root-key <path> --root-id <id>
 //   backup-cert-tool root-info     --root-key <path>
 //   backup-cert-tool issue-server  --root-key <path> --server-id <id>
-//                                  --server-pubkey <hex:<64 位十六进制>|@file> --out <path>
+//                                  --server-pubkey <hex:<64 位十六进制>|@file>
+//                                  --out <path>
 //                                  [--serial N] [--days N] [--not-before N]
 //   backup-cert-tool verify-server --cert <path> [--roots <file>]
 //                                  [--issuer-pub <hex>] [--now N]
@@ -69,8 +70,8 @@ struct Options {
 
 // 严格的十进制整数解析：整个字符串必须被完全消费，且不得溢出。
 //
-// 为什么不能用 strtoll(..., nullptr, 10)：它把 "abc" 读成 0，把 "12abc" 读成 12，
-// 并且正负号可以重复。在这里那不是宽松，而是静默地把用户的笔误
+// 为什么不能用 strtoll(..., nullptr, 10)：它把 "abc" 读成 0，把 "12abc" 读成
+// 12， 并且正负号可以重复。在这里那不是宽松，而是静默地把用户的笔误
 // 变成一个看起来合法的证书（2026 年签发一张 1970 年就过期的证书）。
 bool ParseDecimalU64(const std::string& text, std::uint64_t* out,
                      std::string* error_message) {
@@ -116,17 +117,20 @@ void PrintUsage() {
       "backup-cert-tool —— 离线根与服务器身份证书管理（PR #23）\n"
       "\n"
       "  root-init      --root-key <path> --root-id <id>\n"
-      "                 生成一把新的离线根：私钥写入 <path>（0600，已存在则拒绝），\n"
+      "                 生成一把新的离线根：私钥写入 "
+      "<path>（0600，已存在则拒绝），\n"
       "                 公钥写到 <path>.pub（可直接当可信根文件用）。\n"
       "  root-info      --root-key <path>\n"
       "                 读回根的信息（只输出公钥与指纹）。\n"
       "  issue-server   --root-key <path> --server-id <id>\n"
-      "                 --server-pubkey <hex:<64 位十六进制>|@file> --out <path>\n"
+      "                 --server-pubkey <hex:<64 位十六进制>|@file> --out "
+      "<path>\n"
       "                 [--serial N] [--days N] [--not-before N]\n"
       "                 为已有服务器公钥签发身份证书（不改动任何私钥）。\n"
       "  verify-server  --cert <path> [--roots <file>] [--issuer-pub <hex>]\n"
       "                 [--now N]\n"
-      "                 按可信根验签并检查时间窗；不给 --roots 就用内置官方根。\n"
+      "                 按可信根验签并检查时间窗；不给 --roots "
+      "就用内置官方根。\n"
       "  inspect-server --cert <path>\n"
       "                 只打印证书内容（不做信任判断）。\n"
       "\n"
@@ -156,7 +160,8 @@ bool ReadFile(const std::string& path, std::string* out,
   return true;
 }
 
-// 独占创建 + 精确权限。exclusive=false 时允许覆盖（用于公钥/证书这类公开文件）。
+// 独占创建 + 精确权限。exclusive=false
+// 时允许覆盖（用于公钥/证书这类公开文件）。
 bool WriteFile(const std::string& path, mode_t mode, const std::string& data,
                bool exclusive, std::string* error_message) {
   // O_NOFOLLOW 只挡符号链接，挡不住硬链接：提前把目标做成硬链接，写进去就会
@@ -168,8 +173,8 @@ bool WriteFile(const std::string& path, mode_t mode, const std::string& data,
     }
     return false;
   }
-  const int flags = O_WRONLY | O_CREAT | O_NOFOLLOW |
-                    (exclusive ? O_EXCL : O_TRUNC);
+  const int flags =
+      O_WRONLY | O_CREAT | O_NOFOLLOW | (exclusive ? O_EXCL : O_TRUNC);
   const int fd = ::open(path.c_str(), flags, mode);
   if (fd < 0) {
     if (error_message != nullptr) {
@@ -255,14 +260,15 @@ bool LoadRootKey(const std::string& path, RootKey* out,
   while (position <= text.size()) {
     const std::size_t newline = text.find('\n', position);
     const std::string line = Trim(text.substr(
-        position, newline == std::string::npos ? std::string::npos
-                                               : newline - position));
+        position,
+        newline == std::string::npos ? std::string::npos : newline - position));
     if (line.compare(0, 8, "root-id:") == 0) {
       key.root_id = Trim(line.substr(8));
     } else if (line.compare(0, 9, "seed-hex:") == 0) {
       const std::string hex = Trim(line.substr(9));
       if (!backupproject::crypto::FromHex(hex, &key.seed)) {
-        if (error_message != nullptr) *error_message = "根文件里的 seed-hex 不是合法十六进制";
+        if (error_message != nullptr)
+          *error_message = "根文件里的 seed-hex 不是合法十六进制";
         return false;
       }
     } else if (!line.empty() && line[0] != '#') {
@@ -279,8 +285,8 @@ bool LoadRootKey(const std::string& path, RootKey* out,
     if (error_message != nullptr) *error_message = "根文件缺少合法的 root-id";
     return false;
   }
-  if (!backupproject::crypto::Ed25519PublicKeyFromSeed(key.seed, &key.public_key,
-                                                       error_message)) {
+  if (!backupproject::crypto::Ed25519PublicKeyFromSeed(
+          key.seed, &key.public_key, error_message)) {
     return false;
   }
   *out = key;
@@ -304,7 +310,8 @@ bool ParseServerPublicKey(const std::string& text, std::string* out,
   // 32 字节原始二进制**只**对 @文件 成立。内联的 32 个十六进制字符一律按
   // "十六进制不完整"拒绝：否则同一段输入有两种读法，一个被截断的 64 位
   // 十六进制公钥会被当成 ASCII 原样签进证书，而且看不出来。
-  if (from_file && material.size() == backupproject::crypto::kBpcert1PublicKeySize) {
+  if (from_file &&
+      material.size() == backupproject::crypto::kBpcert1PublicKeySize) {
     *out = material;
     return true;
   }
@@ -332,19 +339,21 @@ int CommandRootInit(const Options& options) {
                                                      &error)) {
     return Fail("生成根密钥失败：" + error);
   }
-  std::string key_text = "# backup-project 离线根私钥 —— 绝不可提交 / 上传 / 打印\n";
+  std::string key_text =
+      "# backup-project 离线根私钥 —— 绝不可提交 / 上传 / 打印\n";
   key_text += "root-id: " + root_id + "\n";
-  key_text += "seed-hex: " + backupproject::crypto::ToHex(
-                                  reinterpret_cast<const unsigned char*>(
-                                      seed.data()),
-                                  seed.size()) +
-              "\n";
+  key_text +=
+      "seed-hex: " +
+      backupproject::crypto::ToHex(
+          reinterpret_cast<const unsigned char*>(seed.data()), seed.size()) +
+      "\n";
   if (!WriteFile(path, 0600, key_text, true, &error)) {
     return Fail(error);
   }
   // 显式写 unlimited：根的"不限期"必须是写出来的意图，不能靠省略字段表达。
   const std::string pub_text =
-      root_id + " " + backupproject::crypto::Ed25519FormatPublicKeyHex(public_key) +
+      root_id + " " +
+      backupproject::crypto::Ed25519FormatPublicKeyHex(public_key) +
       " unlimited\n";
   if (!WriteFile(path + ".pub", 0644, pub_text, false, &error)) {
     return Fail(error);
@@ -353,8 +362,9 @@ int CommandRootInit(const Options& options) {
   std::printf("root_key_file      = %s (mode %s)\n", path.c_str(),
               ModeOf(path).c_str());
   std::printf("root_public_file   = %s.pub\n", path.c_str());
-  std::printf("root_public_key    = %s\n",
-              backupproject::crypto::Ed25519FormatPublicKeyHex(public_key).c_str());
+  std::printf(
+      "root_public_key    = %s\n",
+      backupproject::crypto::Ed25519FormatPublicKeyHex(public_key).c_str());
   std::printf("root_fingerprint   = %s\n",
               backupproject::crypto::Ed25519Fingerprint(public_key).c_str());
   std::printf("content_printed    = NO\n");
@@ -376,10 +386,12 @@ int CommandRootInfo(const Options& options) {
   std::printf("root_id            = %s\n", key.root_id.c_str());
   std::printf("root_key_file      = %s (mode %s)\n", path.c_str(),
               ModeOf(path).c_str());
-  std::printf("root_public_key    = %s\n",
-              backupproject::crypto::Ed25519FormatPublicKeyHex(key.public_key).c_str());
-  std::printf("root_fingerprint   = %s\n",
-              backupproject::crypto::Ed25519Fingerprint(key.public_key).c_str());
+  std::printf(
+      "root_public_key    = %s\n",
+      backupproject::crypto::Ed25519FormatPublicKeyHex(key.public_key).c_str());
+  std::printf(
+      "root_fingerprint   = %s\n",
+      backupproject::crypto::Ed25519Fingerprint(key.public_key).c_str());
   std::printf("content_printed    = NO\n");
   std::memset(&key.seed[0], 0, key.seed.size());
   return 0;
@@ -431,8 +443,8 @@ int CommandIssueServer(const Options& options) {
       static_cast<std::uint64_t>(certificate.not_before);
   if (options.Has("--serial")) {
     std::string number_error;
-    if (!ParseDecimalU64(options.Get("--serial"),
-                         &certificate.serial_number, &number_error)) {
+    if (!ParseDecimalU64(options.Get("--serial"), &certificate.serial_number,
+                         &number_error)) {
       return Fail("--serial 不合法：" + number_error);
     }
   }
@@ -440,7 +452,8 @@ int CommandIssueServer(const Options& options) {
     return Fail("序列号不能为 0（--serial 显式给了 0？）");
   }
   std::string raw;
-  if (!backupproject::crypto::Bpcert1Issue(certificate, key.seed, &raw, &error)) {
+  if (!backupproject::crypto::Bpcert1Issue(certificate, key.seed, &raw,
+                                           &error)) {
     return Fail(error);
   }
   if (!WriteFile(out_path, 0644, raw, false, &error)) {
@@ -458,10 +471,10 @@ int CommandIssueServer(const Options& options) {
               raw.size());
   std::printf("certificate_sha256 = %s\n",
               backupproject::crypto::Bpcert1Fingerprint(raw).c_str());
-  std::printf("server_public_key  = %s\n",
-              backupproject::crypto::X25519FormatKeyHex(
-                  certificate.server_public_key)
-                  .c_str());
+  std::printf(
+      "server_public_key  = %s\n",
+      backupproject::crypto::X25519FormatKeyHex(certificate.server_public_key)
+          .c_str());
   std::printf("content_printed    = NO\n");
   std::memset(&key.seed[0], 0, key.seed.size());
   return 0;
@@ -478,7 +491,8 @@ int CommandVerifyServer(const Options& options) {
     return Fail(error);
   }
   Bpcert1 certificate;
-  const Bpcert1Error parsed = backupproject::crypto::Bpcert1Parse(raw, &certificate);
+  const Bpcert1Error parsed =
+      backupproject::crypto::Bpcert1Parse(raw, &certificate);
   if (parsed != Bpcert1Error::kOk) {
     std::printf("parse_result       = %s\n", Bpcert1ErrorName(parsed));
     return Fail(std::string("证书结构不合法：") + Bpcert1ErrorName(parsed));
@@ -500,7 +514,7 @@ int CommandVerifyServer(const Options& options) {
     TrustedRootStore store;
     if (options.Has("--roots")) {
       if (!TrustedRootStore::LoadFromFile(options.Get("--roots"), &store,
-                                         &error)) {
+                                          &error)) {
         return Fail(error);
       }
     } else {
@@ -552,7 +566,8 @@ int CommandInspectServer(const Options& options) {
     return Fail(error);
   }
   Bpcert1 certificate;
-  const Bpcert1Error parsed = backupproject::crypto::Bpcert1Parse(raw, &certificate);
+  const Bpcert1Error parsed =
+      backupproject::crypto::Bpcert1Parse(raw, &certificate);
   if (parsed != Bpcert1Error::kOk) {
     std::printf("parse_result       = %s\n", Bpcert1ErrorName(parsed));
     return Fail(std::string("证书结构不合法：") + Bpcert1ErrorName(parsed));
@@ -569,13 +584,14 @@ int CommandInspectServer(const Options& options) {
               static_cast<long long>(certificate.not_before));
   std::printf("not_after          = %lld\n",
               static_cast<long long>(certificate.not_after));
-  std::printf("validity_days      = %.2f\n",
-              static_cast<double>(certificate.not_after - certificate.not_before) /
-                  (24.0 * 60 * 60));
-  std::printf("server_public_key  = %s\n",
-              backupproject::crypto::X25519FormatKeyHex(
-                  certificate.server_public_key)
-                  .c_str());
+  std::printf(
+      "validity_days      = %.2f\n",
+      static_cast<double>(certificate.not_after - certificate.not_before) /
+          (24.0 * 60 * 60));
+  std::printf(
+      "server_public_key  = %s\n",
+      backupproject::crypto::X25519FormatKeyHex(certificate.server_public_key)
+          .c_str());
   std::printf("certificate_sha256 = %s\n",
               backupproject::crypto::Bpcert1Fingerprint(raw).c_str());
   std::printf("summary            = %s\n",
