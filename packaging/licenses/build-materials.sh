@@ -59,7 +59,17 @@ for so in "${SONAMES[@]}"; do
   path="$(find /usr/lib /lib -maxdepth 3 -name "$so" -print -quit 2>/dev/null || true)"
   pkg=""; ver=""; lic=""; cpr=""
   if [ -n "$path" ]; then
+    # dpkg 的文件清单用的是 /usr/lib/... 这种规范路径，而 find 可能先从 /lib
+    # （merged-usr 的符号链接）命中，直接查会查不到（第一次就是这样漏了 4 个库：
+    # libcap / libdbus-1 / libkeyutils / liblzma）。三种写法依次试，最后一个用
+    # 通配模式匹配 basename，跨 usrmerge 也能落到正确的包。
     pkg="$( { dpkg -S "$path" 2>/dev/null || true; } | sed -n 's/:.*//p' | sed -n '1p')"
+    if [ -z "$pkg" ]; then
+      pkg="$( { dpkg -S "$(readlink -f "$path")" 2>/dev/null || true; } | sed -n 's/:.*//p' | sed -n '1p')"
+    fi
+    if [ -z "$pkg" ]; then
+      pkg="$( { dpkg -S "*/$so" 2>/dev/null || true; } | sed -n 's/:.*//p' | sed -n '1p')"
+    fi
   fi
   if [ -n "$pkg" ]; then
     ver="$(dpkg-query -W -f='${Version}' "$pkg" 2>/dev/null || echo '?')"
