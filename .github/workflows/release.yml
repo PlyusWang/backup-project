@@ -152,13 +152,15 @@ jobs:
           set -euo pipefail
           v="${{ needs.prepare.outputs.version }}"
           echo "== build A =="
-          bash packaging/build-release.sh --version "$v" --only client --out dist/rep-a > /tmp/rep-a.log 2>&1
+          bash packaging/build-release.sh --version "$v" --only client --out dist/rep-a > /tmp/rep-a.log 2>&1 || {
+            echo "build A 失败，输出如下："; tail -40 /tmp/rep-a.log; exit 1; }
           # 只动 mtime，不动内容：Qt 的 rcc 会把资源输入的 mtime 写进资源表，
           # 因为它认 SOURCE_DATE_EPOCH，所以成品必须仍然逐字节相同。
           find ui/modern/qml -name '*.qml' -exec touch -d '2031-01-01 00:00:00' {} +
           touch ui/modern/resources.qrc
           echo "== build B（mtime 已扰动）=="
-          bash packaging/build-release.sh --version "$v" --only client --out dist/rep-b > /tmp/rep-b.log 2>&1
+          bash packaging/build-release.sh --version "$v" --only client --out dist/rep-b > /tmp/rep-b.log 2>&1 || {
+            echo "build B 失败，输出如下："; tail -40 /tmp/rep-b.log; exit 1; }
           fail=0
           for f in dist/rep-a/"$v"/*; do
             b="dist/rep-b/$v/$(basename "$f")"

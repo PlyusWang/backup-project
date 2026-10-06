@@ -293,7 +293,7 @@ pack_client_tarball() {
   install -m 0644 packaging/client/backup-project.desktop "$tree/packaging/client/"
   install -m 0755 packaging/portable/uninstall-client.sh "$tree/packaging/portable/"
   # 第三方许可材料：tar 解开就在根上（同时给 share/doc 一份，安装后也能找到）
-  bash packaging/licenses/build-materials.sh "$appdir/usr/lib" "$tree" "backup-project-client"
+  bash packaging/licenses/build-materials.sh "$tree/lib" "$tree" "backup-project-client"
   mkdir -p "$tree/share/doc/backup-project-client"
   cp -a "$tree/THIRD-PARTY-NOTICES.txt" "$tree/LICENSE-INVENTORY.md" "$tree/licenses" \
     "$tree/share/doc/backup-project-client/"
