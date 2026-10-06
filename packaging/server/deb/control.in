@@ -1,0 +1,22 @@
+Package: backup-project-server
+Version: @VERSION@
+Section: admin
+Priority: optional
+Architecture: @ARCH@
+Depends: @DEPENDS@
+Installed-Size: @INSTALLED_SIZE@
+Maintainer: Backup Project <noreply@example.invalid>
+Homepage: https://github.com/PlyusWang/backup-project
+Description: Backup Project server (BPSEC1 transport, BPSEC2 signed identity)
+ Streaming backup storage server: BPNET1 protocol over BPSEC1
+ (X25519 + HKDF-SHA256 + AES-256-CTR + HMAC-SHA256), with optional
+ server identity certificates (BPCERT1) signed by an offline root.
+ .
+ The package installs the server, the on-host administration tools and
+ the interactive admin menu, creates a system user "backup-project",
+ and starts the service on 127.0.0.1:18765 only. Publishing the port to
+ the internet is an explicit administrator action: it needs a
+ certificate, a reason, and require_bpsec2 = true.
+ .
+ User data under /var/lib/backup-project-server is never removed by
+ package operations. Use backup-server-purge-data for that.

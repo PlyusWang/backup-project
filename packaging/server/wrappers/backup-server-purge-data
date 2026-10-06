@@ -1,0 +1,2 @@
+#!/bin/sh
+exec /usr/lib/backup-project-server/bin/purge-data.sh "$@"

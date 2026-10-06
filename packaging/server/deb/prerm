@@ -1,0 +1,29 @@
+#!/bin/bash
+# backup-project-server prerm —— 只在真正移除时停服务，升级时不动它
+# （升级期间停服务会让"新二进制坏了、服务也没了"这种状态变得可能）。
+#
+# 顺带在包文件消失之前把"想连数据一起清掉"的唯一入口说清楚：
+# prerm 是最后一个 backup-server-purge-data 还存在的时刻（apt remove 之后
+# /usr/bin/backup-server-purge-data 就没了），错过这里就只能手工清理。
+set -e
+SERVICE=backup-project-server
+case "${1:-remove}" in
+  remove|purge)
+    echo "[backup-project-server] 卸载（remove / purge）不会删除用户数据：备份数据、元数据库、"
+    echo "[backup-project-server] 传输身份私钥、server.conf 与 secrets.env 都会留着。"
+    echo "[backup-project-server] 如果这次就想连数据一起清掉，请在包还没删掉时执行（本命令随包提供）："
+    echo "[backup-project-server]   sudo backup-server-purge-data --dry-run                     # 先看要删什么"
+    echo "[backup-project-server]   sudo backup-server-purge-data                             # 需要手打 DELETE ALL BACKUP DATA"
+    echo "[backup-project-server]   sudo backup-server-purge-data --include-identity          # 连身份私钥一起删（会让所有客户端 pin 失效）"
+    echo "[backup-project-server] 包一卸载这个命令就没有了；之后删数据只能按 docs/install-server.md 的"
+    echo "[backup-project-server] 「手工清理残留数据」一节做。"
+    if [ -d /run/systemd/system ] && command -v systemctl >/dev/null 2>&1; then
+      if command -v deb-systemd-invoke >/dev/null 2>&1; then
+        deb-systemd-invoke stop "$SERVICE.service" >/dev/null 2>&1 || true
+      else
+        systemctl stop "$SERVICE" >/dev/null 2>&1 || true
+      fi
+    fi
+    ;;
+esac
+exit 0

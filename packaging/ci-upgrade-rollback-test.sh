@@ -1,0 +1,298 @@
+#!/usr/bin/env bash
+# packaging/ci-upgrade-rollback-test.sh —— 真实"升级失败 → 自动回滚"验收。
+#
+#   sudo bash packaging/ci-upgrade-rollback-test.sh <release 目录> [client 制品目录]
+#
+# 必须在**有真 systemd 的机器**上以 root 跑（CI 里的 systemd-acceptance job）。
+# 它证明的不是"把版本号改成 999 再装回去"（那只是重装），而是：
+#
+#   新版本自己起不来 → 升级命令返回失败 → 自动恢复升级前的可运行版本 →
+#   服务重新可用，且用户状态（私钥 / secret / 数据库 / 数据 / 配置）一个字节没变。
+#
+# 失败来源是**确定性的**：坏包只把服务端二进制换成一个立刻 exit 7 的 stub，
+# 因此失败一定来自"新版本的运行时载荷"，不是测试环境的随机故障。
+set -Eeuo pipefail
+source "$(dirname "${BASH_SOURCE[0]}")/ci-lib.sh"
+
+REL="${1:?用法: ci-upgrade-rollback-test.sh <release 目录> [client 制品目录]}"
+REL="$(cd "$REL" && pwd)"
+CLIENT_REL="${2:-}"
+if [ -n "$CLIENT_REL" ]; then CLIENT_REL="$(cd "$CLIENT_REL" && pwd)"; fi
+
+REAL_DEB="$(ls "$REL"/backup-project-server_*.deb)"
+INSTANCE=/var/lib/backup-project-server
+CONF=/etc/backup-project-server/server.conf
+BIN=/usr/lib/backup-project-server/bin/backup-server
+CACHE=/var/cache/backup-project-server
+WORK=/tmp/rollback-test
+SENTINEL="$INSTANCE/data/ci-rollback-sentinel"
+
+rm -rf "$WORK"; mkdir -p "$WORK"
+
+log() { printf '  ----  %s\n' "$*"; }
+hash_of() { if [ -e "$1" ]; then sha256sum "$1" | cut -d' ' -f1; else printf 'none'; fi; }
+service_state() { systemctl is-active backup-project-server 2>/dev/null || true; }
+port_listening() { ss -ltn 2>/dev/null | grep -q '127.0.0.1:18765'; }
+
+wait_active() {
+  local i state=""
+  for i in $(seq 1 40); do
+    state="$(service_state)"
+    [ "$state" = "active" ] && return 0
+    sleep 1
+  done
+  printf '  最后状态：%s\n' "$state" >&2
+  return 1
+}
+
+# 用户状态的字节指纹：传输身份私钥、token secret、配置、data 目录内容。
+# **不包含元数据库**：SQLite 在服务重启周期里会重写自己的 header / 日志（本地
+# targeted test 实测：同一载荷同一数据，停服务后两次测量的 sha256 就不同），
+# 所以 DB 断言的是逻辑状态（db_logical），字节哈希只作为信息打印。
+state_fingerprint() {
+  printf 'key=%s\nsecret=%s\nconf=%s\ndata=%s\n' \
+    "$(hash_of "$INSTANCE/state/transport.key")" \
+    "$(hash_of /etc/backup-project-server/secrets.env)" \
+    "$(hash_of "$CONF")" \
+    "$(hash_of "$SENTINEL")"
+}
+
+# 元数据库：逻辑状态用产品自己的管理工具读。
+admin() { backup-server-admin --server-root /var/lib/backup-project-server "$@" 2>&1; }
+db_logical() { admin list-users | grep -vE '^(Host:|Server root:|Data root:|Metadata DB:|Service:|传输身份指纹:| +来源:)' | sed 's/[[:space:]]*$//'; }
+db_bytes() { hash_of "$INSTANCE/state/metadata.sqlite3"; }
+fp_field() { printf '%s\n' "$FP_A" | sed -n "s/^$1=//p"; }
+
+# 造一个"载荷不同 / 版本号更高"的包：$4=yes 时把服务端二进制换成 exit 7 的 stub。
+mk_deb() {  # $1=源 deb $2=输出 deb $3=版本 $4=是否注入启动失败
+  local src="$1" out="$2" ver="$3" broken="$4"
+  local root="$WORK/pkg"
+  rm -rf "$root"; mkdir -p "$root"
+  dpkg-deb -R "$src" "$root"
+  sed -i "s/^Version: .*/Version: $ver/" "$root/DEBIAN/control"
+  if [ "$broken" = "yes" ]; then
+    cat > "$root/usr/lib/backup-project-server/bin/backup-server" <<'STUB'
+#!/bin/sh
+echo "backup-server: injected startup failure (rollback test payload)" >&2
+exit 7
+STUB
+    chmod 0755 "$root/usr/lib/backup-project-server/bin/backup-server"
+  fi
+  ( cd "$root" && find . -type f ! -path './DEBIAN/*' -printf '%P\n' | LC_ALL=C sort | xargs -r md5sum > DEBIAN/md5sums )
+  rm -f "$out"
+  dpkg-deb --root-owner-group -Zxz --build "$root" "$out" > /dev/null
+  rm -rf "$root"
+}
+
+cleanup_all() {
+  dpkg --purge backup-project-server > /dev/null 2>&1 || true
+  dpkg --purge --force-all backup-project-server > /dev/null 2>&1 || true
+  systemctl stop backup-project-server > /dev/null 2>&1 || true
+  systemctl reset-failed backup-project-server > /dev/null 2>&1 || true
+  rm -rf "$INSTANCE" /etc/backup-project-server "$CACHE"
+  userdel backup-project 2>/dev/null || true
+  groupdel backup-project 2>/dev/null || true
+}
+
+# ================================================================ 1. 安装版本 A
+ci_section "1. 安装版本 A（真实发行包）并确认服务可用"
+apt-get update -qq
+expect_ok "apt-get install ./<发行包>" apt-get install -y -qq --no-install-recommends "$REAL_DEB"
+expect_ok "服务进入 active" wait_active
+expect_ok "回环端口 127.0.0.1:18765 在监听" port_listening
+install -o backup-project -g backup-project -m 0640 /dev/null "$SENTINEL"
+printf 'user data must survive an automatic rollback\n' > "$SENTINEL"
+
+# 客户端制品：回环 ping 用它，"注册一个真实用户"也用它（那是元数据库里真正的行）。
+HAVE_CLIENT=0
+if [ -n "$CLIENT_REL" ]; then
+  CLIENT_DEB="$(ls "$CLIENT_REL"/backup-project-client_*.deb)"
+  expect_ok "安装客户端制品（ping 与注册用）" apt-get install -y -qq --no-install-recommends "$CLIENT_DEB"
+  HAVE_CLIENT=1
+fi
+
+VERSION_A="$(dpkg-query -W -f '${Version}' backup-project-server)"
+EXEC_A="$(hash_of "$BIN")"
+FP_A="$(state_fingerprint)"
+PIN="$(backup-server-keygen --show --key-file "$INSTANCE/state/transport.key" | sed -n 's/.*--server-key //p' | sed -n '1p')"
+if [ -n "$PIN" ]; then ci_pass "拿到服务器身份指纹（不打印内容）"; else ci_fail "拿不到指纹"; fi
+if [ "$HAVE_CLIENT" -eq 1 ]; then
+  expect_ok "安装后回环 ping" backupctl remote ping --host 127.0.0.1 --port 18765 --server-key "$PIN"
+  expect_ok "注册一个真实用户（升级失败前的元数据库基线）" \
+    env BACKUP_REMOTE_PASSWORD=rollback-probe-password-1 backupctl remote register \
+    --user rollback-probe --host 127.0.0.1 --port 18765 --server-key "$PIN"
+fi
+DB_LOGICAL_A="$(db_logical)"
+DB_BYTES_A="$(db_bytes)"
+log "元数据库逻辑状态：$(printf '%s' "$DB_LOGICAL_A" | tr '\n' '|' | cut -c1-120)"
+log "版本 A = $VERSION_A"
+log "服务端二进制 sha256 = $EXEC_A"
+printf '%s\n' "$FP_A" | sed 's/^/  A /'
+
+# ================================================================ 2. 成功升级
+ci_section "2. 成功升级（载荷相同、版本号更高）必须提交并清理回滚材料"
+UPGRADE_DEB="$WORK/upgrade-ok.deb"
+VERSION_UP="${VERSION_A}+upgradetest1"
+mk_deb "$REAL_DEB" "$UPGRADE_DEB" "$VERSION_UP" no
+expect_ok "版本号排序：$VERSION_UP > $VERSION_A" dpkg --compare-versions "$VERSION_UP" gt "$VERSION_A"
+expect_ok "dpkg -i <升级包>" dpkg -i "$UPGRADE_DEB"
+expect_ok "升级后服务 active" wait_active
+expect_eq "升级后用户状态指纹不变" "$FP_A" "$(state_fingerprint)"
+if [ -e "$CACHE/rollback/manifest" ]; then ci_fail "升级成功后回滚材料还在（应该被提交清理）"; else ci_pass "升级提交后回滚材料已清理"; fi
+
+# ================================================================ 3. 回到 A
+ci_section "3. 装回 A：为失败升级准备一个确实在跑的旧版本"
+expect_ok "dpkg -i <发行包>" dpkg -i "$REAL_DEB"
+expect_ok "服务 active" wait_active
+expect_eq "二进制回到 A" "$EXEC_A" "$(hash_of "$BIN")"
+expect_eq "用户状态指纹不变" "$FP_A" "$(state_fingerprint)"
+
+# ================================================================ 3.5 快照失败必须中止升级
+ci_section "3.5 旧服务 active 但快照准备失败：升级必须在解包前中止（fail closed）"
+
+EXEC_BEFORE="$(hash_of "$BIN")"
+KEY_BEFORE="$(hash_of "$INSTANCE/state/transport.key")"
+SECRET_BEFORE="$(hash_of /etc/backup-project-server/secrets.env)"
+CONF_BEFORE="$(hash_of "$CONF")"
+DATA_BEFORE="$(hash_of "$SENTINEL")"
+DB_LOGICAL_BEFORE="$(db_logical)"
+VERSION_BEFORE="$(dpkg-query -W -f '${Version}' backup-project-server)"
+dpkg-query -W -f '${Status}\n' backup-project-server > "$WORK/status-before.txt"
+
+# 故障注入：真实文件系统层面的确定性故障 —— 缓存路径被一个普通文件占住，
+# 快照不可能安全建立。不需要任何只给测试用的产品钩子：生产代码里没有开关、
+# 没有环境变量后门，注入只是"把一个真实路径变成一个真实的不可能条件"。
+rm -rf "$CACHE"
+if : > "$CACHE" 2>/dev/null && [ -f "$CACHE" ]; then
+  ci_pass "已注入：缓存路径被普通文件占住（确定性，不依赖磁盘满）"
+else
+  ci_fail "故障注入失败（建不出占位文件）"
+fi
+
+SNAPSHOT_FAIL_DEB="$WORK/snapshot-fail.deb"
+VERSION_SF="${VERSION_A}+snapshotfail1"
+mk_deb "$REAL_DEB" "$SNAPSHOT_FAIL_DEB" "$VERSION_SF" yes
+expect_ok "版本号排序：$VERSION_SF > $VERSION_A" dpkg --compare-versions "$VERSION_SF" gt "$VERSION_A"
+
+set +e
+SF_OUT="$(dpkg -i "$SNAPSHOT_FAIL_DEB" 2>&1)"
+SF_CODE=$?
+set -e
+printf '%s\n' "$SF_OUT" | sed 's/^/  | /'
+printf '%s\n' "$SF_OUT" > "$WORK/snapshot-fail.log"
+
+if [ "$SF_CODE" -ne 0 ]; then ci_pass "dpkg -i 返回非零（exit $SF_CODE）：升级在解包前被中止"; else ci_fail "快照建不起来却仍然升级了（fail-open）"; fi
+expect_contains "输出报告快照准备失败" "$WORK/snapshot-fail.log" "rollback snapshot preparation failed"
+expect_contains "输出报告升级在解包前中止" "$WORK/snapshot-fail.log" "upgrade aborted before unpack"
+expect_contains "输出说明升级前旧服务是 active" "$WORK/snapshot-fail.log" "old service was active"
+expect_contains "输出说明旧安装原封不动" "$WORK/snapshot-fail.log" "existing runnable installation left untouched"
+
+expect_eq "新版本没有被解包：dpkg 元数据仍然是 A" "$VERSION_BEFORE" "$(dpkg-query -W -f '${Version}' backup-project-server)"
+dpkg-query -W -f '${Status}\n' backup-project-server > "$WORK/status-after.txt"
+expect_eq "dpkg 状态没有被改坏（与失败前一致）" "$(cat "$WORK/status-before.txt")" "$(cat "$WORK/status-after.txt")"
+expect_eq "服务端二进制仍然是 A（sha256）" "$EXEC_BEFORE" "$(hash_of "$BIN")"
+expect_ok "旧服务仍然 active" wait_active
+expect_ok "端口仍然在监听" port_listening
+expect_eq "transport.key 未变" "$KEY_BEFORE" "$(hash_of "$INSTANCE/state/transport.key")"
+expect_eq "secrets.env 未变" "$SECRET_BEFORE" "$(hash_of /etc/backup-project-server/secrets.env)"
+expect_eq "server.conf 未变" "$CONF_BEFORE" "$(hash_of "$CONF")"
+expect_eq "data 未变" "$DATA_BEFORE" "$(hash_of "$SENTINEL")"
+expect_eq "元数据库逻辑状态未变" "$DB_LOGICAL_BEFORE" "$(db_logical)"
+if [ -e "$CACHE/rollback" ]; then ci_fail "失败时留下了 rollback/ 材料（半成品不许被当成有效材料）"; else ci_pass "失败时没有留下 rollback/ 材料"; fi
+if [ -n "$(ls -d "$CACHE"/rollback.tmp.* 2>/dev/null || true)" ]; then ci_fail "失败时留下了临时快照目录"; else ci_pass "失败时没有留下 rollback.tmp.* 残留"; fi
+if [ "$HAVE_CLIENT" -eq 1 ]; then
+  expect_ok "中止升级后回环 ping 仍然通过" backupctl remote ping --host 127.0.0.1 --port 18765 --server-key "$PIN"
+fi
+
+# 清掉注入：修好之后快照必须照常建立（SNAPSHOT_READY = YES 由下一节的升级日志验证）
+expect_ok "清掉故障注入" rm -f "$CACHE"
+# ================================================================ 4. 失败升级
+ci_section "4. 故意坏掉的版本 B：升级必须失败，并且必须自动回滚"
+BROKEN_DEB="$WORK/upgrade-broken.deb"
+VERSION_B="${VERSION_A}+rollbacktest1"
+mk_deb "$REAL_DEB" "$BROKEN_DEB" "$VERSION_B" yes
+expect_ok "版本号排序：$VERSION_B > $VERSION_A" dpkg --compare-versions "$VERSION_B" gt "$VERSION_A"
+log "坏包里的 backup-server = 立刻 exit 7 的 stub（确定性失败来源）"
+
+set +e
+UPGRADE_OUT="$(dpkg -i "$BROKEN_DEB" 2>&1)"
+UPGRADE_CODE=$?
+set -e
+printf '%s\n' "$UPGRADE_OUT" | sed 's/^/  | /'
+printf '%s\n' "$UPGRADE_OUT" > "$WORK/broken-upgrade.log"
+
+if [ "$UPGRADE_CODE" -ne 0 ]; then ci_pass "升级命令返回失败（exit $UPGRADE_CODE）"; else ci_fail "升级命令居然成功了（exit 0）：失败升级被伪装成成功"; fi
+expect_contains "升级前快照自检通过（SNAPSHOT_READY = YES）" "$WORK/broken-upgrade.log" "SNAPSHOT_READY = YES"
+expect_contains "postinst 明确报告升级失败" "$WORK/broken-upgrade.log" "升级失败"
+expect_contains "postinst 报告发生了自动回滚" "$WORK/broken-upgrade.log" "ROLLBACK OK"
+expect_contains "postinst 告诉管理员怎么让 dpkg 元数据一致" "$WORK/broken-upgrade.log" "--reinstall"
+expect_eq "服务端二进制已回滚成 A（sha256）" "$EXEC_A" "$(hash_of "$BIN")"
+expect_ok "回滚后服务 active" wait_active
+expect_ok "回滚后回环端口在监听" port_listening
+expect_file "回滚标记（rolled-back）存在" "$CACHE/rollback/rolled-back"
+
+expect_eq "transport.key 未变" "$(fp_field key)" "$(hash_of "$INSTANCE/state/transport.key")"
+expect_eq "secrets.env 未变" "$(fp_field secret)" "$(hash_of /etc/backup-project-server/secrets.env)"
+expect_eq "server.conf 未变（conffile 没被回滚覆盖）" "$(fp_field conf)" "$(hash_of "$CONF")"
+expect_file "元数据库仍然在（不是被删掉或重建）" "$INSTANCE/state/metadata.sqlite3"
+expect_eq "元数据库逻辑状态未变（升级前注册的用户还在）" "$DB_LOGICAL_A" "$(db_logical)"
+log "DB 字节哈希（信息性，不做断言）：before=${DB_BYTES_A:0:16} after=$(db_bytes | cut -c1-16) —— SQLite 打开/关闭会重写 header"
+expect_eq "data 目录内容未变" "$(fp_field data)" "$(hash_of "$SENTINEL")"
+expect_eq "用户状态指纹整体未变" "$FP_A" "$(state_fingerprint)"
+
+# 诚实记录 Debian 的边界：载荷回滚了，dpkg 元数据仍是新版本（half-configured）。
+DB_VERSION="$(dpkg-query -W -f '${Version}' backup-project-server)"
+dpkg-query -W -f '${Status}\n' backup-project-server > "$WORK/dpkg-status.txt"
+log "dpkg 版本 = $DB_VERSION  状态 = $(cat "$WORK/dpkg-status.txt")"
+expect_eq "dpkg 元数据仍是失败的新版本（Debian 的 maintainer script 没有事务回滚）" "$VERSION_B" "$DB_VERSION"
+expect_contains "dpkg 状态是 half-configured（明确地没成功）" "$WORK/dpkg-status.txt" "half-configured"
+log "失败升级证据：failure injected = exit 7 stub / install exit = $UPGRADE_CODE / rollback = OK / restored = $VERSION_A / restored sha256 = $EXEC_A"
+
+# ================================================================ 5. 回滚后仍然可用
+ci_section "5. 回滚之后本机服务端仍然真的可用（回环 ping，真实 BPSEC1 握手）"
+if [ "$HAVE_CLIENT" -eq 1 ]; then
+  expect_ok "回滚后 backupctl remote ping" backupctl remote ping --host 127.0.0.1 --port 18765 --server-key "$PIN"
+  expect_ok "ping 可重复" backupctl remote ping --host 127.0.0.1 --port 18765 --server-key "$PIN"
+else
+  echo "  NOTE  没有给客户端制品目录，跳过回环 ping（回滚后的端口监听已经单独断言）"
+fi
+
+# ================================================================ 6. 首次安装失败
+ci_section "6. 首次安装就失败：必须明确失败，且不许重新生成 key / secret"
+cleanup_all
+FIRST_BROKEN="$WORK/first-install-broken.deb"
+VERSION_C="${VERSION_A}+rollbacktest2"
+mk_deb "$REAL_DEB" "$FIRST_BROKEN" "$VERSION_C" yes
+set +e
+FIRST_OUT="$(dpkg -i "$FIRST_BROKEN" 2>&1)"
+FIRST_CODE=$?
+set -e
+printf '%s\n' "$FIRST_OUT" | sed 's/^/  | /'
+printf '%s\n' "$FIRST_OUT" > "$WORK/first-install.log"
+if [ "$FIRST_CODE" -ne 0 ]; then ci_pass "首次安装失败时 dpkg -i 返回非零（exit $FIRST_CODE）"; else ci_fail "首次安装失败却返回 0"; fi
+expect_contains "明确说明这是首次安装、没有旧版本可回滚" "$WORK/first-install.log" "首次安装"
+expect_file "失败之后 secrets.env 仍然被保留" /etc/backup-project-server/secrets.env
+expect_file "失败之后 transport.key 仍然被保留" "$INSTANCE/state/transport.key"
+KEY_AFTER_FAILED="$(hash_of "$INSTANCE/state/transport.key")"
+SECRET_AFTER_FAILED="$(hash_of /etc/backup-project-server/secrets.env)"
+if [ "$(service_state)" = "active" ]; then ci_fail "坏版本居然把服务起起来了"; else ci_pass "坏版本没有留下 active 的服务（state=$(service_state)）"; fi
+
+expect_ok "装回正常版本 A" dpkg -i "$REAL_DEB"
+expect_ok "服务 active" wait_active
+expect_eq "重装复用第一次生成的 transport.key（没有重新生成）" "$KEY_AFTER_FAILED" "$(hash_of "$INSTANCE/state/transport.key")"
+expect_eq "重装复用第一次生成的 secret（没有重新生成）" "$SECRET_AFTER_FAILED" "$(hash_of /etc/backup-project-server/secrets.env)"
+
+# ================================================================ 7. 收尾
+ci_section "7. 收尾：remove / purge 都不删数据，且不留下回滚材料"
+KEY_FINAL="$(hash_of "$INSTANCE/state/transport.key")"
+expect_ok "apt-get remove" apt-get remove -y -qq backup-project-server
+expect_file "remove 之后数据还在" "$INSTANCE/data"
+expect_file "remove 之后私钥还在" "$INSTANCE/state/transport.key"
+expect_ok "apt-get purge" apt-get purge -y -qq backup-project-server
+expect_file "purge 之后数据还在" "$INSTANCE/data"
+expect_eq "purge 之后私钥内容未变" "$KEY_FINAL" "$(hash_of "$INSTANCE/state/transport.key")"
+if [ -e "$CACHE" ]; then ci_fail "purge 之后回滚材料目录还在（$CACHE）"; else ci_pass "purge 之后回滚材料目录已清理"; fi
+log "清理测试环境留下的系统状态"
+cleanup_all
+
+ci_finish "upgrade-rollback"
