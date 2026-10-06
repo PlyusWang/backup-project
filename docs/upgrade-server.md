@@ -50,6 +50,12 @@
 
 ## 5. 回滚
 
+升级还有一个**前置条件**：如果旧服务升级前是 active，`preinst` 必须先成功建立回滚快照
+（先建在 `rollback.tmp.<pid>/` 里、自检通过后原子换入 `/var/cache/backup-project-server/rollback/`）。
+快照建不起来时 `dpkg` 会**在解包之前**中止升级并打印 `rollback snapshot preparation failed` /
+`upgrade aborted before unpack` —— 旧版本与用户状态原封不动，服务继续跑。旧服务升级前
+没在跑时没有这个前提：不建快照、允许升级，也不承诺自动回滚。
+
 **升级失败时不用你动手**：`postinst` 会先把程序载荷换回升级前的版本、重启并验证，然后带着
 非零退出码失败（`packaging/ci-upgrade-rollback-test.sh` 就是这条路径的验收）。它用的是
 `preinst` 在升级前留下的材料 `/var/cache/backup-project-server/rollback/`：只含二进制、
