@@ -190,9 +190,6 @@ build_appdir() {
   done
   write_build_info "$appdir/usr/share/backup-project" "client-appdir"
   printf '%s\n' "$VERSION" > "$appdir/usr/share/backup-project/VERSION"
-  # 第三方许可材料：在**构建容器里**按实际随包的 .so 生成（见 packaging/licenses/）
-  bash packaging/licenses/build-materials.sh "$appdir/usr/lib" \
-    "$appdir/usr/share/doc/backup-project-client" "backup-project-client"
 
   # 图标要在 linuxdeploy **之前**就位：linuxdeploy 会按 desktop 文件的 Icon=
   # 去 AppDir 里找图标文件，找不到就直接失败。图标本身来自仓库自己的
@@ -237,6 +234,11 @@ build_appdir() {
   # linuxdeploy-plugin-qt 会按它自己的判断挑平台插件（默认通常只有 xcb）。
   # 无显示环境（容器 / CI / 远程维护）要能启动**同一个** AppImage，所以把
   # offscreen 与 minimal 补齐；缺了就直接补，而不是指望环境变量一定生效。
+  # 第三方许可材料：必须在 linuxdeploy **之后**生成 —— 随包的 Qt 与依赖库是
+  # 那一步才拷进 usr/lib 的，之前生成会得到"0 个组件"的空材料。
+  bash packaging/licenses/build-materials.sh "$appdir/usr/lib" \
+    "$appdir/usr/share/doc/backup-project-client" "backup-project-client"
+
   local qt_plugins plugin
   qt_plugins="$(qtpaths6 --query QT_INSTALL_PLUGINS 2>/dev/null || qmake6 -query QT_INSTALL_PLUGINS 2>/dev/null || true)"
   if [ -n "$qt_plugins" ] && [ -d "$qt_plugins/platforms" ]; then
