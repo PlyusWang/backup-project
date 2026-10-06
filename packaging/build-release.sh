@@ -62,7 +62,7 @@ for needed in \
   packaging/server/server.conf packaging/server/launch-server.sh packaging/server/purge-data.sh \
   packaging/server/tmpfiles.conf \
   packaging/server/backup-project-server.service packaging/server/deb/control.in \
-  packaging/server/deb/postinst packaging/server/deb/prerm packaging/server/deb/postrm \
+  packaging/server/deb/postinst packaging/server/deb/preinst packaging/server/deb/prerm packaging/server/deb/postrm \
   packaging/server/wrappers/backup-server packaging/server/wrappers/backup-server-admin \
   packaging/server/wrappers/backup-server-admin-menu \
   packaging/server/wrappers/backup-server-keygen packaging/server/wrappers/backup-cert-tool \

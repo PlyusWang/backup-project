@@ -1,0 +1,97 @@
+#!/bin/bash
+# backup-project-server preinst —— 升级前留下"升级前可运行版本"的程序载荷。
+#
+# 为什么必须在 preinst 做（这是 dpkg 的时序，不是我们的选择）：
+#   1. new-preinst upgrade <old-version>   ← 旧文件还在磁盘上，包清单也还是旧版本的
+#   2. dpkg 解包新文件                     ← 旧二进制在这一步被覆盖，dpkg 不保留旧 payload
+#   3. old-postrm upgrade <new-version>
+#   4. new-postinst configure <old-version> ← 新版本起不来时，磁盘上已经没有旧版本了
+# dpkg 自己只备份 conffile（*.dpkg-old / *.dpkg-new），既不保留被替换掉的旧二进制，
+# 也不提供事务回滚；所以"能恢复的旧版本"只能由我们在第 1 步抓下来。
+#
+# 抓什么、绝不抓什么：
+#   * 来源 = dpkg 的旧包文件清单（provenance 明确：不猜路径、不搜目录）；
+#   * 只有旧服务确实 active 时才抓 —— 否则没有"可运行版本"，也不该假装能恢复；
+#   * 只抓程序载荷：/usr/lib/backup-project-server、/usr/bin 的包装器、unit、
+#     tmpfiles 片段；
+#   * 绝不碰 /etc（conffile 归 dpkg 管，用户改过的 server.conf 更不许覆盖）；
+#   * 绝不碰 /var/lib/backup-project-server（备份数据、元数据库、transport.key）
+#     与 /etc/backup-project-server/secrets.env —— 它们是用户状态，不是回滚对象；
+#   * 不抓 /usr/share/doc 与 /usr/lib/backup-project-server/share/doc（文档不是运行时载荷）。
+# 落点 /var/cache/backup-project-server/rollback/：FHS 里 /var/cache 就是"可再生、
+# 删掉不丢用户状态"的缓存；升级成功由 postinst 删除，卸载/清除由 postrm 删除。
+set -e
+
+ACTION="${1:-}"
+PKG=backup-project-server
+CACHE_DIR=/var/cache/backup-project-server
+ROLLBACK_DIR="$CACHE_DIR/rollback"
+TREE="$ROLLBACK_DIR/tree"
+MANIFEST="$ROLLBACK_DIR/manifest"
+
+# 只有 upgrade 需要旧版本恢复材料；install / abort-upgrade / triggered 什么都不做。
+[ "$ACTION" = "upgrade" ] || exit 0
+
+log()  { echo "[backup-project-server] preinst: $*"; }
+warn() { echo "[backup-project-server] preinst: WARN: $*" >&2; }
+
+have_systemd() { [ -d /run/systemd/system ] && command -v systemctl >/dev/null 2>&1; }
+
+# ---- 1. 旧服务在跑吗？没在跑就没有"可运行版本"可言 ----
+if ! have_systemd || ! systemctl is-active --quiet "$PKG"; then
+  log "升级前旧服务不是 active：不留回滚材料（失败时也不会假装能恢复）。"
+  exit 0
+fi
+
+OLD_VERSION="$(dpkg-query -W -f '${Version}' "$PKG" 2>/dev/null || true)"
+
+# ---- 2. 旧包文件清单（provenance）----
+LIST="$(mktemp)"
+if ! dpkg-query -L "$PKG" > "$LIST" 2>/dev/null; then
+  warn "读不到 $PKG 的文件清单：准备不了回滚材料。升级继续，但失败时无法自动恢复。"
+  rm -f "$LIST"
+  exit 0
+fi
+
+# ---- 3. 只复制程序载荷 ----
+rm -rf "$ROLLBACK_DIR"
+mkdir -p "$TREE"
+: > "$MANIFEST.tmp"
+count=0
+failed=0
+while IFS= read -r path; do
+  [ -n "$path" ] || continue
+  # 路径白名单：postinst 恢复时会用同一份白名单再校验一次。
+  case "$path" in
+    /usr/lib/backup-project-server/share/doc/*) continue ;;
+    /usr/lib/backup-project-server/*|/usr/bin/*|/usr/lib/tmpfiles.d/*|/lib/systemd/system/*|/usr/lib/systemd/system/*) ;;
+    *) continue ;;
+  esac
+  if [ -L "$path" ]; then :; elif [ -d "$path" ]; then continue; fi
+  if [ ! -e "$path" ] && [ ! -L "$path" ]; then continue; fi
+  rel="${path#/}"
+  mkdir -p "$TREE/$(dirname "$rel")" || { failed=1; break; }
+  cp -a "$path" "$TREE/$rel" || { failed=1; break; }        # -a：权限/属主/时间/符号链接
+  if [ -L "$path" ]; then
+    printf 'link\t-\t-\t-\t%s\t%s\n' "$(readlink "$path")" "$path" >> "$MANIFEST.tmp" || { failed=1; break; }
+  else
+    printf 'file\t%s\t%s\t%s\t%s\t%s\n' \
+      "$(stat -c '%a' "$path")" "$(stat -c '%U' "$path")" "$(stat -c '%G' "$path")" \
+      "$(sha256sum "$path" | cut -d' ' -f1)" "$path" >> "$MANIFEST.tmp" || { failed=1; break; }
+  fi
+  count=$((count + 1))
+done < "$LIST"
+rm -f "$LIST"
+
+if [ "$failed" -ne 0 ] || [ "$count" -eq 0 ]; then
+  warn "回滚材料没有准备成功（失败=$failed，已复制=$count 个文件）：升级继续，失败时无法自动恢复。"
+  rm -rf "$ROLLBACK_DIR"
+  exit 0
+fi
+
+mv "$MANIFEST.tmp" "$MANIFEST"
+printf '%s\n' "$OLD_VERSION" > "$ROLLBACK_DIR/version"
+date -u +%Y-%m-%dT%H:%M:%SZ > "$ROLLBACK_DIR/captured-at"
+chmod 0700 "$CACHE_DIR" "$ROLLBACK_DIR"
+log "已准备回滚材料：$count 个程序文件（升级前版本 $OLD_VERSION）→ $ROLLBACK_DIR"
+exit 0
