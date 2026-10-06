@@ -3,6 +3,7 @@
 # stage-client-release.sh —— 把客户端打成可以直接发出去的目录（PR #23）。
 #
 #   bash scripts/stage-client-release.sh [--out <目录>] [--no-gui] [--allow-dirty]
+#                                      [--version <semver>]
 #
 # 产出（默认 dist/client/）：
 #   bin/backupctl                                  客户端 CLI
@@ -30,9 +31,13 @@ cd "$ROOT_DIR"
 OUT_DIR="dist/client"
 WITH_GUI=1
 ALLOW_DIRTY=0
+# 发行版号由打包层给（packaging/build-release.sh --version）；不给就沿用
+# git describe 的老行为 —— 既有调用方式完全不变。
+VERSION_ARG=""
 while [ $# -gt 0 ]; do
   case "$1" in
     --out) OUT_DIR="$2"; shift 2 ;;
+    --version) VERSION_ARG="$2"; shift 2 ;;
     --no-gui) WITH_GUI=0; shift ;;
     --allow-dirty) ALLOW_DIRTY=1; shift ;;
     -h|--help) sed -n '2,20p' "$0"; exit 0 ;;
@@ -53,7 +58,12 @@ fi
 
 COMMIT="$(git rev-parse HEAD)"
 SHORT="$(git rev-parse --short HEAD)"
-STAMP="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+# 可复现构建：有 SOURCE_DATE_EPOCH 就用 commit 时间，没有才用当前时间。
+if [ -n "${SOURCE_DATE_EPOCH:-}" ]; then
+  STAMP="$(date -u -d "@$SOURCE_DATE_EPOCH" +%Y-%m-%dT%H:%M:%SZ)"
+else
+  STAMP="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+fi
 
 echo "== 构建客户端（commit $SHORT）=="
 GUI_NOTE="included"
@@ -83,11 +93,16 @@ cp resources/security/official-root-ed25519.pub "$OUT_DIR/share/backup-project/"
 for doc in docs/client-quick-start.md docs/release-layout.md docs/secure_transport.md; do
   [ -f "$doc" ] && cp "$doc" "$OUT_DIR/docs/"
 done
-printf '%s\n' "$(git describe --tags --always --dirty 2>/dev/null || echo "$SHORT")" > "$OUT_DIR/share/backup-project/VERSION"
+if [ -n "$VERSION_ARG" ]; then
+  printf '%s\n' "$VERSION_ARG" > "$OUT_DIR/share/backup-project/VERSION"
+else
+  printf '%s\n' "$(git describe --tags --always --dirty 2>/dev/null || echo "$SHORT")" > "$OUT_DIR/share/backup-project/VERSION"
+fi
 
-CXX_VERSION="$(g++ --version | head -1)"
+CXX_VERSION="$(g++ --version | awk 'NR==1')"
 cat > "$OUT_DIR/BUILD-INFO.txt" <<EOF
 bundle            = client
+version           = ${VERSION_ARG:-$(git describe --tags --always 2>/dev/null || echo "$SHORT")}
 commit            = $COMMIT
 commit_short      = $SHORT
 built_at_utc      = $STAMP
@@ -116,12 +131,16 @@ else
   FAILED=1
 fi
 if [ "$WITH_GUI" -eq 1 ]; then
-  QT_QPA_PLATFORM=offscreen timeout 10 "$OUT_DIR/bin/backup-gui-modern" > /dev/null 2>&1
+  # 保留 GUI 的输出："启动即退出"如果只说退出码，排查要从头再来一遍。
+  QT_QPA_PLATFORM=offscreen timeout 10 "$OUT_DIR/bin/backup-gui-modern" \
+    > /tmp/stage-client-gui.log 2>&1
   GUI_CODE=$?
   if [ "$GUI_CODE" -eq 124 ] || [ "$GUI_CODE" -eq 0 ]; then
     echo "  PASS GUI 在 offscreen 下启动正常（退出码 $GUI_CODE，124 = 仍在运行）"
   else
     echo "  FAIL GUI 启动即退出，退出码 $GUI_CODE" >&2
+    echo "  --- GUI 输出（最后 25 行）---" >&2
+    tail -25 /tmp/stage-client-gui.log >&2 || true
     FAILED=1
   fi
 fi

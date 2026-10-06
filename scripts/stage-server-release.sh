@@ -2,13 +2,14 @@
 #
 # stage-server-release.sh —— 把服务端打成可以直接发出去的目录（PR #23）。
 #
-#   bash scripts/stage-server-release.sh [--out <目录>] [--allow-dirty]
+#   bash scripts/stage-server-release.sh [--out <目录>] [--allow-dirty] [--version <semver>]
 #
 # 产出（默认 dist/server/）：
 #   bin/backup-server            服务端
 #   bin/backup-server-admin      本机管理工具（不监听端口）
 #   bin/backup-server-keygen     传输身份密钥工具
 #   tools/backup-cert-tool       离线根与证书工具（运维在别的机器上跑）
+#   bin/backup-server-admin.sh   交互式管理菜单（管理员真正会用的入口）
 #   share/backup-project/official-root-ed25519.pub
 #   share/backup-project/VERSION
 #   docs/                        随包文档
@@ -26,9 +27,12 @@ cd "$ROOT_DIR"
 
 OUT_DIR="dist/server"
 ALLOW_DIRTY=0
+# 发行版号由打包层给（packaging/build-release.sh --version）；不给就沿用老行为。
+VERSION_ARG=""
 while [ $# -gt 0 ]; do
   case "$1" in
     --out) OUT_DIR="$2"; shift 2 ;;
+    --version) VERSION_ARG="$2"; shift 2 ;;
     --allow-dirty) ALLOW_DIRTY=1; shift ;;
     -h|--help) sed -n '2,22p' "$0"; exit 0 ;;
     *) echo "未知参数：$1" >&2; exit 2 ;;
@@ -48,7 +52,12 @@ fi
 
 COMMIT="$(git rev-parse HEAD)"
 SHORT="$(git rev-parse --short HEAD)"
-STAMP="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+# 可复现构建：有 SOURCE_DATE_EPOCH 就用 commit 时间，没有才用当前时间。
+if [ -n "${SOURCE_DATE_EPOCH:-}" ]; then
+  STAMP="$(date -u -d "@$SOURCE_DATE_EPOCH" +%Y-%m-%dT%H:%M:%SZ)"
+else
+  STAMP="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+fi
 
 echo "== 构建服务端（commit $SHORT）=="
 if ! make server cert-tool > /tmp/stage-server-build.log 2>&1; then
@@ -64,15 +73,24 @@ cp build/backup-server "$OUT_DIR/bin/backup-server"
 cp build/backup-server-admin "$OUT_DIR/bin/backup-server-admin"
 cp build/backup-server-keygen "$OUT_DIR/bin/backup-server-keygen"
 cp build/backup-cert-tool "$OUT_DIR/tools/backup-cert-tool"
+# 真正给管理员用的交互式入口是 scripts/backup-server-admin.sh。之前 staging
+# 只放了底层命令，装完没有菜单可用 —— 这是 Release 可用性缺口（PR 要求 §32）。
+cp scripts/backup-server-admin.sh "$OUT_DIR/bin/backup-server-admin.sh"
+chmod 0755 "$OUT_DIR/bin/backup-server-admin.sh"
 cp resources/security/official-root-ed25519.pub "$OUT_DIR/share/backup-project/"
 for doc in docs/server-quick-start.md docs/self-hosted-server.md docs/release-layout.md docs/secure_transport.md; do
   [ -f "$doc" ] && cp "$doc" "$OUT_DIR/docs/"
 done
-printf '%s\n' "$(git describe --tags --always --dirty 2>/dev/null || echo "$SHORT")" > "$OUT_DIR/share/backup-project/VERSION"
+if [ -n "$VERSION_ARG" ]; then
+  printf '%s\n' "$VERSION_ARG" > "$OUT_DIR/share/backup-project/VERSION"
+else
+  printf '%s\n' "$(git describe --tags --always --dirty 2>/dev/null || echo "$SHORT")" > "$OUT_DIR/share/backup-project/VERSION"
+fi
 
 CXX_VERSION="$(g++ --version | head -1)"
 cat > "$OUT_DIR/BUILD-INFO.txt" <<EOF
 bundle            = server
+version           = ${VERSION_ARG:-$(git describe --tags --always 2>/dev/null || echo "$SHORT")}
 commit            = $COMMIT
 commit_short      = $SHORT
 built_at_utc      = $STAMP
@@ -111,7 +129,7 @@ fi
 #   2. 任何文件都不许含根密钥文件的行格式（^seed-hex: <64 位十六进制>$）。
 # 注意：二进制里出现 "seed-hex" 这个**字段名**是正常的（解析器要在里面），
 # 所以不能拿字段名当判据 —— 第一版就是这么误报的。
-UNEXPECTED="$(cd "$OUT_DIR" && find . -type f -printf '%P\n' | sort | grep -vE '^(bin/backup-server|bin/backup-server-admin|bin/backup-server-keygen|tools/backup-cert-tool|share/backup-project/official-root-ed25519[.]pub|share/backup-project/VERSION|docs/[A-Za-z0-9._-]+|BUILD-INFO[.]txt|MANIFEST[.]sha256)$' || true)"
+UNEXPECTED="$(cd "$OUT_DIR" && find . -type f -printf '%P\n' | sort | grep -vE '^(bin/backup-server|bin/backup-server-admin|bin/backup-server-admin[.]sh|bin/backup-server-keygen|tools/backup-cert-tool|share/backup-project/official-root-ed25519[.]pub|share/backup-project/VERSION|docs/[A-Za-z0-9._-]+|BUILD-INFO[.]txt|MANIFEST[.]sha256)$' || true)"
 if [ -n "$UNEXPECTED" ]; then
   echo "  FAIL 包内出现预期之外的文件：" >&2
   printf '%s\n' "$UNEXPECTED" >&2

@@ -1,0 +1,8 @@
+#!/bin/sh
+# /usr/bin/backup-project —— 现代 GUI 的稳定入口。
+# 真实二进制在 /usr/lib/backup-project-client/bin/ 下（Qt 运行时也在那里，
+# 不往 /usr/bin 里撒库）。
+set -e
+LIB_DIR=/usr/lib/backup-project-client
+export LD_LIBRARY_PATH="${LD_LIBRARY_PATH:+$LD_LIBRARY_PATH:}$LIB_DIR/lib"
+exec "$LIB_DIR/bin/backup-gui-modern" "$@"

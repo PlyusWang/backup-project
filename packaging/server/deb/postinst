@@ -1,0 +1,310 @@
+#!/bin/bash
+# backup-project-server postinst —— 首次安装与每次升级都会跑，必须幂等。
+#
+# 前四件事是初始化：建系统用户、建目录与权限、缺失时生成随机 secret / 传输身份
+# 私钥、重新加载 systemd。最后一件事是"提交或回滚"：
+#
+#   配置自检 + 重启 + 健康检查（systemd active 且配置的回环端口真的在监听）
+#     全部通过 → 安装/升级提交：删掉 preinst 留下的回滚材料，exit 0
+#     任意一步失败 → 安装/升级失败（exit 非零），并且：
+#        * 升级（$2 非空 + 有版本匹配的回滚材料）→ 先自动恢复升级前的程序载荷、
+#          重启并验证，然后告诉管理员这次升级是失败的；
+#        * 首次安装 → 不假装成功：保留已经生成的 secrets.env / transport.key，
+#          退出非零，让 apt/dpkg 明确报错。
+#
+# 绝不覆盖任何已存在的文件：secrets.env / transport.key / metadata.sqlite3 /
+# data/ 与证书全部 preserve。回滚只还原程序载荷（/usr/lib、/usr/bin、unit、
+# tmpfiles 片段），永远不碰 /etc 与 /var/lib —— 用户状态不是回滚对象。
+set -e
+
+ACTION="${1:-configure}"
+OLD_VERSION="${2:-}"
+INSTANCE_ROOT=/var/lib/backup-project-server
+CONF_DIR=/etc/backup-project-server
+LIB_DIR=/usr/lib/backup-project-server
+CACHE_DIR=/var/cache/backup-project-server
+ROLLBACK_DIR="$CACHE_DIR/rollback"
+SERVICE=backup-project-server
+PKG=backup-project-server
+CHECK_LOG=/tmp/backup-project-server-check.log
+HEALTH_TIMEOUT="${BACKUP_SERVER_HEALTH_TIMEOUT:-20}"
+
+log()  { echo "[backup-project-server] $*"; }
+warn() { echo "[backup-project-server] WARN: $*" >&2; }
+err()  { echo "[backup-project-server] ERROR: $*" >&2; }
+
+have_systemd()  { [ -d /run/systemd/system ] && command -v systemctl >/dev/null 2>&1; }
+service_state() { systemctl is-active "$SERVICE" 2>/dev/null || true; }
+dpkg_version()  { dpkg-query -W -f '${Version}' "$PKG" 2>/dev/null || true; }
+
+conf_value() { sed -n "s|^[[:space:]]*$1[[:space:]]*=[[:space:]]*||p" "$CONF_DIR/server.conf" | sed -n '1p'; }
+
+# ---------------------------------------------------------------- 回滚材料
+# preinst 写、这里读。三个条件缺一不可：
+#   * snapshot-ready —— preinst 只在快照**完整且自检通过**时才写这个标记；
+#     没有它说明材料来路不明（半成品/上一次的残留），宁可不回滚也不拿它覆盖正在运行的程序；
+#   * version 必须等于这次升级之前那个版本（陈旧材料一律不用）；
+#   * manifest / tree 必须存在且非空。
+rollback_available() {
+  [ -f "$ROLLBACK_DIR/snapshot-ready" ] || return 1
+  [ -s "$ROLLBACK_DIR/manifest" ] || return 1
+  [ -s "$ROLLBACK_DIR/version" ] || return 1
+  [ -d "$ROLLBACK_DIR/tree" ] || return 1
+  [ -n "$OLD_VERSION" ] || return 1
+  [ "$(sed -n '1p' "$ROLLBACK_DIR/version" 2>/dev/null || true)" = "$OLD_VERSION" ] || return 1
+  return 0
+}
+
+payload_path_allowed() {
+  case "$1" in
+    /usr/lib/backup-project-server/*|/usr/bin/*|/usr/lib/tmpfiles.d/*|/lib/systemd/system/*|/usr/lib/systemd/system/*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# 恢复 = 逐个文件校验 sha256 之后按记录的权限/属主写回。任何一项对不上就整体拒绝，
+# 宁可报告"回滚失败"，也不拿一份可能被篡改的材料去覆盖正在运行的程序。
+restore_payload() {
+  local type mode owner group hash path src actual n=0
+  while IFS=$'\t' read -r type mode owner group hash path; do
+    [ -n "${path:-}" ] || continue
+    if ! payload_path_allowed "$path"; then
+      err "回滚材料里有不在允许范围内的路径，拒绝恢复：$path"
+      return 1
+    fi
+    src="$ROLLBACK_DIR/tree/${path#/}"
+    if [ "$type" = "link" ]; then
+      [ -L "$src" ] || { err "回滚材料缺少符号链接：$path"; return 1; }
+      ln -sfn "$hash" "$path" || return 1
+    else
+      [ -f "$src" ] || { err "回滚材料缺少文件：$path"; return 1; }
+      actual="$(sha256sum "$src" | cut -d' ' -f1)"
+      [ "$actual" = "$hash" ] || { err "回滚材料自身校验失败（sha256 不匹配）：$path"; return 1; }
+      install -m "$mode" -o "$owner" -g "$group" "$src" "$path" || return 1
+      actual="$(sha256sum "$path" | cut -d' ' -f1)"
+      [ "$actual" = "$hash" ] || { err "恢复后校验失败：$path"; return 1; }
+    fi
+    n=$((n + 1))
+  done < "$ROLLBACK_DIR/manifest"
+  [ "$n" -gt 0 ] || { err "回滚材料是空的"; return 1; }
+  log "已恢复 $n 个程序文件（升级前版本 $OLD_VERSION）"
+}
+
+# ---------------------------------------------------------------- 健康检查
+# 合同 = systemd active + server.conf 里配置的端口真的进入监听。
+# 只看 systemctl restart 的退出码不够：unit 是 Type=simple，进程 fork 出来就算
+# 启动成功，二进制立刻退出时 restart 仍然是 0。
+# 本机没有"无副作用的产品级 probe"（回环 ping 要客户端包），所以第一版合同就是
+# 这两条；ss 不可用时退回 /proc/net/tcp{,6} 解析，不引入新依赖。
+port_listening() {
+  local port="$1" hex
+  hex="$(printf '%04X' "$port")"
+  if command -v ss >/dev/null 2>&1; then
+    ss -ltn 2>/dev/null | awk 'NR > 1 { print $4 }' | grep -q ":$port\$"
+    return $?
+  fi
+  local f
+  for f in /proc/net/tcp /proc/net/tcp6; do
+    [ -r "$f" ] || continue
+    while read -r _ local_addr _ state _; do
+      [ "$state" = "0A" ] || continue
+      case "$local_addr" in *":$hex") return 0 ;; esac
+    done < <(sed -n '2,$p' "$f")
+  done
+  return 1
+}
+
+service_healthy() {
+  local port waited=0
+  systemctl is-active --quiet "$SERVICE" || return 1
+  port="$(conf_value port)"; [ -n "$port" ] || port=18765
+  while [ "$waited" -lt "$HEALTH_TIMEOUT" ]; do
+    port_listening "$port" && return 0
+    systemctl is-active --quiet "$SERVICE" || return 1
+    sleep 1; waited=$((waited + 1))
+  done
+  return 1
+}
+
+start_and_check() {
+  systemctl daemon-reload >/dev/null 2>&1 || true
+  systemctl enable "$SERVICE" >/dev/null 2>&1 || true
+  # 失败升级会让 unit 撞上 StartLimitBurst：先清掉失败状态，否则重启会被拒绝。
+  systemctl reset-failed "$SERVICE" >/dev/null 2>&1 || true
+  systemctl restart "$SERVICE" >/dev/null 2>&1 || true
+  service_healthy
+}
+
+commit_install() {
+  rm -rf "$ROLLBACK_DIR"
+  log "安装/升级提交：已删除回滚材料（$ROLLBACK_DIR）"
+}
+
+# 前置检查：上一次失败升级如果已经回滚过，dpkg 元数据（新版本号）与磁盘载荷
+# （旧版本）就是不一致的。这里必须 fail closed，不能让一次 dpkg --configure -a
+# 把"其实装的是旧版本"悄悄变成"升级成功"。
+check_rolled_back_state() {
+  [ -f "$ROLLBACK_DIR/rolled-back" ] || return 0
+  local restored failed cur
+  restored="$(cut -f1 "$ROLLBACK_DIR/rolled-back")"
+  failed="$(cut -f2 "$ROLLBACK_DIR/rolled-back")"
+  cur="$(dpkg_version)"
+  if [ "$cur" = "$failed" ]; then
+    err "dpkg 说已安装 $cur，但磁盘上的程序载荷是自动回滚恢复的 $restored（上一次升级失败）。"
+    err "在元数据与载荷一致之前，这里不会报告成功。二选一："
+    err "  sudo apt install --reinstall ./<版本 $restored 的 .deb>    # 回到可用版本"
+    err "  或修好 $failed 的问题后重新执行那次升级"
+    exit 1
+  fi
+  rm -f "$ROLLBACK_DIR/rolled-back"
+}
+
+# 失败处理：report -> （升级时）自动回滚 -> 再启动验证。这个函数一定以非零退出，
+# 输出里不含 secret / 私钥内容，只有路径、版本与状态。
+fail_and_maybe_rollback() {
+  local reason="$1"
+  err "新版本没有通过启动/健康检查：$reason"
+  err "  service=$SERVICE  state=$(service_state)"
+  err "  最近日志：journalctl -u $SERVICE -n 80 --no-pager"
+
+  if [ -z "$OLD_VERSION" ]; then
+    err "这是首次安装（没有旧版本可回滚）：程序文件已就位，但没有可运行的服务。"
+    err "已保留首次生成的配置与身份：$CONF_DIR/secrets.env、$INSTANCE_ROOT/state/transport.key（不会重新生成）。"
+    err "修好之后重试： sudo dpkg --configure -a   或   sudo systemctl restart $SERVICE"
+    exit 1
+  fi
+
+  if ! rollback_available; then
+    err "没有可用的回滚材料：要么升级前旧服务不是 active（preinst 因此没有做快照），要么材料已被提交或清理。"
+    err "不会用陈旧 / 不完整的材料去覆盖当前载荷。"
+    err "请修复后重装： sudo apt install --reinstall ./<上一个可用版本的 .deb>"
+    exit 1
+  fi
+
+  log "开始自动回滚：$OLD_VERSION ← 只还原程序载荷（/usr/lib、/usr/bin、unit、tmpfiles 片段）"
+  log "  不碰 $CONF_DIR（配置与 secret）、不碰 $INSTANCE_ROOT（数据、元数据库、身份私钥）"
+  if restore_payload && start_and_check; then
+    log "ROLLBACK OK：已恢复 $OLD_VERSION，service state=$(service_state)，端口 $(conf_value port) 已就绪"
+    printf '%s\t%s\n' "$OLD_VERSION" "$(dpkg_version)" > "$ROLLBACK_DIR/rolled-back"
+    err "升级失败（exit 非零），但旧版本已自动恢复并可运行。"
+    err "注意：dpkg 的元数据仍然记着刚才那个起不来的版本；Debian 的 maintainer script 没有事务回滚，"
+    err "      要让元数据与磁盘载荷一致，请显式重装： sudo apt install --reinstall ./<版本 $OLD_VERSION 的 .deb>"
+    exit 1
+  fi
+
+  err "回滚失败：自动恢复没有把服务带回可运行状态。"
+  err "  rollback attempted = yes"
+  err "  rollback result    = FAILED"
+  err "  service state      = $(service_state)"
+  err "  手工恢复： sudo apt install --reinstall ./<版本 $OLD_VERSION 的 .deb> && sudo systemctl restart $SERVICE"
+  err "  日志：journalctl -u $SERVICE -n 80 --no-pager"
+  exit 1
+}
+
+# ================================================================ 1. 系统用户
+if ! getent group backup-project >/dev/null 2>&1; then
+  addgroup --system backup-project
+  log "已创建系统组 backup-project"
+fi
+if ! getent passwd backup-project >/dev/null 2>&1; then
+  adduser --system --ingroup backup-project --home "$INSTANCE_ROOT" \
+    --no-create-home --shell /usr/sbin/nologin --gecos "Backup Project server" \
+    backup-project >/dev/null
+  log "已创建系统用户 backup-project（/usr/sbin/nologin，无家目录登录）"
+fi
+
+# ================================================================ 2. 目录与权限
+install -d -m 0750 -o backup-project -g backup-project "$INSTANCE_ROOT"
+install -d -m 0750 -o backup-project -g backup-project "$INSTANCE_ROOT/data"
+install -d -m 0750 -o backup-project -g backup-project "$INSTANCE_ROOT/state"
+install -d -m 0750 -o root -g backup-project "$CONF_DIR"
+
+# ================================================================ 3. secret
+if [ ! -e "$CONF_DIR/secrets.env" ]; then
+  umask 007
+  secret_file="$(mktemp "$CONF_DIR/.secrets.env.XXXXXX")"
+  printf 'BACKUP_TOKEN_SECRET=%s\n' "$(head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n')" > "$secret_file"
+  # 产品对 secret 文件的要求是 0600（0400 也接受）—— group/other 一律不允许。
+  # 所以这里给服务用户本人 0600，而不是 root:backup-project 0640。
+  chown backup-project:backup-project "$secret_file"
+  chmod 0600 "$secret_file"
+  mv "$secret_file" "$CONF_DIR/secrets.env"
+  log "已生成随机 BACKUP_TOKEN_SECRET：$CONF_DIR/secrets.env（0600 backup-project）"
+else
+  log "secrets.env 已存在，保持不变：$CONF_DIR/secrets.env"
+fi
+chown backup-project:backup-project "$CONF_DIR/secrets.env" 2>/dev/null || true
+chmod 0600 "$CONF_DIR/secrets.env" 2>/dev/null || true
+
+# ================================================================ 4. 传输身份私钥
+KEY="$INSTANCE_ROOT/state/transport.key"
+if [ ! -e "$KEY" ]; then
+  if command -v runuser >/dev/null 2>&1; then
+    runuser -u backup-project -- "$LIB_DIR/bin/backup-server-keygen" --output "$KEY" >/dev/null
+  else
+    su -s /bin/bash -c "'$LIB_DIR/bin/backup-server-keygen' --output '$KEY'" backup-project >/dev/null
+  fi
+  chmod 0600 "$KEY"
+  log "已在服务器本机生成传输身份私钥：$KEY（0600，不离开本机）"
+else
+  log "传输身份私钥已存在，保持不变：$KEY"
+fi
+chmod 0600 "$KEY" 2>/dev/null || true
+chown backup-project:backup-project "$KEY" 2>/dev/null || true
+
+# ================================================================ 5. systemd 重载
+if have_systemd; then
+  systemctl daemon-reload || true
+fi
+
+# ================================================================ 6. 配置自检
+CONFIG_OK=0
+if "$LIB_DIR/bin/launch-server.sh" --check-config --config "$CONF_DIR/server.conf" >"$CHECK_LOG" 2>&1; then
+  CONFIG_OK=1
+else
+  warn "配置自检没有通过（下面是检查输出，不含任何 secret 内容）："
+  sed 's/^/  /' "$CHECK_LOG" >&2 || true
+fi
+
+if [ "$ACTION" != "configure" ]; then
+  log "action=$ACTION：不是 configure，这里不做服务动作。"
+  exit 0
+fi
+
+check_rolled_back_state
+
+# ================================================================ 7. 没有 systemd
+# 容器 / CI：没有 systemd 就没有"服务健康"可判定，配置自检就是这一层的合同。
+if ! have_systemd; then
+  if [ "$CONFIG_OK" -ne 1 ]; then
+    err "配置自检失败，而且当前环境没有 systemd：安装被视为失败。"
+    err "修好后重试： sudo dpkg --configure -a"
+    exit 1
+  fi
+  log "当前环境没有 systemd（容器/CI）：跳过服务启动。手工启动："
+  log "  $LIB_DIR/bin/launch-server.sh --config $CONF_DIR/server.conf"
+  rm -rf "$ROLLBACK_DIR"
+  exit 0
+fi
+
+# ================================================================ 8. 起服务并验证
+if [ "$CONFIG_OK" -ne 1 ]; then
+  fail_and_maybe_rollback "配置自检失败（launch-server.sh --check-config 返回非零）"
+fi
+
+if ! start_and_check; then
+  fail_and_maybe_rollback "重启后 state=$(service_state)，配置的回环端口 $(conf_value port) 没有进入监听"
+fi
+
+commit_install
+log "服务已启动并通过健康检查：systemctl status $SERVICE"
+
+# ================================================================ 9. 收尾提示
+log "监听地址：$(conf_value bind):$(conf_value port)"
+log "数据目录：$INSTANCE_ROOT/data    状态目录：$INSTANCE_ROOT/state"
+log "管理菜单：sudo backup-server-admin-menu"
+if [ -x "$LIB_DIR/bin/backup-server-keygen" ]; then
+  "$LIB_DIR/bin/backup-server-keygen" --show --key-file "$KEY" 2>/dev/null | sed -n 's/^\(.*指纹.*\)$/\1/p' | sed 's/^/[backup-project-server] /' || true
+fi
+log "公网直连不在本包的默认行为里：要开放请编辑 $CONF_DIR/server.conf（需要证书 + 理由 + require_bpsec2 = true），并自行在云安全组/防火墙放行 TCP。"
+exit 0

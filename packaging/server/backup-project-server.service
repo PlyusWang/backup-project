@@ -1,0 +1,57 @@
+# /lib/systemd/system/backup-project-server.service
+#
+# 由 backup-project-server 包安装。启动动作交给启动器（它解析
+# /etc/backup-project-server/server.conf），systemd 只负责进程生命周期。
+#
+# 加固项逐条评估（docs/install-server.md 里有每一项的"为什么可以打开"）：
+#   NoNewPrivileges / PrivateTmp / ProtectSystem=strict / ProtectHome
+#   ProtectKernel* / ProtectClock / ProtectHostname / ProtectControlGroups
+#   RestrictSUIDSGID / RestrictRealtime / RestrictNamespaces / LockPersonality
+#   RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX（服务端只用 TCP + 本地）
+# 服务端需要写的地方只有 /var/lib/backup-project-server，所以 ProtectSystem=strict
+# 加上一条 ReadWritePaths 就够；配置与二进制保持只读。
+
+[Unit]
+Description=Backup Project Server (BPSEC1 transport + BPSEC2 signed identity)
+Documentation=file:/usr/share/doc/backup-project-server/
+After=network.target
+Wants=network.target
+
+[Service]
+Type=simple
+User=backup-project
+Group=backup-project
+RuntimeDirectory=backup-project-server
+RuntimeDirectoryMode=0750
+ExecStart=/usr/bin/backup-project-server --config /etc/backup-project-server/server.conf
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=on-failure
+RestartSec=2
+StartLimitIntervalSec=120
+StartLimitBurst=5
+TimeoutStopSec=30
+KillSignal=SIGTERM
+
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/backup-project-server
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+ProtectProc=invisible
+RestrictSUIDSGID=true
+RestrictRealtime=true
+RestrictNamespaces=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+SystemCallArchitectures=native
+UMask=0027
+
+[Install]
+WantedBy=multi-user.target

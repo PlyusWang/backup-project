@@ -1,0 +1,427 @@
+# Release packages —— 在旧基线的干净容器里构建两个可以发给真实用户的产品族，
+# 并在干净机器上做安装 / 升级 / 卸载验收。
+#
+# 为什么必须在旧基线容器里构建：开发机是 Ubuntu 24.04（glibc 2.39），生产 ECS 是
+# Ubuntu 22.04（glibc 2.35）。直接用开发机的二进制上去会因为 "GLIBC_2.38 not
+# found" 起不来（PR #20 真实踩过一次）。
+#
+# 基线（证据见 docs/release-packaging.md）：
+#   server: ubuntu:20.04 -> glibc 2.31，无 Qt 依赖
+#   client: debian:12    -> glibc 2.36 + Qt 6.4.2
+#     客户端 GUI 使用 QtQuick.Dialogs 的 FolderDialog（Since: Qt 6.3），
+#     Ubuntu 22.04 只有 Qt 6.2.4，所以 22.04 不能作为客户端构建基线。
+#
+# 本 workflow **不创建 tag、不发布 GitHub Release**：tag 触发只是把设计留在这里
+# （v*），正式发布必须等人工 review。第三方 Action 一律 pin 到 commit SHA。
+#
+# 开发期触发：特性分支上的 push。GitHub 只允许 dispatch 默认分支上的 workflow，
+# 所以 PR 还没合并之前用 push 触发同一份定义。
+
+name: Release packages
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "验收用版本号（不会创建 tag、不会发布 Release）"
+        required: false
+        default: ""
+  push:
+    branches: ["feat/release-packaging"]
+
+permissions:
+  contents: read
+
+# 同一分支连续 push 时，旧的那次已经过时：让新的 run 取消它，避免为每个中间 commit
+# 都跑完整套 Release 验收。只影响还在跑的 run —— 已经跑完的历史 run 与它们的证据不动。
+concurrency:
+  group: release-packages-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  LC_ALL: C
+  TZ: UTC
+
+jobs:
+  prepare:
+    name: version
+    runs-on: ubuntu-24.04
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - id: v
+        run: |
+          v="${{ inputs.version }}"
+          if [ -z "$v" ]; then v="0.0.0+g$(git rev-parse --short=7 HEAD)"; fi
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+          echo "release version: $v (no tag is created)"
+
+  server:
+    name: build server (ubuntu:20.04, glibc 2.31)
+    needs: prepare
+    runs-on: ubuntu-24.04
+    container: ubuntu:20.04
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: install build tools
+        run: |
+          apt-get update
+          DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            git ca-certificates g++ make dpkg-dev libsqlite3-dev binutils file xz-utils python3
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - name: container workspace ownership (git safe.directory)
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+      - name: baseline report
+        run: |
+          . /etc/os-release; echo "build_os=$PRETTY_NAME"
+          echo "build_glibc=$(ldd --version | awk 'NR==1 {print $NF}')"
+          g++ --version | awk 'NR==1'
+      - name: build release artifacts (server)
+        run: bash packaging/build-release.sh --version "${{ needs.prepare.outputs.version }}" --only server
+      - name: ELF / glibc contract
+        run: |
+          bash packaging/ci-elf-report.sh \
+            dist/server/bin/backup-server dist/server/bin/backup-server-admin \
+            dist/server/bin/backup-server-keygen dist/server/tools/backup-cert-tool
+      - name: reproducibility（同一 commit 两次 clean build）
+        run: |
+          set -euo pipefail
+          v="${{ needs.prepare.outputs.version }}"
+          bash packaging/build-release.sh --version "$v" --only server --out dist/rep-a > /tmp/rep-a.log 2>&1
+          touch .gitignore
+          bash packaging/build-release.sh --version "$v" --only server --out dist/rep-b > /tmp/rep-b.log 2>&1
+          fail=0
+          for f in dist/rep-a/"$v"/*; do
+            b="dist/rep-b/$v/$(basename "$f")"
+            if cmp -s "$f" "$b"; then
+              echo "  IDENTICAL  $(basename "$f")  $(sha256sum "$f" | cut -d' ' -f1)"
+            else
+              echo "  DIFFERENT  $(basename "$f")"; fail=1
+            fi
+          done
+          test "$fail" = "0" || { echo "服务端制品不可复现"; exit 1; }
+      - name: deb metadata
+        run: |
+          deb=$(ls dist/release/*/backup-project-server_*.deb)
+          dpkg-deb --info "$deb"
+          dpkg-deb --contents "$deb" | sed -n '1,30p'
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: server-artifacts
+          path: |
+            dist/release/*/backup-project-server*
+            dist/release/*/RELEASE-INFO.txt
+          if-no-files-found: error
+
+  client:
+    name: build client (debian:12, Qt 6.4 / glibc 2.36)
+    needs: prepare
+    runs-on: ubuntu-24.04
+    container: debian:12
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: install build tools + Qt6 + packaging tools
+        run: |
+          apt-get update
+          DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends git ca-certificates g++ make dpkg-dev pkg-config binutils file xz-utils curl python3 python3-pil qt6-base-dev qt6-base-dev-tools qt6-declarative-dev qt6-declarative-dev-tools qt6-qpa-plugins qml6-module-qtquick qml6-module-qtquick-controls qml6-module-qtquick-layouts qml6-module-qtquick-dialogs qml6-module-qtquick-window qml6-module-qtquick-shapes qml6-module-qtquick-templates qml6-module-qtqml qml6-module-qtqml-workerscript
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - name: container workspace ownership (git safe.directory)
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+      - name: baseline report
+        run: |
+          . /etc/os-release; echo "build_os=$PRETTY_NAME"
+          echo "build_glibc=$(ldd --version | awk 'NR==1 {print $NF}')"
+          echo "qt=$(qmake6 -query QT_VERSION)"
+      - name: build release artifacts (client)
+        run: bash packaging/build-release.sh --version "${{ needs.prepare.outputs.version }}" --only client
+      - name: AppImage content check
+        run: |
+          appimage=$(ls dist/release/*/Backup-Project-Client-*-x86_64.AppImage)
+          echo "appimage=$appimage bytes=$(stat -c %s "$appimage")"
+          cd /tmp && rm -rf ext && mkdir ext && cd ext
+          "$GITHUB_WORKSPACE/$appimage" --appimage-extract > /dev/null
+          echo "platforms: $(ls squashfs-root/usr/plugins/platforms 2>/dev/null | tr '\n' ' ')"
+          echo "qml modules: $(ls squashfs-root/usr/qml 2>/dev/null | sed -n '1,8p' | tr '\n' ' ')"
+          test -e squashfs-root/usr/plugins/platforms/libqxcb.so || { echo "缺少 xcb 平台插件"; exit 1; }
+          test -e squashfs-root/usr/bin/backup-gui-modern || { echo "缺少 GUI"; exit 1; }
+      - name: ELF / glibc contract
+        run: |
+          bash packaging/ci-elf-report.sh \
+            dist/client/bin/backupctl dist/client/bin/backup-gui-modern
+      - name: reproducibility（同一 commit 两次 clean build；第二次先扰动 QRC 输入 mtime）
+        run: |
+          set -euo pipefail
+          v="${{ needs.prepare.outputs.version }}"
+          echo "== build A =="
+          bash packaging/build-release.sh --version "$v" --only client --out dist/rep-a > /tmp/rep-a.log 2>&1 || {
+            echo "build A 失败，输出如下："; tail -40 /tmp/rep-a.log; exit 1; }
+          # 只动 mtime，不动内容：Qt 的 rcc 会把资源输入的 mtime 写进资源表，
+          # 因为它认 SOURCE_DATE_EPOCH，所以成品必须仍然逐字节相同。
+          find ui/modern/qml -name '*.qml' -exec touch -d '2031-01-01 00:00:00' {} +
+          touch ui/modern/resources.qrc
+          echo "== build B（mtime 已扰动）=="
+          bash packaging/build-release.sh --version "$v" --only client --out dist/rep-b > /tmp/rep-b.log 2>&1 || {
+            echo "build B 失败，输出如下："; tail -40 /tmp/rep-b.log; exit 1; }
+          fail=0
+          for f in dist/rep-a/"$v"/*; do
+            b="dist/rep-b/$v/$(basename "$f")"
+            if cmp -s "$f" "$b"; then
+              echo "  IDENTICAL  $(basename "$f")  $(sha256sum "$f" | cut -d' ' -f1)"
+            else
+              echo "  DIFFERENT  $(basename "$f")"; fail=1
+            fi
+          done
+          test "$fail" = "0" || { echo "客户端制品不可复现"; exit 1; }
+      - name: deb metadata
+        run: |
+          deb=$(ls dist/release/*/backup-project-client_*.deb)
+          dpkg-deb --info "$deb"
+          echo "--- 前 20 个文件 ---"
+          dpkg-deb --contents "$deb" | sed -n '1,20p'
+          echo "--- 大小 ---"
+          du -sh "$(ls -d dist/release/*/)"*
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: client-artifacts
+          path: |
+            dist/release/*/Backup-Project-Client-*
+            dist/release/*/backup-project-client*
+            dist/release/*/RELEASE-INFO.txt
+          if-no-files-found: error
+
+  bundle:
+    name: bundle + clean-container install tests
+    needs: [prepare, client, server]
+    runs-on: ubuntu-24.04
+    container: debian:12
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - name: install tools
+        run: |
+          apt-get update
+          DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            ca-certificates dpkg-dev xz-utils file binutils iproute2 procps python3 python3-pil xvfb xauth fonts-dejavu-core libx11-6 libxcb1 libxkbcommon-x11-0 libxcb-cursor0 libgl1 libegl1 libopengl0 libglx0 libgl1-mesa-dri libegl-mesa0 libfontconfig1 libfreetype6 libdbus-1-3
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: client-artifacts
+          path: incoming/client
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: server-artifacts
+          path: incoming/server
+      - name: assemble release directory
+        run: |
+          set -e
+          version="${{ needs.prepare.outputs.version }}"
+          out="dist/release/$version"
+          mkdir -p "$out"
+          # upload-artifact 会把通配符匹配到的路径按"最外层公共前缀"保留下来，
+          # 于是下载下来的树里多一层版本目录（incoming/<product>/<version>/…）。
+          # 这里把每一层目录的内容都摊平复制到 out，同时也兼容直接放在根上的情况。
+          copy_tree() {
+            local root="$1" sub
+            for sub in "$root"/*/; do
+              [ -d "$sub" ] || continue
+              cp -a "$sub." "$out"/
+            done
+            find "$root" -maxdepth 1 -type f -exec cp -a {} "$out"/ \;
+          }
+          copy_tree incoming/client
+          copy_tree incoming/server
+          echo "--- $out ---"; ls -la "$out"
+          # RELEASE-INFO.txt 由两个构建作业各自产出（内容相同），这里保留其中一份；
+          # 只重算 SHA256SUMS。清单写到 out 之外再 mv 进来：重定向会在 find 之前
+          # 就把 SHA256SUMS 创建出来，否则清单会把自己也算进去（自校验必然失败）。
+          # 两个构建作业各写了一份 RELEASE-INFO.txt，内容只在 build_os / compiler /
+          # qt_version 上有区别。直接留一份会把客户端写成"Ubuntu 20.04 构建"——
+          # 所以在这里合并：公共字段一份，两边的构建环境各列一段。
+          client_info="$(ls incoming/client/*/RELEASE-INFO.txt 2>/dev/null | sed -n '1p')"
+          server_info="$(ls incoming/server/*/RELEASE-INFO.txt 2>/dev/null | sed -n '1p')"
+          if [ -n "$client_info" ] && [ -n "$server_info" ]; then
+            {
+              grep -vE '^(build_os|build_glibc|compiler|qt_version)' "$client_info"
+              echo "--- client build ---"
+              grep -E '^(build_os|build_glibc|compiler|qt_version)' "$client_info"
+              echo "--- server build ---"
+              grep -E '^(build_os|build_glibc|compiler|qt_version)' "$server_info"
+            } > "$out/RELEASE-INFO.txt"
+          fi
+          test -f "$out/RELEASE-INFO.txt" || { echo "缺少 RELEASE-INFO.txt"; exit 1; }
+          ( cd "$out" && rm -f SHA256SUMS \
+            && find . -maxdepth 1 -type f -printf '%P\n' | LC_ALL=C sort | xargs -r sha256sum > /tmp/release-sha256sums )
+          mv /tmp/release-sha256sums "$out/SHA256SUMS"
+          cat "$out/SHA256SUMS"
+          ( cd "$out" && sha256sum -c --quiet SHA256SUMS ) && echo "SHA256SUMS 自校验通过"
+      - name: AppImage launch tests
+        run: bash packaging/ci-appimage-test.sh "dist/release/${{ needs.prepare.outputs.version }}"
+      - name: client deb install (clean debian:12)
+        run: bash packaging/ci-client-install-test.sh "dist/release/${{ needs.prepare.outputs.version }}"
+      - name: server deb install (clean debian:12, no systemd)
+        run: bash packaging/ci-server-install-test.sh "dist/release/${{ needs.prepare.outputs.version }}"
+      - name: third-party license coverage
+        run: bash packaging/ci-license-coverage.sh "dist/release/${{ needs.prepare.outputs.version }}"
+      - name: RELEASE-INFO 必须同时包含两个构建环境
+        run: |
+          set -euo pipefail
+          info="dist/release/${{ needs.prepare.outputs.version }}/RELEASE-INFO.txt"
+          for section in 'client build' 'server build'; do
+            n="$(grep -c -- "--- $section ---" "$info" || true)"
+            if [ "$n" != "1" ]; then echo "RELEASE-INFO 里 $section 段出现 $n 次（应为 1）"; exit 1; fi
+          done
+          grep -q 'build_os      = Debian GNU/Linux 12 (bookworm)' "$info" || { echo "缺少 client 构建环境"; exit 1; }
+          grep -q 'build_os      = Ubuntu 20.04' "$info" || { echo "缺少 server 构建环境"; exit 1; }
+          grep -q 'qt_version    = 6.4.2' "$info" || { echo "缺少 client Qt 版本"; exit 1; }
+          echo "RELEASE-INFO 同时包含 client 与 server 构建环境"
+      - name: secret scan on final artifacts
+        run: bash packaging/ci-secret-scan.sh "dist/release/${{ needs.prepare.outputs.version }}"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: release-bundle
+          path: dist/release/**
+          if-no-files-found: error
+  systemd-acceptance:
+    name: systemd acceptance (ubuntu:22.04 real VM, sudo)
+    needs: [prepare, server, client]
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: server-artifacts
+          path: incoming
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: client-artifacts
+          path: client-incoming
+      - name: flatten the downloaded artifacts
+        run: |
+          set -eux
+          mkdir -p rel client-rel
+          for sub in incoming/*/; do cp -a "$sub." rel/; done
+          for sub in client-incoming/*/; do cp -a "$sub." client-rel/; done
+          find rel -maxdepth 1 -type f -exec cp -a {} rel/ \;
+          find client-rel -maxdepth 1 -type f -exec cp -a {} client-rel/ \;
+          ls -l rel client-rel
+      - name: install the .deb on a real systemd machine
+        run: |
+          set -eux
+          deb=$(ls rel/backup-project-server_*.deb)
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends ./$deb
+          sudo systemctl is-enabled backup-project-server
+          state=""
+          for i in $(seq 1 30); do
+            state="$(systemctl is-active backup-project-server || true)"
+            [ "$state" = "active" ] && break
+            sleep 1
+          done
+          echo "service state: $state"
+          sudo systemctl status backup-project-server --no-pager || true
+          sudo journalctl -u backup-project-server -n 80 --no-pager || true
+          test "$state" = "active"
+      - name: 默认只监听回环，且服务真的活着
+        run: |
+          set -eu
+          ss -ltn | grep '127.0.0.1:18765'
+          if ss -ltn | grep -q '0.0.0.0:18765'; then echo "不该监听 0.0.0.0"; exit 1; fi
+          sudo backup-server --check-config --config /etc/backup-project-server/server.conf
+          sudo backup-server-admin status || true
+      - name: unit 加固项逐个核对
+        run: |
+          set -eu
+          for prop in NoNewPrivileges PrivateTmp ProtectSystem ProtectHome RestrictSUIDSGID LockPersonality MemoryDenyWriteExecute; do
+            printf '%-24s %s\n' "$prop" "$(systemctl show -p $prop --value backup-project-server)"
+          done
+          systemd-analyze verify /lib/systemd/system/backup-project-server.service && echo "unit verify OK"
+      - name: 管理菜单（交互式入口）在真机上可用
+        run: |
+          set -eu
+          printf '0\n' | sudo backup-server-admin-menu | tail -5
+      - name: 失败升级 -> 自动回滚（真 systemd，sudo）
+        run: |
+          set -eux
+          sudo bash packaging/ci-upgrade-rollback-test.sh "$PWD/rel" "$PWD/client-rel"
+      - name: cleanup（无论如何都清干净，别污染后面的作业）
+        if: always()
+        run: |
+          set -eux
+          sudo apt-get purge -y backup-project-server || true
+          sudo apt-get purge -y backup-project-client || true
+          sudo rm -rf /var/lib/backup-project-server /etc/backup-project-server /var/cache/backup-project-server
+          sudo userdel backup-project || true
+          sudo groupdel backup-project || true
+
+  client-2204-probe:
+    name: client compatibility (Ubuntu 22.04)
+    needs: [prepare, client]
+    runs-on: ubuntu-24.04
+    container: ubuntu:22.04
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: install runtime tools
+        run: |
+          apt-get update
+          DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            git ca-certificates xz-utils file binutils python3 python3-pil xvfb xauth \
+            fonts-dejavu-core libx11-6 libxcb1 libxkbcommon-x11-0 libxcb-cursor0 \
+            libgl1 libegl1 libopengl0 libglx0 libgl1-mesa-dri libegl-mesa0 \
+            libfontconfig1 libfreetype6 libdbus-1-3 iproute2 procps
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - name: container workspace ownership (git safe.directory)
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: client-artifacts
+          path: incoming
+      - name: flatten + chmod
+        run: |
+          set -euo pipefail
+          mkdir -p rel
+          for sub in incoming/*/; do cp -a "$sub." rel/; done
+          find rel -maxdepth 1 -type f -exec cp -a {} rel/ \;
+          chmod 0755 rel/Backup-Project-Client-*-x86_64.AppImage
+          ls -l rel
+      - name: AppImage on Ubuntu 22.04（必须能跑：AppImage 自带 Qt 与它的依赖）
+        run: |
+          set -euo pipefail
+          appimage="$(ls rel/Backup-Project-Client-*-x86_64.AppImage)"
+          echo "OS: $(. /etc/os-release; echo "$PRETTY_NAME")  glibc: $(ldd --version | awk 'NR==1 {print $NF}')"
+          set +e
+          APPIMAGE_EXTRACT_AND_RUN=1 QT_QPA_PLATFORM=offscreen timeout 30 "$appimage" > /tmp/2204.log 2>&1
+          code=$?
+          set -e
+          echo "appimage_exit=$code"
+          case "$code" in
+            0|124) echo "PASS: AppImage 在 Ubuntu 22.04 上启动正常（退出码 $code；自带 Qt 6.4 与 ICU）" ;;
+            *) sed -n '1,12p' /tmp/2204.log; echo "FAIL: AppImage 在 22.04 上没起来"; exit 1 ;;
+          esac
+          qml="$(grep -cE '\.qml:[0-9]+:|is not installed' /tmp/2204.log || true)"
+          echo "qml_warnings=$qml"
+          test "$qml" = "0"
+      - name: client .deb on Ubuntu 22.04（Depends 不许要我们自带的那些库）
+        run: |
+          set -euo pipefail
+          deb="$(ls rel/backup-project-client_*.deb)"
+          apt-get update -qq
+          apt-get install -y -qq "./$deb"
+          dpkg -s backup-project-client | grep '^Version:'
+          backupctl --help > /dev/null
+          set +e
+          QT_QPA_PLATFORM=offscreen timeout 20 /usr/bin/backup-project > /tmp/2204deb.log 2>&1
+          code=$?
+          set -e
+          echo "deb_gui_exit=$code"
+          case "$code" in
+            0|124) echo "PASS: .deb 在 Ubuntu 22.04 上装得上、GUI 也能起" ;;
+            *) sed -n '1,12p' /tmp/2204deb.log; echo "FAIL: .deb 在 22.04 上起来了但 GUI 没起"; exit 1 ;;
+          esac
