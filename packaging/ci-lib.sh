@@ -25,7 +25,8 @@ expect_fail() { # expect_fail <标签> <命令...>
 
 expect_contains() { # expect_contains <标签> <文件> <正则>
   local label="$1" file="$2" pattern="$3"
-  if grep -qE "$pattern" "$file" 2>/dev/null; then ci_pass "$label"; else
+  # -- 是必须的：pattern 可能以 - 开头（例如 --reinstall），否则 grep 会把它当成选项。
+  if grep -qE -- "$pattern" "$file" 2>/dev/null; then ci_pass "$label"; else
     ci_fail "$label（$file 里没有匹配 $pattern 的内容）"; tail -5 "$file" >&2; fi
 }
 
