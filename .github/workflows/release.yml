@@ -80,6 +80,23 @@ jobs:
           bash packaging/ci-elf-report.sh \
             dist/server/bin/backup-server dist/server/bin/backup-server-admin \
             dist/server/bin/backup-server-keygen dist/server/tools/backup-cert-tool
+      - name: reproducibility（同一 commit 两次 clean build）
+        run: |
+          set -euo pipefail
+          v="${{ needs.prepare.outputs.version }}"
+          bash packaging/build-release.sh --version "$v" --only server --out dist/rep-a > /tmp/rep-a.log 2>&1
+          touch .gitignore
+          bash packaging/build-release.sh --version "$v" --only server --out dist/rep-b > /tmp/rep-b.log 2>&1
+          fail=0
+          for f in dist/rep-a/"$v"/*; do
+            b="dist/rep-b/$v/$(basename "$f")"
+            if cmp -s "$f" "$b"; then
+              echo "  IDENTICAL  $(basename "$f")  $(sha256sum "$f" | cut -d' ' -f1)"
+            else
+              echo "  DIFFERENT  $(basename "$f")"; fail=1
+            fi
+          done
+          test "$fail" = "0" || { echo "服务端制品不可复现"; exit 1; }
       - name: deb metadata
         run: |
           deb=$(ls dist/release/*/backup-project-server_*.deb)
@@ -130,6 +147,28 @@ jobs:
         run: |
           bash packaging/ci-elf-report.sh \
             dist/client/bin/backupctl dist/client/bin/backup-gui-modern
+      - name: reproducibility（同一 commit 两次 clean build；第二次先扰动 QRC 输入 mtime）
+        run: |
+          set -euo pipefail
+          v="${{ needs.prepare.outputs.version }}"
+          echo "== build A =="
+          bash packaging/build-release.sh --version "$v" --only client --out dist/rep-a > /tmp/rep-a.log 2>&1
+          # 只动 mtime，不动内容：Qt 的 rcc 会把资源输入的 mtime 写进资源表，
+          # 因为它认 SOURCE_DATE_EPOCH，所以成品必须仍然逐字节相同。
+          find ui/modern/qml -name '*.qml' -exec touch -d '2031-01-01 00:00:00' {} +
+          touch ui/modern/resources.qrc
+          echo "== build B（mtime 已扰动）=="
+          bash packaging/build-release.sh --version "$v" --only client --out dist/rep-b > /tmp/rep-b.log 2>&1
+          fail=0
+          for f in dist/rep-a/"$v"/*; do
+            b="dist/rep-b/$v/$(basename "$f")"
+            if cmp -s "$f" "$b"; then
+              echo "  IDENTICAL  $(basename "$f")  $(sha256sum "$f" | cut -d' ' -f1)"
+            else
+              echo "  DIFFERENT  $(basename "$f")"; fail=1
+            fi
+          done
+          test "$fail" = "0" || { echo "客户端制品不可复现"; exit 1; }
       - name: deb metadata
         run: |
           deb=$(ls dist/release/*/backup-project-client_*.deb)
@@ -219,6 +258,20 @@ jobs:
         run: bash packaging/ci-client-install-test.sh "dist/release/${{ needs.prepare.outputs.version }}"
       - name: server deb install (clean debian:12, no systemd)
         run: bash packaging/ci-server-install-test.sh "dist/release/${{ needs.prepare.outputs.version }}"
+      - name: third-party license coverage
+        run: bash packaging/ci-license-coverage.sh "dist/release/${{ needs.prepare.outputs.version }}"
+      - name: RELEASE-INFO 必须同时包含两个构建环境
+        run: |
+          set -euo pipefail
+          info="dist/release/${{ needs.prepare.outputs.version }}/RELEASE-INFO.txt"
+          for section in 'client build' 'server build'; do
+            n="$(grep -c -- "--- $section ---" "$info" || true)"
+            if [ "$n" != "1" ]; then echo "RELEASE-INFO 里 $section 段出现 $n 次（应为 1）"; exit 1; fi
+          done
+          grep -q 'build_os      = Debian GNU/Linux 12 (bookworm)' "$info" || { echo "缺少 client 构建环境"; exit 1; }
+          grep -q 'build_os      = Ubuntu 20.04' "$info" || { echo "缺少 server 构建环境"; exit 1; }
+          grep -q 'qt_version    = 6.4.2' "$info" || { echo "缺少 client Qt 版本"; exit 1; }
+          echo "RELEASE-INFO 同时包含 client 与 server 构建环境"
       - name: secret scan on final artifacts
         run: bash packaging/ci-secret-scan.sh "dist/release/${{ needs.prepare.outputs.version }}"
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
@@ -315,7 +368,7 @@ jobs:
           sudo userdel backup-project || true
           sudo groupdel backup-project || true
   client-2204-probe:
-    name: client on Ubuntu 22.04 (expected unsupported — record why)
+    name: client compatibility (Ubuntu 22.04)
     needs: [prepare, client]
     runs-on: ubuntu-24.04
     container: ubuntu:22.04
