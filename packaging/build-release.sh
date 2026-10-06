@@ -472,7 +472,7 @@ EOF
   cp packaging/server/deb/conffiles "$tree/DEBIAN-conffiles" 2>/dev/null || true
   local tmp_deb_dir="$WORK/server-deb-meta"
   rm -rf "$tmp_deb_dir"; mkdir -p "$tmp_deb_dir"
-  cp packaging/server/deb/control.in packaging/server/deb/postinst packaging/server/deb/prerm packaging/server/deb/postrm "$tmp_deb_dir/"
+  cp packaging/server/deb/control.in packaging/server/deb/postinst packaging/server/deb/preinst packaging/server/deb/prerm packaging/server/deb/postrm "$tmp_deb_dir/"
   printf '/etc/backup-project-server/server.conf\n' > "$tmp_deb_dir/conffiles"
   local depends
   depends="$(shlibs_depends "$tree/usr/lib/backup-project-server/bin/backup-server" \
