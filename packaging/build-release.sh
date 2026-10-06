@@ -349,9 +349,12 @@ EOF
   local bundled_pkgs="" so pkg
   while IFS= read -r so; do
     [ -n "$so" ] || continue
-    pkg="$(dpkg -S "/usr/lib/x86_64-linux-gnu/$so" 2>/dev/null | sed -n 's/:.*//p' | sed -n '1p')"
-    [ -n "$pkg" ] && bundled_pkgs="$bundled_pkgs $pkg"
-  done < <(find "$tree/usr/lib/backup-project-client/lib" -name '*.so*' -printf '%f\n' 2>/dev/null | LC_ALL=C sort -u)
+    # 注意 set -e + pipefail：dpkg -S 找不到时会返回非 0，直接放进 $( ) 会让
+    # 整个打包在这里静默退出（第一次跑就是这么挂的）。找不到就当成"不是发行版
+    # 提供的"处理，继续往下走。
+    pkg="$( { dpkg -S "/usr/lib/x86_64-linux-gnu/$so" 2>/dev/null || true; } | sed -n 's/:.*//p' | sed -n '1p')"
+    [ -n "$pkg" ] && bundled_pkgs="$bundled_pkgs $pkg" || true
+  done < <( { find "$tree/usr/lib/backup-project-client/lib" -name '*.so*' -printf '%f\n' 2>/dev/null || true; } | LC_ALL=C sort -u)
   log "  随包组件（从 Depends 中剔除）：$(printf '%s' "$bundled_pkgs" | tr ' ' '\n' | sed '/^$/d' | LC_ALL=C sort -u | tr '\n' ' ')"
   # 原来那条"去掉发行版 Qt"的规则保留：Qt 也在随包清单里，但显式写出来更清楚。
 
