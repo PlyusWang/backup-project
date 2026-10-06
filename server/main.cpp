@@ -55,11 +55,14 @@ void PrintUsage(std::FILE* out, const char* program) {
       "  --require-bpsec2        只接受 BPSEC2（签名身份）客户端：收到 BPSEC1\n"
       "                          的握手直接拒绝，不做降级。需要同时给出证书\n"
       "  --allow-public-bind <理由>\n"
-      "  --max-login-failures <n>    同一个用户名连续失败多少次后限速（默认 5，0 = 关闭）\n"
-      "  --login-lockout-seconds <n> 限速窗口秒数（默认 60）\n"
       "                          允许监听非回环地址（官方云端直连用）。默认\n"
       "                          仍然只允许 127.0.0.1；打开时必须同时给出\n"
-      "                          --bpsec2-cert-file，理由是给日志与事后审计的\n"
+      "                          --bpsec2-cert-file 与 "
+      "--require-bpsec2（缺一不可），\n"
+      "                          理由是给日志与事后审计的\n"
+      "  --max-login-failures <n>    同一个用户名连续失败多少次后限速（默认 "
+      "5，0 = 关闭）\n"
+      "  --login-lockout-seconds <n> 限速窗口秒数（默认 60）\n"
       "  --log-file <文件>       追加日志文件（默认只写 stderr）\n"
       "  --pid-file <文件>       PID 文件（同一个 root/db/port 只允许一个）\n"
       "  --workers <数量>        并发 worker 数，默认 4（1..64）\n"
@@ -225,7 +228,8 @@ int main(int argc, char* argv[]) {
       config.max_login_failures = static_cast<int>(number);
     } else if (name == "--login-lockout-seconds") {
       if (!ParseUnsigned(value, 86400, &number)) {
-        std::fprintf(stderr, "Error: --login-lockout-seconds must be a number.");
+        std::fprintf(stderr,
+                     "Error: --login-lockout-seconds must be a number.");
         return 2;
       }
       config.login_lockout_seconds = static_cast<int>(number);

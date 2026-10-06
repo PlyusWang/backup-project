@@ -23,7 +23,8 @@ void PrintUsage(std::FILE* out, const char* program) {
   std::fprintf(
       out,
       "用法:\n"
-      "  %s --output <文件>              生成新的传输身份私钥（0600，不覆盖已有文件）\n"
+      "  %s --output <文件>              "
+      "生成新的传输身份私钥（0600，不覆盖已有文件）\n"
       "  %s --show --key-file <文件>     打印已有私钥对应的公钥与指纹\n"
       "\n"
       "私钥只写在 --output 指定的文件里，不打印、不进日志、不进 Git。\n"
@@ -94,7 +95,8 @@ int main(int argc, char** argv) {
       return 2;
     }
     backupproject::net::TransportIdentity identity;
-    if (!backupproject::net::LoadTransportIdentity(key_file, &identity, &error)) {
+    if (!backupproject::net::LoadTransportIdentity(key_file, &identity,
+                                                   &error)) {
       std::fprintf(stderr, "Error: %s\n", error.c_str());
       return 1;
     }

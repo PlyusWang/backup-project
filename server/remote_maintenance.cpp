@@ -67,13 +67,11 @@ std::string RemoteMaintenance::UserDirectory(std::int64_t user_id) const {
   return root_directory_ + "/users/" + std::to_string(user_id);
 }
 
-std::string RemoteMaintenance::LockFilePath(
-    const std::string& root_directory) {
+std::string RemoteMaintenance::LockFilePath(const std::string& root_directory) {
   return root_directory + "/.backup-server.lock";
 }
 
-std::string RemoteMaintenance::ReadLockHint(
-    const std::string& root_directory) {
+std::string RemoteMaintenance::ReadLockHint(const std::string& root_directory) {
   const int fd =
       ::open(LockFilePath(root_directory).c_str(), O_RDONLY | O_CLOEXEC);
   if (fd < 0) {
@@ -99,24 +97,21 @@ bool RemoteMaintenance::RemoveDirectoryTree(const std::string& path,
     if (errno == ENOENT) {
       return true;
     }
-    SetError(error_message,
-             "cannot inspect " + path + ": " + StrerrorText());
+    SetError(error_message, "cannot inspect " + path + ": " + StrerrorText());
     return false;
   }
   if (!S_ISDIR(info.st_mode)) {
     // 普通文件或符号链接：只删这一个名字，绝不跟进去（跟进去就等于让一个
     // 链接把删除动作引到目录树之外）。
     if (::unlink(path.c_str()) != 0 && errno != ENOENT) {
-      SetError(error_message,
-               "cannot remove " + path + ": " + StrerrorText());
+      SetError(error_message, "cannot remove " + path + ": " + StrerrorText());
       return false;
     }
     return true;
   }
   DIR* directory = ::opendir(path.c_str());
   if (directory == nullptr) {
-    SetError(error_message,
-             "cannot open " + path + ": " + StrerrorText());
+    SetError(error_message, "cannot open " + path + ": " + StrerrorText());
     return false;
   }
   bool ok = true;
@@ -170,7 +165,8 @@ StoreResult RemoteMaintenance::DeleteSnapshot(std::int64_t user_id,
   const StoreResult counted = store_->CountSnapshotChildren(
       user_id, snapshot_id, &children, &store_error);
   if (counted != StoreResult::kOk) {
-    SetError(error_message, "cannot count the dependent snapshots: " + store_error);
+    SetError(error_message,
+             "cannot count the dependent snapshots: " + store_error);
     return StoreResult::kError;
   }
   if (children > 0) {
@@ -286,8 +282,8 @@ StoreResult RemoteMaintenance::DeleteAccount(std::int64_t user_id,
     }
     const std::string suffix = crypto::ToHex(
         reinterpret_cast<const unsigned char*>(raw.data()), raw.size());
-    quarantine = root_directory_ + "/trash/account-" +
-                 std::to_string(user_id) + "." + suffix + ".deleted";
+    quarantine = root_directory_ + "/trash/account-" + std::to_string(user_id) +
+                 "." + suffix + ".deleted";
     // 一步原子操作就让这个账户的全部字节变得不可见：目录被改名之后，
     // 没有任何路径能把 users/<id>/... 再解析出来。
     if (::rename(directory.c_str(), quarantine.c_str()) != 0) {
@@ -315,7 +311,8 @@ StoreResult RemoteMaintenance::DeleteAccount(std::int64_t user_id,
           store_error);
       if (::rename(quarantine.c_str(), directory.c_str()) != 0) {
         Log("warning: the rollback rename failed; the account data is left in"
-            " the root trash: " + StrerrorText());
+            " the root trash: " +
+            StrerrorText());
       }
     }
     SetError(error_message, result == StoreResult::kNotFound

@@ -390,16 +390,16 @@ bool ScheduledBackupService::RunRetention(ScheduleDocument* document,
       *failed += static_cast<std::uint64_t>(diagnostics.size());
     }
     if (!all_removed) {
-      // DeleteSnapshots 在第一个 unlink 失败处就返回，后面的名字**根本没被尝试**。
+      // DeleteSnapshots 在第一个 unlink
+      // 失败处就返回，后面的名字**根本没被尝试**。
       // 两种情形必须分开记，否则计数会撒谎：
       //   * removed 为空（例如依赖排序阶段就拒绝了）：整批都没尝试，
       //     按整批计；
       //   * removed 非空：恰好一个 unlink 真正失败（该函数遇到
       //     失败立即返回），只计这一个。
       if (failed != nullptr) {
-        *failed += removed.empty()
-                       ? static_cast<std::uint64_t>(to_remove.size())
-                       : 1u;
+        *failed +=
+            removed.empty() ? static_cast<std::uint64_t>(to_remove.size()) : 1u;
       }
       SetError(
           error_message,

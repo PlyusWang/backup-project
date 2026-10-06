@@ -326,7 +326,8 @@ bool RemoteServer::Configure(const RemoteServerConfig& config,
     if (!config.require_bpsec2) {
       // 公网监听只允许签名身份，而且要**只**允许签名身份：只开证书却仍接受
       // BPSEC1 的 pin 客户端，等于在公网上保留一条"人工指纹"的旧路。红队
-      // 复核用真实二进制验证过：不加这一条，pin 客户端在公网监听上仍能 ping 通。
+      // 复核用真实二进制验证过：不加这一条，pin 客户端在公网监听上仍能 ping
+      // 通。
       if (error_message != nullptr) {
         *error_message =
             "--allow-public-bind requires --require-bpsec2: a public listener"
@@ -454,8 +455,8 @@ bool RemoteServer::Start(std::string* error_message) {
     public_line << "WARNING: listening on a PUBLIC address "
                 << config_.bind_address << ":" << bound_port_
                 << " reason=" << config_.public_bind_reason
-                << " identity=bpsec2-certificate"
-                << " require_bpsec2=" << (config_.require_bpsec2 ? "yes" : "no");
+                << " identity=bpsec2-certificate" << " require_bpsec2="
+                << (config_.require_bpsec2 ? "yes" : "no");
     Log(public_line.str());
   }
   {
@@ -622,10 +623,11 @@ bool RemoteServer::OpenListener(std::string* error_message) {
 
 void RemoteServer::Stop() {
   // 生命周期合同（见头文件）：Stop() 不得与 Run() 并发。Run() 自己会
-  // shutdown pending 连接并 join 全部 worker，而 Stop() 会把 store_ / listener_fd_ 拆掉。
-  // 两者交叉的话，worker 会在用着 store_ / listener 的时候被拆掉。
-  // Run() 还在跑就调 Stop() 是调用方的错：这里直接返回，不做任何拆除，
-  // 让 Run() 自己把 worker 收干净（RequestStop() 仍然是唯一线程安全的停止入口）。
+  // shutdown pending 连接并 join 全部 worker，而 Stop() 会把 store_ /
+  // listener_fd_ 拆掉。 两者交叉的话，worker 会在用着 store_ / listener
+  // 的时候被拆掉。 Run() 还在跑就调 Stop()
+  // 是调用方的错：这里直接返回，不做任何拆除， 让 Run() 自己把 worker
+  // 收干净（RequestStop() 仍然是唯一线程安全的停止入口）。
   if (run_in_progress_.load()) {
     return;
   }
@@ -822,7 +824,8 @@ std::int64_t RemoteServer::LoginLockRemainingSeconds(
   if (found == login_throttle_.end()) {
     return 0;
   }
-  return found->second.locked_until > now ? found->second.locked_until - now : 0;
+  return found->second.locked_until > now ? found->second.locked_until - now
+                                          : 0;
 }
 
 void RemoteServer::RecordLoginFailure(const std::string& username) {
@@ -882,8 +885,8 @@ bool RemoteServer::HandleLogin(int fd, const FrameHeader& header,
   const std::int64_t lock_remaining = LoginLockRemainingSeconds(username);
   if (lock_remaining > 0) {
     Log("login throttled: too many consecutive failures for the supplied"
-        " username, " + std::to_string(lock_remaining) +
-        "s remaining");
+        " username, " +
+        std::to_string(lock_remaining) + "s remaining");
     return SendError(fd, header.opcode, header.request_id,
                      Status::kUnauthorized, error_message);
   }
