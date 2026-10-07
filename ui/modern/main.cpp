@@ -1,8 +1,8 @@
 // main.cpp
 //
 // 现代 QML GUI 的入口。除正常启动外还带几个开发期开关：
-//   --smoke-test 建引擎、建窗口、切四个页面、换主题后退出
-//   --screenshot <目录>                 四个页面 × 两套主题渲染成 PNG
+//   --smoke-test 建引擎、建窗口、遍历七个页面、换主题后退出
+//   --screenshot <目录>                 七个页面 × 两套主题渲染成 PNG
 //   --self-test <源> <备份文件> <恢复目录> [--include R] [--exclude R]
 //                                       真跑一次 direct archive 备份 + 恢复
 //   --repository-test <源> <仓库> <恢复目录>
@@ -604,7 +604,7 @@ int main(int argc, char* argv[]) {
   }
 
   if (repository_test_index >= 0) {
-    return RunRepositoryTest(&controller,
+    return RunRepositoryTest(window, &controller,
                              arguments.at(repository_test_index + 1),
                              arguments.at(repository_test_index + 2),
                              arguments.at(repository_test_index + 3));

@@ -79,7 +79,8 @@ int RunPreviewTest(backup_modern::FilterRuleModel* model, const QString& source,
 int RunSelfTest(backup_modern::BackupController* controller,
                 const QString& source, const QString& archive_file,
                 const QString& destination);
-int RunRepositoryTest(backup_modern::BackupController* controller,
+int RunRepositoryTest(QQuickWindow* window,
+                      backup_modern::BackupController* controller,
                       const QString& source, const QString& repository,
                       const QString& destination);
 int RunPathTest(backup_modern::BackupController* controller);

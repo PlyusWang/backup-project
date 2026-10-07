@@ -220,6 +220,19 @@ Item {
                     encryptionMethodText: String(
                         modelData["encryptionMethodText"] || "")
                     passwordRequired: Boolean(modelData["passwordRequired"])
+                    // 快照种类与依赖链状态。缺键时按"完整、可恢复"退化：
+                    // 没有这几个字段的老目录不该被误判成不可恢复。退化只
+                    // 影响提示，恢复能不能成仍然由核心裁决。
+                    recordKind: String(modelData["recordKind"] || "full")
+                    isDelta: Boolean(modelData["isDelta"])
+                    parentFileName: String(
+                        modelData["parentFileName"] || "")
+                    chainRestorable:
+                    modelData["chainRestorable"] === undefined
+                        ? true
+                        : Boolean(modelData["chainRestorable"])
+                    chainDiagnostic: String(
+                        modelData["chainDiagnostic"] || "")
                     // 来源与计划变化摘要来自 ScheduleStore（不是文件名解析）：
                     // 手动备份不会被自动淘汰，"这条是谁建的"必须一眼看得出来。
                     // 这两个调用连同实参必须保持在同一行：静态契约按整串匹配，
