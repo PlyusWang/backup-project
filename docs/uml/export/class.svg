@@ -1,0 +1,168 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1420" height="940"
+ viewBox="0 0 1420 940">
+<defs><marker id="ah" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="#37474f"/></marker></defs>
+<rect width="100%" height="100%" fill="#ffffff"/>
+<style>text{font-family:"Noto Sans CJK SC","Droid Sans Fallback",sans-serif;}</style>
+<text x="710" y="28" font-size="21" fill="#1a1a1a" text-anchor="middle" dominant-baseline="central" font-weight="bold">图 2  Class Diagram —— 核心职责类</text>
+<rect x="30" y="60" width="420" height="250" rx="8" fill="#eceff1" stroke="#b0bec5" stroke-width="1.6"/>
+<text x="42" y="80" font-size="15" fill="#37474f" text-anchor="start" dominant-baseline="central" font-weight="bold">前端桥接（ui/modern）</text>
+<rect x="470" y="60" width="430" height="250" rx="8" fill="#e8f5e9" stroke="#b0bec5" stroke-width="1.6"/>
+<text x="482" y="80" font-size="15" fill="#37474f" text-anchor="start" dominant-baseline="central" font-weight="bold">本地核心（src/core）</text>
+<rect x="920" y="60" width="470" height="250" rx="8" fill="#fff8e1" stroke="#b0bec5" stroke-width="1.6"/>
+<text x="932" y="80" font-size="15" fill="#37474f" text-anchor="start" dominant-baseline="central" font-weight="bold">归档与编解码</text>
+<rect x="30" y="340" width="420" height="260" rx="8" fill="#e8f5e9" stroke="#b0bec5" stroke-width="1.6"/>
+<text x="42" y="360" font-size="15" fill="#37474f" text-anchor="start" dominant-baseline="central" font-weight="bold">调度与实时</text>
+<rect x="470" y="340" width="430" height="260" rx="8" fill="#fff8e1" stroke="#b0bec5" stroke-width="1.6"/>
+<text x="482" y="360" font-size="15" fill="#37474f" text-anchor="start" dominant-baseline="central" font-weight="bold">增量备份</text>
+<rect x="920" y="340" width="470" height="260" rx="8" fill="#eceff1" stroke="#b0bec5" stroke-width="1.6"/>
+<text x="932" y="360" font-size="15" fill="#37474f" text-anchor="start" dominant-baseline="central" font-weight="bold">网络与服务端</text>
+<rect x="30" y="630" width="1360" height="260" rx="8" fill="#f3e5f5" stroke="#b0bec5" stroke-width="1.6"/>
+<text x="42" y="650" font-size="15" fill="#37474f" text-anchor="start" dominant-baseline="central" font-weight="bold">配置、目录与文件系统（共享，无 Qt 依赖）</text>
+<rect x="48" y="92" width="180" height="85" rx="4" fill="#ffffff" stroke="#263238" stroke-width="1.6"/>
+<line x1="48" y1="118" x2="228" y2="118" stroke="#263238" stroke-width="1.4"/>
+<text x="138" y="106" font-size="14" fill="#263238" text-anchor="middle" dominant-baseline="central" font-weight="bold">BackupController</text>
+<text x="58" y="134" font-size="12" fill="#37474f" text-anchor="start" dominant-baseline="central">+ startBackupWithStrategy</text>
+<text x="58" y="151" font-size="12" fill="#37474f" text-anchor="start" dominant-baseline="central">+ startManagedRestore</text>
+<text x="58" y="168" font-size="12" fill="#37474f" text-anchor="start" dominant-baseline="central">+ backupRecords</text>
+<rect x="248" y="92" width="180" height="85" rx="4" fill="#ffffff" stroke="#263238" stroke-width="1.6"/>
+<line x1="248" y1="118" x2="428" y2="118" stroke="#263238" stroke-width="1.4"/>
+<text x="338" y="106" font-size="14" fill="#263238" text-anchor="middle" dominant-baseline="central" font-weight="bold">RemoteController</text>
+<text x="258" y="134" font-size="12" fill="#37474f" text-anchor="start" dominant-baseline="central">+ login / register</text>
+<text x="258" y="151" font-size="12" fill="#37474f" text-anchor="start" dominant-baseline="central">+ backupRemote</text>
+<text x="258" y="168" font-size="12" fill="#37474f" text-anchor="start" dominant-baseline="central">+ restoreSnapshot</text>
+<rect x="48" y="206" width="180" height="85" rx="4" fill="#ffffff" stroke="#263238" stroke-width="1.6"/>
+<line x1="48" y1="232" x2="228" y2="232" stroke="#263238" stroke-width="1.4"/>
+<text x="138" y="220" font-size="14" fill="#263238" text-anchor="middle" dominant-baseline="central" font-weight="bold">ScheduleController</text>
+<text x="58" y="248" font-size="12" fill="#37474f" text-anchor="start" dominant-baseline="central">+ saveConfig</text>
+<text x="58" y="265" font-size="12" fill="#37474f" text-anchor="start" dominant-baseline="central">+ runNow</text>
+<text x="58" y="282" font-size="12" fill="#37474f" text-anchor="start" dominant-baseline="central">+ history</text>
+<rect x="248" y="206" width="180" height="68" rx="4" fill="#ffffff" stroke="#263238" stroke-width="1.6"/>
+<line x1="248" y1="232" x2="428" y2="232" stroke="#263238" stroke-width="1.4"/>
+<text x="338" y="220" font-size="14" fill="#263238" text-anchor="middle" dominant-baseline="central" font-weight="bold">FilterRuleModel</text>
+<text x="258" y="248" font-size="12" fill="#37474f" text-anchor="start" dominant-baseline="central">+ validateForm</text>
+<text x="258" y="265" font-size="12" fill="#37474f" text-anchor="start" dominant-baseline="central">+ requestPreview</text>
+<rect x="488" y="92" width="190" height="68" rx="4" fill="#ffffff" stroke="#263238" stroke-width="1.6"/>
+<line x1="488" y1="118" x2="678" y2="118" stroke="#263238" stroke-width="1.4"/>
+<text x="583" y="106" font-size="14" fill="#263238" text-anchor="middle" dominant-baseline="central" font-weight="bold">BackupEngine</text>
+<text x="498" y="134" font-size="12" fill="#37474f" text-anchor="start" dominant-baseline="central">+ Backup / Restore</text>
+<text x="498" y="151" font-size="12" fill="#37474f" text-anchor="start" dominant-baseline="central">+ 按 magic 分流 v0.1 / v2</text>
+<rect x="694" y="92" width="190" height="68" rx="4" fill="#ffffff" stroke="#263238" stroke-width="1.6"/>
+<line x1="694" y1="118" x2="884" y2="118" stroke="#263238" stroke-width="1.4"/>
+<text x="789" y="106" font-size="14" fill="#263238" text-anchor="middle" dominant-baseline="central" font-weight="bold">BackupPipeline</text>
+<text x="704" y="134" font-size="12" fill="#37474f" text-anchor="start" dominant-baseline="central">+ 打包 -&gt; 压缩 -&gt; 加密</text>
+<text x="704" y="151" font-size="12" fill="#37474f" text-anchor="start" dominant-baseline="central">+ PublishNoReplace</text>
+<rect x="488" y="206" width="190" height="68" rx="4" fill="#ffffff" stroke="#263238" stroke-width="1.6"/>
+<line x1="488" y1="232" x2="678" y2="232" stroke="#263238" stroke-width="1.4"/>
+<text x="583" y="220" font-size="14" fill="#263238" text-anchor="middle" dominant-baseline="central" font-weight="bold">BackupCatalog</text>
+<text x="498" y="248" font-size="12" fill="#37474f" text-anchor="start" dominant-baseline="central">+ List / Resolve / Delete</text>
+<text x="498" y="265" font-size="12" fill="#37474f" text-anchor="start" dominant-baseline="central">+ 依赖感知删除</text>
+<rect x="694" y="206" width="190" height="68" rx="4" fill="#ffffff" stroke="#263238" stroke-width="1.6"/>
+<line x1="694" y1="232" x2="884" y2="232" stroke="#263238" stroke-width="1.4"/>
+<text x="789" y="220" font-size="14" fill="#263238" text-anchor="middle" dominant-baseline="central" font-weight="bold">ConfigManager</text>
+<text x="704" y="248" font-size="12" fill="#37474f" text-anchor="start" dominant-baseline="central">+ repository_path</text>
+<text x="704" y="265" font-size="12" fill="#37474f" text-anchor="start" dominant-baseline="central">+ 原子替换写入</text>
+<rect x="940" y="92" width="200" height="68" rx="4" fill="#ffffff" stroke="#263238" stroke-width="1.6"/>
+<line x1="940" y1="118" x2="1140" y2="118" stroke="#263238" stroke-width="1.4"/>
+<text x="1040" y="106" font-size="14" fill="#263238" text-anchor="middle" dominant-baseline="central" font-weight="bold">PackStream</text>
+<text x="950" y="134" font-size="12" fill="#37474f" text-anchor="start" dominant-baseline="central">+ MyPack v2 / USTAR</text>
+<text x="950" y="151" font-size="12" fill="#37474f" text-anchor="start" dominant-baseline="central">+ Fast USTAR</text>
+<rect x="1156" y="92" width="216" height="68" rx="4" fill="#ffffff" stroke="#263238" stroke-width="1.6"/>
+<line x1="1156" y1="118" x2="1372" y2="118" stroke="#263238" stroke-width="1.4"/>
+<text x="1264" y="106" font-size="14" fill="#263238" text-anchor="middle" dominant-baseline="central" font-weight="bold">ContainerFormat</text>
+<text x="1166" y="134" font-size="12" fill="#37474f" text-anchor="start" dominant-baseline="central">+ BKPCNT2 160B 头</text>
+<text x="1166" y="151" font-size="12" fill="#37474f" text-anchor="start" dominant-baseline="central">+ 算法 id + salt/iv/tag</text>
+<rect x="940" y="206" width="200" height="68" rx="4" fill="#ffffff" stroke="#263238" stroke-width="1.6"/>
+<line x1="940" y1="232" x2="1140" y2="232" stroke="#263238" stroke-width="1.4"/>
+<text x="1040" y="220" font-size="14" fill="#263238" text-anchor="middle" dominant-baseline="central" font-weight="bold">CompressionCodec</text>
+<text x="950" y="248" font-size="12" fill="#37474f" text-anchor="start" dominant-baseline="central">+ Huffman (HUF1)</text>
+<text x="950" y="265" font-size="12" fill="#37474f" text-anchor="start" dominant-baseline="central">+ LZSS + Huffman (LZH1)</text>
+<rect x="1156" y="206" width="216" height="68" rx="4" fill="#ffffff" stroke="#263238" stroke-width="1.6"/>
+<line x1="1156" y1="232" x2="1372" y2="232" stroke="#263238" stroke-width="1.4"/>
+<text x="1264" y="220" font-size="14" fill="#263238" text-anchor="middle" dominant-baseline="central" font-weight="bold">Crypto</text>
+<text x="1166" y="248" font-size="12" fill="#37474f" text-anchor="start" dominant-baseline="central">+ X25519 / HKDF / AES-CTR</text>
+<text x="1166" y="265" font-size="12" fill="#37474f" text-anchor="start" dominant-baseline="central">+ Ed25519 / BPCERT1</text>
+<rect x="48" y="374" width="180" height="68" rx="4" fill="#ffffff" stroke="#263238" stroke-width="1.6"/>
+<line x1="48" y1="400" x2="228" y2="400" stroke="#263238" stroke-width="1.4"/>
+<text x="138" y="388" font-size="14" fill="#263238" text-anchor="middle" dominant-baseline="central" font-weight="bold">ScheduleStore</text>
+<text x="58" y="416" font-size="12" fill="#37474f" text-anchor="start" dominant-baseline="central">+ schedule.json</text>
+<text x="58" y="433" font-size="12" fill="#37474f" text-anchor="start" dominant-baseline="central">+ flock 单跑者锁</text>
+<rect x="248" y="374" width="180" height="68" rx="4" fill="#ffffff" stroke="#263238" stroke-width="1.6"/>
+<line x1="248" y1="400" x2="428" y2="400" stroke="#263238" stroke-width="1.4"/>
+<text x="338" y="388" font-size="14" fill="#263238" text-anchor="middle" dominant-baseline="central" font-weight="bold">ScheduledService</text>
+<text x="258" y="416" font-size="12" fill="#37474f" text-anchor="start" dominant-baseline="central">+ 变化检测 skip</text>
+<text x="258" y="433" font-size="12" fill="#37474f" text-anchor="start" dominant-baseline="central">+ 依赖感知保留</text>
+<rect x="48" y="500" width="180" height="68" rx="4" fill="#ffffff" stroke="#263238" stroke-width="1.6"/>
+<line x1="48" y1="526" x2="228" y2="526" stroke="#263238" stroke-width="1.4"/>
+<text x="138" y="514" font-size="14" fill="#263238" text-anchor="middle" dominant-baseline="central" font-weight="bold">RealtimeWatcher</text>
+<text x="58" y="542" font-size="12" fill="#37474f" text-anchor="start" dominant-baseline="central">+ 递归 inotify</text>
+<text x="58" y="559" font-size="12" fill="#37474f" text-anchor="start" dominant-baseline="central">+ overflow -&gt; rebuild</text>
+<rect x="248" y="500" width="180" height="68" rx="4" fill="#ffffff" stroke="#263238" stroke-width="1.6"/>
+<line x1="248" y1="526" x2="428" y2="526" stroke="#263238" stroke-width="1.4"/>
+<text x="338" y="514" font-size="14" fill="#263238" text-anchor="middle" dominant-baseline="central" font-weight="bold">RealtimeStore</text>
+<text x="258" y="542" font-size="12" fill="#37474f" text-anchor="start" dominant-baseline="central">+ realtime.json</text>
+<text x="258" y="559" font-size="12" fill="#37474f" text-anchor="start" dominant-baseline="central">+ source/repo 不重叠</text>
+<rect x="488" y="374" width="190" height="68" rx="4" fill="#ffffff" stroke="#263238" stroke-width="1.6"/>
+<line x1="488" y1="400" x2="678" y2="400" stroke="#263238" stroke-width="1.4"/>
+<text x="583" y="388" font-size="14" fill="#263238" text-anchor="middle" dominant-baseline="central" font-weight="bold">IncrementalBackup</text>
+<text x="498" y="416" font-size="12" fill="#37474f" text-anchor="start" dominant-baseline="central">+ 基线 / delta 生成</text>
+<text x="498" y="433" font-size="12" fill="#37474f" text-anchor="start" dominant-baseline="central">+ fail-closed 保留</text>
+<rect x="694" y="374" width="190" height="68" rx="4" fill="#ffffff" stroke="#263238" stroke-width="1.6"/>
+<line x1="694" y1="400" x2="884" y2="400" stroke="#263238" stroke-width="1.4"/>
+<text x="789" y="388" font-size="14" fill="#263238" text-anchor="middle" dominant-baseline="central" font-weight="bold">IncrementalDelta</text>
+<text x="704" y="416" font-size="12" fill="#37474f" text-anchor="start" dominant-baseline="central">+ BKPINC1 磁盘格式</text>
+<text x="704" y="433" font-size="12" fill="#37474f" text-anchor="start" dominant-baseline="central">+ envelope 自描述</text>
+<rect x="488" y="500" width="190" height="68" rx="4" fill="#ffffff" stroke="#263238" stroke-width="1.6"/>
+<line x1="488" y1="526" x2="678" y2="526" stroke="#263238" stroke-width="1.4"/>
+<text x="583" y="514" font-size="14" fill="#263238" text-anchor="middle" dominant-baseline="central" font-weight="bold">IncrementalRestore</text>
+<text x="498" y="542" font-size="12" fill="#37474f" text-anchor="start" dominant-baseline="central">+ 链解析 + 父绑定三连</text>
+<text x="498" y="559" font-size="12" fill="#37474f" text-anchor="start" dominant-baseline="central">+ staging + 原子发布</text>
+<rect x="694" y="500" width="190" height="68" rx="4" fill="#ffffff" stroke="#263238" stroke-width="1.6"/>
+<line x1="694" y1="526" x2="884" y2="526" stroke="#263238" stroke-width="1.4"/>
+<text x="789" y="514" font-size="14" fill="#263238" text-anchor="middle" dominant-baseline="central" font-weight="bold">DeltaEnvelope</text>
+<text x="704" y="542" font-size="12" fill="#37474f" text-anchor="start" dominant-baseline="central">+ parent 名 + digest</text>
+<text x="704" y="559" font-size="12" fill="#37474f" text-anchor="start" dominant-baseline="central">+ 变化计数 / 墓碑</text>
+<rect x="940" y="374" width="200" height="68" rx="4" fill="#ffffff" stroke="#263238" stroke-width="1.6"/>
+<line x1="940" y1="400" x2="1140" y2="400" stroke="#263238" stroke-width="1.4"/>
+<text x="1040" y="388" font-size="14" fill="#263238" text-anchor="middle" dominant-baseline="central" font-weight="bold">ServerProfile</text>
+<text x="950" y="416" font-size="12" fill="#37474f" text-anchor="start" dominant-baseline="central">+ 官方云 / .bpserver</text>
+<text x="950" y="433" font-size="12" fill="#37474f" text-anchor="start" dominant-baseline="central">+ certificate/pin/ssh</text>
+<rect x="1156" y="374" width="216" height="68" rx="4" fill="#ffffff" stroke="#263238" stroke-width="1.6"/>
+<line x1="1156" y1="400" x2="1372" y2="400" stroke="#263238" stroke-width="1.4"/>
+<text x="1264" y="388" font-size="14" fill="#263238" text-anchor="middle" dominant-baseline="central" font-weight="bold">RemoteArchiveClient</text>
+<text x="1166" y="416" font-size="12" fill="#37474f" text-anchor="start" dominant-baseline="central">+ BPNET1 请求</text>
+<text x="1166" y="433" font-size="12" fill="#37474f" text-anchor="start" dominant-baseline="central">+ 上传 / 下载 / 删除</text>
+<rect x="940" y="500" width="200" height="68" rx="4" fill="#ffffff" stroke="#263238" stroke-width="1.6"/>
+<line x1="940" y1="526" x2="1140" y2="526" stroke="#263238" stroke-width="1.4"/>
+<text x="1040" y="514" font-size="14" fill="#263238" text-anchor="middle" dominant-baseline="central" font-weight="bold">SecureChannel</text>
+<text x="950" y="542" font-size="12" fill="#37474f" text-anchor="start" dominant-baseline="central">+ BPSEC1 / BPSEC2</text>
+<text x="950" y="559" font-size="12" fill="#37474f" text-anchor="start" dominant-baseline="central">+ 序号防重放</text>
+<rect x="1156" y="500" width="216" height="68" rx="4" fill="#ffffff" stroke="#263238" stroke-width="1.6"/>
+<line x1="1156" y1="526" x2="1372" y2="526" stroke="#263238" stroke-width="1.4"/>
+<text x="1264" y="514" font-size="14" fill="#263238" text-anchor="middle" dominant-baseline="central" font-weight="bold">RemoteMetadataStore</text>
+<text x="1166" y="542" font-size="12" fill="#37474f" text-anchor="start" dominant-baseline="central">+ SQLite schema v2</text>
+<text x="1166" y="559" font-size="12" fill="#37474f" text-anchor="start" dominant-baseline="central">+ 用户 / 快照 / 依赖链</text>
+<rect x="60" y="668" width="260" height="68" rx="4" fill="#ffffff" stroke="#263238" stroke-width="1.6"/>
+<line x1="60" y1="694" x2="320" y2="694" stroke="#263238" stroke-width="1.4"/>
+<text x="190" y="682" font-size="14" fill="#263238" text-anchor="middle" dominant-baseline="central" font-weight="bold">FileSystem</text>
+<text x="70" y="710" font-size="12" fill="#37474f" text-anchor="start" dominant-baseline="central">+ lstat / opendir / readdir</text>
+<text x="70" y="727" font-size="12" fill="#37474f" text-anchor="start" dominant-baseline="central">+ 路径边界校验</text>
+<rect x="350" y="668" width="260" height="68" rx="4" fill="#ffffff" stroke="#263238" stroke-width="1.6"/>
+<line x1="350" y1="694" x2="610" y2="694" stroke="#263238" stroke-width="1.4"/>
+<text x="480" y="682" font-size="14" fill="#263238" text-anchor="middle" dominant-baseline="central" font-weight="bold">ArchiveEntry / BackupRecord</text>
+<text x="360" y="710" font-size="12" fill="#37474f" text-anchor="start" dominant-baseline="central">+ 类型 / mode 07777 / uid / gid</text>
+<text x="360" y="727" font-size="12" fill="#37474f" text-anchor="start" dominant-baseline="central">+ mtime 秒 + 纳秒</text>
+<rect x="640" y="668" width="260" height="68" rx="4" fill="#ffffff" stroke="#263238" stroke-width="1.6"/>
+<line x1="640" y1="694" x2="900" y2="694" stroke="#263238" stroke-width="1.4"/>
+<text x="770" y="682" font-size="14" fill="#263238" text-anchor="middle" dominant-baseline="central" font-weight="bold">FileIO</text>
+<text x="650" y="710" font-size="12" fill="#37474f" text-anchor="start" dominant-baseline="central">+ 原子替换 / 不覆盖发布</text>
+<text x="650" y="727" font-size="12" fill="#37474f" text-anchor="start" dominant-baseline="central">+ fsync + 目录 fsync</text>
+<rect x="930" y="668" width="260" height="68" rx="4" fill="#ffffff" stroke="#263238" stroke-width="1.6"/>
+<line x1="930" y1="694" x2="1190" y2="694" stroke="#263238" stroke-width="1.4"/>
+<text x="1060" y="682" font-size="14" fill="#263238" text-anchor="middle" dominant-baseline="central" font-weight="bold">Filter</text>
+<text x="940" y="710" font-size="12" fill="#37474f" text-anchor="start" dominant-baseline="central">+ glob (* ? **)</text>
+<text x="940" y="727" font-size="12" fill="#37474f" text-anchor="start" dominant-baseline="central">+ 11 个字段子句 AND</text>
+<rect x="1220" y="668" width="160" height="51" rx="4" fill="#ffffff" stroke="#263238" stroke-width="1.6"/>
+<line x1="1220" y1="694" x2="1380" y2="694" stroke="#263238" stroke-width="1.4"/>
+<text x="1300" y="682" font-size="14" fill="#263238" text-anchor="middle" dominant-baseline="central" font-weight="bold">UserDirectory</text>
+<text x="1230" y="710" font-size="12" fill="#37474f" text-anchor="start" dominant-baseline="central">+ uid/gid &lt;-&gt; 名字</text>
+</svg>
