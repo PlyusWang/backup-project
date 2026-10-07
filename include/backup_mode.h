@@ -15,7 +15,7 @@
 //   Scheduled + Incremental    （计划路径委托同一个引擎，
 //                               且 retention 已经是 dependency-aware）
 //
-// Realtime 只在 enum 里存在，没有任何产品入口。
+// Realtime 是第三个 Trigger，CLI 与 GUI 都有产品入口（src/realtime/）。
 //
 // 产品入口一律显式拒绝不支持的组合，不做 silent fallback
 // （"选了增量就偷偷按全量跑"是最危险的那种降级）。
@@ -38,7 +38,7 @@ namespace backupproject {
 enum class BackupTrigger : std::uint8_t {
   kManual = 0,
   kScheduled = 1,
-  // 已定义、未实现。没有 inotify，没有 watcher 线程，没有任何产品入口。
+  // 由 inotify watcher + debounce + 共享增量引擎驱动（src/realtime/）。
   kRealtime = 2,
 };
 

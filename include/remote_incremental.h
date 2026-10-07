@@ -267,8 +267,9 @@ class RemoteRawRestoreSession {
   int download_count_ = 0;
 };
 
-// 一次性入口（下载 + 恢复，不支持"再输一次密码"）：CLI 与健壮性测试用它。
-// 需要交互式重试的调用方（GUI）用上面的会话。
+// 一次性入口（下载 + 恢复，不支持"再输一次密码"）：Qt 无关的健壮性回归
+// 用它。需要交互式重试的调用方（GUI）用上面的会话；产品 CLI 没有这条
+// 路径。
 bool RunRemoteRawRestore(const RemoteRawRestoreRequest& request,
                          RemoteRawRestoreOutcome* outcome,
                          std::string* error_message);

@@ -57,7 +57,8 @@ Item {
             // fillHeight 拉平成同一个高度：文字在窄窗口下多折一行时，卡片跟着
             // 变高，而不是把按钮挤出下边框。
             AppCard {
-                // objectName 是 GUI 自检（main.cpp --gui-test）的定位锚点：
+                // objectName 是 GUI 自检（main.cpp --gui-contract-test）的
+                // 定位锚点：
                 // homeCard0..2 与 homeAction0..2 会被逐个抓出来做点击回放和
                 // 几何断言（按钮必须落在卡片内，且三个按钮纵坐标一致）。
                 // 改名等于删掉这部分覆盖。
