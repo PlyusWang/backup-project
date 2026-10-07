@@ -2,6 +2,29 @@
 //
 // 见 realtime_controller.h。
 
+// ---- 本文件的实现职责 ----
+//
+// realtime_controller.h 定义合同，这里只做落地：主线程持有全部状态与定时器，
+// 后台线程只跑一次 RunRealtimeBackupOnce + ListRealtimeSnapshots 并返回值类型
+// 结果。业务判定（配置校验、debounce 合并、retention、overlap 检查）全部转发
+// 给与 backupctl realtime 共用的核心函数，界面不复刻第二套规则。
+//
+// 状态机（phase key 就是 QML 看到的字符串）：
+//   disabled → watching → debouncing → resync → snapshot_created / no_changes
+//   失败 → failed / config_error；监听丢了 → watch_degraded → watch_recovered
+//   （恢复时合成一次 resync，降级期间的变化不会被漏掉）。
+//
+// 三条硬顺序：
+//   1) 提交前必须抢到 kRealtimeEvaluation 闸门；抢不到不丢 trigger，把事件
+//      合并进唯一一个 pending generation，150 ms 后重试；
+//   2) 保存配置先停 watcher → 取 kRealtimeConfig 闸门 → 严格校验 → 原子落盘
+//      →（若启用）重新 attach；失败就用原配置恢复监听；
+//   3) OnRepositoryPathChanged 由持有 kRepositoryChange 闸门的调用方调用，
+//      因此这里绝不能再 Acquire（会与持有者自冲突），也不必等 worker。
+//
+// 失败语义：错误都变成状态条文案（SetStatus），不抛异常。配置读不出来是持续
+// 状态 config_error_：期间不 attach、不触发、不自动重试，绝不把用户的配置悄悄
+// 换成默认值。析构先停表再 detach 后台任务，不留会回调进已析构对象的定时器。
 #include "realtime_controller.h"
 
 #include <QDateTime>
@@ -21,11 +44,13 @@
 #include "backup_controller.h"
 #include "backup_option_keys.h"
 #include "filter.h"
+#include "format_bytes.h"
 
 namespace backup_modern {
 
 namespace {
 
+// 状态条的种类 key：QML 按它选样式，属于跨语言契约，不能随手改名。
 const char kIdle[] = "idle";
 const char kRunning[] = "running";
 const char kSuccess[] = "success";
@@ -33,6 +58,8 @@ const char kWarning[] = "warning";
 const char kError[] = "error";
 
 // 状态机格子。字符串就是 QML 拿到的 key，断言与文案都以它为准。
+// 状态机格子。字符串就是 QML 拿到的 key，断言与文案都以它为准 —— 加格子要同时
+// 改 QML 与自检，删格子等于破坏契约；中文文案（phaseText）与 key 分开维护。
 const char kPhaseDisabled[] = "disabled";
 const char kPhaseWatching[] = "watching";
 const char kPhaseDebouncing[] = "debouncing";
@@ -62,23 +89,22 @@ std::int64_t SteadyMs() {
       .count();
 }
 
+// 秒级 Unix 时间戳转本地时间。<= 0 表示“没有时间戳”（老快照或空字段），
+// 显示成“时间未知”，而不是把 1970-01-01 当成真实时间显示出来。
 QString FormatLocalTime(std::int64_t seconds) {
   if (seconds <= 0) return QStringLiteral("时间未知");
   return QDateTime::fromSecsSinceEpoch(static_cast<qint64>(seconds))
       .toString(QStringLiteral("yyyy-MM-dd HH:mm:ss"));
 }
 
+// 与备份管理页共用同一份格式化规则：以前这里写 2 位小数、
+// 备份管理页写 1 位，同一份归档在两个页面显示不同。
 QString FormatSize(std::uint64_t bytes) {
-  const double value = static_cast<double>(bytes);
-  if (bytes >= 1024ull * 1024ull) {
-    return QStringLiteral("%1 MB").arg(value / (1024.0 * 1024.0), 0, 'f', 2);
-  }
-  if (bytes >= 1024ull) {
-    return QStringLiteral("%1 KB").arg(value / 1024.0, 0, 'f', 1);
-  }
-  return QStringLiteral("%1 B").arg(static_cast<qulonglong>(bytes));
+  return QString::fromStdString(backupproject::FormatByteSize(bytes));
 }
 
+// 变化计数的统一文案。注意参数顺序是 added / removed / modified，而显示顺序是
+// 新增 / 修改 / 删除 —— 按签名传，别按显示顺序传。
 QString ChangeText(qulonglong added, qulonglong removed, qulonglong modified,
                    qulonglong metadata_changed) {
   return QStringLiteral("+%1 新增 · ~%2 修改 · -%3 删除 · %4 元数据变化")
@@ -170,6 +196,13 @@ bool ParseRealtimeNumber(const QString& text, const QString& label,
 
 }  // namespace
 
+// 依赖注入约定：operation_gate 必须与 BackupController /
+// ScheduleController 用的是同一个对象 —— 它才是“同一时刻只有一个 writer”
+// 这条不变式的载体；这里只保存指针，不拥有它。backup_controller 只用于订阅
+// 仓库变化，可为空（自检），但产品路径上永远非空。
+//
+// 构造函数只接定时器与信号，不读盘、不 attach：真正的启动在 start()，
+// 这样自检可以先构造再决定喂什么配置。
 RealtimeController::RealtimeController(QString realtime_file_path,
                                        const QString& config_file_path,
                                        BackupController* backup_controller,
@@ -199,6 +232,8 @@ RealtimeController::RealtimeController(QString realtime_file_path,
   connect(&recovery_timer_, &QTimer::timeout, this,
           &RealtimeController::OnRecoveryTimeout);
 
+  // 两个后台任务的回收点。finished 在主线程发出，所以 OnRunFinished /
+  // OnListFinished 里可以安全地碰 QObject 与 QML 状态。
   connect(&run_watcher_, &QFutureWatcher<RealtimeRunResult>::finished, this,
           &RealtimeController::OnRunFinished);
   connect(&list_watcher_, &QFutureWatcher<RealtimeRunResult>::finished, this,
@@ -214,6 +249,8 @@ RealtimeController::RealtimeController(QString realtime_file_path,
   }
 }
 
+// 先停表、拆 notifier，再 detach 后台任务。detach 而非 waitForFinished：
+// 退出路径不阻塞，而后台任务只操作值类型与文件，不会回调进已经析构的 this。
 RealtimeController::~RealtimeController() {
   // 析构时先停表、再 detach：绝不留下一个还会回调进已析构对象的定时器。
   debounce_timer_.stop();
@@ -225,6 +262,11 @@ RealtimeController::~RealtimeController() {
 
 // ---- 配置装载 ----
 
+// 三种装载结果必须分开处理，不能合并：
+//   kLoaded  → 结构还要过共享核心的 ValidateRealtimeConfig（读得懂 != 合法）
+//   kMissing → 文件不存在等于“用默认配置（未启用）”，不是错误；
+//   kError   → 文件在但读不出来：**绝不自动恢复成默认值**，那是把用户的配置
+//              悄悄换掉；置 config_error 后不 attach、不触发、不重试。
 void RealtimeController::LoadFromDisk() {
   backupproject::RealtimeConfig config;
   std::string error;
@@ -259,6 +301,9 @@ void RealtimeController::LoadFromDisk() {
   emit configChanged();
 }
 
+// 从 config.json 重新读仓库路径。kMissing 也当成“尚未配置”继续往下走，因为
+// “没有仓库”本来就是一个合法的中间状态；只有真的读失败才返回 false，此时
+// *error_message 是给用户看的原因，调用方负责显示与安排重试。
 bool RealtimeController::RefreshRepository(std::string* error_message) {
   backupproject::AppConfig app_config;
   const backupproject::ConfigLoadStatus status =
@@ -275,6 +320,9 @@ bool RealtimeController::RefreshRepository(std::string* error_message) {
   return true;
 }
 
+// 可重复调用的启动入口：先停干净再重来（QML 可以反复点“重新加载”）。顺序是
+// LoadFromDisk → RefreshRepository；配置不可用或未启用就只刷界面，否则
+// BeginWatching。失败不抛错，全部变成 phase + 状态条。
 void RealtimeController::start() {
   StopWatching();
   watch_degraded_ = false;
@@ -311,8 +359,11 @@ void RealtimeController::start() {
   refreshSnapshots();
 }
 
+// reload 只是 start 的别名，QML 侧的语义更清楚；两者都不保存任何配置。
 void RealtimeController::reload() { start(); }
 
+// “本次运行不再监听”，不是“关闭实时备份”：不停用配置、不删任何已落盘的快照，
+// phase 回到 disabled；下次 start() 由配置决定是否重新监听。
 void RealtimeController::stop() {
   StopWatching();
   SetPending(false);
@@ -322,6 +373,7 @@ void RealtimeController::stop() {
   emit runtimeChanged();
 }
 
+// busy 期间不允许清状态条：那一轮的结果还没写进 status_*，清掉等于吞掉错误。
 void RealtimeController::clearStatus() {
   if (busy_) return;
   status_kind_ = QString::fromLatin1(kIdle);
@@ -332,6 +384,11 @@ void RealtimeController::clearStatus() {
 
 // ---- watcher 生命周期 ----
 
+// attach 的全部前置检查，按“越早越便宜”的顺序失败：配置可用 → 源目录非空 →
+// 仓库可解析 → ValidateRealtimeForEnable（源目录存在且是真目录、仓库可解析、
+// 源与仓库的三种重叠）→ InotifyWatcher::Attach。
+// 任何一步失败都进入 degraded 并如实报原因，**不写任何快照**；排重建重试由
+// BeginWatching / OnRecoveryTimeout 负责。
 bool RealtimeController::TryStartWatching() {
   if (!config_loaded_ || config_error_ || !config_.enabled) return false;
   if (config_.source_path.empty()) {
@@ -402,6 +459,9 @@ bool RealtimeController::TryStartWatching() {
   return true;
 }
 
+// TryStartWatching 的包装：失败且“本应监听”（enabled + 配置可用）时排一次
+// 1 秒重建重试。这不是 busy-spin —— 一次只有几次 stat / realpath，且只在
+// 降级期间发生。
 void RealtimeController::BeginWatching() {
   if (TryStartWatching()) return;
   if (config_.enabled && config_loaded_ && !config_error_) {
@@ -410,6 +470,8 @@ void RealtimeController::BeginWatching() {
   emit runtimeChanged();
 }
 
+// 一次调用清掉所有“在监听”的痕迹：三个定时器、notifier、watcher、debouncer。
+// 幂等，可以在任何状态下重复调用（start / stop / 保存配置 / 换仓库都走它）。
 void RealtimeController::StopWatching() {
   debounce_timer_.stop();
   retry_timer_.stop();
@@ -420,6 +482,9 @@ void RealtimeController::StopWatching() {
   emit runtimeChanged();
 }
 
+// 把 watcher 的 fd 接到主线程事件循环：QSocketNotifier 把“可读”变成一次
+// 槽调用，后台线程只有真正落盘的那一件事。先 ClearNotifier 再装，避免
+// 同一 fd 上残留两个 notifier 同时读。
 void RealtimeController::InstallNotifier() {
   ClearNotifier();
   if (watcher_.fd() < 0) return;
@@ -430,6 +495,9 @@ void RealtimeController::InstallNotifier() {
           &RealtimeController::OnWatcherReadable);
 }
 
+// 用 deleteLater 而不是 delete：本函数可能正在被 notifier 自己的信号处理路径
+// 调用（OnWatcherReadable → EnterDegraded），delete 它会释放正在执行的对象。
+// setEnabled(false) 先切断“再进来一次”的可能。
 void RealtimeController::ClearNotifier() {
   if (notifier_ == nullptr) return;
   notifier_->setEnabled(false);
@@ -437,6 +505,9 @@ void RealtimeController::ClearNotifier() {
   notifier_ = nullptr;
 }
 
+// 监听不可用的统一收敛点：拆掉 watcher 与 debouncer、如实报原因，并在“本应
+// 监听”时排重试。恢复走 TryStartWatching，它会合成一次 resync，所以降级期间的
+// 变化不会被漏掉。
 void RealtimeController::EnterDegraded(const QString& reason) {
   ClearNotifier();
   watcher_.Detach();
@@ -456,6 +527,8 @@ void RealtimeController::EnterDegraded(const QString& reason) {
   emit runtimeChanged();
 }
 
+// 重建重试到期：配置被改掉或停用就直接停表不再重试；否则再试一次 attach，
+// 成功时报“已恢复”并刷新 runtimeChanged，失败则继续每秒重试。
 void RealtimeController::OnRecoveryTimeout() {
   if (!config_.enabled || !config_loaded_ || config_error_) {
     recovery_timer_.stop();
@@ -489,6 +562,9 @@ void RealtimeController::OnRecoveryTimeout() {
 // 顺序同样是硬要求：先停掉当前 watcher（从这一刻起，这次切换之后的事件不可能
 // 再被算到旧仓库头上），再用**新**路径重新校验，合法才重新 attach + 合成
 // resync。 任何一条分支都不写 snapshot。
+// 先 StopWatching 再 RefreshRepository 是硬顺序：从停表这一行起，切换之后的
+// 事件不可能再被算到旧仓库头上；反过来（先刷新路径再停 watcher）会留下一个
+// “新路径 + 旧监听”的窗口。
 void RealtimeController::OnRepositoryPathChanged() {
   const QString previous = repository_path_;
 
@@ -538,6 +614,13 @@ void RealtimeController::OnRepositoryPathChanged() {
 
 // ---- 事件 ----
 
+// inotify fd 可读：一次读干净（Drain），把这一批喂给共享核心的 debouncer，
+// 再按批次的旗标决定动作：
+//   structural → Rebuild（先建新 fd 再关旧的，不出现空窗）；
+//   root_lost  → EnterDegraded（源目录本身没了，重试才有意义）；
+//   overflow   → NoteResync（事件历史已不可信，唯一正确的做法是重新观察当前
+//                源树）并计数，供界面如实显示。
+// 界面不算时间、不判断“稳定了没有” —— 那些都在 RealtimeDebouncer 里。
 void RealtimeController::OnWatcherReadable() {
   if (!watcher_.attached() || debouncer_ == nullptr) return;
 
@@ -595,6 +678,9 @@ void RealtimeController::OnWatcherReadable() {
   emit runtimeChanged();
 }
 
+// 把“下一次该醒来问 Due 的时刻”翻译成 QTimer 间隔，并夹在 [1, 200] ms：上限
+// 保证即使 WaitMs 报了很远的未来也会周期性重问（配置或时钟变化不会把一次触发
+// 永久挂住），下限避免 0 间隔的忙轮询。dirty 为假时直接停表。
 void RealtimeController::ArmDebounceTimer() {
   if (debouncer_ == nullptr || !debouncer_->dirty()) {
     debounce_timer_.stop();
@@ -607,6 +693,8 @@ void RealtimeController::ArmDebounceTimer() {
   debounce_timer_.start(static_cast<int>(interval));
 }
 
+// 定时器到期：再问一次 Due（界面不做时间判断），到点就 Consume 出一代并提交。
+// Consume 保证同一代只被取走一次；empty 表示这一代已经被别处消费掉了。
 void RealtimeController::OnDebounceTimeout() {
   if (debouncer_ == nullptr) return;
   const std::int64_t now = SteadyMs();
@@ -627,6 +715,8 @@ void RealtimeController::OnDebounceTimeout() {
   Submit(generation);
 }
 
+// 闸门重试到期。busy_ 为真说明这一代已在回收路径手上（OnRunFinished 会
+// DrainPending），这里什么都不做，避免同一代被提交两次。
 void RealtimeController::OnRetryTimeout() {
   if (!pending_generation_valid_) return;
   if (busy_) return;  // 回收路径会在任务结束时把 pending 交出去。
@@ -637,6 +727,10 @@ void RealtimeController::OnRetryTimeout() {
 
 // ---- 提交 ----
 
+// 多个到期代在这里合并成**唯一**一个 pending：事件数累加，overflow /
+// structural / resync 用逻辑或（任何一次溢出都必须让最终那轮重新同步），
+// settled_ms 与 generation 取最大（保留“最新一代”的身份）。
+// 刻意不排队：队列会在慢盘上无限增长，而增量语义只需要“最终跑一次”。
 void RealtimeController::MergePending(
     const backupproject::RealtimeGeneration& generation) {
   if (!pending_generation_valid_) {
@@ -660,12 +754,18 @@ void RealtimeController::MergePending(
   emit runtimeChanged();
 }
 
+// 与 pending_generation_valid_ 保持一致，且只在真的变化时发信号 —— QML 的绑定
+// 不该被重复信号刷屏。
 void RealtimeController::SetPending(bool pending) {
   if (pending_generation_valid_ == pending) return;
   pending_generation_valid_ = pending;
   emit pendingChanged();
 }
 
+// 提交的唯一入口，按顺序做四件事：busy 就合并进 pending；配置不可用或未启用就
+// 丢弃这一代并如实说明；没有仓库就报错并丢弃 —— 刻意不留一个永远交不出去的
+// pending 空转；最后抢 kRealtimeEvaluation 闸门，抢不到就留代 + 150 ms 重试。
+// 参数按值传递：后台线程拿到自己的副本，不共享成员状态。
 void RealtimeController::Submit(backupproject::RealtimeGeneration generation) {
   if (busy_) {
     // 后台任务在飞：合并成那一个 pending，等 OnRunFinished 再交出去。
@@ -731,6 +831,8 @@ void RealtimeController::Submit(backupproject::RealtimeGeneration generation) {
       repository_identity_, generation));
 }
 
+// 回收路径的收尾：把 pending 交给 Submit，由 Submit 自己决定是“交出去”还是
+// “继续排队”（例如闸门又被别人抢走）。只在这一处交出那一代，避免重复提交。
 void RealtimeController::DrainPending() {
   if (!pending_generation_valid_ || busy_) return;
   const backupproject::RealtimeGeneration generation = pending_generation_;
@@ -740,6 +842,10 @@ void RealtimeController::DrainPending() {
 
 // ---- 后台任务 ----
 
+// 后台线程：只做两件事 —— 跑一次 RunRealtimeBackupOnce，再顺带把快照列表
+// 取回来（界面线程不做文件 IO，也不做 archive 字节校验）。
+// 它是 static，只读入参、只写自己的局部结果，不碰 QObject / QML 状态，
+// 因此不需要加锁；返回值是唯一跨线程传递的东西。
 RealtimeRunResult RealtimeController::RunOnce(
     backupproject::RealtimeConfig config, std::string repository_path,
     std::string repository_identity,
@@ -772,6 +878,8 @@ RealtimeRunResult RealtimeController::RunOnce(
   return result;
 }
 
+// 只列快照的后台任务（刷新列表、切仓库后用）。与 RunOnce 一样是 static；
+// listed=false 表示列举失败，list_error 是原因。
 RealtimeRunResult RealtimeController::ListOnly(std::string repository_path) {
   RealtimeRunResult result;
   std::string error;
@@ -781,6 +889,8 @@ RealtimeRunResult RealtimeController::ListOnly(std::string repository_path) {
   return result;
 }
 
+// 后台结果 → QVariantList：QML 只拿到格式化好的字符串与 key，不自己做策略 /
+// 打包方式的翻译。每项的字段名（fileName / createdText / ...）是 QML 契约。
 void RealtimeController::ApplySnapshots(const RealtimeRunResult& result) {
   QVariantList items;
   for (const backupproject::RealtimeSnapshotRecord& record : result.snapshots) {
@@ -828,6 +938,9 @@ void RealtimeController::ApplySnapshots(const RealtimeRunResult& result) {
   emit snapshotsChanged();
 }
 
+// 只读列举，不取闸门（它不写任何东西）。list_busy_ + list_pending_ 实现
+// latest-request-wins：正在列的时候来的请求只记一下，等这次回来再列一次，
+// 所以任何时刻只有一次列举在飞。
 void RealtimeController::refreshSnapshots() {
   if (repository_path_.isEmpty()) {
     std::string error;
@@ -843,6 +956,8 @@ void RealtimeController::refreshSnapshots() {
                                             repository_path_.toStdString()));
 }
 
+// 列举回收。若期间又排了下一次（例如刚换了仓库），这份结果属于**上一个**
+// 仓库：直接丢掉，否则会“新仓库路径 + 旧仓库列表”同屏；pending 那次马上发出。
 void RealtimeController::OnListFinished() {
   const RealtimeRunResult result = list_watcher_.result();
   list_busy_ = false;
@@ -856,6 +971,12 @@ void RealtimeController::OnListFinished() {
   }
 }
 
+// 把一次后台结果翻译成 phase + 状态条。四类结论必须分开报：
+//   ok=false            → 这一轮没产出快照（error）；
+//   kFailed             → 核心走到了失败（error）；
+//   retention_uncertain → 新快照成功、旧版本淘汰没完成（warning）：这是
+//                         “完成但有隐患”，绝不能报成失败；
+//   kNoChanges          → 增量策略下没有变化，没有写入任何东西（idle）。
 void RealtimeController::ApplyRunResult(const RealtimeRunResult& result) {
   last_outcome_kind_ = QString::fromLatin1(OutcomeKindKey(result.outcome.kind));
   last_snapshot_name_ =
@@ -969,6 +1090,9 @@ void RealtimeController::ApplyRunResult(const RealtimeRunResult& result) {
   SetStatus(kError, QStringLiteral("实时备份失败"), detail);
 }
 
+// 后台完成：先 Release 闸门再 SetBusy(false)，然后才 ApplyRunResult 与
+// DrainPending —— 反了会让 QML 在闸门还握着的时候看到“空闲”。
+// operationFinished(last_succeeded_) 是自检等待的结束信号。
 void RealtimeController::OnRunFinished() {
   const RealtimeRunResult result = run_watcher_.result();
   // 先放开闸门：下面的 DrainPending 可能立刻再提交一轮，而 SetBusy(false)
@@ -988,6 +1112,9 @@ void RealtimeController::OnRunFinished() {
 
 // ---- 保存配置 ----
 
+// QML 侧的文本入口。三个数字在界面上是文本框，所以按文本传进来：QML 的
+// parseInt 会把 "12abc" 悄悄变成 12，而 backupctl 明确拒绝同一个输入。这里
+// 只判“是不是纯十进制整数”，范围由共享核心的 ValidateRealtimeConfig 裁决。
 bool RealtimeController::saveConfigFromText(
     bool enabled, const QString& source_path, const QString& debounce_text,
     const QString& max_wait_text, const QString& retain_text,
@@ -1019,6 +1146,15 @@ bool RealtimeController::saveConfigFromText(
                     strategy_key);
 }
 
+// 保存实时配置。顺序是合同的一部分，不能重排：
+//   1) 先停 watcher —— 保存期间不再有新事件，也不会出现“监听旧源、写新配置”；
+//   2) 取 kRealtimeConfig 闸门（与手动备份 / 计划评估同一把），busy_ 时
+//      直接拒绝 —— 后台正在写盘时保存会与它并发改同一份配置；
+//   3) 任何校验（策略 / 打包 / 压缩 key、ValidateRealtimeConfig、
+//      ValidateRealtimeForEnable）失败都在**落盘之前**返回，绝不写半份配置；
+//   4) 落盘成功才替换内存配置；失败用 restore_watch 恢复原监听（若启用，
+//      BeginWatching 会合成 resync，保存期间的变化不会漏）。
+// 界面只提供“不加密”：无人值守的实时备份没有安全的持久密钥来源。
 bool RealtimeController::saveConfig(bool enabled, const QString& source_path,
                                     int debounce_ms, int max_wait_ms,
                                     int retain_count, const QString& pack_key,
@@ -1156,12 +1292,16 @@ bool RealtimeController::saveConfig(bool enabled, const QString& source_path,
   return true;
 }
 
+// 只改 enabled，其余字段原样回填 —— 因此仍然会走一遍完整校验（启用前必须过
+// ValidateRealtimeForEnable），不是“开关一拨就生效”。
 bool RealtimeController::setEnabled(bool enabled) {
   return saveConfig(enabled, sourcePath(), debounceMs(), maxWaitMs(),
                     retainCount(), packKey(), compressionKey(), includeRules(),
                     excludeRules(), strategyKey());
 }
 
+// 用真实的 Filter 试加一条规则，返回空串表示合法。它只是输入时的即时反馈，
+// 真正的边界仍然是保存时的 ValidateRealtimeConfig —— 页面里没有第二套解析。
 QString RealtimeController::validateRule(const QString& action,
                                          const QString& rule) const {
   backupproject::Filter filter;
@@ -1178,6 +1318,7 @@ QString RealtimeController::validateRule(const QString& action,
 
 // ---- 状态 ----
 
+// 状态条三元组（kind / title / message）总是一起更新；kind 是 QML 的样式键。
 void RealtimeController::SetStatus(const QString& kind, const QString& title,
                                    const QString& message) {
   status_kind_ = kind;
@@ -1186,6 +1327,8 @@ void RealtimeController::SetStatus(const QString& kind, const QString& title,
   emit statusChanged();
 }
 
+// phase key 与中文文案一起设；两者都没变时不发信号 —— ArmDebounceTimer 这条
+// 高频路径会反复调用它。
 void RealtimeController::SetPhase(const QString& key, const QString& text) {
   if (phase_key_ == key && phase_text_ == text) return;
   phase_key_ = key;
@@ -1193,6 +1336,7 @@ void RealtimeController::SetPhase(const QString& key, const QString& text) {
   emit runtimeChanged();
 }
 
+// busy_ 是“后台任务在飞”的唯一标志，与闸门的持有期严格对齐。
 void RealtimeController::SetBusy(bool busy) {
   if (busy_ == busy) return;
   busy_ = busy;
@@ -1276,6 +1420,8 @@ int RealtimeController::watchCount() const {
   return static_cast<int>(watcher_.watch_count());
 }
 
+// 待处理事件数 = debouncer 里正在合并的 + 那一个 pending generation 的；
+// 结果夹到 int 范围内，因为它只用于显示。
 int RealtimeController::pendingEventCount() const {
   std::uint64_t count = debouncer_ != nullptr ? debouncer_->event_count() : 0;
   if (pending_generation_valid_) count += pending_generation_.event_count;
@@ -1340,6 +1486,10 @@ QUrl RealtimeController::directoryDialogStartUrl(const QString& path) const {
   return QUrl::fromLocalFile(QDir::homePath());
 }
 
+// 仅供 main.cpp 的自动化测试：用局部 QEventLoop 把主线程跑到“真正空闲”
+// （没有在飞的后台任务、没有 pending、没有闸门重试）。10 ms 轮询只是让
+// 事件循环有机会处理 finished 信号；timeout_ms 到期也会退出，返回值告诉调用者
+// 到底是空闲了还是超时了 —— 断言不能只看“循环结束了”。
 bool RealtimeController::waitForIdle(int timeout_ms) {
   QEventLoop loop;
   QTimer poll;

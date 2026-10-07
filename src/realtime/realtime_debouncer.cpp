@@ -12,6 +12,9 @@ RealtimeDebouncer::RealtimeDebouncer(std::uint32_t debounce_ms,
                                      std::uint32_t max_wait_ms)
     : debounce_ms_(debounce_ms), max_wait_ms_(max_wait_ms) {}
 
+// 状态机只有两态：Idle(dirty_ == false) 与 Pending(dirty_ == true)。所有
+// Note* 把状态推向 Pending 并（重）算截止时间，只有 Consume 会让它回到
+// Idle。本类不读时钟，now_ms 全部由调用方注入，所以可以离线测试。
 void RealtimeDebouncer::NoteEventInternal(std::uint64_t count, bool structural,
                                           bool overflow, std::int64_t now_ms,
                                           bool resync) {
@@ -38,6 +41,8 @@ void RealtimeDebouncer::NoteEventInternal(std::uint64_t count, bool structural,
   structural_seen_ = structural_seen_ || structural;
 }
 
+// 早退是必要的：count == 0 且没有结构变化/overflow 时什么都不做，否则
+// “空事件”会把软截止一直往后推，等于让一次备份无限期推迟。
 void RealtimeDebouncer::NoteEvents(std::uint64_t count, bool structural,
                                    bool overflow, std::int64_t now_ms) {
   if (count == 0 && !structural && !overflow) return;
@@ -61,6 +66,11 @@ std::int64_t RealtimeDebouncer::WaitMs(std::int64_t now_ms) const {
   return deadline - now_ms;
 }
 
+// 唯一会清 dirty_ 的入口，语义是“快照 + 重置”：返回的是值拷贝，调用方
+// 拿着它随便用；“备份运行期间新到的事件进入下一个 generation”因此是
+// 自然结果，不需要调用方额外协调。
+// 没有 pending 时返回默认构造的空结果（generation == 0）：调用方要用
+// generation 或 empty() 判断“这一代没有事要做”，而不是看指针。
 RealtimeGeneration RealtimeDebouncer::Consume(std::int64_t now_ms) {
   RealtimeGeneration out;
   if (!dirty_) return out;

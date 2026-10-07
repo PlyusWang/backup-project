@@ -7,6 +7,17 @@
 // 这样"截断 / 超长 / 未知版本 / 未知算法 / 长度不合法 / 尾部多余字节"
 // 六类畸形输入都有各自的原因，而不是笼统的 false。
 
+// 本文件是 BPCERT1 的**唯一**编解码实现：格式的权威定义写在 include/bpcert.h，
+// 但字节布局只在这里被拼出来、也只在这里被拆开，别处不许再实现一遍。
+//
+// 职责边界：
+//   * 不判断签发者是否可信（issuer_id 在这里只是个字符串）——那是
+//     TrustedRootStore 的事；
+//   * 不决定"这张证书该不该被接受"（用途、吊销、时间窗的组合策略在调用方）；
+//   * 不读文件、不联网、无全局状态，输入输出全是 std::string。
+//
+// 两端合同：Encode 产出的字节必须能被 Parse 接受，Parse 接受的字节也必须能
+// 被重新编码成同一串——"签名之后不允许有多余字节"正是这条唯一性的保证。
 #include "bpcert.h"
 
 #include <chrono>
@@ -19,6 +30,9 @@ namespace backupproject {
 namespace crypto {
 namespace {
 
+// 下面这几个常量是**格式的一部分**，改值等于换协议：magic 是第一道判据
+// （"这到底是不是一张 BPCERT1"），version 是留给未来的拒绝开关（不认识的
+// 版本一律拒绝，绝不猜），算法与用途各占一个字节，全部进 body 并参与验签。
 constexpr char kMagic[7] = {'B', 'P', 'C', 'E', 'R', 'T', '1'};
 constexpr std::uint16_t kFormatVersion = 1;
 constexpr std::uint8_t kPublicKeyAlgorithmX25519 = 1;
@@ -26,10 +40,14 @@ constexpr std::uint8_t kKeyUsageServerAuth = 1;
 constexpr std::uint8_t kSignatureAlgorithmEd25519 = 1;
 
 // body 的最小长度：server_id 与 issuer_id 都取最短的 1 字节。
+// 它只用于最前面那一次"不可能通过就快速拒绝"，真实判断仍然逐字段做；
+// 数值写错了最多让某类畸形输入换一个错误名，不会让解析器接受非法数据。
 constexpr std::size_t kMinBodySize = sizeof(kMagic) + 2 + 2 + 1 + 1 +
                                      kBpcert1PublicKeySize + 8 + 8 + 8 + 2 + 1 +
                                      1 + 1;
 
+// error_message 是可选出参：不关心细节的调用方传 nullptr，函数照样给出唯一
+// 有意义的失败信号（false 或具名的 Bpcert1Error）。诊断文本永不决定控制流。
 void SetError(std::string* error_message, const char* text) {
   if (error_message != nullptr) {
     *error_message = text;
@@ -37,6 +55,9 @@ void SetError(std::string* error_message, const char* text) {
 }
 
 // 一律大端（"网络字节序"）：格式只有一种表示，不依赖主机字节序。
+// 大端是**唯一的**线上表示：编码器不写"主机序 + 标记"，解析器也不探测字节
+// 序。格式里没有任何"看情况"的分支，不同字节序的机器读到的必然是同一张证
+// 书。下面这四个 Append / Read 就是本模块全部的字节序逻辑。
 void AppendU16(std::string* out, std::uint16_t value) {
   out->push_back(static_cast<char>((value >> 8) & 0xFF));
   out->push_back(static_cast<char>(value & 0xFF));
@@ -48,6 +69,8 @@ void AppendU64(std::string* out, std::uint64_t value) {
   }
 }
 
+// 读侧不做边界检查，是**故意**的：唯一的调用模式是先用 Fits 确认要读的字节
+// 存在，再调用这里。把边界检查塞进每个读函数只会让"谁负责验证"变得模糊。
 std::uint16_t ReadU16(const unsigned char* p) {
   return static_cast<std::uint16_t>((static_cast<std::uint16_t>(p[0]) << 8) |
                                     static_cast<std::uint16_t>(p[1]));
@@ -62,12 +85,18 @@ std::uint64_t ReadU64(const unsigned char* p) {
 }
 
 // 一个字段的"读之前先确认存在"。
+// "先验证，再前进"的落地：off 只增不减，任何越界都在读之前被拦住，因此后面
+// 的 p[off] / ReadU16 / ReadU64 不可能读到 raw 之外。size 有 4096 的硬上限，
+// off + need 不会溢出。
 bool Fits(std::size_t offset, std::size_t need, std::size_t size) {
   return offset + need <= size;
 }
 
 }  // namespace
 
+// 枚举到稳定的机器可读 token。这些字符串会进日志、CLI 输出与自动化断言，
+// 属于对外合同：改名是破坏性变更；新增枚举值必须在这里补一条（switch 不写
+// default，漏了会被 -Wswitch 抓住，而不是悄悄退化成 "unknown"）。
 const char* Bpcert1ErrorName(Bpcert1Error error) {
   switch (error) {
     case Bpcert1Error::kOk:
@@ -106,6 +135,8 @@ const char* Bpcert1ErrorName(Bpcert1Error error) {
   return "unknown";
 }
 
+// 面向用户的中文文案，与 Name 分开是为了让"给机器看的标识"和"给人看的解
+// 释"各自演化：改文案不影响任何脚本，改 token 会。
 const char* Bpcert1ErrorMessage(Bpcert1Error error) {
   switch (error) {
     case Bpcert1Error::kOk:
@@ -144,6 +175,10 @@ const char* Bpcert1ErrorMessage(Bpcert1Error error) {
   return "证书校验失败";
 }
 
+// 标识符 grammar：1..128 字节的可打印 ASCII（0x20..0x7E）。刻意不支持 UTF-8、
+// 换行与 NUL：标识符会出现在日志、命令行、配置文件和界面里，允许不可打印
+// 字节等于允许日志注入与显示歧义；"只比字节"也让签发侧与验证侧不可能因为
+// 归一化或大小写折叠产生分歧。
 bool Bpcert1IsValidIdentity(const std::string& text) {
   if (text.empty() || text.size() > kBpcert1MaxIdentitySize) {
     return false;
@@ -157,6 +192,9 @@ bool Bpcert1IsValidIdentity(const std::string& text) {
   return true;
 }
 
+// 编码 body（不含签名）。这里每一项校验都必须在签发侧挡住：解析器会对同一
+// 组字段再判一次，编码器把不合格的输入编出来，只会得到一张谁都读不了的证
+// 书。*out 先被 clear()，失败时保持"没有半份结果"。
 bool Bpcert1EncodeUnsigned(const Bpcert1& certificate, std::string* out,
                            std::string* error_message) {
   if (out == nullptr) {
@@ -197,6 +235,10 @@ bool Bpcert1EncodeUnsigned(const Bpcert1& certificate, std::string* out,
   std::string body;
   body.reserve(kMinBodySize + certificate.server_id.size() +
                certificate.issuer_id.size());
+  // 从这里开始的 append 顺序**就是**磁盘布局：magic / version / server_id /
+  // 公钥算法 / 公钥 / serial / not_before / not_after / issuer_id / key_usage /
+  // 签名算法，最后再由 Encode 或 Issue 追加签名。顺序不能重排——旧证书按固定
+  // offset 解析；新增字段只能追加到末尾，并把 kFormatVersion 提升。
   body.append(kMagic, sizeof(kMagic));
   AppendU16(&body, kFormatVersion);
   AppendU16(&body, static_cast<std::uint16_t>(certificate.server_id.size()));
@@ -211,6 +253,8 @@ bool Bpcert1EncodeUnsigned(const Bpcert1& certificate, std::string* out,
   body.push_back(static_cast<char>(kKeyUsageServerAuth));
   body.push_back(static_cast<char>(kSignatureAlgorithmEd25519));
 
+  // 长度上限在编码侧也要挡：否则我们能造出一张自己都解析不了的证书
+  // （Bpcert1Parse 会直接返回 kOversized）。上限同时是解析侧的内存下界保证。
   if (body.size() + kBpcert1SignatureSize > kBpcert1MaxCertificateSize) {
     SetError(error_message, "证书超过 4096 字节上限");
     return false;
@@ -219,6 +263,9 @@ bool Bpcert1EncodeUnsigned(const Bpcert1& certificate, std::string* out,
   return true;
 }
 
+// 完整证书 = body || signature。签名必须由调用方（或 Bpcert1Issue）事先算
+// 好，这里不做任何隐式签名；长度不对的签名一律拒绝——长度错误意味着"签的
+// 不是这张证书"，静默补零或截断比拒绝危险得多。
 bool Bpcert1Encode(const Bpcert1& certificate, std::string* out,
                    std::string* error_message) {
   if (out == nullptr) {
@@ -239,6 +286,11 @@ bool Bpcert1Encode(const Bpcert1& certificate, std::string* out,
   return true;
 }
 
+// 签发：not_before == 0 取当前时间，not_after == 0 取 not_before + 180 天
+// （kBpcert1OfficialValiditySeconds），其余字段原样使用，然后对 body 签名。
+//
+// 它只返回字节：不落盘、不打印、不碰 key 文件。issuer_seed 归调用方所有，
+// 本函数不清零它（清零是持有者的责任，见 tools/cert_tool_main.cpp）。
 bool Bpcert1Issue(const Bpcert1& unsigned_certificate,
                   const std::string& issuer_seed, std::string* out,
                   std::string* error_message) {
@@ -272,6 +324,15 @@ bool Bpcert1Issue(const Bpcert1& unsigned_certificate,
   return true;
 }
 
+// 严格解析，也是本模块**唯一**接触不可信字节的入口：raw 可能来自网络握手，
+// 也可能是磁盘上被人替换过的文件。
+//
+// 分层拒绝的顺序是刻意的：先只比较总长（>4096 → kOversized，< 最小合法长度
+// → kTruncated），这两步不索引、不分配，任何输入都不能让解析器按输入声明的
+// 长度去要内存；之后才逐字段走 "Fits -> 读 -> 推进偏移"。
+//
+// 全有或全无：*out 只在最后几个赋值语句里被写，中途任何 return 都不会留下
+// 半个 Bpcert1。返回 kOk 之前 *out 的内容是未定义的，调用方必须看返回值。
 Bpcert1Error Bpcert1Parse(const std::string& raw, Bpcert1* out) {
   if (out == nullptr) {
     return Bpcert1Error::kBadArgument;
@@ -392,6 +453,9 @@ Bpcert1Error Bpcert1Parse(const std::string& raw, Bpcert1* out) {
     return Bpcert1Error::kBadFieldValue;
   }
 
+  // 唯一的写出点：走到这里，所有字段都已通过结构检查与语义检查，赋值不会再
+  // 失败。若将来要在赋值之后再判什么，必须先把结果写进局部 Bpcert1 再整体拷
+  // 过去，否则"返回错误但 *out 已被改"会破坏上面那条全有或全无的承诺。
   out->server_id = server_id;
   out->server_public_key = server_public_key;
   out->issuer_id = issuer_id;
@@ -402,6 +466,8 @@ Bpcert1Error Bpcert1Parse(const std::string& raw, Bpcert1* out) {
   return Bpcert1Error::kOk;
 }
 
+// body = 去掉尾部 64 字节签名。长度不足时返回空串（调用方据此走失败路径），
+// 不抛异常、不返回半截：本函数在验签路径上，不能因为输入畸形就崩。
 std::string Bpcert1Body(const std::string& raw) {
   if (raw.size() <= kBpcert1SignatureSize) {
     return std::string();
@@ -410,6 +476,14 @@ std::string Bpcert1Body(const std::string& raw) {
   return raw.substr(0, raw.size() - kBpcert1SignatureSize);
 }
 
+// 结构 + 签名，两个都通过才返回 kOk。内部**重新解析一次** raw，而不是接受
+// 调用方已经解析好的结构：签名覆盖的是字节本身，让调用方传结构等于允许
+// "验一份字节、用另一份字段"。
+//
+// 它不判断 issuer_id 是否可信、也不看时间窗——本函数只回答"这串字节是不是
+// 这把公钥签的"。发行者身份与有效期分别由 TrustedRootStore 与
+// Bpcert1CheckValidity 负责，分开是为了让"签名无效"与"根不受信"在界面上
+// 是两句不同的话。
 Bpcert1Error Bpcert1VerifySignature(const std::string& raw,
                                     const std::string& issuer_public_key) {
   if (issuer_public_key.size() != kEd25519PublicKeySize) {
@@ -428,6 +502,12 @@ Bpcert1Error Bpcert1VerifySignature(const std::string& raw,
   return Bpcert1Error::kOk;
 }
 
+// 时间窗判断，容差 ±kBpcert1ClockSkewSeconds（5 分钟）且两边对称：证书刚签发
+// 而客户端时钟略慢时，不该被判成"尚未生效"。
+//
+// 不因为时钟可疑就放行，也不因为时钟可疑就拒绝：结论与解释分别放进
+// error_result / message，由调用方决定提示"证书过期"还是"检查本机时钟"，
+// 这两种情形的处置完全不同。
 bool Bpcert1CheckValidity(const Bpcert1& certificate,
                           std::int64_t now_unix_seconds,
                           Bpcert1Error* error_result, std::string* message) {
@@ -463,6 +543,9 @@ bool Bpcert1CheckValidity(const Bpcert1& certificate,
   return true;
 }
 
+// system_clock 是墙上时钟：会被 NTP 或用户改动，也可能回跳。它只用于"现在
+// 几点"这类绝对时间判断（证书窗口、界面显示），绝不用于测量时长或退避间隔。
+// 单独包一个函数，是为了让测试与命令行的 --now 能替换同一条路径上的时间。
 std::int64_t Bpcert1NowUnixSeconds() {
   return static_cast<std::int64_t>(
       std::chrono::duration_cast<std::chrono::seconds>(
@@ -470,6 +553,9 @@ std::int64_t Bpcert1NowUnixSeconds() {
           .count());
 }
 
+// 整张证书的 SHA-256 十六进制，给人核对用（"服务器上那张是不是这一张"）。
+// 空输入返回空串而不是"空串的摘要"：调用方据此区分"没有证书"与"有一张摘
+// 要为 X 的证书"，不让一个不存在的对象得到看起来合法的指纹。
 std::string Bpcert1Fingerprint(const std::string& raw_certificate) {
   if (raw_certificate.empty()) {
     return std::string();
@@ -477,6 +563,9 @@ std::string Bpcert1Fingerprint(const std::string& raw_certificate) {
   return Sha256Hex(raw_certificate);
 }
 
+// 一行摘要，给日志与管理界面用。公钥只打印 sha256 的前 16 个十六进制字符：
+// 完整公钥在日志里没人看又占地方，摘要足够回答"是不是换了密钥"。本函数只
+// 输出公开材料，任何私钥 / seed 都不经过它。
 std::string Bpcert1Describe(const Bpcert1& certificate) {
   std::string text = "BPCERT1 server_id=" + certificate.server_id;
   text += " serial=" + std::to_string(certificate.serial_number);

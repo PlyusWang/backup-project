@@ -2,6 +2,26 @@
 //
 // 见 include/realtime_watcher.h。
 
+// 模块职责：把 Linux inotify 包装成"递归监听源树、只报告可能影响源树的变化"
+// 的 RAII 对象，是 realtime 触发链的最上游一环。
+//
+// 边界：不判断哪些文件最终会进归档（Filter / 类型 / socket 规则全在 core），
+// 不做 debounce（RealtimeDebouncer），也不执行备份（RunRealtimeBackupOnce）。
+// 这里只把内核事件归成 WatchBatch 的三类信号：普通事件、结构事件、overflow。
+//
+// 数据流：源目录 -> 每个目录一个 inotify watch -> fd 可读 -> Drain() 按
+// inotify_event 切分汇总 -> WatchBatch -> 调用方决定 Rebuild 还是 resync。
+// inotify 事件不带路径、只带 wd：路径靠 index_ 反查 WatchTarget 得到。
+//
+// 不变量：Attach / Rebuild 返回 true 时 RootWatchBuilt() 必须为真——root 的
+// watch 一定存在、root_wd_ 有效，且 watches_ 非空；fd_ >= 0 与之同时成立。
+//
+// 失败语义：不抛异常，统一 bool + error_message，文本里带具体 errno。child
+// 层的 ENOENT 是"刚好被删"的良性竞态，root 层同类情况一律硬失败：宁可报
+// 错，也不返回一个 watch_count == 0 却自称健康的实例。
+//
+// 线程与生命周期：单线程使用（fd 由调用方的 poll 循环独占），不加锁、不可
+// 跨线程共享；析构即 Detach，Detach 幂等。
 #include "realtime_watcher.h"
 
 #include <dirent.h>
@@ -50,22 +70,32 @@ const char* DirectoryTypeText(mode_t mode) {
 
 // 读事件用的缓冲：inotify 一次最多返回这么多字节。内核要求至少 sizeof(struct
 // inotify_event) + NAME_MAX + 1，64 KiB 足够一次读完一批常见事件。
+// 内核只保证"一次 read 至少返回一条完整记录"，不保证缓冲区里正好是整数条
+// 记录。Drain 因此必须自己按 offset 切分，并校验每条的 len 没有越界。
 constexpr std::size_t kReadBufferBytes = 64u * 1024u;
 
 // 监听的掩码。目录与普通条目共用一个掩码：多收一点事件没有代价（调用方只做
 // "有没有可能影响源树"的判断），少收一个才是 bug。
+// 掩码里没有 IN_ACCESS / IN_OPEN / IN_CLOSE_NOWRITE：只读操作不会改变归档
+// 内容，收进来只会让 debounce 空转。IN_EXCL_UNLINK 则是必须的：文件被 unlink
+// 后若还有进程持有 fd，没有它就会继续收到 MODIFY，而备份关心的是"这个路径
+// 还在不在"。
 constexpr std::uint32_t kWatchMask =
     IN_CREATE | IN_DELETE | IN_MODIFY | IN_CLOSE_WRITE | IN_ATTRIB |
     IN_MOVED_FROM | IN_MOVED_TO | IN_DELETE_SELF | IN_MOVE_SELF | IN_UNMOUNT |
     IN_EXCL_UNLINK;
 
 // 目录 watch 的附加标志：只接受目录，且不 follow 软链接。
+// IN_ONLYDIR 把"目标不是目录"变成 add_watch 的 EINVAL，而不是静默监听一个
+// 普通文件；IN_DONT_FOLLOW 把"绝不 follow 软链接"落到内核侧。
 constexpr std::uint32_t kDirectoryFlags = IN_ONLYDIR | IN_DONT_FOLLOW;
 
 }  // namespace
 
 InotifyWatcher::~InotifyWatcher() { Detach(); }
 
+// 唯一的清理点：Detach 与析构都走这里，所以必须幂等（fd_ < 0 时不再 close）。
+// 先清 watch 表再关 fd，这样即使有人还持着某个 wd，也查不到对应路径。
 void InotifyWatcher::ReleaseState() {
   watches_.clear();
   index_.clear();
@@ -79,6 +109,9 @@ void InotifyWatcher::ReleaseState() {
 
 void InotifyWatcher::Detach() { ReleaseState(); }
 
+// 递归建立 watch。is_root 决定失败策略：child 的 ENOENT / 非目录是良性竞态
+// （这一层本来就没有东西可看），root 的同类情况致命（实例不可用）。
+// 全程 lstat 而不是 stat：stat 会跟随后报告目标类型，"跳过软链接"就无从实现。
 bool InotifyWatcher::AddDirectory(int fd, const std::string& path, bool is_root,
                                   std::vector<WatchTarget>* watches,
                                   std::unordered_map<int, std::size_t>* index,
@@ -166,6 +199,8 @@ bool InotifyWatcher::AddDirectory(int fd, const std::string& path, bool is_root,
   }
   std::vector<std::string> children;
   while (true) {
+    // readdir 靠"返回 nullptr + errno"两个判据区分读完与出错，而 errno 不会
+    // 自动清零，所以每轮进入前必须自己重置。
     errno = 0;
     struct dirent* item = ::readdir(directory);
     if (item == nullptr) {
@@ -192,12 +227,26 @@ bool InotifyWatcher::AddDirectory(int fd, const std::string& path, bool is_root,
     return false;
   }
 
+  // 先收集完目录项、关掉 DIR 再递归：边读边递归会让深层树同时挂着大量打开的
+  // DIR fd（数量 = 递归深度），这里改成"一层一个 DIR，读完即关"。
   // 排序只是为了让 watch 顺序确定、便于测试与排查；正确性不依赖它。
   std::sort(children.begin(), children.end());
   for (const std::string& name : children) {
     const std::string child = JoinPath(path, name);
     struct stat child_info;
-    if (::lstat(child.c_str(), &child_info) != 0) continue;  // 刚好被删掉
+    if (::lstat(child.c_str(), &child_info) != 0) {
+      // 只有 ENOENT 才是“这一层在这一瞬间被删了”这种可以忽略的竞态。
+      // EACCES / ELOOP / ENAMETOOLONG / EIO 等一律硬失败：把它当成“刚好被删”
+      // 会让整棵子树静默地不被 watch，而 BuildWatches 仍然报成功——
+      // 正是头文件承诺要避免的“假装健康”。
+      const int saved_errno = errno;
+      if (saved_errno != ENOENT) {
+        SetError(error_message,
+                 "Cannot inspect " + child + ": " + ErrnoText(saved_errno));
+        return false;
+      }
+      continue;
+    }
     if (!S_ISDIR(child_info.st_mode)) continue;  // 软链接不 follow
     if (!AddDirectory(fd, child, false, watches, index, error_message)) {
       return false;
@@ -225,6 +274,10 @@ void InotifyWatcher::SetRootPrecheckHookForTesting(void (*hook)(void* context),
   root_precheck_hook_context_ = context;
 }
 
+// 建立或整体替换 watch set。预检顺序是刻意的：空串 -> lstat 失败 -> 软链接 ->
+// 非目录，每种情况给不同的可读原因。"root 不能是软链接"同时是安全策略（否则
+// 可以借链接把源树之外的目录纳入监听）和正确性前提（"源根丢了没有"完全依赖
+// root 自己的 wd）。失败路径不改变任何成员状态：旧实例（如果有）继续可用。
 bool InotifyWatcher::Attach(const std::string& root,
                             std::string* error_message) {
   if (error_message != nullptr) error_message->clear();
@@ -248,6 +301,8 @@ bool InotifyWatcher::Attach(const std::string& root,
     return false;
   }
 
+  // NONBLOCK 是 Drain 里"EAGAIN 表示读空"的前提；CLOEXEC 防止 fd 泄漏给 exec
+  // 出来的子进程。新 fd 上先建完整 watch set，成功之后才替换旧状态。
   const int fd = ::inotify_init1(IN_NONBLOCK | IN_CLOEXEC);
   if (fd < 0) {
     SetError(error_message, "inotify_init1 failed: " + ErrnoText(errno));
@@ -289,6 +344,10 @@ bool InotifyWatcher::Attach(const std::string& root,
   return true;
 }
 
+// 结构事件之后的整体重建：复用已保存的 root_，不再做 Attach 的预检（root 会
+// 在 AddDirectory 里被重新 lstat）。与 Attach 一样，新 set 建成之前绝不关闭旧
+// fd；失败时 watches_ / index_ / root_wd_ 全部保持原样，调用方可以继续在旧 fd
+// 上跑，等下一轮退避重试。
 bool InotifyWatcher::Rebuild(std::string* error_message) {
   if (error_message != nullptr) error_message->clear();
   if (root_.empty()) {
@@ -326,6 +385,9 @@ bool InotifyWatcher::Rebuild(std::string* error_message) {
   return true;
 }
 
+// 读空队列并汇总成一批。每次调用先整体重置 batch，调用方不必自己清。fd 是
+// 非阻塞的，因此本函数返回时队列一定是空的：一批 = "从上次调用到现在内核攒
+// 下的全部事件"，这正是 event_count 的语义（事件条数，不是文件数）。
 bool InotifyWatcher::Drain(WatchBatch* batch, std::string* error_message) {
   if (batch == nullptr) {
     SetError(error_message, "Watch batch output must not be null");
@@ -347,6 +409,8 @@ bool InotifyWatcher::Drain(WatchBatch* batch, std::string* error_message) {
 
   std::vector<unsigned char> buffer(kReadBufferBytes);
   while (true) {
+    // EINTR 只说明有信号到达，重试即可；EAGAIN / EWOULDBLOCK 才是"读完了"。
+    // 其它 errno 一律当 fd 级故障：返回 false，由调用方进入 degraded 并重建。
     const ssize_t got = ::read(fd_, buffer.data(), buffer.size());
     if (got < 0) {
       if (errno == EINTR) continue;
@@ -357,6 +421,8 @@ bool InotifyWatcher::Drain(WatchBatch* batch, std::string* error_message) {
     }
     if (got == 0) break;
 
+    // 一条记录的布局：struct inotify_event(len = 名字长度) + name(len 字节，
+    // 含 NUL 填充)。len 由内核给出，仍要校验它没有超出本次读到的剩余字节。
     std::size_t offset = 0;
     const std::size_t total = static_cast<std::size_t>(got);
     while (offset + sizeof(struct inotify_event) <= total) {
@@ -372,6 +438,13 @@ bool InotifyWatcher::Drain(WatchBatch* batch, std::string* error_message) {
       batch->any_event = true;
       batch->event_count += 1;
 
+      // mask 的翻译规则（调用方只消费下面这几个结论，不自己解析 mask）：
+      //   IN_Q_OVERFLOW 事件历史已不可信，必须 resync；该事件不带有效 wd。
+      //   目录的 create/delete/move -> structural，调用方重建 watch set；
+      //   普通文件级的增删改不改变目录结构，不需要重建。
+      //   DELETE_SELF / MOVE_SELF / UNMOUNT / IN_IGNORED -> structural，
+      //   且 wd == root_wd_ 时置 root_lost：root 没了，只能重新挂。
+      // rename cookie 只做配对计数，不承担 correctness（见头文件）。
       const std::uint32_t mask = event.mask;
       if ((mask & IN_Q_OVERFLOW) != 0) batch->overflow = true;
       if ((mask & IN_ISDIR) != 0 &&
@@ -402,6 +475,7 @@ bool InotifyWatcher::Drain(WatchBatch* batch, std::string* error_message) {
   return true;
 }
 
+// 注入接缝都只影响下一次调用，用完即清；产品路径里永远不触发。
 void InotifyWatcher::InjectOverflowForTesting() { injected_overflow_ = true; }
 
 void InotifyWatcher::InjectAddWatchFailureForTesting(int error_number) {

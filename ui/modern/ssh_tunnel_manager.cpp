@@ -12,6 +12,17 @@
 // 另外一处容易被写错的地方：QProcess 的 finished 信号是在 QProcess 自己的
 // 栈上发出来的，**不能**在那个信号里同步 delete 这个 QProcess。CloseProcess()
 // 因此统一走 disconnect + deleteLater()，任何调用路径都安全。
+// ---- 数据流 ----
+//
+// 调用方填 Options -> Start() -> 参数向量交给 QProcess -> kStarting 阶段用
+// QTcpSocket 探 127.0.0.1:<local_port>，探通才 kReady。stateChanged() 是唯一
+// 的对外通知出口，页面只订阅它，不轮询本类。
+//
+// ---- 边界 ----
+//
+// 不管凭据与身份：口令、私钥、known_hosts 全部由 ssh 自己处理，服务端身份由
+// 隧道里的 BPSEC1 pin 校验，本类不做自动重连（进程退出只报 kFailed）。
+// 全部成员只在 GUI 线程触碰（含 waitForFinished 的阻塞等待），所以内部无锁。
 
 #include "ssh_tunnel_manager.h"
 
@@ -63,6 +74,10 @@ bool SshTunnelManager::PickFreeLoopbackPort(int* out_port, QString* error) {
     return false;
   }
   QTcpServer server;
+  // 这是"先向内核要一个端口，立刻放掉，稍后再让 ssh 去绑"的两步操作，中间
+  // 有天然竞态：别的进程可能抢走同一个端口。所以返回值只是**建议**不是预留，
+  // 真撞车由 OnProcessFinished() 的有界重挑兜底。监听 socket 从未 accept 过
+  // 连接，close() 不会留下 TIME_WAIT，端口可以立刻被 ssh 复用。
   // 只绑回环：这个端口是给本机 GUI 用的，不应该出现在任何其它接口上。
   if (!server.listen(QHostAddress::LocalHost, 0)) {
     if (error != nullptr) {
@@ -84,6 +99,10 @@ bool SshTunnelManager::PickFreeLoopbackPort(int* out_port, QString* error) {
   return true;
 }
 
+// 语义是"此刻有没有 listener 在接"。它是**阻塞**调用（waitForConnected），
+// 只在 Start() 的受理路径上用一次、超时上限 300ms；不要放进任何周期路径 ——
+// 每次成功 connect 都可能让 ssh -L 真的向远端建一条 forwarded channel，
+// 那份代价不在本机，而是记在 backup-server 头上。
 bool SshTunnelManager::IsLoopbackPortOpen(int port, int timeout_ms,
                                           QString* error) {
   if (port < 1 || port > 65535) {
@@ -113,6 +132,9 @@ QString SshTunnelManager::SanitizeSshStderr(const QByteArray& raw) {
   }
   const QByteArray kept =
       raw.size() > kStderrKeepBytes ? raw.right(kStderrKeepBytes) : raw;
+  // 处理顺序不能换：先按**字节**截尾（UTF-8 可能被截在多字节字符中间，交给
+  // 后面的替换吸收），再删 ANSI 序列 —— 必须赶在控制字符替换之前，否则 ESC
+  // 已经变成空格，CSI 正则再也匹配不上，界面里就会留下乱码方块。
   QString text = QString::fromUtf8(kept);
   // ANSI 转义（CSI）：先整段删掉，否则界面里会出现乱码方块。
   static const QRegularExpression ansi(
@@ -150,6 +172,9 @@ QString SshTunnelManager::SanitizeSshStderr(const QByteArray& raw) {
 
 SshTunnelManager::Failure SshTunnelManager::ClassifySshStderr(
     const QString& sanitized) {
+  // 模式串是 OpenSSH 的英文原文，全部小写匹配。前提假设：ssh 的 stderr 没有被
+  // gettext 本地化。假设不成立时也不会误判成更"安全"的类别，只会一路落到末尾
+  // 的 kExited，也就是退化成"通道已断开"这条通用结论。
   const QString text = sanitized.toLower();
   const auto has = [&text](const char* needle) {
     return text.contains(QLatin1String(needle));
@@ -418,6 +443,8 @@ void SshTunnelManager::CloseProcess() {
     return;
   }
   process_->disconnect(this);
+  // 最坏情况这里会阻塞 GUI 线程约 5 秒（terminate 等 3s，kill 后再等 2s）。
+  // 这是有意的取舍：宁可短暂卡住界面，也不留孤儿 ssh -N 或僵尸进程。
   if (owned_ && process_->state() != QProcess::NotRunning) {
     process_->terminate();
     if (!process_->waitForFinished(3000)) {
@@ -430,6 +457,11 @@ void SshTunnelManager::CloseProcess() {
   owned_ = false;
 }
 
+// 失败是**终态**：进来就把进程、probe、定时器全拆掉，并把 local_port_ 清零，
+// 免得界面还显示一个已经不存在的端点。
+// 这里直接给 state_ 赋值再 emit 而不走 SetState()：状态很可能本来就是
+// kFailed，只是失败原因变了（先超时，随后又读到真正的 stderr），相等短路会把
+// 这条更新吞掉，用户就会一直看到过期原因。
 void SshTunnelManager::Fail(Failure failure, const QString& detail) {
   failure_ = failure;
   if (!detail.isEmpty()) {
@@ -456,6 +488,10 @@ void SshTunnelManager::SetSshProgram(const QString& program) {
   options_.ssh_program = program;
 }
 
+// 幂等：已经 kStopped 且既无自有进程也无外部借用时立刻返回，连信号都不发，
+// 关闭流程里重复调用不会引起多余重绘。
+// 拆除期间 stop_requested_ 保持置位，屏蔽在途的 finished / errorOccurred
+// 回调；否则"用户主动关闭"会被改写成一次失败（与 Fail() 同一手法）。
 void SshTunnelManager::Stop() {
   if (state_ == State::kStopped && process_ == nullptr && !external_reuse_) {
     return;
@@ -481,6 +517,8 @@ void SshTunnelManager::Stop() {
   emit stateChanged();
 }
 
+// 只在这里重置自动重挑预算：一次新的用户请求算一份新的重试额度。内部的自动
+// 重挑走 StartInternal()，刻意绕过这一行，才能在有限次数内把额度用掉。
 bool SshTunnelManager::Start(const Options& options) {
   auto_port_retries_ = 0;
   return StartInternal(options);
@@ -507,6 +545,8 @@ bool SshTunnelManager::StartInternal(const Options& options) {
     return true;
   }
 
+  // options_ 到这一步才赋值：上面两个早退分支（重复请求、已有可用通道）不应该
+  // 用被拒绝的参数覆盖当前生效的 Options。
   options_ = options;
   stop_requested_ = false;
   stderr_buffer_.clear();
@@ -560,6 +600,8 @@ bool SshTunnelManager::StartInternal(const Options& options) {
   external_reuse_ = false;
 
   // ---- ssh 可执行文件（只有真的要起进程时才需要）----
+  // 显式指定的路径在这里就校验 exists/isFile/isExecutable：目录或不可执行的
+  // 文件要当场变成 kSshMissing，而不是等 QProcess 报一句含糊的启动失败。
   QString program = options_.ssh_program.trimmed();
   if (!program.isEmpty()) {
     const QFileInfo info(program);
@@ -591,6 +633,10 @@ bool SshTunnelManager::StartInternal(const Options& options) {
   // 的入口。
   process_->setProcessEnvironment(QProcessEnvironment::systemEnvironment());
   process_->setProgram(program);
+  // 参数向量里**永远不放凭据**：命令行会出现在 ps 与 /proc/<pid>/cmdline 里，
+  // 把口令写进去等于公开它，认证完全交给密钥与 ssh-agent。
+  // 这些 -o 写在命令行而不是依赖 ~/.ssh/config，让行为不随用户配置漂移：
+  // 用户自己的 config 仍然生效，但上面这几条不会被它放宽。
   process_->setArguments(QStringList{
       QStringLiteral("-N"),
       // 关掉一切交互式提问：需要口令时立刻失败，而不是把 GUI 卡在提示上。
@@ -603,6 +649,8 @@ bool SshTunnelManager::StartInternal(const Options& options) {
       QStringLiteral("-o"), QStringLiteral("ServerAliveInterval=15"),
       QStringLiteral("-o"), QStringLiteral("ServerAliveCountMax=3"),
       // 只绑回环：这个本地端口不对局域网开放。
+      // 绑定地址写字面量 127.0.0.1 而不是 localhost：后者在 IPv6 优先的机器
+      // 上可能解析到 ::1，而探针只连 IPv4 回环，会一直探不通直到 kTimeout。
       QStringLiteral("-L"),
       QStringLiteral("127.0.0.1:%1:%2:%3")
           .arg(local_port_)
@@ -618,6 +666,9 @@ bool SshTunnelManager::StartInternal(const Options& options) {
           &SshTunnelManager::OnProcessErrorOccurred);
 
   process_->start();
+  // 起不来时手工拆除而不调 CloseProcess()：owned_ 此刻还是 false，那个函数的
+  // terminate 分支本来就不适用。顺序仍然照抄它：先取 errorString() 当诊断，
+  // 再 disconnect，最后 release + deleteLater，绝不在信号栈上同步析构。
   if (!process_->waitForStarted(5000)) {
     const QString error_text = process_->errorString();
     process_->disconnect(this);
@@ -657,6 +708,10 @@ bool SshTunnelManager::StartInternal(const Options& options) {
   return true;
 }
 
+// 只借端口，不接管进程：owned_ 保持 false，Stop() 与析构都不会去动用户自己在
+// 外面开的那条 ssh。进入 kReady 的前置条件由调用方保证：StartInternal() 用
+// IsLoopbackPortOpen() 确认过端口上真的有 listener。不做身份校验是有意的，
+// 隧道那头是谁由隧道内的 BPSEC1 pin 判定，另加一层检查只会制造安全错觉。
 bool SshTunnelManager::AdoptExternalListener(const Options& options,
                                              int local_port) {
   options_ = options;
@@ -674,6 +729,9 @@ bool SshTunnelManager::AdoptExternalListener(const Options& options,
   return true;
 }
 
+// 有两个调用者：readyReadStandardError（事件驱动）和 OnPollTick（兜底），因此
+// 必须可重复调用 —— readAllStandardError() 已经抽干管道缓冲区，重复调用只会
+// 拿到空数据直接返回，不会把同一段文本追加两次。
 void SshTunnelManager::ReadStderrIntoDiagnostic() {
   if (process_ == nullptr) {
     return;
@@ -701,7 +759,7 @@ void SshTunnelManager::OnProbeConnected() {
   failure_ = Failure::kNone;
   state_ = State::kReady;
   // 停表 + 把 probe 整个销毁：从这一刻起本类**不再发起任何 TCP 连接**。
-  // 这是本轮修掉的 blocker —— 之前这里只是把间隔改成 400ms，于是空闲 GUI
+  // 这里曾经只是把间隔改成 400ms，于是空闲 GUI
   // 每 400ms 就往本地转发端口 connect 一次，而 ssh -L 每接受一次连接就可能
   // 真的向 ECS 建一条 forwarded channel，等于持续给 backup-server 送连接。
   //
@@ -712,6 +770,9 @@ void SshTunnelManager::OnProbeConnected() {
   DisarmProbe();
 }
 
+// 每个 tick 的顺序是固定的：读 stderr -> 判断进程是否已经退出 -> 判断截止时间
+// 与次数 -> 发起一次探测。先读 stderr 是为了让超时与退出路径拿到尽量完整的
+// 诊断；先判死再判超时，是为了让"ssh 自己退了"优先于"我们等超时了"报给用户。
 void SshTunnelManager::OnPollTick() {
   // 这个定时器**只服务于建立阶段**。Ready 之后它已经被 OnProbeConnected
   // 停掉；真跑到了这里也只可能是迟到的 tick，直接收摊。
@@ -759,6 +820,9 @@ void SshTunnelManager::OnProcessErrorOccurred(QProcess::ProcessError error) {
   // 处理，避免同一件事报两次。
 }
 
+// 进程退出是"通道没了"的唯一证据（Ready 之后没有周期探测）。先把管道里剩下
+// 的 stderr 读干净：进程退出与 readyRead 的派发顺序在平台之间并不一致，漏读
+// 会让诊断文本缺掉最关键的最后几行。
 void SshTunnelManager::OnProcessFinished(int exit_code,
                                          QProcess::ExitStatus exit_status) {
   if (process_ == nullptr) {
@@ -781,6 +845,9 @@ void SshTunnelManager::OnProcessFinished(int exit_code,
   const bool was_ready = state_ == State::kReady;
   // 自动挑的端口撞车（本地端口竞态）时重挑一次：这是**有界**重试，
   // 而不是把失败直接甩给用户。
+  // 重挑端口前先把现场拆干净（停表 -> 收 probe -> 收进程 -> kStopped），复用
+  // 与 Stop() 相同的拆除序列，保证任何时刻最多只有一个 ssh 子进程；递归深度
+  // 由 auto_port_retries_ 封顶，不会无限重试。
   if (!was_ready && classified == Failure::kForwardFailed &&
       options_.local_port == 0 && auto_port_retries_ < kMaxAutoPortRetries) {
     ++auto_port_retries_;
@@ -797,6 +864,8 @@ void SshTunnelManager::OnProcessFinished(int exit_code,
     Fail(Failure::kExited, detail);
     return;
   }
+  // 没进过 Ready 又没输出：最可能是连不上（BatchMode 会压掉交互提示）。归成
+  // kHostUnreachable 比"通道已断开"更能指向一个可执行的排查动作。
   Fail(classified == Failure::kExited && sanitized.isEmpty()
            ? Failure::kHostUnreachable
            : classified,

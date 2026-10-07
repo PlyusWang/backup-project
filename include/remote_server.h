@@ -1,6 +1,6 @@
 // include/remote_server.h
 //
-// PR #20：远程备份服务端（backup-server）。
+// 远程备份服务端（backup-server）。
 //
 // 定位：**存储后端 + 传输边界**。它负责
 //
@@ -84,7 +84,7 @@ struct RemoteServerConfig {
   // 只接受 BPSEC2（签名身份）的客户端。收到 BPSEC1 的 ClientHello 直接拒绝，
   // 这就是"拒绝降级"的开关；打开时必须同时配置证书。
   bool require_bpsec2 = false;
-  // PR #23：允许**公网**监听（--bind 不是 127.0.0.1）。默认 false，且必须
+  // 允许**公网**监听（--bind 不是 127.0.0.1）。默认 false，且必须
   // 同时满足「配置了 BPSEC2 证书」与「给出一句话理由」，理由会写进启动日志。
   // 没有这个开关时行为与过去完全一致：任何非回环地址一律 fail closed。
   bool allow_public_bind = false;
@@ -130,7 +130,7 @@ struct ConnectionContext {
   std::uint64_t upload_received = 0;
   int upload_fd = -1;
 
-  // PR #21：这次上传要登记的链关系。UPLOAD_BEGIN 时校验并定下来，
+  // 这次上传要登记的链关系。UPLOAD_BEGIN 时校验并定下来，
   // UPLOAD_END 发布时写进元数据。generation 由**服务端**按父的 generation
   // 推导（父 + 1），客户端没有机会自己填一个数。
   std::uint16_t upload_kind = 0;
@@ -166,6 +166,33 @@ class RemoteServer {
   // 建监听 socket、建目录、打开数据库、读 secret。任何一步失败都返回 false，
   // 并且**不留下**半开状态（listener 会关掉）。
   bool Start(std::string* error_message);
+
+  // ---- 生命周期合同（三条，违反其中任意一条都是 UB）----
+  //
+  //   RequestStop()   唯一允许与 Run() 并发调用的入口：只置停止标志，
+  //                   线程安全，不碰任何 fd / 线程 / 数据库。
+  //   Run()           accept 循环与 worker 池的 owner：它在返回之前自己
+  //                   会 shutdown 掉 pending 连接、join 全部 worker、清空
+  //                   workers_。
+  //   Stop()          只能在 Run() 返回之后调用（或者从来没有调用过 Run()），
+  //                   负责释放 listener / store / maintenance / 数据目录锁。
+  //                   **不得与 Run() 并发**：两者都会 join 同一个 workers_，
+  //                   并且 Stop() 会关掉 Run() 正在使用的 listener。
+  //
+  // “运行中停止”只有一个正确写法：
+  //
+  //   std::thread runner([&]{ server.Run(&error); });
+  //   ...
+  //   server.RequestStop();     // 线程安全
+  //   runner.join();            // Run() 在这里收尾
+  //   server.Stop();            // 现在才可以做最终清理
+  //
+  // 产品路径（server/main.cpp）就是上面这个顺序。析构函数调用 Stop()，所以
+  // “Run() 还在跑的时候销毁对象”同样是 UB。
+  //
+  // Stop() 内部会检查 Run() 是否仍在进行：如果在，它直接返回不做任何拆除
+  // （宁可留下资源让 Run() 自己收尾，也不在 worker 还在用 store_/listener 的
+  // 时候把它们销毁）。这是一道防误用的闸，不是并发调用的许可。
   void Stop();
 
   // 实际绑定到的端口（port == 0 时由内核分配，测试用这个拿真实端口）。
@@ -199,7 +226,8 @@ class RemoteServer {
   // 一次。产品代码里没有任何地方调用它。
   void FailNextAccountDeleteForTesting();
 
-  // 阻塞式运行：accept + 固定 worker 池，Stop() 之后返回。
+  // 阻塞式运行：accept + 固定 worker 池。RequestStop() 之后返回，返回前自己
+  // join 掉全部 worker。Stop() 只能在它返回之后调用（见上面的生命周期合同）。
   bool Run(std::string* error_message);
   void RequestStop();
 
@@ -326,6 +354,9 @@ class RemoteServer {
   std::deque<int> pending_;
   std::vector<std::thread> workers_;
   std::atomic<bool> stop_requested_{false};
+  // Run() 是否正在执行。只用来挡住“Run() 与 Stop() 并发”这种误用：
+  // Stop() 在它为 true 时不做任何拆除（细节见头文件的生命周期合同）。
+  std::atomic<bool> run_in_progress_{false};
   std::size_t busy_workers_ = 0;
   std::size_t worker_count_ = 0;
   bool fail_next_write_ = false;

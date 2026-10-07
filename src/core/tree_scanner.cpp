@@ -57,6 +57,7 @@ struct InodeKey {
 
 // 软链接目标原文。readlink 不 follow，读到的是链接自己存的那串字节。
 // 用 lstat 的 size 作为起始缓冲长度：对软链接来说它就是目标的字节数。
+// 用 4 次尝试 × 每次翻倍来对付“读到一半目标又被改长”，上限 64 KiB。
 bool ReadLinkTarget(const std::string& disk_path, std::uint64_t hint,
                     std::string* target, std::string* error_message) {
   std::size_t size = static_cast<std::size_t>(hint);
@@ -87,11 +88,17 @@ bool ReadLinkTarget(const std::string& disk_path, std::uint64_t hint,
 }
 
 // Backup 消费者：把 walker 给出的事实落成 ArchiveEntry。
+// 生命周期：栈上构造、只在一次 WalkSourceTree 调用内存活，所以 seen_inodes_
+// 天然就是“单次扫描”的作用域，不会被下一次扫描复用（跨备份的 inode 复用
+// 没有意义，见上面的 InodeKey 说明）。
 class ArchiveEntryBuilder : public SourceTreeVisitor {
  public:
   explicit ArchiveEntryBuilder(std::vector<ArchiveEntry>* entries)
       : entries_(entries) {}
 
+  // 消费者契约：返回 false 表示“这次扫描整体失败”，walker 会立刻停止并把它
+  // 转成 kConsumerFailed —— 所以这里的每个 return false 之前都必须先写好
+  // error_message，没有别人会替你补。
   bool OnEntry(const std::string& disk_path, const std::string& archive_path,
                const SourceEntryFacts& facts, SourceEntryDecision decision,
                std::string* error_message) override {
@@ -99,6 +106,9 @@ class ArchiveEntryBuilder : public SourceTreeVisitor {
     if (decision != SourceEntryDecision::kIncluded) return true;
 
     ArchiveEntry entry;
+    // 条目顺序即归档顺序：walker 是确定的 lexical DFS，同一份输入必然产生
+    // 逐字节相同的条目序列，hardlink 的“第一条”因此可复现，不随 readdir
+    // 顺序漂移。
     entry.archive_path = archive_path;
     entry.source_path = disk_path;
     entry.type = facts.type;
@@ -130,6 +140,8 @@ class ArchiveEntryBuilder : public SourceTreeVisitor {
       case EntryType::kRegularFile: {
         // hardlink：同一 (st_dev, st_ino) 第二次出现时只写一条"指向第一次
         // archive_path"的 hardlink 条目，绝不重复存一份 payload。
+        // link_count 来自 lstat：1 表示只有这一条目录项，>1 才是硬链接。
+        // 扫描按路径走，同一 inode 只能靠这张表认出“刚才已经存过它”。
         if (facts.link_count > 1) {
           const InodeKey key{facts.device_id, facts.inode};
           const auto found = seen_inodes_.find(key);

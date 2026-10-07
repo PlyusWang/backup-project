@@ -1,6 +1,20 @@
 // file_io.cpp
 //
 // 见 file_io.h。
+// 本文件是 include/file_io.h 的实现，只放"磁盘 I/O 原语"，不含归档/业务语义：
+// 它不知道什么是 entry、什么是 manifest，只认字节、路径和 fd。
+//
+// 数据流：调用方把内容写进 FileSink，Close() 成功后得到已 fsync 的临时文件，
+// 再用 PublishNoReplace / PublishReplacing 发布成正式文件；FileSource 是反方向
+// 的只读端（打开时记 size、按绝对偏移读，不共享文件游标）。
+//
+// 核心不变量：输出永远 0600 且 O_CREAT|O_EXCL（或 mkstemp）——不截断、不跟随
+// 别人预放的符号链接，也不比 legacy v0.1 的 0600 更宽松；"fd 是否打开"
+// （fd_ >= 0）与"路径是否归本对象所有"（owns_path_）分开记，因为 Close() 失败
+// 时 fd 已经关闭而路径仍归自己，半成品照样要 unlink；失败一律返回 false +
+// error_message，已写出的字节不回滚，由调用方整份丢弃。
+// 线程约束：单个 FileSink/FileSource 不是线程安全的（含 256 KiB 缓冲与偏移
+// 状态），唯一的进程级全局是 file_io_syscalls 注入点，只能在单线程测试里替换。
 
 #include "file_io.h"
 
@@ -55,6 +69,8 @@ std::string BaseNameOf(const std::string& path) {
 
 // 目录项落盘不靠 fsync 文件本身，而靠 fsync 父目录。失败只当诊断：
 // 内容已经写完了，因为"目录项可能还没落盘"去报失败反而会误导调用方。
+// 返回值刻意是 void：目录 fsync 失败只影响"目录项何时落盘"，调用方若把它当成
+// 发布成功的判据，就会在内容已经完整的情况下报出一个并不存在的失败。
 void SyncDirectoryQuietly(const std::string& directory) {
   const int fd = ::open(directory.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
   if (fd < 0) {
@@ -85,6 +101,9 @@ int DefaultRenameNoReplace(const char* old_path, const char* new_path) {
 
 }  // namespace
 
+// 注入点存在的唯一理由是"可测"：fsync/close 失败、link 与 renameat2 的三种组合
+// 在真实文件系统上没法按需制造。它们是进程级可变全局，测试用完必须还原，生产
+// 路径永远走 Default* 实现；正因为是全局，这些 hook 只能在单线程测试里替换。
 namespace file_io_syscalls {
 
 FsyncFn& FsyncHook() {
@@ -110,6 +129,11 @@ RenameNoReplaceFn& RenameNoReplaceHook() {
 }  // namespace file_io_syscalls
 
 // ---- FileSink --------------------------------------------------------------
+// 状态机：Idle → (Open|OpenTemp) 打开 → Write/Flush/Patch → Close →
+// Committed；任何一步失败都可以 Abandon()（析构也会兜底）回到 Idle 并 unlink。
+// fd_ >= 0 表示可写，owns_path_ 表示"路径还归本对象负责清理"，committed_ 一旦
+// 为真就不再 unlink。用三个独立标志而不是一个 enum，是因为 Close() 失败恰好
+// 落在"fd 已关、路径仍归我"这个中间态上。
 
 FileSink::~FileSink() {
   // 析构也是 fail-safe 清理点：只要路径还归本对象所有而且没提交，就删掉。
@@ -122,6 +146,9 @@ FileSink::~FileSink() {
   }
 }
 
+// 前置条件：对象处于 Idle（既没开 fd 也没持有路径），重复打开报内部错误而不是
+// 悄悄丢掉旧 fd。父目录不会被创建（调用方负责）；O_EXCL 让"目标已存在"直接
+// 失败——这是"绝不覆盖"在文件系统层的落点。
 bool FileSink::Open(const std::string& path, std::string* error_message) {
   if (fd_ >= 0 || owns_path_) {
     SetError(error_message, "Internal error: sink already open: " + path);
@@ -149,6 +176,9 @@ bool FileSink::Open(const std::string& path, std::string* error_message) {
   return true;
 }
 
+// mkstemp 生成唯一名字（0600 + O_CREAT|O_EXCL），明文中间产物既不会撞名也不会
+// 跟随别人预放的符号链接。随机化的文件名不是安全边界，0700 的父目录才是；
+// path() 事后返回真实临时名，调用方发布或清理时都用它。
 bool FileSink::OpenTemp(const std::string& directory, const std::string& prefix,
                         std::string* error_message) {
   if (fd_ >= 0 || owns_path_) {
@@ -178,6 +208,8 @@ bool FileSink::OpenTemp(const std::string& directory, const std::string& prefix,
   return true;
 }
 
+// 绕过用户态缓冲直写 fd，bytes_written_ 只在真正写成功后累加；失败时给底层错误
+// 补上路径，让"哪个文件写坏了"不必靠调用栈去猜。
 bool FileSink::WriteRaw(const void* data, std::size_t size,
                         std::string* error_message) {
   if (size == 0) {
@@ -193,6 +225,9 @@ bool FileSink::WriteRaw(const void* data, std::size_t size,
   return true;
 }
 
+// 语义：把 size 个字节全部接受下来（可能只是进缓冲），返回 true 就代表调用方
+// 不必重试。大块直写、小块攒进缓冲，是为了不让 512 字节的 header 和对齐填充
+// 各占一次 syscall；fd_ < 0 时报内部错误，因为那是调用方的编排 bug。
 bool FileSink::Write(const void* data, std::size_t size,
                      std::string* error_message) {
   if (fd_ < 0) {
@@ -235,6 +270,9 @@ bool FileSink::Flush(std::string* error_message) {
   return true;
 }
 
+// 回填"写完才知道"的字段（entry_count、auth_tag）：先把自己的缓冲 Flush 落盘，
+// 再用 pwrite 定点覆盖，绝不改动文件偏移。同一区间可以重复 Patch，但调用方要
+// 保证该区间已经写满——pwrite 不会补洞，空洞在稀疏文件里读出来是 0。
 bool FileSink::Patch(std::uint64_t offset, const void* data, std::size_t size,
                      std::string* error_message) {
   if (fd_ < 0) {
@@ -262,6 +300,10 @@ bool FileSink::Patch(std::uint64_t offset, const void* data, std::size_t size,
   return true;
 }
 
+// 顺序不可交换：Flush（缓冲落盘）→ fsync（内容落盘）→ close（释放 fd）。
+// close 失败仍然算失败，但**不重试**：Linux 上 close 返回 EINTR 时 fd 已经
+// 释放，重试可能关掉别的线程刚拿到的 fd。失败时刻意保留 owns_path_，让
+// Abandon() 与析构仍然能把这份半成品删掉。
 bool FileSink::Close(std::string* error_message) {
   if (fd_ < 0) {
     if (committed_) {
@@ -290,6 +332,8 @@ bool FileSink::Close(std::string* error_message) {
   return ok;
 }
 
+// 失败清理：关掉还开着的句柄，并在 owns_path_ && !committed_ 时 unlink。清理
+// 用真正的 close 而不是注入点，否则测试把 close 换成"总是失败"就会漏 fd。
 void FileSink::Abandon() {
   if (fd_ >= 0) {
     // 清理路径用真正的 close，不走注入点：测试把 close 换成"总是失败"之后，
@@ -305,9 +349,14 @@ void FileSink::Abandon() {
 }
 
 // ---- FileSource ------------------------------------------------------------
+// 只读端：Open 时 fstat 记下 size，之后所有读取都用 pread 的绝对偏移，不共享
+// 文件游标，因此同一个 fd 可以被多个线程安全地并发读。
 
 FileSource::~FileSource() { Close(); }
 
+// 先 Close() 是"重新打开"语义，允许同一个对象换文件。只接受普通文件：调用点
+// 都是"按偏移读归档"，目录/设备/FIFO 在这里没有意义，早点拒绝比让后面的 pread
+// 返回 EISDIR 更容易排障。
 bool FileSource::Open(const std::string& path, std::string* error_message) {
   Close();
   const int raw_fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
@@ -340,6 +389,8 @@ void FileSource::Close() {
   size_ = 0;
 }
 
+// 必须精确读满 size 字节：短读由循环补齐，EOF 直接失败——解析 header 的调用方
+// 不能容忍"只解了一半"；offset 是绝对偏移，越界读由 EOF 检查兜住。
 bool FileSource::ReadAt(std::uint64_t offset, void* buffer, std::size_t size,
                         std::string* error_message) const {
   if (fd_ < 0) {
@@ -367,6 +418,9 @@ bool FileSource::ReadAt(std::uint64_t offset, void* buffer, std::size_t size,
   return true;
 }
 
+// 流式复制 [offset, offset+size) 到 sink，内存占用固定为 kCopyBufferSize，与
+// 区间大小无关。任何一段失败就整段失败，但已经写进 sink 的字节不会撤回——
+// 调用方拿到 false 必须丢弃整个 sink，而不是以为"前一半是好的"。
 bool FileSource::CopyRangeTo(std::uint64_t offset, std::uint64_t size,
                              FileSink* sink, std::string* error_message) const {
   if (fd_ < 0 || sink == nullptr) {
@@ -401,6 +455,9 @@ bool FileSource::CopyRangeTo(std::uint64_t offset, std::uint64_t size,
   return true;
 }
 
+// 写满或失败，没有第三种结果：短写由循环补齐，EINTR 重试。它只保证"交给了
+// 内核"，不保证落盘——fsync 是调用方的事，而这两件事的失败语义完全不同
+// （一个是写不进去，一个是掉电后可能丢）。
 bool WriteFully(int fd, const void* data, std::size_t size,
                 std::string* error_message) {
   const unsigned char* bytes = static_cast<const unsigned char*>(data);
@@ -421,6 +478,9 @@ bool WriteFully(int fd, const void* data, std::size_t size,
 
 // ---- 清理与私有工作目录 -----------------------------------------------------
 
+// 递归删除但不 follow 软链接：lstat + unlink 删链接本身，不进入它指向的目录。
+// 失败一律静默（调用点都是失败清理路径，报错也没人能处理）；递归深度等于目录
+// 深度，软链接环不会让它无限递归。
 void RemoveTreeNoFollow(const std::string& path) {
   struct stat info;
   if (::lstat(path.c_str(), &info) != 0) {
@@ -444,8 +504,13 @@ void RemoveTreeNoFollow(const std::string& path) {
   ::rmdir(path.c_str());
 }
 
+// 析构即清理：无论成功还是失败，明文中间产物都不会留在用户目录里。这是
+// TempDirectoryGuard 存在的全部理由——把"记得删"变成编译器保证的事。
 TempDirectoryGuard::~TempDirectoryGuard() { Remove(); }
 
+// 先 Remove() 让同一个对象可以重复使用。mkdtemp 已经给 0700，这里仍然显式
+// chmod 一次：这条安全属性不该依赖 umask 或平台细节；chmod 失败要把刚建的
+// 目录删掉，绝不能留下一个权限不明的目录让调用方继续用。
 bool TempDirectoryGuard::Create(const std::string& parent,
                                 const std::string& prefix,
                                 std::string* error_message) {
@@ -491,6 +556,11 @@ void TempDirectoryGuard::Remove() {
 
 // ---- 发布 ------------------------------------------------------------------
 
+// 契约：temp_file 必须已经 fsync；成功时 final_path 指向完整文件、temp_file 被
+// 消费掉；失败时 final_path **一定不存在**（绝不部分发布），temp_file 由调用方
+// 清理。决策顺序是有意的：link 是最老的"创建即原子"原语，先试它；renameat2
+// 需要较新的内核/文件系统，作为备选；两个都不可用时 fail closed，绝不退回
+// 非原子的 "lstat 确认不存在 + rename"（那中间有 TOCTOU 覆盖窗口）。
 bool PublishNoReplace(const std::string& temp_file,
                       const std::string& final_path,
                       std::string* error_message) {
@@ -532,7 +602,7 @@ bool PublishNoReplace(const std::string& temp_file,
   // 两个原子 no-replace 原语都不可用 / 都失败：**fail closed**。
   //
   // 这里绝不能再退回 "lstat(final) 确认不存在，然后普通 rename(temp, final)"：
-  // 检查与 rename 之间，另一个进程（或另一个 dsh 任务）完全可以创建 final，
+  // 检查与 rename 之间，另一个进程完全可以创建 final，
   // 而普通 rename() 会**直接覆盖**它。"绝不覆盖已有备份"是备份工具最不能
   // 让步的一条，所以宁可用一个没有人读得懂的失败，也不要一次静默覆盖。
   //
@@ -558,6 +628,9 @@ bool PublishNoReplace(const std::string& temp_file,
   return false;
 }
 
+// 只给"用户已经明确同意覆盖"的调用点（例如下载 --force）。这条路径允许覆盖，
+// 所以不需要 no-replace 原语：rename 一步原子，读者要么看到旧的完整内容、要么
+// 看到新的完整内容；失败时 final_path 保持原样。
 bool PublishReplacing(const std::string& temp_file,
                       const std::string& final_path,
                       std::string* error_message) {
@@ -576,6 +649,9 @@ bool PublishReplacing(const std::string& temp_file,
   return true;
 }
 
+// 可用空间 sanity check，不是配额系统：statvfs 拿不到就放行，绝不因为它失败而
+// 让用户连正常备份都做不了。用 f_bavail（非特权用户可用）而不是 f_bfree，并留
+// 1% 余量给目录项、文件系统元数据和同时发生的其他写入。
 bool CheckFreeSpace(const std::string& directory, std::uint64_t need_bytes,
                     std::string* error_message) {
   std::string base = directory.empty() ? std::string(".") : directory;
@@ -604,6 +680,9 @@ bool CheckFreeSpace(const std::string& directory, std::uint64_t need_bytes,
 
 // ---- 目录与"整份文件原子替换" ----
 
+// mkdir -p，权限固定 0700。路径已存在且确实是目录时直接成功，**不改**已有目录
+// 的权限（改别人的目录权限不是本函数的职责）；存在但不是目录时明确失败，绝不
+// 删掉它重建——那不是"创建目录"，那是破坏用户的数据。
 bool EnsurePrivateDirectory(const std::string& path,
                             std::string* error_message) {
   if (path.empty() || path == "." || path == "/") return true;
@@ -636,6 +715,8 @@ bool EnsurePrivateDirectory(const std::string& path,
   return true;
 }
 
+// 按用途命名的包装："这个文件要落在哪个目录里"。比让调用方自己算父目录再调
+// EnsurePrivateDirectory 少一次选错语义的机会（两者的边界语义并不相同）。
 bool EnsurePrivateDirectoryFor(const std::string& file_path,
                                std::string* error_message) {
   if (file_path.empty()) {
@@ -645,6 +726,10 @@ bool EnsurePrivateDirectoryFor(const std::string& file_path,
   return EnsurePrivateDirectory(ParentDirectoryOf(file_path), error_message);
 }
 
+// 整份文件原子替换，给"配置/状态"这类小文件用：mkstemp → write → fsync →
+// close → rename → fsync(目录)，任何一步失败都清理临时文件，绝不留下半份 .tmp。
+// rename 之前目标文件一个字节都没动，所以崩溃只会留下完整的旧内容或完整的新
+// 内容；目录 fsync 失败不算错误（少数文件系统不支持对目录 fsync）。
 bool WriteFileAtomicallyReplacing(const std::string& path,
                                   const std::string& data,
                                   std::string* error_message) {

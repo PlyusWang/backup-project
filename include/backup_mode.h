@@ -9,10 +9,10 @@
 //
 // 本版本真正实现并对外承诺的三种：
 //
-//   Manual    + Full           （PR #15 / #16）
-//   Scheduled + Full           （PR #17）
-//   Manual    + Incremental    （PR #18：delta 格式 + 依赖链恢复 + 共享引擎）
-//   Scheduled + Incremental    （PR #18：计划路径委托同一个引擎，
+//   Manual    + Full
+//   Scheduled + Full
+//   Manual    + Incremental    （delta 格式 + 依赖链恢复 + 共享引擎）
+//   Scheduled + Incremental    （计划路径委托同一个引擎，
 //                               且 retention 已经是 dependency-aware）
 //
 // Realtime 只在 enum 里存在，没有任何产品入口。

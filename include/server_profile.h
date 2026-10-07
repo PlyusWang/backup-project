@@ -1,6 +1,6 @@
 // include/server_profile.h
 //
-// ServerProfile —— "要连哪台服务器、怎么确认它是它"的一份完整描述（PR #23）。
+// ServerProfile —— "要连哪台服务器、怎么确认它是它"的一份完整描述。
 //
 // 三件事在这里合流：
 //   * 官方云端：**编译进二进制**的唯一一份 profile，用户侧零配置。地址、端口、
@@ -30,12 +30,12 @@ namespace net {
 // 官方云端的编译期常量。
 //
 // 主机名来自部署侧的事实，推导命令记录在这里，改的时候要一起改：
-//     ssh -G aliyun-ecs | awk '/^hostname /{print $2}'   -> 8.130.9.200
-// （2026-10-05 核对）。客户端把它编进二进制，而不是去读 ~/.ssh/config：
+//     ssh -G aliyun-ecs | awk '/^hostname /{print $2}'   -> 39.101.77.9
+// （2026-10-07 核对）。客户端把它编进二进制，而不是去读 ~/.ssh/config：
 // 官方云端的用户不应该需要任何本地配置，更不应该因为本机 ssh 配置不同而
 // 连到别的地方去。
 inline constexpr const char* kOfficialCloudDisplayName = "Backup Project Cloud";
-inline constexpr const char* kOfficialCloudHost = "8.130.9.200";
+inline constexpr const char* kOfficialCloudHost = "39.101.77.9";
 inline constexpr std::uint16_t kOfficialCloudPort = 18765;
 inline constexpr const char* kOfficialCloudServerId =
     "backup-project-cloud-production";

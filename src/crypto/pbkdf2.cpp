@@ -20,6 +20,9 @@ namespace backupproject {
 namespace crypto {
 namespace {
 
+// 用 volatile 写零：编译器有权把"写完就再也没人读"的 memset 整段删掉，
+// 而这里的零正是要留给下一任内存使用者的。函数只覆盖调用方给出的区间，
+// 长度由调用方保证——它不负责找齐所有副本（寄存器、被换出的页不在范围内）。
 void SecureZero(void* data, std::size_t size) {
   volatile unsigned char* p = static_cast<volatile unsigned char*>(data);
   while (size-- > 0) *p++ = 0;
@@ -27,6 +30,12 @@ void SecureZero(void* data, std::size_t size) {
 
 }  // namespace
 
+// 前置条件：iterations >= 1、derived_key_size >= 1（都是 RFC 8018 的硬要求，
+// 不满足时显式失败而不是替调用方取默认值）；password / salt 是任意字节串，
+// 允许内含 NUL，长度由 size() 给出。out 不得与 password / salt 指向同一对象。
+// 后置条件：成功时 *out 恰好是 derived_key_size 字节的派生密钥；
+// 失败时返回 false、error_message 写入原因，且 *out 已被清空（不是半截密钥）。
+// 代价：O(blocks * iterations) 次 HMAC-SHA256，纯计算、不阻塞在 I/O 上。
 bool Pbkdf2HmacSha256(const std::string& password, const std::string& salt,
                       std::uint32_t iterations, std::size_t derived_key_size,
                       std::string* out, std::string* error_message) {
@@ -90,6 +99,8 @@ bool Pbkdf2HmacSha256(const std::string& password, const std::string& salt,
       for (std::size_t i = 0; i < kSha256DigestSize; ++i) t[i] ^= target[i];
     }
 
+    // 最后一块通常不满 32 字节：只取需要的前缀，绝不把整块写出去
+    // （那会让 *out 比请求的长度更长，调用方按 size 截断时等于换了密钥）。
     const std::size_t take =
         std::min(kSha256DigestSize, derived_key_size - written);
     std::memcpy(&result[written], t, take);

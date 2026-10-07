@@ -2,6 +2,16 @@
 //
 // 信任决策的实现。原则：**默认拒绝**，每一条通过的理由都要写清楚。
 
+// 边界：本文件只回答"这张 BPCERT1 是不是由我信的一把根签的"。它不做网络
+// 访问、不拉 CRL、不建链（根 -> 服务器证书只有一跳），也不判断证书里那把
+// 服务器公钥后来有没有被换掉 —— 那是协议层的事。
+//
+// 信任的唯一来源是 roots_ 这个内存向量：内置常量（随二进制走，不能被"在
+// 旁边放个文件"篡改）或调用方显式加载的根文件。没有第三条路径。
+//
+// 失败方向一律 fail-closed：空存储、issuer 未知、根被吊销、根在签发时刻
+// 不在有效窗口内、验签失败，全部拒绝并给出结构化 Bpcert1Error。只有 kOk
+// 才代表"可信"，其它任何返回值都必须按"不可信"处理。
 #include "trusted_root_store.h"
 
 #include <cstdio>
@@ -31,6 +41,9 @@ void SetError(std::string* error_message, const char* text) {
 // 严格解析 Unix 秒。strtoll 不带 endptr 检查会把 "not-a-number" 变成 0，
 // 而 0 在这份格式里是"不限期"—— 一个笔误就把"根 2033 年过期"变成"根永久
 // 有效"，这是实打实的 fail-open。所以：整串必须都是数字，否则报错。
+// 已知边界：strtoll 溢出时返回 LLONG_MAX 并置 errno=ERANGE，这里没有检查
+// errno，所以天文数字会被当成"很晚才过期"。方向上是保守的（只会让根更晚
+// 失效，不会把有效期改短），但配置里多敲几个 0 不会得到任何报错。
 bool ParseSecondsStrict(const std::string& text, std::int64_t* out) {
   if (text.empty()) return false;
   char* end = nullptr;
@@ -46,6 +59,10 @@ const char* TrustedRootStore::OfficialCloudRootId() {
   return "backup-project-official-root-a";
 }
 
+// 加根是**追加**而不是替换：同一时刻可以有多把根在线（Root-A / Root-B），
+// 老证书继续可验、新证书已经用新根签，这正是根轮换期的需要。
+// 校验顺序固定：标识 -> 公钥长度 -> 有效期窗口 -> 标识唯一。最后一条不能
+// 省：查找、吊销与 *_root_id 输出都按标识定位，重名会让它们变成二义。
 bool TrustedRootStore::AddRoot(const TrustedRoot& root,
                                std::string* error_message) {
   if (!Bpcert1IsValidIdentity(root.root_id)) {
@@ -69,6 +86,9 @@ bool TrustedRootStore::AddRoot(const TrustedRoot& root,
   return true;
 }
 
+// 返回的指针指向 roots_ 内部元素，任何后续 AddRoot 都可能因 vector 扩容而
+// 让它失效（吊销只改标志位，不删元素）。调用方不得跨 AddRoot 保存它，
+// 也不得把它当长期引用持有。
 const TrustedRoot* TrustedRootStore::FindRoot(
     const std::string& root_id) const {
   for (const TrustedRoot& root : roots_) {
@@ -79,6 +99,12 @@ const TrustedRoot* TrustedRootStore::FindRoot(
   return nullptr;
 }
 
+// 完整信任决策。检查顺序：非空存储 -> 结构解析 -> 签发者命中 -> 未吊销 ->
+// 签发时刻落在根的有效窗口内 -> Ed25519 验签。字符串与标志位检查全部排在
+// 密码学运算之前，不为不可信的输入支付验签代价。
+// 输出契约：*matched_root_id 进函数先清空，但一旦命中根就会被填写，因此
+// 返回非 kOk 时它也可能非空 —— 调用方只能按返回值判定成功与否。
+// *message 是给用户看的中文原因，不含任何密钥材料。
 Bpcert1Error TrustedRootStore::VerifyCertificate(
     const std::string& raw_certificate, std::string* matched_root_id,
     std::string* message) const {
@@ -129,6 +155,8 @@ Bpcert1Error TrustedRootStore::VerifyCertificate(
     }
     return Bpcert1Error::kUntrustedIssuer;
   }
+  // 签名只覆盖 body（magic 到 signature_algorithm 的全部字节），所以验签
+  // 必须用 Bpcert1Body 的切片，不能拿整串原文去验。
   const std::string body = Bpcert1Body(raw_certificate);
   if (!Ed25519Verify(root->public_key, body.data(), body.size(),
                      certificate.signature, nullptr)) {
@@ -143,6 +171,10 @@ Bpcert1Error TrustedRootStore::VerifyCertificate(
   return Bpcert1Error::kOk;
 }
 
+// 整份文本先解析进一个局部临时存储，全部成功后才整体赋给 *out：任何一行
+// 出错都不会改动调用方已有的存储（"要么全换，要么不动"）。
+// 字段顺序固定为 <root-id> <public-key> [not_before] [not_after]
+// [active|revoked]，多一个字段就报错，不做"忽略看不懂的东西"。
 bool TrustedRootStore::LoadFromText(const std::string& text,
                                     TrustedRootStore* out,
                                     std::string* error_message) {
@@ -228,6 +260,8 @@ bool TrustedRootStore::LoadFromText(const std::string& text,
   return true;
 }
 
+// 只是把文件读成文本再交给 LoadFromText：所有校验只有一份实现，文件路径
+// 这一层不额外放宽任何条件，也不做"读一半也凑合"的降级。
 bool TrustedRootStore::LoadFromFile(const std::string& path,
                                     TrustedRootStore* out,
                                     std::string* error_message) {

@@ -2,7 +2,7 @@
 //
 // 管理工具的用户选择器：**永远不猜**。
 //
-// 人工验收发现的问题：`backup-server-admin show-user 23` 里的 23 到底指
+// 一个实际发生过的歧义：`backup-server-admin show-user 23` 里的 23 到底指
 // "id=23 的账户"还是"用户名叫 23 的账户"？旧实现直接按数字当 id 解析，于是
 // 用户可能看到的是另一个账户，而且界面上没有任何提示。这里把规则固定下来：
 //
@@ -14,6 +14,9 @@
 //
 // 解析与判定是两个纯函数：调用方负责查库，这里负责"怎么读用户输入"和"两个
 // 候选都在的时候怎么办"。规则只有一份，命令行、包装脚本、测试看到的是同一套。
+// 调用顺序固定三步：ParseUserSelector（只解析，不查库）→ 调用方按 id 与
+// 用户名各查一次库、得到两个 bool → DecideUserResolution 合并结论。
+// 三个函数都是纯函数：无 I/O、无全局状态、可重入，也不需要加锁。
 
 #ifndef BACKUP_PROJECT_ADMIN_SELECTOR_H
 #define BACKUP_PROJECT_ADMIN_SELECTOR_H
@@ -78,6 +81,7 @@ inline bool ParseUserSelector(const std::string& raw, UserSelector* out,
   }
   if (text.rfind("id:", 0) == 0) {
     const std::string digits = TrimSelector(text.substr(3));
+    // 18 位是刻意留的余量：int64 最大 19 位，卡在 18 位就不必再做溢出检查。
     if (!IsAllDigits(digits) || digits.size() > 18) {
       if (error_message != nullptr) {
         *error_message = "id: 后面必须是最多 18 位的数字，例如 id:23";
@@ -107,6 +111,8 @@ inline bool ParseUserSelector(const std::string& raw, UserSelector* out,
   out->text = text;
   // 裸输入如果全是数字，也要按编号解析一次：这正是"歧义"的来源——同一个数字
   // 既要当编号查一遍，也要当用户名查一遍，只有两边都能查到才拒绝执行。
+  // 只有“全数字且 ≤ 18 位”的裸输入才填 id。调用方必须用同样的条件决定要
+  // 不要按 id 查库（admin_main.cpp 正是如此），否则默认的 0 会被当真实编号。
   if (IsAllDigits(text) && text.size() <= 18) {
     out->id =
         static_cast<std::int64_t>(std::strtoll(text.c_str(), nullptr, 10));
@@ -115,6 +121,8 @@ inline bool ParseUserSelector(const std::string& raw, UserSelector* out,
 }
 
 // 关键判定：只有**一个**候选时才解析成功。显式写法永远只认自己那一种。
+// 唯一职责是“合并两个 bool”：不查库、不打印。显式写法永远只认自己那一种
+// （id: 命中用户名不算命中），只有裸输入才需要同时看两边。
 inline UserResolution DecideUserResolution(const UserSelector& selector,
                                            bool has_id_match,
                                            bool has_name_match) {

@@ -14,7 +14,9 @@ fi
 # 手写 C++ 源码所在目录。ui/desktop 是 Qt 桌面 GUI：它必须走同一个 lint 入口，
 # 否则 GUI 文件就算格式不合规，./scripts/lint.sh 也照样报 PASS。
 # ui/desktop 不存在时跳过，保证没有 GUI 的环境下 lint 依然可用。
-LINT_DIRS="app src include"
+# server/ 与 tools/ 是产品源码（backup-server / -admin / -keygen /
+# backup-cert-tool 的 main），必须与其他目录一样受同一个格式门禁约束。
+LINT_DIRS="app src include server tools"
 if [[ -d ui/desktop ]]; then
     LINT_DIRS="$LINT_DIRS ui/desktop"
 fi

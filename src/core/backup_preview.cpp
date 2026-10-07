@@ -83,6 +83,8 @@ class PreviewCollector : public SourceTreeVisitor {
   PreviewResult* result_ = nullptr;
 };
 
+// 只在“用户能做什么”的层面区分：源不可用与选择被阻断需要不同的提示，其余
+// 失败对调用方都是同一件事 —— 报错、不要重试、不要显示半份清单。
 PreviewErrorKind ErrorKindOf(SourceWalkFailureKind kind) {
   switch (kind) {
     case SourceWalkFailureKind::kSourceRoot:
@@ -103,6 +105,7 @@ PreviewErrorKind ErrorKindOf(SourceWalkFailureKind kind) {
 
 }  // namespace
 
+// 不带 faults 的重载等价于“没有注入故障”，供生产调用点使用。
 PreviewResult PreviewBackupSelection(const std::string& source_directory,
                                      const std::vector<FilterRuleDraft>& rules,
                                      std::size_t limit) {
@@ -124,6 +127,7 @@ PreviewResult PreviewBackupSelection(const std::string& source_directory,
     return result;
   }
 
+  // limit == 0 已在上面归一成默认窗口；收集器只写 result，不拥有它。
   PreviewCollector collector(limit, &result);
   SourceWalkFailure failure;
   if (!WalkSourceTree(source_directory, &filter, &collector, &failure,

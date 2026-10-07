@@ -1,4 +1,19 @@
 // ui/modern/remote_controller.cpp
+//
+// 远端备份页的控制器：QML 与 network / crypto / incremental core 之间唯一的
+// 适配层。它把"用户点了什么"翻译成一次 RemoteRequest，把 core 的英文诊断
+// 翻译成一条中文结论加一个可照做的下一步。
+//
+// 职责边界（刻意不做的事）：不实现 BPNET1 / BPSEC1 的线格式、握手、加密与
+// 增量判断；不重新定义用户名 / 口令 / 显示名的合法性，一律调用共享校验器；
+// 不解析归档内容，原始归档恢复把字节交给本地恢复核心。
+//
+// 线程模型：本对象的状态（busy_、snapshot_items_、各错误行）只由主线程读写；
+// 网络调用整段跑在 QtConcurrent 的工作线程里，工作线程只允许写原子进度变量，
+// 再向主线程投递一条排队调用（见 PublishProgress）。
+//
+// 单飞不变量：busy_ 才是真闸门，QML 的 enabled 只是可见性；同一个事件回合里
+// 的第二个请求由 BeginOperation 拒绝，不排队，也不与正在跑的那个抢连接。
 
 #include "remote_controller.h"
 
@@ -13,7 +28,7 @@
 #include <cstdio>
 #include <utility>
 
-// PR #21 产品级远端备份 / 链恢复：与 backupctl remote backup / remote restore
+// 产品级远端备份 / 链恢复：与 backupctl remote backup / remote restore
 // 用的是**同一个** core。GUI 不重新实现任何增量判断（有没有可信基线、父是谁、
 // 代数、lineage、要不要 bootstrap 缓存）——它只把"源目录 + 策略"和
 // "目标快照 + 目标目录"交给这一层。
@@ -27,6 +42,8 @@
 
 #if defined(Q_OS_UNIX)
 #include <signal.h>  // 只给自检用的 killOwnedTunnelForTest
+
+#include "format_bytes.h"
 #endif
 
 namespace backup_modern {
@@ -49,6 +66,8 @@ using backupproject::net::Status;
 // 第一类不靠猜字符串：把 error_message 与共享函数对每个状态码的输出比一遍，
 // 反查出状态码，再取共享的 StatusName()。所以本文件里**没有**第二份状态表——
 // 候选项就是共享函数自己产出的那几句。
+// 匹配是**逐字节相等**而不是子串：漏掉一个状态码只会让 error_kind 退化成
+// server/unknown（文案变笼统），绝不会把失败说成成功 —— ApplyResult 只认 ok。
 bool ResolveSharedStatus(const std::string& message, std::uint32_t* status) {
   static const Status kCandidates[] = {
       Status::kInvalidRequest, Status::kUnauthorized,
@@ -76,6 +95,8 @@ bool Contains(const std::string& haystack, const char* needle) {
 
 // 尽力而为地抹掉内存里的一份口令。std::string 也可能有副本（分配器、COW），
 // 所以这只是缩小窗口，不是内存加密——与 password_ 的擦除同一条边界。
+// volatile 是必须的：否则编译器可以把"写完就没人读"的循环整个优化掉，
+// 而我们真正想要的就是那几次内存写本身。
 void WipeSecret(std::string* secret) {
   if (secret == nullptr || secret->empty()) {
     return;
@@ -93,6 +114,9 @@ void WipeSecret(std::string* secret) {
 //      是给归类用的，不是给用户读的；
 //   2. 把本机临时工作目录（.../raw-restore-XXXXXX/xxx.bak）换成占位符：用户
 //      不需要、也不该在界面上看到本机的临时路径。
+// 两处刻意的边界：guard 上限 8 次替换，防止脏输入把这里变成无界循环；
+// 结果截断到 160 字符 —— 理由串来自 core，长度不受本层控制，而它要放进
+// 一页横幅里。
 QString SanitizeLocalRestoreReason(const std::string& detail) {
   QString text = QString::fromStdString(detail);
   const int dash = text.lastIndexOf(QStringLiteral("— "));
@@ -138,6 +162,8 @@ QString SanitizeLocalRestoreReason(const std::string& detail) {
 // 长度与字符集的规则只在 ValidateUsername 里实现一次；这里不判断长度，也不
 // 遍历字符。允许的字符全部是单字节 ASCII，所以"字节"与"字符"是同一个数，
 // 但对用户说"字符"更自然。
+// 与 UsernameReasonName 是一对：前者给用户看，后者进终端诊断（分类名便于
+// 对数时按原因分组）。两者必须覆盖同一组枚举值，新增枚举时一起加。
 QString UsernameReasonText(backupproject::net::UsernameValidation reason) {
   using backupproject::net::UsernameValidation;
   switch (reason) {
@@ -176,6 +202,8 @@ const char* UsernameReasonName(backupproject::net::UsernameValidation reason) {
 
 }  // namespace
 
+// 构造只做三件事：填默认端点、把 pin 的两个落点对齐、接好两个信号。
+// 不发起网络动作、不读磁盘 —— 构造期失败没有地方可以报（QML 侧还没绑好）。
 RemoteController::RemoteController(QObject* parent) : QObject(parent) {
   endpoint_.host = backupproject::net::kDefaultRemoteHost;
   endpoint_.port = backupproject::net::kDefaultRemotePort;
@@ -195,6 +223,8 @@ RemoteController::~RemoteController() {
   // 最后才销毁任何东西。关窗守卫（Main.qml 的 onClosing）已经挡住"传输中
   // 关窗"，这里是最后一道保险。
   shutting_down_.store(true);
+  // waitForFinished 是有界的：后台任务是网络调用，超时由传输层自己管，
+  // 所以关窗不会被一次卡住的传输永远挂住。
   if (watcher_.isRunning()) {
     watcher_.waitForFinished();
   }
@@ -202,6 +232,8 @@ RemoteController::~RemoteController() {
   // GUI 退出不允许留下孤儿 ssh -N：本程序启动的那一条在这里被有界地收掉
   // （terminate → 有界等待 → 必要时 kill）。用户自己在外面开的隧道不属于
   // 本对象，一个字节都不会动它。
+  // 只收本程序启动的那一条：用户自己在外面开的隧道不属于本对象，
+  // 一个字节都不会动它（owned_ 标志在 SshTunnelManager 里）。
   tunnel_.Stop();
   // 尽力而为地擦掉口令。QString 可能因隐式共享留下副本，也没有 mlock，
   // 所以这只是缩小窗口，不是内存加密。
@@ -219,6 +251,9 @@ QString RemoteController::sessionText() const {
 }
 
 // 服务器可达性：空串表示"还没有试过"，于是界面什么都不说。
+// 只有真的试过一次连接才谈得上"可达 / 不可达"：唯一会写这两个值的地方是
+// RunOperation 里调用过 Connect 的那两个分支，不靠定时探测或超时去猜。
+// kUnknown 渲染成空串 —— 界面宁可什么都不说，也不给一个没有证据的结论。
 QString RemoteController::serverReachabilityText() const {
   switch (reachability_) {
     case RemoteReachability::kReachable:
@@ -247,6 +282,9 @@ QString RemoteController::statusScope() const {
                                                    : QStringLiteral("remote");
 }
 
+// total 为 0 表示"还不知道总量"（连接 / 校验阶段），此时比例是 0 而不是
+// NaN —— QML 的进度条不接受 NaN。结果强制夹在 [0,1]：服务端上报的总量与
+// 本地已发字节来自不同时机，短暂超过 100% 是可能的。
 double RemoteController::progressRatio() const {
   const std::uint64_t total = bytes_total_.load();
   if (total == 0) {
@@ -272,22 +310,13 @@ QString RemoteController::progressText() const {
 // ---- 格式化：列表与进度都只展示这两样的结果 ----
 
 QString RemoteController::FormatSize(std::uint64_t bytes) {
-  const double value = static_cast<double>(bytes);
-  if (bytes < 1024ull) {
-    return QStringLiteral("%1 字节").arg(static_cast<qulonglong>(bytes));
-  }
-  if (bytes < 1024ull * 1024ull) {
-    return QStringLiteral("%1 KiB").arg(
-        QString::number(value / 1024.0, 'f', 1));
-  }
-  if (bytes < 1024ull * 1024ull * 1024ull) {
-    return QStringLiteral("%1 MiB").arg(
-        QString::number(value / (1024.0 * 1024.0), 'f', 1));
-  }
-  return QStringLiteral("%1 GiB").arg(
-      QString::number(value / (1024.0 * 1024.0 * 1024.0), 'f', 2));
+  // 进度与列表都走全产品唯一的格式化规则（include/format_bytes.h）：
+  // 以前这里对小于 1 KiB 的值说“字节”、其余说 KiB/MiB，而备份页说 B/KB。
+  return QString::fromStdString(backupproject::FormatByteSize(bytes));
 }
 
+// 只精确到分钟：列表里的一行不需要秒，省略秒也让同一屏的文本宽度更稳。
+// 0 是"服务端没给时间"的哨兵，渲染成"时间未知"而不是 1970-01-01。
 QString RemoteController::FormatTime(std::uint64_t unix_seconds) {
   if (unix_seconds == 0) {
     return QStringLiteral("时间未知");
@@ -297,6 +326,8 @@ QString RemoteController::FormatTime(std::uint64_t unix_seconds) {
   return when.toString(QStringLiteral("yyyy-MM-dd HH:mm"));
 }
 
+// Kind 的字符串名同时出现在三处：operationFinished 信号的参数、QML 侧的
+// 判断依据、自检脚本的期望值。改名字等于改接口。
 QString RemoteController::KindName(RemoteOpResult::Kind kind) {
   switch (kind) {
     case RemoteOpResult::Kind::kRegister:
@@ -323,6 +354,11 @@ QString RemoteController::KindName(RemoteOpResult::Kind kind) {
   return QStringLiteral("unknown");
 }
 
+// detail 的匹配是**子串**，所以下面的判断顺序本身就是语义：具体的失败
+// （raw restore: ... / server-key-mismatch）必须排在笼统的（connect / 依赖链）
+// 之前，否则会被先命中的宽规则吞掉，用户拿到的下一步就变成了错的。
+// 这些子串是共享 core 的稳定前缀（见 remote_incremental.cpp），不是这里
+// 现造的文案 —— 改 core 的诊断措辞就等于改这里的分类结果。
 QString RemoteController::ClassifyFailure(const std::string& status_name,
                                           const std::string& detail,
                                           RemoteOpResult::Kind kind) {
@@ -414,11 +450,11 @@ QString RemoteController::ClassifyFailure(const std::string& status_name,
   if (Contains(detail, "already exists")) {
     return QStringLiteral("target-exists");
   }
-  // ---- 连接层：失败必须分层报，不能全压成一句"网络错误"（PR #22）----
+  // ---- 连接层：失败必须分层报，不能全压成一句"网络错误" ----
   //
   // 层次从下到上是：
   //   本地/隧道 -> BPSEC1 握手 -> 服务端身份(pin) -> 账号口令 -> 服务端业务
-  // 每一层都有自己的一句话与自己的下一步动作。人工验收里"服务器暂时不可达"
+  // 每一层都有自己的一句话与自己的下一步动作。"服务器暂时不可达"
   // 这一句同时盖住了四五种完全不同的原因，用户无从下手。
   //
   // (1) 服务端身份 pin 不符：这是"连错服务器 / 服务器换了密钥"，不是网络抖动。
@@ -473,6 +509,10 @@ QString RemoteController::ClassifyFailure(const std::string& status_name,
   return QStringLiteral("unknown");
 }
 
+// error_kind -> 面向用户的中文结论。契约：每一句都要能回答"然后我该做
+// 什么"，不许出现"操作失败，请重试"这种什么都不说的兜底（留到最后一行）。
+// 这里不含内部错误码，技术详情留在 last_detail_ 与 stderr。
+// 与 TitleForFailure 成对：新增一个 kind 必须同时加两处，否则标题与正文会打架。
 QString RemoteController::DescribeFailure(const QString& error_kind) {
   if (error_kind == QStringLiteral("credentials")) {
     return QStringLiteral("登录失败：用户名或密码不正确。");
@@ -571,7 +611,7 @@ QString RemoteController::DescribeFailure(const QString& error_kind) {
   if (error_kind == QStringLiteral("rejected")) {
     return QStringLiteral("服务器拒绝了这个请求（两端版本可能不一致）。");
   }
-  // ---- PR #22：连接层的每一种失败各有各的说法与下一步 ----
+  // ---- 连接层的每一种失败各有各的说法与下一步 ----
   //
   // ssh-* / tunnel-not-ready 的文案只有一份，在 SshTunnelManager 里
   // （FailureUserText）。这里按 kind 反查，避免同一个事实写两遍、改一处忘
@@ -620,6 +660,8 @@ QString RemoteController::DescribeFailure(const QString& error_kind) {
   return QStringLiteral("操作没有完成，请稍后重试。");
 }
 
+// 图标旁那一行短标题。没有匹配的 kind 时退化成"操作失败"，
+// 因此它永远不会返回空串（空的标题会画出一个空横幅）。
 QString RemoteController::TitleForFailure(const QString& error_kind) {
   if (error_kind == QStringLiteral("credentials")) {
     return QStringLiteral("登录失败");
@@ -682,7 +724,7 @@ QString RemoteController::TitleForFailure(const QString& error_kind) {
       error_kind == QStringLiteral("server")) {
     return QStringLiteral("服务器拒绝了请求");
   }
-  // ---- PR #22：连接层的标题 ----
+  // ---- 连接层的标题 ----
   const SshTunnelManager::Failure tunnel_failure =
       SshTunnelManager::FailureFromKindName(error_kind);
   if (tunnel_failure != SshTunnelManager::Failure::kNone) {
@@ -714,6 +756,9 @@ QString RemoteController::TitleForFailure(const QString& error_kind) {
 
 // ---- 状态条 / 忙碌 / 列表 ----
 
+// 状态条的唯一写入口。值没变就直接返回：QML 绑定会被反复求值，每次 emit
+// statusChanged() 都会让整页重新绑定一次 —— 去重不是优化，是避免闪烁与
+// 无谓的重绘。
 void RemoteController::SetStatus(const QString& kind, const QString& title,
                                  const QString& message) {
   if (status_kind_ == kind && status_title_ == title &&
@@ -726,6 +771,8 @@ void RemoteController::SetStatus(const QString& kind, const QString& title,
   emit statusChanged();
 }
 
+// busy_ 与 busy_action_ 必须一起更新：所有"正在 X"的文案都从 busy_action_
+// 取，分两次改会让界面上短暂出现"正在做上一次那件事"。
 void RemoteController::SetBusy(bool busy, const QString& action) {
   if (busy_ == busy && busy_action_ == action) {
     return;
@@ -742,6 +789,8 @@ void RemoteController::ResetIdleStatus() {
   SetIdleBaseline();
 }
 
+// 空闲基线的三态：已登录 / 未登录且确认不可达 / 未登录且没试过。
+// 它是"页面上没有别的话要说"时的常驻状态，因此只说**有证据**的事。
 void RemoteController::SetIdleBaseline() {
   if (authenticated_) {
     SetStatus(QStringLiteral("idle"),
@@ -763,6 +812,10 @@ void RemoteController::SetIdleBaseline() {
 
 void RemoteController::clearStatus() { ResetIdleStatus(); }
 
+// 把网络层的快照列表转成 QML 用的 QVariantList。这里的 key 名（id / name /
+// kind / generation 等）就是与 RemotePage.qml 的接口，增删 key 属于接口变更。
+// 所有面向显示的字符串（sizeText / createdText / parentShort / sha256Short）
+// 都在这里预先算好：QML 不做格式化，也不会第二次发明一套单位或时间格式。
 void RemoteController::SetSnapshots(
     const std::vector<RemoteSnapshotInfo>& snapshots) {
   // 服务端不保证顺序，最新的一律排在最前面：列表的第一行就是"最近一次备份"。
@@ -800,7 +853,7 @@ void RemoteController::SetSnapshots(
     // 显示名猜：
     //
     //   rawArchive   lineage 为空、不是增量
-    //                -> PR #20 时代的原始归档上传 / 低层 remote upload。
+    //                -> 低层 remote upload（旧版客户端的原始归档上传）。
     //                   它不是 BPSNAP1 材料包，**没有**链语义（没有父、没有
     //                   代数），所以既不能显示成"完整备份"，也没有"代数 0"
     //                   可言。它可以"下载之后按本地格式独立恢复"，但那不是
@@ -867,6 +920,10 @@ void RemoteController::SetSnapshots(
 
 // ---- 进度：后台线程写原子变量，主线程读 ----
 
+// 工作线程 -> 主线程的唯一通道。三点约定：
+//   * 内存序统一用 relaxed：这几个值互相独立，显示端不需要 happens-before，
+//     只要能读到某个自洽的版本，用 seq_cst 只会白增同步开销；
+//   * shutting_down_ 为真时立刻返回，析构期间不再投递新的排队调用。
 void RemoteController::PublishProgress(const RemoteTransferProgress& p) {
   if (shutting_down_.load(std::memory_order_relaxed)) {
     return;
@@ -883,6 +940,9 @@ void RemoteController::PublishProgress(const RemoteTransferProgress& p) {
       this, [this]() { OnProgressNotify(); }, Qt::QueuedConnection);
 }
 
+// 主线程侧：把原子进度快照翻译成文案并广播 progressChanged。transfer_active_
+// 与 transfer_phase_text_ 是给 QML 判断"要不要画进度条"的两个派生值，
+// 它们只在主线程里改，所以不需要是原子变量。
 void RemoteController::OnProgressNotify() {
   const int phase = phase_.load();
   transfer_active_ = phase != static_cast<int>(Phase::kNone);
@@ -908,6 +968,8 @@ void RemoteController::OnProgressNotify() {
 
 // ---- 输入校验 ----
 
+// last_error_kind_ 由调用方先设置好（横幅标题要用它），这里只负责把同一句
+// 话投递到正确的容器，并且只在值真的发生变化时才发信号。
 void RemoteController::ReportSurfaceError(ErrorSurface surface,
                                           const QString& message) {
   // 错误只写在**触发它的那个位置**：登录表单、注册表单、注销对话框，或者
@@ -985,6 +1047,9 @@ void RemoteController::ClearSurfaceError(ErrorSurface surface) {
   }
 }
 
+// 端点校验的固定顺序：地址 -> 端口 -> 用户名，全部通过才写出参。
+// 校验失败时**一个出参都不改**，调用方因此不会 CommitEndpoint —— 界面上
+// 显示的目标永远是最后一次真正被接受的那一组值。
 bool RemoteController::ValidateEndpoint(const QString& host,
                                         const QString& port_text,
                                         const QString& username,
@@ -1013,7 +1078,7 @@ bool RemoteController::ValidateEndpoint(const QString& host,
   std::string user_error;
   // 复用共享校验器，而且用**结构化**的那一个：规则只有一份，界面只把原因翻
   // 译成文案。旧实现把"长度不合法"和"字符不合法"合成一句固定文案，于是输入
-  // "W"（1 个字符）被显示成"字符有问题"——人工验收发现的最后一处 UX mismatch。
+  // "W"（1 个字符）被显示成"字符有问题"——这是一处 UX mismatch。
   const backupproject::net::UsernameValidation username_reason =
       backupproject::net::ValidateUsername(user, &user_error);
   if (username_reason != backupproject::net::UsernameValidation::kOk) {
@@ -1034,6 +1099,8 @@ bool RemoteController::ValidateEndpoint(const QString& host,
   return true;
 }
 
+// 提交点：只有全部输入合法才会走到这里，被拒的输入连 endpoint_ 都不碰。
+// 值没有变化时直接返回，省掉一次无意义的状态广播。
 void RemoteController::CommitEndpoint(const QString& host, int port,
                                       const QString& username) {
   // 只有全部输入都通过校验之后才动"上一次生效的地址"：被拒的输入连这个状态
@@ -1052,6 +1119,9 @@ void RemoteController::CommitEndpoint(const QString& host, int port,
   emit endpointChanged();
 }
 
+// 上限与字符集规则只有共享的 IsValidPassword 一处实现，界面不重写。
+// 注意单位是**字节**而不是字符：非 ASCII 口令的字符数会比字节数少，
+// 所以这里只按字节数报错，不让用户去心算编码后的长度。
 bool RemoteController::ValidatePassword(const QString& password,
                                         ErrorSurface surface) {
   last_error_kind_ = QStringLiteral("validation");
@@ -1094,6 +1164,10 @@ bool RemoteController::ValidateCurrentPassword(const QString& password) {
   return true;
 }
 
+// 按操作类型挑最终给用户看的那一句话。分层的意义：同一种网络失败，在"登录"
+// 和"上传"里要说成不同的话 —— 前者要提示凭据可能不对，后者要说明什么都还
+// 没发生、可以直接重试。连接层失败在这里被整体短路：它们的原因与 kind 无关，
+// 而且"稍后重试"恰恰是最不该给的下一步。
 QString RemoteController::SurfaceFailureMessage(RemoteOpResult::Kind kind,
                                                 const QString& error_kind,
                                                 const QString& fallback) const {
@@ -1117,7 +1191,8 @@ QString RemoteController::SurfaceFailureMessage(RemoteOpResult::Kind kind,
   }
   switch (kind) {
     case RemoteOpResult::Kind::kLogin:
-      // 账户枚举防护：用户不存在与密码错误回**同一句话**，界面不泄露账号是否存在。
+      // 账户枚举防护：用户不存在与密码错误回**同一句话**，
+      // 界面不泄露账号是否存在。
       if (error_kind == QStringLiteral("credentials")) {
         return QStringLiteral("用户名或密码错误");
       }
@@ -1177,7 +1252,7 @@ QString RemoteController::SurfaceFailureMessage(RemoteOpResult::Kind kind,
     case RemoteOpResult::Kind::kRestoreRaw:
       // 原始归档恢复的每一种失败都**只有一处**中文文案：DescribeFailure。
       // 这里刻意不再各写一份——两份文案是同一个事实的两次表述，改一处忘一处
-      // 就会让横幅和详情自相矛盾（本轮就抓到过这个漂移：横幅还在说"不能脱离
+      // 就会让横幅和详情自相矛盾（曾经出现过这种漂移：横幅还在说"不能脱离
       // 依赖链"，而详情里已经写明"缺少父备份"）。所以只有与类型无关的网络 /
       // 服务端两种情形在这里特判，其余一律落回 fallback。
       if (network) {
@@ -1208,12 +1283,18 @@ QString RemoteController::SurfaceFailureMessage(RemoteOpResult::Kind kind,
   return fallback;
 }
 
-// 官方模式的登录路径曾经被人工 pin 挡死（PR #23 人工验收 blocker）：身份来源
+// 官方模式的登录路径曾经被人工 pin 挡死：身份来源
 // 其实是**互斥的两条路**，而这里说的是“这个模式需不需要人工 pin”这唯一一件事。
+// 只回答"这个模式需不需要人工 pin"这一件事：official 用内置 profile +
+// 内置根证书 + BPSEC2，证书模式根本不看 pin；ssh / direct 仍然依赖人工 pin
+// 提供身份。所以它与页面上有没有那个输入框无关。
 bool RemoteController::RequiresManualPin() const {
   return connection_mode_ != ConnectionMode::kOfficialCloud;
 }
 
+// 所有操作的公共前置：单飞闸门 -> 登录态 -> 人工 pin -> 置忙。
+// 三次检查的顺序有意义：先把"已有操作在跑"说清楚（连按两次按钮时这才是真正
+// 的原因），再谈凭据。返回 false 时错误已经写进 surface。
 bool RemoteController::BeginOperation(const QString& action_text,
                                       bool need_login, ErrorSurface surface) {
   if (busy_) {
@@ -1239,8 +1320,7 @@ bool RemoteController::BeginOperation(const QString& action_text,
   }
   // 连接之前必须有服务端身份 pin —— **但只有靠人工 pin 认服务器的模式才需要**。
   //
-  // PR #23 人工验收发现的
-  // blocker：官方云端模式下“服务器身份指纹”输入区是隐藏的， 而这里无条件要求
+  // 官方云端模式下“服务器身份指纹”输入区是隐藏的，而这里无条件要求
   // server_key_pin_ 非空，于是官方用户被一句“还没有填写服务器
   // 身份指纹”挡在门外。身份来源是互斥的两条路（见
   // remote_backup_client.h:48-57）： 证书模式根本不看
@@ -1268,6 +1348,9 @@ bool RemoteController::BeginOperation(const QString& action_text,
   return true;
 }
 
+// 真正的派发点（Submit 的所有分支都汇聚到这里）。启动后台任务之前先把进度
+// 归零：新一次操作的百分比不能沿用上一次的，否则进度条会先画一个 100%
+// 再跳回来。
 void RemoteController::DispatchRequest(const RemoteRequest& request) {
   // 测试注入点（默认关闭，见头文件）：只记录这一次**真正要发出去**的请求端点，
   // 一个字节都不发。官方 profile 指向真实 ECS，而 final gate 不能依赖公网，
@@ -1301,8 +1384,13 @@ void RemoteController::DispatchRequest(const RemoteRequest& request) {
                                        &client_, request, this));
 }
 
+// 三种连接模式在这里分流（调用点一个都不用改，因此不可能出现"某一条操作
+// 忘了走隧道"的漏网）：
+//   official -> 忽略调用方给的地址，改用内置 profile + 证书身份；
+//   direct -> 原样发出去；ssh -> 只拨 127.0.0.1:<本地转发端口>，远端地址在
+//             ssh -L 里，BPSEC1 的 pin 校验仍然在隧道内部照跑。
 void RemoteController::Submit(const RemoteRequest& request) {
-  // 传输层的唯一闸门。直连模式与 PR #21 完全一样；SSH 模式先保证"本地有一个
+  // 传输层的唯一闸门。直连模式与既有行为完全一样；SSH 模式先保证"本地有一个
   // 能连上的端口"这件事成立，再把请求发出去。
   //
   // 调用点一个都不用改：所有提交都经过这里，所以不可能出现"某一条操作忘了
@@ -1347,6 +1435,10 @@ void RemoteController::Submit(const RemoteRequest& request) {
 
 // ---- 后台线程：真正的网络调用全在这里 ----
 
+// 工作线程主体。两条硬约束：不碰任何 QML / 主线程状态，进度只能通过
+// progress_sink 的原子变量发布；各 case 只负责调 client 并把结果拷进
+// RemoteOpResult，所有失败在函数末尾统一归一（status_name -> error_kind ->
+// message），因此不存在"某个 case 忘了归类"的可能。
 RemoteOpResult RemoteController::RunOperation(
     backupproject::net::RemoteArchiveClient* client, RemoteRequest request,
     RemoteController* progress_sink) {
@@ -1552,6 +1644,9 @@ RemoteOpResult RemoteController::RunOperation(
 
 // ---- 主线程：结果落地 ----
 
+// 主线程收口：应用结果 -> 结束忙碌 -> 广播 operationFinished。
+// 顺序不能变：ApplyResult 的分支会读 busy_（例如决定要不要顺带刷新列表），
+// 而 SetBusy(false) 之后 QML 已经可以发起新的操作了。
 void RemoteController::OnOperationFinished() {
   const RemoteOpResult result = watcher_.result();
   ApplyResult(result);
@@ -1577,6 +1672,10 @@ void RemoteController::OnOperationFinished() {
   }
 }
 
+// 结果落地的唯一入口（成功与失败都走这里）。这里有一个顺序上的不变量：
+// 原始归档恢复的结构化状态必须**先**落地，后面的失败分支才能判断这次到底是
+// "一条错误"还是"还差一样东西"（缺密码时 raw_session 非空，界面据此切到
+// 输入密码那一段，而不是报错）。
 void RemoteController::ApplyResult(const RemoteOpResult& result) {
   if (result.reachability != RemoteReachability::kUnknown) {
     // 只在这条后台线程真的试过连接时更新：登录 / 注册会连接，其它操作复用
@@ -1631,7 +1730,7 @@ void RemoteController::ApplyResult(const RemoteOpResult& result) {
     //   token**；
     //                                            下一次操作会自动重连并恢复会话
     //
-    // 这一条是人工验收里"点一次刷新就被退出登录"的根因：以前任何一次网络抖动
+    // "点一次刷新就被退出登录"的根因：以前任何一次网络抖动
     // 都会清掉登录态，而 token 明明是好的。现在网络错误只影响这一次操作，
     // 登录状态与云端数据都不动。
     if (result.error_kind == QStringLiteral("not-logged-in")) {
@@ -1648,8 +1747,8 @@ void RemoteController::ApplyResult(const RemoteOpResult& result) {
     if (result.kind == RemoteOpResult::Kind::kLogin) {
       // 登录失败 = 没有会话。哪怕这一次尝试之前是登录状态，它也已经把那条会话
       // 换掉了（客户端在 Login 之前先丢掉旧会话）。界面上不允许同时出现
-      // "登录失败"和"当前账户：xxx（已登录）"——那正是人工验收里看到的
-      // "注销之后居然还能显示登录成功"的那类自相矛盾状态。
+      // "登录失败"和"当前账户：xxx（已登录）"——自相矛盾的状态，
+      // 与"注销之后居然还能显示登录成功"是同一类问题。
       client_.Disconnect();
       list_loaded_ = false;
       SetSnapshots(std::vector<RemoteSnapshotInfo>());
@@ -1856,7 +1955,7 @@ void RemoteController::ApplyResult(const RemoteOpResult& result) {
       // "未登录"。云端数据由服务端删除，这里不做任何本地清理。
       //
       // 这一组更新必须一起发生：只要还有一处留着旧状态，界面就会出现"服务端
-      // 已经删了、本机还显示已登录"这种自相矛盾的样子（人工验收见过）。
+      // 已经删了、本机还显示已登录"这种自相矛盾的样子。
       // 账户已经不存在了：三个错误行一起清掉，免得注销成功之后登录表单里还
       // 留着上一次"用户名或密码错误"这种已经不成立的话。
       ClearSurfaceError(ErrorSurface::kDeleteAccount);
@@ -1959,6 +2058,9 @@ bool RemoteController::login(const QString& host, const QString& port_text,
   Submit(request);
   return true;
 }
+// 只清本机：断开 socket、擦掉内存里的口令、清空列表，**不**联系服务端
+// （没有"服务端登出"这个协议动作，token 由服务端过期或下一次登录覆盖）。
+// 传输中拒绝执行：会话正是这次传输的一部分。
 void RemoteController::logoutLocal() {
   if (busy_) {
     // 传输中不给退：会话正是这次传输的一部分。
@@ -1998,6 +2100,9 @@ bool RemoteController::refreshList() {
   return true;
 }
 
+// 上传的入口。本地检查只覆盖"这个文件现在能不能读"这一类可判定的事实；
+// 显示名交给共享的 IsValidDisplayName（服务端会用同一条规则再判一次），
+// 归档内容本身不在这里解析 —— 内容校验属于服务端与恢复路径。
 bool RemoteController::uploadArchive(const QString& local_path,
                                      const QString& display_name) {
   if (local_path.isEmpty()) {
@@ -2115,7 +2220,7 @@ bool RemoteController::setServerKeyPin(const QString& pin) {
   // 预置，以及 backupctl 同款语义）一个布尔返回值。校验与落点只有一份实现，
   // 就是 CommitServerKeyPin —— 否则"应用"这条路径会有两套规则，而两套规则
   // 迟早会漂移。modern_gui_check 里那条"指纹的校验复用共享解析器（期望 1 处）"
-  // 断言钉的正是这件事：它在本轮一度变成 2 处，说明我确实写重了一份。
+  // 断言钉的正是这件事：这个数字一旦变化就说明有人在别处又定义了一份。
   return CommitServerKeyPin(pin) != QStringLiteral("invalid");
 }
 
@@ -2200,6 +2305,9 @@ QUrl RemoteController::fileDialogStartUrl(const QString& path) const {
   return QUrl::fromLocalFile(QDir::homePath());
 }
 
+// 只用于给文件选择器填一个默认名，不参与任何路径拼接；真正的落盘位置由用户
+// 在选择器里决定。显示名为空（服务端没给）时退化成 "remote-backup.bak"，
+// 让用户至少有一个可以直接确认的文件名。
 QString RemoteController::suggestedDownloadName(
     const QString& display_name) const {
   // 建议名就是云端那份备份的显示名（上传时用的就是本地文件名）。
@@ -2222,6 +2330,9 @@ void RemoteController::clearBackupSummary() {
   emit backupSummaryChanged();
 }
 
+// 产品级远端备份。这里只做**本地可判定**的前置检查（源目录存在且是目录），
+// 真正交给 core 的只有"源目录 + 允不允许续链"两项；能不能续上、要不要退化成
+// 完整基线，全部由 core 依据服务端元数据判断，GUI 不持有任何链状态。
 bool RemoteController::backupRemote(const QString& source_directory,
                                     bool allow_incremental) {
   const QString source = source_directory.trimmed();
@@ -2261,6 +2372,9 @@ bool RemoteController::backupRemote(const QString& source_directory,
   return true;
 }
 
+// 链恢复：只给"哪一个快照 + 恢复到哪"。依赖链的解析、下载、逐跳应用都在
+// core 里；GUI 不预先创建目标目录，也不替 core 判断它可不可用 ——
+// "不存在或为空目录"这条契约由恢复核心统一裁决，两条路径说法一致。
 bool RemoteController::restoreSnapshot(const QString& snapshot_id,
                                        const QString& destination_directory) {
   const QString id = snapshot_id.trimmed();
@@ -2292,6 +2406,9 @@ bool RemoteController::restoreSnapshot(const QString& snapshot_id,
   return true;
 }
 
+// 原始归档（raw）恢复的第一次交互。一次交互 = 一次 Prepare（下载 + SHA-256
+// 校验 + 按内容识别）加一到多次 Run（带密码重试），所以这里先清掉上一次的
+// 会话：旧的临时归档立刻作废，页面回到"只问目标目录"的第一段。
 bool RemoteController::restoreRawArchive(const QString& snapshot_id,
                                          const QString& destination_directory,
                                          const QString& password) {
@@ -2348,6 +2465,9 @@ bool RemoteController::restoreRawArchive(const QString& snapshot_id,
   return true;
 }
 
+// 这一步只在 raw_session_ 非空时成立：会话为空说明这次交互已经结束（成功 /
+// 取消 / 致命失败），对着一个空会话重试没有意义，只能让用户重新点"恢复"。
+// 口令提交后同样立刻从本地请求对象里抹掉，与第一次交互保持一致。
 bool RemoteController::restoreRawArchiveWithPassword(const QString& password) {
   if (raw_session_ == nullptr) {
     // 没有待输入的密码 = 这次交互已经结束了（成功 / 取消 / 致命失败）。
@@ -2374,6 +2494,9 @@ bool RemoteController::restoreRawArchiveWithPassword(const QString& password) {
   return true;
 }
 
+// 取消 = 放弃会话：Abandon 让 core 删掉临时目录（含那份已校验的归档），
+// 口令清零，界面回到空闲。目标目录从来没有被改动过，所以取消没有回滚动作；
+// 真正不可取消的时刻由 busy_ 挡住 —— 那时后台线程正握着同一个会话。
 void RemoteController::cancelRawRestore() {
   if (raw_session_ == nullptr) {
     return;  // 幂等：没有正在进行的交互
@@ -2398,6 +2521,9 @@ void RemoteController::cancelRawRestore() {
                            "目标目录没有被改动。"));
 }
 
+// 会话的所有权从工作线程交回主线程：result 里带着 shared_ptr，主线程接管后
+// 界面才能据此切到"输入密码"那一段。目标目录从**会话**里回显，而不是从界面
+// 输入框取 —— 重输密码时不该有机会换一个恢复位置。
 void RemoteController::ApplyRawRestoreState(const RemoteOpResult& result) {
   // 会话非空 = 这次交互还没结束，正等着用户输入密码。
   raw_session_ = result.raw_session;
@@ -2423,7 +2549,7 @@ void RemoteController::ApplyRawRestoreState(const RemoteOpResult& result) {
   emit rawRestoreStateChanged();
 }
 
-// ================= PR #22：连接方式 / SSH 安全通道 / pin 应用反馈
+// ================= 连接方式 / SSH 安全通道 / pin 应用反馈
 // =================
 //
 // 这一段的定位：它是"用户点了一下之后**看得见**发生了什么"的全部实现。
@@ -2441,6 +2567,9 @@ QString RemoteController::officialCloudName() const {
       backupproject::net::OfficialCloudProfile().display_name);
 }
 
+// 对外的模式名只有三种字符串，QML 与自检脚本都按它们判断；未识别的内部值
+// 一律降级成 "direct"（最保守的那一种，不会假装有隧道）。
+// 判定 RequiresManualPin 与选择身份来源读的都是同一个 connection_mode_。
 QString RemoteController::connectionMode() const {
   if (connection_mode_ == ConnectionMode::kOfficialCloud) {
     return QStringLiteral("official");
@@ -2470,6 +2599,9 @@ QString RemoteController::tunnelState() const {
   return QStringLiteral("stopped");
 }
 
+// 模式名只认 official / ssh / direct 三个，其余明确拒绝而不是悄悄当成
+// direct —— 那会让"我以为在用隧道"变成一个说不清的连接失败。切到官方云端时
+// 顺手清掉人工 pin 的反馈：红色报错与"已应用"描述的都是另一条身份路径。
 bool RemoteController::setConnectionMode(const QString& mode) {
   ConnectionMode next = connection_mode_;
   if (mode == QStringLiteral("official")) {
@@ -2489,7 +2621,7 @@ bool RemoteController::setConnectionMode(const QString& mode) {
   connection_mode_ = next;
 
   // 切进官方云端时，把人工 pin 那一套反馈收起来：官方模式既没有指纹输入框，
-  // 也不该残留上一轮 manual pin 的红色报错（人工验收：从 ssh/direct 切回官方
+  // 也不该残留先前 manual pin 的红色报错（从 ssh/direct 切回官方
   // 之后仍然看到“服务器身份指纹不合法”）。这里**只清 pin 相关的东西**：
   // 真正的证书错误（签名失败 / server_id 不匹配 / 过期）是切过来之后、真的
   // 尝试连接时才产生的，不会被这一段碰到。
@@ -2540,6 +2672,10 @@ void RemoteController::setSshProgram(const QString& program) {
   emit connectionChanged();
 }
 
+// 现有通道还能不能用于**当前**这组参数：ssh 目标、远端地址端口、本地端口、
+// ssh 程序四者全等才算匹配。界面显示 B 而实际走在通往 A 的隧道上，是最难查
+// 的一类错。外部复用的 listener 例外：它不是本程序启动的，转发目标无从查询，
+// 安全性交给下一层 —— BPSEC1 的 pin 会验证隧道那头到底是谁。
 bool RemoteController::TunnelMatchesEndpoint() const {
   if (!tunnel_.IsReady()) {
     return false;
@@ -2557,6 +2693,9 @@ bool RemoteController::TunnelMatchesEndpoint() const {
          used.local_port == ssh_local_port_ && used.ssh_program == ssh_program_;
 }
 
+// 提交之前的最后一道可用性检查，返回 false 时调用方会去重建通道。
+// 代价是刻意不对称的：自有 ssh 读状态（免费），外部复用的 listener 才付一次
+// 有界探测（300ms）—— 探测发生在**提交路径**上，所以上限必须硬。
 bool RemoteController::TransportUsableForSubmit() {
   if (!tunnel_.IsReady() || tunnel_.localPort() <= 0) {
     return false;
@@ -2601,6 +2740,8 @@ bool RemoteController::StartTunnelForEndpoint(const QString& action_text) {
   return accepted;
 }
 
+// 挂起一条请求，等通道建好再发。同一时刻只会有一条被挂起：busy_ 保证了这
+// 一点（第二条请求在 BeginOperation 就被拒了）。
 void RemoteController::DeferRequest(const RemoteRequest& request,
                                     const QString& action_text,
                                     ErrorSurface surface) {
@@ -2611,6 +2752,8 @@ void RemoteController::DeferRequest(const RemoteRequest& request,
   last_deferred_action_ = action_text;
 }
 
+// 通道就绪后补发挂起的那一条。地址在这里被换成 127.0.0.1:<本地端口>：请求里
+// 原来的远端地址只用于建立隧道，不用于拨号。
 void RemoteController::FlushDeferredRequest() {
   if (!deferred_.active || !tunnel_.IsReady() || tunnel_.localPort() <= 0) {
     return;
@@ -2625,6 +2768,8 @@ void RemoteController::FlushDeferredRequest() {
   DispatchRequest(request);
 }
 
+// 通道建失败：把这次挂起的操作**明确结束**（而不是让它一直挂着），并且回到
+// 它自己的错误落点（登录失败就该写在登录框下面）。
 void RemoteController::FailDeferredRequest() {
   if (!deferred_.active) {
     return;
@@ -2642,6 +2787,9 @@ void RemoteController::FailDeferredRequest() {
   emit operationFinished(QStringLiteral("tunnel"), false);
 }
 
+// 通道状态机的唯一订阅点（连接建在构造函数里，所以任何一次变化都不会漏）。
+// 两个等待者的优先级固定：tunnel_only_wait_（用户点了"建立连接"）先处理并
+// return；kStarting / kStopping 什么都不做，只有 kReady / kFailed 是终态。
 void RemoteController::OnTunnelStateChanged() {
   emit tunnelChanged();
   if (tunnel_only_wait_) {
@@ -2679,6 +2827,9 @@ void RemoteController::OnTunnelStateChanged() {
   }
 }
 
+// 连接设置页的"建立连接"按钮。直连模式下如实说明"不需要通道"，而不是假装
+// 做了一个动作；已经就绪且匹配时是幂等的 —— 已登录就顺带刷新列表，让用户
+// 看到数据而不是一句"通道好了"。
 bool RemoteController::ensureConnection(const QString& host,
                                         const QString& port_text) {
   ClearSurfaceError(ErrorSurface::kBanner);
@@ -2741,6 +2892,8 @@ bool RemoteController::ensureConnection(const QString& host,
   return true;
 }
 
+// 用户手动关通道。通道不代表会话：登录状态与已取回的列表都保留，
+// 下一次操作会按需重新建立通道。
 void RemoteController::stopTunnel() {
   const bool waiting = deferred_.active || tunnel_only_wait_;
   const ErrorSurface surface =
@@ -2759,6 +2912,9 @@ void RemoteController::stopTunnel() {
   SetIdleBaseline();
 }
 
+// 返回值是三态字符串，调用方据此决定显示哪一行反馈：invalid（校验失败，红色
+// 原因已贴在指纹输入框下面）/ unchanged（与当前相同，是一个确定的结果，不是
+// "什么都没发生"）/ applied（已写入，并同步更新 endpoint_ 里的那份副本）。
 QString RemoteController::CommitServerKeyPin(const QString& pin) {
   // 与 setServerKeyPin 同一份校验与落点：解析器只有共享的那一个，界面不做
   // 第二套"看起来对"的判断。
@@ -2812,6 +2968,9 @@ void RemoteController::clearPinApplyState() {
   emit pinApplyChanged();
 }
 
+// "应用"之后给出的绿色结论。三种 state 与 CommitServerKeyPin 的返回值一一
+// 对应，QML 只按它决定显示哪一行；不合法时绿色那一行必须收起来 ——
+// 不能同时显示"不合法"和"✓ 已应用"。
 void RemoteController::PublishPinApplyFeedback(const QString& state) {
   if (state == QStringLiteral("applied")) {
     // "活动连接"= 此刻真的有一条 socket，或者有一条操作正在跑。已经登录但
@@ -2880,12 +3039,15 @@ bool RemoteController::registerAccountWithPin(const QString& host,
   return registerAccount(host, port_text, username, password, confirm_password);
 }
 
+// 人工 pin 模式下的登录入口（官方云端在上面直接转给 login）。
+// 失败路径的落点是登录表单而不是页面横幅：用户此刻盯着的就是那张表单，
+// 而且这次登录根本还没有开始，横幅上不该出现"正在登录"这种过期状态。
 bool RemoteController::loginWithPin(const QString& host,
                                     const QString& port_text,
                                     const QString& username,
                                     const QString& password,
                                     const QString& base_pin) {
-  // PR #23 人工验收发现的 blocker：官方云端模式的身份来自内置
+  // 官方云端模式的身份来自内置
   // OfficialCloudProfile + 内置官方根 + BPSEC2 证书，页面上**没有**指纹输入框。
   // 这里必须先按模式分流：否则一个隐藏的空输入框会被当成“指纹不合法”，把官方
   // 登录整条挡住（用户看到的就是“服务器身份指纹不合法，请先按上面的提示修正，
@@ -2894,7 +3056,7 @@ bool RemoteController::loginWithPin(const QString& host,
   if (connection_mode_ == ConnectionMode::kOfficialCloud) {
     return login(host, port_text, username, password);
   }
-  // 提交之前先把**用户此刻看得见的那一个** pin 提交掉。人工验收里最自然的
+  // 提交之前先把**用户此刻看得见的那一个** pin 提交掉。最自然的
   // 路径就是"填 pin -> 填账号 -> 点登录"，旧实现会让这次登录用上一次的
   // 值（没有就是空），于是要么莫名失败、要么用户以为填的已经生效了。
   const QString pin_state = CommitServerKeyPin(base_pin);

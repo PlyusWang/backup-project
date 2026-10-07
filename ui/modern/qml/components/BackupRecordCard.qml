@@ -5,8 +5,9 @@
 // entryCountText / diagnosticText / packMethodText / …），
 // 卡片内部不解析来源不明的 QVariantMap。
 //
-// 卡片是自洽的：恢复目录选择、加密备份的密码输入与删除确认都在这一个文件里完成，
-// 最后由它调用 controller 的 Q_INVOKABLE。这样 delegate 里不需要引用任何外层 id，
+// 卡片是自洽的：恢复目录选择、加密备份的密码输入与删除确认
+// 都在这一个文件里完成，最后由它调用 controller 的 Q_INVOKABLE。
+// 这样 delegate 里不需要引用任何外层 id，
 // 静态检查与运行期的作用域都干净。
 //
 // 文案边界（archive 的事实）：
@@ -123,7 +124,8 @@ Rectangle {
             objectName: "backupRecordRecognition"
             Layout.fillWidth: true
             text: card.recognized
-                  ? "已识别归档格式 · v" + card.formatVersion + " · " + card.entryCountText + " 个条目"
+                  ? "已识别归档格式 · v" + card.formatVersion + " · "
+                    + card.entryCountText + " 个条目"
                     + (card.hasPipelineMethods ? "" : " · Legacy v0.1")
                   : "无法识别归档头"
             font.pixelSize: 15
@@ -137,7 +139,10 @@ Rectangle {
             objectName: "backupRecordPipeline"
             Layout.fillWidth: true
             visible: card.hasPipelineMethods
-            text: card.hasPipelineMethods ? card.packMethodText + " · " + card.compressionMethodText + " · " + card.encryptionMethodText : ""
+            text: card.hasPipelineMethods
+                  ? card.packMethodText + " · " + card.compressionMethodText
+                    + " · " + card.encryptionMethodText
+                  : ""
             font.pixelSize: 15
             color: theme.textPrimary
             wrapMode: Text.WordWrap
@@ -148,7 +153,10 @@ Rectangle {
         Text {
             objectName: "backupRecordOrigin"
             Layout.fillWidth: true
-            text: card.originText + (card.scheduledChangesText !== "" ? "  ·  " + card.scheduledChangesText : "")
+            text: card.originText
+                  + (card.scheduledChangesText !== ""
+                    ? "  ·  " + card.scheduledChangesText
+                    : "")
             font.pixelSize: 15
             color: theme.textSecondary
             wrapMode: Text.WordWrap
@@ -205,7 +213,8 @@ Rectangle {
                 // Resolve 会校验名字，真正的完整校验在 preflight 里。
                 enabled: !card.busy && card.recognized
                 onClicked: {
-                    restoreDialog.currentFolder = controller.directoryDialogStartUrl("")
+                    restoreDialog.currentFolder =
+                        controller.directoryDialogStartUrl("")
                     restoreDialog.open()
                 }
             }
@@ -223,13 +232,14 @@ Rectangle {
     }
 
     // 恢复目标目录。selectedFolder 由平台目录对话框写入，这里只负责把 URL
-    // 还原成本地路径（中文、空格、# 与 % 都靠 localPathFromUrl，不手写前缀裁剪），
-    // 剩下的分流交给 beginRestore()。
+    // 还原成本地路径（中文、空格、# 与 % 都靠 localPathFromUrl，
+    // 不手写前缀裁剪），剩下的分流交给 beginRestore()。
     FolderDialog {
         id: restoreDialog
         objectName: "managedRestoreDialog"
         title: "选择恢复目录"
-        onAccepted: card.beginRestore(controller.localPathFromUrl(restoreDialog.selectedFolder))
+        onAccepted: card.beginRestore(
+                controller.localPathFromUrl(restoreDialog.selectedFolder))
     }
 
     // 加密备份的密码对话框。密码是一次性的输入：不进任何全局状态，
@@ -239,8 +249,10 @@ Rectangle {
         objectName: "restorePasswordDialog"
         anchors.centerIn: parent
         modal: true
-        // 自定义 Dialog 默认没有内容边距，标题 / 正文 / 输入框 / 按钮会贴着边框。
-        // 统一给 18，与 AppCard 的内边距同一个量级；background 的圆角与描边不动。
+        // 自定义 Dialog 默认没有内容边距，
+        // 标题 / 正文 / 输入框 / 按钮会贴着边框。
+        // 统一给 18，与 AppCard 的内边距同一个量级；
+        // background 的圆角与描边不动。
         padding: 18
 
         // 关闭路径不止“取消”一种，所以清空挂在 onClosed 上，
@@ -301,13 +313,15 @@ Rectangle {
                     objectName: "restorePasswordConfirm"
                     text: "恢复"
                     variant: "primary"
-                    // 空密码不给提交；操作进行中同样不给提交（一次只跑一个操作）。
+                    // 空密码不给提交；操作进行中同样不给提交
+                    // （一次只跑一个操作）。
                     // 密码错一次之后这个按钮照样可点：重试只是重新走一遍恢复。
                     enabled: card.restorePassword.length > 0 && !card.busy
                     onClicked: {
-                        controller.startManagedRestoreWithPassword(card.fileNameText,
-                                                                   card.pendingRestoreDestination,
-                                                                   card.restorePassword)
+                        controller.startManagedRestoreWithPassword(
+                            card.fileNameText,
+                            card.pendingRestoreDestination,
+                            card.restorePassword)
                         // 密码只服务这一次调用：先清掉本地副本，再关对话框。
                         card.clearRestoreSecrets()
                         restorePasswordDialog.close()
@@ -323,7 +337,8 @@ Rectangle {
         objectName: "deleteConfirmDialog"
         anchors.centerIn: parent
         modal: true
-        // 同 restorePasswordDialog：这是同一套自定义 Dialog 样式，边距保持一致。
+        // 同 restorePasswordDialog：这是同一套自定义 Dialog 样式，
+        // 边距保持一致。
         padding: 18
 
         background: Rectangle {
@@ -345,7 +360,8 @@ Rectangle {
 
             Text {
                 Layout.preferredWidth: 320
-                text: "确定要从备份仓库中删除 " + card.fileNameText + " 吗？此操作不可撤销。"
+                text: "确定要从备份仓库中删除 " + card.fileNameText
+                    + " 吗？此操作不可撤销。"
                 color: theme.textSecondary
                 font.pixelSize: 15
                 wrapMode: Text.WordWrap

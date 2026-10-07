@@ -9,6 +9,15 @@
 // 已知强度问题：DES 有效密钥只有 56 位（每字节最低位是奇偶校验位，PC-1 直接
 // 丢弃，这里不做校验位修正），单独使用不足以抵御现代暴力破解。保留它是为了
 // 兼容旧容器格式；新数据请走 AES-256-CTR。
+//
+// 职责边界：本文件只做 DES 单块、CBC 链接与 PKCS#7 填充，**不提供完整性**。
+// 认证由上层容器做 Encrypt-then-MAC（HMAC-SHA256）。调用方必须先验 MAC 再
+// 解密，否则这里返回的 padding 错误就是一个 padding oracle。
+// 流式契约：Process() 可以被任意次调用，分块边界与 8 字节块边界无关（内部有
+// 缓冲）；Finish() 只能调用一次，之后再 Process 是无效操作。参数非法或已结束
+// 的对象会静默丢弃输入，因此调用方必须检查 Finish() 的返回值。
+// 线程模型：每个对象独占自己的链值与轮密钥，不共享全局状态；同一对象不能被
+// 多线程并发使用，不同对象之间互不影响。
 
 #include <cstring>
 
@@ -101,6 +110,9 @@ constexpr unsigned char kSBoxes[8][64] = {
      7,  11, 4,  1, 9,  12, 14, 2,  0,  6,  10, 13, 15, 3,  5,  8,
      2,  1,  14, 7, 4,  10, 8,  13, 15, 12, 9,  0,  3,  5,  6,  11}};
 
+// 用 volatile 写 0，防止编译器把这个"之后没人读"的循环优化掉。
+// 只用于密钥与链值这类敏感缓冲，不用于普通数据；它的作用是缩短敏感数据在
+// 内存里的停留时间，而不是"防住内存取证"。
 void SecureZero(void* data, std::size_t size) {
   volatile unsigned char* p = static_cast<volatile unsigned char*>(data);
   while (size-- > 0) *p++ = 0;
@@ -108,6 +120,8 @@ void SecureZero(void* data, std::size_t size) {
 
 // 按 1-based 位号表做置换：out_bits 是输出位数，in_bits 是输入的位宽。
 // 表里所有位号都在 [1, in_bits] 内，因此移位量恒在 [0, in_bits - 1]。
+// 输出的第 i 位取自输入的 table[i] 位（1-based，第 1 位是最高位）。
+// 表在编译期固定，因此这里不做位号范围检查。
 std::uint64_t Permute(std::uint64_t input, const int* table,
                       std::size_t out_bits, std::size_t in_bits) {
   std::uint64_t out = 0;
@@ -119,6 +133,9 @@ std::uint64_t Permute(std::uint64_t input, const int* table,
   return out;
 }
 
+// DES 的字节序是 big-endian（FIPS 46-3 的位号从最高位算起），与本项目其它
+// 格式（多为 little-endian）相反：块和密钥都要在这里显式转换，
+// 不能把原始字节直接 memcpy 进 uint64。
 std::uint64_t LoadBigEndian64(const unsigned char* data) {
   std::uint64_t value = 0;
   for (std::size_t i = 0; i < 8; ++i) {
@@ -135,6 +152,8 @@ void StoreBigEndian64(std::uint64_t value, unsigned char* data) {
 
 // 由 64 位密钥生成 16 个 48 位轮密钥。密钥的奇偶校验位被 PC-1 丢弃，
 // 因此不做校验位修正（与 FIPS 46-3 的"密钥奇偶性不影响结果"一致）。
+// 每轮左右两半各自循环左移 kKeyShifts[round] 位，移完用 0x0FFFFFFF
+// 掩回 28 位。移位量是常量，因此轮密钥生成没有秘密相关的分支。
 void KeySchedule(std::uint64_t key, std::uint64_t subkeys[16]) {
   const std::uint64_t permuted = Permute(key, kKeyPermutation1, 56, 64);
   std::uint32_t left =
@@ -152,6 +171,9 @@ void KeySchedule(std::uint64_t key, std::uint64_t subkeys[16]) {
 
 // 轮函数 F：扩展 -> 与轮密钥异或 -> S 盒代换 -> P 置换。
 // 输入是 32 位右半部分，输出 32 位。
+// S 盒的 6 位输入按"最高位在前"切分：第 1、6 位组成行号，中间 4 位是列号。
+// 8 个 S 盒的输出按盒序从高位到低位拼成 32 位；顺序写反会得到一个自洽但
+// 完全错误的算法（加密解密仍互逆，只是与标准不兼容）。
 std::uint64_t Feistel(std::uint64_t half, std::uint64_t subkey) {
   const std::uint64_t expanded = Permute(half, kExpansion, 48, 32) ^ subkey;
   std::uint64_t substituted = 0;
@@ -168,6 +190,8 @@ std::uint64_t Feistel(std::uint64_t half, std::uint64_t subkey) {
 
 // 16 轮 Feistel + 末置换。subkeys 的顺序由调用方决定：正序加密、逆序解密，
 // 这是 DES 的结构性质（解密用同一台机器、同一批轮密钥倒着跑）。
+// 轮数固定 16，不可配置：DES 的轮数写死在标准里，把它参数化只会制造
+// "加密用 16 轮、解密用 15 轮"这类无法从格式上察觉的错误。
 std::uint64_t DesCrypt(std::uint64_t input, const std::uint64_t subkeys[16]) {
   const std::uint64_t permuted = Permute(input, kInitialPermutation, 64, 64);
   std::uint32_t left = static_cast<std::uint32_t>(permuted >> 32);
@@ -187,6 +211,9 @@ std::uint64_t DesCrypt(std::uint64_t input, const std::uint64_t subkeys[16]) {
 
 }  // namespace
 
+// 单块加密。返回空串表示参数长度不合法（这是本文件统一的失败表示：
+// 这一层没有 error_message 通道，加密本身不会因为输入内容而失败）。
+// 轮密钥用完立刻清零，避免它在栈上停留到函数返回之后。
 std::string DesBlockEncrypt(const std::string& key8,
                             const std::string& block8) {
   if (key8.size() != kDesKeySize || block8.size() != kDesBlockSize) {
@@ -205,6 +232,8 @@ std::string DesBlockEncrypt(const std::string& key8,
   return out;
 }
 
+// 单块解密：同一台机器、同一批轮密钥倒着跑一遍即可（Feistel 的结构性质），
+// 不需要另写一套"逆 S 盒"。正序与逆序两份轮密钥都在退出前清零。
 std::string DesBlockDecrypt(const std::string& key8,
                             const std::string& block8) {
   if (key8.size() != kDesKeySize || block8.size() != kDesBlockSize) {
@@ -226,6 +255,9 @@ std::string DesBlockDecrypt(const std::string& key8,
   return out;
 }
 
+// 构造失败（密钥或 IV 长度不是 8 字节）不抛异常，而是让对象停在
+// valid_ == false 的无效状态：后续 Process 全部成为 no-op，
+// Finish 返回 false 并给出原因。调用方因此只有一个必须检查的返回值。
 DesCbcEncryptor::DesCbcEncryptor(const std::string& key8,
                                  const std::string& iv8)
     : subkeys_{},
@@ -242,12 +274,16 @@ DesCbcEncryptor::DesCbcEncryptor(const std::string& key8,
   valid_ = true;
 }
 
+// 析构清零轮密钥、链值与缓冲：对象销毁后，内存里不应再残留能用于解密的
+// 中间状态（链值虽然等同于最后一块密文，也一并清掉）。
 DesCbcEncryptor::~DesCbcEncryptor() {
   SecureZero(subkeys_, sizeof(subkeys_));
   SecureZero(chain_, sizeof(chain_));
   SecureZero(buffer_, sizeof(buffer_));
 }
 
+// CBC：密文块 = E(明文块 XOR 链值)，随后本块密文成为新的链值。
+// xored 是临时缓冲，用完立即清零。
 void DesCbcEncryptor::EncryptOneBlock(const unsigned char in[kDesBlockSize],
                                       unsigned char out[kDesBlockSize]) {
   unsigned char xored[kDesBlockSize];
@@ -259,6 +295,9 @@ void DesCbcEncryptor::EncryptOneBlock(const unsigned char in[kDesBlockSize],
   SecureZero(xored, sizeof(xored));
 }
 
+// 只缓存不足一块的尾巴，凑满 8 字节就立刻加密并追加到 out，因此输出长度恒为
+// floor(已喂入字节数 / 8) * 8；最后一个不完整块留给 Finish 做 PKCS#7 填充。
+// data == nullptr 或 size == 0 是合法的空操作，不算错误。
 void DesCbcEncryptor::Process(const void* data, std::size_t size,
                               std::string* out) {
   if (!valid_ || finished_ || out == nullptr || data == nullptr || size == 0) {
@@ -282,6 +321,9 @@ void DesCbcEncryptor::Process(const void* data, std::size_t size,
   }
 }
 
+// 收尾：把缓冲里剩下的 0..7 字节按 PKCS#7 补齐一整块并加密写出。
+// 明文为空时也会写出整整一个 padding 块，因此密文长度恒 >= 8，
+// 解密端也就永远能区分"空明文"和"密文被截断"这两种情况。
 bool DesCbcEncryptor::Finish(std::string* out, std::string* error_message) {
   const auto fail = [error_message](const char* message) {
     if (error_message != nullptr) *error_message = message;
@@ -305,6 +347,8 @@ bool DesCbcEncryptor::Finish(std::string* out, std::string* error_message) {
   return true;
 }
 
+// 与加密侧同构的无效状态约定；pending_ / has_pending_ 用于延迟交付最后一块
+// 明文——只有 Finish 知道它是不是带 padding 的尾块。
 DesCbcDecryptor::DesCbcDecryptor(const std::string& key8,
                                  const std::string& iv8)
     : subkeys_{},
@@ -323,6 +367,8 @@ DesCbcDecryptor::DesCbcDecryptor(const std::string& key8,
   valid_ = true;
 }
 
+// 比加密侧多清 pending_：里面是已经解密、还没交给调用方的最后一块明文，
+// 是整条链路上最敏感的一块缓冲。
 DesCbcDecryptor::~DesCbcDecryptor() {
   SecureZero(subkeys_, sizeof(subkeys_));
   SecureZero(chain_, sizeof(chain_));
@@ -330,6 +376,9 @@ DesCbcDecryptor::~DesCbcDecryptor() {
   SecureZero(pending_, sizeof(pending_));
 }
 
+// CBC 解密：明文 = D(密文块) XOR 上一块密文，链值更新为**本块密文**
+// （不是明文）——加密与解密用同一个链值序列，这是 CBC 的定义。
+// 中间缓冲 reversed / plain 用完清零。
 void DesCbcDecryptor::DecryptOneBlock(const unsigned char in[kDesBlockSize],
                                       unsigned char out[kDesBlockSize]) {
   std::uint64_t reversed[16];
@@ -343,6 +392,9 @@ void DesCbcDecryptor::DecryptOneBlock(const unsigned char in[kDesBlockSize],
   SecureZero(plain, sizeof(plain));
 }
 
+// 每解出一块先压进 pending_，把上一块交出去：任何一块都可能是最后一块，
+// 而最后一块要等 Finish 验完 padding 才能确定该吐多少字节。
+// 因此 Process 的输出比输入滞后一整块，这是刻意设计的。
 void DesCbcDecryptor::Process(const void* data, std::size_t size,
                               std::string* out) {
   if (!valid_ || finished_ || out == nullptr || data == nullptr || size == 0) {
@@ -371,6 +423,9 @@ void DesCbcDecryptor::Process(const void* data, std::size_t size,
   }
 }
 
+// 只在这里做 padding 校验：长度必须是 8 的倍数、密文非空、最后一块的填充
+// 字节必须全部等于填充长度。任一条不满足就返回 false 且不写出任何明文，
+// 绝不交付未通过校验的数据。
 bool DesCbcDecryptor::Finish(std::string* out, std::string* error_message) {
   const auto fail = [error_message](const char* message) {
     if (error_message != nullptr) *error_message = message;
@@ -397,6 +452,10 @@ bool DesCbcDecryptor::Finish(std::string* out, std::string* error_message) {
   return true;
 }
 
+// 一次性接口：内部就是 Process + Finish。失败时 *out 里可能已经有部分密文
+// （到达 Finish 才失败的情况），调用方应丢弃它，不要当成可解密的流。
+// 实际路径上：失败只可能来自 Finish 的参数与状态检查，而那时 Process 是
+// no-op，所以 *out 是空的；不要把失败的输出当成密文去解密。
 bool DesCbcEncrypt(const std::string& key8, const std::string& iv8,
                    const std::string& plaintext, std::string* out,
                    std::string* error_message) {
@@ -411,6 +470,8 @@ bool DesCbcEncrypt(const std::string& key8, const std::string& iv8,
   return encryptor.Finish(out, error_message);
 }
 
+// 一次性接口：任何失败路径都会把 *out 清空，绝不把"没通过 padding 校验的
+// 明文"留给调用方；这是本文件里唯一一处刻意的回滚语义。
 bool DesCbcDecrypt(const std::string& key8, const std::string& iv8,
                    const std::string& ciphertext, std::string* out,
                    std::string* error_message) {

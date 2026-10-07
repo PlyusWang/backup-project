@@ -1,11 +1,12 @@
 // tools/cert_tool_main.cpp
 //
-// backup-cert-tool —— 离线根密钥与服务器身份证书的管理工具（PR #23）。
+// backup-cert-tool —— 离线根密钥与服务器身份证书的管理工具。
 //
 //   backup-cert-tool root-init     --root-key <path> --root-id <id>
 //   backup-cert-tool root-info     --root-key <path>
 //   backup-cert-tool issue-server  --root-key <path> --server-id <id>
-//                                  --server-pubkey <hex:<64 位十六进制>|@file> --out <path>
+//                                  --server-pubkey <hex:<64 位十六进制>|@file>
+//                                  --out <path>
 //                                  [--serial N] [--days N] [--not-before N]
 //   backup-cert-tool verify-server --cert <path> [--roots <file>]
 //                                  [--issuer-pub <hex>] [--now N]
@@ -22,10 +23,24 @@
 //
 // 退出码：0 = 成功；1 = 业务失败（附原因）；2 = 用法错误。
 
+// 本文件是**离线**管理工具的入口：只在运维自己的机器上跑，不被 server / GUI
+// 链接，不监听端口、不联网、不读配置文件。
+//
+// 职责边界：
+//   * 不实现任何密码学：Ed25519 / X25519 / BPCERT1 / 可信根全部来自 src/crypto
+//     的库代码，工具与服务器共用同一份实现，证书格式因此不会"签发端一套、
+//     验证端另一套"；
+//   * 不保存状态：每次运行只读参数里给的文件、只写参数里给的路径；
+//   * 不接受任何形式的私钥命令行取值（main 里有显式黑名单）：argv 会进 shell
+//     历史、ps、审计日志与 CI 日志。
+//
+// 输出约定：stdout 只有 "key = value" 形式的结果行（可被脚本解析），stderr
+// 只有错误原因；退出码 0 = 成功 / 1 = 业务失败 / 2 = 用法错误。
 #include <fcntl.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -47,10 +62,16 @@ using backupproject::crypto::Bpcert1ErrorName;
 using backupproject::crypto::TrustedRoot;
 using backupproject::crypto::TrustedRootStore;
 
+// argv 的解析结果：命令名 + 展开后的 --name value 列表。
+//
+// 用有序 vector 而不是 map：重复给同一个参数时行为必须确定（取第一次出现的
+// 值），而且报错时要能按用户输入的顺序复述参数名。
 struct Options {
   std::string command;
   std::vector<std::pair<std::string, std::string>> values;
 
+  // Has / Get 都是线性扫描：参数只有个位数，可读性比复杂度重要。Get 取**第一
+  // 次**出现的值，重复参数不会静默变成最后一个。
   bool Has(const std::string& name) const {
     for (const auto& item : values) {
       if (item.first == name) return true;
@@ -66,22 +87,75 @@ struct Options {
   }
 };
 
+// 严格的十进制整数解析：整个字符串必须被完全消费，且不得溢出。
+//
+// 为什么不能用 strtoll(..., nullptr, 10)：它把 "abc" 读成 0，把 "12abc" 读成
+// 12， 并且正负号可以重复。在这里那不是宽松，而是静默地把用户的笔误
+// 变成一个看起来合法的证书（2026 年签发一张 1970 年就过期的证书）。
+// 溢出判断是"乘之前先比上界"（value > (UINT64_MAX - digit) / 10），不会先
+// 溢出再检查；整串必须被消费，不许有前导空格、'+' 号或尾随字符。
+bool ParseDecimalU64(const std::string& text, std::uint64_t* out,
+                     std::string* error_message) {
+  if (out == nullptr) return false;
+  if (text.empty()) {
+    if (error_message != nullptr) *error_message = "空字符串不是合法的数字";
+    return false;
+  }
+  std::uint64_t value = 0;
+  for (const char digit : text) {
+    if (digit < '0' || digit > '9') {
+      if (error_message != nullptr) {
+        *error_message = "只接受十进制非负整数，实际是 '" + text + "'";
+      }
+      return false;
+    }
+    const std::uint64_t digit_value = static_cast<std::uint64_t>(digit - '0');
+    if (value > (UINT64_MAX - digit_value) / 10u) {
+      if (error_message != nullptr) *error_message = "数字超出 uint64 范围";
+      return false;
+    }
+    value = value * 10u + digit_value;
+  }
+  *out = value;
+  return true;
+}
+
+// 时间戳与天数是 int64 语义（负数在协议层会被拒绝），这里只做上限校验。
+// 只接受十进制非负整数：时间窗为负在协议层本来就会被拒，少一种输入形态就少
+// 一类"用户以为写了 -1、实际写进一个巨大正数"的事故。
+bool ParseDecimalI64(const std::string& text, std::int64_t* out,
+                     std::string* error_message) {
+  std::uint64_t magnitude = 0;
+  if (!ParseDecimalU64(text, &magnitude, error_message)) return false;
+  if (magnitude > static_cast<std::uint64_t>(INT64_MAX)) {
+    if (error_message != nullptr) *error_message = "数字超出 int64 范围";
+    return false;
+  }
+  *out = static_cast<std::int64_t>(magnitude);
+  return true;
+}
+
+// 用法文本本身也是安全文档：明确写出私钥只能走文件路径，并说明为什么没有
+// --root-key-hex 这类参数。文案写错只会让人困惑，缺失的警告会让人误用。
 void PrintUsage() {
   std::printf(
-      "backup-cert-tool —— 离线根与服务器身份证书管理（PR #23）\n"
+      "backup-cert-tool —— 离线根与服务器身份证书管理\n"
       "\n"
       "  root-init      --root-key <path> --root-id <id>\n"
-      "                 生成一把新的离线根：私钥写入 <path>（0600，已存在则拒绝），\n"
+      "                 生成一把新的离线根：私钥写入 "
+      "<path>（0600，已存在则拒绝），\n"
       "                 公钥写到 <path>.pub（可直接当可信根文件用）。\n"
       "  root-info      --root-key <path>\n"
       "                 读回根的信息（只输出公钥与指纹）。\n"
       "  issue-server   --root-key <path> --server-id <id>\n"
-      "                 --server-pubkey <hex:<64 位十六进制>|@file> --out <path>\n"
+      "                 --server-pubkey <hex:<64 位十六进制>|@file> --out "
+      "<path>\n"
       "                 [--serial N] [--days N] [--not-before N]\n"
       "                 为已有服务器公钥签发身份证书（不改动任何私钥）。\n"
       "  verify-server  --cert <path> [--roots <file>] [--issuer-pub <hex>]\n"
       "                 [--now N]\n"
-      "                 按可信根验签并检查时间窗；不给 --roots 就用内置官方根。\n"
+      "                 按可信根验签并检查时间窗；不给 --roots "
+      "就用内置官方根。\n"
       "  inspect-server --cert <path>\n"
       "                 只打印证书内容（不做信任判断）。\n"
       "\n"
@@ -89,6 +163,10 @@ void PrintUsage() {
       "--root-key-hex 这类参数：私钥走命令行会进 shell 历史与 ps。\n");
 }
 
+// 一次性读入整个文件（4096 字节一块）：根文件与证书都是几百字节的小文件。
+//
+// 失败时 *out 的内容是未定义的（可能已写进前半段），调用方必须看返回值；
+// 判定依据是 ferror 而不是 fread 的返回值，避免把"读完了"当成"读失败"。
 bool ReadFile(const std::string& path, std::string* out,
               std::string* error_message) {
   FILE* file = std::fopen(path.c_str(), "rb");
@@ -111,7 +189,11 @@ bool ReadFile(const std::string& path, std::string* out,
   return true;
 }
 
-// 独占创建 + 精确权限。exclusive=false 时允许覆盖（用于公钥/证书这类公开文件）。
+// 独占创建 + 精确权限。exclusive=false
+// 时允许覆盖（用于公钥/证书这类公开文件）。
+// 不调用 fsync：本工具是一次性离线操作，人手重跑即可，不承诺 durability。但
+// O_EXCL 让"崩溃留下的半截根文件"不会被下一次 root-init 静默覆盖——必须由人
+// 先看一眼再删，这种摩擦是刻意保留的。
 bool WriteFile(const std::string& path, mode_t mode, const std::string& data,
                bool exclusive, std::string* error_message) {
   // O_NOFOLLOW 只挡符号链接，挡不住硬链接：提前把目标做成硬链接，写进去就会
@@ -123,8 +205,8 @@ bool WriteFile(const std::string& path, mode_t mode, const std::string& data,
     }
     return false;
   }
-  const int flags = O_WRONLY | O_CREAT | O_NOFOLLOW |
-                    (exclusive ? O_EXCL : O_TRUNC);
+  const int flags =
+      O_WRONLY | O_CREAT | O_NOFOLLOW | (exclusive ? O_EXCL : O_TRUNC);
   const int fd = ::open(path.c_str(), flags, mode);
   if (fd < 0) {
     if (error_message != nullptr) {
@@ -159,6 +241,8 @@ bool WriteFile(const std::string& path, mode_t mode, const std::string& data,
 // 回显参数名时只保留 '=' 之前的部分，并且截断长度。
 // 原因：运维完全可能写成 --root-key-hex=<64 位种子>，整串回显就等于把私钥
 // 写进了 stderr 与日志 —— 这是"私钥永不进日志"这条承诺上唯一被抓到的反例。
+// 只影响回显，不影响解析：合法参数名都很短，32 字符的截断上限只是为了兜住
+// "用户把一整串私钥当参数名粘进来"这一种情况。
 std::string RedactArgument(const std::string& raw) {
   const std::size_t equal = raw.find('=');
   std::string head = equal == std::string::npos ? raw : raw.substr(0, equal);
@@ -168,6 +252,9 @@ std::string RedactArgument(const std::string& raw) {
   return head;
 }
 
+// 手写的密钥文件常带 Windows 换行或行尾空格，所以只按 ASCII 的四种空白
+// （空格 / tab / CR / LF）裁剪；不用 isspace，避免 locale 影响对同一份文件的
+// 解析结果。
 std::string Trim(const std::string& text) {
   std::size_t begin = 0;
   std::size_t end = text.size();
@@ -182,6 +269,8 @@ std::string Trim(const std::string& text) {
   return text.substr(begin, end - begin);
 }
 
+// 打印文件的实际权限，供人核对"说 0600 是不是真的 0600"（umask 与复制粘贴都
+// 会改变它）。stat 失败返回 "unknown" 而不报错：这只是一行给人看的证据。
 std::string ModeOf(const std::string& path) {
   struct stat info;
   if (::stat(path.c_str(), &info) != 0) return "unknown";
@@ -190,6 +279,8 @@ std::string ModeOf(const std::string& path) {
   return text;
 }
 
+// 一把离线根的内存表示。seed 是 32 字节原始私钥材料：只在栈上存在、只在
+// 子命令内部使用，并在返回前 memset 清零；public_key 由 seed 派生，不落盘。
 struct RootKey {
   std::string root_id;
   std::string seed;        // 32 字节私钥材料
@@ -199,6 +290,12 @@ struct RootKey {
 // 根密钥文件（纯文本，权限 0600）：
 //     root-id: backup-project-official-root-a
 //     seed-hex: <64 位十六进制>
+// 解析宽容、校验严格：按行找 root-id / seed-hex，'#' 开头与不认识的字段忽略
+// （将来加字段不会让新工具拒读旧文件），但 seed 必须正好 32 字节、root-id 必须
+// 过 Bpcert1IsValidIdentity。
+//
+// 这里不检查文件权限：根文件可能来自只读介质，强制 0600 会让人没法用它；
+// root-info 会把实际 mode 打印出来给人核对。
 bool LoadRootKey(const std::string& path, RootKey* out,
                  std::string* error_message) {
   std::string text;
@@ -210,14 +307,15 @@ bool LoadRootKey(const std::string& path, RootKey* out,
   while (position <= text.size()) {
     const std::size_t newline = text.find('\n', position);
     const std::string line = Trim(text.substr(
-        position, newline == std::string::npos ? std::string::npos
-                                               : newline - position));
+        position,
+        newline == std::string::npos ? std::string::npos : newline - position));
     if (line.compare(0, 8, "root-id:") == 0) {
       key.root_id = Trim(line.substr(8));
     } else if (line.compare(0, 9, "seed-hex:") == 0) {
       const std::string hex = Trim(line.substr(9));
       if (!backupproject::crypto::FromHex(hex, &key.seed)) {
-        if (error_message != nullptr) *error_message = "根文件里的 seed-hex 不是合法十六进制";
+        if (error_message != nullptr)
+          *error_message = "根文件里的 seed-hex 不是合法十六进制";
         return false;
       }
     } else if (!line.empty() && line[0] != '#') {
@@ -234,14 +332,16 @@ bool LoadRootKey(const std::string& path, RootKey* out,
     if (error_message != nullptr) *error_message = "根文件缺少合法的 root-id";
     return false;
   }
-  if (!backupproject::crypto::Ed25519PublicKeyFromSeed(key.seed, &key.public_key,
-                                                       error_message)) {
+  if (!backupproject::crypto::Ed25519PublicKeyFromSeed(
+          key.seed, &key.public_key, error_message)) {
     return false;
   }
   *out = key;
   return true;
 }
 
+// 十六进制优先，只有 "@文件" 才允许裸的 32 字节二进制；文件内容会先 Trim，
+// 容忍 xxd 或编辑器留下的尾随换行。
 bool ParseServerPublicKey(const std::string& text, std::string* out,
                           std::string* error_message) {
   std::string material = text;
@@ -259,7 +359,8 @@ bool ParseServerPublicKey(const std::string& text, std::string* out,
   // 32 字节原始二进制**只**对 @文件 成立。内联的 32 个十六进制字符一律按
   // "十六进制不完整"拒绝：否则同一段输入有两种读法，一个被截断的 64 位
   // 十六进制公钥会被当成 ASCII 原样签进证书，而且看不出来。
-  if (from_file && material.size() == backupproject::crypto::kBpcert1PublicKeySize) {
+  if (from_file &&
+      material.size() == backupproject::crypto::kBpcert1PublicKeySize) {
     *out = material;
     return true;
   }
@@ -269,11 +370,21 @@ bool ParseServerPublicKey(const std::string& text, std::string* out,
   return false;
 }
 
+// 所有业务失败的唯一出口：原因写 stderr、返回 1。stdout 上永远只有结果行，
+// 于是脚本可以放心地把 stdout 当数据、把退出码当结论。
 int Fail(const std::string& message) {
   std::fprintf(stderr, "错误：%s\n", message.c_str());
   return 1;
 }
 
+// 生成一把新的离线根。目标私钥文件必须不存在（O_EXCL），这就是"绝不悄悄替换
+// 旧根"的全部实现。
+//
+// 顺序是刻意的：先写私钥（0600），再写 <path>.pub（0644，允许覆盖）。公钥写
+// 失败时私钥已经落盘，重跑会被 O_EXCL 拒绝——宁可让人工介入，也不要自动删掉
+// 一把可能已经被别处引用的根。
+//
+// 输出只含公开材料 + 实际 mode + content_printed = NO，最后 memset 掉 seed。
 int CommandRootInit(const Options& options) {
   const std::string path = options.Get("--root-key");
   const std::string root_id = options.Get("--root-id");
@@ -287,19 +398,21 @@ int CommandRootInit(const Options& options) {
                                                      &error)) {
     return Fail("生成根密钥失败：" + error);
   }
-  std::string key_text = "# backup-project 离线根私钥 —— 绝不可提交 / 上传 / 打印\n";
+  std::string key_text =
+      "# backup-project 离线根私钥 —— 绝不可提交 / 上传 / 打印\n";
   key_text += "root-id: " + root_id + "\n";
-  key_text += "seed-hex: " + backupproject::crypto::ToHex(
-                                  reinterpret_cast<const unsigned char*>(
-                                      seed.data()),
-                                  seed.size()) +
-              "\n";
+  key_text +=
+      "seed-hex: " +
+      backupproject::crypto::ToHex(
+          reinterpret_cast<const unsigned char*>(seed.data()), seed.size()) +
+      "\n";
   if (!WriteFile(path, 0600, key_text, true, &error)) {
     return Fail(error);
   }
   // 显式写 unlimited：根的"不限期"必须是写出来的意图，不能靠省略字段表达。
   const std::string pub_text =
-      root_id + " " + backupproject::crypto::Ed25519FormatPublicKeyHex(public_key) +
+      root_id + " " +
+      backupproject::crypto::Ed25519FormatPublicKeyHex(public_key) +
       " unlimited\n";
   if (!WriteFile(path + ".pub", 0644, pub_text, false, &error)) {
     return Fail(error);
@@ -308,8 +421,9 @@ int CommandRootInit(const Options& options) {
   std::printf("root_key_file      = %s (mode %s)\n", path.c_str(),
               ModeOf(path).c_str());
   std::printf("root_public_file   = %s.pub\n", path.c_str());
-  std::printf("root_public_key    = %s\n",
-              backupproject::crypto::Ed25519FormatPublicKeyHex(public_key).c_str());
+  std::printf(
+      "root_public_key    = %s\n",
+      backupproject::crypto::Ed25519FormatPublicKeyHex(public_key).c_str());
   std::printf("root_fingerprint   = %s\n",
               backupproject::crypto::Ed25519Fingerprint(public_key).c_str());
   std::printf("content_printed    = NO\n");
@@ -318,6 +432,8 @@ int CommandRootInit(const Options& options) {
   return 0;
 }
 
+// 只读子命令：读回根并打印公钥与指纹，用来核对"手里这把是不是线上信任的那
+// 把"。seed 只用于派生公钥，返回前同样清零。
 int CommandRootInfo(const Options& options) {
   const std::string path = options.Get("--root-key");
   if (path.empty()) {
@@ -331,15 +447,25 @@ int CommandRootInfo(const Options& options) {
   std::printf("root_id            = %s\n", key.root_id.c_str());
   std::printf("root_key_file      = %s (mode %s)\n", path.c_str(),
               ModeOf(path).c_str());
-  std::printf("root_public_key    = %s\n",
-              backupproject::crypto::Ed25519FormatPublicKeyHex(key.public_key).c_str());
-  std::printf("root_fingerprint   = %s\n",
-              backupproject::crypto::Ed25519Fingerprint(key.public_key).c_str());
+  std::printf(
+      "root_public_key    = %s\n",
+      backupproject::crypto::Ed25519FormatPublicKeyHex(key.public_key).c_str());
+  std::printf(
+      "root_fingerprint   = %s\n",
+      backupproject::crypto::Ed25519Fingerprint(key.public_key).c_str());
   std::printf("content_printed    = NO\n");
   std::memset(&key.seed[0], 0, key.seed.size());
   return 0;
 }
 
+// 为已有服务器公钥签发身份证书（全程不改动任何私钥文件）。
+//
+// 默认值都是"安全的那一个"：not_before = 现在，not_after = not_before + 180 天
+// （--days 可调，1..3650，落在解析器 10 年上限之内），serial 默认取 not_before
+// 的秒数——单调、几乎不可能重复，用户显式给 --serial 时才覆盖；0 一律拒绝。
+//
+// 这里**不**判断 not_before 落在过去还是未来：签发工具允许回填，时间窗的结论
+// 交给 verify-server 与调用方策略。
 int CommandIssueServer(const Options& options) {
   const std::string root_key_path = options.Get("--root-key");
   const std::string server_id = options.Get("--server-id");
@@ -363,27 +489,40 @@ int CommandIssueServer(const Options& options) {
     return Fail(error);
   }
   const std::int64_t now = backupproject::crypto::Bpcert1NowUnixSeconds();
-  certificate.not_before = options.Has("--not-before")
-                               ? std::strtoll(options.Get("--not-before").c_str(),
-                                              nullptr, 10)
-                               : now;
-  const std::int64_t days = options.Has("--days")
-                                ? std::strtoll(options.Get("--days").c_str(),
-                                               nullptr, 10)
-                                : 180;
+  certificate.not_before = now;
+  if (options.Has("--not-before")) {
+    std::string number_error;
+    if (!ParseDecimalI64(options.Get("--not-before"), &certificate.not_before,
+                         &number_error)) {
+      return Fail("--not-before 不合法：" + number_error);
+    }
+  }
+  std::int64_t days = 180;
+  if (options.Has("--days")) {
+    std::string number_error;
+    if (!ParseDecimalI64(options.Get("--days"), &days, &number_error)) {
+      return Fail("--days 不合法：" + number_error);
+    }
+  }
   if (days <= 0 || days > 3650) {
     return Fail("--days 必须在 1..3650 之间");
   }
   certificate.not_after = certificate.not_before + days * 24 * 60 * 60;
   certificate.serial_number =
-      options.Has("--serial")
-          ? std::strtoull(options.Get("--serial").c_str(), nullptr, 10)
-          : static_cast<std::uint64_t>(certificate.not_before);
+      static_cast<std::uint64_t>(certificate.not_before);
+  if (options.Has("--serial")) {
+    std::string number_error;
+    if (!ParseDecimalU64(options.Get("--serial"), &certificate.serial_number,
+                         &number_error)) {
+      return Fail("--serial 不合法：" + number_error);
+    }
+  }
   if (certificate.serial_number == 0) {
     return Fail("序列号不能为 0（--serial 显式给了 0？）");
   }
   std::string raw;
-  if (!backupproject::crypto::Bpcert1Issue(certificate, key.seed, &raw, &error)) {
+  if (!backupproject::crypto::Bpcert1Issue(certificate, key.seed, &raw,
+                                           &error)) {
     return Fail(error);
   }
   if (!WriteFile(out_path, 0644, raw, false, &error)) {
@@ -401,15 +540,25 @@ int CommandIssueServer(const Options& options) {
               raw.size());
   std::printf("certificate_sha256 = %s\n",
               backupproject::crypto::Bpcert1Fingerprint(raw).c_str());
-  std::printf("server_public_key  = %s\n",
-              backupproject::crypto::X25519FormatKeyHex(
-                  certificate.server_public_key)
-                  .c_str());
+  std::printf(
+      "server_public_key  = %s\n",
+      backupproject::crypto::X25519FormatKeyHex(certificate.server_public_key)
+          .c_str());
   std::printf("content_printed    = NO\n");
   std::memset(&key.seed[0], 0, key.seed.size());
   return 0;
 }
 
+// 验证一张证书：先结构、再信任、最后时间窗，三步都过才打印 verdict = TRUSTED
+// 并返回 0。
+//
+// 信任来源二选一：--roots 指定的可信根文件，或内置官方根
+// （OfficialCloudStore）。--issuer-pub 是给"还没有可信根列表"的场景准备的
+// 旁路：绕过根列表、只用给定公钥验签，输出里会明确标成命令行直接给出的根。
+//
+// 两个结论分开打印：trust_result 回答"谁签的、可不可信"，validity_result 回
+// 答"现在能不能用"。matched_root 让操作者知道是哪把根签的——排查时必须能回
+// 答这个问题，否则"验过了"没有意义。
 int CommandVerifyServer(const Options& options) {
   const std::string cert_path = options.Get("--cert");
   if (cert_path.empty()) {
@@ -421,7 +570,8 @@ int CommandVerifyServer(const Options& options) {
     return Fail(error);
   }
   Bpcert1 certificate;
-  const Bpcert1Error parsed = backupproject::crypto::Bpcert1Parse(raw, &certificate);
+  const Bpcert1Error parsed =
+      backupproject::crypto::Bpcert1Parse(raw, &certificate);
   if (parsed != Bpcert1Error::kOk) {
     std::printf("parse_result       = %s\n", Bpcert1ErrorName(parsed));
     return Fail(std::string("证书结构不合法：") + Bpcert1ErrorName(parsed));
@@ -443,7 +593,7 @@ int CommandVerifyServer(const Options& options) {
     TrustedRootStore store;
     if (options.Has("--roots")) {
       if (!TrustedRootStore::LoadFromFile(options.Get("--roots"), &store,
-                                         &error)) {
+                                          &error)) {
         return Fail(error);
       }
     } else {
@@ -460,10 +610,13 @@ int CommandVerifyServer(const Options& options) {
   std::printf("issuer_id          = %s\n", certificate.issuer_id.c_str());
   std::printf("certificate_sha256 = %s\n",
               backupproject::crypto::Bpcert1Fingerprint(raw).c_str());
-  const std::int64_t now = options.Has("--now")
-                               ? std::strtoll(options.Get("--now").c_str(),
-                                              nullptr, 10)
-                               : backupproject::crypto::Bpcert1NowUnixSeconds();
+  std::int64_t now = backupproject::crypto::Bpcert1NowUnixSeconds();
+  if (options.Has("--now")) {
+    std::string number_error;
+    if (!ParseDecimalI64(options.Get("--now"), &now, &number_error)) {
+      return Fail("--now 不合法：" + number_error);
+    }
+  }
   Bpcert1Error window = Bpcert1Error::kOk;
   std::string window_message;
   const bool in_window = backupproject::crypto::Bpcert1CheckValidity(
@@ -481,6 +634,9 @@ int CommandVerifyServer(const Options& options) {
   return 0;
 }
 
+// 只看内容，不做任何信任判断：不读可信根、不验签、不看时间窗。它回答的是
+// "这个文件是什么"，而不是"它可不可信"——把两件事混进一个子命令，会让用户
+// 在没验签的情况下以为自己已经验过了。
 int CommandInspectServer(const Options& options) {
   const std::string cert_path = options.Get("--cert");
   if (cert_path.empty()) {
@@ -492,7 +648,8 @@ int CommandInspectServer(const Options& options) {
     return Fail(error);
   }
   Bpcert1 certificate;
-  const Bpcert1Error parsed = backupproject::crypto::Bpcert1Parse(raw, &certificate);
+  const Bpcert1Error parsed =
+      backupproject::crypto::Bpcert1Parse(raw, &certificate);
   if (parsed != Bpcert1Error::kOk) {
     std::printf("parse_result       = %s\n", Bpcert1ErrorName(parsed));
     return Fail(std::string("证书结构不合法：") + Bpcert1ErrorName(parsed));
@@ -509,13 +666,14 @@ int CommandInspectServer(const Options& options) {
               static_cast<long long>(certificate.not_before));
   std::printf("not_after          = %lld\n",
               static_cast<long long>(certificate.not_after));
-  std::printf("validity_days      = %.2f\n",
-              static_cast<double>(certificate.not_after - certificate.not_before) /
-                  (24.0 * 60 * 60));
-  std::printf("server_public_key  = %s\n",
-              backupproject::crypto::X25519FormatKeyHex(
-                  certificate.server_public_key)
-                  .c_str());
+  std::printf(
+      "validity_days      = %.2f\n",
+      static_cast<double>(certificate.not_after - certificate.not_before) /
+          (24.0 * 60 * 60));
+  std::printf(
+      "server_public_key  = %s\n",
+      backupproject::crypto::X25519FormatKeyHex(certificate.server_public_key)
+          .c_str());
   std::printf("certificate_sha256 = %s\n",
               backupproject::crypto::Bpcert1Fingerprint(raw).c_str());
   std::printf("summary            = %s\n",
@@ -525,12 +683,19 @@ int CommandInspectServer(const Options& options) {
 
 }  // namespace
 
+// 入口只做参数装配与分派，所有业务判断都在子命令里。
+//
+// 参数形态只有 "--name value" 两段式：不接受 --name=value，不接受位置参数，
+// 参数名短于 3 个字符直接拒绝。于是 "--root-key-hex=<种子>" 会作为一个整体
+// 落进列表，被下面那条显式黑名单抓住，而不是被拆成半个合法参数。
 int main(int argc, char** argv) {
   if (argc < 2) {
     PrintUsage();
     return 2;
   }
   Options options;
+  // argv[0] 是程序名，子命令固定在第 1 位；之后的参数一律成对消费，落单的
+  // 参数名（缺取值）当场报错，不会用空串糊过去。
   options.command = argv[1];
   for (int i = 2; i < argc; ++i) {
     const std::string name = argv[i];
@@ -558,6 +723,8 @@ int main(int argc, char** argv) {
     }
   }
 
+  // 分派是显式的 if 链：多一个子命令就必须在这里加一行，不存在"命令名拼错也
+  // 能模糊匹配上"的情况；未知子命令打印用法并以 2 退出。
   if (options.command == "root-init") return CommandRootInit(options);
   if (options.command == "root-info") return CommandRootInfo(options);
   if (options.command == "issue-server") return CommandIssueServer(options);

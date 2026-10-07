@@ -36,6 +36,7 @@ CORE_SOURCES := src/core/archive_entry.cpp src/core/archive_pipeline.cpp \
 CORE_SOURCES += src/core/backup_mode.cpp \
                 src/core/backup_option_keys.cpp \
                 src/core/simple_json.cpp \
+                src/core/format_bytes.cpp \
                 src/platform/app_paths.cpp \
                 src/platform/file_lock.cpp \
                 src/platform/application_instance_lock.cpp \
@@ -65,6 +66,7 @@ SERVER_TARGET := $(BUILD_DIR)/backup-server
 # 源文件混进去会让它们全部失败。协议与客户端（backupctl/GUI 也要用）留在
 # src/network/，服务端实现放 server/。
 SERVER_CORE_SOURCES := src/network/network_protocol.cpp \
+                       src/core/format_bytes.cpp \
                        server/remote_auth.cpp \
                        server/remote_metadata_store.cpp \
                        server/remote_maintenance.cpp \

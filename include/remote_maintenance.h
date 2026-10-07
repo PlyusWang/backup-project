@@ -1,6 +1,6 @@
 // include/remote_maintenance.h
 //
-// PR #20（closure）：服务端与 ECS 本地管理工具**共用**的数据维护原语。
+// 服务端与 ECS 本地管理工具**共用**的数据维护原语。
 //
 // 为什么必须要有这一层：管理工具需要"删除某个 snapshot"和"删除某个账户及其
 // 全部云端数据"。如果它自己拼 SQL + rm，安全删除的顺序（先让数据不可见、再动
@@ -58,7 +58,11 @@ class RemoteMaintenance {
   // 删除单个 snapshot。返回值与 RemoteServer::HandleDelete 原来的语义逐字一致：
   //   kOk       删除完成（trash 里的残留 unlink 失败只记告警）
   //   kNotFound 该用户的这一行不存在，或 blob 已经不在磁盘上
-  //   kError    任何一步失败，且磁盘与元数据都保持原样
+  //   kError    任何一步失败。正常情况下它会先把已经动过的那一步回滚掉，
+  //            但回滚本身也可能失败（例如把 blob 从 trash
+  //            改名回去时磁盘出错）。 那种情况下数据会停在 quarantine / trash
+  //            里， 元数据行仍然存在，并且会写一条明确的诊断日志。
+  //            **不要把 kError 读成“磁盘与元数据一定完全没动过”**。
   StoreResult DeleteSnapshot(std::int64_t user_id,
                              const std::string& snapshot_id,
                              RemoteSnapshotRecord* removed,

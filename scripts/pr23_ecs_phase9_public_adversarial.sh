@@ -24,7 +24,7 @@ ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT_DIR"
 
 SERVER_ID="backup-project-cloud-production"
-PUBLIC_HOST="8.130.9.200"
+PUBLIC_HOST="39.101.77.9"
 PUBLIC_PORT=18765
 USER_NAME="phase9-public-user"
 ACCOUNT_PASSWORD="phase9-public-password"

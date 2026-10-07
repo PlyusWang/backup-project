@@ -117,8 +117,7 @@ bool DecodeHeader(const char* block /*512 字节*/, Header* header,
 // entry.size 之后**再** fstat 一次，确认源文件仍是扫描时那一份（普通文件、
 // size 与 mtime（秒 + 纳秒）未变，entry.source_ino 非 0 时 dev+ino 也未变）。
 // 任何一条不满足都让整次写入失败，磁盘上不留归档。这条检查挡不住"原地改写、
-// 长度不变、mtime 被改回原值、inode 也没换"的替换——那需要内容哈希，不在本轮
-// 范围内。
+// 长度不变、mtime 被改回原值、inode 也没换"的替换——那需要内容哈希，本层不做。
 //
 // 两者都用 O_WRONLY|O_CREAT|O_EXCL、权限 0600 创建输出（不覆盖已有文件），
 // 失败时删掉自己创建的半成品；写完的归档恰好以两个全零 block 结束，后面没有

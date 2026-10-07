@@ -9,6 +9,12 @@
 // 参考：FIPS 180-4 §4.1.3（初始值）、§4.2.3（常量）、§5.1.2（消息填充）、
 //       §6.4（压缩函数）。
 
+// 本层在签名路径上：Ed25519 验签的正确性直接等于这里的正确性，所以宁可慢
+// 一点也不做任何"优化" —— 补位、字节序、轮常量都逐行对应 FIPS 180-4。
+// 与 sha256.cpp 的关系：共用 crypto.h 里的 ToHex；两个类的形状刻意保持一致
+// （Update 任意切分、Final 单次，Sha512 多一个 Reset），便于互相参照复核。
+// 限制：消息长度按字节累计，只支持 < 2^64 bit 的输入（约 2 EiB）；长度字段
+// 的高 64 位写 0，见 Final。
 #include <cstring>
 
 #include "crypto.h"
@@ -59,6 +65,8 @@ inline std::uint64_t Rotr(std::uint64_t x, unsigned n) {
   return (x >> n) | (x << (64 - n));
 }
 
+// 手工拼字节，不做 memcpy + 类型双关：既避开对齐与严格别名问题，也让
+// "大端"这件事在代码里显式可见（主机字节序与本算法无关）。
 inline std::uint64_t LoadBigEndian64(const unsigned char* p) {
   return (static_cast<std::uint64_t>(p[0]) << 56) |
          (static_cast<std::uint64_t>(p[1]) << 48) |
@@ -70,6 +78,8 @@ inline std::uint64_t LoadBigEndian64(const unsigned char* p) {
          static_cast<std::uint64_t>(p[7]);
 }
 
+// 与 LoadBigEndian64 互为逆操作；摘要与 bit 长度都经它写出，任何一端改字节
+// 序都会让测试向量对不上，属于必然暴露的那类错误。
 inline void StoreBigEndian64(std::uint64_t value, unsigned char* p) {
   p[0] = static_cast<unsigned char>(value >> 56);
   p[1] = static_cast<unsigned char>(value >> 48);
@@ -85,6 +95,8 @@ inline void StoreBigEndian64(std::uint64_t value, unsigned char* p) {
 
 Sha512::Sha512() { Reset(); }
 
+// 回到初始状态，等价于新建对象：这是与 Sha256 唯一的接口差别，Final 之后
+// 想复用同一个对象必须先走这里。
 void Sha512::Reset() {
   std::memcpy(state_, kInitial, sizeof(state_));
   total_size_ = 0;
@@ -92,6 +104,9 @@ void Sha512::Reset() {
   std::memset(buffer_, 0, sizeof(buffer_));
 }
 
+// 总长度按**字节**累计，比特长度在 Final 里现算：这样 size << 3 不会在 32
+// 位平台上被截断。边界与 Sha256::Update 相同：(data == nullptr, size > 0)
+// 被静默忽略。
 void Sha512::Update(const void* data, std::size_t size) {
   if (data == nullptr || size == 0) {
     return;  // 空消息合法
@@ -123,6 +138,9 @@ void Sha512::Update(const void* data, std::size_t size) {
   }
 }
 
+// 补位按 §5.1.2：0x80 后补零到 112 (mod 128)，再写 16 字节大端 bit 长度。
+// 这里逐个字节调 Update 填零：buffer_size_ 每次只前进 1，不可能跨过 112，
+// 循环必然终止。Final 之后不重置状态，继续 Update 得到的不是标准值。
 void Sha512::Final(unsigned char out[kSha512DigestSize]) {
   // FIPS 180-4 §5.1.2：先补 0x80，再补零到 112 (mod 128)，最后 16
   // 字节大端比特长度。
@@ -146,6 +164,8 @@ void Sha512::Final(unsigned char out[kSha512DigestSize]) {
   // 由调用方显式 Reset（与 Sha256 的行为一致）。
 }
 
+// 80 轮压缩函数。它与 Sha256::Transform 结构相同、常量与旋转位数不同，
+// 比对两个实现时只看这几处差异即可确认没有抄错。
 void Sha512::Transform(const unsigned char block[kSha512BlockSize]) {
   std::uint64_t w[80];
   for (int t = 0; t < 16; ++t) {
@@ -196,6 +216,8 @@ void Sha512::Transform(const unsigned char block[kSha512BlockSize]) {
   state_[7] += h;
 }
 
+// 一次性入口：内部新建上下文，等价于 Update + Final。out 不做空指针检查
+// （调用方永远传栈上的 kSha512DigestSize 数组），因此它没有失败返回值。
 void Sha512::Digest(const void* data, std::size_t size,
                     unsigned char out[kSha512DigestSize]) {
   Sha512 ctx;
@@ -203,6 +225,8 @@ void Sha512::Digest(const void* data, std::size_t size,
   ctx.Final(out);
 }
 
+// 原始字节版本：返回值几乎一定含 NUL，只能当二进制用；文本形态请用
+// Sha512Hex（128 个小写十六进制字符）。
 std::string Sha512Raw(const std::string& data) {
   unsigned char out[kSha512DigestSize];
   Sha512::Digest(data.data(), data.size(), out);

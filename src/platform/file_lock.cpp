@@ -1,6 +1,10 @@
 // file_lock.cpp
 //
 // 见 file_lock.h。
+// 这是一把**建议锁**（advisory）：flock 只约束同样调用 flock 的进程，
+// 不配合的进程、直接删掉锁文件的用户都能绕过它。它的用途是“同一个用户
+// 别同时跑两次备份”，不是安全边界。选 flock 而不是 fcntl(F_SETLK)：
+// POSIX 记录锁会在进程关闭任意一个指向该文件的 fd 时丢失，容易误伤。
 
 #include "file_lock.h"
 
@@ -41,8 +45,12 @@ std::string FileTypeText(const struct stat& status) {
 
 }  // namespace
 
+// 析构即释放：拷贝构造/赋值已在头文件里 delete，所以一个对象最多持有
+// 一把锁，不存在“两个对象共用一把锁、其中一个提前放掉”的情况。
 FileLock::~FileLock() { Release(); }
 
+// 先 Release 再取：同一个对象可以换路径重新取锁，不会泄漏上一个 fd。
+// 所有失败路径都在 fd_ 被赋值之前返回，所以失败后对象仍是“未持锁”状态。
 FileLockStatus FileLock::Acquire(const std::string& lock_file_path,
                                  std::string* error_message) {
   if (error_message != nullptr) error_message->clear();
@@ -53,6 +61,8 @@ FileLockStatus FileLock::Acquire(const std::string& lock_file_path,
     return FileLockStatus::kError;
   }
 
+  // O_CLOEXEC：锁由 fd 持有，fd 泄漏给 exec 出来的子进程会让锁在父进程
+  // 退出后仍然活着，下一个进程于是永远拿不到锁。
   // 0600：锁文件里没有秘密，但也没有理由让别的用户看到这台机器上谁在跑备份。
   // O_NOFOLLOW：这个名字是符号链接时**打开本身**就失败（ELOOP），
   // 而不是跟到链接目标上去加锁——那会把锁加到别的文件上。
@@ -134,6 +144,9 @@ FileLockStatus FileLock::Acquire(const std::string& lock_file_path,
   return FileLockStatus::kAcquired;
 }
 
+// 重新 open 路径来读，而不是复用持锁的 fd（持锁者读自己的提示没有意义）。
+// 因此读到的是**此刻**文件里的内容，也可能是别的进程后来覆盖的值：它只
+// 用于把 EWOULDBLOCK 报得好懂一点，不能当作持锁者的确切身份。
 std::string FileLock::ReadOwnerHint() const {
   if (lock_file_path_.empty()) return std::string();
   const int fd = ::open(lock_file_path_.c_str(), O_RDONLY | O_CLOEXEC);

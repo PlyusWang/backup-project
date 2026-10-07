@@ -3,10 +3,10 @@
 // 云端备份列表里的一行。它只做三件事：展示、发意图、把"这一条能不能恢复"
 // 如实说清楚。
 //
-//   * 主视觉是用户看得懂的：名称、大小、创建时间，加上 PR #21 的链信息
+//   * 主视觉是用户看得懂的：名称、大小、创建时间，加上依赖链信息
 //     （完整 / 增量、代数、父快照前 12 位）；
 //   * 编号与摘要属于技术细节，放在页面里默认折叠的"技术详情"里；
-//   * 主操作三种类型都叫"恢复"（PR #21 UI closure 第二轮）：完整备份 / 增量
+//   * 主操作三种类型都叫"恢复"：完整备份 / 增量
 //     备份走链（自动取回整条依赖链）；原始归档（lineage 为空）下载那一个 blob
 //     之后按本地备份格式独立恢复。内部实现是两条路，但那是**类型 badge** 与
 //     说明行要说的事——按钮只表达用户的意图，不表达"这次能不能成"。
@@ -29,7 +29,7 @@ Rectangle {
     property string nameText: ""
     property string sizeText: ""
     property string createdText: ""
-    // ---- PR #21 链信息 ----
+    // ---- 链信息 ----
     property string kindText: ""      // "原始归档" / "完整备份" / "增量备份"
     property string kindKey: ""       // "raw" / "full" / "incremental"
     // 原始归档：不显示"代数"（它没有链）；主操作与产品级一样是"恢复"。
@@ -88,7 +88,8 @@ Rectangle {
                 objectName: "remoteSnapshotDownloadButton"
                 text: "下载归档"
                 enabled: !card.busy
-                onClicked: card.downloadRequested(card.snapshotId, card.nameText)
+                onClicked:
+                    card.downloadRequested(card.snapshotId, card.nameText)
             }
 
             AppButton {
@@ -141,7 +142,8 @@ Rectangle {
 
             Text {
                 objectName: "remoteSnapshotParentText"
-                visible: card.kindKey === "incremental" && card.parentShort !== ""
+                visible: card.kindKey === "incremental"
+                    && card.parentShort !== ""
                 text: "父 " + card.parentShort
                 font.pixelSize: 15
                 color: theme.textSecondary
