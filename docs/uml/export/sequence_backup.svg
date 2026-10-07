@@ -1,0 +1,52 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1420" height="460"
+ viewBox="0 0 1420 460">
+<defs><marker id="ah" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="#37474f"/></marker></defs>
+<rect width="100%" height="100%" fill="#ffffff"/>
+<style>text{font-family:"Noto Sans CJK SC","Droid Sans Fallback",sans-serif;}</style>
+<text x="710" y="28" font-size="21" fill="#1a1a1a" text-anchor="middle" dominant-baseline="central" font-weight="bold">图 4  Sequence Diagram —— 本地备份（v2 容器）</text>
+<rect x="32" y="58" width="156" height="40" rx="4" fill="#eceff1" stroke="#263238" stroke-width="1.6"/>
+<text x="110" y="78" font-size="13" fill="#1a1a1a" text-anchor="middle" dominant-baseline="central" font-weight="bold">用户</text>
+<line x1="110" y1="98" x2="110" y2="460" stroke="#b0bec5" stroke-width="1.2"/>
+<rect x="182" y="58" width="156" height="40" rx="4" fill="#eceff1" stroke="#263238" stroke-width="1.6"/>
+<text x="260" y="78" font-size="13" fill="#1a1a1a" text-anchor="middle" dominant-baseline="central" font-weight="bold">CLI / GUI</text>
+<line x1="260" y1="98" x2="260" y2="460" stroke="#b0bec5" stroke-width="1.2"/>
+<rect x="332" y="58" width="156" height="40" rx="4" fill="#eceff1" stroke="#263238" stroke-width="1.6"/>
+<text x="410" y="78" font-size="13" fill="#1a1a1a" text-anchor="middle" dominant-baseline="central" font-weight="bold">BackupEngine</text>
+<line x1="410" y1="98" x2="410" y2="460" stroke="#b0bec5" stroke-width="1.2"/>
+<rect x="482" y="58" width="156" height="40" rx="4" fill="#eceff1" stroke="#263238" stroke-width="1.6"/>
+<text x="560" y="78" font-size="13" fill="#1a1a1a" text-anchor="middle" dominant-baseline="central" font-weight="bold">Filter</text>
+<line x1="560" y1="98" x2="560" y2="460" stroke="#b0bec5" stroke-width="1.2"/>
+<rect x="632" y="58" width="156" height="40" rx="4" fill="#eceff1" stroke="#263238" stroke-width="1.6"/>
+<text x="710" y="78" font-size="13" fill="#1a1a1a" text-anchor="middle" dominant-baseline="central" font-weight="bold">遍历器</text>
+<line x1="710" y1="98" x2="710" y2="460" stroke="#b0bec5" stroke-width="1.2"/>
+<rect x="782" y="58" width="156" height="40" rx="4" fill="#eceff1" stroke="#263238" stroke-width="1.6"/>
+<text x="860" y="78" font-size="13" fill="#1a1a1a" text-anchor="middle" dominant-baseline="central" font-weight="bold">归档写入</text>
+<line x1="860" y1="98" x2="860" y2="460" stroke="#b0bec5" stroke-width="1.2"/>
+<rect x="932" y="58" width="156" height="40" rx="4" fill="#eceff1" stroke="#263238" stroke-width="1.6"/>
+<text x="1010" y="78" font-size="13" fill="#1a1a1a" text-anchor="middle" dominant-baseline="central" font-weight="bold">压缩</text>
+<line x1="1010" y1="98" x2="1010" y2="460" stroke="#b0bec5" stroke-width="1.2"/>
+<rect x="1082" y="58" width="156" height="40" rx="4" fill="#eceff1" stroke="#263238" stroke-width="1.6"/>
+<text x="1160" y="78" font-size="13" fill="#1a1a1a" text-anchor="middle" dominant-baseline="central" font-weight="bold">加密</text>
+<line x1="1160" y1="98" x2="1160" y2="460" stroke="#b0bec5" stroke-width="1.2"/>
+<rect x="1232" y="58" width="156" height="40" rx="4" fill="#eceff1" stroke="#263238" stroke-width="1.6"/>
+<text x="1310" y="78" font-size="13" fill="#1a1a1a" text-anchor="middle" dominant-baseline="central" font-weight="bold">FileIO</text>
+<line x1="1310" y1="98" x2="1310" y2="460" stroke="#b0bec5" stroke-width="1.2"/>
+<line x1="110" y1="120" x2="260" y2="120" stroke="#455a64" stroke-width="1.8" marker-end="url(#ah)"/>
+<text x="185" y="109" font-size="12" fill="#455a64" text-anchor="middle" dominant-baseline="central">backup &lt;源目录&gt; [--include/--exclude] [--strategy] [--pack ...]</text>
+<line x1="260" y1="154" x2="410" y2="154" stroke="#455a64" stroke-width="1.8" marker-end="url(#ah)"/>
+<text x="335" y="143" font-size="12" fill="#455a64" text-anchor="middle" dominant-baseline="central">startBackupWithStrategy(...) 校验组合 -&gt; 后台线程</text>
+<line x1="410" y1="188" x2="560" y2="188" stroke="#455a64" stroke-width="1.8" marker-end="url(#ah)"/>
+<text x="485" y="177" font-size="12" fill="#455a64" text-anchor="middle" dominant-baseline="central">Filter::ShouldIncludeFile / ShouldPruneDirectory</text>
+<line x1="410" y1="222" x2="710" y2="222" stroke="#455a64" stroke-width="1.8" marker-end="url(#ah)"/>
+<text x="560" y="211" font-size="12" fill="#455a64" text-anchor="middle" dominant-baseline="central">遍历源树：lstat / readdir，记录类型与元数据</text>
+<line x1="710" y1="256" x2="860" y2="256" stroke="#455a64" stroke-width="1.8" marker-end="url(#ah)"/>
+<text x="785" y="245" font-size="12" fill="#455a64" text-anchor="middle" dominant-baseline="central">逐条写 entry：mode 07777 / uid / gid / mtime(ns)</text>
+<line x1="860" y1="290" x2="1010" y2="290" stroke="#455a64" stroke-width="1.8" marker-end="url(#ah)"/>
+<text x="935" y="279" font-size="12" fill="#455a64" text-anchor="middle" dominant-baseline="central">打包后的 payload 交给压缩（none / HUF1 / LZH1）</text>
+<line x1="1010" y1="324" x2="1160" y2="324" stroke="#455a64" stroke-width="1.8" marker-end="url(#ah)"/>
+<text x="1085" y="313" font-size="12" fill="#455a64" text-anchor="middle" dominant-baseline="central">加密封装（可选）：先加密再算 MAC</text>
+<line x1="1010" y1="358" x2="1160" y2="358" stroke="#455a64" stroke-width="1.8" marker-end="url(#ah)"/>
+<text x="1085" y="347" font-size="12" fill="#455a64" text-anchor="middle" dominant-baseline="central">写临时文件 -&gt; fsync -&gt; rename 发布（不覆盖已有）</text>
+<line x1="1160" y1="392" x2="260" y2="392" stroke="#2e7d32" stroke-width="1.8" marker-end="url(#ah)"/>
+<text x="710" y="381" font-size="12" fill="#2e7d32" text-anchor="middle" dominant-baseline="central">回执：归档名 / 算法 / 条目数 / 备注</text>
+</svg>
