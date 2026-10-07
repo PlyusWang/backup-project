@@ -2539,6 +2539,28 @@ void WaitForAnimation(int milliseconds) {
 // 断了；"少抓一张继续跑"会让人对着不完整的图集得出错误结论。
 // 副作用：会改主题（AppTheme::setDark）与当前页（currentPage 属性），调用方
 // 需要时自行恢复；只在开发期开关 --screenshot 下被调用。
+// 等到远程页的模式选择器真的显示成期望的模式。
+//
+// 连接方式是 RemoteController 上的属性，页面靠属性变更通知重新绑定，绑定生效
+// 之后还要过一个事件循环回合才会重新渲染。所以这里不做"睡固定毫秒"的猜测，
+// 而是一边泵事件、一边读界面上的真实值（remoteConnectionModeTabs 的
+// currentKey），达到目标值再放过一帧。超时返回 false，由调用方判失败。
+bool WaitForRemoteMode(QQuickWindow* window, const QString& mode,
+                       int timeout_ms = 5000) {
+  QElapsedTimer timer;
+  timer.start();
+  while (timer.elapsed() < timeout_ms) {
+    QCoreApplication::processEvents(QEventLoop::AllEvents, 20);
+    QObject* tabs =
+        window->findChild<QObject*>(QStringLiteral("remoteConnectionModeTabs"));
+    if (tabs != nullptr && tabs->property("currentKey").toString() == mode) {
+      WaitForAnimation(120);
+      return true;
+    }
+  }
+  return false;
+}
+
 int CaptureScreenshots(QQuickWindow* window, backup_modern::AppTheme* theme,
                        backup_modern::BackupController* controller,
                        backup_modern::RemoteController* remote,
@@ -2591,23 +2613,87 @@ int CaptureScreenshots(QQuickWindow* window, backup_modern::AppTheme* theme,
   // 服务器身份的三种模式各留一张：官方云端 / 自定义（SSH 通道）/
   // 自定义（直连）。这三张图正是要证明的东西 —— 官方云端只显示名字
   // 加一句话，主机、端口、指纹一个都不出现；自定义模式才需要用户填。
+  //
+  // 这里不能"设完就抓"：连接方式是控制器上的属性，页面要靠一次变更通知重新
+  // 绑定，渲染还要再过一个事件循环回合。早先的写法是设完立刻 grabWindow()，
+  // 于是三张"不同模式"的图逐字节相同 —— 抓到的全是切换前的画面，而断言只看
+  // 文件在不在、非不非空，所以一直没被发现。
+  // 现在：设模式 -> 等界面上的 currentKey 真的变成目标值 -> 用该模式独有的
+  // 控件证明确实切过去了 -> 才抓；抓完再按主题比对三张图的 SHA-256 兜底。
   if (remote != nullptr) {
     struct ModeShot {
       const char* mode;
       const char* name;
+      const char* witness;  // 该模式独有的可见控件
+      const char* absent;   // 该模式下必须不可见的控件
     };
-    const ModeShot shots[3] = {{"official", "official-cloud"},
-                               {"ssh", "advanced-ssh-mode"},
-                               {"direct", "custom-server-profile"}};
+    const ModeShot shots[3] = {
+        {"official", "official-cloud", "remoteOfficialCloudName",
+         "remoteHostField"},
+        {"ssh", "advanced-ssh-mode", "remoteSshHostField",
+         "remoteOfficialCloudName"},
+        {"direct", "custom-server-profile", "remoteHostField",
+         "remoteSshHostField"}};
+    window->setProperty("currentPage", kPageCount - 1);
     for (const ModeShot& shot : shots) {
-      remote->setConnectionMode(QString::fromLatin1(shot.mode));
+      const QString mode = QString::fromLatin1(shot.mode);
+      if (!remote->setConnectionMode(mode)) {
+        std::fprintf(stderr, "截图：切不到连接模式 %s\n", shot.mode);
+        return 1;
+      }
+      if (!WaitForRemoteMode(window, mode)) {
+        std::fprintf(stderr, "截图：等了 5 秒界面仍不是连接模式 %s\n",
+                     shot.mode);
+        return 1;
+      }
+      // 属性变了不等于画面变了：用该模式独有的控件作证。
+      if (!EffectivelyVisible(window, shot.witness) ||
+          EffectivelyVisible(window, shot.absent)) {
+        std::fprintf(stderr,
+                     "截图：模式 %s 的界面状态与预期不符"
+                     "（%s 应可见、%s 应不可见）\n",
+                     shot.mode, shot.witness, shot.absent);
+        return 1;
+      }
       for (int dark = 0; dark < 2; ++dark) {
         theme->setDark(dark == 1);
-        window->setProperty("currentPage", kPageCount - 1);
         if (!grab(QString::fromLatin1(shot.name), dark == 1)) {
           return 1;
         }
       }
+    }
+    // 三张图必须真的不一样。上面的可见性断言已经证过"模式特有 UI 确实换了"，
+    // 这里再按主题比一次 SHA-256 兜底，防止将来有人把见证控件删了却仍然通过。
+    for (int dark = 0; dark < 2; ++dark) {
+      QStringList digests;
+      for (const ModeShot& shot : shots) {
+        const QString path = directory + QStringLiteral("/") +
+                             QString::fromLatin1(shot.name) +
+                             (dark == 1 ? QStringLiteral("-dark.png")
+                                        : QStringLiteral("-light.png"));
+        QFile file(path);
+        if (!file.open(QIODevice::ReadOnly)) {
+          std::fprintf(stderr, "截图：读不回来 %s\n", qPrintable(path));
+          return 1;
+        }
+        digests << QString::fromLatin1(
+            QCryptographicHash::hash(file.readAll(), QCryptographicHash::Sha256)
+                .toHex());
+      }
+      for (int i = 0; i < digests.size(); ++i) {
+        for (int j = i + 1; j < digests.size(); ++j) {
+          if (digests.at(i) == digests.at(j)) {
+            std::fprintf(stderr,
+                         "截图：%s主题下 %s 与 %s 逐字节相同 —— "
+                         "模式切换没有反映到画面上\n",
+                         dark == 1 ? "深色" : "浅色", shots[i].name,
+                         shots[j].name);
+            return 1;
+          }
+        }
+      }
+      std::printf("screenshot: %s主题的三种服务器模式截图互不相同\n",
+                  dark == 1 ? "深色" : "浅色");
     }
     remote->setConnectionMode(QStringLiteral("official"));
   }
