@@ -176,6 +176,21 @@ Item {
         page.draftSshLocalPort = remote.sshLocalPort
     }
 
+    // 控制器那边的连接方式可能在页面构造**之后**才变：CLI 与自检 harness 会
+    // 直接调 RemoteController::setConnectionMode，上面那段只回填一次。
+    // 不跟随的话，页面会继续显示旧模式，控制器却已经按新模式去连 —— 界面在
+    // "到底用哪条身份路径"这件事上说了假话。
+    // 只跟随 connectionMode：其余 draft* 是用户正在编辑的输入，不能被"控制器
+    // 那边动了一下"覆盖掉（connectionChanged 也会因 SSH 主机、端口、指纹变化
+    // 而发出）。
+    Connections {
+        target: remote
+
+        function onConnectionChanged() {
+            page.draftConnectionMode = remote.connectionMode
+        }
+    }
+
     // 下面这些函数是卡片信号与对话框之间的中介：卡片只报"用户点了哪一条"，
     // 由页面决定走哪条路径（确认框 / 选目录 / 直接执行），同一张卡片因此
     // 不需要知道产品级恢复与原始归档恢复的区别。
