@@ -81,6 +81,67 @@ QQuickItem* FindItemByName(QQuickItem* root, const QString& name) {
   return nullptr;
 }
 
+// 收集可视项树里所有叫这个名字的项。FindItemByName 只给第一个，而管理页的
+// 记录卡片是 Repeater 的委托，一屏里可能有好几张，必须按记录认领。
+void CollectItemsByName(QQuickItem* root, const QString& name,
+                        QList<QQuickItem*>* out) {
+  if (root == nullptr) {
+    return;
+  }
+  if (root->objectName() == name) {
+    out->append(root);
+  }
+  const QList<QQuickItem*> children = root->childItems();
+  for (QQuickItem* child : children) {
+    CollectItemsByName(child, name, out);
+  }
+}
+
+// 某一条记录对应的卡片：按卡片里显示的文件名认领，而不是假定 Repeater 的
+// 顺序 —— 列表顺序由 core 决定，界面不该依赖它。
+QQuickItem* FindRecordCard(QQuickWindow* window, const QString& file_name) {
+  QList<QQuickItem*> cards;
+  CollectItemsByName(window->contentItem(), QStringLiteral("backupRecordCard"),
+                     &cards);
+  for (QQuickItem* card : cards) {
+    QList<QQuickItem*> names;
+    CollectItemsByName(card, QStringLiteral("backupRecordName"), &names);
+    for (QQuickItem* label : names) {
+      if (label->property("text").toString() == file_name) {
+        return card;
+      }
+    }
+  }
+  return nullptr;
+}
+
+// 卡片内部某个 objectName 控件的文本 / 可见性 / 可用性。卡片里的控件不能走
+// window->findChild()：那会命中第一张卡片的同名控件。
+QString CardText(QQuickItem* card, const char* name) {
+  QList<QQuickItem*> found;
+  CollectItemsByName(card, QString::fromLatin1(name), &found);
+  return found.isEmpty() ? QString()
+                         : found.first()->property("text").toString();
+}
+
+bool CardVisible(QQuickItem* card, const char* name) {
+  QList<QQuickItem*> found;
+  CollectItemsByName(card, QString::fromLatin1(name), &found);
+  return !found.isEmpty() && found.first()->property("visible").toBool();
+}
+
+bool CardEnabled(QQuickItem* card, const char* name) {
+  QList<QQuickItem*> found;
+  CollectItemsByName(card, QString::fromLatin1(name), &found);
+  return !found.isEmpty() && found.first()->property("enabled").toBool();
+}
+
+// 依赖链场景的断言：失败就打一行并返回 1，与 RunRepositoryTest 既有风格一致。
+int ChainFail(const char* what, const QString& detail) {
+  std::fprintf(stderr, "chain: %s（%s）\n", what, qPrintable(detail));
+  return 1;
+}
+
 // 把备份页滚到指定位置。展开后的高级选项在页面下半部分，窗口一屏放不下，
 // 不滚动的话抓到的"展开状态"只有标题那一行，评审时看不出面板长什么样。
 // 滚的是 ScrollView 的 Flickable；越界值由 Flickable 自己夹到边界。
@@ -2466,7 +2527,7 @@ void WaitForAnimation(int milliseconds) {
   loop.exec();
 }
 
-// --screenshot：五个页面 × 两套主题各抓一张 PNG，另外补两种状态：
+// --screenshot：七个页面 × 两套主题各抓一张 PNG，另外补两种状态：
 // 高级选项展开、加密归档的恢复密码对话框。
 // 抓帧走窗口自己的 grabWindow()，和用户看到的是同一条渲染路径，
 // 不是另画一份示意图。
@@ -2755,7 +2816,8 @@ int RunSelfTest(backup_modern::BackupController* controller,
 //
 // 每一步失败都把真实 diagnostic 打到 stderr 并以非 0 退出，
 // 所以脚本可以只信退出码，也可以从 stderr 看到核心的原文原因。
-int RunRepositoryTest(backup_modern::BackupController* controller,
+int RunRepositoryTest(QQuickWindow* window,
+                      backup_modern::BackupController* controller,
                       const QString& source, const QString& repository,
                       const QString& destination) {
   // 1. 保存仓库设置：EnsureRepository + ConfigManager::Save
@@ -2825,6 +2887,202 @@ int RunRepositoryTest(backup_modern::BackupController* controller,
       qPrintable(record.value(QStringLiteral("modifiedTimeText")).toString()),
       record_recognized ? "true" : "false", record_format_version,
       record_entry_count);
+
+  // 3.6 快照依赖链状态。
+  //
+  // 管理页必须在用户点"恢复"之前，就把"这份现在恢复不了"讲清楚。这里对三个
+  // 场景各断言一次：完整快照 / 健康的增量 / 断链的增量。每个场景断两层 ——
+  // controller 给出的字段（数据来源），以及卡片上 objectName 指向的真实控件
+  // （用户真正看到的东西）；两层都过，这个功能才算真的接通。
+  //
+  // 用独立临时仓库，跑完把仓库切回参数给的那个，不打扰上面的产品链路。
+  // 这一层只是 UX：核心的 restore preflight 一字未动，CLI 或任何绕过界面的
+  // 调用方依旧 fail closed，禁用按钮不构成任何保证。
+  {
+    QTemporaryDir chain_dir;
+    const QString chain_repo = chain_dir.filePath(QStringLiteral("repo"));
+    const QString chain_src = chain_dir.filePath(QStringLiteral("src"));
+    QDir().mkpath(chain_repo);
+    QDir().mkpath(chain_src);
+    if (!WriteTestFile(chain_src + QStringLiteral("/a.txt"),
+                       QByteArray("one\n"))) {
+      return ChainFail("临时源目录写入失败", chain_src);
+    }
+    if (!controller->saveRepositoryPath(chain_repo)) {
+      return ChainFail("保存临时仓库失败", controller->statusMessage());
+    }
+    controller->setSourcePath(chain_src);
+
+    // A. 完整快照：字段是"完整、可恢复"，卡片写"完整备份"，恢复可用。
+    if (!controller->startBackupWithStrategy(
+            QStringLiteral("full"), QStringLiteral("mypack"),
+            QStringLiteral("none"), QStringLiteral("none"), QString(),
+            QString()) ||
+        !controller->waitForIdle(600000) || !controller->lastSucceeded()) {
+      return ChainFail("完整快照备份失败", controller->statusMessage());
+    }
+    controller->refreshBackups();
+    if (!controller->waitForCatalogIdle(600000)) {
+      return ChainFail("完整快照列表超时", QString());
+    }
+    QVariantList chain_records = controller->backupRecords();
+    if (chain_records.size() != 1) {
+      return ChainFail("完整快照条数不为 1",
+                       QString::number(chain_records.size()));
+    }
+    QVariantMap chain_record = chain_records.at(0).toMap();
+    const QString full_name =
+        chain_record.value(QStringLiteral("fileName")).toString();
+    if (chain_record.value(QStringLiteral("recordKind")).toString() !=
+            QStringLiteral("full") ||
+        chain_record.value(QStringLiteral("isDelta")).toBool() ||
+        !chain_record.value(QStringLiteral("chainRestorable")).toBool()) {
+      return ChainFail("完整快照的链字段不对", full_name);
+    }
+    window->setProperty("currentPage", 3);
+    WaitForAnimation(400);
+    QQuickItem* card = FindRecordCard(window, full_name);
+    if (card == nullptr) {
+      return ChainFail("管理页找不到完整快照卡片", full_name);
+    }
+    if (CardText(card, "backupRecordSnapshotKind") !=
+        QStringLiteral("完整备份")) {
+      return ChainFail("完整快照没有显示成完整备份",
+                       CardText(card, "backupRecordSnapshotKind"));
+    }
+    if (CardVisible(card, "backupRecordChainBroken")) {
+      return ChainFail("完整快照不该显示断链警告", full_name);
+    }
+    if (!CardEnabled(card, "backupRecordRestore")) {
+      return ChainFail("完整快照的恢复按钮被禁用了", full_name);
+    }
+    std::printf("chain: 完整快照 ok（完整备份 / 恢复可用）\n");
+
+    // B. 健康的增量：字段是"增量 + 父快照 + 可恢复"，卡片显示种类与父快照，
+    //    恢复可用。增量只支持 mypack + 不加密，所以这两个 key 是写死的。
+    //
+    //    第一次增量通常还没有可续的链，引擎会先重建一份完整基线（那一份
+    //    不是 delta），所以要"改一次源 + 跑一次增量"直到真的拿到 delta。
+    QVariantMap delta_record;
+    for (int attempt = 0; attempt < 3 && delta_record.isEmpty(); ++attempt) {
+      const QString probe = QStringLiteral("/probe%1.txt").arg(attempt);
+      if (!WriteTestFile(chain_src + probe, QByteArray("two\n"))) {
+        return ChainFail("增量前写入源文件失败", chain_src + probe);
+      }
+      if (!controller->startBackupWithStrategy(
+              QStringLiteral("incremental"), QStringLiteral("mypack"),
+              QStringLiteral("none"), QStringLiteral("none"), QString(),
+              QString()) ||
+          !controller->waitForIdle(600000) || !controller->lastSucceeded()) {
+        return ChainFail("增量备份失败", controller->statusMessage());
+      }
+      controller->refreshBackups();
+      if (!controller->waitForCatalogIdle(600000)) {
+        return ChainFail("增量快照列表超时", QString());
+      }
+      chain_records = controller->backupRecords();
+      for (const QVariant& item : chain_records) {
+        if (item.toMap().value(QStringLiteral("isDelta")).toBool()) {
+          delta_record = item.toMap();
+        }
+      }
+    }
+    if (delta_record.isEmpty()) {
+      return ChainFail("三轮增量之后仍然没有 delta 记录",
+                       QString::number(chain_records.size()));
+    }
+    const QString delta_name =
+        delta_record.value(QStringLiteral("fileName")).toString();
+    const QString parent_name =
+        delta_record.value(QStringLiteral("parentFileName")).toString();
+    // 第一次增量没有可续的链时会先重建一份完整基线，delta 挂的是那份基线，
+    // 而不是上面用 full 策略做的那份快照 —— 所以这里只断言"父名字非空，
+    // 而且列表里确实有这一条"，不假定它是哪一条。
+    WaitForAnimation(200);
+    const bool parent_listed = !parent_name.isEmpty() &&
+                               FindRecordCard(window, parent_name) != nullptr;
+    if (delta_record.value(QStringLiteral("recordKind")).toString() !=
+            QStringLiteral("delta") ||
+        !parent_listed ||
+        !delta_record.value(QStringLiteral("chainRestorable")).toBool()) {
+      return ChainFail("健康增量的链字段不对", delta_name);
+    }
+    card = FindRecordCard(window, delta_name);
+    if (card == nullptr) {
+      return ChainFail("管理页找不到增量卡片", delta_name);
+    }
+    const QString delta_kind_text = CardText(card, "backupRecordSnapshotKind");
+    if (!delta_kind_text.contains(QStringLiteral("增量备份")) ||
+        !delta_kind_text.contains(parent_name)) {
+      return ChainFail("增量卡片没有显示种类 / 父快照", delta_kind_text);
+    }
+    if (CardVisible(card, "backupRecordChainBroken")) {
+      return ChainFail("健康增量不该显示断链警告", delta_name);
+    }
+    if (!CardEnabled(card, "backupRecordRestore")) {
+      return ChainFail("健康增量的恢复按钮被禁用了", delta_name);
+    }
+    std::printf("chain: 健康增量 ok（增量备份 / 父快照 / 恢复可用）\n");
+
+    // C. 断链的增量：把父快照改名，列表必须立刻说"不可恢复"并给出原因，
+    //    恢复按钮同步禁用 —— 用户不必点一次、等 preflight 报错才知道。
+    const QString parent_path = chain_repo + QStringLiteral("/") + parent_name;
+    const QString parent_hidden = parent_path + QStringLiteral(".hidden");
+    if (!QFile::rename(parent_path, parent_hidden)) {
+      return ChainFail("隐藏父快照失败", parent_path);
+    }
+    controller->refreshBackups();
+    if (!controller->waitForCatalogIdle(600000)) {
+      return ChainFail("断链后列表超时", QString());
+    }
+    chain_records = controller->backupRecords();
+    delta_record = QVariantMap();
+    for (const QVariant& item : chain_records) {
+      if (item.toMap().value(QStringLiteral("isDelta")).toBool()) {
+        delta_record = item.toMap();
+      }
+    }
+    if (delta_record.isEmpty()) {
+      return ChainFail("断链后 delta 记录消失", QString());
+    }
+    if (delta_record.value(QStringLiteral("chainRestorable")).toBool()) {
+      return ChainFail("父快照缺失时仍然报告可恢复", delta_name);
+    }
+    const QString chain_reason =
+        delta_record.value(QStringLiteral("chainDiagnostic")).toString();
+    if (chain_reason.isEmpty()) {
+      return ChainFail("断链没有给出原因", delta_name);
+    }
+    WaitForAnimation(200);
+    card = FindRecordCard(window, delta_name);
+    if (card == nullptr) {
+      return ChainFail("断链后找不到增量卡片", delta_name);
+    }
+    if (!CardVisible(card, "backupRecordChainBroken")) {
+      return ChainFail("卡片没有显示依赖链不可恢复", delta_name);
+    }
+    if (!CardVisible(card, "backupRecordChainDiagnostic")) {
+      return ChainFail("卡片没有显示断链原因", delta_name);
+    }
+    if (CardEnabled(card, "backupRecordRestore")) {
+      return ChainFail("断链后恢复按钮仍然可点", delta_name);
+    }
+    std::printf("chain: 断链增量 ok（不可恢复 / 原因可见 / 恢复禁用）\n");
+    std::printf("chain: 断链原因=%s\n", qPrintable(chain_reason));
+
+    // 收尾：父快照改回来，仓库切回参数给的那一个。后面的既有步骤
+    // （产物字节 / 恢复 / 删除）看到的状态与进入本节时完全一致。
+    if (!QFile::rename(parent_hidden, parent_path)) {
+      return ChainFail("恢复父快照名失败", parent_path);
+    }
+    if (!controller->saveRepositoryPath(repository)) {
+      return ChainFail("切回原仓库失败", controller->statusMessage());
+    }
+    controller->refreshBackups();
+    if (!controller->waitForCatalogIdle(600000)) {
+      return ChainFail("切回原仓库后列表超时", QString());
+    }
+  }
 
   // 3.5 产物字节：界面展示 uid / gid / user / group / symlink / FIFO，筛选预览
   // 也会说某个 special entry“进入归档” —— 这些承诺只有在产物真的是 v2 容器时

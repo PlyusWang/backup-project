@@ -19,7 +19,11 @@
 //   * legacy v0.1 记录没有 pipeline 字段（hasPipelineMethods 为 false）：
 //     一条算法名都不显示，免得让人以为它也被 v2 管道处理过；
 //   * v2 记录的三段算法名一律用 C++ 给的展示文案拼，界面不解释枚举数字，
-//     也不自己编算法名 —— 真值来源只有一处。
+//     也不自己编算法名 —— 真值来源只有一处；
+//   * 快照种类与依赖链状态同样全部来自 C++：完整 / 增量、父快照名、
+//     "能不能恢复"以及不能恢复的原因。界面只做连接，不自己推断；
+//   * 断链时禁用恢复按钮只是 UX，让用户不必点一次才知道；核心的
+//     preflight 没有因此削弱，绕过界面的调用方依旧 fail closed。
 //
 // 密码边界（加密恢复）：
 //   * 密码只活在这一张卡片里（restorePassword），提交后立刻清空，
@@ -50,6 +54,14 @@ Rectangle {
     required property string encryptionMethodText
     // 加密备份恢复时需要密码。它只决定交互：恢复能不能成由核心裁决。
     required property bool passwordRequired
+    // 快照种类与依赖链状态。这几个值来自 BackupCatalog 的廉价判断
+    // （只确认父文件还在），不是完整校验；所以它们只用来把已知事实
+    // 提前讲清楚，绝不替代核心的 preflight。
+    required property string recordKind
+    required property bool isDelta
+    required property string parentFileName
+    required property bool chainRestorable
+    required property string chainDiagnostic
     // 来源（手动备份 / 定时备份）与计划快照的变化摘要。
     // 两者都来自 ScheduleStore，QML 不解析文件名也不自己推断。
     required property string originText
@@ -133,6 +145,52 @@ Rectangle {
             wrapMode: Text.WordWrap
         }
 
+        // 快照种类。父快照名就用仓库里的文件名 —— 它在列表里本来
+        // 就看得到，不是把内部格式术语摊给用户。
+        Text {
+            objectName: "backupRecordSnapshotKind"
+            Layout.fillWidth: true
+            text: card.isDelta
+                  ? (card.parentFileName !== ""
+                     ? "增量备份 · 父快照 " + card.parentFileName
+                     : "增量备份")
+                  : "完整备份"
+            font.pixelSize: 15
+            color: theme.textPrimary
+            wrapMode: Text.WordWrap
+        }
+
+        // 依赖链断了：恢复一定会失败，所以在卡片上提前说清楚，用户不必
+        // 点一次"恢复"、等 preflight 报错才知道。这层只是把已知事实讲
+        // 出来，真正的裁决仍然在核心，禁用按钮不构成任何安全保证。
+        Text {
+            objectName: "backupRecordChainBroken"
+            Layout.fillWidth: true
+            visible: card.isDelta && !card.chainRestorable
+            text: "依赖链不可恢复"
+            font.pixelSize: 15
+            font.weight: Font.DemiBold
+            color: theme.warning
+            wrapMode: Text.WordWrap
+        }
+
+        // 原因原样来自核心（"父快照缺失: xxx" / "没有声明父快照"），
+        // 界面不自己编，也不把它翻译成另一套说法。
+        TextEdit {
+            objectName: "backupRecordChainDiagnostic"
+            Layout.fillWidth: true
+            visible: card.isDelta && !card.chainRestorable
+                     && card.chainDiagnostic.length > 0
+            text: card.chainDiagnostic
+            readOnly: true
+            selectByMouse: true
+            cursorVisible: false
+            textFormat: TextEdit.PlainText
+            font.pixelSize: 14
+            color: theme.warning
+            wrapMode: TextEdit.WrapAnywhere
+        }
+
         // v2 记录的三个算法名：全部来自 C++，这里只做连接。
         // legacy 记录连这一步连接都不做，卡片里不会留下任何算法名文本。
         Text {
@@ -209,9 +267,12 @@ Rectangle {
                 text: "恢复"
                 variant: "primary"
                 iconName: "restore"
-                // 不认得 header 就不给恢复入口。但控制器并不依赖这层 UI 防护：
-                // Resolve 会校验名字，真正的完整校验在 preflight 里。
-                enabled: !card.busy && card.recognized
+                // 不认得 header、或者依赖链已经断了，都不给恢复入口 ——
+                // 后一种情况恢复一定失败，让用户点了再报错没有意义。
+                // 控制器并不依赖这层 UI 防护：Resolve 会校验名字，真正的
+                // 完整校验（含整条依赖链）在 preflight 里，CLI 或任何绕过
+                // 界面的调用方照样 fail closed。
+                enabled: !card.busy && card.recognized && card.chainRestorable
                 onClicked: {
                     restoreDialog.currentFolder =
                         controller.directoryDialogStartUrl("")
