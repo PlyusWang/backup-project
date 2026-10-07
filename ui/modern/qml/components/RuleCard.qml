@@ -4,7 +4,7 @@
 // （actionText / actionLabel / conditionLabel / summaryText / dslText /
 // detailText），卡片内部不解析任何来源不明的 var QVariantMap。
 //
-// 信息层级是本轮的重点（人工验收："主行要讲人话，DSL 是次要信息"）：
+// 信息层级是这个卡片的重点（"主行要讲人话，DSL 是次要信息"）：
 //
 //   包含 · 文件扩展名：cpp、h              <- 主行：动作 + 条件（人话）
 //   包含：扩展名为 cpp 或 h 的文件          <- 正文：完整句子
@@ -13,7 +13,8 @@
 // 主行与正文都来自共享 builder 的中文摘要（SummarizeShort / Summarize），
 // 卡片只负责摆放，不构造任何术语。
 //
-// 布局：正文在上、操作按钮在下并右对齐；卡片高度完全由正文 implicitHeight 决定。
+// 布局：正文在上、操作按钮在下并右对齐；
+// 卡片高度完全由正文 implicitHeight 决定。
 // 正文的几行 Text 都带 objectName，供 headless 测试读取真实 text/宽高，
 // 用来防止"模型里有字符串、屏幕上却是一片空白"的回归。
 

@@ -1,6 +1,6 @@
 // realtime_backup_service.h
 //
-// PR #19：一次"已经稳定的 realtime 触发"如何执行，以及 realtime 快照的归属。
+// 一次"已经稳定的 realtime 触发"如何执行，以及 realtime 快照的归属。
 //
 // 三条硬规则：
 //
@@ -10,11 +10,11 @@
 //      sidecar `<snapshot>.realtime`（BPREALTIME1），内容机器写机器读。没有
 //      "每次备份都改写"的 realtime history JSON，也就没有"监听 home 时状态文件
 //      自己触发自己"的问题。
-//   3. **marker 必须绑定实际 archive bytes**：写 marker 之前用 PR #18 的
+//   3. **marker 必须绑定实际 archive bytes**：写 marker 之前用
 //      LoadVerifiedSnapshotIdentity 拿到验证过的 snapshot id，只信实际字节，
 //      不信 header / envelope 的声明值。
 //
-// retention 直接复用 PR #18 的依赖感知计划与 descendants-first 删除；跨 Trigger
+// retention 复用同一套依赖感知计划与 descendants-first 删除；跨 Trigger
 // 的祖先（Manual / Scheduled 建的）绝不被 realtime retention 误删。
 //
 // 本文件是纯 C++17：不依赖 Qt，也不依赖任何第三方库。

@@ -61,7 +61,7 @@ class Filter {
   bool AddRule(FilterAction action, const std::string& text,
                std::string* error_message);
 
-  // 没有任何规则时，备份行为必须与 PR #8 完全一致。
+  // 没有任何规则时，备份行为必须与"不带任何规则"的既有行为完全一致。
   bool empty() const { return rules_.empty(); }
   bool has_include() const;
   std::size_t rule_count() const { return rules_.size(); }

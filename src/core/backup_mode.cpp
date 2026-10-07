@@ -3,6 +3,9 @@
 // Trigger / Strategy 的 key 解析与展示文本。表驱动而不是 if 链：
 // 加一个维度取值时只改这一张表，解析与反查不会走散。
 
+// 与 backup_option_keys.cpp 同构：key 进配置（schedule.json 的 trigger /
+// strategy 字段），text 只进界面。正查函数与解析函数必须成对维护，缺一个
+// 就会出现"写进去的读不出来"。
 #include "backup_mode.h"
 
 #include "incremental_backup.h"
@@ -16,6 +19,8 @@ struct TriggerEntry {
   const char* text;
 };
 
+// 触发方式：manual（点按钮）/ scheduled（计划器）/ realtime（文件监视）。
+// 它只回答"什么时候触发"，不决定"保存什么"。
 const TriggerEntry kTriggerEntries[] = {
     {"manual", BackupTrigger::kManual, "Manual"},
     {"scheduled", BackupTrigger::kScheduled, "Scheduled"},
@@ -28,6 +33,8 @@ struct StrategyEntry {
   const char* text;
 };
 
+// 策略：full（每次一份完整归档）/ incremental（基线 + delta 链）。
+// 它与 pack_method、encryption_method 一起才构成一次备份的完整选项。
 const StrategyEntry kStrategyEntries[] = {
     {"full", BackupStrategy::kFull, "Full"},
     {"incremental", BackupStrategy::kIncremental, "Incremental"},
@@ -45,18 +52,17 @@ struct ModeEntry {
 };
 
 const ModeEntry kModeEntries[] = {
-    // PR #18：Manual + Incremental 现在是真的了 —— delta 格式、依赖链恢复、
-    // baseline/delta/no-change 决策都在共享核心里，CLI 与 GUI 走同一条路径。
+    // Manual + Incremental：delta 格式、依赖链恢复、baseline/delta/no-change
+    // 决策都在共享核心里，CLI 与 GUI 走同一条路径。
     {BackupTrigger::kManual, BackupStrategy::kIncremental, true},
     {BackupTrigger::kScheduled, BackupStrategy::kFull, true},
-    // PR #18：Scheduled + Incremental 现在也是真的了。它成立的前提有两件事，
-    // 缺一不可，而且都已经落地：
+    // Scheduled + Incremental 成立的前提有两件事，缺一不可：
     //   * 计划路径把增量决策交给共享引擎（内容身份，而不是 metadata-first）；
     //   * retention 变成 dependency-aware，不会为了"删最旧"而删掉某个 delta
     //     的祖先。
     {BackupTrigger::kScheduled, BackupStrategy::kIncremental, true},
     {BackupTrigger::kManual, BackupStrategy::kFull, true},
-    // PR #19：Realtime 成为第三个 Trigger。它只决定"什么时候触发"，
+    // Realtime 是第三个 Trigger。它只决定“什么时候触发”，
     // 保存什么仍然完全交给既有 Strategy（Full → BackupEngine，
     // Incremental → RunIncrementalBackup）。
     {BackupTrigger::kRealtime, BackupStrategy::kFull, true},
@@ -130,6 +136,9 @@ bool IsSupportedBackupMode(BackupTrigger trigger, BackupStrategy strategy) {
   return false;
 }
 
+// 给用户的拒绝理由。注意它把支持矩阵**又写了一遍**（真值表在
+// IsSupportedBackupMode 里）：表变了这句话就会撒谎，两者必须一起改。
+// 返回值不含上下文，调用方需要时自己加前缀（见组合版本）。
 std::string UnsupportedBackupModeReason(BackupTrigger trigger,
                                         BackupStrategy strategy) {
   return std::string("Unsupported backup mode: ") + BackupTriggerText(trigger) +
@@ -162,6 +171,8 @@ bool IsSupportedBackupOptionCombination(
   return true;
 }
 
+// 空串表示"这个触发方式没有无人值守加密的限制"。调用方不得把空串当成可
+// 展示的理由，否则界面上会出现一条没有内容的错误。
 std::string UnattendedEncryptionDisabledReason(BackupTrigger trigger) {
   if (trigger == BackupTrigger::kScheduled) {
     return std::string(
@@ -173,6 +184,9 @@ std::string UnattendedEncryptionDisabledReason(BackupTrigger trigger) {
   return std::string();
 }
 
+// 组合是否支持的**唯一**判定在 IsSupportedBackupOptionCombination 里，所以
+// 这个函数必须按同样的顺序检查同样的谓词：顺序一旦错位，就可能给用户一个
+// 与真实拒绝原因不同的解释。返回空串表示"这个组合是支持的"。
 std::string UnsupportedBackupOptionCombinationReason(
     const BackupOptionCombination& combination) {
   if (!IsSupportedBackupMode(combination.trigger, combination.strategy)) {

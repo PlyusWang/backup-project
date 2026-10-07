@@ -1,4 +1,26 @@
 // source_manifest.cpp
+// 源树“内容身份”快照的读写与差分。三条边界先说清楚：
+//   * 不做备份、不写归档：只回答“这一轮的源树与上一轮比变了没有”；
+//   * 不做增量存储：结论只有“要不要再建一份完整快照”；
+//   * 不读用户文件内容——只有强化版（v3）为普通文件算 SHA-256。
+//
+// 数据流：ScanSourceTree（备份自己用的扫描器 + 同一个 Filter）-> ArchiveEntry
+// -> ManifestFromScannedEntries -> ManifestEntry -> SerializeManifestV3 文本
+// -> 调用方原子写盘；反向则是文本 -> ParseManifest -> ManifestEntry -> 与
+// 当前扫描结果 DiffManifests -> ChangeSummary。
+//
+// 磁盘布局是行式文本、TAB 分隔，第一行是版本头：
+//   BPMANIFEST3 <count>\t<snapshot>\t<repository>\t<source>\n
+//   <12 个 v2 字段>\t<转义后的 content_digest>\n   （每个条目一行）
+// 转义只覆盖反斜杠与 \t \n \r：Linux 路径里这四种字节都合法，不转义就会
+// 把一个字段切成两半，或者让“反斜杠加 t”与 TAB 产生二义性。
+//
+// 不变量：条目数与头行声明一致、archive_path 唯一且是相对路径、字段数固定、
+// 所有数字都做过范围检查、binding 要么完整合法要么整份 manifest 不写不认。
+//
+// 失败边界：全部返回 bool + error_message，不抛异常；解析是 fail-closed 的，
+// 任何一处不规范都判整份文件损坏。容错地猜出一个半可信的基线，会让增量链上
+// 所有后代一起继承这个错误——宁可多建一份完整快照，绝不错误跳过。
 
 #include "source_manifest.h"
 
@@ -20,6 +42,8 @@
 namespace backupproject {
 namespace {
 
+// error_message 是可选出参：调用方不关心文本时传 nullptr。所有失败路径都只
+// 经过这里写一次文本，因此“报错文案”与“返回 false”不会脱节。
 void SetError(std::string* error_message, const std::string& text) {
   if (error_message != nullptr) *error_message = text;
 }
@@ -29,6 +53,8 @@ void SetError(std::string* error_message, const std::string& text) {
 // 刻意不用 std::stoull：它会抛 std::out_of_range，"解析失败"与"内部错误"
 // 就分不开了。这里全部返回 bool。
 
+// 语法是唯一的规范形式：[0] | [1-9][0-9]*，且不超过 20 位（UINT64_MAX 的
+// 位数）。长度上限先挡一次，逐位累加时再用 (UINT64_MAX - digit) / 10 判溢出。
 bool ParseUnsigned(const std::string& text, std::uint64_t* value) {
   if (text.empty() || text.size() > 20) return false;
   // 拒绝前导零：manifest 由本模块自己写，规范形式就是唯一的合法形式。
@@ -44,6 +70,11 @@ bool ParseUnsigned(const std::string& text, std::uint64_t* value) {
   return true;
 }
 
+// 与 ParseUnsigned 共用同一套数字语法，只是多一个可选的负号。
+// INT64_MIN 的绝对值比 INT64_MAX 大 1，无法先转成正数再取负，所以负数分支
+// 单独用 kNegativeLimit 判断并特判 INT64_MIN。
+// 已知的宽松点："-0" 会被解析成 0，也就是接受了一个非规范写法（值相同，
+// 因此不影响正确性，但打破了“只认规范形式”的严格性）。
 bool ParseSigned(const std::string& text, std::int64_t* value) {
   if (text.empty()) return false;
   bool negative = false;
@@ -76,6 +107,9 @@ bool ParseSigned(const std::string& text, std::int64_t* value) {
 // 不转义就会把一个字段切成两半；不转义反斜杠则会产生二义性（"\t" 到底是
 // 一个 TAB 还是一个反斜杠加 t）。
 
+// 转义后保证：结果里不会再出现 TAB、LF、CR，因此“一行一条记录、一个字段
+// 一段”这个结构不会被字段内容破坏；其它字节（含 UTF-8 多字节序列）原样透传，
+// 不做任何编码转换——manifest 是字节透明的，不替用户的文件名做规范化。
 std::string EscapeField(const std::string& value) {
   std::string escaped;
   escaped.reserve(value.size());
@@ -101,6 +135,10 @@ std::string EscapeField(const std::string& value) {
   return escaped;
 }
 
+// 严格反向：未知的转义序列（例如 \x）直接判失败，而不是原样保留。
+// 接受未知序列会让同一份文本有多种解码结果，破坏“规范形式唯一”这条前提，
+// 而唯一性正是 DiffManifests 与 ManifestDigest 可复现的基础。
+// 失败时 *value 里可能有部分内容，调用方必须在返回 true 之后才使用它。
 bool UnescapeField(const std::string& text, std::string* value) {
   value->clear();
   value->reserve(text.size());
@@ -132,6 +170,9 @@ bool UnescapeField(const std::string& text, std::string* value) {
   return true;
 }
 
+// 按 TAB 切分。字段数上界用来让病态输入（一行里上百万个 TAB）也能被拒绝，
+// 但检查点在循环里，最后一次 push 不再判，所以实际放行的是最多 65 个字段。
+// 这一点无害：调用方要求字段数恰好 12 或 13，多出来的那一个必然被判错。
 bool SplitFields(const std::string& line, std::vector<std::string>* fields) {
   fields->clear();
   std::size_t start = 0;
@@ -147,6 +188,11 @@ bool SplitFields(const std::string& line, std::vector<std::string>* fields) {
   }
 }
 
+// archive_path 的语法检查。这里是**不可信输入**的入口：文本可能来自磁盘上
+// 被改过的 manifest。拒绝绝对路径、NUL、"./" 前缀与结尾 '/'，是为了让同一个
+// 逻辑路径只有一种写法——它同时是去重键和 diff 的排序键，多种写法会让这两
+// 件事都出错。注意这里只做结构检查：archive_path 由扫描器产生，
+// 因此“不含 .. 组件”这条更强的不变量并没有在这里被验证。
 bool IsValidArchivePath(const std::string& path) {
   if (path.empty()) return false;
   if (path[0] == '/') return false;
@@ -156,6 +202,8 @@ bool IsValidArchivePath(const std::string& path) {
   return true;
 }
 
+// 排序与比较统一走这一个谓词：std::string 的 < 是逐字节的（无符号 memcmp
+// 语义），因此结果与 locale、文件系统返回顺序都无关——摘要的可复现性依赖它。
 bool LessByArchivePath(const ManifestEntry& left, const ManifestEntry& right) {
   return left.archive_path < right.archive_path;
 }
@@ -164,6 +212,8 @@ bool LessByArchivePath(const ManifestEntry& left, const ManifestEntry& right) {
 // 分隔符、不是 "." / ".."、不含 NUL。".bak 后缀"这条更具体的归档命名规则属于
 // BackupCatalog / ScheduleStore 那一层，由 ScheduleStore::LoadManifest 再校验
 // 一次；两层各守自己的规则，谁也不替谁放宽。
+// 反斜杠也一并拒绝：它在 Linux 上不是分隔符，但 manifest 可能被拿到别的
+// 平台上处理，这里不做平台猜测，直接判不合法。
 bool IsPlainSingleComponentName(const std::string& name) {
   if (name.empty()) return false;
   if (name == "." || name == "..") return false;
@@ -173,6 +223,11 @@ bool IsPlainSingleComponentName(const std::string& name) {
   return true;
 }
 
+// binding 的完整校验：三个字段都非空、都不含 NUL、长度各自有上界，快照名
+// 还必须是单组件文件名。这些条件成立时，调用方才能把 snapshot_file_name
+// 安全地 join 到仓库目录去检查那份快照是否真的存在。
+// 校验顺序固定、错误文案固定：它们有测试按文案断言。上界与 schedule.json
+// 的字符串上界同量级，避免一行头就把内存放大。
 bool IsValidManifestBinding(const ManifestBinding& binding,
                             std::string* error_message) {
   if (binding.snapshot_file_name.empty()) {
@@ -216,6 +271,9 @@ bool IsValidManifestBinding(const ManifestBinding& binding,
 }
 
 // 条目正文。v1 与 v2 的正文格式完全一样，只有头行不同。
+// v1/v2 的条目行：12 个 TAB 分隔字段，顺序就是磁盘布局，不能重排——旧版本按
+// 固定字段序号读取。新增字段只能追加到末尾并提升版本号（v3 就是这么做的）。
+// 数字字段一律十进制无前导零、无符号，负数只可能出现在 mtime_sec。
 void AppendManifestEntries(const std::vector<ManifestEntry>& entries,
                            std::string* out) {
   for (const ManifestEntry& entry : entries) {
@@ -248,6 +306,9 @@ void AppendManifestEntries(const std::vector<ManifestEntry>& entries,
 
 // version 3 的条目行：v2 的 12 个字段之后追加内容摘要（第 13 个字段）。
 // 摘要本身是十六进制，转义只是让"字段"这个概念保持统一。
+// v3 的条目行 = v2 的 12 个字段 + 第 13 个字段 content_digest（64 个小写
+// 十六进制字符）。前面的字段顺序与含义与 v2 逐字节相同，因此 v2 的读取器
+// 至少能读出前 12 个字段。
 void AppendManifestEntriesV3(const std::vector<ManifestEntry>& entries,
                              std::string* out) {
   for (const ManifestEntry& entry : entries) {
@@ -282,6 +343,11 @@ void AppendManifestEntriesV3(const std::vector<ManifestEntry>& entries,
 
 // 把一次 ScanSourceTree 的结果映射成 manifest 条目。
 // source_path 一并带上：强化版要拿它去读正文算摘要。
+// 把扫描结果映射成 manifest 条目，字段一一对应地搬运。
+// hardlink_degree 需要先统计：它是“有多少条条目把本路径当作 leader”
+// （link_target == 本路径的条目数），必须扫完一遍才知道，所以分两趟。
+// source_path 一并带上，但**不参与序列化**：它只用来读正文算摘要，写进
+// manifest 等于把源目录的绝对路径留在磁盘上。
 void ManifestFromScannedEntries(const std::vector<ArchiveEntry>& scanned,
                                 std::vector<ManifestEntry>* entries) {
   std::unordered_map<std::string, std::uint32_t> hardlink_degree;
@@ -314,11 +380,17 @@ void ManifestFromScannedEntries(const std::vector<ArchiveEntry>& scanned,
 
 }  // namespace
 
+// 四个桶互斥，所以总数可以直接相加；调用方用它判断“这一轮到底有没有变化”。
 std::uint64_t ChangeSummaryTotal(const ChangeSummary& summary) {
   return summary.added + summary.removed + summary.modified +
          summary.metadata_changed;
 }
 
+// 元数据版：只 lstat、不读正文，因此便宜但存在已知盲区（same-size +
+// same-mtime 的 in-place rewrite 看不出来）。
+// 复用备份自己的扫描器：集合、类型判定、filter 剪枝、socket 规则都只有一份，
+// “manifest 看到的集合”与“备份实际写入的集合”因此不可能漂移。
+// 失败时 *entries 保持为空：清空在入口做，填充只在扫描与条数检查都通过之后。
 bool BuildSourceManifest(const std::string& source_directory,
                          const Filter* filter,
                          std::vector<ManifestEntry>* entries,
@@ -344,6 +416,10 @@ bool BuildSourceManifest(const std::string& source_directory,
   return true;
 }
 
+// 强化版：集合与元数据版完全一致，额外为每个普通文件读一遍正文算 SHA-256，
+// 为每个软链接算目标字节的 SHA-256。代价是 O(源体积) 的读盘。
+// 第一版刻意全量哈希，不做 size+mtime 缓存：缓存的失效判断本身就是
+// correctness 问题，而这里漏掉一次变化会被增量链的所有后代继承。
 bool BuildStrongSourceManifest(const std::string& source_directory,
                                const Filter* filter,
                                std::vector<ManifestEntry>* entries,
@@ -367,6 +443,10 @@ bool BuildStrongSourceManifest(const std::string& source_directory,
 
   // 全量哈希。第一版不做任何 size+mtime 摘要缓存：缓存的失效判断本身就是
   // correctness 问题，而"漏掉一次变化"在增量链上是会被后代继承的错误。
+  // 只有普通文件与软链接需要内容身份：目录、FIFO、设备、socket 的身份由类型
+  // 加元数据字段唯一确定，再算一遍摘要只是重复。
+  // 摘要失败（读不了、不是普通文件、被换成符号链接）一律让整次构建失败，
+  // 绝不用空摘要冒充成功。
   for (ManifestEntry& entry : *entries) {
     if (entry.type == EntryType::kRegularFile) {
       std::string digest;
@@ -383,6 +463,9 @@ bool BuildStrongSourceManifest(const std::string& source_directory,
   // 读正文期间源不许变。变了就整次失败：否则 manifest 会把"读到的内容"与
   // "扫描时记下的元数据"拼成一个从未真实存在过的版本，而增量链会把它当成
   // 一个可信的祖先。
+  // 复查用 lstat 而不是 stat：哈希之后路径被换成符号链接也必须被发现，
+  // 而 S_ISREG 正是在这一步挡掉它的。比较 size 与 mtime（秒 + 纳秒）三项，
+  // 任何一项不符都说明“读到的内容”与“记录的元数据”不是同一个瞬间的状态。
   for (const ManifestEntry& entry : *entries) {
     if (entry.type != EntryType::kRegularFile) continue;
     struct stat info;
@@ -406,6 +489,9 @@ bool BuildStrongSourceManifest(const std::string& source_directory,
   return true;
 }
 
+// 这是“能不能当增量基线”的唯一判据：普通文件与软链接都必须有合法摘要。
+// 空 manifest 会 vacuous 地返回 true，所以调用方还要自己处理“一条都没有”
+// 的情形，不能只看这一个布尔值。
 bool HasContentDigests(const std::vector<ManifestEntry>& entries) {
   for (const ManifestEntry& entry : entries) {
     if (entry.type != EntryType::kRegularFile &&
@@ -417,6 +503,11 @@ bool HasContentDigests(const std::vector<ManifestEntry>& entries) {
   return true;
 }
 
+// 两份 manifest 的变化摘要。分类规则互斥且有序：只在一侧、类型变了、
+// 内容变了、元数据变了，命中即停，因此总数等于各桶之和，不会重复计数。
+// 目录的 mtime 刻意不参与比较（见头文件里那条已知盲区），hardlink 条目也
+// 只比 link_target，理由同样是“别重复计数”。
+// 失败只可能来自空指针参数；正常路径恒返回 true 且 *summary 已清零。
 bool DiffManifests(const std::vector<ManifestEntry>& previous,
                    const std::vector<ManifestEntry>& current,
                    ChangeSummary* summary,
@@ -429,6 +520,10 @@ bool DiffManifests(const std::vector<ManifestEntry>& previous,
   *summary = ChangeSummary{};
   if (changed_paths != nullptr) changed_paths->clear();
 
+  // 先按 archive_path 排序再做归并式单遍扫描，输入顺序因此不影响结果——
+  // manifest 里的顺序取决于目录遍历顺序，那不是契约。
+  // 存指针而不是复制 ManifestEntry：每条带两个 std::string，复制几十万条
+  // 既费内存又费时间，而这里的比较是只读的。
   std::vector<const ManifestEntry*> left;
   std::vector<const ManifestEntry*> right;
   left.reserve(previous.size());
@@ -462,6 +557,11 @@ bool DiffManifests(const std::vector<ManifestEntry>& previous,
 
     const ManifestEntry& old_entry = *left[i];
     const ManifestEntry& new_entry = *right[j];
+    // 同一个路径两侧都有，按**新**条目的类型分派比较：不同类型的“同一性”由
+    // 不同字段决定——普通文件看 size + mtime（有摘要时再看摘要），链接看
+    // target， 设备看 major/minor，目录与 FIFO
+    // 没有可比字段（只可能落到元数据桶）。 is_modified 与 is_metadata_changed
+    // 是互斥的：前者为真时不再判后者。
     bool is_modified = false;
     bool is_metadata_changed = false;
 
@@ -521,12 +621,17 @@ bool DiffManifests(const std::vector<ManifestEntry>& previous,
           // 把它算进来会让"新增一个被 filter 排除的文件"也触发一次完整快照，
           // 而实际备份集合并没有变。代价是单独 touch 目录看不出来——已知盲区。
           is_metadata_changed = true;
+          // leader 自己的元数据一字未变、只是多/少了一个指向同一 inode
+          // 的硬链接时， 只有这个计数会动；它因此是 hardlink
+          // 身份里唯一需要单独比较的字段。
         } else if (old_entry.hardlink_degree != new_entry.hardlink_degree) {
           is_metadata_changed = true;
         }
       }
     }
 
+    // 计数与路径是同一个判定的两个视图：只要落进某个桶就一定会 push 路径，
+    // 调用方不会看到“计数 3 条、路径只有 2 条”这种自相矛盾的结果。
     if (is_modified) {
       ++summary->modified;
       if (changed_paths != nullptr)
@@ -542,6 +647,8 @@ bool DiffManifests(const std::vector<ManifestEntry>& previous,
   return true;
 }
 
+// 返回空串表示“拒绝序列化”，不是“内容为空”（空 manifest 至少有一行头）。
+// 调用方必须把空串当错误处理，绝不能把空串写进磁盘冒充一份 manifest。
 std::string SerializeManifest(const std::vector<ManifestEntry>& entries,
                               const ManifestBinding& binding) {
   // 归属不完整就什么都不写。调用方必须在写盘前拿到一个明确的失败，
@@ -592,6 +699,10 @@ std::string SerializeManifestV3(const std::vector<ManifestEntry>& entries,
   return out;
 }
 
+// manifest 自身的摘要，覆盖“规范化的 v3 正文”：条目先按 archive_path 排序再
+// 序列化，同一个源状态无论遍历细节如何，摘要都可复现。
+// 它刻意不含 binding：binding 说的是“这份 manifest 属于哪一份快照”，
+// 不是源的内容身份。摘要本身不再进 manifest，只用于比对与日志。
 std::string ManifestDigest(const std::vector<ManifestEntry>& entries) {
   // 先按 archive_path 排序：摘要必须只取决于"源是什么样"，不取决于遍历
   // 恰好以什么顺序产出条目。排序后的顺序就是规范顺序。
@@ -614,6 +725,8 @@ std::string ManifestDigest(const std::vector<ManifestEntry>& entries) {
   return ContentDigestOfBytes(text);
 }
 
+// v1 写出只服务于兼容性与迁移测试：头行没有 binding，读回来必然是不可信
+// 基线。生产路径一律用带 binding 的 SerializeManifest / SerializeManifestV3。
 std::string SerializeManifestV1(const std::vector<ManifestEntry>& entries) {
   std::string out;
   out += "BPMANIFEST1 ";
@@ -623,6 +736,9 @@ std::string SerializeManifestV1(const std::vector<ManifestEntry>& entries) {
   return out;
 }
 
+// 严格解析器：头必须完全匹配、字段数固定、数字全部做范围检查、条数必须与
+// 正文一致、末尾不许有多余字节。任何偏差都判整份文件损坏，不“尽力猜”。
+// 失败时 *entries 与 *binding 都保持清空/空值，调用方据此安全地走重建流程。
 bool ParseManifest(const std::string& text, std::vector<ManifestEntry>* entries,
                    ManifestBinding* binding, std::string* error_message) {
   if (entries == nullptr) {
@@ -636,6 +752,8 @@ bool ParseManifest(const std::string& text, std::vector<ManifestEntry>* entries,
   entries->clear();
   *binding = ManifestBinding{};
 
+  // 先卡总字节数再解析：整份文本在内存里被反复扫描，没有上限就等于让一个坏
+  // 文件决定进程的内存占用。条目数与单行长度在上限之外还有各自的上界。
   if (text.size() > kMaxManifestBytes) {
     SetError(error_message, "Source manifest is too large: " +
                                 std::to_string(text.size()) + " bytes");
@@ -651,6 +769,10 @@ bool ParseManifest(const std::string& text, std::vector<ManifestEntry>* entries,
   bool is_version_2 = false;
   bool is_version_3 = false;
   std::size_t header_size = 0;
+  // compare(0, min(header.size(), text.size()), ...) 让短文本（甚至空串）也走
+  // 同一条比较路径，不需要先判长度、也不会抛异常。
+  // is_version_2 的含义是“头行带 binding”，v3 同样带，所以 v3 会把两个标志
+  // 都置真；条目字段数才用 is_version_3 单独区分。
   if (text.compare(0, std::min(header_v3.size(), text.size()), header_v3) ==
       0) {
     is_version_3 = true;
@@ -719,7 +841,12 @@ bool ParseManifest(const std::string& text, std::vector<ManifestEntry>* entries,
     }
   }
 
+  // 循环次数以头行声明的条数为准，而不是“读到没有行”：声明与正文必须一致，
+  // 多一条少一条都算坏文件。declared_count 已在头行解析时被卡到
+  // kMaxManifestEntries 以内，所以这里的 reserve 不会被一行坏数字放大。
   entries->reserve(static_cast<std::size_t>(declared_count));
+  // 重复路径必须在这里挡住：它会让 diff 把同一条路径算两次，也让“按路径查找”
+  // 的调用方产生歧义。去重用的是反转义后的 archive_path，即逻辑路径。
   std::unordered_set<std::string> seen_paths;
   std::size_t position = first_newline + 1;
   for (std::uint64_t index = 0; index < declared_count; ++index) {
@@ -739,6 +866,8 @@ bool ParseManifest(const std::string& text, std::vector<ManifestEntry>* entries,
     }
 
     std::vector<std::string> fields;
+    // 字段数由版本决定，且要求**恰好相等**：多一个 TAB、少一个字段都说明这份
+    // 文本不是本模块写出来的，不能按“前 N 个字段有效”来宽容处理。
     const std::size_t expected_fields = is_version_3 ? 13u : 12u;
     if (!SplitFields(line, &fields) || fields.size() != expected_fields) {
       SetError(error_message,
@@ -757,6 +886,9 @@ bool ParseManifest(const std::string& text, std::vector<ManifestEntry>* entries,
     ManifestEntry entry;
     entry.type = static_cast<EntryType>(type_id);
 
+    // 范围本身就是格式的一部分：size ≤ 2^62（给后续加法留出余量）、mtime_nsec
+    // < 1e9、mode ≤ 07777、uid/gid/dev ≤ 2^32-1、hardlink_degree ≤ 条目上限。
+    // 这些上界同时也是内存与算术安全的前提，缺一条都要重新审一遍解析器。
     if (!ParseUnsigned(fields[1], &entry.size) || entry.size > (1ull << 62)) {
       SetError(error_message,
                "Invalid source manifest: bad size '" + fields[1] + "'");
@@ -822,6 +954,9 @@ bool ParseManifest(const std::string& text, std::vector<ManifestEntry>* entries,
     }
     entry.hardlink_degree = static_cast<std::uint32_t>(degree);
 
+    // archive_path 是唯一参与集合语义的字段：先反转义，再按“归档路径”的语法
+    // 校验（相对、无 NUL、无 "./" 前缀、不以 '/' 结尾）。它是去重键，也是 diff
+    // 的排序键，因此这一步失败必须整份拒绝，而不是跳过这一条。
     if (!UnescapeField(fields[10], &entry.archive_path) ||
         !IsValidArchivePath(entry.archive_path)) {
       SetError(error_message,
@@ -864,6 +999,8 @@ bool ParseManifest(const std::string& text, std::vector<ManifestEntry>* entries,
     entries->push_back(std::move(entry));
   }
 
+  // 末尾不许有多余字节。“多出来的内容被忽略”会让一份被追加过数据的文件看
+  // 起来完全正常，而 manifest 是机器写的，出现偏差就说明状态已经坏了。
   if (position != text.size()) {
     SetError(error_message,
              "Invalid source manifest: unexpected data after the last entry");

@@ -2,6 +2,9 @@
 //
 // 具体色值和 QSS 都在这个文件里。GUI 其它部分只使用 ThemeColors 和
 // BuildStyleSheet 的结果，不自己写颜色常量。
+// 主题切换是整体重建：BuildStyleSheet 只在切换时调用一次，结果通过
+// QApplication::setStyleSheet 一次性下发，没有增量更新。ThemeColors 是值
+// 语义，调用方拿到的是副本，改副本不会影响已经应用的样式。
 
 #include "theme.h"
 
@@ -65,12 +68,15 @@ ThemeColors LightTheme() { return MakeLightColors(); }
 ThemeColors DarkTheme() { return MakeDarkColors(); }
 
 // 第一次启动默认浅色：不预设用户偏好，浅色在投影和截图里也更稳妥。
+// 只认 “dark”，其余一律按浅色处理：旧版本或手工改坏的配置文件不会让界面
+// 落到未定义状态（读侧接受的集合就是写侧写出的两个值）。
 ThemeKind LoadThemeKind() {
   QSettings settings;
   const QString value = settings.value(kThemeSettingKey, "light").toString();
   return value == "dark" ? ThemeKind::kDark : ThemeKind::kLight;
 }
 
+// 同步写入：主题切换是低频操作，不需要延迟提交或批量刷盘。
 void SaveThemeKind(ThemeKind kind) {
   QSettings settings;
   settings.setValue(kThemeSettingKey,
@@ -93,6 +99,8 @@ QString StatusColor(const ThemeColors& colors, StatusKind kind) {
   return colors.text_primary;
 }
 
+// 模板里的占位符与 ThemeColors 的字段一一对应：新增字段必须同时在这里加
+// 一次 replace，否则 QSS 里会留下没被替换的 @xxx 而静默失效。
 QString BuildStyleSheet(const ThemeColors& colors) {
   // QSS 写成带占位符的模板：样式结构固定在下面这段文本里，
   // 具体颜色在函数末尾统一替换，避免把颜色散进十几个小字符串。

@@ -37,7 +37,7 @@ class BackupEngine {
   bool Backup(const std::string& source_directory,
               const std::string& archive_file, std::string* error_message);
 
-  // 带筛选的版本：Filter 决定哪些条目进入归档；不传则等价于 PR #8 行为。
+  // 带筛选的版本：Filter 决定哪些条目进入归档；不传则等价于无规则行为。
   bool Backup(const std::string& source_directory,
               const std::string& archive_file, const Filter& filter,
               std::string* error_message);

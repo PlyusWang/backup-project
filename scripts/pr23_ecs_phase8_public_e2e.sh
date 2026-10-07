@@ -6,7 +6,7 @@
 #   bash scripts/pr23_ecs_phase8_public_e2e.sh
 #
 # 与 Phase 5 的区别：Phase 5 走 ssh -L 隧道（连本地端口），这一步客户端连的就是
-# 公网地址 8.130.9.200:18765 本身。
+# 公网地址 39.101.77.9:18765 本身。
 #
 # 「零 SSH」怎么证明（不是靠嘴说）：
 #   1. 全程统计 ssh 进程数，前后 delta 必须为 0；
@@ -25,7 +25,7 @@ ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT_DIR"
 
 SERVER_ID="backup-project-cloud-production"
-PUBLIC_HOST="8.130.9.200"
+PUBLIC_HOST="39.101.77.9"
 PUBLIC_PORT=18765
 USER_NAME="phase8-public-user"
 ACCOUNT_PASSWORD="phase8-public-password"

@@ -1,6 +1,6 @@
 // include/remote_backup_client.h
 //
-// PR #20：远程备份客户端。
+// 远程备份客户端。
 //
 // **CLI 与 Modern GUI 共用这一个客户端**：不存在"CLI 一套 socket、GUI 再写
 // 一套 socket"的结构。它只负责：
@@ -66,7 +66,7 @@ struct RemoteSnapshotInfo {
   std::string sha256;
   std::uint64_t created_at = 0;
 
-  // ---- PR #21：远端增量链 ----
+  // ---- 远端增量链 ----
   //
   // 这些字段**只用来定位与展示**。它们来自服务端元数据，因此在恢复路径上
   // 永远不能替代"下载到的实际字节 + SHA-256 验证"（见
@@ -159,7 +159,7 @@ class RemoteArchiveClient {
                          RemoteSnapshotInfo* uploaded,
                          std::string* error_message);
 
-  // PR #21：带链关系的上传。与上一个函数的差别只有 UPLOAD_BEGIN 里多声明的
+  // 带链关系的上传。与上一个函数的差别只有 UPLOAD_BEGIN 里多声明的
   // 三个字段（类型 / 父 id / lineage）以及 UPLOAD_END 响应里多回来的
   // （类型 / generation / 父 id）。服务端会校验父必须存在、属于同一个用户、
   // lineage 相同，并自己推导 generation。

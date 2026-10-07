@@ -1,6 +1,6 @@
 // realtime_watcher.h
 //
-// PR #19：递归 inotify watcher（纯 C++17 / Linux，不依赖 Qt）。
+// 递归 inotify watcher（纯 C++17 / Linux，不依赖 Qt）。
 //
 // 职责边界（写死在接口上）：watcher 只回答"源树里哪里发生了**可能影响源树**的
 // 变化"，并给出三类信号：

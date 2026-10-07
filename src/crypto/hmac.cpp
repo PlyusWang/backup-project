@@ -9,6 +9,9 @@
 // 比较函数放在这里是因为它唯一的用途就是校验 MAC：用 memcmp 校验标签会在
 // 第一个不同字节处提前返回，攻击者可以用它逐字节把标签试出来。
 
+// 使用契约（见 include/crypto.h）：构造 → 任意次 Update → 恰好一次 Final。
+// Final 之后对象不可复用（外层哈希已经收尾），本类没有 Reset，调用方每次校验都
+// 新建实例。密钥由调用方从 PBKDF2 派生后传入，本文件不接触口令本身。
 #include <cstring>
 
 #include "crypto.h"
@@ -76,6 +79,9 @@ void HmacSha256::Compute(const void* key, std::size_t key_size,
   hmac.Final(out);
 }
 
+// Raw 返回 32 字节原始摘要（可能含 0x00，不能当 C 字符串用），用于写二进制头部
+// 或做内存比较；Hex 返回 64 个小写十六进制字符，只用于日志、诊断和人眼比对。
+// 两者算的是同一个 MAC，选哪个只是表示形式的差别。
 std::string HmacSha256Raw(const std::string& key, const std::string& data) {
   unsigned char digest[kSha256DigestSize];
   HmacSha256::Compute(key.data(), key.size(), data.data(), data.size(), digest);
@@ -88,6 +94,8 @@ std::string HmacSha256Hex(const std::string& key, const std::string& data) {
   return ToHex(digest, sizeof(digest));
 }
 
+// 指针为空且 size != 0 时返回 false（fail-closed：比不了就当作不相等）；
+// size == 0 返回 true 表示两个空串相等，长度不等的情形由 string 重载先挡掉。
 bool ConstantTimeEquals(const void* a, const void* b, std::size_t size) {
   if (size == 0) return true;
   if (a == nullptr || b == nullptr) return false;

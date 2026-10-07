@@ -1,7 +1,7 @@
 // SegmentedTabs.qml
 //
 // 分段控件：一个圆角容器里放若干个等宽分段，选中项用强调色，其余用容器的
-// 中性底色。人工验收的结论是"登录 / 注册"以前只是两个各自独立的按钮，看起来
+// 中性底色。"登录 / 注册"以前只是两个各自独立的按钮，看起来
 // 像可以同时按；分段控件把它们表达成"二选一"，一眼就能看出当前在哪一页。
 //
 // 它**不**新造视觉体系，每一个取值都来自设计系统里已有的东西：
@@ -73,14 +73,17 @@ Item {
                         radius: 6
                         color: segment.active ? theme.accent : "transparent"
 
-                        // hover 覆盖层：固定色 + 只动画 opacity（与 AppButton 同一条规则）。
+                        // hover 覆盖层：固定色 + 只动画 opacity
+                        // （与 AppButton 同一条规则）。
                         Rectangle {
                             anchors.fill: parent
                             radius: parent.radius
                             color: theme.hover
                             opacity: (!segment.active && segment.hovered &&
                                       segment.enabled) ? 1 : 0
-                            Behavior on opacity { NumberAnimation { duration: 110 } }
+                            Behavior on opacity {
+                                NumberAnimation { duration: 110 }
+                            }
                         }
                     }
 
@@ -89,11 +92,15 @@ Item {
                         horizontalAlignment: Text.AlignHCenter
                         verticalAlignment: Text.AlignVCenter
                         font.pixelSize: 16
-                        font.weight: segment.active ? Font.DemiBold : Font.Normal
+                        font.weight: segment.active
+                            ? Font.DemiBold
+                            : Font.Normal
                         color: {
                             if (!segment.enabled)
                                 return theme.textDisabled
-                            return segment.active ? "#ffffff" : theme.textPrimary
+                            return segment.active
+                                ? "#ffffff"
+                                : theme.textPrimary
                         }
                     }
 
@@ -116,7 +123,8 @@ Item {
             if (String(control.model[i]["key"]) === control.currentKey)
                 index = i
         }
-        const next = (index + delta + control.model.length) % control.model.length
+        const next =
+            (index + delta + control.model.length) % control.model.length
         control.activated(String(control.model[next]["key"]))
     }
 }

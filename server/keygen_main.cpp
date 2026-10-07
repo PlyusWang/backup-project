@@ -11,6 +11,18 @@
 //
 // 客户端拿到的 pin 就是这里打印的 "sha256:<指纹>" 或 "hex:<公钥>"。
 
+// ---- 本文件的实现边界 ----
+//
+// 这个工具只做两件事：生成新的服务端传输身份私钥，或从已有私钥文件打印公钥
+// 与指纹。它不参与握手、不读网络配置、不改任何其它文件。
+//
+// 安全边界（与 secure_transport 的约定一致）：私钥只由 SaveTransportIdentity
+// 写到 --output 指定的文件（0600、O_NOFOLLOW、必须是普通文件），已存在时明确
+// 拒绝覆盖 —— 不会悄悄换掉一个正在服役的身份；本文件从头到尾不打印、不记录
+// 私钥内容，输出只有公钥与指纹这两个公开值。
+//
+// 退出码是脚本接口：0 成功 / 1 运行失败 / 2 用法错误；诊断走 stderr，正常输出
+// 走 stdout，所以把本工具接进管道是安全的。
 #include <cstdio>
 #include <string>
 
@@ -19,11 +31,14 @@
 
 namespace {
 
+// usage 按调用场景分流：--help 走 stdout（成功），参数错误走 stderr（失败），
+// 所以管道里不会混进用法文本。
 void PrintUsage(std::FILE* out, const char* program) {
   std::fprintf(
       out,
       "用法:\n"
-      "  %s --output <文件>              生成新的传输身份私钥（0600，不覆盖已有文件）\n"
+      "  %s --output <文件>              "
+      "生成新的传输身份私钥（0600，不覆盖已有文件）\n"
       "  %s --show --key-file <文件>     打印已有私钥对应的公钥与指纹\n"
       "\n"
       "私钥只写在 --output 指定的文件里，不打印、不进日志、不进 Git。\n"
@@ -34,6 +49,8 @@ void PrintUsage(std::FILE* out, const char* program) {
       program, program);
 }
 
+// 只输出公开材料：公钥 hex、SHA-256 指纹，以及两种可直接粘进 --server-key 的
+// 写法。identity 里的私钥字段在这里从不被读取。
 void PrintKeyMaterial(const backupproject::net::TransportIdentity& identity) {
   const std::string hex =
       backupproject::crypto::X25519FormatKeyHex(identity.public_key);
@@ -48,6 +65,9 @@ void PrintKeyMaterial(const backupproject::net::TransportIdentity& identity) {
 
 }  // namespace
 
+// 手写参数解析（工具足够小，不引入命令行库）。两条互斥的用法在解析之后统一
+// 校验：--show 必须配 --key-file，生成必须配 --output，混用一律按用法错误
+// （退出码 2）拒绝，而不是取其中一个继续跑。
 int main(int argc, char** argv) {
   const char* program = argc > 0 ? argv[0] : "backup-server-keygen";
   std::string output_path;
@@ -94,7 +114,8 @@ int main(int argc, char** argv) {
       return 2;
     }
     backupproject::net::TransportIdentity identity;
-    if (!backupproject::net::LoadTransportIdentity(key_file, &identity, &error)) {
+    if (!backupproject::net::LoadTransportIdentity(key_file, &identity,
+                                                   &error)) {
       std::fprintf(stderr, "Error: %s\n", error.c_str());
       return 1;
     }

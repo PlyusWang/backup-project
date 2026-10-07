@@ -1,6 +1,6 @@
 // incremental_backup.h
 //
-// PR #18：把"增量策略"接在既有备份流水线上。
+// 把"增量策略"接在既有备份流水线上。
 //
 // 一次增量备份要回答三个问题，这个模块就是这三个问题本身：
 //
@@ -69,7 +69,7 @@ std::string SnapshotManifestFileName(const std::string& snapshot_file_name);
 //   * 规则变了：有效备份集合变了，把"因为规则变化而不再包含的路径"当成一堆
 //     tombstone 去删，是拿用户的数据赌一个配置改动；
 //   * pack/compression/encryption 变了：同一条链里的 delta 必须用同一套参数
-//     才能被正确应用（见 PR18 设计第 13 节），跨参数继续链是不合法的。
+//     才能被正确应用，跨参数继续链是不合法的。
 //
 // ---- 为什么它还必须绑定"这一个 .bak"（BPIDENT2）----
 //
@@ -166,7 +166,8 @@ struct SnapshotIdentity {
 //
 // 顺序是硬的：
 //   1.
-//   文件名必须是仓库的直接子项、普通文件、非符号链接（BackupCatalog::Resolve）；
+//   文件名必须是仓库的直接子项、普通文件、
+//   非符号链接（BackupCatalog::Resolve）；
 //   2. delta：ReadDeltaEnvelope（信封布局 + 字段边界 + 自摘要）
 //      → VerifyDeltaPayload（**实际 payload 字节**的 SHA-256
 //      必须等于信封声明值） → 才认 snapshot_id / payload_sha256；
@@ -288,7 +289,7 @@ struct RetentionPlan {
   // 如实记下来，让调用方报出去，而不是替用户猜一个删除集合。
   std::vector<std::string> unreadable;
 
-  // 依赖不确定性（本轮新增的 fail-closed 语义）。
+  // 依赖不确定性（fail-closed 语义）。
   //
   // 只要**任何一个必须保留的点**的依赖链无法完整解析——它自己读不出来、父缺失、
   // 父的绑定无效、payload 与声明不符、成环——"哪些更老的候选可能是它的祖先"

@@ -1,6 +1,6 @@
 // include/network_protocol.h
 //
-// PR #20：BPNET1 —— 远程备份的线上协议。
+// BPNET1 —— 远程备份的线上协议。
 //
 // 这一层只负责"把结构化消息变成字节、再从字节变回来"，不碰备份语义：
 // 它不知道什么是归档、什么是增量链，只知道帧、字段和错误码。
@@ -60,7 +60,7 @@ inline constexpr std::size_t kSha256HexBytes = 64;
 // 一个 LIST 响应里最多多少条（防止一帧被撑爆）。
 inline constexpr std::uint32_t kMaxListEntries = 4096;
 
-// PR #21：远端链的 lineage 标识。它必须正好是 64 个小写十六进制字符
+// 远端链的 lineage 标识。它必须正好是 64 个小写十六进制字符
 // （与 SHA-256 十六进制同形，因此复用同一个校验器），含义是"这条增量链
 // 属于哪个源 + 哪个远端仓库身份"的摘要。客户端与服务端都不解释它的内容，
 // 只做**相等**比较：父与子的 lineage 不同就是跨链，直接拒绝。
@@ -92,7 +92,7 @@ inline constexpr std::uint64_t kDefaultMaxUploadBytes =
 // ---- 操作码 ----
 //
 // 每个操作码的 payload 字段（**顺序即线上顺序**，整数一律大端，字符串一律
-// u16 长度前缀 + 原始字节）。PR #21 新增的字段都用 (PR21) 标出来，它们都追加
+// u16 长度前缀 + 原始字节）。后加的字段都用 (追加) 标出来，它们都追加
 // 在原有字段**之后**：旧客户端会在"读不到 / 有尾巴"处被明确拒绝，不做兼容猜测。
 //
 //   kPing          请求: 空
@@ -108,22 +108,22 @@ inline constexpr std::uint64_t kDefaultMaxUploadBytes =
 //                  响应: u32 count, 然后每项
 //                        string snapshot_id, string display_name,
 //                        string sha256, u64 size_bytes, u64 created_at,
-//                        u16 snapshot_kind (PR21), u64 generation (PR21),
-//                        string parent_snapshot_id (PR21), string lineage
-//                        (PR21)
+//                        u16 snapshot_kind (追加), u64 generation (追加),
+//                        string parent_snapshot_id (追加), string lineage
+//                        (追加)
 //   kUploadBegin   请求: string display_name, u64 declared_size,
 //                        string declared_sha256,
-//                        u16 snapshot_kind (PR21),
-//                        string parent_snapshot_id (PR21), string lineage
-//                        (PR21)
+//                        u16 snapshot_kind (追加),
+//                        string parent_snapshot_id (追加), string lineage
+//                        (追加)
 //                  响应: 空
 //   kUploadChunk   请求: 裸字节块（<= 256 KiB，长度由帧头承载）
 //                  响应: 空
 //   kUploadEnd     请求: 空
 //                  响应: string snapshot_id, string sha256, u64 size_bytes,
-//                        u64 created_at, u16 snapshot_kind (PR21),
-//                        u64 generation (PR21), string parent_snapshot_id
-//                        (PR21)
+//                        u64 created_at, u16 snapshot_kind (追加),
+//                        u64 generation (追加), string parent_snapshot_id
+//                        (追加)
 //   kDownloadBegin 请求: string snapshot_id
 //                  响应: string display_name, string sha256, u64 size_bytes
 //   kDownloadChunk 请求: 空；响应: 裸字节块（空 payload = 流结束）
@@ -132,9 +132,9 @@ inline constexpr std::uint64_t kDefaultMaxUploadBytes =
 //   kDeleteAccount 请求: string password；响应: 空
 //   kError         响应: 空（原因只写服务端日志）
 //
-// PR #21 的语义补充：snapshot_kind 0 = 完整快照、1 = 增量；parent_snapshot_id
+// 语义补充：snapshot_kind 0 = 完整快照、1 = 增量；parent_snapshot_id
 // 为空串表示"没有父"（完整快照）；lineage 为空串表示"不属于任何链的独立快照"
-// （PR #20 时代的旧数据与低层 remote upload 都是这一类）。generation 由
+// （旧版写出的数据与低层 remote upload 都是这一类）。generation 由
 // **服务端**按父推导，客户端不发送它。
 
 enum class Opcode : std::uint16_t {
@@ -190,11 +190,11 @@ enum class Status : std::uint32_t {
   kInternalError = 9,
   kUnsupportedVersion = 10,
   kMalformedFrame = 11,
-  // 该操作码在当前构建里还没有实现。PR20 是分阶段提交的：第一个 commit
-  // 只有协议、帧循环与 PING，之后的 commit 才把其余操作码一个个接上。
+  // 该操作码在当前构建里还没有实现。协议是分阶段落地的：最初只有
+  // 帧循环与 PING，之后才把其余操作码一个个接上。
   // 在那之前服务端如实回答"不支持"，不假装成功。
   kUnsupported = 12,
-  // PR #21 审查修复：远端增量链的边界条件不成立。四种情况共用这一个码：
+  // 远端增量链的边界条件。四种情况共用这一个码：
   // 父快照已经被删除、lineage 不同、代数不是父+1、父已经有活着的孩子
   // （本产品是线性链），以及代数超过本地引擎能恢复的上限。
   // 单独一个码是为了让界面能说清"这是链的问题"，而不是笼统的"请求不合法"。

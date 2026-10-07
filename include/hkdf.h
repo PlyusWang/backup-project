@@ -1,6 +1,6 @@
 // include/hkdf.h
 //
-// PR #21：手写 HKDF-SHA256（RFC 5869）。
+// 手写 HKDF-SHA256（RFC 5869）。
 //
 // 传输加密的密钥派生用它：X25519 得到的两份共享秘密进 HKDF-Extract，
 // 再用 HKDF-Expand 按**标签**导出方向分离的加密/MAC 密钥与握手完成密钥。

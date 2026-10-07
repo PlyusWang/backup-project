@@ -40,7 +40,7 @@ namespace backup_modern {
 // Filter / FilterAction，不必到处加限定名。
 using Filter = backupproject::Filter;
 using FilterAction = backupproject::FilterAction;
-// PR #18：策略与触发方式是 Qt 无关的共享核心类型，别名只为少写限定名。
+// 策略与触发方式是 Qt 无关的共享核心类型，别名只为少写限定名。
 using BackupStrategy = backupproject::BackupStrategy;
 using BackupTrigger = backupproject::BackupTrigger;
 
@@ -106,6 +106,21 @@ class BackupController : public QObject {
   // 三个 status* 属性是分开的：kind 决定 banner 的颜色和图标，
   // title 与 message 是两行文案。用不透明的字符串而不是 C++ enum，
   // 是为了让 QML 直接做判断，将来加一种状态也不必注册新类型。
+  // 备份选项的显示名（手动 / 自动 / 实时三个页面共用）。
+  //
+  // 为什么放在这里：三个页面各自写了一份，而且手动页写 "MyPack"、
+  // 另两页写 "MyPack（推荐）"，同一个下拉在不同页面显示不同文字。
+  // 文案属于 GUI 层，所以不进共享核心；键与合法组合仍然由
+  // backup_mode.h / backup_option_keys.h 的真值表决定（CLI 与 GUI 同一张）。
+  //
+  // 顺序与对应的 key 一一对应，QML 侧用 indexOf(key) 取下标。
+  Q_PROPERTY(
+      QStringList optionStrategyLabels READ optionStrategyLabels CONSTANT)
+  Q_PROPERTY(QStringList optionPackLabels READ optionPackLabels CONSTANT)
+  Q_PROPERTY(
+      QStringList optionCompressionLabels READ optionCompressionLabels CONSTANT)
+  Q_PROPERTY(
+      QStringList optionEncryptionLabels READ optionEncryptionLabels CONSTANT)
   Q_PROPERTY(bool busy READ busy NOTIFY busyChanged)
   Q_PROPERTY(QString statusKind READ statusKind NOTIFY statusChanged)
   Q_PROPERTY(QString statusTitle READ statusTitle NOTIFY statusChanged)
@@ -166,6 +181,10 @@ class BackupController : public QObject {
     archive_deleted_observer_ = observer;
   }
 
+  QStringList optionStrategyLabels() const;
+  QStringList optionPackLabels() const;
+  QStringList optionCompressionLabels() const;
+  QStringList optionEncryptionLabels() const;
   bool busy() const { return busy_; }
   QString statusKind() const { return status_kind_; }
   QString statusTitle() const { return status_title_; }
@@ -198,7 +217,7 @@ class BackupController : public QObject {
   Q_INVOKABLE bool addFilterRule(const QString& action, const QString& rule);
   // 按界面列表顺序删除：先 include，后 exclude。
   Q_INVOKABLE bool removeFilterRule(int index);
-  // 清空所有规则：回到"没有筛选"的 PR #8 行为。
+  // 清空所有规则：回到"没有筛选"的既有行为。
   Q_INVOKABLE void clearFilterRules();
 
   // ---- 产品入口 ----
@@ -211,7 +230,7 @@ class BackupController : public QObject {
   // 界面不再要求用户填写归档完整路径。
   // 产物是 v2 container：界面展示的 uid / gid / symlink / FIFO 只有 v2 装得下，
   // v0.1 会把它们丢掉或者直接失败。
-  // 这个入口保持 PR #15 的行为一字不变，等价于 MyPack + 不压缩 + 不加密。
+  // 这个入口保持既有行为一字不变，等价于 MyPack + 不压缩 + 不加密。
   Q_INVOKABLE bool startBackup();
   // 带显式算法选择的备份入口。三个 key 的取值见本文件顶部的映射表；
   // 未知 key、以及"选了加密但密码为空 / 两次不一致"都在启动后台线程之前失败。
@@ -221,7 +240,7 @@ class BackupController : public QObject {
                                           const QString& encryption_key,
                                           const QString& password,
                                           const QString& confirm_password);
-  // PR #18：带策略的入口。strategy_key 取 "full" / "incremental"。
+  // 带策略的入口。strategy_key 取 "full" / "incremental"。
   // startBackupWithOptions 就是它加 "full"，旧调用方一字不改。
   //
   // 组合是否被支持只问共享核心的 IsSupportedBackupMode，界面不自己判断：
@@ -322,10 +341,10 @@ class BackupController : public QObject {
     backupproject::RestoreOptions restore_options;
     // true 时恢复走带 options 的 v2 入口。只有"用户真的输入了恢复密码"这一条
     // 路径会把它置 true；false 时走按 magic 分流的旧入口，legacy v0.1 与未加密
-    // 的 v2 都靠它，行为与 PR #15 完全一致。
+    // 的 v2 都靠它，保持既有行为完全一致。
     bool restore_is_v2 = false;
 
-    // ---- PR #18：增量备份 ----
+    // ---- 增量备份 ----
     //
     // 策略是备份的第二个维度，不是第二种操作：kind 仍然是 kBackup，
     // 后台线程只是改走增量引擎。仓库、快照名与规则原文一起带过去，

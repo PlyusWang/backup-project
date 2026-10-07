@@ -1,6 +1,6 @@
 // file_system.cpp
 //
-// Sprint 1 文件系统层的实现。整棵目录树的递归复制都在这个文件里，
+// 文件系统层的实现。整棵目录树的递归复制都在这个文件里，
 // 只处理普通目录和普通文件。
 //
 // 复制循环没有用 std::ifstream 之类的现成封装，而是直接 read / write：
@@ -145,6 +145,7 @@ bool IsSameOrDescendantPath(const fs::path& base, const fs::path& candidate) {
 }  // namespace
 
 // 拼接路径。父路径末尾有没有 '/' 都行，结果保证只有一个分隔符。
+// 纯字符串拼接：不化简 “..”，也不检查 parent 是不是目录（那是调用方的事）。
 std::string FileSystem::JoinPath(const std::string& parent,
                                  const std::string& child) {
   if (parent.empty() || parent.back() == '/') {
@@ -157,6 +158,8 @@ std::string FileSystem::JoinPath(const std::string& parent,
 // 这里故意用 lstat 而不是 stat：stat 会跟着软链接走，lstat 不会。
 // v0.1 要的是“识别出软链接并拒绝它”，而不是偷偷复制链接目标，
 // 所以必须用 lstat。
+// 返回 kOther 而不是在这里直接拒绝，是因为“软链接能不能接受”取决于调用方：
+// 备份侧拒绝它（避免跟着链接跑到源树外面），将来做归档解包时另有规则。
 FileSystem::PathStatus FileSystem::InspectPath(const std::string& path,
                                                std::string* error_message) {
   struct stat info;
@@ -321,6 +324,8 @@ bool FileSystem::IsMissingOrEmptyDirectory(const std::string& path,
 // 复制单个普通文件，整个函数就是“读一块、写一块”的循环。
 // 两个容易踩的坑都显式处理：read 不一定给满整个缓冲区；
 // write 也不保证一次写完，所以写侧再套一层循环，直到全部落盘。
+// 非原子：失败会在目标留下一个截断的文件，调用方必须把整次调用当成失败、
+// 把目标目录视为不可用。本函数不回滚，也不删除自己写出的半个文件。
 bool FileSystem::CopyRegularFile(const std::string& source,
                                  const std::string& destination,
                                  std::string* error_message) {
@@ -413,6 +418,7 @@ bool FileSystem::CopyRegularFile(const std::string& source,
 }
 
 // 对外的复制入口：整次复制只做一次拓扑检查，然后把活交给 CopyTreeInternal。
+// 失败时 error_message 是唯一的原因出口；成功路径保证它为空（入口先 clear）。
 bool FileSystem::CopyTree(const std::string& source,
                           const std::string& destination,
                           std::string* error_message) {
@@ -460,6 +466,9 @@ bool FileSystem::IsDestinationOutsideSource(const std::string& source,
 // 目录：先建目标目录，再逐个孩子递归；普通文件：复制内容；
 // 其他类型（软链接、FIFO、设备、socket）：明确失败。
 // 任何一层失败整次调用都失败——宁可备份不完整，也不生成“看似成功”的备份。
+// 递归用的是调用栈，深度受源树深度限制：极深的目录树会撞到栈上限，v0.1
+// 不做显式深度限制。复制的是内容而不是元数据 —— 权限、属主、时间戳一律
+// 不保留，硬链接也会被展开成各自独立的副本（inode 关系丢失）。
 bool FileSystem::CopyTreeInternal(const std::string& source,
                                   const std::string& destination,
                                   std::string* error_message) {

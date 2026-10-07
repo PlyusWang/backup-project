@@ -1,5 +1,12 @@
 // app_paths.cpp
 
+// 职责：把 XDG 规则翻译成本产品的配置目录与配置文件名；不创建目录、
+// 不检查可写性、不读配置文件内容 —— 那些是调用方与 ConfigManager 的事。
+// 数据流：环境变量 -> GenericConfigDirectory -> AppConfigDirectory
+// （<config>/<组织>/<应用>）-> AppConfigFilePath -> Default*FilePath。
+// 失败契约：不抛异常；Default*FilePath 没有 error 出口，用空串表示失败，
+// 调用方必须把空串当失败处理。无缓存，每次调用重新读环境变量：测试里
+// setenv 之后同进程内立刻生效。
 #include "app_paths.h"
 
 #include <cstdlib>
@@ -17,6 +24,8 @@ bool IsAbsolutePath(const std::string& path) {
   return !path.empty() && path[0] == '/';
 }
 
+// 空串与“未设置”同等对待：XDG_CONFIG_HOME= 这种“清空而不是删除”的写法
+// 在 shell 与 CI 里很常见，它不能被当成一个有效目录。
 const char* NonEmptyEnvironment(const char* name) {
   const char* value = std::getenv(name);
   if (value == nullptr || value[0] == '\0') return nullptr;
@@ -33,6 +42,8 @@ std::string StripTrailingSlashes(const std::string& path) {
 
 }  // namespace
 
+// 只算目录名，不创建。HOME 不是绝对路径时返回空串，而不是退化成
+// “/.config”：宁可让上层明确失败，也不把配置写到根目录去。
 std::string GenericConfigDirectory() {
   const char* xdg_config_home = NonEmptyEnvironment("XDG_CONFIG_HOME");
   if (xdg_config_home != nullptr &&
@@ -62,6 +73,9 @@ bool AppConfigDirectory(std::string* directory, std::string* error_message) {
   return true;
 }
 
+// 路径边界：file_name 必须是单一分量，空串或含 '/' 一律拒绝。当前所有
+// 调用点传的都是编译期常量，外部输入到不了这里；将来若有动态名字传入，
+// 必须在这里补上对 “..” 之类的拦截。
 bool AppConfigFilePath(const std::string& file_name, std::string* path,
                        std::string* error_message) {
   if (path == nullptr) {
@@ -81,6 +95,8 @@ bool AppConfigFilePath(const std::string& file_name, std::string* path,
   return true;
 }
 
+// 三个 Default* 入口只差文件名：目录布局改动时只需要改上面的函数，
+// 文件名各自保持稳定（老用户的配置不会因为改名而“消失”）。
 std::string DefaultConfigFilePath() {
   std::string path;
   std::string error;

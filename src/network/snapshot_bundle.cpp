@@ -2,6 +2,23 @@
 //
 // BPSNAP1 的实现。格式与信任链的说明见 include/snapshot_bundle.h。
 
+// 职责：把三件套（.bak / .manifest / .identity）装进一个
+// BPSNAP1 容器，以及从容器里取出并逐成员校验。
+// 它不解释成员内部的字节——归档格式仍然完全由增量引擎拥有。
+//
+// 数据流：打包时先对三个源文件各做一遍流式摘要（不整份读进内存），
+// 再写包头并逐个成员复制，复制的同时对真正写进去的字节再算一次摘要并与第一遍比
+// 对。解包时反向：先索引成员表，再按索引把数据写成临时文件并逐个校验，
+// 全部通过后才发布。
+//
+// 安全边界：bundle 是**本地文件且随时可能被改写**，不能当可信输入。
+// 所有写入路径只用第一遍已校验过的成员名拼接，两次解析之间被改写只会导致失败；
+// 打开源文件用 O_NOFOLLOW 并要求 S_ISREG，发布一律
+// NoReplace。
+//
+// 失败语义：任何一步失败都不留下半成品——临时文件 unlink，
+// 已发布的成员回滚，输出参数 info 保持被清空的状态。错误只走
+// error_message，不用异常。
 #include "snapshot_bundle.h"
 
 #include <fcntl.h>
@@ -21,13 +38,24 @@ namespace backupproject {
 namespace net {
 namespace {
 
+// 复制缓冲区大小。与传输块同一量级：任何一份归档都不会被整份读进内存，
+// 缓冲区只分配一次并在所有成员之间复用。
 constexpr std::size_t kCopyChunkBytes = 256u * 1024u;
+// magic 含结尾的 NUL，正好 8 字节，因此比较时按整个数组 memcmp。
+// 这个字面量就是磁盘格式的一部分，改动等于换协议。
 constexpr const char kBundleMagic[8] = {'B', 'P', 'S', 'N',
                                         'A', 'P', '1', '\0'};
 constexpr std::size_t kSha256Bytes = crypto::kSha256DigestSize;
 
+// 调用点必须在任何可能改写 errno 的操作**之前**取值：
+// 典型写法是先存进局部变量，再 close()、再拼错误消息。否则报出来的会是
+// close 的 errno 而不是真正的失败原因。
 std::string StrerrorText() { return std::string(std::strerror(errno)); }
 
+// 路径边界的第一道闸：只接受不含路径分隔符、不含 NUL 的单组件名字，
+// 且长度不超过 255。成员名后面会被拼成缓存目录里的文件名、写进
+// .remote-index.tsv 的一行，因此 '..'
+// 逃逸与索引注入都在这里被挡住。
 bool IsSingleComponentName(const std::string& name) {
   if (name.empty() || name == "." || name == "..") {
     return false;
@@ -49,6 +77,10 @@ bool IsSingleComponentName(const std::string& name) {
   return name.size() <= kSnapshotBundleMaxNameBytes;
 }
 
+// 本地大端原语，与 network_protocol.cpp
+// 里那一套是**两份独立实现**：两者格式相同但归属不同的协议，
+// 不共享是为了让任一边的格式改动不会静默影响另一边。同样是手工移位，
+// 不写结构体。
 void AppendU16(std::string* out, std::uint16_t value) {
   out->push_back(static_cast<char>((value >> 8) & 0xFFu));
   out->push_back(static_cast<char>(value & 0xFFu));
@@ -73,6 +105,9 @@ std::uint64_t LoadU64(const unsigned char* data) {
   return value;
 }
 
+// 循环写满并处理 EINTR。失败时可能已经写出去一部分字节，
+// 所以调用方的处理方式是**丢弃整个临时文件**，而不是就地修补：半截
+// bundle没有任何可用的恢复语义。
 bool WriteAll(int fd, const void* data, std::size_t size,
               std::string* error_message) {
   const char* cursor = static_cast<const char*>(data);
@@ -100,6 +135,8 @@ bool WriteAll(int fd, const void* data, std::size_t size,
   return true;
 }
 
+// 循环读满。eof 只在“一个字节都没读到就遇到文件结尾”时为 true；
+// 读到一半结束属于材料被截断，是错误而不是正常结尾（错误消息会明确写出来）。
 bool ReadAll(int fd, void* data, std::size_t size, bool* eof,
              std::string* error_message) {
   if (eof != nullptr) {
@@ -134,6 +171,13 @@ bool ReadAll(int fd, void* data, std::size_t size, bool* eof,
 }
 
 // 打开并确认是普通文件、不跟随符号链接；同时给出大小。
+// O_NOFOLLOW 打开并要求 fstat 出来是普通文件：符号链接、目录、
+// 设备、FIFO 全部拒绝，避免把设备当成快照材料读，
+// 也避免顺着链接读到仓库之外。
+//
+// 这里只能保证“打开的这个 fd 是普通文件”；路径本身在之后仍可能被替换，
+// 所以后续所有读写都走这个 fd，绝不再按路径重开。失败时内部已把 fd 关掉，
+// 调用方不需要清理。
 bool OpenRegularFile(const std::string& path, int* fd, std::uint64_t* size,
                      std::string* error_message) {
   const int opened = ::open(path.c_str(), O_RDONLY | O_NOFOLLOW);
@@ -168,6 +212,9 @@ bool OpenRegularFile(const std::string& path, int* fd, std::uint64_t* size,
 }
 
 // 流式读一个文件并算出 SHA-256。
+// 流式摘要：固定缓冲区循环读，内存占用与文件大小无关。close
+// 失败也算失败（出错路径上的 close 反而更值得怀疑），函数只读源文件、
+// 不修改任何东西。
 bool HashFile(const std::string& path, std::string* sha256_hex,
               std::uint64_t* size, std::string* error_message) {
   int fd = -1;
@@ -206,6 +253,10 @@ bool HashFile(const std::string& path, std::string* sha256_hex,
   return true;
 }
 
+// 临时文件名 = 目标路径 + .part-<pid>-<index>。带 pid
+// 是为了让并发的两个进程（或同一进程的不同快照）不会互相覆盖临时文件；
+// 调用点统一先 unlink 再以 O_EXCL 创建，
+// 因此“同名残留”只可能来自上一轮崩溃，不会被误用。
 std::string PartPathFor(const std::string& target_path, std::size_t index) {
   return target_path + ".part-" +
          std::to_string(static_cast<long>(::getpid())) + "-" +
@@ -213,6 +264,16 @@ std::string PartPathFor(const std::string& target_path, std::size_t index) {
 }
 
 // 读 bundle 的成员表（不解包）。
+// 只读成员表，不碰数据区。校验顺序：magic -> version ->
+// 成员数（必须正好 3）-> 每个成员的名字长度、名字、数据长度与摘要。
+//
+// 每个长度都先比上限再使用：名字长度限制在 1..255，成员长度限制在
+// kSnapshotBundleMaxMemberBytes 且**不允许为
+// 0**——写侧从不产出空成员，读侧接受它就等于承认一种只能由攻击者构造的状态。
+//
+// 数据区用 lseek 跳过而不是读进来：一份 16 GiB
+// 的成员不应该为了让调用方看到索引而被读一遍。函数返回时 fd
+// 的位置停在最后一个成员的数据之后。
 bool ReadBundleIndex(int fd, const std::string& bundle_path,
                      SnapshotBundleInfo* info, std::string* error_message) {
   unsigned char header[kSnapshotBundleHeaderSize];
@@ -303,6 +364,10 @@ bool ReadBundleIndex(int fd, const std::string& bundle_path,
 }
 
 // 成员名必须正好是 <archive> / <archive>.manifest / <archive>.identity。
+// 成员名必须严格由第一个成员（归档名）派生：archive、
+// archive.manifest、archive.identity，
+// 名字对不上就整体拒绝。这样“三件套属于同一份快照”这件事由命名规则保证，
+// 而不是靠调用方自觉。
 bool MembersMatchArchive(const SnapshotBundleInfo& info,
                          std::string* error_message) {
   if (info.members.size() != kSnapshotBundleMemberCount) {
@@ -329,6 +394,16 @@ bool MembersMatchArchive(const SnapshotBundleInfo& info,
 
 }  // namespace
 
+// 两遍扫描：第一遍只算长度与摘要（确认三个文件都能读、都不是空文件、
+// 都没超上限），第二遍才真正复制。
+// 先索引再复制的理由是失败要趁早——源文件缺失或超限时一个字节都不必写。
+//
+// 发布语义：全程写 <目标>.part-<pid>-0，成功才 fsync +
+// NoReplace 改名。目标已存在时明确失败，不覆盖：
+// 一份已经上传过的包不能被本地重试悄悄换掉。
+//
+// 失败路径统一 unlink 临时文件；源文件自始至终以只读方式打开，
+// 打包不会修改仓库里的任何东西。
 bool BuildSnapshotBundle(const std::string& repository_directory,
                          const std::string& archive_name,
                          const std::string& bundle_path,
@@ -385,6 +460,9 @@ bool BuildSnapshotBundle(const std::string& repository_directory,
   }
 
   // 第二遍：写包头 + 逐个成员复制数据。
+  // 先 unlink 再 O_EXCL|0600 创建：0600
+  // 保证摘要材料不会在打包期间短暂暴露给同机的其它用户；O_EXCL
+  // 让“临时文件已存在”变成硬失败而不是静默复用别人的内容。
   const std::string part_path = PartPathFor(bundle_path, 0);
   ::unlink(part_path.c_str());
   const int out = ::open(part_path.c_str(), O_WRONLY | O_CREAT | O_EXCL, 0600);
@@ -435,6 +513,8 @@ bool BuildSnapshotBundle(const std::string& repository_directory,
       ok = false;
       break;
     }
+    // 长度检查是最便宜的一道门，但它只能发现变长或变短；
+    // **同长度**的改写要靠下面复制时的第二遍摘要。两道检查缺一不可。
     if (source_size != members[index].size) {
       if (error_message != nullptr) {
         *error_message =
@@ -538,6 +618,9 @@ bool BuildSnapshotBundle(const std::string& repository_directory,
     }
   }
 
+  // 发布前 fsync：文件名一旦出现就必须有完整内容，
+  // 否则崩溃会留下一个“名字在、内容空”的包，而它已经可能被上传。fsync
+  // 失败与写失败同等对待，同样放弃整包。
   if (ok && ::fsync(out) != 0) {
     if (error_message != nullptr) {
       *error_message = "fsync " + part_path + " 失败：" + StrerrorText();
@@ -574,6 +657,8 @@ bool BuildSnapshotBundle(const std::string& repository_directory,
   return true;
 }
 
+// 只读探测：只解析成员表并做命名一致性检查，不写任何文件。失败时 info
+// 保持被清空的状态，调用方拿到的永远是一份完整索引而不是半份。
 bool InspectSnapshotBundle(const std::string& bundle_path,
                            SnapshotBundleInfo* info,
                            std::string* error_message) {
@@ -598,6 +683,13 @@ bool InspectSnapshotBundle(const std::string& bundle_path,
   return MembersMatchArchive(*info, error_message);
 }
 
+// 两阶段提交：先把每个成员写进唯一临时文件、边写边算 SHA-256、
+// 长度与摘要都对得上才算通过；**全部成员都通过之后**才逐个
+// NoReplace 发布。
+//
+// 回滚语义：任一成员失败，本次所有临时文件都被删掉；
+// 发布阶段失败则连已经发布的成员一起撤回（只删本次创建的文件）。
+// 绝不留下一套缺件的三件套——缓存目录里的东西要么验证完整，要么不存在。
 bool ExtractSnapshotBundle(const std::string& bundle_path,
                            const std::string& target_directory,
                            SnapshotBundleInfo* info,
@@ -669,6 +761,8 @@ bool ExtractSnapshotBundle(const std::string& bundle_path,
       ok = false;
       break;
     }
+    // 路径只用**第一遍已校验过的**成员名拼接，因此不存在 ../ 逃逸；发布用
+    // NoReplace，目标已存在同名文件时明确失败，不覆盖缓存里已有的内容。
     const std::string final_path = target_directory + "/" + indexed.name;
     const std::string part_path = PartPathFor(final_path, i);
     ::unlink(part_path.c_str());
@@ -681,6 +775,9 @@ bool ExtractSnapshotBundle(const std::string& bundle_path,
       ok = false;
       break;
     }
+    // 边写边算：复制完立刻与包头声明的摘要比较，不符就把临时文件删掉。
+    // 摘要比较在数据落盘之后、发布之前，
+    // 所以永远不会有一个“已经发布但内容不对”的成员。
     crypto::Sha256 hasher;
     std::uint64_t remaining = data_size;
     while (remaining > 0) {
@@ -739,6 +836,9 @@ bool ExtractSnapshotBundle(const std::string& bundle_path,
 
   // 全部成员都验证通过之后才发布：任何一步失败都会把本次已经发布的成员撤掉，
   // 绝不留下一套缺件的三件套。
+  // 回滚范围由 published 界定：[0, published)
+  // 是本函数已经发布出去的成员，需要连同临时文件一起删；之后的我还在 .part
+  // 名下，删临时文件即可。
   std::size_t published = 0;
   for (; published < part_paths.size(); ++published) {
     std::string publish_error;

@@ -1,6 +1,6 @@
 // realtime_debouncer.h
 //
-// PR #19：Realtime 的 debounce / coalescing 状态机（纯状态，可注入时间）。
+// Realtime 的 debounce / coalescing 状态机（纯状态，可注入时间）。
 //
 // 为什么单独一个文件：把 debounce 逻辑散在 QTimer / shell sleep / 事件回调里，
 // 就会出现"每个 inotify 事件建一个 .bak"这种典型错误，而且无法测试。

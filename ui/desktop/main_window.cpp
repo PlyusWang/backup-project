@@ -24,7 +24,7 @@ namespace backup_gui {
 // 主题必须放在搭界面之后——QSS 依赖控件上已经设置好的 objectName。
 MainWindow::MainWindow(QWidget* parent) : QMainWindow(parent) {
   // 保留 GNOME 原生标题栏：自绘无边框标题栏会连带引入 Wayland、HiDPI、
-  // 拖拽、最大化、系统快捷键等一堆兼容问题，而这一轮的目标只是内部界面好看。
+  // 拖拽、最大化、系统快捷键等一堆兼容问题，而目标只是内部界面好看。
   setWindowTitle(QString::fromUtf8("备份工具"));
   resize(1100, 700);
   // 1100x700 在普通笔记本上排得比较舒服；

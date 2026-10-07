@@ -3,6 +3,16 @@
 // 窗口骨架：自绘标题栏 + 左侧导航 + 右侧页面区。
 // 页面切换只做 150ms 淡入，不做滑动/弹簧——现代感来自一致与克制，不是动画数量。
 
+// 这一层只做窗口外壳：页面数据、忙闲标志与错误文案全部来自 C++ 注册的
+// 上下文对象（controller / schedule / realtime / remote / theme），QML 只
+// 持有"当前在哪一页"以及由它派生的可见性。
+//
+// useNativeFrame 也是 C++ 传进来的（--native-frame），它同时决定自绘标题栏
+// 与四边缩放热区的可见性；几处绑定必须一致，否则会出现"有热区没标题栏"
+// 这种自相矛盾的窗口。
+//
+// 忙碌判定横跨四个对象：手动备份与恢复在 controller，计划与实时各自有
+// libraryBusy，远程在 remote；onClosing 是它们唯一的汇总点。
 import QtQuick
 import QtQuick.Controls.Basic
 import QtQuick.Layouts
@@ -23,9 +33,14 @@ ApplicationWindow {
     title: "备份工具"
     color: theme.background
 
-    // --native-frame 时退回 GNOME 原生标题栏：Wayland 下自绘标题栏万一表现不稳，
-    // 一条命令就能切回系统行为，不需要改 QML，也不需要复杂的 hack。
+    // --native-frame 时退回 GNOME 原生标题栏：
+    // Wayland 下自绘标题栏万一表现不稳，一条命令就能切回系统行为，
+    // 不需要改 QML，也不需要复杂的 hack。
     flags: useNativeFrame ? Qt.Window : (Qt.Window | Qt.FramelessWindowHint)
+    // 最大化状态从 visibility 反推，而不是自己维护一个 bool：窗口管理器
+    // 也能最大化（双击标题栏、快捷键），自维护的标志会和现实脱节。
+    // 无边框时自绘标题栏接管最小化 / 最大化 / 关闭，拖动与双击最大化交给
+    // 合成器；切换原生标题栏只是这一个窗口标志的差别，不需要平台代码。
     readonly property bool maximized: root.visibility === Window.Maximized
 
     // 核心没有取消能力，所以任务进行中一律不允许关窗，免得让用户以为
@@ -44,6 +59,11 @@ ApplicationWindow {
         }
     }
 
+    // 页面编号（跨语言契约：C++ 的 --screenshot 与自动化测试按号切页）：
+    //   0 首页 / 1 备份 / 2 自动备份 / 3 备份管理
+    //   4 设置 / 5 实时备份 / 6 远程备份
+    // 下面 StackLayout 的子项顺序必须与这套编号一致；dismissTransientMessage
+    // 里的分支也按同一套编号分发状态清理。
     // 当前页面索引；--screenshot 模式会直接从 C++ 改这个属性逐页抓图。
     property int currentPage: 0
     // 上一次停留的页面。用属性记住"离开的是哪一页"，而不是把清理逻辑塞进每个
@@ -76,6 +96,8 @@ ApplicationWindow {
     // 侧栏底部主题按钮要显示“当前是哪套主题”，所以直接读 theme.dark。
     function toggleTheme() { theme.toggle() }
 
+    // 布局：标题栏 + 主体（侧栏 + 页面区）两行一列。侧栏宽度写死 228 是
+    // 刻意的：它不随窗口宽度伸缩，窗口变宽只影响页面区，视觉上更稳定。
     ColumnLayout {
         anchors.fill: parent
         spacing: 0
@@ -111,16 +133,20 @@ ApplicationWindow {
                 Item { Layout.fillWidth: true }
 
                 AppButton {
-                    iconName: "minimize"; variant: "flat"; implicitWidth: 40; implicitHeight: 30
+                    iconName: "minimize"; variant: "flat";
+                    implicitWidth: 40; implicitHeight: 30
                     onClicked: root.showMinimized()
                 }
                 AppButton {
                     iconName: root.maximized ? "restore-window" : "maximize"
                     variant: "flat"; implicitWidth: 40; implicitHeight: 30
-                    onClicked: root.maximized ? root.showNormal() : root.showMaximized()
+                    onClicked: root.maximized
+                        ? root.showNormal()
+                        : root.showMaximized()
                 }
                 AppButton {
-                    iconName: "close"; variant: "flat"; implicitWidth: 40; implicitHeight: 30
+                    iconName: "close"; variant: "flat";
+                    implicitWidth: 40; implicitHeight: 30
                     // 和系统关闭走同一条路径：任务进行中会被 onClosing 拦下。
                     onClicked: root.close()
                 }
@@ -133,7 +159,9 @@ ApplicationWindow {
                 onActiveChanged: if (active) root.startSystemMove()
             }
             TapHandler {
-                onDoubleTapped: root.maximized ? root.showNormal() : root.showMaximized()
+                onDoubleTapped: root.maximized
+                    ? root.showNormal()
+                    : root.showMaximized()
             }
         }
 
@@ -243,6 +271,10 @@ ApplicationWindow {
                 }
             }
 
+            // 七页同时存在、只切 currentIndex：页面不重建，各页的临时状态
+            // （比如正在输入的口令）会跨页保留；离开时清掉的是提示，
+            // 不是用户输入。
+            // 子项顺序 = currentPage 编号，新增页面只能追加到末尾。
             // 页面区：七页叠在同一位置，切换时当前页淡入。
             StackLayout {
                 id: pageStack
@@ -252,41 +284,70 @@ ApplicationWindow {
 
                 HomePage {
                     opacity: root.currentPage === 0 ? 1 : 0
-                    Behavior on opacity { NumberAnimation { duration: 150; easing.type: Easing.OutCubic } }
-                    onNavigateTo: function (pageIndex) { root.currentPage = pageIndex }
+                    Behavior on opacity {
+                        NumberAnimation {
+                            duration: 150; easing.type: Easing.OutCubic
+                        }
+                    }
+                    onNavigateTo: function (pageIndex) {
+                        root.currentPage = pageIndex }
                 }
 
                 BackupPage {
                     opacity: root.currentPage === 1 ? 1 : 0
-                    Behavior on opacity { NumberAnimation { duration: 150; easing.type: Easing.OutCubic } }
+                    Behavior on opacity {
+                        NumberAnimation {
+                            duration: 150; easing.type: Easing.OutCubic
+                        }
+                    }
                     // 页面自己不改 root.currentPage，只发意图，跳转由窗口决定。
                     onOpenSettings: root.currentPage = 4
                 }
 
                 SchedulePage {
                     opacity: root.currentPage === 2 ? 1 : 0
-                    Behavior on opacity { NumberAnimation { duration: 150; easing.type: Easing.OutCubic } }
+                    Behavior on opacity {
+                        NumberAnimation {
+                            duration: 150; easing.type: Easing.OutCubic
+                        }
+                    }
                 }
 
                 BackupManagementPage {
                     opacity: root.currentPage === 3 ? 1 : 0
-                    Behavior on opacity { NumberAnimation { duration: 150; easing.type: Easing.OutCubic } }
+                    Behavior on opacity {
+                        NumberAnimation {
+                            duration: 150; easing.type: Easing.OutCubic
+                        }
+                    }
                     onOpenSettings: root.currentPage = 4
                 }
 
                 SettingsPage {
                     opacity: root.currentPage === 4 ? 1 : 0
-                    Behavior on opacity { NumberAnimation { duration: 150; easing.type: Easing.OutCubic } }
+                    Behavior on opacity {
+                        NumberAnimation {
+                            duration: 150; easing.type: Easing.OutCubic
+                        }
+                    }
                 }
 
                 RealtimePage {
                     opacity: root.currentPage === 5 ? 1 : 0
-                    Behavior on opacity { NumberAnimation { duration: 150; easing.type: Easing.OutCubic } }
+                    Behavior on opacity {
+                        NumberAnimation {
+                            duration: 150; easing.type: Easing.OutCubic
+                        }
+                    }
                 }
 
                 RemotePage {
                     opacity: root.currentPage === 6 ? 1 : 0
-                    Behavior on opacity { NumberAnimation { duration: 150; easing.type: Easing.OutCubic } }
+                    Behavior on opacity {
+                        NumberAnimation {
+                            duration: 150; easing.type: Easing.OutCubic
+                        }
+                    }
                 }
             }
         }
@@ -298,6 +359,9 @@ ApplicationWindow {
     Item {
         anchors.fill: parent
         visible: !useNativeFrame
+    // 覆盖整窗的缩放热区层，z=100 保证它在页面之上。Item 自身没有事件处理，
+    // 只有四条 6px 的 MouseArea 会吃按下事件，中间区域照常透给页面；所以
+    // 这四条边不能再加宽，否则会抢掉靠边控件的点击。
         z: 100
 
         MouseArea {
@@ -352,7 +416,8 @@ ApplicationWindow {
 
             Text {
                 Layout.preferredWidth: 300
-                text: "备份、恢复或实时/定时备份尚未完成。为避免留下不完整结果，请等待当前操作结束后再退出。"
+                text: "备份、恢复或实时/定时备份尚未完成。"
+                    + "为避免留下不完整结果，请等待当前操作结束后再退出。"
                 color: theme.textSecondary
                 font.pixelSize: 15
                 wrapMode: Text.WordWrap

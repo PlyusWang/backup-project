@@ -84,7 +84,7 @@ struct ScheduleConfig {
 
   PackMethod pack_method = PackMethod::kMyPack;
   CompressionMethod compression_method = CompressionMethod::kNone;
-  // 本 PR 的无人值守计划只允许 kNone。理由见 ValidateScheduleConfig。
+  // 无人值守计划只允许 kNone。理由见 ValidateScheduleConfig。
   EncryptionMethod encryption_method = EncryptionMethod::kNone;
 
   std::vector<std::string> include_rules;
@@ -175,7 +175,7 @@ struct ScheduleHistoryEntry {
   ChangeSummary changes;
 
   // 诊断原文（核心给出的错误文本，或 retention 的失败原因）。
-  // 绝不允许出现密码：本 PR 的计划任务不接受加密，这条是硬约束而非约定。
+  // 绝不允许出现密码：无人值守计划任务不接受加密，这条是硬约束而非约定。
   std::string diagnostic;
 };
 

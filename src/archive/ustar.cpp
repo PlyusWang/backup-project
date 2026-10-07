@@ -23,6 +23,14 @@
 //     是 GNU 扩展——与其写一个自己也解释不了的值，不如让调用方知道存不下；
 //   * 读侧容忍 GNU 的 "./" 前缀和目录名结尾的 '/'（那是同一个路径的两种写法），
 //     其余路径规则一条不让。
+//
+// 调用方：pack_stream.cpp 按 PackMethod 选 WriteBaseline / WriteFast，Scan 的
+// 结果交给上层（压缩、加密、恢复编排）当索引，恢复时按 Member 的偏移调
+// ExtractData / ExtractDataToString 取 payload。压缩、加密、目录遍历都不在
+// 本文件里，本文件也不碰归档之外的任何路径。
+//
+// 失败模型：公开函数一律返回 bool + error_message（动作、路径、原因），没有
+// throw / catch；成功时磁盘上不留半成品。
 
 #include "ustar.h"
 
@@ -42,12 +50,35 @@
 namespace backupproject {
 namespace ustar {
 
+// 匿名 namespace：格式细节（字段编解码、路径语义、两个写入器的 I/O 策略）全部
+// 留在翻译单元内部，只有 ustar.h 里声明的那些符号有外部链接。这样哪些行为是
+// 对外契约，在链接层面就是清楚的，测试也只能通过公开 API 驱动。
 namespace {
 
 // ---- header 内的字段偏移 ----
 // 直接对应 POSIX ustar 布局：name[100] mode[8] uid[8] gid[8] size[12]
 // mtime[12] chksum[8] typeflag[1] linkname[100] magic[6] version[2]
 // uname[32] gname[32] devmajor[8] devminor[8] prefix[155] pad[12]，合计 512。
+// 完整布局表（offset / size / field / 编码）。所有数字字段都是 ASCII，既没有
+// 二进制整数，也就没有字节序问题——这是 ustar 能跨架构互读的原因，也是这里
+// 不出现 htonl / ntohl 的原因：
+//    0  100  name      定长字符串，恰好 100 字节时允许没有 NUL
+//  100    8  mode      7 位八进制 + NUL，取值 0..07777
+//  108    8  uid       7 位八进制 + NUL
+//  116    8  gid       7 位八进制 + NUL
+//  124   12  size      11 位八进制 + NUL，普通文件的 payload 长度
+//  136   12  mtime     11 位八进制 + NUL，无符号，负值不可表示
+//  148    8  chksum    6 位八进制 + NUL + 空格
+//  156    1  typeflag  单字节，取值见 TypeFlagFor
+//  157  100  linkname  定长字符串
+//  257    6  magic     固定的 'ustar' + NUL
+//  263    2  version   固定为 '00'
+//  265   32  uname     定长字符串，写侧最多 31 字节（留一个 NUL）
+//  297   32  gname     同上
+//  329    8  devmajor  7 位八进制 + NUL；非设备条目允许整字段全 NUL
+//  337    8  devminor  同上
+//  345  155  prefix    定长字符串，与 name 用 '/' 拼成完整路径
+//  500   12  pad       保留字节，写侧全 0，读侧不解释
 constexpr std::size_t kModeOffset = 100;
 constexpr std::size_t kUidOffset = 108;
 constexpr std::size_t kGidOffset = 116;
@@ -160,6 +191,9 @@ std::uint64_t OctalLimit(std::size_t digits) {
 
 // 写数字字段：field_size - 1 位八进制 + 1 个 NUL。
 // 放不下就失败，不截断——把 size 写小只会让归档说谎。
+// 编码是定长大端、前导 '0' 填满：先写最高位的 3 bit，所以值很小时字段里也是一串
+// 前导 '0' + 数字 + NUL，总长度永远等于 field_size。大端是 POSIX 规定的读法，与
+// 主机字节序无关。
 bool AppendOctal(char* block, std::size_t offset, std::size_t field_size,
                  std::uint64_t value, const char* field_name,
                  std::string* error_message) {
@@ -198,6 +232,9 @@ bool ParseOctal(const char* field, std::size_t field_size,
     ++index;
     ++digits;
   }
+  // 一个八进制数字都没有：可能是 GNU 对 devmajor / devminor 写的整字段空白
+  // （合法，见 allow_empty），也可能是被清零或损坏的字段（非法）。两者的区别
+  // 只在调用方给的 allow_empty，所以判定必须交给参数，不能靠这里猜。
   if (digits == 0) {
     bool blank = true;
     for (std::size_t i = index; i < field_size; ++i) {
@@ -286,6 +323,13 @@ bool DecodeFixedField(const char* field, std::size_t field_size,
 // ---- checksum ----
 
 // 计算时把 chksum 字段当成 8 个空格，写和读都用这一份。
+// chksum 是 ustar 唯一的完整性字段，但它只是 512 字节的无符号字节和，能发现
+// 传输 / 写入损坏，挡不住有意篡改：能改 header 的人也能重算 checksum。所以读侧
+// 只把它当格式自洽性检查，不当认证。
+//
+// 两个细节不能动：(1) 累加前必须转 unsigned char——char 在 x86 上是有符号的，
+// 直接加会把 >= 0x80 的字节变成负数；(2) chksum 字段自身按 8 个空格参与，这样
+// 字段先清零再算和原样算得到同一个值，写侧读侧才能共用这一份实现。
 std::uint64_t ComputeChecksum(const char* block) {
   std::uint64_t sum = 0;
   for (std::size_t i = 0; i < kBlockSize; ++i) {
@@ -302,6 +346,11 @@ std::uint64_t ComputeChecksum(const char* block) {
 // ---- 路径 ----
 
 // 512 对齐的 payload 长度。调用方保证 size <= 077777777777，不会溢出。
+// padding 长度不写进归档，读侧只能靠 header 里的 size 反推，所以写侧
+// AppendZeros(PaddingFor(size)) 与 Scan 里的 RoundUpToBlock(data_size) 必须用
+// 同一个公式，任何一侧改动都会让后续 header 的偏移整体错位。
+// size 的上界由 EncodeHeader / DecodeHeader 保证 <= 077777777777（8 GiB - 1），
+// 因此 size + 511 不会溢出 uint64。
 std::uint64_t RoundUpToBlock(std::uint64_t size) {
   return ((size + kBlockSize - 1) / kBlockSize) * kBlockSize;
 }
@@ -430,6 +479,9 @@ bool WriteAllFd(int fd, const char* data, std::size_t length,
   return true;
 }
 
+// 全零 block 是归档的结束标记，它与任何合法 header 都不相交：零 block 的 magic
+// 对不上 'ustar' + NUL，chksum 字段里也没有八进制数字。正因为两个集合不相交，
+// 读到全零块才可以无歧义地判定归档到此结束，而不是某个字段刚好为 0。
 bool IsZeroBlock(const char* block) {
   for (std::size_t i = 0; i < kBlockSize; ++i) {
     if (block[i] != '\0') {
@@ -518,6 +570,12 @@ bool CheckMemberBounds(const Member& member, std::uint64_t file_size,
 
 // 输出归档文件：O_EXCL 创建（绝不覆盖已有文件），失败或提前返回时把自己
 // 创建的那个半成品删掉——备份工具不能在磁盘上留下"看起来成功了"的残file。
+// 生命周期契约：Create 成功才算这个对象拥有文件，Finish 是唯一的提交点。Create
+// 之前析构什么也不删（owns_file_ 为 false），Finish 之后析构也不删（finished_
+// 为 true）。于是调用方只需要失败就 return，清理是自动的。
+//
+// 不可拷贝：fd 与路径一一对应，复制会让两个析构都去 unlink 同一个路径。线程
+// 安全等级：仅供单线程使用，内部没有锁，也不打算有。
 class OutputArchive {
  public:
   OutputArchive() = default;
@@ -534,7 +592,8 @@ class OutputArchive {
   OutputArchive& operator=(const OutputArchive&) = delete;
 
   bool Create(const std::string& path, std::string* error_message) {
-    // O_EXCL：已存在的文件一律不覆盖。备份文件被静默覆盖是最不能接受的失败模式。
+    // O_EXCL：已存在的文件一律不覆盖。
+    // 备份文件被静默覆盖是最不能接受的失败模式。
     // 权限 0600：归档是用户数据的完整副本，不给同组 / 其他人读的机会；legacy
     // v0.1 写入器同样是 0600，两个后端产出的文件权限必须一致。
     fd_ = ::open(path.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
@@ -578,6 +637,10 @@ class OutputArchive {
 
 // 定长输出缓冲。两个写入器的真实差别不在"有没有缓冲"，而在缓冲多大、
 // 什么时候 flush、payload 是读进临时数组再拷，还是直接在缓冲的空闲区里读。
+// 不变量：used_ <= data_.size()，且 [0, used_) 是尚未写出的字节；Flush 成功之后
+// used_ 归零。FreeData() / Commit() 是给 DirectPayloadSink 的零拷贝接口，
+// 它们不做边界检查——调用方必须先确认 FreeSpace() 足够，Commit 的长度也不能
+// 超过它。这条约定只在这两个类之间成立，所以两者都是文件内部的实现细节。
 class OutputBuffer {
  public:
   OutputBuffer(OutputArchive* output, std::size_t capacity)
@@ -684,6 +747,8 @@ class BufferedPayloadSink : public PayloadSink {
         std::min<std::uint64_t>(length, chunk_.size()));
     ssize_t got = -1;
     do {
+      // 短读是正常返回：一次 read 拿到多少就 append 多少，剩下的由上层循环
+      // （CopyVerifiedPayload）继续要。EINTR 在这里就地重试，不冒泡给调用方。
       got = ::read(fd, chunk_.data(), want);
     } while (got < 0 && errno == EINTR);
     if (got < 0) {
@@ -846,6 +911,14 @@ bool CopyVerifiedPayload(const std::string& source_path,
 }
 
 // ArchiveEntry -> Header。两个写入器共用这一份映射，格式不可能各自漂移。
+// 字段映射里几个刻意的取值：
+//   * size 只有普通文件取 entry.size，其余类型强制 0——给软链接写 size 会让
+//     GNU tar 去读一段并不存在的 payload；
+//   * linkname 先清空再按类型赋值，非链接条目即使 entry.link_target 有内容也不
+//     落进字段，避免调用方复用 Header 时把上一次的状态带出去；
+//   * mtime 只传秒，entry.mtime_nsec 直接丢弃：ustar 的 mtime 字段只有秒，精度
+//     损失是格式决定的，不是这里漏了；
+//   * dev_major / dev_minor 原样传递（普通文件通常是 0），GNU tar 同样这么写。
 bool BuildHeader(const ArchiveEntry& entry, Header* header,
                  std::string* error_message) {
   if (entry.type == EntryType::kSocket) {
@@ -972,6 +1045,22 @@ bool SplitPath(const std::string& archive_path, std::string* name,
   return false;
 }
 
+// typeflag 取值表（POSIX 1003.1 与 GNU）。读侧必须逐个认出下面这些字符，才能把
+// 支持与不支持分开报错，而不是统统落进 default 说一句 unknown：
+//   '0' / NUL   普通文件（全 NUL 的 typeflag 是早期 tar 写法，POSIX 要求接受）
+//   '1'         硬链接，linkname 是归档内另一条成员的目标
+//   '2'         软链接，linkname 是链接目标原文，不做路径校验
+//   '3'         字符设备，devmajor / devminor 有意义
+//   '4'         块设备，同上
+//   '5'         目录，成员路径允许带结尾 '/'（Scan 会归一化掉）
+//   '6'         FIFO
+//   '7'         contiguous file：POSIX 有定义，我们不写也不认
+//   'x' / 'g'   pax 扩展头（per-file / global）
+//   'L' / 'K'   GNU 长名字 / 长链接名头
+//   'A' 'D' 'M' 'N' 'S' 'V'  GNU 多卷、sparse、增量等扩展头
+//   's'         GNU socket：归档格式里没有 socket，写侧写不出、读侧也不认
+// 读写共用这一张表，所以我们写出去的 typeflag 一定能读回来，这是结构性的，
+// 不靠两边各自维护一份映射。
 char TypeFlagFor(EntryType type) {
   switch (type) {
     case EntryType::kRegularFile:
@@ -1063,6 +1152,13 @@ bool TypeFromFlag(char typeflag, EntryType* type, std::string* error_message) {
   }
 }
 
+// 前置条件：block 非空且至少有 512 字节可写。后置条件：成功时 *block 正好 512
+// 字节，每个字节都被显式写过——先整块清零再逐字段覆盖，绝不依赖上一次编码
+// 留下的字节。失败时 *block 的内容没有意义，调用方必须丢弃它。
+//
+// 失败语义：字段放不下就返回 false 并写明字段名与原因，只有 uname / gname 例外
+// （按 tar 惯例截断到 31 字节）。失败而不截断是有意的：少一位数字的 size 会在
+// 恢复时变成静默的数据错位，比当场报错难查得多。
 bool EncodeHeader(const Header& header, std::string* block,
                   std::string* error_message) {
   if (block == nullptr) {
@@ -1097,12 +1193,16 @@ bool EncodeHeader(const Header& header, std::string* block,
                                 " 字节，超过 100 字节字段");
     return false;
   }
+  // mode 字段只放 07777：文件类型位（S_IFMT）不写进 mode。
+  // 类型由 typeflag 表达，两处都写会让这个条目是什么有两个互相矛盾的来源。
   if (header.mode > kMaxMode) {
     SetError(error_message, "ustar header: mode " +
                                 std::to_string(header.mode) +
                                 " 超过 07777（权限位 + setuid/setgid/sticky）");
     return false;
   }
+  // 非普通条目必须显式把 size 写成 0，而不是让这里悄悄改小：调用方若以为自己
+  // 声明了 payload，静默清零会让它继续按 size 读源文件，而归档里少了一截。
   if (type != EntryType::kRegularFile && header.size != 0) {
     SetError(error_message, std::string("ustar header: ") +
                                 EntryTypeName(type) +
@@ -1125,6 +1225,8 @@ bool EncodeHeader(const Header& header, std::string* block,
     return false;
   }
 
+  // 从这里开始的写字段顺序与磁盘布局一致，每个 offset 都取自文件开头那组
+  // constexpr，函数体里不出现裸数字。
   block->assign(kBlockSize, '\0');
   char* out = block->data();
   if (!AppendFixedField(out, 0, kNameSize, header.name, "name",
@@ -1153,6 +1255,8 @@ bool EncodeHeader(const Header& header, std::string* block,
                         "linkname", error_message)) {
     return false;
   }
+  // magic / version 是常量，不从 Header 取值：Header 结构里干脆没有这两个字段，
+  // 让我们只写标准 ustar 这件事在类型层面就成立。
   std::memcpy(out + kMagicOffset, kMagic, sizeof(kMagic));
   std::memcpy(out + kVersionOffset, kVersion, sizeof(kVersion));
   // uname / gname 超过 31 字节时按 tar 惯例截断：这两个字段是给人看的提示，
@@ -1197,6 +1301,17 @@ bool EncodeHeader(const Header& header, std::string* block,
   return true;
 }
 
+// 输入是不可信数据：block 来自磁盘上的归档，可能被截断、被改写，甚至根本不是
+// tar。因此每个字段都当攻击面处理，任何一条校验失败都返回 false，且 *header
+// 只在函数末尾整体赋值——不会留下一个解析了一半的 Header 给调用方。
+//
+// 校验顺序是有讲究的：先 magic / version，再 checksum，最后才解析数值字段。
+// checksum 通过之前读到的数字只是待验证的字节，先算 checksum 就不必拿它们做
+// 任何范围推理。
+//
+// 明确不做的事：不认 GNU 那种 magic 里带空格的 'ustar ' 变体；不认 base-256
+// 数值（最高位被置 1 的字段会被 ParseOctal 当非法字符拒绝）；不跳过 typeflag
+// 为 pax / GNU 扩展的条目——跳过它们会让后续成员的路径与 size 全部错位。
 bool DecodeHeader(const char* block, Header* header,
                   std::string* error_message) {
   if (block == nullptr || header == nullptr) {
@@ -1227,6 +1342,7 @@ bool DecodeHeader(const char* block, Header* header,
     return false;
   }
 
+  // 数值字段逐个解析，任一失败立即返回：不做部分成功的解码。
   std::uint64_t mode = 0;
   std::uint64_t uid = 0;
   std::uint64_t gid = 0;
@@ -1279,6 +1395,8 @@ bool DecodeHeader(const char* block, Header* header,
     return false;
   }
 
+  // 到这里 header 已经自洽：magic / version / checksum / 各数字字段，以及
+  // typeflag 与 size 的一致性都过了，才开始组装返回值。
   Header decoded;
   decoded.typeflag = block[kTypeFlagOffset];
   if (!DecodeFixedField(block, kNameSize, "name", &decoded.name,
@@ -1316,6 +1434,8 @@ bool DecodeHeader(const char* block, Header* header,
                                 " 条目的 linkname 是空的");
     return false;
   }
+  // 收窄到 Header 的字段宽度不会丢信息：进入 uint32 的这几个字段最宽 7 位八进制
+  // （mode / uid / gid / devmajor / devminor），上限 07777777。
   decoded.mode = static_cast<std::uint32_t>(mode);
   decoded.uid = static_cast<std::uint32_t>(uid);
   decoded.gid = static_cast<std::uint32_t>(gid);
@@ -1329,6 +1449,12 @@ bool DecodeHeader(const char* block, Header* header,
 
 // ---- 两个写入器 ----
 
+// 成功后置条件：目标路径上恰好是一个以两个全零 block 结束的合法 ustar 文件，
+// 权限 0600；失败时这个文件已经被删掉，磁盘上看不到半成品。整个函数没有回滚点
+// ——要么 Finish 成功，要么什么都不留，这是调用方可以依赖的原子性。
+//
+// header 编码、payload 读取、快照复核都与 WriteFast 共用同一份实现，所以两者的
+// 产物逐字节相同，差别只在 syscall 形状。
 bool WriteBaseline(const std::vector<ArchiveEntry>& entries,
                    const std::string& archive_file,
                    std::string* error_message) {
@@ -1382,6 +1508,13 @@ bool WriteBaseline(const std::vector<ArchiveEntry>& entries,
   return output.Finish(error_message);
 }
 
+// 与 WriteBaseline 的产物逐字节相同（同样的预校验、同样的 BuildHeader、同样的
+// CopyVerifiedPayload）。差别只在 I/O 形状：1 MiB 缓冲把 header、payload、
+// padding 聚合在一起，只有缓冲满或收尾才 write；baseline 则是每条 entry 结束
+// 都 flush，write 次数至少是条目数。
+//
+// 代价是失败时已经写出的字节更多，但语义不变：仍然由 OutputArchive 析构删掉
+// 半成品，调用方看到的只有成功或失败。
 bool WriteFast(const std::vector<ArchiveEntry>& entries,
                const std::string& archive_file, std::string* error_message) {
   if (!ValidateEntries(entries, error_message)) {
@@ -1429,6 +1562,16 @@ bool WriteFast(const std::vector<ArchiveEntry>& entries,
 
 // ---- 读取器 ----
 
+// 只读的 preflight：Scan 除了读归档文件之外不碰任何路径，既不创建也不删除；返回
+// 的 Member 只有元数据与偏移，payload 一个字节都没读。
+//
+// 失败语义：任一条校验不过就返回 false，且 *members 的内容没有意义——函数开头
+// 已经 clear，中途 push_back 的成员在失败时一并作废。调用方要么整体接受这份
+// 成员列表，要么丢弃重来，不存在部分可用这种中间状态。
+//
+// 两遍扫描的分工：第一遍沿 block 链走，解码 header、校验边界与路径、维护
+// index_by_path；第二遍只解析硬链接依赖图。payload 不参与遍历，靠 size 向上取整
+// 跳过。
 bool Scan(const std::string& archive_file, std::vector<Member>* members,
           std::string* error_message) {
   if (members == nullptr) {
@@ -1447,6 +1590,9 @@ bool Scan(const std::string& archive_file, std::vector<Member>* members,
   // 反向的前缀冲突检测（std::map 的 lower_bound 能做前缀查询）。
   std::map<std::string, std::size_t> index_by_path;
   std::uint64_t offset = 0;
+  // 两个 512 字节栈缓冲：block 装本轮 header，second_block 只在判定结尾标记
+  // 时用。不变量：每轮结束时 offset 前进到下一个 header 起点（512 加 payload
+  // 向上取整），严格单调递增且有 file_size 兜底，所以循环一定终止。
   char block[kBlockSize];
   char second_block[kBlockSize];
   while (true) {
@@ -1508,6 +1654,9 @@ bool Scan(const std::string& archive_file, std::vector<Member>* members,
       AddContext(error_message, "block 偏移 " + std::to_string(offset));
       return false;
     }
+    // prefix 与 name 用 '/' 拼回完整路径：prefix 非空时 name 必须非空，中间恰好
+    // 一个分隔符。拼出来的只是候选路径，紧接着就要过归一化与语义校验，绝不直接
+    // 拿去拼文件系统路径。
     const std::string raw_path =
         header.prefix.empty() ? header.name : header.prefix + "/" + header.name;
     const bool trailing_slash = raw_path.size() > 1 && raw_path.back() == '/';
@@ -1523,6 +1672,9 @@ bool Scan(const std::string& archive_file, std::vector<Member>* members,
       return false;
     }
 
+    // header -> Member 的映射与写侧 BuildHeader 严格对称：非普通条目的 size
+    // 一律记 0，纳秒记 0（ustar 没有这个字段），source_path 留空——Scan 不碰
+    // 文件系统，也就没有源路径可填。
     Member member;
     member.entry.archive_path = path;
     member.entry.source_path.clear();  // Scan 不碰文件系统，也就没有源路径
@@ -1621,8 +1773,8 @@ bool Scan(const std::string& archive_file, std::vector<Member>* members,
   //
   // 用 DFS + 三色标记（unvisited / visiting / resolved）：visiting 表示"这条链
   // 还在当前 DFS 栈上"，再遇到就是环。刻意不用"反复迭代到不动点"——那种写法在
-  // 环上转不出来，还得额外设迭代上限兜底。链可以任意长，所以用显式栈而不是递归，
-  // 避免深链把调用栈打爆（成员数上限是 100 万）。
+  // 环上转不出来，还得额外设迭代上限兜底。链可以任意长，所以用显式栈而不是
+  // 递归，避免深链把调用栈打爆（成员数上限是 100 万）。
   {
     constexpr unsigned char kUnvisited = 0;
     constexpr unsigned char kVisiting = 1;
@@ -1682,6 +1834,16 @@ bool Scan(const std::string& archive_file, std::vector<Member>* members,
   return true;
 }
 
+// 前置条件：member 应当来自同一个归档的 Scan。本函数不信任这一点：打开归档后
+// 重新 fstat 并重跑 CheckMemberBounds，挡住 Scan 之后归档被换掉，以及 member
+// 是调用方手工拼的这两种输入。
+//
+// 副作用与回滚：目标文件以 O_CREAT|O_TRUNC 打开，也就是先破坏旧内容；此后任何
+// 一步失败都 unlink 目标文件，而不是尝试恢复旧内容——旧内容在 O_TRUNC 那一刻就
+// 没了，留一个半截新文件比什么都不留更危险。
+//
+// 本函数不做 fsync：只保证写出并 close 成功。掉电后数据是否还在由调用方的持久化
+// 策略决定，恢复层需要时自己补。
 bool ExtractData(const std::string& archive_file, const Member& member,
                  const std::string& destination_file,
                  std::string* error_message) {
@@ -1734,6 +1896,13 @@ bool ExtractData(const std::string& archive_file, const Member& member,
   return true;
 }
 
+// 与 ExtractData 的差别只有落点：payload 一次性读进内存，给需要在不落盘的前提下
+// 检查内容的调用方用（例如内容摘要复核）。
+//
+// 内存上界由 CheckMemberBounds 保证：data_size 不会超过归档文件的真实大小，所以
+// 归档里的一个数字不可能让这里申请到天文数字的内存。代价仍然存在——超大成员会
+// 占用同等内存，这是本 API 的已知边界，大文件请走 ExtractData。失败时 output 被
+// 清空。
 bool ExtractDataToString(const std::string& archive_file, const Member& member,
                          std::string* output, std::string* error_message) {
   if (output == nullptr) {

@@ -20,6 +20,22 @@
 //
 // 解码的 match 必须逐字节复制：distance 可以小于 length，源和目标重叠，复制
 // 过程中刚写出去的字节会立刻被再次读到（例如 100000 个 'a'，distance = 1）。
+//
+// ---- LZH1 外层头部（20 字节，全部小端）----
+//
+//   offset  size  字段
+//   0       4     magic "LZH1"
+//   4       8     original_size      解压后的原始字节数，解码的唯一结束条件
+//   12      8     token_stream_size  LZSS token 流的字节数
+//   20      ...   内层 HUF1 流（自带 magic、码长表和精确流长度）
+//
+// 三处长度必须互相印证：外层 original_size、外层 token_stream_size、内层 HUF1
+// 头部声明的长度。解压前先对上，避免"先解压再发现长度不对"把不可信数据放大
+// 成内存与磁盘消耗。
+//
+// 威胁模型：头部与 token 流都来自归档文件，是不可信输入。解码走 fail closed：
+// distance 为 0、超过窗口、超过已产出字节数、输出将超过 original_size 的 match
+// 一律拒绝，绝不用"截断到合法范围"的方式继续解。
 
 #include <unistd.h>
 
@@ -47,6 +63,8 @@ constexpr std::size_t kSymbolCount = 256;
 // 每个位置最多回溯的候选数。128 已经足够吃掉长重复，再大只是让最坏情况变慢。
 constexpr std::size_t kMaxChainLength = 128;
 constexpr std::size_t kNoPosition = static_cast<std::size_t>(-1);
+// 一个 control byte 管 8 个 token，bit7 对应第 1 个：bit = 1 是 literal，
+// bit = 0 是 match。写侧与读侧必须按同一顺序取位。
 constexpr std::size_t kTokensPerControlByte = 8;
 
 // 处理位置 pos 时，编码器可能读到的最远字节是 pos + kMaxMatchLength + 2
@@ -54,6 +72,8 @@ constexpr std::size_t kTokensPerControlByte = 8;
 // 会用 pos+3 > size 提前返回）。所以前瞻必须留足 kMaxMatchLength +
 // kMinMatchLength。
 constexpr std::size_t kLookahead = kMaxMatchLength + kMinMatchLength;
+// 缓冲比窗口多出一段前瞻，是为了让"匹配长度"这种跨越窗口边界的读取始终
+// 落在同一个数组里，At() 不需要处理回绕。
 constexpr std::size_t kWindowBufferSize = kWindowSize + kLookahead;
 
 void SetError(std::string* error_message, const std::string& text) {
@@ -63,12 +83,15 @@ void SetError(std::string* error_message, const std::string& text) {
 }
 
 // 外层 LZH1 头部同样是小端，不假设主机字节序。
+// 逐字节移位写出，而不是 memcpy 一个结构体：这样与主机字节序、结构体对齐
+// 和填充都无关，同一份输入在任何平台上产出同一串字节。
 void AppendLittleEndian64(std::uint64_t value, std::string* out) {
   for (int shift = 0; shift < 64; shift += 8) {
     out->push_back(static_cast<char>((value >> shift) & 0xFF));
   }
 }
 
+// 读侧对应实现。调用方负责保证至少 8 字节可读（长度已由 ReadExact 校验）。
 std::uint64_t ReadLittleEndian64(const unsigned char* data) {
   std::uint64_t value = 0;
   for (int i = 0; i < 8; ++i) {
@@ -113,6 +136,10 @@ class LzssStreamEncoder {
   LzssStreamEncoder(SequentialReader* input, ByteSinkAdapter* sink)
       : input_(input), sink_(sink) {}
 
+  // 主循环不变量：每个输入位置恰好被 Insert() 一次（literal 占 1 个位置，match
+  // 占 length 个），所以哈希链里不会出现重复位置。EnsureLookahead 保证
+  // [pos, min(size_, pos + kLookahead)) 可读，FindMatch 只在这个范围内取值。
+  // 输出按组攒够 8 个 token 才落 sink，最后一组不满也在 FlushGroup 里补零写出。
   bool Encode(std::uint64_t* original_size, std::uint64_t* token_bytes,
               std::string* error_message) {
     size_ = input_->remaining();
@@ -165,6 +192,11 @@ class LzssStreamEncoder {
 
  private:
   // 保证 buffer_ 覆盖 [limit(pos), min(size_, pos + kLookahead))。
+  // 滑动窗口的搬运逻辑：缓冲写满而还需要前瞻时，把 base_ 推进到
+  // max(base_, pos - kWindowSize)——窗口之前的历史不会再被匹配引用，可以丢，
+  // 保留整个窗口是为了让 distance 仍可达 32768。drop == 0 说明缓冲已满却无处
+  // 可丢，那是内部不变量被破坏，直接报错而不是继续往下读。
+  // 每次先算准要读多少再交给 ReadExact，短读由它负责重试。
   bool EnsureLookahead(std::size_t pos, std::string* error_message) {
     const std::uint64_t need_end =
         (size_ - pos > kLookahead) ? pos + kLookahead : size_;
@@ -205,6 +237,9 @@ class LzssStreamEncoder {
   }
 
   // 记住 pos 处的 3 字节哈希，供后面的位置回溯。
+  // prev_ 是环形数组，位置滑出窗口后会被新位置覆盖，链上因此可能存在"过期"
+  // 条目。这不是 bug：FindMatch 用 candidate >= limit 与 chain 计数双重终止，
+  // 过期条目最坏只是多跑一次比较。
   void Insert(std::size_t pos) {
     if (pos + kMinMatchLength > size_) {
       return;
@@ -215,6 +250,9 @@ class LzssStreamEncoder {
   }
 
   // 返回最长匹配长度（不足 kMinMatchLength 时返回 0）与对应 distance。
+  // 候选链按"最近出现的在前"遍历，因此先命中的匹配 distance 更小；长度相同
+  // 时保留先找到的那个，编码结果因此完全确定（冻结 fixture 依赖这一点）。
+  // 每轮先用 data[candidate + best_length] 快速否决，只有可能更长时才逐字节比。
   std::size_t FindMatch(std::size_t pos, std::size_t* distance) const {
     if (pos + kMinMatchLength > size_) {
       return 0;
@@ -252,6 +290,8 @@ class LzssStreamEncoder {
     return best_length;
   }
 
+  // 写一个 literal：把本组对应的 control 位按 MSB-first 置 1，再追加 1 字节
+  // 原文；攒满 8 个 token 就立刻落 sink，不在内存里留更多。
   bool EmitLiteral(std::uint8_t value, std::string* error_message) {
     control_ |= std::uint32_t{1} << (7 - group_tokens_);
     group_.push_back(static_cast<char>(value));
@@ -262,6 +302,8 @@ class LzssStreamEncoder {
     return true;
   }
 
+  // 写一个 match：uint16 distance + uint8 (length - kMinMatchLength)，小端。
+  // 减 3 是因为最短匹配是 3 字节，3..258 正好压进 1 字节（最大 255）。
   bool EmitMatch(std::size_t distance, std::size_t length,
                  std::string* error_message) {
     group_.push_back(static_cast<char>(distance & 0xFF));
@@ -274,6 +316,9 @@ class LzssStreamEncoder {
     return true;
   }
 
+  // 把攒好的一组写出去：第 0 字节这时才被填成真正的 control byte。
+  // group_tokens_ == 0 直接返回，对应"上一组正好凑满 8 个"的情况——那一次
+  // 落盘已经发生，不需要再补一个空的占位组。
   bool FlushGroup(std::string* error_message) {
     if (group_tokens_ == 0) {
       return true;  // 最后一组正好凑满时没有多余占位要写
@@ -290,6 +335,15 @@ class LzssStreamEncoder {
     return true;
   }
 
+  // 成员语义（base_ / filled_ 是滑动窗口的核心不变量）：
+  //   buffer_  容量 kWindowSize + kLookahead；下标 0 对应绝对位置 base_
+  //   base_    缓冲里第一个字节的绝对位置，单调不减
+  //   filled_  有效字节数，缓冲覆盖 [base_, base_ + filled_)
+  //   size_    输入总长度（SequentialReader::remaining()），全程不变
+  //   head_    3 字节哈希 -> 最近一次出现该哈希的绝对位置
+  //   prev_    位置 pos 的前驱，下标 pos % kWindowSize，环形复用
+  //   group_   当前 token 组，第 0 字节是 control byte 占位
+  //   control_ 这一组已写完的 control 位；token_bytes_ 是已写出的 token 字节数
   SequentialReader* input_;
   ByteSinkAdapter* sink_;
   std::vector<unsigned char> buffer_;
@@ -305,6 +359,14 @@ class LzssStreamEncoder {
 };
 
 // 流式 LZSS 解码器。expected_original_size 是唯一的结束条件。
+// 解码侧的第一道闸门，每一条检查都是 fail closed：
+//   * control byte / literal 操作数 / match 操作数缺失 -> 流被截断，拒绝；
+//   * distance = 0 无意义（自己匹配自己），distance > 32768 超出窗口上界；
+//   * distance > 已产出字节数，说明引用了根本不存在的历史；
+//   * 输出将超过 original_size，说明流比声明的长。
+// 这些量全部直接来自不可信输入，少查一个都可能变成越界读。
+// original_size 是唯一的结束条件：凑够就停，同时要求剩余 control 位为 0
+// （格式规定它们是 padding），最后还要求 token 流恰好用尽、不多不少。
 bool LzssDecodeCore(SequentialReader* tokens, ByteSinkAdapter* sink,
                     std::uint64_t expected_original_size,
                     std::uint64_t* written, std::string* error_message) {
@@ -387,6 +449,8 @@ bool LzssDecodeCore(SequentialReader* tokens, ByteSinkAdapter* sink,
 }
 
 // 读 LZH1 的 20 字节外层头部并校验 magic。
+// 先验 magic 再取长度：长度字段在流里是攻击者可控的，只有 magic 对上了才
+// 值得往下看。
 bool ReadOuterHeader(SequentialReader* reader, std::uint64_t* original_size,
                      std::uint64_t* token_stream_size,
                      std::string* error_message) {
@@ -404,6 +468,8 @@ bool ReadOuterHeader(SequentialReader* reader, std::uint64_t* original_size,
   return true;
 }
 
+// 写出来的长度必须正好 kLzssHuffmanHeaderSize：多写或少写都会让内层 HUF1
+// 的起始偏移错位，读侧会把整条流判成坏的。
 bool WriteOuterHeader(std::uint64_t original_size,
                       std::uint64_t token_stream_size, ByteSinkAdapter* sink,
                       std::string* error_message) {
@@ -458,6 +524,9 @@ bool LzssDecode(const std::string& tokens, std::uint64_t original_size,
   return true;
 }
 
+// 编码顺序是 LZSS -> Huffman，字节顺序却是"外层头部在前、Huffman 流在后"：
+// 头部里的两个长度要等两层都跑完才知道，所以头部是最后拼上去的。
+// 这条路径整条流都在内存里，只适合小输入；大文件走 CompressStream。
 bool LzssHuffmanCompress(const std::string& input, std::string* output,
                          std::string* error_message) {
   if (output == nullptr) {
@@ -482,6 +551,10 @@ bool LzssHuffmanCompress(const std::string& input, std::string* output,
   return true;
 }
 
+// 先只验头部（外层 magic、内层 HUF1 的魔数 / 码长 / Kraft 不等式 / 精确流
+// 长度），再检查内外两层声明的 token stream 长度是否一致，全部通过才开始
+// 解压。顺序很重要：把"这是不是一个合法的 LZH1 流"与"解出来的内容对不对"
+// 分开，可以让明显不是本格式的输入在不分配大块内存的情况下被拒掉。
 bool LzssHuffmanDecompress(const std::string& input, std::string* output,
                            std::string* error_message) {
   if (output == nullptr) {
@@ -521,6 +594,9 @@ bool LzssHuffmanDecompress(const std::string& input, std::string* output,
   return LzssDecode(tokens, original_size, output, error_message);
 }
 
+// 只做头部嗅探，不解压也不分配，供格式识别做快速判断。
+// 返回 true 只说明"看起来像"，完整性仍由 LzssHuffmanDecompress 保证，调用
+// 方不能用它替代真正的解压校验。
 bool LooksLikeLzssHuffman(const std::string& data) {
   SequentialReader reader;
   reader.OpenMemory(&data);
@@ -538,6 +614,10 @@ bool LooksLikeLzssHuffman(const std::string& data) {
          token_stream_size;
 }
 
+// 只读头部就报出三件事：解压后的原始长度、token 流长度、内层 HUF1 的头部
+// 信息（compression.h 的 LzssHuffmanStreamInfo），并算出 header_bytes 与
+// stream_bytes 供上层按偏移读取。任一处对不上都返回 false，避免调用方拿着
+// 半份信息去做容量计算。
 bool LzssHuffmanReadStreamInfo(const std::string& input_file,
                                LzssHuffmanStreamInfo* info,
                                std::string* error_message) {
@@ -571,6 +651,11 @@ bool LzssHuffmanReadStreamInfo(const std::string& input_file,
   return true;
 }
 
+// 流式压缩：输入是文件，中间产物只有一个 token 临时文件。
+// 顺序是"先把整个 token 流写进私有目录里的临时文件并 Close，再把内层 HUF1
+// 追加写到 sink"——外层头部要声明 token 流的字节数，而 Huffman 只能从头开始
+// 写输出。临时文件落在 0700 私有目录里、名字随机；ScopedTokenFile 保证任何
+// 返回路径上都 unlink，Abandon() 负责"已打开但还没 Close"的失败。
 bool LzssHuffmanCompressStream(const std::string& input_file, FileSink* sink,
                                const std::string& workspace_directory,
                                std::uint64_t* original_size,
@@ -637,6 +722,11 @@ bool LzssHuffmanCompressStream(const std::string& input_file, FileSink* sink,
   return true;
 }
 
+// 流式解压：先把两层头部读完并把三处长度对上（LzssHuffmanReadStreamInfo），
+// 确认 original_size 与容器声明一致，才开始真正解压。
+// 分两步落盘：内层 HUF1 先解成 token 临时文件，再由 LZSS 解码器顺序读它产出
+// 最终数据。峰值内存因此只与窗口大小有关，与归档条目大小无关。
+// 任一失败都走 Abandon()，不留半截临时文件。
 bool LzssHuffmanDecompressStream(const std::string& input_file, FileSink* sink,
                                  const std::string& workspace_directory,
                                  std::uint64_t expected_original_size,

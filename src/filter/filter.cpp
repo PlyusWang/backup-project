@@ -9,6 +9,29 @@
 // 刻意不做的事：布尔表达式、regex、内容搜索、后代统计——它们都记在
 // docs/backlog/filter_future.md 里，本文既不实现也不为它们留隐式钩子。
 
+// 数据流：DSL 文本（命令行 --include/--exclude，或界面草稿经
+// FilterRuleBuilder 序列化后的产物）在这里被解析成 Rule + Clause；扫描层
+// 逐条目构造 FilterEntry 后调用 ShouldPruneDirectory / ShouldIncludeFile /
+// ShouldSkipSpecialEntry，把结果交给归档写入器。
+// Filter 自己不产生任何 I/O，也不持有扫描状态：一份构造完成的 Filter
+// 可以给任意多条条目复用，而且只需要只读访问。
+//
+// 不变量：
+//   * rules_ 里每条 Rule 的 clauses 都非空且全部解析成功——AddRule 只在
+//     整条文本解析完之后才 push_back，半成品规则永远不会入库；
+//   * 规则之间是 OR，一条规则内部的子句之间是 AND；
+//   * exclude 永远优先：include 只能收窄，不能把已被 exclude 的东西放回来。
+//
+// 失败语义：唯一的失败入口是 AddRule，返回 false 并写 error_message，且
+// 不改变已有规则（调用方可以放心逐条添加）。匹配类接口都是纯查询，没有
+// 失败路径——非法输入在 AddRule 阶段就被拒绝，运行期不会遇到半个规则。
+//
+// 线程与生命周期：全部成员都是值语义，没有共享可变状态；AddRule 之后只读
+// 复用，不需要加锁。对象由调用方持有，本文不 new、不 delete、不缓存指针。
+//
+// 安全边界：DSL 来自命令行与界面输入，属于不受信输入。解析只做字段白名单
+// 与取值范围校验，绝不把输入当作路径、命令或格式串；不认识的东西一律明确
+// 报错，不做"尽力猜一个"的降级。
 #include "filter.h"
 
 #include <cctype>
@@ -38,6 +61,10 @@ bool IsAsciiDigit(char c) { return c >= '0' && c <= '9'; }
 
 // ---- glob ---------------------------------------------------------------
 
+// token 只有 kind 与 literal 两个字段，连续的普通字符会被合并成一个
+// kLiteral，所以 token 数远小于模式长度，DP 表也跟着小一圈。
+// 这里刻意不用正则：std::regex 的行为与性能随实现而变，而筛选规则必须在
+// 所有平台上逐字一致。
 // 把 glob 模式切成 token。** 与 **/ 分开：后者按"零个或多个路径段"匹配，
 // 这样 **/build/** 既能命中 build/x，也能命中 a/build/x。
 struct GlobToken {
@@ -57,6 +84,12 @@ void FlushLiteral(std::string* literal, std::vector<GlobToken>* tokens) {
   literal->clear();
 }
 
+// 单遍扫描，不回溯：'*' / '?' 各自成 token，其余字符累积成字面量。
+// 刻意不支持转义、字符类 [a-z]、花括号展开和大小写折叠——它们都是 glob
+// 的方言，一旦支持就必须同时定义反斜杠怎么转义，而反斜杠在 Linux 文件名
+// 里是合法普通字符，把它定成转义符会让一部分真实文件名再也匹配不上。
+// 唯一的多字符特例是 "**/"：必须整体识别，否则它里面的 '/' 会被当成
+// 字面量字符，规则只在字面量意义上成立。
 std::vector<GlobToken> TokenizeGlob(const std::string& pattern) {
   std::vector<GlobToken> tokens;
   std::string literal;
@@ -98,6 +131,13 @@ std::vector<GlobToken> TokenizeGlob(const std::string& pattern) {
   return tokens;
 }
 
+// glob 匹配。时间与空间都是 O(|tokens| x |text|)，全部在 vector 上分配：
+// 模式来自用户、路径来自文件系统，长度都不可信，递归写法等于把栈交给输入。
+//
+// 语义：
+//   * 整串匹配，不是子串查找；空模式只匹配空串；
+//   * 大小写敏感、逐字节比较（Linux 文件名就是字节串）；
+//   * '*' 与 '?' 不跨越 '/'，只有 '**' 系列才跨目录。
 // 自底向上的 DP：dp[i][j] 表示 tokens[i..] 能否匹配 text[j..]。
 // 不用朴素递归回溯——a*a*a*a* 这类模式在朴素写法下会指数级爆炸。
 bool GlobMatch(const std::string& pattern, const std::string& text) {
@@ -150,6 +190,9 @@ std::string StemOf(const std::string& name) {
   return name.substr(0, dot);
 }
 
+// 扩展名 = 最后一个 '.' 之后的部分，同样排除隐藏文件名；"a.tar.gz" 的
+// 扩展名是 "gz"（只取最后一段），"a." 的扩展名是空串。
+// 比较是逐字节精确比较、不做大小写折叠：ext:JPG 匹配不到 a.jpg。
 std::string ExtensionOf(const std::string& name) {
   const std::size_t dot = name.rfind('.');
   if (dot == std::string::npos || dot == 0) {
@@ -160,6 +203,9 @@ std::string ExtensionOf(const std::string& name) {
 
 // ---- size ---------------------------------------------------------------
 
+// 只接受非空的 ASCII 十进制数字串：前后空白、正负号、十六进制一律拒绝
+// （strtoull 会接受 " 12"、"+7"、"0x10"，那些都不是 DSL 的语法）。
+// 溢出在这里就判定，调用方拿到的一定是完整解析后的值，不必再查 errno。
 bool ParseUnsigned(const std::string& text, std::uint64_t* out) {
   if (text.empty()) {
     return false;
@@ -180,6 +226,15 @@ bool ParseUnsigned(const std::string& text, std::uint64_t* out) {
   return true;
 }
 
+// size: 的数值字面量 = <十进制数字><单位?>，单位取 B / KB / MB / GB
+// （大写不敏感，1024 进制，与界面上 "1 MB" 的含义一致）；缺省单位是字节。
+//
+// 三条失败路径都写 error_message 并返回 false，且都不写 *out：单位不认识、
+// 数字部分非法、以及乘完之后会溢出 uint64。溢出检查放在乘法之前，
+// size:18446744073709551615GB 这类输入必须被拒绝而不是回绕成一个小数。
+//
+// 固定 1024 进制是刻意的：同一条规则在 CLI 与 GUI 上必须给出同一个边界，
+// 引入 1000 进制（MB 的另一种常见定义）会让两边悄悄分叉。
 bool ParseSizeLiteral(const std::string& text, std::uint64_t* out,
                       std::string* error_message) {
   std::size_t split = 0;
@@ -223,6 +278,9 @@ bool ParseSizeLiteral(const std::string& text, std::uint64_t* out,
 
 // ---- uid / gid ----------------------------------------------------------
 
+// 取值范围跟着 POSIX 的 uid_t / gid_t 走：0 合法（root），上界是 uint32
+// 满值。两条边界都必须显式——接受 0 才不让 root 的规则永远匹配不到，
+// 卡住上界才不会把超范围输入悄悄截断成一条完全不同的规则。
 // uid:/gid: 的数值：先按 uint64 解析（顺带查溢出），再卡到 uint32 上界。
 // 99999999999 这类超范围输入必须明确报错，而不是截断成一个"看起来能跑"的数。
 bool ParseIdNumber(const std::string& field, const std::string& text,
@@ -240,6 +298,8 @@ bool ParseIdNumber(const std::string& field, const std::string& text,
 
 // ---- mtime --------------------------------------------------------------
 
+// mktime 返回 -1 既可能是这个时刻表示不出来，也可能是真的出错，这里统一
+// 按失败处理：筛选规则里的日期都在 1970 年之后，区分这两种情况没有收益。
 // 本地时区某一天的 00:00:00。day_offset 是相对 (year, month, day) 的自然日
 // 偏移（可以为负），跨月 / 跨年 / 跨 DST 全部交给 mktime 归一化，不自己算日期。
 //
@@ -276,6 +336,10 @@ bool LocalDayEnd(int year, int month, int day, std::int64_t* out) {
   return true;
 }
 
+// 格式是死的四位年 '-' 两位月 '-' 两位日，不接受 "2024-1-1" 这类宽松
+// 写法：宽松解析会让 "2024-13-01" 这种手误有机会被归一化悄悄变成另一个
+// 日期。月 / 日只做粗筛（1..12、1..31），真正的合法性判断由 LocalDayStart
+// 的归一化比对给出，年份范围交给 mktime 自己兜底。
 // YYYY-MM-DD -> 本地日历日。年月日一并回给调用方：窗口上界要用它们算
 // "这一天的最后一秒"（见 LocalDayEnd），只回一个时间戳是算不出来的。
 bool ParseDate(const std::string& text, int* year, int* month, int* day,
@@ -305,6 +369,20 @@ bool ParseDate(const std::string& text, int* year, int* month, int* day,
   return true;
 }
 
+// mtime: 的取值语法（全部小写）：
+//   today | yesterday            归一化成 [当天 00:00, 当天 23:59:59]
+//   <N>days                      N 是十进制正整数，上限 kMaxDaysBack
+//   YYYY-MM-DD                   单日，等价于 [当天 00:00, 次日 00:00 - 1]
+//   YYYY-MM-DD..YYYY-MM-DD       闭区间，两端都含
+//
+// 返回的 *kind 就是 Clause::TimeKind 的枚举序号（0=kDay、1=kDayRange、
+// 2=kLastDays），调用方直接 static_cast 装回枚举：这个整数映射是既有约定，
+// 新增 TimeKind 时只能追加，不能插在中间。
+//
+// kLastDays 故意不在这里换算成时间戳：规则可能在长驻进程里活很久，"最近
+// 7 天"的锚点是匹配那一刻的 now，而不是解析那一刻。
+//
+// 失败时写 error_message 并返回 false，*kind / *low / *high 一律不写。
 // mtime 取值换算成闭区间 [low, high]。kLastDays 只记天数，匹配时再拿
 // "现在"去算，避免长驻进程把"今天"固定在启动那一刻。
 bool ParseMtimeValue(const std::string& value, int* kind, std::int64_t* low,
@@ -395,6 +473,9 @@ bool ParseMtimeValue(const std::string& value, int* kind, std::int64_t* low,
 
 // ---- 规则文本 -----------------------------------------------------------
 
+// 字段白名单，也是整个 DSL 的词汇表。SplitClauses 用它判断空白后面是不是
+// 一个新子句的开始，ParseClause 用它判断字段名是否合法——两处必须共用这
+// 一张表，否则会出现切得开却解析不了、或者反过来漏切的分叉。
 bool IsKnownField(const std::string& field) {
   return field == "name" || field == "path" || field == "stem" ||
          field == "ext" || field == "type" || field == "size" ||
@@ -402,6 +483,11 @@ bool IsKnownField(const std::string& field) {
          field == "user" || field == "group";
 }
 
+// 把一条规则文本切成子句。分隔符不是空白本身，而是空白加已知字段名加冒号：
+//   * name:my report.txt 里的空格属于文件名，不是分隔符；
+//   * type:folder path:**/build 之间的空白才是真的子句边界。
+// 切不出任何子句时写 "empty rule" 并返回空 vector，调用方据此直接失败，
+// 不会拿到零个子句的合法规则。
 // 只在"空白后面紧跟已知字段名 + 冒号"处切分，这样 name:my file.txt 里的
 // 空格不会被误当成分隔符，而 type:folder path:**/build 能切成两个子句。
 std::vector<std::string> SplitClauses(const std::string& text,
@@ -446,6 +532,11 @@ std::vector<std::string> SplitClauses(const std::string& text,
   return clauses;
 }
 
+// 单个子句 -> (字段, 原值)。只按第一个 ':' 切开，因为值本身可以含 ':'。
+//
+// 后置条件：成功时 field_out 与 value_out 都被写入，且字段在白名单内、值
+// 非空；失败时两者都不写，只写 error_message。范围的合法性不在这里判定，
+// 留到 AddRule 的对应分支——那里才知道这个值该按哪种类型解释。
 bool ParseClause(const std::string& text, std::string* field_out,
                  std::string* value_out, std::string* error_message) {
   const std::size_t colon = text.find(':');
@@ -473,8 +564,14 @@ bool ParseClause(const std::string& text, std::string* field_out,
 
 }  // namespace
 
+// 单个子句的匹配。纯函数：只读 clause 与 entry，不碰磁盘、不改任何状态，
+// 因此同一份 Filter 可以被多个线程并行查询。
+// 没有匹配失败这种结果：每个分支都必然给出 true 或 false。
 bool Filter::ClauseMatches(const Clause& clause,
                            const FilterEntry& entry) const {
+  // low 就是用户写的那一侧边界，high 只在 kRange 时有意义；uid / gid 的
+  // kEqual 来自裸数字，size 的等于被 builder 展开成 a..a，两条路径最终都
+  // 落到这张表上。比较本身是无符号的：uid / gid / size 都不可能为负。
   // size / uid / gid 共用同一套数值比较；闭区间两端都算命中。
   const auto numeric_match = [](std::uint64_t value, Clause::Compare compare,
                                 std::uint64_t low, std::uint64_t high) {
@@ -581,6 +678,9 @@ bool Filter::ClauseMatches(const Clause& clause,
   return false;
 }
 
+// 一条规则 = 它所有子句的 AND。空子句列表返回 false 而不是 true：空规则
+// 会匹配一切，那正是用户写错却看不出后果的情况；AddRule 与这里的双重保护
+// 让空规则不可能被理解成全匹配。
 bool Filter::RuleMatches(const Rule& rule, const FilterEntry& entry) const {
   for (const Clause& clause : rule.clauses) {
     if (!ClauseMatches(clause, entry)) {
@@ -590,6 +690,9 @@ bool Filter::RuleMatches(const Rule& rule, const FilterEntry& entry) const {
   return !rule.clauses.empty();
 }
 
+// 动作维度上的 OR：只要有一条同向规则命中就算命中。
+// 线性扫描是刻意的——规则数量是人手写出来的个位数，排序或建索引带来的
+// 复杂度与顺序即优先级这样的隐式约定都不划算。
 bool Filter::MatchesAny(FilterAction action, const FilterEntry& entry) const {
   for (const Rule& rule : rules_) {
     if (rule.action == action && RuleMatches(rule, entry)) {
@@ -608,6 +711,11 @@ bool Filter::has_include() const {
   return false;
 }
 
+// 目录剪枝。这是语义而不只是优化：剪掉之后子树里的 symlink / FIFO /
+// socket 不再被遍历，也就不会再触发备份遇到不支持类型的失败。
+//
+// 下面第二段只对整条规则都是 path 子句的 exclude 生效：规则里只要混进
+// type: / size: 等条件，就不能只凭路径决定整棵子树，否则那些条件会被绕过。
 bool Filter::ShouldPruneDirectory(const FilterEntry& entry) const {
   if (MatchesAny(FilterAction::kExclude, entry)) {
     return true;
@@ -639,6 +747,10 @@ bool Filter::ShouldPruneDirectory(const FilterEntry& entry) const {
   return false;
 }
 
+// 归档是否收录这个条目。三种来源：被任意 exclude 命中 -> 否；一条
+// include 都没有 -> 是（行为与未引入筛选时逐字一致）；否则必须命中至少
+// 一条 include。目录也走这个函数（保留结构）：要不要连子树一起剪掉是
+// ShouldPruneDirectory 的问题，两个问题分开回答。
 bool Filter::ShouldIncludeFile(const FilterEntry& entry) const {
   if (MatchesAny(FilterAction::kExclude, entry)) {
     return false;  // exclude 优先
@@ -649,11 +761,25 @@ bool Filter::ShouldIncludeFile(const FilterEntry& entry) const {
   return MatchesAny(FilterAction::kInclude, entry);
 }
 
+// 特殊文件（symlink / FIFO / socket / 设备）默认让整次备份失败，这是
+// fail-closed：静默跳过会让用户以为备份成功且完整。
+// 只有用户明确写了 exclude 才算授权跳过；include 规则不构成这种授权，
+// 所以这里只查 exclude。
 bool Filter::ShouldSkipSpecialEntry(const FilterEntry& entry) const {
   // 只有明确的 exclude 才能让特殊文件被跳过；否则调用方仍然报错。
   return MatchesAny(FilterAction::kExclude, entry);
 }
 
+// 解析并追加一条规则。事务语义：整条文本全部解析成功才 push_back，中途
+// 任何一步失败都直接返回 false，rules_ 保持调用前的样子。
+// 进入时先清空 error_message，避免调用方在一次成功调用后读到上次的残留。
+//
+// 失败时写 error_message（仅当指针非空），文案以 "Invalid filter rule: "
+// 开头——CLI 与 GUI 共用这句报错，前缀属于对外契约，改动前要确认没有测试
+// 或文档按前缀匹配。
+//
+// rule.text 原样保留用户写的那一行，只用于展示与报错，不参与匹配：匹配全部
+// 走解析后的 Clause，避免展示文本和判定依据各说各话。
 bool Filter::AddRule(FilterAction action, const std::string& text,
                      std::string* error_message) {
   if (error_message != nullptr) {
@@ -781,6 +907,9 @@ bool Filter::AddRule(FilterAction action, const std::string& text,
                      "or socket)");
         ok = false;
       }
+      // size
+      // 没有裸数字形式：省略运算符没有唯一合理的默认解释（小于还是等于？），
+      // 因此明确要求写 < <= > >= 或 a..b 区间，而不是替用户猜一个。
     } else if (field == "size") {
       clause.field = Clause::Field::kSize;
       const std::size_t range = value.find("..");
@@ -833,6 +962,9 @@ bool Filter::AddRule(FilterAction action, const std::string& text,
           }
         }
       }
+      // uid / gid 的裸数字表示等于（uid:1000），也支持 < <= > >= 与 a..b。
+      // 与 size 的差别正在这里：size 拒绝裸数字，uid 接受，因为只看某个用户
+      // 是最常见的用法。
     } else if (field == "uid" || field == "gid") {
       clause.field =
           (field == "uid") ? Clause::Field::kUid : Clause::Field::kGid;

@@ -1,6 +1,6 @@
 // realtime_commands.h
 //
-// PR #19：backupctl realtime 子命令。
+// backupctl realtime 子命令。
 //
 // 与 schedule 子命令同构：解析参数 → 调共享核心 → 翻译结果。
 // 这里没有自己的策略/校验/retention 实现：
