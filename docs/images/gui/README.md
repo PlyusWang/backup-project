@@ -36,13 +36,16 @@ cp tests/output/screenshots/plain/{home,backup,backup-expanded,management,schedu
 realtime,remote,settings}-light.png docs/images/gui/
 ```
 
-## 已知限制（如实记录，未修）
+## 服务器身份三种模式
 
-`--screenshot` 会按"服务器身份三种模式"各抓一张（`official-cloud-*.png`、
-`advanced-ssh-mode-*.png`、`custom-server-profile-*.png`）。在 2026-10-07 的这次运行里，
-同主题下的这四张（含 `remote-*.png`）**逐字节相同**，也就是说切换连接模式之后画面并没有
-真正变化就被抓帧了。测试脚本只断言这些文件存在与大小非空，不做像素比对，所以没有拦住它。
+`--screenshot` 还会按服务器身份的三种模式各抓一张（`official-cloud-*.png`、
+`advanced-ssh-mode-*.png`、`custom-server-profile-*.png`）。这三张留在测试产物目录里，
+没有进本目录 —— 理由是这里的 8 张已经够文档用，不是因为它们有问题。
 
-因此本目录只收录确定互不相同的 8 张，不把那几张同图放进文档冒充"不同模式"。
-根因在截图 harness 的等待时机（`ui/modern/dev_harnesses.cpp` 的截图段），属于测试工具问题，
-不是界面问题；产品代码已冻结，本轮未修改。
+（2026-10-07 修）此前这三张会与 `remote-*.png` **逐字节相同**：模式切换是控制器上的
+属性变更，页面只在构造时回填一次，运行时不再跟随；截图 harness 又是"设完模式立刻抓帧"，
+所以抓到的全是切换前的画面，而断言只看文件存在与大小非空，一直没有拦住。
+现在两侧都修好了：页面跟随 `connectionChanged` 更新模式显示，harness 改为等到界面上的
+模式真的切过去（读 `remoteConnectionModeTabs` 的 `currentKey`）并用该模式独有的控件作证，
+最后按主题比对三张图的 SHA-256，相同即判失败。同一次运行里浅色与深色主题下三张图
+互不相同。

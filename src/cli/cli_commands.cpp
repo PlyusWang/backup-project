@@ -239,11 +239,16 @@ void PrintCliUsage(const std::string& program_name, std::ostream& output) {
   output
       << "Usage:\n"
       << "  " << program_name
-      << " backup <source_directory> [--include <rule>]... [--exclude "
-         "<rule>]...\n"
+      << " backup <source_directory> [--strategy <full|incremental>]\n"
+      << "        [--include <rule>]... [--exclude <rule>]...\n"
       << "    The archive is written into the configured repository, with a "
          "name the\n"
       << "    program generates; there is no way to give it a path.\n"
+      << "    --strategy defaults to full. incremental stores only the "
+         "changes since\n"
+      << "    the previous snapshot and needs one to exist in the "
+         "repository;\n"
+      << "    it also requires --pack mypack and --encryption none.\n"
       << "  " << program_name
       << " preview <source_directory> [--include <rule>]... [--exclude "
          "<rule>]...\n"
