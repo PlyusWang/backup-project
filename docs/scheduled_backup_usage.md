@@ -324,7 +324,6 @@ backupctl backup <source> <archive> --encryption aes-256-ctr-hmac-sha256
 默认布局（与 Modern GUI 严格同源，见 include/app_paths.h）：
 
 ~~~text
-$XDG_CONFIG_HOME/backup-project/backup-gui-modern/app.lock
 $XDG_CONFIG_HOME/backup-project/backup-gui-modern/config.json
 $XDG_CONFIG_HOME/backup-project/backup-gui-modern/schedule.json
 $XDG_CONFIG_HOME/backup-project/backup-gui-modern/schedule-manifest.dat
@@ -332,6 +331,9 @@ $XDG_CONFIG_HOME/backup-project/backup-gui-modern/schedule.json.lock
 ~~~
 
 XDG_CONFIG_HOME 未设置或不是绝对路径时回退到 $HOME/.config。目录按 0700 创建。
+
+注意上面这张表里**没有全应用单实例锁**：它不在配置目录，而在 per-user 运行时
+目录（见 §6.1）。`schedule.json.lock` 是另一把锁 —— 计划备份自己的 runner 锁。
 
 * schedule.json 是 versioned 的固定 schema，字段集合**完全相等**：
   少一个字段报 missing required field，多一个字段报 unknown field，
@@ -349,11 +351,13 @@ XDG_CONFIG_HOME 未设置或不是绝对路径时回退到 $HOME/.config。目�
 四种组合全部拒绝，而且是在进入任何业务逻辑之前就拒绝（不会先读一遍配置再发现
 "已经有另一个实例"）。
 
-* 锁是 `app.lock`，用 `flock(LOCK_EX | LOCK_NB)`：进程正常退出、崩溃、被 SIGKILL
-  都由内核自动释放。磁盘上留一个 stale 的锁文件**不会**把产品永久锁死，锁文件里的
-  pid 只是给人看的提示。
-* 锁路径只由配置根决定（`app_paths.h`），**与仓库、`--config-file`、
-  `--schedule-file` 全都无关**：换个参数启动不会绕过单实例。
+* 锁文件叫 `backup-project.lock`，位置是 per-user 运行时目录：默认
+  `/run/user/<uid>/backup-project.lock`；该目录不可用（不存在、属主不符、
+  不可进入）时回退到 `/tmp/backup-project-<uid>.lock`。
+  它用 `flock(LOCK_EX | LOCK_NB)`：进程正常退出、崩溃、被 SIGKILL 都由内核
+  自动释放。磁盘上留一个 stale 的锁文件**不会**把产品永久锁死。
+* 锁路径与仓库、`--config-file`、`--schedule-file` 全都无关：换个参数启动不会
+  绕过单实例。所以 §6 的配置目录布局里看不到它。
 * 锁路径本身如果是符号链接、目录或 FIFO，一律 fail closed 并明确报错，绝不 truncate
   目标文件。
 * 纯 `--help` 不抢锁：已经有实例在跑时，用户仍然看得到用法。

@@ -1,6 +1,8 @@
-# 桌面 GUI（Qt 6 Widgets）
+# 桌面 GUI（Qt 6 Widgets，legacy）
 
-> 状态：第一版实现，随 `feature/ubuntu-desktop-gui` 分支引入。
+> 状态：第一版 GUI，随 `feature/ubuntu-desktop-gui` 分支引入，现在只作为
+> **回归 / 参考前端**保留，不是正式发布 GUI。正式前端是 Modern Qt 6 QML GUI
+> （`backup-gui-modern`，见 `docs/ui/modern_qml_gui.md`），发行包里只有它。
 
 ## 1. 为什么第一版选 Qt 6 Widgets
 
@@ -11,7 +13,9 @@
 - Linux 支持成熟，系统自带 Qt 6 运行库，部署简单；
 - Widgets 默认样式偏朴素，但布局和外观可以用 QSS 自己做，第一版够用。
 
-因此没有选 Qt Quick / QML、GTK、Electron、WebView 这些方案。
+因此第一版没有选 Qt Quick / QML、GTK、Electron、WebView 这些方案。
+（正式 GUI 后来改用 Qt Quick / QML，见 `docs/ui/modern_qml_gui.md`；这一版
+现在的定位见第 7 节。）
 
 ## 2. GUI 与核心的调用关系
 
@@ -31,13 +35,16 @@ GUI 和 CLI 是两个并列入口，共用同一份核心：
 
 左侧导航两个入口，右侧是内容区：
 
-- **备份**：源目录 + 备份仓库 → 开始备份；
-- **恢复**：备份仓库 + 恢复目录 → 开始恢复。
+- **备份**：源目录 + 备份文件 → 开始备份（备份文件就是归档文件的完整路径，由用户自己填）；
+- **恢复**：备份文件 + 恢复目录 → 开始恢复。
 
-两个页面各有两条路径输入框。输入框始终可编辑，因为备份仓库允许是一个**尚不存在**的路径，
-而系统的目录选择对话框只能方便地选已存在的目录；不能让对话框把核心本来就支持的能力限制住。
+两个页面各有两条路径输入框。输入框始终可编辑：备份时"存成哪个归档文件"可以直接
+手写一个尚不存在的路径，对话框只是帮你挑一个位置；路径合不合法仍然由核心判断，
+GUI 不复制一套校验规则。
 
-第一版界面上只有真正能用的东西，没有 Archive、压缩、加密、过滤、定时、实时、网络等占位控件。
+这一版界面上只有两个页面，外加备份页上一个纯文本的筛选规则列表；没有打包 /
+压缩 / 加密选项、定时、实时、网络、历史记录等入口——这些能力现在由 Modern GUI
+与 `backupctl` 提供，不在这里补。
 
 ## 4. 主题
 
@@ -61,11 +68,28 @@ GUI 和 CLI 是两个并列入口，共用同一份核心：
 
 第一版不做假的百分比。等核心提供真实进度接口之后，再改成精确进度。
 
-## 7. 当前功能边界
+## 7. 当前功能边界与技术差异
 
-这一版只暴露现在就真实可用的功能：备份、恢复、Light/Dark 主题、操作状态与错误显示。
+这一版只有**备份 / 恢复**两个页面、Light/Dark 主题、操作状态与错误显示，备份页上
+另有一个纯文本的筛选规则列表（"加为 Include" / "加为 Exclude"，语法仍由核心
+`Filter` 校验）。它没有打包 / 压缩 / 加密选项，没有定时 / 实时 / 网络备份，也没有
+运行历史，更没有 Modern GUI 的可视化规则编辑器与筛选预览。
 
-还没有实现：Archive / 打包、压缩、加密、文件过滤、定时备份、实时备份、网络备份、历史记录。
+它和产品当前写法的差异是结构性的，所以**不要拿它演示**这些能力：
+
+- 备份调的是 `BackupEngine::Backup(source, archive_file, filter, ...)` 这个不带
+  `BackupOptions` 的重载，也就是 legacy v0.1 写入路径：产物是 `BKPARCH`，不是
+  产品当前的 `BKPCNT2` v2 容器——压缩与加密在这里无从演示；
+- v0.1 只保存 mode（0777 位）与 mtime，不含 uid / gid，所以元数据也不该用它演示；
+- 归档路径由用户在界面上自己填，而产品模型是"归档写进配置好的仓库、文件名由程序
+  生成"；"备份写到哪就是哪"这条路径在 Modern GUI 与 `backupctl` 里都不存在；
+- 恢复走的是同一个不带密码参数的旧重载：未加密的 v2 容器按 magic 仍然认得出来，
+  加密容器在这里会明确失败（而不是被当成坏文件）。
+
+这一版现在有两个用途：一是历史参考，二是单实例锁的第三个前端回归——它和
+Modern GUI、`backupctl` 抢同一把按 Unix UID 定位的应用锁，
+`scripts/scheduled_backup_test.sh` 的 K.05..K.07 就断言这三个前端互斥。
+演示、验收以及"GUI 与 CLI 功能一致"这条产品义务都属于 Modern GUI。
 
 ## 8. 后续主题扩展点
 
@@ -90,4 +114,8 @@ QT_QPA_PLATFORM=offscreen ./build/backup-gui --smoke-test    # 无显示环境�
 
 依赖：Qt 6 开发包（Ubuntu：`sudo apt-get install -y qt6-base-dev qt6-base-dev-tools`）。
 
-`make` 仍然只构建 CLI；GUI 是独立的 `make gui` 目标。
+`make` / `make all` 构建的是 `backupctl` 与 `backup-server`，**不含任何 GUI**：
+这一版 legacy Widgets GUI 要显式敲 `make gui`（Modern GUI 是 `make gui-modern`，
+两个一起是 `make gui-all`）。`make client` 与
+`scripts/stage-client-release.sh` 带的是 `backupctl` 与 `backup-gui-modern`，
+不会带上它。
