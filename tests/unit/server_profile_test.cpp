@@ -45,7 +45,7 @@ int main() {
     const ServerProfile& official = OfficialCloudProfile();
     Check(official.display_name == "Backup Project Cloud",
           "P01 display_name = Backup Project Cloud", official.display_name);
-    Check(official.host == "8.130.9.200", "P02 host 来自 ssh -G 的 HostName",
+    Check(official.host == "39.101.77.9", "P02 host 来自 ssh -G 的 HostName",
           official.host);
     Check(official.port == 18765, "P03 port = 18765");
     Check(official.identity == kIdentityCertificate,
