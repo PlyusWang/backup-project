@@ -114,6 +114,8 @@ QT_QPA_PLATFORM=offscreen ./build/backup-gui --smoke-test    # 无显示环境�
 
 依赖：Qt 6 开发包（Ubuntu：`sudo apt-get install -y qt6-base-dev qt6-base-dev-tools`）。
 
-`make` 仍然只构建 CLI；这一版是独立的 `make gui` 目标。发行打包
-（`make client`、`scripts/stage-client-release.sh`）只带 `backupctl` 与
-`backup-gui-modern`，不会带上它。
+`make` / `make all` 构建的是 `backupctl` 与 `backup-server`，**不含任何 GUI**：
+这一版 legacy Widgets GUI 要显式敲 `make gui`（Modern GUI 是 `make gui-modern`，
+两个一起是 `make gui-all`）。`make client` 与
+`scripts/stage-client-release.sh` 带的是 `backupctl` 与 `backup-gui-modern`，
+不会带上它。
