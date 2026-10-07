@@ -1,5 +1,20 @@
 \documentclass[UTF8,10pt]{ctexart}
-% Sprint cadence revised after Lesson 2; source retained as the canonical Gantt definition.
+% ===========================================================================
+% 本文件已更新到当前阶段：Course Closeout（收口阶段，2026-10-06 起）。
+%
+%   1. S1--S9 全部标记为已完成。原计划排在 S6--S9 的 Huffman 压缩、加密、
+%      定时 + inotify、增量 + 网络，实际在 2026-09-26 至 10-04 之间连续落地，
+%      并在 10-07 的全量回归里一起验收，所以图中不再有"未开始"的功能条目。
+%   2. 新增 Course Closeout 阶段（发行打包 / 源码质量收口 / 文档与证据归档 /
+%      最终报告与答辩准备），脚注表中的"当前节点"也由第 2 次课改为该阶段。
+%   3. 产品源码在本轮保持冻结（基线 6d1e2ba），本次改动只动本文档。
+%
+%   注意：这台机器没有安装 LaTeX（pdflatex / xelatex / latexmk 都不存在），
+%   因此 docs/gantt/project_gantt.pdf 仍是 2026-09-10 编译的旧版本，未重新
+%   生成。PDF 需要在有 LaTeX 的机器上重新编译本文件后替换：
+%       xelatex project_gantt.tex        （ctexart 建议用 xelatex）
+%   修改前的 .tex 与它对应的 PDF 快照存于 docs/gantt/archive/2026100718/。
+% ===========================================================================
 \usepackage[a4paper,landscape,margin=1.15cm]{geometry}
 \usepackage{pgfgantt}
 \usepackage{xcolor}
@@ -17,7 +32,8 @@
 \begin{center}
 {\LARGE\bfseries 数据备份软件课程项目滚动甘特图}\par
 \vspace{0.15em}
-{\small 以 10 次课程为检查节点；每个 Sprint 从本次课启动，到下一次课评审、回顾并收口}\par
+{\small 以 10 次课程为检查节点；Sprint 从本次课启动、下一次课评审并收口。
+后半程多个 Sprint 在相邻数日内连续收口，节点刻度只用于对照课程进度，不作为排期承诺。}\par
 \vspace{0.55em}
 \end{center}
 
@@ -46,37 +62,50 @@
 \gantttitle{课程检查节点}{10} \\
 \gantttitlelist{1,...,10}{1} \\
 
-\ganttgroup[group/.append style={fill=donegray!18,draw=donegray!80}]{Sprint 迭代主线}{1}{10} \\
-\ganttbar[bar/.append style={fill=currentorange!76,draw=currentorange!95}]{S1：v0.1 基础 Backup / Restore；第2次课收口}{1}{2} \\
-\ganttbar{S2：v0.2 Backup Package：Archive v0.1 + Metadata v0.1 + 极简 UI}{2}{3} \\
-\ganttbar{S3：v0.3 Filter + Package Hardening + 测试环境完善}{3}{4} \\
-\ganttbar{S4：v0.4 程序框架 / 接口收口 + 特殊文件 + UML 同步}{4}{5} \\
-\ganttbar{S5：v0.5 Archive 规范化与集成；结合打包解包课程完善}{5}{6} \\
-\ganttbar{S6：v0.6 Huffman 压缩 / 解压 + Round-trip 测试}{6}{7} \\
-\ganttbar{S7：v0.7 加密 / 解密 + 压缩加密流水线集成}{7}{8} \\
-\ganttbar{S8：v0.8 定时备份 + inotify 实时备份 + 后台状态}{8}{9} \\
-\ganttbar[bar/.append style={fill=stretchgold!72,draw=stretchgold!95}]{S9：Release Candidate；全量回归 + 增量 / 网络等 Stretch}{9}{10} \\
+\ganttgroup[group/.append style={fill=donegray!18,draw=donegray!80}]{Sprint 迭代主线（S1--S9 全部完成）}{1}{10} \\
+\ganttbar[bar/.append style={fill=donegray!70,draw=donegray!95}]{S1：v0.1 基础 Backup / Restore（09-03 -- 09-12）}{1}{2} \\
+\ganttbar[bar/.append style={fill=donegray!70,draw=donegray!95}]{S2：v0.2 Archive v0.1 + Metadata v0.1 + 两套 GUI（09-12）}{2}{3} \\
+\ganttbar[bar/.append style={fill=donegray!70,draw=donegray!95}]{S3：v0.3 Filter + 仓库 / 配置 + 可视化规则编辑器（09-17 -- 09-25）}{3}{4} \\
+\ganttbar[bar/.append style={fill=donegray!70,draw=donegray!95}]{S4：v0.4 程序框架 / 接口收口 + Sprint 1/2 回归 + UML 同步（09-17 -- 09-24）}{4}{5} \\
+\ganttbar[bar/.append style={fill=donegray!70,draw=donegray!95}]{S5：v0.5 Archive v2 容器：打包 / 压缩 / 加密流水线（09-26）}{5}{6} \\
+\ganttbar[bar/.append style={fill=donegray!70,draw=donegray!95}]{S6：v0.6 Huffman / LZSS-Huffman 压缩（09-26，提前完成）}{6}{7} \\
+\ganttbar[bar/.append style={fill=donegray!70,draw=donegray!95}]{S7：v0.7 AES-256-CTR-HMAC / DES-CBC 加密（09-26，提前完成）}{7}{8} \\
+\ganttbar[bar/.append style={fill=donegray!70,draw=donegray!95}]{S8：v0.8 定时备份 + 保留策略 + inotify 实时备份（09-27 -- 09-30，提前完成）}{8}{9} \\
+\ganttbar[bar/.append style={fill=donegray!70,draw=donegray!95}]{S9：增量与网络由 Stretch 落地 + 全量回归（09-28 -- 10-07，提前完成）}{9}{10} \\
+\ganttmilestone[milestone/.append style={fill=donegray,draw=donegray}]{产品代码冻结（基线 6d1e2ba，10-07 合并）}{9} \\
+
+\ganttgroup[group/.append style={fill=currentorange!16,draw=currentorange!80}]{Course Closeout：收口阶段（当前节点）}{9}{10} \\
+\ganttbar[bar/.append style={fill=currentorange!72,draw=currentorange!95}]{发行打包：Client AppImage / deb / tar.xz + Server deb / tar.xz（10-06）}{9}{10} \\
+\ganttbar[bar/.append style={fill=currentorange!72,draw=currentorange!95}]{源码质量收口：注释、格式、行宽与重复实现收敛（10-06 -- 10-07）}{9}{10} \\
+\ganttbar[bar/.append style={fill=currentorange!72,draw=currentorange!95}]{课程文档与证据归档：Gantt / Scrum / 安装与演示材料（10-07）}{9}{10} \\
+\ganttbar[bar/.append style={fill=currentorange!72,draw=currentorange!95}]{最终报告与答辩准备（10-07 起）}{10}{10} \\
 \ganttmilestone[milestone/.append style={fill=docgreen,draw=docgreen}]{Final Release / 答辩}{10} \\
 
 \ganttgroup[group/.append style={fill=docgreen!18,draw=docgreen!85}]{持续工程活动}{1}{10} \\
-\ganttbar[bar/.append style={fill=docgreen!68,draw=docgreen!95}]{需求 / 架构 / UML 随实现滚动更新}{1}{9} \\
-\ganttbar[bar/.append style={fill=docgreen!68,draw=docgreen!95}]{自动测试 / CI / Regression：每个 Sprint 都执行}{1}{9} \\
-\ganttbar[bar/.append style={fill=docgreen!68,draw=docgreen!95}]{Kanban + Sprint Backlog + Review / Retrospective}{2}{9} \\
-\ganttbar[bar/.append style={fill=docgreen!68,draw=docgreen!95}]{测试报告、最终报告、演示材料持续归档}{7}{10} \\
+\ganttbar[bar/.append style={fill=docgreen!68,draw=docgreen!95}]{需求 / 架构 / UML 随实现滚动更新，收口时统一归档}{1}{10} \\
+\ganttbar[bar/.append style={fill=docgreen!68,draw=docgreen!95}]{自动测试 / CI / Regression：每个 Sprint 都执行}{1}{10} \\
+\ganttbar[bar/.append style={fill=docgreen!68,draw=docgreen!95}]{Kanban + Sprint Backlog + Review / Retrospective}{2}{10} \\
+\ganttbar[bar/.append style={fill=docgreen!68,draw=docgreen!95}]{测试报告、源代码质量报告、最终报告与演示材料}{6}{10} \\
 
-\ganttgroup[group/.append style={fill=stretchgold!14,draw=stretchgold!78}]{主要责任线（Primary Owner）}{2}{9} \\
-\ganttbar[bar/.append style={fill=stretchgold!66,draw=stretchgold!92}]{Core Algorithm \& Integration：Archive → Huffman → Encryption → Integration}{2}{9} \\
-\ganttbar[bar/.append style={fill=stretchgold!52,draw=stretchgold!82}]{Architecture / Product / UI：UML、UI、交互与演示}{2}{9} \\
-\ganttbar[bar/.append style={fill=stretchgold!38,draw=stretchgold!74}]{Filesystem / Engineering：Metadata、Filter、特殊文件、Automation、Quality}{2}{9}
+\ganttgroup[group/.append style={fill=stretchgold!14,draw=stretchgold!78}]{主要责任线（Primary Owner，不表示进度）}{1}{10} \\
+\ganttbar[bar/.append style={fill=stretchgold!66,draw=stretchgold!92}]{Core Algorithm \& Integration：Archive → Compression → Encryption → Incremental}{1}{10} \\
+\ganttbar[bar/.append style={fill=stretchgold!52,draw=stretchgold!82}]{Architecture / Product / UI：UML、GUI、交互与演示}{1}{10} \\
+\ganttbar[bar/.append style={fill=stretchgold!38,draw=stretchgold!74}]{Filesystem / Engineering：Metadata、Filter、特殊文件、Automation、Quality}{1}{10} \\
 
 \end{ganttchart}
 
-\vspace{0.55em}
+\vspace{0.45em}
+{\small 图例：\textcolor{donegray}{\rule{1.1em}{0.7ex}}~已完成（S1--S9）\quad
+\textcolor{currentorange}{\rule{1.1em}{0.7ex}}~当前阶段（Course Closeout）\quad
+\textcolor{docgreen}{\rule{1.1em}{0.7ex}}~持续工程活动\quad
+\textcolor{stretchgold}{\rule{1.1em}{0.7ex}}~责任线}
+\vspace{0.5em}
 {\small
 \begin{tabular}{@{}>{\raggedright\arraybackslash}p{0.17\linewidth} p{0.78\linewidth}@{}}
-\textbf{当前节点} & 第 2 次课：完成 Sprint 1 的测试、缺陷修复、Review / Retrospective，并在同一节点启动 Sprint 2；Sprint 1 不是“第 1 次课当天完成”，而是跨第 1--2 次课的一周迭代。 \\
-\textbf{每轮 DoD} & 必须形成“可运行版本 + 自动测试 / 回归结果 + 关键源码可解释 + UML / 文档同步”；测试不再集中到第 9 次课，第 9--10 次课主要用于 Release Candidate、全量回归和答辩准备。 \\
-\textbf{开发策略} & 本地 120+ 分能力优先；网络、增量、多算法等属于后续 Stretch。三人按 Primary Owner 分工，但关键代码至少有 Secondary Reviewer，避免三个子项目到最后才第一次集成。 \\
+\textbf{当前节点} & Course Closeout（收口阶段，2026-10-06 起）。收口阶段本身包含发行打包（PR \#24）、源码质量收口（PR \#26）与 GUI 状态显示修正（PR \#27）；产品代码在 6d1e2ba 冻结之后，本轮只写文档，不再改产品源码。 \\
+\textbf{进度偏差} & 原计划把 Huffman（S6）、加密（S7）、定时 + inotify（S8）、增量与网络（S9）安排在课程后半程；实际它们在 2026-09-26 至 10-04 之间连续合入，并在 10-07 的全量回归里一起验收：scripts/final\_gate.sh 的 49 行 GATE 结果全部 exit=0（46 个独立套件 + 3 个构建 / 重建步骤），failed suites = 0。 \\
+\textbf{每轮 DoD} & 可运行版本 + 自动测试 / 回归结果 + 关键源码可解释 + UML / 文档同步。测试从 Sprint 3 起就是每个阶段交付的一部分，没有集中到最后；收口阶段以同一套可复现检查加上文档归档收尾。 \\
+\textbf{开发策略} & 本地能力优先，网络 / 增量 / 多算法原本是 Stretch；它们在 S3 之后被逐项纳入主线，因为每一项都能用已有的 round-trip、变异与消毒剂测试验证。收口阶段不回补功能，只做交付与文档。 \\
 \end{tabular}
 }
 

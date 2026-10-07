@@ -1,0 +1,86 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1420" height="1010"
+ viewBox="0 0 1420 1010">
+<defs><marker id="ah" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="#37474f"/></marker></defs>
+<rect width="100%" height="100%" fill="#ffffff"/>
+<style>text{font-family:"Noto Sans CJK SC","Droid Sans Fallback",sans-serif;}</style>
+<text x="710" y="28" font-size="21" fill="#1a1a1a" text-anchor="middle" dominant-baseline="central" font-weight="bold">图 3  Component Diagram —— 构件与依赖</text>
+<rect x="30" y="52" width="1360" height="118" rx="8" fill="#eceff1" stroke="#b0bec5" stroke-width="1.4"/>
+<text x="46" y="74" font-size="15" fill="#37474f" text-anchor="start" dominant-baseline="central" font-weight="bold">表现层</text>
+<rect x="70" y="88" width="300" height="66" rx="6" fill="#ffffff" stroke="#263238" stroke-width="1.6"/>
+<text x="220" y="108" font-size="15" fill="#1a1a1a" text-anchor="middle" dominant-baseline="central" font-weight="bold">backupctl（CLI）</text>
+<text x="220" y="130" font-size="12" fill="#546e7a" text-anchor="middle" dominant-baseline="central">backup / restore / preview / schedule</text>
+<rect x="400" y="88" width="300" height="66" rx="6" fill="#ffffff" stroke="#263238" stroke-width="1.6"/>
+<text x="550" y="108" font-size="15" fill="#1a1a1a" text-anchor="middle" dominant-baseline="central" font-weight="bold">Modern GUI（Qt 6 QML）</text>
+<text x="550" y="130" font-size="12" fill="#546e7a" text-anchor="middle" dominant-baseline="central">7 页 + 6 个 controller</text>
+<rect x="730" y="88" width="300" height="66" rx="6" fill="#ffffff" stroke="#263238" stroke-width="1.6"/>
+<text x="880" y="108" font-size="15" fill="#1a1a1a" text-anchor="middle" dominant-baseline="central" font-weight="bold">backup-server-admin</text>
+<text x="880" y="130" font-size="12" fill="#546e7a" text-anchor="middle" dominant-baseline="central">运维子命令（独立二进制）</text>
+<rect x="1060" y="88" width="300" height="66" rx="6" fill="#ffffff" stroke="#263238" stroke-width="1.6"/>
+<text x="1210" y="108" font-size="15" fill="#1a1a1a" text-anchor="middle" dominant-baseline="central" font-weight="bold">cert-tool / keygen</text>
+<text x="1210" y="130" font-size="12" fill="#546e7a" text-anchor="middle" dominant-baseline="central">离线根、服务器证书、传输密钥</text>
+<rect x="30" y="186" width="1360" height="210" rx="8" fill="#e8f5e9" stroke="#a5d6a7" stroke-width="1.4"/>
+<text x="46" y="208" font-size="15" fill="#2e7d32" text-anchor="start" dominant-baseline="central" font-weight="bold">共享核心（不依赖 Qt）</text>
+<rect x="70" y="222" width="250" height="70" rx="6" fill="#ffffff" stroke="#263238" stroke-width="1.6"/>
+<text x="195" y="242" font-size="15" fill="#1a1a1a" text-anchor="middle" dominant-baseline="central" font-weight="bold">BackupEngine / Pipeline</text>
+<text x="195" y="264" font-size="12" fill="#546e7a" text-anchor="middle" dominant-baseline="central">备份 · 还原 · 发布</text>
+<rect x="340" y="222" width="250" height="70" rx="6" fill="#ffffff" stroke="#263238" stroke-width="1.6"/>
+<text x="465" y="242" font-size="15" fill="#1a1a1a" text-anchor="middle" dominant-baseline="central" font-weight="bold">Filter</text>
+<text x="465" y="264" font-size="12" fill="#546e7a" text-anchor="middle" dominant-baseline="central">11 字段 glob 匹配</text>
+<rect x="610" y="222" width="250" height="70" rx="6" fill="#ffffff" stroke="#263238" stroke-width="1.6"/>
+<text x="735" y="242" font-size="15" fill="#1a1a1a" text-anchor="middle" dominant-baseline="central" font-weight="bold">Archive / Pack</text>
+<text x="735" y="264" font-size="12" fill="#546e7a" text-anchor="middle" dominant-baseline="central">MyPack v2 · USTAR</text>
+<rect x="880" y="222" width="250" height="70" rx="6" fill="#ffffff" stroke="#263238" stroke-width="1.6"/>
+<text x="1005" y="242" font-size="15" fill="#1a1a1a" text-anchor="middle" dominant-baseline="central" font-weight="bold">Compression</text>
+<text x="1005" y="264" font-size="12" fill="#546e7a" text-anchor="middle" dominant-baseline="central">Huffman · LZSS+Huffman</text>
+<rect x="1150" y="222" width="210" height="70" rx="6" fill="#ffffff" stroke="#263238" stroke-width="1.6"/>
+<text x="1255" y="242" font-size="15" fill="#1a1a1a" text-anchor="middle" dominant-baseline="central" font-weight="bold">Crypto</text>
+<text x="1255" y="264" font-size="12" fill="#546e7a" text-anchor="middle" dominant-baseline="central">手写原语 + BPCERT1</text>
+<rect x="70" y="306" width="250" height="70" rx="6" fill="#ffffff" stroke="#263238" stroke-width="1.6"/>
+<text x="195" y="326" font-size="15" fill="#1a1a1a" text-anchor="middle" dominant-baseline="central" font-weight="bold">Config / Catalog</text>
+<text x="195" y="348" font-size="12" fill="#546e7a" text-anchor="middle" dominant-baseline="central">仓库路径 · 归档目录</text>
+<rect x="340" y="306" width="250" height="70" rx="6" fill="#ffffff" stroke="#263238" stroke-width="1.6"/>
+<text x="465" y="326" font-size="15" fill="#1a1a1a" text-anchor="middle" dominant-baseline="central" font-weight="bold">FileIO / FileSystem</text>
+<text x="465" y="348" font-size="12" fill="#546e7a" text-anchor="middle" dominant-baseline="central">原子写 · 路径边界</text>
+<rect x="610" y="306" width="250" height="70" rx="6" fill="#ffffff" stroke="#263238" stroke-width="1.6"/>
+<text x="735" y="326" font-size="15" fill="#1a1a1a" text-anchor="middle" dominant-baseline="central" font-weight="bold">Scheduler</text>
+<text x="735" y="348" font-size="12" fill="#546e7a" text-anchor="middle" dominant-baseline="central">滚动间隔 · 变化检测</text>
+<rect x="880" y="306" width="250" height="70" rx="6" fill="#ffffff" stroke="#263238" stroke-width="1.6"/>
+<text x="1005" y="326" font-size="15" fill="#1a1a1a" text-anchor="middle" dominant-baseline="central" font-weight="bold">Realtime</text>
+<text x="1005" y="348" font-size="12" fill="#546e7a" text-anchor="middle" dominant-baseline="central">inotify · debounce</text>
+<rect x="1150" y="306" width="210" height="70" rx="6" fill="#ffffff" stroke="#263238" stroke-width="1.6"/>
+<text x="1255" y="326" font-size="15" fill="#1a1a1a" text-anchor="middle" dominant-baseline="central" font-weight="bold">Incremental</text>
+<text x="1255" y="348" font-size="12" fill="#546e7a" text-anchor="middle" dominant-baseline="central">BKPINC1 · 依赖链</text>
+<rect x="30" y="424" width="1360" height="108" rx="8" fill="#fff8e1" stroke="#ffe082" stroke-width="1.4"/>
+<text x="46" y="446" font-size="15" fill="#ef6c00" text-anchor="start" dominant-baseline="central" font-weight="bold">网络与服务端</text>
+<rect x="70" y="440" width="300" height="74" rx="6" fill="#fff8e1" stroke="#263238" stroke-width="1.6"/>
+<text x="220" y="460" font-size="15" fill="#1a1a1a" text-anchor="middle" dominant-baseline="central" font-weight="bold">Network client</text>
+<text x="220" y="482" font-size="12" fill="#546e7a" text-anchor="middle" dominant-baseline="central">RemoteArchiveClient（BPNET1）</text>
+<rect x="400" y="440" width="300" height="74" rx="6" fill="#fff8e1" stroke="#263238" stroke-width="1.6"/>
+<text x="550" y="460" font-size="15" fill="#1a1a1a" text-anchor="middle" dominant-baseline="central" font-weight="bold">Secure transport</text>
+<text x="550" y="482" font-size="12" fill="#546e7a" text-anchor="middle" dominant-baseline="central">BPSEC1 / BPSEC2（自研）</text>
+<rect x="730" y="440" width="300" height="74" rx="6" fill="#fff8e1" stroke="#263238" stroke-width="1.6"/>
+<text x="880" y="460" font-size="15" fill="#1a1a1a" text-anchor="middle" dominant-baseline="central" font-weight="bold">backup-server</text>
+<text x="880" y="482" font-size="12" fill="#546e7a" text-anchor="middle" dominant-baseline="central">BPSEC 握手 + 会话</text>
+<rect x="1060" y="440" width="300" height="74" rx="6" fill="#fff8e1" stroke="#263238" stroke-width="1.6"/>
+<text x="1210" y="460" font-size="15" fill="#1a1a1a" text-anchor="middle" dominant-baseline="central" font-weight="bold">Metadata store</text>
+<text x="1210" y="482" font-size="12" fill="#546e7a" text-anchor="middle" dominant-baseline="central">SQLite：用户 / 快照 / 依赖</text>
+<rect x="70" y="556" width="1290" height="108" rx="8" fill="#f3e5f5" stroke="#ce93d8" stroke-width="1.4"/>
+<text x="86" y="578" font-size="15" fill="#6a1b9a" text-anchor="start" dominant-baseline="central" font-weight="bold">存储</text>
+<rect x="110" y="592" width="380" height="60" rx="6" fill="#ffffff" stroke="#263238" stroke-width="1.6"/>
+<text x="300" y="612" font-size="15" fill="#1a1a1a" text-anchor="middle" dominant-baseline="central" font-weight="bold">本地备份仓库</text>
+<text x="300" y="634" font-size="12" fill="#546e7a" text-anchor="middle" dominant-baseline="central">*.bak + .manifest + .identity</text>
+<rect x="520" y="592" width="380" height="60" rx="6" fill="#ffffff" stroke="#263238" stroke-width="1.6"/>
+<text x="710" y="612" font-size="15" fill="#1a1a1a" text-anchor="middle" dominant-baseline="central" font-weight="bold">服务端存储</text>
+<text x="710" y="634" font-size="12" fill="#546e7a" text-anchor="middle" dominant-baseline="central">blob + SQLite 元数据</text>
+<rect x="930" y="592" width="400" height="60" rx="6" fill="#ffffff" stroke="#263238" stroke-width="1.6"/>
+<text x="1130" y="612" font-size="15" fill="#1a1a1a" text-anchor="middle" dominant-baseline="central" font-weight="bold">远端缓存（客户端）</text>
+<text x="1130" y="634" font-size="12" fill="#546e7a" text-anchor="middle" dominant-baseline="central">remote-cache/&lt;指纹&gt;/&lt;用户&gt;</text>
+<rect x="70" y="684" width="1290" height="300" rx="8" fill="#fafafa" stroke="#b0bec5" stroke-width="1.4"/>
+<text x="86" y="706" font-size="15" fill="#37474f" text-anchor="start" dominant-baseline="central" font-weight="bold">数据流</text>
+<text x="120" y="736" font-size="15" fill="#263238" text-anchor="start" dominant-baseline="central">GUI / CLI  -&gt;  共享核心  -&gt;  archive / filter / compression / crypto</text>
+<line x1="120" y1="764" x2="1250" y2="764" stroke="#1565c0" stroke-width="1.8" marker-end="url(#ah)"/>
+<text x="120" y="800" font-size="15" fill="#263238" text-anchor="start" dominant-baseline="central">remote client  -&gt;  secure transport  -&gt;  backup-server  -&gt;  metadata + storage</text>
+<line x1="120" y1="828" x2="1250" y2="828" stroke="#1565c0" stroke-width="1.8" marker-end="url(#ah)"/>
+<text x="120" y="864" font-size="15" fill="#263238" text-anchor="start" dominant-baseline="central">增量恢复：base snapshot -&gt; delta chain -&gt; preflight -&gt; staging restore -&gt; atomic publish</text>
+<line x1="120" y1="892" x2="1250" y2="892" stroke="#2e7d32" stroke-width="1.8" marker-end="url(#ah)"/>
+</svg>

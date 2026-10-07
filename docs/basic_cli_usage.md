@@ -1,22 +1,38 @@
-# 基础 CLI 使用说明（Sprint 1 / v0.1）
+# 基础 CLI 使用说明
 
-> 分支：feature/archive-format-v01
-> 状态：v0.1 实现文档
+> 描述对象：当前 `main` 上的产品 CLI `backupctl`（构建产物 `build/backupctl`）。
+> 归档格式见 `docs/format/`，筛选规则见 `docs/filter_usage.md`，定时备份见
+> `docs/scheduled_backup_usage.md`，网络备份见 `docs/network_backup_usage.md`。
 
-## 1. 本阶段实现范围
+## 1. 实现范围
 
 - 普通文件的递归备份与恢复（字节级一致，含空文件与二进制文件）；
 - 普通目录（含空目录、多级嵌套目录）的备份与恢复；
+- 符号链接按链接本身保存（不跟随）；硬链接只存一份 payload，恢复时重新指向
+  归档里的第一个副本；
+- 元数据：mode（07777，含 setuid / setgid / sticky）、uid / gid、
+  mtime（秒 + 纳秒）、设备号；
+- FIFO、字符设备、块设备按条目类型保存并在恢复时重建（设备节点需要
+  CAP_MKNOD，建不出来就明确失败并说清原因，不会静默降级成普通文件）；
+- 文件过滤：11 个字段 name / path / stem / ext / type / size / mtime /
+  uid / gid / user / group，语法见 `docs/filter_usage.md`；
+- 打包 mypack / ustar / fast-ustar、压缩 none / huffman / lzss-huffman、
+  加密 none / aes-256-ctr-hmac-sha256 / des-cbc-hmac-sha256；
+- 定时备份、实时备份（inotify）、网络备份（backup-server + BPNET1）；
 - 文件名支持空格与 UTF-8（中文）；
 - 错误路径明确报错并返回非 0：源不存在、源不是目录、仓库不存在、
   仓库缺少 data/、目标已存在且非空、不支持的文件类型、权限不足、
   无法创建目录等。
 
-## 2. 本阶段不包含
+## 2. 边界
 
-元数据（UID/GID/mode/时间戳）、符号链接与硬链接身份、FIFO/设备/socket、
-文件过滤、打包、压缩、加密、定时备份、实时备份（inotify）、网络备份
-等。遇到不支持的文件类型会明确失败并返回非 0。
+- 产品 CLI 与 GUI 都不提供"把归档写到任意路径"的入口：备份写进配置好的仓库，
+  文件名由程序生成，见第 4 节；
+- socket 不进入归档：只要它没有被 Filter 明确排除，整次备份就明确失败并返回
+  非 0（既不静默跳过，也不跟随它）；
+- Archive v0.1（`BKPARCH`）只保留**读**兼容：产品当前一律写出 v2 容器
+  （`BKPCNT2`），旧归档只要在仓库里就仍然恢复得回来；
+- 加密口令只从 `/dev/tty` 交互读取，不接受参数、环境变量或管道输入。
 
 ## 3. 构建
 
@@ -42,10 +58,18 @@ make test-fixtures        # 产出 build/archive-cli
 ./build/backupctl config repository set <仓库目录>   # 先配置仓库
 ./build/backupctl preview <source_directory> [--include R]... [--exclude R]...
 ./build/backupctl backup <source_directory> [--pack ...] [--compression ...] [--encryption ...] [--include R]... [--exclude R]...
-./build/backupctl repository list                    # 列出仓库里的归档
+./build/backupctl repository list                     # 列出仓库里的归档
+./build/backupctl repository delete <file_name>
 ./build/backupctl restore <file_name> <destination_directory>
+./build/backupctl schedule show | set | enable | disable | run | history | watch
+./build/backupctl realtime show | set | enable | disable | watch | history
+./build/backupctl remote ping | register | login | list | upload | download | backup | restore | delete | delete-account
 ./build/backupctl --help
 ```
+
+每个子命令的完整参数见 `backupctl --help`（用法错误时也会把整份 usage 再打一
+次）。定时备份的详细说明见 `docs/scheduled_backup_usage.md`，网络备份见
+`docs/network_backup_usage.md` 与 `docs/remote_incremental.md`。
 
 产品 CLI 与 Modern GUI 使用**同一套业务模型**：
 
