@@ -53,9 +53,10 @@ Item {
     // onActivated 用 currentIndex 查 keys，两个数组一旦顺序不一致，提交给
     // 核心的就是另一个算法，而界面上显示的还是用户选的那个。
     // 显示名与键分开放：下拉里给人看的是显示名，交给 C++ 的始终是键。
-    // 显示名只有一份来源（backup_option_labels.h，通过 main.cpp 注册的
-    // controller 的 option*Labels 属性）：手动 / 自动 / 实时三个页面
-    // 共用同一组文字。
+    // 显示名只有一份来源（BackupController 的 option*Labels 属性，见
+    // backup_controller.cpp 的展示文案表）：手动 / 自动 / 实时三个页面
+    // 共用同一组文字。键另有唯一来源 include/backup_option_keys.h，
+    // 两张表一一对应。
     // 以前手动页写 "MyPack"、另两页写 "MyPack（推荐）"，下拉里看到的文字
     // 会随页面不同而不同；键仍然由各页自己列出，与展示名一一对应。
     readonly property var strategyLabels: controller.optionStrategyLabels
