@@ -550,44 +550,9 @@ log "== SHA256SUMS 与 RELEASE-INFO.txt =="
 } > "$RELEASE_DIR/RELEASE-INFO.txt"
 
 # ---- 制品自查：私钥扫描 + 清单核对 ----
-log "== 制品私钥扫描 =="
-SCAN_TARGET="$WORK/scan"
-rm -rf "$SCAN_TARGET"; mkdir -p "$SCAN_TARGET"
-for artifact in "$RELEASE_DIR"/*; do
-  case "$artifact" in *SHA256SUMS|*RELEASE-INFO.txt) continue ;; esac
-  base="$(basename "$artifact")"
-  case "$artifact" in
-    *.deb)
-      rm -rf "$SCAN_TARGET/$base"; mkdir -p "$SCAN_TARGET/$base"
-      dpkg-deb -x "$artifact" "$SCAN_TARGET/$base" || die "解包失败（dpkg-deb -x）：$base" ;;
-    *.tar.xz)
-      rm -rf "$SCAN_TARGET/$base"; mkdir -p "$SCAN_TARGET/$base"
-      tar -xJf "$artifact" -C "$SCAN_TARGET/$base" || die "解包失败（tar -xJf）：$base"
-      compgen -G "$SCAN_TARGET/$base/*/bin/backupctl" > /dev/null || die "tar 解包结果异常：$base" ;;
-    *.AppImage)
-      # 解包失败必须让构建失败：旧写法是 "--appimage-extract ... || true"，
-      # 解包失败后扫描会退化成“扫一个空目录”，然后报 0 命中。
-      rm -rf "$SCAN_TARGET/$base"; mkdir -p "$SCAN_TARGET/$base"
-      cp -f "$artifact" "$SCAN_TARGET/$base/.extract.AppImage"
-      chmod 0755 "$SCAN_TARGET/$base/.extract.AppImage"
-      ( cd "$SCAN_TARGET/$base" && ./.extract.AppImage --appimage-extract ) > /dev/null 2>&1 \
-        || die "AppImage 解包失败：$base"
-      rm -f "$SCAN_TARGET/$base/.extract.AppImage"
-      [ -x "$SCAN_TARGET/$base/squashfs-root/usr/bin/backupctl" ] \
-        || die "AppImage 解包结果缺少 backupctl：$base" ;;
-    *)
-      die "不认识的发行文件（不允许跳过扫描）：$base" ;;
-  esac
-done
-hits="$(scan_for_secrets "$SCAN_TARGET")"
-if [ "$hits" != "0" ]; then
-  die "制品里发现了疑似私钥/口令内容（$hits 处）"
-fi
-log "  私钥扫描：0 命中"
-if [ -n "$(find "$SCAN_TARGET" \( -name '*.key' -o -name 'secrets.env' \) -print -quit)" ]; then
-  die "制品里出现了 .key / secrets.env 文件"
-fi
-log "  文件级检查：无 .key / secrets.env"
+log "== 制品自查（解包 + 私钥扫描，与 CI 同一套判据）=="
+bash packaging/ci-artifact-selfscan.sh "$RELEASE_DIR" \
+  || die "制品自查失败：解包不完整或发现疑似私钥"
 
 log "== 完成 =="
 ( cd "$RELEASE_DIR" && ls -l && echo && cat SHA256SUMS )

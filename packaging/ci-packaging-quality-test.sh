@@ -26,6 +26,9 @@ CLIENT_TAR="$(find "$REL" -maxdepth 1 -name 'backup-project-client-*-linux-x86_6
 ci_section "正对照：正式制品必须通过全部检查"
 expect_ok "正对照 私钥扫描通过" bash "$HERE/ci-secret-scan.sh" "$REL"
 expect_ok "正对照 许可覆盖通过" bash "$HERE/ci-license-coverage.sh" "$REL"
+# 构建期与 CI 共用同一套解包判据：这里把**整个发行目录**（客户端 + 服务端）喂给它，
+# 任何一种产品族的期望值写歪了都会在 CI 里当场失败。
+expect_ok "正对照 制品自查通过（客户端 + 服务端）"   bash "$HERE/ci-artifact-selfscan.sh" "$REL"
 
 # ---- 1) P1-01：解包失败 / 内容缺失 / 不认识的制品，都必须让扫描失败 ----
 ci_section "P1-01 私钥扫描必须 fail-closed"
@@ -39,6 +42,10 @@ if [ -n "$APPIMAGE" ]; then
   d="$WORK/empty"; mkdir -p "$d"
   : > "$d/$base"
   expect_fail "P1-01 空文件冒充 AppImage -> 扫描失败" bash "$HERE/ci-secret-scan.sh" "$d"
+
+  d="$WORK/selfscan-truncated"; mkdir -p "$d"
+  head -c 4096 "$APPIMAGE" > "$d/$base"
+  expect_fail "P1-01 自查：截断的 AppImage -> 失败"     bash "$HERE/ci-artifact-selfscan.sh" "$d"
 
   d="$WORK/missing-content"; mkdir -p "$d"
   # 能跑起来、但解出来的树里没有我们核对的内容：用真实 AppImage 前 1 MiB
