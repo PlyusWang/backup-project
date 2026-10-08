@@ -1,7 +1,8 @@
 # 发布与演示
 
 > 文档编号：04
-> 状态：已完成（基线 main = 6d1e2ba，PR #27 已合并）
+> 状态：已完成（**写作时**的基线 main = 6d1e2ba，PR #27 已合并；之后 main 继续前进，
+> 发行流程、当前版本与验收依据见 `docs/release-packaging.md` 与 GitHub Releases）
 > 说明：本文的命令都在本轮这台 Ubuntu VM 上执行过；标"实测"的输出是真实回显，
 > 路径与归档名按现场替换。所有演示操作只往 `/tmp` 或 `~/demo` 写数据，不改产品源码。
 
@@ -125,7 +126,7 @@ linuxdeploy 等工具只在构建期使用，不随制品分发。
     find . -type f ! -name MANIFEST.sha256 -printf '%P\n' | sort | xargs sha256sum
 
 想看这份包是不是当前基线构建的，直接比 `commit` 与 `git rev-parse HEAD`：
-本轮 `dist/` 里现存的那份是 `b3cd6bd`，而 main 已经是 `6d1e2ba` ——
+（举例）写作时 `dist/` 里现存的那份是 `b3cd6bd`，而当时的 main 是 `6d1e2ba` ——
 **演示前如果要"包与基线一致"，重新跑一次 staging 脚本**（第 1.3 节）。
 
 ### 2.3 冒烟测试（脚本自动做，失败即失败）
@@ -786,7 +787,7 @@ same-size + same-mtime 改写被识别为一次修改、从 delta 依赖链恢�
 
 逐条打勾，任何一条不过都先修好再开演：
 
-* [ ] **知道自己在哪台机器、哪个 commit**：`git rev-parse HEAD`（本轮 `6d1e2ba`）、
+* [ ] **知道自己在哪台机器、哪个 commit**：`git rev-parse HEAD`（示例：写作时是 `6d1e2ba`）、
       `git status --short`（演示用的目录包与当前 commit 是否一致，见 2.2）。
 * [ ] **二进制都在**：
       `ls build/backupctl build/backup-gui-modern build/backup-server build/backup-server-keygen build/backup-cert-tool`。

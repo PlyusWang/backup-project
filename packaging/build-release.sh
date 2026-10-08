@@ -233,14 +233,6 @@ build_appdir() {
   fi
   tail -12 "$WORK/linuxdeploy.log"
 
-  # linuxdeploy-plugin-qt 会按它自己的判断挑平台插件（默认通常只有 xcb）。
-  # 无显示环境（容器 / CI / 远程维护）要能启动**同一个** AppImage，所以把
-  # offscreen 与 minimal 补齐；缺了就直接补，而不是指望环境变量一定生效。
-  # 第三方许可材料：必须在 linuxdeploy **之后**生成 —— 随包的 Qt 与依赖库是
-  # 那一步才拷进 usr/lib 的，之前生成会得到"0 个组件"的空材料。
-  bash packaging/licenses/build-materials.sh "$appdir/usr/lib" \
-    "$appdir/usr/share/doc/backup-project-client" "backup-project-client"
-
   local qt_plugins plugin
   qt_plugins="$(qtpaths6 --query QT_INSTALL_PLUGINS 2>/dev/null || qmake6 -query QT_INSTALL_PLUGINS 2>/dev/null || true)"
   if [ -n "$qt_plugins" ] && [ -d "$qt_plugins/platforms" ]; then
@@ -258,6 +250,13 @@ pack_client_appimage() {
   local appdir="$WORK/appdir"
   local tools="$REPO_ROOT/dist/.tools"
   local out="$RELEASE_DIR/Backup-Project-Client-$VERSION-x86_64.AppImage"
+  # 第三方许可材料：必须在全部 AppDir 内容就位之后生成——随包的 Qt 与依赖库是
+  # linuxdeploy 拷进去的，offscreen / minimal 平台插件是它之后补齐的。早一步生成就会
+  # 漏掉这些组件（旧版本漏的正是 plugins/ 与 qml/ 里的 33 个对象）。
+  # 对象根传 usr/：lib/、plugins/、qml/ 三个目录一起清点。
+  bash packaging/licenses/build-materials.sh "$appdir/usr" \
+    "$appdir/usr/share/doc/backup-project-client" "backup-project-client"
+
   log "== appimagetool =="
   # AppDir 里的 BUILD-INFO/MANIFEST 必须反映最终内容：Qt 是 linuxdeploy 之后
   # 才进去的，所以清单在这里（打包前）重新生成。
@@ -295,7 +294,8 @@ pack_client_tarball() {
   install -m 0644 packaging/client/backup-project.desktop "$tree/packaging/client/"
   install -m 0755 packaging/portable/uninstall-client.sh "$tree/packaging/portable/"
   # 第三方许可材料：tar 解开就在根上（同时给 share/doc 一份，安装后也能找到）
-  bash packaging/licenses/build-materials.sh "$tree/lib" "$tree" "backup-project-client"
+  # 对象根是 tar 树的根：lib/ plugins/ qml/ 都要清点（旧版本只看 lib/）。
+  bash packaging/licenses/build-materials.sh "$tree" "$tree" "backup-project-client"
   mkdir -p "$tree/share/doc/backup-project-client"
   cp -a "$tree/THIRD-PARTY-NOTICES.txt" "$tree/LICENSE-INVENTORY.md" "$tree/licenses" \
     "$tree/share/doc/backup-project-client/"
@@ -325,19 +325,15 @@ pack_client_deb() {
   for doc in docs/client-quick-start.md docs/release-layout.md docs/secure_transport.md docs/install-client.md docs/release-packaging.md; do
     [ -f "$doc" ] && install -m 0644 "$doc" "$tree/usr/share/doc/backup-project-client/"
   done
-  bash packaging/licenses/build-materials.sh "$tree/usr/lib/backup-project-client/lib" \
+  # 对象根是随包对象目录本身：lib/ plugins/ qml/ 里的共享对象都要清点。
+  bash packaging/licenses/build-materials.sh "$tree/usr/lib/backup-project-client" \
     "$tree/usr/share/doc/backup-project-client" "backup-project-client"
   write_build_info "$tree/usr/share/doc/backup-project-client" client
   write_manifest "$tree/usr/share/doc/backup-project-client" > /dev/null
-  cat > "$WORK/third-party-notices-client.txt" <<EOF
-本发行包动态链接 Qt（版本 $QT_VERSION，来自构建基线的发行版软件包，LGPL-3.0）。
-Qt 以动态库形式随包提供，位于 /usr/lib/backup-project-client/lib/ 与
-/usr/lib/backup-project-client/qml/，可以被替换（也可被移除，改用系统 Qt）。
-Qt 源码： https://download.qt.io/official_releases/qt/
-打包工具（构建期使用，不随包分发）：见 packaging/tools.lock —— linuxdeploy、
-linuxdeploy-plugin-qt、appimagetool，各自的版本、来源 URL、sha256 与许可证。
-EOF
-  install -m 0644 "$WORK/third-party-notices-client.txt" "$tree/usr/share/doc/backup-project-client/THIRD-PARTY-NOTICES.txt"
+  # 这里不再写一份简短的 Qt 说明去覆盖 THIRD-PARTY-NOTICES.txt：上面
+  # build-materials.sh 生成的才是完整声明（逐组件 + 提供包 + 许可）。覆盖它
+  # 会让 .deb 只剩 6 行简介，而同族的 AppImage / tar.xz 带的是完整版本。
+  # 构建期工具的说明现在由生成器统一输出。
   cat > "$tree/usr/share/doc/backup-project-client/copyright" <<EOF
 backup-project-client $VERSION
 
@@ -561,9 +557,26 @@ for artifact in "$RELEASE_DIR"/*; do
   case "$artifact" in *SHA256SUMS|*RELEASE-INFO.txt) continue ;; esac
   base="$(basename "$artifact")"
   case "$artifact" in
-    *.deb) dpkg-deb -x "$artifact" "$SCAN_TARGET/$base" ;;
-    *.tar.xz) mkdir -p "$SCAN_TARGET/$base" && tar -xf "$artifact" -C "$SCAN_TARGET/$base" ;;
-    *.AppImage) mkdir -p "$SCAN_TARGET/$base" && ( cd "$SCAN_TARGET/$base" && "$artifact" --appimage-extract >/dev/null 2>&1 || true ) ;;
+    *.deb)
+      rm -rf "$SCAN_TARGET/$base"; mkdir -p "$SCAN_TARGET/$base"
+      dpkg-deb -x "$artifact" "$SCAN_TARGET/$base" || die "解包失败（dpkg-deb -x）：$base" ;;
+    *.tar.xz)
+      rm -rf "$SCAN_TARGET/$base"; mkdir -p "$SCAN_TARGET/$base"
+      tar -xJf "$artifact" -C "$SCAN_TARGET/$base" || die "解包失败（tar -xJf）：$base"
+      compgen -G "$SCAN_TARGET/$base/*/bin/backupctl" > /dev/null || die "tar 解包结果异常：$base" ;;
+    *.AppImage)
+      # 解包失败必须让构建失败：旧写法是 "--appimage-extract ... || true"，
+      # 解包失败后扫描会退化成“扫一个空目录”，然后报 0 命中。
+      rm -rf "$SCAN_TARGET/$base"; mkdir -p "$SCAN_TARGET/$base"
+      cp -f "$artifact" "$SCAN_TARGET/$base/.extract.AppImage"
+      chmod 0755 "$SCAN_TARGET/$base/.extract.AppImage"
+      ( cd "$SCAN_TARGET/$base" && ./.extract.AppImage --appimage-extract ) > /dev/null 2>&1 \
+        || die "AppImage 解包失败：$base"
+      rm -f "$SCAN_TARGET/$base/.extract.AppImage"
+      [ -x "$SCAN_TARGET/$base/squashfs-root/usr/bin/backupctl" ] \
+        || die "AppImage 解包结果缺少 backupctl：$base" ;;
+    *)
+      die "不认识的发行文件（不允许跳过扫描）：$base" ;;
   esac
 done
 hits="$(scan_for_secrets "$SCAN_TARGET")"

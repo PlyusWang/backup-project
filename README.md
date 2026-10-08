@@ -386,7 +386,8 @@ reader 会把它当成一份完整快照，然后安静地恢复出错的东西�
 | `scripts/final_gate.sh` | 总门禁：全量重建（含 sanitizer 构建）+ lint + 把全部独立套件各跑一遍，每个套件一行 `GATE <名字> exit=<码> 秒数` | `bash scripts/final_gate.sh`（日志在 `/tmp/final_gate.log`） |
 | `scripts/modern_gui_check.sh` | Modern GUI：构建 + offscreen 启动 + qmllint + 静态约束 + 端到端（含真起一个 `backup-server` 的远程页合同测试） | `bash scripts/modern_gui_check.sh`（日志在 `tests/output/modern-gui-check.log`） |
 
-**当前 main 的真实结果**（commit `6d1e2ba`）：
+**基线 `6d1e2ba` 上的实测结果**（历史记录，不是当前 main 的数字；当前发行的构建
+与验收见 `docs/release-packaging.md` 与 GitHub Releases）：
 
 ```text
 scripts/test.sh              PASS=279 FAIL=0
@@ -433,6 +434,10 @@ bash scripts/stage-server-release.sh     # 默认 dist/server/
 根私钥永远留在离线机器上；打包脚本会扫描包内容，私钥字段出现在不该出现的地方
 即判失败。更上层的发行制品（AppImage / .deb / portable tar.xz）由
 `packaging/build-release.sh` 在旧基线容器里构建，见 `docs/release-packaging.md`。
+
+**正式发行版**：`v0.1.0`（2026-10-08）。发行制品由 `.github/workflows/release.yml`
+在 Debian 12（客户端）/ Ubuntu 20.04（服务端）基线容器里构建，并做安装、升级、
+失败回滚、可复现性、密钥扫描与第三方许可覆盖验收；版本号以 GitHub Releases 为准。
 
 ---
 
@@ -499,7 +504,7 @@ bash scripts/stage-server-release.sh     # 默认 dist/server/
 | `docs/backlog/backup_mode_roadmap.md` | 备份触发方式 × 备份策略的后续路线 |
 | `docs/backlog/filter_future.md` | Filter 的技术债与待决策事项 |
 | `docs/backlog/remote_management_future.md` | 远程管理面的后续方向（**均未实现**） |
-| `docs/04_release_and_demo.md` | 发布与演示流程（Draft，尚未展开） |
+| `docs/04_release_and_demo.md` | 发布与演示流程（完整流程 + 演示脚本 + 回退表） |
 
 最终报告在 `report/`（LaTeX，`report/main.tex` 汇总 `sections/` 与
 `appendices/`）。
