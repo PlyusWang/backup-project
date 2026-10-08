@@ -1,7 +1,10 @@
 # 发行打包（release packaging）
 
 本文说明发行制品是怎么做出来的、为什么这么选基线、以及哪些性质是**可核验**的。
-所有数字都来自本轮的实测输出（见 `backup_project_artifacts/releases/<版本>/`）。
+所有数字都来自实际构建的实测输出（发行目录 `dist/release/<版本>/`，由
+`.github/workflows/release.yml` 在基线容器里产出）。
+
+**正式发行**：`v0.1.0`（2026-10-08，GitHub Releases）。
 
 ## 1. 两个产品族
 
