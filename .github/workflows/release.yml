@@ -268,6 +268,10 @@ jobs:
         run: bash packaging/ci-server-install-test.sh "dist/release/${{ needs.prepare.outputs.version }}"
       - name: third-party license coverage
         run: bash packaging/ci-license-coverage.sh "dist/release/${{ needs.prepare.outputs.version }}"
+      - name: release manifest（完整清单 + 哈希）
+        run: bash packaging/ci-release-manifest.sh "dist/release/${{ needs.prepare.outputs.version }}" --family all --expect-commit "${{ github.sha }}"
+      - name: artifact self-scan（解包 + 安全检查 + BUILD-INFO 契约）
+        run: bash packaging/ci-artifact-selfscan.sh "dist/release/${{ needs.prepare.outputs.version }}" --expect-commit "${{ github.sha }}" --expect-version "${{ needs.prepare.outputs.version }}"
       - name: packaging quality tests（检查自身的缺陷检出）
         run: bash packaging/ci-packaging-quality-test.sh "dist/release/${{ needs.prepare.outputs.version }}"
       - name: RELEASE-INFO 必须同时包含两个构建环境
