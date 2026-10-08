@@ -21,6 +21,7 @@
 | P2-01 | P2 | `packaging/licenses/build-materials.sh` | 双引号里的未转义反引号触发命令替换：构建日志出现 `.so: command not found`，生成的声明里那句话还被替换掉了 | **已修** |
 | P2-02 | P2 | Release Notes | v0.1.0 说明把 BPSEC1 的 X25519 pin 与 BPSEC2 的 Ed25519 证书混在一句里 | **已修**（v0.1.1 说明按源码改写） |
 | P3-01 | P3 | README、`docs/04_release_and_demo.md`、`docs/release-packaging.md` | 把 `6d1e2ba` 当"当前 main"、发行目录写成不存在的路径、04 还标着 Draft | **已修**（历史与当前分开表述） |
+| P1-05 | P1 | `packaging/build-release.sh`（构建期自查） | 解包核对项与产品族绑定，把客户端 tar 才有的 `bin/backupctl` 当成对**所有** tar 的要求；同一判据当时有两份实现，改了一份漏了另一份 | **已修**（抽成唯一实现，核对项与产品族无关） |
 | P3-02 | P3 | `packaging/build-release.sh`:345 | `gzip -9n -c ... > /dev/null 2>&1 || true` 是一句没有效果的调用 | **未修**（无功能影响，见 §5） |
 
 ## 2. 逐项根因、影响与修法
@@ -112,6 +113,30 @@ expect_eq "..." "$(find "$libdir" -maxdepth 1 -name '*.so*' | wc -l)" "$total"
 Qt6 QML 模块而查不到提供包（v0.1.0 自己在 Debian 12 容器里生成的清单证明这四个
 库在那里是可解析的：`libicu72 72.1-3+deb12u1`、`libjpeg62-turbo 1:2.1.5-2`）；
 在 CI 的 Debian 12 基线里由发行构建自行验证。
+
+### P1-05 发行 CI 第一次运行的真实失败（本轮自己引入的回归）
+
+v0.1.1 的第一次发行 CI（run `37830934861`，head = 合并提交 `484b86c`）在
+`build server (ubuntu:20.04)` 上失败，客户端作业成功：
+
+```text
+[release] ERROR: tar 解包结果异常：backup-project-server-0.1.1-linux-x86_64.tar.xz
+```
+
+根因：本轮把解包核对写成"tar 里必须有 `*/bin/backupctl`"——那是**客户端** tar 的
+文件名；服务端 tar 里是 `bin/backup-server`，于是被误判成"解包结果异常"。
+更根本的问题是**同一类判据当时有两份实现**（`build-release.sh` 的内联扫描与
+`ci-secret-scan.sh`）：修 P1-01 时只把后者改成产品相关，前者留了旧形状。
+
+**处置**：按任务书的要求，任何关键检查失败即停止发布 —— 本轮到此没有创建 v0.1.1 的
+tag，也没有发布任何 GitHub Release，因此不需要回滚。
+
+**修法**：把解包 + 私钥自查抽成唯一实现 `packaging/ci-artifact-selfscan.sh`
+（`build-release.sh` 直接调用它），并把核对项改成**与产品族无关**：tar 只要求
+"顶层目录下有 `bin/`"、deb 要求 `usr/` 非空、AppImage 要求
+`squashfs-root/usr/bin/` 非空。同时给 `ci-packaging-quality-test.sh` 补上
+"正对照：真品自查通过（客户端 + 服务端）"——正是这次撞到的组合——以及截断 AppImage 的
+负对照，让这一类"两处期望值漂移"下次在 CI 里当场暴露。
 
 ### P2-01 反引号命令替换
 
@@ -206,9 +231,9 @@ Debian 12 容器里覆盖，因为本地没有 appimagetool / linuxdeploy。）
 | 项 | 值 |
 | --- | --- |
 | 审查文件数 | 46（`packaging/` 全部脚本 + `release.yml`），另核对 README 与 3 份发行文档 |
-| 发现问题 | 9（P1×4、P2×2、P3×3） |
-| 已修复 | 8（P1×4、P2×2、P3×1）；未修 1（P3-02，已说明） |
-| 改动文件 | 9 个修改（+344/−112）+ 2 个新增（144 行）＝ 11 个文件、+488/−112 |
-| 新增测试 | 1 个新套件（`ci-packaging-quality-test.sh`，~20 条断言）+ 覆盖检查新增 6 类断言 + 生成器 1 条守卫 |
+| 发现问题 | 10（P1×5、P2×2、P3×3） |
+| 已修复 | 9（P1×5、P2×2、P3×1）；未修 1（P3-02，已说明） |
+| 改动文件 | 11 个修改 + 3 个新增（含 `ci-artifact-selfscan.sh`）＝ 14 个文件 |
+| 新增测试 | 1 个新套件（含真品自查正对照与截断 AppImage 负对照）（`ci-packaging-quality-test.sh`，~20 条断言）+ 覆盖检查新增 6 类断言 + 生成器 1 条守卫 |
 | 接口 / 数据格式影响 | **无**：没有改产品源码、公共头文件、归档格式、链格式、协议或用户数据结构；改动全部在打包 / 验收 / 文档层 |
 | 产品编译警告 | 未受影响（本轮没有改 C++）；仍以发行 CI 与 `final_gate.sh` 的 0 warning 为准 |
