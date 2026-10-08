@@ -268,6 +268,8 @@ jobs:
         run: bash packaging/ci-server-install-test.sh "dist/release/${{ needs.prepare.outputs.version }}"
       - name: third-party license coverage
         run: bash packaging/ci-license-coverage.sh "dist/release/${{ needs.prepare.outputs.version }}"
+      - name: packaging quality tests（检查自身的缺陷检出）
+        run: bash packaging/ci-packaging-quality-test.sh "dist/release/${{ needs.prepare.outputs.version }}"
       - name: RELEASE-INFO 必须同时包含两个构建环境
         run: |
           set -euo pipefail
