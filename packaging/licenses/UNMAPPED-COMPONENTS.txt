@@ -1,0 +1,8 @@
+# packaging/licenses/UNMAPPED-COMPONENTS.txt —— 允许"查不到提供包"的组件白名单
+#
+# 覆盖检查（packaging/ci-license-coverage.sh）对每个随包共享对象都要求：
+#   制品里的对象 -> shipped-objects.tsv -> coverage.tsv -> licenses/<提供包>/copyright
+# 整条链成立。查不到提供包（NOT_PROVIDED_BY_A_PACKAGE）的组件只有在这张表里
+# 显式列出才允许放行 —— 空表意味着"一个都不许"，任何漏配都会让发行失败。
+#
+# 格式：每行一个 soname，行内 '#' 之后写理由。没有正当理由不要往这里加。
