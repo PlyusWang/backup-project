@@ -46,8 +46,13 @@ if [ -z "$EXPECT_VERSION" ]; then
   exit 1
 fi
 V="$EXPECT_VERSION"
+# .deb 的文件名与 Version 字段用的是 **Debian 版本**：semver 里 "-" 之后的预发布段在
+# deb 里写成 "~"（见 lib/common.sh 的 deb_version_of）。单族构建用 --only server 配
+# 带短横线的版本号时，两者会不一样 —— 这个差别是本地单族构建实测出来的。
+DEB_V="$(grep -m1 '^deb_version' "$INFO" 2>/dev/null | awk '{print $3}')"
+[ -n "$DEB_V" ] || DEB_V="$V"
 
-ci_section "发行清单：家族 $FAMILY，版本 $V"
+ci_section "发行清单：家族 $FAMILY，版本 $V（deb: $DEB_V）"
 
 declare -A PATTERN=(
   [appimage]='Backup-Project-Client-*-x86_64.AppImage'
@@ -58,9 +63,9 @@ declare -A PATTERN=(
 )
 declare -A EXPECTED=(
   [appimage]="Backup-Project-Client-$V-x86_64.AppImage"
-  [client_deb]="backup-project-client_${V}_amd64.deb"
+  [client_deb]="backup-project-client_${DEB_V}_amd64.deb"
   [client_tar]="backup-project-client-$V-linux-x86_64.tar.xz"
-  [server_deb]="backup-project-server_${V}_amd64.deb"
+  [server_deb]="backup-project-server_${DEB_V}_amd64.deb"
   [server_tar]="backup-project-server-$V-linux-x86_64.tar.xz"
 )
 
@@ -134,7 +139,7 @@ for key in client_deb server_deb; do
   [ -f "$REL/${EXPECTED[$key]}" ] || continue
   debv="$(dpkg-deb -f "$REL/${EXPECTED[$key]}" Version 2>/dev/null || true)"
   deba="$(dpkg-deb -f "$REL/${EXPECTED[$key]}" Architecture 2>/dev/null || true)"
-  expect_eq "$key 的 deb Version 与期望一致" "$V" "$debv"
+  expect_eq "$key 的 deb Version 与期望一致" "$DEB_V" "$debv"
   expect_eq "$key 的 deb Architecture = amd64" "amd64" "$deba"
 done
 
