@@ -105,10 +105,10 @@ want_artifacts="$(for key in "${KEYS[@]}"; do printf '%s\n' "${EXPECTED[$key]}";
 # 五件之外的东西（例如另一族的旧版本残留）——这样单独构建一族（CI 的 client / server
 # 作业）不会因为"没有另一族"而失败，而正式 bundle 目录（--family all）仍是严格全检。
 allowed_artifacts="$(for key in appimage client_deb client_tar server_deb server_tar; do printf '%s\n' "${EXPECTED[$key]}"; done | LC_ALL=C sort)"
-extra="$(comm -13 <(printf '%s\n' "$allowed_artifacts") <(printf '%s\n' "$actual_artifacts") | grep -c . || true)"
+extra="$(LC_ALL=C comm -13 <(printf '%s\n' "$allowed_artifacts") <(printf '%s\n' "$actual_artifacts") | grep -c . || true)"
 if [ "$extra" != "0" ]; then
   ci_fail "发行目录里有未预期的发行文件（$extra 个，不在正式发行包里）："
-  comm -13 <(printf '%s\n' "$allowed_artifacts") <(printf '%s\n' "$actual_artifacts") | sed 's/^/        /' >&2
+  LC_ALL=C comm -13 <(printf '%s\n' "$allowed_artifacts") <(printf '%s\n' "$actual_artifacts") | sed 's/^/        /' >&2
 else
   ci_pass "没有多余的发行文件（旧版本残留 / 重复制品）"
 fi
@@ -149,14 +149,16 @@ if [ ! -f "$SUM" ]; then
 else
   ci_pass "存在 SHA256SUMS"
   listed="$(awk '{ $1=""; sub(/^[ \t]+/, ""); sub(/^\*/, ""); if ($0 != "") print }' "$SUM" | LC_ALL=C sort)"
-  want="$( { printf '%s\n' "$want_artifacts"; [ -f "$INFO" ] && printf '%s\n' "RELEASE-INFO.txt"; } | LC_ALL=C sort)"
+  # 制品必须**全部**在清单里 —— 这条不打折。
+  # RELEASE-INFO.txt 则可有可无：构建期在单族目录里生成清单时它还没写出来（清单在
+  # RELEASE-INFO 之前生成），而 CI bundle 阶段重算清单时它已经在了；两种都接受。
   listed_artifacts="$(printf '%s\n' "$listed" | grep -vx 'RELEASE-INFO.txt' | grep -c . || true)"
-  missing_in_sums="$(comm -23 <(printf '%s\n' "$want") <(printf '%s\n' "$listed") | grep -c . || true)"
-  unknown_in_sums="$(comm -13 <(printf '%s\n' "$allowed_artifacts") <(printf '%s\n' "$listed" | grep -vx 'RELEASE-INFO.txt') | grep -c . || true)"
+  missing_in_sums="$(LC_ALL=C comm -23 <(printf '%s\n' "$want_artifacts") <(printf '%s\n' "$listed") | grep -c . || true)"
+  unknown_in_sums="$(LC_ALL=C comm -13 <(printf '%s\n' "$allowed_artifacts") <(printf '%s\n' "$listed" | grep -vx 'RELEASE-INFO.txt') | grep -c . || true)"
   expect_eq "SHA256SUMS 列出了本族全部制品（共 $listed_artifacts 个制品行）" "0" "$missing_in_sums"
   expect_eq "SHA256SUMS 没有列入发行包之外的文件" "0" "$unknown_in_sums"
   if [ "$missing_in_sums" != "0" ]; then
-    comm -23 <(printf '%s\n' "$want") <(printf '%s\n' "$listed") | sed 's/^/        /' >&2
+    LC_ALL=C comm -23 <(printf '%s\n' "$want_artifacts") <(printf '%s\n' "$listed") | sed 's/^/        /' >&2
   fi
   bad=0
   while read -r want_hash file; do
