@@ -62,6 +62,62 @@ std::string SnapshotName(int index) {
   return "snap-" + std::to_string(index) + ".bak";
 }
 
+// ---- R-01 回归用的确定性失败注入 ----
+//
+// 产品把 staging / overlay / inner_container 三个临时路径放在 destination
+// 旁边、名字带 getpid() 后缀。同进程的测试因此能精确算出它们：把"失败点"表达
+// 成**文件系统事实**（挡路的同名目录、清理不掉的只读残留、0500 的合并目标），
+// 既不需要产品侧测试后门，也不依赖时序或随机性。
+std::string TempPath(const std::string& destination, const char* suffix) {
+  return destination + "." + std::to_string(static_cast<long>(::getpid())) +
+         suffix;
+}
+
+// 造一个"清理不掉的残留"：0500 的目录 + 里面一个文件。产品进入时会先
+// RemoveTree 同名残留，但只读目录里的 unlink 会 EACCES、unlink 本身又删不掉
+// 目录，所以它原样留着——正好把下游那一步钉成失败。
+bool MakeStubbornResidue(const std::string& path) {
+  if (::mkdir(path.c_str(), 0755) != 0) return false;
+  if (!test_support::WriteFile(path + "/residue", "residue", 0644)) {
+    return false;
+  }
+  return ::chmod(path.c_str(), 0500) == 0;
+}
+
+void DropStubbornResidue(const std::string& path) {
+  ::chmod(path.c_str(), 0755);
+  test_support::RemoveTree(path);
+}
+
+// 只读子树让"尽力而为"的清理删不干净：产品的 RemoveTree 全程 lstat + unlink，
+// 不会为了删除先去 chmod。契约允许残留（只占磁盘，下次进入再清一次），所以
+// 测试自己按"先放开权限再删"的方式把这棵注入用的树收掉。
+void DropTreeForcingModes(const std::string& path) {
+  struct stat info;
+  if (::lstat(path.c_str(), &info) != 0) return;
+  if (!S_ISDIR(info.st_mode)) {
+    test_support::RemoveTree(path);
+    return;
+  }
+  ::chmod(path.c_str(), 0700);
+  for (const std::string& name : test_support::DirEntries(path)) {
+    DropTreeForcingModes(path + "/" + name);
+  }
+  test_support::RemoveTree(path);
+}
+
+// 一次受支持的增量备份（MyPack + 不压缩 + 不加密）。
+bool MakeSnapshot(const std::string& source, const std::string& repository,
+                  const std::string& name, bp::IncrementalOutcome* outcome,
+                  std::string* error) {
+  bp::Filter filter;
+  bp::BackupOptions options;
+  return bp::RunIncrementalBackup(
+      source, repository, name, "repo-identity", filter, options,
+      std::vector<std::string>(), std::vector<std::string>(), "", outcome,
+      error);
+}
+
 }  // namespace
 
 int main() {
@@ -642,6 +698,375 @@ int main() {
                         "INC-R T9 判别：错误密码被拒绝");
     test_support::Check(!test_support::Exists(restored_wrong),
                         "INC-R T9 恢复失败时不留半个目标目录");
+  }
+
+
+  // ---- R-01：链上任何一个 delta 失败都必须让整次恢复失败 ----
+  //
+  // 旧控制流里，ReadDeltaEnvelope / ExtractDeltaPayload / delta 的
+  // RunRestorePipeline / MergeTree 这四个失败分支只 break 了内层 for，没有把
+  // 失败写进 delta_failed。for 结束后 delta_failed 仍是 false，代码继续走到
+  // 发布：返回 true，destination 里出现一棵"没有应用完增量"的树。
+  //
+  // 每个用例都先把**指定的那一步**钉成确定性失败，再要求：返回 false、
+  // destination 一个字节都没发布、临时路径按原契约清理。失败的具体位置由
+  // error_message 里的路径断言兜住，证明打的确实是目标分支。
+  test_support::Section("INC-R 10. R-01：delta 失败不得发布半成品");
+  {
+    // 10.1 成功路径的对照：多 delta 链上每一个 delta 的结果都要验证。
+    const std::string work = test_support::FreshDir("inc-r01-multi");
+    const std::string source = work + "/src";
+    const std::string repository = work + "/repo";
+    const std::string oracle_repo = work + "/oracle";
+    test_support::Mkdir(source, 0755);
+    test_support::Mkdir(repository, 0755);
+    test_support::Mkdir(oracle_repo, 0755);
+    bp::IncrementalOutcome outcome;
+    std::string error;
+
+    test_support::WriteFile(source + "/keep.txt", "keep-v1", 0644);
+    test_support::WriteFile(source + "/first.txt", "first-v1", 0644);
+    test_support::Check(
+        MakeSnapshot(source, repository, "s1.bak", &outcome, &error) &&
+            outcome.kind == bp::IncrementalOutcome::Kind::kFullBaseline,
+        "INC-R T10 基线建立成功", error);
+    test_support::WriteFile(source + "/first.txt", "first-v2", 0644);
+    test_support::Check(
+        MakeSnapshot(source, repository, "s2.bak", &outcome, &error) &&
+            outcome.kind == bp::IncrementalOutcome::Kind::kDelta,
+        "INC-R T10 第一个 delta 建立成功", error);
+    test_support::WriteFile(source + "/second.txt", "second-v1", 0644);
+    test_support::Check(
+        MakeSnapshot(source, repository, "s3.bak", &outcome, &error) &&
+            outcome.kind == bp::IncrementalOutcome::Kind::kDelta,
+        "INC-R T10 第二个 delta 建立成功", error);
+
+    const std::string restored = work + "/restored";
+    bp::RestoreReport report;
+    error.clear();
+    test_support::Check(
+        bp::RestoreSnapshotChain(repository, "s3.bak", restored,
+                                 bp::RestoreOptions{}, &report, &error),
+        "INC-R T10 三份快照的链恢复成功", error);
+    std::string content;
+    test_support::Check(
+        test_support::ReadFile(restored + "/first.txt", &content) &&
+            content == "first-v2",
+        "INC-R T10 第一个 delta 的结果也在（不是只看最后一个）", content);
+    test_support::Check(
+        test_support::ReadFile(restored + "/second.txt", &content) &&
+            content == "second-v1",
+        "INC-R T10 第二个 delta 的结果也在", content);
+    test_support::Check(
+        test_support::ReadFile(restored + "/keep.txt", &content) &&
+            content == "keep-v1",
+        "INC-R T10 没被任何 delta 触碰的文件原样保留", content);
+    bp::Filter filter;
+    std::string oracle;
+    test_support::Check(
+        MakeOracle(source, oracle_repo, "multi", filter, &oracle, &error),
+        "INC-R T10 oracle 完整备份成功", error);
+    std::string detail;
+    test_support::Check(test_support::CompareTrees(oracle, restored, &detail),
+                        "INC-R T10 链恢复 == 完整恢复（逐节点）", detail);
+  }
+  {
+    // 10.2 目标分支：**最后一个 delta** 的 MergeTree 失败（合并目标不可写）。
+    const std::string work = test_support::FreshDir("inc-r01-last");
+    const std::string source = work + "/src";
+    const std::string repository = work + "/repo";
+    test_support::Mkdir(source, 0755);
+    test_support::Mkdir(repository, 0755);
+    bp::IncrementalOutcome outcome;
+    std::string error;
+
+    test_support::WriteFile(source + "/a.txt", "a-v1", 0644);
+    test_support::Mkdir(source + "/ro", 0755);
+    test_support::WriteFile(source + "/ro/keep.txt", "keep", 0644);
+    test_support::Check(::chmod((source + "/ro").c_str(), 0500) == 0,
+                        "INC-R T11 源树里的 ro 置成 0500");
+    test_support::Check(
+        MakeSnapshot(source, repository, "s1.bak", &outcome, &error) &&
+            outcome.kind == bp::IncrementalOutcome::Kind::kFullBaseline,
+        "INC-R T11 基线建立成功（带上只读目录的 mode）", error);
+    // 第一个 delta 只改 a.txt：ro 的 mode 在 s1 / s2 两处都是 0500，
+    // staging 里的 ro 因此一直是只读的——最后一个 delta 往它里面写新文件时
+    // 才必然失败（这正是要注入的那一步）。
+    test_support::WriteFile(source + "/a.txt", "a-v2", 0644);
+    test_support::Check(
+        MakeSnapshot(source, repository, "s2.bak", &outcome, &error) &&
+            outcome.kind == bp::IncrementalOutcome::Kind::kDelta,
+        "INC-R T11 第一个 delta 建立成功", error);
+    test_support::Check(::chmod((source + "/ro").c_str(), 0755) == 0 &&
+                            test_support::WriteFile(source + "/ro/new.txt",
+                                                    "new", 0644) &&
+                            ::chmod((source + "/ro").c_str(), 0500) == 0,
+                        "INC-R T11 只读目录里加上 ro/new.txt 后收回 0500");
+    test_support::Check(
+        MakeSnapshot(source, repository, "s3.bak", &outcome, &error) &&
+            outcome.kind == bp::IncrementalOutcome::Kind::kDelta,
+        "INC-R T11 最后一个 delta 建立成功（新增 ro/new.txt）", error);
+
+    // 前提校验：恢复出来的 ro 确实带着 0500，合并才必然失败。
+    const std::string probe = work + "/probe";
+    bp::RestoreReport probe_report;
+    error.clear();
+    test_support::Check(
+        bp::RestoreSnapshotChain(repository, "s2.bak", probe,
+                                 bp::RestoreOptions{}, &probe_report, &error),
+        "INC-R T11 探针：s2 的链恢复成功", error);
+    struct stat ro_info;
+    test_support::Check(
+        test_support::StatOf(probe + "/ro", &ro_info) &&
+            (ro_info.st_mode & 07777) == 0500,
+        "INC-R T11 探针：恢复出来的 ro 是 0500（注入前提成立）");
+
+    const std::string destination = work + "/restored";
+    bp::RestoreReport report;
+    error.clear();
+    const bool ok = bp::RestoreSnapshotChain(repository, "s3.bak", destination,
+                                             bp::RestoreOptions{}, &report,
+                                             &error);
+    test_support::Check(!ok, "INC-R T11 判别：最后一个 delta 合并失败即整次失败",
+                        error);
+    test_support::Check(!test_support::Exists(destination),
+                        "INC-R T11 判别：失败时 destination 一个字节都没发布");
+    test_support::Check(error.find("ro/new.txt") != std::string::npos,
+                        "INC-R T11 失败出在合并 ro/new.txt 这一步", error);
+    test_support::Check(!test_support::Exists(TempPath(destination, ".container")),
+                        "INC-R T11 失败后中间容器文件清理掉了");
+    // staging / overlay 里那棵只读子树会让"尽力而为"的清理留下残留（产品契约
+    // 如此，不是本轮缺陷）：这里按先放开权限再删的方式收掉。
+    DropTreeForcingModes(TempPath(destination, ".staging"));
+    DropTreeForcingModes(TempPath(destination, ".overlay"));
+  }
+  {
+    // 10.3 目标分支：**中间 delta** 的 payload 提取失败（同名残留挡路，
+    // ExtractDeltaPayload 用 O_CREAT|O_EXCL 打开容器文件）。
+    const std::string work = test_support::FreshDir("inc-r01-extract");
+    const std::string source = work + "/src";
+    const std::string repository = work + "/repo";
+    test_support::Mkdir(source, 0755);
+    test_support::Mkdir(repository, 0755);
+    bp::IncrementalOutcome outcome;
+    std::string error;
+
+    test_support::WriteFile(source + "/a.txt", "a-v1", 0644);
+    test_support::Check(
+        MakeSnapshot(source, repository, "s1.bak", &outcome, &error),
+        "INC-R T12 基线建立成功", error);
+    test_support::WriteFile(source + "/a.txt", "a-v2", 0644);
+    test_support::Check(
+        MakeSnapshot(source, repository, "s2.bak", &outcome, &error),
+        "INC-R T12 中间 delta 建立成功", error);
+    test_support::WriteFile(source + "/b.txt", "b-v1", 0644);
+    test_support::Check(
+        MakeSnapshot(source, repository, "s3.bak", &outcome, &error),
+        "INC-R T12 最后一个 delta 建立成功", error);
+
+    const std::string destination = work + "/restored";
+    test_support::Check(
+        ::mkdir(TempPath(destination, ".container").c_str(), 0755) == 0,
+        "INC-R T12 预置挡路的 container 残留");
+    bp::RestoreReport report;
+    error.clear();
+    const bool ok = bp::RestoreSnapshotChain(repository, "s3.bak", destination,
+                                             bp::RestoreOptions{}, &report,
+                                             &error);
+    test_support::Check(!ok, "INC-R T12 判别：中间 delta 提取失败即整次失败",
+                        error);
+    test_support::Check(!test_support::Exists(destination),
+                        "INC-R T12 判别：失败时不发布（不建目录、不写半棵树）");
+    test_support::Check(error.find(".container") != std::string::npos,
+                        "INC-R T12 失败出在 container 那一步", error);
+    test_support::Check(
+        !test_support::Exists(TempPath(destination, ".staging")) &&
+            !test_support::Exists(TempPath(destination, ".overlay")),
+        "INC-R T12 失败后 staging / overlay 都清理掉了");
+    test_support::RemoveTree(TempPath(destination, ".container"));
+  }
+  {
+    // 10.4 目标分支：delta 容器恢复到 overlay 时失败（残留非空且清理不掉）。
+    const std::string work = test_support::FreshDir("inc-r01-container");
+    const std::string source = work + "/src";
+    const std::string repository = work + "/repo";
+    test_support::Mkdir(source, 0755);
+    test_support::Mkdir(repository, 0755);
+    bp::IncrementalOutcome outcome;
+    std::string error;
+
+    test_support::WriteFile(source + "/a.txt", "a-v1", 0644);
+    test_support::Check(
+        MakeSnapshot(source, repository, "s1.bak", &outcome, &error),
+        "INC-R T13 基线建立成功", error);
+    test_support::WriteFile(source + "/a.txt", "a-v2", 0644);
+    test_support::Check(
+        MakeSnapshot(source, repository, "s2.bak", &outcome, &error) &&
+            outcome.kind == bp::IncrementalOutcome::Kind::kDelta,
+        "INC-R T13 delta 建立成功", error);
+
+    const std::string destination = work + "/restored";
+    test_support::Check(
+        MakeStubbornResidue(TempPath(destination, ".overlay")),
+        "INC-R T13 预置清理不掉的 overlay 残留");
+    bp::RestoreReport report;
+    error.clear();
+    const bool ok = bp::RestoreSnapshotChain(repository, "s2.bak", destination,
+                                             bp::RestoreOptions{}, &report,
+                                             &error);
+    test_support::Check(!ok, "INC-R T13 判别：容器恢复失败即整次失败", error);
+    test_support::Check(!test_support::Exists(destination),
+                        "INC-R T13 判别：失败时不发布");
+    test_support::Check(error.find("not empty") != std::string::npos,
+                        "INC-R T13 失败出在 overlay 目标非空", error);
+    test_support::Check(!test_support::Exists(TempPath(destination, ".staging")),
+                        "INC-R T13 失败后 staging 清理掉了");
+    DropStubbornResidue(TempPath(destination, ".overlay"));
+  }
+  {
+    // 10.5 既有分支回归：tombstone 操作失败必须整次失败（这条以前就是对的，
+    // 修复不能把它弄坏）。
+    const std::string work = test_support::FreshDir("inc-r01-tombstone");
+    const std::string source = work + "/src";
+    const std::string repository = work + "/repo";
+    test_support::Mkdir(source, 0755);
+    test_support::Mkdir(repository, 0755);
+    bp::IncrementalOutcome outcome;
+    std::string error;
+
+    test_support::WriteFile(source + "/a.txt", "a-v1", 0644);
+    test_support::Mkdir(source + "/ro", 0755);
+    test_support::WriteFile(source + "/ro/keep.txt", "keep", 0644);
+    test_support::Check(::chmod((source + "/ro").c_str(), 0500) == 0,
+                        "INC-R T14 源树里的 ro 置成 0500");
+    test_support::Check(
+        MakeSnapshot(source, repository, "s1.bak", &outcome, &error),
+        "INC-R T14 基线建立成功", error);
+    test_support::Check(::chmod((source + "/ro").c_str(), 0755) == 0 &&
+                            ::unlink((source + "/ro/keep.txt").c_str()) == 0 &&
+                            ::chmod((source + "/ro").c_str(), 0500) == 0,
+                        "INC-R T14 删掉 ro/keep.txt（delta 会带上 tombstone）");
+    test_support::Check(
+        MakeSnapshot(source, repository, "s2.bak", &outcome, &error) &&
+            outcome.kind == bp::IncrementalOutcome::Kind::kDelta,
+        "INC-R T14 带 tombstone 的 delta 建立成功", error);
+
+    const std::string destination = work + "/restored";
+    bp::RestoreReport report;
+    error.clear();
+    const bool ok = bp::RestoreSnapshotChain(repository, "s2.bak", destination,
+                                             bp::RestoreOptions{}, &report,
+                                             &error);
+    test_support::Check(!ok, "INC-R T14 判别：tombstone 删不掉即整次失败", error);
+    test_support::Check(!test_support::Exists(destination),
+                        "INC-R T14 判别：失败时不发布");
+    test_support::Check(error.find("tombstone") != std::string::npos,
+                        "INC-R T14 失败出在 tombstone 那一步", error);
+  }
+  {
+    // 10.6 error_message 是可选诊断出参：传 nullptr 时失败控制流必须照样正确；
+    // 已存在的**空** destination 不能被当成"发布成功"；失败不污染后续恢复。
+    const std::string work = test_support::FreshDir("inc-r01-null");
+    const std::string source = work + "/src";
+    const std::string repository = work + "/repo";
+    test_support::Mkdir(source, 0755);
+    test_support::Mkdir(repository, 0755);
+    bp::IncrementalOutcome outcome;
+    std::string error;
+
+    test_support::WriteFile(source + "/a.txt", "a-v1", 0644);
+    test_support::Check(
+        MakeSnapshot(source, repository, "s1.bak", &outcome, &error),
+        "INC-R T15 基线建立成功", error);
+    test_support::WriteFile(source + "/a.txt", "a-v2", 0644);
+    test_support::Check(
+        MakeSnapshot(source, repository, "s2.bak", &outcome, &error),
+        "INC-R T15 delta 建立成功", error);
+
+    // (a) nullptr：同一个失败注入，诊断通道关掉。
+    const std::string dest_null = work + "/restored-null";
+    test_support::Check(
+        ::mkdir(TempPath(dest_null, ".container").c_str(), 0755) == 0,
+        "INC-R T15 预置挡路的 container 残留");
+    bp::RestoreReport null_report;
+    const bool null_ok = bp::RestoreSnapshotChain(
+        repository, "s2.bak", dest_null, bp::RestoreOptions{}, &null_report,
+        nullptr);
+    test_support::Check(!null_ok,
+                        "INC-R T15 判别：error_message=nullptr 时失败仍然返回 "
+                        "false");
+    test_support::Check(!test_support::Exists(dest_null),
+                        "INC-R T15 判别：error_message=nullptr 时也不发布");
+    test_support::RemoveTree(TempPath(dest_null, ".container"));
+
+    // (b) destination 预先存在但是空的：失败之后必须还是那个空目录。
+    const std::string dest_empty = work + "/restored-empty";
+    test_support::Check(test_support::Mkdir(dest_empty, 0755),
+                        "INC-R T15 预置空 destination");
+    test_support::Check(
+        ::mkdir(TempPath(dest_empty, ".container").c_str(), 0755) == 0,
+        "INC-R T15 预置挡路的 container 残留（空 destination 版）");
+    bp::RestoreReport empty_report;
+    error.clear();
+    const bool empty_ok = bp::RestoreSnapshotChain(
+        repository, "s2.bak", dest_empty, bp::RestoreOptions{}, &empty_report,
+        &error);
+    test_support::Check(!empty_ok, "INC-R T15 判别：空 destination 版也失败",
+                        error);
+    test_support::Check(test_support::Exists(dest_empty) &&
+                            test_support::DirEntries(dest_empty).empty(),
+                        "INC-R T15 判别：原本存在的空 destination 没有被发布成半成品");
+    test_support::RemoveTree(TempPath(dest_empty, ".container"));
+
+    // (c) 失败之后同一个仓库再做一次有效恢复：必须完全正常。
+    const std::string dest_ok = work + "/restored-after-failure";
+    bp::RestoreReport ok_report;
+    error.clear();
+    test_support::Check(
+        bp::RestoreSnapshotChain(repository, "s2.bak", dest_ok,
+                                 bp::RestoreOptions{}, &ok_report, &error),
+        "INC-R T15 失败之后再次执行有效恢复成功", error);
+    std::string content;
+    test_support::Check(
+        test_support::ReadFile(dest_ok + "/a.txt", &content) &&
+            content == "a-v2",
+        "INC-R T15 再次恢复的结果正确", content);
+  }
+  {
+    // 10.7 对照：**基座**恢复失败走的本来就是 do-while 的 break（这条一直
+    // 是对的，用它说明"不是所有失败都被 for 吞掉"）。
+    const std::string work = test_support::FreshDir("inc-r01-base");
+    const std::string source = work + "/src";
+    const std::string repository = work + "/repo";
+    test_support::Mkdir(source, 0755);
+    test_support::Mkdir(repository, 0755);
+    bp::IncrementalOutcome outcome;
+    std::string error;
+
+    test_support::WriteFile(source + "/a.txt", "a-v1", 0644);
+    test_support::Check(
+        MakeSnapshot(source, repository, "s1.bak", &outcome, &error),
+        "INC-R T16 基线建立成功", error);
+    test_support::WriteFile(source + "/a.txt", "a-v2", 0644);
+    test_support::Check(
+        MakeSnapshot(source, repository, "s2.bak", &outcome, &error),
+        "INC-R T16 delta 建立成功", error);
+
+    const std::string destination = work + "/restored";
+    test_support::Check(
+        MakeStubbornResidue(TempPath(destination, ".staging")),
+        "INC-R T16 预置清理不掉的 staging 残留");
+    bp::RestoreReport report;
+    error.clear();
+    const bool ok = bp::RestoreSnapshotChain(repository, "s2.bak", destination,
+                                             bp::RestoreOptions{}, &report,
+                                             &error);
+    test_support::Check(!ok, "INC-R T16 判别：基座恢复失败即整次失败", error);
+    test_support::Check(!test_support::Exists(destination),
+                        "INC-R T16 判别：失败时不发布");
+    test_support::Check(error.find("not empty") != std::string::npos,
+                        "INC-R T16 失败出在基座目标的非空检查", error);
+    DropStubbornResidue(TempPath(destination, ".staging"));
   }
 
   return test_support::Finish("incremental_restore_test");
