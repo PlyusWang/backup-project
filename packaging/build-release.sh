@@ -342,7 +342,6 @@ backup-project-client $VERSION
 做任何声明或推断 —— 这一点如实记在这里，而不是替权利人补一个许可证。
 随包分发的第三方组件：Qt $QT_VERSION（LGPL-3.0，动态链接，见 THIRD-PARTY-NOTICES.txt）。
 EOF
-  gzip -9n -c "$tree/usr/share/doc/backup-project-client/copyright" > /dev/null 2>&1 || true
   # 依赖来自两处：CLI 自己链接的系统库，以及**随包的 Qt 库**各自链接的系统库
   # （X11 / xcb / GL / fontconfig 这些不随包，必须由目标机器的发行版提供）。
   # 不把 GUI 二进制直接交给 dpkg-shlibdeps：它链接的 Qt 是我们自己带的，
@@ -491,7 +490,8 @@ pack_server_tarball() {
   mkdir -p "$tree/share" "$tree/docs" "$tree/packaging/server" "$tree/packaging/portable"
   server_payload "$tree/portable-root"
   # deb 布局 -> portable 布局：/usr/lib/backup-project-server/bin -> bin/
-  rm -rf "$tree/bin" "$tree/etc"
+  # $tree 为空时会变成 rm -rf "/bin" "/etc"：ShellCheck 的 SC2115 指的就是这一类。
+  rm -rf "${tree:?}/bin" "${tree:?}/etc"
   mv "$tree/portable-root/usr/lib/backup-project-server/bin" "$tree/bin"
   mv "$tree/portable-root/usr/lib/backup-project-server/share/backup-project" "$tree/share/backup-project"
   mv "$tree/portable-root/usr/lib/backup-project-server/share/doc/backup-project/." "$tree/docs/" 2>/dev/null || true
@@ -527,7 +527,7 @@ fi
 
 # ---- release 元数据 ----
 log "== SHA256SUMS 与 RELEASE-INFO.txt =="
-( cd "$RELEASE_DIR" && find . -maxdepth 1 -type f ! -name SHA256SUMS ! -name RELEASE-INFO.txt -printf '%P\n' | LC_ALL=C sort | xargs -r sha256sum > SHA256SUMS )
+( cd "$RELEASE_DIR" && find . -maxdepth 1 -type f ! -name SHA256SUMS -printf '%P\n' | LC_ALL=C sort | xargs -r sha256sum > SHA256SUMS )
 {
   echo "product       = Backup Project"
   echo "version       = $VERSION"
@@ -553,6 +553,11 @@ log "== SHA256SUMS 与 RELEASE-INFO.txt =="
 log "== 制品自查（解包 + 私钥扫描，与 CI 同一套判据）=="
 bash packaging/ci-artifact-selfscan.sh "$RELEASE_DIR" \
   || die "制品自查失败：解包不完整或发现疑似私钥"
+
+# ---- 发行清单完整性（家族由 --only 决定；中间阶段只要求本族）----
+log "== 发行清单完整性检查 =="
+bash packaging/ci-release-manifest.sh "$RELEASE_DIR" --family "$ONLY" \
+  --expect-commit "$COMMIT" --expect-version "$VERSION"
 
 log "== 完成 =="
 ( cd "$RELEASE_DIR" && ls -l && echo && cat SHA256SUMS )
