@@ -688,8 +688,11 @@ bool RestoreSnapshotChain(const std::string& repository_directory,
   bool ok = false;
   // “这一轮 delta 失败了”必须由这个布尔量表达，**不能**去读 error_message：
   // error_message 是可选的诊断出参（允许 nullptr），拿它当状态机会在
-  // 传 nullptr 时失效：tombstone 循环只 break 掉内层，外层照样把未完成的
-  // staging 发布成 destination，于是一次失败的恢复被报成成功。
+  // 传 nullptr 时失效。
+  //
+  // 不变量：delta 循环里**每一个**致命分支都要先置位再 break。只 break 只能
+  // 跳出内层 for —— 循环之后 delta_failed 还是 false 的话，代码会继续走到
+  // 发布，于是一次失败的恢复被报成成功，目标里是一棵没应用完增量的树。
   bool delta_failed = false;
   do {
     // 1) base：走既有的完整恢复路径（它自己也是 staging + 原子发布的写法）。
@@ -705,11 +708,18 @@ bool RestoreSnapshotChain(const std::string& repository_directory,
     for (std::size_t index = 1; index < chain.files.size(); ++index) {
       const std::string& delta = chain.files[index];
       DeltaEnvelope envelope;
-      if (!ReadDeltaEnvelope(delta, &envelope, error_message)) break;
-      if (!ExtractDeltaPayload(delta, inner_container, error_message)) break;
+      if (!ReadDeltaEnvelope(delta, &envelope, error_message)) {
+        delta_failed = true;
+        break;
+      }
+      if (!ExtractDeltaPayload(delta, inner_container, error_message)) {
+        delta_failed = true;
+        break;
+      }
       RemoveTree(overlay);
       if (!RunRestorePipeline(inner_container, overlay, options, report,
                               error_message)) {
+        delta_failed = true;
         break;
       }
       ::unlink(inner_container.c_str());
@@ -748,7 +758,10 @@ bool RestoreSnapshotChain(const std::string& repository_directory,
       // merged_entries 则累加进 report，让"这次恢复写了多少条目"是个总量。
       MergeContext context;
       context.report = report;
-      if (!MergeTree(overlay, staging, &context, error_message)) break;
+      if (!MergeTree(overlay, staging, &context, error_message)) {
+        delta_failed = true;
+        break;
+      }
       // 2c) 源根自己的 metadata：overlay 的根就是源根，它的 mode/uid/gid/mtime
       //     由 delta 的源根条目负责。合并只处理了子项，根要单独贴一次，
       //     否则"往根里写了东西"之后的根 mtime 就没人负责了。
