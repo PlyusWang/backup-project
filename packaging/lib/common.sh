@@ -146,35 +146,111 @@ SECRET_SCAN_CONTENT_PATTERNS='-----BEGIN [A-Z ]*PRIVATE KEY|^seed-hex: [0-9a-f]{
 SECRET_SCAN_RAW_KEY_BYTES=32
 SECRET_SCAN_RAW_KEY_EXCLUDE='/usr/share/|/docs/|/qml/|/lib/'
 
-secret_scan_content_files() {  # 命中内容规则的文件清单（每行一个）
+# ---- 扫描的"错误状态"必须传播（第3轮 P2-01）--------------------------------
+#
+# 旧实现是 grep 后面跟 2>/dev/null || true。GNU grep 用退出码区分三种结果：
+#   0 = 有命中，1 = 正常完成但没有命中，2 = 执行 / 读取 / 参数错误。
+# || true 把 2 也折叠成"没有发现" —— 而"读不出来"恰恰是最该报警的情形（不可读的
+# 目录、坏掉的挂载、模式写错、grep 被换掉）。所以本文件的三个扫描函数统一遵守：
+#   * stdout = 命中清单；返回 0 = 扫描成功（清单可能为空）；
+#   * 返回 2 = 扫描本身出错（诊断打到 stderr），调用方**必须**据此失败；
+#   * 扫描根不存在 / 不是目录 / 不可进入，同样算扫描错误 —— 静默扫一个不存在的
+#     目录，等价于宣布"这里没有私钥"，那正是假通过。
+SECRET_SCAN_ERROR_RC=2
+
+secret_scan_require_root() {   # $1 = 扫描根；不合法时打印诊断并返回 2
+  local root="${1:-}"
+  if [ -z "$root" ]; then
+    printf '[release] ERROR: 安全扫描失败：没有给出扫描根目录\n' >&2
+    return "$SECRET_SCAN_ERROR_RC"
+  fi
+  if [ ! -e "$root" ]; then
+    printf '[release] ERROR: 安全扫描失败：扫描根目录不存在：%s\n' "$root" >&2
+    return "$SECRET_SCAN_ERROR_RC"
+  fi
+  if [ ! -d "$root" ]; then
+    printf '[release] ERROR: 安全扫描失败：扫描根不是目录：%s\n' "$root" >&2
+    return "$SECRET_SCAN_ERROR_RC"
+  fi
+  if [ ! -r "$root" ] || [ ! -x "$root" ]; then
+    printf '[release] ERROR: 安全扫描失败：扫描根目录不可进入（需要 r+x）：%s\n' "$root" >&2
+    return "$SECRET_SCAN_ERROR_RC"
+  fi
+}
+
+secret_scan_content_files() {  # 命中内容规则的文件清单（每行一个）；2 = 扫描错误
+  local root="$1" out rc=0
   # -I：只把**文本文件**算进来。这是刻意的判据 —— 私钥文件是文本；而随包的 Qt TLS
   #     后端（lib/libQt6Network.so.6、plugins/tls/libqopensslbackend.so）里含有
   #     "-----BEGIN ... PRIVATE KEY" 这样的**字符串常量**，按二进制匹配会在每个合法
   #     发行包上误报。合成数据测试钉住了两个方向：文本 PEM 必拦、真品必过。
   # --：pattern 以 '-' 开头，不加 -- 会被 grep 当成选项（GNU grep 直接退出 2），
   #     而这个错误又被 2>/dev/null + || true 吞掉 —— 于是这条规则在 v0.1.1 及更早
-  #     的版本里**从未真正生效过**（本轮发现，属"检查形同虚设"一类）。
-  grep -rIlE -- "$SECRET_SCAN_CONTENT_PATTERNS" "$1" 2>/dev/null || true
+  #     的版本里**从未真正生效过**（上一轮发现，属"检查形同虚设"一类）。
+  secret_scan_require_root "$root" || return $?
+  # stderr 故意**不**重定向：grep 自己的诊断（哪一层目录读不了）原样进日志，只把
+  # stdout（命中清单）收进变量 —— 两条流合流会让"警告文本"被当成"命中文件"。
+  out="$(grep -rIlE -- "$SECRET_SCAN_CONTENT_PATTERNS" "$root")" || rc=$?
+  if [ "$rc" -gt 1 ]; then
+    printf '[release] ERROR: 安全扫描失败：内容规则扫描出错（grep 退出码 %s）：%s\n' "$rc" "$root" >&2
+    return "$SECRET_SCAN_ERROR_RC"
+  fi
+  [ -z "$out" ] || printf '%s\n' "$out"
 }
 
-secret_scan_key_files() {      # 命中敏感文件名的文件清单
-  find "$1" -type f \( -name '*.key' -o -name 'secrets.env' -o -name '*.bpcert' \) 2>/dev/null || true
+secret_scan_key_files() {      # 命中敏感文件名的文件清单；2 = 扫描错误
+  local root="$1" out rc=0
+  secret_scan_require_root "$root" || return $?
+  out="$(find "$root" -type f \( -name '*.key' -o -name 'secrets.env' -o -name '*.bpcert' \))" || rc=$?
+  if [ "$rc" -ne 0 ]; then
+    printf '[release] ERROR: 安全扫描失败：敏感文件名扫描出错（find 退出码 %s）：%s\n' "$rc" "$root" >&2
+    return "$SECRET_SCAN_ERROR_RC"
+  fi
+  [ -z "$out" ] || printf '%s\n' "$out"
 }
 
-secret_scan_raw_key_files() {  # "32 字节原始密钥形状"的文件清单（按上面的依据排除目录）
-  find "$1" -type f -size -64c -size +16c 2>/dev/null | while read -r f; do
-    if [ "$(stat -c %s "$f" 2>/dev/null)" = "$SECRET_SCAN_RAW_KEY_BYTES" ]; then
-      if LC_ALL=C grep -qP '^[\x00-\xff]{32}$' "$f" 2>/dev/null; then echo "$f"; fi
+secret_scan_raw_key_files() {  # "32 字节原始密钥形状"的文件清单；2 = 扫描错误
+  local root="$1" files f size rc=0 grc erc
+  secret_scan_require_root "$root" || return $?
+  # 只枚举 17..63 字节的文件。旧实现是
+  #   find ... 2>/dev/null | while ... done | { grep -vE ... || true; }
+  # 整条管道把 find 的错误状态吞掉（而且 while 在子 shell 里，错误传不出来）。
+  # 这里改成先取清单再在**当前 shell** 里循环，任何一步出错都返回 2。
+  files="$(find "$root" -type f -size -64c -size +16c)" || rc=$?
+  if [ "$rc" -ne 0 ]; then
+    printf '[release] ERROR: 安全扫描失败：枚举候选文件出错（find 退出码 %s）：%s\n' "$rc" "$root" >&2
+    return "$SECRET_SCAN_ERROR_RC"
+  fi
+  [ -n "$files" ] || return 0
+  while IFS= read -r f; do
+    [ -n "$f" ] || continue
+    size="$(stat -c %s -- "$f")" || {
+      printf '[release] ERROR: 安全扫描失败：读不到候选文件的大小：%s\n' "$f" >&2
+      return "$SECRET_SCAN_ERROR_RC"
+    }
+    [ "$size" = "$SECRET_SCAN_RAW_KEY_BYTES" ] || continue
+    grc=0
+    if LC_ALL=C grep -qP '^[\x00-\xff]{32}$' -- "$f" 2>/dev/null; then grc=0; else grc=$?; fi
+    if [ "$grc" -gt 1 ]; then
+      printf '[release] ERROR: 安全扫描失败：读取候选文件出错（grep 退出码 %s）：%s\n' "$grc" "$f" >&2
+      return "$SECRET_SCAN_ERROR_RC"
     fi
-  done | { grep -vE "$SECRET_SCAN_RAW_KEY_EXCLUDE" || true; }
+    [ "$grc" -eq 0 ] || continue
+    erc=0
+    if printf '%s\n' "$f" | grep -qE -- "$SECRET_SCAN_RAW_KEY_EXCLUDE"; then erc=0; else erc=$?; fi
+    # 排除规则出错时**不放行**：宁可多问一句，也不把可疑文件当正常数据放过。
+    if [ "$erc" -eq 0 ]; then continue; fi
+    printf '%s\n' "$f"
+  done <<< "$files"
 }
 
-scan_for_secrets() {           # 兼容旧调用：返回内容规则命中数（清单打到 stderr）
-  local root="$1" found
-  found="$(secret_scan_content_files "$root")"
+scan_for_secrets() {           # 兼容旧调用：返回内容规则命中数（清单打到 stderr）；2 = 扫描错误
+  local root="$1" found rc=0
+  found="$(secret_scan_content_files "$root")" || rc=$?
+  [ "$rc" -eq 0 ] || return "$rc"
   if [ -n "$found" ]; then
     printf '%s\n' "$found" >&2
-    printf '%s\n' "$found" | wc -l
+    printf '%s\n' "$found" | awk 'END { print NR }'
   else
     printf '0'
   fi

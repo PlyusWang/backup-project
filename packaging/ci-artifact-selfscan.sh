@@ -98,17 +98,42 @@ version_rel() {  # $1 = 制品基名
   esac
 }
 
-# portable tar 的顶层目录名两端不一致（客户端大写 / 服务端小写），所以用 find 定位，
-# 但要求**恰好一个**，并且必须落在本次解包的目录里。
-resolve_tar_file() {  # $1 = 解包目录, $2 = 文件名
-  local dest="$1" name="$2" found
-  # 必须**递归**找：portable tar 里 BUILD-INFO.txt 在树根（深度 2），而 VERSION 在
-  # <top>/share/backup-project/VERSION（深度 4）—— 上界写死 maxdepth 会在不同产品族
-  # 上各漏一次。这里用"恰好一个 + 必须落在解包目录内"两条约束兜住，不靠深度。
-  found="$(find "$dest" -name "$name" -print 2>/dev/null | LC_ALL=C sort)"
-  [ -n "$found" ] || { printf '%s' ''; return; }
-  [ "$(printf '%s\n' "$found" | wc -l)" = "1" ] || { printf '%s' 'AMBIGUOUS'; return; }
-  case "$found" in "$dest"/*) printf '%s' "$found" ;; *) printf '%s' 'OUTSIDE' ;; esac
+# ---- portable tar 的严格布局（第3轮 P2-02）---------------------------------
+#
+# 契约（客户端 / 服务端一致，只有顶层目录名的大小写不同）：
+#   <唯一顶层目录>/BUILD-INFO.txt
+#   <唯一顶层目录>/share/backup-project/VERSION
+# 上一轮用"递归 find 找同名文件、恰好一个就通过"，那只保证**名字唯一**，不保证
+# **位置正确**：BUILD-INFO.txt 被挪到 random-place/ 也照样通过。这一轮改成先钉住
+# 唯一的顶层目录，再按固定相对路径取文件，并核对文件类型与真实路径归属。
+tar_top_dir() {  # $1 = 解包目录；打印唯一顶层目录（不合法即 die）
+  local dest="$1" entry top="" count=0
+  for entry in "$dest"/* "$dest"/.[!.]* "$dest"/..?*; do
+    [ -e "$entry" ] || [ -L "$entry" ] || continue
+    count=$((count + 1))
+    [ -n "$top" ] || top="$entry"
+  done
+  [ "$count" -gt 0 ] || die "tar 解包结果为空（顶层没有任何条目）：$dest"
+  [ "$count" -eq 1 ] || die "portable tar 顶层内容不唯一（$count 项；契约要求恰好一个顶层目录）：$dest"
+  [ ! -L "$top" ] || die "portable tar 的顶层条目是符号链接（契约要求真实目录）：$top"
+  [ -d "$top" ] || die "portable tar 的顶层条目不是目录：$top"
+  printf '%s' "$top"
+}
+
+# 严格取一个契约文件：必须是根目录下的**普通文件**（不许符号链接），真实路径不得
+# 逃出根目录。$1 = 根目录, $2 = 相对路径, $3 = 制品基名（诊断用）
+require_contract_file() {
+  local root="$1" rel="$2" base="$3" path real
+  path="$root/$rel"
+  [ -e "$path" ] || [ -L "$path" ] || die "$base 里找不到 $rel（按发行布局的固定路径查找，不做递归搜索）"
+  [ ! -L "$path" ] || die "$base 的 $rel 是符号链接，拒绝（发行契约要求普通文件）"
+  [ -f "$path" ] || die "$base 的 $rel 不是普通文件"
+  real="$(readlink -f -- "$path")" || die "$base 的 $rel 无法解析真实路径"
+  case "$real" in
+    "$root"/*) : ;;
+    *) die "$base 的 $rel 真实路径逃出 $root" ;;
+  esac
+  printf '%s' "$path"
 }
 
 log "== 制品自查：解包 + 安全检查 + BUILD-INFO 契约 =="
@@ -123,20 +148,21 @@ for artifact in "$REL"/*; do
   unpack_one "$artifact" "$dest"
   checked=$((checked + 1))
 
-  # ---- BUILD-INFO / VERSION 契约 ----
+  # ---- BUILD-INFO / VERSION 契约（按产品族固定路径，严格核对）----
   rel="$(build_info_rel "$base")"
   [ -n "$rel" ] || die "不认识的发行文件形状（无法核对 BUILD-INFO）：$base"
-  info=""
+  vrel="$(version_rel "$base")"
+  [ -n "$vrel" ] || die "不认识的发行文件形状（无法核对 VERSION）：$base"
   case "$base" in
-    *.tar.xz) info="$(resolve_tar_file "$dest" 'BUILD-INFO.txt')" ;;
-    *)        info="$dest/$rel" ;;
+    *.tar.xz)
+      # portable tar：先钉住唯一顶层目录，再按 <top>/... 取文件（不递归找同名文件）。
+      top="$(tar_top_dir "$dest")"
+      info="$(require_contract_file "$top" "$rel" "$base")"
+      vfile="$(require_contract_file "$top" "$vrel" "$base")" ;;
+    *)
+      info="$(require_contract_file "$dest" "$rel" "$base")"
+      vfile="$(require_contract_file "$dest" "$vrel" "$base")" ;;
   esac
-  case "$info" in
-    '') die "$base 里找不到 BUILD-INFO.txt（按产品族路径 $rel 也没找到）" ;;
-    AMBIGUOUS) die "$base 里有多个 BUILD-INFO.txt" ;;
-    OUTSIDE) die "$base 的 BUILD-INFO.txt 不在解包目录内" ;;
-  esac
-  [ -f "$info" ] || die "$base 的 BUILD-INFO.txt 不是普通文件：$info"
   if [ -n "$EXPECT_VERSION" ]; then
     got_version="$(grep -m1 '^version' "$info" | awk '{print $3}')"
     [ "$got_version" = "$EXPECT_VERSION" ] \
@@ -147,16 +173,6 @@ for artifact in "$REL"/*; do
     [ "$got_commit" = "$EXPECT_COMMIT" ] \
       || die "$base 的 BUILD-INFO commit=$got_commit，期望 $EXPECT_COMMIT"
   fi
-
-  vrel="$(version_rel "$base")"
-  case "$base" in
-    *.tar.xz) vfile="$(resolve_tar_file "$dest" 'VERSION')" ;;
-    *)        vfile="$dest/$vrel" ;;
-  esac
-  case "$vfile" in
-    ''|AMBIGUOUS|OUTSIDE) die "$base 里找不到 share/backup-project/VERSION（$vrel）" ;;
-  esac
-  [ -f "$vfile" ] || die "$base 的 VERSION 不是普通文件：$vfile"
   if [ -n "$EXPECT_VERSION" ]; then
     got_v="$(head -1 "$vfile")"
     [ "$got_v" = "$EXPECT_VERSION" ] \
@@ -167,17 +183,23 @@ done
 [ "$checked" -gt 0 ] || die "发行目录里没有任何制品：$REL"
 
 # ---- 统一的安全检查（与 ci-secret-scan.sh 同一份规则）----
-content_files="$(secret_scan_content_files "$SCAN_TARGET")"
+# 三个扫描函数返回 2 = 扫描本身出错（根目录不存在 / 不可读、grep / find 报错）。
+# 出错时必须让自查失败：把"没扫成"说成"没有私钥"就是假通过（第3轮 P2-01）。
+SCAN_FAILED=0
+content_files="$(secret_scan_content_files "$SCAN_TARGET")" || SCAN_FAILED=1
+key_files="$(secret_scan_key_files "$SCAN_TARGET")" || SCAN_FAILED=1
+raw_files="$(secret_scan_raw_key_files "$SCAN_TARGET")" || SCAN_FAILED=1
+if [ "$SCAN_FAILED" -ne 0 ]; then
+  die "安全检查失败：扫描出错，拒绝给出没有私钥的结论（见上方 [release] ERROR 诊断）"
+fi
 if [ -n "$content_files" ]; then
   printf '%s\n' "$content_files" >&2
   die "制品里发现了疑似私钥/口令内容（PEM / seed-hex / secret 行）"
 fi
-key_files="$(secret_scan_key_files "$SCAN_TARGET")"
 if [ -n "$key_files" ]; then
   printf '%s\n' "$key_files" >&2
   die "制品里出现了 .key / secrets.env / .bpcert 文件"
 fi
-raw_files="$(secret_scan_raw_key_files "$SCAN_TARGET")"
 if [ -n "$raw_files" ]; then
   printf '%s\n' "$raw_files" >&2
   die "制品里出现了 32 字节裸密钥形状的文件"

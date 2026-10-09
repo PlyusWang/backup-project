@@ -52,22 +52,36 @@ for artifact in "$REL"/*; do
   esac
 done
 
+# 行数统计：空行不算。用 awk 而不是 grep -c —— grep 在"0 行"时退出码是 1，
+# 旧代码只能靠 || true 压住，那正是本轮要收敛的"吞掉错误状态"写法（第3轮 P2-01）。
+count_hits() { awk 'NF { n++ } END { print n + 0 }'; }
+
 if [ "$UNPACK_FAILED" -ne 0 ]; then
   # 有任何一件没解出来，就不允许给出"没有私钥"的结论：那正是假通过的来源。
   ci_fail "解包不完整：拒绝报告扫描结果（先修解包，再谈扫描）"
 else
   ci_section "结构规则扫描（规则见 packaging/lib/common.sh）"
-  content_files="$(secret_scan_content_files "$WORK")"
-  hits="$(printf '%s' "$content_files" | grep -c . || true)"
-  expect_eq "私钥/口令结构规则命中 = 0" "0" "$hits"
-  if [ "$hits" != "0" ]; then printf '%s\n' "$content_files" | sed -n '1,5p' >&2; fi
+  # 三个扫描函数用 0/2 区分"扫完了"（可能 0 命中）与"扫描本身出错"（见 common.sh
+  # 的 P2-01 段）。出错时**不给结论**、只记一条 FAIL：把"没扫成"说成"没有私钥"，
+  # 正是这一轮要消灭的假通过。
+  SCAN_FAILED=0
+  content_files="$(secret_scan_content_files "$WORK")" || SCAN_FAILED=1
+  key_files="$(secret_scan_key_files "$WORK")" || SCAN_FAILED=1
+  raw_files="$(secret_scan_raw_key_files "$WORK")" || SCAN_FAILED=1
+  if [ "$SCAN_FAILED" -ne 0 ]; then
+    ci_fail "安全检查没有跑完：扫描出错，拒绝报告扫描结果（见上方 [release] ERROR 诊断）"
+  else
+    hits="$(printf '%s' "$content_files" | count_hits)"
+    expect_eq "私钥/口令结构规则命中 = 0" "0" "$hits"
+    if [ "$hits" != "0" ]; then printf '%s\n' "$content_files" | sed -n '1,5p' >&2; fi
 
-  key_files="$(secret_scan_key_files "$WORK" | wc -l)"
-  expect_eq "制品里没有 .key / secrets.env / .bpcert 文件" "0" "$key_files"
+    key_count="$(printf '%s' "$key_files" | count_hits)"
+    expect_eq "制品里没有 .key / secrets.env / .bpcert 文件" "0" "$key_count"
 
-  ci_section "32 字节裸密钥形状扫描（transport.key 的形状；排除目录见 common.sh）"
-  raw="$(secret_scan_raw_key_files "$WORK" | wc -l)"
-  expect_eq "没有 32 字节裸密钥形状的文件" "0" "$raw"
+    ci_section "32 字节裸密钥形状扫描（transport.key 的形状；排除目录见 common.sh）"
+    raw_count="$(printf '%s' "$raw_files" | count_hits)"
+    expect_eq "没有 32 字节裸密钥形状的文件" "0" "$raw_count"
+  fi
 fi
 
 ci_finish "secret-scan"
