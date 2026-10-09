@@ -680,7 +680,7 @@ portable 安装早就该有的**真实身份握手**测试。产品代码、协�
 | 表格 | 20 张，未转义竖线数与表头一致 |
 | 行内代码 | 全部闭合 |
 
-另外记录一处**既有、不在本轮范围**的问题：仓库根 `README.md` 第 237 行 
+另外记录一处**既有、不在本轮范围**的问题：仓库根 `README.md` 第 237 行
 `#### 界面预览` 从 h1 直接跳到 h4（渲染层级不连续），本轮未改。
 
 ### 12.2 portable 服务端身份认证测试
@@ -751,4 +751,3 @@ portable 安装早就该有的**真实身份握手**测试。产品代码、协�
 本轮的门禁与 CI 记录（提交号标注在各自日志首行）随证据包
 `release-verification-closure-evidence-round5.zip` 提供：CI 走 `workflow_dispatch`（只读权限，
 不创建 tag、不发布 Release），本地在交付 HEAD 上执行 `scripts/final_gate.sh`。
-
