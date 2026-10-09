@@ -78,7 +78,9 @@ install -d -o backup-project -g backup-project -m 0750 /run/backup-project-serve
 runuser -u backup-project -- /usr/lib/backup-project-server/bin/launch-server.sh --config "$CONF" \
   > /tmp/server-run.log 2>&1 &
 SERVER_PID=$!
-for i in $(seq 1 40); do
+# 这个计数器只用来数秒（40 次 × 0.5s），没有业务用途：用 _ 表示"刻意不使用"，
+# 语义与原来完全一致，ShellCheck 也不再报 SC2034。
+for _ in $(seq 1 40); do
   ss -ltn 2>/dev/null | grep '127.0.0.1:18765' > /dev/null && break
   sleep 0.5
 done
@@ -142,12 +144,82 @@ expect_file "portable 配置" "$PREFIX/etc/server.conf"
 expect_mode "portable transport.key 0600" "$PREFIX/var/state/transport.key" "600"
 expect_ok "portable --check-config" "$PREFIX/bin/launch-server.sh" --check-config --config "$PREFIX/etc/server.conf"
 PIN2="$("$PREFIX/bin/backup-server-keygen" --show --key-file "$PREFIX/var/state/transport.key" | sed -n 's/.*--server-key //p' | sed -n '1p')"
+# 夹具自检：portable 安装自己的身份指纹必须提取得出来，而且形状正确 ——
+# keygen --show 打印的是 "sha256:<64 位小写十六进制>"（见 server/keygen_main.cpp:62）。
+# 拿不到指纹就直接失败：不能跳过握手还报通过。
+if [ -n "$PIN2" ]; then
+  ci_pass "portable 身份指纹提取成功（只断言存在性，不打印内容）"
+else
+  ci_fail "portable 身份指纹提取失败（后面的回环握手无法执行）"
+fi
+if printf '%s' "$PIN2" | grep -qE '^sha256:[0-9a-f]{64}$'; then
+  ci_pass "portable 指纹形状正确（sha256:<64 位小写十六进制>）"
+else
+  ci_fail "portable 指纹形状不对（既不是空也不是 sha256:<64 hex>）"
+fi
+# 端口必须先空闲：否则后面"监听到了"可能来自上一个残留进程（端口断言的假阳性）。
+if ss -ltn 2>/dev/null | grep -q '127.0.0.1:18999'; then
+  ci_fail "启动前 127.0.0.1:18999 已被占用（监听断言会变成假阳性）"
+else
+  ci_pass "启动前 127.0.0.1:18999 空闲"
+fi
 "$PREFIX/bin/launch-server.sh" --config "$PREFIX/etc/server.conf" > /tmp/server-portable.log 2>&1 &
 PPORT_PID=$!
-for i in $(seq 1 40); do ss -ltn 2>/dev/null | grep '127.0.0.1:18999' > /dev/null && break; sleep 0.5; done
+# 半路失败也要收尸：脚本因为 set -e 提前退出时，不能把服务端进程留在机器上。
+trap 'kill "$PPORT_PID" 2>/dev/null || true' EXIT
+# 40 次 × 0.5s，与原来一致的等待上限；计数器无业务用途，用 _。
+for _ in $(seq 1 40); do ss -ltn 2>/dev/null | grep '127.0.0.1:18999' > /dev/null && break; sleep 0.5; done
 if ss -ltn 2>/dev/null | grep '127.0.0.1:18999' > /dev/null; then ci_pass "portable 服务端在 127.0.0.1:18999 监听"; else ci_fail "portable 服务端没有监听"; tail -20 /tmp/server-portable.log >&2; fi
+
+# ---- 真实 BPSEC1 握手：用 portable 安装**自己的**身份指纹 ----
+# 只检查"端口在听"证明不了装出来的身份能用于安全传输，所以这里做一次真实回环握手。
+if [ -n "$PIN2" ]; then
+  rc=0
+  timeout 30 backupctl remote ping --host 127.0.0.1 --port 18999 --server-key "$PIN2" > /tmp/portable-ping.log 2>&1 || rc=$?
+  if [ "$rc" -eq 0 ]; then
+    ci_pass "portable 回环 ping（真实 BPSEC1 握手，portable 自己的指纹）"
+  else
+    ci_fail "portable 回环 ping（真实 BPSEC1 握手，portable 自己的指纹）：退出码 $rc"
+    sed 's/^/        /' /tmp/portable-ping.log | tail -8 >&2
+    printf '  ----  服务端日志尾部（/tmp/server-portable.log）
+' >&2
+    tail -20 /tmp/server-portable.log >&2
+  fi
+else
+  ci_fail "portable 回环 ping（真实 BPSEC1 握手，portable 自己的指纹）：拿不到指纹，无法执行"
+fi
+
+# ---- 负向：换掉一位十六进制的错误指纹必须被**明确拒绝** ----
+# 超时（124）不算拒绝：那说明客户端既没成功也没拿到明确的失败结论。
+if [ -n "$PIN2" ]; then
+  WRONG2="$(printf '%s' "$PIN2" | awk '{ n=length($0); c=substr($0,n,1); r=(c=="0")?"1":"0"; print substr($0,1,n-1) r }')"
+  rc=0
+  timeout 30 backupctl remote ping --host 127.0.0.1 --port 18999 --server-key "$WRONG2" > /tmp/portable-ping-bad.log 2>&1 || rc=$?
+  if [ "$rc" -eq 0 ]; then
+    ci_fail "错误身份指纹被接受了（安全缺陷：服务端不该与未知身份握手）"
+  elif [ "$rc" -eq 124 ]; then
+    ci_fail "错误身份指纹：客户端超时而不是明确拒绝（退出码 124）"
+    sed 's/^/        /' /tmp/portable-ping-bad.log | tail -8 >&2
+  else
+    ci_pass "错误身份指纹被明确拒绝（负向用例，退出码 $rc）"
+  fi
+else
+  ci_fail "错误身份指纹必须被拒绝（负向用例）：拿不到指纹，无法构造"
+fi
+
+# ---- 停止服务并确认真的停了（kill -0 对僵尸进程仍为真，所以先 wait 回收）----
 kill "$PPORT_PID" 2>/dev/null || true
-sleep 1
+wait "$PPORT_PID" 2>/dev/null || true
+if kill -0 "$PPORT_PID" 2>/dev/null; then
+  ci_fail "portable 服务端进程没有停掉（PID $PPORT_PID）"
+else
+  ci_pass "portable 服务端进程已停止"
+fi
+if ss -ltn 2>/dev/null | grep -q '127.0.0.1:18999'; then
+  ci_fail "portable 服务端已退出但 127.0.0.1:18999 仍在监听"
+else
+  ci_pass "127.0.0.1:18999 已释放"
+fi
 
 ci_section "10. portable 卸载（默认保留数据）"
 expect_ok "uninstall.sh --prefix" "${TOP}uninstall.sh" --prefix "$PREFIX"
