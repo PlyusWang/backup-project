@@ -24,6 +24,7 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 APPIMAGE="$(find "$REL" -maxdepth 1 -name '*.AppImage' -print -quit 2>/dev/null || true)"
 CLIENT_DEB="$(find "$REL" -maxdepth 1 -name 'backup-project-client_*.deb' -print -quit 2>/dev/null || true)"
 CLIENT_TAR="$(find "$REL" -maxdepth 1 -name 'backup-project-client-*-linux-x86_64.tar.xz' -print -quit 2>/dev/null || true)"
+SERVER_TAR="$(find "$REL" -maxdepth 1 -name 'backup-project-server-*-linux-x86_64.tar.xz' -print -quit 2>/dev/null || true)"
 VERSION="$(grep -m1 '^version' "$REL/RELEASE-INFO.txt" 2>/dev/null | awk '{print $3}')"
 [ -n "$VERSION" ] || VERSION="0.0.0"
 
@@ -82,6 +83,53 @@ expect_both_scans_fail() {  # expect_both_scans_fail <标签> <目录>
   local label="$1" dir="$2"
   expect_fail "$label（构建期自查）" bash "$HERE/ci-artifact-selfscan.sh" "$dir"
   expect_fail "$label（CI 扫描）" bash "$HERE/ci-secret-scan.sh" "$dir"
+}
+
+# 通用重打包：把任意 portable tar 解开、执行片段、再打回去（保持单一顶层目录）。
+make_tar_variant() {  # make_tar_variant <源 tar> <输出 tar> <片段>
+  local src="$1" out="$2" snippet="$3" d top
+  d="$(mktemp -d "$WORK/tv.XXXXXX")"
+  tar -xJf "$src" -C "$d"
+  top="$(find "$d" -maxdepth 1 -mindepth 1 -type d | sed -n '1p')"
+  ( cd "$top" && eval "$snippet" )
+  ( cd "$d" && tar -cJf "$out" "$(basename "$top")" )
+  rm -rf "$d"
+}
+
+# 直接把共享函数当被测对象：打印退出码 / 合并输出（不依赖文件权限，root 下也成立）。
+scan_fn_rc() {   # scan_fn_rc <函数名> <扫描根>
+  bash -c 'source "$1"; rc=0; "$2" "$3" >/dev/null 2>&1 || rc=$?; printf "%s" "$rc"' \
+    _ "$HERE/lib/common.sh" "$1" "$2"
+}
+scan_fn_out() {  # scan_fn_out <函数名> <扫描根>
+  bash -c 'source "$1"; rc=0; "$2" "$3" 2>&1 || rc=$?; exit 0' \
+    _ "$HERE/lib/common.sh" "$1" "$2"
+}
+
+# 运行一个检查脚本，打印 "rc|合并输出" 交给调用方断言（不吞任何状态）。
+run_capture() {  # run_capture <命令...>
+  local rc=0 out
+  out="$("$@" 2>&1)" || rc=$?
+  printf '%s|%s' "$rc" "$out"
+}
+
+# 清单检查必须以非零退出、并且**点名**那个非法条目、并给出对应原因。
+expect_top_reject() {  # expect_top_reject <标签> <目录> <应点名> <原因正则>
+  local label="$1" dir="$2" name="$3" pattern="$4" res rc out
+  res="$(run_capture bash "$HERE/ci-release-manifest.sh" "$dir" --family all)"
+  rc="${res%%|*}"; out="${res#*|}"
+  if [ "$rc" -eq 0 ]; then ci_fail "$label（本应失败却成功了）"; return; fi
+  if ! printf '%s' "$out" | grep -qF -- "$name"; then
+    ci_fail "$label（失败信息里没有点名 $name）"
+    printf '%s\n' "$out" | tail -6 | sed 's/^/        /' >&2
+    return
+  fi
+  if ! printf '%s' "$out" | grep -qE -- "$pattern"; then
+    ci_fail "$label（原因里没有 $pattern）"
+    printf '%s\n' "$out" | tail -6 | sed 's/^/        /' >&2
+    return
+  fi
+  ci_pass "$label（点名 $name 且原因正确）"
 }
 
 # ---- 0) 正对照：真品必须通过全部检查 ----
@@ -313,5 +361,212 @@ expect_eq "P2-01 生成器 stderr 没有 command not found" "0" \
 # shellcheck disable=SC2016  # 单引号是有意的：这是交给 grep -E 的字面模式
 expect_contains "P2-01 声明里保留了字面量反引号 .so" \
   "$WORK/mats-out/THIRD-PARTY-NOTICES.txt" '每个 `\.so` 一行'
+
+
+# ---- 9) 第3轮 P2-01：扫描出错必须 fail-closed ----
+ci_section "第3轮 P2-01 扫描的错误状态必须传播（共享函数 + 两个入口）"
+for fn in secret_scan_content_files secret_scan_key_files secret_scan_raw_key_files; do
+  expect_eq "P2-01 $fn：扫描根不存在 -> 返回 2" "2" "$(scan_fn_rc "$fn" "$WORK/r3-missing-root")"
+done
+out="$(scan_fn_out secret_scan_content_files "$WORK/r3-missing-root")"
+if printf '%s' "$out" | grep -q "扫描根目录不存在"; then
+  ci_pass "P2-01 扫描根不存在时给出明确诊断"
+else
+  ci_fail "P2-01 扫描根不存在时没有给出诊断"
+  printf '%s\n' "$out" | sed 's/^/        /' >&2
+fi
+printf 'x' > "$WORK/r3-not-a-dir"
+expect_eq "P2-01 扫描根不是目录 -> 返回 2" "2" "$(scan_fn_rc secret_scan_content_files "$WORK/r3-not-a-dir")"
+out="$(scan_fn_out secret_scan_key_files "$WORK/r3-not-a-dir")"
+if printf '%s' "$out" | grep -q "不是目录"; then
+  ci_pass "P2-01 扫描根不是目录时给出明确诊断"
+else
+  ci_fail "P2-01 扫描根不是目录时没有给出诊断"
+fi
+expect_eq "P2-01 正对照：正常根上内容规则扫描成功" "0" "$(scan_fn_rc secret_scan_content_files "$REL")"
+
+# 确定性故障注入：让 grep 在内容扫描那一次调用上退出 2（不依赖权限，root 下同样成立）
+REAL_GREP="$(command -v grep)"
+d="$WORK/r3-inject"; fakebin="$WORK/r3-inject-bin"
+mkdir -p "$d" "$fakebin"
+cp -a "$CLIENT_TAR" "$d/$(basename "$CLIENT_TAR")"
+{
+  printf '%s\n' '#!/usr/bin/env bash'
+  printf '%s\n' 'for a in "$@"; do'
+  printf '%s\n' '  if [ "$a" = "-rIlE" ]; then printf "grep: 注入的读取错误\n" >&2; exit 2; fi'
+  printf '%s\n' 'done'
+  printf 'exec %s "$@"\n' "$REAL_GREP"
+} > "$fakebin/grep"
+chmod 0755 "$fakebin/grep"
+res="$(PATH="$fakebin:$PATH" run_capture bash "$HERE/ci-artifact-selfscan.sh" "$d")"
+rc="${res%%|*}"; out="${res#*|}"
+if [ "$rc" -ne 0 ] && printf '%s' "$out" | grep -q "扫描出错"; then
+  ci_pass "P2-01 注入 grep 退出 2 -> 构建期自查失败且原因正确"
+else
+  ci_fail "P2-01 注入 grep 退出 2 -> 构建期自查本应失败（rc=$rc）"
+  printf '%s\n' "$out" | tail -6 | sed 's/^/        /' >&2
+fi
+res="$(PATH="$fakebin:$PATH" run_capture bash "$HERE/ci-secret-scan.sh" "$d")"
+rc="${res%%|*}"; out="${res#*|}"
+if [ "$rc" -ne 0 ] && printf '%s' "$out" | grep -qE "扫描出错|没有跑完"; then
+  ci_pass "P2-01 注入 grep 退出 2 -> CI 扫描失败且原因正确"
+else
+  ci_fail "P2-01 注入 grep 退出 2 -> CI 扫描本应失败（rc=$rc）"
+  printf '%s\n' "$out" | tail -6 | sed 's/^/        /' >&2
+fi
+
+# 读取错误：制品里放一个 0000 权限的文件。root 会绕过文件权限，那种情况下不做假测试。
+if [ "$(id -u)" -eq 0 ]; then
+  printf '  SKIP  不可读文件注入：当前是 root（文件权限不生效），不构造假测试\n'
+else
+  make_tar_variant "$CLIENT_TAR" "$WORK/r3-locked-src.tar.xz"     'mkdir -p extra && printf "synthetic\n" > extra/locked.txt'
+  d="$WORK/r3-locked"; mkdir -p "$d"
+  python3 - "$WORK/r3-locked-src.tar.xz" "$d/$(basename "$CLIENT_TAR")" <<'PYEOF'
+import io, sys, tarfile
+src, dst = sys.argv[1], sys.argv[2]
+with tarfile.open(src) as t, tarfile.open(dst, "w:xz") as o:
+    for m in t.getmembers():
+        if m.name.endswith("extra/locked.txt"):
+            m.mode = 0
+        o.addfile(m, t.extractfile(m) if m.isfile() else None)
+PYEOF
+  chk="$WORK/r3-locked-check"; mkdir -p "$chk"
+  tar -xJf "$d/$(basename "$CLIENT_TAR")" -C "$chk"
+  locked="$(find "$chk" -name locked.txt -print -quit)"
+  if [ -n "$locked" ] && [ ! -r "$locked" ]; then
+    ci_pass "P2-01 夹具确实造出不可读文件（注入有效）"
+  else
+    ci_fail "P2-01 夹具没有造出不可读文件，这条测试无意义"
+  fi
+  res="$(run_capture bash "$HERE/ci-artifact-selfscan.sh" "$d")"
+  rc="${res%%|*}"; out="${res#*|}"
+  if [ "$rc" -ne 0 ] && printf '%s' "$out" | grep -q "扫描出错"; then
+    ci_pass "P2-01 读不了制品里的文件 -> 构建期自查失败（不再报告 0 命中）"
+  else
+    ci_fail "P2-01 读不了制品里的文件 -> 构建期自查本应失败（rc=$rc）"
+    printf '%s\n' "$out" | tail -6 | sed 's/^/        /' >&2
+  fi
+  res="$(run_capture bash "$HERE/ci-secret-scan.sh" "$d")"
+  rc="${res%%|*}"; out="${res#*|}"
+  if [ "$rc" -ne 0 ] && printf '%s' "$out" | grep -qE "扫描出错|没有跑完"; then
+    ci_pass "P2-01 读不了制品里的文件 -> CI 扫描失败（不再报告 0 命中）"
+  else
+    ci_fail "P2-01 读不了制品里的文件 -> CI 扫描本应失败（rc=$rc）"
+    printf '%s\n' "$out" | tail -6 | sed 's/^/        /' >&2
+  fi
+fi
+
+# 反向：第三方二进制里的 PEM 字符串常量（grep -I 视为二进制）不得误报
+make_client_tar_variant "$WORK/r3-binary-pem.tar.xz"   'mkdir -p extra && printf "x\000-----BEGIN RSA PRIVATE KEY-----\000y" > extra/libtls-fake.so'
+d="$WORK/r3-binary-pem"; mkdir -p "$d"; cp -a "$WORK/r3-binary-pem.tar.xz" "$d/$(basename "$CLIENT_TAR")"
+expect_ok "P2-01 二进制里的 PEM 字符串常量不误报（构建期自查）" bash "$HERE/ci-artifact-selfscan.sh" "$d"
+expect_ok "P2-01 二进制里的 PEM 字符串常量不误报（CI 扫描）" bash "$HERE/ci-secret-scan.sh" "$d"
+
+# 入口层：发行目录不存在也必须失败（不许"扫了个寂寞还报成功"）
+expect_fail "P2-01 入口：发行目录不存在 -> 构建期自查失败" bash "$HERE/ci-artifact-selfscan.sh" "$WORK/r3-no-such-release"
+expect_fail "P2-01 入口：发行目录不存在 -> CI 扫描失败" bash "$HERE/ci-secret-scan.sh" "$WORK/r3-no-such-release"
+
+# ---- 10) 第3轮 P2-02：portable tar 的严格路径 ----
+ci_section "第3轮 P2-02 portable tar 的 BUILD-INFO / VERSION 必须严格在 <top>/ 下"
+if [ -z "$CLIENT_TAR" ]; then
+  ci_fail "P2-02 找不到客户端 portable tar：无法验证严格路径"
+else
+  mkdir -p "$WORK/r3"
+  d="$WORK/r3-tar-ok"; mkdir -p "$d"; cp -a "$CLIENT_TAR" "$d/"
+  expect_ok "P2-02 正对照：正常客户端 portable tar 通过" bash "$HERE/ci-artifact-selfscan.sh" "$d"
+
+  make_client_tar_variant "$WORK/r3/move-info.tar.xz"     'mkdir -p random-place && mv BUILD-INFO.txt random-place/'
+  d="$WORK/r3-move-info"; mkdir -p "$d"; cp -a "$WORK/r3/move-info.tar.xz" "$d/$(basename "$CLIENT_TAR")"
+  expect_scan_reason "P2-02 BUILD-INFO 被挪到 random-place/ -> 失败"     "$HERE/ci-artifact-selfscan.sh" "$d" "找不到 BUILD-INFO.txt"
+
+  make_client_tar_variant "$WORK/r3/move-version.tar.xz"     'mkdir -p random-place && mv share/backup-project/VERSION random-place/'
+  d="$WORK/r3-move-version"; mkdir -p "$d"; cp -a "$WORK/r3/move-version.tar.xz" "$d/$(basename "$CLIENT_TAR")"
+  expect_scan_reason "P2-02 VERSION 被挪到 random-place/ -> 失败"     "$HERE/ci-artifact-selfscan.sh" "$d" "找不到 share/backup-project/VERSION"
+
+  make_client_tar_variant "$WORK/r3/no-version.tar.xz" 'rm -f share/backup-project/VERSION'
+  d="$WORK/r3-no-version"; mkdir -p "$d"; cp -a "$WORK/r3/no-version.tar.xz" "$d/$(basename "$CLIENT_TAR")"
+  expect_scan_reason "P2-02 VERSION 缺失 -> 失败"     "$HERE/ci-artifact-selfscan.sh" "$d" "找不到 share/backup-project/VERSION"
+
+  mkdir -p "$WORK/r3-two-tops/src" "$WORK/r3-two-tops/rel"
+  tar -xJf "$CLIENT_TAR" -C "$WORK/r3-two-tops/src"
+  top="$(find "$WORK/r3-two-tops/src" -maxdepth 1 -mindepth 1 -type d | sed -n '1p')"
+  mkdir -p "$WORK/r3-two-tops/src/extra-top"
+  ( cd "$WORK/r3-two-tops/src" && tar -cJf "$WORK/r3-two-tops/rel/$(basename "$CLIENT_TAR")" "$(basename "$top")" extra-top )
+  expect_scan_reason "P2-02 顶层目录不唯一 -> 失败"     "$HERE/ci-artifact-selfscan.sh" "$WORK/r3-two-tops/rel" "顶层内容不唯一"
+
+  make_client_tar_variant "$WORK/r3/symlink-info.tar.xz"     'rm -f BUILD-INFO.txt && ln -s /etc/hostname BUILD-INFO.txt'
+  d="$WORK/r3-symlink-info"; mkdir -p "$d"; cp -a "$WORK/r3/symlink-info.tar.xz" "$d/$(basename "$CLIENT_TAR")"
+  expect_scan_reason "P2-02 BUILD-INFO 是符号链接（指向树外）-> 失败"     "$HERE/ci-artifact-selfscan.sh" "$d" "是符号链接"
+
+  outside="$WORK/r3-outside"; mkdir -p "$outside/backup-project"; printf '0.1.1\n' > "$outside/backup-project/VERSION"
+  make_client_tar_variant "$WORK/r3/symlink-share.tar.xz" "rm -rf share && ln -s $outside share"
+  d="$WORK/r3-symlink-share"; mkdir -p "$d"; cp -a "$WORK/r3/symlink-share.tar.xz" "$d/$(basename "$CLIENT_TAR")"
+  expect_scan_reason "P2-02 share 是指向树外的符号链接（真实路径逃逸）-> 失败"     "$HERE/ci-artifact-selfscan.sh" "$d" "真实路径逃出"
+
+  d="$WORK/r3-tar-ok"
+  expect_fail "P2-02 VERSION 与期望版本不一致 -> 失败"     bash "$HERE/ci-artifact-selfscan.sh" "$d" --expect-version 9.9.9
+  expect_fail "P2-02 BUILD-INFO commit 与期望不一致 -> 失败"     bash "$HERE/ci-artifact-selfscan.sh" "$d" --expect-commit 0000000000000000000000000000000000000000
+
+  # 解包阶段本身的路径安全：GNU tar 必须拒绝 ".." 成员与"穿过符号链接写入"
+  python3 - "$WORK/r3-dots.tar.xz" <<'PYEOF'
+import io, sys, tarfile
+with tarfile.open(sys.argv[1], "w:xz") as t:
+    ti = tarfile.TarInfo("../escaped.txt"); ti.size = 3
+    t.addfile(ti, io.BytesIO(b"bad"))
+PYEOF
+  d="$WORK/r3-dots"; mkdir -p "$d"; cp -a "$WORK/r3-dots.tar.xz" "$d/$(basename "$CLIENT_TAR")"
+  expect_scan_reason "P2-02 tar 成员名含 .. -> 解包即失败"     "$HERE/ci-artifact-selfscan.sh" "$d" "解包失败"
+  expect_fail "P2-02 tar 成员名含 .. -> CI 扫描同样失败" bash "$HERE/ci-secret-scan.sh" "$d"
+
+  rm -rf /tmp/r3-escape-target
+  python3 - "$WORK/r3-symlink-write.tar.xz" <<'PYEOF'
+import io, sys, tarfile
+with tarfile.open(sys.argv[1], "w:xz") as t:
+    link = tarfile.TarInfo("top/link"); link.type = tarfile.SYMTYPE
+    link.linkname = "/tmp/r3-escape-target"; t.addfile(link)
+    data = b"pwned\n"
+    member = tarfile.TarInfo("top/link/pwned.txt"); member.size = len(data)
+    t.addfile(member, io.BytesIO(data))
+PYEOF
+  d="$WORK/r3-symlink-write"; mkdir -p "$d"; cp -a "$WORK/r3-symlink-write.tar.xz" "$d/$(basename "$CLIENT_TAR")"
+  expect_fail "P2-02 tar 试图穿过符号链接写入 -> 解包失败" bash "$HERE/ci-artifact-selfscan.sh" "$d"
+  if [ -e /tmp/r3-escape-target/pwned.txt ]; then
+    ci_fail "P2-02 解包发生了路径逃逸（/tmp/r3-escape-target/pwned.txt 被写出）"
+  else
+    ci_pass "P2-02 解包没有逃逸（树外没有被写入）"
+  fi
+fi
+if [ -z "$SERVER_TAR" ]; then
+  printf '  SKIP  找不到服务端 portable tar：跳过服务端正对照\n'
+else
+  d="$WORK/r3-server-tar"; mkdir -p "$d"; cp -a "$SERVER_TAR" "$d/"
+  expect_ok "P2-02 正对照：正常服务端 portable tar 通过" bash "$HERE/ci-artifact-selfscan.sh" "$d"
+fi
+
+# ---- 11) 第3轮 P3-01：发行目录顶层严格白名单 ----
+ci_section "第3轮 P3-01 发行目录顶层只允许七件套"
+d="$WORK/r3-top-ok"; make_rel_dir "$d"
+expect_ok "P3-01 正对照：七件套通过" bash "$HERE/ci-release-manifest.sh" "$d" --family all
+
+d="$WORK/r3-top-log"; make_rel_dir "$d"; printf 'noise\n' > "$d/debug.log"
+expect_top_reject "P3-01 多出 debug.log" "$d" "debug.log" "未预期条目"
+
+d="$WORK/r3-top-hidden"; make_rel_dir "$d"; printf 'x\n' > "$d/.unexpected"
+expect_top_reject "P3-01 多出隐藏文件 .unexpected" "$d" ".unexpected" "隐藏文件"
+
+d="$WORK/r3-top-dir"; make_rel_dir "$d"; mkdir -p "$d/extra-dir"; printf 'x\n' > "$d/extra-dir/f.txt"
+expect_top_reject "P3-01 多出意外目录" "$d" "extra-dir" "未预期条目"
+
+d="$WORK/r3-top-zip"; make_rel_dir "$d"; printf 'x\n' > "$d/weird.zip"
+expect_top_reject "P3-01 多出未知格式文件" "$d" "weird.zip" "未预期条目"
+
+d="$WORK/r3-top-symlink"; make_rel_dir "$d"; rm -f "$d/SHA256SUMS"; ln -s /etc/hostname "$d/SHA256SUMS"
+expect_top_reject "P3-01 SHA256SUMS 被符号链接冒充" "$d" "SHA256SUMS" "不是普通文件"
+
+# 兼容性：单族目录里出现另一族的**合法**制品不得误伤（CI 的 client / server 作业）
+d="$WORK/r3-top-cross"; make_rel_dir "$d" --only-client
+cp -a "$REL"/backup-project-server_*.deb "$REL"/backup-project-server-*-linux-x86_64.tar.xz "$d/" 2>/dev/null || true
+expect_ok "P3-01 客户端目录里带另一族合法制品：family=client 通过"   bash "$HERE/ci-release-manifest.sh" "$d" --family client
+expect_fail "P3-01 客户端目录里带另一族合法制品：family=all 仍失败（本族不齐）"   bash "$HERE/ci-release-manifest.sh" "$d" --family all
 
 ci_finish "packaging-quality"
