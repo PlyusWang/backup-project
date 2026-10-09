@@ -417,7 +417,11 @@ fi
 
 # 读取错误：制品里放一个 0000 权限的文件。root 会绕过文件权限，那种情况下不做假测试。
 if [ "$(id -u)" -eq 0 ]; then
-  printf '  SKIP  不可读文件注入：当前是 root（文件权限不生效），不构造假测试\n'
+  # root 会绕过文件权限，造不出"读不了"的文件 —— 这 3 条如实记 SKIP（不计入 PASS），
+  # 而不是伪造通过。非 root 环境下它们会真正执行，所以断言总数恒为 100。
+  ci_skip "P2-01 夹具确实造出不可读文件（注入有效）"
+  ci_skip "P2-01 读不了制品里的文件 -> 构建期自查失败（不再报告 0 命中）"
+  ci_skip "P2-01 读不了制品里的文件 -> CI 扫描失败（不再报告 0 命中）"
 else
   make_tar_variant "$CLIENT_TAR" "$WORK/r3-locked-src.tar.xz"     'mkdir -p extra && printf "synthetic\n" > extra/locked.txt'
   d="$WORK/r3-locked"; mkdir -p "$d"
@@ -537,7 +541,7 @@ PYEOF
   fi
 fi
 if [ -z "$SERVER_TAR" ]; then
-  printf '  SKIP  找不到服务端 portable tar：跳过服务端正对照\n'
+  ci_skip "P2-02 正对照：正常服务端 portable tar 通过（目录里没有服务端 tar）"
 else
   d="$WORK/r3-server-tar"; mkdir -p "$d"; cp -a "$SERVER_TAR" "$d/"
   expect_ok "P2-02 正对照：正常服务端 portable tar 通过" bash "$HERE/ci-artifact-selfscan.sh" "$d"
@@ -569,4 +573,12 @@ cp -a "$REL"/backup-project-server_*.deb "$REL"/backup-project-server-*-linux-x8
 expect_ok "P3-01 客户端目录里带另一族合法制品：family=client 通过"   bash "$HERE/ci-release-manifest.sh" "$d" --family client
 expect_fail "P3-01 客户端目录里带另一族合法制品：family=all 仍失败（本族不齐）"   bash "$HERE/ci-release-manifest.sh" "$d" --family all
 
-ci_finish "packaging-quality"
+# 断言总数口径：本套件定义 100 条断言。本地非 root 环境 100 条全部执行；CI 的 root
+# 容器里跳过 3 条依赖文件权限的用例（记 SKIP），97 + 3 仍然等于 100 —— 少了或多了都会
+# 被 ci_finish 拦住。只在正对照制品齐全时断言总数：制品缺失的目录本来就会在对应小节里
+# 明确 ci_fail（例如"找不到客户端 .deb"），不需要再叠一条口径告警。
+if [ -n "$APPIMAGE" ] && [ -n "$CLIENT_DEB" ] && [ -n "$CLIENT_TAR" ] && [ -n "$SERVER_TAR" ]; then
+  ci_finish "packaging-quality" 100
+else
+  ci_finish "packaging-quality"
+fi

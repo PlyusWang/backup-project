@@ -5,10 +5,15 @@ set -uo pipefail
 
 CI_FAILED=0
 CI_PASSED=0
+CI_SKIPPED=0
 
 ci_section() { printf '\n== %s ==\n' "$*"; }
 ci_pass() { CI_PASSED=$((CI_PASSED + 1)); printf '  PASS  %s\n' "$*"; }
 ci_fail() { CI_FAILED=$((CI_FAILED + 1)); printf '  FAIL  %s\n' "$*" >&2; }
+# 有些断言在特定环境下**无法执行**（典型例子：依赖文件权限的用例，root 会绕过权限）。
+# 这种情况必须记成 SKIP 而不是 PASS：SKIP 单独计数，永远不计入通过数。
+# 统计口径（三个数必须能对上）：assertions = passed + failed + skipped
+ci_skip() { CI_SKIPPED=$((CI_SKIPPED + 1)); printf '  SKIP  %s\n' "$*"; }
 
 expect_ok() {   # expect_ok <标签> <命令...>
   local label="$1"; shift
@@ -94,7 +99,20 @@ ci_unpack() {  # ci_unpack <标签> <制品> <目标目录> <期望相对路径.
   return 0
 }
 
-ci_finish() { # ci_finish <套件名>
-  printf '\n[%s] passed=%d failed=%d\n' "$1" "$CI_PASSED" "$CI_FAILED"
+ci_finish() { # ci_finish <套件名> [期望断言总数]
+  local name="$1" want="" total
+  if [ "$#" -ge 2 ]; then want="$2"; fi
+  total=$((CI_PASSED + CI_FAILED + CI_SKIPPED))
+  if [ -n "$want" ] && [ "$total" -ne "$want" ]; then
+    # 断言总数对不上 = 有断言没有跑到，或者被重复计数（第4轮核查发现的口径问题）。
+    # 以前只能靠人对日志，现在由套件自己在收尾时拦住。
+    CI_FAILED=$((CI_FAILED + 1))
+    printf '  FAIL  断言总数 %d != 预期的 %d（有断言没有跑到，或有重复计数）\n' "$total" "$want" >&2
+    total=$((CI_PASSED + CI_FAILED + CI_SKIPPED))
+  fi
+  # 第一行保持历史格式（passed=/failed=）：仓内已有脚本用 grep -oE 提取它。
+  # 第二行是给人和脚本核对口径用的：passed + failed + skipped = assertions。
+  printf '\n[%s] passed=%d failed=%d\n' "$name" "$CI_PASSED" "$CI_FAILED"
+  printf '[%s] skipped=%d assertions=%d（passed + failed + skipped）\n' "$name" "$CI_SKIPPED" "$total"
   [ "$CI_FAILED" -eq 0 ]
 }

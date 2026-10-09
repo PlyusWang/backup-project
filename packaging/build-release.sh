@@ -89,7 +89,12 @@ GLIBC_VERSION="$(ldd --version | awk 'NR==1 {print $NF}')"
 CXX_VERSION="$(g++ --version | awk 'NR==1')"
 QT_VERSION="$(command -v qmake6 >/dev/null 2>&1 && qmake6 -query QT_VERSION || echo none)"
 COMMIT="$(git rev-parse HEAD)"
-TREE="$(git rev-parse HEAD^{tree})"
+# git 的 <rev>^{<type>} 语法里的大括号必须原样交给 git。不加引号时 bash 之所以
+# 能原样传递，只是因为这个大括号里没有逗号/序列 —— 一旦写成 HEAD^{tree,blob}，
+# 就会被 brace expansion 拆成两个参数。ShellCheck 的 SC1083 提示的正是这一点
+# （它是"字面量大括号"的真实提示，不是误报）。单引号把 revision 钉成字面量，
+# 取值与改动前逐字节相同（对照见 docs/release-verification-closure-review.md 第 11 节）。
+TREE="$(git rev-parse 'HEAD^{tree}')"
 BRANCH="$(git rev-parse --abbrev-ref HEAD)"
 STAMP="$(date -u -d "@$SOURCE_DATE_EPOCH" +%Y-%m-%dT%H:%M:%SZ)"
 
