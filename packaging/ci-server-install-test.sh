@@ -165,6 +165,8 @@ else
 fi
 "$PREFIX/bin/launch-server.sh" --config "$PREFIX/etc/server.conf" > /tmp/server-portable.log 2>&1 &
 PPORT_PID=$!
+# 半路失败也要收尸：脚本因为 set -e 提前退出时，不能把服务端进程留在机器上。
+trap 'kill "$PPORT_PID" 2>/dev/null || true' EXIT
 # 40 次 × 0.5s，与原来一致的等待上限；计数器无业务用途，用 _。
 for _ in $(seq 1 40); do ss -ltn 2>/dev/null | grep '127.0.0.1:18999' > /dev/null && break; sleep 0.5; done
 if ss -ltn 2>/dev/null | grep '127.0.0.1:18999' > /dev/null; then ci_pass "portable 服务端在 127.0.0.1:18999 监听"; else ci_fail "portable 服务端没有监听"; tail -20 /tmp/server-portable.log >&2; fi
