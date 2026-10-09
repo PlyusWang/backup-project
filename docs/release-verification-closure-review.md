@@ -451,3 +451,200 @@ CI 两个产品族），v0.1.1 的真品只用于测试逻辑的正 / 负对照�
 - ShellCheck 的 2 条 SC1083 误报（`HEAD^{tree}`，预先存在，本轮未改）。
 - X4（`--skip-appimage` 开发开关）仍按上一轮的决定不修。
 - 本轮**不**创建 tag / Release；v0.1.0 / v0.1.1 的已发布制品保持不变。
+
+## 11. 两项遗留问题最终核查（第4轮）
+
+上一轮独立验收提出两个疑点：证据里同时出现 **91 / 97 / 100** 三个测试数字，以及
+ShellCheck 的 **SC1083 + exit=1** 被上一轮报告称为"既有误报"。本轮把两个都查到底：
+**两处都是真实问题**（一个是我上一轮汇总脚本的口径错误，一个是确实不规范的引用写法），
+各做最小修复。§1–§10 的历史记录原文保留，本节是核查与更正的记录。
+
+### 11.1 断言计数 91 / 97 / 100：三个数字的来源与口径
+
+先给结论：**套件从来没有漏跑或重复计数**；91 是**我上一轮证据汇总脚本的统计口径**造成
+的（按"去掉括号后缀的唯一标签"聚合），97 是 **CI 的 root 环境跳过 3 条依赖文件权限的
+断言**，100 是套件定义的断言总数。三个数字的原始出处：
+
+| 数字 | 原始出处（不可改写的证据） | 运行主体与环境 | 命令 | 口径 |
+| --- | --- | --- | --- | --- |
+| **100** | 证据 ZIP（第3轮）`tests/green-new-tests-on-new-code.log`，末行 `[packaging-quality] passed=100 failed=0` | 本轮代码 + 本轮测试；VM 普通用户（非 root），基线 c922d5b5 的 `packaging/` 作为 RED 侧 | `bash packaging/ci-packaging-quality-test.sh /tmp/v011-verify/dl/0.1.1` | 套件自带计数器：每执行一条断言 +1；该日志逐条 `  PASS` 行正好 100 条 |
+| **80 / 20（RED）** | 证据 ZIP（第3轮）`tests/red-new-tests-on-old-code.log`，末行 `[packaging-quality] passed=80 failed=20` | 同一份测试文件；`packaging/` 换成基线 c922d5b5 的版本 | 同上 | 同上（100 条断言，20 条失败） |
+| **91** | 证据 ZIP（第3轮）`tests/redgreen-summary.log` 里的 `用例总数：RED=91 GREEN=91` | **我上一轮的对照脚本** `/tmp/r3/redgreen.sh`（不在仓库里） | `bash /tmp/r3/redgreen.sh` | 脚本内联 Python 用 `d[去掉括号后缀的标签] = PASS/FAIL` 聚合，`len(d)` = **唯一标签数**，不是断言数 |
+| **97** | CI run [37915246454](https://github.com/PlyusWang/backup-project/actions/runs/37915246454) 的 bundle 作业日志（job 113771564326）里 `[packaging-quality] passed=97 failed=0` | CI 的 root 容器（`id -u = 0`） | workflow 步骤 `bash packaging/ci-packaging-quality-test.sh "dist/release/0.1.1-r3ci"` | 套件计数器：root 会绕过文件权限，3 条依赖权限的断言整段跳过（日志里 1 行 `  SKIP`），97 + 3 = 100 |
+
+**9 条差额到底是什么**：不是丢失的测试，而是 **9 个标签被两条断言复用** —— 每个注入
+夹具都同时跑"构建期自查"和"CI 扫描"两个入口，标签只差括号里的后缀：
+
+``
+P1-01 截断的 AppImage（构建期自查）/（CI 扫描）
+P1-01 空文件冒充 AppImage（构建期自查）/（CI 扫描）
+P1-01 不认识的发行文件（构建期自查）/（CI 扫描）
+B 含测试用 .key（构建期自查）/（CI 扫描）
+B 含测试用 .bpcert（构建期自查）/（CI 扫描）
+B 含模拟 PEM 私钥（构建期自查）/（CI 扫描）
+B 含模拟 token secret（构建期自查）/（CI 扫描）
+B 含 32 字节原始密钥形状（排除目录之外）（构建期自查）/（CI 扫描）
+P2-01 二进制里的 PEM 字符串常量不误报（构建期自查）/（CI 扫描）
+``
+
+9 个标签 × 2 条 = 18 行；100 − 18 + 9 = **91**。RED 与 GREEN 两份日志都是同样的
+100 行 / 91 标签，差额完全一致 —— 也就是说这个 91 与"旧代码还是新代码"无关，
+纯粹是汇总口径。
+
+**逐项回答核查清单**：
+
+- *91 代表哪个提交、哪个时间点、哪个测试集合*：不代表任何提交的测试集合，它是我在
+  2026-10-09 生成第3轮证据时，对 RED/GREEN 两份日志用"唯一标签"口径重算出来的数字。
+- *100 代表哪一个*：本轮代码 + 本轮测试（100 条断言）在**非 root** 环境下的结果，
+  同时也是套件定义的全部断言数。
+- *97 是不是因为 root 跳过 3 条*：是。CI 日志里那 3 条落在
+  `if [ "$(id -u)" -eq 0 ]` 分支（夹具有效性 + 两个入口的失败断言）；
+  本轮已把它们改成显式 `ci_skip` 并在收尾行报出口径。
+- *是否存在统计遗漏 / 重复计数 / 历史日志混入*：没有。RED/GREEN 两份日志逐条核对，
+  100 条断言一一对应；两份日志来自同一次对照运行（同一台机器、同一份测试文件、
+  同一输入目录），没有混入旧日志。
+- *RED/GREEN 是否可比*：可比。对照脚本把**当前工作树的测试文件**复制进基线树
+  （`cp "$REPO/packaging/ci-packaging-quality-test.sh" "$OLD/packaging/"`），
+  两侧测试定义逐字节相同；输入都是同一份 v0.1.1 真品目录；两侧用例数相同（100/100），
+  逐条按顺序配对。
+- *是否有"代码改了但汇总没同步"*：有，就是这次的 91 —— 汇总脚本的口径与套件不一致。
+  本轮修掉了汇总口径，并让套件自己输出可核对的口径（见下）。
+- *最终 HEAD 是否覆盖全部要求的负向场景*：是，100 条断言的分组为
+  P1-01 解包 fail-closed（6）、P1-02 声明不被简化（1）、P1-03 插件/QML 双向登记（2）、
+  A 核心库定位（5）、B 两套扫描一致性矩阵（24）、C 完整清单与哈希（12）、
+  D BUILD-INFO 契约（4）、P2-01 扫描错误传播（15）、P2-02 tar 严格路径（16）、
+  P3-01 顶层白名单（9）、正对照与家族模式（6）。
+
+**修复**（把口径固化进套件，避免以后再靠人对日志）：
+
+- `packaging/ci-lib.sh`：新增 `ci_skip()`（SKIP 单独计数，
+  **永远不计入 PASS**）；`ci_finish()` 追加一行
+  `[套件名] skipped=N assertions=M（passed + failed + skipped）`，
+  并支持传入期望断言总数，对不上就记一条 FAIL。历史格式的
+  `passed=… failed=…` 一行**保持不变**（仓内已有脚本用 `grep -oE` 提取它）。
+- `packaging/ci-packaging-quality-test.sh`：root 分支改用 3 条
+  `ci_skip`（如实记录而不是伪造通过），收尾声明总数 100。
+
+**修复后的实测**：
+
+| 场景 | 结果 |
+| --- | --- |
+| 非 root（本机，v0.1.1 真品） | `passed=100 failed=0` + `skipped=0 assertions=100`，exit 0 |
+| root 路径（把判据改成恒真的**副本**模拟；本机拿不到 root：sudo 需要密码、`unshare -r` 被内核限制） | `passed=97 failed=0` + `skipped=3 assertions=100`，exit 0 |
+| CI（真实 root 容器，run 37937121722） | 见 §11.4 |
+| 守卫自测：1 条断言 vs 期望 2 | `FAIL  断言总数 1 != 预期的 2`，exit 1（守卫真的会响） |
+| 守卫自测：1 通过 + 1 SKIP vs 期望 2 | exit 0（SKIP 计入总数、不计入通过） |
+
+### 11.2 ShellCheck SC1083：引用不规范，不是误报（更正式上一轮的说法）
+
+**原始异常**：ShellCheck 0.10.0 对 `packaging/build-release.sh:92` 报 2 条
+`SC1083 (warning)`，进程退出码 1；上一轮报告称其为"既有误报"，但没有给出依据。
+
+**原始输出（改动前，逐字）**：
+
+``
+In packaging/build-release.sh line 92:
+TREE="$(git rev-parse HEAD^{tree})"
+                           ^-- SC1083 (warning): This { is literal. Check expression (missing ;/
+?) or quote it.
+                                ^-- SC1083 (warning): This } is literal. Check expression (missing ;/
+?) or quote it.
+build-release.sh exit=1
+``
+
+**SC1083 的含义**：它在提醒"这个 `{` 会被当作字面量"，建议检查是不是漏写了
+`$` 或者**加引号**。
+
+**bash 实际怎么解析**（实测，GNU bash 5.2）：
+
+| 写法 | 传给命令的参数 | 说明 |
+| --- | --- | --- |
+| `HEAD^{tree}` | 1 个参数，内容 `HEAD^{tree}` | 大括号里没有逗号/序列 → 不触发 brace expansion |
+| `HEAD^{tree,blob}` | **2 个参数**：`HEAD^tree`、`HEAD^blob` | 有逗号 → brace expansion 生效 |
+
+所以原文案"能用"依赖的是一个巧合（大括号里恰好没有逗号），**ShellCheck 的说法是准确的**：
+这是字面量大括号，而且是**脆弱的引用方式** —— 一旦有人写出 `HEAD^{tree,blob}`
+之类的写法，bash 就会悄悄拆参数。**结论：不是工具误报，是引用不规范**；上一轮的
+"既有误报"结论依据不足，本节更正。
+
+**两条诊断的原因**：`{` 与 `}` 各报一条，所以是 2 条 warning（不是 2 个问题）。
+
+**退出码与严重度**：两条都是 `warning`（不是 `error`），但 ShellCheck
+只要报告了 warning，进程退出码就是 1 —— 这就是"0 error / 2 warning / exit=1"的来源。
+
+**对制品有没有影响**：没有，且已实测。
+
+| 检查 | 结果 |
+| --- | --- |
+| 四种写法（不加引号 / 单引号 / 双引号 / 反斜杠转义）取值 | 全部相同：`516ccb2fa3db8218e6cfe732bf8ff2d71fec56d1`（= 改动前的 HEAD tree） |
+| 与 `git cat-file -p HEAD` 的 tree 字段对照 | 一致 |
+| 从仓库根 / `packaging/` / `scripts/` 子目录执行 | 一致 |
+| 制品里是否包含 `build-release.sh` | 不包含（tar 里只有 `packaging/portable`、`packaging/client`、`packaging/server` 的安装脚本），所以改这个文件不改变任何制品字节 |
+| 修复后从新 HEAD（`e5d4049`）实际构建服务端制品 | `BUILD-INFO` / `RELEASE-INFO` 的 `tree` = `ecb2740c82b5c748bfbd0272b3e7e159528f07fb`、`commit` = `e5d4049b…`，与独立计算的 `git rev-parse HEAD^{tree}` / `git rev-parse HEAD` **完全一致** |
+
+**修法**：`TREE="$(git rev-parse 'HEAD^{tree}')"` —— 用单引号把 revision 钉成
+字面量，语义与取值都不变，只把意图写明。
+
+**修复后**：本 PR 改动的脚本（`lib/common.sh`、`ci-secret-scan.sh`、
+`ci-artifact-selfscan.sh`、`ci-release-manifest.sh`、
+`ci-packaging-quality-test.sh`、`ci-lib.sh`、`build-release.sh`）
+ShellCheck **0 error / 0 warning / exit=0**。
+
+**没有做的事**：没有用 `# shellcheck disable=SC1083`、没有屏蔽整个文件、没有
+缩小检查范围、没有 `|| true`。
+
+**顺带记录（不改）**：把范围放宽到 `packaging/*.sh` 全部 21 个脚本时，
+还剩 3 条**预先存在**的 `SC2034`（未使用变量）：
+`ci-server-install-test.sh:144`（`PIN2`）、
+`ci-server-install-test.sh:147` 与 `ci-upgrade-rollback-test.sh:39`
+（循环变量 `i`）。它们不在本 PR 的改动范围里，本轮按"不扩大范围"处理，
+如实记录在此（其中 `PIN2` 看起来是一处**被赋值但从未断言**的取值，
+可能是那两个安装测试的遗留，建议后续单独核查）。
+
+### 11.3 本轮的修改
+
+| 文件 | 变化 | 原因 |
+| --- | --- | --- |
+| `packaging/build-release.sh` | +6 / −1 | SC1083：把 `HEAD^{tree}` 用单引号钉成字面量 |
+| `packaging/ci-lib.sh` | +20 / −2 | 新增 `CI_SKIPPED` / `ci_skip()`；`ci_finish()` 输出 skipped/assertions 并支持期望总数校验 |
+| `packaging/ci-packaging-quality-test.sh` | +15 / −3 | root 分支改用 `ci_skip`；收尾声明断言总数 100 |
+
+未改动：产品代码、协议、用户数据格式、发行包布局、命令行接口、
+`ci_finish` 的历史输出格式（`passed=… failed=…` 一行保持原样）。
+
+### 11.4 复核与门禁
+
+#### (1) CI：真实 root 容器
+
+run [37937121722](https://github.com/PlyusWang/backup-project/actions/runs/37937121722)
+（@@BQ@@workflow_dispatch@@BQ@@，只读权限，提交 @@BQ@@e5d4049b@@BQ@@）：**6 / 6 作业 success**。
+bundle 作业里每个套件的收尾行（新格式）：
+
+| 步骤 | PASS | FAIL | SKIP | 收尾行 |
+| --- | --- | --- | --- | --- |
+| @@BQ@@ci-packaging-quality-test.sh@@BQ@@ | 97 | 0 | **3** | @@BQ@@passed=97 failed=0@@BQ@@ / @@BQ@@skipped=3 assertions=100@@BQ@@ |
+| @@BQ@@ci-release-manifest.sh@@BQ@@ | 19 | 0 | 0 | @@BQ@@skipped=0 assertions=19@@BQ@@ |
+| @@BQ@@ci-secret-scan.sh@@BQ@@ | 8 | 0 | 0 | @@BQ@@skipped=0 assertions=8@@BQ@@ |
+| @@BQ@@ci-license-coverage.sh@@BQ@@ | 71 | 0 | 0 | @@BQ@@skipped=0 assertions=71@@BQ@@ |
+| @@BQ@@ci-client-install-test.sh@@BQ@@ | 33 | 0 | 0 | @@BQ@@skipped=0 assertions=33@@BQ@@ |
+| @@BQ@@ci-server-install-test.sh@@BQ@@ | 75 | 0 | 0 | @@BQ@@skipped=0 assertions=75@@BQ@@ |
+| @@BQ@@ci-appimage-test.sh@@BQ@@ | 14 | 0 | 0 | @@BQ@@skipped=0 assertions=14@@BQ@@ |
+
+CI 日志里那 3 条 SKIP 的标签与本地非 root 环境下真正执行的 3 条断言**完全一致**，
+因此"97 + 3 = 100"在 CI 日志里是自解释的 —— 这正是本轮要修的东西。
+
+#### (2) 本地复核
+
+| 场景 | 结果 |
+| --- | --- |
+| 打包质量套件（非 root，v0.1.1 真品） | @@BQ@@passed=100 failed=0@@BQ@@ + @@BQ@@skipped=0 assertions=100@@BQ@@，exit 0 |
+| root 路径（判据恒真的副本模拟） | @@BQ@@passed=97 failed=0@@BQ@@ + @@BQ@@skipped=3 assertions=100@@BQ@@，exit 0 |
+| ShellCheck（本轮改动的 7 个脚本） | **0 error / 0 warning / exit=0** |
+| ShellCheck（@@BQ@@packaging/*.sh@@BQ@@ 全量 21 个脚本） | 3 条预先存在的 @@BQ@@SC2034@@BQ@@（见 §11.2，未修） |
+| 从新 HEAD（@@BQ@@e5d4049@@BQ@@）构建服务端制品 | exit 0；@@BQ@@BUILD-INFO@@BQ@@/@@BQ@@RELEASE-INFO@@BQ@@ 的 tree = @@BQ@@ecb2740c…@@BQ@@、commit = @@BQ@@e5d4049b…@@BQ@@，与 git 独立计算一致 |
+| 新制品上的检查器 | 自查 exit 0；清单(server) 14/0；私钥扫描 5/0；许可覆盖 8/0（均带 @@BQ@@skipped=0 assertions=N@@BQ@@） |
+| @@BQ@@ci_finish@@BQ@@ 守卫自测 | 1 条 vs 期望 2 → @@BQ@@FAIL  断言总数 1 != 预期的 2@@BQ@@ + exit 1；1 通过 + 1 SKIP vs 期望 2 → exit 0 |
+
+本节引用的 CI 与本地数字都对应**代码提交 @@BQ@@e5d4049@@BQ@@**；文档提交之后的交付 HEAD
+上重跑了完整门禁（@@BQ@@scripts/final_gate.sh@@BQ@@），日志在证据 ZIP 的 @@BQ@@gates/@@BQ@@ 下，
+两者的 SHA 分别标注在日志首行。
