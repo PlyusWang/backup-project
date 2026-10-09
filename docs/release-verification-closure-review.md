@@ -117,6 +117,9 @@ BUILD-INFO/VERSION 的存在与内容，并支持 `--expect-commit/--expect-vers
 | X2 | P3 | `build-release.sh` | `rm -rf "$tree/bin" "$tree/etc"`：`$tree` 为空时会变成 `rm -rf /bin /etc`（ShellCheck SC2115） | 已修（`tree:?` 守卫） |
 | X3 | P3 | `build-release.sh` 生成的 `SHA256SUMS` | 与 CI bundle 阶段的集合定义不一致（是否含 `RELEASE-INFO.txt`） | 已修（统一为包含） |
 | X4 | P3 | `build-release.sh --skip-appimage` | 该开发用开关会让 AppDir 没有 `usr/lib`，材料生成器因此失败（上一轮加"0 个对象即失败"守卫后暴露；更早版本同样会因"找不到随包库目录"失败） | **未修**：CI 与文档都不用这个开关；如要保留该路径需另立范围 |
+| X6 | P3 | 本轮新增的 `ci-release-manifest.sh` | 用原始版本号拼 `.deb` 文件名；带短横线的预发布版本在 deb 里写成 `~`，于是自报假失败 | 已修（读 `RELEASE-INFO.txt` 的 `deb_version`），由本地 `--only server --version 0.1.1-local` 实测暴露 |
+| X7 | P3 | 同上 | `comm` 在环境 locale 下运行、输入却是 `LC_ALL=C` 排的序，制品一多就报“文件没有被正确排序” | 已修（四处 `comm` 显式加 `LC_ALL=C`） |
+| X8 | P3 | 同上 + `build-release.sh` | 单族目录生成 `SHA256SUMS` 时 `RELEASE-INFO.txt` 还没写出来，所以那份清单不含它；bundle 阶段重算时含它 | 已修（检查器要求“本族制品必须全部在清单里”，`RELEASE-INFO.txt` 两种布局都接受） |
 | X5 | P3 | `build-release.sh:92/264/365/530` 等 | ShellCheck 的 SC1083（`HEAD^{tree}` 是合法 git 语法）、SC2094（清单生成已排除清单自身）、SC2015（`A && B || true` 的既有写法） | **误报**，保留并在此说明 |
 
 ## 3. 负向用例与 RED/GREEN
@@ -173,17 +176,44 @@ RELEASE-INFO / 缺 SHA256SUMS / 哈希不符 / 版本不符 / 重复制品 / 只
 
 ## 7. 完整门禁结果
 
-见证据包 test-logs/ 与 summary.txt（本轮实际运行）。
+全部来自本轮实际运行（提交后的干净树；日志见证据包的 gates/ 与 tests/）：
+
+| 项目 | 结果 |
+| --- | --- |
+| 改动脚本 `bash -n`（21 个） | 0 失败 |
+| `git diff --check` | 通过 |
+| ShellCheck 0.10.0（/tmp 临时静态二进制） | **error 0**；warning 2（均为 `build-release.sh:92` 的 SC1083 误报） |
+| 干净构建 `make clean` + `all server cert-tool gui-all test-fixtures` | exit 0，**warning 0 / error 0** |
+| `scripts/lint.sh` | PASS |
+| `scripts/comment_ratio.py` | 21.40% |
+| `scripts/source_style_check.py` | 0 / 0 / 0 |
+| `scripts/test.sh` | **279 PASS / 0 FAIL** |
+| `scripts/modern_gui_check.sh` | PASS |
+| 打包质量套件（真品，62 条断言） | **62 / 0** |
+| 许可覆盖（真品） | 71 / 0 |
+| 私钥扫描（真品） | 8 / 0 |
+| 完整清单（真品，all / client / server） | 19/0、17/0、16/0 |
+| release staging（干净树） | 客户端 9 文件 / 服务端 13 文件，双 PASS |
+| **仅服务端家族发行构建**（干净树） | **PASS**（产物：server deb + tar + RELEASE-INFO + SHA256SUMS；清单 14/0） |
+| `scripts/final_gate.sh` | **49/49 套件，failed suites = 0**（2501 秒） |
+
+两点如实说明：
+
+- `final_gate.sh` 这一次是在**工作树有未提交改动**时跑的（它自己在日志里记了
+  `worktree=9 个改动`）。该门禁只跑产品构建与 C++ 测试，与本次改动（纯打包 / 验收脚本）
+  没有交集；而 staging 与单族构建**依赖干净树**，所以在提交之后单独复跑，结果见上表。
+- 本轮有两次把长远程脚本放在前台调用，分别被工具超时（300 秒 / 5 分钟）打断；脚本在
+  远端继续跑完，相关结论随后都用后台任务重新复算过（本条只为说明取证过程）。
 
 ## 8. 统计
 
 | 项 | 值 |
 | --- | --- |
 | 审查文件数 | 22（`packaging/` 全部 21 个脚本 + `release.yml`），另核对 README 与 3 份发行文档 |
-| 实际修改文件数 | 8（7 个修改 + 1 个新增 `ci-release-manifest.sh`） |
-| 新增 / 删除行数 | **+501 / −127** |
-| 发现的问题 | 9（P1×1、P2×2、P3×6 —— 含 X1...X5） |
-| 已修复 | 8；未修 1（X4，已说明理由） |
+| 实际修改文件数 | 9（7 个脚本修改 + 1 个新脚本 `ci-release-manifest.sh` + 1 份新文档） |
+| 新增 / 删除行数 | **+880 / −127**（9 个文件；6 个提交） |
+| 发现的问题 | 11（P1×1、P2×2、P3×8 —— 含 X1...X8） |
+| 已修复 | 10；未修 1（X4，已说明理由） |
 | 新增测试数 | 1 个套件（`ci-packaging-quality-test.sh`，62 条断言，含 A/B/C/D 四组矩阵） |
 | 测试套件与断言 | 打包质量套件 62/0；许可覆盖 71/0；私钥扫描 8/0；完整清单 3 种家族模式 PASS |
 | 公共接口 / 协议 / 用户数据格式 | **无任何变更**（改动全部在打包与验收脚本层） |
