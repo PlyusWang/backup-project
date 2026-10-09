@@ -44,13 +44,41 @@ check_client_material() {  # $1 = 解包根, $2 = 材料根（相对）, $3 = �
   done
 
   ci_section "$label：随包共享对象 -> inventory -> 许可材料"
-  local libdir objectroot
-  libdir="$(dirname "$(find "$root" -name 'libQt6Core.so.6' -print -quit 2>/dev/null || true)")"
+  # 定位随包库目录：先拿到 find 的**原始结果**再判断，绝不把 dirname 的 "." 当目录。
+  # 旧写法是 libdir="$(dirname "$(find … || true)")"：find 无结果时 dirname 返回
+  # "."，而 "." 永远存在 —— 失败分支形同虚设，objectroot 还会指到解包目录之外，
+  # 后面的双向核对会去扫制品以外的目录。
+  local qtcore qtcore_real libdir objectroot
+  qtcore="$(find "$root" -name 'libQt6Core.so.6' -print -quit 2>/dev/null || true)"
+  if [ -z "$qtcore" ]; then
+    ci_fail "$label 在制品里找不到随包核心库 libQt6Core.so.6（随包库目录无法定位）"
+    return
+  fi
+  if [ ! -f "$qtcore" ]; then
+    if [ -L "$qtcore" ]; then
+      ci_fail "$label libQt6Core.so.6 是断链（指向不存在的目标）：$qtcore"
+    else
+      ci_fail "$label libQt6Core.so.6 不是普通文件：$qtcore"
+    fi
+    return
+  fi
+  qtcore_real="$(readlink -f "$qtcore" 2>/dev/null || true)"
+  [ -n "$qtcore_real" ] || qtcore_real="$qtcore"
+  case "$qtcore_real" in
+    "$root"|"$root"/*) ;;
+    *) ci_fail "$label 随包核心库落在解包目录之外：$qtcore_real"; return ;;
+  esac
+  libdir="$(dirname "$qtcore_real")"
   if [ ! -d "$libdir" ]; then
-    ci_fail "$label 在制品里找不到随包库目录（libQt6Core.so.6 不在）"
+    ci_fail "$label 随包库目录不存在：$libdir"
     return
   fi
   objectroot="$(dirname "$libdir")"
+  # 注意 "$root" 本身也要接受：portable tar 的"对象根"就是它的顶层目录。
+  case "$objectroot" in
+    "$root"|"$root"/*) ;;
+    *) ci_fail "$label 随包库目录落在解包目录之外：$objectroot"; return ;;
+  esac
 
   # ---- 1) 路径级双向核对：制品 <-> shipped-objects.tsv ----
   local -a actual declared
@@ -87,8 +115,8 @@ check_client_material() {  # $1 = 解包根, $2 = 材料根（相对）, $3 = �
   fi
 
   # ---- 3) 每个组件的许可材料必须真的在制品里 ----
-  local so pkg ver cpr lic missing_cpr=0 unmapped=0
-  while IFS=$'\t' read -r so pkg ver cpr lic; do
+  local so pkg missing_cpr=0 unmapped=0
+  while IFS=$'\t' read -r so pkg _ _ _; do
     [ "$so" = "soname" ] && continue
     [ -n "$so" ] || continue
     if [ "$pkg" = "NOT_PROVIDED_BY_A_PACKAGE" ]; then
