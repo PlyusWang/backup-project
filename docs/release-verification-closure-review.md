@@ -120,7 +120,7 @@ BUILD-INFO/VERSION 的存在与内容，并支持 `--expect-commit/--expect-vers
 | X6 | P3 | 本轮新增的 `ci-release-manifest.sh` | 用原始版本号拼 `.deb` 文件名；带短横线的预发布版本在 deb 里写成 `~`，于是自报假失败 | 已修（读 `RELEASE-INFO.txt` 的 `deb_version`），由本地 `--only server --version 0.1.1-local` 实测暴露 |
 | X7 | P3 | 同上 | `comm` 在环境 locale 下运行、输入却是 `LC_ALL=C` 排的序，制品一多就报“文件没有被正确排序” | 已修（四处 `comm` 显式加 `LC_ALL=C`） |
 | X8 | P3 | 同上 + `build-release.sh` | 单族目录生成 `SHA256SUMS` 时 `RELEASE-INFO.txt` 还没写出来，所以那份清单不含它；bundle 阶段重算时含它 | 已修（检查器要求“本族制品必须全部在清单里”，`RELEASE-INFO.txt` 两种布局都接受） |
-| X5 | P3 | `build-release.sh:92/264/365/530` 等 | ShellCheck 的 SC1083（`HEAD^{tree}` 是合法 git 语法）、SC2094（清单生成已排除清单自身）、SC2015（`A && B || true` 的既有写法） | **误报**，保留并在此说明 |
+| X5 | P3 | `build-release.sh:92/264/365/530` 等 | ShellCheck 的 SC1083（`HEAD^{tree}` 是合法 git 语法）、SC2094（清单生成已排除清单自身）、SC2015（`A && B \|\| true` 的既有写法） | **误报**，保留并在此说明 |
 
 ## 3. 负向用例与 RED/GREEN
 
@@ -617,18 +617,18 @@ ShellCheck **0 error / 0 warning / exit=0**。
 #### (1) CI：真实 root 容器
 
 run [37937121722](https://github.com/PlyusWang/backup-project/actions/runs/37937121722)
-（@@BQ@@workflow_dispatch@@BQ@@，只读权限，提交 @@BQ@@e5d4049b@@BQ@@）：**6 / 6 作业 success**。
+（`workflow_dispatch`，只读权限，提交 `e5d4049b`）：**6 / 6 作业 success**。
 bundle 作业里每个套件的收尾行（新格式）：
 
 | 步骤 | PASS | FAIL | SKIP | 收尾行 |
 | --- | --- | --- | --- | --- |
-| @@BQ@@ci-packaging-quality-test.sh@@BQ@@ | 97 | 0 | **3** | @@BQ@@passed=97 failed=0@@BQ@@ / @@BQ@@skipped=3 assertions=100@@BQ@@ |
-| @@BQ@@ci-release-manifest.sh@@BQ@@ | 19 | 0 | 0 | @@BQ@@skipped=0 assertions=19@@BQ@@ |
-| @@BQ@@ci-secret-scan.sh@@BQ@@ | 8 | 0 | 0 | @@BQ@@skipped=0 assertions=8@@BQ@@ |
-| @@BQ@@ci-license-coverage.sh@@BQ@@ | 71 | 0 | 0 | @@BQ@@skipped=0 assertions=71@@BQ@@ |
-| @@BQ@@ci-client-install-test.sh@@BQ@@ | 33 | 0 | 0 | @@BQ@@skipped=0 assertions=33@@BQ@@ |
-| @@BQ@@ci-server-install-test.sh@@BQ@@ | 75 | 0 | 0 | @@BQ@@skipped=0 assertions=75@@BQ@@ |
-| @@BQ@@ci-appimage-test.sh@@BQ@@ | 14 | 0 | 0 | @@BQ@@skipped=0 assertions=14@@BQ@@ |
+| `ci-packaging-quality-test.sh` | 97 | 0 | **3** | `passed=97 failed=0` / `skipped=3 assertions=100` |
+| `ci-release-manifest.sh` | 19 | 0 | 0 | `skipped=0 assertions=19` |
+| `ci-secret-scan.sh` | 8 | 0 | 0 | `skipped=0 assertions=8` |
+| `ci-license-coverage.sh` | 71 | 0 | 0 | `skipped=0 assertions=71` |
+| `ci-client-install-test.sh` | 33 | 0 | 0 | `skipped=0 assertions=33` |
+| `ci-server-install-test.sh` | 75 | 0 | 0 | `skipped=0 assertions=75` |
+| `ci-appimage-test.sh` | 14 | 0 | 0 | `skipped=0 assertions=14` |
 
 CI 日志里那 3 条 SKIP 的标签与本地非 root 环境下真正执行的 3 条断言**完全一致**，
 因此"97 + 3 = 100"在 CI 日志里是自解释的 —— 这正是本轮要修的东西。
@@ -637,14 +637,14 @@ CI 日志里那 3 条 SKIP 的标签与本地非 root 环境下真正执行的 3
 
 | 场景 | 结果 |
 | --- | --- |
-| 打包质量套件（非 root，v0.1.1 真品） | @@BQ@@passed=100 failed=0@@BQ@@ + @@BQ@@skipped=0 assertions=100@@BQ@@，exit 0 |
-| root 路径（判据恒真的副本模拟） | @@BQ@@passed=97 failed=0@@BQ@@ + @@BQ@@skipped=3 assertions=100@@BQ@@，exit 0 |
+| 打包质量套件（非 root，v0.1.1 真品） | `passed=100 failed=0` + `skipped=0 assertions=100`，exit 0 |
+| root 路径（判据恒真的副本模拟） | `passed=97 failed=0` + `skipped=3 assertions=100`，exit 0 |
 | ShellCheck（本轮改动的 7 个脚本） | **0 error / 0 warning / exit=0** |
-| ShellCheck（@@BQ@@packaging/*.sh@@BQ@@ 全量 21 个脚本） | 3 条预先存在的 @@BQ@@SC2034@@BQ@@（见 §11.2，未修） |
-| 从新 HEAD（@@BQ@@e5d4049@@BQ@@）构建服务端制品 | exit 0；@@BQ@@BUILD-INFO@@BQ@@/@@BQ@@RELEASE-INFO@@BQ@@ 的 tree = @@BQ@@ecb2740c…@@BQ@@、commit = @@BQ@@e5d4049b…@@BQ@@，与 git 独立计算一致 |
-| 新制品上的检查器 | 自查 exit 0；清单(server) 14/0；私钥扫描 5/0；许可覆盖 8/0（均带 @@BQ@@skipped=0 assertions=N@@BQ@@） |
-| @@BQ@@ci_finish@@BQ@@ 守卫自测 | 1 条 vs 期望 2 → @@BQ@@FAIL  断言总数 1 != 预期的 2@@BQ@@ + exit 1；1 通过 + 1 SKIP vs 期望 2 → exit 0 |
+| ShellCheck（`packaging/*.sh` 全量 21 个脚本） | 3 条预先存在的 `SC2034`（见 §11.2，未修） |
+| 从新 HEAD（`e5d4049`）构建服务端制品 | exit 0；`BUILD-INFO`/`RELEASE-INFO` 的 tree = `ecb2740c…`、commit = `e5d4049b…`，与 git 独立计算一致 |
+| 新制品上的检查器 | 自查 exit 0；清单(server) 14/0；私钥扫描 5/0；许可覆盖 8/0（均带 `skipped=0 assertions=N`） |
+| `ci_finish` 守卫自测 | 1 条 vs 期望 2 → `FAIL  断言总数 1 != 预期的 2` + exit 1；1 通过 + 1 SKIP vs 期望 2 → exit 0 |
 
-本节引用的 CI 与本地数字都对应**代码提交 @@BQ@@e5d4049@@BQ@@**；文档提交之后的交付 HEAD
-上重跑了完整门禁（@@BQ@@scripts/final_gate.sh@@BQ@@），日志在证据 ZIP 的 @@BQ@@gates/@@BQ@@ 下，
+本节引用的 CI 与本地数字都对应**代码提交 `e5d4049`**；文档提交之后的交付 HEAD
+上重跑了完整门禁（`scripts/final_gate.sh`），日志在证据 ZIP 的 `gates/` 下，
 两者的 SHA 分别标注在日志首行。
