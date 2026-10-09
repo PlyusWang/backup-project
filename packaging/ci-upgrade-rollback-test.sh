@@ -35,8 +35,9 @@ service_state() { systemctl is-active backup-project-server 2>/dev/null || true;
 port_listening() { ss -ltn 2>/dev/null | grep -q '127.0.0.1:18765'; }
 
 wait_active() {
-  local i state=""
-  for i in $(seq 1 40); do
+  local state=""
+  # 40 次 × 1 秒：等待上限与间隔都和原来一致；计数器无业务用途，用 _ 表示刻意不使用。
+  for _ in $(seq 1 40); do
     state="$(service_state)"
     [ "$state" = "active" ] && return 0
     sleep 1
