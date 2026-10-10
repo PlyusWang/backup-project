@@ -23,7 +23,7 @@
 set -uo pipefail
 
 ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
-cd "$ROOT_DIR"
+cd "$ROOT_DIR" || exit 1
 
 PASS=0
 FAIL=0
@@ -108,7 +108,8 @@ else
   echo "[remote-reliability] 失败项：$FAIL"
   exit 1
 fi
-export BACKUP_REMOTE_SERVER_KEY="$(grep -oE 'sha256:[0-9a-f]{64}' "$WORK/keygen.out" | head -1)"
+BACKUP_REMOTE_SERVER_KEY="$(grep -oE 'sha256:[0-9a-f]{64}' "$WORK/keygen.out" | head -1)"
+export BACKUP_REMOTE_SERVER_KEY
 
 PORT=0
 for candidate in $(seq 23100 23180); do
@@ -126,7 +127,7 @@ fi
   --log-file "$WORK/logs/server.log" --quiet >>"$WORK/logs/server.out" 2>&1 &
 SERVER_PID=$!
 ready=0
-for i in $(seq 1 50); do
+for _ in $(seq 1 50); do
   if ss -ltn 2>/dev/null | grep -q "127.0.0.1:$PORT "; then ready=1; break; fi
   sleep 0.1
 done
@@ -138,7 +139,8 @@ else
   exit 1
 fi
 
-export BACKUP_REMOTE_PASSWORD="pw-$(head -c 16 /dev/urandom | sha256sum | cut -c1-24)"
+BACKUP_REMOTE_PASSWORD="pw-$(head -c 16 /dev/urandom | sha256sum | cut -c1-24)"
+export BACKUP_REMOTE_PASSWORD
 USER_NAME="remote-reliability-$$"
 REMOTE="--user $USER_NAME --host 127.0.0.1 --port $PORT"
 run_remote() { ./build/backupctl remote "$@" 2>&1; }
@@ -240,7 +242,7 @@ fi
 
 echo "[remote-reliability] E. 可靠性"
 PING_OK=0
-for i in $(seq 1 10); do
+for _ in $(seq 1 10); do
   if run_remote ping --host 127.0.0.1 --port "$PORT" >/dev/null 2>&1; then PING_OK=$((PING_OK + 1)); fi
 done
 if [ "$PING_OK" = "10" ]; then
@@ -250,7 +252,7 @@ else
 fi
 
 LOGIN_OK=0
-for i in $(seq 1 3); do
+for _ in $(seq 1 3); do
   if run_remote login $REMOTE >/dev/null 2>&1; then LOGIN_OK=$((LOGIN_OK + 1)); fi
 done
 if [ "$LOGIN_OK" = "3" ]; then
@@ -260,7 +262,7 @@ else
 fi
 
 LIST_OK=0
-for i in $(seq 1 5); do
+for _ in $(seq 1 5); do
   if run_remote list $REMOTE >/dev/null 2>&1; then LIST_OK=$((LIST_OK + 1)); fi
 done
 if [ "$LIST_OK" = "5" ]; then
@@ -289,7 +291,7 @@ fi
 echo "[remote-reliability] F. 优雅停止"
 kill -TERM "$SERVER_PID" 2>/dev/null
 STOPPED=0
-for i in $(seq 1 50); do
+for _ in $(seq 1 50); do
   if ! kill -0 "$SERVER_PID" 2>/dev/null; then STOPPED=1; break; fi
   sleep 0.1
 done
