@@ -20,6 +20,7 @@
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <signal.h>
 #include <string.h>
 #include <sys/stat.h>
 #include <sys/types.h>
@@ -27,6 +28,7 @@
 #include <utime.h>
 
 #include <algorithm>
+#include <cstdlib>
 #include <map>
 #include <string>
 #include <vector>
@@ -91,6 +93,139 @@ bool RemoveTree(const std::string& path) {
   ::closedir(directory);
   if (::rmdir(path.c_str()) != 0) ok = false;
   return ok;
+}
+
+// 强制删除**本进程自己的**临时树。与 RemoveTree 的唯一区别是：目录缺少宿主
+// (owner) 的读/写/执行位时，先把这三个位补上再继续删。
+//
+// 为什么需要它：staging 会忠实保留源树的权限（例如源里有一个 0500 的 ro/）。
+// 一旦这一轮恢复在合并阶段失败，RemoveTree 就会卡在"ro/ 里的文件删不掉、
+// ro/ 本身又因为非空 rmdir 不掉"，于是整棵临时树原样留在 destination 旁边
+// ——这就是实测到的"失败恢复留下删不掉的中间目录"的根因。
+//
+// 为什么这样改是安全的：
+//   * 只用于 <destination>.<pid>.{staging,overlay,container}：这三个路径是
+//     本进程刚创建的，按定义全是半成品，永远不会被发布；
+//   * 全程 lstat：软链接一律 unlink 自身，绝不 follow（不会去动链接目标）；
+//   * 只**增加**宿主 rwx 位，不动 group/other，也不减少任何已有位；
+//   * 不做任何"按后缀扫目录"的动作——那是 ReclaimStaleTempDirs 的职责，
+//     并且它有自己的边界。
+bool RemoveTreeForcingOwnerAccess(const std::string& path) {
+  struct stat info;
+  if (::lstat(path.c_str(), &info) != 0) {
+    return errno == ENOENT;
+  }
+  if (!S_ISDIR(info.st_mode)) {
+    return ::unlink(path.c_str()) == 0;
+  }
+  const mode_t wanted = S_IRUSR | S_IWUSR | S_IXUSR;
+  if ((info.st_mode & wanted) != wanted) {
+    // 补权限失败也继续尝试删除：父目录可写时 rmdir 本来就够用。
+    ::chmod(path.c_str(), (info.st_mode & 07777) | wanted);
+  }
+  DIR* directory = ::opendir(path.c_str());
+  if (directory == nullptr) return false;
+  bool ok = true;
+  while (struct dirent* item = ::readdir(directory)) {
+    const std::string name = item->d_name;
+    if (name == "." || name == "..") continue;
+    if (!RemoveTreeForcingOwnerAccess(JoinPath(path, name))) ok = false;
+  }
+  ::closedir(directory);
+  if (::rmdir(path.c_str()) != 0) ok = false;
+  return ok;
+}
+
+// 把 destination 拆成"父目录 + 基名"。没有斜杠时父目录取 "."。
+void SplitDestination(const std::string& destination, std::string* parent,
+                      std::string* base) {
+  const std::size_t slash = destination.find_last_of('/');
+  if (slash == std::string::npos) {
+    *parent = ".";
+    *base = destination;
+    return;
+  }
+  *parent = (slash == 0) ? "/" : destination.substr(0, slash);
+  *base = destination.substr(slash + 1);
+}
+
+// 回收**已经死掉的旧进程**留在 destination 旁边的临时目录。
+//
+// 进入时的清理只认"当前 pid 的同名残留"，跨 pid 的旧残留永远不会被再看一眼，
+// 这是残留无上限累积的第二个原因。这里做一次边界严格的回收，任何一条不满足
+// 就跳过——**绝不按后缀猜**：
+//   1. 名字必须精确等于 <destination 基名>.<十进制 pid>.<kind>，kind 只能是
+//      staging / overlay / container，而且必须与 destination 同父目录；
+//   2. lstat 必须是真正的目录：软链接一律跳过（避免被指到别处去删）；
+//   3. 属主必须等于当前 euid：绝不碰别人的文件；
+//   4. pid 必须不等于自己；
+//   5. pid 必须已经不存在（kill(pid,0) 失败且 errno == ESRCH）。活着的 pid
+//      一律跳过——那可能是另一个进程正在用的中间数据。
+//
+// 并发前提：客户端用 ApplicationInstanceLock 保证一个 UID 同时只有一个
+// backupctl 进程，所以"同一个 destination 上还有另一个活着的恢复"在锁语义下
+// 不成立；第 5 条再补一道运行时检查。
+//
+// 已知残余窗口（如实记录，不在本轮消除）：第 5 条与随后的删除之间，内核可能
+// 把该 pid 复用给一个新进程，而它恰好正在恢复同一个 destination。窗口极窄，
+// 且被单实例锁覆盖。
+void ReclaimStaleTempDirs(const std::string& destination_directory) {
+  std::string parent;
+  std::string base;
+  SplitDestination(destination_directory, &parent, &base);
+  if (base.empty()) return;
+  DIR* directory = ::opendir(parent.c_str());
+  if (directory == nullptr) return;
+  const std::string prefix = base + ".";
+  std::vector<std::string> stale;
+  while (struct dirent* item = ::readdir(directory)) {
+    const std::string name = item->d_name;
+    if (name.size() <= prefix.size() ||
+        name.compare(0, prefix.size(), prefix) != 0) {
+      continue;
+    }
+    std::string rest = name.substr(prefix.size());
+    bool matched_kind = false;
+    for (const char* candidate : {".staging", ".overlay", ".container"}) {
+      const std::string suffix(candidate);
+      if (rest.size() > suffix.size() &&
+          rest.compare(rest.size() - suffix.size(), suffix.size(), suffix) ==
+              0) {
+        rest = rest.substr(0, rest.size() - suffix.size());
+        matched_kind = true;
+        break;
+      }
+    }
+    if (!matched_kind || rest.empty()) continue;
+    bool digits_only = true;
+    for (char c : rest) {
+      if (c < '0' || c > '9') {
+        digits_only = false;
+        break;
+      }
+    }
+    if (!digits_only) continue;
+    const long long owner_pid = ::strtoll(rest.c_str(), nullptr, 10);
+    if (owner_pid <= 0 || owner_pid == static_cast<long long>(::getpid())) {
+      continue;
+    }
+    const std::string path = JoinPath(parent, name);
+    struct stat info;
+    if (::lstat(path.c_str(), &info) != 0) continue;
+    // 不要求"必须是目录"：非目录（含软链接）由下面的强制删除用 unlink 摘掉
+    // 条目本身——unlink 只作用于这个目录项，绝不会 follow 到链接目标。
+    if (info.st_uid != ::geteuid()) continue;
+    if (::kill(static_cast<pid_t>(owner_pid), 0) == 0 || errno != ESRCH) {
+      continue;
+    }
+    stale.push_back(path);
+  }
+  ::closedir(directory);
+  // 排序只为让回收顺序可复现（顺序不影响结果）。
+  std::sort(stale.begin(), stale.end());
+  for (const std::string& path : stale) {
+    RemoveTreeForcingOwnerAccess(path);
+  }
 }
 
 // destination 的预检之一。打不开目录是**错误**，不是"当作空"：把非空目录误判
@@ -634,7 +769,12 @@ bool ResolveSnapshotChain(const std::string& repository_directory,
 //
 // 全过程只写三个临时路径（staging / overlay / inner_container），名字带 pid
 // 后缀且与 destination 同目录：既保证 rename 落在同一文件系统内，又让不同进程
-// 不会互相覆盖。进入时先清理同名残留（上次崩溃留下的），退出时再清一次。
+// 不会互相覆盖。
+//
+// 临时文件生命周期：进入时先回收**已死进程**留下的同 destination 残留
+// （ReclaimStaleTempDirs），再清自己的同名残留；退出时不管成功失败都用强制
+// 版本删掉自己的三个临时路径（RemoveTreeForcingOwnerAccess）。因此正常与失败
+// 两种路径都不再留下本进程的中间目录。
 bool RestoreSnapshotChain(const std::string& repository_directory,
                           const std::string& target_file_name,
                           const std::string& destination_directory,
@@ -679,8 +819,13 @@ bool RestoreSnapshotChain(const std::string& repository_directory,
   const std::string overlay = destination_directory + suffix + ".overlay";
   const std::string inner_container =
       destination_directory + suffix + ".container";
-  RemoveTree(staging);
-  RemoveTree(overlay);
+  // 1) 先把**别的（已死）进程**留在同一个 destination 旁边的临时目录收掉：
+  //    名字/属主/死 pid 三条都要满足，见 ReclaimStaleTempDirs 的边界说明。
+  // 2) 再清自己的同名残留：上一次同 pid 的进程崩在中途（pid 后来被复用）时
+  //    会遇到，普通 RemoveTree 可能删不掉只读子树。
+  ReclaimStaleTempDirs(destination_directory);
+  RemoveTreeForcingOwnerAccess(staging);
+  RemoveTreeForcingOwnerAccess(overlay);
   ::unlink(inner_container.c_str());
 
   // do/while(false) 只用来做"带 break 的单出口"：任何一步失败都跳到末尾的统一
@@ -716,7 +861,7 @@ bool RestoreSnapshotChain(const std::string& repository_directory,
         delta_failed = true;
         break;
       }
-      RemoveTree(overlay);
+      RemoveTreeForcingOwnerAccess(overlay);
       if (!RunRestorePipeline(inner_container, overlay, options, report,
                               error_message)) {
         delta_failed = true;
@@ -772,7 +917,7 @@ bool RestoreSnapshotChain(const std::string& repository_directory,
       if (report != nullptr) {
         report->restored_entries += context.merged_entries;
       }
-      RemoveTree(overlay);
+      RemoveTreeForcingOwnerAccess(overlay);
     }
     if (delta_failed) break;
 
@@ -801,9 +946,14 @@ bool RestoreSnapshotChain(const std::string& repository_directory,
   } while (false);
 
   // 成功与失败都走这里。staging 在发布成功后已被 rename 搬走；overlay 与中间
-  // 容器一定还在。返回值不检查：残留只占磁盘，下一次恢复进入时会再清一次。
-  RemoveTree(staging);
-  RemoveTree(overlay);
+  // 容器一定还在。
+  //
+  // 这里必须用**强制**版本：这棵树里可能带着 0500 之类的只读目录（staging 会
+  // 忠实保留源树权限），普通 RemoveTree 会卡在"里面删不掉、目录又非空"而把整棵
+  // 留下——这正是实测到的残留来源。三个路径都是本进程刚建的临时树，放开宿主
+  // 权限再删是安全的（见 RemoveTreeForcingOwnerAccess）。
+  RemoveTreeForcingOwnerAccess(staging);
+  RemoveTreeForcingOwnerAccess(overlay);
   ::unlink(inner_container.c_str());
   return ok;
 }
