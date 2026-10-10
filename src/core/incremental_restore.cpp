@@ -1141,34 +1141,49 @@ bool RestoreSnapshotChain(const std::string& repository_directory,
   const std::string temp_owner_name =
       TempOwnerFileName(destination_base, self_pid);
 
-  // 父目录只解析一次：后面所有"这个名字在不在 / 是谁的"都在这个 fd 上做，
-  // 不再重新解析路径。
+  // 父目录 fd：**惰性**打开，而且"父目录还不存在"不是错误。
+  //
+  // destination 可能是 "<一个还没建的目录>/x"。产品既有的行为是交给
+  // RunRestorePipeline 里的 `MakeDirectories(destination_parent)`
+  // 把父目录建出来 （见 archive_pipeline.cpp）——
+  // 所以这里必须先接受"父目录不存在"这个状态，
+  // 否则就把一条本来能成功的恢复路径变成失败（本轮的现代 GUI 端到端套件正是
+  // 这么把它抓出来的：`Cannot open the destination parent directory
+  // .../restore: No such file or directory`）。
+  //
+  // 父目录不存在 = 那里**不可能**有任何临时残留或同名冲突对象，于是标记、
+  // 回收与冲突检查整段跳过，全部交给下游创建。下游建完之后 Ensure() 再打开它，
+  // 之后的删除仍然全部相对这个 fd，不重新解析路径。
   struct ParentDirGuard {
-    int fd;
+    int fd = -1;
     ~ParentDirGuard() {
       if (fd >= 0) ::close(fd);
     }
+    int Ensure(const std::string& path) {
+      if (fd < 0) {
+        fd = ::open(path.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+      }
+      return fd;
+    }
   };
-  ParentDirGuard destination_parent_dir{
-      ::open(destination_parent.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC)};
-  if (destination_parent_dir.fd < 0) {
-    SetError(error_message, "Cannot open the destination parent directory " +
-                                destination_parent + ": " + ErrnoText(errno));
-    return false;
-  }
-  const int parent_fd = destination_parent_dir.fd;
+  ParentDirGuard parent_dir;
+  int parent_fd = parent_dir.Ensure(destination_parent);
+  const bool parent_exists = (parent_fd >= 0);
 
   // 进入时这个名字上**已经**有一个属于本 pid 的合法标记吗？
   //   有   => 上一轮同 pid 的进程崩在中途留下的，这批名字归本程序；
   //   没有 => 下面任何"同名条目已存在"都只能说明名字被别人的对象占着。
   const bool marker_pre_existing =
+      parent_exists &&
       TempOwnerMarkerMatches(parent_fd, temp_owner_name, self_pid);
 
   // marker_owned  ：正常收尾时可以撤掉标记（本次建的，或上一轮同 pid 留下的）
   // marker_created：标记**就是本次调用建的** —— 只有这种情况失败退出时才撤它
   bool marker_owned = false;
   bool marker_created = false;
-  switch (CreateTempOwnerMarker(parent_fd, temp_owner_name, self_pid)) {
+  switch (parent_exists
+              ? CreateTempOwnerMarker(parent_fd, temp_owner_name, self_pid)
+              : TempMarkerResult::kFailed) {
     case TempMarkerResult::kCreated:
       marker_owned = true;
       marker_created = true;
@@ -1194,6 +1209,7 @@ bool RestoreSnapshotChain(const std::string& repository_directory,
   }
 
   // 1) 先收**别的（已死）进程**留下、且能证明来源的临时条目。
+  //    它内部自己会打开父目录，父目录不存在时直接早退，所以可以直接调用。
   ReclaimStaleTempDirs(destination);
 
   // 2) 本 pid 的同名条目：**无论标记在不在，一律不删。**
@@ -1215,9 +1231,9 @@ bool RestoreSnapshotChain(const std::string& repository_directory,
   const std::string claimed[3] = {staging_name, overlay_name, container_name};
   for (const std::string& name : claimed) {
     struct stat occupied;
-    if (::fstatat(parent_fd, name.c_str(), &occupied, AT_SYMLINK_NOFOLLOW) !=
-        0) {
-      continue;  // ENOENT：这个名字是干净的
+    if (!parent_exists || ::fstatat(parent_fd, name.c_str(), &occupied,
+                                    AT_SYMLINK_NOFOLLOW) != 0) {
+      continue;  // 父目录不存在，或 ENOENT：这个名字是干净的
     }
     if (marker_created) {
       ::unlinkat(parent_fd, temp_owner_name.c_str(), 0);
@@ -1243,8 +1259,8 @@ bool RestoreSnapshotChain(const std::string& repository_directory,
   //    窗口收掉。下游 RunRestorePipeline 的 MakeDirectories 容忍 EEXIST，
   //    所以这里的认领就是最终归属；认领失败说明有人抢在前面放了一个同名对象，
   //    同样是 fail-closed。
-  if (::mkdir(staging.c_str(), 0700) != 0 ||
-      ::mkdir(overlay.c_str(), 0700) != 0) {
+  if (parent_exists && (::mkdir(staging.c_str(), 0700) != 0 ||
+                        ::mkdir(overlay.c_str(), 0700) != 0)) {
     const int claim_errno = errno;
     RemoveTempEntryAt(parent_fd, staging_name);
     RemoveTempEntryAt(parent_fd, overlay_name);
@@ -1293,10 +1309,13 @@ bool RestoreSnapshotChain(const std::string& repository_directory,
         break;
       }
       container_present = true;
+      // 下游可能刚把父目录建出来（destination 的父目录原先不存在），
+      // 所以这里重新取一次 fd 再做相对删除 / 排他认领。
+      parent_fd = parent_dir.Ensure(destination_parent);
       RemoveTempEntryAt(parent_fd, overlay_name);
       // 每个 delta 的 overlay 也走排他认领：删不掉又占着名字时宁可在这里
       // 失败，也不要往一棵来路不明的目录里写。
-      if (::mkdir(overlay.c_str(), 0700) != 0) {
+      if (parent_fd >= 0 && ::mkdir(overlay.c_str(), 0700) != 0) {
         SetError(error_message, "Cannot claim the delta overlay directory " +
                                     overlay + ": " + ErrnoText(errno));
         delta_failed = true;
@@ -1360,6 +1379,7 @@ bool RestoreSnapshotChain(const std::string& repository_directory,
       if (report != nullptr) {
         report->restored_entries += context.merged_entries;
       }
+      parent_fd = parent_dir.Ensure(destination_parent);
       RemoveTempEntryAt(parent_fd, overlay_name);
     }
     if (delta_failed) break;
@@ -1397,6 +1417,8 @@ bool RestoreSnapshotChain(const std::string& repository_directory,
   // 的残留来源。这棵树是本进程排他认领的，放开宿主权限再删是安全的。
   //
   // 两次删除都相对 parent_fd，**不重新解析父目录路径**。
+  // 下游（或发布）可能刚把父目录建出来；再取一次 fd 才能做相对删除。
+  parent_fd = parent_dir.Ensure(destination_parent);
   const bool staging_clear = RemoveTempEntryAt(parent_fd, staging_name);
   const bool overlay_clear = RemoveTempEntryAt(parent_fd, overlay_name);
   if (container_present) {
