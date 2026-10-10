@@ -1,0 +1,72 @@
+# /etc/systemd/system/backup-project-server-ecs.service
+#
+# ECS 生产实例的 systemd profile（仓库内的权威副本）。
+#
+# 这份文件**不是**发行包布局的模板：packaging/server/backup-project-server.service
+# 面向的是安装包布局（User=backup-project、/var/lib/...、/usr/bin/... 启动器）。
+# ECS 现场用的是裸二进制 + ubuntu 用户 + /home/ubuntu/backup-project-server，
+# 所以必须有自己的一份，照抄发行包那份会让服务起不来。
+#
+# 与现场一致的要点：
+#   * ProtectHome **不能开**：整个部署就在 /home/ubuntu 下。
+#   * ProtectSystem=full 让 /usr /boot /efi /etc 只读；可写状态都在 /home/ubuntu 下。
+#   * StartLimit* 在 systemd 249 上只认 [Unit] 段；写在 [Service] 会被静默忽略
+#     （systemd-analyze verify 会报 "Unknown key name ... ignoring"）。
+#   * 运行时参数与原手工启动的 argv 逐字一致，含 --require-bpsec2 与公网绑定审计理由。
+#
+# 这里没有任何密钥：只有路径与命令行开关，都是 systemctl show 本来就可见的信息。
+# 安装方式见同目录 README.md；核对方式见 verify-ecs-deployment.sh（只读）。
+
+[Unit]
+Description=Backup Project Server (ECS production, BPSEC2 signed identity required)
+Documentation=file:/home/ubuntu/backup-project-server/
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=120
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/home/ubuntu/backup-project-server
+ExecStart=/home/ubuntu/backup-project-server/bin/backup-server \
+  --bind 0.0.0.0 --port 18765 \
+  --root /home/ubuntu/backup-project-server/data \
+  --db /home/ubuntu/backup-project-server/state/metadata.sqlite3 \
+  --secret-file /home/ubuntu/.config/backup-project-server/secrets.env \
+  --transport-key-file /home/ubuntu/backup-project-server/state/transport.key \
+  --log-file /home/ubuntu/backup-project-server/logs/server.log \
+  --pid-file /home/ubuntu/backup-project-server/state/server.pid \
+  --bpsec2-cert-file /home/ubuntu/backup-project-server/state/server-identity.bpcert \
+  --require-bpsec2 \
+  --allow-public-bind PR23-Phase7-official-cloud-direct
+
+Restart=on-failure
+RestartSec=2
+TimeoutStopSec=30
+KillSignal=SIGTERM
+KillMode=control-group
+SyslogIdentifier=backup-server
+StandardOutput=journal
+StandardError=journal
+
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+RestrictSUIDSGID=true
+RestrictRealtime=true
+RestrictNamespaces=true
+LockPersonality=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+SystemCallArchitectures=native
+UMask=0027
+
+[Install]
+WantedBy=multi-user.target

@@ -17,7 +17,8 @@
 # /tmp/final_gate_summary.txt 时需要调用方重定向）。
 
 set -uo pipefail
-cd "$(dirname "$BASH_SOURCE")/.."
+# SC2164 / SC2128：cd 失败必须退出；数组要用带下标的 ${BASH_SOURCE[0]}。
+cd "$(dirname "${BASH_SOURCE[0]}")/.." || exit 1
 
 LOG="${FINAL_GATE_LOG:-/tmp/final_gate.log}"
 BUILD_LOG="${FINAL_GATE_BUILD_LOG:-/tmp/gate_build.log}"
@@ -46,6 +47,9 @@ run() {
 }
 
 run lint bash scripts/lint.sh
+# ShellCheck：只覆盖显式清单里的脚本；工具缺失时**失败而不是跳过**。
+# 版本与严重级别由脚本自己打印，见 scripts/shellcheck.sh 的说明。
+run shellcheck bash scripts/shellcheck.sh
 
 # PR #23：手写密码学原语与证书层的独立套件。四个都是纯 C++（不链接 Qt）、
 # 跑得快，而且是 BPSEC2 的地基 —— 放最前面，坏的时候报错最直白：
@@ -79,6 +83,10 @@ run ssh-tunnel bash scripts/ssh_tunnel_manager_test.sh
 run ssh-tunnel-sanitize env SSH_TUNNEL_TEST_EXTRA_FLAGS="-g -O1 -fsanitize=address,undefined -fno-omit-frame-pointer" SSH_TUNNEL_TEST_SANITIZE=1 bash scripts/ssh_tunnel_manager_test.sh
 run secure-transport bash scripts/secure_transport_test.sh
 run remote-incremental bash scripts/remote_incremental_test.sh
+# 远端可靠性与下载路径契约（本轮新增）：remote download 的内容落在调用方给定的
+# 路径上，不是 "<快照ID>.bak" —— 上一轮的临时脚本正是踩了这个假设，把一次完全
+# 正确的下载判成 FAIL。脚本自带比较函数自检，橡皮图章式的比较会被判失败。
+run remote-reliability bash scripts/remote_reliability_test.sh
 run secure-transport-sanitize env SECURE_TRANSPORT_TEST_EXTRA_FLAGS="-g -O1 -fsanitize=address,undefined -fno-omit-frame-pointer" bash scripts/secure_transport_test.sh
 run quality bash scripts/quality_test.sh
 
