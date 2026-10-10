@@ -45,6 +45,7 @@ else
     scripts/final_gate.sh
     scripts/remote_reliability_test.sh
     scripts/shellcheck.sh
+    packaging/ecs/verify-ecs-deployment.sh
   )
 fi
 
