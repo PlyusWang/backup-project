@@ -16,6 +16,7 @@
 #include <fcntl.h>
 #include <sys/stat.h>
 #include <sys/types.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 #include <cstdint>
@@ -87,6 +88,38 @@ bool MakeStubbornResidue(const std::string& path) {
 void DropStubbornResidue(const std::string& path) {
   ::chmod(path.c_str(), 0755);
   test_support::RemoveTree(path);
+}
+
+// 把 BKPINC1 delta 的 **payload 区**首字节改成垃圾，长度保持不变。
+//
+// 磁盘布局（src/core/incremental_delta.cpp 的 ReadDeltaLayout）：
+//   offset 0..23  定长头：magic(8) / version(2) / header_size(2) /
+//                 envelope_len(u32 @12) / payload_len(u64 @16)
+//   offset 24..   envelope 文本
+//   之后          payload = 内层 v2 container
+// 只改 payload，所以"文件长度 == 24 + envelope_len + payload_len"这条自洽性
+// 检查照样通过：ReadDeltaEnvelope 与 ExtractDeltaPayload 都成功，失败点精确
+// 落在"把 container 恢复到 overlay"那一步。
+bool CorruptDeltaPayload(const std::string& delta_file) {
+  const int fd = ::open(delta_file.c_str(), O_RDWR | O_CLOEXEC);
+  if (fd < 0) return false;
+  unsigned char header[24] = {0};
+  if (::pread(fd, header, sizeof(header), 0) !=
+      static_cast<ssize_t>(sizeof(header))) {
+    ::close(fd);
+    return false;
+  }
+  const std::uint32_t envelope_len =
+      static_cast<std::uint32_t>(header[12]) |
+      (static_cast<std::uint32_t>(header[13]) << 8) |
+      (static_cast<std::uint32_t>(header[14]) << 16) |
+      (static_cast<std::uint32_t>(header[15]) << 24);
+  const off_t payload_offset = static_cast<off_t>(sizeof(header) + envelope_len);
+  const unsigned char garbage[8] = {0xFF, 0xFF, 0xFF, 0xFF,
+                                    0xFF, 0xFF, 0xFF, 0xFF};
+  const ssize_t written = ::pwrite(fd, garbage, sizeof(garbage), payload_offset);
+  ::close(fd);
+  return written == static_cast<ssize_t>(sizeof(garbage));
 }
 
 // 只读子树让"尽力而为"的清理删不干净：产品的 RemoveTree 全程 lstat + unlink，
@@ -835,8 +868,14 @@ int main() {
                         "INC-R T11 失败出在合并 ro/new.txt 这一步", error);
     test_support::Check(!test_support::Exists(TempPath(destination, ".container")),
                         "INC-R T11 失败后中间容器文件清理掉了");
-    // staging / overlay 里那棵只读子树会让"尽力而为"的清理留下残留（产品契约
-    // 如此，不是本轮缺陷）：这里按先放开权限再删的方式收掉。
+    // R-01 残留修复（本轮）：staging 里那棵只读子树以前会让"尽力而为"的清理
+    // 留下一整棵删不掉的中间目录，而且跨 pid 累积。修复后失败路径也必须把
+    // 自己的 staging / overlay 收干净。
+    test_support::Check(!test_support::Exists(TempPath(destination, ".staging")),
+                        "INC-R T11 失败后 staging 不留残留");
+    test_support::Check(!test_support::Exists(TempPath(destination, ".overlay")),
+                        "INC-R T11 失败后 overlay 不留残留");
+    // 无论上面是红是绿，都把注入树收掉，避免它污染后续用例。
     DropTreeForcingModes(TempPath(destination, ".staging"));
     DropTreeForcingModes(TempPath(destination, ".overlay"));
   }
@@ -886,7 +925,13 @@ int main() {
     test_support::RemoveTree(TempPath(destination, ".container"));
   }
   {
-    // 10.4 目标分支：delta 容器恢复到 overlay 时失败（残留非空且清理不掉）。
+    // 10.4 目标分支：delta 容器恢复到 overlay 时失败。
+    //
+    // 注入方式（本轮修正）：以前这里是"预置一个 0500 的 overlay 残留让清理
+    // 失败"——那是**利用清理缺陷**做故障注入。本轮把该缺陷修好之后这个注入
+    // 不再成立（残留会被正确回收），于是改成直接损坏 delta 的 payload：
+    // 信封与长度仍然自洽，只有内层 container 变成垃圾，失败点依旧精确落在
+    // "container -> overlay"这一步，覆盖的分支没有变。
     const std::string work = test_support::FreshDir("inc-r01-container");
     const std::string source = work + "/src";
     const std::string repository = work + "/repo";
@@ -906,9 +951,8 @@ int main() {
         "INC-R T13 delta 建立成功", error);
 
     const std::string destination = work + "/restored";
-    test_support::Check(
-        MakeStubbornResidue(TempPath(destination, ".overlay")),
-        "INC-R T13 预置清理不掉的 overlay 残留");
+    test_support::Check(CorruptDeltaPayload(repository + "/s2.bak"),
+                        "INC-R T13 把 delta 的 payload 改成垃圾（长度不变）");
     bp::RestoreReport report;
     error.clear();
     const bool ok = bp::RestoreSnapshotChain(repository, "s2.bak", destination,
@@ -917,11 +961,14 @@ int main() {
     test_support::Check(!ok, "INC-R T13 判别：容器恢复失败即整次失败", error);
     test_support::Check(!test_support::Exists(destination),
                         "INC-R T13 判别：失败时不发布");
-    test_support::Check(error.find("not empty") != std::string::npos,
-                        "INC-R T13 失败出在 overlay 目标非空", error);
+    test_support::Check(!error.empty(), "INC-R T13 失败带诊断信息", error);
     test_support::Check(!test_support::Exists(TempPath(destination, ".staging")),
                         "INC-R T13 失败后 staging 清理掉了");
-    DropStubbornResidue(TempPath(destination, ".overlay"));
+    test_support::Check(!test_support::Exists(TempPath(destination, ".overlay")),
+                        "INC-R T13 失败后 overlay 清理掉了");
+    test_support::Check(
+        !test_support::Exists(TempPath(destination, ".container")),
+        "INC-R T13 失败后 container 清理掉了");
   }
   {
     // 10.5 既有分支回归：tombstone 操作失败必须整次失败（这条以前就是对的，
@@ -1053,20 +1100,170 @@ int main() {
         "INC-R T16 delta 建立成功", error);
 
     const std::string destination = work + "/restored";
-    test_support::Check(
-        MakeStubbornResidue(TempPath(destination, ".staging")),
-        "INC-R T16 预置清理不掉的 staging 残留");
+    // 注入方式（本轮修正）：以前是"预置一个清理不掉的 staging 残留"——同样是
+    // 利用清理缺陷。改成把**工作目录**设成 0500：base 那一步要在它下面建
+    // staging，mkdir 必然 EACCES，失败点仍然精确落在基座恢复这一步。
+    test_support::Check(::chmod(work.c_str(), 0500) == 0,
+                        "INC-R T16 把工作目录设成 0500");
     bp::RestoreReport report;
     error.clear();
     const bool ok = bp::RestoreSnapshotChain(repository, "s2.bak", destination,
                                              bp::RestoreOptions{}, &report,
                                              &error);
+    ::chmod(work.c_str(), 0755);
     test_support::Check(!ok, "INC-R T16 判别：基座恢复失败即整次失败", error);
     test_support::Check(!test_support::Exists(destination),
                         "INC-R T16 判别：失败时不发布");
-    test_support::Check(error.find("not empty") != std::string::npos,
-                        "INC-R T16 失败出在基座目标的非空检查", error);
+    test_support::Check(!error.empty(), "INC-R T16 失败带诊断信息", error);
+
+    // 反向对照（残留修复的直接回归）：同 pid 的 0500 残留是"上一次同 pid 的
+    // 进程崩在中途"留下的，属于本进程自己的临时数据，**必须被强制清理**，
+    // 恢复要照常成功；修复之前这里会以"not empty"失败。
+    test_support::Check(
+        MakeStubbornResidue(TempPath(destination, ".staging")),
+        "INC-R T16 预置同 pid 的 0500 staging 残留");
+    error.clear();
+    const bool ok_after = bp::RestoreSnapshotChain(
+        repository, "s2.bak", destination, bp::RestoreOptions{}, &report, &error);
+    test_support::Check(ok_after,
+                        "INC-R T16 同 pid 残留被强制清理后恢复成功", error);
+    test_support::Check(test_support::Exists(destination + "/a.txt"),
+                        "INC-R T16 恢复结果正确（a.txt 内容为 a-v2）");
+    test_support::Check(!test_support::Exists(TempPath(destination, ".staging")),
+                        "INC-R T16 成功后不留 staging 残留");
     DropStubbornResidue(TempPath(destination, ".staging"));
+  }
+
+  {
+    // 10.8 R-01 临时文件生命周期：跨进程（跨 pid）回收 + 严格边界。
+    //
+    // 产品只回收"名字精确等于 <destination 基名>.<十进制 pid>.<kind>、与
+    // destination 同父目录、属主是当前 euid、且该 pid 已经不存在"的条目；
+    // 其余（活 pid、名字不匹配、别人的 destination、别人的文件）一律不动。
+    const std::string work = test_support::FreshDir("inc-r01-residue");
+    const std::string source = work + "/src";
+    const std::string repository = work + "/repo";
+    test_support::Mkdir(source, 0755);
+    test_support::Mkdir(repository, 0755);
+    bp::IncrementalOutcome outcome;
+    std::string error;
+
+    test_support::WriteFile(source + "/a.txt", "a-v1", 0644);
+    test_support::Check(
+        MakeSnapshot(source, repository, "s1.bak", &outcome, &error),
+        "INC-R T17 基线建立成功", error);
+
+    const std::string destination = work + "/restored";
+
+    // 一个**真的已经死掉**的 pid：fork 后立刻退出并回收。
+    const pid_t dead_pid = ::fork();
+    if (dead_pid == 0) {
+      ::_exit(0);
+    }
+    int child_status = 0;
+    if (dead_pid > 0) {
+      ::waitpid(dead_pid, &child_status, 0);
+    }
+    // 一个**活着**的 pid：子进程睡着，代表"另一个进程正在用的中间数据"。
+    const pid_t live_pid = ::fork();
+    if (live_pid == 0) {
+      ::sleep(60);
+      ::_exit(0);
+    }
+    // 第二个死 pid：专门用来构造"同名前缀但是软链接"的残留。
+    const pid_t dead_pid2 = ::fork();
+    if (dead_pid2 == 0) {
+      ::_exit(0);
+    }
+    if (dead_pid2 > 0) {
+      ::waitpid(dead_pid2, &child_status, 0);
+    }
+    test_support::Check(dead_pid > 0 && live_pid > 0 && dead_pid2 > 0,
+                        "INC-R T17 fork 出构造用的死/活 pid");
+
+    if (dead_pid > 0 && live_pid > 0) {
+      const std::string dead_suffix =
+          "." + std::to_string(static_cast<long>(dead_pid));
+      const std::string live_suffix =
+          "." + std::to_string(static_cast<long>(live_pid));
+
+      // 1) 死 pid 的 staging 目录 + container 文件：应当被回收。
+      const std::string stale_staging = destination + dead_suffix + ".staging";
+      const std::string stale_overlay = destination + dead_suffix + ".overlay";
+      const std::string stale_container = destination + dead_suffix + ".container";
+      test_support::Mkdir(stale_staging, 0755);
+      test_support::WriteFile(stale_staging + "/left.txt", "left", 0644);
+      test_support::Mkdir(stale_overlay, 0755);
+      test_support::WriteFile(stale_overlay + "/left.txt", "left", 0644);
+      test_support::WriteFile(stale_container, "container", 0644);
+      // 只读子树：以前正是它让"尽力而为"的清理整棵失败。
+      test_support::Mkdir(stale_staging + "/ro", 0500);
+
+      // 2) 活 pid 的 staging：必须原样保留（那是别人正在用的）。
+      const std::string live_staging = destination + live_suffix + ".staging";
+      test_support::Mkdir(live_staging, 0755);
+      test_support::WriteFile(live_staging + "/inuse.txt", "inuse", 0644);
+
+      // 3) 名字不匹配 / 属于别的 destination 的同前缀兄弟：一个都不能动。
+      const std::string not_a_number = destination + ".notanumber.staging";
+      const std::string wrong_kind = destination + dead_suffix + ".staging.bak";
+      const std::string other_destination = work + "/restored-other";
+      const std::string other_stale = other_destination + dead_suffix + ".staging";
+      test_support::Mkdir(not_a_number, 0755);
+      test_support::Mkdir(wrong_kind, 0755);
+      test_support::Mkdir(other_stale, 0755);
+      test_support::WriteFile(other_stale + "/keep.txt", "keep", 0644);
+
+      // 4) 软链接形态的"同名前缀"：绝不 follow，只允许摘掉链接本身。
+      const std::string precious = work + "/precious";
+      test_support::Mkdir(precious, 0755);
+      test_support::WriteFile(precious + "/treasure.txt", "treasure", 0644);
+      // 名字**完全符合**回收候选规则（合法 kind 后缀 + 死 pid），但它是软链接：
+      // 只允许摘掉链接本身，绝不允许 follow 进去删目标。
+      const std::string dead_suffix2 =
+          "." + std::to_string(static_cast<long>(dead_pid2));
+      const std::string symlink_path = destination + dead_suffix2 + ".overlay";
+      test_support::Check(::symlink(precious.c_str(), symlink_path.c_str()) == 0,
+                          "INC-R T17 造出指回 precious 的软链接残留");
+
+      bp::RestoreReport report;
+      error.clear();
+      const bool ok = bp::RestoreSnapshotChain(
+          repository, "s1.bak", destination, bp::RestoreOptions{}, &report,
+          &error);
+      test_support::Check(ok, "INC-R T17 正常恢复成功（回收不影响发布）", error);
+      test_support::Check(test_support::Exists(destination + "/a.txt"),
+                          "INC-R T17 恢复结果正确");
+
+      test_support::Check(!test_support::Exists(stale_staging),
+                          "INC-R T17 死 pid 的 staging 残留被回收（含只读子树）");
+      test_support::Check(!test_support::Exists(stale_overlay),
+                          "INC-R T17 死 pid 的 overlay 残留被回收");
+      test_support::Check(!test_support::Exists(stale_container),
+                          "INC-R T17 死 pid 的 container 残留被回收");
+      test_support::Check(test_support::Exists(live_staging + "/inuse.txt"),
+                          "INC-R T17 活 pid 的中间数据未被删除");
+      test_support::Check(test_support::Exists(not_a_number),
+                          "INC-R T17 名字不是 pid 的同前缀目录未被删除");
+      test_support::Check(test_support::Exists(wrong_kind),
+                          "INC-R T17 kind 后缀不匹配的目录未被删除");
+      test_support::Check(test_support::Exists(other_stale + "/keep.txt"),
+                          "INC-R T17 别的 destination 的残留未被删除");
+      test_support::Check(test_support::Exists(precious + "/treasure.txt"),
+                          "INC-R T17 软链接残留没有被 follow（目标完好）");
+      struct stat link_info;
+      test_support::Check(::lstat(symlink_path.c_str(), &link_info) != 0,
+                          "INC-R T17 软链接残留本身被摘掉（unlink 不 follow）");
+
+      // 收尾：把活着的子进程和注入树收掉。
+      ::kill(live_pid, SIGTERM);
+      ::waitpid(live_pid, &child_status, 0);
+      DropTreeForcingModes(live_staging);
+      DropTreeForcingModes(not_a_number);
+      DropTreeForcingModes(wrong_kind);
+      DropTreeForcingModes(other_stale);
+      DropTreeForcingModes(symlink_path);
+    }
   }
 
   return test_support::Finish("incremental_restore_test");
