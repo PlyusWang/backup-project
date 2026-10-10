@@ -17,7 +17,8 @@
 # /tmp/final_gate_summary.txt 时需要调用方重定向）。
 
 set -uo pipefail
-cd "$(dirname "$BASH_SOURCE")/.."
+# SC2164 / SC2128：cd 失败必须退出；数组要用带下标的 ${BASH_SOURCE[0]}。
+cd "$(dirname "${BASH_SOURCE[0]}")/.." || exit 1
 
 LOG="${FINAL_GATE_LOG:-/tmp/final_gate.log}"
 BUILD_LOG="${FINAL_GATE_BUILD_LOG:-/tmp/gate_build.log}"
@@ -46,6 +47,9 @@ run() {
 }
 
 run lint bash scripts/lint.sh
+# ShellCheck：只覆盖显式清单里的脚本；工具缺失时**失败而不是跳过**。
+# 版本与严重级别由脚本自己打印，见 scripts/shellcheck.sh 的说明。
+run shellcheck bash scripts/shellcheck.sh
 
 # PR #23：手写密码学原语与证书层的独立套件。四个都是纯 C++（不链接 Qt）、
 # 跑得快，而且是 BPSEC2 的地基 —— 放最前面，坏的时候报错最直白：
