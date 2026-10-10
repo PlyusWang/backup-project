@@ -281,19 +281,20 @@ bool RemoveTreeAt(int parent_fd, const std::string& name,
   return ok;
 }
 
-// 按路径打开父目录，然后把 name 交给 RemoveTreeAt。父目录的解析只发生一次，
-// name 之后的所有操作都相对这个 fd。
-bool RemoveTreeForcingOwnerAccess(const std::string& path) {
-  std::string parent;
-  std::string name;
-  SplitDestination(path, &parent, &name);
-  if (name.empty() || name == "." || name == ".." || name == "/") return false;
-  const int parent_fd =
-      ::open(parent.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
-  if (parent_fd < 0) return false;
-  const bool ok = RemoveTreeAt(parent_fd, name, /*force_owner_access=*/true);
-  ::close(parent_fd);
-  return ok;
+// 删除一个**本进程临时命名空间**里的条目，相对已经打开的父目录 fd。
+//
+// 这里刻意不再提供"按路径"的版本：以前那个版本会拿完整路径再走一次
+// open(parent)，如果父目录路径上的某一级在这中间被换掉，删的就不是当初验证过
+// 的那棵目录树。临时命名空间的所有删除都必须走这个入口。
+//
+// force_owner_access 是必需的：staging 会忠实保留源树的权限，0500/0000 的只读
+// 目录不先补权限就删不掉，会留下整棵残留（这正是实测到的残留来源）。这棵树是
+// 本进程**排他认领**的，所以放开宿主权限再删是安全的。
+bool RemoveTempEntryAt(int parent_fd, const std::string& name) {
+  if (parent_fd < 0 || name.empty() || name == "." || name == "..") {
+    return false;
+  }
+  return RemoveTreeAt(parent_fd, name, /*force_owner_access=*/true);
 }
 
 // 读所有权标记并校验：必须是普通文件、属主是自己、不带 group/other 写位、
@@ -316,11 +317,19 @@ bool TempOwnerMarkerMatches(int parent_fd, const std::string& name,
   if (!regular) return false;
 
   // 类型/属主/权限都确认过是"普通文件"之后，才真的打开来读。
-  const int fd =
-      ::openat(parent_fd, name.c_str(), O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
+  //
+  // 两个细节都是必需的，不是保险起见：
+  //   * O_NONBLOCK：探测与这次打开之间名字可以被换成 FIFO。FIFO 的
+  //     open(O_RDONLY) 会一直等一个写者——那正是"恢复卡死"。加了 O_NONBLOCK
+  //     之后 FIFO 也会立刻返回而不是阻塞（普通文件上 O_NONBLOCK 无副作用）。
+  //   * dev/ino 比对：打开之后必须确认拿到的**还是探测时那一个对象**，
+  //     否则后面读到的内容与前面判定的类型可能根本不是同一个东西。
+  const int fd = ::openat(parent_fd, name.c_str(),
+                          O_RDONLY | O_NONBLOCK | O_NOFOLLOW | O_CLOEXEC);
   if (fd < 0) return false;
   struct stat info;
-  if (::fstat(fd, &info) != 0 || !S_ISREG(info.st_mode)) {
+  if (::fstat(fd, &info) != 0 || !S_ISREG(info.st_mode) ||
+      info.st_dev != probe_info.st_dev || info.st_ino != probe_info.st_ino) {
     ::close(fd);
     return false;
   }
@@ -390,11 +399,20 @@ TempMarkerResult CreateTempOwnerMarker(int parent_fd, const std::string& name,
     }
     written += static_cast<std::size_t>(got);
   }
+  struct stat info;
+  const bool have_info = ::fstat(fd, &info) == 0;
   ::close(fd);
   if (!ok) {
     // 半截标记只可能是刚由本次调用创建的（O_EXCL 保证了这一点），所以可以
-    // 安全地撤销，不给下一次回收留下"内容不匹配的垃圾"。
-    ::unlinkat(parent_fd, name.c_str(), 0);
+    // 撤销。但撤销**仍然要绑定对象**：从 close 到 unlinkat 之间，这个名字
+    // 可以被换掉，按名字删就会删掉别人的东西。只有 dev/ino 都还是刚刚那个
+    // 对象时才撤。
+    struct stat now;
+    if (have_info &&
+        ::fstatat(parent_fd, name.c_str(), &now, AT_SYMLINK_NOFOLLOW) == 0 &&
+        now.st_dev == info.st_dev && now.st_ino == info.st_ino) {
+      ::unlinkat(parent_fd, name.c_str(), 0);
+    }
     return TempMarkerResult::kFailed;
   }
   return TempMarkerResult::kCreated;
@@ -1058,10 +1076,11 @@ bool ResolveSnapshotChain(const std::string& repository_directory,
 // 后缀且与 destination 同目录：既保证 rename 落在同一文件系统内，又让不同进程
 // 不会互相覆盖。
 //
-// 临时文件生命周期：进入时先回收**已死进程**留下的同 destination 残留
-// （ReclaimStaleTempDirs），再清自己的同名残留；退出时不管成功失败都用强制
-// 版本删掉自己的三个临时路径（RemoveTreeForcingOwnerAccess）。因此正常与失败
-// 两种路径都不再留下本进程的中间目录。
+// 临时文件生命周期：进入时只回收**已死进程**留下、且能证明来源的残留
+// （ReclaimStaleTempDirs）；本 pid 的同名条目一律不删，宁可 fail-closed。
+// 退出时不管成功失败，都用相对已打开父目录 fd 的 RemoveTempEntryAt 删掉自己
+// 排他认领的三个临时路径。因此正常与失败两种路径都不会留下本进程的中间目录，
+// 也绝不会碰任何本程序没有创建过的对象。
 bool RestoreSnapshotChain(const std::string& repository_directory,
                           const std::string& target_file_name,
                           const std::string& destination_directory,
@@ -1104,16 +1123,21 @@ bool RestoreSnapshotChain(const std::string& repository_directory,
     return false;
   }
 
-  const std::string suffix =
-      "." + std::to_string(static_cast<unsigned long>(::getpid()));
-  const std::string staging = destination + suffix + ".staging";
-  const std::string overlay = destination + suffix + ".overlay";
-  const std::string inner_container = destination + suffix + ".container";
-
   std::string destination_parent;
   std::string destination_base;
   SplitDestination(destination, &destination_parent, &destination_base);
   const long long self_pid = static_cast<long long>(::getpid());
+  const std::string suffix = "." + std::to_string(self_pid);
+
+  // 临时条目同时保留**完整路径**（交给下游 RunRestorePipeline /
+  // PublishReplacing）与**相对父目录的名字**：本文件里所有针对临时条目的删除
+  // 都只用后者配合**已经打开的父目录 fd**，不再重新解析父目录路径。
+  const std::string staging_name = destination_base + suffix + ".staging";
+  const std::string overlay_name = destination_base + suffix + ".overlay";
+  const std::string container_name = destination_base + suffix + ".container";
+  const std::string staging = destination + suffix + ".staging";
+  const std::string overlay = destination + suffix + ".overlay";
+  const std::string inner_container = destination + suffix + ".container";
   const std::string temp_owner_name =
       TempOwnerFileName(destination_base, self_pid);
 
@@ -1140,9 +1164,15 @@ bool RestoreSnapshotChain(const std::string& repository_directory,
   const bool marker_pre_existing =
       TempOwnerMarkerMatches(parent_fd, temp_owner_name, self_pid);
 
+  // marker_owned  ：正常收尾时可以撤掉标记（本次建的，或上一轮同 pid 留下的）
+  // marker_created：标记**就是本次调用建的** —— 只有这种情况失败退出时才撤它
   bool marker_owned = false;
+  bool marker_created = false;
   switch (CreateTempOwnerMarker(parent_fd, temp_owner_name, self_pid)) {
     case TempMarkerResult::kCreated:
+      marker_owned = true;
+      marker_created = true;
+      break;
     case TempMarkerResult::kReusedOurs:
       marker_owned = true;
       break;
@@ -1166,39 +1196,45 @@ bool RestoreSnapshotChain(const std::string& repository_directory,
   // 1) 先收**别的（已死）进程**留下、且能证明来源的临时条目。
   ReclaimStaleTempDirs(destination);
 
-  // 2) 本 pid 的同名条目。这里就是 P0-B 的落点：**本进程的 pid 不能单独证明
-  //    路径归属**——标记也可能是本进程刚刚写的，它证明不了"这个同名目录是
-  //    我建的"。
-  //      * marker_pre_existing == true：它们确实是本程序上一轮崩溃的残留
-  //        （pid 被复用而上次没清干净），按 R-01 的原有语义强制清理；
-  //      * 否则：同名条目**不是**本程序建的。修复前这里是
-  //        RemoveTreeForcingOwnerAccess(staging/overlay) + unlink(container)，
-  //        会把用户自己恰好同名的目录（pid 可复用、名字可预测）递归强删，
-  //        0500 的还会先被 chmod 成 0700。现在一律 fail-closed：绝不
-  //        "先删除再重新创建"。
-  if (marker_pre_existing) {
-    RemoveTreeForcingOwnerAccess(staging);
-    RemoveTreeForcingOwnerAccess(overlay);
-    ::unlink(inner_container.c_str());
-  } else {
-    const std::string claimed[3] = {destination_base + suffix + ".staging",
-                                    destination_base + suffix + ".overlay",
-                                    destination_base + suffix + ".container"};
-    for (const std::string& name : claimed) {
-      struct stat occupied;
-      if (::fstatat(parent_fd, name.c_str(), &occupied, AT_SYMLINK_NOFOLLOW) !=
-          0) {
-        continue;  // ENOENT：这个名字是干净的
-      }
-      if (marker_owned) {
-        ::unlinkat(parent_fd, temp_owner_name.c_str(), 0);
-      }
+  // 2) 本 pid 的同名条目：**无论标记在不在，一律不删。**
+  //
+  //    这里是 P0-B 的落点。pid 证明不了归属；而"本进程刚写的标记"更证明不了
+  //    —— 标记的生命周期**严格包含**临时树（先写标记、后建树；先删树、后删
+  //    标记），所以完全可能留下一个"有标记、却没有树"的孤儿标记。此后只要
+  //    pid 被复用，用户自己恰好同名的目录就会被当成残留：先强行 chmod 再递归
+  //    删除。修复前更糟——那时连标记都不需要。
+  //
+  //    因此这里一律 fail-closed，绝不"先删除再重新创建"。
+  //    同一 pid 的崩溃残留由**下一次 pid 不同的运行**通过第 1 步回收（那个
+  //    pid 那时已经死了、标记也还在），所以"崩溃后能自愈"的能力并没有丢；
+  //    只有恰好又拿到同一个 pid 的那一次会被拒绝，而且给出可照着做的诊断。
+  //
+  //    标记的取舍也要分清：kCreated 时这个名字上除了刚建的标记什么都没有，
+  //    失败退出就该把标记撤掉；kReusedOurs 说明**残留还在**，标记必须留着，
+  //    否则下一次回收就失去了唯一的来源证明。
+  const std::string claimed[3] = {staging_name, overlay_name, container_name};
+  for (const std::string& name : claimed) {
+    struct stat occupied;
+    if (::fstatat(parent_fd, name.c_str(), &occupied, AT_SYMLINK_NOFOLLOW) != 0) {
+      continue;  // ENOENT：这个名字是干净的
+    }
+    if (marker_created) {
+      ::unlinkat(parent_fd, temp_owner_name.c_str(), 0);
+    }
+    if (marker_pre_existing) {
+      SetError(error_message,
+               "Refusing to restore: a previous run of this program that had the "
+               "same pid left temporary data at " +
+                   JoinPath(destination_parent, name) +
+                   "; it cannot be told apart from user data, so it is left "
+                   "untouched - remove it and retry");
+    } else {
       SetError(error_message,
                "Refusing to restore: the temporary path " +
                    JoinPath(destination_parent, name) +
                    " already exists and was not created by this program");
-      return false;
     }
+    return false;
   }
 
   // 3) 排他认领 staging / overlay：mkdir 的原子性把"检查存在"与"创建"之间的
@@ -1208,9 +1244,9 @@ bool RestoreSnapshotChain(const std::string& repository_directory,
   if (::mkdir(staging.c_str(), 0700) != 0 ||
       ::mkdir(overlay.c_str(), 0700) != 0) {
     const int claim_errno = errno;
-    RemoveTreeForcingOwnerAccess(staging);
-    RemoveTreeForcingOwnerAccess(overlay);
-    if (marker_owned) {
+    RemoveTempEntryAt(parent_fd, staging_name);
+    RemoveTempEntryAt(parent_fd, overlay_name);
+    if (marker_created) {
       ::unlinkat(parent_fd, temp_owner_name.c_str(), 0);
     }
     SetError(error_message, "Cannot claim the temporary directories for " +
@@ -1255,7 +1291,7 @@ bool RestoreSnapshotChain(const std::string& repository_directory,
         break;
       }
       container_present = true;
-      RemoveTreeForcingOwnerAccess(overlay);
+      RemoveTempEntryAt(parent_fd, overlay_name);
       // 每个 delta 的 overlay 也走排他认领：删不掉又占着名字时宁可在这里
       // 失败，也不要往一棵来路不明的目录里写。
       if (::mkdir(overlay.c_str(), 0700) != 0) {
@@ -1269,7 +1305,8 @@ bool RestoreSnapshotChain(const std::string& repository_directory,
         delta_failed = true;
         break;
       }
-      if (::unlink(inner_container.c_str()) == 0 || errno == ENOENT) {
+      if (::unlinkat(parent_fd, container_name.c_str(), 0) == 0 ||
+          errno == ENOENT) {
         container_present = false;
       }
 
@@ -1321,7 +1358,7 @@ bool RestoreSnapshotChain(const std::string& repository_directory,
       if (report != nullptr) {
         report->restored_entries += context.merged_entries;
       }
-      RemoveTreeForcingOwnerAccess(overlay);
+      RemoveTempEntryAt(parent_fd, overlay_name);
     }
     if (delta_failed) break;
 
@@ -1352,22 +1389,27 @@ bool RestoreSnapshotChain(const std::string& repository_directory,
   // 成功与失败都走这里。staging 在发布成功后已被 rename 搬走；overlay 与中间
   // 容器一定还在。
   //
-  // 这里必须用**强制**版本：这棵树里可能带着 0500 之类的只读目录（staging 会
-  // 忠实保留源树权限），普通 RemoveTree 会卡在"里面删不掉、目录又非空"而把整棵
-  // 留下——这正是实测到的残留来源。三个路径都是本进程刚建的临时树，放开宿主
-  // 权限再删是安全的（见 RemoveTreeForcingOwnerAccess）。
-  RemoveTreeForcingOwnerAccess(staging);
-  RemoveTreeForcingOwnerAccess(overlay);
-  if (container_present) {
-    ::unlink(inner_container.c_str());
-  }
-  // 自己的临时树已经收干净，撤掉所有权标记：它只用于"证明这批条目是同类"，
-  // 留着一个没有条目的标记只会让下一次回收做无用功。
+  // 这里必须用**强制**版本（RemoveTempEntryAt 内部就是 force_owner_access）：
+  // 这棵树里可能带着 0500 之类的只读目录（staging 会忠实保留源树权限），
+  // 普通 RemoveTree 会卡在"里面删不掉、目录又非空"而把整棵留下——这正是实测到
+  // 的残留来源。这棵树是本进程排他认领的，放开宿主权限再删是安全的。
   //
-  // 只撤**本程序**的标记：kConflict 已经在上面 return 了，kFailed 时这个
-  // 名字上根本没有我们的东西——绝不能去 unlink 别人的对象。这正是修复前
-  // "无论标记是否创建成功都无条件 unlink 这个路径"的反面。
-  if (marker_owned) {
+  // 两次删除都相对 parent_fd，**不重新解析父目录路径**。
+  const bool staging_clear = RemoveTempEntryAt(parent_fd, staging_name);
+  const bool overlay_clear = RemoveTempEntryAt(parent_fd, overlay_name);
+  if (container_present) {
+    if (::unlinkat(parent_fd, container_name.c_str(), 0) == 0 ||
+        errno == ENOENT) {
+      container_present = false;
+    }
+  }
+  // 撤所有权标记的条件是"**确实**没有条目还挂着"：
+  //   * 留着一个没有条目的标记没有意义（下一次回收只会做无用功）；
+  //   * 但**删掉一个还有条目的标记**会让那些残留永久失去唯一的来源证明，
+  //     以后再也无法被自动回收 —— 那是比多留一个标记坏得多的结果。
+  // 另外只撤**本程序**的标记：kConflict 已经在上面 return 了，kFailed 时这个
+  // 名字上根本没有我们的东西，绝不能去 unlink 别人的对象。
+  if (marker_owned && staging_clear && overlay_clear && !container_present) {
     ::unlinkat(parent_fd, temp_owner_name.c_str(), 0);
   }
   return ok;
