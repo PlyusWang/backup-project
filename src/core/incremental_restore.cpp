@@ -1215,19 +1215,21 @@ bool RestoreSnapshotChain(const std::string& repository_directory,
   const std::string claimed[3] = {staging_name, overlay_name, container_name};
   for (const std::string& name : claimed) {
     struct stat occupied;
-    if (::fstatat(parent_fd, name.c_str(), &occupied, AT_SYMLINK_NOFOLLOW) != 0) {
+    if (::fstatat(parent_fd, name.c_str(), &occupied, AT_SYMLINK_NOFOLLOW) !=
+        0) {
       continue;  // ENOENT：这个名字是干净的
     }
     if (marker_created) {
       ::unlinkat(parent_fd, temp_owner_name.c_str(), 0);
     }
     if (marker_pre_existing) {
-      SetError(error_message,
-               "Refusing to restore: a previous run of this program that had the "
-               "same pid left temporary data at " +
-                   JoinPath(destination_parent, name) +
-                   "; it cannot be told apart from user data, so it is left "
-                   "untouched - remove it and retry");
+      SetError(
+          error_message,
+          "Refusing to restore: a previous run of this program that had the "
+          "same pid left temporary data at " +
+              JoinPath(destination_parent, name) +
+              "; it cannot be told apart from user data, so it is left "
+              "untouched - remove it and retry");
     } else {
       SetError(error_message,
                "Refusing to restore: the temporary path " +
