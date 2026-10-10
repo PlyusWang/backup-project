@@ -106,7 +106,8 @@ bool RemoveTree(const std::string& path) {
 //      另一个进程（同 UID 即可）把目录项换成指向别处的软链接，后面的 chmod /
 //      opendir / rmdir 就会落到链接目标上。这是 TOCTOU，"全程 lstat 所以不会
 //      follow"这个结论并不成立。
-//   2. 回收旧残留只看"名字像 <dest>.<pid>.<kind> + 同父目录 + 同 UID + pid 已死"。
+//   2. 回收旧残留只看"名字像 <dest>.<pid>.<kind> + 同父目录 + 同 UID + pid
+//   已死"。
 //      这四条都不能证明目录是**本软件建的**：用户自己在同一目录下建一个恰好
 //      同名的普通目录、里面放重要文件，就会被当成残留递归删掉。
 //
@@ -121,9 +122,10 @@ bool RemoveTree(const std::string& path) {
 
 // destination 的词法规范化：只去掉**尾部**多余的 '/'，'/' 本身保持 '/'。
 //
-// 为什么需要：临时路径是按 "<destination>.<pid>.<kind>" 直接拼出来的。destination
-// 若带尾斜杠（"/tmp/x/restore/"），临时树就会落进 destination **内部**，发布那一
-// 步的 rmdir(destination) 必然 ENOTEMPTY，恢复整体失败——这是实测到的真实缺陷。
+// 为什么需要：临时路径是按 "<destination>.<pid>.<kind>"
+// 直接拼出来的。destination 若带尾斜杠（"/tmp/x/restore/"），临时树就会落进
+// destination **内部**，发布那一 步的 rmdir(destination) 必然
+// ENOTEMPTY，恢复整体失败——这是实测到的真实缺陷。
 //
 // 只做这一件事：不解析 "." / ".."、不碰软链接、不合并不同路径。调用方给的
 // destination 必须保持"同一个路径"的语义，任何额外解析都可能把两条不同路径
@@ -152,7 +154,8 @@ void SplitDestination(const std::string& destination, std::string* parent,
   *base = trimmed.substr(slash + 1);
 }
 
-// 所有权标记的魔数与文件名。标记文件与临时树同级，永远不会被发布进 destination。
+// 所有权标记的魔数与文件名。标记文件与临时树同级，永远不会被发布进
+// destination。
 const char kTempOwnerMagic[] = "BPRESTORE-TMP-OWNER/1";
 
 std::string TempOwnerFileName(const std::string& destination_base,
@@ -174,8 +177,8 @@ bool RemoveTreeAt(int parent_fd, const std::string& name,
                   bool force_owner_access) {
   // O_NOFOLLOW|O_DIRECTORY：软链接以 ELOOP 失败、普通文件以 ENOTDIR 失败，
   // 两者都走下面的 unlinkat 分支——只摘掉这个目录项本身，绝不 follow。
-  const int dir_fd = ::openat(
-      parent_fd, name.c_str(), O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+  const int dir_fd = ::openat(parent_fd, name.c_str(),
+                              O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
   if (dir_fd < 0) {
     if (errno == ENOENT) return true;  // 幂等
     if (errno == ELOOP || errno == ENOTDIR) {
@@ -200,8 +203,8 @@ bool RemoveTreeAt(int parent_fd, const std::string& name,
         if (::unlinkat(parent_fd, name.c_str(), 0) == 0) return true;
         return errno == ENOENT;
       }
-      if (::fchmodat(parent_fd, name.c_str(),
-                     (info.st_mode & 07777) | S_IRWXU, 0) != 0) {
+      if (::fchmodat(parent_fd, name.c_str(), (info.st_mode & 07777) | S_IRWXU,
+                     0) != 0) {
         return false;  // 补不了权限就如实报告"没删掉"
       }
       return RemoveTreeAt(parent_fd, name, force_owner_access);
@@ -231,7 +234,8 @@ bool RemoveTreeAt(int parent_fd, const std::string& name,
   while (struct dirent* item = ::readdir(directory)) {
     const std::string child = item->d_name;
     if (child == "." || child == "..") continue;
-    if (!RemoveTreeAt(::dirfd(directory), child, force_owner_access)) ok = false;
+    if (!RemoveTreeAt(::dirfd(directory), child, force_owner_access))
+      ok = false;
   }
   ::closedir(directory);
   if (::unlinkat(parent_fd, name.c_str(), AT_REMOVEDIR) != 0) ok = false;
@@ -245,7 +249,8 @@ bool RemoveTreeForcingOwnerAccess(const std::string& path) {
   std::string name;
   SplitDestination(path, &parent, &name);
   if (name.empty() || name == "." || name == ".." || name == "/") return false;
-  const int parent_fd = ::open(parent.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+  const int parent_fd =
+      ::open(parent.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
   if (parent_fd < 0) return false;
   const bool ok = RemoveTreeAt(parent_fd, name, /*force_owner_access=*/true);
   ::close(parent_fd);
@@ -284,11 +289,12 @@ bool TempOwnerMarkerMatches(int parent_fd, const std::string& name,
 // 但会被如实返回给调用方用于诊断。
 bool CreateTempOwnerMarker(const std::string& parent, const std::string& name,
                            long long owner_pid) {
-  const int parent_fd = ::open(parent.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+  const int parent_fd =
+      ::open(parent.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
   if (parent_fd < 0) return false;
-  const int fd = ::openat(parent_fd, name.c_str(),
-                          O_WRONLY | O_CREAT | O_TRUNC | O_NOFOLLOW | O_CLOEXEC,
-                          0600);
+  const int fd =
+      ::openat(parent_fd, name.c_str(),
+               O_WRONLY | O_CREAT | O_TRUNC | O_NOFOLLOW | O_CLOEXEC, 0600);
   ::close(parent_fd);
   if (fd < 0) return false;
   const std::string payload = TempOwnerPayload(owner_pid);
@@ -326,16 +332,18 @@ bool CreateTempOwnerMarker(const std::string& parent, const std::string& name,
 // 所有条目操作都相对**已打开的父目录 fd**（openat/fstatat/unlinkat），扫描之后
 // 不再重新解析路径；条目本身用 O_NOFOLLOW 打开，软链接不可能被 follow。
 //
-// 并发前提：客户端用 ApplicationInstanceLock 保证一个 UID 同时只有一个 backupctl，
-// 所以"同一 destination 上还有另一个活着的恢复"在锁语义下不成立；第 5 条再补
-// 一道运行时检查。已知残余窗口：第 5 条与随后删除之间 pid 可能被复用，而新进程
-// 恰好正在恢复同一个 destination —— 窗口极窄且被单实例锁覆盖，如实记录。
+// 并发前提：客户端用 ApplicationInstanceLock 保证一个 UID 同时只有一个
+// backupctl， 所以"同一 destination 上还有另一个活着的恢复"在锁语义下不成立；第
+// 5 条再补 一道运行时检查。已知残余窗口：第 5 条与随后删除之间 pid
+// 可能被复用，而新进程 恰好正在恢复同一个 destination ——
+// 窗口极窄且被单实例锁覆盖，如实记录。
 void ReclaimStaleTempDirs(const std::string& destination_directory) {
   std::string parent;
   std::string base;
   SplitDestination(destination_directory, &parent, &base);
   if (base.empty()) return;
-  const int parent_fd = ::open(parent.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+  const int parent_fd =
+      ::open(parent.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
   if (parent_fd < 0) return;
   // fdopendir 会接管 fd 的所有权，所以给扫描单独 dup 一个，parent_fd 留给
   // 后面的 openat / fstatat / unlinkat 用。
