@@ -19,6 +19,8 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
+#include <csignal>
+
 #include <cstdint>
 #include <string>
 #include <vector>
@@ -1127,22 +1129,51 @@ int main() {
                         "INC-R T16 判别：失败时不发布");
     test_support::Check(!error.empty(), "INC-R T16 失败带诊断信息", error);
 
-    // 反向对照（残留修复的直接回归）：同 pid 的 0500 残留是"上一次同 pid 的
-    // 进程崩在中途"留下的，属于本进程自己的临时数据，**必须被强制清理**，
-    // 恢复要照常成功；修复之前这里会以"not empty"失败。
+    // 反向对照（P0-B 的直接回归）：**没有来源证明**的同 pid 残留不是本程序的
+    // 临时数据。修复前这里会走 RemoveTreeForcingOwnerAccess：先把这个 0500
+    // 目录 chmod 成 0700，再递归删掉，然后"恢复成功"——那正是本轮要消除的
+    // 数据破坏（名字带 pid 不等于归属，pid 会复用、名字可预测）。
+    // 现在必须 fail-closed，且残留一个字节、一个权限位都不能变。
+    const std::string unmarked_residue = TempPath(destination, ".staging");
+    test_support::Check(MakeStubbornResidue(unmarked_residue),
+                        "INC-R T16 预置无标记的同 pid 0500 staging 残留");
+    error.clear();
+    const bool ok_blocked = bp::RestoreSnapshotChain(
+        repository, "s2.bak", destination, bp::RestoreOptions{}, &report, &error);
+    struct stat residue_info;
+    std::string residue_body;
+    test_support::Check(!ok_blocked,
+                        "INC-R T16 无来源证明的同 pid 残留让恢复 fail-closed",
+                        error);
+    test_support::Check(!test_support::Exists(destination),
+                        "INC-R T16 判别：被拒绝时不发布");
     test_support::Check(
-        MakeStubbornResidue(TempPath(destination, ".staging")),
-        "INC-R T16 预置同 pid 的 0500 staging 残留");
+        ::lstat(unmarked_residue.c_str(), &residue_info) == 0 &&
+            S_ISDIR(residue_info.st_mode) &&
+            (residue_info.st_mode & 07777) == 0500,
+        "INC-R T16 无标记残留未被删除、权限位也未被改成 0700");
+    test_support::Check(
+        test_support::ReadFile(unmarked_residue + "/residue", &residue_body) &&
+            residue_body == "residue",
+        "INC-R T16 无标记残留内容完好", residue_body);
+
+    // 正向对照：**有**来源证明的同 pid 残留仍然必须被强制回收（0500 子树也
+    // 要清掉），恢复照常成功——R-01 的"崩溃后能自愈"能力不能被这次收口弄丢。
+    test_support::Check(
+        test_support::WriteFile(
+            TempOwnerMarkerPath(destination, static_cast<long>(::getpid())),
+            TempOwnerMarkerText(static_cast<long>(::getpid())), 0600),
+        "INC-R T16 补上属于本 pid 的所有权标记");
     error.clear();
     const bool ok_after = bp::RestoreSnapshotChain(
         repository, "s2.bak", destination, bp::RestoreOptions{}, &report, &error);
     test_support::Check(ok_after,
-                        "INC-R T16 同 pid 残留被强制清理后恢复成功", error);
+                        "INC-R T16 有标记的同 pid 残留被强制清理后恢复成功", error);
     test_support::Check(test_support::Exists(destination + "/a.txt"),
                         "INC-R T16 恢复结果正确（a.txt 内容为 a-v2）");
-    test_support::Check(!test_support::Exists(TempPath(destination, ".staging")),
+    test_support::Check(!test_support::Exists(unmarked_residue),
                         "INC-R T16 成功后不留 staging 残留");
-    DropStubbornResidue(TempPath(destination, ".staging"));
+    DropStubbornResidue(unmarked_residue);
   }
 
   {
@@ -1501,6 +1532,559 @@ int main() {
     test_support::Check(
         !test_support::Exists(work + "/dest-one." + self_pid_text + ".owner"),
         "INC-R T19 尾斜杠恢复后不留所有权标记");
+  }
+
+{
+    // ============================================================
+    // 10.11 P0-A：所有权标记路径**绝不能**覆盖或删除既有的用户对象。
+    //
+    // 修复前的实现用 openat(O_WRONLY|O_CREAT|O_TRUNC|O_NOFOLLOW) 写标记，
+    // 结束时又对同一路径做**无条件** unlink。三条真实后果：
+    //   * O_TRUNC 截断已经存在的同名普通文件；同名硬链接会把目标文件一起毁掉；
+    //   * 同名 FIFO 上 O_WRONLY 没有 O_NONBLOCK，恢复不是失败而是**永久阻塞**；
+    //   * 无条件 unlink 把同名软链接 / 只读文件直接摘掉，哪怕标记根本没写成功。
+    //
+    // 契约：标记必须**排他创建**；路径上已有"不是本程序刚建的对象"时
+    // fail-closed，该对象的内容 / inode / 权限 / 链接数一个都不能变。
+    // ============================================================
+    test_support::Section("INC-R 10.11 所有权标记不得覆盖或删除既有对象");
+    const std::string work = test_support::FreshDir("inc-owner-no-clobber");
+    const std::string source = work + "/src";
+    const std::string repository = work + "/repo";
+    test_support::Mkdir(source, 0755);
+    test_support::Mkdir(repository, 0755);
+    bp::IncrementalOutcome outcome;
+    std::string error;
+    test_support::WriteFile(source + "/a.txt", "owner-v1", 0644);
+    test_support::Check(
+        MakeSnapshot(source, repository, "s1.bak", &outcome, &error),
+        "INC-R T20 基线建立成功", error);
+
+    const std::string self_pid =
+        std::to_string(static_cast<long>(::getpid()));
+
+    struct FileState {
+      bool ok = false;
+      dev_t dev = 0;
+      ino_t ino = 0;
+      mode_t mode = 0;
+      nlink_t nlink = 0;
+    };
+    auto state_of = [](const std::string& path) {
+      FileState state;
+      struct stat info;
+      if (::lstat(path.c_str(), &info) == 0) {
+        state.ok = true;
+        state.dev = info.st_dev;
+        state.ino = info.st_ino;
+        state.mode = info.st_mode;
+        state.nlink = info.st_nlink;
+      }
+      return state;
+    };
+    auto try_restore = [&](const std::string& dest) {
+      bp::RestoreReport report;
+      error.clear();
+      return bp::RestoreSnapshotChain(repository, "s1.bak", dest,
+                                      bp::RestoreOptions{}, &report, &error);
+    };
+
+    {
+      // A1：同名普通文件（哨兵内容）——不得被截断，恢复 fail-closed。
+      const std::string dest = work + "/a1";
+      const std::string marker = dest + "." + self_pid + ".owner";
+      test_support::WriteFile(marker, "USER-SENTINEL-CONTENT", 0644);
+      const FileState before = state_of(marker);
+      const bool ok = try_restore(dest);
+      const FileState after = state_of(marker);
+      std::string content;
+      test_support::Check(!ok,
+                          "INC-R T20 A1 标记路径被既有文件占用时 fail-closed", error);
+      test_support::Check(after.ok && before.ino == after.ino &&
+                              before.dev == after.dev,
+                          "INC-R T20 A1 既有文件的 inode 未被替换");
+      test_support::Check(
+          test_support::ReadFile(marker, &content) &&
+              content == "USER-SENTINEL-CONTENT",
+          "INC-R T20 A1 既有文件内容未被 O_TRUNC 截断", content);
+      test_support::Check(!test_support::Exists(dest),
+                          "INC-R T20 A1 失败时不发布目标");
+    }
+
+    {
+      // A2：同名硬链接——截断会连带毁掉另一个名字下的真实文件。
+      const std::string dest = work + "/a2";
+      const std::string victim = work + "/a2-victim.txt";
+      const std::string marker = dest + "." + self_pid + ".owner";
+      test_support::WriteFile(victim, "HARDLINK-VICTIM", 0644);
+      test_support::Check(::link(victim.c_str(), marker.c_str()) == 0,
+                          "INC-R T20 A2 造出同名硬链接");
+      const FileState before = state_of(victim);
+      const bool ok = try_restore(dest);
+      const FileState after = state_of(victim);
+      std::string content;
+      test_support::Check(!ok,
+                          "INC-R T20 A2 标记路径被硬链接占用时 fail-closed", error);
+      test_support::Check(
+          test_support::ReadFile(victim, &content) &&
+              content == "HARDLINK-VICTIM",
+          "INC-R T20 A2 硬链接另一个名字下的文件内容未被毁掉", content);
+      test_support::Check(after.ok && before.ino == after.ino &&
+                              before.nlink == after.nlink,
+                          "INC-R T20 A2 硬链接本身未被摘掉（链接数不变）");
+    }
+
+    {
+      // A3：同名软链接——旧的收尾无条件 unlink 会摘掉它。
+      const std::string dest = work + "/a3";
+      const std::string victim = work + "/a3-victim.txt";
+      const std::string marker = dest + "." + self_pid + ".owner";
+      test_support::WriteFile(victim, "SYMLINK-VICTIM", 0644);
+      test_support::Check(test_support::CreateSymlink(victim, marker),
+                          "INC-R T20 A3 造出同名软链接");
+      const bool ok = try_restore(dest);
+      struct stat info;
+      test_support::Check(!ok,
+                          "INC-R T20 A3 标记路径被软链接占用时 fail-closed", error);
+      test_support::Check(::lstat(marker.c_str(), &info) == 0 &&
+                              S_ISLNK(info.st_mode),
+                          "INC-R T20 A3 既有软链接未被无条件 unlink 摘掉");
+      std::string content;
+      test_support::Check(
+          test_support::ReadFile(victim, &content) && content == "SYMLINK-VICTIM",
+          "INC-R T20 A3 软链接目标未被 follow，内容不变", content);
+    }
+
+    {
+      // A4：同名目录——不得被当作"标记"清掉。
+      const std::string dest = work + "/a4";
+      const std::string marker = dest + "." + self_pid + ".owner";
+      test_support::Mkdir(marker, 0755);
+      test_support::WriteFile(marker + "/inside.txt", "DIR-INSIDE", 0644);
+      const bool ok = try_restore(dest);
+      std::string content;
+      test_support::Check(!ok,
+                          "INC-R T20 A4 标记路径被目录占用时 fail-closed", error);
+      test_support::Check(
+          test_support::ReadFile(marker + "/inside.txt", &content) &&
+              content == "DIR-INSIDE",
+          "INC-R T20 A4 既有目录及其内容未被触碰", content);
+    }
+
+    {
+      // A5：同名只读文件——unlink 只看父目录写权限，旧实现会把它删掉。
+      const std::string dest = work + "/a5";
+      const std::string marker = dest + "." + self_pid + ".owner";
+      test_support::Check(test_support::WriteFile(marker, "READONLY-SENTINEL", 0444),
+                          "INC-R T20 A5 造出同名只读文件");
+      const FileState before = state_of(marker);
+      const bool ok = try_restore(dest);
+      const FileState after = state_of(marker);
+      std::string content;
+      test_support::Check(!ok,
+                          "INC-R T20 A5 标记路径被只读文件占用时 fail-closed", error);
+      test_support::Check(after.ok && before.ino == after.ino &&
+                              before.mode == after.mode,
+                          "INC-R T20 A5 只读文件未被删除、权限未被改动");
+      test_support::Check(
+          test_support::ReadFile(marker, &content) &&
+              content == "READONLY-SENTINEL",
+          "INC-R T20 A5 只读文件内容不变", content);
+    }
+
+    {
+      // A6：同名 FIFO——旧实现在 openat(O_WRONLY) 上**永久阻塞**。
+      //     用子进程 + alarm 做硬超时：既证明不再挂死，也证明 FIFO 没被删。
+      const std::string dest = work + "/a6";
+      test_support::Check(true, "INC-R T20 A6 FIFO 由子进程按自己的 pid 创建");
+      const std::string progress = work + "/a6-progress.txt";
+      // FIFO **必须在子进程里按子进程自己的 pid 造**：产品用 getpid() 拼临时
+      // 名字，用父进程 pid 拼出来的名字产品根本不会碰，那样的断言是假通过。
+      const pid_t child = ::fork();
+      if (child == 0) {
+        // 进度文件区分"恢复失败"与"恢复卡死"：卡死时 done 永远不会写出来。
+        const int pfd = ::open(progress.c_str(),
+                               O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, 0644);
+        const std::string child_marker =
+            dest + "." + std::to_string(static_cast<long>(::getpid())) + ".owner";
+        const bool made = ::mkfifo(child_marker.c_str(), 0600) == 0;
+        if (pfd >= 0) {
+          const std::string line =
+              std::string("fifo=") + (made ? "1" : "0") + "\n";
+          const ssize_t wrote = ::write(pfd, line.data(), line.size());
+          (void)wrote;
+        }
+        ::alarm(20);  // 卡死时的硬超时
+        bp::RestoreReport report;
+        std::string child_error;
+        const bool ok = bp::RestoreSnapshotChain(
+            repository, "s1.bak", dest, bp::RestoreOptions{}, &report,
+            &child_error);
+        const std::string line =
+            std::string("done ok=") + (ok ? "1" : "0") + " err=" + child_error +
+            "\n";
+        if (pfd >= 0) {
+          const ssize_t wrote = ::write(pfd, line.data(), line.size());
+          (void)wrote;
+        }
+        ::_exit(ok ? 0 : 1);
+      }
+      int status = 0;
+      test_support::Check(child > 0 && ::waitpid(child, &status, 0) == child,
+                          "INC-R T20 A6 子进程已结束");
+      const std::string child_marker =
+          dest + "." + std::to_string(static_cast<long>(child)) + ".owner";
+      std::string progress_text;
+      test_support::ReadFile(progress, &progress_text);
+      const bool blocked = progress_text.find("done") == std::string::npos;
+      const bool killed = WIFSIGNALED(status) && WTERMSIG(status) == SIGALRM;
+      test_support::Check(!blocked && !killed,
+                          "INC-R T20 A6 FIFO 占位时恢复不卡死（旧实现永久阻塞）",
+                          "progress=[" + progress_text + "] sigalrm=" +
+                              (killed ? "yes" : "no"));
+      struct stat info;
+      test_support::Check(::lstat(child_marker.c_str(), &info) == 0 &&
+                              S_ISFIFO(info.st_mode),
+                          "INC-R T20 A6 既有 FIFO 未被删除");
+      test_support::Check(!test_support::Exists(dest),
+                          "INC-R T20 A6 冲突时 fail-closed 不发布目标");
+    }
+
+    {
+      // A7：反向对照——真由本程序留下、内容正确的标记（同 pid 崩溃残留）
+      //     必须被复用、恢复照常成功，结束后标记撤掉。
+      const std::string dest = work + "/a7";
+      const std::string marker = dest + "." + self_pid + ".owner";
+      test_support::WriteFile(
+          marker, TempOwnerMarkerText(static_cast<long>(::getpid())), 0600);
+      const bool ok = try_restore(dest);
+      std::string content;
+      test_support::Check(ok, "INC-R T20 A7 合法的同 pid 标记被复用，恢复成功",
+                          error);
+      test_support::Check(
+          test_support::ReadFile(dest + "/a.txt", &content) &&
+              content == "owner-v1",
+          "INC-R T20 A7 恢复内容正确", content);
+      test_support::Check(!test_support::Exists(marker),
+                          "INC-R T20 A7 结束后自己的标记被撤掉");
+    }
+  }
+
+  {
+    // ============================================================
+    // 10.12 P0-B：当前 pid 的临时路径**不构成**归属证明。
+    //
+    // 修复前进入时无条件执行：
+    //     RemoveTreeForcingOwnerAccess(dest.<pid>.staging)
+    //     RemoveTreeForcingOwnerAccess(dest.<pid>.overlay)
+    //     unlink(dest.<pid>.container)
+    // 而所有权标记是本进程**刚刚**写的——它证明不了这些对象是本程序建的。
+    // 用户只要恰好有一个同名目录（pid 会复用、名字可预测），就会被递归强删，
+    // 0500 的还会先被 chmod 成 0700 再删。
+    // 契约：证明不了就 fail-closed，绝不"先删除再重新创建"。
+    // ============================================================
+    test_support::Section("INC-R 10.12 当前 pid 临时路径不得无证明删除");
+    const std::string work = test_support::FreshDir("inc-pid-collision");
+    const std::string source = work + "/src";
+    const std::string repository = work + "/repo";
+    test_support::Mkdir(source, 0755);
+    test_support::Mkdir(repository, 0755);
+    bp::IncrementalOutcome outcome;
+    std::string error;
+    test_support::WriteFile(source + "/a.txt", "owner-v1", 0644);
+    test_support::Check(
+        MakeSnapshot(source, repository, "s1.bak", &outcome, &error),
+        "INC-R T21 基线建立成功", error);
+
+    const std::string self_pid =
+        std::to_string(static_cast<long>(::getpid()));
+    auto try_restore = [&](const std::string& dest) {
+      bp::RestoreReport report;
+      error.clear();
+      return bp::RestoreSnapshotChain(repository, "s1.bak", dest,
+                                      bp::RestoreOptions{}, &report, &error);
+    };
+    auto make_user_dir = [](const std::string& path, const std::string& file,
+                            const std::string& text, mode_t mode) {
+      test_support::Mkdir(path, 0755);
+      test_support::WriteFile(path + "/" + file, text, 0644);
+      ::chmod(path.c_str(), mode);
+    };
+
+    {
+      // B1：无标记的同 pid staging 目录（用户自建）。
+      const std::string dest = work + "/b1";
+      const std::string stale = dest + "." + self_pid + ".staging";
+      make_user_dir(stale, "precious.txt", "USER-DATA-B1", 0755);
+      const bool ok = try_restore(dest);
+      std::string content;
+      test_support::Check(!ok,
+                          "INC-R T21 B1 无标记的同 pid staging 占位时 fail-closed",
+                          error);
+      test_support::Check(
+          test_support::ReadFile(stale + "/precious.txt", &content) &&
+              content == "USER-DATA-B1",
+          "INC-R T21 B1 用户目录及其内容一个字节都没少", content);
+      test_support::Check(!test_support::Exists(dest),
+                          "INC-R T21 B1 失败时不发布目标");
+      test_support::Check(!test_support::Exists(dest + "." + self_pid + ".owner"),
+                          "INC-R T21 B1 冲突失败后不留下自己的标记");
+      DropTreeForcingModes(stale);
+    }
+
+    {
+      // B2：无标记的同 pid overlay 目录。
+      const std::string dest = work + "/b2";
+      const std::string stale = dest + "." + self_pid + ".overlay";
+      make_user_dir(stale, "precious.txt", "USER-DATA-B2", 0755);
+      const bool ok = try_restore(dest);
+      std::string content;
+      test_support::Check(!ok,
+                          "INC-R T21 B2 无标记的同 pid overlay 占位时 fail-closed",
+                          error);
+      test_support::Check(
+          test_support::ReadFile(stale + "/precious.txt", &content) &&
+              content == "USER-DATA-B2",
+          "INC-R T21 B2 用户 overlay 目录未被递归删除", content);
+      DropTreeForcingModes(stale);
+    }
+
+    {
+      // B3：无标记的同 pid container **普通文件**——旧实现无条件 unlink。
+      const std::string dest = work + "/b3";
+      const std::string container = dest + "." + self_pid + ".container";
+      test_support::WriteFile(container, "USER-CONTAINER-B3", 0644);
+      const bool ok = try_restore(dest);
+      std::string content;
+      test_support::Check(!ok,
+                          "INC-R T21 B3 无标记的同 pid container 占位时 fail-closed",
+                          error);
+      test_support::Check(
+          test_support::ReadFile(container, &content) &&
+              content == "USER-CONTAINER-B3",
+          "INC-R T21 B3 用户 container 文件未被无条件 unlink", content);
+    }
+
+    {
+      // B4：无标记的同 pid container **软链接**。
+      const std::string dest = work + "/b4";
+      const std::string victim = work + "/b4-victim.txt";
+      const std::string container = dest + "." + self_pid + ".container";
+      test_support::WriteFile(victim, "CONTAINER-LINK-TARGET", 0644);
+      test_support::Check(test_support::CreateSymlink(victim, container),
+                          "INC-R T21 B4 造出同 pid container 软链接");
+      const bool ok = try_restore(dest);
+      struct stat info;
+      std::string content;
+      test_support::Check(!ok,
+                          "INC-R T21 B4 container 是软链接时 fail-closed", error);
+      test_support::Check(::lstat(container.c_str(), &info) == 0 &&
+                              S_ISLNK(info.st_mode),
+                          "INC-R T21 B4 用户软链接未被摘掉");
+      test_support::Check(
+          test_support::ReadFile(victim, &content) &&
+              content == "CONTAINER-LINK-TARGET",
+          "INC-R T21 B4 软链接目标完好", content);
+    }
+
+    {
+      // B5：无标记的同 pid 0500 staging——旧实现会先 chmod 0700 再递归删。
+      const std::string dest = work + "/b5";
+      const std::string stale = dest + "." + self_pid + ".staging";
+      make_user_dir(stale, "precious.txt", "USER-DATA-B5", 0500);
+      const bool ok = try_restore(dest);
+      struct stat info;
+      std::string content;
+      test_support::Check(!ok,
+                          "INC-R T21 B5 无标记的 0500 staging 占位时 fail-closed",
+                          error);
+      test_support::Check(::lstat(stale.c_str(), &info) == 0 &&
+                              (info.st_mode & 07777) == 0500,
+                          "INC-R T21 B5 用户目录权限位未被改成 0700");
+      test_support::Check(
+          test_support::ReadFile(stale + "/precious.txt", &content) &&
+              content == "USER-DATA-B5",
+          "INC-R T21 B5 只读用户目录内容完好", content);
+      DropTreeForcingModes(stale);
+    }
+
+    {
+      // B6：反向对照——**有**来源证明的同 pid 崩溃残留必须照旧被回收，
+      //     否则 R-01 的"崩溃后能自愈"能力就没了。
+      const std::string dest = work + "/b6";
+      test_support::WriteFile(
+          dest + "." + self_pid + ".owner",
+          TempOwnerMarkerText(static_cast<long>(::getpid())), 0600);
+      const std::string stale_staging = dest + "." + self_pid + ".staging";
+      const std::string stale_overlay = dest + "." + self_pid + ".overlay";
+      const std::string stale_container = dest + "." + self_pid + ".container";
+      make_user_dir(stale_staging, "left.txt", "left", 0500);  // 只读子树
+      make_user_dir(stale_overlay, "left.txt", "left", 0755);
+      test_support::WriteFile(stale_container, "junk", 0644);
+      const bool ok = try_restore(dest);
+      std::string content;
+      test_support::Check(
+          ok, "INC-R T21 B6 有来源证明的同 pid 崩溃残留被回收，恢复成功", error);
+      test_support::Check(!test_support::Exists(stale_staging),
+                          "INC-R T21 B6 只读 staging 残留被强制清掉");
+      test_support::Check(!test_support::Exists(stale_overlay),
+                          "INC-R T21 B6 overlay 残留被清掉");
+      test_support::Check(!test_support::Exists(stale_container),
+                          "INC-R T21 B6 container 残留被清掉");
+      test_support::Check(!test_support::Exists(dest + "." + self_pid + ".owner"),
+                          "INC-R T21 B6 标记被撤掉");
+      test_support::Check(
+          test_support::ReadFile(dest + "/a.txt", &content) &&
+              content == "owner-v1",
+          "INC-R T21 B6 恢复内容正确", content);
+      DropTreeForcingModes(stale_staging);
+    }
+
+    {
+      // B7：名字**不**符合临时条目规则的同级文件一律不碰。
+      const std::string dest = work + "/b7";
+      const std::string not_number = dest + ".notanumber.staging";
+      const std::string wrong_kind = dest + "." + self_pid + ".staging.bak";
+      const std::string other = dest + ".other";
+      test_support::WriteFile(not_number, "keep-notanumber", 0644);
+      test_support::WriteFile(wrong_kind, "keep-wrongkind", 0644);
+      test_support::WriteFile(other, "keep-other", 0644);
+      const bool ok = try_restore(dest);
+      std::string content;
+      test_support::Check(ok, "INC-R T21 B7 不合规的同级文件不影响恢复", error);
+      test_support::Check(
+          test_support::ReadFile(not_number, &content) &&
+              content == "keep-notanumber",
+          "INC-R T21 B7 非数字 pid 的同级文件未被删除", content);
+      test_support::Check(
+          test_support::ReadFile(wrong_kind, &content) &&
+              content == "keep-wrongkind",
+          "INC-R T21 B7 后缀不合规的同级文件未被删除", content);
+      test_support::Check(
+          test_support::ReadFile(other, &content) && content == "keep-other",
+          "INC-R T21 B7 无关同级文件未被删除", content);
+    }
+
+    {
+      // B8：干净目录下的正常恢复对照。
+      const std::string dest = work + "/b8";
+      const bool ok = try_restore(dest);
+      std::string content;
+      test_support::Check(ok, "INC-R T21 B8 干净目录下正常恢复成功（对照）", error);
+      test_support::Check(
+          test_support::ReadFile(dest + "/a.txt", &content) &&
+              content == "owner-v1",
+          "INC-R T21 B8 恢复内容正确", content);
+      test_support::Check(!test_support::Exists(dest + "." + self_pid + ".owner"),
+                          "INC-R T21 B8 不留所有权标记");
+      test_support::Check(!test_support::Exists(dest + "." + self_pid + ".staging"),
+                          "INC-R T21 B8 不留 staging 残留");
+    }
+  }
+
+  {
+    // ============================================================
+    // 10.13 P0-C：fd 相对删除的权限修复路径与软链接边界。
+    //
+    // 旧的 EACCES 回退是 fstatat + **按路径** fchmodat：两者之间目录项可以被
+    // 换成软链接，而 Linux 的 fchmodat 没有 AT_SYMLINK_NOFOLLOW，会作用到
+    // 链接目标上。现在改成"先拿 O_PATH fd 绑定对象，再通过 /proc/self/fd
+    // 对**已绑定对象**改权限"，拿不到对象就保守失败。
+    // 这一节同时守住"0000 目录仍然能被清掉"这个必须保留的能力。
+    // ============================================================
+    test_support::Section("INC-R 10.13 fd 相对清理的权限与软链接边界");
+    const std::string work = test_support::FreshDir("inc-fd-cleanup");
+    const std::string source = work + "/src";
+    const std::string repository = work + "/repo";
+    test_support::Mkdir(source, 0755);
+    test_support::Mkdir(repository, 0755);
+    bp::IncrementalOutcome outcome;
+    std::string error;
+    test_support::WriteFile(source + "/a.txt", "owner-v1", 0644);
+    test_support::Check(
+        MakeSnapshot(source, repository, "s1.bak", &outcome, &error),
+        "INC-R T22 基线建立成功", error);
+
+    const std::string self_pid =
+        std::to_string(static_cast<long>(::getpid()));
+    auto try_restore = [&](const std::string& dest) {
+      bp::RestoreReport report;
+      error.clear();
+      return bp::RestoreSnapshotChain(repository, "s1.bak", dest,
+                                      bp::RestoreOptions{}, &report, &error);
+    };
+
+    {
+      // C1：自己（有标记）的残留在 0000 子目录上仍必须清得干净。
+      const std::string dest = work + "/c1";
+      test_support::WriteFile(
+          dest + "." + self_pid + ".owner",
+          TempOwnerMarkerText(static_cast<long>(::getpid())), 0600);
+      const std::string stale = dest + "." + self_pid + ".staging";
+      test_support::Mkdir(stale, 0755);
+      test_support::Mkdir(stale + "/zero", 0755);
+      test_support::WriteFile(stale + "/zero/inside.txt", "zero", 0644);
+      test_support::Check(::chmod((stale + "/zero").c_str(), 0000) == 0,
+                          "INC-R T22 C1 造出 0000 子目录");
+      const bool ok = try_restore(dest);
+      test_support::Check(ok, "INC-R T22 C1 0000 子目录仍能被安全强制清理",
+                          error);
+      test_support::Check(!test_support::Exists(stale),
+                          "INC-R T22 C1 含 0000 子目录的残留被清干净");
+      DropTreeForcingModes(stale);
+    }
+
+    {
+      // C2：有标记的软链接条目——只允许摘掉链接本身。
+      const std::string dest = work + "/c2";
+      test_support::WriteFile(
+          dest + "." + self_pid + ".owner",
+          TempOwnerMarkerText(static_cast<long>(::getpid())), 0600);
+      const std::string precious = work + "/c2-precious";
+      test_support::Mkdir(precious, 0755);
+      test_support::WriteFile(precious + "/treasure.txt", "TREASURE", 0644);
+      const std::string link = dest + "." + self_pid + ".overlay";
+      test_support::Check(test_support::CreateSymlink(precious, link),
+                          "INC-R T22 C2 造出同名软链接残留");
+      const bool ok = try_restore(dest);
+      std::string content;
+      struct stat info;
+      test_support::Check(ok, "INC-R T22 C2 软链接残留不影响恢复", error);
+      test_support::Check(
+          test_support::ReadFile(precious + "/treasure.txt", &content) &&
+              content == "TREASURE",
+          "INC-R T22 C2 软链接目标未被 follow", content);
+      test_support::Check(::lstat(link.c_str(), &info) != 0,
+                          "INC-R T22 C2 只摘掉链接本身");
+    }
+
+    {
+      // C3：跨进程（死 pid）的 0000 残留——走的是同一条强制权限路径。
+      const std::string dest = work + "/c3";
+      const pid_t dead = ::fork();
+      if (dead == 0) {
+        ::_exit(0);
+      }
+      int child_status = 0;
+      if (dead > 0) {
+        ::waitpid(dead, &child_status, 0);
+      }
+      test_support::Check(dead > 0, "INC-R T22 C3 fork 出一个死 pid");
+      const long dead_pid = static_cast<long>(dead);
+      const std::string stale =
+          dest + "." + std::to_string(dead_pid) + ".staging";
+      test_support::Mkdir(stale, 0755);
+      test_support::Mkdir(stale + "/zero", 0755);
+      test_support::WriteFile(stale + "/zero/inside.txt", "zero", 0644);
+      ::chmod((stale + "/zero").c_str(), 0000);
+      test_support::WriteFile(TempOwnerMarkerPath(dest, dead_pid),
+                              TempOwnerMarkerText(dead_pid), 0600);
+      const bool ok = try_restore(dest);
+      test_support::Check(ok, "INC-R T22 C3 死 pid 的 0000 残留被回收", error);
+      test_support::Check(!test_support::Exists(stale),
+                          "INC-R T22 C3 含 0000 子目录的跨进程残留被清掉");
+      DropTreeForcingModes(stale);
+    }
   }
 
   return test_support::Finish("incremental_restore_test");
