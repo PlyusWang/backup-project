@@ -2125,5 +2125,63 @@ int main() {
     }
   }
 
+  {
+    // ============================================================
+    // 10.14 destination 的父目录不存在时仍必须能恢复。
+    //
+    // 这是**本轮自己引入又自己修掉**的一个回归：为了让所有删除都相对一个已经
+    // 打开的父目录 fd 进行，第一版实现进入时直接 open(destination_parent)，
+    // 父目录不存在就报错返回。但产品既有契约是"父目录交给
+    // RunRestorePipeline 里的 MakeDirectories 建出来"
+    // （archive_pipeline.cpp: \`MakeDirectories(destination_parent)\`），
+    // 所以恢复到一个还不存在的目录下面本来应当成功。
+    //
+    // 抓到它的是现代 GUI 的端到端套件：backup-options 区的
+    // "AES 正确密码恢复成功" 变成了
+    // \`Cannot open the destination parent directory ...: No such file or directory\`。
+    // 这里补一条单元级回归，让它在被改坏的第一时间就红。
+    // ============================================================
+    test_support::Section("INC-R 10.14 父目录不存在时仍能恢复");
+    const std::string work = test_support::FreshDir("inc-parent-missing");
+    const std::string source = work + "/src";
+    const std::string repository = work + "/repo";
+    test_support::Mkdir(source, 0755);
+    test_support::Mkdir(repository, 0755);
+    bp::IncrementalOutcome outcome;
+    std::string error;
+    test_support::WriteFile(source + "/a.txt", "parent-v1", 0644);
+    test_support::Check(
+        MakeSnapshot(source, repository, "s1.bak", &outcome, &error),
+        "INC-R T23 基线建立成功", error);
+
+    // 两级父目录都不存在。
+    const std::string missing_parent = work + "/nope/deeper";
+    const std::string destination = missing_parent + "/restored";
+    test_support::Check(!test_support::Exists(missing_parent),
+                        "INC-R T23 前置：父目录确实不存在");
+    bp::RestoreReport report;
+    error.clear();
+    const bool ok = bp::RestoreSnapshotChain(repository, "s1.bak", destination,
+                                             bp::RestoreOptions{}, &report,
+                                             &error);
+    std::string content;
+    test_support::Check(ok, "INC-R T23 父目录不存在时恢复成功", error);
+    test_support::Check(
+        test_support::ReadFile(destination + "/a.txt", &content) &&
+            content == "parent-v1",
+        "INC-R T23 恢复内容正确", content);
+    const std::string self_pid =
+        std::to_string(static_cast<long>(::getpid()));
+    test_support::Check(
+        !test_support::Exists(destination + "." + self_pid + ".staging"),
+        "INC-R T23 不留 staging 残留");
+    test_support::Check(
+        !test_support::Exists(destination + "." + self_pid + ".overlay"),
+        "INC-R T23 不留 overlay 残留");
+    test_support::Check(
+        !test_support::Exists(destination + "." + self_pid + ".owner"),
+        "INC-R T23 不留所有权标记");
+  }
+
   return test_support::Finish("incremental_restore_test");
 }
