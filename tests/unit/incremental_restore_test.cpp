@@ -139,6 +139,17 @@ void DropTreeForcingModes(const std::string& path) {
   test_support::RemoveTree(path);
 }
 
+// 与产品一致的临时条目**所有权标记**：目录名 + 标记内容同时匹配才会被回收。
+// 没有标记的同名目录（= 用户自建）一律不碰，这是本轮 P0 的安全契约。
+std::string TempOwnerMarkerPath(const std::string& destination, long owner_pid) {
+  return destination + "." + std::to_string(owner_pid) + ".owner";
+}
+
+std::string TempOwnerMarkerText(long owner_pid) {
+  return std::string("BPRESTORE-TMP-OWNER/1\n") + std::to_string(owner_pid) +
+         "\n";
+}
+
 // 一次受支持的增量备份（MyPack + 不压缩 + 不加密）。
 bool MakeSnapshot(const std::string& source, const std::string& repository,
                   const std::string& name, bp::IncrementalOutcome* outcome,
@@ -1178,7 +1189,18 @@ int main() {
     if (dead_pid2 > 0) {
       ::waitpid(dead_pid2, &child_status, 0);
     }
-    test_support::Check(dead_pid > 0 && live_pid > 0 && dead_pid2 > 0,
+    // 第三个死 pid：构造"名字合规但**完全没有标记**"的用户自建目录。
+    // 注意所有权标记是 **per-pid** 的（见 TempOwnerMarkerPath），所以不能与
+    // 已经有标记的 pid 复用，否则测的就不是"没有标记"这件事了。
+    const pid_t dead_pid3 = ::fork();
+    if (dead_pid3 == 0) {
+      ::_exit(0);
+    }
+    if (dead_pid3 > 0) {
+      ::waitpid(dead_pid3, &child_status, 0);
+    }
+    test_support::Check(dead_pid > 0 && live_pid > 0 && dead_pid2 > 0 &&
+                            dead_pid3 > 0,
                         "INC-R T17 fork 出构造用的死/活 pid");
 
     if (dead_pid > 0 && live_pid > 0) {
@@ -1198,6 +1220,12 @@ int main() {
       test_support::WriteFile(stale_container, "container", 0644);
       // 只读子树：以前正是它让"尽力而为"的清理整棵失败。
       test_support::Mkdir(stale_staging + "/ro", 0500);
+      // 来源证明：这些条目要能被回收，必须有内容正确的所有权标记。
+      test_support::Check(
+          test_support::WriteFile(
+              TempOwnerMarkerPath(destination, static_cast<long>(dead_pid)),
+              TempOwnerMarkerText(static_cast<long>(dead_pid)), 0600),
+          "INC-R T17 为死 pid 的条目写下所有权标记");
 
       // 2) 活 pid 的 staging：必须原样保留（那是别人正在用的）。
       const std::string live_staging = destination + live_suffix + ".staging";
@@ -1225,6 +1253,17 @@ int main() {
       const std::string symlink_path = destination + dead_suffix2 + ".overlay";
       test_support::Check(::symlink(precious.c_str(), symlink_path.c_str()) == 0,
                           "INC-R T17 造出指回 precious 的软链接残留");
+      test_support::Check(
+          test_support::WriteFile(
+              TempOwnerMarkerPath(destination, static_cast<long>(dead_pid2)),
+              TempOwnerMarkerText(static_cast<long>(dead_pid2)), 0600),
+          "INC-R T17 为软链接条目写下所有权标记");
+      // 安全对照：名字完全合规、但**没有标记**（用户自建）的目录必须原样保留。
+      const std::string dead_suffix3 =
+          "." + std::to_string(static_cast<long>(dead_pid3));
+      const std::string unmarked = destination + dead_suffix3 + ".staging";
+      test_support::Mkdir(unmarked, 0755);
+      test_support::WriteFile(unmarked + "/user-file.txt", "user", 0644);
 
       bp::RestoreReport report;
       error.clear();
@@ -1254,6 +1293,13 @@ int main() {
       struct stat link_info;
       test_support::Check(::lstat(symlink_path.c_str(), &link_info) != 0,
                           "INC-R T17 软链接残留本身被摘掉（unlink 不 follow）");
+      test_support::Check(
+          test_support::Exists(unmarked + "/user-file.txt"),
+          "INC-R T17 无标记的同名用户目录原样保留（来源证明生效）");
+      test_support::Check(
+          !test_support::Exists(
+              TempOwnerMarkerPath(destination, static_cast<long>(dead_pid))),
+          "INC-R T17 回收后死 pid 的所有权标记被清掉");
 
       // 收尾：把活着的子进程和注入树收掉。
       ::kill(live_pid, SIGTERM);
@@ -1263,7 +1309,198 @@ int main() {
       DropTreeForcingModes(wrong_kind);
       DropTreeForcingModes(other_stale);
       DropTreeForcingModes(symlink_path);
+      DropTreeForcingModes(unmarked);
     }
+  }
+
+  {
+    // 10.9 临时条目回收的**来源证明**与路径安全（本轮 P0 修复的回归）。
+    //
+    // 契约：只有同时满足"名字规则 + 所有权标记内容匹配 + 属主是自己 + pid 已死"
+    // 的条目才会被回收；**没有标记的一律不碰**。这直接对应"同一 UID 的用户自建
+    // 同名目录不能被删"这条安全要求。
+    const std::string work = test_support::FreshDir("inc-tmp-provenance");
+    const std::string source = work + "/src";
+    const std::string repository = work + "/repo";
+    test_support::Mkdir(source, 0755);
+    test_support::Mkdir(repository, 0755);
+    bp::IncrementalOutcome outcome;
+    std::string error;
+
+    test_support::WriteFile(source + "/a.txt", "a-v1", 0644);
+    test_support::Check(
+        MakeSnapshot(source, repository, "s1.bak", &outcome, &error),
+        "INC-R T18 基线建立成功", error);
+
+    const std::string destination = work + "/restored";
+
+    // 三个**真的已经死掉**的 pid（fork 后立刻退出并回收）。
+    pid_t dead[3] = {0, 0, 0};
+    int child_status = 0;
+    for (int index = 0; index < 3; ++index) {
+      dead[index] = ::fork();
+      if (dead[index] == 0) {
+        ::_exit(0);
+      }
+      if (dead[index] > 0) {
+        ::waitpid(dead[index], &child_status, 0);
+      }
+    }
+    test_support::Check(dead[0] > 0 && dead[1] > 0 && dead[2] > 0,
+                        "INC-R T18 fork 出三个死 pid");
+
+    const long pid0 = static_cast<long>(dead[0]);
+    const long pid1 = static_cast<long>(dead[1]);
+    const long pid2 = static_cast<long>(dead[2]);
+
+    // (1) 同 UID 用户自建、名字**完全符合**回收规则的普通目录，里面放重要文件。
+    //     它的"标记"是伪造的（内容不对），因此必须原样保留。
+    const std::string forged = destination + "." + std::to_string(pid0) + ".staging";
+    test_support::Mkdir(forged, 0755);
+    test_support::WriteFile(forged + "/precious.txt", "user-data", 0644);
+    test_support::WriteFile(TempOwnerMarkerPath(destination, pid0),
+                            "THIS-IS-NOT-OUR-MAGIC\n" + std::to_string(pid0) +
+                                "\n",
+                            0600);
+
+    // (2) 真正由本软件留下的旧残留：目录 + 内容正确的标记 → 应当被回收。
+    const std::string real = destination + "." + std::to_string(pid1) + ".staging";
+    test_support::Mkdir(real, 0755);
+    test_support::WriteFile(real + "/left.txt", "left", 0644);
+    test_support::Mkdir(real + "/ro", 0500);  // 只读子树：清理仍须成功
+    test_support::WriteFile(TempOwnerMarkerPath(destination, pid1),
+                            TempOwnerMarkerText(pid1), 0600);
+
+    // (3) 名字与标记都合规，但条目本身是**指向受保护目录的软链接**：
+    //     只允许摘掉链接，绝不允许 follow 进目标。
+    const std::string precious_dir = work + "/precious-dir";
+    test_support::Mkdir(precious_dir, 0755);
+    test_support::WriteFile(precious_dir + "/treasure.txt", "treasure", 0644);
+    const std::string link_entry =
+        destination + "." + std::to_string(pid2) + ".overlay";
+    test_support::Check(::symlink(precious_dir.c_str(), link_entry.c_str()) == 0,
+                        "INC-R T18 造出合规名字的软链接条目");
+    test_support::WriteFile(TempOwnerMarkerPath(destination, pid2),
+                            TempOwnerMarkerText(pid2), 0600);
+
+    bp::RestoreReport report;
+    error.clear();
+    const bool ok = bp::RestoreSnapshotChain(repository, "s1.bak", destination,
+                                             bp::RestoreOptions{}, &report,
+                                             &error);
+    test_support::Check(ok, "INC-R T18 正常恢复成功（回收不影响发布）", error);
+    std::string restored;
+    test_support::Check(
+        test_support::ReadFile(destination + "/a.txt", &restored) &&
+            restored == "a-v1",
+        "INC-R T18 恢复内容正确", restored);
+
+    // 核心安全断言：没有来源证明的用户目录**一个字节都不能少**。
+    test_support::Check(test_support::Exists(forged),
+                        "INC-R T18 无标记的同名用户目录未被删除");
+    test_support::Check(test_support::Exists(forged + "/precious.txt"),
+                        "INC-R T18 无标记目录里的受保护文件未被删除");
+    test_support::Check(test_support::Exists(TempOwnerMarkerPath(destination, pid0)),
+                        "INC-R T18 伪造的标记文件未被删除");
+
+    // 有来源证明的旧残留应当被回收（含 0500 只读子树）。
+    test_support::Check(!test_support::Exists(real),
+                        "INC-R T18 有标记的旧 staging 残留被回收（含只读子树）");
+    test_support::Check(!test_support::Exists(TempOwnerMarkerPath(destination, pid1)),
+                        "INC-R T18 有标记的旧残留其标记也一并清掉");
+
+    // 软链接：目标必须完好，链接条目本身被摘掉。
+    test_support::Check(test_support::Exists(precious_dir + "/treasure.txt"),
+                        "INC-R T18 合规名字的软链接未被 follow（目标完好）");
+    struct stat link_info;
+    test_support::Check(::lstat(link_entry.c_str(), &link_info) != 0,
+                        "INC-R T18 合规名字的软链接条目本身被摘掉");
+    test_support::Check(!test_support::Exists(TempOwnerMarkerPath(destination, pid2)),
+                        "INC-R T18 软链接条目的标记也已清掉");
+
+    // 本轮自己的标记：正常结束后不应残留。
+    const std::string self_pid_text =
+        std::to_string(static_cast<long>(::getpid()));
+    test_support::Check(
+        !test_support::Exists(destination + "." + self_pid_text + ".owner"),
+        "INC-R T18 本轮自己的所有权标记已撤掉");
+
+    DropTreeForcingModes(forged);
+    DropTreeForcingModes(TempOwnerMarkerPath(destination, pid0));
+    DropTreeForcingModes(real);
+  }
+  {
+    // 10.10 destination 词法规范化：尾斜杠不得再破坏恢复（本轮 P1 修复的回归）。
+    const std::string work = test_support::FreshDir("inc-trailing-slash");
+    const std::string source = work + "/src";
+    const std::string repository = work + "/repo";
+    test_support::Mkdir(source, 0755);
+    test_support::Mkdir(repository, 0755);
+    bp::IncrementalOutcome outcome;
+    std::string error;
+    test_support::WriteFile(source + "/a.txt", "slash-v1", 0644);
+    test_support::Check(
+        MakeSnapshot(source, repository, "s1.bak", &outcome, &error),
+        "INC-R T19 基线建立成功", error);
+    bp::RestoreReport report;
+
+    const std::string with_slash = work + "/dest-one";
+    test_support::Mkdir(with_slash, 0755);
+    error.clear();
+    test_support::Check(
+        bp::RestoreSnapshotChain(repository, "s1.bak", with_slash + "/",
+                                 bp::RestoreOptions{}, &report, &error),
+        "INC-R T19 单尾斜杠（已存在空目录）恢复成功", error);
+    std::string got;
+    test_support::Check(
+        test_support::ReadFile(with_slash + "/a.txt", &got) && got == "slash-v1",
+        "INC-R T19 单尾斜杠恢复内容正确", got);
+
+    const std::string many_slash = work + "/dest-many";
+    error.clear();
+    test_support::Check(
+        bp::RestoreSnapshotChain(repository, "s1.bak", many_slash + "///",
+                                 bp::RestoreOptions{}, &report, &error),
+        "INC-R T19 多尾斜杠（目标不存在）恢复成功", error);
+    test_support::Check(
+        test_support::ReadFile(many_slash + "/a.txt", &got) && got == "slash-v1",
+        "INC-R T19 多尾斜杠恢复内容正确", got);
+
+    const std::string plain = work + "/dest-plain";
+    error.clear();
+    test_support::Check(
+        bp::RestoreSnapshotChain(repository, "s1.bak", plain,
+                                 bp::RestoreOptions{}, &report, &error),
+        "INC-R T19 无尾斜杠恢复正常", error);
+    test_support::Check(
+        test_support::ReadFile(plain + "/a.txt", &got) && got == "slash-v1",
+        "INC-R T19 无尾斜杠内容正确", got);
+
+    error.clear();
+    test_support::Check(
+        !bp::RestoreSnapshotChain(repository, "s1.bak", with_slash,
+                                  bp::RestoreOptions{}, &report, &error),
+        "INC-R T19 非空目标被拒绝", error);
+    test_support::Check(
+        test_support::ReadFile(with_slash + "/a.txt", &got) && got == "slash-v1",
+        "INC-R T19 非空目标内容未被覆盖", got);
+
+    error.clear();
+    test_support::Check(
+        !bp::RestoreSnapshotChain(repository, "s1.bak", "/",
+                                  bp::RestoreOptions{}, &report, &error),
+        "INC-R T19 根目录被安全拒绝", error);
+    test_support::Check(test_support::Exists("/tmp"),
+                        "INC-R T19 根目录尝试后 /tmp 仍然存在");
+
+    const std::string self_pid_text =
+        std::to_string(static_cast<long>(::getpid()));
+    test_support::Check(
+        !test_support::Exists(work + "/dest-one." + self_pid_text + ".staging"),
+        "INC-R T19 尾斜杠恢复后不留 staging 残留");
+    test_support::Check(
+        !test_support::Exists(work + "/dest-one." + self_pid_text + ".owner"),
+        "INC-R T19 尾斜杠恢复后不留所有权标记");
   }
 
   return test_support::Finish("incremental_restore_test");
