@@ -686,10 +686,12 @@ include/archive_pipeline.h:74-78）。
 
 如实列出，不藏的才叫限制：
 
-1. **TOCTOU**：路径检查通过之后按 pathname 再使用，不抵抗恶意并发进程在检查与使用
-   之间替换路径组件。仓库层（include/backup_catalog.h:30-38）与归档层
-   （src/archive/archive.cpp:750）都写明了这一点；更强的做法是 dirfd + openat2，
-   当前版本没有实现。
+1. **TOCTOU / 文件系统竞争边界**：仓库层、部分归档与恢复失败清理仍含先检查再按
+   pathname 操作的竞争窗口，不能声称可抵抗恶意同 UID 进程。PR #34 已对增量恢复的
+   临时目录排他认领、身份不可验证时的保守回滚，以及部分 fd 相对清理做了定向加固；
+   这不等于整个代码库具有统一的 dirfd / openat2 沙箱。剩余风险、威胁模型和独立
+   复现验收标准集中记录在 `docs/backlog/filesystem_security_future.md`，不在当前
+   PR 中继续扩大修改范围。
 2. **手写密码学未审计**：DES-CBC 明确是 legacy / educational，AES 组合也不是
    经过审计的密码学产品（include/container_format.h:13-16）。
 3. **v0.1 只读兼容**：产品里没有生成 v0.1 归档的路径，写入能力只在测试夹具
