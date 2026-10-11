@@ -501,6 +501,8 @@ bash scripts/stage-server-release.sh     # 默认 dist/server/
 | `docs/requirements/requirements_revision_suggestions.md` | 对需求文档与 UML 的修改建议 |
 | `docs/uml/*.mdj` | 用例图 / 类图 / 组件图 / 备份与恢复时序图（StarUML） |
 | `docs/gantt/project_gantt.tex`（含 `archive/` 下的历史版本） | 项目甘特图 |
+| `docs/backlog/README.md` | **后续 TODO / Backlog 总索引**：按安全技术债、备份、Filter、远程管理分类 |
+| `docs/backlog/filesystem_security_future.md` | **文件系统安全加固**：残余 TOCTOU、同 UID 对抗、增量提取失败清理 | 
 | `docs/backlog/backup_mode_roadmap.md` | 备份触发方式 × 备份策略的后续路线 |
 | `docs/backlog/filter_future.md` | Filter 的技术债与待决策事项 |
 | `docs/backlog/remote_management_future.md` | 远程管理面的后续方向（**均未实现**） |
