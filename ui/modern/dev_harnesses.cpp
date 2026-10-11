@@ -3654,14 +3654,12 @@ int RunCloseGuardTest(QQuickWindow* window,
 // 非当前页整体不可见，用 visible 永远测不出"这一页会不会显示这条消息"。
 // ---- --combo-hover-test ----
 //
-// 共享 AppComboBox 下拉行的状态回归（同一个坑的不同形态）。
+// 共享 AppComboBox 下拉行的状态回归。
 //
-//   第一轮：hover 底色绑到 control.highlightedIndex（常驻索引）
-//   第二轮：改成"键盘高亮 + highlightedIndex"，但 highlightedIndex 会被鼠标改脏
-//   第三轮：改成监听 Keys.onPressed，真实桌面上收不到事件（焦点在 ComboBox 上）
-//
-// 现在键盘模式由**Qt 导航的结果**推断：popup ListView 的 currentIndex 变了、
-// 而且当前没有指针活动 —— 不监听按键，也不接管任何键。
+// 被钉住的不变量：hover 底色只能来自 row.hovered，键盘高亮只能由**Qt 导航的
+// 结果**推断（popup ListView 的 currentIndex 变化且当前没有指针活动）。
+// highlightedIndex 既不能证明键盘高亮（鼠标划过也会改它），监听按键也收不到
+// 事件（焦点在 ComboBox 上，不在 popup 的 ListView），所以两者都不用。
 //
 // 这个自检真的把指针移到行上、移走，也真的把 ↓ 送进真实焦点链，然后逐行读
 // 运行期状态（hovered / 覆盖层 opacity / currentIndex / 输入方式闸门）。

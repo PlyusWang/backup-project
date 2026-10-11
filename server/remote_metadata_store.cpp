@@ -54,8 +54,8 @@ namespace {
 constexpr const char* kPragmaStatements[] = {
     // busy_timeout 必须排在**最前面**：并发首次打开时，第二条连接若还没装上
     // busy_timeout 就先执行 journal_mode=WAL（需要写锁），它会立刻拿到
-    // SQLITE_BUSY，表现为随机的 "database is locked" 假失败（审查轮实测
-    // 2 线程首次并发 Open 可复现，重试即成功）。
+    // SQLITE_BUSY，表现为随机的 "database is locked" 假失败（2 线程首次并发
+    // Open 即可复现，重试即成功）。
     "PRAGMA busy_timeout=5000;", "PRAGMA journal_mode=WAL;",
     "PRAGMA synchronous=FULL;",  "PRAGMA foreign_keys=ON;",
     "PRAGMA busy_timeout=5000;",

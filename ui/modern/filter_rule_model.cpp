@@ -351,17 +351,15 @@ QString ClauseDetail(const bp::FilterClauseDraft& clause) {
   return QString();
 }
 
-// 预览里的文件大小也走全产品唯一的格式化规则：以前这里是整数截断的
-// “KB / MB”，而实际除的是 1024。
-// 预览里的大小也走全产品唯一的格式化函数：以前这里是整数截断的 KB/MB，
-// 而实际除的是 1024，同一份数据在预览和归档列表上显示成两个值。
+// 预览里的大小也走全产品唯一的格式化函数：以前这里按 1024 除却写成 KB/MB，
+// 同一份数据在预览和归档列表上会显示成两个值。
 QString FormatSize(std::uint64_t bytes) {
   return QString::fromStdString(backupproject::FormatByteSize(bytes));
 }
 
-// 单位键 -> 枚举。注意这里会默默兜底：不认识的键
-// 一律变成 KB。它安全的前提是调用方只喂 kUnits 表里的取值；如果哪天键来自
-// 持久化数据，这里必须改成返回 bool，否则规则会悄悄换一个数量级。
+// 单位键 -> 枚举。它**会默默兜底**：不认识的键一律变成 KB。安全的前提是调用方
+// 只喂 kUnits 表里的取值；如果哪天键来自持久化数据，这里必须改成返回 bool，
+// 否则规则会悄悄换一个数量级。
 bp::RuleSizeUnit UnitFromText(const QString& text) {
   if (text == "B") return bp::RuleSizeUnit::kByte;
   if (text == "MB") return bp::RuleSizeUnit::kMega;
