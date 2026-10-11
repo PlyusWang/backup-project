@@ -37,6 +37,7 @@
 #include "backup_catalog.h"
 #include "container_format.h"
 #include "file_io.h"
+#include "file_system.h"
 #include "incremental_backup.h"
 
 // O_PATH 是 Linux 2.6.39+ 的原语：只把目录项**绑定**成对象，不打开内容。
@@ -303,44 +304,82 @@ bool RemoveTempEntryAt(int parent_fd, const std::string& name) {
 // 不能来自文件名、pid，也不能来自一次事先的存在性检查。把"没有创建成功"误解成
 // "现在可以删除"，就会去删一个别人的同名对象。
 struct TempClaim {
-  // 本轮拥有这个名字（收尾可以尝试回收它）。
+  // 本轮拥有这个名字（收尾可以按名字回收它）。
+  //
+  // 它等价于 created && id_known：只有"排他创建成功"**且**"当场拿到了对象身份"
+  // 两项都成立，这个名字才归本轮处置。少任何一项都没有按名字删除的依据。
   bool owned = false;
-  // **本次调用**的 mkdirat 真的成功了 —— 只有它授权"认领中途失败时回滚删除"。
+  // **本次调用**的 mkdirat 真的成功了。文件系统确实变了，所以调用方既不能当作
+  // "什么都没发生"，也不能凭它取得按名字删除的权限。
   bool created = false;
-  // 记录到了创建那一刻的 dev/ino，回收前要拿它比对。
+  // 创建那一刻记录到的对象身份（dev/ino，且确认过那是个目录），回滚前要拿它比对。
   bool id_known = false;
   struct stat id {};
 };
+
+// 排他认领的结果。**三态是必需的**："创建成功但身份未知"既不是成功，也不是
+// "什么都没创建"：
+//   * kNotCreated   —— mkdirat 失败：同名对象不是本轮创建的，**绝不允许删除**；
+//   * kClaimed      —— 创建成功且当场记录了对象身份：可以继续使用，按名字回收；
+//   * kUnverifiable —— 创建成功、身份却没拿到：文件系统确实变了，但这个名字此刻
+//                      是否仍指向本轮创建的对象**无法证明**。既不能按名字继续
+//                      使用，也不能按名字递归删除，只能 fail-closed，把残留与
+//                      所有权标记留下，等"能证明来源"的路径去回收。
+enum class TempClaimResult { kNotCreated, kClaimed, kUnverifiable };
+
+// 回滚一个"本次调用刚刚创建"的临时目录的结果。
+//   * kNotCreated  —— 不是本次创建的：什么都没做，也绝不允许删除；
+//   * kRemoved     —— 确认是本次创建的那个对象，已经回收（或已经不在了）；
+//   * kLeftInPlace —— 无法确认身份：保守留下，**没有删除任何东西**。
+enum class RollbackResult { kNotCreated, kRemoved, kLeftInPlace };
 
 // 排他认领一个临时目录。相对**已经打开的父目录 fd**（mkdirat），不做路径解析。
 //
 // mkdirat 的原子性同时提供了"检查存在"与"创建"两件事：EEXIST 就是冲突，
 // 不需要（也不应该）先前再 fstatat 查一次——那会多出一个 TOCTOU 窗口。
 //
-// 返回 false 时**保证没有创建任何东西**，调用方因此绝不允许删除同名对象。
-bool ClaimTempDirectoryAt(int parent_fd, const std::string& name,
-                          TempClaim* claim) {
-  if (parent_fd < 0 || name.empty()) return false;
-  // 失败时**一个字段都不改**：调用方可能正拿着一份"上一轮记录的 dev/ino"，
-  // 把它清掉会让后面的回收退回按名字删除，等于把已经堵上的洞重新打开。
-  if (::mkdirat(parent_fd, name.c_str(), 0700) != 0) return false;
-  claim->created = true;
-  claim->owned = true;
-  claim->id_known = false;
-  // 记下刚创建出来的对象身份，供回收时比对。这里失败是几乎不可能的事件；
-  // 保守处理成"身份未知"，回收时会退回名字匹配（见 ReclaimTempEntry）。
-  struct stat info;
-  if (::fstatat(parent_fd, name.c_str(), &info, AT_SYMLINK_NOFOLLOW) == 0) {
-    claim->id = info;
-    claim->id_known = true;
+// kNotCreated 时**一个字段都不改**：调用方可能正拿着一份"上一轮记录的
+// dev/ino"，把它清掉会让后面的回收退回按名字删除，等于把已经堵上的洞重新打开。
+TempClaimResult ClaimTempDirectoryAt(int parent_fd, const std::string& name,
+                                     TempClaim* claim) {
+  if (parent_fd < 0 || name.empty()) {
+    errno = EINVAL;
+    return TempClaimResult::kNotCreated;
   }
-  return true;
+  if (::mkdirat(parent_fd, name.c_str(), 0700) != 0) {
+    return TempClaimResult::kNotCreated;  // errno 就是 mkdirat 的原因
+  }
+  claim->created = true;
+  claim->owned = false;
+  claim->id_known = false;
+  // 记下刚创建出来的对象身份，供回滚时比对。
+  //
+  // 这里**只探测一次**，失败就认"身份未知"。再探一次不是更安全，而是更危险：
+  // 两次探测之间那个名字可能已经被换成别人的对象，第二次探到的 dev/ino 恰好会
+  // 把**别人的**对象记成"我们的"，回滚时再理直气壮地把它删掉。
+  struct stat info;
+  if (::fstatat(parent_fd, name.c_str(), &info, AT_SYMLINK_NOFOLLOW) != 0) {
+    return TempClaimResult::kUnverifiable;  // errno 保留 fstatat 的原因
+  }
+  if (!S_ISDIR(info.st_mode)) {
+    // 我们建的是目录：这个名字上现在不是目录，就说明它不是刚建出来的那一个。
+    errno = ENOTDIR;
+    return TempClaimResult::kUnverifiable;
+  }
+  claim->id = info;
+  claim->id_known = true;
+  claim->owned = true;
+  return TempClaimResult::kClaimed;
 }
 
-// 收尾时回收一项本轮拥有的临时资源。
+// 收尾时回收一项临时资源。
 //
-//   * 不拥有 -> 什么都不做（返回 true：没有属于本轮的东西残留）；
-//   * 拥有   -> 走 fd 相对的 RemoveTempEntryAt。
+//   * 不拥有、也没创建过 -> 什么都不做（返回 true：没有属于本轮的东西残留）；
+//   * 不拥有、却创建过   -> "我们做出来的、但无法证明"的东西可能还挂在这个名字
+//                           上：不按名字删（没有依据），也不宣称干净（调用方会
+//                           因此撤掉所有权标记，那些残留就永远失去回收来源），
+//                           如实返回 false；
+//   * 拥有              -> 走 fd 相对的 RemoveTempEntryAt。
 //
 // 这里刻意不做 dev/ino 比对。staging 与 overlay 一旦交给下游的
 // RunRestorePipeline，就会被它自己的暂存加原子 rename 整体换掉 inode；
@@ -349,14 +388,14 @@ bool ClaimTempDirectoryAt(int parent_fd, const std::string& name,
 // 甚至让下一个 delta 的认领直接 EEXIST 失败。
 // （这条是被实测抓出来的：加错位置的版本在 T3/T8/T10/T11 上一度连红 15 条。）
 //
-// 身份约束加在真正需要它的地方 —— "认领中途失败时回滚刚刚创建的那个空目录"，
-// 见 RollbackJustCreatedEntry。
+// 身份约束加在真正需要它的地方 —— "认领中途失败时回滚刚刚创建的那个空目录"
+// （见 RollbackJustCreatedEntry），以及上面"身份没拿到就绝不声称干净"。
 //
 // 返回 false 表示"有东西没回收掉"。调用方据此决定**不要**撤销所有权标记，
 // 否则那些残留以后再也无法被自动回收。
 bool ReclaimTempEntry(int parent_fd, const std::string& name,
                       const TempClaim& claim) {
-  if (!claim.owned) return true;
+  if (!claim.owned) return !claim.created;
   return RemoveTempEntryAt(parent_fd, name);
 }
 
@@ -365,20 +404,27 @@ bool ReclaimTempEntry(int parent_fd, const std::string& name,
 // 所以它的身份是可靠的、也应当被校验。
 //
 //   * created == false -> 不是本次创建的，**绝不删除**；
-//   * 记过 dev/ino   -> 目录项此刻必须仍指向同一个对象，否则保守失败、不删。
-bool RollbackJustCreatedEntry(int parent_fd, const std::string& name,
-                              const TempClaim& claim) {
-  if (!claim.created) return false;
-  if (claim.id_known) {
-    struct stat now;
-    if (::fstatat(parent_fd, name.c_str(), &now, AT_SYMLINK_NOFOLLOW) != 0) {
-      return errno == ENOENT;  // 已经不在了：视为已回收
-    }
-    if (now.st_dev != claim.id.st_dev || now.st_ino != claim.id.st_ino) {
-      return false;  // 已经被换成别的对象：绝不删除未知对象
-    }
+//   * id_known == false -> 创建过、却始终没取得对象身份：**绝不能按名字递归
+//                          删除**。身份缺失不是删除的理由，恰恰相反 —— 它意味着
+//                          删除的依据根本不存在。（这正是被修掉的那个洞：以前
+//                          身份缺失会**跳过**身份检查，直接按名字删。）
+//   * 记过 dev/ino -> 目录项此刻必须仍指向同一个对象，否则保守失败、不删。
+RollbackResult RollbackJustCreatedEntry(int parent_fd, const std::string& name,
+                                        const TempClaim& claim) {
+  if (!claim.created) return RollbackResult::kNotCreated;
+  if (!claim.id_known) return RollbackResult::kLeftInPlace;
+  struct stat now;
+  if (::fstatat(parent_fd, name.c_str(), &now, AT_SYMLINK_NOFOLLOW) != 0) {
+    // 只有 ENOENT 才说明"这个名字上已经没有我们的东西了"；其它错误说不清，
+    // 一律保守留下，也不删。
+    return errno == ENOENT ? RollbackResult::kRemoved
+                           : RollbackResult::kLeftInPlace;
   }
-  return RemoveTempEntryAt(parent_fd, name);
+  if (now.st_dev != claim.id.st_dev || now.st_ino != claim.id.st_ino) {
+    return RollbackResult::kLeftInPlace;  // 已被换成别的对象：绝不删除未知对象
+  }
+  return RemoveTempEntryAt(parent_fd, name) ? RollbackResult::kRemoved
+                                            : RollbackResult::kLeftInPlace;
 }
 
 // 读所有权标记并校验：必须是普通文件、属主是自己、不带 group/other 写位、
@@ -1225,19 +1271,30 @@ bool RestoreSnapshotChain(const std::string& repository_directory,
   const std::string temp_owner_name =
       TempOwnerFileName(destination_base, self_pid);
 
-  // 父目录 fd：**惰性**打开，而且"父目录还不存在"不是错误。
+  // 父目录：**本函数自己按项目既有契约建出来，然后打开并一直持有它的 fd**。
   //
-  // destination 可能是 "<一个还没建的目录>/x"。产品既有的行为是交给
-  // RunRestorePipeline 里的 `MakeDirectories(destination_parent)`
-  // 把父目录建出来 （见 archive_pipeline.cpp）——
-  // 所以这里必须先接受"父目录不存在"这个状态，
-  // 否则就把一条本来能成功的恢复路径变成失败（本轮的现代 GUI 端到端套件正是
-  // 这么把它抓出来的：`Cannot open the destination parent directory
-  // .../restore: No such file or directory`）。
+  // destination 可能是 "<一个还没建的目录>/x"，产品既有的行为就是允许的
+  // （RunRestorePipeline 里的 `MakeDirectories(destination_parent)` 会把它建
+  // 出来，见 archive_pipeline.cpp）。把**同一次调用**前移到认领之前，理由不是
+  // "早点建更好看"，而是安全：
   //
-  // 父目录不存在 = 那里**不可能**有任何临时残留或同名冲突对象，于是标记、
-  // 回收与冲突检查整段跳过，全部交给下游创建。下游建完之后 Ensure() 再打开它，
-  // 之后的删除仍然全部相对这个 fd，不重新解析路径。
+  //   临时资源的所有权必须来自一次**真实的排他创建**。以前父目录不存在时，
+  //   代码把 staging / overlay 直接记成 owned=true，依据只是"进入时那里什么都
+  //   没有"这条**假设** —— 从这条假设到收尾的按名字删除之间，别人完全可以先
+  //   在那个名字下放一个目录，于是它会被当成"自己的残留"递归删掉。
+  //   现在父目录先建好、fd 先拿住，两项资源都走 mkdirat 排他认领，所有权不再
+  //   有任何假设成分。
+  //
+  // 用的是与下游同一个函数：对已经存在的目录它只会拿到 EEXIST 并放过
+  // （**不 chmod、不重建**），所以权限位与 symlink 语义与既有行为完全一致。
+  // 失败时直接返回，此时标记与临时资源都还没有创建，没有任何东西需要回滚。
+  FileSystem file_system;
+  std::string parent_error;
+  if (!file_system.MakeDirectories(destination_parent, &parent_error)) {
+    SetError(error_message, "Cannot create the destination parent directory " +
+                                destination_parent + ": " + parent_error);
+    return false;
+  }
   struct ParentDirGuard {
     int fd = -1;
     ~ParentDirGuard() {
@@ -1252,22 +1309,23 @@ bool RestoreSnapshotChain(const std::string& repository_directory,
   };
   ParentDirGuard parent_dir;
   int parent_fd = parent_dir.Ensure(destination_parent);
-  const bool parent_exists = (parent_fd >= 0);
+  if (parent_fd < 0) {
+    SetError(error_message, "Cannot open the destination parent directory " +
+                                destination_parent + ": " + ErrnoText(errno));
+    return false;
+  }
 
   // 进入时这个名字上**已经**有一个属于本 pid 的合法标记吗？
   //   有   => 上一轮同 pid 的进程崩在中途留下的，这批名字归本程序；
   //   没有 => 下面任何"同名条目已存在"都只能说明名字被别人的对象占着。
   const bool marker_pre_existing =
-      parent_exists &&
       TempOwnerMarkerMatches(parent_fd, temp_owner_name, self_pid);
 
   // marker_owned  ：正常收尾时可以撤掉标记（本次建的，或上一轮同 pid 留下的）
   // marker_created：标记**就是本次调用建的** —— 只有这种情况失败退出时才撤它
   bool marker_owned = false;
   bool marker_created = false;
-  switch (parent_exists
-              ? CreateTempOwnerMarker(parent_fd, temp_owner_name, self_pid)
-              : TempMarkerResult::kFailed) {
+  switch (CreateTempOwnerMarker(parent_fd, temp_owner_name, self_pid)) {
     case TempMarkerResult::kCreated:
       marker_owned = true;
       marker_created = true;
@@ -1337,13 +1395,33 @@ bool RestoreSnapshotChain(const std::string& repository_directory,
     }
   };
 
+  // "创建成功、身份取不到"的统一诊断。必须说清两件事：这次调用**确实创建过**
+  // 东西，以及它**没有被删除**（否则用户会以为磁盘上什么都没有）。
+  const auto refuse_unverifiable = [&](const std::string& name,
+                                       int probe_errno) {
+    SetError(error_message,
+             "Cannot verify the identity of the temporary directory " +
+                 JoinPath(destination_parent, name) +
+                 " created by this run: " + ErrnoText(probe_errno) +
+                 "; it was left in place and nothing under it was removed");
+  };
+
+  // 留下"无法验证 / 无法回收"的残留时，必须同时保住所有权标记：它是以后唯一的
+  // 来源证明，删掉标记等于把这些残留变成永远清不掉的垃圾。
+  const auto note_leftover = [&](std::string* message) {
+    if (message == nullptr) return;
+    *message +=
+        "; the temporary data was left in place and the ownership marker is "
+        "kept so a later run can reclaim it";
+  };
+
   // 2) 进入时的同名冲突检查（纵深防御）。真正权威的冲突检测是第 3 步的排他
   //    mkdirat —— 那一步是原子的；这一遍只是为了让"名字被占着"这种情况在动手
   //    之前就带着更具体的诊断退出。
   //
   //    注意它**不是**安全边界：检查与创建之间对象仍然可能出现（这正是本轮要
   //    修的那条路径），所以第 3 步的认领失败处理必须自己站得住。
-  if (parent_exists) {
+  {
     const std::string occupied_names[3] = {staging_name, overlay_name,
                                            container_name};
     for (const std::string& name : occupied_names) {
@@ -1363,17 +1441,39 @@ bool RestoreSnapshotChain(const std::string& repository_directory,
   // 3) 排他认领 staging / overlay。
   //
   //    本轮的**核心不变量**：清理权限来自"本次调用确实创建了它"这个事实，
-  //    不来自文件名、pid，也不来自事先的存在性检查。认领失败时绝不能去删那个
-  //    同名对象——它不是本轮创建的。
+  //    不来自文件名、pid，也不来自事先的存在性检查。父目录在上面已经由本函数
+  //    自己建好并打开，所以这里**不存在**任何"将来那个名字一定是我建的"这种
+  //    假设 —— 每一项资源的所有权都来自一次真实的 mkdirat
+  //    加一次真实的身份探测。
   //
-  //    父目录原本就不存在时名字也必然不存在（下游会连同父目录一起建出来），
-  //    所以那种情况下这两项直接记成"本轮拥有、但没有记录到身份"。
+  //    三种结果各有各的处置，缺一不可。kNotCreated 表示什么都没创建，那么
+  //    同名对象**绝不删除**；kUnverifiable 表示创建过但身份取不到，走回滚入口、
+  //    由它保证"不按名字删"；kClaimed 才是可以继续往下走的正常路径。
   TempClaim staging_claim;
   TempClaim overlay_claim;
-  staging_claim.owned = !parent_exists;
-  overlay_claim.owned = !parent_exists;
-  if (parent_exists) {
-    if (!ClaimTempDirectoryAt(parent_fd, staging_name, &staging_claim)) {
+  // 退出时"本进程可能还有东西留在临时命名空间里"。它**不决定删不删**（那由
+  // TempClaim 决定），只决定**不要**撤掉所有权标记 —— 标记是那些残留以后唯一的
+  // 来源证明。
+  bool residue_left = false;
+
+  switch (ClaimTempDirectoryAt(parent_fd, staging_name, &staging_claim)) {
+    case TempClaimResult::kClaimed:
+      break;
+    case TempClaimResult::kUnverifiable: {
+      const int saved_errno = errno;
+      // 创建成功、身份没拿到：走回滚入口，由它保证"身份不可验证时绝不按名字
+      // 递归删除"。这里就是那条契约的调用点。
+      residue_left =
+          RollbackJustCreatedEntry(parent_fd, staging_name, staging_claim) !=
+          RollbackResult::kRemoved;
+      refuse_unverifiable(staging_name, saved_errno);
+      if (marker_created && !residue_left) {
+        ::unlinkat(parent_fd, temp_owner_name.c_str(), 0);
+      }
+      if (residue_left) note_leftover(error_message);
+      return false;
+    }
+    case TempClaimResult::kNotCreated: {
       const int saved_errno = errno;
       // staging 没有被本轮创建：**绝不删除它**，也不改它的权限、不碰它的内容。
       // 只撤销本轮确实建出来、且仍属于本轮的标记。
@@ -1383,25 +1483,32 @@ bool RestoreSnapshotChain(const std::string& repository_directory,
       refuse_claim(staging_name, saved_errno);
       return false;
     }
-    if (!ClaimTempDirectoryAt(parent_fd, overlay_name, &overlay_claim)) {
+  }
+
+  switch (ClaimTempDirectoryAt(parent_fd, overlay_name, &overlay_claim)) {
+    case TempClaimResult::kClaimed:
+      break;
+    case TempClaimResult::kUnverifiable:
+    case TempClaimResult::kNotCreated: {
       const int saved_errno = errno;
       // staging 是**本次调用刚刚创建的空目录**：可以回收，而且回收前会比对创建
-      // 时记录的 dev/ino（见 ReclaimTempEntry）。
-      // overlay **不是**本轮创建的：绝不删除它。
+      // 时记录的 dev/ino（见 RollbackJustCreatedEntry）。
+      // overlay 则**永远不删**：kNotCreated 说明它不是本轮创建的，
+      // kUnverifiable 说明无法证明它此刻还是本轮创建的那一个。
       const bool staging_gone =
-          RollbackJustCreatedEntry(parent_fd, staging_name, staging_claim);
-      if (marker_created && staging_gone) {
+          RollbackJustCreatedEntry(parent_fd, staging_name, staging_claim) ==
+          RollbackResult::kRemoved;
+      residue_left =
+          !staging_gone || overlay_claim.created;  // created 即 kUnverifiable
+      if (overlay_claim.created) {
+        refuse_unverifiable(overlay_name, saved_errno);
+      } else {
+        refuse_claim(overlay_name, saved_errno);
+      }
+      if (marker_created && !residue_left) {
         ::unlinkat(parent_fd, temp_owner_name.c_str(), 0);
       }
-      refuse_claim(overlay_name, saved_errno);
-      if (!staging_gone && error_message != nullptr) {
-        // 无法确认 staging 仍是本轮创建的那个对象 —— 保守留下不删，
-        // 并在诊断里说清楚；所有权标记也一并留着，那些残留以后只能靠它被回收。
-        *error_message +=
-            "; the staging directory could not be verified as ours and was "
-            "left in place (the ownership marker is kept so a later run can "
-            "reclaim it)";
-      }
+      if (residue_left) note_leftover(error_message);
       return false;
     }
   }
@@ -1459,12 +1566,20 @@ bool RestoreSnapshotChain(const std::string& repository_directory,
         overlay_claim = TempClaim{};
       }
       // 每个 delta 的 overlay 走排他认领：认领失败说明这个名字不是本轮创建的，
-      // 宁可在这里失败，也**绝不删除它**、更不往里面写。
-      if (!ClaimTempDirectoryAt(parent_fd, overlay_name, &overlay_claim)) {
+      // 宁可在这里失败，也**绝不删除它**、更不往里面写；创建成功却取不到身份
+      // 同样 fail-closed，并且不撤所有权标记（那个名字上可能留着我们的东西）。
+      const TempClaimResult delta_overlay =
+          ClaimTempDirectoryAt(parent_fd, overlay_name, &overlay_claim);
+      if (delta_overlay != TempClaimResult::kClaimed) {
         const int saved_errno = errno;
-        SetError(error_message, "Cannot claim the delta overlay directory " +
-                                    overlay + ": " + ErrnoText(saved_errno) +
-                                    " (it was left untouched)");
+        if (delta_overlay == TempClaimResult::kUnverifiable) {
+          refuse_unverifiable(overlay_name, saved_errno);
+          residue_left = true;
+        } else {
+          SetError(error_message, "Cannot claim the delta overlay directory " +
+                                      overlay + ": " + ErrnoText(saved_errno) +
+                                      " (it was left untouched)");
+        }
         delta_failed = true;
         break;
       }
@@ -1565,11 +1680,12 @@ bool RestoreSnapshotChain(const std::string& repository_directory,
   // 普通 RemoveTree 会卡在"里面删不掉、目录又非空"而把整棵留下——这正是实测到
   // 的残留来源。这棵树是本进程排他认领的，放开宿主权限再删是安全的。
   //
-  // 两次删除都相对 parent_fd，**不重新解析父目录路径**。
-  // 下游（或发布）可能刚把父目录建出来；再取一次 fd 才能做相对删除。
-  // 只回收**本轮确实拥有**的资源：ReclaimTempEntry 对不拥有的名字什么都不做，
-  // 对自己创建过的名字还要先比对创建时记录的 dev/ino。认领失败时留下的同名
-  // 对象因此绝不会被这里误删。
+  // 两次删除都相对 parent_fd，**不重新解析父目录路径**（fd 是进入时打开的，
+  // 之后一直持有，路径上的某一级被换掉也影响不到这里）。
+  // 只回收**本轮确实拥有**的资源：ReclaimTempEntry
+  // 对"没创建过"的名字什么都不做，
+  // 对"创建过但身份不可验证"的名字也什么都不做、并且如实报告没清干净。
+  // 认领失败 / 身份不可验证时留下的同名对象因此绝不会被这里误删。
   parent_fd = parent_dir.Ensure(destination_parent);
   const bool staging_clear =
       ReclaimTempEntry(parent_fd, staging_name, staging_claim);
@@ -1587,7 +1703,11 @@ bool RestoreSnapshotChain(const std::string& repository_directory,
   //     以后再也无法被自动回收 —— 那是比多留一个标记坏得多的结果。
   // 另外只撤**本程序**的标记：kConflict 已经在上面 return 了，kFailed 时这个
   // 名字上根本没有我们的东西，绝不能去 unlink 别人的对象。
-  if (marker_owned && staging_clear && overlay_clear && !container_present) {
+  //
+  // residue_left 是"本进程创建过、但无法证明 / 无法回收"的东西还存在：那种情况
+  // 下即使 staging_clear 与 overlay_clear 都为真也不能撤标记。
+  if (marker_owned && staging_clear && overlay_clear && !container_present &&
+      !residue_left) {
     ::unlinkat(parent_fd, temp_owner_name.c_str(), 0);
   }
   return ok;
