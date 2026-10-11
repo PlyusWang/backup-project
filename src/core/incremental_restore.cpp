@@ -80,8 +80,8 @@ std::string JoinPath(const std::string& directory, const std::string& name) {
 
 // 递归删除（staging / overlay 的清理用）。不存在视为成功。
 // 全程 lstat，绝不 follow：指向 / 的软链接只会被 unlink 掉自己，不会被递归
-// 进去。ENOENT 视为成功，所以清理是幂等的——重跑不会因为"上一轮已经删干净"
-// 而失败。
+// 进去。ENOENT 视为成功，所以清理是幂等的——重跑不会因为"上一次运行已经删
+// 干净"而失败。
 //
 // 失败是尽力而为的：继续删完剩下的条目，最后返回 false 让调用方知道有残留。
 bool RemoveTree(const std::string& path) {
@@ -110,18 +110,16 @@ bool RemoveTree(const std::string& path) {
 // 这一节只做"删除"，所以每一处都必须回答同一个问题：**我删的到底是不是我刚
 // 打开、刚验证过的那个对象？**
 //
-// PR #34 第一版的实现用 lstat + chmod + opendir + rmdir 这一套**路径**操作，
-// 有两个真实缺陷（本轮修复）：
-//   1. lstat 只保证"这一次查的时候不是软链接"。查完之后路径会被重新解析：
-//      另一个进程（同 UID 即可）把目录项换成指向别处的软链接，后面的 chmod /
-//      opendir / rmdir 就会落到链接目标上。这是 TOCTOU，"全程 lstat 所以不会
-//      follow"这个结论并不成立。
-//   2. 回收旧残留只看"名字像 <dest>.<pid>.<kind> + 同父目录 + 同 UID + pid
-//   已死"。
-//      这四条都不能证明目录是**本软件建的**：用户自己在同一目录下建一个恰好
-//      同名的普通目录、里面放重要文件，就会被当成残留递归删掉。
+// 按路径删除有两类无法回避的缺陷，本节的写法就是为了关掉它们：
+//   1. lstat 只保证"这一次查的时候不是软链接"，查完之后路径会被重新解析。
+//      同 UID 的另一个进程把目录项换成指向别处的软链接，后面的 chmod /
+//      opendir / rmdir 就会落到链接目标上。这是 TOCTOU —— "全程 lstat 所以
+//      不会 follow"并不成立。
+//   2. 只凭"名字像 <dest>.<pid>.<kind> + 同父目录 + 同 UID + pid 已死"回收
+//      残留，不能证明目录是**本软件建的**：用户在同一目录下建一个恰好同名的
+//      普通目录、里面放重要文件，就会被当成残留递归删掉。
 //
-// 现在两条都收口：
+// 两条对应的写法：
 //   * 删除全部改成**基于已打开目录 fd 的相对操作**（openat / fstatat /
 //     fdopendir / unlinkat / fchmod）。打开之后不再用路径，所有验证都在 fd 上
 //     做（fstat），于是"验证的对象"和"操作的对象"是同一个内核对象。
@@ -132,10 +130,9 @@ bool RemoveTree(const std::string& path) {
 
 // destination 的词法规范化：只去掉**尾部**多余的 '/'，'/' 本身保持 '/'。
 //
-// 为什么需要：临时路径是按 "<destination>.<pid>.<kind>"
-// 直接拼出来的。destination 若带尾斜杠（"/tmp/x/restore/"），临时树就会落进
-// destination **内部**，发布那一 步的 rmdir(destination) 必然
-// ENOTEMPTY，恢复整体失败——这是实测到的真实缺陷。
+// 为什么需要：临时路径是按 "<destination>.<pid>.<kind>" 直接拼出来的。
+// destination 若带尾斜杠（"/tmp/x/restore/"），临时树就会落进 destination
+// **内部**，发布那一步的 rmdir(destination) 必然 ENOTEMPTY，整次恢复失败。
 //
 // 只做这一件事：不解析 "." / ".."、不碰软链接、不合并不同路径。调用方给的
 // destination 必须保持"同一个路径"的语义，任何额外解析都可能把两条不同路径
@@ -199,10 +196,10 @@ bool RemoveTreeAt(int parent_fd, const std::string& name,
       // 目录打不开（例如 0000 权限）：先用 **O_PATH** 把目录项绑定成内核对象，
       // 再对**已绑定的那个对象**补权限。
       //
-      // 修复前这里是 fstatat + 按路径 fchmodat：两者之间目录项可以被换成
-      // 软链接，而 Linux 的 fchmodat 没有 AT_SYMLINK_NOFOLLOW（glibc 传这个
-      // 标志会返回 ENOTSUP，实际等价于 follow）——软件就可能去改一个跟本次
-      // 恢复毫无关系的文件的权限位。
+      // 不能退化成 fstatat + 按路径 fchmodat：两者之间目录项可被换成软链接，
+      // 而 Linux 的 fchmodat 没有 AT_SYMLINK_NOFOLLOW（glibc 传这个标志会返回
+      // ENOTSUP，实际等价于 follow）——那就可能去改一个跟本次恢复毫无关系的
+      // 文件的权限位。
       //
       // O_PATH 只要求父目录可搜索、不要求目标自身的任何权限，所以 0000 的
       // 目录也能拿到 fd；/proc/self/fd/N 是内核 magic link，chmod 解析到的
@@ -289,8 +286,8 @@ bool RemoveTreeAt(int parent_fd, const std::string& name,
 // 的那棵目录树。临时命名空间的所有删除都必须走这个入口。
 //
 // force_owner_access 是必需的：staging 会忠实保留源树的权限，0500/0000 的只读
-// 目录不先补权限就删不掉，会留下整棵残留（这正是实测到的残留来源）。这棵树是
-// 本进程**排他认领**的，所以放开宿主权限再删是安全的。
+// 目录不先补权限就删不掉，整棵残留会因此留下。这棵树是本进程**排他认领**的，
+// 所以放开宿主权限再删是安全的。
 bool RemoveTempEntryAt(int parent_fd, const std::string& name) {
   if (parent_fd < 0 || name.empty() || name == "." || name == "..") {
     return false;
@@ -312,7 +309,8 @@ struct TempClaim {
   // **本次调用**的 mkdirat 真的成功了。文件系统确实变了，所以调用方既不能当作
   // "什么都没发生"，也不能凭它取得按名字删除的权限。
   bool created = false;
-  // 创建那一刻记录到的对象身份（dev/ino，且确认过那是个目录），回滚前要拿它比对。
+  // 创建那一刻记录到的对象身份（dev/ino，且确认过那是个目录）；
+  // 回滚前要拿它比对。
   bool id_known = false;
   struct stat id {};
 };
@@ -386,7 +384,6 @@ TempClaimResult ClaimTempDirectoryAt(int parent_fd, const std::string& name,
 // 那是同一次恢复里的正常步骤，不是被谁换掉了。
 // 按 inode 比对会把我们自己的树误判成外来对象，于是拒绝回收、留下残留，
 // 甚至让下一个 delta 的认领直接 EEXIST 失败。
-// （这条是被实测抓出来的：加错位置的版本在 T3/T8/T10/T11 上一度连红 15 条。）
 //
 // 身份约束加在真正需要它的地方 —— "认领中途失败时回滚刚刚创建的那个空目录"
 // （见 RollbackJustCreatedEntry），以及上面"身份没拿到就绝不声称干净"。
@@ -490,18 +487,17 @@ enum class TempMarkerResult {
 
 // 写下本进程的所有权标记。
 //
-// 只做**排他创建**，这是 P0 的核心不变量：执行一次恢复，绝不修改或删除一个
-// 本来不属于本次恢复的文件。修复前的实现是
+// 只做**排他创建**，这是本文件的核心不变量：执行一次恢复，绝不修改或删除一个
+// 本来不属于本次恢复的文件。把它换成
 //     openat(..., O_WRONLY | O_CREAT | O_TRUNC | O_NOFOLLOW, 0600)
-// 它有三个真实后果（都已被 RED 用例实测复现）：
+// 会同时引入三个后果：
 //   * O_TRUNC：同名普通文件被截断；同名**硬链接**会把另一个名字下的真实文件
-//     一起毁掉（实测：受害文件内容被替换成标记文本）；
-//   * O_WRONLY 打开同名 FIFO 且没有 O_NONBLOCK：恢复不是失败而是**永久阻塞**；
-//   * 无论创建成功与否，收尾还会无条件 unlink 这个路径，把同名软链接 /
-//     只读文件直接摘掉。
+//     一起毁掉；
+//   * 同名 FIFO 上 O_WRONLY 没有 O_NONBLOCK：恢复不是失败，而是**永久阻塞**；
+//   * 若再配一次无条件 unlink 收尾，同名的软链接 / 只读文件会被直接摘掉。
 // O_CREAT|O_EXCL 把这三条一次解决：名字已被占用时内核直接返回 EEXIST，
 // 既不会打开、不会截断、也不会阻塞；此时只有"内容确实是本 pid 的标记"才被
-// 认作自己上一轮的残留，其余一律报 kConflict 让调用方 fail-closed。
+// 认作自己上一次运行留下的残留，其余一律报 kConflict 让调用方 fail-closed。
 TempMarkerResult CreateTempOwnerMarker(int parent_fd, const std::string& name,
                                        long long owner_pid) {
   if (parent_fd < 0) return TempMarkerResult::kFailed;
@@ -551,26 +547,26 @@ TempMarkerResult CreateTempOwnerMarker(int parent_fd, const std::string& name,
 // 回收**已经死掉的旧进程**留下的临时条目。
 //
 // 进入时的清理只认"当前 pid 的同名残留"，跨 pid 的旧残留永远不会被再看一眼，
-// 这是残留无上限累积的第二个原因。这里做一次回收，但**必须先证明来源**：
+// 残留会无上限累积。这里做一次回收，但**必须先证明来源**：
 //   1. 名字必须精确等于 <destination 基名>.<十进制 pid>.<kind>，kind 只能是
 //      staging / overlay / container，且与 destination 同父目录；
 //   2. **同一 pid 必须还有一个所有权标记** <基名>.<pid>.owner：普通文件、属主
 //      是自己、不带 group/other 写位、内容与魔数和 pid 完全匹配。
-//      没有标记就一律不碰 —— 用户自建的"名字恰好相似"的目录因此绝对安全，
-//      这正是"只靠同 UID 不能替代来源证明"的落点；
+//      没有标记就一律不碰——用户自建的"名字恰好相似"的目录因此绝对安全，
+//      这正是"同 UID 不能替代来源证明"的落点；
 //   3. 条目属主必须是自己；
 //   4. pid 不能是自己；
 //   5. pid 必须已经不存在（kill(pid,0) 以 ESRCH 失败）。活着的 pid 一律跳过
-//      —— 那可能是另一个进程正在用的中间数据。
+//      ——那可能是另一个进程正在用的中间数据。
 //
 // 所有条目操作都相对**已打开的父目录 fd**（openat/fstatat/unlinkat），扫描之后
 // 不再重新解析路径；条目本身用 O_NOFOLLOW 打开，软链接不可能被 follow。
 //
 // 并发前提：客户端用 ApplicationInstanceLock 保证一个 UID 同时只有一个
-// backupctl， 所以"同一 destination 上还有另一个活着的恢复"在锁语义下不成立；第
-// 5 条再补 一道运行时检查。已知残余窗口：第 5 条与随后删除之间 pid
-// 可能被复用，而新进程 恰好正在恢复同一个 destination ——
-// 窗口极窄且被单实例锁覆盖，如实记录。
+// backupctl，所以"同一 destination 上还有另一个活着的恢复"在锁语义下不成立，
+// 第 5 条只是再补一道运行时检查。已知残余窗口：第 5 条与随后的删除之间，
+// pid 可能被复用，而新进程恰好正在恢复同一个 destination——窗口极窄，
+// 且被单实例锁覆盖。
 void ReclaimStaleTempDirs(const std::string& destination_directory) {
   std::string parent;
   std::string base;
@@ -1221,10 +1217,7 @@ bool RestoreSnapshotChain(const std::string& repository_directory,
                             error_message)) {
     return false;
   }
-  // 词法规范化：去掉尾部多余的 '/'，且必须在**任何**路径构造与预检之前做。
-  // 否则 "<dest>.<pid>.staging" 会落进 dest 内部，发布那一步的 rmdir 必然
-  // ENOTEMPTY —— 这就是尾斜杠 destination 恢复失败的真实根因。
-  // 只去尾斜杠：不解析 "." / ".."、不碰软链接、不合并不同路径。
+  // 规范化必须在**任何**路径构造与预检之前做，理由见 NormalizeDestination。
   const std::string destination = NormalizeDestination(destination_directory);
   if (destination.empty()) {
     SetError(error_message, "The destination directory must not be empty");
@@ -1275,15 +1268,14 @@ bool RestoreSnapshotChain(const std::string& repository_directory,
   //
   // destination 可能是 "<一个还没建的目录>/x"，产品既有的行为就是允许的
   // （RunRestorePipeline 里的 `MakeDirectories(destination_parent)` 会把它建
-  // 出来，见 archive_pipeline.cpp）。把**同一次调用**前移到认领之前，理由不是
+  // 出来，见 archive_pipeline.cpp）。把同一次调用**前移到认领之前**的理由不是
   // "早点建更好看"，而是安全：
   //
-  //   临时资源的所有权必须来自一次**真实的排他创建**。以前父目录不存在时，
-  //   代码把 staging / overlay 直接记成 owned=true，依据只是"进入时那里什么都
-  //   没有"这条**假设** —— 从这条假设到收尾的按名字删除之间，别人完全可以先
-  //   在那个名字下放一个目录，于是它会被当成"自己的残留"递归删掉。
-  //   现在父目录先建好、fd 先拿住，两项资源都走 mkdirat 排他认领，所有权不再
-  //   有任何假设成分。
+  //   临时资源的所有权必须来自一次**真实的排他创建**。若父目录还不存在就把
+  //   staging / overlay 记成 owned=true，依据只是"进入时那里什么都没有"这条
+  //   **假设**——从这条假设到收尾的按名字删除之间，别人完全可以先在那个名字
+  //   下放一个目录，于是它会被当成"自己的残留"递归删掉。父目录先建好、fd 先
+  //   拿住之后，两项资源都走 mkdirat 排他认领，所有权不再有任何假设成分。
   //
   // 用的是与下游同一个函数：对已经存在的目录它只会拿到 EEXIST 并放过
   // （**不 chmod、不重建**），所以权限位与 symlink 语义与既有行为完全一致。
@@ -1356,16 +1348,15 @@ bool RestoreSnapshotChain(const std::string& repository_directory,
 
   // 2) 本 pid 的同名条目：**无论标记在不在，一律不删。**
   //
-  //    这里是 P0-B 的落点。pid 证明不了归属；而"本进程刚写的标记"更证明不了
-  //    —— 标记的生命周期**严格包含**临时树（先写标记、后建树；先删树、后删
-  //    标记），所以完全可能留下一个"有标记、却没有树"的孤儿标记。此后只要
-  //    pid 被复用，用户自己恰好同名的目录就会被当成残留：先强行 chmod 再递归
-  //    删除。修复前更糟——那时连标记都不需要。
+  //    pid 证明不了归属；"本进程刚写的标记"同样证明不了——标记的生命周期
+  //    **严格包含**临时树（先写标记、后建树；先删树、后删标记），所以完全
+  //    可能留下一个"有标记、却没有树"的孤儿标记。此后只要 pid 被复用，用户
+  //    恰好同名的目录就会被当成残留：先强行 chmod 再递归删除。这里一律
+  //    fail-closed，绝不"先删除再重新创建"。
   //
-  //    因此这里一律 fail-closed，绝不"先删除再重新创建"。
-  //    同一 pid 的崩溃残留由**下一次 pid 不同的运行**通过第 1 步回收（那个
-  //    pid 那时已经死了、标记也还在），所以"崩溃后能自愈"的能力并没有丢；
-  //    只有恰好又拿到同一个 pid 的那一次会被拒绝，而且给出可照着做的诊断。
+  //    同一 pid 的崩溃残留由**下一次 pid 不同的运行**通过第 1 步回收（那时
+  //    pid 已经死了、标记也还在），所以"崩溃后能自愈"的能力并没有丢；只有
+  //    恰好又拿到同一个 pid 的那一次会被拒绝，而且给出可照着做的诊断。
   //
   //    标记的取舍也要分清：kCreated 时这个名字上除了刚建的标记什么都没有，
   //    失败退出就该把标记撤掉；kReusedOurs 说明**残留还在**，标记必须留着，
@@ -1419,8 +1410,8 @@ bool RestoreSnapshotChain(const std::string& repository_directory,
   //    mkdirat —— 那一步是原子的；这一遍只是为了让"名字被占着"这种情况在动手
   //    之前就带着更具体的诊断退出。
   //
-  //    注意它**不是**安全边界：检查与创建之间对象仍然可能出现（这正是本轮要
-  //    修的那条路径），所以第 3 步的认领失败处理必须自己站得住。
+  //    注意它**不是**安全边界：检查与创建之间对象仍然可能被替换，所以第 3 步
+  //    的认领失败处理必须自己站得住。
   {
     const std::string occupied_names[3] = {staging_name, overlay_name,
                                            container_name};
@@ -1516,7 +1507,7 @@ bool RestoreSnapshotChain(const std::string& repository_directory,
   // do/while(false) 只用来做"带 break 的单出口"：任何一步失败都跳到末尾的统一
   // 清理，最终只有 ok == true 才代表 destination 真的被发布了。
   bool ok = false;
-  // “这一轮 delta 失败了”必须由这个布尔量表达，**不能**去读 error_message：
+  // "这一次 delta 失败了"必须由这个布尔量表达，**不能**去读 error_message：
   // error_message 是可选的诊断出参（允许 nullptr），拿它当状态机会在
   // 传 nullptr 时失效。
   //
@@ -1524,8 +1515,8 @@ bool RestoreSnapshotChain(const std::string& repository_directory,
   // 跳出内层 for —— 循环之后 delta_failed 还是 false 的话，代码会继续走到
   // 发布，于是一次失败的恢复被报成成功，目标里是一棵没应用完增量的树。
   bool delta_failed = false;
-  // 中间容器是**本程序**在 ExtractDeltaPayload 里创建的。只有确实创建过才在
-  // 收尾时删除它——这样"恢复结束时无条件 unlink 一个路径"就彻底不存在了。
+  // 中间容器由**本程序**在 ExtractDeltaPayload 里创建，只有确实创建过才在收尾
+  // 时删除它；收尾不做任何无条件的 unlink。
   bool container_present = false;
   do {
     // 1) base：走既有的完整恢复路径（它自己也是 staging + 原子发布的写法）。
@@ -1664,7 +1655,7 @@ bool RestoreSnapshotChain(const std::string& repository_directory,
     // WriteFileAtomicallyReplacing 保持同一条 durability 策略。
     //
     // rename 一旦成功，destination 就已经真实发布了：这里不做任何
-    // “失败就把 destination 删掉”的补救，那只会把一次成功的恢复变成
+    // "失败就把 destination 删掉"的补救，那只会把一次成功的恢复变成
     // 数据丢失。
     if (!PublishReplacing(staging, destination, error_message)) {
       break;
@@ -1673,19 +1664,13 @@ bool RestoreSnapshotChain(const std::string& repository_directory,
   } while (false);
 
   // 成功与失败都走这里。staging 在发布成功后已被 rename 搬走；overlay 与中间
-  // 容器一定还在。
+  // 容器一定还在。删除一律相对 parent_fd，**不重新解析父目录路径**（fd 是进入
+  // 时打开的，之后一直持有，路径上的某一级被换掉也影响不到这里）。
   //
-  // 这里必须用**强制**版本（RemoveTempEntryAt 内部就是 force_owner_access）：
-  // 这棵树里可能带着 0500 之类的只读目录（staging 会忠实保留源树权限），
-  // 普通 RemoveTree 会卡在"里面删不掉、目录又非空"而把整棵留下——这正是实测到
-  // 的残留来源。这棵树是本进程排他认领的，放开宿主权限再删是安全的。
-  //
-  // 两次删除都相对 parent_fd，**不重新解析父目录路径**（fd 是进入时打开的，
-  // 之后一直持有，路径上的某一级被换掉也影响不到这里）。
-  // 只回收**本轮确实拥有**的资源：ReclaimTempEntry
-  // 对"没创建过"的名字什么都不做，
-  // 对"创建过但身份不可验证"的名字也什么都不做、并且如实报告没清干净。
+  // ReclaimTempEntry 只回收**本次调用确实拥有**的资源：对"没创建过"的名字什么
+  // 都不做，对"创建过但身份不可验证"的名字也什么都不做、并如实报告没清干净。
   // 认领失败 / 身份不可验证时留下的同名对象因此绝不会被这里误删。
+  // 强制放开宿主权限的理由见 RemoveTempEntryAt。
   parent_fd = parent_dir.Ensure(destination_parent);
   const bool staging_clear =
       ReclaimTempEntry(parent_fd, staging_name, staging_claim);

@@ -324,9 +324,11 @@ ConfigLoadStatus ConfigManager::Load(AppConfig* config,
   return ConfigLoadStatus::kLoaded;
 }
 
-// 写入是"整份替换"：先拼出完整文本再原子替换，不存在"改了一半"的中间态。
-// 失败语义：返回 false 时磁盘上的旧配置原封不动（临时文件由
-// WriteFileAtomicallyReplacing 自己清理），调用方可以安全地重试。
+// 先构造完整配置，再交给 WriteFileAtomicallyReplacing 原子替换。
+// 失败语义分两段：rename 之前失败不会发布新配置，旧内容保持不变，临时文件由
+// WriteFileAtomicallyReplacing 自己清理；rename 之后只剩目录同步可能失败，
+// 那时目标路径已经指向新配置，函数却仍返回 false，持久性未得到确认。
+// 因此调用方不能只凭返回值判断旧配置是否还在。
 bool ConfigManager::Save(const AppConfig& config,
                          std::string* error_message) const {
   if (error_message != nullptr) error_message->clear();

@@ -64,6 +64,7 @@ class FileSink {
   // 在 directory 下创建一个唯一命名的临时文件（mkstemp => 0600）。
   bool OpenTemp(const std::string& directory, const std::string& prefix,
                 std::string* error_message);
+  // 缓冲写；写入侧的失败可能留到 Flush / Close 才浮现。
   bool Write(const void* data, std::size_t size, std::string* error_message);
   bool Patch(std::uint64_t offset, const void* data, std::size_t size,
              std::string* error_message);
@@ -95,8 +96,8 @@ class FileSink {
   std::uint64_t bytes_written_ = 0;
   std::size_t buffered_ = 0;
   std::vector<unsigned char> buffer_;
-  // 路径所有权与提交状态分开记：fd_
-  // 只说明句柄，说明不了"这个文件还是不是我写的"。
+  // 路径所有权与提交状态分开记：fd_ 只说明句柄，
+  // 说明不了"这个文件还是不是我写的"。
   bool owns_path_ = false;
   bool committed_ = false;
 };

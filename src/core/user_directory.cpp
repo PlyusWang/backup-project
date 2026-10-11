@@ -77,7 +77,7 @@ bool LookupGroupName(std::uint32_t gid, std::string* out) {
     return false;
   }
   out->clear();
-  // 注意这里是 _SC_GETGR_R_SIZE_MAX：group 数据库和 passwd 数据库是两回事，
+  // 这里必须用 _SC_GETGR_R_SIZE_MAX：group 数据库和 passwd 数据库是两回事，
   // 用错 hint 在 NSS 后端上会得到一个偏小甚至为 -1 的起点。
   std::size_t size = InitialBufferSize(::sysconf(_SC_GETGR_R_SIZE_MAX));
   while (size <= kMaxBufferSize) {
