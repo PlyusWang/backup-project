@@ -22,6 +22,8 @@
 #include <csignal>
 
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 #include <string>
 #include <vector>
 
@@ -2181,6 +2183,199 @@ int main() {
     test_support::Check(
         !test_support::Exists(destination + "." + self_pid + ".owner"),
         "INC-R T23 不留所有权标记");
+  }
+
+  {
+    // ============================================================
+    // 10.15 排他认领失败时**不得删除未认领的同名对象**（本轮 P0）。
+    //
+    // 缺陷：认领失败分支无条件执行
+    //     RemoveTempEntryAt(parent_fd, staging_name);
+    //     RemoveTempEntryAt(parent_fd, overlay_name);
+    // 于是
+    //   * mkdir(staging) 失败（EEXIST）时 staging **不是本轮创建的**，却仍被递归删除；
+    //   * mkdir(staging) 成功、mkdir(overlay) 失败时 overlay 不是本轮创建的，同样被删。
+    //
+    // 怎么确定性命中：产品在进入时先查一遍同名冲突，之后才认领；冲突对象必须出现在
+    // 这两步**之间**，纯文件系统事实做不到。因此用 LD_PRELOAD 注入（方案二，
+    // 注入器见 time-control/claiminject.c）：命中时先真的把受保护目录与哨兵建出来，
+    // 再返回**真实的 EEXIST**，所以产品看到的是完全正常的内核错误。
+    //
+    // 没有装配注入器时这两条用例**明确报 SKIP**（不是静默通过）——只有配套的
+    // 专用 runner 下它们才是有意义的验证。
+    // ============================================================
+    test_support::Section("INC-R 10.15 认领失败不得删除未认领对象");
+    const std::string work = test_support::FreshDir("inc-claim-failure");
+    const std::string source = work + "/src";
+    const std::string repository = work + "/repo";
+    test_support::Mkdir(source, 0755);
+    test_support::Mkdir(repository, 0755);
+    bp::IncrementalOutcome outcome;
+    std::string error;
+    test_support::WriteFile(source + "/a.txt", "claim-v1", 0644);
+    test_support::Check(
+        MakeSnapshot(source, repository, "s1.bak", &outcome, &error),
+        "INC-R T24 基线建立成功", error);
+
+    const std::string self_pid =
+        std::to_string(static_cast<long>(::getpid()));
+    const char* inject_env = ::getenv("R9_CLAIM_INJECT_FILE");
+    const std::string inject_file =
+        (inject_env != nullptr) ? std::string(inject_env) : std::string();
+    const bool inject_armed = !inject_file.empty();
+
+    auto write_inject_target = [](const std::string& file,
+                                  const std::string& mkdir_path,
+                                  const std::string& mkdirat_name) {
+      std::FILE* handle = std::fopen(file.c_str(), "w");
+      if (handle == nullptr) return false;
+      if (!mkdir_path.empty()) {
+        std::fprintf(handle, "mkdir %s\n", mkdir_path.c_str());
+      }
+      if (!mkdirat_name.empty()) {
+        std::fprintf(handle, "mkdirat %s\n", mkdirat_name.c_str());
+      }
+      std::fclose(handle);
+      return ::unlink((file + ".state").c_str()) == 0 || errno == ENOENT;
+    };
+    // 注入器把创建出来的对象身份写进 <目标文件>.state，测试据此比对"没有被改动"。
+    auto read_injected_state = [](const std::string& file,
+                                  unsigned long long* dev,
+                                  unsigned long long* ino, unsigned* mode) {
+      std::FILE* handle = std::fopen((file + ".state").c_str(), "r");
+      if (handle == nullptr) return false;
+      const int got = std::fscanf(handle, "%llu %llu %o", dev, ino, mode);
+      std::fclose(handle);
+      return got == 3;
+    };
+
+    // ---- 场景 A：staging 认领失败 ----
+    {
+      const std::string dest = work + "/claim-a";
+      const std::string staging_full = dest + "." + self_pid + ".staging";
+      const std::string staging_name = "claim-a." + self_pid + ".staging";
+      if (!inject_armed) {
+        std::printf(
+            "  SKIP  INC-R T24 A 认领失败（需要 LD_PRELOAD 注入器；见 "
+            "time-control/claiminject.c）\n");
+      } else {
+        test_support::Check(write_inject_target(inject_file, staging_full,
+                                                staging_name),
+                            "INC-R T24 A 写下注入目标");
+        bp::RestoreReport report;
+        error.clear();
+        const bool ok = bp::RestoreSnapshotChain(
+            repository, "s1.bak", dest, bp::RestoreOptions{}, &report, &error);
+        unsigned long long dev = 0;
+        unsigned long long ino = 0;
+        unsigned mode = 0;
+        const bool have_state = read_injected_state(inject_file, &dev, &ino, &mode);
+        struct stat info;
+        std::string content;
+        test_support::Check(have_state, "INC-R T24 A 注入器确实命中了 staging 认领");
+        test_support::Check(!ok, "INC-R T24 A 认领失败即整次失败", error);
+        test_support::Check(
+            error.find(staging_full) != std::string::npos ||
+                error.find(staging_name) != std::string::npos,
+            "INC-R T24 A 失败诊断指向 staging", error);
+        test_support::Check(::lstat(staging_full.c_str(), &info) == 0 &&
+                                S_ISDIR(info.st_mode),
+                            "INC-R T24 A 未认领的 staging 目录仍然存在");
+        test_support::Check(
+            have_state && info.st_dev == static_cast<dev_t>(dev) &&
+                info.st_ino == static_cast<ino_t>(ino) &&
+                (info.st_mode & 07777) == static_cast<mode_t>(mode),
+            "INC-R T24 A 未认领目录的 inode 与权限位都没变");
+        test_support::Check(
+            test_support::ReadFile(staging_full + "/precious.txt", &content) &&
+                content == "USER-DATA-MUST-SURVIVE\n",
+            "INC-R T24 A 受保护内容一个字节都没少", content);
+        test_support::Check(!test_support::Exists(dest),
+                            "INC-R T24 A 失败时不发布目标");
+        test_support::Check(
+            !test_support::Exists(dest + "." + self_pid + ".owner"),
+            "INC-R T24 A 不留下自己的标记");
+        test_support::RemoveTree(staging_full);
+      }
+    }
+
+    // ---- 场景 B：staging 成功、overlay 认领失败 ----
+    {
+      const std::string dest = work + "/claim-b";
+      const std::string staging_full = dest + "." + self_pid + ".staging";
+      const std::string overlay_full = dest + "." + self_pid + ".overlay";
+      const std::string overlay_name = "claim-b." + self_pid + ".overlay";
+      if (!inject_armed) {
+        std::printf(
+            "  SKIP  INC-R T24 B 认领失败（需要 LD_PRELOAD 注入器；见 "
+            "time-control/claiminject.c）\n");
+      } else {
+        test_support::Check(write_inject_target(inject_file, overlay_full,
+                                                overlay_name),
+                            "INC-R T24 B 写下注入目标");
+        bp::RestoreReport report;
+        error.clear();
+        const bool ok = bp::RestoreSnapshotChain(
+            repository, "s1.bak", dest, bp::RestoreOptions{}, &report, &error);
+        unsigned long long dev = 0;
+        unsigned long long ino = 0;
+        unsigned mode = 0;
+        const bool have_state = read_injected_state(inject_file, &dev, &ino, &mode);
+        struct stat info;
+        std::string content;
+        test_support::Check(have_state, "INC-R T24 B 注入器确实命中了 overlay 认领");
+        test_support::Check(!ok, "INC-R T24 B 认领失败即整次失败", error);
+        test_support::Check(
+            error.find("already exists") != std::string::npos,
+            "INC-R T24 B 失败原因是名字已被占用（真实 EEXIST）", error);
+        test_support::Check(::lstat(overlay_full.c_str(), &info) == 0 &&
+                                S_ISDIR(info.st_mode),
+                            "INC-R T24 B 未认领的 overlay 目录仍然存在");
+        test_support::Check(
+            have_state && info.st_dev == static_cast<dev_t>(dev) &&
+                info.st_ino == static_cast<ino_t>(ino) &&
+                (info.st_mode & 07777) == static_cast<mode_t>(mode),
+            "INC-R T24 B 未认领目录的 inode 与权限位都没变");
+        test_support::Check(
+            test_support::ReadFile(overlay_full + "/precious.txt", &content) &&
+                content == "USER-DATA-MUST-SURVIVE\n",
+            "INC-R T24 B 受保护内容一个字节都没少", content);
+        test_support::Check(!test_support::Exists(staging_full),
+                            "INC-R T24 B 本轮创建成功的 staging 被正确回收");
+        test_support::Check(!test_support::Exists(dest),
+                            "INC-R T24 B 失败时不发布目标");
+        test_support::Check(
+            !test_support::Exists(dest + "." + self_pid + ".owner"),
+            "INC-R T24 B 不留下自己的标记（staging 已回收）");
+        test_support::RemoveTree(overlay_full);
+      }
+    }
+
+    // ---- 场景 C：注入器在场但目标不是本轮的临时名字 → 正常恢复必须照常成功 ----
+    {
+      const std::string dest = work + "/claim-c";
+      if (!inject_armed) {
+        std::printf(
+            "  SKIP  INC-R T24 C 注入器对照（需要 LD_PRELOAD 注入器）\n");
+      } else {
+        test_support::Check(
+            write_inject_target(inject_file, work + "/never-used-path", ""),
+            "INC-R T24 C 把注入目标指向一个不会被用到的路径");
+        bp::RestoreReport report;
+        error.clear();
+        const bool ok = bp::RestoreSnapshotChain(
+            repository, "s1.bak", dest, bp::RestoreOptions{}, &report, &error);
+        std::string content;
+        test_support::Check(ok, "INC-R T24 C 注入器不影响正常恢复", error);
+        test_support::Check(
+            test_support::ReadFile(dest + "/a.txt", &content) &&
+                content == "claim-v1",
+            "INC-R T24 C 恢复内容正确", content);
+        test_support::Check(
+            !test_support::Exists(dest + "." + self_pid + ".owner"),
+            "INC-R T24 C 正常收尾不留标记");
+      }
+    }
   }
 
   return test_support::Finish("incremental_restore_test");
