@@ -158,8 +158,9 @@
 项目里已经存在、与 Filter 无直接关系、但同样属于"以后要处理"的事项，统一引用既有文档，
 不在这里复制一遍：
 
-- **TOCTOU 路径竞争**：见 `docs/02_architecture.md` 的"已知可靠性限制与后续改进"；
-  当前实现沿用"先检查后写入"，没有 `openat2` / dirfd 沙箱。
+- **TOCTOU 与恢复清理安全加固**：见 `docs/backlog/filesystem_security_future.md`；
+  `docs/02_architecture.md` 保留整体安全边界说明。PR #34 的部分恢复路径已引入 fd 相对
+  操作，但恶意同 UID 对抗模型和部分清理竞争仍属后续安全专项，不在 Filter backlog 重复展开。
 - **归档层后续能力**：compression、encryption、完整性校验、去重、多版本，见
   `docs/format/archive_v0.1.md` 的"在备份流水线中的位置"与"已知限制"。
 - **GUI 已知限制**：无边框窗口的拖拽 / 边缘缩放需要真实鼠标；任务进行中禁止关窗。
