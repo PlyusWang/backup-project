@@ -111,8 +111,8 @@ inline bool ParseUserSelector(const std::string& raw, UserSelector* out,
   out->text = text;
   // 裸输入如果全是数字，也要按编号解析一次：这正是"歧义"的来源——同一个数字
   // 既要当编号查一遍，也要当用户名查一遍，只有两边都能查到才拒绝执行。
-  // 只有“全数字且 ≤ 18 位”的裸输入才填 id。调用方必须用同样的条件决定要
-  // 不要按 id 查库（admin_main.cpp 正是如此），否则默认的 0 会被当真实编号。
+  // 只有"全数字且 ≤ 18 位"的裸输入才填 id。调用方必须用同样的条件决定要不要
+  // 按 id 查库（admin_main.cpp 正是如此），否则默认的 0 会被当真实编号。
   if (IsAllDigits(text) && text.size() <= 18) {
     out->id =
         static_cast<std::int64_t>(std::strtoll(text.c_str(), nullptr, 10));
@@ -120,8 +120,8 @@ inline bool ParseUserSelector(const std::string& raw, UserSelector* out,
   return true;
 }
 
-// 关键判定：只有**一个**候选时才解析成功。显式写法永远只认自己那一种。
-// 唯一职责是“合并两个 bool”：不查库、不打印。显式写法永远只认自己那一种
+// 关键判定：只有**一个**候选时才解析成功。
+// 唯一职责是"合并两个 bool"：不查库、不打印。显式写法永远只认自己那一种
 // （id: 命中用户名不算命中），只有裸输入才需要同时看两边。
 inline UserResolution DecideUserResolution(const UserSelector& selector,
                                            bool has_id_match,
@@ -149,9 +149,8 @@ inline UserResolution DecideUserResolution(const UserSelector& selector,
 
 // 歧义时的原话。**两种写法都写出来**：只说"有歧义"等于把问题丢回给用户。
 inline std::string AmbiguityMessage(const std::string& text) {
-  // 第一句就是验收里要求的那句话：先说"有歧义"，再给出两种明确写法。
-  // 括号里补一句为什么——因为"这个数字既能当编号用，也已经有同名的账户"，
-  // 所以管理工具不敢替用户决定。
+  // 先说"有歧义"，再给出两种明确写法；括号里补一句为什么——这个数字既能当
+  // 编号用，也已经有同名的账户，所以管理工具不敢替用户决定。
   return "输入 " + text + " 存在歧义。请使用 id:" + text + " 或 name:" + text +
          "。（这个数字既能当编号用，也已经有同名的账户）";
 }
