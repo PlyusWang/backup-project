@@ -10,9 +10,9 @@
 //   * Append* 只追加，绝不覆盖或重排已有内容 —— 缓冲区内容就是磁盘布局；
 //   * Store* 没有长度参数，调用方必须保证目标缓冲区至少有 N 字节；
 //   * Read* 只在字段完整时才推进 cursor：失败时 cursor 原地不动，调用方
-//     可以“读失败就整体放弃”，不会留下一个半移动的游标；
+//     可以"读失败就整体放弃"，不会留下一个半移动的游标；
 //   * cursor 永不超过 size，这是 Read* 自己维持的不变量，也是
-//     “*cursor + N”不会整数回绕的前提；
+//     "*cursor + N"不会整数回绕的前提；
 //   * Load* 不做边界检查，只在整块长度已被校验（或块本身定长）时使用。
 // 没有异常、没有动态分配，失败一律用返回值表达。
 
@@ -114,8 +114,7 @@ inline bool ReadU64LE(const unsigned char* data, std::size_t size,
   return true;
 }
 
-// 定长缓冲区版本（读侧从已经读进内存的固定长度块里取值）。
-// 读侧的无 cursor 版本：偏移由调用方自己知道，适合定长 header 内部取值。
+// 无 cursor 的读侧版本：偏移由调用方自己知道，适合定长 header 内部取值。
 // 一旦需要边读边校验长度，就应该改用上面的 Read* 系列。
 inline std::uint16_t LoadU16LE(const unsigned char* data) {
   return static_cast<std::uint16_t>(data[0]) |

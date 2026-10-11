@@ -95,7 +95,6 @@ std::string JoinPath(const std::string& directory, const std::string& name) {
 }
 
 // 只读整个文件（manifest 副文件有大小上界）。
-// 只读整个文件（manifest 副文件有大小上界）。
 //
 // 只读、且不跟随软链接：O_NOFOLLOW 让"仓库里的 .manifest 被换成指向别处的
 // 链接"直接失败，而不是把别处的文件内容当成源清单读进来。
@@ -203,8 +202,6 @@ bool WriteManifestFile(const std::string& path, const std::string& text,
   return true;
 }
 
-// 把 manifest 条目映射成"要写进 payload 的 ArchiveEntry"。路径与元数据来自
-// 这一次的真实扫描（manifest 是同一套扫描器产出的）。
 // 把 manifest 条目映射成"要写进 payload 的 ArchiveEntry"。路径与元数据全部
 // 来自这一次的真实扫描；manifest 只是同一套扫描器的产物，不引入第二份真相。
 //

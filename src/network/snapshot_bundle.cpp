@@ -748,10 +748,10 @@ bool ExtractSnapshotBundle(const std::string& bundle_path,
     const std::string expected_sha256 = crypto::ToHex(fixed + 8, kSha256Bytes);
 
     // 第二遍读到的成员头**只用来交叉校验**，路径一律取第一遍已经校验过的
-    // 成员表。两次解析之间文件内容是可变的（bundle 是本地文件），如果这里用
-    // 刚读到的 name 去拼路径，就等于把"写到哪个文件"的决定权交给能在两次解析
-    // 之间改写文件的人——审查轮实测 40 轮里 6-9 轮能把文件写到目标目录之外
-    // （用例 RT2.10）。改成索引取值 + 逐项比对之后，改写只会导致失败。
+    // 成员表。两次解析之间文件内容是可变的（bundle 是本地文件），若用刚读到的
+    // name 去拼路径，就等于把"写到哪个文件"的决定权交给能在两次解析之间改写
+    // 文件的人，足以把成员写到目标目录之外（覆盖用例 RT2.10）。改成索引取值
+    // 加逐项比对之后，改写只会导致失败。
     const SnapshotBundleMember& indexed = index.members[i];
     if (name != indexed.name || data_size != indexed.size ||
         expected_sha256 != indexed.sha256) {

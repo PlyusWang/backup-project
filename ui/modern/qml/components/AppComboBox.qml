@@ -215,25 +215,16 @@ ComboBox {
 
     // 每一行：行高、padding 与**三种互相独立的状态**。
     //
-    // 同一个坑出现过三种形态，根因都是"用一个残影当输入状态用"：
+    // 两种看似可用的"输入状态"都不能用，根因都是拿一个残影当输入状态：
+    //   * highlightedIndex 不等于键盘高亮 —— 打开下拉时 Qt 就把它设成当前已
+    //     选择项；鼠标划过一行，Qt 也会把它留在那一行上（指针移出 popup 后
+    //     highlightedIndex 仍在、row.hovered 已经是 false）。
+    //   * 监听 Keys.onPressed 也拿不到事件 —— 按键送到的是 ComboBox（真实点击
+    //     之后焦点在它身上），不是 popup 的 ListView。
     //
-    //   第一轮：background 里 row.highlighted（= highlightedIndex === index）
-    //           与 row.hovered 返回同一块 theme.hover。打开下拉时 Qt 就把
-    //           highlightedIndex 设成当前已选择项，于是那一行从打开起就是灰的，
-    //           鼠标移开当然不会消失。
-    //   第二轮：换成"键盘高亮 + accentSoft"之后仍然残留
-    //           —— 因为 highlightedIndex **不能证明高亮是键盘来的**：
-    //           鼠标划过一行，Qt 也会把 highlightedIndex 留在那一行上
-    //           （实测：指针移出 popup 后 highlightedIndex=4、
-    //           row.hovered=false，那一行照样被画出一块底色）。
-    //   第三轮：改成监听 Keys.onPressed 之后，真实桌面里**键盘高亮永远不亮** ——
-    //           因为按键送到的是 ComboBox（真实点击之后焦点在它身上），
-    //           不是 popup 的 ListView；监听按键这条路
-    //           在真实焦点链上收不到事件。
-    //
-    // 三轮下来结论只有一句：**不要监听"用户有没有按键"，要观察"Qt 把键盘位置
-    // 移到了哪里"**。真实桌面实测：↑/↓ 会让 popup ListView 的 currentIndex
-    // 一步一步跟着走（0 -> 1 -> 2 -> 1），那才是键盘位置的唯一可靠来源。
+    // 结论只有一句：**不要监听"用户有没有按键"，要观察"Qt 把键盘位置移到了
+    // 哪里"**。↑/↓ 会让 popup ListView 的 currentIndex 一步一步跟着走
+    // （0 -> 1 -> 2 -> 1），那才是键盘位置的唯一可靠来源。
     //
     // 三种状态因此各走各的通道：
     //

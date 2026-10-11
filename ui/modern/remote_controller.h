@@ -536,7 +536,7 @@ class RemoteController : public QObject {
   // 输入框被编辑时清掉上一次的绿色反馈：旧结论不能挂在新输入上。
   Q_INVOKABLE void clearPinApplyState();
 
-  // ---- 连接方式与 SSH 安全通道 ----
+  // ---- 连接方式的对外接口 ----
   //
   // setConnectionMode 接受 "ssh" / "direct"；其它值被拒并返回 false。
   // 切换模式不会自动联网，也不会杀掉正在用的通道 —— 它是配置动作。
@@ -970,7 +970,7 @@ class RemoteController : public QObject {
   QString pin_apply_state_;  // "" / "applied" / "unchanged" / "invalid"
   QString pin_apply_message_;  // 绿色那一行；invalid 时为空（红字在输入框下）
 
-  // ---- 连接方式与 SSH 安全通道 ----
+  // ---- 连接方式的内部状态 ----
   //
   // 连接方式与通道配置。与 host / port / pin 一样**只存在于内存**：当前
   // 部署的唯一事实来源是 ~/.ssh/config，产品不另造一套持久化。
