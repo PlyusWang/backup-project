@@ -44,9 +44,10 @@ class ConfigManager {
   // 上一次的内容。error_message 可以为 nullptr。
   ConfigLoadStatus Load(AppConfig* config, std::string* error_message) const;
 
-  // 整份替换写入：先拼出完整文本，再用同目录唯一临时文件 + rename 原子替换，
-  // 不存在"改了一半"的中间态；父目录按需创建（0700）。返回 false 时磁盘上的
-  // 旧配置原封不动，调用方可以安全重试。
+  // 整份替换写入：先按需创建父目录（0700），再写同目录临时文件并用 rename
+  // 原子替换。rename 之前失败时旧配置内容不变（父目录若已新建则保留）；rename
+  // 成功后若目录同步失败仍会返回 false，此时新配置已经可见，只是持久性未得到
+  // 确认。因此不能只凭 false 断定旧配置还在，也不能断定重试没有副作用。
   bool Save(const AppConfig& config, std::string* error_message) const;
 
   // 构造时传入的路径，原样返回。
