@@ -365,7 +365,6 @@ bool WriteGlobalHeader(ArchiveOutput* output, std::string* error_message) {
   return output->Write(header.data(), header.size(), error_message);
 }
 
-// 全局 header 的解码结果。
 // 全局 header 的解码结果。刻意只有这三项：preflight 与 InspectHeader 都只
 // 需要它们，entry 层面的信息在读侧另行解析，避免这个结构演化成"半个归档
 // 模型"——那会让两处解析逻辑互相牵制。

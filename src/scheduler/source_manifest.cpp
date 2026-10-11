@@ -191,8 +191,8 @@ bool SplitFields(const std::string& line, std::vector<std::string>* fields) {
 // archive_path 的语法检查。这里是**不可信输入**的入口：文本可能来自磁盘上
 // 被改过的 manifest。拒绝绝对路径、NUL、"./" 前缀与结尾 '/'，是为了让同一个
 // 逻辑路径只有一种写法——它同时是去重键和 diff 的排序键，多种写法会让这两
-// 件事都出错。注意这里只做结构检查：archive_path 由扫描器产生，
-// 因此“不含 .. 组件”这条更强的不变量并没有在这里被验证。
+// 件事都出错。这里只做结构检查：archive_path 由扫描器产生，
+// 因此"不含 .. 组件"这条更强的不变量并没有在这里被验证。
 bool IsValidArchivePath(const std::string& path) {
   if (path.empty()) return false;
   if (path[0] == '/') return false;
