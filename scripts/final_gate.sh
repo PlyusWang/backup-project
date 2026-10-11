@@ -129,6 +129,12 @@ run config_manager bash scripts/config_manager_test.sh
 run crypto bash scripts/crypto_test.sh
 run file_io bash scripts/file_io_test.sh
 run cleanup-contract bash scripts/cleanup_contract_test.sh
+# 认领 / 身份 / 回滚路径的**真实注入**检查（PR #34 收口）。单元测试里的
+# T24/T25/T26 在没有 LD_PRELOAD 注入器时是显式 SKIP —— SKIP 不等于通过，
+# 所以门禁必须跑这个脚本：它自己从当前源码编译注入器与被测程序，把 SKIP、
+# 注入未命中、哨兵变化、非零退出全部判成失败。刻意排在 quality（make clean）
+# 之后，顺带证明它不依赖 build/ 里的任何残留产物。
+run claim-failure-injection bash scripts/claim_failure_test.sh
 run format-bytes bash scripts/format_bytes_test.sh
 run filter_metadata bash scripts/filter_metadata_test.sh
 run filter_rule_builder bash scripts/filter_rule_builder_test.sh

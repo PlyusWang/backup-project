@@ -43,6 +43,7 @@ if [ -n "${SHELLCHECK_FILES:-}" ]; then
 else
   FILES=(
     scripts/final_gate.sh
+    scripts/claim_failure_test.sh
     scripts/remote_reliability_test.sh
     scripts/shellcheck.sh
     packaging/ecs/verify-ecs-deployment.sh
