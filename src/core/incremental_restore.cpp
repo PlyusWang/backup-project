@@ -342,11 +342,12 @@ bool ClaimTempDirectoryAt(int parent_fd, const std::string& name,
 //   * 不拥有 -> 什么都不做（返回 true：没有属于本轮的东西残留）；
 //   * 拥有   -> 走 fd 相对的 RemoveTempEntryAt。
 //
-// 这里**刻意不做** dev/ino 比对：staging / overlay 一旦交给 RunRestorePipeline，
-// 就会被它自己的"暂存 + 原子 rename"整体换掉 inode —— 那是同一次恢复的正常
-// 步骤。按 inode 比对会把**我们自己的树**误判成"被别人换掉了"，从而拒绝回收、
-// 留下残留，甚至让下一个 delta 的认领直接 EEXIST 失败。
-// （这条是被实测抓出来的：新版本在 T3/T8/T10/T11 上一度连红 15 条。）
+// 这里刻意不做 dev/ino 比对。staging 与 overlay 一旦交给下游的
+// RunRestorePipeline，就会被它自己的暂存加原子 rename 整体换掉 inode；
+// 那是同一次恢复里的正常步骤，不是被谁换掉了。
+// 按 inode 比对会把我们自己的树误判成外来对象，于是拒绝回收、留下残留，
+// 甚至让下一个 delta 的认领直接 EEXIST 失败。
+// （这条是被实测抓出来的：加错位置的版本在 T3/T8/T10/T11 上一度连红 15 条。）
 //
 // 身份约束加在真正需要它的地方 —— "认领中途失败时回滚刚刚创建的那个空目录"，
 // 见 RollbackJustCreatedEntry。
@@ -1446,8 +1447,9 @@ bool RestoreSnapshotChain(const std::string& repository_directory,
       // 所以这里重新取一次 fd 再做相对回收 / 排他认领。
       parent_fd = parent_dir.Ensure(destination_parent);
       if (parent_fd < 0) {
-        SetError(error_message, "Cannot open the destination parent directory " +
-                                    destination_parent);
+        SetError(error_message,
+                 "Cannot open the destination parent directory " +
+                     destination_parent);
         delta_failed = true;
         break;
       }
@@ -1460,9 +1462,9 @@ bool RestoreSnapshotChain(const std::string& repository_directory,
       // 宁可在这里失败，也**绝不删除它**、更不往里面写。
       if (!ClaimTempDirectoryAt(parent_fd, overlay_name, &overlay_claim)) {
         const int saved_errno = errno;
-        SetError(error_message,
-                 "Cannot claim the delta overlay directory " + overlay + ": " +
-                     ErrnoText(saved_errno) + " (it was left untouched)");
+        SetError(error_message, "Cannot claim the delta overlay directory " +
+                                    overlay + ": " + ErrnoText(saved_errno) +
+                                    " (it was left untouched)");
         delta_failed = true;
         break;
       }
