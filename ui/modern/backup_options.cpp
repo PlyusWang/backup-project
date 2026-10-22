@@ -17,7 +17,6 @@ using backupproject::CompressionMethod;
 using backupproject::EncryptionMethod;
 using backupproject::PackMethod;
 
-QString Text(const QString& value) { return value; }
 
 }  // namespace
 
