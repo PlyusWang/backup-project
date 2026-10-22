@@ -1692,6 +1692,12 @@ Item {
                             kindText: String(modelData["kindText"] || "")
                             kindKey: String(modelData["kind"] || "")
                             rawArchive: modelData["rawArchive"] === true
+                            copyToLocalVisible: true
+                            copyToLocalEnabled:
+                                remote.authenticated && !remote.busy
+                            onCopyToLocalRequested:
+                                remote.copySnapshotToLocalRepository(
+                                    snapshotId)
                             generationVisible:
                                 modelData["generationVisible"] !== false
                             generation: Number(modelData["generation"] || 0)
