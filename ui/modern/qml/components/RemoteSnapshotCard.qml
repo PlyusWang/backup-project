@@ -44,7 +44,14 @@ Rectangle {
     property string restoreHint: ""   // 不能恢复时的一句话
     property bool busy: false
 
+    // 下载到本地仓库（与“下载归档”是两件事：前者进入仓库、成为可管理 / 可恢复的
+    // 本地备份；后者只是把 blob 存到用户选择的路径）。默认隐藏，由统一的
+    // 备份管理页打开。
+    property bool copyToLocalVisible: false
+    property bool copyToLocalEnabled: true
+
     signal restoreRequested(string snapshotId, string name)
+    signal copyToLocalRequested(string snapshotId, string name)
     signal downloadRequested(string snapshotId, string name)
     signal deleteRequested(string snapshotId, string name)
 
@@ -82,6 +89,15 @@ Rectangle {
                 variant: "primary"
                 enabled: !card.busy && card.restorable
                 onClicked: card.restoreRequested(card.snapshotId, card.nameText)
+            }
+
+            AppButton {
+                objectName: "remoteSnapshotCopyToLocalButton"
+                visible: card.copyToLocalVisible
+                text: "下载到本地仓库"
+                enabled: !card.busy && card.copyToLocalEnabled
+                onClicked:
+                    card.copyToLocalRequested(card.snapshotId, card.nameText)
             }
 
             AppButton {
