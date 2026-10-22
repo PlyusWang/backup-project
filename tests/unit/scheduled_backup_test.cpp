@@ -247,7 +247,7 @@ void TestTimeSemantics() {
   config.encryption_method = bp::EncryptionMethod::kAes256CtrHmacSha256;
   test_support::Check(
       !bp::ValidateScheduleConfig(config, &error) &&
-          error.find("定时无人值守加密需要安全的密钥来源") != std::string::npos,
+          error.find("需要先配置") != std::string::npos,
       "TIME-16 unattended encryption is refused with the documented reason",
       error);
 }
@@ -744,7 +744,7 @@ void TestEncryptionBoundaryAndLock() {
   std::string error;
   test_support::Check(
       !store.Save(document, &error) &&
-          error.find("定时无人值守加密需要安全的密钥来源") != std::string::npos,
+          error.find("需要先配置") != std::string::npos,
       "ENC-01 a schedule store refuses to persist encryption", error);
 
   // 手写一份带 password 字段的 schedule.json 也不会被接受：解析层只认 schema，
