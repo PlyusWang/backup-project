@@ -10777,7 +10777,8 @@ int RunScheduleTest(backup_modern::ScheduleController* schedule,
                                    QStringList() << QStringLiteral("ext:txt"),
                                    QStringList()
                                        << QStringLiteral("path:**/build/**")),
-              QStringLiteral("SCH-85 保存一份合法配置"), schedule->statusMessage());
+              QStringLiteral("SCH-85 保存一份合法配置"),
+              schedule->statusMessage());
     run.Check(!schedule->suspended(),
               QStringLiteral("SCH-86 保存成功之后挂起自动解除"));
     run.Check(schedule->tickActiveForTest(),

@@ -742,10 +742,10 @@ void TestEncryptionBoundaryAndLock() {
   bp::ScheduleDocument document;
   document.config = config;
   std::string error;
-  test_support::Check(
-      !store.Save(document, &error) &&
-          error.find("需要先配置") != std::string::npos,
-      "ENC-01 a schedule store refuses to persist encryption", error);
+  test_support::Check(!store.Save(document, &error) &&
+                          error.find("需要先配置") != std::string::npos,
+                      "ENC-01 a schedule store refuses to persist encryption",
+                      error);
 
   // 手写一份带 password 字段的 schedule.json 也不会被接受：解析层只认 schema，
   // 未知字段直接报错。这样"密码写进 schedule.json"这条路连门都没有。
