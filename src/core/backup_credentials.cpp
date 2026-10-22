@@ -31,9 +31,8 @@ bool InspectCredentialFile(const std::string& path, struct stat* info,
     return false;
   }
   if (::lstat(path.c_str(), info) != 0) {
-    SetError(error_message,
-             "Cannot read the credential file '" + path + "': " +
-                 std::strerror(errno));
+    SetError(error_message, "Cannot read the credential file '" + path +
+                                "': " + std::strerror(errno));
     return false;
   }
   if (S_ISLNK(info->st_mode)) {
@@ -43,8 +42,8 @@ bool InspectCredentialFile(const std::string& path, struct stat* info,
     return false;
   }
   if (!S_ISREG(info->st_mode)) {
-    SetError(error_message, "The credential file '" + path +
-                                "' is not a regular file");
+    SetError(error_message,
+             "The credential file '" + path + "' is not a regular file");
     return false;
   }
   if (info->st_uid != ::geteuid()) {
@@ -59,15 +58,14 @@ bool InspectCredentialFile(const std::string& path, struct stat* info,
     return false;
   }
   if ((info->st_mode & 0400) == 0) {
-    SetError(error_message, "The credential file '" + path +
-                                "' is not readable by its owner");
+    SetError(error_message,
+             "The credential file '" + path + "' is not readable by its owner");
     return false;
   }
   if (info->st_size <= 0 || info->st_size > kMaxCredentialFileBytes) {
-    SetError(error_message, "The credential file '" + path +
-                                "' must contain between 1 and " +
-                                std::to_string(kMaxCredentialFileBytes) +
-                                " bytes");
+    SetError(error_message,
+             "The credential file '" + path + "' must contain between 1 and " +
+                 std::to_string(kMaxCredentialFileBytes) + " bytes");
     return false;
   }
   return true;
@@ -90,8 +88,8 @@ bool IsUsableCredentialPath(const std::string& path,
     return false;
   }
   if (path.front() != '/') {
-    SetError(error_message, "Credential file path must be absolute: '" + path +
-                                "'");
+    SetError(error_message,
+             "Credential file path must be absolute: '" + path + "'");
     return false;
   }
   return true;
@@ -128,8 +126,8 @@ bool ReadCredentialFile(const std::string& path, std::string* secret,
     return false;
   }
   if (content.size() > kMaxCredentialFileBytes) {
-    SetError(error_message, "The credential file '" + path +
-                                "' grew beyond the allowed size");
+    SetError(error_message,
+             "The credential file '" + path + "' grew beyond the allowed size");
     return false;
   }
   if (content.find('\0') != std::string::npos) {

@@ -303,9 +303,9 @@ BackupController::BackupController(const QString& config_file_path,
           // 主界面只显示中文结论与下一步；核心原文进错误对话框的
           // “技术详情”（默认折叠），一个字节都不丢。
           const UserFacingError explained = ExplainOperationError(
-              outcome.error_message,
-              kind == Kind::kBackup ? QStringLiteral("备份")
-                                    : QStringLiteral("恢复"));
+              outcome.error_message, kind == Kind::kBackup
+                                         ? QStringLiteral("备份")
+                                         : QStringLiteral("恢复"));
           // 主要反馈只有对话框这一条：页面横幅立刻回到 idle，避免同一个
           // 错误同时以“弹窗 + 红条”出现两次。
           SetStatus(QString::fromLatin1("idle"), QString(), QString());
@@ -1108,9 +1108,11 @@ bool BackupController::Start(const OperationRequest& request,
 
 void BackupController::OnArchiveProgress(
     const backupproject::ArchiveProgress& progress) {
-  static const std::map<std::string, int> kPhaseCodes = {
-      {"scanning", 1}, {"packing", 2}, {"compressing", 3},
-      {"writing", 4},  {"finishing", 5}};
+  static const std::map<std::string, int> kPhaseCodes = {{"scanning", 1},
+                                                         {"packing", 2},
+                                                         {"compressing", 3},
+                                                         {"writing", 4},
+                                                         {"finishing", 5}};
   const auto found = kPhaseCodes.find(progress.phase);
   progress_phase_.store(found == kPhaseCodes.end() ? 0 : found->second);
   progress_items_done_.store(progress.items_done);
@@ -1124,12 +1126,18 @@ void BackupController::OnArchiveProgress(
 
 QString BackupController::progressPhase() const {
   switch (progress_phase_.load()) {
-    case 1: return QStringLiteral("scanning");
-    case 2: return QStringLiteral("packing");
-    case 3: return QStringLiteral("compressing");
-    case 4: return QStringLiteral("writing");
-    case 5: return QStringLiteral("finishing");
-    default: return QString();
+    case 1:
+      return QStringLiteral("scanning");
+    case 2:
+      return QStringLiteral("packing");
+    case 3:
+      return QStringLiteral("compressing");
+    case 4:
+      return QStringLiteral("writing");
+    case 5:
+      return QStringLiteral("finishing");
+    default:
+      return QString();
   }
 }
 
@@ -1149,9 +1157,8 @@ qulonglong BackupController::progressBytesTotal() const {
 double BackupController::progressRatio() const {
   const qulonglong total = progress_bytes_total_.load();
   if (total == 0) return -1.0;
-  const double ratio =
-      static_cast<double>(progress_bytes_done_.load()) /
-      static_cast<double>(total);
+  const double ratio = static_cast<double>(progress_bytes_done_.load()) /
+                       static_cast<double>(total);
   return ratio < 0 ? 0 : (ratio > 1 ? 1 : ratio);
 }
 
@@ -1162,10 +1169,10 @@ QString BackupController::progressText() const {
   const qulonglong items_total = progress_items_total_.load();
   const qulonglong bytes_done = progress_bytes_done_.load();
   const qulonglong bytes_total = progress_bytes_total_.load();
-  if (phase == QStringLiteral("scanning")) return QStringLiteral("正在扫描文件…");
+  if (phase == QStringLiteral("scanning"))
+    return QStringLiteral("正在扫描文件…");
   if (phase == QStringLiteral("packing")) {
-    if (items_total == 0)
-      return QStringLiteral("正在生成备份…");
+    if (items_total == 0) return QStringLiteral("正在生成备份…");
     return QStringLiteral("正在生成备份… %1 / %2 个文件")
         .arg(items_done)
         .arg(items_total);
@@ -1174,14 +1181,13 @@ QString BackupController::progressText() const {
     return QStringLiteral("正在压缩…");
   if (phase == QStringLiteral("writing")) {
     if (bytes_total == 0) return QStringLiteral("正在写入备份…");
-    const double percent =
-        100.0 * static_cast<double>(bytes_done) / static_cast<double>(bytes_total);
+    const double percent = 100.0 * static_cast<double>(bytes_done) /
+                           static_cast<double>(bytes_total);
     return QStringLiteral("正在写入备份… %1 / %2（%3%）")
-        .arg(QString::fromStdString(
-            backupproject::FormatByteSize(
-                static_cast<std::uint64_t>(bytes_done))),
-            QString::fromStdString(backupproject::FormatByteSize(
-                static_cast<std::uint64_t>(bytes_total))))
+        .arg(QString::fromStdString(backupproject::FormatByteSize(
+                 static_cast<std::uint64_t>(bytes_done))),
+             QString::fromStdString(backupproject::FormatByteSize(
+                 static_cast<std::uint64_t>(bytes_total))))
         .arg(QString::number(percent, 'f', 0));
   }
   return QStringLiteral("正在完成备份…");
@@ -1233,9 +1239,9 @@ OperationOutcome BackupController::RunOperation(OperationRequest request) {
   } else if (request.kind == Kind::kBackup) {
     if (request.backup_flavor == BackupFlavor::kModernV2) {
       // 三项都由用户在界面上选择，这里不再写死任何一项。
-      outcome.succeeded = engine.Backup(first, second, request.filter,
-                                        request.backup_options, &error_message,
-                                        request.progress);
+      outcome.succeeded =
+          engine.Backup(first, second, request.filter, request.backup_options,
+                        &error_message, request.progress);
     } else {
       // legacy v0.1：旧格式始终保留一条被真实执行的回归入口。
       outcome.succeeded =

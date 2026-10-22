@@ -6,11 +6,12 @@
 // 指纹、两种模式同时配置 —— 每一条都必须在解析时就失败，而不是等到连接时
 // 用一句"握手失败"收场。
 
+#include "server_profile.h"
+
 #include <cstdio>
 #include <string>
 
 #include "remote_backup_client.h"
-#include "server_profile.h"
 
 namespace {
 
@@ -36,7 +37,8 @@ void Check(bool ok, const std::string& label, const std::string& detail = "") {
   std::printf("[profile]   FAIL %s（%s）\n", label.c_str(), detail.c_str());
 }
 
-const char* kPin = "sha256:f491f0be36bc715d064d96766eaf96539b39737515deaff9390b20e0cb6c9b60";
+const char* kPin =
+    "sha256:f491f0be36bc715d064d96766eaf96539b39737515deaff9390b20e0cb6c9b60";
 
 }  // namespace
 
@@ -129,7 +131,8 @@ int main() {
          "display_name = x\nhost = h\nport = 18765\nidentity = magic\n"},
         {"P18 不是 key = value 必须报错", "display_name x\nhost = h\n"},
         {"P19 缺 display_name 必须报错",
-         "host = h\nport = 18765\nidentity = certificate\nexpected_server_id = s\n"},
+         "host = h\nport = 18765\nidentity = certificate\nexpected_server_id = "
+         "s\n"},
     };
     for (const Case& item : cases) {
       ServerProfile parsed;

@@ -34,12 +34,14 @@ bool ReadCredentialFile(const std::string& path, std::string* secret,
 
 // 只做检查、不返回内容：启用计划 / 实时任务前用它，避免把口令读进一个
 // 根本不打算运行的进程。检查项与 ReadCredentialFile 完全相同。
-bool ValidateCredentialFile(const std::string& path, std::string* error_message);
+bool ValidateCredentialFile(const std::string& path,
+                            std::string* error_message);
 
 // 口令文件路径的**结构**检查（非空、长度上限、无 NUL、是绝对路径）。
 // 它不做文件系统探测，供 ValidateScheduleConfig / ValidateRealtimeConfig
 // 这类"只看配置文本"的校验使用。
-bool IsUsableCredentialPath(const std::string& path, std::string* error_message);
+bool IsUsableCredentialPath(const std::string& path,
+                            std::string* error_message);
 
 }  // namespace backupproject
 

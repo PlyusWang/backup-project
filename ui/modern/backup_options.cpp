@@ -33,8 +33,7 @@ QStringList BackupOptionsCatalog::strategyLabels() const {
 }
 
 QStringList BackupOptionsCatalog::packLabels() const {
-  return {QStringLiteral("MyPack（推荐）"),
-          QStringLiteral("USTAR（标准格式）"),
+  return {QStringLiteral("MyPack（推荐）"), QStringLiteral("USTAR（标准格式）"),
           QStringLiteral("Fast USTAR（高吞吐）")};
 }
 
@@ -44,13 +43,12 @@ QStringList BackupOptionsCatalog::compressionLabels() const {
 }
 
 QStringList BackupOptionsCatalog::encryptionLabels() const {
-  return {QStringLiteral("不加密"),
-          QStringLiteral("AES-256-CTR + HMAC-SHA256"),
+  return {QStringLiteral("不加密"), QStringLiteral("AES-256-CTR + HMAC-SHA256"),
           QStringLiteral("DES-CBC + HMAC-SHA256（教学用）")};
 }
 
-bool BackupOptionsCatalog::needsCredentialFile(const QString& trigger,
-                                                const QString& encryption) const {
+bool BackupOptionsCatalog::needsCredentialFile(
+    const QString& trigger, const QString& encryption) const {
   const bool unattended = trigger == QStringLiteral("scheduled") ||
                           trigger == QStringLiteral("realtime");
   return unattended && encryption != QStringLiteral("none");
@@ -65,10 +63,12 @@ QString BackupOptionsCatalog::strategyNote(const QString& strategy) const {
   return QStringLiteral("每次备份都生成一份完整、自包含的归档。");
 }
 
-QString BackupOptionsCatalog::validate(
-    const QString& trigger, const QString& strategy, const QString& pack,
-    const QString& compression, const QString& encryption,
-    bool credential_configured) const {
+QString BackupOptionsCatalog::validate(const QString& trigger,
+                                       const QString& strategy,
+                                       const QString& pack,
+                                       const QString& compression,
+                                       const QString& encryption,
+                                       bool credential_configured) const {
   BackupTrigger parsed_trigger = BackupTrigger::kManual;
   BackupStrategy parsed_strategy = BackupStrategy::kFull;
   PackMethod parsed_pack = PackMethod::kMyPack;

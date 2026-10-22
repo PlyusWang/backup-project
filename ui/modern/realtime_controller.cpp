@@ -1231,8 +1231,8 @@ bool RealtimeController::saveConfig(bool enabled, const QString& source_path,
   }
   // 加密方式与凭据路径来自界面草稿；口令内容不在这里，由运行期从
   // 0600 文件读取。
-  if (!backupproject::ParseEncryptionMethodKey(draft_encryption_key_.toStdString(),
-                                               &next.encryption_method)) {
+  if (!backupproject::ParseEncryptionMethodKey(
+          draft_encryption_key_.toStdString(), &next.encryption_method)) {
     SetStatus(kError, QStringLiteral("未知的加密方式"), draft_encryption_key_);
     restore_watch();
     return false;
@@ -1458,8 +1458,9 @@ QString RealtimeController::encryptionNote() const {
         backupproject::UnattendedEncryptionDisabledReason(
             backupproject::BackupTrigger::kRealtime));
   }
-  return QStringLiteral("加密口令将在每次触发时从该文件读取；"
-                        "文件不可读时这一轮备份会明确失败。");
+  return QStringLiteral(
+      "加密口令将在每次触发时从该文件读取；"
+      "文件不可读时这一轮备份会明确失败。");
 }
 
 bool RealtimeController::watching() const { return watcher_.attached(); }

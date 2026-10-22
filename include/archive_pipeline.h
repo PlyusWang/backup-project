@@ -19,6 +19,7 @@
 #define BACKUP_PROJECT_INCLUDE_ARCHIVE_PIPELINE_H_
 
 #include <cstdint>
+#include <functional>
 #include <string>
 #include <vector>
 
@@ -26,8 +27,6 @@
 #include "container_format.h"
 #include "filter.h"
 #include "pack_stream.h"
-
-#include <functional>
 
 namespace backupproject {
 
@@ -77,8 +76,7 @@ using ArchiveProgressCallback = std::function<void(const ArchiveProgress&)>;
 
 bool RunBackupPipeline(const std::string& source_directory,
                        const std::string& archive_file, const Filter& filter,
-                       const BackupOptions& options,
-                       std::string* error_message,
+                       const BackupOptions& options, std::string* error_message,
                        const ArchiveProgressCallback& progress = {});
 
 // 从一份已经准备好的条目表走完整条流水线（扫描是唯一被跳过的步骤）。

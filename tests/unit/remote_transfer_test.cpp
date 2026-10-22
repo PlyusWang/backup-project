@@ -230,12 +230,13 @@ bool HandshakeOrShutdown(Session* session, const std::string& pin,
 }
 
 net::FrameReadStatus Request(Session* session, net::Opcode opcode,
-                             const std::string& payload, net::FrameHeader* header,
-                             std::string* response, std::string* error) {
+                             const std::string& payload,
+                             net::FrameHeader* header, std::string* response,
+                             std::string* error) {
   const std::uint64_t request_id = session->next_request_id++;
-  if (!remote_test_support::SendTestFrame(
-          &session->channel, session->fd, static_cast<std::uint16_t>(opcode), 0,
-          request_id, payload, error)) {
+  if (!remote_test_support::SendTestFrame(&session->channel, session->fd,
+                                          static_cast<std::uint16_t>(opcode), 0,
+                                          request_id, payload, error)) {
     return net::FrameReadStatus::kIoError;
   }
   return remote_test_support::ReceiveTestFrame(&session->channel, session->fd,
@@ -318,8 +319,7 @@ bool OpenSession(net::RemoteServer* server, const std::string& username,
 // 都不碰增量链，链本身由专门的链测试覆盖。所以这里发的字节与产品 CLI 在
 // remote upload 下发的完全一致。
 std::string UploadBeginPayload(const std::string& display_name,
-                               std::uint64_t size,
-                               const std::string& sha256) {
+                               std::uint64_t size, const std::string& sha256) {
   net::PayloadBuilder builder;
   std::string error;
   builder.AppendString(display_name, net::kMaxDisplayNameBytes, &error);
@@ -698,10 +698,9 @@ int main() {
   const std::string password = RandomHex(16);
   Session session;
   std::string session_error;
-  test_support::Check(
-      OpenSession(&server, username, password, fixture.pin, &session,
-                  &session_error),
-      "XFER T1 注册并登录", session_error);
+  test_support::Check(OpenSession(&server, username, password, fixture.pin,
+                                  &session, &session_error),
+                      "XFER T1 注册并登录", session_error);
 
   const std::string data = RandomHex(512);  // 1024 字节
   const std::string sha = Sha256Of(data);
@@ -710,9 +709,9 @@ int main() {
   std::string note;
   const bool uploaded =
       UploadBuffer(&session, "first.bak", data, &snapshot_id, &status, &note);
-  test_support::Check(uploaded && status == static_cast<std::uint32_t>(
-                                          net::Status::kOk),
-                      "XFER T1 上传成功", net::StatusName(status));
+  test_support::Check(
+      uploaded && status == static_cast<std::uint32_t>(net::Status::kOk),
+      "XFER T1 上传成功", net::StatusName(status));
   test_support::Check(net::IsValidSnapshotId(snapshot_id, &error),
                       "XFER T1 服务端生成的 snapshot id 合法");
   test_support::Check(note.compare(0, sha.size() + 6, sha + "|1024|") == 0,
@@ -732,10 +731,11 @@ int main() {
 
   std::vector<std::string> ids;
   status = 0;
-  test_support::Check(ListSnapshots(&session, nullptr, &ids, &status, &error) &&
-                          status == static_cast<std::uint32_t>(net::Status::kOk) &&
-                          ids.size() == 1 && ids[0] == snapshot_id,
-                      "XFER T1 列表里有且只有这一条", net::StatusName(status));
+  test_support::Check(
+      ListSnapshots(&session, nullptr, &ids, &status, &error) &&
+          status == static_cast<std::uint32_t>(net::Status::kOk) &&
+          ids.size() == 1 && ids[0] == snapshot_id,
+      "XFER T1 列表里有且只有这一条", net::StatusName(status));
 
   std::string downloaded;
   std::uint64_t declared_size = 0;
@@ -755,9 +755,9 @@ int main() {
   std::string missing_sha;
   DownloadBuffer(&session, std::string(32, 'f'), &missing, &missing_size,
                  &missing_sha, &status, &error);
-  test_support::Check(status == static_cast<std::uint32_t>(net::Status::kNotFound),
-                      "XFER T1 不存在的 snapshot id = NOT_FOUND",
-                      net::StatusName(status));
+  test_support::Check(
+      status == static_cast<std::uint32_t>(net::Status::kNotFound),
+      "XFER T1 不存在的 snapshot id = NOT_FOUND", net::StatusName(status));
 
   status = 0;
   DeleteSnapshot(&session, snapshot_id, &status, &error);
@@ -773,10 +773,12 @@ int main() {
   test_support::Check(ids.empty(), "XFER T1 判别：删除之后列表为空");
   status = 0;
   DeleteSnapshot(&session, snapshot_id, &status, &error);
-  test_support::Check(status == static_cast<std::uint32_t>(net::Status::kNotFound),
-                      "XFER T1 再删一次 = NOT_FOUND");
+  test_support::Check(
+      status == static_cast<std::uint32_t>(net::Status::kNotFound),
+      "XFER T1 再删一次 = NOT_FOUND");
 
-  test_support::Section("XFER 2. 块边界：1 / chunk-1 / chunk / chunk+1 / 5 MiB");
+  test_support::Section(
+      "XFER 2. 块边界：1 / chunk-1 / chunk / chunk+1 / 5 MiB");
   {
     const std::size_t chunk = net::kTransferChunkBytes;
     const std::size_t sizes[] = {1, chunk - 1, chunk, chunk + 1,
@@ -807,9 +809,8 @@ int main() {
       }
       DeleteSnapshot(&session, id, &status, &error);
     }
-    test_support::Check(all_ok,
-                        "XFER T2 判别：五种长度都往返一致（失败长度: " + details +
-                            "）");
+    test_support::Check(all_ok, "XFER T2 判别：五种长度都往返一致（失败长度: " +
+                                    details + "）");
   }
 
   test_support::Section("XFER 3. 状态机：没有 BEGIN 就没有 CHUNK / END");
@@ -855,10 +856,9 @@ int main() {
     Request(&session, net::Opcode::kUploadBegin,
             UploadBeginPayload("bad\nname.bak", 10, std::string(64, 'a')),
             &header, &response, &error);
-    test_support::Check(
-        header.status ==
-            static_cast<std::uint32_t>(net::Status::kInvalidRequest),
-        "XFER T4 含控制字符的显示名 = INVALID_REQUEST");
+    test_support::Check(header.status == static_cast<std::uint32_t>(
+                                             net::Status::kInvalidRequest),
+                        "XFER T4 含控制字符的显示名 = INVALID_REQUEST");
     Request(&session, net::Opcode::kUploadBegin,
             UploadBeginPayload("huge.bak", 9ull * 1024 * 1024 * 1024,
                                std::string(64, 'a')),
@@ -869,10 +869,9 @@ int main() {
     Request(&session, net::Opcode::kUploadBegin,
             UploadBeginPayload("badsha.bak", 10, std::string(63, 'a')), &header,
             &response, &error);
-    test_support::Check(
-        header.status ==
-            static_cast<std::uint32_t>(net::Status::kInvalidRequest),
-        "XFER T4 摘要文本长度不对 = INVALID_REQUEST");
+    test_support::Check(header.status == static_cast<std::uint32_t>(
+                                             net::Status::kInvalidRequest),
+                        "XFER T4 摘要文本长度不对 = INVALID_REQUEST");
   }
 
   test_support::Section("XFER 5. 失败路径：磁盘上不能留下任何东西");
@@ -907,7 +906,7 @@ int main() {
     Request(&session, net::Opcode::kUploadEnd, std::string(), &header,
             &response, &error);
     test_support::Check(header.status == static_cast<std::uint32_t>(
-                                            net::Status::kIntegrityMismatch),
+                                             net::Status::kIntegrityMismatch),
                         "XFER T5 声明长度大于实际 = INTEGRITY_MISMATCH");
     test_support::Check(CountEntries(user_directory + "/tmp") == 0,
                         "XFER T5 判别：长度不符之后临时文件被删掉");
@@ -922,7 +921,7 @@ int main() {
     Request(&session, net::Opcode::kUploadEnd, std::string(), &header,
             &response, &error);
     test_support::Check(header.status == static_cast<std::uint32_t>(
-                                            net::Status::kIntegrityMismatch),
+                                             net::Status::kIntegrityMismatch),
                         "XFER T5 摘要不符 = INTEGRITY_MISMATCH");
     test_support::Check(CountEntries(user_directory + "/tmp") == 0 &&
                             CountBlobs(user_directory) == 0,
@@ -934,17 +933,16 @@ int main() {
             &header, &response, &error);
     Request(&session, net::Opcode::kUploadChunk, std::string(), &header,
             &response, &error);
-    test_support::Check(
-        header.status ==
-            static_cast<std::uint32_t>(net::Status::kInvalidRequest),
-        "XFER T5 空块 = INVALID_REQUEST");
+    test_support::Check(header.status == static_cast<std::uint32_t>(
+                                             net::Status::kInvalidRequest),
+                        "XFER T5 空块 = INVALID_REQUEST");
     Request(&session, net::Opcode::kUploadChunk, body, &header, &response,
             &error);
     Request(&session, net::Opcode::kUploadEnd, std::string(), &header,
             &response, &error);
-    test_support::Check(header.status ==
-                            static_cast<std::uint32_t>(net::Status::kOk),
-                        "XFER T5 判别：被拒绝的帧没有打断正在进行的上传");
+    test_support::Check(
+        header.status == static_cast<std::uint32_t>(net::Status::kOk),
+        "XFER T5 判别：被拒绝的帧没有打断正在进行的上传");
     net::PayloadReader reader(response);
     std::string id;
     std::string returned_sha;
@@ -959,15 +957,15 @@ int main() {
     // 5e. 超过块上限的帧（256 KiB < 300 KiB <= 1 MiB）-> TOO_LARGE。
     // 这一帧只是被拒绝：它里面的字节一个都没写进去，上传还能继续。
     const std::string big_body(300 * 1024, 'x');
-    Request(&session, net::Opcode::kUploadBegin,
-            UploadBeginPayload("bigchunk.bak", big_body.size(),
-                               Sha256Of(big_body)),
+    Request(
+        &session, net::Opcode::kUploadBegin,
+        UploadBeginPayload("bigchunk.bak", big_body.size(), Sha256Of(big_body)),
+        &header, &response, &error);
+    Request(&session, net::Opcode::kUploadChunk, std::string(300 * 1024, 'x'),
             &header, &response, &error);
-    Request(&session, net::Opcode::kUploadChunk,
-            std::string(300 * 1024, 'x'), &header, &response, &error);
-    test_support::Check(header.status == static_cast<std::uint32_t>(
-                                            net::Status::kTooLarge),
-                        "XFER T5 单个块超过 256 KiB = TOO_LARGE");
+    test_support::Check(
+        header.status == static_cast<std::uint32_t>(net::Status::kTooLarge),
+        "XFER T5 单个块超过 256 KiB = TOO_LARGE");
     Request(&session, net::Opcode::kUploadChunk,
             big_body.substr(0, net::kTransferChunkBytes), &header, &response,
             &error);
@@ -976,9 +974,9 @@ int main() {
             &error);
     Request(&session, net::Opcode::kUploadEnd, std::string(), &header,
             &response, &error);
-    test_support::Check(header.status ==
-                            static_cast<std::uint32_t>(net::Status::kOk),
-                        "XFER T5 判别：被拒绝的超大块没有污染上传内容");
+    test_support::Check(
+        header.status == static_cast<std::uint32_t>(net::Status::kOk),
+        "XFER T5 判别：被拒绝的超大块没有污染上传内容");
     net::PayloadReader big_reader(response);
     std::string big_id;
     std::string big_sha;
@@ -994,9 +992,9 @@ int main() {
     big_reader.ReadU16(&big_kind);
     big_reader.ReadU64(&big_generation);
     big_reader.ReadString(net::kMaxSnapshotIdBytes, &big_parent);
-    test_support::Check(big_sha == Sha256Of(big_body) &&
-                            big_size == big_body.size(),
-                        "XFER T5 判别：最终 blob 就是完整的 300 KiB");
+    test_support::Check(
+        big_sha == Sha256Of(big_body) && big_size == big_body.size(),
+        "XFER T5 判别：最终 blob 就是完整的 300 KiB");
     DeleteSnapshot(&session, big_id, &status, &error);
 
     // 5f. 注入磁盘写失败
@@ -1006,10 +1004,9 @@ int main() {
             &response, &error);
     Request(&session, net::Opcode::kUploadChunk, body, &header, &response,
             &error);
-    test_support::Check(
-        header.status ==
-            static_cast<std::uint32_t>(net::Status::kInternalError),
-        "XFER T5 注入的写盘失败 = INTERNAL_ERROR");
+    test_support::Check(header.status == static_cast<std::uint32_t>(
+                                             net::Status::kInternalError),
+                        "XFER T5 注入的写盘失败 = INTERNAL_ERROR");
     test_support::Check(CountEntries(user_directory + "/tmp") == 0 &&
                             CountBlobs(user_directory) == 0,
                         "XFER T5 判别：写盘失败之后没有留下任何文件");
@@ -1019,12 +1016,12 @@ int main() {
     std::string injected_id;
     std::uint32_t injected_status = 0;
     std::string injected_note;
-    UploadBuffer(&session, "rollback.bak", body, &injected_id,
-                 &injected_status, &injected_note);
-    test_support::Check(
-        injected_status == static_cast<std::uint32_t>(net::Status::kInternalError),
-        "XFER T5 注入的元数据写入失败 = INTERNAL_ERROR",
-        net::StatusName(injected_status));
+    UploadBuffer(&session, "rollback.bak", body, &injected_id, &injected_status,
+                 &injected_note);
+    test_support::Check(injected_status == static_cast<std::uint32_t>(
+                                               net::Status::kInternalError),
+                        "XFER T5 注入的元数据写入失败 = INTERNAL_ERROR",
+                        net::StatusName(injected_status));
     test_support::Check(CountBlobs(user_directory) == 0 &&
                             CountEntries(user_directory + "/tmp") == 0,
                         "XFER T5 判别：元数据失败之后已发布的 blob 被回滚");
@@ -1042,18 +1039,17 @@ int main() {
     std::thread second_worker = ServeOneConnection(&server);
     Session second;
     std::string second_error;
-    test_support::Check(
-        OpenSession(&server, username, password, fixture.pin, &second,
-                    &second_error),
-        "XFER T6 第二条连接登录", second_error);
+    test_support::Check(OpenSession(&server, username, password, fixture.pin,
+                                    &second, &second_error),
+                        "XFER T6 第二条连接登录", second_error);
     net::FrameHeader header;
     std::string response;
     Request(&second, net::Opcode::kUploadBegin,
             UploadBeginPayload("drop.bak", body.size(), Sha256Of(body)),
             &header, &response, &error);
-    test_support::Check(header.status ==
-                            static_cast<std::uint32_t>(net::Status::kOk),
-                        "XFER T6 第二条连接开始上传");
+    test_support::Check(
+        header.status == static_cast<std::uint32_t>(net::Status::kOk),
+        "XFER T6 第二条连接开始上传");
     Request(&second, net::Opcode::kUploadChunk, body.substr(0, 100), &header,
             &response, &error);
     test_support::Check(CountEntries(user_directory + "/tmp") == 2,
@@ -1061,9 +1057,8 @@ int main() {
     // 不发 UPLOAD_END，直接断开。断连是"可续传"而不是"失败清理"：
     // 临时文件与 .resume 检查点必须保留，等客户端回来继续。
     ::close(second.fd);
-    test_support::Check(
-        CountEntries(user_directory + "/tmp") == 2,
-        "XFER T6 判别：断开之后保留 .part 与 .resume 检查点");
+    test_support::Check(CountEntries(user_directory + "/tmp") == 2,
+                        "XFER T6 判别：断开之后保留 .part 与 .resume 检查点");
     test_support::Check(CountBlobs(user_directory) == 0,
                         "XFER T6 判别：断开没有发布任何 blob");
     second_worker.join();
@@ -1078,11 +1073,10 @@ int main() {
     UploadBuffer(&session, "tamper.bak", body, &id, &upload_status,
                  &upload_note);
     const std::string blob = user_directory + "/" + id + ".bak";
-    test_support::Check(upload_status ==
-                            static_cast<std::uint32_t>(net::Status::kOk) &&
-                            test_support::WriteFile(blob, std::string(body.size(), 'Z'),
-                                                    0600),
-                        "XFER T7 夹具：把磁盘上的 blob 换成同长度的另一份内容");
+    test_support::Check(
+        upload_status == static_cast<std::uint32_t>(net::Status::kOk) &&
+            test_support::WriteFile(blob, std::string(body.size(), 'Z'), 0600),
+        "XFER T7 夹具：把磁盘上的 blob 换成同长度的另一份内容");
     std::string back;
     std::uint64_t declared_size = 0;
     std::string declared_sha;
@@ -1128,24 +1122,22 @@ int main() {
         UploadStream(&big_session, "big.bak", kBigTransferBytes, &generator,
                      &big_id, &upload_status, &upload_note);
     const std::uint64_t rss_after_upload = PeakRssKb();
-    test_support::Check(sent && upload_status ==
-                                     static_cast<std::uint32_t>(
-                                         net::Status::kOk),
-                        "XFER T8 32 MiB 上传成功", net::StatusName(upload_status));
+    test_support::Check(
+        sent && upload_status == static_cast<std::uint32_t>(net::Status::kOk),
+        "XFER T8 32 MiB 上传成功", net::StatusName(upload_status));
 
     std::uint64_t received = 0;
     std::string download_sha;
     std::uint32_t download_status = 0;
-    const bool got = DownloadAndHash(&big_session, big_id, &received,
-                                     &download_sha, &download_status,
-                                     &big_error);
+    const bool got =
+        DownloadAndHash(&big_session, big_id, &received, &download_sha,
+                        &download_status, &big_error);
     const std::uint64_t rss_after_download = PeakRssKb();
-    test_support::Check(got && download_status ==
-                                    static_cast<std::uint32_t>(
-                                        net::Status::kOk) &&
-                            received == kBigTransferBytes,
-                        "XFER T8 32 MiB 下载成功且长度一致",
-                        net::StatusName(download_status));
+    test_support::Check(
+        got &&
+            download_status == static_cast<std::uint32_t>(net::Status::kOk) &&
+            received == kBigTransferBytes,
+        "XFER T8 32 MiB 下载成功且长度一致", net::StatusName(download_status));
     // upload_note 就是 "服务端回的摘要|长度"，直接比文本即可
     // （不能对它再做一次 SHA-256，那是摘要的摘要）。
     test_support::Check(
@@ -1166,8 +1158,9 @@ int main() {
 #else
     std::printf("RSS_BOUND: non-sanitized = %s\n",
                 growth < 16 * 1024 ? "PASS" : "FAIL");
-    test_support::Check(growth < 16 * 1024,
-                        "XFER T8 判别：32 MiB 文件没有进内存（峰值增长 < 16 MiB）");
+    test_support::Check(
+        growth < 16 * 1024,
+        "XFER T8 判别：32 MiB 文件没有进内存（峰值增长 < 16 MiB）");
 #endif
 
     const std::string big_blob = big.root + "/users/1/" + big_id + ".bak";
@@ -1176,8 +1169,9 @@ int main() {
     if (blob) {
       blob_size = static_cast<std::streamoff>(blob.tellg());
     }
-    test_support::Check(blob_size == static_cast<std::streamoff>(kBigTransferBytes),
-                        "XFER T8 判别：磁盘上的 blob 就是 32 MiB");
+    test_support::Check(
+        blob_size == static_cast<std::streamoff>(kBigTransferBytes),
+        "XFER T8 判别：磁盘上的 blob 就是 32 MiB");
     DeleteSnapshot(&big_session, big_id, &status, &big_error);
     ::close(big_session.fd);
     big_worker.join();
@@ -1187,7 +1181,8 @@ int main() {
   test_support::Section("XFER 9. 跨用户隔离（socket 层）");
   {
     Fixture shared;
-    test_support::Check(SetupFixture(&shared, "xfer-users"), "XFER T9 夹具就绪");
+    test_support::Check(SetupFixture(&shared, "xfer-users"),
+                        "XFER T9 夹具就绪");
     net::RemoteServer shared_server;
     std::string shared_error;
     test_support::Check(shared_server.Configure(shared.config, &shared_error) &&
@@ -1214,9 +1209,9 @@ int main() {
     std::string upload_note;
     UploadBuffer(&alice, "alice.bak", body, &alice_id, &upload_status,
                  &upload_note);
-    test_support::Check(upload_status ==
-                            static_cast<std::uint32_t>(net::Status::kOk),
-                        "XFER T9 A 上传成功");
+    test_support::Check(
+        upload_status == static_cast<std::uint32_t>(net::Status::kOk),
+        "XFER T9 A 上传成功");
 
     std::vector<std::string> bob_ids;
     status = 0;
@@ -1228,15 +1223,16 @@ int main() {
     std::uint64_t declared_size = 0;
     std::string declared_sha;
     status = 0;
-    DownloadBuffer(&bob, alice_id, &back, &declared_size, &declared_sha, &status,
-                   &shared_error);
-    test_support::Check(status == static_cast<std::uint32_t>(net::Status::kNotFound),
-                        "XFER T9 判别：B 下载 A 的快照 = NOT_FOUND",
-                        net::StatusName(status));
+    DownloadBuffer(&bob, alice_id, &back, &declared_size, &declared_sha,
+                   &status, &shared_error);
+    test_support::Check(
+        status == static_cast<std::uint32_t>(net::Status::kNotFound),
+        "XFER T9 判别：B 下载 A 的快照 = NOT_FOUND", net::StatusName(status));
     status = 0;
     DeleteSnapshot(&bob, alice_id, &status, &shared_error);
-    test_support::Check(status == static_cast<std::uint32_t>(net::Status::kNotFound),
-                        "XFER T9 判别：B 删除 A 的快照 = NOT_FOUND");
+    test_support::Check(
+        status == static_cast<std::uint32_t>(net::Status::kNotFound),
+        "XFER T9 判别：B 删除 A 的快照 = NOT_FOUND");
 
     std::vector<std::string> alice_ids;
     status = 0;
@@ -1246,10 +1242,11 @@ int main() {
     status = 0;
     DownloadBuffer(&alice, alice_id, &back, &declared_size, &declared_sha,
                    &status, &shared_error);
-    test_support::Check(status == static_cast<std::uint32_t>(net::Status::kOk) &&
-                            back == body,
-                        "XFER T9 判别：A 自己下载成功且内容一致");
-    const std::string alice_blob = shared.root + "/users/1/" + alice_id + ".bak";
+    test_support::Check(
+        status == static_cast<std::uint32_t>(net::Status::kOk) && back == body,
+        "XFER T9 判别：A 自己下载成功且内容一致");
+    const std::string alice_blob =
+        shared.root + "/users/1/" + alice_id + ".bak";
     test_support::Check(test_support::Exists(alice_blob),
                         "XFER T9 判别：B 的越权删除没有动到 A 的文件");
 

@@ -17,8 +17,10 @@ UserFacingError ExplainOperationError(const QString& technical,
   error.title = action + QStringLiteral("没有完成");
 
   if (Contains(technical, "not empty")) {
-    error.summary = QStringLiteral("目标文件夹中已有文件，请选择一个空文件夹。");
-    error.suggestion = QStringLiteral("换一个空的恢复目录，或先清空该目录后重试。");
+    error.summary =
+        QStringLiteral("目标文件夹中已有文件，请选择一个空文件夹。");
+    error.suggestion =
+        QStringLiteral("换一个空的恢复目录，或先清空该目录后重试。");
     return error;
   }
   if (Contains(technical, "no snapshot with a usable content manifest") ||
@@ -29,7 +31,8 @@ UserFacingError ExplainOperationError(const QString& technical,
   }
   if (Contains(technical, "No space left") || Contains(technical, "空间")) {
     error.summary = QStringLiteral("磁盘空间不足，操作已停止。");
-    error.suggestion = QStringLiteral("清理目标磁盘或换一个容量充足的位置后重试。");
+    error.suggestion =
+        QStringLiteral("清理目标磁盘或换一个容量充足的位置后重试。");
     return error;
   }
   if (Contains(technical, "Permission denied") ||
@@ -41,13 +44,15 @@ UserFacingError ExplainOperationError(const QString& technical,
   if (Contains(technical, "already exists") ||
       Contains(technical, "ALREADY_EXISTS")) {
     error.summary = QStringLiteral("同名文件已经存在，未覆盖任何内容。");
-    error.suggestion = QStringLiteral("换一个名称，或先确认已有文件是否需要保留。");
+    error.suggestion =
+        QStringLiteral("换一个名称，或先确认已有文件是否需要保留。");
     return error;
   }
   if (Contains(technical, "UNAUTHORIZED") ||
       Contains(technical, "unauthorized")) {
     error.summary = QStringLiteral("用户名或密码不正确，尚未登录。");
-    error.suggestion = QStringLiteral("检查账号信息；连续失败会触发登录节流，请稍后再试。");
+    error.suggestion =
+        QStringLiteral("检查账号信息；连续失败会触发登录节流，请稍后再试。");
     return error;
   }
   if (Contains(technical, "password") || Contains(technical, "口令")) {
@@ -58,10 +63,12 @@ UserFacingError ExplainOperationError(const QString& technical,
   if (Contains(technical, "chain") || Contains(technical, "parent") ||
       Contains(technical, "依赖")) {
     error.summary = QStringLiteral("备份的依赖链不完整，无法安全恢复。");
-    error.suggestion = QStringLiteral("保留同一链上的全部备份，或重新创建一份完整备份。");
+    error.suggestion =
+        QStringLiteral("保留同一链上的全部备份，或重新创建一份完整备份。");
     return error;
   }
-  if (Contains(technical, "does not exist") || Contains(technical, "No such file")) {
+  if (Contains(technical, "does not exist") ||
+      Contains(technical, "No such file")) {
     error.summary = QStringLiteral("指定的文件或文件夹不存在。");
     error.suggestion = QStringLiteral("确认路径仍然存在，然后重新选择。");
     return error;
@@ -74,8 +81,9 @@ UserFacingError ExplainOperationError(const QString& technical,
   }
 
   error.summary = QStringLiteral("操作未能完成，已有数据没有被覆盖。");
-  error.suggestion = QStringLiteral("请检查路径、权限与可用空间后重试；"
-                                    "技术细节可在下方展开。");
+  error.suggestion = QStringLiteral(
+      "请检查路径、权限与可用空间后重试；"
+      "技术细节可在下方展开。");
   return error;
 }
 

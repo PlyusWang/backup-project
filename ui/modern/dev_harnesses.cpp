@@ -1383,9 +1383,9 @@ int RunRemoteProductFlow(backup_modern::RemoteController* remote, CheckRun* run,
     backupproject::Filter filter;
     backupproject::BackupEngine engine;
     std::string copy_error;
-    const bool local_created = engine.Backup(
-        source.toStdString(), local_archive.toStdString(), filter, options,
-        &copy_error);
+    const bool local_created =
+        engine.Backup(source.toStdString(), local_archive.toStdString(), filter,
+                      options, &copy_error);
     run->Check(local_created,
                QStringLiteral("REPO-COPY 01 本地仓库里生成一份真实备份"),
                QString::fromStdString(copy_error));
@@ -1393,8 +1393,8 @@ int RunRemoteProductFlow(backup_modern::RemoteController* remote, CheckRun* run,
     const bool up_accepted =
         remote->copyLocalArchiveToCloud(QStringLiteral("manual.bak"));
     const bool up_idle = up_accepted && remote->waitForIdle(900000);
-    const bool up_ok = up_idle && remote->lastErrorKindForTest() ==
-                                      QStringLiteral("none");
+    const bool up_ok =
+        up_idle && remote->lastErrorKindForTest() == QStringLiteral("none");
     refresh();
     const QVariantMap uploaded_row =
         findByDisplayName(QStringLiteral("manual.bak"));
@@ -1408,8 +1408,8 @@ int RunRemoteProductFlow(backup_modern::RemoteController* remote, CheckRun* run,
     remote->setLocalRepositoryPath(download_repo);
     const bool down_accepted = remote->copySnapshotToLocalRepository(delta_id);
     const bool down_idle = down_accepted && remote->waitForIdle(900000);
-    const bool down_ok = down_idle && remote->lastErrorKindForTest() ==
-                                          QStringLiteral("none");
+    const bool down_ok =
+        down_idle && remote->lastErrorKindForTest() == QStringLiteral("none");
     backupproject::BackupCatalog catalog;
     std::vector<backupproject::BackupRecord> downloaded;
     std::string list_error;
@@ -4653,7 +4653,7 @@ int RunRemoteAcceptance(QQuickWindow* window,
   };
   const auto goRemote = [window]() {
     GoToPage(window, "management");
-  GoToManagementTab(window, "cloud");
+    GoToManagementTab(window, "cloud");
     WaitForAnimation(400);
   };
   // 每个状态开头的归一化：确保页面是 Remote、窗口是主开发尺寸、主题已知。
@@ -7093,8 +7093,8 @@ int RunRemoteTest(QQuickWindow* window, backup_modern::RemoteController* remote,
     // 6 还要切到云端标签，否则页面是构造了但不可见。
     if (page == 6) {
       window->setProperty("currentPageKey", QStringLiteral("management"));
-      if (QObject* management = window->findChild<QObject*>(
-              QStringLiteral("managementPage"))) {
+      if (QObject* management =
+              window->findChild<QObject*>(QStringLiteral("managementPage"))) {
         management->setProperty("currentTab", QStringLiteral("cloud"));
       }
     } else if (page == 3 || page == 4) {
@@ -7102,8 +7102,8 @@ int RunRemoteTest(QQuickWindow* window, backup_modern::RemoteController* remote,
     } else {
       window->setProperty(
           "currentPageKey",
-          QString::fromLatin1(kPageKeys[page >= 0 && page < kPageCount ? page
-                                                                     : 0]));
+          QString::fromLatin1(
+              kPageKeys[page >= 0 && page < kPageCount ? page : 0]));
     }
     WaitForAnimation(400);
   };
@@ -7396,10 +7396,12 @@ int RunRemoteTest(QQuickWindow* window, backup_modern::RemoteController* remote,
   // 侧栏项由 Repeater 生成，QML 的 QObject 父链不保证能被 findChild 遍历；
   // 导航行为本身由下面的 currentPageKey + 页面可见性验证，不把对象树形状
   // 当成产品契约。
-  run.Check(page != nullptr,
-            QStringLiteral("REMOTE-01 远程备份页已实例化（备份管理 / 云端仓库）"));
+  run.Check(
+      page != nullptr,
+      QStringLiteral("REMOTE-01 远程备份页已实例化（备份管理 / 云端仓库）"));
   goToPage(6);
-  run.Check(window->property("currentPageKey").toString() == QStringLiteral("management") &&
+  run.Check(window->property("currentPageKey").toString() ==
+                    QStringLiteral("management") &&
                 page != nullptr && EffectivelyVisible(window, "remotePage"),
             QStringLiteral("REMOTE-01 能进入“备份管理 / 云端仓库”"));
   goToPage(0);
@@ -7772,7 +7774,7 @@ int RunRemoteTest(QQuickWindow* window, backup_modern::RemoteController* remote,
     const QString page_before_check =
         window->property("currentPageKey").toString();
     GoToPage(window, "management");
-  GoToManagementTab(window, "cloud");
+    GoToManagementTab(window, "cloud");
     WaitForAnimation(60);
     bool busy_line_seen = false;
     QElapsedTimer busy_line_clock;

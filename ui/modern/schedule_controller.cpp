@@ -730,8 +730,8 @@ bool ScheduleController::saveConfig(bool enabled, const QString& source_path,
   }
   // 加密方式与凭据路径来自界面草稿。口令内容不在这里，也不在任何
   // 配置文件里：运行期由 ScheduledBackupService 从 0600 文件读取。
-  if (!backupproject::ParseEncryptionMethodKey(draft_encryption_key_.toStdString(),
-                                               &config.encryption_method)) {
+  if (!backupproject::ParseEncryptionMethodKey(
+          draft_encryption_key_.toStdString(), &config.encryption_method)) {
     SetStatus(kError, QStringLiteral("未知的加密方式"), draft_encryption_key_);
     return false;
   }
@@ -1034,8 +1034,9 @@ QString ScheduleController::encryptionNote() const {
         backupproject::UnattendedEncryptionDisabledReason(
             backupproject::BackupTrigger::kScheduled));
   }
-  return QStringLiteral("加密口令将在每次运行时从该文件读取；"
-                        "文件不可读时这一轮备份会明确失败。");
+  return QStringLiteral(
+      "加密口令将在每次运行时从该文件读取；"
+      "文件不可读时这一轮备份会明确失败。");
 }
 
 QString ScheduleController::lastRunText() const {

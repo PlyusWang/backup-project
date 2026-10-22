@@ -32,8 +32,8 @@
 
 #include <cerrno>
 #include <cstdio>
-#include <cstring>
 #include <cstdlib>
+#include <cstring>
 #include <exception>
 #include <fstream>
 #include <string>
@@ -751,9 +751,8 @@ bool EnsureResumeDirectory(const std::string& path) {
   }
   while (index <= path.size()) {
     const std::size_t slash = path.find('/', index);
-    const std::string part =
-        path.substr(index, slash == std::string::npos ? std::string::npos
-                                                      : slash - index);
+    const std::string part = path.substr(
+        index, slash == std::string::npos ? std::string::npos : slash - index);
     if (!part.empty()) {
       if (current.size() > 1 && current.back() != '/') current += '/';
       current += part;
@@ -807,9 +806,12 @@ bool SaveUploadResumeState(const std::string& path,
   const std::string temporary = path + ".tmp";
   std::ofstream out(temporary, std::ios::binary | std::ios::trunc);
   if (!out) return false;
-  out << "v1\n" << state.upload_id << "\n" << state.offset << "\n"
-      << state.size << "\n" << state.sha256 << "\n" << state.display_name
-      << "\n";
+  out << "v1\n"
+      << state.upload_id << "\n"
+      << state.offset << "\n"
+      << state.size << "\n"
+      << state.sha256 << "\n"
+      << state.display_name << "\n";
   out.flush();
   if (!out) return false;
   out.close();
@@ -841,13 +843,12 @@ void RemoteArchiveClient::ProbeResumeSupport() {
     server_supports_resume_ = false;
     return;
   }
-  server_supports_resume_ =
-      version >= kTransferProtocolVersion &&
-      (flags & kCapabilityResumableTransfer) != 0;
+  server_supports_resume_ = version >= kTransferProtocolVersion &&
+                            (flags & kCapabilityResumableTransfer) != 0;
   if (std::getenv("BACKUP_REMOTE_DEBUG") != nullptr) {
-    std::fprintf(stderr, "[resume] capability version=%u flags=%u supported=%d\n",
-                 static_cast<unsigned>(version),
-                 static_cast<unsigned>(flags),
+    std::fprintf(stderr,
+                 "[resume] capability version=%u flags=%u supported=%d\n",
+                 static_cast<unsigned>(version), static_cast<unsigned>(flags),
                  server_supports_resume_ ? 1 : 0);
   }
 }
@@ -1081,7 +1082,8 @@ bool RemoteArchiveClient::UploadSnapshotFile(
     sent += static_cast<std::uint64_t>(got);
     // 每 4 MiB 把"已经发到哪里"落盘；断连时服务端保留的是它自己的检查点，
     // 两者最多差一个检查点间隔。
-    if (!resume_path.empty() && sent - saved_offset >= 4ull * 1024ull * 1024ull) {
+    if (!resume_path.empty() &&
+        sent - saved_offset >= 4ull * 1024ull * 1024ull) {
       UploadResumeState state{upload_id, sent, size, sha256, display_name};
       if (SaveUploadResumeState(resume_path, state)) {
         saved_offset = sent;
@@ -1134,7 +1136,8 @@ bool RemoteArchiveClient::DownloadWithResume(
     RemoteSnapshotInfo* downloaded, std::string* error_message) {
   EnsureResumeDirectory(resume_directory_);
   if (target_path.empty()) {
-    if (error_message != nullptr) *error_message = "the download target path is empty";
+    if (error_message != nullptr)
+      *error_message = "the download target path is empty";
     return false;
   }
   if (!allow_overwrite && ::access(target_path.c_str(), F_OK) == 0) {
@@ -1143,8 +1146,7 @@ bool RemoteArchiveClient::DownloadWithResume(
     }
     return false;
   }
-  const std::string key =
-      crypto::Sha256Hex(snapshot_id + "\n" + target_path);
+  const std::string key = crypto::Sha256Hex(snapshot_id + "\n" + target_path);
   const std::string state_path = resume_directory_ + "/" + key + ".download";
   const std::string target_directory = ParentDirectoryOf(target_path);
   const std::string part_path =
@@ -1263,14 +1265,15 @@ bool RemoteArchiveClient::DownloadWithResume(
                             O_WRONLY | O_CREAT | (resumed ? 0 : O_EXCL), 0600);
   if (output < 0) {
     finish_download(false);
-    if (error_message != nullptr) *error_message = "cannot create the partial file";
+    if (error_message != nullptr)
+      *error_message = "cannot create the partial file";
     return false;
   }
-  if (offset > 0 &&
-      ::lseek(output, static_cast<off_t>(offset), SEEK_SET) < 0) {
+  if (offset > 0 && ::lseek(output, static_cast<off_t>(offset), SEEK_SET) < 0) {
     ::close(output);
     finish_download(false);
-    if (error_message != nullptr) *error_message = "cannot seek the partial file";
+    if (error_message != nullptr)
+      *error_message = "cannot seek the partial file";
     return false;
   }
 
@@ -1287,7 +1290,8 @@ bool RemoteArchiveClient::DownloadWithResume(
       if (prefix.gcount() != static_cast<std::streamsize>(want)) {
         ::close(output);
         finish_download(true);
-        if (error_message != nullptr) *error_message = "the partial file is truncated";
+        if (error_message != nullptr)
+          *error_message = "the partial file is truncated";
         return false;
       }
       hasher.Update(buffer.data(), want);
@@ -1299,8 +1303,12 @@ bool RemoteArchiveClient::DownloadWithResume(
     const std::string temporary = state_path + ".tmp";
     std::ofstream out(temporary, std::ios::binary | std::ios::trunc);
     if (out) {
-      out << "v1\n" << snapshot_id << "\n" << info.sha256 << "\n"
-          << declared_size << "\n" << offset << "\n" << part_path << "\n";
+      out << "v1\n"
+          << snapshot_id << "\n"
+          << info.sha256 << "\n"
+          << declared_size << "\n"
+          << offset << "\n"
+          << part_path << "\n";
       out.close();
       ::chmod(temporary.c_str(), 0600);
       ::rename(temporary.c_str(), state_path.c_str());
@@ -1327,19 +1335,23 @@ bool RemoteArchiveClient::DownloadWithResume(
     hasher.Update(response.data(), response.size());
     received += response.size();
     if (received > declared_size) {
-      if (error_message != nullptr) *error_message = "the server sent too many bytes";
+      if (error_message != nullptr)
+        *error_message = "the server sent too many bytes";
       ok = false;
       break;
     }
-    if (progress) progress(RemoteTransferProgress{"download", received, declared_size});
+    if (progress)
+      progress(RemoteTransferProgress{"download", received, declared_size});
   }
   unsigned char digest[crypto::kSha256DigestSize];
   hasher.Final(digest);
-  const std::string actual_sha256 = crypto::ToHex(digest, crypto::kSha256DigestSize);
+  const std::string actual_sha256 =
+      crypto::ToHex(digest, crypto::kSha256DigestSize);
   bool data_corrupt = false;
   if (ok && (received != declared_size || actual_sha256 != info.sha256)) {
     if (error_message != nullptr) {
-      *error_message = "the downloaded archive does not match the declared size or SHA-256";
+      *error_message =
+          "the downloaded archive does not match the declared size or SHA-256";
     }
     // 内容校验失败说明半成品（可能是续传前缀）已经坏了。保留它只会让
     // 每一次重试都失败：删掉状态与半成品，下一次从 0 开始。
@@ -1359,8 +1371,9 @@ bool RemoteArchiveClient::DownloadWithResume(
   }
   std::string publish_error;
   const bool published =
-      allow_overwrite ? PublishReplacing(part_path, target_path, &publish_error)
-                      : PublishNoReplace(part_path, target_path, &publish_error);
+      allow_overwrite
+          ? PublishReplacing(part_path, target_path, &publish_error)
+          : PublishNoReplace(part_path, target_path, &publish_error);
   if (!published) {
     if (error_message != nullptr) {
       *error_message = publish_error.empty() ? ("cannot publish " + target_path)
