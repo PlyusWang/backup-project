@@ -637,12 +637,16 @@ int main() {
     server.RequestStop();
     runner.join();
     server.Stop();
-    // 服务端的上传临时文件必须已经消失（AbortUpload）。这一步放在服务端完全
-    // 停下之后断言：worker 都 join 过了，清理不可能还没跑到。
+    // 中断的上传现在**保留**临时文件与 .resume 检查点：断连是可续传，不是
+    // 失败清理。失败清理只发生在长度/摘要校验失败这类"内容已不可信"的路径。
     std::vector<std::string> leftovers;
     CollectFilesWithSuffix(fixture.root, ".part", &leftovers);
-    test_support::Check(leftovers.empty(),
-                        "CLI T5 判别：服务端没有留下上传临时文件");
+    test_support::Check(leftovers.size() == 1,
+                        "CLI T5 判别：中断的上传保留 1 个可续传临时文件");
+    std::vector<std::string> checkpoints;
+    CollectFilesWithSuffix(fixture.root, ".resume", &checkpoints);
+    test_support::Check(checkpoints.size() == 1,
+                        "CLI T5 判别：中断的上传留下 1 个续传检查点");
   }
 
   test_support::Section(
