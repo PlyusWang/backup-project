@@ -264,7 +264,8 @@ int RunAcceptanceShots(QQuickWindow* window,
     pump(400);
     const QImage image = window->grabWindow();
     if (image.isNull()) return false;
-    return image.save(directory + QStringLiteral("/") + QString::fromLatin1(name));
+    return image.save(directory + QStringLiteral("/") +
+                      QString::fromLatin1(name));
   };
 
   if (!controller->saveRepositoryPath(repository)) return 1;
@@ -276,7 +277,8 @@ int RunAcceptanceShots(QQuickWindow* window,
   if (!controller->waitForIdle(120000)) return 1;
   if (!controller->lastSucceeded()) return 1;
   const auto scroll_to_end = [&](const char* object_name, int offset) {
-    QObject* view = window->findChild<QObject*>(QString::fromLatin1(object_name));
+    QObject* view =
+        window->findChild<QObject*>(QString::fromLatin1(object_name));
     if (view == nullptr) return;
     QObject* content = view->property("contentItem").value<QObject*>();
     if (content != nullptr) {
@@ -284,9 +286,8 @@ int RunAcceptanceShots(QQuickWindow* window,
           content->property("contentHeight").toDouble();
       const double viewport = view->property("height").toDouble();
       Q_UNUSED(offset);
-      const double target = content_height > viewport
-                                ? content_height - viewport
-                                : 0.0;
+      const double target =
+          content_height > viewport ? content_height - viewport : 0.0;
       content->setProperty("contentY", target);
     }
     pump(300);
@@ -302,8 +303,8 @@ int RunAcceptanceShots(QQuickWindow* window,
   const QString file_name =
       records.first().toMap().value(QStringLiteral("fileName")).toString();
   window->setProperty("currentPageKey", QStringLiteral("management"));
-  if (QObject* page = window->findChild<QObject*>(
-          QStringLiteral("managementPage"))) {
+  if (QObject* page =
+          window->findChild<QObject*>(QStringLiteral("managementPage"))) {
     page->setProperty("currentTab", QStringLiteral("local"));
   }
   if (!grab("local-repository.png")) return 1;
@@ -521,11 +522,10 @@ int main(int argc, char* argv[]) {
       smoke_test || path_test || close_guard_test || gui_contract_test ||
       preview_test_index >= 0 || incremental_test_index >= 0 ||
       screenshot_index >= 0 || screenshot_remote_index >= 0 ||
-      acceptance_shots_index >= 0 ||
-      self_test_index >= 0 || repository_test_index >= 0 || realtime_test ||
-      backup_options_test || schedule_test || filter_ux_test ||
-      combo_hover_test || remote_test || remote_acceptance_index >= 0 ||
-      remote_smoke_index >= 0;
+      acceptance_shots_index >= 0 || self_test_index >= 0 ||
+      repository_test_index >= 0 || realtime_test || backup_options_test ||
+      schedule_test || filter_ux_test || combo_hover_test || remote_test ||
+      remote_acceptance_index >= 0 || remote_smoke_index >= 0;
   QString config_file_path = ResolveConfigFilePath(arguments);
   QString schedule_file_path = ResolveScheduleFilePath(arguments);
   QString realtime_file_path = ResolveRealtimeFilePath(arguments);

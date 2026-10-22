@@ -104,11 +104,18 @@ bool WriteUploadResumeRecord(const std::string& temp_path,
     if (error_message != nullptr) *error_message = "cannot create " + temporary;
     return false;
   }
-  out << "v1\n" << record.user_id << "\n" << record.display_name << "\n"
-      << record.declared_size << "\n" << record.sha256 << "\n" << record.kind
-      << "\n" << record.parent_id << "\n" << record.lineage << "\n"
-      << record.generation << "\n" << record.snapshot_id << "\n"
-      << record.checkpoint << "\n" << record.checkpoint_sha256 << "\n";
+  out << "v1\n"
+      << record.user_id << "\n"
+      << record.display_name << "\n"
+      << record.declared_size << "\n"
+      << record.sha256 << "\n"
+      << record.kind << "\n"
+      << record.parent_id << "\n"
+      << record.lineage << "\n"
+      << record.generation << "\n"
+      << record.snapshot_id << "\n"
+      << record.checkpoint << "\n"
+      << record.checkpoint_sha256 << "\n";
   out.flush();
   if (!out) {
     if (error_message != nullptr) *error_message = "cannot write " + temporary;
@@ -1473,7 +1480,8 @@ void RemoteServer::AbortUpload(ConnectionContext* context) {
     if (::unlink(context->upload_temp_path.c_str()) != 0 && errno != ENOENT) {
       Log("warning: could not remove the upload temp file");
     }
-    const std::string record = UploadResumeRecordPath(context->upload_temp_path);
+    const std::string record =
+        UploadResumeRecordPath(context->upload_temp_path);
     if (::unlink(record.c_str()) != 0 && errno != ENOENT) {
       Log("warning: could not remove the upload resume record");
     }
@@ -1590,8 +1598,7 @@ bool RemoteServer::HandleUploadResumeBegin(int fd, const FrameHeader& header,
     return SendError(fd, header.opcode, header.request_id,
                      Status::kInvalidState, error_message);
   }
-  if (record.user_id != context->user_id ||
-      record.snapshot_id != upload_id) {
+  if (record.user_id != context->user_id || record.snapshot_id != upload_id) {
     return SendError(fd, header.opcode, header.request_id,
                      Status::kInvalidState, error_message);
   }
@@ -1633,8 +1640,8 @@ bool RemoteServer::HandleUploadResumeBegin(int fd, const FrameHeader& header,
   }
   input.close();
   // 检查点之后的字节没有经过验证（也可能是写了一半的块）：截掉再续。
-  if (::truncate(temp_path.c_str(),
-                 static_cast<off_t>(record.checkpoint)) != 0) {
+  if (::truncate(temp_path.c_str(), static_cast<off_t>(record.checkpoint)) !=
+      0) {
     return SendError(fd, header.opcode, header.request_id,
                      Status::kInternalError, error_message);
   }
@@ -2214,9 +2221,9 @@ bool RemoteServer::HandleDownloadResumeBegin(int fd, const FrameHeader& header,
   }
   RemoteSnapshotRecord record;
   std::string store_error;
-  const StoreResult result = store_->FindSnapshot(
-      static_cast<std::int64_t>(context->user_id), snapshot_id, &record,
-      &store_error);
+  const StoreResult result =
+      store_->FindSnapshot(static_cast<std::int64_t>(context->user_id),
+                           snapshot_id, &record, &store_error);
   if (result == StoreResult::kNotFound) {
     return SendError(fd, header.opcode, header.request_id, Status::kNotFound,
                      error_message);
@@ -2243,7 +2250,8 @@ bool RemoteServer::HandleDownloadResumeBegin(int fd, const FrameHeader& header,
     return SendError(fd, header.opcode, header.request_id, Status::kNotFound,
                      error_message);
   }
-  if (offset > 0 && ::lseek(blob_fd, static_cast<off_t>(offset), SEEK_SET) < 0) {
+  if (offset > 0 &&
+      ::lseek(blob_fd, static_cast<off_t>(offset), SEEK_SET) < 0) {
     ::close(blob_fd);
     return SendError(fd, header.opcode, header.request_id,
                      Status::kInternalError, error_message);

@@ -299,8 +299,7 @@ bool ValidateScheduleConfig(const ScheduleConfig& config,
   // 不加密时允许凭据路径为空（默认就是空）。填了就必须是能用的绝对路径，
   // 免得配置里躺着一个永远读不到的半截值。
   if (!config.encryption_password_file.empty() &&
-      !IsUsableCredentialPath(config.encryption_password_file,
-                              error_message)) {
+      !IsUsableCredentialPath(config.encryption_password_file, error_message)) {
     return false;
   }
   if (config.interval_minutes < kMinIntervalMinutes ||
@@ -451,8 +450,7 @@ bool ValidateScheduleForEnable(const ScheduleConfig& config,
   // 加密任务只有在“现在就能读到口令”时才允许启用。只看配置里的路径不够：
   // 文件被删、权限被改成 0644、内容为空，都会让第一次真正到点的运行失败。
   if (config.encryption_method != EncryptionMethod::kNone &&
-      !ValidateCredentialFile(config.encryption_password_file,
-                             error_message)) {
+      !ValidateCredentialFile(config.encryption_password_file, error_message)) {
     return false;
   }
   return RequireRealDirectory(config.source_path, "Schedule source directory",

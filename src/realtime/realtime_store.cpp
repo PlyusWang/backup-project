@@ -276,8 +276,7 @@ bool ValidateRealtimeConfig(const RealtimeConfig& config,
   }
   // 不加密时允许为空；填了就必须是可用的绝对路径。
   if (!config.encryption_password_file.empty() &&
-      !IsUsableCredentialPath(config.encryption_password_file,
-                              error_message)) {
+      !IsUsableCredentialPath(config.encryption_password_file, error_message)) {
     return false;
   }
   return true;
@@ -295,8 +294,7 @@ bool ValidateRealtimeForEnable(const RealtimeConfig& config,
   if (!ValidateRealtimeConfig(config, error_message)) return false;
   // 与定时任务同一条边界：启用时就必须能读到口令，而不是等第一次触发才失败。
   if (config.encryption_method != EncryptionMethod::kNone &&
-      !ValidateCredentialFile(config.encryption_password_file,
-                             error_message)) {
+      !ValidateCredentialFile(config.encryption_password_file, error_message)) {
     return false;
   }
   if (config.source_path.empty()) {

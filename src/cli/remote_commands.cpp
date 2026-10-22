@@ -17,8 +17,6 @@
 
 #include "remote_commands.h"
 
-#include "app_paths.h"
-
 #include <libgen.h>
 
 #include <cstdio>
@@ -29,6 +27,7 @@
 #include <string>
 #include <vector>
 
+#include "app_paths.h"
 #include "incremental_backup.h"
 #include "remote_backup_client.h"
 #include "remote_incremental.h"

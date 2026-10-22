@@ -273,10 +273,10 @@ class RemoteController : public QObject {
   Q_PROPERTY(QString authMode READ authMode NOTIFY connectionChanged)
   // 自建证书模式必须显式给出可信根与预期 server_id；允许为空，但提交时
   // 明确拒绝——绝不因为为空就回退到内置官方根。
-  Q_PROPERTY(QString trustedRootsFile READ trustedRootsFile NOTIFY
-                 connectionChanged)
-  Q_PROPERTY(QString expectedServerId READ expectedServerId NOTIFY
-                 connectionChanged)
+  Q_PROPERTY(
+      QString trustedRootsFile READ trustedRootsFile NOTIFY connectionChanged)
+  Q_PROPERTY(
+      QString expectedServerId READ expectedServerId NOTIFY connectionChanged)
   // ~/.ssh/config 里的别名（当前部署是 aliyun-ecs）或 user@host。
   Q_PROPERTY(
       QString sshHost READ sshHost WRITE setSshHost NOTIFY connectionChanged)

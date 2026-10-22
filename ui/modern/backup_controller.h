@@ -20,13 +20,12 @@
 #define BACKUP_PROJECT_UI_MODERN_BACKUP_CONTROLLER_H_
 
 #include <QFutureWatcher>
-
-#include <atomic>
 #include <QObject>
 #include <QString>
 #include <QStringList>
 #include <QUrl>
 #include <QVariantList>
+#include <atomic>
 #include <vector>
 
 #include "archive_pipeline.h"

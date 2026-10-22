@@ -41,8 +41,8 @@
 #include "remote_auth.h"
 #include "remote_incremental.h"
 #include "secure_transport.h"
-#include "snapshot_bundle.h"
 #include "server_profile.h"
+#include "snapshot_bundle.h"
 #include "user_error.h"
 
 #if defined(Q_OS_UNIX)
@@ -336,10 +336,10 @@ QString RemoteController::FormatTime(std::uint64_t unix_seconds) {
 // 两个仓库的清单各自是线性的（一个 delta 只有一个父），所以复制一条链就是：
 // 从目标往回走到根，再反向逐份复制。任何一环缺失都拒绝整次复制——
 // 只发布半条链会让云端 / 本地出现"看起来存在、其实恢复不了"的快照。
-bool BuildLocalCopyChain(const std::vector<backupproject::BackupRecord>& records,
-                         const std::string& target,
-                         std::vector<backupproject::BackupRecord>* chain,
-                         std::string* error) {
+bool BuildLocalCopyChain(
+    const std::vector<backupproject::BackupRecord>& records,
+    const std::string& target, std::vector<backupproject::BackupRecord>* chain,
+    std::string* error) {
   chain->clear();
   std::vector<const backupproject::BackupRecord*> reversed;
   std::string current = target;
@@ -1767,8 +1767,8 @@ RemoteOpResult RemoteController::RunOperation(
         std::string upload_path = record.archive_path;
         std::string bundle_path;
         if (has_sidecars) {
-          bundle_path = request.local_repository + "/.copy-bundle-" +
-                        record.file_name;
+          bundle_path =
+              request.local_repository + "/.copy-bundle-" + record.file_name;
           ::unlink(bundle_path.c_str());
           backupproject::net::SnapshotBundleInfo bundle_info;
           if (!backupproject::net::BuildSnapshotBundle(
@@ -1780,8 +1780,9 @@ RemoteOpResult RemoteController::RunOperation(
           upload_path = bundle_path;
         }
         RemoteSnapshotInfo uploaded;
-        const bool uploaded_ok = client->UploadSnapshotFile(
-            upload_path, record.file_name, options, progress, &uploaded, &error);
+        const bool uploaded_ok =
+            client->UploadSnapshotFile(upload_path, record.file_name, options,
+                                       progress, &uploaded, &error);
         if (!bundle_path.empty()) ::unlink(bundle_path.c_str());
         if (!uploaded_ok) {
           result.ok = false;
@@ -1794,7 +1795,8 @@ RemoteOpResult RemoteController::RunOperation(
       }
       if (result.ok) {
         const auto target = id_by_name.find(request.display_name);
-        if (target != id_by_name.end()) result.copied_snapshot_id = target->second;
+        if (target != id_by_name.end())
+          result.copied_snapshot_id = target->second;
       }
       break;
     }
@@ -1869,7 +1871,8 @@ RemoteOpResult RemoteController::RunOperation(
           }
           QFile::remove(partial);
         } else {
-          if (::rename(partial.toStdString().c_str(), target.toStdString().c_str()) != 0) {
+          if (::rename(partial.toStdString().c_str(),
+                       target.toStdString().c_str()) != 0) {
             QFile::remove(partial);
             error = "无法把下载结果发布到本地仓库：" + name;
             result.ok = false;
@@ -2097,22 +2100,19 @@ void RemoteController::ApplyResult(const RemoteOpResult& result) {
     // 只作为折叠的技术详情。表单校验（缺字段 / 两次密码不一致）不走这里，
     // 那些仍然在输入框附近提示。
     const QString action =
-        result.kind == RemoteOpResult::Kind::kLogin
-            ? QStringLiteral("登录")
-            : result.kind == RemoteOpResult::Kind::kRegister
-                  ? QStringLiteral("注册")
-                  : result.kind == RemoteOpResult::Kind::kUpload
-                        ? QStringLiteral("上传")
-                        : result.kind == RemoteOpResult::Kind::kDownload
-                              ? QStringLiteral("下载")
-                              : result.kind == RemoteOpResult::Kind::kCopyToCloud
-                                    ? QStringLiteral("复制到云端")
-                                    : result.kind ==
-                                              RemoteOpResult::Kind::kCopyToLocal
-                                          ? QStringLiteral("下载到本地仓库")
-                                          : QStringLiteral("云端操作");
-    const UserFacingError explained = ExplainOperationError(
-        QString::fromStdString(result.detail), action);
+        result.kind == RemoteOpResult::Kind::kLogin ? QStringLiteral("登录")
+        : result.kind == RemoteOpResult::Kind::kRegister
+            ? QStringLiteral("注册")
+        : result.kind == RemoteOpResult::Kind::kUpload ? QStringLiteral("上传")
+        : result.kind == RemoteOpResult::Kind::kDownload
+            ? QStringLiteral("下载")
+        : result.kind == RemoteOpResult::Kind::kCopyToCloud
+            ? QStringLiteral("复制到云端")
+        : result.kind == RemoteOpResult::Kind::kCopyToLocal
+            ? QStringLiteral("下载到本地仓库")
+            : QStringLiteral("云端操作");
+    const UserFacingError explained =
+        ExplainOperationError(QString::fromStdString(result.detail), action);
     emit userError(explained.title, explained.summary, explained.suggestion,
                    QString::fromStdString(result.detail));
     // 登录 / 注册 / 注销各自有错误行：原因写在那里，页面底部的横幅也不能继续
@@ -2277,13 +2277,11 @@ void RemoteController::ApplyResult(const RemoteOpResult& result) {
               .arg(QString::fromStdString(result.copied_snapshot_id).left(12)));
       break;
     case RemoteOpResult::Kind::kCopyToLocal:
-      SetStatus(
-          QStringLiteral("success"),
-          QStringLiteral("已下载到本地仓库"),
-          QStringLiteral("本次下载 %1 份、跳过 %2 份已存在的快照。"
-                         "现在可以在本地仓库中恢复。")
-              .arg(static_cast<qulonglong>(result.copied_count))
-              .arg(static_cast<qulonglong>(result.skipped_count)));
+      SetStatus(QStringLiteral("success"), QStringLiteral("已下载到本地仓库"),
+                QStringLiteral("本次下载 %1 份、跳过 %2 份已存在的快照。"
+                               "现在可以在本地仓库中恢复。")
+                    .arg(static_cast<qulonglong>(result.copied_count))
+                    .arg(static_cast<qulonglong>(result.skipped_count)));
       break;
     case RemoteOpResult::Kind::kRestoreRaw:
       // 原始归档的恢复：对用户来说就是"恢复完成"——内部走的是哪条流水线
@@ -2954,8 +2952,9 @@ QString RemoteController::serverKind() const {
 }
 
 QString RemoteController::transportMode() const {
-  return connection_mode_ == ConnectionMode::kSshTunnel ? QStringLiteral("ssh")
-                                                       : QStringLiteral("direct");
+  return connection_mode_ == ConnectionMode::kSshTunnel
+             ? QStringLiteral("ssh")
+             : QStringLiteral("direct");
 }
 
 bool RemoteController::setServerKind(const QString& kind) {
@@ -3564,7 +3563,8 @@ bool RemoteController::copyLocalArchiveToCloud(const QString& file_name) {
   return true;
 }
 
-bool RemoteController::copySnapshotToLocalRepository(const QString& snapshot_id) {
+bool RemoteController::copySnapshotToLocalRepository(
+    const QString& snapshot_id) {
   if (local_repository_path_.isEmpty()) {
     SetStatus(QStringLiteral("error"), QStringLiteral("没有本地仓库"),
               QStringLiteral("先在“本地仓库”里设置一个仓库，再下载备份。"));

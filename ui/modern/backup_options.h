@@ -40,9 +40,8 @@ class BackupOptionsCatalog : public QObject {
 
   // 返回空串表示这组选项可用；否则是一句中文原因。
   // credentialConfigured 只在 scheduled / realtime + 加密时有意义。
-  Q_INVOKABLE QString validate(const QString& trigger,
-                               const QString& strategy, const QString& pack,
-                               const QString& compression,
+  Q_INVOKABLE QString validate(const QString& trigger, const QString& strategy,
+                               const QString& pack, const QString& compression,
                                const QString& encryption,
                                bool credentialConfigured) const;
 

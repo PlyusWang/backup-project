@@ -504,8 +504,7 @@ bool RunBackupPipeline(const std::string& source_directory,
     return false;
   }
   if (progress) {
-    progress(ArchiveProgress{"scanning", entries.size(), entries.size(), 0,
-                             0});
+    progress(ArchiveProgress{"scanning", entries.size(), entries.size(), 0, 0});
   }
   return RunBackupPipelineFromEntries(entries, archive_file, options,
                                       error_message, progress);
@@ -772,10 +771,9 @@ bool RunBackupPipelineFromEntries(const std::vector<ArchiveEntry>& entries,
           // 只在跨过 1% 或 4 MiB 时回调：进度是给人看的，不是每 64 KiB
           // 发一次信号把 GUI 线程淹没。
           if (progress) {
-            const std::uint64_t step =
-                header.payload_size / 100 > (4u << 20)
-                    ? header.payload_size / 100
-                    : (4u << 20);
+            const std::uint64_t step = header.payload_size / 100 > (4u << 20)
+                                           ? header.payload_size / 100
+                                           : (4u << 20);
             if (payload_bytes - last_reported_payload >= step ||
                 payload_bytes == header.payload_size) {
               last_reported_payload = payload_bytes;
