@@ -10635,6 +10635,7 @@ int RunScheduleTest(backup_modern::ScheduleController* schedule,
               QStringLiteral("SCH-63 另一个进程拿到锁"),
               QString::fromStdString(other_error));
 
+    schedule->setEncryptionChoice(QStringLiteral("none"), QString());
     run.Check(schedule->saveConfig(true, source, 5, 7, QStringLiteral("ustar"),
                                    QStringLiteral("huffman"), QStringList(),
                                    QStringList()),

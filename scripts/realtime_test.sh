@@ -104,7 +104,7 @@ fi
 if cli realtime set --source "$CLI_WORK/src" \
     --encryption aes-256-ctr-hmac-sha256 >"$OUT" 2>&1; then
   record_fail "B.2 realtime 拒绝加密" "命令居然成功了"
-elif grep -q '不启用加密' "$OUT"; then
+elif grep -q '需要先配置' "$OUT"; then
   record_pass "B.2 realtime 拒绝加密并说明原因"
 else
   record_fail "B.2 realtime 拒绝加密并说明原因" "$(first_line)"
