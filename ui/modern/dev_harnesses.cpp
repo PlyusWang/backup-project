@@ -10771,12 +10771,13 @@ int RunScheduleTest(backup_modern::ScheduleController* schedule,
 
     // 唯一的恢复入口：显式保存一份合法配置。这里同时把收尾需要的
     // 跨前端配置写回去（与 SCH-36 / SCH-67 完全一致）。
+    schedule->setEncryptionChoice(QStringLiteral("none"), QString());
     run.Check(schedule->saveConfig(true, source, 5, 7, QStringLiteral("ustar"),
                                    QStringLiteral("huffman"),
                                    QStringList() << QStringLiteral("ext:txt"),
                                    QStringList()
                                        << QStringLiteral("path:**/build/**")),
-              QStringLiteral("SCH-85 保存一份合法配置"));
+              QStringLiteral("SCH-85 保存一份合法配置"), schedule->statusMessage());
     run.Check(!schedule->suspended(),
               QStringLiteral("SCH-86 保存成功之后挂起自动解除"));
     run.Check(schedule->tickActiveForTest(),

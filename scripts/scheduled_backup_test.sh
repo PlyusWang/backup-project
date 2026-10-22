@@ -1430,11 +1430,9 @@ if [ -x "$GUI" ]; then
     env XDG_CONFIG_HOME="$KG/b" "$GUI" --schedule-show \
       --config-file "$KG/b/config.json" --schedule-file "$KG/b/schedule.json"
   if [ -x "$LEGACY_GUI" ]; then
-    expect_exit "K.05 G2b legacy desktop 也被同一把锁拒绝" 3 \
-      env XDG_CONFIG_HOME="$KG/b" timeout 20 "$LEGACY_GUI" --smoke-test
+    record_fail "K.05 legacy desktop 已停用" "build/backup-gui 仍被构建"
   else
-    record_fail "K.05 G2b legacy desktop 也被同一把锁拒绝" \
-      "build/backup-gui 缺失（脚本应当已经按需构建它）"
+    record_pass "K.05 legacy desktop 不再构建"
   fi
 fi
 
