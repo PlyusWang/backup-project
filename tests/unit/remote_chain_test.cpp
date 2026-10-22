@@ -238,6 +238,83 @@ void TestSnapshotBundle() {
                                                    &error),
         "重复解包到同一目录被拒绝（不覆盖）");
 
+  // 目标目录已有一个同名成员：必须失败，已有的那个成员保持原样，且不能
+  // 留下本次已经发布的其他成员。
+  const std::string out3 = root + "/out3";
+  Check(MakeDirectory(out3), "建冲突输出目录");
+  Check(WriteFile(out3 + "/" + manifest, "preexisting-manifest"),
+        "预置同名 .manifest");
+  Check(!backupproject::net::ExtractSnapshotBundle(bundle, out3, &inspected,
+                                                   &error),
+        "目标已有同名成员 -> 解包失败");
+  std::string existing;
+  Check(!FileExists(out3 + "/" + archive) &&
+            ReadFile(out3 + "/" + manifest, &existing) &&
+            existing == "preexisting-manifest",
+        "失败回滚不删除也不覆盖已有成员");
+
+  // 两个线程同时解包同一材料包：唯一暂存目录 + NoReplace 必须保证只有一个
+  // 成功，最终三件套完整且没有残留暂存目录。
+  const std::string out4 = root + "/out4";
+  Check(MakeDirectory(out4), "建并发输出目录");
+  std::atomic<int> concurrent_success{0};
+  std::vector<std::thread> workers;
+  for (int i = 0; i < 2; ++i) {
+    workers.emplace_back([&]() {
+      SnapshotBundleInfo local_info;
+      std::string local_error;
+      if (backupproject::net::ExtractSnapshotBundle(bundle, out4, &local_info,
+                                                    &local_error)) {
+        concurrent_success.fetch_add(1);
+      }
+    });
+  }
+  for (std::thread& worker : workers) worker.join();
+  Check(concurrent_success.load() == 1, "并发解包同一材料包：恰好一个成功");
+  auto count_entries = [](const std::string& path) {
+    DIR* directory = ::opendir(path.c_str());
+    if (directory == nullptr) return -1;
+    int count = 0;
+    while (const dirent* entry = ::readdir(directory)) {
+      if (std::strcmp(entry->d_name, ".") != 0 &&
+          std::strcmp(entry->d_name, "..") != 0) {
+        ++count;
+      }
+    }
+    ::closedir(directory);
+    return count;
+  };
+  Check(count_entries(out4) == 3, "并发解包后恰好三件套，无暂存残留");
+
+  // 目标名被替换成符号链接：发布必须失败且不能跟随链接改写外部文件。
+  const std::string out5 = root + "/out5";
+  Check(MakeDirectory(out5), "建符号链接输出目录");
+  const std::string outside = root + "/outside.txt";
+  Check(WriteFile(outside, "outside-original"), "写外部文件");
+  Check(::symlink(outside.c_str(), (out5 + "/" + archive).c_str()) == 0,
+        "在目标位置放一个符号链接");
+  Check(!backupproject::net::ExtractSnapshotBundle(bundle, out5, &inspected,
+                                                   &error),
+        "目标名是符号链接 -> 解包失败");
+  std::string outside_after;
+  Check(
+      ReadFile(outside, &outside_after) && outside_after == "outside-original",
+      "符号链接指向的外部文件没有被改写");
+
+  // 旧实现使用可预测的 .part-<pid>-<index> 名字并先 unlink；现在必须先证明
+  // 该名字即使存在也不会被删除、不会被当成自己的临时文件复用。
+  const std::string bundle2 = root + "/snapshot2.bundle";
+  const std::string old_part =
+      bundle2 + ".part-" + std::to_string(static_cast<long>(::getpid())) + "-0";
+  Check(WriteFile(old_part, "sentinel-part"), "预置旧式可预测临时名");
+  SnapshotBundleInfo info2;
+  Check(backupproject::net::BuildSnapshotBundle(repo, archive, bundle2, &info2,
+                                                &error),
+        "存在旧式临时名时仍能打包", error);
+  std::string sentinel;
+  Check(ReadFile(old_part, &sentinel) && sentinel == "sentinel-part",
+        "打包不删除也不复用不属于自己的临时文件");
+
   // 篡改：把成员数据区的一个字节翻掉。
   std::string bytes;
   Check(ReadFile(bundle, &bytes), "读回材料包");
@@ -1619,41 +1696,44 @@ void TestExtractionLocalAttacks() {
           std::to_string(entries) + " 个条目");
   }
 
-  // (e) 目标目录里已经有同名 .part- 临时文件
+  // (e) 目标目录里已有**不属于本次任务**的旧式 .part- 文件：
+  //     新契约是“只认领自己创建的对象”，所以这些文件必须原样保留，不能被
+  //     unlink 掉；解包使用私有暂存目录，仍然成功且只多出三件套。
   {
     const std::string out = root + "/out-part";
     Check(MakeDirectoryTree(out), "RT2.5 建目标目录");
     const std::string pid = std::to_string(static_cast<long>(::getpid()));
-    // 产品给每个成员用的临时名是 <成员最终路径>.part-<pid>-<成员序号>，
-    // 所以三个成员各有各的临时名（不是都以 .bak 结尾）。
     const std::string stale_parts[3] = {archive + ".part-" + pid + "-0",
                                         manifest + ".part-" + pid + "-1",
                                         identity + ".part-" + pid + "-2"};
     for (int index = 0; index < 3; ++index) {
       Check(WriteFile(out + "/" + stale_parts[index], "STALE-PART-CONTENT"),
-            "RT2.5 预置同名 .part- 临时文件");
+            "RT2.5 预置不属于本次任务的 .part- 文件");
     }
     backupproject::net::SnapshotBundleInfo info;
     std::string extract_error;
     Check(backupproject::net::ExtractSnapshotBundle(bundle_path, out, &info,
                                                     &extract_error),
-          "RT2.5 已有 .part- 文件时解包仍然成功（清理后重建）", extract_error);
+          "RT2.5 已有旧式 .part- 文件时解包仍然成功", extract_error);
     std::string a;
     std::string b;
     Check(ReadFile(out + "/" + archive, &a) && a == bak_data,
           "RT2.5 产物是包里的字节，不是预置的临时文件内容");
     Check(ReadFile(out + "/" + manifest, &b) && b == manifest_data,
           "RT2.5 .manifest 也是包里的字节");
-    bool part_left = false;
+    int stale_kept = 0;
     for (const std::string& name : DirectoryEntries(out)) {
-      if (name.find(".part-") != std::string::npos) {
-        part_left = true;
+      if (name.find(".part-") == std::string::npos) continue;
+      std::string content;
+      if (ReadFile(out + "/" + name, &content) &&
+          content == "STALE-PART-CONTENT") {
+        ++stale_kept;
       }
     }
-    Check(!part_left,
-          "RT2.5 收尾之后目录里没有 .part- "
-          "残留（三个预置临时文件都被清理并重建）");
-    Check(CountDirectoryEntries(out) == 3, "RT2.5 目录里恰好三件套");
+    Check(stale_kept == 3,
+          "RT2.5 三个已有 .part- 文件原样保留（未被删除/复用）");
+    Check(CountDirectoryEntries(out) == 6,
+          "RT2.5 目录里是三件套 + 三个预置文件，没有新增残留");
   }
 
   // (f) 目标目录本身是符号链接 -> 明确行为：落到真实目录，不越出，不替换链接
