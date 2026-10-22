@@ -140,6 +140,9 @@ struct ConnectionContext {
 
   // 上传中的增量摘要器。Sha256 只能 Final 一次，所以复位靠整体赋值一个新的。
   crypto::Sha256 upload_hasher;
+  // 最近一次落盘的续传检查点（字节数）。每跨过 4 MiB 更新一次：续传记录
+  // 不能每个 chunk 都写盘，也不能只在正常结束时写。
+  std::uint64_t upload_checkpoint = 0;
 
   // 下载中
   std::string download_snapshot_id;
@@ -266,9 +269,17 @@ class RemoteServer {
                     std::string* error_message);
   bool HandleList(int fd, const FrameHeader& header, ConnectionContext* context,
                   std::string* error_message);
+  bool HandleCapabilities(int fd, const FrameHeader& header,
+                          const std::string& payload,
+                          ConnectionContext* context,
+                          std::string* error_message);
   bool HandleUploadBegin(int fd, const FrameHeader& header,
                          const std::string& payload, ConnectionContext* context,
                          std::string* error_message);
+  bool HandleUploadResumeBegin(int fd, const FrameHeader& header,
+                               const std::string& payload,
+                               ConnectionContext* context,
+                               std::string* error_message);
   bool HandleUploadChunk(int fd, const FrameHeader& header,
                          const std::string& payload, ConnectionContext* context,
                          std::string* error_message);
@@ -279,6 +290,10 @@ class RemoteServer {
                            const std::string& payload,
                            ConnectionContext* context,
                            std::string* error_message);
+  bool HandleDownloadResumeBegin(int fd, const FrameHeader& header,
+                                 const std::string& payload,
+                                 ConnectionContext* context,
+                                 std::string* error_message);
   bool HandleDownloadChunk(int fd, const FrameHeader& header,
                            const std::string& payload,
                            ConnectionContext* context,
@@ -311,6 +326,8 @@ class RemoteServer {
   void ResetUploadState(ConnectionContext* context);
   // 中止上传：关 fd + 删临时文件 + 清状态。任何失败路径都走这里。
   void AbortUpload(ConnectionContext* context);
+  // 断连时保留可续传的前缀与检查点；与 AbortUpload（删除）相对。
+  void SuspendUpload(ConnectionContext* context);
   void CloseDownload(ConnectionContext* context);
   std::string UserDirectory(std::int64_t user_id) const;
   bool EnsureUserDirectory(std::int64_t user_id, std::string* directory,

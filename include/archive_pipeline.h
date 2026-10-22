@@ -27,6 +27,8 @@
 #include "filter.h"
 #include "pack_stream.h"
 
+#include <functional>
+
 namespace backupproject {
 
 // 备份选项。默认值等价于"跟以前一样"：MyPack + 不压缩 + 不加密。
@@ -58,10 +60,26 @@ struct RestoreReport {
 // 走 v2 container 的备份。source_directory 必须是目录；archive_file
 // 必须不存在， 也不能落在源目录内部。任何一步失败都会删掉自己创建的半成品：
 // 用户看到目录里有个 .bak 就会当它是可用备份。
+// 真实进度：只在**已经知道总量**时才填 bytes_total / items_total；
+// total 为 0 表示这一阶段无法给出可靠总量，界面应显示活动状态而不是百分比。
+//
+// phase 的取值是稳定的（GUI 与 CLI 都按它显示文案）：
+//   "scanning" / "packing" / "compressing" / "writing" / "finishing"
+struct ArchiveProgress {
+  std::string phase;
+  std::uint64_t items_done = 0;
+  std::uint64_t items_total = 0;
+  std::uint64_t bytes_done = 0;
+  std::uint64_t bytes_total = 0;
+};
+
+using ArchiveProgressCallback = std::function<void(const ArchiveProgress&)>;
+
 bool RunBackupPipeline(const std::string& source_directory,
                        const std::string& archive_file, const Filter& filter,
                        const BackupOptions& options,
-                       std::string* error_message);
+                       std::string* error_message,
+                       const ArchiveProgressCallback& progress = {});
 
 // 从一份已经准备好的条目表走完整条流水线（扫描是唯一被跳过的步骤）。
 // 给测试与工具用：非 root 环境造不出真的字符/块设备，但格式层与 metadata 层
@@ -69,7 +87,8 @@ bool RunBackupPipeline(const std::string& source_directory,
 bool RunBackupPipelineFromEntries(const std::vector<ArchiveEntry>& entries,
                                   const std::string& archive_file,
                                   const BackupOptions& options,
-                                  std::string* error_message);
+                                  std::string* error_message,
+                                  const ArchiveProgressCallback& progress = {});
 
 // 走 v2 container 的恢复。destination_directory 不存在或存在但为空时都可以。
 //

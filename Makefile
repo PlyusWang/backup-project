@@ -34,6 +34,7 @@ CORE_SOURCES := src/core/archive_entry.cpp src/core/archive_pipeline.cpp \
 # 这些源文件都是 Qt 无关的纯 C++17，CLI 与 Modern GUI 共用同一份，
 # 所以它们属于 CORE_SOURCES，而不是某个前端的目标。
 CORE_SOURCES += src/core/backup_mode.cpp \
+                src/core/backup_credentials.cpp \
                 src/core/backup_option_keys.cpp \
                 src/core/simple_json.cpp \
                 src/core/format_bytes.cpp \

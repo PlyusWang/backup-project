@@ -117,12 +117,14 @@ class RealtimeController : public QObject {
   Q_PROPERTY(QString packKey READ packKey NOTIFY configChanged)
   Q_PROPERTY(QString compressionKey READ compressionKey NOTIFY configChanged)
   Q_PROPERTY(QString encryptionKey READ encryptionKey NOTIFY configChanged)
+  // 无人值守加密的口令文件草稿（只保存路径）。
+  Q_PROPERTY(QString credentialFile READ credentialFile NOTIFY configChanged)
   Q_PROPERTY(QStringList includeRules READ includeRules NOTIFY configChanged)
   Q_PROPERTY(QStringList excludeRules READ excludeRules NOTIFY configChanged)
   // 当前真实支持的模式。QML 只显示这一行，不做"未实现的按钮"。
   Q_PROPERTY(QString supportedModeText READ supportedModeText CONSTANT)
   // 加密说明：只有 none。这句话是页面文案的唯一来源，不在 QML 里再写一遍。
-  Q_PROPERTY(QString encryptionNote READ encryptionNote CONSTANT)
+  Q_PROPERTY(QString encryptionNote READ encryptionNote NOTIFY configChanged)
 
   // ---- 运行状态 ----
   Q_PROPERTY(bool libraryBusy READ libraryBusy NOTIFY busyChanged)
@@ -180,6 +182,7 @@ class RealtimeController : public QObject {
   QString packKey() const;
   QString compressionKey() const;
   QString encryptionKey() const;
+  QString credentialFile() const { return draft_credential_file_; }
   QStringList includeRules() const;
   QStringList excludeRules() const;
   QString supportedModeText() const;
@@ -238,6 +241,9 @@ class RealtimeController : public QObject {
       const QString& strategy_key = QStringLiteral("full"));
   // 只改 enabled。启用前会做完整校验。
   Q_INVOKABLE bool setEnabled(bool enabled);
+  // 保存前的加密选择：只更新草稿，不写盘、不读文件。
+  Q_INVOKABLE bool setEncryptionChoice(const QString& encryption_key,
+                                       const QString& credential_file);
 
   // 用真实的 Filter 校验一条规则；返回空串表示合法。
   // 真正的边界仍然是保存时的 ValidateRealtimeConfig —— 页面里没有、也不会有
@@ -259,6 +265,11 @@ class RealtimeController : public QObject {
   void pumpDebounceForTest() { OnDebounceTimeout(); }
 
  signals:
+  // 用户主动操作失败时的唯一主要反馈。summary / suggestion 是自然中文，
+  // technical 可以包含路径与错误码，但生成方保证其中没有口令、私钥或令牌。
+  // 后台定时 / 实时失败不弹这个信号：它们进运行记录与页面状态。
+  void userError(const QString& title, const QString& summary,
+                 const QString& suggestion, const QString& technical);
   void configChanged();
   void runtimeChanged();
   void statusChanged();
@@ -320,6 +331,9 @@ class RealtimeController : public QObject {
   backupproject::ConfigManager config_manager_;
   backupproject::RealtimeStore store_;
   backupproject::RealtimeConfig config_;
+  // 保存前草稿（只存路径；口令内容不进入 GUI 状态）。
+  QString draft_encryption_key_ = QStringLiteral("none");
+  QString draft_credential_file_;
   bool config_loaded_ = false;
   // 落盘配置读不出来 / 结构不合法。与"这一轮失败"不同：它是一个持续状态，
   // 期间不 attach、不触发，也不自动重试。

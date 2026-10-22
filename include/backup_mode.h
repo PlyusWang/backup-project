@@ -99,6 +99,12 @@ struct BackupOptionCombination {
   PackMethod pack_method = PackMethod::kMyPack;
   CompressionMethod compression_method = CompressionMethod::kNone;
   EncryptionMethod encryption_method = EncryptionMethod::kNone;
+  // 无人值守加密的**唯一**前提：已经配置了一个可通过安全检查的口令文件。
+  // 它不是一个“能力开关”，而是对配置事实的描述：校验层先把配置里的
+  // 口令文件路径读出来，再用这个字段告诉共享真值表。
+  //
+  // 手动触发忽略这个字段（密码在启动任务时由用户输入）。
+  bool unattended_credential_available = false;
 };
 
 bool IsSupportedBackupOptionCombination(
@@ -109,11 +115,11 @@ bool IsSupportedBackupOptionCombination(
 std::string UnsupportedBackupOptionCombinationReason(
     const BackupOptionCombination& combination);
 
-// 自动触发（Scheduled / Realtime）为什么一律不加密。
+// 自动触发（Scheduled / Realtime）在**没有可用凭据**时为什么不能加密。
 //
 // 这句话只能有一处来源：CLI 的拒绝理由与 GUI 的说明文案都读它，谁都不许
 // 复制一份字面量——两份文案迟早会有一份忘了改。
-// 非自动触发返回空串。
+// 非自动触发返回空串；配置了凭据时也返回空串（限制已经解除）。
 std::string UnattendedEncryptionDisabledReason(BackupTrigger trigger);
 
 }  // namespace backupproject

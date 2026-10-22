@@ -51,6 +51,9 @@ Item {
     property int draftStrategyIndex: 0
     property int draftPackIndex: 0
     property int draftCompressionIndex: 0
+    property int draftEncryptionIndex: 0
+    // 无人值守加密的口令文件草稿（只保存路径）。
+    property string draftCredentialFile: ""
 
     // 两个折叠区都默认收起，而且**不持久化**：折叠是这一屏的临时视图状态，
     // 不是配置；重新进入页面时回到"常用设置 + 运行状态优先"的默认样子。
@@ -69,6 +72,20 @@ Item {
     // 压缩发生在打包之后："none" 只是压缩层直通，不代表不打成归档。
     readonly property var compressionKeys: ["none", "huffman", "lzss-huffman"]
     readonly property var compressionLabels: controller.optionCompressionLabels
+    // 与快速备份、定时备份同一组加密 key / 显示名（backupOptions 唯一来源）。
+    readonly property var encryptionKeys: ["none",
+                                           "aes-256-ctr-hmac-sha256",
+                                           "des-cbc-hmac-sha256"]
+    readonly property var encryptionLabels: backupOptions.encryptionLabels
+    readonly property string encryptionKeyValue:
+        page.encryptionKeys[page.draftEncryptionIndex]
+    readonly property string optionError: backupOptions.validate(
+        "realtime",
+        page.strategyKeys[page.draftStrategyIndex],
+        page.packKeys[page.draftPackIndex],
+        page.compressionKeys[page.draftCompressionIndex],
+        page.encryptionKeyValue,
+        page.draftCredentialFile.length > 0)
 
     // 备份方式的短解释：只解释当前选中的那一种，避免两个术语同时出现。
     // 措辞与自动备份页逐字一致（三个页面统一产品语言）。
@@ -98,6 +115,9 @@ Item {
         || page.packKeys[page.draftPackIndex] !== realtime.packKey
         || page.compressionKeys[page.draftCompressionIndex]
            !== realtime.compressionKey
+        || page.encryptionKeys[page.draftEncryptionIndex]
+           !== realtime.encryptionKey
+        || page.draftCredentialFile !== realtime.credentialFile
         || ruleEditor.rulesSignature !== page.savedRulesSignature
 
     // 用控制器状态覆盖全部草稿。触发点有两个：页面完成加载，以及 savedSignature
@@ -115,6 +135,9 @@ Item {
             Math.max(0, page.packKeys.indexOf(realtime.packKey))
         page.draftCompressionIndex =
             Math.max(0, page.compressionKeys.indexOf(realtime.compressionKey))
+        page.draftEncryptionIndex =
+            Math.max(0, page.encryptionKeys.indexOf(realtime.encryptionKey))
+        page.draftCredentialFile = realtime.credentialFile
         // 落盘配置里的规则读进共享编辑器（校验仍然走共享 builder）。读不懂时
         // 编辑器会显示共享核心给出的原因，这里不吞掉它。
         ruleEditor.loadRules(realtime.includeRules, realtime.excludeRules)
@@ -138,6 +161,7 @@ Item {
         realtime.enabled, realtime.sourcePath, realtime.debounceMs,
         realtime.maxWaitMs, realtime.retainCount, realtime.strategyKey,
         realtime.packKey, realtime.compressionKey,
+        realtime.encryptionKey, realtime.credentialFile,
         realtime.includeRules.join(","), realtime.excludeRules.join(",")
     ].join("|")
     onSavedSignatureChanged: syncFromController()
@@ -447,24 +471,31 @@ Item {
                             text: "保存设置"
                             variant: "primary"
                             enabled: !realtime.libraryBusy
+                                     && page.optionError.length === 0
                             // 三个数字按**文本**交给 C++：QML 的 parseInt 会把
                             // "12abc" 悄悄变成 12，而 backupctl 会明确拒绝它。
                             // 解析规则只有一份，在共享核心里。
                             // 一次调用提交整份配置：全部字段校验通过后才落盘，
                             // 不存在"目录存了、策略没存"的中间态；规则文本来自
                             // 共享编辑器，失败原因由控制器写进状态栏。
-                            onClicked: realtime.saveConfigFromText(
-                                page.draftEnabled,
-                                page.draftSource,
-                                page.draftDebounce,
-                                page.draftMaxWait,
-                                page.draftRetain,
-                                page.packKeys[page.draftPackIndex],
-                                page.compressionKeys[
-                                    page.draftCompressionIndex],
-                                ruleEditor.includeRuleTexts,
-                                ruleEditor.excludeRuleTexts,
-                                page.strategyKeys[page.draftStrategyIndex])
+                            onClicked: {
+                                if (!realtime.setEncryptionChoice(
+                                        page.encryptionKeyValue,
+                                        page.draftCredentialFile))
+                                    return
+                                realtime.saveConfigFromText(
+                                    page.draftEnabled,
+                                    page.draftSource,
+                                    page.draftDebounce,
+                                    page.draftMaxWait,
+                                    page.draftRetain,
+                                    page.packKeys[page.draftPackIndex],
+                                    page.compressionKeys[
+                                        page.draftCompressionIndex],
+                                    ruleEditor.includeRuleTexts,
+                                    ruleEditor.excludeRuleTexts,
+                                    page.strategyKeys[page.draftStrategyIndex])
+                            }
                         }
 
                         Item { Layout.fillWidth: true }
@@ -694,24 +725,83 @@ Item {
                             Layout.fillWidth: true
                         }
 
-                        // ---- 加密：一句弱提示，不再摆永远点不动的下拉框 ----
+                        // ---- 加密：与快速备份、定时备份同一组 key ----
                         RowLayout {
                             Layout.fillWidth: true
-                            spacing: 8
+                            spacing: 24
+                            visible: page.advancedExpanded
 
-                            Text {
-                                text: "加密"
-                                font.pixelSize: 16
-                                color: theme.textSecondary
+                            ColumnLayout {
+                                spacing: 4
+
+                                Text {
+                                    text: "加密方式"
+                                    font.pixelSize: 16
+                                    color: theme.textSecondary
+                                }
+
+                                AppComboBox {
+                                    objectName: "realtimeEncryptionCombo"
+                                    implicitWidth: 260
+                                    enabled: !realtime.libraryBusy
+                                    model: page.encryptionLabels
+                                    currentIndex: page.draftEncryptionIndex
+                                    onActivated: page.draftEncryptionIndex =
+                                        currentIndex
+                                }
                             }
-                            Text {
-                                objectName: "realtimeEncryptionText"
-                                visible: page.advancedExpanded
-                                text: "暂不支持"
-                                font.pixelSize: 16
-                                color: theme.textDisabled
+
+                            ColumnLayout {
+                                Layout.fillWidth: true
+                                spacing: 4
+                                visible: page.encryptionKeyValue !== "none"
+
+                                Text {
+                                    text: "口令文件（权限 0600）"
+                                    font.pixelSize: 16
+                                    color: theme.textSecondary
+                                }
+
+                                RowLayout {
+                                    Layout.fillWidth: true
+                                    spacing: 8
+
+                                    AppTextField {
+                                        objectName: "realtimeCredentialField"
+                                        Layout.fillWidth: true
+                                        enabled: !realtime.libraryBusy
+                                        placeholderText:
+                                            "选择仅本人可读的口令文件"
+                                        text: page.draftCredentialFile
+                                        onTextEdited:
+                                            page.draftCredentialFile = text
+                                    }
+
+                                    AppButton {
+                                        objectName: "realtimeCredentialBrowse"
+                                        text: "选择文件"
+                                        iconName: "folder"
+                                        enabled: !realtime.libraryBusy
+                                        onClicked: {
+                                            credentialDialog.currentFolder =
+                                                controller.directoryDialogStartUrl(
+                                                    page.draftCredentialFile)
+                                            credentialDialog.open()
+                                        }
+                                    }
+                                }
                             }
-                            Item { Layout.fillWidth: true }
+                        }
+
+                        Text {
+                            objectName: "realtimeOptionError"
+                            visible: page.advancedExpanded
+                                     && page.optionError.length > 0
+                            Layout.fillWidth: true
+                            text: page.optionError
+                            font.pixelSize: 14
+                            color: theme.error
+                            wrapMode: Text.WordWrap
                         }
 
                         // 说明来自控制器（控制器读的是核心里那句唯一来源），
@@ -1146,6 +1236,19 @@ Item {
                 realtime.localPathFromUrl(sourceDialog.selectedFolder)
             if (chosen !== "")
                 page.draftSource = chosen
+        }
+    }
+
+    FileDialog {
+        id: credentialDialog
+        objectName: "realtimeCredentialDialog"
+        title: "选择加密口令文件"
+        fileMode: FileDialog.OpenFile
+        onAccepted: {
+            const chosen =
+                controller.localPathFromUrl(credentialDialog.selectedFile)
+            if (chosen !== "")
+                page.draftCredentialFile = chosen
         }
     }
 }

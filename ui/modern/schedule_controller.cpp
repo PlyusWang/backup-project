@@ -162,6 +162,12 @@ void ScheduleController::LoadFromDisk() {
     document_ = std::move(document);
   }
   config_loaded_ = true;
+  // 草稿从已保存配置初始化：用户不碰加密控件时，保存不会悄悄把加密方式
+  // 改回 none。
+  draft_encryption_key_ = QString::fromLatin1(
+      backupproject::EncryptionMethodKey(document_.config.encryption_method));
+  draft_credential_file_ =
+      QString::fromStdString(document_.config.encryption_password_file);
   // 文件本身读得懂，所以"读不懂"这条挂起理由不成立。配置**内容**是否合法
   // 由 Evaluate 回答（见 OnEvaluationFinished）：它能看见 Filter、仓库与
   // 无人值守加密边界，比这里的一次结构检查更完整。
@@ -722,9 +728,14 @@ bool ScheduleController::saveConfig(bool enabled, const QString& source_path,
     SetStatus(kError, QStringLiteral("未知的压缩方式"), compression_key);
     return false;
   }
-  // 界面只提供"不加密"。无人值守的定时任务没有安全的持久密钥来源，
-  // 这里不是"暂时隐藏"，而是真的没有任何地方可以存密码。
-  config.encryption_method = backupproject::EncryptionMethod::kNone;
+  // 加密方式与凭据路径来自界面草稿。口令内容不在这里，也不在任何
+  // 配置文件里：运行期由 ScheduledBackupService 从 0600 文件读取。
+  if (!backupproject::ParseEncryptionMethodKey(draft_encryption_key_.toStdString(),
+                                               &config.encryption_method)) {
+    SetStatus(kError, QStringLiteral("未知的加密方式"), draft_encryption_key_);
+    return false;
+  }
+  config.encryption_password_file = draft_credential_file_.toStdString();
 
   config.include_rules.clear();
   for (const QString& rule : include_rules) {
@@ -958,6 +969,37 @@ QString ScheduleController::encryptionKey() const {
       backupproject::EncryptionMethodKey(document_.config.encryption_method));
 }
 
+bool ScheduleController::setEncryptionChoice(const QString& encryption_key,
+                                             const QString& credential_file) {
+  backupproject::EncryptionMethod method =
+      backupproject::EncryptionMethod::kNone;
+  if (!backupproject::ParseEncryptionMethodKey(encryption_key.toStdString(),
+                                               &method)) {
+    SetStatus(kError, QStringLiteral("未知的加密方式"), encryption_key);
+    return false;
+  }
+  // 组合是否成立只有共享真值表能回答；这里提前问一次，界面能在保存前就
+  // 显示原因，而不是等 saveConfig 拒绝。
+  backupproject::BackupOptionCombination combination;
+  combination.trigger = backupproject::BackupTrigger::kScheduled;
+  combination.strategy = document_.config.strategy;
+  combination.pack_method = document_.config.pack_method;
+  combination.compression_method = document_.config.compression_method;
+  combination.encryption_method = method;
+  combination.unattended_credential_available = !credential_file.isEmpty();
+  if (!backupproject::IsSupportedBackupOptionCombination(combination)) {
+    SetStatus(kError, QStringLiteral("当前选项组合不可用"),
+              QString::fromStdString(
+                  backupproject::UnsupportedBackupOptionCombinationReason(
+                      combination)));
+    return false;
+  }
+  draft_encryption_key_ = encryption_key;
+  draft_credential_file_ = credential_file;
+  emit configChanged();
+  return true;
+}
+
 QStringList ScheduleController::includeRules() const {
   QStringList list;
   for (const std::string& rule : document_.config.include_rules) {
@@ -981,10 +1023,19 @@ QString ScheduleController::supportedModeText() const {
 }
 
 QString ScheduleController::encryptionNote() const {
-  // 唯一来源：核心那句"无人值守为什么不加密"。GUI 不复制一份字面量。
-  return QString::fromStdString(
-      backupproject::UnattendedEncryptionDisabledReason(
-          backupproject::BackupTrigger::kScheduled));
+  // 唯一来源：核心那句“无人值守加密需要什么”。GUI 不复制一份字面量。
+  if (draft_encryption_key_ == QStringLiteral("none")) {
+    return QStringLiteral(
+        "选择加密后，需要指定一个仅本人可读（0600）的口令文件；"
+        "程序不会把口令明文写入配置。");
+  }
+  if (draft_credential_file_.isEmpty()) {
+    return QString::fromStdString(
+        backupproject::UnattendedEncryptionDisabledReason(
+            backupproject::BackupTrigger::kScheduled));
+  }
+  return QStringLiteral("加密口令将在每次运行时从该文件读取；"
+                        "文件不可读时这一轮备份会明确失败。");
 }
 
 QString ScheduleController::lastRunText() const {

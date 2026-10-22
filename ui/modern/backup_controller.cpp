@@ -13,6 +13,7 @@
 #include <QtConcurrent/QtConcurrentRun>
 #include <cstddef>
 #include <cstring>
+#include <map>
 #include <string>
 #include <utility>
 #include <vector>
@@ -795,6 +796,10 @@ bool BackupController::StartBackupWithStrategy(
   request.filter = filter;
   request.backup_options = options;
   request.strategy = strategy;
+  // 进度回调只捕获 this；控制器比任务活得久（析构会先等任务结束）。
+  request.progress = [this](const backupproject::ArchiveProgress& progress) {
+    OnArchiveProgress(progress);
+  };
   if (strategy == BackupStrategy::kIncremental) {
     // 增量在后台自己决定 baseline / delta / 不写，所以它需要仓库本身、
     // 快照名与规则原文（规则是链 identity 的一部分）。
@@ -1068,6 +1073,13 @@ bool BackupController::Start(const OperationRequest& request,
       operation_gate_ != nullptr ? gate_kind : OperationGate::Kind::kNone;
   active_kind_ = request.kind;
   active_file_name_ = file_name;
+  // 新任务从零开始：上一轮的 100% 不能先闪一下再跳回 0。
+  progress_phase_.store(0);
+  progress_items_done_.store(0);
+  progress_items_total_.store(0);
+  progress_bytes_done_.store(0);
+  progress_bytes_total_.store(0);
+  emit progressChanged();
   // 记住这次操作属于哪一页：完成提示要落回发起它的页面，而不是用户此刻
   // 正在看的页面。
   active_scope_ = status_scope_;
@@ -1084,6 +1096,89 @@ bool BackupController::Start(const OperationRequest& request,
   watcher_.setFuture(
       QtConcurrent::run(&BackupController::RunOperation, request));
   return true;
+}
+
+// ---- 真实进度：后台线程写原子量，GUI 线程读 ----
+
+void BackupController::OnArchiveProgress(
+    const backupproject::ArchiveProgress& progress) {
+  static const std::map<std::string, int> kPhaseCodes = {
+      {"scanning", 1}, {"packing", 2}, {"compressing", 3},
+      {"writing", 4},  {"finishing", 5}};
+  const auto found = kPhaseCodes.find(progress.phase);
+  progress_phase_.store(found == kPhaseCodes.end() ? 0 : found->second);
+  progress_items_done_.store(progress.items_done);
+  progress_items_total_.store(progress.items_total);
+  progress_bytes_done_.store(progress.bytes_done);
+  progress_bytes_total_.store(progress.bytes_total);
+  // 只投递一次通知，不在后台线程里碰 QML 对象。
+  QMetaObject::invokeMethod(
+      this, [this]() { emit progressChanged(); }, Qt::QueuedConnection);
+}
+
+QString BackupController::progressPhase() const {
+  switch (progress_phase_.load()) {
+    case 1: return QStringLiteral("scanning");
+    case 2: return QStringLiteral("packing");
+    case 3: return QStringLiteral("compressing");
+    case 4: return QStringLiteral("writing");
+    case 5: return QStringLiteral("finishing");
+    default: return QString();
+  }
+}
+
+qulonglong BackupController::progressItemsDone() const {
+  return progress_items_done_.load();
+}
+qulonglong BackupController::progressItemsTotal() const {
+  return progress_items_total_.load();
+}
+qulonglong BackupController::progressBytesDone() const {
+  return progress_bytes_done_.load();
+}
+qulonglong BackupController::progressBytesTotal() const {
+  return progress_bytes_total_.load();
+}
+
+double BackupController::progressRatio() const {
+  const qulonglong total = progress_bytes_total_.load();
+  if (total == 0) return -1.0;
+  const double ratio =
+      static_cast<double>(progress_bytes_done_.load()) /
+      static_cast<double>(total);
+  return ratio < 0 ? 0 : (ratio > 1 ? 1 : ratio);
+}
+
+QString BackupController::progressText() const {
+  const QString phase = progressPhase();
+  if (phase.isEmpty()) return QString();
+  const qulonglong items_done = progress_items_done_.load();
+  const qulonglong items_total = progress_items_total_.load();
+  const qulonglong bytes_done = progress_bytes_done_.load();
+  const qulonglong bytes_total = progress_bytes_total_.load();
+  if (phase == QStringLiteral("scanning")) return QStringLiteral("正在扫描文件…");
+  if (phase == QStringLiteral("packing")) {
+    if (items_total == 0)
+      return QStringLiteral("正在生成备份…");
+    return QStringLiteral("正在生成备份… %1 / %2 个文件")
+        .arg(items_done)
+        .arg(items_total);
+  }
+  if (phase == QStringLiteral("compressing"))
+    return QStringLiteral("正在压缩…");
+  if (phase == QStringLiteral("writing")) {
+    if (bytes_total == 0) return QStringLiteral("正在写入备份…");
+    const double percent =
+        100.0 * static_cast<double>(bytes_done) / static_cast<double>(bytes_total);
+    return QStringLiteral("正在写入备份… %1 / %2（%3%）")
+        .arg(QString::fromStdString(
+            backupproject::FormatByteSize(
+                static_cast<std::uint64_t>(bytes_done))),
+            QString::fromStdString(backupproject::FormatByteSize(
+                static_cast<std::uint64_t>(bytes_total))))
+        .arg(QString::number(percent, 'f', 0));
+  }
+  return QStringLiteral("正在完成备份…");
 }
 
 // 每次调用都新建一个 BackupEngine：核心没有全局状态，
@@ -1108,7 +1203,7 @@ OperationOutcome BackupController::RunOperation(OperationRequest request) {
         request.snapshot_file_name.toStdString(),
         request.repository_identity.toStdString(), request.filter,
         request.backup_options, request.include_rules, request.exclude_rules,
-        std::string(), &incremental, &error_message);
+        std::string(), &incremental, &error_message, request.progress);
     outcome.succeeded = ok;
     outcome.incremental = true;
     if (ok) {
@@ -1133,7 +1228,8 @@ OperationOutcome BackupController::RunOperation(OperationRequest request) {
     if (request.backup_flavor == BackupFlavor::kModernV2) {
       // 三项都由用户在界面上选择，这里不再写死任何一项。
       outcome.succeeded = engine.Backup(first, second, request.filter,
-                                        request.backup_options, &error_message);
+                                        request.backup_options, &error_message,
+                                        request.progress);
     } else {
       // legacy v0.1：旧格式始终保留一条被真实执行的回归入口。
       outcome.succeeded =

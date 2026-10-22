@@ -33,6 +33,9 @@
 #include <cerrno>
 #include <cstdio>
 #include <cstring>
+#include <exception>
+#include <fstream>
+#include <string>
 #include <vector>
 
 #include "crypto.h"
@@ -722,6 +725,96 @@ bool RemoteArchiveClient::List(std::vector<RemoteSnapshotInfo>* snapshots,
   return true;
 }
 
+namespace {
+
+// 上传续传状态：一条很小的文本记录，和真正的数据（服务端临时文件）分开。
+// 键由"本地文件身份"决定：换文件、改内容、改显示名都不会误续到别的上传。
+struct UploadResumeState {
+  std::string upload_id;
+  std::uint64_t offset = 0;
+  std::uint64_t size = 0;
+  std::string sha256;
+  std::string display_name;
+};
+
+std::string UploadResumeKey(const std::string& path, std::uint64_t size,
+                            const std::string& sha256,
+                            const std::string& display_name) {
+  return crypto::Sha256Hex(path + "\n" + std::to_string(size) + "\n" + sha256 +
+                           "\n" + display_name);
+}
+
+std::string UploadResumeStatePath(const std::string& directory,
+                                  const std::string& key) {
+  return directory + "/" + key + ".upload";
+}
+
+bool LoadUploadResumeState(const std::string& path, UploadResumeState* state) {
+  std::ifstream in(path, std::ios::binary);
+  if (!in) return false;
+  std::string version;
+  std::getline(in, version);
+  if (version != "v1") return false;
+  std::string offset;
+  std::string size;
+  if (!std::getline(in, state->upload_id) || !std::getline(in, offset) ||
+      !std::getline(in, size) || !std::getline(in, state->sha256) ||
+      !std::getline(in, state->display_name)) {
+    return false;
+  }
+  try {
+    state->offset = std::stoull(offset);
+    state->size = std::stoull(size);
+  } catch (const std::exception&) {
+    return false;
+  }
+  return true;
+}
+
+bool SaveUploadResumeState(const std::string& path,
+                           const UploadResumeState& state) {
+  const std::string temporary = path + ".tmp";
+  std::ofstream out(temporary, std::ios::binary | std::ios::trunc);
+  if (!out) return false;
+  out << "v1\n" << state.upload_id << "\n" << state.offset << "\n"
+      << state.size << "\n" << state.sha256 << "\n" << state.display_name
+      << "\n";
+  out.flush();
+  if (!out) return false;
+  out.close();
+  ::chmod(temporary.c_str(), 0600);
+  return ::rename(temporary.c_str(), path.c_str()) == 0;
+}
+
+void RemoveResumeFile(const std::string& path) { ::unlink(path.c_str()); }
+
+}  // namespace
+
+void RemoteArchiveClient::ProbeResumeSupport() {
+  if (resume_probed_) return;
+  resume_probed_ = true;
+  // 老服务端不认识这个操作码：Request 会返回 false 并留下一条协议层错误。
+  // 这里把它归成"不支持续传"，不把错误升级成用户的失败。
+  std::string ignored;
+  FrameHeader header;
+  std::string response;
+  if (!Request(Opcode::kCapabilities, std::string(), &header, &response,
+               &ignored)) {
+    server_supports_resume_ = false;
+    return;
+  }
+  PayloadReader reader(response);
+  std::uint16_t version = 0;
+  std::uint32_t flags = 0;
+  if (!reader.ReadU16(&version) || !reader.ReadU32(&flags)) {
+    server_supports_resume_ = false;
+    return;
+  }
+  server_supports_resume_ =
+      version >= kTransferProtocolVersion &&
+      (flags & kCapabilityResumableTransfer) != 0;
+}
+
 bool RemoteArchiveClient::UploadArchiveFile(
     const std::string& local_path, const std::string& display_name,
     const RemoteProgressCallback& progress, RemoteSnapshotInfo* uploaded,
@@ -778,6 +871,48 @@ bool RemoteArchiveClient::UploadSnapshotFile(
     return false;
   }
 
+  // ---- 续传：能续就续，续不了就从头发 ----
+  // 只有服务端明确宣告支持、且本地有一条与当前文件身份一致的记录时才尝试。
+  // 服务端会重新验证前缀摘要；任何不匹配都会回 kInvalidState，这里删掉本地
+  // 记录并退回普通上传。
+  std::string upload_id;
+  std::uint64_t start_offset = 0;
+  bool resuming = false;
+  std::string resume_key;
+  std::string resume_path;
+  if (!resume_directory_.empty()) {
+    ProbeResumeSupport();
+  }
+  if (server_supports_resume_ && !resume_directory_.empty()) {
+    resume_key = UploadResumeKey(local_path, size, sha256, display_name);
+    resume_path = UploadResumeStatePath(resume_directory_, resume_key);
+    UploadResumeState state;
+    if (LoadUploadResumeState(resume_path, &state) && state.size == size &&
+        state.sha256 == sha256 && state.display_name == display_name &&
+        state.offset <= size) {
+      PayloadBuilder resume;
+      std::string resume_build_error;
+      if (resume.AppendString(state.upload_id, kMaxSnapshotIdBytes,
+                              &resume_build_error)) {
+        resume.AppendU64(state.offset);
+        FrameHeader resume_header;
+        std::string resume_response;
+        std::string resume_error;
+        if (Request(Opcode::kUploadResumeBegin, resume.data(), &resume_header,
+                    &resume_response, &resume_error)) {
+          PayloadReader resume_reader(resume_response);
+          std::uint64_t offset = 0;
+          if (resume_reader.ReadU64(&offset) && offset <= size) {
+            upload_id = state.upload_id;
+            start_offset = offset;
+            resuming = true;
+          }
+        }
+      }
+      if (!resuming) RemoveResumeFile(resume_path);
+    }
+  }
+
   PayloadBuilder begin;
   std::string build_error;
   // 字段顺序必须与服务端的解码顺序一致：显示名 -> 长度 -> SHA-256。
@@ -811,10 +946,25 @@ bool RemoteArchiveClient::UploadSnapshotFile(
 
   FrameHeader header;
   std::string response;
-  if (!Request(Opcode::kUploadBegin, begin.data(), &header, &response,
-               error_message)) {
-    ::close(source);
-    return false;
+  if (!resuming) {
+    if (!Request(Opcode::kUploadBegin, begin.data(), &header, &response,
+                 error_message)) {
+      ::close(source);
+      return false;
+    }
+    // 服务端在响应里给出续传会话 id。老服务端没有这个字段：读不到就是空串，
+    // 本次上传照常完成，只是无法跨进程续传。
+    PayloadReader id_reader(response);
+    if (!id_reader.ReadString(kMaxSnapshotIdBytes, &upload_id)) {
+      upload_id.clear();
+    }
+    if (!upload_id.empty() && !resume_path.empty()) {
+      UploadResumeState state{upload_id, 0, size, sha256, display_name};
+      if (!SaveUploadResumeState(resume_path, state)) {
+        RemoveResumeFile(resume_path);
+        resume_path.clear();
+      }
+    }
   }
 
   // UPLOAD_BEGIN 已经被服务端接受：服务端现在处于 UPLOAD_IN_PROGRESS。
@@ -830,11 +980,18 @@ bool RemoteArchiveClient::UploadSnapshotFile(
     DisconnectSocket();
   };
 
+  // 续传从服务端验证过的检查点开始；普通上传从 0 开始。
+  if (start_offset > 0 &&
+      ::lseek(source, static_cast<off_t>(start_offset), SEEK_SET) < 0) {
+    abort_upload_transaction();
+    return false;
+  }
   // 第二遍：分块发送。内存里只有一个块。
   std::vector<char> buffer(kTransferChunkBytes);
-  std::uint64_t sent = 0;
+  std::uint64_t sent = start_offset;
+  std::uint64_t saved_offset = start_offset;
   if (progress) {
-    progress(RemoteTransferProgress{"upload", 0, size});
+    progress(RemoteTransferProgress{"upload", sent, size});
   }
   while (sent < size) {
     ssize_t got = 0;
@@ -847,10 +1004,12 @@ bool RemoteArchiveClient::UploadSnapshotFile(
     }
     if (got < 0) {
       // 先记下本地错误（StrerrorText 要在 close 之前读 errno），再终止事务：
-      // 收尾不能覆盖调用方看到的原始原因。
+      // 收尾不能覆盖调用方看到的原始原因。本地文件读不出来时续传前缀也不再
+      // 可信，删掉续传记录，下一次从 0 开始。
       if (error_message != nullptr) {
         *error_message = "cannot read " + local_path + ": " + StrerrorText();
       }
+      if (!resume_path.empty()) RemoveResumeFile(resume_path);
       abort_upload_transaction();
       return false;
     }
@@ -859,6 +1018,7 @@ bool RemoteArchiveClient::UploadSnapshotFile(
       if (error_message != nullptr) {
         *error_message = "the file shrank while it was being uploaded";
       }
+      if (!resume_path.empty()) RemoveResumeFile(resume_path);
       abort_upload_transaction();
       return false;
     }
@@ -871,6 +1031,14 @@ bool RemoteArchiveClient::UploadSnapshotFile(
       return false;
     }
     sent += static_cast<std::uint64_t>(got);
+    // 每 4 MiB 把"已经发到哪里"落盘；断连时服务端保留的是它自己的检查点，
+    // 两者最多差一个检查点间隔。
+    if (!resume_path.empty() && sent - saved_offset >= 4ull * 1024ull * 1024ull) {
+      UploadResumeState state{upload_id, sent, size, sha256, display_name};
+      if (SaveUploadResumeState(resume_path, state)) {
+        saved_offset = sent;
+      }
+    }
     if (progress) {
       progress(RemoteTransferProgress{"upload", sent, size});
     }
@@ -899,9 +1067,255 @@ bool RemoteArchiveClient::UploadSnapshotFile(
   info.lineage = options.lineage;
   info.display_name = display_name;
   info.created_at = created_at;
+  if (!resume_path.empty()) RemoveResumeFile(resume_path);
   if (uploaded != nullptr) {
     *uploaded = info;
   }
+  return true;
+}
+
+// ---- 支持续传的下载 ----
+//
+// 半成品用**稳定命名**、放在目标目录里（发布必须在同一个文件系统上）：
+//   <target-dir>/.backup-project-<key>.part
+// 状态文件放在 resume/ 下，记录快照 id、期望摘要 / 总长、当前偏移与半成品路径。
+// 失败时两者都保留；下一次调用同一份快照时先从服务端取回可续位置，再从那里写。
+bool RemoteArchiveClient::DownloadWithResume(
+    const std::string& snapshot_id, const std::string& target_path,
+    bool allow_overwrite, const RemoteProgressCallback& progress,
+    RemoteSnapshotInfo* downloaded, std::string* error_message) {
+  if (target_path.empty()) {
+    if (error_message != nullptr) *error_message = "the download target path is empty";
+    return false;
+  }
+  if (!allow_overwrite && ::access(target_path.c_str(), F_OK) == 0) {
+    if (error_message != nullptr) {
+      *error_message = target_path + " already exists (use --force to replace)";
+    }
+    return false;
+  }
+  const std::string key =
+      crypto::Sha256Hex(snapshot_id + "\n" + target_path);
+  const std::string state_path = resume_directory_ + "/" + key + ".download";
+  const std::string target_directory = ParentDirectoryOf(target_path);
+  const std::string part_path =
+      target_directory + "/.backup-project-" + key.substr(0, 24) + ".part";
+
+  struct DownloadState {
+    std::string snapshot_id;
+    std::string sha256;
+    std::uint64_t size = 0;
+    std::uint64_t offset = 0;
+    std::string part_path;
+  } state;
+  bool have_state = false;
+  {
+    std::ifstream in(state_path, std::ios::binary);
+    std::string version;
+    if (in && std::getline(in, version) && version == "v1" &&
+        std::getline(in, state.snapshot_id) && std::getline(in, state.sha256)) {
+      std::string size_text, offset_text;
+      if (std::getline(in, size_text) && std::getline(in, offset_text) &&
+          std::getline(in, state.part_path)) {
+        try {
+          state.size = std::stoull(size_text);
+          state.offset = std::stoull(offset_text);
+          have_state = state.snapshot_id == snapshot_id;
+        } catch (const std::exception&) {
+          have_state = false;
+        }
+      }
+    }
+  }
+  struct stat part_info;
+  if (have_state) {
+    if (::lstat(state.part_path.c_str(), &part_info) != 0 ||
+        !S_ISREG(part_info.st_mode)) {
+      have_state = false;
+    } else {
+      state.offset = static_cast<std::uint64_t>(part_info.st_size);
+    }
+  }
+
+  FrameHeader header;
+  std::string response;
+  std::string request_error;
+  bool resumed = false;
+  RemoteSnapshotInfo info;
+  std::uint64_t declared_size = 0;
+  std::uint64_t offset = 0;
+  if (have_state) {
+    PayloadBuilder request;
+    std::string build_error;
+    if (request.AppendString(snapshot_id, kMaxSnapshotIdBytes, &build_error)) {
+      request.AppendU64(state.offset);
+      if (Request(Opcode::kDownloadResumeBegin, request.data(), &header,
+                  &response, &request_error)) {
+        PayloadReader reader(response);
+        if (reader.ReadString(kMaxDisplayNameBytes, &info.display_name) &&
+            reader.ReadString(kSha256HexBytes, &info.sha256) &&
+            reader.ReadU64(&declared_size) && reader.ReadU64(&offset) &&
+            offset <= declared_size && info.sha256 == state.sha256 &&
+            declared_size == state.size) {
+          resumed = true;
+        }
+      }
+    }
+  }
+  if (!resumed) {
+    have_state = false;
+    PayloadBuilder request;
+    std::string build_error;
+    if (!request.AppendString(snapshot_id, kMaxSnapshotIdBytes, &build_error) ||
+        !Request(Opcode::kDownloadBegin, request.data(), &header, &response,
+                 &request_error)) {
+      if (error_message != nullptr) {
+        *error_message = request_error.empty() ? build_error : request_error;
+      }
+      return false;
+    }
+    PayloadReader reader(response);
+    if (!reader.ReadString(kMaxDisplayNameBytes, &info.display_name) ||
+        !reader.ReadString(kSha256HexBytes, &info.sha256) ||
+        !reader.ReadU64(&declared_size) || !reader.AtEnd()) {
+      if (error_message != nullptr) {
+        *error_message = "cannot decode the DOWNLOAD_BEGIN response";
+      }
+      return false;
+    }
+    offset = 0;
+  }
+  info.snapshot_id = snapshot_id;
+  info.size_bytes = declared_size;
+
+  bool download_active = true;
+  const auto finish_download = [&](bool keep_partial) {
+    if (download_active) {
+      download_active = false;
+      if (fd_ >= 0 && !SocketLooksClosed(fd_)) {
+        std::string ignored;
+        Request(Opcode::kDownloadEnd, std::string(), &header, &response,
+                &ignored);
+      }
+    }
+    if (!keep_partial) {
+      ::unlink(part_path.c_str());
+      ::unlink(state_path.c_str());
+    }
+  };
+
+  if (!resumed) {
+    // 全新的下载：半成品必须是 O_EXCL，绝不覆盖目标目录里已有的同名文件。
+    ::unlink(part_path.c_str());
+  } else if (offset > 0) {
+    // 复用已有半成品。
+  }
+  const int output = ::open(part_path.c_str(),
+                            O_WRONLY | O_CREAT | (resumed ? 0 : O_EXCL), 0600);
+  if (output < 0) {
+    finish_download(false);
+    if (error_message != nullptr) *error_message = "cannot create the partial file";
+    return false;
+  }
+  if (offset > 0 &&
+      ::lseek(output, static_cast<off_t>(offset), SEEK_SET) < 0) {
+    ::close(output);
+    finish_download(false);
+    if (error_message != nullptr) *error_message = "cannot seek the partial file";
+    return false;
+  }
+
+  // 前缀摘要：续传时必须从磁盘重新算，不能相信状态文件里的声明。
+  crypto::Sha256 hasher;
+  if (offset > 0) {
+    std::ifstream prefix(part_path, std::ios::binary);
+    std::vector<char> buffer(kTransferChunkBytes);
+    std::uint64_t remaining = offset;
+    while (prefix && remaining > 0) {
+      const std::size_t want = static_cast<std::size_t>(
+          remaining < buffer.size() ? remaining : buffer.size());
+      prefix.read(buffer.data(), static_cast<std::streamsize>(want));
+      if (prefix.gcount() != static_cast<std::streamsize>(want)) {
+        ::close(output);
+        finish_download(true);
+        if (error_message != nullptr) *error_message = "the partial file is truncated";
+        return false;
+      }
+      hasher.Update(buffer.data(), want);
+      remaining -= want;
+    }
+  }
+  // 先把状态写成"从 offset 继续"，崩溃后下一次仍能定位到同一份半成品。
+  {
+    const std::string temporary = state_path + ".tmp";
+    std::ofstream out(temporary, std::ios::binary | std::ios::trunc);
+    if (out) {
+      out << "v1\n" << snapshot_id << "\n" << info.sha256 << "\n"
+          << declared_size << "\n" << offset << "\n" << part_path << "\n";
+      out.close();
+      ::chmod(temporary.c_str(), 0600);
+      ::rename(temporary.c_str(), state_path.c_str());
+    }
+  }
+  if (progress) {
+    progress(RemoteTransferProgress{"download", offset, declared_size});
+  }
+  std::uint64_t received = offset;
+  bool ok = true;
+  for (;;) {
+    if (!Request(Opcode::kDownloadChunk, std::string(), &header, &response,
+                 error_message)) {
+      ok = false;
+      break;
+    }
+    if (response.empty()) break;
+    if (::write(output, response.data(), response.size()) !=
+        static_cast<ssize_t>(response.size())) {
+      if (error_message != nullptr) *error_message = StrerrorText();
+      ok = false;
+      break;
+    }
+    hasher.Update(response.data(), response.size());
+    received += response.size();
+    if (received > declared_size) {
+      if (error_message != nullptr) *error_message = "the server sent too many bytes";
+      ok = false;
+      break;
+    }
+    if (progress) progress(RemoteTransferProgress{"download", received, declared_size});
+  }
+  unsigned char digest[crypto::kSha256DigestSize];
+  hasher.Final(digest);
+  const std::string actual_sha256 = crypto::ToHex(digest, crypto::kSha256DigestSize);
+  if (ok && (received != declared_size || actual_sha256 != info.sha256)) {
+    if (error_message != nullptr) {
+      *error_message = "the downloaded archive does not match the declared size or SHA-256";
+    }
+    ok = false;
+  }
+  if (ok && ::fsync(output) != 0) {
+    if (error_message != nullptr) *error_message = StrerrorText();
+    ok = false;
+  }
+  if (::close(output) != 0) ok = false;
+  if (!ok) {
+    finish_download(true);  // 保留半成品与状态：下一次从已验证的位置继续
+    return false;
+  }
+  std::string publish_error;
+  const bool published =
+      allow_overwrite ? PublishReplacing(part_path, target_path, &publish_error)
+                      : PublishNoReplace(part_path, target_path, &publish_error);
+  if (!published) {
+    if (error_message != nullptr) {
+      *error_message = publish_error.empty() ? ("cannot publish " + target_path)
+                                             : publish_error;
+    }
+    finish_download(true);
+    return false;
+  }
+  finish_download(false);
+  if (downloaded != nullptr) *downloaded = info;
   return true;
 }
 
@@ -921,6 +1335,13 @@ bool RemoteArchiveClient::DownloadArchiveFile(
     RemoteSnapshotInfo* downloaded, std::string* error_message) {
   if (!RequireAuthenticated("download", error_message)) {
     return false;
+  }
+  if (!resume_directory_.empty()) {
+    ProbeResumeSupport();
+    if (server_supports_resume_) {
+      return DownloadWithResume(snapshot_id, target_path, allow_overwrite,
+                                progress, downloaded, error_message);
+    }
   }
   if (target_path.empty()) {
     if (error_message != nullptr) {

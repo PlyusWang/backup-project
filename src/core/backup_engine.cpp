@@ -131,10 +131,10 @@ bool BackupEngine::Restore(const std::string& archive_file,
 // 已经存在）由 pipeline 自己做，这里只负责把 Filter 传下去。
 bool BackupEngine::Backup(const std::string& source_directory,
                           const std::string& archive_file, const Filter& filter,
-                          const BackupOptions& options,
-                          std::string* error_message) {
+                          const BackupOptions& options, std::string* error_message,
+                          const ArchiveProgressCallback& progress) {
   return RunBackupPipeline(source_directory, archive_file, filter, options,
-                           error_message);
+                           error_message, progress);
 }
 
 bool BackupEngine::Restore(const std::string& archive_file,

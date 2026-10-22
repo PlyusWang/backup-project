@@ -56,6 +56,7 @@
 #include <vector>
 
 #include "backup_catalog.h"
+#include "backup_credentials.h"
 #include "backup_option_keys.h"
 #include "file_io.h"
 #include "simple_json.h"
@@ -287,9 +288,19 @@ bool ValidateScheduleConfig(const ScheduleConfig& config,
   combination.pack_method = config.pack_method;
   combination.compression_method = config.compression_method;
   combination.encryption_method = config.encryption_method;
+  // 是否配置了口令文件，是共享真值表判断“无人值守加密能不能成立”的唯一依据。
+  combination.unattended_credential_available =
+      !config.encryption_password_file.empty();
   if (!IsSupportedBackupOptionCombination(combination)) {
     SetError(error_message,
              UnsupportedBackupOptionCombinationReason(combination));
+    return false;
+  }
+  // 不加密时允许凭据路径为空（默认就是空）。填了就必须是能用的绝对路径，
+  // 免得配置里躺着一个永远读不到的半截值。
+  if (!config.encryption_password_file.empty() &&
+      !IsUsableCredentialPath(config.encryption_password_file,
+                              error_message)) {
     return false;
   }
   if (config.interval_minutes < kMinIntervalMinutes ||
@@ -435,6 +446,13 @@ bool ValidateScheduleForEnable(const ScheduleConfig& config,
   }
   if (!RequireRealDirectory(repository_path, "The backup repository",
                             error_message)) {
+    return false;
+  }
+  // 加密任务只有在“现在就能读到口令”时才允许启用。只看配置里的路径不够：
+  // 文件被删、权限被改成 0644、内容为空，都会让第一次真正到点的运行失败。
+  if (config.encryption_method != EncryptionMethod::kNone &&
+      !ValidateCredentialFile(config.encryption_password_file,
+                             error_message)) {
     return false;
   }
   return RequireRealDirectory(config.source_path, "Schedule source directory",
@@ -679,6 +697,9 @@ std::string SerializeScheduleDocument(const ScheduleDocument& document) {
   AppendStringField(&out, "encryption",
                     EncryptionMethodKey(document.config.encryption_method),
                     false);
+  AppendIndent(&out, 2);
+  AppendStringField(&out, "encryption_password_file",
+                    document.config.encryption_password_file, false);
   AppendStringArrayField(&out, "include_rules", document.config.include_rules,
                          2, false);
   AppendStringArrayField(&out, "exclude_rules", document.config.exclude_rules,
@@ -768,6 +789,10 @@ const std::vector<const char*> kConfigFields = {
     "enabled",          "trigger",       "strategy",     "source_path",
     "interval_minutes", "retain_count",  "pack",         "compression",
     "encryption",       "include_rules", "exclude_rules"};
+// 无人值守加密的口令文件是后加的字段：没有它的旧文件必须继续读得进来，
+// 读到的是空串（= 不加密）。未知字段仍然报 unknown。
+const std::vector<const char*> kConfigOptionalFields = {
+    "encryption_password_file"};
 const std::vector<const char*> kStateFields = {
     "next_run_time_sec", "last_success_time_sec", "last_manifest_entry_count",
     "managed_snapshots", "history"};
@@ -843,7 +868,8 @@ bool ParseConfig(const JsonValue& root, ScheduleConfig* config,
   if (!RequireObject(root.Find("config"), "config", &object, error_message)) {
     return false;
   }
-  if (!RequireExactFields(*object, kConfigFields, "config", error_message)) {
+  if (!RequireExactFields(*object, kConfigFields, kConfigOptionalFields,
+                          "config", error_message)) {
     return false;
   }
   if (!RequireBool(*object, "enabled", "config", &config->enabled,
@@ -918,6 +944,11 @@ bool ParseConfig(const JsonValue& root, ScheduleConfig* config,
         "config", "encryption",
         "is not a known encryption method: '" + encryption_key + "'",
         error_message);
+  }
+  if (!RequireOptionalString(*object, "encryption_password_file", "config",
+                             &config->encryption_password_file,
+                             error_message)) {
+    return false;
   }
 
   // 规则条数与单条长度在这里再查一遍：Save() 侧查过，但读进来的文件可能

@@ -41,14 +41,15 @@ Item {
             spacing: 16
 
             Text {
-                text: "备份"
+                text: "快速备份"
                 font.pixelSize: 30
                 font.weight: Font.DemiBold
                 color: theme.textPrimary
             }
 
             Text {
-                text: "选择一个目录，备份文件会自动命名并保存到备份仓库。"
+                text: "选择一个文件夹，立即创建一份备份；可继续配置筛选、"
+                    + "打包、压缩和加密。"
                 font.pixelSize: 17
                 color: theme.textSecondary
                 Layout.topMargin: -8
@@ -228,31 +229,62 @@ Item {
                     }
                 }
 
-                // 不确定进度条：核心没有百分比回调，这里只表达“在跑”。
-                Rectangle {
-                    id: progressTrack
+                // 真实进度：数据全部来自 controller（共享核心的
+                // ArchiveProgress 回调）。ratio < 0 表示这一阶段没有可靠
+                // 总量——此时只显示活动状态，不画一个假的百分比。
+                ColumnLayout {
                     Layout.fillWidth: true
-                    Layout.preferredHeight: 3
-                    radius: 1.5
-                    color: theme.hover
+                    Layout.preferredWidth: 320
                     visible: controller.busy
-                    clip: true
+                    spacing: 4
 
                     Rectangle {
-                        id: progressChunk
-                        width: progressTrack.width * 0.3
-                        height: parent.height
-                        radius: 1.5
-                        color: theme.accent
+                        id: progressTrack
+                        Layout.fillWidth: true
+                        Layout.preferredHeight: 6
+                        radius: 3
+                        color: theme.hover
+                        clip: true
 
-                        NumberAnimation on x {
-                            running: controller.busy
-                            loops: Animation.Infinite
-                            from: -progressChunk.width
-                            to: progressTrack.width
-                            duration: 1150
-                            easing.type: Easing.InOutQuad
+                        // 有总量：按真实字节比例填充。
+                        Rectangle {
+                            visible: controller.progressRatio >= 0
+                            width: progressTrack.width
+                                   * Math.max(0, controller.progressRatio)
+                            height: parent.height
+                            radius: 3
+                            color: theme.accent
                         }
+
+                        // 没有总量：一条循环滑动的活动指示，只是“在跑”。
+                        Rectangle {
+                            visible: controller.progressRatio < 0
+                            width: progressTrack.width * 0.28
+                            height: parent.height
+                            radius: 3
+                            color: theme.accent
+
+                            NumberAnimation on x {
+                                running: controller.busy
+                                         && controller.progressRatio < 0
+                                loops: Animation.Infinite
+                                from: -progressTrack.width * 0.28
+                                to: progressTrack.width
+                                duration: 1150
+                                easing.type: Easing.InOutQuad
+                            }
+                        }
+                    }
+
+                    Text {
+                        objectName: "backupProgressText"
+                        Layout.fillWidth: true
+                        text: controller.progressText.length > 0
+                              ? controller.progressText
+                              : "正在处理…"
+                        font.pixelSize: 14
+                        color: theme.textSecondary
+                        elide: Text.ElideRight
                     }
                 }
             }

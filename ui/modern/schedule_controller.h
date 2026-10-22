@@ -96,13 +96,15 @@ class ScheduleController : public QObject,
   Q_PROPERTY(QString packKey READ packKey NOTIFY configChanged)
   Q_PROPERTY(QString compressionKey READ compressionKey NOTIFY configChanged)
   Q_PROPERTY(QString encryptionKey READ encryptionKey NOTIFY configChanged)
+  // 无人值守加密的口令文件草稿（只保存路径，口令内容由核心里读取）。
+  Q_PROPERTY(QString credentialFile READ credentialFile NOTIFY configChanged)
   Q_PROPERTY(QStringList includeRules READ includeRules NOTIFY configChanged)
   Q_PROPERTY(QStringList excludeRules READ excludeRules NOTIFY configChanged)
   // 当前真实支持的模式。QML 只显示这一行，不做"未实现的按钮"。
   Q_PROPERTY(QString supportedModeText READ supportedModeText CONSTANT)
-  // 定时无人值守为什么不能加密。与实时页同一条来源：核心里那句唯一的话
+  // 无人值守加密的前提说明。与实时页同一条来源：核心里那句唯一的话
   // （UnattendedEncryptionDisabledReason），界面不复制一份字面量。
-  Q_PROPERTY(QString encryptionNote READ encryptionNote CONSTANT)
+  Q_PROPERTY(QString encryptionNote READ encryptionNote NOTIFY configChanged)
 
   // ---- 运行状态 ----
   Q_PROPERTY(bool libraryBusy READ libraryBusy NOTIFY busyChanged)
@@ -159,6 +161,7 @@ class ScheduleController : public QObject,
   QString packKey() const;
   QString compressionKey() const;
   QString encryptionKey() const;
+  QString credentialFile() const { return draft_credential_file_; }
   QStringList includeRules() const;
   QStringList excludeRules() const;
   QString supportedModeText() const;
@@ -232,6 +235,10 @@ class ScheduleController : public QObject,
       const QString& strategy_key = QStringLiteral("full"));
   // 只改 enabled。启用前会做完整校验。
   Q_INVOKABLE bool setEnabled(bool enabled);
+  // 保存前的加密选择。界面每改一次加密方式 / 口令文件就调用它：
+  // 只更新草稿，不写盘、不读文件；真正的校验与落盘仍然走 saveConfig。
+  Q_INVOKABLE bool setEncryptionChoice(const QString& encryption_key,
+                                       const QString& credential_file);
   // 备份管理页的 JOIN：file_name -> 来源 / 计划变化摘要。
   //
   // 依赖方向仍然是 ScheduleService -> BackupCatalog：这里只读 ScheduleStore
@@ -268,6 +275,11 @@ class ScheduleController : public QObject,
   void pumpTickForTest() { Tick(); }
 
  signals:
+  // 用户主动操作失败时的唯一主要反馈。summary / suggestion 是自然中文，
+  // technical 可以包含路径与错误码，但生成方保证其中没有口令、私钥或令牌。
+  // 后台定时 / 实时失败不弹这个信号：它们进运行记录与页面状态。
+  void userError(const QString& title, const QString& summary,
+                 const QString& suggestion, const QString& technical);
   void configChanged();
   void stateChanged();
   void statusChanged();
@@ -305,6 +317,10 @@ class ScheduleController : public QObject,
   backupproject::ConfigManager config_manager_;
   backupproject::ScheduleStore store_;
   backupproject::ScheduleDocument document_;
+  // 界面草稿：保存前不写进 document_，避免“还没点保存就被后台评估读到”。
+  // 只保存路径；口令内容永远不进入这个进程的 GUI 状态。
+  QString draft_encryption_key_ = QStringLiteral("none");
+  QString draft_credential_file_;
   bool config_loaded_ = false;
   QString load_error_;
 

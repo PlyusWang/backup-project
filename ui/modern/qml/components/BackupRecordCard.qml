@@ -68,6 +68,15 @@ Rectangle {
     required property string scheduledChangesText
     property bool busy: false
 
+    // 本地 -> 云端复制。按钮是否出现 / 可用由“统一备份管理”页决定：
+    // 未登录云端时按钮仍然可见但禁用，用户能看出“为什么现在不能点”。
+    property bool copyToCloudVisible: false
+    property bool copyToCloudEnabled: true
+
+    // 发出的是单组件文件名；控制器负责解析成本地仓库里的真实路径，
+    // 页面不拼路径、不读目录。
+    signal copyToCloudRequested(string fileName)
+
     // 卡片本地的加密恢复状态。两者都在密码对话框关闭时清空。
     property string pendingRestoreDestination: ""
     property string restorePassword: ""
@@ -261,6 +270,17 @@ Rectangle {
             spacing: 10
 
             Item { Layout.fillWidth: true }
+
+            AppButton {
+                objectName: "backupRecordCopyToCloud"
+                visible: card.copyToCloudVisible
+                text: "复制到云端"
+                iconName: "cloud"
+                enabled: !card.busy && card.copyToCloudEnabled
+                         && card.recognized
+                onClicked:
+                    card.copyToCloudRequested(card.fileNameText)
+            }
 
             AppButton {
                 objectName: "backupRecordRestore"

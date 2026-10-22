@@ -278,6 +278,10 @@ void RealtimeController::LoadFromDisk() {
   switch (status) {
     case backupproject::RealtimeLoadStatus::kLoaded:
       config_ = config;
+      draft_encryption_key_ = QString::fromLatin1(
+          backupproject::EncryptionMethodKey(config_.encryption_method));
+      draft_credential_file_ =
+          QString::fromStdString(config_.encryption_password_file);
       config_loaded_ = true;
       // 读得懂不等于合法。结构校验用共享核心那一个函数，前端不复刻规则。
       if (!backupproject::ValidateRealtimeConfig(config_, &error)) {
@@ -1225,9 +1229,15 @@ bool RealtimeController::saveConfig(bool enabled, const QString& source_path,
     restore_watch();
     return false;
   }
-  // 界面只提供"不加密"。无人值守的实时备份没有安全的持久密钥来源，
-  // 这里不是"暂时隐藏"，而是真的没有任何地方可以存密码。
-  next.encryption_method = backupproject::EncryptionMethod::kNone;
+  // 加密方式与凭据路径来自界面草稿；口令内容不在这里，由运行期从
+  // 0600 文件读取。
+  if (!backupproject::ParseEncryptionMethodKey(draft_encryption_key_.toStdString(),
+                                               &next.encryption_method)) {
+    SetStatus(kError, QStringLiteral("未知的加密方式"), draft_encryption_key_);
+    restore_watch();
+    return false;
+  }
+  next.encryption_password_file = draft_credential_file_.toStdString();
 
   next.include_rules.clear();
   for (const QString& rule : include_rules) {
@@ -1384,6 +1394,35 @@ QString RealtimeController::encryptionKey() const {
       backupproject::EncryptionMethodKey(config_.encryption_method));
 }
 
+bool RealtimeController::setEncryptionChoice(const QString& encryption_key,
+                                             const QString& credential_file) {
+  backupproject::EncryptionMethod method =
+      backupproject::EncryptionMethod::kNone;
+  if (!backupproject::ParseEncryptionMethodKey(encryption_key.toStdString(),
+                                               &method)) {
+    SetStatus(kError, QStringLiteral("未知的加密方式"), encryption_key);
+    return false;
+  }
+  backupproject::BackupOptionCombination combination;
+  combination.trigger = backupproject::BackupTrigger::kRealtime;
+  combination.strategy = config_.strategy;
+  combination.pack_method = config_.pack_method;
+  combination.compression_method = config_.compression_method;
+  combination.encryption_method = method;
+  combination.unattended_credential_available = !credential_file.isEmpty();
+  if (!backupproject::IsSupportedBackupOptionCombination(combination)) {
+    SetStatus(kError, QStringLiteral("当前选项组合不可用"),
+              QString::fromStdString(
+                  backupproject::UnsupportedBackupOptionCombinationReason(
+                      combination)));
+    return false;
+  }
+  draft_encryption_key_ = encryption_key;
+  draft_credential_file_ = credential_file;
+  emit configChanged();
+  return true;
+}
+
 QStringList RealtimeController::includeRules() const {
   QStringList list;
   for (const std::string& rule : config_.include_rules) {
@@ -1408,10 +1447,19 @@ QString RealtimeController::supportedModeText() const {
 }
 
 QString RealtimeController::encryptionNote() const {
-  // 唯一来源：核心那句"自动触发为什么不加密"。GUI 不复制一份字面量。
-  return QString::fromStdString(
-      backupproject::UnattendedEncryptionDisabledReason(
-          backupproject::BackupTrigger::kRealtime));
+  // 唯一来源：核心那句“无人值守加密需要什么”。GUI 不复制一份字面量。
+  if (draft_encryption_key_ == QStringLiteral("none")) {
+    return QStringLiteral(
+        "选择加密后，需要指定一个仅本人可读（0600）的口令文件；"
+        "程序不会把口令明文写入配置。");
+  }
+  if (draft_credential_file_.isEmpty()) {
+    return QString::fromStdString(
+        backupproject::UnattendedEncryptionDisabledReason(
+            backupproject::BackupTrigger::kRealtime));
+  }
+  return QStringLiteral("加密口令将在每次触发时从该文件读取；"
+                        "文件不可读时这一轮备份会明确失败。");
 }
 
 bool RealtimeController::watching() const { return watcher_.attached(); }

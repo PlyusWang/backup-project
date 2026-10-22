@@ -67,9 +67,25 @@
 #include "scheduler_lock.h"
 #include "server_profile.h"
 
-const int kPageCount = 7;
+// 页面用语义 key 标识：数字下标只属于 StackLayout 内部，不再是对外契约。
+// 新增页面时同时改这里与 Main.qml 的 pageKeys。
+inline constexpr int kPageCount = 5;
+inline constexpr const char* kPageKeys[kPageCount] = {
+    "home", "quick", "scheduled", "realtime", "management"};
 
 void WaitForAnimation(int milliseconds);
+
+// 自动化只通过语义 key 切页；"management" 额外允许切到 local / cloud 分区。
+// 这两个 helper 不改变产品行为，只是把测试从“数字下标”迁移到页面标识。
+inline void GoToPage(QQuickWindow* window, const char* key) {
+  window->setProperty("currentPageKey", QString::fromLatin1(key));
+}
+inline void GoToManagementTab(QQuickWindow* window, const char* tab) {
+  QObject* page = window->findChild<QObject*>(QStringLiteral("managementPage"));
+  if (page != nullptr) {
+    page->setProperty("currentTab", QString::fromLatin1(tab));
+  }
+}
 int CaptureScreenshots(QQuickWindow* window, backup_modern::AppTheme* theme,
                        backup_modern::BackupController* controller,
                        backup_modern::RemoteController* remote,

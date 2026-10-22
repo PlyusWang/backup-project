@@ -41,6 +41,7 @@
 #include <string>
 #include <vector>
 
+#include "backup_credentials.h"
 #include "backup_engine.h"
 #include "backup_option_keys.h"
 #include "incremental_delta.h"
@@ -838,6 +839,17 @@ bool RunRealtimeBackupOnce(const RealtimeConfig& config,
     return false;
   }
 
+  // 无人值守加密的凭据只在本次运行内读取；读不到就这次失败，
+  // 不写 marker、不产出一个“看起来成功”的空快照。
+  std::string credential;
+  if (config.encryption_method != EncryptionMethod::kNone) {
+    if (!ReadCredentialFile(config.encryption_password_file, &credential,
+                            error_message)) {
+      outcome->kind = RealtimeOutcome::Kind::kFailed;
+      return false;
+    }
+  }
+
   const std::string source_identity =
       SourceIdentityDigest(config.source_path, repository_identity);
   const std::string filter_identity =
@@ -863,7 +875,16 @@ bool RunRealtimeBackupOnce(const RealtimeConfig& config,
   BackupOptions options;
   options.pack_method = config.pack_method;
   options.compression_method = config.compression_method;
-  options.encryption_method = EncryptionMethod::kNone;  // 自动触发不加密
+  options.encryption_method = config.encryption_method;
+  if (options.encryption_method != EncryptionMethod::kNone) {
+    if (credential.empty()) {
+      outcome->kind = RealtimeOutcome::Kind::kFailed;
+      SetError(error_message,
+               "Encryption is enabled but no credential was loaded");
+      return false;
+    }
+    options.password = credential;
+  }
 
   std::string snapshot_file_name;
   if (config.strategy == BackupStrategy::kFull) {
@@ -878,8 +899,16 @@ bool RunRealtimeBackupOnce(const RealtimeConfig& config,
     BackupEngine engine;
     if (!engine.Backup(config.source_path, archive_path, filter, options,
                        error_message)) {
+      if (!credential.empty()) {
+        credential.assign(credential.size(), '\0');
+        credential.clear();
+      }
       outcome->kind = RealtimeOutcome::Kind::kFailed;
       return false;
+    }
+    if (!credential.empty()) {
+      credential.assign(credential.size(), '\0');
+      credential.clear();
     }
     outcome->kind = RealtimeOutcome::Kind::kFullSnapshot;
     // 面向用户的那句话只有一处：CLI 与 GUI 都显示它。
