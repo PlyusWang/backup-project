@@ -682,16 +682,6 @@ std::string UserDirectory(const Fixture& fixture) {
   return fixture.root + "/users/1";
 }
 
-bool WaitForEmptyDirectory(const std::string& path, int attempts) {
-  for (int index = 0; index < attempts; ++index) {
-    if (CountEntries(path) == 0) {
-      return true;
-    }
-    ::usleep(50000);
-  }
-  return CountEntries(path) == 0;
-}
-
 }  // namespace
 
 int main() {
@@ -1066,13 +1056,14 @@ int main() {
                         "XFER T6 第二条连接开始上传");
     Request(&second, net::Opcode::kUploadChunk, body.substr(0, 100), &header,
             &response, &error);
-    test_support::Check(CountEntries(user_directory + "/tmp") == 1,
-                        "XFER T6 判别：上传中确实存在一个临时文件");
-    // 不发 UPLOAD_END，直接断开。
+    test_support::Check(CountEntries(user_directory + "/tmp") == 2,
+                        "XFER T6 判别：上传中有 .part 与 .resume 两个条目");
+    // 不发 UPLOAD_END，直接断开。断连是"可续传"而不是"失败清理"：
+    // 临时文件与 .resume 检查点必须保留，等客户端回来继续。
     ::close(second.fd);
     test_support::Check(
-        WaitForEmptyDirectory(user_directory + "/tmp", 100),
-        "XFER T6 判别：断开之后服务端删掉了临时文件");
+        CountEntries(user_directory + "/tmp") == 2,
+        "XFER T6 判别：断开之后保留 .part 与 .resume 检查点");
     test_support::Check(CountBlobs(user_directory) == 0,
                         "XFER T6 判别：断开没有发布任何 blob");
     second_worker.join();
