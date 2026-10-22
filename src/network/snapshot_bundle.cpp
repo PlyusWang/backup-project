@@ -257,12 +257,6 @@ bool HashFile(const std::string& path, std::string* sha256_hex,
 // 是为了让并发的两个进程（或同一进程的不同快照）不会互相覆盖临时文件；
 // 调用点统一先 unlink 再以 O_EXCL 创建，
 // 因此“同名残留”只可能来自上一轮崩溃，不会被误用。
-std::string PartPathFor(const std::string& target_path, std::size_t index) {
-  return target_path + ".part-" +
-         std::to_string(static_cast<long>(::getpid())) + "-" +
-         std::to_string(index);
-}
-
 // 读 bundle 的成员表（不解包）。
 // 只读成员表，不碰数据区。校验顺序：magic -> version ->
 // 成员数（必须正好 3）-> 每个成员的名字长度、名字、数据长度与摘要。
@@ -460,16 +454,28 @@ bool BuildSnapshotBundle(const std::string& repository_directory,
   }
 
   // 第二遍：写包头 + 逐个成员复制数据。
-  // 先 unlink 再 O_EXCL|0600 创建：0600
-  // 保证摘要材料不会在打包期间短暂暴露给同机的其它用户；O_EXCL
-  // 让“临时文件已存在”变成硬失败而不是静默复用别人的内容。
-  const std::string part_path = PartPathFor(bundle_path, 0);
-  ::unlink(part_path.c_str());
-  const int out = ::open(part_path.c_str(), O_WRONLY | O_CREAT | O_EXCL, 0600);
+  // 临时名由 mkstemp 生成（唯一、0700 目录内、0600），**不**先 unlink 任何
+  // 已有路径：攻击者预先放一个同名文件/符号链接时，我们既不会删掉它，也不会
+  // 复用它。写完 fsync 后再 NoReplace 发布成 bundle_path。
+  std::string part_template = bundle_path + ".part-XXXXXX";
+  std::vector<char> part_buffer(part_template.begin(), part_template.end());
+  part_buffer.push_back('\0');
+  const int out = ::mkstemp(part_buffer.data());
   if (out < 0) {
     if (error_message != nullptr) {
-      *error_message = "无法创建 " + part_path + "：" + StrerrorText();
+      *error_message =
+          "无法创建材料包临时文件（" + bundle_path + "）：" + StrerrorText();
     }
+    return false;
+  }
+  const std::string part_path(part_buffer.data());
+  // mkstemp 已经是 0600；再显式设一次，不依赖实现细节。
+  if (::fchmod(out, 0600) != 0) {
+    if (error_message != nullptr) {
+      *error_message = "无法设置材料包临时文件权限：" + StrerrorText();
+    }
+    ::close(out);
+    ::unlink(part_path.c_str());
     return false;
   }
 
@@ -721,6 +727,15 @@ bool ExtractSnapshotBundle(const std::string& bundle_path,
     return false;
   }
 
+  // 所有成员先写进一个 0700 的唯一暂存目录，成员名也放在里面；发布阶段才
+  // 用 NoReplace 落到目标目录。这样并发解包不会互删对方的临时文件，也不会
+  // 在目标仓库里制造可预测的半成品名。
+  TempDirectoryGuard staging;
+  if (!staging.Create(target_directory, ".unpack-", error_message)) {
+    ::close(fd);
+    return false;
+  }
+
   std::vector<char> buffer(kCopyChunkBytes);
   std::vector<std::string> part_paths;
   std::vector<std::string> final_paths;
@@ -764,8 +779,7 @@ bool ExtractSnapshotBundle(const std::string& bundle_path,
     // 路径只用**第一遍已校验过的**成员名拼接，因此不存在 ../ 逃逸；发布用
     // NoReplace，目标已存在同名文件时明确失败，不覆盖缓存里已有的内容。
     const std::string final_path = target_directory + "/" + indexed.name;
-    const std::string part_path = PartPathFor(final_path, i);
-    ::unlink(part_path.c_str());
+    const std::string part_path = staging.Child("member-" + std::to_string(i));
     const int out =
         ::open(part_path.c_str(), O_WRONLY | O_CREAT | O_EXCL, 0600);
     if (out < 0) {

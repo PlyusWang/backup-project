@@ -1377,6 +1377,16 @@ int RunRemoteProductFlow(backup_modern::RemoteController* remote, CheckRun* run,
     const QString download_repo = work + QStringLiteral("/copy-repo-down");
     QDir().mkpath(local_repo);
     QDir().mkpath(download_repo);
+    // 模拟上一次进程被 SIGKILL 留下的无主暂存目录：下一次复制必须清掉它。
+    const QString stale_staging =
+        local_repo + QStringLiteral("/.copy-up-stale");
+    QDir().mkpath(stale_staging);
+    {
+      QFile stale(stale_staging + QStringLiteral("/leftover.bin"));
+      if (stale.open(QIODevice::WriteOnly)) stale.write("stale");
+      QFile lease(stale_staging + QStringLiteral("/.lease"));
+      if (lease.open(QIODevice::WriteOnly)) lease.write("dead");
+    }
     const QString local_archive = local_repo + QStringLiteral("/manual.bak");
     QFile::remove(local_archive);
     backupproject::BackupOptions options;
@@ -1404,6 +1414,70 @@ int RunRemoteProductFlow(backup_modern::RemoteController* remote, CheckRun* run,
                    remote->lastDetailForTest());
     run->Check(QFile::exists(local_archive),
                QStringLiteral("REPO-COPY 03 复制到云端后本地备份仍在"));
+    run->Check(!QFileInfo::exists(stale_staging),
+               QStringLiteral("REPO-COPY 04a 无主暂存目录被下一次复制清理"));
+
+    // 重复复制同一裸归档：内容摘要相同 -> 跳过，不产生第二份。
+    const int count_before_repeat = remote->snapshotCountForTest();
+    const bool repeat_accepted =
+        remote->copyLocalArchiveToCloud(QStringLiteral("manual.bak"));
+    const bool repeat_ok =
+        repeat_accepted && remote->waitForIdle(900000) &&
+        remote->lastErrorKindForTest() == QStringLiteral("none");
+    refresh();
+    run->Check(
+        repeat_ok && remote->snapshotCountForTest() == count_before_repeat,
+        QStringLiteral("REPO-COPY 05 同一裸归档重复复制被识别为已存在"),
+        remote->lastErrorKindForTest() + QStringLiteral(": ") +
+            remote->lastDetailForTest());
+
+    // 同名、同大小、内容不同：必须拒绝，且云端不新增/不改写。
+    QFile manual_file(local_archive);
+    QByteArray original_bytes;
+    if (manual_file.open(QIODevice::ReadOnly)) {
+      original_bytes = manual_file.readAll();
+      manual_file.close();
+    }
+    QByteArray same_size_different = original_bytes;
+    if (!same_size_different.isEmpty()) {
+      same_size_different[0] = static_cast<char>(same_size_different[0] ^ 0x5a);
+    }
+    if (!original_bytes.isEmpty() &&
+        manual_file.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
+      manual_file.write(same_size_different);
+      manual_file.close();
+    }
+    const bool conflict_accepted =
+        remote->copyLocalArchiveToCloud(QStringLiteral("manual.bak"));
+    const bool conflict_finished =
+        conflict_accepted && remote->waitForIdle(900000);
+    const QString conflict_kind = remote->lastErrorKindForTest();
+    refresh();
+    run->Check(
+        conflict_finished && conflict_kind != QStringLiteral("none") &&
+            remote->snapshotCountForTest() == count_before_repeat,
+        QStringLiteral("REPO-COPY 06 同名同大小不同内容被拒绝"),
+        conflict_kind + QStringLiteral(": ") + remote->lastDetailForTest());
+
+    // 同名、不同大小同样拒绝。
+    if (manual_file.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
+      manual_file.write(original_bytes + QByteArray(1, 'x'));
+      manual_file.close();
+    }
+    const bool size_conflict_accepted =
+        remote->copyLocalArchiveToCloud(QStringLiteral("manual.bak"));
+    const bool size_conflict_finished =
+        size_conflict_accepted && remote->waitForIdle(900000);
+    run->Check(size_conflict_finished &&
+                   remote->lastErrorKindForTest() != QStringLiteral("none") &&
+                   remote->snapshotCountForTest() == count_before_repeat,
+               QStringLiteral("REPO-COPY 07 同名不同大小被拒绝"),
+               remote->lastErrorKindForTest() + QStringLiteral(": ") +
+                   remote->lastDetailForTest());
+    if (manual_file.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
+      manual_file.write(original_bytes);
+      manual_file.close();
+    }
 
     remote->setLocalRepositoryPath(download_repo);
     const bool down_accepted = remote->copySnapshotToLocalRepository(delta_id);
@@ -1432,6 +1506,146 @@ int RunRemoteProductFlow(backup_modern::RemoteController* remote, CheckRun* run,
                    QString::fromStdString(list_error) +
                    QStringLiteral(" files=") +
                    QString::number(downloaded.size()));
+
+    // 下载方向的同名冲突：本地同名文件被改成同大小不同内容，必须拒绝，
+    // 且原文件一个字节都不动。
+    std::string delta_name;
+    for (const auto& record : downloaded) {
+      if (record.incremental_delta) delta_name = record.file_name;
+    }
+    const QString delta_path =
+        QDir(download_repo).filePath(QString::fromStdString(delta_name));
+    QFile delta_file(delta_path);
+    QByteArray delta_original;
+    if (delta_file.open(QIODevice::ReadOnly)) {
+      delta_original = delta_file.readAll();
+      delta_file.close();
+    }
+    QByteArray delta_tampered = delta_original;
+    if (!delta_tampered.isEmpty()) {
+      delta_tampered[delta_tampered.size() - 1] =
+          static_cast<char>(delta_tampered[delta_tampered.size() - 1] ^ 0x33);
+    }
+    if (!delta_original.isEmpty() &&
+        delta_file.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
+      delta_file.write(delta_tampered);
+      delta_file.close();
+    }
+    const int local_count_before =
+        QDir(download_repo)
+            .entryList(QStringList() << QStringLiteral("*.bak"), QDir::Files)
+            .size();
+    const bool down_conflict_accepted =
+        remote->copySnapshotToLocalRepository(delta_id);
+    const bool down_conflict_finished =
+        down_conflict_accepted && remote->waitForIdle(900000);
+    QByteArray after_conflict;
+    if (delta_file.open(QIODevice::ReadOnly)) {
+      after_conflict = delta_file.readAll();
+      delta_file.close();
+    }
+    run->Check(
+        down_conflict_finished &&
+            remote->lastErrorKindForTest() != QStringLiteral("none") &&
+            after_conflict == delta_tampered &&
+            QDir(download_repo)
+                    .entryList(QStringList() << QStringLiteral("*.bak"),
+                               QDir::Files)
+                    .size() == local_count_before,
+        QStringLiteral("REPO-COPY 08 下载遇到同名不同内容被拒绝且原件不变"),
+        remote->lastErrorKindForTest() + QStringLiteral(": ") +
+            remote->lastDetailForTest());
+
+    // 恢复原字节之后，同一快照再复制应被摘要识别为已存在。
+    if (delta_file.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
+      delta_file.write(delta_original);
+      delta_file.close();
+    }
+    const bool down_repeat_accepted =
+        remote->copySnapshotToLocalRepository(delta_id);
+    const bool down_repeat_ok =
+        down_repeat_accepted && remote->waitForIdle(900000) &&
+        remote->lastErrorKindForTest() == QStringLiteral("none");
+    run->Check(down_repeat_ok &&
+                   QDir(download_repo)
+                           .entryList(QStringList() << QStringLiteral("*.bak"),
+                                      QDir::Files)
+                           .size() == local_count_before,
+               QStringLiteral("REPO-COPY 09 同一依赖链重复下载被识别为已存在"),
+               remote->lastErrorKindForTest() + QStringLiteral(": ") +
+                   remote->lastDetailForTest());
+
+    // 本地同名对象缺一半副文件：无法证明身份，必须拒绝而不是覆盖。
+    QFile::remove(delta_path + QStringLiteral(".identity"));
+    const bool incomplete_accepted =
+        remote->copySnapshotToLocalRepository(delta_id);
+    const bool incomplete_finished =
+        incomplete_accepted && remote->waitForIdle(900000);
+    run->Check(incomplete_finished &&
+                   remote->lastErrorKindForTest() != QStringLiteral("none") &&
+                   QFile::exists(delta_path),
+               QStringLiteral("REPO-COPY 10 副文件不完整的同名对象被拒绝"),
+               remote->lastErrorKindForTest() + QStringLiteral(": ") +
+                   remote->lastDetailForTest());
+
+    // BPSNAP1 重复上传：本地已有一条与云端同内容的完整快照（含三件套），
+    // 再复制一次必须按材料包摘要识别为已存在。
+    std::string full_name;
+    for (const auto& record : downloaded) {
+      if (!record.incremental_delta) full_name = record.file_name;
+    }
+    const int cloud_count_before_bundle = remote->snapshotCountForTest();
+    remote->setLocalRepositoryPath(download_repo);
+    const bool bundle_repeat_accepted =
+        remote->copyLocalArchiveToCloud(QString::fromStdString(full_name));
+    const bool bundle_repeat_ok =
+        bundle_repeat_accepted && remote->waitForIdle(900000) &&
+        remote->lastErrorKindForTest() == QStringLiteral("none");
+    refresh();
+    run->Check(bundle_repeat_ok &&
+                   remote->snapshotCountForTest() == cloud_count_before_bundle,
+               QStringLiteral("REPO-COPY 11 同一 BPSNAP1 材料包重复复制被识别"),
+               remote->lastErrorKindForTest() + QStringLiteral(": ") +
+                   remote->lastDetailForTest());
+
+    // 同名材料包但 manifest 被改动：摘要不同，必须拒绝且云端不新增。
+    const QString manifest_path =
+        QDir(download_repo)
+            .filePath(QString::fromStdString(
+                backupproject::SnapshotManifestFileName(full_name)));
+    QFile manifest_file(manifest_path);
+    QByteArray manifest_original;
+    if (manifest_file.open(QIODevice::ReadOnly)) {
+      manifest_original = manifest_file.readAll();
+      manifest_file.close();
+    }
+    QByteArray manifest_changed = manifest_original;
+    manifest_changed.append(' ');
+    if (manifest_file.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
+      manifest_file.write(manifest_changed);
+      manifest_file.close();
+    }
+    run->Check(
+        QFileInfo(manifest_path).size() == manifest_changed.size(),
+        QStringLiteral("REPO-COPY 12a 测试夹具：manifest 已改成不同内容"),
+        QString::number(QFileInfo(manifest_path).size()));
+    const bool bundle_conflict_accepted =
+        remote->copyLocalArchiveToCloud(QString::fromStdString(full_name));
+    const bool bundle_conflict_finished =
+        bundle_conflict_accepted && remote->waitForIdle(900000);
+    const QString bundle_conflict_kind = remote->lastErrorKindForTest();
+    const QString bundle_conflict_detail = remote->lastDetailForTest();
+    refresh();
+    run->Check(
+        bundle_conflict_finished &&
+            bundle_conflict_kind != QStringLiteral("none") &&
+            remote->snapshotCountForTest() == cloud_count_before_bundle,
+        QStringLiteral("REPO-COPY 12 同名材料包内容不同被拒绝"),
+        bundle_conflict_kind + QStringLiteral(": ") + bundle_conflict_detail);
+    if (manifest_file.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
+      manifest_file.write(manifest_original);
+      manifest_file.close();
+    }
   }
 
   // ---- 清理：注销临时账号（正式数据不受影响）----
