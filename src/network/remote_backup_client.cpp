@@ -738,6 +738,36 @@ struct UploadResumeState {
   std::string display_name;
 };
 
+// mkdir -p（0700）。续传状态目录不存在时，Save 会静默失败，用户看到的
+// 就是“明明支持续传却从不续传”。这里显式建目录，失败只清空 resume 路径，
+// 不影响本次上传本身。
+bool EnsureResumeDirectory(const std::string& path) {
+  if (path.empty()) return false;
+  std::string current;
+  std::size_t index = 0;
+  if (path.front() == '/') {
+    current = "/";
+    index = 1;
+  }
+  while (index <= path.size()) {
+    const std::size_t slash = path.find('/', index);
+    const std::string part =
+        path.substr(index, slash == std::string::npos ? std::string::npos
+                                                      : slash - index);
+    if (!part.empty()) {
+      if (current.size() > 1 && current.back() != '/') current += '/';
+      current += part;
+      if (::mkdir(current.c_str(), 0700) != 0 && errno != EEXIST) {
+        return false;
+      }
+    }
+    if (slash == std::string::npos) break;
+    index = slash + 1;
+  }
+  struct stat info;
+  return ::stat(path.c_str(), &info) == 0 && S_ISDIR(info.st_mode);
+}
+
 std::string UploadResumeKey(const std::string& path, std::uint64_t size,
                             const std::string& sha256,
                             const std::string& display_name) {
@@ -889,6 +919,10 @@ bool RemoteArchiveClient::UploadSnapshotFile(
   std::string resume_path;
   if (std::getenv("BACKUP_REMOTE_DEBUG") != nullptr) {
     std::fprintf(stderr, "[resume] directory=%s\n", resume_directory_.c_str());
+  }
+  if (!resume_directory_.empty() && !EnsureResumeDirectory(resume_directory_)) {
+    // 建不出目录就不假装有续传：本次上传照常，下一次从 0 开始。
+    resume_directory_.clear();
   }
   if (!resume_directory_.empty()) {
     ProbeResumeSupport();
@@ -1098,6 +1132,7 @@ bool RemoteArchiveClient::DownloadWithResume(
     const std::string& snapshot_id, const std::string& target_path,
     bool allow_overwrite, const RemoteProgressCallback& progress,
     RemoteSnapshotInfo* downloaded, std::string* error_message) {
+  EnsureResumeDirectory(resume_directory_);
   if (target_path.empty()) {
     if (error_message != nullptr) *error_message = "the download target path is empty";
     return false;
@@ -1301,10 +1336,14 @@ bool RemoteArchiveClient::DownloadWithResume(
   unsigned char digest[crypto::kSha256DigestSize];
   hasher.Final(digest);
   const std::string actual_sha256 = crypto::ToHex(digest, crypto::kSha256DigestSize);
+  bool data_corrupt = false;
   if (ok && (received != declared_size || actual_sha256 != info.sha256)) {
     if (error_message != nullptr) {
       *error_message = "the downloaded archive does not match the declared size or SHA-256";
     }
+    // 内容校验失败说明半成品（可能是续传前缀）已经坏了。保留它只会让
+    // 每一次重试都失败：删掉状态与半成品，下一次从 0 开始。
+    data_corrupt = true;
     ok = false;
   }
   if (ok && ::fsync(output) != 0) {
@@ -1313,7 +1352,9 @@ bool RemoteArchiveClient::DownloadWithResume(
   }
   if (::close(output) != 0) ok = false;
   if (!ok) {
-    finish_download(true);  // 保留半成品与状态：下一次从已验证的位置继续
+    // 网络/本地写失败：保留半成品，下一次从已验证的位置继续。
+    // 内容校验失败：半成品已不可信，必须丢弃。
+    finish_download(!data_corrupt);
     return false;
   }
   std::string publish_error;

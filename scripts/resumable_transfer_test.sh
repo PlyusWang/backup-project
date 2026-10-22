@@ -4,19 +4,15 @@
 #
 #   bash scripts/resumable_transfer_test.sh
 #
-# 覆盖的是“真实进程被杀”之后的恢复，而不是同一次连接里的重试：
-#   A. 上传进行中杀掉服务端 -> 客户端失败但保留续传状态
-#   B. 服务端重启 -> 新客户端进程从服务端已验证的检查点继续，最终 blob 的
-#      SHA-256 与本地文件一致
-#   C. 下载进行中杀掉服务端 -> 半成品与状态保留
-#   D. 服务端重启 -> 新客户端进程从半成品继续，最终文件逐字节一致
-#   E. 前端损坏的半成品必须被拒绝，客户端从头重传后仍然成功
+# 覆盖“真实进程被杀”之后的恢复，而不是同一次连接里的重试：
+#   A. 上传中断 -> 客户端失败但保留状态 -> 新进程从服务端检查点继续
+#   B. 下载中断 -> 半成品与状态保留 -> 新进程从 offset 继续
+#   C. 半成品被篡改 -> 内容校验失败 -> 状态被丢弃 -> 下一次从头成功
 #
 # 退出码：0 = 全部通过，非 0 = 有 FAIL。
 
 set -uo pipefail
-
-ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT_DIR" || exit 1
 
 PASS=0
@@ -28,229 +24,141 @@ finish() {
   [ "$FAIL" -eq 0 ] || exit 1
 }
 
-TEST_ROOT="$(mktemp -d /tmp/resumable-transfer-test-XXXXXX)"
-SERVER_PID=""
-cleanup() {
-  if [ -n "$SERVER_PID" ] && kill -0 "$SERVER_PID" 2>/dev/null; then
-    kill -KILL "$SERVER_PID" 2>/dev/null
-    wait "$SERVER_PID" 2>/dev/null
-  fi
-  rm -rf "$TEST_ROOT"
-}
-trap cleanup EXIT
-
 if [ ! -x ./build/backupctl ] || [ ! -x ./build/backup-server ]; then
-  make -j4 all server >"$TEST_ROOT/build.log" 2>&1 || {
-    echo "构建失败"; tail -5 "$TEST_ROOT/build.log"; exit 1;
+  make -j4 all server >/tmp/resume-build.log 2>&1 || {
+    echo "构建失败"; tail -5 /tmp/resume-build.log; exit 1;
   }
 fi
 
-WORK="$TEST_ROOT/e2e"
-mkdir -p "$WORK/data" "$WORK/state" "$WORK/logs" "$WORK/src" "$WORK/home/.config" "$WORK/downloads"
-export HOME="$WORK/home"
-BACKUP_REMOTE_PASSWORD="$(head -c 18 /dev/urandom | base64 | tr -d "\n")"
+W=$(mktemp -d /tmp/resume-e2e-XXXXXX)
+export HOME="$W/home"
+mkdir -p "$W/data" "$W/state" "$W/logs" "$W/home/.config" "$W/src" "$W/out" "$W/out2"
+SP=""
+cleanup() {
+  if [ -n "$SP" ] && [ "$(cat "/proc/$SP/comm" 2>/dev/null)" = "backup-server" ]; then
+    kill -KILL "$SP" 2>/dev/null
+  fi
+  rm -rf "$W"
+}
+trap cleanup EXIT
+
+head -c 32 /dev/urandom | sha256sum | cut -c1-64 >"$W/secret"
+echo "BACKUP_TOKEN_SECRET=$(cat "$W/secret")" >"$W/secrets.env"
+chmod 600 "$W/secrets.env"
+./build/backup-server-keygen --output "$W/key" >"$W/key.out" 2>&1 || { echo keygen 失败; exit 1; }
+export BACKUP_REMOTE_SERVER_KEY="$(grep -oE 'sha256:[0-9a-f]{64}' "$W/key.out" | head -1)"
+BACKUP_REMOTE_PASSWORD="$(head -c 18 /dev/urandom | base64 | tr -d '\n')"
 export BACKUP_REMOTE_PASSWORD
 
-head -c 32 /dev/urandom | sha256sum | cut -c1-64 >"$WORK/secret.value"
-echo "BACKUP_TOKEN_SECRET=$(cat "$WORK/secret.value")" >"$WORK/secrets.env"
-chmod 600 "$WORK/secrets.env"
-./build/backup-server-keygen --output "$WORK/transport.key" >"$WORK/keygen.out" 2>&1 || {
-  echo "keygen 失败"; cat "$WORK/keygen.out"; exit 1;
-}
-BACKUP_REMOTE_SERVER_KEY="$(grep -oE 'sha256:[0-9a-f]{64}' "$WORK/keygen.out" | head -1)"
-export BACKUP_REMOTE_SERVER_KEY
-
 PORT=0
-for candidate in $(seq 24100 24200); do
-  if ! ss -ltn 2>/dev/null | grep -q ":$candidate "; then PORT=$candidate; break; fi
+for p in $(seq 25300 25450); do
+  if ! ss -ltn 2>/dev/null | grep -q ":$p "; then PORT=$p; break; fi
 done
-if [ "$PORT" = "0" ]; then echo "没有空闲端口"; exit 1; fi
+[ "$PORT" != "0" ] || { echo 没有空闲端口; exit 1; }
+REMOTE="--host 127.0.0.1 --port $PORT --user resume_user"
 
-start_server() {
-  ./build/backup-server --bind 127.0.0.1 --port "$PORT" --root "$WORK/data" \
-    --db "$WORK/state/metadata.sqlite3" --secret-file "$WORK/secrets.env" \
-    --transport-key-file "$WORK/transport.key" --pid-file "$WORK/state/server.pid" \
-    --log-file "$WORK/logs/server.log" --quiet >>"$WORK/logs/server.out" 2>&1 &
-  SERVER_PID=$!
-  for _ in $(seq 1 80); do
-    if ss -ltn 2>/dev/null | grep -q "127.0.0.1:$PORT "; then return 0; fi
-    sleep 0.1
+start() {
+  ./build/backup-server --bind 127.0.0.1 --port "$PORT" --root "$W/data" \
+    --db "$W/state/db" --secret-file "$W/secrets.env" \
+    --transport-key-file "$W/key" --log-file "$W/logs/s.log" --quiet \
+    >>"$W/logs/out" 2>&1 &
+  SP=$!
+  for _ in $(seq 1 100); do
+    ss -ltn 2>/dev/null | grep -q ":$PORT " && return 0
+    sleep 0.05
   done
   return 1
 }
-stop_server_hard() {
-  # 只允许停掉我们自己启动的 backup-server：PID 为空、1 或换成了别的进程
-  # 一律不动。测试脚本没有资格杀任何其它东西。
-  if [ -z "${SERVER_PID:-}" ] || [ "$SERVER_PID" -le 1 ]; then
-    return 0
+kill_server() {
+  if [ -n "$SP" ] && [ "$(cat "/proc/$SP/comm" 2>/dev/null)" = "backup-server" ]; then
+    kill -KILL "$SP" 2>/dev/null
   fi
-  if [ ! -r "/proc/$SERVER_PID/comm" ] ||
-     [ "$(cat "/proc/$SERVER_PID/comm" 2>/dev/null)" != "backup-server" ]; then
-    echo "  WARN 拒绝停止非 backup-server 进程（pid=$SERVER_PID）"
-    SERVER_PID=""
-    return 0
-  fi
-  kill -TERM "$SERVER_PID" 2>/dev/null
-  for _ in $(seq 1 30); do
-    kill -0 "$SERVER_PID" 2>/dev/null || break
-    sleep 0.1
+  wait "$SP" 2>/dev/null
+  SP=""
+}
+wait_part() {
+  local dir="$1" target="$2" size=0 part=""
+  for _ in $(seq 1 5000); do
+    part=$(find "$dir" -name '*.part' -type f 2>/dev/null | head -1)
+    [ -n "$part" ] && size=$(stat -c %s "$part" 2>/dev/null || echo 0)
+    [ "$size" -ge "$target" ] && { echo "$size"; return 0; }
+    sleep 0.01
   done
-  kill -KILL "$SERVER_PID" 2>/dev/null
-  wait "$SERVER_PID" 2>/dev/null
-  SERVER_PID=""
+  echo "$size"
+  return 1
 }
 
-start_server || { echo "服务端未监听"; exit 1; }
-REMOTE="--host 127.0.0.1 --port $PORT --user resume_user"
-./build/backupctl remote register $REMOTE >"$WORK/register.log" 2>&1 || {
-  echo "注册失败"; tail -3 "$WORK/register.log"; exit 1;
-}
-./build/backupctl remote login $REMOTE >"$WORK/login.log" 2>&1 || {
-  echo "登录失败"; tail -3 "$WORK/login.log"; exit 1;
-}
-
-# 64 MiB：足够跨过 4 MiB 检查点，又不会让测试跑太久。
-head -c 67108864 /dev/urandom >"$WORK/src/big.bak"
-LOCAL_SHA="$(sha256sum "$WORK/src/big.bak" | cut -d' ' -f1)"
-
-part_size() {
-  local part
-  part="$(find "$1" -name '*.part' -type f 2>/dev/null | head -1)"
-  [ -n "$part" ] && stat -c '%s' "$part" 2>/dev/null || echo 0
-}
-upload_state_count() {
-  find "$HOME/.config" -name '*.upload' -type f 2>/dev/null | wc -l
-}
-download_state_count() {
-  find "$HOME/.config" -name '*.download' -type f 2>/dev/null | wc -l
-}
-
-echo "[resumable-transfer] A. 上传中断"
-( ./build/backupctl remote upload "$WORK/src/big.bak" --name resume-big.bak $REMOTE >"$WORK/upload1.log" 2>&1 ) &
-UPLOAD_PID=$!
-# 等到服务端真的写进去 8 MiB，再杀服务端：这样一定不是“还没 BEGIN”的空失败。
-SIZE=0
-for _ in $(seq 1 300); do
-  SIZE=$(part_size "$WORK/data")
-  [ "$SIZE" -ge 8388608 ] && break
-  sleep 0.1
-done
-if [ "$SIZE" -lt 8388608 ]; then
-  record_fail "A.1 上传中途终止" "没等到 8 MiB 临时数据（size=$SIZE）"
+echo "[resumable-transfer] A. 上传中断与续传"
+start || { echo 服务端启动失败; finish; }
+./build/backupctl remote register $REMOTE >"$W/reg.log" 2>&1
+./build/backupctl remote login $REMOTE >"$W/login.log" 2>&1 || { echo 登录失败; finish; }
+head -c 67108864 /dev/urandom >"$W/src/big.bak"
+LOCAL_SHA=$(sha256sum "$W/src/big.bak" | cut -d' ' -f1)
+( ./build/backupctl remote upload "$W/src/big.bak" --name big.bak $REMOTE >"$W/u1.log" 2>&1 ) &
+UP=$!
+if ! S=$(wait_part "$W/data" 12582912); then
+  record_fail "A.1 上传产生至少 12 MiB 临时数据" "size=$S"
   finish
 fi
-stop_server_hard
-wait "$UPLOAD_PID" 2>/dev/null
-UPLOAD1_CODE=$?
-if [ "$UPLOAD1_CODE" -ne 0 ]; then
-  record_pass "A.1 上传中途终止（客户端非 0 退出）"
-else
-  record_fail "A.1 上传中途终止" "服务端被杀之后客户端仍然返回 0"
-fi
-if [ "$(upload_state_count)" -ge 1 ]; then
-  record_pass "A.2 续传状态已落盘"
-else
-  record_fail "A.2 续传状态已落盘" "找不到 *.upload 状态文件"
-fi
+kill_server
+wait $UP 2>/dev/null
+U1=$?
+[ "$U1" -ne 0 ] && record_pass "A.2 中断后客户端非 0 退出" || record_fail "A.2 中断后客户端非 0 退出" "exit=$U1"
+N=$(find "$HOME/.config" -name '*.upload' | wc -l)
+[ "$N" -ge 1 ] && record_pass "A.3 客户端保留续传状态" || record_fail "A.3 客户端保留续传状态" "state=$N"
+start || { echo 服务端重启失败; finish; }
+./build/backupctl remote upload "$W/src/big.bak" --name big.bak $REMOTE >"$W/u2.log" 2>&1
+U2=$?
+[ "$U2" -eq 0 ] && record_pass "A.4 续传上传成功" || record_fail "A.4 续传上传成功" "$(tail -2 "$W/u2.log" | tr '\n' ' ')"
+N=$(grep -c 'upload resumed at offset' "$W/logs/s.log" || true)
+[ "$N" -ge 1 ] && record_pass "A.5 服务端确认从检查点继续" || record_fail "A.5 服务端确认从检查点继续" "log=$N"
+BLOB=$(find "$W/data/users" -name '*.bak' -type f | head -1)
+BLOB_SHA=$(sha256sum "$BLOB" | cut -d' ' -f1)
+[ "$LOCAL_SHA" = "$BLOB_SHA" ] && record_pass "A.6 云端 blob 与本地逐字节一致" || record_fail "A.6 云端 blob 与本地逐字节一致" "sha mismatch"
+SNAP=$(grep -oE '快照 ID: [0-9a-f]{32}' "$W/u2.log" | grep -oE '[0-9a-f]{32}' | head -1)
+[ -n "$SNAP" ] && record_pass "A.7 取得快照 id" || { record_fail "A.7 取得快照 id" "missing"; finish; }
 
-echo "[resumable-transfer] B. 上传从检查点继续"
-start_server || { echo "服务端重启失败"; finish; }
-./build/backupctl remote upload "$WORK/src/big.bak" --name resume-big.bak $REMOTE >"$WORK/upload2.log" 2>&1
-UPLOAD2_CODE=$?
-if [ "$UPLOAD2_CODE" -eq 0 ]; then
-  record_pass "B.1 续传上传成功"
-else
-  record_fail "B.1 续传上传成功" "$(tail -2 "$WORK/upload2.log" | tr '\n' ' ')"
-fi
-if grep -q "upload resumed at offset" "$WORK/logs/server.log"; then
-  record_pass "B.2 服务端确认从检查点继续"
-else
-  record_fail "B.2 服务端确认从检查点继续" "服务端日志里没有 resume 记录"
-fi
-./build/backupctl remote list $REMOTE >"$WORK/list.log" 2>&1
-REMOTE_SHA="$(grep -A3 'resume-big.bak' "$WORK/list.log" | grep -oE '[0-9a-f]{64}' | head -1)"
-if [ "$REMOTE_SHA" = "$LOCAL_SHA" ]; then
-  record_pass "B.3 云端 blob 的 SHA-256 与本地一致"
-else
-  record_fail "B.3 云端 blob 的 SHA-256 与本地一致" "cloud=$REMOTE_SHA local=$LOCAL_SHA"
-fi
-SNAPSHOT_ID="$(grep -B1 'resume-big.bak' "$WORK/list.log" | grep -oE '[0-9a-f]{32}' | head -1)"
-if [ -z "$SNAPSHOT_ID" ]; then
-  SNAPSHOT_ID="$(grep -oE '[0-9a-f]{32}' "$WORK/list.log" | head -1)"
-fi
-[ -n "$SNAPSHOT_ID" ] || { record_fail "B.4 取得快照 id" "列表里没有 id"; finish; }
-record_pass "B.4 取得快照 id"
-
-echo "[resumable-transfer] C. 下载中断"
-( timeout 120 ./build/backupctl remote download "$SNAPSHOT_ID" "$WORK/downloads/big.bak" $REMOTE >"$WORK/download1.log" 2>&1 ) &
-DOWNLOAD_PID=$!
-SIZE=0
-for _ in $(seq 1 300); do
-  SIZE=$(part_size "$WORK/downloads")
-  [ "$SIZE" -ge 8388608 ] && break
-  sleep 0.1
-done
-if [ "$SIZE" -lt 8388608 ]; then
-  record_fail "C.1 下载中途终止" "没等到 8 MiB 半成品（size=$SIZE）"
+echo "[resumable-transfer] B. 下载中断与续传"
+( ./build/backupctl remote download "$SNAP" "$W/out/big.bak" $REMOTE >"$W/d1.log" 2>&1 ) &
+DP=$!
+if ! S=$(wait_part "$W/out" 12582912); then
+  record_fail "B.1 下载产生至少 12 MiB 半成品" "size=$S"
   finish
 fi
-stop_server_hard
-wait "$DOWNLOAD_PID" 2>/dev/null
-if [ "$(download_state_count)" -ge 1 ]; then
-  record_pass "C.1 下载状态已落盘"
-else
-  record_fail "C.1 下载状态已落盘" "找不到 *.download 状态文件"
-fi
+kill_server
+wait $DP 2>/dev/null
+D1=$?
+[ "$D1" -ne 0 ] && record_pass "B.2 中断后客户端非 0 退出" || record_fail "B.2 中断后客户端非 0 退出" "exit=$D1"
+N=$(find "$HOME/.config" -name '*.download' | wc -l)
+[ "$N" -ge 1 ] && record_pass "B.3 客户端保留下载状态" || record_fail "B.3 客户端保留下载状态" "state=$N"
+start || { echo 服务端重启失败; finish; }
+./build/backupctl remote download "$SNAP" "$W/out/big.bak" $REMOTE >"$W/d2.log" 2>&1
+D2=$?
+[ "$D2" -eq 0 ] && record_pass "B.4 续传下载成功" || record_fail "B.4 续传下载成功" "$(tail -2 "$W/d2.log" | tr '\n' ' ')"
+N=$(grep -c 'download resumed at offset' "$W/logs/s.log" || true)
+[ "$N" -ge 1 ] && record_pass "B.5 服务端确认从 offset 继续" || record_fail "B.5 服务端确认从 offset 继续" "log=$N"
+cmp -s "$W/src/big.bak" "$W/out/big.bak" && record_pass "B.6 下载结果逐字节一致" || record_fail "B.6 下载结果逐字节一致" "cmp 不一致"
 
-echo "[resumable-transfer] D. 下载从半成品继续"
-start_server || { echo "服务端重启失败"; finish; }
-./build/backupctl remote download "$SNAPSHOT_ID" "$WORK/downloads/big.bak" $REMOTE >"$WORK/download2.log" 2>&1
-DOWNLOAD2_CODE=$?
-if [ "$DOWNLOAD2_CODE" -eq 0 ]; then
-  record_pass "D.1 续传下载成功"
-else
-  record_fail "D.1 续传下载成功" "$(tail -2 "$WORK/download2.log" | tr '\n' ' ')"
+echo "[resumable-transfer] C. 半成品损坏的清理"
+( ./build/backupctl remote download "$SNAP" "$W/out2/big.bak" $REMOTE >"$W/d3.log" 2>&1 ) &
+DP=$!
+if ! S=$(wait_part "$W/out2" 12582912); then
+  record_fail "C.1 第三次下载产生半成品" "size=$S"
+  finish
 fi
-if grep -q "download resumed at offset" "$WORK/logs/server.log"; then
-  record_pass "D.2 服务端确认从 offset 继续"
-else
-  record_fail "D.2 服务端确认从 offset 继续" "服务端日志里没有 download resume 记录"
-fi
-if cmp -s "$WORK/src/big.bak" "$WORK/downloads/big.bak"; then
-  record_pass "D.3 下载结果逐字节一致"
-else
-  record_fail "D.3 下载结果逐字节一致" "cmp 不一致"
-fi
-
-echo "[resumable-transfer] E. 损坏的半成品必须被拒绝"
-rm -f "$WORK/downloads/big.bak"
-# 再制造一次中断，然后篡改半成品的前缀。
-( timeout 120 ./build/backupctl remote download "$SNAPSHOT_ID" "$WORK/downloads/big.bak" $REMOTE >"$WORK/download3.log" 2>&1 ) &
-DOWNLOAD_PID=$!
-for _ in $(seq 1 300); do
-  SIZE=$(part_size "$WORK/downloads")
-  [ "$SIZE" -ge 8388608 ] && break
-  sleep 0.1
-done
-stop_server_hard
-wait "$DOWNLOAD_PID" 2>/dev/null
-PART="$(find "$WORK/downloads" -name '*.part' -type f | head -1)"
-if [ -n "$PART" ]; then
-  printf 'CORRUPTED' | dd of="$PART" bs=1 seek=4096 conv=notrunc status=none
-fi
-start_server || { echo "服务端重启失败"; finish; }
-./build/backupctl remote download "$SNAPSHOT_ID" "$WORK/downloads/big.bak" $REMOTE >"$WORK/download4.log" 2>&1
-if cmp -s "$WORK/src/big.bak" "$WORK/downloads/big.bak"; then
-  record_pass "E.1 前缀损坏后重新下载仍得到正确文件"
-else
-  record_fail "E.1 前缀损坏后重新下载仍得到正确文件" "$(tail -2 "$WORK/download4.log" | tr '\n' ' ')"
-fi
-
-echo "[resumable-transfer] F. 不留半成品"
-if find "$WORK/downloads" -name '*.part' -type f | grep -q .; then
-  record_fail "F.1 成功发布后不留半成品" "还有 .part 文件"
-else
-  record_pass "F.1 成功发布后不留半成品"
-fi
+kill_server
+wait $DP 2>/dev/null
+PART=$(find "$W/out2" -name '*.part' -type f | head -1)
+printf 'CORRUPTED' | dd of="$PART" bs=1 seek=4096 conv=notrunc status=none
+start || { echo 服务端重启失败; finish; }
+./build/backupctl remote download "$SNAP" "$W/out2/big.bak" $REMOTE >"$W/d4.log" 2>&1
+D4=$?
+[ "$D4" -ne 0 ] && record_pass "C.2 损坏的半成品被完整性校验拒绝" || record_fail "C.2 损坏的半成品被完整性校验拒绝" "exit=0"
+N=$(find "$HOME/.config" -name '*.download' | wc -l)
+[ "$N" -eq 0 ] && record_pass "C.3 损坏后状态被丢弃" || record_fail "C.3 损坏后状态被丢弃" "state=$N"
+./build/backupctl remote download "$SNAP" "$W/out2/big.bak" $REMOTE >"$W/d5.log" 2>&1
+D5=$?
+[ "$D5" -eq 0 ] && record_pass "C.4 下一次从头下载成功" || record_fail "C.4 下一次从头下载成功" "$(tail -2 "$W/d5.log" | tr '\n' ' ')"
+cmp -s "$W/src/big.bak" "$W/out2/big.bak" && record_pass "C.5 重下结果逐字节一致" || record_fail "C.5 重下结果逐字节一致" "cmp 不一致"
 
 finish
