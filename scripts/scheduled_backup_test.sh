@@ -1256,7 +1256,7 @@ else
   expect_exit "I.14 定时加密边界：aes 在 CLI 侧被拒绝（exit 2）" 2 \
     "$BACKUPCTL" --config-file "$PAR_CONFIG" --schedule-file "$PAR_STORE" schedule set \
     --encryption aes-256-ctr-hmac-sha256
-  expect_grep "I.15 拒绝理由与 GUI 挂起时用的是同一条核心规则" "none only"
+  expect_grep "I.15 拒绝理由与 GUI 挂起时用的是同一条核心规则" "需要先配置"
   expect_exit "I.16 非法筛选规则被拒绝（exit 2）" 2 \
     "$BACKUPCTL" --config-file "$PAR_CONFIG" --schedule-file "$PAR_STORE" schedule set \
     --include "type:bogus"

@@ -122,7 +122,7 @@ int main() {
     encrypted.encryption_method = bp::EncryptionMethod::kDesCbcHmacSha256;
     test_support::Check(
         bp::UnsupportedBackupOptionCombinationReason(encrypted).find(
-            "不启用加密") != std::string::npos,
+            "需要先配置") != std::string::npos,
         "INC-RT19 T1 实时加密的拒绝理由说明不保存密码");
   }
 
