@@ -227,6 +227,119 @@ QString ResolveRealtimeFilePath(const QStringList& arguments) {
   return QString::fromStdString(backupproject::DefaultRealtimeFilePath());
 }
 
+// --acceptance-shots：真实操作状态截图（备份完成、仓库列表、恢复成功、错误对话框）。
+// 与 --screenshot 的分工：那一条拍“页面长什么样”，这一条拍“操作之后长什么样”。
+// 所有数据都造在 QTemporaryDir 里，截完随进程销毁。
+int RunAcceptanceShots(QQuickWindow* window,
+                       backup_modern::BackupController* controller,
+                       const QString& directory) {
+  if (!QDir().mkpath(directory)) return 1;
+  QTemporaryDir work;
+  if (!work.isValid()) return 1;
+  const QString source = work.filePath(QStringLiteral("source"));
+  const QString repository = work.filePath(QStringLiteral("repository"));
+  const QString restore_ok = work.filePath(QStringLiteral("restore-ok"));
+  const QString restore_bad = work.filePath(QStringLiteral("restore-bad"));
+  QDir().mkpath(source);
+  QDir().mkpath(restore_bad);
+  {
+    QFile a(source + QStringLiteral("/说明.txt"));
+    a.open(QIODevice::WriteOnly);
+    a.write(QStringLiteral("备份内容\n").toUtf8());
+    QFile b(source + QStringLiteral("/data.bin"));
+    b.open(QIODevice::WriteOnly);
+    b.write(QByteArray(4096, 'x'));
+    QFile occupied(restore_bad + QStringLiteral("/已有文件.txt"));
+    occupied.open(QIODevice::WriteOnly);
+    occupied.write("do not overwrite\n");
+  }
+  const auto pump = [](int ms) {
+    QElapsedTimer timer;
+    timer.start();
+    while (timer.elapsed() < ms) {
+      QCoreApplication::processEvents(QEventLoop::AllEvents, 20);
+    }
+  };
+  const auto grab = [&](const char* name) {
+    pump(400);
+    const QImage image = window->grabWindow();
+    if (image.isNull()) return false;
+    return image.save(directory + QStringLiteral("/") + QString::fromLatin1(name));
+  };
+
+  if (!controller->saveRepositoryPath(repository)) return 1;
+  controller->setSourcePath(source);
+  window->setProperty("currentPageKey", QStringLiteral("quick"));
+  pump(200);
+  if (!controller->startBackup()) return 1;
+  pump(500);  // 至少让「正在备份」的一帧有机会被画出来
+  if (!controller->waitForIdle(120000)) return 1;
+  if (!controller->lastSucceeded()) return 1;
+  const auto scroll_to_end = [&](const char* object_name, int offset) {
+    QObject* view = window->findChild<QObject*>(QString::fromLatin1(object_name));
+    if (view == nullptr) return;
+    QObject* content = view->property("contentItem").value<QObject*>();
+    if (content != nullptr) {
+      const double content_height =
+          content->property("contentHeight").toDouble();
+      const double viewport = view->property("height").toDouble();
+      Q_UNUSED(offset);
+      const double target = content_height > viewport
+                                ? content_height - viewport
+                                : 0.0;
+      content->setProperty("contentY", target);
+    }
+    pump(300);
+  };
+  // 结果横幅在页面下半部分：先滚到底，否则截到的是页面顶部。
+  scroll_to_end("backupPageScroll", 10000);
+  if (!grab("backup-restore-result.png")) return 1;
+
+  controller->refreshBackups();
+  if (!controller->waitForCatalogIdle(60000)) return 1;
+  const QVariantList records = controller->backupRecords();
+  if (records.isEmpty()) return 1;
+  const QString file_name =
+      records.first().toMap().value(QStringLiteral("fileName")).toString();
+  window->setProperty("currentPageKey", QStringLiteral("management"));
+  if (QObject* page = window->findChild<QObject*>(
+          QStringLiteral("managementPage"))) {
+    page->setProperty("currentTab", QStringLiteral("local"));
+  }
+  if (!grab("local-repository.png")) return 1;
+
+  QDir().mkpath(restore_ok);
+  if (!controller->startManagedRestore(file_name, restore_ok)) return 1;
+  if (!controller->waitForIdle(120000) || !controller->lastSucceeded()) {
+    return 1;
+  }
+  if (!grab("restore-success.png")) return 1;
+
+  // 真实进度：写一个 256 MiB 的稀疏文件，备份开始后立刻抓一帧。
+  // 抓到的阶段与字节数都来自核心的 ArchiveProgress 回调，不是动画。
+  {
+    QFile big(source + QStringLiteral("/big.bin"));
+    if (big.open(QIODevice::ReadWrite)) {
+      big.resize(256LL * 1024 * 1024);
+      big.close();
+    }
+    window->setProperty("currentPageKey", QStringLiteral("quick"));
+    pump(100);
+    controller->startBackup();
+    pump(120);
+    scroll_to_end("backupPageScroll", 0);
+    grab("real-progress.png");
+    controller->waitForIdle(300000);
+  }
+
+  // 真实失败：目标文件夹非空。控制器发 userError，Main.qml 打开对话框。
+  if (!controller->startManagedRestore(file_name, restore_bad)) return 1;
+  if (!controller->waitForIdle(120000)) return 1;
+  pump(800);
+  if (!grab("error-dialog.png")) return 1;
+  return 0;
+}
+
 // 它验的是桥加核心这一整条链路：先备份再恢复，任何一步失败
 // 就把核心的原文错误打到 stderr 并以非 0 退出。
 // --self-test 可以带 --include / --exclude：这些规则和界面点"添加"时走的是
@@ -298,6 +411,8 @@ int main(int argc, char* argv[]) {
       arguments.indexOf(QStringLiteral("--incremental-test"));
   const int screenshot_index =
       arguments.indexOf(QStringLiteral("--screenshot"));
+  const int acceptance_shots_index =
+      arguments.indexOf(QStringLiteral("--acceptance-shots"));
   const int screenshot_remote_index =
       arguments.indexOf(QStringLiteral("--screenshot-remote"));
   const int official_acceptance_index =
@@ -406,6 +521,7 @@ int main(int argc, char* argv[]) {
       smoke_test || path_test || close_guard_test || gui_contract_test ||
       preview_test_index >= 0 || incremental_test_index >= 0 ||
       screenshot_index >= 0 || screenshot_remote_index >= 0 ||
+      acceptance_shots_index >= 0 ||
       self_test_index >= 0 || repository_test_index >= 0 || realtime_test ||
       backup_options_test || schedule_test || filter_ux_test ||
       combo_hover_test || remote_test || remote_acceptance_index >= 0 ||
@@ -654,6 +770,19 @@ int main(int argc, char* argv[]) {
     return RunRemoteScreenshot(window, &remote_controller, &theme,
                                arguments.at(screenshot_remote_index + 1));
   }
+  if (acceptance_shots_index >= 0) {
+    if (acceptance_shots_index + 1 >= arguments.size()) {
+      std::fprintf(stderr, "--acceptance-shots 需要一个输出目录参数\n");
+      return 2;
+    }
+    const int result = RunAcceptanceShots(
+        window, &controller, arguments.at(acceptance_shots_index + 1));
+    if (result != 0) {
+      std::fprintf(stderr, "acceptance-shots 失败（exit=%d）\n", result);
+    }
+    return result;
+  }
+
   if (screenshot_index >= 0) {
     if (screenshot_index + 1 >= arguments.size()) {
       std::fprintf(stderr, "--screenshot 需要一个输出目录参数\n");

@@ -148,7 +148,7 @@ FIXTURE_OBJECTS := $(patsubst %.cpp,$(BUILD_DIR)/%.o,$(FIXTURE_SOURCES))
 FIXTURE_CORE_OBJECTS := $(patsubst %.cpp,$(BUILD_DIR)/%.o,$(CORE_SOURCES) $(FILESYSTEM_SOURCES))
 DEPENDS += $(FIXTURE_OBJECTS:.o=.d)
 
-.PHONY: all client client-cli debug sanitize test test-fixtures server remote-sequence gui gui-modern gui-all cert-tool clean
+.PHONY: all client client-cli debug sanitize test test-fixtures server remote-sequence gui-modern gui-all cert-tool clean
 
 # 产品构建：三个产品产物（CLI + 服务端 + 测试夹具除外）。
 # archive-cli 是测试夹具，见上面的说明。
@@ -290,35 +290,17 @@ QT_PACKAGES := Qt6Widgets Qt6Concurrent
 QT_CFLAGS := $(patsubst -I%,-isystem %,$(shell pkg-config --cflags $(QT_PACKAGES) 2>/dev/null))
 QT_LIBS := $(shell pkg-config --libs $(QT_PACKAGES) 2>/dev/null)
 
-GUI_TARGET := $(BUILD_DIR)/backup-gui
-GUI_SOURCES := $(wildcard ui/desktop/*.cpp)
-GUI_OBJECTS := $(patsubst %.cpp,$(BUILD_DIR)/%.o,$(GUI_SOURCES))
 CORE_OBJECTS := $(patsubst %.cpp,$(BUILD_DIR)/%.o,$(CORE_SOURCES) $(FILESYSTEM_SOURCES))
-DEPENDS += $(GUI_OBJECTS:.o=.d)
 
-gui: check-qt $(GUI_TARGET)
-
-# 缺 Qt 时给一句能照做的提示，而不是让 g++ 抛出一屏找不到头文件的错误。
-check-qt:
-	@pkg-config --exists $(QT_PACKAGES) || { \
-		echo "未找到 Qt 6 开发包（需要 $(QT_PACKAGES)）。"; \
-		echo "Ubuntu 上可执行: sudo apt-get install -y qt6-base-dev qt6-base-dev-tools"; \
-		exit 1; \
-	}
-
-$(GUI_TARGET): $(GUI_OBJECTS) $(CORE_OBJECTS)
-	@mkdir -p $(BUILD_DIR)
-	$(CXX) $(CXXFLAGS) $(GUI_OBJECTS) $(CORE_OBJECTS) $(QT_LIBS) -o $@
-
-# GUI 单独一条模式规则：Qt 需要 -fPIC 和 Qt 的 include 路径；
-# 这条规则的 stem 更短，GNU Make 会优先选它，CLI 的规则不受影响。
-$(BUILD_DIR)/ui/desktop/%.o: ui/desktop/%.cpp
-	@mkdir -p $(dir $@)
-	$(CXX) $(CPPFLAGS) $(CXXFLAGS) -fPIC $(QT_CFLAGS) -MMD -MP -c $< -o $@
+# ---- 旧 Qt Widgets GUI 已从正式产品中停用 ----
+#
+# 产品入口只剩 backupctl 与 Qt Quick/QML GUI。ui/desktop/ 的源码暂时保留
+# 供历史审计，但**不再有构建目标、安装入口或发布资产**：没有任何正式脚本
+# 会调用 make gui，final_gate 与发布打包也只处理 backup-gui-modern。
+# 删除这段源码之前先读 docs/ui/desktop_gui.md 的调用关系审计。
 
 # ---- 现代 GUI（Qt Quick / QML + Qt Concurrent）----
-# 和 Widgets GUI 完全并行：make gui 与 make gui-modern 各自构建各自的产物，
-# 默认的 make 依旧只构建 CLI，因此没有 Qt Quick 的环境也能编译核心。
+# 默认的 make 依旧只构建 CLI 与服务端，因此没有 Qt Quick 的环境也能编译核心。
 # PR #22 起多了 Qt6Network：SSH 安全通道的就绪判定与活性探测用 QTcpSocket /
 # QTcpServer（"进程还活着"不等于"本地端口连得上"）。Qt6Network 与 Qt6Core
 # 同属 qt6-base-dev，没有引入新的系统依赖。
@@ -379,8 +361,8 @@ $(BUILD_DIR)/ui/modern/qrc_resources.o: $(MODERN_QRC_SOURCE)
 	@mkdir -p $(dir $@)
 	$(CXX) $(CPPFLAGS) -Iui/modern $(CXXFLAGS) -fPIC $(QT_QML_CFLAGS) -MMD -MP -c $< -o $@
 
-# 一次构建两套 GUI；不是默认目标，避免把 Qt Quick 变成 make 的依赖。
-gui-all: gui gui-modern
+# 正式产品只构建 QML GUI；不是默认目标，避免把 Qt Quick 变成 make 的依赖。
+gui-all: gui-modern
 
 clean:
 	@rm -rf $(BUILD_DIR) build-debug build-sanitize

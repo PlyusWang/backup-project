@@ -33,6 +33,7 @@
 #include <cerrno>
 #include <cstdio>
 #include <cstring>
+#include <cstdlib>
 #include <exception>
 #include <fstream>
 #include <string>
@@ -813,6 +814,12 @@ void RemoteArchiveClient::ProbeResumeSupport() {
   server_supports_resume_ =
       version >= kTransferProtocolVersion &&
       (flags & kCapabilityResumableTransfer) != 0;
+  if (std::getenv("BACKUP_REMOTE_DEBUG") != nullptr) {
+    std::fprintf(stderr, "[resume] capability version=%u flags=%u supported=%d\n",
+                 static_cast<unsigned>(version),
+                 static_cast<unsigned>(flags),
+                 server_supports_resume_ ? 1 : 0);
+  }
 }
 
 bool RemoteArchiveClient::UploadArchiveFile(
@@ -880,6 +887,9 @@ bool RemoteArchiveClient::UploadSnapshotFile(
   bool resuming = false;
   std::string resume_key;
   std::string resume_path;
+  if (std::getenv("BACKUP_REMOTE_DEBUG") != nullptr) {
+    std::fprintf(stderr, "[resume] directory=%s\n", resume_directory_.c_str());
+  }
   if (!resume_directory_.empty()) {
     ProbeResumeSupport();
   }
@@ -957,6 +967,10 @@ bool RemoteArchiveClient::UploadSnapshotFile(
     PayloadReader id_reader(response);
     if (!id_reader.ReadString(kMaxSnapshotIdBytes, &upload_id)) {
       upload_id.clear();
+    }
+    if (std::getenv("BACKUP_REMOTE_DEBUG") != nullptr) {
+      std::fprintf(stderr, "[resume] upload_id_len=%zu state_path=%s\n",
+                   upload_id.size(), resume_path.c_str());
     }
     if (!upload_id.empty() && !resume_path.empty()) {
       UploadResumeState state{upload_id, 0, size, sha256, display_name};

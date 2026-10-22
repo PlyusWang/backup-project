@@ -23,6 +23,7 @@
 #include "format_bytes.h"
 #include "incremental_backup.h"
 #include "incremental_restore.h"
+#include "user_error.h"
 
 namespace backup_modern {
 
@@ -299,12 +300,17 @@ BackupController::BackupController(const QString& config_file_path,
             // 恢复不会改变仓库内容，不需要刷新列表。
           }
         } else {
-          // 核心给的错误信息原样展示：里面写清了是哪个路径、什么原因，
-          // 在桥这层改写成“操作失败，请重试”会把最有用的部分丢掉。
-          SetStatus(QString::fromLatin1(kError),
-                    kind == Kind::kBackup ? QStringLiteral("备份失败")
-                                          : QStringLiteral("恢复失败"),
-                    outcome.error_message);
+          // 主界面只显示中文结论与下一步；核心原文进错误对话框的
+          // “技术详情”（默认折叠），一个字节都不丢。
+          const UserFacingError explained = ExplainOperationError(
+              outcome.error_message,
+              kind == Kind::kBackup ? QStringLiteral("备份")
+                                    : QStringLiteral("恢复"));
+          // 主要反馈只有对话框这一条：页面横幅立刻回到 idle，避免同一个
+          // 错误同时以“弹窗 + 红条”出现两次。
+          SetStatus(QString::fromLatin1("idle"), QString(), QString());
+          emit userError(explained.title, explained.summary,
+                         explained.suggestion, outcome.error_message);
         }
         active_file_name_.clear();
         emit operationFinished(outcome.succeeded);

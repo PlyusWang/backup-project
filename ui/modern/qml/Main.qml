@@ -331,25 +331,35 @@ ApplicationWindow {
     Connections {
         target: controller
         function onUserError(title, summary, suggestion, technical) {
-            userErrorDialog.show(title, summary, suggestion, technical)
+            userErrorDialog.showError(title, summary, suggestion, technical)
         }
     }
     Connections {
         target: schedule
         function onUserError(title, summary, suggestion, technical) {
-            userErrorDialog.show(title, summary, suggestion, technical)
+            userErrorDialog.showError(title, summary, suggestion, technical)
         }
     }
     Connections {
         target: realtime
         function onUserError(title, summary, suggestion, technical) {
-            userErrorDialog.show(title, summary, suggestion, technical)
+            userErrorDialog.showError(title, summary, suggestion, technical)
         }
     }
     Connections {
         target: remote
         function onUserError(title, summary, suggestion, technical) {
-            userErrorDialog.show(title, summary, suggestion, technical)
+            userErrorDialog.showError(title, summary, suggestion, technical)
+        }
+        // 仓库复制成功后，两边列表都要刷新：复制把数据从一个仓库搬到了另一个，
+        // 只刷新当前可见的那一边会让另一边显示过期内容。
+        function onOperationFinished(kind, succeeded) {
+            if (!succeeded)
+                return
+            if (kind === "copy-to-cloud" || kind === "copy-to-local") {
+                controller.refreshBackups()
+                remote.refreshList()
+            }
         }
     }
 }
