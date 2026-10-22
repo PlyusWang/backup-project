@@ -62,7 +62,8 @@ bool InspectCredentialFile(const std::string& path, struct stat* info,
              "The credential file '" + path + "' is not readable by its owner");
     return false;
   }
-  if (info->st_size <= 0 || info->st_size > static_cast<off_t>(kMaxCredentialFileBytes)) {
+  if (info->st_size <= 0 ||
+      info->st_size > static_cast<off_t>(kMaxCredentialFileBytes)) {
     SetError(error_message,
              "The credential file '" + path + "' must contain between 1 and " +
                  std::to_string(kMaxCredentialFileBytes) + " bytes");
