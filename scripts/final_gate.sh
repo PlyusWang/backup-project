@@ -120,7 +120,11 @@ run remote-connection-ux bash scripts/remote_connection_ux_test.sh
 run raw-archive-restore-sanitize env RAW_RESTORE_SANITIZE=1 bash scripts/raw_archive_restore_test.sh
 run scheduled_backup bash scripts/scheduled_backup_test.sh
 run realtime bash scripts/realtime_test.sh
-run modern_gui bash scripts/modern_gui_check.sh
+# 旧七页 modern_gui_check 已退役：它的 692 条断言绑定旧页面结构与旧 Widgets。
+# 新结构由契约测试 + 真实服务端 GUI 流程覆盖；旧脚本保留在仓库里供历史审计，
+# 但不再进入正式门禁，避免用“改断言”掩盖结构变化。
+run unified-gui bash scripts/unified_gui_contract_test.sh
+run remote-gui env QT_QPA_PLATFORM=offscreen ./build/backup-gui-modern --remote-test
 run gui_smoke bash scripts/gui_smoke_test.sh
 run archive_pipeline bash scripts/archive_pipeline_test.sh
 run backup_catalog bash scripts/backup_catalog_test.sh
