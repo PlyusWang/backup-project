@@ -17,7 +17,6 @@ using backupproject::CompressionMethod;
 using backupproject::EncryptionMethod;
 using backupproject::PackMethod;
 
-
 }  // namespace
 
 BackupOptionsCatalog::BackupOptionsCatalog(QObject* parent) : QObject(parent) {}
