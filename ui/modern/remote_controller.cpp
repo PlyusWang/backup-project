@@ -42,6 +42,7 @@
 #include "remote_incremental.h"
 #include "secure_transport.h"
 #include "server_profile.h"
+#include "user_error.h"
 
 #if defined(Q_OS_UNIX)
 #include <signal.h>  // 只给自检用的 killOwnedTunnelForTest
@@ -2029,6 +2030,28 @@ void RemoteController::ApplyResult(const RemoteOpResult& result) {
     // 触发，也在页面上回报。
     const QString message =
         SurfaceFailureMessage(result.kind, result.error_kind, result.message);
+    // 用户主动发起的操作失败：一条中文结论 + 下一步进对话框；原始协议原因
+    // 只作为折叠的技术详情。表单校验（缺字段 / 两次密码不一致）不走这里，
+    // 那些仍然在输入框附近提示。
+    const QString action =
+        result.kind == RemoteOpResult::Kind::kLogin
+            ? QStringLiteral("登录")
+            : result.kind == RemoteOpResult::Kind::kRegister
+                  ? QStringLiteral("注册")
+                  : result.kind == RemoteOpResult::Kind::kUpload
+                        ? QStringLiteral("上传")
+                        : result.kind == RemoteOpResult::Kind::kDownload
+                              ? QStringLiteral("下载")
+                              : result.kind == RemoteOpResult::Kind::kCopyToCloud
+                                    ? QStringLiteral("复制到云端")
+                                    : result.kind ==
+                                              RemoteOpResult::Kind::kCopyToLocal
+                                          ? QStringLiteral("下载到本地仓库")
+                                          : QStringLiteral("云端操作");
+    const UserFacingError explained = ExplainOperationError(
+        QString::fromStdString(result.detail), action);
+    emit userError(explained.title, explained.summary, explained.suggestion,
+                   QString::fromStdString(result.detail));
     // 登录 / 注册 / 注销各自有错误行：原因写在那里，页面底部的横幅也不能继续
     // 挂着"正在登录"这种已经过期的运行状态（那是"点了没反应"的另一面：按钮
     // 早就停了，横幅还在转，而且 running 还是跨页可见的全局状态）。
