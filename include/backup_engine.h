@@ -58,7 +58,8 @@ class BackupEngine {
   // 传了 options 就走 v2 container：pack → compress → encrypt。
   bool Backup(const std::string& source_directory,
               const std::string& archive_file, const Filter& filter,
-              const BackupOptions& options, std::string* error_message);
+              const BackupOptions& options, std::string* error_message,
+              const ArchiveProgressCallback& progress = {});
 
   // 恢复 v2 容器。report 可以为空。
   bool Restore(const std::string& archive_file,

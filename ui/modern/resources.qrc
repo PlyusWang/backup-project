@@ -16,12 +16,12 @@
     <file>qml/components/RemoteSnapshotCard.qml</file>
     <file>qml/components/NavItem.qml</file>
     <file>qml/components/StatusBanner.qml</file>
+    <file>qml/components/UserErrorDialog.qml</file>
     <file>qml/pages/HomePage.qml</file>
     <file>qml/pages/BackupPage.qml</file>
     <file>qml/pages/BackupManagementPage.qml</file>
     <file>qml/pages/SchedulePage.qml</file>
     <file>qml/pages/RealtimePage.qml</file>
-    <file>qml/pages/SettingsPage.qml</file>
     <file>qml/pages/RemotePage.qml</file>
   </qresource>
 </RCC>

@@ -1409,7 +1409,8 @@ int RunRemoteTunnelEcs(QQuickWindow* window,
                        const QString& port_text, const QString& password,
                        const QString& pin) {
   run->prefix = "[remote-acceptance]";
-  window->setProperty("currentPage", 6);
+  GoToPage(window, "management");
+  GoToManagementTab(window, "cloud");
   WaitForAnimation(300);
 
   const auto waitForTunnelState = [remote](const QString& wanted,
@@ -1927,7 +1928,8 @@ int RunRemoteConnectionUx(QQuickWindow* window,
                           const QString& source_dir) {
   run->prefix = "[remote-test]";
   // 先把页面切到 Remote 页：控件的 visible 绑定与这一页的 currentPage 有关。
-  window->setProperty("currentPage", 6);
+  GoToPage(window, "management");
+  GoToManagementTab(window, "cloud");
   WaitForAnimation(300);
 
   // ---- 官方云端不该经过人工 pin 的回归 ----
@@ -2595,18 +2597,26 @@ int CaptureScreenshots(QQuickWindow* window, backup_modern::AppTheme* theme,
     return true;
   };
 
-  // 顺序必须与 Main.qml 的 StackLayout 一致：首页 / 备份 / 自动备份 /
-  // 备份管理 / 设置 / 实时备份。
-  const char* page_names[kPageCount] = {"home",       "backup",   "schedule",
-                                        "management", "settings", "realtime",
-                                        "remote"};
+  // 顺序与 Main.qml 的 pageKeys 一致：首页 / 快速备份 / 定时备份 /
+  // 实时备份 / 备份管理。备份管理再按两个仓库标签各抓一张。
+  const char* page_names[kPageCount] = {"home", "quick-backup",
+                                        "scheduled-backup", "realtime-backup",
+                                        "local-repository"};
   for (int dark = 0; dark < 2; ++dark) {
     theme->setDark(dark == 1);
     for (int page = 0; page < kPageCount; ++page) {
-      window->setProperty("currentPage", page);
+      GoToPage(window, kPageKeys[page]);
+      if (page == kPageCount - 1) {
+        GoToManagementTab(window, "local");
+      }
       if (!grab(QString::fromLatin1(page_names[page]), dark == 1)) {
         return 1;
       }
+    }
+    GoToPage(window, "management");
+    GoToManagementTab(window, "cloud");
+    if (!grab(QStringLiteral("cloud-repository"), dark == 1)) {
+      return 1;
     }
   }
 
@@ -2634,7 +2644,8 @@ int CaptureScreenshots(QQuickWindow* window, backup_modern::AppTheme* theme,
          "remoteOfficialCloudName"},
         {"direct", "custom-server-profile", "remoteHostField",
          "remoteSshHostField"}};
-    window->setProperty("currentPage", kPageCount - 1);
+    GoToPage(window, "management");
+    GoToManagementTab(window, "cloud");
     for (const ModeShot& shot : shots) {
       const QString mode = QString::fromLatin1(shot.mode);
       if (!remote->setConnectionMode(mode)) {
@@ -2708,7 +2719,7 @@ int CaptureScreenshots(QQuickWindow* window, backup_modern::AppTheme* theme,
   }
   for (int dark = 0; dark < 2; ++dark) {
     theme->setDark(dark == 1);
-    window->setProperty("currentPage", 1);
+    GoToPage(window, "quick");
     panel->setProperty("expanded", true);
     ScrollBackupPage(window, 100000);
     if (!grab(QStringLiteral("backup-expanded"), dark == 1)) {
@@ -2753,7 +2764,7 @@ int CaptureScreenshots(QQuickWindow* window, backup_modern::AppTheme* theme,
   }
   for (int dark = 0; dark < 2; ++dark) {
     theme->setDark(dark == 1);
-    window->setProperty("currentPage", 2);
+    GoToPage(window, "scheduled");
     restore_dialog->setProperty("visible", true);
     if (!grab(QStringLiteral("management-password-dialog"), dark == 1)) {
       return 1;
@@ -3025,7 +3036,7 @@ int RunRepositoryTest(QQuickWindow* window,
         !chain_record.value(QStringLiteral("chainRestorable")).toBool()) {
       return ChainFail("完整快照的链字段不对", full_name);
     }
-    window->setProperty("currentPage", 3);
+    GoToPage(window, "management");
     WaitForAnimation(400);
     QQuickItem* card = FindRecordCard(window, full_name);
     if (card == nullptr) {
@@ -3676,7 +3687,7 @@ int RunComboHoverTest(QQuickWindow* window, backup_modern::AppTheme* theme) {
             QStringLiteral("hover=%1 keyboard=%2")
                 .arg(hover_color.name(), keyboard_color.name()));
 
-  window->setProperty("currentPage", 1);
+  GoToPage(window, "quick");
   window->setWidth(1280);
   window->setHeight(1000);
   WaitForAnimation(150);
@@ -4102,7 +4113,7 @@ int RunFilterUxTest(QQuickWindow* window,
     return window->findChild<QQuickItem*>(name);
   };
   const auto goToPage = [window](int page) {
-    window->setProperty("currentPage", page);
+    window->setProperty("currentPageKey", QString::fromLatin1(kPageKeys[page]));
     WaitForAnimation(90);
   };
   // 点真实按钮：AppButton 是 AbstractButton，clicked 是它的信号。
@@ -4572,7 +4583,8 @@ int RunRemoteAcceptance(QQuickWindow* window,
     return item != nullptr && QMetaObject::invokeMethod(item, "clicked");
   };
   const auto goRemote = [window]() {
-    window->setProperty("currentPage", 6);
+    GoToPage(window, "management");
+  GoToManagementTab(window, "cloud");
     WaitForAnimation(400);
   };
   // 每个状态开头的归一化：确保页面是 Remote、窗口是主开发尺寸、主题已知。
@@ -6565,7 +6577,8 @@ int RunOfficialAcceptance(QQuickWindow* window,
   if (remote_page != nullptr) {
     remote_page->setProperty("draftConnectionMode", QStringLiteral("official"));
   }
-  window->setProperty("currentPage", 6);
+  GoToPage(window, "management");
+  GoToManagementTab(window, "cloud");
   WaitForAnimation(500);
   run.Check(EffectivelyVisible(window, "remoteOfficialCloudName"),
             QStringLiteral("A01 官方云端已选中（页面上显示云端名字）"));
@@ -6727,7 +6740,8 @@ int RunRemoteScreenshot(QQuickWindow* window,
   };
 
   theme->setDark(false);
-  window->setProperty("currentPage", 6);
+  GoToPage(window, "management");
+  GoToManagementTab(window, "cloud");
   QQuickItem* scroll =
       window->findChild<QQuickItem*>(QStringLiteral("remotePageScroll"));
   const auto scrollTop = [scroll](int y) {
@@ -7006,7 +7020,7 @@ int RunRemoteTest(QQuickWindow* window, backup_modern::RemoteController* remote,
   run.prefix = "[remote-test]";
 
   const auto goToPage = [window](int page) {
-    window->setProperty("currentPage", page);
+    window->setProperty("currentPageKey", QString::fromLatin1(kPageKeys[page]));
     WaitForAnimation(400);
   };
   const auto itemByName = [window](const char* name) -> QQuickItem* {
@@ -7299,7 +7313,7 @@ int RunRemoteTest(QQuickWindow* window, backup_modern::RemoteController* remote,
   run.Check(page != nullptr && nav_item != nullptr,
             QStringLiteral("REMOTE-01 远程备份页与侧栏导航项都存在"));
   goToPage(6);
-  run.Check(window->property("currentPage").toInt() == 6 && page != nullptr &&
+  run.Check(window->property("currentPageKey").toString() == QStringLiteral("management") && page != nullptr &&
                 page->opacity() > 0.5,
             QStringLiteral("REMOTE-01 能从导航进入远程备份页"));
   goToPage(0);
@@ -7669,8 +7683,10 @@ int RunRemoteTest(QQuickWindow* window, backup_modern::RemoteController* remote,
     // 这一行在"当前页不是远程备份页"时不会被界面刷新（StackLayout 把非当前页
     // 整体设为不可见）——所以断言之前先把这一页切到前台，这正是用户看到它的
     // 前提条件；查完再切回去，不影响后面的用例。
-    const int page_before_check = window->property("currentPage").toInt();
-    window->setProperty("currentPage", 6);
+    const QString page_before_check =
+        window->property("currentPageKey").toString();
+    GoToPage(window, "management");
+  GoToManagementTab(window, "cloud");
     WaitForAnimation(60);
     bool busy_line_seen = false;
     QElapsedTimer busy_line_clock;
@@ -7682,7 +7698,7 @@ int RunRemoteTest(QQuickWindow* window, backup_modern::RemoteController* remote,
         break;
       }
     }
-    window->setProperty("currentPage", page_before_check);
+    window->setProperty("currentPageKey", page_before_check);
     WaitForAnimation(20);
     const bool busy_text_ok =
         positive_busy && busy_text != nullptr && busy_line_seen &&
@@ -8533,7 +8549,7 @@ int RunGuiContractTest(QQuickWindow* window,
       "remoteStatusBanner"};
 
   const auto goToPage = [window](int page) {
-    window->setProperty("currentPage", page);
+    window->setProperty("currentPageKey", QString::fromLatin1(kPageKeys[page]));
     // 切换之后要让绑定与布局都算完：这里等的是"事件循环转一圈 + 布局"，
     // 不是某个动画时长。
     WaitForAnimation(60);
@@ -8749,7 +8765,7 @@ int RunGuiContractTest(QQuickWindow* window,
   // 切页就在**同一个事件循环回合内**完成：完成回调还没有机会派发，busy 一定
   // 还是 true，所以这条断言不取决于任务跑得多快（与 --close-guard-test 用的是
   // 同一条推理）。这里刻意不调用 goToPage()，它会让事件循环转一圈。
-  window->setProperty("currentPage", 4);
+  GoToPage(window, "management");
   run.Check(
       controller->busy() &&
           controller->statusKind() == QStringLiteral("running") &&

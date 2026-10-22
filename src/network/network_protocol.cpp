@@ -227,11 +227,14 @@ bool IsKnownOpcode(std::uint16_t opcode) {
     case Opcode::kLogin:
     case Opcode::kLogout:
     case Opcode::kResume:
+    case Opcode::kCapabilities:
     case Opcode::kList:
     case Opcode::kUploadBegin:
     case Opcode::kUploadChunk:
     case Opcode::kUploadEnd:
+    case Opcode::kUploadResumeBegin:
     case Opcode::kDownloadBegin:
+    case Opcode::kDownloadResumeBegin:
     case Opcode::kDownloadChunk:
     case Opcode::kDownloadEnd:
     case Opcode::kDelete:
@@ -254,6 +257,8 @@ const char* OpcodeName(std::uint16_t opcode) {
       return "LOGOUT";
     case Opcode::kResume:
       return "RESUME";
+    case Opcode::kCapabilities:
+      return "CAPABILITIES";
     case Opcode::kList:
       return "LIST";
     case Opcode::kUploadBegin:
@@ -262,12 +267,16 @@ const char* OpcodeName(std::uint16_t opcode) {
       return "UPLOAD_CHUNK";
     case Opcode::kUploadEnd:
       return "UPLOAD_END";
+    case Opcode::kUploadResumeBegin:
+      return "UPLOAD_RESUME_BEGIN";
     case Opcode::kDownloadBegin:
       return "DOWNLOAD_BEGIN";
     case Opcode::kDownloadChunk:
       return "DOWNLOAD_CHUNK";
     case Opcode::kDownloadEnd:
       return "DOWNLOAD_END";
+    case Opcode::kDownloadResumeBegin:
+      return "DOWNLOAD_RESUME_BEGIN";
     case Opcode::kDelete:
       return "DELETE";
     case Opcode::kDeleteAccount:
@@ -319,6 +328,7 @@ bool OpcodeAllowsEmptyPayload(std::uint16_t opcode) {
   switch (static_cast<Opcode>(opcode)) {
     case Opcode::kPing:
     case Opcode::kLogout:
+    case Opcode::kCapabilities:
     case Opcode::kList:
     case Opcode::kUploadEnd:
     case Opcode::kDownloadChunk:

@@ -1212,7 +1212,8 @@ bool RunIncrementalBackup(const std::string& source_directory,
                           const std::vector<std::string>& exclude_rules,
                           const std::string& baseline_snapshot_name,
                           IncrementalOutcome* outcome,
-                          std::string* error_message) {
+                          std::string* error_message,
+                          const ArchiveProgressCallback& progress) {
   if (outcome == nullptr) {
     SetError(error_message, "Incremental outcome output must not be null");
     return false;
@@ -1329,7 +1330,8 @@ bool RunIncrementalBackup(const std::string& source_directory,
                              error_message)) {
       return false;
     }
-    if (!RunBackupPipelineFromEntries(all, target, options, error_message)) {
+    if (!RunBackupPipelineFromEntries(all, target, options, error_message,
+                                      progress)) {
       return false;
     }
     // 快照发布成功之后才写副文件：反过来会留下"基线存在但没有快照"的状态。

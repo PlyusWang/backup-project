@@ -167,6 +167,11 @@ void PrintConfig(const CliContext& context, const RealtimeConfig& config,
             << CompressionMethodKey(config.compression_method) << "\n";
   std::cout << "Encryption:     "
             << EncryptionMethodKey(config.encryption_method) << "\n";
+  std::cout << "Password file:  "
+            << (config.encryption_password_file.empty()
+                    ? std::string("(not set)")
+                    : config.encryption_password_file)
+            << "\n";
   std::cout << "Include rules:";
   if (config.include_rules.empty()) {
     std::cout << "  (none)\n";
@@ -572,6 +577,8 @@ int RunRealtimeCommand(const CliContext& context,
           return UsageError(context,
                             "unknown encryption method '" + value + "'");
         }
+      } else if (option == "--password-file") {
+        config.encryption_password_file = value;
       } else {
         return UsageError(context, "unknown option '" + option + "'");
       }
@@ -584,6 +591,8 @@ int RunRealtimeCommand(const CliContext& context,
     combination.pack_method = config.pack_method;
     combination.compression_method = config.compression_method;
     combination.encryption_method = config.encryption_method;
+    combination.unattended_credential_available =
+        !config.encryption_password_file.empty();
     // 先问真值表、再问结构校验：组合本身不成立时，用户需要知道"为什么这个组合
     // 不行"（UnsupportedBackupOptionCombinationReason 给出原因），而不是先被
     // 一堆范围错误淹没。

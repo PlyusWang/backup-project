@@ -20,6 +20,8 @@
 #define BACKUP_PROJECT_UI_MODERN_BACKUP_CONTROLLER_H_
 
 #include <QFutureWatcher>
+
+#include <atomic>
 #include <QObject>
 #include <QString>
 #include <QStringList>
@@ -122,6 +124,20 @@ class BackupController : public QObject {
   Q_PROPERTY(
       QStringList optionEncryptionLabels READ optionEncryptionLabels CONSTANT)
   Q_PROPERTY(bool busy READ busy NOTIFY busyChanged)
+  // ---- 真实进度 ----
+  // 全部来自共享核心的 ArchiveProgress 回调。total 为 0 表示这一阶段没有
+  // 可靠总量，界面必须显示活动状态而不是百分比。
+  Q_PROPERTY(QString progressPhase READ progressPhase NOTIFY progressChanged)
+  Q_PROPERTY(qulonglong progressItemsDone READ progressItemsDone NOTIFY
+                 progressChanged)
+  Q_PROPERTY(qulonglong progressItemsTotal READ progressItemsTotal NOTIFY
+                 progressChanged)
+  Q_PROPERTY(qulonglong progressBytesDone READ progressBytesDone NOTIFY
+                 progressChanged)
+  Q_PROPERTY(qulonglong progressBytesTotal READ progressBytesTotal NOTIFY
+                 progressChanged)
+  Q_PROPERTY(double progressRatio READ progressRatio NOTIFY progressChanged)
+  Q_PROPERTY(QString progressText READ progressText NOTIFY progressChanged)
   Q_PROPERTY(QString statusKind READ statusKind NOTIFY statusChanged)
   Q_PROPERTY(QString statusTitle READ statusTitle NOTIFY statusChanged)
   Q_PROPERTY(QString statusMessage READ statusMessage NOTIFY statusChanged)
@@ -186,6 +202,13 @@ class BackupController : public QObject {
   QStringList optionCompressionLabels() const;
   QStringList optionEncryptionLabels() const;
   bool busy() const { return busy_; }
+  QString progressPhase() const;
+  qulonglong progressItemsDone() const;
+  qulonglong progressItemsTotal() const;
+  qulonglong progressBytesDone() const;
+  qulonglong progressBytesTotal() const;
+  double progressRatio() const;
+  QString progressText() const;
   QString statusKind() const { return status_kind_; }
   QString statusTitle() const { return status_title_; }
   QString statusMessage() const { return status_message_; }
@@ -296,6 +319,13 @@ class BackupController : public QObject {
 
   // busy / status / 路径 / 列表各有独立信号，QML 只订阅自己用到的那些。
  signals:
+  // 真实进度变化（后台线程排队的通知，GUI 线程发出）。
+  void progressChanged();
+  // 用户主动操作失败时的唯一主要反馈。summary / suggestion 是自然中文，
+  // technical 可以包含路径与错误码，但生成方保证其中没有口令、私钥或令牌。
+  // 后台定时 / 实时失败不弹这个信号：它们进运行记录与页面状态。
+  void userError(const QString& title, const QString& summary,
+                 const QString& suggestion, const QString& technical);
   void busyChanged();
   void statusChanged();
   void sourcePathChanged();
@@ -350,6 +380,9 @@ class BackupController : public QObject {
     // 后台线程只是改走增量引擎。仓库、快照名与规则原文一起带过去，
     // 因为增量链的 identity 需要它们（规则变了就必须重新建基线）。
     BackupStrategy strategy = BackupStrategy::kFull;
+    // 后台线程的真实进度回调。它只捕获控制器指针并把数字写进原子量；
+    // 请求本身仍然是一个值类型，任务结束后回调随之销毁。
+    backupproject::ArchiveProgressCallback progress;
     QString repository_directory;
     QString repository_identity;
     QString snapshot_file_name;
@@ -409,6 +442,16 @@ class BackupController : public QObject {
   // 它只表示 backup / restore 这类会写盘的数据操作 —— 仓库列表刷新是只读的，
   // 不纳入 busy，所以也不纳入关窗守卫。
   bool busy_ = false;
+
+  // 进度是**跨线程只写 / GUI 线程只读**的一组值：后台任务写原子量，再投递
+  // 一次 queued 调用通知绑定更新。不共享 QString / std::string。
+  std::atomic<int> progress_phase_{0};
+  std::atomic<qulonglong> progress_items_done_{0};
+  std::atomic<qulonglong> progress_items_total_{0};
+  std::atomic<qulonglong> progress_bytes_done_{0};
+  std::atomic<qulonglong> progress_bytes_total_{0};
+  // 后台线程回调：只写原子量，然后排队通知 GUI 线程。
+  void OnArchiveProgress(const backupproject::ArchiveProgress& progress);
   bool last_succeeded_ = false;
   // 任务结束时要区分是备份还是恢复，否则成功文案只能写成笼统的“操作完成”。
   Kind active_kind_ = Kind::kBackup;

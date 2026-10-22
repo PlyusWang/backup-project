@@ -217,7 +217,8 @@ bool RunIncrementalBackup(const std::string& source_directory,
                           const std::vector<std::string>& exclude_rules,
                           const std::string& baseline_snapshot_name,
                           IncrementalOutcome* outcome,
-                          std::string* error_message);
+                          std::string* error_message,
+                          const ArchiveProgressCallback& progress = {});
 
 // ---- 依赖图与副文件生命周期 ----
 //

@@ -466,8 +466,8 @@ void SortDirectoriesDeepestFirst(const PackedStreamReader& reader,
 // 后续流程不再看 filter。
 bool RunBackupPipeline(const std::string& source_directory,
                        const std::string& archive_file, const Filter& filter,
-                       const BackupOptions& options,
-                       std::string* error_message) {
+                       const BackupOptions& options, std::string* error_message,
+                       const ArchiveProgressCallback& progress) {
   if (error_message != nullptr) {
     error_message->clear();
   }
@@ -495,13 +495,20 @@ bool RunBackupPipeline(const std::string& source_directory,
     return false;
   }
 
+  if (progress) {
+    progress(ArchiveProgress{"scanning", 0, 0, 0, 0});
+  }
   // 扫描：三种 pack 后端消费同一份条目表。
   std::vector<ArchiveEntry> entries;
   if (!ScanSourceTree(source_directory, &filter, &entries, error_message)) {
     return false;
   }
+  if (progress) {
+    progress(ArchiveProgress{"scanning", entries.size(), entries.size(), 0,
+                             0});
+  }
   return RunBackupPipelineFromEntries(entries, archive_file, options,
-                                      error_message);
+                                      error_message, progress);
 }
 
 // 调用方契约：entries 必须是 ScanSourceTree 的产物（或测试里人工构造的
@@ -515,7 +522,8 @@ bool RunBackupPipeline(const std::string& source_directory,
 bool RunBackupPipelineFromEntries(const std::vector<ArchiveEntry>& entries,
                                   const std::string& archive_file,
                                   const BackupOptions& options,
-                                  std::string* error_message) {
+                                  std::string* error_message,
+                                  const ArchiveProgressCallback& progress) {
   if (error_message != nullptr) {
     error_message->clear();
   }
@@ -568,8 +576,14 @@ bool RunBackupPipelineFromEntries(const std::vector<ArchiveEntry>& entries,
   }
   const std::string packed_file = workspace.Child("packed.tmp");
 
+  if (progress) {
+    progress(ArchiveProgress{"packing", 0, entries.size(), 0, 0});
+  }
   if (!PackEntries(options.pack_method, entries, packed_file, error_message)) {
     return false;
+  }
+  if (progress) {
+    progress(ArchiveProgress{"packing", entries.size(), entries.size(), 0, 0});
   }
   std::uint64_t packed_size = 0;
   if (!FileSizeOf(packed_file, &packed_size, error_message)) {
@@ -590,9 +604,17 @@ bool RunBackupPipelineFromEntries(const std::vector<ArchiveEntry>& entries,
   std::uint64_t compressed_size = packed_size;
   if (options.compression_method != CompressionMethod::kNone) {
     compressed_file = workspace.Child("compressed.tmp");
+    if (progress) {
+      progress(ArchiveProgress{"compressing", entries.size(), entries.size(), 0,
+                               packed_size});
+    }
     if (!CompressFile(packed_file, compressed_file, options.compression_method,
                       workspace.path(), &compressed_size, error_message)) {
       return false;
+    }
+    if (progress) {
+      progress(ArchiveProgress{"compressing", entries.size(), entries.size(),
+                               compressed_size, compressed_size});
     }
   }
 
@@ -704,6 +726,11 @@ bool RunBackupPipelineFromEntries(const std::vector<ArchiveEntry>& entries,
   }
 
   std::uint64_t payload_bytes = 0;
+  std::uint64_t last_reported_payload = 0;
+  if (ok && progress) {
+    progress(ArchiveProgress{"writing", entries.size(), entries.size(), 0,
+                             header.payload_size});
+  }
   if (ok) {
     FileSource plain;
     if (!plain.Open(compressed_file, error_message)) {
@@ -742,6 +769,21 @@ bool RunBackupPipelineFromEntries(const std::vector<ArchiveEntry>& entries,
           }
           sha.Update(chunk.data(), chunk.size());
           payload_bytes += chunk.size();
+          // 只在跨过 1% 或 4 MiB 时回调：进度是给人看的，不是每 64 KiB
+          // 发一次信号把 GUI 线程淹没。
+          if (progress) {
+            const std::uint64_t step =
+                header.payload_size / 100 > (4u << 20)
+                    ? header.payload_size / 100
+                    : (4u << 20);
+            if (payload_bytes - last_reported_payload >= step ||
+                payload_bytes == header.payload_size) {
+              last_reported_payload = payload_bytes;
+              progress(ArchiveProgress{"writing", entries.size(),
+                                       entries.size(), payload_bytes,
+                                       header.payload_size});
+            }
+          }
         }
         offset += want;
       }
@@ -763,6 +805,10 @@ bool RunBackupPipelineFromEntries(const std::vector<ArchiveEntry>& entries,
     }
   }
 
+  if (ok && progress) {
+    progress(ArchiveProgress{"finishing", entries.size(), entries.size(),
+                             payload_bytes, header.payload_size});
+  }
   // 自检而不是输入校验：payload_bytes 是刚刚自己写出去的字节数，对不上说明
   // header 与写入逻辑已经不同步（例如 DesPaddedSize 的算法改过），是编程错误。
   if (ok && payload_bytes != header.payload_size) {

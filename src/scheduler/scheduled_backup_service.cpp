@@ -22,6 +22,7 @@
 #include <vector>
 
 #include "backup_catalog.h"
+#include "backup_credentials.h"
 #include "backup_engine.h"
 #include "incremental_backup.h"
 #include "source_manifest.h"
@@ -604,6 +605,27 @@ bool ScheduledBackupService::EvaluateInternal(std::int64_t now_sec, bool force,
     return true;
   }
 
+  // 无人值守加密的凭据在这一轮开始时读取一次：配置里只有文件路径，
+  // 口令本身绝不进 schedule.json / history / 日志。读不到就这一轮失败，
+  // 不产生任何空归档或半成品。
+  std::string credential;
+  if (document.config.encryption_method != EncryptionMethod::kNone) {
+    std::string credential_error;
+    if (!ReadCredentialFile(document.config.encryption_password_file,
+                            &credential, &credential_error)) {
+      return finish_failed(
+          "The credential file for unattended encryption could not be read: " +
+          credential_error);
+    }
+  }
+  // 无论从哪条路径返回，都先把本进程里的口令副本抹掉。
+  const auto wipe_credential = [&credential]() {
+    if (!credential.empty()) {
+      credential.assign(credential.size(), '\0');
+      credential.clear();
+    }
+  };
+
   // ---- 扫描：与备份用的是同一个扫描器，集合不可能漂移 ----
   std::vector<ManifestEntry> current;
   std::string manifest_error;
@@ -696,7 +718,9 @@ bool ScheduledBackupService::EvaluateInternal(std::int64_t now_sec, bool force,
     BackupOptions incremental_options;
     incremental_options.pack_method = document.config.pack_method;
     incremental_options.compression_method = document.config.compression_method;
-    // 无人值守计划不接受加密：配置层已经拒过一次，这里不再提供入口。
+    // 增量 v1 的 BKPINC1 信封是明文且没有独立 MAC，配置层已经拒绝
+    // incremental + encryption；这里保持 none，避免绕过校验的调用方
+    // 产出“看起来加密了、信封却可被改写”的链。
     incremental_options.encryption_method = EncryptionMethod::kNone;
 
     IncrementalOutcome outcome;
@@ -794,9 +818,17 @@ bool ScheduledBackupService::EvaluateInternal(std::int64_t now_sec, bool force,
   BackupOptions options;
   options.pack_method = document.config.pack_method;
   options.compression_method = document.config.compression_method;
-  // 无人值守计划不接受加密；配置层已经拒过一次，这里再钉一遍：
-  // 没有任何密码参数能从这条路径进来。
-  options.encryption_method = EncryptionMethod::kNone;
+  options.encryption_method = document.config.encryption_method;
+  // 口令只来自本轮开头读取的凭据文件；没有凭据时配置校验已经拦住了
+  // 非 none 的加密方式，这里再要求一次非空，防止未来新增入口绕过校验。
+  if (options.encryption_method != EncryptionMethod::kNone) {
+    if (credential.empty()) {
+      wipe_credential();
+      return finish_failed(
+          "Encryption is enabled but no credential was loaded for this run");
+    }
+    options.password = credential;
+  }
 
   std::string archive_path;
   if (snapshot_already_written) {
@@ -810,8 +842,12 @@ bool ScheduledBackupService::EvaluateInternal(std::int64_t now_sec, bool force,
     BackupEngine engine;
     if (!engine.Backup(document.config.source_path, archive_path, filter,
                        options, &work_error)) {
+      wipe_credential();
       return finish_failed(work_error);
     }
+    // 归档已经写完，口令副本不再需要：立刻抹掉，别让它在后面的登记、
+    // retention 与 state 保存里继续活着。
+    wipe_credential();
   }
 
   // 归档已经成功发布。从这一刻起，这一轮就是"成功"——后面的登记、淘汰、

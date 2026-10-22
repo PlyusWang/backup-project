@@ -142,6 +142,7 @@
 #include "application_instance_lock.h"
 #include "archive_pipeline.h"
 #include "backup_controller.h"
+#include "backup_options.h"
 #include "config_manager.h"
 #include "dev_harnesses.h"
 #include "filter_rule_model.h"
@@ -446,6 +447,9 @@ int main(int argc, char* argv[]) {
   // 两个控制器拿到的是同一个对象：手动备份/恢复/删除/改仓库与"后台评估 +
   // 保存计划"互相排斥，由 C++ 保证，而不是靠 QML 把按钮置灰。
   backup_modern::OperationGate operation_gate;
+  // 三种备份方式共用的选项目录与组合校验：QML 只读它，不再各自维护一份
+  // 显示文案与拒绝原因。
+  backup_modern::BackupOptionsCatalog backup_options;
   backup_modern::BackupController controller(config_file_path, &operation_gate);
   // 计划存储文件与配置走同一套默认位置策略（见 app_paths.h）：
   // backupctl schedule show 读到的就是这一份。路径已在上面解析并定型
@@ -478,6 +482,10 @@ int main(int argc, char* argv[]) {
   // "同一时刻只有一个本地仓库 writer"，而远程网络 I/O 不改动本地仓库的任何
   // 持久状态（上传只读一个用户选定的 .bak，下载写的是用户指定的新路径）。
   backup_modern::RemoteController remote_controller;
+  // 传输续传状态跟着配置文件走：换了 --config-file 的测试不会读写到真实用户
+  // 的 resume/ 目录。
+  remote_controller.setResumeDirectory(
+      QFileInfo(config_file_path).absolutePath() + QStringLiteral("/resume"));
   // 三个页面的筛选规则编辑器共用同一个 presentation 组件，但每个页面有**自己**
   // 的规则列表：备份页的模型直接挂在 BackupController 上（编辑即生效），计划页
   // 与实时页是"草稿 + 保存"，所以它们的模型不带落点（构造参数为 nullptr），
@@ -494,6 +502,8 @@ int main(int argc, char* argv[]) {
   engine.rootContext()->setContextProperty(QStringLiteral("theme"), &theme);
   engine.rootContext()->setContextProperty(QStringLiteral("controller"),
                                            &controller);
+  engine.rootContext()->setContextProperty(QStringLiteral("backupOptions"),
+                                           &backup_options);
   engine.rootContext()->setContextProperty(QStringLiteral("filterRuleModel"),
                                            &filter_rule_model);
   engine.rootContext()->setContextProperty(
@@ -687,7 +697,8 @@ int main(int argc, char* argv[]) {
     // 只把 kPageCount 加一而不真正切页，等于根本没有验证新页面。
     for (int page = 0; page < kPageCount; ++page) {
       QTimer::singleShot(120 + page * 90, &app, [window, page]() {
-        window->setProperty("currentPage", page);
+        window->setProperty("currentPageKey",
+                            QString::fromLatin1(kPageKeys[page]));
       });
     }
     const int after_pages = 120 + kPageCount * 90;
@@ -700,7 +711,8 @@ int main(int argc, char* argv[]) {
     });
     for (int page = 0; page < kPageCount; ++page) {
       QTimer::singleShot(after_pages + 80 + page * 70, &app, [window, page]() {
-        window->setProperty("currentPage", page);
+        window->setProperty("currentPageKey",
+                            QString::fromLatin1(kPageKeys[page]));
       });
     }
     const int after_narrow = after_pages + 80 + kPageCount * 70;

@@ -66,6 +66,128 @@ namespace backupproject {
 namespace net {
 namespace {
 
+// ---- 上传续传会话的落盘记录 ----
+//
+// 记录与临时文件放在同一个用户目录（<root>/users/<uid>/tmp/<id>.part.resume），
+// 因此“谁能读这条记录”与“谁能读这个半成品”是同一条权限边界。记录里没有
+// 口令、没有 token；即使被同用户读到，也只是他自己上传的元数据。
+//
+// 格式是逐行文本，字段顺序固定：
+//   v1 / user_id / display_name / declared_size / sha256 / kind / parent /
+//   lineage / generation / snapshot_id / checkpoint / checkpoint_sha256
+// display_name 已由协议校验器拒绝换行，其他字段都是数字或十六进制。
+struct UploadResumeRecord {
+  std::uint64_t user_id = 0;
+  std::string display_name;
+  std::uint64_t declared_size = 0;
+  std::string sha256;
+  std::uint16_t kind = 0;
+  std::string parent_id;
+  std::string lineage;
+  std::uint64_t generation = 0;
+  std::string snapshot_id;
+  std::uint64_t checkpoint = 0;
+  std::string checkpoint_sha256;
+};
+
+std::string UploadResumeRecordPath(const std::string& temp_path) {
+  return temp_path + ".resume";
+}
+
+bool WriteUploadResumeRecord(const std::string& temp_path,
+                             const UploadResumeRecord& record,
+                             std::string* error_message) {
+  const std::string path = UploadResumeRecordPath(temp_path);
+  const std::string temporary = path + ".tmp";
+  std::ofstream out(temporary, std::ios::binary | std::ios::trunc);
+  if (!out) {
+    if (error_message != nullptr) *error_message = "cannot create " + temporary;
+    return false;
+  }
+  out << "v1\n" << record.user_id << "\n" << record.display_name << "\n"
+      << record.declared_size << "\n" << record.sha256 << "\n" << record.kind
+      << "\n" << record.parent_id << "\n" << record.lineage << "\n"
+      << record.generation << "\n" << record.snapshot_id << "\n"
+      << record.checkpoint << "\n" << record.checkpoint_sha256 << "\n";
+  out.flush();
+  if (!out) {
+    if (error_message != nullptr) *error_message = "cannot write " + temporary;
+    return false;
+  }
+  out.close();
+  if (::chmod(temporary.c_str(), 0600) != 0 ||
+      ::rename(temporary.c_str(), path.c_str()) != 0) {
+    if (error_message != nullptr) {
+      *error_message = "cannot publish " + path;
+    }
+    ::unlink(temporary.c_str());
+    return false;
+  }
+  return true;
+}
+
+bool ReadUploadResumeRecord(const std::string& temp_path,
+                            UploadResumeRecord* record,
+                            std::string* error_message) {
+  const std::string path = UploadResumeRecordPath(temp_path);
+  std::ifstream in(path, std::ios::binary);
+  if (!in) {
+    if (error_message != nullptr) *error_message = "missing " + path;
+    return false;
+  }
+  std::string version;
+  std::getline(in, version);
+  if (version != "v1") {
+    if (error_message != nullptr) *error_message = "bad version in " + path;
+    return false;
+  }
+  std::string user_id, declared_size, kind, generation, checkpoint;
+  if (!std::getline(in, user_id) || !std::getline(in, record->display_name) ||
+      !std::getline(in, declared_size) || !std::getline(in, record->sha256) ||
+      !std::getline(in, kind) || !std::getline(in, record->parent_id) ||
+      !std::getline(in, record->lineage) || !std::getline(in, generation) ||
+      !std::getline(in, record->snapshot_id) || !std::getline(in, checkpoint) ||
+      !std::getline(in, record->checkpoint_sha256)) {
+    if (error_message != nullptr) *error_message = "truncated " + path;
+    return false;
+  }
+  try {
+    record->user_id = std::stoull(user_id);
+    record->declared_size = std::stoull(declared_size);
+    record->kind = static_cast<std::uint16_t>(std::stoul(kind));
+    record->generation = std::stoull(generation);
+    record->checkpoint = std::stoull(checkpoint);
+  } catch (const std::exception&) {
+    if (error_message != nullptr) *error_message = "bad number in " + path;
+    return false;
+  }
+  return true;
+}
+
+// 把当前上传进度落成一条续传检查点。只在跨过 4 MiB 或连接结束时调用：
+// 每个 256 KiB chunk 都写盘会让上传吞吐掉一个量级。
+bool PersistUploadCheckpoint(ConnectionContext* context,
+                             std::string* error_message) {
+  if (context == nullptr || context->upload_temp_path.empty()) return true;
+  crypto::Sha256 clone = context->upload_hasher;
+  unsigned char digest[crypto::kSha256DigestSize];
+  clone.Final(digest);
+  UploadResumeRecord record;
+  record.user_id = context->user_id;
+  record.display_name = context->upload_display_name;
+  record.declared_size = context->upload_declared_size;
+  record.sha256 = context->upload_sha256;
+  record.kind = context->upload_kind;
+  record.parent_id = context->upload_parent_id;
+  record.lineage = context->upload_lineage;
+  record.generation = context->upload_generation;
+  record.snapshot_id = context->upload_snapshot_id;
+  record.checkpoint = context->upload_received;
+  record.checkpoint_sha256 = crypto::ToHex(digest, crypto::kSha256DigestSize);
+  return WriteUploadResumeRecord(context->upload_temp_path, record,
+                                 error_message);
+}
+
 // listen backlog：worker 全忙时排在这里，超出的连接由内核拒绝。
 constexpr int kListenBacklog = 64;
 // 最大 worker 数。超过这个数就不再是"foundation 的有界模型"了。
@@ -1335,6 +1457,7 @@ void RemoteServer::ResetUploadState(ConnectionContext* context) {
   context->upload_received = 0;
   context->upload_fd = -1;
   context->upload_hasher = crypto::Sha256();
+  context->upload_checkpoint = 0;
   context->state = ConnectionState::kAuthenticated;
 }
 
@@ -1346,10 +1469,33 @@ void RemoteServer::AbortUpload(ConnectionContext* context) {
     context->upload_fd = -1;
   }
   if (!context->upload_temp_path.empty()) {
-    // 失败路径绝不留下半个文件：临时文件在这里被删掉。
+    // 失败路径绝不留下半个文件：临时文件与续传记录在这里一起删掉。
     if (::unlink(context->upload_temp_path.c_str()) != 0 && errno != ENOENT) {
       Log("warning: could not remove the upload temp file");
     }
+    const std::string record = UploadResumeRecordPath(context->upload_temp_path);
+    if (::unlink(record.c_str()) != 0 && errno != ENOENT) {
+      Log("warning: could not remove the upload resume record");
+    }
+  }
+  ResetUploadState(context);
+}
+
+// 连接断了（不是数据校验失败）：保留临时文件与检查点，等客户端回来续传。
+// 这是“断点续传”与“失败清理”的唯一区别：前者保留可验证的前缀，后者删除
+// 任何可能被误当成完整备份的半成品。
+void RemoteServer::SuspendUpload(ConnectionContext* context) {
+  if (context->upload_temp_path.empty()) {
+    ResetUploadState(context);
+    return;
+  }
+  std::string error;
+  if (!PersistUploadCheckpoint(context, &error)) {
+    Log("warning: could not persist the upload checkpoint: " + error);
+  }
+  if (context->upload_fd >= 0) {
+    ::close(context->upload_fd);
+    context->upload_fd = -1;
   }
   ResetUploadState(context);
 }
@@ -1377,9 +1523,145 @@ void RemoteServer::CleanupConnection(ConnectionContext* context) {
   // 两个都要做：客户端半路断开时上传要删临时文件、下载要关句柄。
   if (context->state == ConnectionState::kUploadInProgress ||
       context->upload_fd >= 0) {
-    AbortUpload(context);
+    // 断连保留可续传的前缀；客户端主动取消走 AbortUpload（删文件）。
+    SuspendUpload(context);
   }
   CloseDownload(context);
+}
+
+// 能力协商：老服务端不认识这个操作码，会回 kError；新客户端据此明确关闭
+// 续传，而不是“试一下再说”。
+bool RemoteServer::HandleCapabilities(int fd, const FrameHeader& header,
+                                      const std::string& payload,
+                                      ConnectionContext* context,
+                                      std::string* error_message) {
+  (void)context;
+  if (!payload.empty()) {
+    return SendError(fd, header.opcode, header.request_id,
+                     Status::kInvalidRequest, error_message);
+  }
+  PayloadBuilder builder;
+  builder.AppendU16(kTransferProtocolVersion);
+  builder.AppendU32(kCapabilityResumableTransfer);
+  return SendStatus(fd, header, Status::kOk, builder.data(), error_message);
+}
+
+// 断点续传的上传协商。服务端只接受**自己记录过、且前缀已经验证**的位置：
+//   * id 属于当前用户；
+//   * 临时文件还在，且长度不小于检查点；
+//   * 检查点 <= 客户端声称已发送的字节数（否则客户端会跳过没发过的数据）；
+//   * 磁盘上前缀的 SHA-256 与检查点记录一致。
+// 任何一条不成立都回 kInvalidState：客户端从 0 重新走 UPLOAD_BEGIN，
+// 不猜测、不截断到“看起来差不多”的位置。
+bool RemoteServer::HandleUploadResumeBegin(int fd, const FrameHeader& header,
+                                           const std::string& payload,
+                                           ConnectionContext* context,
+                                           std::string* error_message) {
+  if (context->state != ConnectionState::kAuthenticated) {
+    return SendError(fd, header.opcode, header.request_id,
+                     Status::kUnauthorized, error_message);
+  }
+  if (RejectIfAccountMissing(fd, header, context, error_message)) return true;
+  PayloadReader reader(payload);
+  std::string upload_id;
+  std::uint64_t requested_offset = 0;
+  if (!reader.ReadString(kMaxSnapshotIdBytes, &upload_id) ||
+      !reader.ReadU64(&requested_offset) || !reader.AtEnd()) {
+    return SendError(fd, header.opcode, header.request_id,
+                     Status::kInvalidRequest, error_message);
+  }
+  std::string validation_error;
+  if (!IsValidSnapshotId(upload_id, &validation_error)) {
+    return SendError(fd, header.opcode, header.request_id,
+                     Status::kInvalidRequest, error_message);
+  }
+  const std::string directory =
+      UserDirectory(static_cast<std::int64_t>(context->user_id));
+  const std::string temp_path = directory + "/tmp/" + upload_id + ".part";
+  struct stat info;
+  if (::lstat(temp_path.c_str(), &info) != 0) {
+    return SendError(fd, header.opcode, header.request_id, Status::kNotFound,
+                     error_message);
+  }
+  UploadResumeRecord record;
+  std::string record_error;
+  if (!ReadUploadResumeRecord(temp_path, &record, &record_error)) {
+    Log("rejecting a resume without a valid record: " + record_error);
+    return SendError(fd, header.opcode, header.request_id,
+                     Status::kInvalidState, error_message);
+  }
+  if (record.user_id != context->user_id ||
+      record.snapshot_id != upload_id) {
+    return SendError(fd, header.opcode, header.request_id,
+                     Status::kInvalidState, error_message);
+  }
+  if (requested_offset < record.checkpoint ||
+      record.checkpoint > record.declared_size ||
+      static_cast<std::uint64_t>(info.st_size) < record.checkpoint) {
+    return SendError(fd, header.opcode, header.request_id,
+                     Status::kInvalidState, error_message);
+  }
+  // 重新读一遍前缀并计算摘要：相信记录里的值等于相信“文件没被改过”，
+  // 那不是校验，只是声明。
+  std::ifstream input(temp_path, std::ios::binary);
+  if (!input) {
+    return SendError(fd, header.opcode, header.request_id,
+                     Status::kInternalError, error_message);
+  }
+  crypto::Sha256 hasher;
+  std::vector<char> buffer(kTransferChunkBytes);
+  std::uint64_t remaining = record.checkpoint;
+  while (remaining > 0) {
+    const std::size_t want = static_cast<std::size_t>(
+        remaining < buffer.size() ? remaining : buffer.size());
+    input.read(buffer.data(), static_cast<std::streamsize>(want));
+    if (input.gcount() != static_cast<std::streamsize>(want)) {
+      return SendError(fd, header.opcode, header.request_id,
+                       Status::kInternalError, error_message);
+    }
+    hasher.Update(buffer.data(), want);
+    remaining -= want;
+  }
+  unsigned char digest[crypto::kSha256DigestSize];
+  crypto::Sha256 check = hasher;
+  check.Final(digest);
+  if (crypto::ToHex(digest, crypto::kSha256DigestSize) !=
+      record.checkpoint_sha256) {
+    Log("rejecting a resume whose prefix no longer matches its checkpoint");
+    return SendError(fd, header.opcode, header.request_id,
+                     Status::kInvalidState, error_message);
+  }
+  input.close();
+  // 检查点之后的字节没有经过验证（也可能是写了一半的块）：截掉再续。
+  if (::truncate(temp_path.c_str(),
+                 static_cast<off_t>(record.checkpoint)) != 0) {
+    return SendError(fd, header.opcode, header.request_id,
+                     Status::kInternalError, error_message);
+  }
+  const int temp_fd = ::open(temp_path.c_str(), O_WRONLY);
+  if (temp_fd < 0 || ::lseek(temp_fd, 0, SEEK_END) < 0) {
+    if (temp_fd >= 0) ::close(temp_fd);
+    return SendError(fd, header.opcode, header.request_id,
+                     Status::kInternalError, error_message);
+  }
+  context->state = ConnectionState::kUploadInProgress;
+  context->upload_display_name = record.display_name;
+  context->upload_declared_size = record.declared_size;
+  context->upload_sha256 = record.sha256;
+  context->upload_snapshot_id = record.snapshot_id;
+  context->upload_temp_path = temp_path;
+  context->upload_received = record.checkpoint;
+  context->upload_fd = temp_fd;
+  context->upload_hasher = hasher;
+  context->upload_kind = record.kind;
+  context->upload_parent_id = record.parent_id;
+  context->upload_generation = record.generation;
+  context->upload_lineage = record.lineage;
+  context->upload_checkpoint = record.checkpoint;
+  Log("upload resumed at offset " + std::to_string(record.checkpoint));
+  PayloadBuilder builder;
+  builder.AppendU64(record.checkpoint);
+  return SendStatus(fd, header, Status::kOk, builder.data(), error_message);
 }
 
 // 一次上传的协商阶段：定下名字、长度、摘要与链关系，并创建临时文件。真正的
@@ -1556,7 +1838,36 @@ bool RemoteServer::HandleUploadBegin(int fd, const FrameHeader& header,
   context->upload_parent_id = parent_snapshot_id;
   context->upload_generation = generation;
   context->upload_lineage = lineage;
-  return SendStatus(fd, header, Status::kOk, std::string(), error_message);
+  context->upload_checkpoint = 0;
+  // 续传会话记录：客户端拿到 upload_id 之后，下一次失败可以带着它回来。
+  // 记录写不出来不是致命错误（仍然可以完成这次上传，只是无法续传），
+  // 但必须留下日志，不能让“静默不支持续传”变成看不见的状态。
+  UploadResumeRecord resume;
+  resume.user_id = context->user_id;
+  resume.display_name = display_name;
+  resume.declared_size = declared_size;
+  resume.sha256 = declared_sha256;
+  resume.kind = snapshot_kind;
+  resume.parent_id = parent_snapshot_id;
+  resume.lineage = lineage;
+  resume.generation = generation;
+  resume.snapshot_id = snapshot_id;
+  resume.checkpoint = 0;
+  resume.checkpoint_sha256 = crypto::Sha256Hex(std::string());
+  std::string resume_error;
+  if (!WriteUploadResumeRecord(temp_path, resume, &resume_error)) {
+    Log("warning: upload resume record not written: " + resume_error);
+  }
+  std::string response;
+  PayloadBuilder builder;
+  std::string build_error;
+  if (!builder.AppendString(snapshot_id, kMaxSnapshotIdBytes, &build_error)) {
+    AbortUpload(context);
+    return SendError(fd, header.opcode, header.request_id,
+                     Status::kInternalError, error_message);
+  }
+  response = builder.data();
+  return SendStatus(fd, header, Status::kOk, response, error_message);
 }
 
 // 数据块：写进临时文件，同时把同一份字节喂给摘要器（顺序读一遍就同时完成
@@ -1600,6 +1911,17 @@ bool RemoteServer::HandleUploadChunk(int fd, const FrameHeader& header,
   }
   context->upload_hasher.Update(payload.data(), payload.size());
   context->upload_received += payload.size();
+  // 4 MiB 一个检查点：断点续传最多重传 4 MiB，而不是整份归档。
+  constexpr std::uint64_t kCheckpointInterval = 4ull * 1024ull * 1024ull;
+  if (context->upload_received - context->upload_checkpoint >=
+      kCheckpointInterval) {
+    std::string persist_error;
+    if (PersistUploadCheckpoint(context, &persist_error)) {
+      context->upload_checkpoint = context->upload_received;
+    } else {
+      Log("warning: could not persist a checkpoint: " + persist_error);
+    }
+  }
   return SendStatus(fd, header, Status::kOk, std::string(), error_message);
 }
 
@@ -1689,6 +2011,14 @@ bool RemoteServer::HandleUploadEnd(int fd, const FrameHeader& header,
     AbortUpload(context);
     return SendError(fd, header.opcode, header.request_id,
                      Status::kInternalError, error_message);
+  }
+  {
+    // 已发布：续传记录不再有意义。删不掉也只是留下一个永远不会再匹配的
+    // 孤儿记录（临时文件已经不在了），不影响正确性。
+    const std::string resume_record = UploadResumeRecordPath(temp_path);
+    if (::unlink(resume_record.c_str()) != 0 && errno != ENOENT) {
+      Log("warning: could not remove the upload resume record");
+    }
   }
   FsyncDirectory(directory);
 
@@ -1858,6 +2188,87 @@ bool RemoteServer::HandleDownloadBegin(int fd, const FrameHeader& header,
 // 也就没有"用偏移量去探测别人的数据"这条路。
 // 空 payload 是流结束的信号（读到的字节数为 0），客户端据此停止循环；累计发送
 // 数超过元数据声明的长度说明磁盘上的文件被换过，直接中止这次下载。
+// 断点续传的下载协商：快照不可变，所以 0..size 之间任意 offset 都是安全的。
+// 响应里重新给出名称 / 摘要 / 总长度，客户端据此复核“续的确实是那一份”。
+bool RemoteServer::HandleDownloadResumeBegin(int fd, const FrameHeader& header,
+                                             const std::string& payload,
+                                             ConnectionContext* context,
+                                             std::string* error_message) {
+  if (context->state != ConnectionState::kAuthenticated) {
+    return SendError(fd, header.opcode, header.request_id,
+                     Status::kUnauthorized, error_message);
+  }
+  if (RejectIfAccountMissing(fd, header, context, error_message)) return true;
+  PayloadReader reader(payload);
+  std::string snapshot_id;
+  std::uint64_t offset = 0;
+  if (!reader.ReadString(kMaxSnapshotIdBytes, &snapshot_id) ||
+      !reader.ReadU64(&offset) || !reader.AtEnd()) {
+    return SendError(fd, header.opcode, header.request_id,
+                     Status::kInvalidRequest, error_message);
+  }
+  std::string validation_error;
+  if (!IsValidSnapshotId(snapshot_id, &validation_error)) {
+    return SendError(fd, header.opcode, header.request_id,
+                     Status::kInvalidRequest, error_message);
+  }
+  RemoteSnapshotRecord record;
+  std::string store_error;
+  const StoreResult result = store_->FindSnapshot(
+      static_cast<std::int64_t>(context->user_id), snapshot_id, &record,
+      &store_error);
+  if (result == StoreResult::kNotFound) {
+    return SendError(fd, header.opcode, header.request_id, Status::kNotFound,
+                     error_message);
+  }
+  if (result != StoreResult::kOk) {
+    Log("cannot read the snapshot row: " + store_error);
+    return SendError(fd, header.opcode, header.request_id,
+                     Status::kInternalError, error_message);
+  }
+  if (record.storage_name.empty() ||
+      record.storage_name.find('/') != std::string::npos ||
+      record.storage_name != record.snapshot_id + ".bak") {
+    return SendError(fd, header.opcode, header.request_id,
+                     Status::kInternalError, error_message);
+  }
+  if (offset > record.size_bytes) {
+    return SendError(fd, header.opcode, header.request_id,
+                     Status::kInvalidRequest, error_message);
+  }
+  const std::string path =
+      UserDirectory(record.user_id) + "/" + record.storage_name;
+  const int blob_fd = ::open(path.c_str(), O_RDONLY);
+  if (blob_fd < 0) {
+    return SendError(fd, header.opcode, header.request_id, Status::kNotFound,
+                     error_message);
+  }
+  if (offset > 0 && ::lseek(blob_fd, static_cast<off_t>(offset), SEEK_SET) < 0) {
+    ::close(blob_fd);
+    return SendError(fd, header.opcode, header.request_id,
+                     Status::kInternalError, error_message);
+  }
+  context->state = ConnectionState::kDownloadInProgress;
+  context->download_snapshot_id = snapshot_id;
+  context->download_size = record.size_bytes;
+  context->download_sha256 = record.sha256;
+  context->download_sent = offset;
+  context->download_fd = blob_fd;
+  Log("download resumed at offset " + std::to_string(offset));
+  PayloadBuilder builder;
+  std::string build_error;
+  if (!builder.AppendString(record.display_name, kMaxDisplayNameBytes,
+                            &build_error) ||
+      !builder.AppendString(record.sha256, kSha256HexBytes, &build_error)) {
+    CloseDownload(context);
+    return SendError(fd, header.opcode, header.request_id,
+                     Status::kInternalError, error_message);
+  }
+  builder.AppendU64(record.size_bytes);
+  builder.AppendU64(offset);
+  return SendStatus(fd, header, Status::kOk, builder.data(), error_message);
+}
+
 bool RemoteServer::HandleDownloadChunk(int fd, const FrameHeader& header,
                                        const std::string& payload,
                                        ConnectionContext* context,
@@ -2182,16 +2593,24 @@ bool RemoteServer::HandleFrame(int fd, const FrameHeader& header,
       return HandleLogout(fd, header, context, error_message);
     case Opcode::kResume:
       return HandleResume(fd, header, payload, context, error_message);
+    case Opcode::kCapabilities:
+      return HandleCapabilities(fd, header, payload, context, error_message);
     case Opcode::kList:
       return HandleList(fd, header, context, error_message);
     case Opcode::kUploadBegin:
       return HandleUploadBegin(fd, header, payload, context, error_message);
+    case Opcode::kUploadResumeBegin:
+      return HandleUploadResumeBegin(fd, header, payload, context,
+                                     error_message);
     case Opcode::kUploadChunk:
       return HandleUploadChunk(fd, header, payload, context, error_message);
     case Opcode::kUploadEnd:
       return HandleUploadEnd(fd, header, payload, context, error_message);
     case Opcode::kDownloadBegin:
       return HandleDownloadBegin(fd, header, payload, context, error_message);
+    case Opcode::kDownloadResumeBegin:
+      return HandleDownloadResumeBegin(fd, header, payload, context,
+                                       error_message);
     case Opcode::kDownloadChunk:
       return HandleDownloadChunk(fd, header, payload, context, error_message);
     case Opcode::kDownloadEnd:

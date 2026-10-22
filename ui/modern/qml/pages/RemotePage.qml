@@ -65,6 +65,10 @@ Item {
     id: page
     objectName: "remotePage"
 
+    // 作为“备份管理 / 云端仓库”标签页的内容嵌入时，本页不再画自己的大标题：
+    // 外层已经有一条页面标题与标签栏，重复的标题会让用户以为进错了页面。
+    property bool embedded: false
+
     // ---------- 草稿 ----------
     // 输入框里的是草稿：只有点"登录 / 注册 / 上传 / 下载"时才交给控制器。
     // 用户每敲一个字符就改 endpoint 会让"上一个真正生效的地址"和"正在编辑的
@@ -82,6 +86,12 @@ Item {
     // 因为当前部署的服务端只监听它自己的回环地址）；"direct" = 直连（高级，
     // 逻辑与"不经隧道"的既有行为完全一样）。
     property string draftConnectionMode: "ssh"
+    // 三个正交维度：服务器 / 连接方式 / 身份验证。
+    // connectionMode 仍从控制器读，作为 transport + server 的兼容投影。
+    property string draftServerKind: "custom"
+    property string draftAuthMode: "pin"
+    property string draftTrustedRoots: ""
+    property string draftExpectedServerId: ""
     // ~/.ssh/config 里的别名（当前部署是 aliyun-ecs）或 user@host。
     property string draftSshHost: ""
     // 空 = 自动挑一个空闲回环端口。**不**默认写死 18765：那个端口很可能已经
@@ -140,11 +150,18 @@ Item {
     // 那一条提示（§4）。
     readonly property bool pinDirty:
         page.draftServerKeyPin.trim() !== remote.appliedServerKeyPin
-    readonly property bool sshMode: page.draftConnectionMode === "ssh"
-    // 官方云端：身份与地址都来自编译进二进制的 profile，界面上不需要任何输入。
-    // 几个派生布尔量把"当前模式"变成可读的绑定：模板里到处写
-    // draftConnectionMode === "..." 容易写错，也不利于以后再加一种模式。
-    readonly property bool officialMode: page.draftConnectionMode === "official"
+    // 官方服务器：地址与身份都来自编译进二进制的 profile，界面上不需要输入。
+    // 自建服务器：连接方式与身份验证是两个独立维度。
+    readonly property bool officialMode: page.draftServerKind === "official"
+    readonly property bool customMode: page.draftServerKind === "custom"
+    readonly property bool sshMode: page.customMode
+                                    && page.draftConnectionMode === "ssh"
+    readonly property bool directMode: page.customMode
+                                       && page.draftConnectionMode === "direct"
+    readonly property bool certificateMode: page.customMode
+                                            && page.draftAuthMode === "certificate"
+    readonly property bool pinMode: page.customMode
+                                    && page.draftAuthMode === "pin"
     // 通道状态的颜色：建好了是绿的，失败是红的，正在动是黄的，没启动是灰的。
     readonly property color tunnelColor:
         remote.tunnelState === "ready" ? theme.success
@@ -172,6 +189,10 @@ Item {
         // 连接方式与 SSH 参数也回填：调用方（自检 / 命令行）已经配好的值要
         // 出现在页面上，用户看到的永远是"现在真的会用哪一个"。
         page.draftConnectionMode = remote.connectionMode
+        page.draftServerKind = remote.serverKind
+        page.draftAuthMode = remote.authMode
+        page.draftTrustedRoots = remote.trustedRootsFile
+        page.draftExpectedServerId = remote.expectedServerId
         page.draftSshHost = remote.sshHost
         page.draftSshLocalPort = remote.sshLocalPort
     }
@@ -188,6 +209,8 @@ Item {
 
         function onConnectionChanged() {
             page.draftConnectionMode = remote.connectionMode
+            page.draftServerKind = remote.serverKind
+            page.draftAuthMode = remote.authMode
         }
     }
 
@@ -404,7 +427,8 @@ Item {
             spacing: 16
 
             Text {
-                text: "远程备份"
+                visible: !page.embedded
+                text: "云端仓库"
                 font.pixelSize: 30
                 font.weight: Font.DemiBold
                 color: theme.textPrimary
@@ -412,6 +436,7 @@ Item {
 
             Text {
                 Layout.fillWidth: true
+                visible: !page.embedded
                 text: "把本机的备份存到云端服务器，需要时可以再取回来。"
                 font.pixelSize: 17
                 color: theme.textSecondary
@@ -453,42 +478,97 @@ Item {
                         spacing: 6
 
                         Text {
-                            text: "连接方式"
+                            text: "服务器"
                             font.pixelSize: 15
                             color: theme.textSecondary
                         }
 
+                        SegmentedTabs {
+                            objectName: "remoteServerKindTabs"
+                            Layout.preferredWidth: 420
+                            enabled: !remote.busy
+                            currentKey: page.draftServerKind
+                            model: [
+                                { "key": "official", "text": "官方服务器" },
+                                { "key": "custom", "text": "自建服务器" }
+                            ]
+                            onActivated: function (key) {
+                                if (!remote.setServerKind(key))
+                                    return
+                                page.draftServerKind = remote.serverKind
+                                page.draftConnectionMode =
+                                    remote.connectionMode
+                                page.draftAuthMode = remote.authMode
+                            }
+                        }
+
+                        // 自建服务器才有“怎么连”。官方服务器固定直连 + 证书。
                         RowLayout {
                             Layout.fillWidth: true
+                            Layout.topMargin: 6
                             spacing: 12
+                            visible: page.customMode
 
-                            SegmentedTabs {
-                                objectName: "remoteConnectionModeTabs"
-                                Layout.preferredWidth: 600
-                                enabled: !remote.busy
-                                currentKey: page.draftConnectionMode
-                                model: [
-                                    // 官方云端是普通用户的默认 / 推荐路径；
-                                    // SSH 安全通道降为“兼容”：仍然完全可用，
-                                    // 只是官方用户不需要理解它。
-                                    { "key": "official",
-                                      "text": "官方云端（推荐）" },
-                                    { "key": "ssh",
-                                      "text": "SSH 安全通道（兼容）" },
-                                    { "key": "direct",
-                                      "text": "直接连接（高级）" }
-                                ]
-                                onActivated: function (key) {
-                                    page.draftConnectionMode = key
-                                    remote.setConnectionMode(key)
-                                    // 换模式不动已经建立的通道，也不联网：
-                                    // 这是配置动作。页面把状态原样显示出来。
-                                    page.draftSshHost = remote.sshHost
-                                    page.draftSshLocalPort = remote.sshLocalPort
+                            ColumnLayout {
+                                spacing: 4
+
+                                Text {
+                                    text: "连接方式"
+                                    font.pixelSize: 15
+                                    color: theme.textSecondary
+                                }
+
+                                SegmentedTabs {
+                                    objectName: "remoteConnectionModeTabs"
+                                    Layout.preferredWidth: 380
+                                    enabled: !remote.busy
+                                    currentKey: page.draftConnectionMode
+                                    model: [
+                                        { "key": "direct", "text": "直接连接" },
+                                        { "key": "ssh",
+                                          "text": "SSH 安全通道" }
+                                    ]
+                                    onActivated: function (key) {
+                                        if (!remote.setServerKind("custom"))
+                                            return
+                                        if (!remote.setConnectionMode(key))
+                                            return
+                                        page.draftServerKind = remote.serverKind
+                                        page.draftConnectionMode =
+                                            remote.connectionMode
+                                        page.draftSshHost = remote.sshHost
+                                        page.draftSshLocalPort =
+                                            remote.sshLocalPort
+                                    }
                                 }
                             }
 
-                            Item { Layout.fillWidth: true }
+                            ColumnLayout {
+                                spacing: 4
+
+                                Text {
+                                    text: "身份验证"
+                                    font.pixelSize: 15
+                                    color: theme.textSecondary
+                                }
+
+                                SegmentedTabs {
+                                    objectName: "remoteAuthModeTabs"
+                                    Layout.preferredWidth: 380
+                                    enabled: !remote.busy
+                                    currentKey: page.draftAuthMode
+                                    model: [
+                                        { "key": "certificate",
+                                          "text": "证书认证" },
+                                        { "key": "pin", "text": "公钥指纹认证" }
+                                    ]
+                                    onActivated: function (key) {
+                                        if (!remote.setAuthMode(key))
+                                            return
+                                        page.draftAuthMode = remote.authMode
+                                    }
+                                }
+                            }
                         }
                     }
 
@@ -804,12 +884,87 @@ Item {
                     // 服务器身份指纹：连接设置的一部分（地址 / 端口 / 用户名 /
                     // 指纹）。指纹错了就是一个输入问题，"应用"之后原因写在这
                     // 张表单自己的错误行里，不弹对话框，也不占用页面底部横幅。
-                    // 官方模式用证书认证，根本不比对指纹，所以整块隐藏。
+                    // ---------- 自建 + 证书 ----------
+                    // 可信根与预期 server_id 都必须由用户明确给出；为空时提交
+                    // 会被拒绝，程序绝不回退到内置官方根。
+                    ColumnLayout {
+                        Layout.fillWidth: true
+                        Layout.topMargin: 4
+                        spacing: 6
+                        visible: page.certificateMode
+
+                        Text {
+                            text: "可信根文件"
+                            font.pixelSize: 15
+                            color: theme.textSecondary
+                        }
+
+                        RowLayout {
+                            Layout.fillWidth: true
+                            spacing: 8
+
+                            AppTextField {
+                                objectName: "remoteTrustedRootsField"
+                                Layout.fillWidth: true
+                                enabled: !remote.busy
+                                placeholderText:
+                                    "服务器管理员提供的根证书文件"
+                                text: page.draftTrustedRoots
+                                onTextEdited: {
+                                    page.draftTrustedRoots = text
+                                    remote.setCertificateSettings(
+                                        page.draftTrustedRoots,
+                                        page.draftExpectedServerId)
+                                }
+                            }
+
+                            AppButton {
+                                objectName: "remoteTrustedRootsBrowse"
+                                text: "选择文件"
+                                iconName: "folder"
+                                enabled: !remote.busy
+                                onClicked: rootsDialog.open()
+                            }
+                        }
+
+                        Text {
+                            text: "预期服务器标识（server_id）"
+                            font.pixelSize: 15
+                            color: theme.textSecondary
+                            Layout.topMargin: 4
+                        }
+
+                        AppTextField {
+                            objectName: "remoteExpectedServerIdField"
+                            Layout.fillWidth: true
+                            enabled: !remote.busy
+                            placeholderText: "例如 my-server"
+                            text: page.draftExpectedServerId
+                            onTextEdited: {
+                                page.draftExpectedServerId = text
+                                remote.setCertificateSettings(
+                                    page.draftTrustedRoots,
+                                    page.draftExpectedServerId)
+                            }
+                        }
+
+                        Text {
+                            Layout.fillWidth: true
+                            text: "证书认证会校验服务器签名、可信根与服务器标识；"
+                                + "任何一项不匹配都会明确失败，不会自动降级。"
+                            font.pixelSize: 14
+                            color: theme.textSecondary
+                            wrapMode: Text.WordWrap
+                        }
+                    }
+
+                    // 指纹只属于“公钥指纹认证”，与连接方式无关：SSH 通道里
+                    // 也照样比对指纹。
                     ColumnLayout {
                         Layout.fillWidth: true
                         Layout.topMargin: 4
                         spacing: 4
-                        visible: !page.officialMode
+                        visible: page.pinMode
 
                         Text {
                             text: "服务器身份指纹（server-key）"
@@ -978,6 +1133,7 @@ Item {
                                     // 这里只是让调用点与当前模式的语义一致。
                                     if (!remote.busy)
                                         page.officialMode
+                                            || page.certificateMode
                                             ? remote.login(
                                                 page.draftHost,
                                                 page.draftPort,
@@ -1008,6 +1164,7 @@ Item {
                                     // 人工 pin 模式（ssh / direct）
                                     // 保持“先自动提交再登录”。
                                     onClicked: page.officialMode
+                                               || page.certificateMode
                                                ? remote.login(
                                                    page.draftHost,
                                                    page.draftPort,
@@ -1115,6 +1272,7 @@ Item {
                                     enabled: !remote.busy
                                     // 官方云端模式不走人工 pin。
                                     onClicked: page.officialMode
+                                               || page.certificateMode
                                                ? remote.registerAccount(
                                                    page.draftHost,
                                                    page.draftPort,
@@ -2286,4 +2444,21 @@ Item {
             }
         }
     }
+    // 可信根文件只选路径；证书内容由网络层读取。
+    FileDialog {
+        id: rootsDialog
+        objectName: "remoteTrustedRootsDialog"
+        title: "选择可信根证书"
+        fileMode: FileDialog.OpenFile
+        onAccepted: {
+            const chosen =
+                remote.localPathFromUrl(rootsDialog.selectedFile)
+            if (chosen !== "") {
+                page.draftTrustedRoots = chosen
+                remote.setCertificateSettings(page.draftTrustedRoots,
+                                              page.draftExpectedServerId)
+            }
+        }
+    }
+
 }

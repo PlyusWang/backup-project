@@ -62,6 +62,9 @@ Item {
     // GUI 与 backupctl 用的是同一套解析规则。下拉框则用下标，因为选项表由
     // 控制器提供，页面只认下标对应的 key。
     property int draftCompressionIndex: 0
+    property int draftEncryptionIndex: 0
+    // 无人值守加密的口令文件草稿。只保存路径，口令内容由核心在运行时读取。
+    property string draftCredentialFile: ""
 
     // 高级设置默认收起：一打开页面先看到日常要用的那几项。
     property bool advancedExpanded: false
@@ -76,6 +79,21 @@ Item {
     readonly property var packLabels: controller.optionPackLabels
     readonly property var compressionKeys: ["none", "huffman", "lzss-huffman"]
     readonly property var compressionLabels: controller.optionCompressionLabels
+    // 三种备份方式共用同一组加密 key / 显示名（backupOptions 是唯一来源）。
+    readonly property var encryptionKeys: ["none",
+                                           "aes-256-ctr-hmac-sha256",
+                                           "des-cbc-hmac-sha256"]
+    readonly property var encryptionLabels: backupOptions.encryptionLabels
+    readonly property string encryptionKeyValue:
+        page.encryptionKeys[page.draftEncryptionIndex]
+    // 组合校验问共享真值表；文案由 backupOptions 翻译成中文。
+    readonly property string optionError: backupOptions.validate(
+        "scheduled",
+        page.strategyKeys[page.draftStrategyIndex],
+        page.packKeys[page.draftPackIndex],
+        page.compressionKeys[page.draftCompressionIndex],
+        page.encryptionKeyValue,
+        page.draftCredentialFile.length > 0)
 
     // 频率单位来自控制器（背后是共享核心的分钟边界），界面不自己定义单位表。
     // 单位表来自控制器，背后是共享核心的分钟边界（分钟 / 小时 / 天）。页面
@@ -105,6 +123,9 @@ Item {
             Math.max(0, page.packKeys.indexOf(schedule.packKey))
         page.draftCompressionIndex =
             Math.max(0, page.compressionKeys.indexOf(schedule.compressionKey))
+        page.draftEncryptionIndex =
+            Math.max(0, page.encryptionKeys.indexOf(schedule.encryptionKey))
+        page.draftCredentialFile = schedule.credentialFile
         // 落盘配置里的规则读进共享编辑器（校验仍然走共享 builder）。读不懂时
         // 编辑器会显示共享核心给出的原因，这里不吞掉它。
         ruleEditor.loadRules(schedule.includeRules, schedule.excludeRules)
@@ -120,6 +141,7 @@ Item {
         schedule.enabled, schedule.sourcePath, schedule.intervalMinutes,
         schedule.retainCount, schedule.strategyKey,
         schedule.packKey, schedule.compressionKey,
+        schedule.encryptionKey, schedule.credentialFile,
         schedule.includeRules.join(","), schedule.excludeRules.join(",")
     ].join("|")
     onSavedSignatureChanged: syncFromController()
@@ -153,7 +175,7 @@ Item {
             spacing: 16
 
             Text {
-                text: "自动备份"
+                text: "定时备份"
                 font.pixelSize: 30
                 font.weight: Font.DemiBold
                 color: theme.textPrimary
@@ -424,22 +446,31 @@ Item {
                             text: "保存设置"
                             variant: "primary"
                             enabled: !schedule.libraryBusy
+                                     && page.optionError.length === 0
                             // 频率（值 + 单位）与保留数量按**文本**交给 C++：
                             // QML 的 parseInt 会把 "12abc" 悄悄变成 12，
                             // 而 backupctl 会明确拒绝它。解析规则只有一份，
                             // 在共享核心里。
-                            onClicked: schedule.saveConfigFromFrequencyText(
-                                page.draftEnabled,
-                                page.draftSource,
-                                page.draftFrequencyValue,
-                                page.draftFrequencyUnit,
-                                page.draftRetain,
-                                page.packKeys[page.draftPackIndex],
-                                page.compressionKeys[
-                                    page.draftCompressionIndex],
-                                ruleEditor.includeRuleTexts,
-                                ruleEditor.excludeRuleTexts,
-                                page.strategyKeys[page.draftStrategyIndex])
+                            // 先把加密选择交给控制器草稿（只改内存），
+                            // 再由唯一的保存入口整份提交。任何一步拒绝都不写盘。
+                            onClicked: {
+                                if (!schedule.setEncryptionChoice(
+                                        page.encryptionKeyValue,
+                                        page.draftCredentialFile))
+                                    return
+                                schedule.saveConfigFromFrequencyText(
+                                    page.draftEnabled,
+                                    page.draftSource,
+                                    page.draftFrequencyValue,
+                                    page.draftFrequencyUnit,
+                                    page.draftRetain,
+                                    page.packKeys[page.draftPackIndex],
+                                    page.compressionKeys[
+                                        page.draftCompressionIndex],
+                                    ruleEditor.includeRuleTexts,
+                                    ruleEditor.excludeRuleTexts,
+                                    page.strategyKeys[page.draftStrategyIndex])
+                            }
                         }
 
                         AppButton {
@@ -585,11 +616,76 @@ Item {
                             Layout.fillWidth: true
                         }
 
-                        // 加密：一条弱提示，不再摆一个永远点不动的下拉框。
-                        // 说明来自控制器（控制器读的是核心里那句唯一来源）。
+                        // 加密：与快速备份、实时备份同一组 key 与显示名。
+                        // 无人值守任务没有交互输入，口令只来自一个 0600 文件。
+                        RowLayout {
+                            Layout.fillWidth: true
+                            spacing: 24
+                            visible: page.advancedExpanded
+
+                            ColumnLayout {
+                                spacing: 4
+
+                                Text {
+                                    text: "加密方式"
+                                    font.pixelSize: 16
+                                    color: theme.textSecondary
+                                }
+
+                                AppComboBox {
+                                    objectName: "scheduleEncryptionCombo"
+                                    implicitWidth: 260
+                                    enabled: !schedule.libraryBusy
+                                    model: page.encryptionLabels
+                                    currentIndex: page.draftEncryptionIndex
+                                    onActivated: page.draftEncryptionIndex =
+                                        currentIndex
+                                }
+                            }
+
+                            ColumnLayout {
+                                Layout.fillWidth: true
+                                spacing: 4
+                                visible: page.encryptionKeyValue !== "none"
+
+                                Text {
+                                    text: "口令文件（权限 0600）"
+                                    font.pixelSize: 16
+                                    color: theme.textSecondary
+                                }
+
+                                RowLayout {
+                                    Layout.fillWidth: true
+                                    spacing: 8
+
+                                    AppTextField {
+                                        objectName: "scheduleCredentialField"
+                                        Layout.fillWidth: true
+                                        enabled: !schedule.libraryBusy
+                                        placeholderText:
+                                            "选择仅本人可读的口令文件"
+                                        text: page.draftCredentialFile
+                                        onTextEdited:
+                                            page.draftCredentialFile = text
+                                    }
+
+                                    AppButton {
+                                        objectName: "scheduleCredentialBrowse"
+                                        text: "选择文件"
+                                        iconName: "folder"
+                                        enabled: !schedule.libraryBusy
+                                        onClicked: {
+                                            credentialDialog.currentFolder =
+                                                controller.directoryDialogStartUrl(
+                                                    page.draftCredentialFile)
+                                            credentialDialog.open()
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
                         Text {
-                            // 说明文字来自控制器（控制器读核心那句唯一来源），
-                            // 页面不重复写一份"暂不支持加密"的解释。
                             objectName: "scheduleEncryptionNote"
                             visible: page.advancedExpanded
                             Layout.fillWidth: true
@@ -599,14 +695,16 @@ Item {
                             wrapMode: Text.WordWrap
                         }
 
+                        // 组合不成立时在保存按钮上方直接说明，而不是等核心拒绝。
                         Text {
-                            objectName: "scheduleEncryptionText"
+                            objectName: "scheduleOptionError"
                             visible: page.advancedExpanded
-                            // 曾经是一个永远点不动的下拉框，现在退化成一条
-                            // 说明；objectName 保留，测试仍在同一位置断言。
-                            text: "加密：暂不支持"
+                                     && page.optionError.length > 0
+                            Layout.fillWidth: true
+                            text: page.optionError
                             font.pixelSize: 14
-                            color: theme.textDisabled
+                            color: theme.error
+                            wrapMode: Text.WordWrap
                         }
 
                     }
@@ -855,6 +953,20 @@ Item {
                 schedule.localPathFromUrl(sourceDialog.selectedFolder)
             if (chosen !== "")
                 page.draftSource = chosen
+        }
+    }
+
+    // 口令文件只选路径；内容由核心在每次运行时读取，界面从不显示它。
+    FileDialog {
+        id: credentialDialog
+        objectName: "scheduleCredentialDialog"
+        title: "选择加密口令文件"
+        fileMode: FileDialog.OpenFile
+        onAccepted: {
+            const chosen =
+                controller.localPathFromUrl(credentialDialog.selectedFile)
+            if (chosen !== "")
+                page.draftCredentialFile = chosen
         }
     }
 }

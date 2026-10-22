@@ -1,37 +1,34 @@
 // HomePage.qml
 //
-// 首页只展示真实存在的东西：入口按钮 + 当前操作状态。
-// 不加“备份次数 / 节省空间 / 安全评分”这类当前根本没有的数据。
+// 首页只展示真实存在的东西：四个入口 + 当前操作状态。
+// 四张卡片在宽屏下同行等宽，窄屏自动退化成 2×2 或单列；
+// 按钮落在卡片底部，同一行的按钮因此保持同一条基线。
 
-// 职责边界：本页只负责“把入口摆出来 + 显示全局状态”。它不读配置、不碰备份引擎、
-// 不发起任何操作：按钮只发出导航意图（navigateTo），切页由 Main.qml 决定；
-// 状态是 controller 的只读投影（statusScope / statusKind / 消息文本等）。
+// 职责边界：本页只负责“把入口摆出来 + 显示全局状态”。它不读配置、不碰备份
+// 引擎、不发起任何操作：按钮只发出语义导航 key，切页由 Main.qml 决定；
+// 状态是 controller 的只读投影。
 import QtQuick
 import QtQuick.Layouts
 
-// 目录导入：AppCard / AppButton / AppIcon / StatusBanner 这些类型名由该目录下的
-// 文件导出，路径相对本文件。新增组件不必在这里登记，但目录名不可改。
 import "../components"
 
 Item {
     id: page
 
-    // 首页不直接操作窗口，交给 Main.qml 处理跳转，页面之间保持解耦。
-    // 页面编号 = Main.qml 里 StackLayout 的子项顺序，是一份跨文件协议：
-    //   1 = BackupPage（手动备份）   2 = SchedulePage（自动备份）
-    //   3 = BackupManagementPage（备份管理）
-    // 新增页面只能追加到 StackLayout 末尾：插在中间会让本页按钮静默跳错页，
-    // 而且没有编译期检查。本页不持有页面状态，只发导航意图。
-    signal navigateTo(int pageIndex)
+    // 语义导航：home / quick / scheduled / realtime / management。
+    signal navigateTo(string key)
 
-    // 整页只有一列，锚在顶部居中而非垂直居中：窗口变高时内容留在上方，
-    // 底部留白交给末尾的弹性 Item；变窄时先由 width 绑定减掉左右边距。
+    // 宽屏四列、中等宽度两列、窄屏单列。阈值按页面可用宽度算，
+    // 不按窗口宽度：侧栏固定 228，窗口宽度不能直接代表卡片可用空间。
+    readonly property int columns: page.width >= 900 ? 4
+                                 : (page.width >= 560 ? 2 : 1)
+
     ColumnLayout {
         id: column
         anchors.horizontalCenter: parent.horizontalCenter
         anchors.top: parent.top
         anchors.topMargin: 32
-        width: Math.min(parent.width - 64, 900)
+        width: Math.min(parent.width - 64, 1080)
         spacing: 18
 
         Text {
@@ -42,129 +39,100 @@ Item {
         }
 
         Text {
-            text: "本地数据备份与恢复"
+            text: "本地与云端数据备份、恢复和管理"
             font.pixelSize: 17
             color: theme.textSecondary
             Layout.topMargin: -10
         }
 
-        RowLayout {
+        GridLayout {
+            id: entries
             Layout.fillWidth: true
             Layout.topMargin: 6
-            spacing: 16
+            columns: page.columns
+            columnSpacing: 16
+            rowSpacing: 16
 
-            // 卡片高度由内容决定（AppCard.implicitHeight），三张卡片再用
-            // fillHeight 拉平成同一个高度：文字在窄窗口下多折一行时，卡片跟着
-            // 变高，而不是把按钮挤出下边框。
-            AppCard {
-                // objectName 是 GUI 自检（main.cpp --gui-contract-test）的
-                // 定位锚点：
-                // homeCard0..2 与 homeAction0..2 会被逐个抓出来做点击回放和
-                // 几何断言（按钮必须落在卡片内，且三个按钮纵坐标一致）。
-                // 改名等于删掉这部分覆盖。
-                objectName: "homeCard0"
-                Layout.fillWidth: true
-                Layout.fillHeight: true
-
-                ColumnLayout {
-                    anchors.fill: parent
-                    spacing: 10
-
-                    // 图标名来自 AppIcon 的 switch 表：拼错只会留一个空位，
-                    // 不会有任何报错。
-                    AppIcon { name: "backup"; size: 22; color: theme.accent }
-                    Text {
-                        text: "备份"
-                        font.pixelSize: 20
-                        font.weight: Font.DemiBold
-                        color: theme.textPrimary
+            Repeater {
+                model: [
+                    {
+                        "key": "quick",
+                        "title": "快速备份",
+                        "detail": "选择一个文件夹，立即创建备份",
+                        "action": "开始备份",
+                        "icon": "backup"
+                    },
+                    {
+                        "key": "scheduled",
+                        "title": "定时备份",
+                        "detail": "按周期自动检查，有变化才备份",
+                        "action": "设置定时备份",
+                        "icon": "clock"
+                    },
+                    {
+                        "key": "realtime",
+                        "title": "实时备份",
+                        "detail": "监视文件夹，变化后自动备份",
+                        "action": "设置实时备份",
+                        "icon": "refresh"
+                    },
+                    {
+                        "key": "management",
+                        "title": "备份管理",
+                        "detail": "查看本地与云端备份，恢复或删除",
+                        "action": "打开备份管理",
+                        "icon": "folder"
                     }
-                    Text {
-                        text: "选择一个目录，自动命名并保存到备份仓库"
-                        font.pixelSize: 16
-                        color: theme.textSecondary
-                        Layout.fillWidth: true
-                        wrapMode: Text.WordWrap
-                    }
-                    // 弹性占位把按钮压到卡片底部：三张卡片被 Layout.fillHeight
-                    // 拉成等高，说明文字多折一行的那张仍然让按钮落在同一条
-                    // 水平线上（自检会验证这个不变量）。
-                    Item { Layout.fillHeight: true }
-                    AppButton {
-                        objectName: "homeAction0"
-                        text: "开始备份"
-                        // 三张卡片一律 primary、不分主次：它们是并列入口，
-                        // 把某一项画成次级等于在暗示它不重要。secondary /
-                        // flat 留给页面内部的次级操作。
-                        variant: "primary"
-                        onClicked: page.navigateTo(1)
-                    }
-                }
-            }
+                ]
 
-            AppCard {
-                objectName: "homeCard1"
-                Layout.fillWidth: true
-                Layout.fillHeight: true
+                delegate: AppCard {
+                    id: card
+                    required property var modelData
+                    required property int index
 
-                ColumnLayout {
-                    anchors.fill: parent
-                    spacing: 10
+                    // objectName 是 GUI 自检的定位锚点：
+                    // homeCard0..3 / homeAction0..3 会被逐个抓出来做点击回放
+                    // 和几何断言（按钮必须落在卡片内，同一行按钮纵坐标一致）。
+                    objectName: "homeCard" + index
+                    Layout.fillWidth: true
+                    Layout.preferredHeight: 216
+                    Layout.alignment: Qt.AlignTop
 
-                    AppIcon { name: "folder"; size: 22; color: theme.accent }
-                    Text {
-                        text: "备份管理"
-                        font.pixelSize: 20
-                        font.weight: Font.DemiBold
-                        color: theme.textPrimary
-                    }
-                    Text {
-                        text: "查看仓库中的备份，从中恢复或删除"
-                        font.pixelSize: 16
-                        color: theme.textSecondary
-                        Layout.fillWidth: true
-                        wrapMode: Text.WordWrap
-                    }
-                    Item { Layout.fillHeight: true }
-                    AppButton {
-                        objectName: "homeAction1"
-                        text: "打开备份管理"
-                        variant: "primary"
-                        onClicked: page.navigateTo(3)
-                    }
-                }
-            }
+                    ColumnLayout {
+                        anchors.fill: parent
+                        spacing: 10
 
-            AppCard {
-                objectName: "homeCard2"
-                Layout.fillWidth: true
-                Layout.fillHeight: true
-
-                ColumnLayout {
-                    anchors.fill: parent
-                    spacing: 10
-
-                    AppIcon { name: "clock"; size: 22; color: theme.accent }
-                    Text {
-                        text: "自动备份"
-                        font.pixelSize: 20
-                        font.weight: Font.DemiBold
-                        color: theme.textPrimary
-                    }
-                    Text {
-                        text: "定时触发 + 完整快照：" +
-                              "只有真的发生变化才建立新副本"
-                        font.pixelSize: 16
-                        color: theme.textSecondary
-                        Layout.fillWidth: true
-                        wrapMode: Text.WordWrap
-                    }
-                    Item { Layout.fillHeight: true }
-                    AppButton {
-                        objectName: "homeAction2"
-                        text: "打开自动备份"
-                        variant: "primary"
-                        onClicked: page.navigateTo(2)
+                        AppIcon {
+                            name: card.modelData["icon"]
+                            size: 22
+                            color: theme.accent
+                        }
+                        Text {
+                            text: card.modelData["title"]
+                            font.pixelSize: 20
+                            font.weight: Font.DemiBold
+                            color: theme.textPrimary
+                        }
+                        Text {
+                            Layout.fillWidth: true
+                            // 固定两行高度：四张卡在同一行时的按钮基线
+                            // 因此与说明文字实际折几行无关。
+                            Layout.preferredHeight: 46
+                            text: card.modelData["detail"]
+                            font.pixelSize: 15
+                            color: theme.textSecondary
+                            wrapMode: Text.WordWrap
+                            maximumLineCount: 2
+                            elide: Text.ElideRight
+                        }
+                        Item { Layout.fillHeight: true }
+                        AppButton {
+                            objectName: "homeAction" + card.index
+                            text: card.modelData["action"]
+                            // 四张卡片一律 primary、不分主次：它们是并列入口。
+                            variant: "primary"
+                            onClicked: page.navigateTo(card.modelData["key"])
+                        }
                     }
                 }
             }
@@ -178,15 +146,11 @@ Item {
             Layout.topMargin: 4
         }
 
-        // "当前状态"只显示**全局**状态（scope 为空）：空闲基线，以及后台任务
-        // 正在跑时那条"正在备份/恢复"。各业务页的结果提示都带自己的 scope，
-        // 属于哪一页就只出现在哪一页，不会漏到这里。
+        // "当前状态"只显示全局状态（scope 为空）：空闲基线，以及后台任务
+        // 正在跑时那条"正在备份/恢复"。各业务页的结果提示带自己的 scope。
         StatusBanner {
             objectName: "homeStatusBanner"
             Layout.fillWidth: true
-            // 首页只显示全局消息（controller.statusScope 为空的那一类）：
-            // 首页自己不发起操作，不会有 scope 为 home 的消息，controller
-            // 侧的 scope 常量只有 backup / management / settings 三种。
             pageScope: "home"
             scope: controller.statusScope
             kind: controller.statusKind
@@ -194,8 +158,6 @@ Item {
             message: controller.statusMessage
         }
 
-        // 末尾弹性占位：column 没有 anchors.bottom，高度 = 内容隐式高度，
-        // 所以这一行当前不产生视觉差异；将来若给 column 受限高度才会生效。
         Item { Layout.fillHeight: true }
     }
 }

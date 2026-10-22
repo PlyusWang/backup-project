@@ -17,6 +17,8 @@
 
 #include "remote_commands.h"
 
+#include "app_paths.h"
+
 #include <libgen.h>
 
 #include <cstdio>
@@ -450,6 +452,15 @@ int RunRemoteCommand(const CliContext& context,
   // client 贯穿整个子命令：连接、登录与后续请求复用同一条已认证会话，
   // 退出时随栈对象销毁，不做全局单例（也就没有“上一次登录残留”这种状态）。
   net::RemoteArchiveClient client;
+  // 传输续传状态落在配置目录旁边：与 GUI 同一个约定，默认位置来自
+  // app_paths.h，不从 HOME 猜。
+  {
+    const std::string config = backupproject::DefaultConfigFilePath();
+    const std::size_t slash = config.rfind('/');
+    if (slash != std::string::npos) {
+      client.SetResumeStateDirectory(config.substr(0, slash) + "/resume");
+    }
+  }
   std::string error;
 
   // ping 只用 client.Connect：它不需要账户，因此不走 ConnectAndLogin。

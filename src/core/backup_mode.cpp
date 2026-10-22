@@ -157,11 +157,13 @@ bool IsSupportedBackupOptionCombination(
       !IsSupportedIncrementalPack(combination.pack_method)) {
     return false;
   }
-  // 计划路径从来没有"口令"这个东西：无人值守的加密需要安全的密钥来源，
-  // 本版本一律拒绝（与 ValidateScheduleConfig 逐字一致的那句话）。
+  // 无人值守加密只有在配置了可通过安全检查的口令文件时才成立。
+  // 这不是“支持 / 不支持”的产品矩阵，而是配置前提：没有凭据就不允许把一个
+  // 以后一定会静默失败的任务保存下来。
   if ((combination.trigger == BackupTrigger::kScheduled ||
        combination.trigger == BackupTrigger::kRealtime) &&
-      combination.encryption_method != EncryptionMethod::kNone) {
+      combination.encryption_method != EncryptionMethod::kNone &&
+      !combination.unattended_credential_available) {
     return false;
   }
   if (combination.strategy == BackupStrategy::kIncremental &&
@@ -176,10 +178,13 @@ bool IsSupportedBackupOptionCombination(
 std::string UnattendedEncryptionDisabledReason(BackupTrigger trigger) {
   if (trigger == BackupTrigger::kScheduled) {
     return std::string(
-        "定时无人值守加密需要安全的密钥来源；当前版本不会持久化明文密码。");
+        "定时任务要使用加密，需要先配置一个仅本人可读的口令文件"
+        "（权限 0600）。程序不会把口令明文写进配置。");
   }
   if (trigger == BackupTrigger::kRealtime) {
-    return std::string("实时无人值守备份当前不保存密码，因此不启用加密。");
+    return std::string(
+        "实时任务要使用加密，需要先配置一个仅本人可读的口令文件"
+        "（权限 0600）。程序不会把口令明文写进配置。");
   }
   return std::string();
 }
@@ -199,12 +204,13 @@ std::string UnsupportedBackupOptionCombinationReason(
   }
   if ((combination.trigger == BackupTrigger::kScheduled ||
        combination.trigger == BackupTrigger::kRealtime) &&
-      combination.encryption_method != EncryptionMethod::kNone) {
+      combination.encryption_method != EncryptionMethod::kNone &&
+      !combination.unattended_credential_available) {
     // 前缀说明"这是哪条边界"，句子本体来自唯一来源。
     const std::string prefix =
         combination.trigger == BackupTrigger::kScheduled
-            ? "Unattended scheduled encryption is not supported: "
-            : "Unattended realtime encryption is not supported: ";
+            ? "Unattended scheduled encryption is not configured: "
+            : "Unattended realtime encryption is not configured: ";
     return prefix + UnattendedEncryptionDisabledReason(combination.trigger);
   }
   if (combination.strategy == BackupStrategy::kIncremental &&

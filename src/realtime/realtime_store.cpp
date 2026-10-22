@@ -37,6 +37,7 @@
 #include <vector>
 
 #include "backup_catalog.h"
+#include "backup_credentials.h"
 #include "backup_option_keys.h"
 #include "file_io.h"
 #include "incremental_delta.h"
@@ -266,9 +267,17 @@ bool ValidateRealtimeConfig(const RealtimeConfig& config,
   combination.pack_method = config.pack_method;
   combination.compression_method = config.compression_method;
   combination.encryption_method = config.encryption_method;
+  combination.unattended_credential_available =
+      !config.encryption_password_file.empty();
   if (!IsSupportedBackupOptionCombination(combination)) {
     SetError(error_message,
              UnsupportedBackupOptionCombinationReason(combination));
+    return false;
+  }
+  // 不加密时允许为空；填了就必须是可用的绝对路径。
+  if (!config.encryption_password_file.empty() &&
+      !IsUsableCredentialPath(config.encryption_password_file,
+                              error_message)) {
     return false;
   }
   return true;
@@ -284,6 +293,12 @@ bool ValidateRealtimeForEnable(const RealtimeConfig& config,
                                std::string* error_message,
                                std::string* repository_identity) {
   if (!ValidateRealtimeConfig(config, error_message)) return false;
+  // 与定时任务同一条边界：启用时就必须能读到口令，而不是等第一次触发才失败。
+  if (config.encryption_method != EncryptionMethod::kNone &&
+      !ValidateCredentialFile(config.encryption_password_file,
+                             error_message)) {
+    return false;
+  }
   if (config.source_path.empty()) {
     SetError(error_message, "Realtime source directory must not be empty");
     return false;
@@ -615,9 +630,11 @@ RealtimeLoadStatus RealtimeStore::Load(RealtimeConfig* config,
   // 那个字段生效了。
   if (!RequireExactFields(
           root,
-          {"version", "enabled", "trigger", "source_path", "debounce_ms",
-           "max_wait_ms", "retain_count", "strategy", "pack", "compression",
-           "encryption", "include_rules", "exclude_rules"},
+          std::vector<const char*>{
+              "version", "enabled", "trigger", "source_path", "debounce_ms",
+              "max_wait_ms", "retain_count", "strategy", "pack", "compression",
+              "encryption", "include_rules", "exclude_rules"},
+          std::vector<const char*>{"encryption_password_file"},
           "realtime config", error_message)) {
     return RealtimeLoadStatus::kError;
   }
@@ -698,6 +715,13 @@ RealtimeLoadStatus RealtimeStore::Load(RealtimeConfig* config,
              "realtime config: unknown encryption method '" + text_value + "'");
     return RealtimeLoadStatus::kError;
   }
+  // 可选字段：没有它的旧文件按“未配置凭据”读入（= 不加密）。
+  if (root.Find("encryption_password_file") != nullptr &&
+      !RealtimeRequireString(root, "encryption_password_file", what,
+                             &config->encryption_password_file,
+                             error_message)) {
+    return RealtimeLoadStatus::kError;
+  }
   if (!RealtimeRequireRuleList(root, "include_rules", what,
                                &config->include_rules, error_message)) {
     return RealtimeLoadStatus::kError;
@@ -746,6 +770,9 @@ bool RealtimeStore::Save(const RealtimeConfig& config,
          std::string(CompressionMethodKey(config.compression_method)) + "\",\n";
   out += "    \"encryption\": \"" +
          std::string(EncryptionMethodKey(config.encryption_method)) + "\",\n";
+  AppendStringField(&out, "encryption_password_file",
+                    config.encryption_password_file);
+  out += ",\n";
   AppendRules(&out, "include_rules", config.include_rules, false);
   // exclude_rules 必须是最后一行：AppendRules 的 last=true 决定不写尾逗号。
   AppendRules(&out, "exclude_rules", config.exclude_rules, true);

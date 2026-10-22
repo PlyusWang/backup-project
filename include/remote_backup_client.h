@@ -199,6 +199,14 @@ class RemoteArchiveClient {
   // 用于注册 / 登录）；失败（例如口令不对）不动会话。
   bool DeleteAccount(const std::string& password, std::string* error_message);
 
+  // 传输续传的状态目录。为空 = 不落盘续传状态（进程内仍然可续，但重启后
+  // 从头开始）。产品的 GUI / CLI 会把它指向配置目录下的 resume/。
+  void SetResumeStateDirectory(const std::string& path) {
+    resume_directory_ = path;
+  }
+  // 服务端是否支持传输续传（CAPABILITIES 协商结果）。只用于展示与测试。
+  bool server_supports_resume() const { return server_supports_resume_; }
+
   // 最近一次失败的原始原因（英文协议层原因），供日志与测试使用。
   const std::string& last_error() const { return last_error_; }
 
@@ -225,6 +233,15 @@ class RemoteArchiveClient {
   // 在新连接上用 token 恢复会话。服务端明确回 UNAUTHORIZED 时才丢掉 token。
   bool ResumeSession(std::string* error_message);
   void Fail(const std::string& reason);
+  // 能力协商：只在第一次需要续传时发一次。老服务端回 kError，这里把它
+  // 归成"不支持续传"而不是一次用户可见的失败。
+  void ProbeResumeSupport();
+  // 支持续传的下载路径：稳定命名的半成品 + 状态文件，失败保留、成功后原子发布。
+  bool DownloadWithResume(const std::string& snapshot_id,
+                          const std::string& target_path, bool allow_overwrite,
+                          const RemoteProgressCallback& progress,
+                          RemoteSnapshotInfo* downloaded,
+                          std::string* error_message);
 
   int fd_ = -1;
   std::uint64_t next_request_id_ = 1;
@@ -235,6 +252,9 @@ class RemoteArchiveClient {
   SecureChannel channel_;
   ServerKeyPin server_key_pin_;
   std::string last_error_;
+  std::string resume_directory_;
+  bool resume_probed_ = false;
+  bool server_supports_resume_ = false;
   std::uint32_t last_status_ = 0;
 };
 

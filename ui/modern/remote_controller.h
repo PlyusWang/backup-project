@@ -111,6 +111,12 @@ struct RemoteOpResult {
     // 认出它是不是本机能独立恢复的归档，然后交给既有的本地恢复核心。
     // 它**不是**链恢复：原始归档没有 lineage / parent / 副文件。
     kRestoreRaw,
+    // 统一仓库模型的复制：本地仓库 -> 云端仓库。按依赖链顺序上传，
+    // 已存在且大小一致的快照跳过；任何一份失败都不发布半条链。
+    kCopyToCloud,
+    // 云端仓库 -> 本地仓库。按依赖链顺序下载到本地仓库，已存在且大小一致
+    // 的目标跳过；不同内容明确失败，绝不覆盖用户已有的备份。
+    kCopyToLocal,
   };
 
   Kind kind = Kind::kList;
@@ -130,6 +136,10 @@ struct RemoteOpResult {
   QString message;
 
   std::vector<backupproject::net::RemoteSnapshotInfo> snapshots;
+  // kCopyToCloud / kCopyToLocal：实际复制 / 跳过的快照数量与最终快照 id。
+  std::uint64_t copied_count = 0;
+  std::uint64_t skipped_count = 0;
+  std::string copied_snapshot_id;
   backupproject::net::RemoteSnapshotInfo archive;
   std::uint64_t bytes_done = 0;
   std::uint64_t bytes_total = 0;
@@ -207,6 +217,9 @@ struct RemoteRequest {
   // kRestore（链恢复）不需要它：增量链的外层信封由内层身份记录保护。
   // 只在本对象的生命周期内存在：提交之后立刻被就地抹掉，不落盘、不进日志。
   std::string restore_password;
+  // kCopyToCloud / kCopyToLocal：当前本地仓库路径（由界面显式传入，
+  // 控制器不猜配置位置）。两端的依赖链都在后台线程里解析。
+  std::string local_repository;
   // kRestoreRaw：非空表示这是"再输一次密码"的重试——沿用会话里已经下载并
   // 校验过的那份字节与第一次选定的目标目录，snapshot_id / display_name 都不再
   // 参与（它们已经固化在会话里）。
@@ -251,6 +264,19 @@ class RemoteController : public QObject {
   // 证据，不是替代关系。
   Q_PROPERTY(QString connectionMode READ connectionMode WRITE setConnectionMode
                  NOTIFY connectionChanged)
+  // ---- 三个正交概念 ----
+  // 服务器（official / custom）、连接方式（direct / ssh）、身份验证
+  // （certificate / pin）。connectionMode 保留为三者的兼容投影，供既有脚本
+  // 继续按 official / ssh / direct 断言；产品界面改用下面这三条。
+  Q_PROPERTY(QString serverKind READ serverKind NOTIFY connectionChanged)
+  Q_PROPERTY(QString transportMode READ transportMode NOTIFY connectionChanged)
+  Q_PROPERTY(QString authMode READ authMode NOTIFY connectionChanged)
+  // 自建证书模式必须显式给出可信根与预期 server_id；允许为空，但提交时
+  // 明确拒绝——绝不因为为空就回退到内置官方根。
+  Q_PROPERTY(QString trustedRootsFile READ trustedRootsFile NOTIFY
+                 connectionChanged)
+  Q_PROPERTY(QString expectedServerId READ expectedServerId NOTIFY
+                 connectionChanged)
   // ~/.ssh/config 里的别名（当前部署是 aliyun-ecs）或 user@host。
   Q_PROPERTY(
       QString sshHost READ sshHost WRITE setSshHost NOTIFY connectionChanged)
@@ -419,6 +445,15 @@ class RemoteController : public QObject {
   QString serverKeyPinError() const { return server_key_pin_error_; }
   // ---- 连接方式 / 通道 ----
   QString connectionMode() const;
+  QString serverKind() const;
+  QString transportMode() const;
+  QString authMode() const {
+    return connection_mode_ == ConnectionMode::kOfficialCloud
+               ? QStringLiteral("certificate")
+               : auth_mode_;
+  }
+  QString trustedRootsFile() const { return trusted_roots_file_; }
+  QString expectedServerId() const { return expected_server_id_; }
   QString officialCloudName() const;
   QString sshHost() const { return ssh_host_; }
   QString sshLocalPort() const;
@@ -489,6 +524,17 @@ class RemoteController : public QObject {
   Q_INVOKABLE bool refreshList();
   Q_INVOKABLE bool uploadArchive(const QString& local_path,
                                  const QString& display_name);
+  // 统一仓库模型的两个复制动作。与“上传原始归档 / 下载归档”的区别是它们
+  // 以**仓库**为目标：本地 -> 云端会保留原本地备份，并按依赖链先上传父快照；
+  // 云端 -> 本地会把快照及其依赖链放进当前本地仓库，之后可在本地列表里
+  // 直接恢复。返回值只表示“已受理”，结果通过 operationFinished("copy", ...)
+  // 与 status* 反馈。
+  Q_INVOKABLE bool copyLocalArchiveToCloud(const QString& file_name);
+  Q_INVOKABLE bool copySnapshotToLocalRepository(const QString& snapshot_id);
+  // 界面把当前本地仓库告诉控制器（备份管理页在路径变化 / 首次加载时调用）。
+  Q_INVOKABLE void setLocalRepositoryPath(const QString& path);
+  // 传输续传状态的落盘目录（由 main.cpp 按配置目录给出）。为空 = 不跨进程续传。
+  Q_INVOKABLE void setResumeDirectory(const QString& path);
   Q_INVOKABLE bool downloadArchive(const QString& snapshot_id,
                                    const QString& target_path,
                                    bool allow_overwrite);
@@ -541,6 +587,15 @@ class RemoteController : public QObject {
   // setConnectionMode 接受 "ssh" / "direct"；其它值被拒并返回 false。
   // 切换模式不会自动联网，也不会杀掉正在用的通道 —— 它是配置动作。
   Q_INVOKABLE bool setConnectionMode(const QString& mode);
+  // 服务器种类：official / custom。切到 official 会强制 direct + certificate。
+  Q_INVOKABLE bool setServerKind(const QString& kind);
+  // 身份验证方式：certificate / pin。它独立于连接方式：SSH 只是传输层，
+  // 不会因为选中 SSH 就自动退回 pin。
+  Q_INVOKABLE bool setAuthMode(const QString& mode);
+  // 自建证书模式的两个字段。两者都为空是合法状态（尚未配置），但提交时
+  // 会被拒绝；这里不做“空就用官方根”的兜底。
+  Q_INVOKABLE void setCertificateSettings(const QString& trusted_roots_file,
+                                          const QString& expected_server_id);
   // 下面三个是 Q_PROPERTY 的 WRITE 落点：它们只改配置，不联网、不动进程。
   void setSshHost(const QString& host);
   void setSshLocalPort(const QString& port_text);
@@ -748,6 +803,11 @@ class RemoteController : public QObject {
   bool killOwnedTunnelForTest();
 
  signals:
+  // 用户主动操作失败时的唯一主要反馈。summary / suggestion 是自然中文，
+  // technical 可以包含路径与错误码，但生成方保证其中没有口令、私钥或令牌。
+  // 后台定时 / 实时失败不弹这个信号：它们进运行记录与页面状态。
+  void userError(const QString& title, const QString& summary,
+                 const QString& suggestion, const QString& technical);
   void endpointChanged();
   void sessionChanged();
   void reachabilityChanged();
@@ -975,6 +1035,13 @@ class RemoteController : public QObject {
   // 连接方式与通道配置。与 host / port / pin 一样**只存在于内存**：当前
   // 部署的唯一事实来源是 ~/.ssh/config，产品不另造一套持久化。
   ConnectionMode connection_mode_ = ConnectionMode::kSshTunnel;
+  // 身份验证独立于连接方式。默认 pin：既有 .bpserver/手工指纹路径不变；
+  // 官方模式在 Submit 时强制 certificate，不读这两个字段。
+  QString auth_mode_ = QStringLiteral("pin");
+  // 复制动作的两端：当前本地仓库由界面显式设置，不在控制器里猜配置路径。
+  QString local_repository_path_;
+  QString trusted_roots_file_;
+  QString expected_server_id_;
   QString ssh_host_ = QStringLiteral("aliyun-ecs");
   // 0 = 自动挑一个空闲回环端口。
   int ssh_local_port_ = 0;

@@ -45,6 +45,11 @@ namespace net {
 // "BPN1"：0x42 0x50 0x4E 0x31。
 inline constexpr std::uint32_t kProtocolMagic = 0x42504E31u;
 inline constexpr std::uint16_t kProtocolVersion = 1;
+// 传输续传能力版本。帧头版本保持 1：新增能力走**新操作码**，不认识的操作码
+// 在老服务端上会得到明确的 kError，而不是把整条流判成损坏。
+inline constexpr std::uint16_t kTransferProtocolVersion = 2;
+// CAPABILITIES 响应里的 flags。
+inline constexpr std::uint32_t kCapabilityResumableTransfer = 1u << 0;
 inline constexpr std::size_t kFrameHeaderSize = 32;
 // 单个帧 payload 的上限（控制帧与文件块共用）。
 inline constexpr std::uint64_t kMaxPayloadBytes = 1024ull * 1024ull;
@@ -116,7 +121,7 @@ inline constexpr std::uint64_t kDefaultMaxUploadBytes =
 //                        u16 snapshot_kind (追加),
 //                        string parent_snapshot_id (追加), string lineage
 //                        (追加)
-//                  响应: 空
+//                  响应: string upload_id（续传会话标识；支持续传的服务端才给）
 //   kUploadChunk   请求: 裸字节块（<= 256 KiB，长度由帧头承载）
 //                  响应: 空
 //   kUploadEnd     请求: 空
@@ -153,13 +158,27 @@ enum class Opcode : std::uint16_t {
   // 载荷：token（u16 前缀字符串）。目标账户来自 token 自己的签名内容，
   // 客户端无法指定"恢复成谁"。
   kResume = 5,
+  // 能力协商：请求空；响应 u16 transfer_version, u32 flags。
+  // 客户端在登录后调用一次；老服务端不认识这个操作码，会回 kError，
+  // 客户端据此明确关闭续传（而不是假装续传可用）。
+  kCapabilities = 6,
   kList = 10,
   kUploadBegin = 20,
   kUploadChunk = 21,
   kUploadEnd = 22,
+  // 断点续传：请求 string upload_id, u64 requested_offset；
+  //                响应 u64 resume_offset（服务端校验过的安全续传点）。
+  // 服务端只在 upload_id 属于当前用户、会话临时文件仍在、且已保存的检查点
+  // 摘要与磁盘前缀一致时才接受续传；否则回 kInvalidState，客户端从头发送。
+  kUploadResumeBegin = 23,
   kDownloadBegin = 30,
   kDownloadChunk = 31,
   kDownloadEnd = 32,
+  // 断点续传：请求 string snapshot_id, u64 requested_offset；
+  //                响应 string display_name, string sha256, u64 size_bytes,
+  //                     u64 resume_offset。快照不可变，所以服务端接受
+  //                     0..size 之间任意对齐的 offset。
+  kDownloadResumeBegin = 33,
   kDelete = 40,
   // 注销账户：删除调用方**自己的**账户以及它的全部云端数据。
   //

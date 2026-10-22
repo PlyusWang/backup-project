@@ -888,6 +888,11 @@ int ScheduleShow(const CliContext& context) {
             << CompressionMethodKey(config.compression_method) << "\n";
   std::cout << "Encryption:     "
             << EncryptionMethodKey(config.encryption_method) << "\n";
+  std::cout << "Password file:  "
+            << (config.encryption_password_file.empty()
+                    ? std::string("(not set)")
+                    : config.encryption_password_file)
+            << "\n";
   std::cout << "Include rules:  " << JoinRules(config.include_rules) << "\n";
   std::cout << "Exclude rules:  " << JoinRules(config.exclude_rules) << "\n";
   std::cout << "Last success:   "
@@ -956,6 +961,7 @@ int ScheduleSet(const CliContext& context,
   bool saw_pack = false;
   bool saw_compression = false;
   bool saw_encryption = false;
+  bool saw_password_file = false;
 
   for (std::size_t index = 0; index < arguments.size(); ++index) {
     const std::string option = arguments[index];
@@ -1049,15 +1055,19 @@ int ScheduleSet(const CliContext& context,
       if (!ParseEncryptionMethodKey(value, &method)) {
         return UsageError(context, "unknown encryption method '" + value + "'");
       }
-      if (method != EncryptionMethod::kNone) {
-        // 无人值守的定时任务没有安全的持久密钥来源。
-        // 明确拒绝，绝不落盘明文密码，也绝不静默降级成不加密。
-        return UsageError(
-            context,
-            "the scheduled backup supports --encryption none only: "
-            "定时无人值守加密需要安全的密钥来源；当前版本不会持久化明文密码。");
-      }
+      // 无人值守加密的凭据只来自 --password-file（仅本人可读的文件）。
+      // 这里只接受方式；"有没有凭据"由共享真值表在下面统一回答。
       config.encryption_method = method;
+      continue;
+    }
+    if (option == "--password-file") {
+      if (!MarkSingleOption(&saw_password_file, option, &error)) {
+        return UsageError(context, error);
+      }
+      if (!TakeValue(arguments, &index, option, &value, &error)) {
+        return UsageError(context, error);
+      }
+      config.encryption_password_file = value;
       continue;
     }
     if (option == "--include" || option == "--exclude") {

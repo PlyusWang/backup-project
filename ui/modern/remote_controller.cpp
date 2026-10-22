@@ -17,6 +17,7 @@
 
 #include "remote_controller.h"
 
+#include <QCryptographicHash>
 #include <QDateTime>
 #include <QDir>
 #include <QEventLoop>
@@ -26,12 +27,14 @@
 #include <QtConcurrent/QtConcurrentRun>
 #include <algorithm>
 #include <cstdio>
+#include <map>
 #include <utility>
 
 // 产品级远端备份 / 链恢复：与 backupctl remote backup / remote restore
 // 用的是**同一个** core。GUI 不重新实现任何增量判断（有没有可信基线、父是谁、
 // 代数、lineage、要不要 bootstrap 缓存）——它只把"源目录 + 策略"和
 // "目标快照 + 目标目录"交给这一层。
+#include "backup_catalog.h"
 #include "incremental_backup.h"
 #include "incremental_restore.h"
 #include "network_protocol.h"
@@ -326,6 +329,111 @@ QString RemoteController::FormatTime(std::uint64_t unix_seconds) {
   return when.toString(QStringLiteral("yyyy-MM-dd HH:mm"));
 }
 
+// ---- 仓库复制的依赖链 ----
+//
+// 两个仓库的清单各自是线性的（一个 delta 只有一个父），所以复制一条链就是：
+// 从目标往回走到根，再反向逐份复制。任何一环缺失都拒绝整次复制——
+// 只发布半条链会让云端 / 本地出现"看起来存在、其实恢复不了"的快照。
+bool BuildLocalCopyChain(const std::vector<backupproject::BackupRecord>& records,
+                         const std::string& target,
+                         std::vector<backupproject::BackupRecord>* chain,
+                         std::string* error) {
+  chain->clear();
+  std::vector<const backupproject::BackupRecord*> reversed;
+  std::string current = target;
+  for (std::size_t depth = 0; depth <= 64; ++depth) {
+    const backupproject::BackupRecord* found = nullptr;
+    for (const auto& record : records) {
+      if (record.file_name == current) {
+        found = &record;
+        break;
+      }
+    }
+    if (found == nullptr) {
+      if (error != nullptr) {
+        *error = "备份 " + current + " 不在本地仓库中";
+      }
+      return false;
+    }
+    for (const auto* seen : reversed) {
+      if (seen == found) {
+        if (error != nullptr) *error = "本地备份的依赖链出现循环";
+        return false;
+      }
+    }
+    reversed.push_back(found);
+    if (!found->incremental_delta) break;
+    if (found->parent_file_name.empty()) {
+      if (error != nullptr) *error = "增量备份缺少父快照记录";
+      return false;
+    }
+    current = found->parent_file_name;
+  }
+  if (reversed.size() > 64) {
+    if (error != nullptr) *error = "依赖链超过 64 层";
+    return false;
+  }
+  for (auto it = reversed.rbegin(); it != reversed.rend(); ++it) {
+    chain->push_back(**it);
+  }
+  return true;
+}
+
+bool BuildRemoteCopyChain(const std::vector<RemoteSnapshotInfo>& snapshots,
+                          const std::string& target_id,
+                          std::vector<RemoteSnapshotInfo>* chain,
+                          std::string* error) {
+  chain->clear();
+  std::vector<RemoteSnapshotInfo> reversed;
+  std::string current = target_id;
+  for (std::size_t depth = 0; depth <= 64; ++depth) {
+    const RemoteSnapshotInfo* found = nullptr;
+    for (const auto& snapshot : snapshots) {
+      if (snapshot.snapshot_id == current) {
+        found = &snapshot;
+        break;
+      }
+    }
+    if (found == nullptr) {
+      if (error != nullptr) *error = "云端快照不存在或已被删除";
+      return false;
+    }
+    for (const auto& seen : reversed) {
+      if (seen.snapshot_id == found->snapshot_id) {
+        if (error != nullptr) *error = "云端备份的依赖链出现循环";
+        return false;
+      }
+    }
+    reversed.push_back(*found);
+    if (found->snapshot_kind == 0) break;
+    if (found->parent_snapshot_id.empty()) {
+      if (error != nullptr) *error = "云端增量快照缺少父快照";
+      return false;
+    }
+    current = found->parent_snapshot_id;
+  }
+  if (reversed.size() > 64) {
+    if (error != nullptr) *error = "依赖链超过 64 层";
+    return false;
+  }
+  for (auto it = reversed.rbegin(); it != reversed.rend(); ++it) {
+    chain->push_back(*it);
+  }
+  return true;
+}
+
+// 复制到云端时同一份本地仓库使用固定 lineage：父与子必须相同，服务端只会
+// 接受同一 lineage 的增量。
+std::string CopyLineageForRepository(const std::string& repository_path) {
+  const QByteArray seed =
+      QByteArray("backup-project-local-copy:") +
+      QByteArray::fromStdString(
+          backupproject::RepositoryIdentity(repository_path));
+  return QCryptographicHash::hash(seed, QCryptographicHash::Sha256)
+      .toHex()
+      .toStdString();
+}
+
 // Kind 的字符串名同时出现在三处：operationFinished 信号的参数、QML 侧的
 // 判断依据、自检脚本的期望值。改名字等于改接口。
 QString RemoteController::KindName(RemoteOpResult::Kind kind) {
@@ -350,6 +458,10 @@ QString RemoteController::KindName(RemoteOpResult::Kind kind) {
       return QStringLiteral("restore");
     case RemoteOpResult::Kind::kRestoreRaw:
       return QStringLiteral("restore-raw");
+    case RemoteOpResult::Kind::kCopyToCloud:
+      return QStringLiteral("copy-to-cloud");
+    case RemoteOpResult::Kind::kCopyToLocal:
+      return QStringLiteral("copy-to-local");
   }
   return QStringLiteral("unknown");
 }
@@ -1289,7 +1401,8 @@ QString RemoteController::SurfaceFailureMessage(RemoteOpResult::Kind kind,
 // 内置根证书 + BPSEC2，证书模式根本不看 pin；ssh / direct 仍然依赖人工 pin
 // 提供身份。所以它与页面上有没有那个输入框无关。
 bool RemoteController::RequiresManualPin() const {
-  return connection_mode_ != ConnectionMode::kOfficialCloud;
+  return connection_mode_ != ConnectionMode::kOfficialCloud &&
+         auth_mode_ == QStringLiteral("pin");
 }
 
 // 所有操作的公共前置：单飞闸门 -> 登录态 -> 人工 pin -> 置忙。
@@ -1330,6 +1443,26 @@ bool RemoteController::BeginOperation(const QString& action_text,
   // 没有 pin 时客户端会**直接拒绝连接**（不做首次连接自动信任），而那是一条
   // 协议级的底层原因，用户读不懂“我到底少做了什么”。与地址 / 端口 / 口令同一条
   // 规矩：本地就挡住，一个字节都不发。
+  if (connection_mode_ != ConnectionMode::kOfficialCloud &&
+      auth_mode_ == QStringLiteral("certificate")) {
+    // 自建证书模式必须有明确的可信根与预期身份。空字段绝不回退到内置官方根：
+    // 那会让“自建服务器”悄悄信任另一个根。
+    if (trusted_roots_file_.trimmed().isEmpty()) {
+      last_error_kind_ = QStringLiteral("validation");
+      ReportSurfaceError(
+          surface,
+          QStringLiteral("证书认证需要指定可信根文件（服务器管理员提供的 "
+                         "根证书）。"));
+      return false;
+    }
+    if (expected_server_id_.trimmed().isEmpty()) {
+      last_error_kind_ = QStringLiteral("validation");
+      ReportSurfaceError(
+          surface,
+          QStringLiteral("证书认证需要填写预期的服务器标识（server_id）。"));
+      return false;
+    }
+  }
   if (RequiresManualPin() && server_key_pin_.isEmpty()) {
     last_error_kind_ = QStringLiteral("validation");
     ReportSurfaceError(
@@ -1407,12 +1540,24 @@ void RemoteController::Submit(const RemoteRequest& request) {
     DispatchRequest(directed);
     return;
   }
+  // 自建服务器：身份验证与连接方式是两个独立维度。SSH 只替换拨号地址，
+  // 证书 / 指纹的选择原样带到握手层。
+  RemoteRequest directed = request;
+  if (auth_mode_ == QStringLiteral("certificate")) {
+    directed.endpoint.identity_mode = "certificate";
+    directed.endpoint.trusted_roots_file = trusted_roots_file_.toStdString();
+    directed.endpoint.expected_server_id = expected_server_id_.toStdString();
+    directed.endpoint.server_key_pin.clear();
+  } else {
+    directed.endpoint.identity_mode = "pin";
+    directed.endpoint.server_key_pin = server_key_pin_.toStdString();
+  }
   if (connection_mode_ == ConnectionMode::kDirect) {
-    DispatchRequest(request);
+    DispatchRequest(directed);
     return;
   }
   if (TunnelMatchesEndpoint() && TransportUsableForSubmit()) {
-    RemoteRequest dialed = request;
+    RemoteRequest dialed = directed;
     // 客户端拨的是**本地**那一段：127.0.0.1:<自动挑到的端口>。远端地址在
     // ssh 的 -L 参数里，BPSEC1 的 pin 校验仍然在隧道里面照跑。
     dialed.endpoint.host = std::string("127.0.0.1");
@@ -1422,7 +1567,7 @@ void RemoteController::Submit(const RemoteRequest& request) {
   }
   // 通道还没好（或者用户改了远端地址，旧通道已经不指向它了）：把这条请求
   // 挂起，先建通道，建好之后自动接着发。用户不需要知道这个顺序。
-  DeferRequest(request, busy_action_, pending_surface_);
+  DeferRequest(directed, busy_action_, pending_surface_);
   SetStatus(QStringLiteral("running"), busy_action_,
             QStringLiteral("正在建立安全通道：%1 -> %2…")
                 .arg(ssh_host_, tunnelRemoteEndpointText()));
@@ -1550,6 +1695,125 @@ RemoteOpResult RemoteController::RunOperation(
         result.restore_downloaded_bytes = outcome.downloaded_bytes;
         result.restore_reused_bytes = outcome.reused_bytes;
         result.restore_restored_entries = outcome.restored_entries;
+      }
+      break;
+    }
+    case RemoteOpResult::Kind::kCopyToCloud: {
+      // 本地仓库 -> 云端仓库：按依赖链顺序上传，已存在且大小一致的快照跳过。
+      backupproject::BackupCatalog catalog;
+      std::vector<backupproject::BackupRecord> records;
+      if (!catalog.List(request.local_repository, &records, &error)) {
+        result.ok = false;
+        break;
+      }
+      std::vector<backupproject::BackupRecord> chain;
+      if (!BuildLocalCopyChain(records, request.display_name, &chain, &error)) {
+        result.ok = false;
+        break;
+      }
+      std::vector<RemoteSnapshotInfo> remote;
+      if (!client->List(&remote, &error)) {
+        result.ok = false;
+        break;
+      }
+      std::map<std::string, std::string> id_by_name;
+      std::map<std::string, std::uint64_t> size_by_name;
+      for (const auto& snapshot : remote) {
+        id_by_name[snapshot.display_name] = snapshot.snapshot_id;
+        size_by_name[snapshot.display_name] = snapshot.size_bytes;
+      }
+      const std::string lineage =
+          CopyLineageForRepository(request.local_repository);
+      for (const auto& record : chain) {
+        const auto existing = id_by_name.find(record.file_name);
+        if (existing != id_by_name.end()) {
+          if (size_by_name[record.file_name] != record.archive_size) {
+            error = "云端已存在同名但内容不同的备份：" + record.file_name +
+                    "；请先重命名本地备份";
+            result.ok = false;
+            break;
+          }
+          ++result.skipped_count;
+          continue;
+        }
+        backupproject::net::RemoteUploadOptions options;
+        options.snapshot_kind = record.incremental_delta ? 1 : 0;
+        if (record.incremental_delta) {
+          const auto parent = id_by_name.find(record.parent_file_name);
+          if (parent == id_by_name.end()) {
+            error = "父快照没有成功复制到云端：" + record.parent_file_name;
+            result.ok = false;
+            break;
+          }
+          options.parent_snapshot_id = parent->second;
+          options.lineage = lineage;
+        }
+        RemoteSnapshotInfo uploaded;
+        if (!client->UploadSnapshotFile(record.archive_path, record.file_name,
+                                        options, progress, &uploaded, &error)) {
+          result.ok = false;
+          break;
+        }
+        id_by_name[record.file_name] = uploaded.snapshot_id;
+        size_by_name[record.file_name] = uploaded.size_bytes;
+        ++result.copied_count;
+        result.copied_snapshot_id = uploaded.snapshot_id;
+      }
+      if (result.ok) {
+        const auto target = id_by_name.find(request.display_name);
+        if (target != id_by_name.end()) result.copied_snapshot_id = target->second;
+      }
+      break;
+    }
+    case RemoteOpResult::Kind::kCopyToLocal: {
+      // 云端仓库 -> 本地仓库：按依赖链顺序下载，绝不覆盖不同内容的同名文件。
+      backupproject::BackupCatalog catalog;
+      if (!catalog.EnsureRepository(request.local_repository, &error)) {
+        result.ok = false;
+        break;
+      }
+      std::vector<RemoteSnapshotInfo> remote;
+      if (!client->List(&remote, &error)) {
+        result.ok = false;
+        break;
+      }
+      std::vector<RemoteSnapshotInfo> chain;
+      if (!BuildRemoteCopyChain(remote, request.snapshot_id, &chain, &error)) {
+        result.ok = false;
+        break;
+      }
+      for (const auto& snapshot : chain) {
+        std::string name = snapshot.display_name;
+        std::string name_error;
+        if (!backupproject::IsManagedBackupFileName(name) ||
+            !backupproject::net::IsValidDisplayName(name, &name_error)) {
+          error = "云端备份名不能作为本地文件名，无法保留依赖链：" + name;
+          result.ok = false;
+          break;
+        }
+        const QString target =
+            QDir(QString::fromStdString(request.local_repository))
+                .filePath(QString::fromStdString(name));
+        const QFileInfo info(target);
+        if (info.exists()) {
+          if (static_cast<std::uint64_t>(info.size()) == snapshot.size_bytes) {
+            ++result.skipped_count;
+            result.copied_snapshot_id = snapshot.snapshot_id;
+            continue;
+          }
+          error = "本地仓库已存在同名但内容不同的备份：" + name;
+          result.ok = false;
+          break;
+        }
+        RemoteSnapshotInfo downloaded;
+        if (!client->DownloadArchiveFile(snapshot.snapshot_id,
+                                         target.toStdString(), false, progress,
+                                         &downloaded, &error)) {
+          result.ok = false;
+          break;
+        }
+        ++result.copied_count;
+        result.copied_snapshot_id = snapshot.snapshot_id;
       }
       break;
     }
@@ -1917,6 +2181,24 @@ void RemoteController::ApplyResult(const RemoteOpResult& result) {
       }
       break;
     }
+    case RemoteOpResult::Kind::kCopyToCloud:
+      SetStatus(
+          QStringLiteral("success"), QStringLiteral("已复制到云端"),
+          QStringLiteral("本次上传 %1 份、跳过 %2 份已存在的快照。"
+                         "云端快照 %3。")
+              .arg(static_cast<qulonglong>(result.copied_count))
+              .arg(static_cast<qulonglong>(result.skipped_count))
+              .arg(QString::fromStdString(result.copied_snapshot_id).left(12)));
+      break;
+    case RemoteOpResult::Kind::kCopyToLocal:
+      SetStatus(
+          QStringLiteral("success"),
+          QStringLiteral("已下载到本地仓库"),
+          QStringLiteral("本次下载 %1 份、跳过 %2 份已存在的快照。"
+                         "现在可以在本地仓库中恢复。")
+              .arg(static_cast<qulonglong>(result.copied_count))
+              .arg(static_cast<qulonglong>(result.skipped_count)));
+      break;
     case RemoteOpResult::Kind::kRestoreRaw:
       // 原始归档的恢复：对用户来说就是"恢复完成"——内部走的是哪条流水线
       // （链 vs 单份归档）由列表里的类型 badge 说明，不写进结论里，更不写
@@ -2579,6 +2861,51 @@ QString RemoteController::connectionMode() const {
              : QStringLiteral("direct");
 }
 
+QString RemoteController::serverKind() const {
+  return connection_mode_ == ConnectionMode::kOfficialCloud
+             ? QStringLiteral("official")
+             : QStringLiteral("custom");
+}
+
+QString RemoteController::transportMode() const {
+  return connection_mode_ == ConnectionMode::kSshTunnel ? QStringLiteral("ssh")
+                                                       : QStringLiteral("direct");
+}
+
+bool RemoteController::setServerKind(const QString& kind) {
+  if (kind == QStringLiteral("official")) {
+    return setConnectionMode(QStringLiteral("official"));
+  }
+  if (kind != QStringLiteral("custom")) return false;
+  if (connection_mode_ == ConnectionMode::kOfficialCloud) {
+    return setConnectionMode(QStringLiteral("direct"));
+  }
+  return true;
+}
+
+bool RemoteController::setAuthMode(const QString& mode) {
+  if (mode != QStringLiteral("certificate") && mode != QStringLiteral("pin")) {
+    return false;
+  }
+  if (connection_mode_ == ConnectionMode::kOfficialCloud) {
+    // 官方模式固定证书认证；这里明确拒绝，而不是让界面显示一个不会生效的值。
+    return mode == QStringLiteral("certificate");
+  }
+  if (auth_mode_ == mode) return true;
+  auth_mode_ = mode;
+  // 切换身份验证方式不会改变连接方式，也不会动已经在跑的隧道。
+  ClearSurfaceError(ErrorSurface::kServerKey);
+  emit connectionChanged();
+  return true;
+}
+
+void RemoteController::setCertificateSettings(
+    const QString& trusted_roots_file, const QString& expected_server_id) {
+  trusted_roots_file_ = trusted_roots_file;
+  expected_server_id_ = expected_server_id;
+  emit connectionChanged();
+}
+
 QString RemoteController::sshLocalPort() const {
   return ssh_local_port_ > 0 ? QString::number(ssh_local_port_) : QString();
 }
@@ -2625,6 +2952,11 @@ bool RemoteController::setConnectionMode(const QString& mode) {
   // 之后仍然看到“服务器身份指纹不合法”）。这里**只清 pin 相关的东西**：
   // 真正的证书错误（签名失败 / server_id 不匹配 / 过期）是切过来之后、真的
   // 尝试连接时才产生的，不会被这一段碰到。
+  if (next != ConnectionMode::kOfficialCloud &&
+      auth_mode_ != QStringLiteral("certificate") &&
+      auth_mode_ != QStringLiteral("pin")) {
+    auth_mode_ = QStringLiteral("pin");
+  }
   if (next == ConnectionMode::kOfficialCloud) {
     ClearSurfaceError(ErrorSurface::kServerKey);
     clearPinApplyState();
@@ -3106,6 +3438,68 @@ bool RemoteController::killOwnedTunnelForTest() {
 #else
   return false;
 #endif
+}
+
+// ---- 统一仓库复制 ----
+//
+// 这两条入口的目标是“仓库”，不是“一个文件路径”：
+// 本地 -> 云端先确认登录与列表，再按依赖链顺序上传；云端 -> 本地把快照与
+// 依赖链下载进当前本地仓库。真正的链解析与写入在后台任务里完成，
+// 界面只看到受理 / 进度 / 结果。
+void RemoteController::setLocalRepositoryPath(const QString& path) {
+  local_repository_path_ = path;
+}
+
+void RemoteController::setResumeDirectory(const QString& path) {
+  client_.SetResumeStateDirectory(path.toStdString());
+}
+
+bool RemoteController::copyLocalArchiveToCloud(const QString& file_name) {
+  if (local_repository_path_.isEmpty()) {
+    SetStatus(QStringLiteral("error"), QStringLiteral("没有本地仓库"),
+              QStringLiteral("先在“本地仓库”里设置一个仓库，再复制备份。"));
+    return false;
+  }
+  if (file_name.isEmpty()) {
+    SetStatus(QStringLiteral("error"), QStringLiteral("没有选中备份"),
+              QStringLiteral("先在列表里选中一份本地备份。"));
+    return false;
+  }
+  if (!BeginOperation(QStringLiteral("正在复制到云端"),
+                      /*need_login=*/true)) {
+    return false;
+  }
+  RemoteRequest request;
+  request.kind = RemoteOpResult::Kind::kCopyToCloud;
+  request.endpoint = endpoint_;
+  request.local_repository = local_repository_path_.toStdString();
+  request.display_name = file_name.toStdString();
+  Submit(request);
+  return true;
+}
+
+bool RemoteController::copySnapshotToLocalRepository(const QString& snapshot_id) {
+  if (local_repository_path_.isEmpty()) {
+    SetStatus(QStringLiteral("error"), QStringLiteral("没有本地仓库"),
+              QStringLiteral("先在“本地仓库”里设置一个仓库，再下载备份。"));
+    return false;
+  }
+  if (snapshot_id.isEmpty()) {
+    SetStatus(QStringLiteral("error"), QStringLiteral("没有选中云端备份"),
+              QStringLiteral("先在云端列表里选中一份备份。"));
+    return false;
+  }
+  if (!BeginOperation(QStringLiteral("正在下载到本地仓库"),
+                      /*need_login=*/true)) {
+    return false;
+  }
+  RemoteRequest request;
+  request.kind = RemoteOpResult::Kind::kCopyToLocal;
+  request.endpoint = endpoint_;
+  request.local_repository = local_repository_path_.toStdString();
+  request.snapshot_id = snapshot_id.toStdString();
+  Submit(request);
+  return true;
 }
 
 }  // namespace backup_modern
