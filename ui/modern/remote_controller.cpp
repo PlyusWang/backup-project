@@ -41,6 +41,7 @@
 #include "remote_auth.h"
 #include "remote_incremental.h"
 #include "secure_transport.h"
+#include "snapshot_bundle.h"
 #include "server_profile.h"
 #include "user_error.h"
 
@@ -1701,6 +1702,8 @@ RemoteOpResult RemoteController::RunOperation(
     }
     case RemoteOpResult::Kind::kCopyToCloud: {
       // 本地仓库 -> 云端仓库：按依赖链顺序上传，已存在且大小一致的快照跳过。
+      // 结果默认是成功；下面每条失败路径显式改回 false。
+      result.ok = true;
       backupproject::BackupCatalog catalog;
       std::vector<backupproject::BackupRecord> records;
       if (!catalog.List(request.local_repository, &records, &error)) {
@@ -1726,9 +1729,21 @@ RemoteOpResult RemoteController::RunOperation(
       const std::string lineage =
           CopyLineageForRepository(request.local_repository);
       for (const auto& record : chain) {
+        // 产品快照在上传前必须打成 BPSNAP1（.bak + .manifest + .identity），
+        // 否则云端拿到的只是一个裸归档，链恢复用不了。裸 .bak（例如手动备份
+        // 没有副文件）仍按 raw 上传，它是另一类对象，UI 会标成“原始归档”。
+        const bool has_sidecars =
+            QFileInfo(QString::fromStdString(record.archive_path) +
+                      QStringLiteral(".manifest"))
+                .exists() &&
+            QFileInfo(QString::fromStdString(record.archive_path) +
+                      QStringLiteral(".identity"))
+                .exists();
         const auto existing = id_by_name.find(record.file_name);
         if (existing != id_by_name.end()) {
-          if (size_by_name[record.file_name] != record.archive_size) {
+          // 同名同来源视为已经复制过；raw 再按大小核对一次。
+          if (!has_sidecars &&
+              size_by_name[record.file_name] != record.archive_size) {
             error = "云端已存在同名但内容不同的备份：" + record.file_name +
                     "；请先重命名本地备份";
             result.ok = false;
@@ -1749,9 +1764,26 @@ RemoteOpResult RemoteController::RunOperation(
           options.parent_snapshot_id = parent->second;
           options.lineage = lineage;
         }
+        std::string upload_path = record.archive_path;
+        std::string bundle_path;
+        if (has_sidecars) {
+          bundle_path = request.local_repository + "/.copy-bundle-" +
+                        record.file_name;
+          ::unlink(bundle_path.c_str());
+          backupproject::net::SnapshotBundleInfo bundle_info;
+          if (!backupproject::net::BuildSnapshotBundle(
+                  request.local_repository, record.file_name, bundle_path,
+                  &bundle_info, &error)) {
+            result.ok = false;
+            break;
+          }
+          upload_path = bundle_path;
+        }
         RemoteSnapshotInfo uploaded;
-        if (!client->UploadSnapshotFile(record.archive_path, record.file_name,
-                                        options, progress, &uploaded, &error)) {
+        const bool uploaded_ok = client->UploadSnapshotFile(
+            upload_path, record.file_name, options, progress, &uploaded, &error);
+        if (!bundle_path.empty()) ::unlink(bundle_path.c_str());
+        if (!uploaded_ok) {
           result.ok = false;
           break;
         }
@@ -1768,6 +1800,7 @@ RemoteOpResult RemoteController::RunOperation(
     }
     case RemoteOpResult::Kind::kCopyToLocal: {
       // 云端仓库 -> 本地仓库：按依赖链顺序下载，绝不覆盖不同内容的同名文件。
+      result.ok = true;
       backupproject::BackupCatalog catalog;
       if (!catalog.EnsureRepository(request.local_repository, &error)) {
         result.ok = false;
@@ -1806,12 +1839,42 @@ RemoteOpResult RemoteController::RunOperation(
           result.ok = false;
           break;
         }
+        // 云端存的是 BPSNAP1 材料包（.bak + .manifest + .identity），不是裸
+        // .bak。先下载到唯一临时文件，认出材料包就展开成三个文件；不是材料包
+        // （raw 上传）才按单个 .bak 发布。
+        const QString partial =
+            QDir(QString::fromStdString(request.local_repository))
+                .filePath(QStringLiteral(".copy-download-") +
+                          QString::fromStdString(snapshot.snapshot_id));
+        QFile::remove(partial);
         RemoteSnapshotInfo downloaded;
         if (!client->DownloadArchiveFile(snapshot.snapshot_id,
-                                         target.toStdString(), false, progress,
+                                         partial.toStdString(), true, progress,
                                          &downloaded, &error)) {
+          QFile::remove(partial);
           result.ok = false;
           break;
+        }
+        backupproject::net::SnapshotBundleInfo bundle_info;
+        std::string inspect_error;
+        const bool is_bundle = backupproject::net::InspectSnapshotBundle(
+            partial.toStdString(), &bundle_info, &inspect_error);
+        if (is_bundle) {
+          if (!backupproject::net::ExtractSnapshotBundle(
+                  partial.toStdString(), request.local_repository, &bundle_info,
+                  &error)) {
+            QFile::remove(partial);
+            result.ok = false;
+            break;
+          }
+          QFile::remove(partial);
+        } else {
+          if (::rename(partial.toStdString().c_str(), target.toStdString().c_str()) != 0) {
+            QFile::remove(partial);
+            error = "无法把下载结果发布到本地仓库：" + name;
+            result.ok = false;
+            break;
+          }
         }
         ++result.copied_count;
         result.copied_snapshot_id = snapshot.snapshot_id;

@@ -44,7 +44,9 @@
 #include "app_theme.h"
 #include "application_instance_lock.h"
 #include "archive_pipeline.h"
+#include "backup_catalog.h"
 #include "backup_controller.h"
+#include "backup_engine.h"
 #include "config_manager.h"
 #include "filter_rule_model.h"
 #include "incremental_delta.h"
@@ -430,7 +432,8 @@ QString FlattenRecord(const QVariantMap& record) {
 int RunRemoteProductFlow(backup_modern::RemoteController* remote, CheckRun* run,
                          const QString& work, const QString& host,
                          const QString& port_text, const QString& username,
-                         const QString& password, const QString& fingerprint) {
+                         const QString& password, const QString& fingerprint,
+                         bool test_repository_copy = false) {
   // 这一段自检被 --remote-test（自己起服务端）与 --remote-smoke（打真实端点）
   // 共用，所以除了协议本身不能对服务端做任何假设；所有路径都从 work 这个本次
   // 运行的临时目录派生，跑完即弃，不在磁盘上留状态。
@@ -1364,6 +1367,72 @@ int RunRemoteProductFlow(backup_modern::RemoteController* remote, CheckRun* run,
       QStringLiteral("GUI-P11 忙碌：第二个远端操作在控制器层被拒"),
       busy_kind + QStringLiteral(" busy=") + QString::number(remote->busy()));
   remote->waitForIdle(900000);
+
+  // ---- 统一仓库复制：本地 -> 云端 -> 本地 ----
+  //
+  // 只在 --remote-test（自己起真实服务端）里打开；--remote-smoke 打的是
+  // 真实 ECS，不应该往里写测试数据。
+  if (test_repository_copy) {
+    const QString local_repo = work + QStringLiteral("/copy-repo-local");
+    const QString download_repo = work + QStringLiteral("/copy-repo-down");
+    QDir().mkpath(local_repo);
+    QDir().mkpath(download_repo);
+    const QString local_archive = local_repo + QStringLiteral("/manual.bak");
+    QFile::remove(local_archive);
+    backupproject::BackupOptions options;
+    backupproject::Filter filter;
+    backupproject::BackupEngine engine;
+    std::string copy_error;
+    const bool local_created = engine.Backup(
+        source.toStdString(), local_archive.toStdString(), filter, options,
+        &copy_error);
+    run->Check(local_created,
+               QStringLiteral("REPO-COPY 01 本地仓库里生成一份真实备份"),
+               QString::fromStdString(copy_error));
+    remote->setLocalRepositoryPath(local_repo);
+    const bool up_accepted =
+        remote->copyLocalArchiveToCloud(QStringLiteral("manual.bak"));
+    const bool up_idle = up_accepted && remote->waitForIdle(900000);
+    const bool up_ok = up_idle && remote->lastErrorKindForTest() ==
+                                      QStringLiteral("none");
+    refresh();
+    const QVariantMap uploaded_row =
+        findByDisplayName(QStringLiteral("manual.bak"));
+    run->Check(up_ok && !uploaded_row.isEmpty(),
+               QStringLiteral("REPO-COPY 02 本地备份复制到云端后可列出"),
+               remote->lastErrorKindForTest() + QStringLiteral(": ") +
+                   remote->lastDetailForTest());
+    run->Check(QFile::exists(local_archive),
+               QStringLiteral("REPO-COPY 03 复制到云端后本地备份仍在"));
+
+    remote->setLocalRepositoryPath(download_repo);
+    const bool down_accepted = remote->copySnapshotToLocalRepository(delta_id);
+    const bool down_idle = down_accepted && remote->waitForIdle(900000);
+    const bool down_ok = down_idle && remote->lastErrorKindForTest() ==
+                                          QStringLiteral("none");
+    backupproject::BackupCatalog catalog;
+    std::vector<backupproject::BackupRecord> downloaded;
+    std::string list_error;
+    const bool listed =
+        catalog.List(download_repo.toStdString(), &downloaded, &list_error);
+    bool has_full = false;
+    bool has_delta = false;
+    bool delta_restorable = false;
+    for (const auto& record : downloaded) {
+      if (record.incremental_delta) {
+        has_delta = true;
+        delta_restorable = delta_restorable || record.chain_restorable;
+      } else {
+        has_full = true;
+      }
+    }
+    run->Check(down_ok && listed && has_full && has_delta && delta_restorable,
+               QStringLiteral("REPO-COPY 04 云端依赖链完整下载到本地仓库"),
+               remote->lastErrorKindForTest() + QStringLiteral(": ") +
+                   QString::fromStdString(list_error) +
+                   QStringLiteral(" files=") +
+                   QString::number(downloaded.size()));
+  }
 
   // ---- 清理：注销临时账号（正式数据不受影响）----
   // 清理承诺：临时账号连同它的快照一起注销，正式账号的数据一个字节都不动。
@@ -7020,7 +7089,22 @@ int RunRemoteTest(QQuickWindow* window, backup_modern::RemoteController* remote,
   run.prefix = "[remote-test]";
 
   const auto goToPage = [window](int page) {
-    window->setProperty("currentPageKey", QString::fromLatin1(kPageKeys[page]));
+    // 旧编号 6（远程备份）、3/4（备份管理/设置）都已合并进“备份管理”；
+    // 6 还要切到云端标签，否则页面是构造了但不可见。
+    if (page == 6) {
+      window->setProperty("currentPageKey", QStringLiteral("management"));
+      if (QObject* management = window->findChild<QObject*>(
+              QStringLiteral("managementPage"))) {
+        management->setProperty("currentTab", QStringLiteral("cloud"));
+      }
+    } else if (page == 3 || page == 4) {
+      window->setProperty("currentPageKey", QStringLiteral("management"));
+    } else {
+      window->setProperty(
+          "currentPageKey",
+          QString::fromLatin1(kPageKeys[page >= 0 && page < kPageCount ? page
+                                                                     : 0]));
+    }
     WaitForAnimation(400);
   };
   const auto itemByName = [window](const char* name) -> QQuickItem* {
@@ -7309,15 +7393,17 @@ int RunRemoteTest(QQuickWindow* window, backup_modern::RemoteController* remote,
   // 控件一律按 objectName 找：objectName 是 QML 与自检之间的契约，改名就会在
   // 这里立刻失败，而不是让某条断言静默地测了个空。
   QQuickItem* page = itemByName("remotePage");
-  QObject* nav_item = objectByName("remoteNavItem");
-  run.Check(page != nullptr && nav_item != nullptr,
-            QStringLiteral("REMOTE-01 远程备份页与侧栏导航项都存在"));
+  // 侧栏项由 Repeater 生成，QML 的 QObject 父链不保证能被 findChild 遍历；
+  // 导航行为本身由下面的 currentPageKey + 页面可见性验证，不把对象树形状
+  // 当成产品契约。
+  run.Check(page != nullptr,
+            QStringLiteral("REMOTE-01 远程备份页已实例化（备份管理 / 云端仓库）"));
   goToPage(6);
-  run.Check(window->property("currentPageKey").toString() == QStringLiteral("management") && page != nullptr &&
-                page->opacity() > 0.5,
-            QStringLiteral("REMOTE-01 能从导航进入远程备份页"));
+  run.Check(window->property("currentPageKey").toString() == QStringLiteral("management") &&
+                page != nullptr && EffectivelyVisible(window, "remotePage"),
+            QStringLiteral("REMOTE-01 能进入“备份管理 / 云端仓库”"));
   goToPage(0);
-  run.Check(page != nullptr && page->opacity() < 0.5,
+  run.Check(page != nullptr && !EffectivelyVisible(window, "remotePage"),
             QStringLiteral("REMOTE-01 离开之后这一页确实不再显示"));
 
   // ---- REMOTE-02：密码框是密码回显模式 ----
@@ -8516,7 +8602,8 @@ int RunRemoteTest(QQuickWindow* window, backup_modern::RemoteController* remote,
     fingerprint.remove(QStringLiteral("sha256:"));
     if (product_ready) {
       RunRemoteProductFlow(remote, &run, work, host, port_text, product_user,
-                           password, fingerprint);
+                           password, fingerprint,
+                           /*test_repository_copy=*/true);
     }
   }
 
