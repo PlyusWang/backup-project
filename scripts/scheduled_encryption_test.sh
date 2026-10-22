@@ -59,10 +59,27 @@ if grep -rq "correct horse battery staple" "$HOME/.config" 2>/dev/null; then
 else
   record_pass "D.1 口令不落盘"
 fi
-if [ -s "$W/repo" ] || find "$W/repo" -name '*.bak' | grep -q .; then
+ARCHIVE_NAME=$(find "$W/repo" -name '*.bak' -printf '%f\n' | head -1)
+if [ -n "$ARCHIVE_NAME" ]; then
   record_pass "D.2 产出 1 份加密备份"
 else
   record_fail "D.2 产出 1 份加密备份" "仓库为空"
 fi
+
+# E. 用同一个 0600 口令文件恢复；0644 文件必须被拒绝。
+mkdir -p "$W/restore"
+BACKUP_RESTORE_PASSWORD_FILE="$W/pass.txt" ./build/backupctl restore "$ARCHIVE_NAME" "$W/restore" >"$W/restore.log" 2>&1
+[ $? -eq 0 ] && record_pass "E.1 0600 口令文件可恢复加密备份" || record_fail "E.1 0600 口令文件可恢复加密备份" "$(tail -1 "$W/restore.log")"
+if [ -d "$W/restore" ] && diff -r "$W/src" "$W/restore" >/dev/null 2>&1; then
+  record_pass "E.2 恢复结果逐字节一致"
+elif [ -d "$W/restore/$(basename "$W/src")" ] && diff -r "$W/src" "$W/restore/$(basename "$W/src")" >/dev/null 2>&1; then
+  record_pass "E.2 恢复结果逐字节一致"
+else
+  record_fail "E.2 恢复结果逐字节一致" "diff 不一致"
+fi
+mkdir -p "$W/restore-bad"
+BACKUP_RESTORE_PASSWORD_FILE="$W/bad.txt" ./build/backupctl restore "$ARCHIVE_NAME" "$W/restore-bad" >"$W/restore-bad.log" 2>&1
+[ $? -ne 0 ] && record_pass "E.3 0644 口令文件无法恢复" || record_fail "E.3 0644 口令文件无法恢复" "accepted"
+
 rm -rf "$W"
 finish

@@ -24,6 +24,7 @@
 #include <unistd.h>
 
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <ctime>
 #include <iostream>
@@ -32,6 +33,7 @@
 
 #include "archive_pipeline.h"
 #include "backup_catalog.h"
+#include "backup_credentials.h"
 #include "backup_engine.h"
 #include "backup_mode.h"
 #include "backup_option_keys.h"
@@ -748,10 +750,18 @@ int RunRestoreCommand(const CliContext& context,
   RestoreOptions options;
   std::string secret;
   if (wants_password) {
-    // 只有归档自己说"我需要密码"时才去问。问的方式还是 /dev/tty；
-    // 识别失败时不在这里报错，交给真正的恢复路径给出更准确的诊断。
-    if (!ReadSecretFromTerminal("Restore password: ", &secret,
-                                &error_message)) {
+    // 无人值守恢复：环境变量里只有 0600 口令文件的路径，没有口令本身。
+    // 未设置时才回退到终端输入。
+    const char* password_file = std::getenv("BACKUP_RESTORE_PASSWORD_FILE");
+    if (password_file != nullptr && password_file[0] != '\0') {
+      if (!ReadCredentialFile(password_file, &secret, &error_message)) {
+        PrintError(error_message);
+        return kCliExitOperationFailed;
+      }
+    } else if (!ReadSecretFromTerminal("Restore password: ", &secret,
+                                       &error_message)) {
+      // 只有归档自己说"我需要密码"时才去问。问的方式还是 /dev/tty；
+      // 识别失败时不在这里报错，交给真正的恢复路径给出更准确的诊断。
       PrintError(error_message);
       return kCliExitOperationFailed;
     }
