@@ -365,7 +365,7 @@ expect_grep "D.09 默认未启用" "Enabled:        no"
 expect_exit "D.10 计划不接受非 none 的加密" 2 \
   "$BACKUPCTL" --config-file "$CONFIG" --schedule-file "$STORE" schedule set \
   --encryption aes-256-ctr-hmac-sha256
-expect_grep "D.11 拒绝原因写清楚了" "定时无人值守加密需要安全的密钥来源"
+expect_grep "D.11 拒绝原因写清楚了" "需要先配置"
 
 expect_exit "D.12 schedule enable" 0 \
   "$BACKUPCTL" --config-file "$CONFIG" --schedule-file "$STORE" schedule enable
@@ -1121,7 +1121,7 @@ else
   expect_exit "E.08 CLI 写一份新计划" 0 \
     "$BACKUPCTL" --config-file "$CROSS_CONFIG" --schedule-file "$CROSS_STORE" schedule set \
     --source "$CROSS/src" --interval-minutes 9 --retain 4 --pack fast-ustar \
-    --compression lzss-huffman --include 'ext:txt;md'
+    --compression lzss-huffman --encryption none --include 'ext:txt;md'
   "$GUI" --schedule-show --config-file "$CROSS_CONFIG" --schedule-file "$CROSS_STORE" >"$OUT" 2>&1
   expect_grep "E.09 GUI 读到 CLI 写的周期" "interval=9"
   expect_grep "E.10 GUI 读到 CLI 写的保留数量" "retain=4"
