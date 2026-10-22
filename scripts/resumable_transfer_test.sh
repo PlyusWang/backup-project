@@ -48,7 +48,8 @@ fi
 WORK="$TEST_ROOT/e2e"
 mkdir -p "$WORK/data" "$WORK/state" "$WORK/logs" "$WORK/src" "$WORK/home/.config" "$WORK/downloads"
 export HOME="$WORK/home"
-export BACKUP_REMOTE_PASSWORD="resume-test-password"
+BACKUP_REMOTE_PASSWORD="$(head -c 18 /dev/urandom | base64 | tr -d "\n")"
+export BACKUP_REMOTE_PASSWORD
 
 head -c 32 /dev/urandom | sha256sum | cut -c1-64 >"$WORK/secret.value"
 echo "BACKUP_TOKEN_SECRET=$(cat "$WORK/secret.value")" >"$WORK/secrets.env"
