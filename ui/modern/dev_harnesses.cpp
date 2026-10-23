@@ -1381,11 +1381,16 @@ int RunRemoteProductFlow(backup_modern::RemoteController* remote, CheckRun* run,
     const QString stale_staging =
         local_repo + QStringLiteral("/.copy-up-stale");
     QDir().mkpath(stale_staging);
+    QFile::setPermissions(stale_staging, QFileDevice::ReadOwner |
+                                             QFileDevice::WriteOwner |
+                                             QFileDevice::ExeOwner);
     {
       QFile stale(stale_staging + QStringLiteral("/leftover.bin"));
       if (stale.open(QIODevice::WriteOnly)) stale.write("stale");
       QFile lease(stale_staging + QStringLiteral("/.lease"));
-      if (lease.open(QIODevice::WriteOnly)) lease.write("dead");
+      if (lease.open(QIODevice::WriteOnly)) {
+        lease.write("BPSCOPY1 22222222222222222222222222222222\n");
+      }
     }
     const QString local_archive = local_repo + QStringLiteral("/manual.bak");
     QFile::remove(local_archive);

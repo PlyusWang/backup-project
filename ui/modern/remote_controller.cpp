@@ -43,6 +43,7 @@
 // 代数、lineage、要不要 bootstrap 缓存）——它只把"源目录 + 策略"和
 // "目标快照 + 目标目录"交给这一层。
 #include "backup_catalog.h"
+#include "copy_staging.h"
 #include "file_io.h"
 #include "incremental_backup.h"
 #include "incremental_restore.h"
@@ -185,78 +186,6 @@ bool LocalObjectMatches(const std::string& repository, const std::string& name,
 
 // 把解包并验证过的三件套发布到仓库：全部用 NoReplace，任何一步失败只回滚
 // 本次已经发布的文件。这样仓库里不会出现“三件套缺一件”的可见状态。
-void RemoveTree(const std::string& path) {
-  DIR* directory = ::opendir(path.c_str());
-  if (directory != nullptr) {
-    while (const dirent* entry = ::readdir(directory)) {
-      if (std::strcmp(entry->d_name, ".") == 0 ||
-          std::strcmp(entry->d_name, "..") == 0) {
-        continue;
-      }
-      const std::string child = path + "/" + entry->d_name;
-      struct stat info;
-      if (::lstat(child.c_str(), &info) == 0 && S_ISDIR(info.st_mode)) {
-        RemoveTree(child);
-      } else {
-        ::unlink(child.c_str());
-      }
-    }
-    ::closedir(directory);
-  }
-  ::rmdir(path.c_str());
-}
-
-// 复制任务的工作目录用 .lease + flock 标记“仍有活着的所有者”。进程被
-// SIGKILL 时 flock 由内核释放，下一次运行就能安全清掉上次留下的目录；
-// 仍在运行的任务持锁，清理会跳过它。
-class CopyStagingLease {
- public:
-  ~CopyStagingLease() {
-    if (fd_ >= 0) ::close(fd_);
-  }
-  bool Create(const std::string& directory, std::string* error_message) {
-    const std::string path = directory + "/.lease";
-    fd_ = ::open(path.c_str(), O_RDWR | O_CREAT | O_CLOEXEC, 0600);
-    if (fd_ < 0 || ::flock(fd_, LOCK_EX | LOCK_NB) != 0) {
-      if (fd_ >= 0) ::close(fd_);
-      fd_ = -1;
-      if (error_message != nullptr) {
-        *error_message = "无法为复制任务建立暂存租约";
-      }
-      return false;
-    }
-    return true;
-  }
-
- private:
-  int fd_ = -1;
-};
-
-void CleanupStaleCopyStaging(const std::string& repository) {
-  DIR* directory = ::opendir(repository.c_str());
-  if (directory == nullptr) return;
-  std::vector<std::string> candidates;
-  while (const dirent* entry = ::readdir(directory)) {
-    const std::string name = entry->d_name;
-    if (name.rfind(".copy-up-", 0) == 0 || name.rfind(".copy-down-", 0) == 0) {
-      candidates.push_back(name);
-    }
-  }
-  ::closedir(directory);
-  for (const std::string& name : candidates) {
-    const std::string path = repository + "/" + name;
-    const std::string lease = path + "/.lease";
-    const int fd = ::open(lease.c_str(), O_RDWR | O_CLOEXEC);
-    if (fd < 0) continue;  // 没有租约：可能是刚建立还没加锁，交给下一次
-    if (::flock(fd, LOCK_EX | LOCK_NB) == 0) {
-      ::close(fd);
-      RemoveTree(path);
-    } else {
-      ::close(fd);
-    }
-  }
-}
-
 bool PublishBundleFiles(const std::string& extracted_directory,
                         const std::string& repository,
                         const std::string& archive_name,
@@ -1942,20 +1871,17 @@ RemoteOpResult RemoteController::RunOperation(
       // 临时材料只活在本目录里；析构即清理，失败也不会在用户仓库留下
       // 可预测名字的包。先清掉上次被 SIGKILL 留下的无主暂存目录。
       CleanupStaleCopyStaging(request.local_repository);
-      backupproject::TempDirectoryGuard staging;
-      if (!staging.Create(request.local_repository, ".copy-up-", &error)) {
-        result.ok = false;
-        break;
-      }
       CopyStagingLease lease;
-      if (!lease.Create(staging.path(), &error)) {
+      if (!lease.Create(request.local_repository, CopyStagingKind::kUpload,
+                        &error)) {
         result.ok = false;
         break;
       }
+      const std::string staging_dir = lease.path();
       std::map<std::string, CopyObject> objects;
       for (const auto& record : chain) {
         CopyObject object;
-        if (!PrepareCopyObject(request.local_repository, record, staging.path(),
+        if (!PrepareCopyObject(request.local_repository, record, staging_dir,
                                &object, &error)) {
           result.ok = false;
           break;
@@ -2060,16 +1986,13 @@ RemoteOpResult RemoteController::RunOperation(
         break;
       }
       CleanupStaleCopyStaging(request.local_repository);
-      backupproject::TempDirectoryGuard staging;
-      if (!staging.Create(request.local_repository, ".copy-down-", &error)) {
-        result.ok = false;
-        break;
-      }
       CopyStagingLease lease;
-      if (!lease.Create(staging.path(), &error)) {
+      if (!lease.Create(request.local_repository, CopyStagingKind::kDownload,
+                        &error)) {
         result.ok = false;
         break;
       }
+      const std::string staging_dir = lease.path();
       std::vector<RemoteSnapshotInfo> remote;
       if (!client->List(&remote, &error)) {
         result.ok = false;
@@ -2096,7 +2019,7 @@ RemoteOpResult RemoteController::RunOperation(
           std::string match_error;
           if (LocalObjectMatches(request.local_repository, name,
                                  snapshot.sha256, snapshot.size_bytes,
-                                 staging.path(), &match_error)) {
+                                 staging_dir, &match_error)) {
             ++result.skipped_count;
             result.copied_snapshot_id = snapshot.snapshot_id;
             continue;
@@ -2107,7 +2030,7 @@ RemoteOpResult RemoteController::RunOperation(
           break;
         }
         const std::string downloaded_path =
-            staging.Child("download-" + snapshot.snapshot_id);
+            staging_dir + "/download-" + snapshot.snapshot_id;
         RemoteSnapshotInfo downloaded_info;
         if (!client->DownloadArchiveFile(snapshot.snapshot_id, downloaded_path,
                                          false, progress, &downloaded_info,
@@ -2127,7 +2050,7 @@ RemoteOpResult RemoteController::RunOperation(
             downloaded_path, &bundle_info, &inspect_error);
         bool published = false;
         if (is_bundle) {
-          const std::string extracted = staging.Child("extracted-" + name);
+          const std::string extracted = staging_dir + "/extracted-" + name;
           if (!QDir().mkpath(QString::fromStdString(extracted))) {
             error = "无法创建解包暂存目录：" + name;
             result.ok = false;
@@ -2181,7 +2104,7 @@ RemoteOpResult RemoteController::RunOperation(
             std::string match_error;
             if (!LocalObjectMatches(request.local_repository, name,
                                     snapshot.sha256, snapshot.size_bytes,
-                                    staging.path(), &match_error)) {
+                                    staging_dir, &match_error)) {
               result.ok = false;
               break;
             }
@@ -2194,7 +2117,7 @@ RemoteOpResult RemoteController::RunOperation(
             std::string match_error;
             if (!LocalObjectMatches(request.local_repository, name,
                                     snapshot.sha256, snapshot.size_bytes,
-                                    staging.path(), &match_error)) {
+                                    staging_dir, &match_error)) {
               error = "无法把下载结果发布到本地仓库：" + name + "：" +
                       publish_error;
               result.ok = false;
