@@ -2,10 +2,13 @@
 #include "cloud_task.h"
 
 #include <fcntl.h>
+#include <poll.h>
+#include <signal.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
 #include <cerrno>
+#include <chrono>
 #include <cstdlib>
 #include <cstring>
 #include <sstream>
@@ -46,6 +49,7 @@ bool RunPasswordCommand(const std::string& command, std::string* secret,
   }
   const pid_t child = ::fork();
   if (child == 0) {
+    ::setsid();
     ::close(pipe_fds[0]);
     if (::dup2(pipe_fds[1], STDOUT_FILENO) < 0) _exit(127);
     ::close(pipe_fds[1]);
@@ -61,7 +65,27 @@ bool RunPasswordCommand(const std::string& command, std::string* secret,
   std::string output;
   char buffer[1024];
   bool too_long = false;
+  bool timed_out = false;
+  const auto deadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds(5);
   while (true) {
+    const auto remaining =
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            deadline - std::chrono::steady_clock::now());
+    if (remaining.count() <= 0) {
+      timed_out = true;
+      break;
+    }
+    struct pollfd poll_fd;
+    poll_fd.fd = pipe_fds[0];
+    poll_fd.events = POLLIN;
+    poll_fd.revents = 0;
+    const int polled = ::poll(&poll_fd, 1, static_cast<int>(remaining.count()));
+    if (polled < 0 && errno == EINTR) continue;
+    if (polled <= 0) {
+      timed_out = true;
+      break;
+    }
     const ssize_t got = ::read(pipe_fds[0], buffer, sizeof(buffer));
     if (got < 0 && errno == EINTR) continue;
     if (got <= 0) break;
@@ -72,10 +96,13 @@ bool RunPasswordCommand(const std::string& command, std::string* secret,
     output.append(buffer, static_cast<std::size_t>(got));
   }
   ::close(pipe_fds[0]);
-  if (too_long) {
+  if (too_long || timed_out) {
+    ::kill(-child, SIGKILL);
     int status = 0;
     ::waitpid(child, &status, 0);
-    if (error_message != nullptr) *error_message = "密码命令输出过长";
+    if (error_message != nullptr) {
+      *error_message = too_long ? "密码命令输出过长" : "密码命令执行超时";
+    }
     return false;
   }
   int status = 0;

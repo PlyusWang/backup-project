@@ -459,6 +459,49 @@ int RunRemoteProductFlow(backup_modern::RemoteController* remote, CheckRun* run,
       file.write(text.toUtf8());
     }
   };
+  // F3：取密命令必须有超时和输出上限，且不能留下子进程。
+  {
+    const QString creds_path = work + QStringLiteral("/timeout-creds.env");
+    QFile creds(creds_path);
+    if (creds.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
+      creds.write(
+          QStringLiteral("host=127.0.0.1\nport=1\nusername=timeout_user\n"
+                         "password_command=sleep 60\n"
+                         "identity_mode=pin\npin=sha256:%1\n")
+              .arg(QString(64, QLatin1Char('0')))
+              .toUtf8());
+    }
+    creds.close();
+    QFile::setPermissions(creds_path,
+                          QFileDevice::ReadOwner | QFileDevice::WriteOwner);
+    backupproject::CloudCredentials ignored;
+    std::string timeout_error;
+    QElapsedTimer timer;
+    timer.start();
+    const bool accepted = backupproject::LoadCloudCredentialsFile(
+        creds_path.toStdString(), &ignored, &timeout_error);
+    run->Check(!accepted && timer.elapsed() < 8000,
+               QStringLiteral("F3 取密命令挂起：5 秒超时并回收"),
+               QStringLiteral("elapsed=%1ms").arg(timer.elapsed()));
+    if (creds.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
+      creds.write(
+          QStringLiteral("host=127.0.0.1\nport=1\nusername=timeout_user\n"
+                         "password_command=yes\n"
+                         "identity_mode=pin\npin=sha256:%1\n")
+              .arg(QString(64, QLatin1Char('0')))
+              .toUtf8());
+    }
+    creds.close();
+    QElapsedTimer limit_timer;
+    limit_timer.start();
+    const bool limit_accepted = backupproject::LoadCloudCredentialsFile(
+        creds_path.toStdString(), &ignored, &timeout_error);
+    run->Check(!limit_accepted && limit_timer.elapsed() < 3000,
+               QStringLiteral("F3 取密命令输出超限：立即终止并回收"),
+               QStringLiteral("elapsed=%1ms").arg(limit_timer.elapsed()));
+    QFile::remove(creds_path);
+  }
+
   // 一份 200 KiB 的随机文件 + 两个小文本（其中一个在子目录里）：这样"改一个
   // 小文件"之后的增量必须远小于完整基线。
   {
