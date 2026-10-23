@@ -84,6 +84,7 @@ run ssh-tunnel-sanitize env SSH_TUNNEL_TEST_EXTRA_FLAGS="-g -O1 -fsanitize=addre
 run secure-transport bash scripts/secure_transport_test.sh
 run remote-incremental bash scripts/remote_incremental_test.sh
 run copy-staging bash scripts/copy_staging_test.sh
+run ownership-ledger bash scripts/ownership_ledger_test.sh
 # 远端可靠性与下载路径契约（本轮新增）：remote download 的内容落在调用方给定的
 # 路径上，不是 "<快照ID>.bak" —— 上一轮的临时脚本正是踩了这个假设，把一次完全
 # 正确的下载判成 FAIL。脚本自带比较函数自检，橡皮图章式的比较会被判失败。
