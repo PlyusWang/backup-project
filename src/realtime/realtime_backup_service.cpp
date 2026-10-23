@@ -38,14 +38,19 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <cstdio>
+#include <fstream>
 #include <map>
 #include <mutex>
+#include <set>
 #include <string>
 #include <vector>
 
+#include "app_paths.h"
 #include "backup_credentials.h"
 #include "backup_engine.h"
 #include "backup_option_keys.h"
+#include "cloud_retention.h"
 #include "cloud_task.h"
 #include "incremental_delta.h"
 #include "source_digest.h"
@@ -234,6 +239,42 @@ bool ReadWholeFile(const std::string& path, std::string* text,
     return false;
   }
   return true;
+}
+
+std::string CloudOwnedLedgerPath(const std::string& repository_id,
+                                 const std::string& source) {
+  std::string config;
+  std::string error;
+  if (!AppConfigDirectory(&config, &error)) return std::string();
+  const std::string key = repository_id + "|" + source;
+  std::uint64_t hash = 1469598103934665603ull;
+  for (unsigned char byte : key) {
+    hash ^= byte;
+    hash *= 1099511628211ull;
+  }
+  char name[64];
+  std::snprintf(name, sizeof(name), "/realtime-cloud-owned-%016llx.txt",
+                static_cast<unsigned long long>(hash));
+  return config + name;
+}
+
+bool AppendCloudOwned(const std::string& path, const std::string& name) {
+  if (path.empty() || name.empty()) return false;
+  std::ofstream out(path, std::ios::app);
+  if (!out) return false;
+  out << name << '\n';
+  return out.good();
+}
+
+std::vector<std::string> ReadCloudOwned(const std::string& path) {
+  std::vector<std::string> names;
+  std::set<std::string> seen;
+  std::ifstream in(path);
+  std::string line;
+  while (std::getline(in, line)) {
+    if (!line.empty() && seen.insert(line).second) names.push_back(line);
+  }
+  return names;
 }
 
 }  // namespace
@@ -916,6 +957,21 @@ bool RunRealtimeBackupOnce(const RealtimeConfig& config,
       outcome->kind = RealtimeOutcome::Kind::kFailed;
       SetError(error_message, "Cloud backup failed: " + cloud_error);
       return false;
+    }
+    if (!cloud.no_changes && config.retain_count > 0) {
+      const std::string ledger =
+          CloudOwnedLedgerPath(config.cloud_repository_id, config.source_path);
+      if (AppendCloudOwned(ledger, cloud.archive_name)) {
+        backupproject::CloudRetentionRequest retention;
+        retention.credentials = task.credentials;
+        retention.expected_repository_id = config.cloud_repository_id;
+        retention.retain_count = config.retain_count;
+        retention.owned_archive_names = ReadCloudOwned(ledger);
+        backupproject::CloudRetentionResult retention_result;
+        std::string retention_error;
+        backupproject::RunCloudRetention(retention, &retention_result,
+                                         &retention_error);
+      }
     }
     if (cloud.no_changes) {
       outcome->kind = RealtimeOutcome::Kind::kNoChanges;
