@@ -14,9 +14,11 @@
 #include <sys/types.h>
 
 #include <algorithm>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <string>
+#include <thread>
 #include <unordered_set>
 #include <utility>
 #include <vector>
@@ -605,7 +607,13 @@ bool ScheduledBackupService::EvaluateInternal(std::int64_t now_sec, bool force,
       task.options.password = credential;
     }
     backupproject::CloudTaskOutcome outcome;
-    const bool ok = backupproject::RunCloudTask(task, &outcome, &cloud_error);
+    bool ok = false;
+    for (int attempt = 0; attempt < 3 && !ok; ++attempt) {
+      ok = backupproject::RunCloudTask(task, &outcome, &cloud_error);
+      if (!ok && attempt < 2) {
+        std::this_thread::sleep_for(std::chrono::seconds(1 << attempt));
+      }
+    }
     if (!credential.empty()) credential.assign(credential.size(), '\0');
     if (!ok) return finish_failed("Cloud backup failed: " + cloud_error);
 
