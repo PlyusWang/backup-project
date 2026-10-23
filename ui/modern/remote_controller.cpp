@@ -43,6 +43,8 @@
 // 代数、lineage、要不要 bootstrap 缓存）——它只把"源目录 + 策略"和
 // "目标快照 + 目标目录"交给这一层。
 #include "backup_catalog.h"
+#include "backup_mode.h"
+#include "backup_option_keys.h"
 #include "copy_staging.h"
 #include "file_io.h"
 #include "incremental_backup.h"
@@ -1794,6 +1796,8 @@ RemoteOpResult RemoteController::RunOperation(
       backup.client = client;
       backup.cache = cache;
       backup.source_directory = request.source_directory;
+      backup.filter = request.filter;
+      backup.options = request.backup_options;
       backup.allow_incremental = request.allow_incremental;
       backup.display_name = request.display_name;
       backup.progress = progress;
@@ -2934,6 +2938,17 @@ void RemoteController::clearBackupSummary() {
 // 完整基线，全部由 core 依据服务端元数据判断，GUI 不持有任何链状态。
 bool RemoteController::backupRemote(const QString& source_directory,
                                     bool allow_incremental) {
+  return backupRemoteWithOptions(source_directory, allow_incremental,
+                                 QStringLiteral("mypack"),
+                                 QStringLiteral("none"), QStringLiteral("none"),
+                                 QString(), QStringList(), QStringList());
+}
+
+bool RemoteController::backupRemoteWithOptions(
+    const QString& source_directory, bool allow_incremental,
+    const QString& pack_key, const QString& compression_key,
+    const QString& encryption_key, const QString& password,
+    const QStringList& include_rules, const QStringList& exclude_rules) {
   const QString source = source_directory.trimmed();
   if (source.isEmpty()) {
     SetStatus(QStringLiteral("error"), QStringLiteral("还没有选择源目录"),
@@ -2949,6 +2964,52 @@ bool RemoteController::backupRemote(const QString& source_directory,
   }
   // 策略只决定"允不允许续链"：真正的判断（有没有可信基线、链深、缓存是否
   // 可信）在 core 里。GUI 不传递 parent / generation / lineage。
+  backupproject::BackupOptions options;
+  if (!backupproject::ParsePackMethodKey(pack_key.toStdString(),
+                                         &options.pack_method) ||
+      !backupproject::ParseCompressionMethodKey(compression_key.toStdString(),
+                                                &options.compression_method) ||
+      !backupproject::ParseEncryptionMethodKey(encryption_key.toStdString(),
+                                               &options.encryption_method)) {
+    SetStatus(QStringLiteral("error"), QStringLiteral("备份选项不可用"),
+              QStringLiteral("打包、压缩或加密方式不是已知取值。"));
+    return false;
+  }
+  options.password = password.toStdString();
+  backupproject::BackupOptionCombination combination;
+  combination.trigger = backupproject::BackupTrigger::kManual;
+  combination.strategy = allow_incremental
+                             ? backupproject::BackupStrategy::kIncremental
+                             : backupproject::BackupStrategy::kFull;
+  combination.pack_method = options.pack_method;
+  combination.compression_method = options.compression_method;
+  combination.encryption_method = options.encryption_method;
+  combination.unattended_credential_available = !options.password.empty();
+  if (!backupproject::IsSupportedBackupOptionCombination(combination)) {
+    const QString reason = QString::fromStdString(
+        backupproject::UnsupportedBackupOptionCombinationReason(combination));
+    SetStatus(QStringLiteral("error"), QStringLiteral("当前选项组合不可用"),
+              reason);
+    return false;
+  }
+  backupproject::Filter filter;
+  std::string filter_error;
+  for (const QString& rule : include_rules) {
+    if (!filter.AddRule(backupproject::FilterAction::kInclude,
+                        rule.toStdString(), &filter_error)) {
+      SetStatus(QStringLiteral("error"), QStringLiteral("筛选规则不可用"),
+                QString::fromStdString(filter_error));
+      return false;
+    }
+  }
+  for (const QString& rule : exclude_rules) {
+    if (!filter.AddRule(backupproject::FilterAction::kExclude,
+                        rule.toStdString(), &filter_error)) {
+      SetStatus(QStringLiteral("error"), QStringLiteral("筛选规则不可用"),
+                QString::fromStdString(filter_error));
+      return false;
+    }
+  }
   if (!BeginOperation(allow_incremental
                           ? QStringLiteral("正在准备增量远端备份")
                           : QStringLiteral("正在准备完整远端备份"),
@@ -2965,6 +3026,14 @@ bool RemoteController::backupRemote(const QString& source_directory,
   request.username = username_.toStdString();
   request.source_directory = source.toStdString();
   request.allow_incremental = allow_incremental;
+  request.filter = filter;
+  request.backup_options = options;
+  for (const QString& rule : include_rules) {
+    request.include_rules.push_back(rule.toStdString());
+  }
+  for (const QString& rule : exclude_rules) {
+    request.exclude_rules.push_back(rule.toStdString());
+  }
   // 显示名留空：链的命名（remote-<lineage 前 12 位>-<时间>-g<代数>.bak）由
   // core 按链规则生成——GUI 不参与命名，也就不会造出与链不一致的名字。
   Submit(request);

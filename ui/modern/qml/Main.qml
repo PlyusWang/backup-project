@@ -235,6 +235,10 @@ ApplicationWindow {
                         root.goTo("management")
                         managementPage.showTab("local", "settings")
                     }
+                    onOpenCloud: {
+                        root.goTo("management")
+                        managementPage.showTab("cloud")
+                    }
                 }
 
                 SchedulePage {

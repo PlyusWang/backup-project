@@ -119,6 +119,11 @@ class RealtimeController : public QObject {
   Q_PROPERTY(QString encryptionKey READ encryptionKey NOTIFY configChanged)
   // 无人值守加密的口令文件草稿（只保存路径）。
   Q_PROPERTY(QString credentialFile READ credentialFile NOTIFY configChanged)
+  Q_PROPERTY(QString repositoryType READ repositoryType NOTIFY configChanged)
+  Q_PROPERTY(QString cloudCredentialsFile READ cloudCredentialsFile NOTIFY
+                 configChanged)
+  Q_PROPERTY(
+      QString cloudRepositoryId READ cloudRepositoryId NOTIFY configChanged)
   Q_PROPERTY(QStringList includeRules READ includeRules NOTIFY configChanged)
   Q_PROPERTY(QStringList excludeRules READ excludeRules NOTIFY configChanged)
   // 当前真实支持的模式。QML 只显示这一行，不做"未实现的按钮"。
@@ -183,6 +188,16 @@ class RealtimeController : public QObject {
   QString compressionKey() const;
   QString encryptionKey() const;
   QString credentialFile() const { return draft_credential_file_; }
+  QString repositoryType() const {
+    return QString::fromStdString(
+        config_.repository_type.empty() ? "local" : config_.repository_type);
+  }
+  QString cloudCredentialsFile() const {
+    return QString::fromStdString(config_.cloud_credentials_file);
+  }
+  QString cloudRepositoryId() const {
+    return QString::fromStdString(config_.cloud_repository_id);
+  }
   QStringList includeRules() const;
   QStringList excludeRules() const;
   QString supportedModeText() const;
@@ -242,6 +257,10 @@ class RealtimeController : public QObject {
   // 只改 enabled。启用前会做完整校验。
   Q_INVOKABLE bool setEnabled(bool enabled);
   // 保存前的加密选择：只更新草稿，不写盘、不读文件。
+  Q_INVOKABLE bool setRepositoryTarget(const QString& repository_type,
+                                       const QString& credentials_file,
+                                       const QString& repository_id);
+  Q_INVOKABLE QString cloudRepositoryIdForFile(const QString& credentials_file);
   Q_INVOKABLE bool setEncryptionChoice(const QString& encryption_key,
                                        const QString& credential_file);
 

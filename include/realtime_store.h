@@ -53,6 +53,12 @@ struct RealtimeConfig {
   bool enabled = false;
   BackupTrigger trigger = BackupTrigger::kRealtime;
   std::string source_path;
+
+  // 目标仓库：空串 / "local" = 本地仓库；"cloud" = 云端。
+  std::string repository_type = "local";
+  std::string cloud_credentials_file;
+  std::string cloud_repository_id;
+
   std::uint32_t debounce_ms = kDefaultRealtimeDebounceMs;
   std::uint32_t max_wait_ms = kDefaultRealtimeMaxWaitMs;
   std::uint32_t retain_count = kDefaultRealtimeRetainCount;

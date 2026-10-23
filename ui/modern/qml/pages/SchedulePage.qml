@@ -65,6 +65,9 @@ Item {
     property int draftEncryptionIndex: 0
     // 无人值守加密的口令文件草稿。只保存路径，口令内容由核心在运行时读取。
     property string draftCredentialFile: ""
+    property string draftRepositoryType: schedule.repositoryType
+    property string draftCloudCredentialsFile: schedule.cloudCredentialsFile
+    property string draftCloudRepositoryId: schedule.cloudRepositoryId
 
     // 高级设置默认收起：一打开页面先看到日常要用的那几项。
     property bool advancedExpanded: false
@@ -126,6 +129,9 @@ Item {
         page.draftEncryptionIndex =
             Math.max(0, page.encryptionKeys.indexOf(schedule.encryptionKey))
         page.draftCredentialFile = schedule.credentialFile
+        page.draftRepositoryType = schedule.repositoryType
+        page.draftCloudCredentialsFile = schedule.cloudCredentialsFile
+        page.draftCloudRepositoryId = schedule.cloudRepositoryId
         // 落盘配置里的规则读进共享编辑器（校验仍然走共享 builder）。读不懂时
         // 编辑器会显示共享核心给出的原因，这里不吞掉它。
         ruleEditor.loadRules(schedule.includeRules, schedule.excludeRules)
@@ -142,6 +148,8 @@ Item {
         schedule.retainCount, schedule.strategyKey,
         schedule.packKey, schedule.compressionKey,
         schedule.encryptionKey, schedule.credentialFile,
+        schedule.repositoryType, schedule.cloudCredentialsFile,
+        schedule.cloudRepositoryId,
         schedule.includeRules.join(","), schedule.excludeRules.join(",")
     ].join("|")
     onSavedSignatureChanged: syncFromController()
@@ -257,6 +265,77 @@ Item {
                             variant: page.draftEnabled ? "secondary" : "primary"
                             enabled: !schedule.libraryBusy
                             onClicked: page.draftEnabled = !page.draftEnabled
+                        }
+                    }
+
+                    Text {
+                        text: "目标仓库"
+                        font.pixelSize: 16
+                        font.weight: Font.DemiBold
+                        color: theme.textSecondary
+                        Layout.topMargin: 2
+                    }
+
+                    SegmentedTabs {
+                        objectName: "scheduleTargetTabs"
+                        Layout.preferredWidth: 360
+                        enabled: !schedule.libraryBusy
+                        currentKey: page.draftRepositoryType
+                        model: [
+                            { "key": "local", "text": "本地仓库" },
+                            { "key": "cloud", "text": "云端仓库" }
+                        ]
+                        onActivated: function (key) {
+                            page.draftRepositoryType = key
+                        }
+                    }
+
+                    ColumnLayout {
+                        Layout.fillWidth: true
+                        visible: page.draftRepositoryType === "cloud"
+                        spacing: 6
+
+                        Text {
+                            text: "0600 云端凭据文件（host/port/username/"
+                                + "password/pin 或 server_id；密码不进配置）"
+                            font.pixelSize: 14
+                            color: theme.textSecondary
+                            wrapMode: Text.WordWrap
+                        }
+
+                        RowLayout {
+                            Layout.fillWidth: true
+                            spacing: 8
+
+                            AppTextField {
+                                objectName: "scheduleCloudCredentialsField"
+                                Layout.fillWidth: true
+                                text: page.draftCloudCredentialsFile
+                                onTextEdited: page.draftCloudCredentialsFile = text
+                                placeholderText: "绝对路径，例如 /home/me/cloud.env"
+                            }
+
+                            AppButton {
+                                text: "生成仓库标识"
+                                enabled: page.draftCloudCredentialsFile.length > 0
+                                onClicked: {
+                                    const id = schedule.cloudRepositoryIdForFile(
+                                        page.draftCloudCredentialsFile)
+                                    if (id.length > 0)
+                                        page.draftCloudRepositoryId = id
+                                }
+                            }
+                        }
+
+                        Text {
+                            objectName: "scheduleCloudRepositoryId"
+                            Layout.fillWidth: true
+                            text: page.draftCloudRepositoryId.length > 0
+                                  ? "仓库标识：" + page.draftCloudRepositoryId
+                                  : "尚未生成仓库标识"
+                            font.pixelSize: 13
+                            color: theme.textSecondary
+                            wrapMode: Text.WrapAnywhere
                         }
                     }
 
@@ -454,6 +533,19 @@ Item {
                             // 先把加密选择交给控制器草稿（只改内存），
                             // 再由唯一的保存入口整份提交。任何一步拒绝都不写盘。
                             onClicked: {
+                                let targetId = page.draftCloudRepositoryId
+                                if (page.draftRepositoryType === "cloud"
+                                        && targetId.length === 0
+                                        && page.draftCloudCredentialsFile.length > 0) {
+                                    targetId = schedule.cloudRepositoryIdForFile(
+                                        page.draftCloudCredentialsFile)
+                                    page.draftCloudRepositoryId = targetId
+                                }
+                                if (!schedule.setRepositoryTarget(
+                                        page.draftRepositoryType,
+                                        page.draftCloudCredentialsFile,
+                                        targetId))
+                                    return
                                 if (!schedule.setEncryptionChoice(
                                         page.encryptionKeyValue,
                                         page.draftCredentialFile))
