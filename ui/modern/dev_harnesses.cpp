@@ -499,6 +499,22 @@ int RunRemoteProductFlow(backup_modern::RemoteController* remote, CheckRun* run,
     run->Check(!limit_accepted && limit_timer.elapsed() < 3000,
                QStringLiteral("F3 取密命令输出超限：立即终止并回收"),
                QStringLiteral("elapsed=%1ms").arg(limit_timer.elapsed()));
+    if (creds.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
+      creds.write(
+          QStringLiteral("host=127.0.0.1\nport=1\nusername=timeout_user\n"
+                         "password_command=exec 1>&-; sleep 60\n"
+                         "identity_mode=pin\npin=sha256:%1\n")
+              .arg(QString(64, QLatin1Char('0')))
+              .toUtf8());
+    }
+    creds.close();
+    QElapsedTimer eof_timer;
+    eof_timer.start();
+    const bool eof_accepted = backupproject::LoadCloudCredentialsFile(
+        creds_path.toStdString(), &ignored, &timeout_error);
+    run->Check(!eof_accepted && eof_timer.elapsed() < 8000,
+               QStringLiteral("F3 EOF 后子进程仍运行：5 秒总超时回收"),
+               QStringLiteral("elapsed=%1ms").arg(eof_timer.elapsed()));
     QFile::remove(creds_path);
   }
 
