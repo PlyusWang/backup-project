@@ -85,7 +85,8 @@ bool LoadCloudCredentialsFile(const std::string& path,
     return false;
   }
   if (parsed.identity_mode != "pin" && parsed.identity_mode != "certificate") {
-    if (error_message != nullptr) *error_message = "云端身份方式必须是 pin 或 certificate";
+    if (error_message != nullptr)
+      *error_message = "云端身份方式必须是 pin 或 certificate";
     return false;
   }
   if (parsed.identity_mode == "pin" && parsed.server_key_pin.empty()) {
