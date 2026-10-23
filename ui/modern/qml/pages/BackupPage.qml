@@ -208,7 +208,7 @@ Item {
                     AppButton {
                         objectName: "goToSettingsButton"
                         visible: !controller.repositoryConfigured
-                        text: "前往设置"
+                        text: "前往备份管理"
                         iconName: "settings"
                         onClicked: page.openSettings()
                     }
