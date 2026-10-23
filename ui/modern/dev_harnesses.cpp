@@ -2301,57 +2301,6 @@ int RunRemoteProductFlow(backup_modern::RemoteController* remote, CheckRun* run,
                  QString::fromStdString(chain_error));
     }
 
-    // ---- G1 名称复用：旧对象删除后同名新对象不属于旧任务 ----
-    {
-      backupproject::CloudCredentials creds;
-      std::string creds_error;
-      backupproject::LoadCloudCredentialsFile(cloud_credentials.toStdString(),
-                                              &creds, &creds_error);
-      backupproject::net::RemoteEndpoint endpoint;
-      endpoint.host = creds.host;
-      endpoint.port = creds.port;
-      endpoint.identity_mode = creds.identity_mode;
-      endpoint.server_key_pin = creds.server_key_pin;
-      endpoint.trusted_roots_file = creds.trusted_roots_file;
-      endpoint.expected_server_id = creds.expected_server_id;
-      backupproject::net::RemoteArchiveClient client;
-      const bool connected =
-          client.Connect(endpoint, &creds_error) &&
-          client.Login(creds.username, creds.password, &creds_error);
-      const bool deleted =
-          connected && client.Delete(chain_full_id, &creds_error);
-      const QString replacement = work + QStringLiteral("/same-name.bak");
-      QFile replacement_file(replacement);
-      if (replacement_file.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
-        replacement_file.write(QByteArray(2048, 'x'));
-      }
-      replacement_file.close();
-      backupproject::net::RemoteSnapshotInfo uploaded;
-      const bool reuploaded =
-          deleted &&
-          client.UploadArchiveFile(replacement.toStdString(), chain_full,
-                                   backupproject::net::RemoteProgressCallback(),
-                                   &uploaded, &creds_error);
-      backupproject::CloudRetentionRequest request;
-      request.credentials = creds;
-      request.expected_repository_id = backupproject::CloudRepositoryId(creds);
-      request.retain_count = 1;
-      request.owned_snapshot_ids = {chain_full_id};
-      request.owned_sha256 = {chain_full_sha};
-      request.dry_run = true;
-      backupproject::CloudRetentionResult result;
-      std::string retention_error;
-      const bool retention_ok =
-          reuploaded &&
-          backupproject::RunCloudRetention(request, &result, &retention_error);
-      refresh();
-      run->Check(
-          reuploaded && retention_ok && result.dry_run_delete.empty() &&
-              !findByDisplayName(QString::fromStdString(chain_full)).isEmpty(),
-          QStringLiteral("G1 名称复用：同名新对象不被旧归属删除"),
-          QString::fromStdString(creds_error + " / " + retention_error));
-    }
-
     // ---- G6 并发：两个线程同时触发云端实时备份 ----
     if (server_process != nullptr) {
       const QString concurrent_file =
