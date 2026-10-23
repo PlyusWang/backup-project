@@ -1164,7 +1164,7 @@ Item {
                             text: realtime.repositoryConfigured
                                   ? "备份仓库：" + realtime.repositoryPath
                                   : "备份仓库：尚未配置" +
-                                    "（请在设置页选择仓库目录）"
+                                    "（请先在“备份管理”中添加仓库）"
                             font.pixelSize: 14
                             color: realtime.repositoryConfigured
                                     ? theme.textSecondary
