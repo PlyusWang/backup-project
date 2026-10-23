@@ -1873,6 +1873,31 @@ int RunRemoteProductFlow(backup_modern::RemoteController* remote, CheckRun* run,
                               backupproject::RealtimeOutcome::Kind::kDelta,
         QStringLiteral("G6 实时云端增量备份：接在完整基线之后"),
         QString::fromStdString(realtime_delta_error));
+
+    // G7：用最新云端增量快照做一次完整链恢复，核对内容。
+    refresh();
+    const QVariantMap cloud_chain_row = findByDisplayName(
+        QString::fromStdString(realtime_outcome.snapshot_file_name));
+    const QString cloud_chain_id =
+        cloud_chain_row.value(QStringLiteral("id")).toString();
+    const QString cloud_chain_restore =
+        work + QStringLiteral("/cloud-chain-restore");
+    QDir().mkpath(cloud_chain_restore);
+    const bool cloud_chain_restore_ok =
+        !cloud_chain_id.isEmpty() &&
+        remote->restoreSnapshot(cloud_chain_id, cloud_chain_restore) &&
+        remote->waitForIdle(900000) &&
+        remote->lastErrorKindForTest() == QStringLiteral("none");
+    QString cloud_chain_text;
+    QFile cloud_chain_file(cloud_chain_restore + QStringLiteral("/a.txt"));
+    if (cloud_chain_file.open(QIODevice::ReadOnly)) {
+      cloud_chain_text = QString::fromUtf8(cloud_chain_file.readAll());
+    }
+    run->Check(cloud_chain_restore_ok &&
+                   cloud_chain_text == QStringLiteral("cloud-realtime-1\n"),
+               QStringLiteral("G7 云端完整+增量链恢复内容一致"),
+               remote->lastErrorKindForTest() + QStringLiteral(": ") +
+                   remote->lastDetailForTest());
   }
 
   // ---- 清理：注销临时账号（正式数据不受影响）----
