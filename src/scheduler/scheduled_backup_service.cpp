@@ -29,6 +29,7 @@
 #include "cloud_retention.h"
 #include "cloud_task.h"
 #include "incremental_backup.h"
+#include "ownership_ledger.h"
 #include "source_manifest.h"
 
 namespace backupproject {

@@ -669,6 +669,10 @@ void AppendHistoryField(std::string* out, const ScheduleHistoryEntry& entry,
   AppendStringField(out, "result", ScheduleRunResultKey(entry.result), false);
   AppendIndent(out, depth + 1);
   AppendStringField(out, "archive_file_name", entry.archive_file_name, false);
+  AppendIndent(out, depth + 1);
+  AppendStringField(out, "cloud_snapshot_id", entry.cloud_snapshot_id, false);
+  AppendIndent(out, depth + 1);
+  AppendStringField(out, "cloud_sha256", entry.cloud_sha256, false);
   AppendChangeFields(out, entry.changes, depth + 1);
   AppendIndent(out, depth + 1);
   AppendStringField(out, "diagnostic", entry.diagnostic, true);
@@ -846,6 +850,9 @@ const std::vector<const char*> kHistoryFields = {
     "scheduled_at_sec",  "started_at_sec", "finished_at_sec", "result",
     "archive_file_name", "added",          "removed",         "modified",
     "metadata_changed",  "diagnostic"};
+// 新版本追加的归属字段：旧 schedule.json 没有它们也必须能读。
+const std::vector<const char*> kHistoryOptionalFields = {"cloud_snapshot_id",
+                                                         "cloud_sha256"};
 
 // 解析错误的统一形状 "Invalid schedule store: <位置>: field '<key>' ..."。
 // 位置用 state.managed_snapshots[3] 这类路径式写法，用户能直接定位到字段。
@@ -1109,7 +1116,8 @@ bool ParseHistoryEntry(const JsonValue& value, const std::string& what,
              "Invalid schedule store: " + what + ": must be an object");
     return false;
   }
-  if (!RequireExactFields(value, kHistoryFields, what, error_message)) {
+  if (!RequireExactFields(value, kHistoryFields, kHistoryOptionalFields, what,
+                          error_message)) {
     return false;
   }
   if (!RequireInt64(value, "scheduled_at_sec", what, &entry->scheduled_at_sec,
@@ -1142,6 +1150,26 @@ bool ParseHistoryEntry(const JsonValue& value, const std::string& what,
     return BadField(what, "archive_file_name",
                     "must be empty or a single .bak file name: '" +
                         entry->archive_file_name + "'",
+                    error_message);
+  }
+  if (!RequireOptionalString(value, "cloud_snapshot_id", what,
+                             &entry->cloud_snapshot_id, error_message) ||
+      !RequireOptionalString(value, "cloud_sha256", what, &entry->cloud_sha256,
+                             error_message)) {
+    return false;
+  }
+  const auto hex_ok = [](const std::string& text, std::size_t size) {
+    if (text.empty()) return true;
+    if (text.size() != size) return false;
+    for (char c : text) {
+      if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f'))) return false;
+    }
+    return true;
+  };
+  if (!hex_ok(entry->cloud_snapshot_id, 32) ||
+      !hex_ok(entry->cloud_sha256, 64)) {
+    return BadField(what, "cloud_snapshot_id",
+                    "must be empty or 32/64 lowercase hex digits",
                     error_message);
   }
   if (!ParseChangeFields(value, what, &entry->changes, error_message)) {

@@ -26,6 +26,7 @@
 #include <QQuickStyle>
 #include <QQuickWindow>
 #include <QRandomGenerator>
+#include <QRegularExpression>
 #include <QSet>
 #include <QStandardPaths>
 #include <QStringList>
@@ -1975,6 +1976,48 @@ int RunRemoteProductFlow(backup_modern::RemoteController* remote, CheckRun* run,
         QStringLiteral("G5 定时云端增量备份：真实触发并记录结果"),
         QString::fromStdString(schedule_error + " / " + schedule_run_error));
 
+    // ---- A 历史身份字段保存/重载 + 旧格式兼容 ----
+    {
+      backupproject::ScheduleDocument identity_doc;
+      std::string identity_error;
+      const bool identity_loaded =
+          cloud_schedule_store.Load(&identity_doc, &identity_error) ==
+          backupproject::ScheduleLoadStatus::kLoaded;
+      bool identity_found = false;
+      for (const auto& entry : identity_doc.state.history) {
+        if (entry.cloud_snapshot_id.size() == 32 &&
+            entry.cloud_sha256.size() == 64) {
+          identity_found = true;
+        }
+      }
+      run->Check(identity_loaded && identity_found,
+                 QStringLiteral("A 定时历史身份字段保存后重载不丢失"),
+                 QString::fromStdString(identity_error));
+      QFile current(schedule_cloud_path);
+      QString text;
+      if (current.open(QIODevice::ReadOnly)) {
+        text = QString::fromUtf8(current.readAll());
+      }
+      text.remove(QRegularExpression(
+          QStringLiteral("\n\s*\"cloud_snapshot_id\": \"[^\"]*\",")));
+      text.remove(QRegularExpression(
+          QStringLiteral("\n\s*\"cloud_sha256\": \"[^\"]*\",")));
+      const QString old_path =
+          work + QStringLiteral("/cloud-schedule-old.json");
+      QFile old_file(old_path);
+      if (old_file.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
+        old_file.write(text.toUtf8());
+      }
+      old_file.close();
+      backupproject::ScheduleStore old_store(old_path.toStdString());
+      backupproject::ScheduleDocument old_doc;
+      std::string old_error;
+      run->Check(old_store.Load(&old_doc, &old_error) ==
+                     backupproject::ScheduleLoadStatus::kLoaded,
+                 QStringLiteral("A 旧版 schedule.json 仍可读取"),
+                 QString::fromStdString(old_error));
+    }
+
     // ---- F1 云端保留：4 个完整快照，保留 2，删除旧 2 ----
     {
       const QString retention_source = work + QStringLiteral("/retention-src");
@@ -2315,6 +2358,87 @@ int RunRemoteProductFlow(backup_modern::RemoteController* remote, CheckRun* run,
                      manual_kept,
                  QStringLiteral("F1 链依赖与非本任务快照受保护"),
                  QString::fromStdString(chain_error));
+    }
+
+    // ---- B 名称复用：旧对象删除后同名新对象不属于旧任务 ----
+    {
+      const QString reuse_source = work + QStringLiteral("/reuse-src");
+      QDir().mkpath(reuse_source);
+      QFile content(reuse_source + QStringLiteral("/data.txt"));
+      if (content.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
+        content.write(QByteArray(2048, 'a'));
+      }
+      content.close();
+      backupproject::CloudCredentials reuse_creds;
+      std::string reuse_error;
+      const bool creds_ok = backupproject::LoadCloudCredentialsFile(
+          cloud_credentials.toStdString(), &reuse_creds, &reuse_error);
+      backupproject::CloudTaskRequest first_task;
+      first_task.credentials = reuse_creds;
+      first_task.expected_repository_id =
+          backupproject::CloudRepositoryId(reuse_creds);
+      first_task.source_directory = reuse_source.toStdString();
+      first_task.allow_incremental = false;
+      backupproject::CloudTaskOutcome first_outcome;
+      const bool first_created =
+          creds_ok &&
+          backupproject::RunCloudTask(first_task, &first_outcome, &reuse_error);
+      backupproject::net::RemoteEndpoint endpoint;
+      endpoint.host = reuse_creds.host;
+      endpoint.port = reuse_creds.port;
+      endpoint.identity_mode = reuse_creds.identity_mode;
+      endpoint.server_key_pin = reuse_creds.server_key_pin;
+      endpoint.trusted_roots_file = reuse_creds.trusted_roots_file;
+      endpoint.expected_server_id = reuse_creds.expected_server_id;
+      backupproject::net::RemoteArchiveClient client;
+      const bool connected = first_created &&
+                             client.Connect(endpoint, &reuse_error) &&
+                             client.Login(reuse_creds.username,
+                                          reuse_creds.password, &reuse_error);
+      const bool removed =
+          connected && client.Delete(first_outcome.snapshot_id, &reuse_error);
+      const QString replacement_path =
+          work + QStringLiteral("/replacement.bak");
+      QFile replacement(replacement_path);
+      if (replacement.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
+        replacement.write(QByteArray(4096, 'b'));
+      }
+      replacement.close();
+      backupproject::net::RemoteSnapshotInfo replacement_info;
+      const bool reuploaded =
+          removed &&
+          client.UploadArchiveFile(replacement_path.toStdString(),
+                                   first_outcome.archive_name,
+                                   backupproject::net::RemoteProgressCallback(),
+                                   &replacement_info, &reuse_error);
+      backupproject::CloudRetentionRequest request;
+      request.credentials = reuse_creds;
+      request.expected_repository_id =
+          backupproject::CloudRepositoryId(reuse_creds);
+      request.retain_count = 1;
+      request.owned_snapshot_ids = {first_outcome.snapshot_id};
+      request.owned_sha256 = {first_outcome.sha256};
+      request.dry_run = true;
+      backupproject::CloudRetentionResult reuse_result;
+      std::string retention_error;
+      const bool reused =
+          reuploaded && backupproject::RunCloudRetention(request, &reuse_result,
+                                                         &retention_error);
+      refresh();
+      const bool replacement_exists =
+          !findByDisplayName(QString::fromStdString(first_outcome.archive_name))
+               .isEmpty();
+      request.owned_snapshot_ids = {replacement_info.snapshot_id};
+      request.owned_sha256 = {std::string(64, '0')};
+      backupproject::CloudRetentionResult mismatch_result;
+      const bool mismatch_rejected =
+          reuploaded && !backupproject::RunCloudRetention(
+                            request, &mismatch_result, &retention_error);
+      run->Check(reused && replacement_exists && mismatch_rejected &&
+                     replacement_info.snapshot_id != first_outcome.snapshot_id,
+                 QStringLiteral(
+                     "B 名称复用：同名新对象不被旧归属删除，摘要不一致拒绝"),
+                 QString::fromStdString(reuse_error + " / " + retention_error));
     }
 
     // ---- G6 并发：两个线程同时触发云端实时备份 ----
