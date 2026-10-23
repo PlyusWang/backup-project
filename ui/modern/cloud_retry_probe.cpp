@@ -11,9 +11,12 @@
 #include <QTemporaryDir>
 #include <QThread>
 #include <cstdio>
+#include <set>
 
 #include "backup_engine.h"
+#include "cloud_retention.h"
 #include "cloud_task.h"
+#include "ownership_ledger.h"
 #include "realtime_backup_service.h"
 #include "remote_backup_client.h"
 #include "remote_controller.h"
@@ -340,6 +343,78 @@ int RunCloudRetryProbe(const QString& work_root) {
             bad_timer.elapsed() < 2500,
         "D 永久错误：认证失败快速失败不重试",
         "elapsed=" + QString::number(bad_timer.elapsed()));
+
+  // A：超过 32 个版本 + 重启后账本驱动的淘汰。
+  {
+    const QString direct_creds = write_creds(server_port, password);
+    backupproject::CloudCredentials stress_creds;
+    std::string stress_error;
+    backupproject::LoadCloudCredentialsFile(direct_creds.toStdString(),
+                                            &stress_creds, &stress_error);
+    std::vector<std::string> owned_ids;
+    std::vector<std::string> owned_shas;
+    for (int i = 0; i < 40; ++i) {
+      QFile file(source + "/stress.txt");
+      if (file.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
+        file.write(QByteArray(64, 'a' + (i % 26)));
+        file.write(QString::number(i).toUtf8());
+      }
+      file.close();
+      backupproject::CloudTaskRequest task;
+      task.credentials = stress_creds;
+      task.expected_repository_id =
+          backupproject::CloudRepositoryId(stress_creds);
+      task.source_directory = source.toStdString();
+      task.allow_incremental = false;
+      backupproject::CloudTaskOutcome outcome;
+      std::string run_error;
+      if (!backupproject::RunCloudTask(task, &outcome, &run_error)) {
+        Check(false, "A 40 版本创建", QString::fromStdString(run_error));
+        return 1;
+      }
+      owned_ids.push_back(outcome.snapshot_id);
+      owned_shas.push_back(outcome.sha256);
+    }
+    backupproject::CloudRetentionRequest retention;
+    retention.credentials = stress_creds;
+    retention.expected_repository_id =
+        backupproject::CloudRepositoryId(stress_creds);
+    retention.retain_count = 36;
+    retention.owned_snapshot_ids = owned_ids;
+    retention.owned_sha256 = owned_shas;
+    backupproject::CloudRetentionResult result;
+    Check(backupproject::RunCloudRetention(retention, &result, &stress_error) &&
+              result.deleted.size() == 4,
+          "A >32 版本：保留 36、删除 4", QString::fromStdString(stress_error));
+
+    const QString ledger = dir + "/stress.ledger";
+    for (std::size_t i = 0; i < owned_ids.size(); ++i) {
+      backupproject::AppendOwnershipRecord(
+          ledger.toStdString(),
+          backupproject::OwnershipRecord{owned_ids[i], owned_shas[i]},
+          &stress_error);
+    }
+    std::vector<backupproject::OwnershipRecord> persisted;
+    Check(backupproject::ReadOwnershipRecords(ledger.toStdString(), &persisted,
+                                              &stress_error) &&
+              persisted.size() == 40,
+          "A 重启前账本保存 40 条");
+    backupproject::CloudRetentionRequest reloaded;
+    reloaded.credentials = stress_creds;
+    reloaded.expected_repository_id =
+        backupproject::CloudRepositoryId(stress_creds);
+    reloaded.retain_count = 32;
+    for (const auto& record : persisted) {
+      reloaded.owned_snapshot_ids.push_back(record.snapshot_id);
+      reloaded.owned_sha256.push_back(record.sha256);
+    }
+    backupproject::CloudRetentionResult reloaded_result;
+    Check(backupproject::RunCloudRetention(reloaded, &reloaded_result,
+                                           &stress_error) &&
+              reloaded_result.deleted.size() == 4,
+          "A 重启后按持久账本保留 32、删除 4",
+          QString::fromStdString(stress_error));
+  }
 
   proxy_holder->kill();
   proxy_holder->waitForFinished(3000);
