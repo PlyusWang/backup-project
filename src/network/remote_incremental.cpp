@@ -818,6 +818,7 @@ bool RunRemoteBackup(const RemoteBackupRequest& request,
     return false;
   }
   outcome->snapshot_id = uploaded.snapshot_id;
+  outcome->sha256 = uploaded.sha256;
   outcome->parent_snapshot_id = uploaded.parent_snapshot_id;
   outcome->generation = uploaded.generation;
   outcome->uploaded_bytes = bundle.bundle_size;

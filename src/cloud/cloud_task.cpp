@@ -288,6 +288,7 @@ bool RunCloudTask(const CloudTaskRequest& request, CloudTaskOutcome* outcome,
   outcome->rebuilt_full_baseline = result.rebuilt_full_baseline;
   outcome->no_changes = result.no_changes;
   outcome->snapshot_id = result.snapshot_id;
+  outcome->sha256 = result.sha256;
   outcome->parent_snapshot_id = result.parent_snapshot_id;
   outcome->generation = result.generation;
   outcome->archive_name = result.archive_name;

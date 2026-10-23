@@ -633,6 +633,8 @@ bool ScheduledBackupService::EvaluateInternal(std::int64_t now_sec, bool force,
       result->diagnostic = "cloud repository";
       entry.result = ScheduleRunResult::kSuccessCreated;
       entry.archive_file_name = outcome.archive_name;
+      entry.cloud_snapshot_id = outcome.snapshot_id;
+      entry.cloud_sha256 = outcome.sha256;
       entry.diagnostic = "cloud repository";
     }
     AppendHistoryEntry(&document.state, entry);
@@ -642,9 +644,11 @@ bool ScheduledBackupService::EvaluateInternal(std::int64_t now_sec, bool force,
       retention.expected_repository_id = task.expected_repository_id;
       retention.retain_count = document.config.retain_count;
       for (const auto& history_entry : document.state.history) {
-        if (!history_entry.archive_file_name.empty()) {
-          retention.owned_archive_names.push_back(
-              history_entry.archive_file_name);
+        if (!history_entry.cloud_snapshot_id.empty() &&
+            !history_entry.cloud_sha256.empty()) {
+          retention.owned_snapshot_ids.push_back(
+              history_entry.cloud_snapshot_id);
+          retention.owned_sha256.push_back(history_entry.cloud_sha256);
         }
       }
       backupproject::CloudRetentionResult retention_result;

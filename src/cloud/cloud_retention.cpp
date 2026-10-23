@@ -76,13 +76,23 @@ bool RunCloudRetention(const CloudRetentionRequest& request,
     }
   }
 
-  std::set<std::string> owned_names(request.owned_archive_names.begin(),
-                                    request.owned_archive_names.end());
+  if (request.owned_snapshot_ids.size() != request.owned_sha256.size()) {
+    SetError(error_message, "归属记录 id/摘要数量不一致，拒绝淘汰");
+    return false;
+  }
+  std::map<std::string, std::string> owned_by_id;
+  for (std::size_t i = 0; i < request.owned_snapshot_ids.size(); ++i) {
+    owned_by_id[request.owned_snapshot_ids[i]] = request.owned_sha256[i];
+  }
   std::vector<net::RemoteSnapshotInfo> owned;
   for (const auto& snapshot : snapshots) {
-    if (owned_names.count(snapshot.display_name) > 0) {
-      owned.push_back(snapshot);
+    const auto owned_it = owned_by_id.find(snapshot.snapshot_id);
+    if (owned_it == owned_by_id.end()) continue;
+    if (owned_it->second.empty() || snapshot.sha256 != owned_it->second) {
+      SetError(error_message, "远端快照摘要与归属记录不一致，拒绝淘汰");
+      return false;
     }
+    owned.push_back(snapshot);
   }
   std::sort(
       owned.begin(), owned.end(),
