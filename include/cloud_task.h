@@ -20,7 +20,10 @@ struct CloudCredentials {
   std::string host;
   std::uint16_t port = 0;
   std::string username;
+  // 二选一：password 或 password_command。后者从系统密钥库/密码管理器读取，
+  // 避免把密码明文写进凭据文件；两者同时给出会被拒绝。
   std::string password;
+  std::string password_command;
   // "pin" 或 "certificate"；与 RemoteEndpoint 的语义一致。
   std::string identity_mode = "pin";
   std::string server_key_pin;
@@ -29,9 +32,12 @@ struct CloudCredentials {
 };
 
 // 读取 0600 凭据文件。格式是每行 key=value：
-//   host=, port=, username=, password=
+//   host=, port=, username=
+//   password= 或 password_command=（二选一；推荐 secret-tool/pass 等命令）
 //   identity_mode=pin|certificate
 //   pin= / roots= / server_id=
+// 0600 只提供文件级访问控制，不是加密；password_command 才是避免明文落盘的
+// 推荐方式。命令由凭据文件所有者配置，输出只进内存。
 // 失败原因只包含路径与原因，绝不包含文件内容。
 bool LoadCloudCredentialsFile(const std::string& path,
                               CloudCredentials* credentials,
