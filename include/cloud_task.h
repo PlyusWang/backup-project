@@ -73,6 +73,9 @@ struct CloudTaskOutcome {
 bool RunCloudTask(const CloudTaskRequest& request, CloudTaskOutcome* outcome,
                   std::string* error_message);
 
+// 认证/身份/配置类错误重试也不会变好；只有网络/暂时性错误值得有限重试。
+bool IsRetryableCloudError(const std::string& error_message);
+
 }  // namespace backupproject
 
 #endif  // BACKUP_PROJECT_INCLUDE_CLOUD_TASK_H_
