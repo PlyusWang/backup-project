@@ -921,6 +921,7 @@ bool RunRealtimeBackupOnce(const RealtimeConfig& config,
     bool ok = false;
     for (int attempt = 0; attempt < 3 && !ok; ++attempt) {
       ok = backupproject::RunCloudTask(task, &cloud, &cloud_error);
+      if (!ok && !backupproject::IsRetryableCloudError(cloud_error)) break;
       if (!ok && attempt < 2) {
         std::this_thread::sleep_for(std::chrono::seconds(1 << attempt));
       }

@@ -143,6 +143,7 @@
 #include "archive_pipeline.h"
 #include "backup_controller.h"
 #include "backup_options.h"
+#include "cloud_retry_probe.h"
 #include "config_manager.h"
 #include "dev_harnesses.h"
 #include "filter_rule_model.h"
@@ -611,6 +612,10 @@ int main(int argc, char* argv[]) {
   backup_modern::FilterRuleModel filter_rule_model(&controller);
   backup_modern::FilterRuleModel schedule_filter_rule_model(nullptr);
   backup_modern::FilterRuleModel realtime_filter_rule_model(nullptr);
+
+  if (arguments.contains(QStringLiteral("--cloud-retry-test"))) {
+    return backup_modern::RunCloudRetryProbe(QString());
+  }
 
   QQmlApplicationEngine engine;
   // 用上下文属性而不是注册 QML 类型：QML 侧直接写 theme.accent /

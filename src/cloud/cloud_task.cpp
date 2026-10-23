@@ -252,6 +252,17 @@ std::string CloudRepositoryId(const CloudCredentials& credentials) {
   return id;
 }
 
+bool IsRetryableCloudError(const std::string& error_message) {
+  static const char* kPermanent[] = {
+      "UNAUTHORIZED", "ALREADY_EXISTS", "认证", "凭据",     "密码",
+      "pin",          "certificate",    "证书", "identity", "身份",
+      "permission",   "拒绝访问",       "配置"};
+  for (const char* token : kPermanent) {
+    if (error_message.find(token) != std::string::npos) return false;
+  }
+  return true;
+}
+
 bool RunCloudTask(const CloudTaskRequest& request, CloudTaskOutcome* outcome,
                   std::string* error_message) {
   if (outcome == nullptr) {
