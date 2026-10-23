@@ -40,6 +40,7 @@
 #include <cstring>
 #include <ctime>
 #include <functional>
+#include <thread>
 
 #include "app_paths.h"
 #include "app_theme.h"
@@ -2066,6 +2067,53 @@ int RunRemoteProductFlow(backup_modern::RemoteController* remote, CheckRun* run,
                QStringLiteral("G7 云端完整+增量链恢复内容一致"),
                remote->lastErrorKindForTest() + QStringLiteral(": ") +
                    remote->lastDetailForTest());
+
+    // ---- G6 并发：两个线程同时触发云端实时备份 ----
+    if (server_process != nullptr) {
+      const QString concurrent_file =
+          QString::fromStdString(realtime_config.source_path) +
+          QStringLiteral("/concurrent-64m.bin");
+      QFile concurrent(concurrent_file);
+      if (concurrent.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
+        concurrent.resize(64LL * 1024 * 1024);
+      }
+      concurrent.close();
+      backupproject::RealtimeOutcome outcome_a;
+      backupproject::RealtimeOutcome outcome_b;
+      std::string error_a;
+      std::string error_b;
+      bool ok_a = false;
+      bool ok_b = false;
+      std::thread worker_a([&]() {
+        backupproject::RealtimeEventSummary events;
+        events.generation = 10;
+        events.event_count = 1;
+        ok_a = backupproject::RunRealtimeBackupOnce(
+            realtime_config, std::string(), std::string(), events,
+            static_cast<std::int64_t>(::time(nullptr)), &outcome_a, &error_a);
+      });
+      std::thread worker_b([&]() {
+        backupproject::RealtimeEventSummary events;
+        events.generation = 11;
+        events.event_count = 1;
+        ok_b = backupproject::RunRealtimeBackupOnce(
+            realtime_config, std::string(), std::string(), events,
+            static_cast<std::int64_t>(::time(nullptr)), &outcome_b, &error_b);
+      });
+      worker_a.join();
+      worker_b.join();
+      const auto acceptable = [](backupproject::RealtimeOutcome::Kind kind) {
+        return kind == backupproject::RealtimeOutcome::Kind::kFullSnapshot ||
+               kind == backupproject::RealtimeOutcome::Kind::kDelta ||
+               kind == backupproject::RealtimeOutcome::Kind::kNoChanges ||
+               kind == backupproject::RealtimeOutcome::Kind::kFullBaseline;
+      };
+      run->Check(ok_a && ok_b && acceptable(outcome_a.kind) &&
+                     acceptable(outcome_b.kind),
+                 QStringLiteral("G6 并发触发：两个云端实时任务不并发写链"),
+                 QString::fromStdString(error_a + " / " + error_b));
+      QFile::remove(concurrent_file);
+    }
   }
 
   // ---- 清理：注销临时账号（正式数据不受影响）----
