@@ -24,6 +24,7 @@
 #include "backup_catalog.h"
 #include "backup_credentials.h"
 #include "backup_engine.h"
+#include "cloud_retention.h"
 #include "cloud_task.h"
 #include "incremental_backup.h"
 #include "source_manifest.h"
@@ -627,6 +628,29 @@ bool ScheduledBackupService::EvaluateInternal(std::int64_t now_sec, bool force,
       entry.diagnostic = "cloud repository";
     }
     AppendHistoryEntry(&document.state, entry);
+    if (document.config.retain_count > 0) {
+      backupproject::CloudRetentionRequest retention;
+      retention.credentials = task.credentials;
+      retention.expected_repository_id = task.expected_repository_id;
+      retention.retain_count = document.config.retain_count;
+      for (const auto& history_entry : document.state.history) {
+        if (!history_entry.archive_file_name.empty()) {
+          retention.owned_archive_names.push_back(
+              history_entry.archive_file_name);
+        }
+      }
+      backupproject::CloudRetentionResult retention_result;
+      std::string retention_error;
+      if (!backupproject::RunCloudRetention(retention, &retention_result,
+                                            &retention_error)) {
+        result->diagnostic +=
+            " (cloud retention stopped: " + retention_error + ")";
+      } else {
+        result->diagnostic += " (cloud retention deleted " +
+                              std::to_string(retention_result.deleted.size()) +
+                              ")";
+      }
+    }
     std::string save_error;
     if (!store_->Save(document, &save_error)) {
       result->diagnostic +=

@@ -49,6 +49,7 @@
 #include "backup_catalog.h"
 #include "backup_controller.h"
 #include "backup_engine.h"
+#include "cloud_retention.h"
 #include "cloud_task.h"
 #include "config_manager.h"
 #include "filter_rule_model.h"
@@ -1915,6 +1916,61 @@ int RunRemoteProductFlow(backup_modern::RemoteController* remote, CheckRun* run,
         QStringLiteral("G5 定时云端增量备份：真实触发并记录结果"),
         QString::fromStdString(schedule_error + " / " + schedule_run_error));
 
+    // ---- F1 云端保留：4 个完整快照，保留 2，删除旧 2 ----
+    {
+      const QString retention_source = work + QStringLiteral("/retention-src");
+      QDir().mkpath(retention_source);
+      backupproject::CloudCredentials retention_creds;
+      std::string retention_creds_error;
+      const bool creds_ok = backupproject::LoadCloudCredentialsFile(
+          cloud_credentials.toStdString(), &retention_creds,
+          &retention_creds_error);
+      std::vector<std::string> owned;
+      bool created_all = creds_ok;
+      for (int index = 0; index < 4 && created_all; ++index) {
+        QFile source_file(retention_source + QStringLiteral("/data.txt"));
+        if (source_file.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
+          source_file.write(QByteArray(1024 * (index + 1), 'a' + index));
+        }
+        source_file.close();
+        backupproject::CloudTaskRequest task;
+        task.credentials = retention_creds;
+        task.expected_repository_id =
+            backupproject::CloudRepositoryId(retention_creds);
+        task.source_directory = retention_source.toStdString();
+        task.allow_incremental = false;
+        backupproject::CloudTaskOutcome task_outcome;
+        std::string task_error;
+        if (!backupproject::RunCloudTask(task, &task_outcome, &task_error) ||
+            task_outcome.archive_name.empty()) {
+          created_all = false;
+          retention_creds_error = task_error;
+        } else {
+          owned.push_back(task_outcome.archive_name);
+        }
+      }
+      backupproject::CloudRetentionRequest retention;
+      retention.credentials = retention_creds;
+      retention.expected_repository_id =
+          backupproject::CloudRepositoryId(retention_creds);
+      retention.retain_count = 2;
+      retention.owned_archive_names = owned;
+      retention.dry_run = true;
+      backupproject::CloudRetentionResult dry;
+      std::string retention_error;
+      const bool dry_ok = created_all && backupproject::RunCloudRetention(
+                                             retention, &dry, &retention_error);
+      retention.dry_run = false;
+      backupproject::CloudRetentionResult real;
+      const bool real_ok = dry_ok && backupproject::RunCloudRetention(
+                                         retention, &real, &retention_error);
+      run->Check(
+          created_all && dry_ok && real_ok && dry.dry_run_delete.size() == 2 &&
+              real.deleted.size() == 2 && real.kept.size() == 2,
+          QStringLiteral("F1 云端保留：4 个完整快照保留 2 个并安全删除旧 2"),
+          QString::fromStdString(retention_error));
+    }
+
     auto cloud_realtime_config = [&]() {
       backupproject::RealtimeConfig config;
       config.enabled = true;
@@ -2067,6 +2123,112 @@ int RunRemoteProductFlow(backup_modern::RemoteController* remote, CheckRun* run,
                QStringLiteral("G7 云端完整+增量链恢复内容一致"),
                remote->lastErrorKindForTest() + QStringLiteral(": ") +
                    remote->lastDetailForTest());
+
+    // ---- F1 实时云端保留：3 个完整快照，保留 1，旧 2 被删 ----
+    {
+      backupproject::RealtimeConfig retention_config = realtime_config;
+      retention_config.strategy = backupproject::BackupStrategy::kFull;
+      retention_config.retain_count = 1;
+      std::vector<std::string> realtime_owned;
+      bool realtime_created = true;
+      for (int index = 0; index < 3 && realtime_created; ++index) {
+        QFile source_file(QString::fromStdString(retention_config.source_path) +
+                          QStringLiteral("/retention-data.txt"));
+        if (source_file.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
+          source_file.write(QByteArray(4096 * (index + 1), 'r'));
+        }
+        source_file.close();
+        backupproject::RealtimeEventSummary events;
+        events.generation = 20 + index;
+        events.event_count = 1;
+        backupproject::RealtimeOutcome retention_outcome;
+        std::string retention_error;
+        if (!backupproject::RunRealtimeBackupOnce(
+                retention_config, std::string(), std::string(), events,
+                static_cast<std::int64_t>(::time(nullptr)), &retention_outcome,
+                &retention_error) ||
+            retention_outcome.snapshot_file_name.empty()) {
+          realtime_created = false;
+        } else {
+          realtime_owned.push_back(retention_outcome.snapshot_file_name);
+        }
+      }
+      refresh();
+      const bool old_two_gone =
+          realtime_created && realtime_owned.size() == 3 &&
+          findByDisplayName(QString::fromStdString(realtime_owned[0]))
+              .isEmpty() &&
+          findByDisplayName(QString::fromStdString(realtime_owned[1]))
+              .isEmpty();
+      const bool newest_kept =
+          realtime_created && realtime_owned.size() == 3 &&
+          !findByDisplayName(QString::fromStdString(realtime_owned[2]))
+               .isEmpty();
+      run->Check(
+          old_two_gone && newest_kept,
+          QStringLiteral("F1 实时云端保留：3 个完整快照保留 1 个并删除旧 2"),
+          QStringLiteral("old_gone=%1 newest=%2")
+              .arg(old_two_gone ? 1 : 0)
+              .arg(newest_kept ? 1 : 0));
+    }
+
+    // ---- F1 链依赖 + 非本任务快照保护 ----
+    {
+      const QString chain_source = work + QStringLiteral("/retention-chain");
+      QDir().mkpath(chain_source);
+      backupproject::CloudCredentials chain_creds;
+      std::string chain_creds_error;
+      backupproject::LoadCloudCredentialsFile(cloud_credentials.toStdString(),
+                                              &chain_creds, &chain_creds_error);
+      auto run_cloud = [&](bool allow_incremental, const QString& text,
+                           std::string* name) {
+        QFile file(chain_source + QStringLiteral("/chain.txt"));
+        if (file.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
+          file.write(text.toUtf8());
+        }
+        file.close();
+        backupproject::CloudTaskRequest task;
+        task.credentials = chain_creds;
+        task.expected_repository_id =
+            backupproject::CloudRepositoryId(chain_creds);
+        task.source_directory = chain_source.toStdString();
+        task.allow_incremental = allow_incremental;
+        backupproject::CloudTaskOutcome cloud_outcome;
+        std::string cloud_error;
+        if (!backupproject::RunCloudTask(task, &cloud_outcome, &cloud_error)) {
+          return false;
+        }
+        *name = cloud_outcome.archive_name;
+        return !name->empty();
+      };
+      std::string chain_full;
+      std::string chain_delta;
+      std::string manual_name;
+      const bool chain_created =
+          run_cloud(false, QStringLiteral("base"), &chain_full) &&
+          run_cloud(true, QStringLiteral("delta"), &chain_delta) &&
+          run_cloud(false, QStringLiteral("manual"), &manual_name);
+      backupproject::CloudRetentionRequest chain_retention;
+      chain_retention.credentials = chain_creds;
+      chain_retention.expected_repository_id =
+          backupproject::CloudRepositoryId(chain_creds);
+      chain_retention.retain_count = 1;
+      chain_retention.owned_archive_names = {chain_full, chain_delta};
+      chain_retention.dry_run = true;
+      backupproject::CloudRetentionResult chain_result;
+      std::string chain_error;
+      const bool chain_ok =
+          chain_created && backupproject::RunCloudRetention(
+                               chain_retention, &chain_result, &chain_error);
+      refresh();
+      const bool manual_kept =
+          !findByDisplayName(QString::fromStdString(manual_name)).isEmpty();
+      run->Check(chain_ok && chain_result.dry_run_delete.empty() &&
+                     chain_result.protected_ancestors.size() >= 1 &&
+                     manual_kept,
+                 QStringLiteral("F1 链依赖与非本任务快照受保护"),
+                 QString::fromStdString(chain_error));
+    }
 
     // ---- G6 并发：两个线程同时触发云端实时备份 ----
     if (server_process != nullptr) {
