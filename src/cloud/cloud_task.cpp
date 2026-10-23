@@ -106,7 +106,21 @@ bool RunPasswordCommand(const std::string& command, std::string* secret,
     return false;
   }
   int status = 0;
-  while (::waitpid(child, &status, 0) < 0 && errno == EINTR) {
+  while (true) {
+    const pid_t waited = ::waitpid(child, &status, WNOHANG);
+    if (waited == child) break;
+    if (waited < 0 && errno != EINTR) {
+      if (error_message != nullptr) *error_message = "等待密码命令失败";
+      return false;
+    }
+    if (std::chrono::steady_clock::now() >= deadline) {
+      ::kill(-child, SIGKILL);
+      while (::waitpid(child, &status, 0) < 0 && errno == EINTR) {
+      }
+      if (error_message != nullptr) *error_message = "密码命令执行超时";
+      return false;
+    }
+    ::poll(nullptr, 0, 20);
   }
   if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
     if (error_message != nullptr) *error_message = "密码命令执行失败";
