@@ -22,8 +22,9 @@
 //   写失败时降级为"成功 + warning"，并放弃破坏性 retention：宁可少删，也不能
 //   在归属不可信时删。
 //
-// 线程：本文件没有跨调用的全局状态（唯一例外是测试开关），也不缓存 fd；
-//   并发调用需要调用方自己串行化。
+// 线程：本文件没有跨调用的全局状态（唯一例外是测试开关），也不缓存 fd。
+//   RunRealtimeBackupOnce 用进程内互斥量串行化：GUI 的闸门是第一道防线，
+//   这里的锁保证即使两个调用方同时误触发，也不会并发写同一条远端链。
 #include "realtime_backup_service.h"
 
 #include <dirent.h>
@@ -38,6 +39,7 @@
 
 #include <algorithm>
 #include <map>
+#include <mutex>
 #include <string>
 #include <vector>
 
@@ -829,6 +831,8 @@ bool RunRealtimeBackupOnce(const RealtimeConfig& config,
                            const RealtimeEventSummary& events,
                            std::int64_t now_sec, RealtimeOutcome* outcome,
                            std::string* error_message) {
+  static std::mutex run_mutex;
+  std::lock_guard<std::mutex> run_guard(run_mutex);
   if (outcome == nullptr) {
     SetError(error_message, "Realtime outcome output must not be null");
     return false;
