@@ -38,12 +38,14 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <chrono>
 #include <cstdio>
 #include <fstream>
 #include <map>
 #include <mutex>
 #include <set>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "app_paths.h"
@@ -951,7 +953,13 @@ bool RunRealtimeBackupOnce(const RealtimeConfig& config,
     task.options = options;
     task.allow_incremental = config.strategy == BackupStrategy::kIncremental;
     backupproject::CloudTaskOutcome cloud;
-    const bool ok = backupproject::RunCloudTask(task, &cloud, &cloud_error);
+    bool ok = false;
+    for (int attempt = 0; attempt < 3 && !ok; ++attempt) {
+      ok = backupproject::RunCloudTask(task, &cloud, &cloud_error);
+      if (!ok && attempt < 2) {
+        std::this_thread::sleep_for(std::chrono::seconds(1 << attempt));
+      }
+    }
     if (!credential.empty()) credential.assign(credential.size(), '\0');
     if (!ok) {
       outcome->kind = RealtimeOutcome::Kind::kFailed;
