@@ -184,30 +184,14 @@ bool LocalObjectMatches(const std::string& repository, const std::string& name,
          actual_size == expected_size;
 }
 
-// 把解包并验证过的三件套发布到仓库：全部用 NoReplace，任何一步失败只回滚
-// 本次已经发布的文件。这样仓库里不会出现“三件套缺一件”的可见状态。
+// 把解包并验证过的三件套发布到仓库。真正的顺序/锁/孤儿清理在共享核心
+// PublishSnapshotFiles 里（.bak 最后发布，崩溃不会留下可见半成品）。
 bool PublishBundleFiles(const std::string& extracted_directory,
                         const std::string& repository,
                         const std::string& archive_name,
                         std::string* error_message) {
-  const std::string names[3] = {
-      archive_name,
-      backupproject::SnapshotManifestFileName(archive_name),
-      backupproject::SnapshotIdentityFileName(archive_name),
-  };
-  std::vector<std::string> published;
-  for (const std::string& name : names) {
-    const std::string from = extracted_directory + "/" + name;
-    const std::string to = QDir(QString::fromStdString(repository))
-                               .filePath(QString::fromStdString(name))
-                               .toStdString();
-    if (!backupproject::PublishNoReplace(from, to, error_message)) {
-      for (const std::string& path : published) ::unlink(path.c_str());
-      return false;
-    }
-    published.push_back(to);
-  }
-  return true;
+  return backupproject::net::PublishSnapshotFiles(
+      repository, archive_name, extracted_directory, error_message);
 }
 
 // ---- 失败归类 ----

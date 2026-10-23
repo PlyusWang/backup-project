@@ -16,10 +16,12 @@
 #include <dirent.h>
 #include <fcntl.h>
 #include <netinet/in.h>
+#include <signal.h>
 #include <sqlite3.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/types.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 #include <algorithm>
@@ -35,6 +37,7 @@
 #include <vector>
 
 #include "archive_pipeline.h"
+#include "backup_catalog.h"
 #include "crypto.h"
 #include "file_io.h"
 #include "filter.h"
@@ -1746,9 +1749,8 @@ void TestExtractionLocalAttacks() {
     std::string extract_error;
     const bool ok = backupproject::net::ExtractSnapshotBundle(
         bundle_path, link, &info, &extract_error);
-    Check(ok, "RT2.6 目标目录是符号链接 -> 解包成功（落到真实目录）",
-          extract_error);
-    Check(CountDirectoryEntries(real) == 3, "RT2.6 真实目录里恰好三件套",
+    Check(!ok, "RT2.6 目标目录是符号链接 -> 拒绝（不跟随）", extract_error);
+    Check(CountDirectoryEntries(real) == 0, "RT2.6 真实目录没有被写入",
           std::to_string(CountDirectoryEntries(real)) + " 个条目");
     Check(IsSymlink(link), "RT2.6 符号链接本身没有被替换成目录");
     Check(!FileExists(root + "/" + archive),
@@ -3574,6 +3576,94 @@ void TestConcurrentSameParentUpload() {
 }
 }  // namespace
 
+int g_crash_stage = 0;
+
+void KillAtPublishStage(int stage) {
+  if (stage == g_crash_stage) {
+    ::raise(SIGKILL);
+  }
+}
+
+// G2：真实子进程在发布阶段的每个检查点被 SIGKILL。父进程重新打开仓库，
+// 只根据文件系统事实判断“半成品是否可见”。
+void TestCrashConsistentPublish() {
+  std::printf("[chain] G2 崩溃一致性发布\n");
+  const std::string root = WorkRoot() + "/g2-crash";
+  RemoveTree(root);
+  const std::string repo = root + "/repo";
+  const std::string base = root + "/bundle";
+  Check(MakeDirectoryTree(repo) && MakeDirectoryTree(base), "G2 建测试目录");
+  const std::string archive = "remote-g2-100-g0.bak";
+  const std::string bak_data = "G2-ARCHIVE-PAYLOAD";
+  Check(WriteFile(repo + "/" + archive, bak_data) &&
+            WriteFile(repo + "/" + archive + ".manifest", "BPMANIFEST3 1\n") &&
+            WriteFile(repo + "/" + archive + ".identity",
+                      "BPIDENT2\nsnapshot_id=g2\n"),
+        "G2 准备三件套");
+  const std::string bundle = base + "/g2.bundle";
+  SnapshotBundleInfo bundle_info;
+  std::string error;
+  Check(backupproject::net::BuildSnapshotBundle(repo, archive, bundle,
+                                                &bundle_info, &error),
+        "G2 打材料包", error);
+
+  for (int stage = 1; stage <= 4; ++stage) {
+    const std::string target = root + "/target-" + std::to_string(stage);
+    Check(MakeDirectoryTree(target),
+          "G2 建目标目录 stage=" + std::to_string(stage));
+    g_crash_stage = stage;
+    const pid_t child = ::fork();
+    if (child == 0) {
+      backupproject::net::PublishStageTestHook() = &KillAtPublishStage;
+      backupproject::net::SnapshotBundleInfo info;
+      std::string child_error;
+      backupproject::net::ExtractSnapshotBundle(bundle, target, &info,
+                                                &child_error);
+      _exit(0);
+    }
+    int status = 0;
+    ::waitpid(child, &status, 0);
+    Check(WIFSIGNALED(status) && WTERMSIG(status) == SIGKILL,
+          "G2 stage " + std::to_string(stage) + " 子进程被 SIGKILL");
+    const std::string target_bak = target + "/" + archive;
+    const bool bak_visible = FileExists(target_bak);
+    Check(bak_visible == (stage == 4),
+          "G2 stage " + std::to_string(stage) + " .bak 仅在提交点之后可见");
+    backupproject::BackupCatalog catalog;
+    std::vector<backupproject::BackupRecord> records;
+    std::string list_error;
+    const bool listed = catalog.List(target, &records, &list_error);
+    Check(listed && records.size() == (stage == 4 ? 1u : 0u),
+          "G2 stage " + std::to_string(stage) + " 仓库列表不把半成品当备份",
+          std::to_string(records.size()));
+    if (stage < 4) {
+      backupproject::net::PublishStageTestHook() = nullptr;
+      backupproject::net::SnapshotBundleInfo info;
+      std::string retry_error;
+      Check(backupproject::net::ExtractSnapshotBundle(bundle, target, &info,
+                                                      &retry_error),
+            "G2 stage " + std::to_string(stage) + " 重启后可重新提交",
+            retry_error);
+      std::string restored;
+      Check(ReadFile(target_bak, &restored) && restored == bak_data,
+            "G2 stage " + std::to_string(stage) + " 重启后内容正确");
+    } else {
+      std::string before;
+      Check(ReadFile(target_bak, &before), "G2 stage4 读取已提交归档");
+      backupproject::net::PublishStageTestHook() = nullptr;
+      backupproject::net::SnapshotBundleInfo info;
+      std::string retry_error;
+      const bool repeated = backupproject::net::ExtractSnapshotBundle(
+          bundle, target, &info, &retry_error);
+      std::string after;
+      Check(!repeated && ReadFile(target_bak, &after) && before == after,
+            "G2 stage4 重试不覆盖已提交的三件套");
+    }
+  }
+  backupproject::net::PublishStageTestHook() = nullptr;
+  RemoveTree(root);
+}
+
 int main() {
   std::printf("远端增量链单元测试\n");
   TestSnapshotBundle();
@@ -3583,6 +3673,7 @@ int main() {
   TestUnknownSchemaVersion();
   TestBundleMaliciousConstructions();
   TestExtractionLocalAttacks();
+  TestCrashConsistentPublish();
   TestRemoteIndexAttacks();
   TestCacheIsolation();
   TestMetadataArchiveCrossCheck();
