@@ -438,7 +438,8 @@ int RunRemoteProductFlow(backup_modern::RemoteController* remote, CheckRun* run,
                          const QString& work, const QString& host,
                          const QString& port_text, const QString& username,
                          const QString& password, const QString& fingerprint,
-                         bool test_repository_copy = false) {
+                         bool test_repository_copy = false,
+                         QProcess* server_process = nullptr) {
   // 这一段自检被 --remote-test（自己起服务端）与 --remote-smoke（打真实端点）
   // 共用，所以除了协议本身不能对服务端做任何假设；所有路径都从 work 这个本次
   // 运行的临时目录派生，跑完即弃，不在磁盘上留状态。
@@ -1378,6 +1379,100 @@ int RunRemoteProductFlow(backup_modern::RemoteController* remote, CheckRun* run,
   // 只在 --remote-test（自己起真实服务端）里打开；--remote-smoke 打的是
   // 真实 ECS，不应该往里写测试数据。
   if (test_repository_copy) {
+    // ---- GUI 上传续传探针：只认服务端确认的非零续传偏移 ----
+    if (server_process != nullptr) {
+      const QString resume_path =
+          work + QStringLiteral("/gui-resume-probe.bin");
+      QFile resume_file(resume_path);
+      if (resume_file.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
+        resume_file.resize(128LL * 1024 * 1024);
+      }
+      resume_file.close();
+      const bool first_started = remote->uploadArchive(
+          resume_path, QStringLiteral("gui-resume-probe.bak"));
+      std::uint64_t first_progress = 0;
+      for (int attempt = 0; attempt < 2000; ++attempt) {
+        WaitForAnimation(10);
+        first_progress = remote->bytesDone();
+        if (first_progress >= 4ULL * 1024 * 1024) break;
+      }
+      const bool first_partial = first_progress >= 4ULL * 1024 * 1024;
+      QString server_log_path;
+      const QStringList server_arguments = server_process->arguments();
+      for (int index = 0; index + 1 < server_arguments.size(); ++index) {
+        if (server_arguments[index] == QStringLiteral("--log-file")) {
+          server_log_path = server_arguments[index + 1];
+        }
+      }
+      const QString program = server_process->program();
+      const QStringList arguments = server_arguments;
+      server_process->kill();
+      server_process->waitForFinished(5000);
+      remote->waitForIdle(180000);
+      std::fprintf(stderr,
+                   "[resume-probe] first_started=%d first_progress=%llu "
+                   "after_fail_kind=%s after_fail_detail=%s\n",
+                   first_started ? 1 : 0,
+                   static_cast<unsigned long long>(first_progress),
+                   remote->lastErrorKindForTest().toUtf8().constData(),
+                   remote->lastDetailForTest().toUtf8().constData());
+      server_process->start(program, arguments);
+      server_process->waitForStarted(10000);
+      bool relogin = false;
+      for (int attempt = 0; attempt < 40 && !relogin; ++attempt) {
+        WaitForAnimation(500);
+        if (server_process->state() != QProcess::Running) break;
+        relogin = remote->login(host, port_text, username, password) &&
+                  remote->waitForIdle(120000) && remote->authenticated();
+      }
+      std::fprintf(stderr, "[resume-probe] relogin=%d\n", relogin ? 1 : 0);
+      const bool retried =
+          relogin && remote->uploadArchive(
+                         resume_path, QStringLiteral("gui-resume-probe.bak"));
+      const bool finished = retried && remote->waitForIdle(900000);
+      QString server_log;
+      if (!server_log_path.isEmpty()) {
+        QFile log_file(server_log_path);
+        if (log_file.open(QIODevice::ReadOnly)) {
+          server_log = QString::fromUtf8(log_file.readAll());
+        }
+      }
+      const int resumed_lines =
+          server_log.count(QStringLiteral("upload resumed at offset"));
+      QString resumed_offset = QStringLiteral("(none)");
+      const int marker =
+          server_log.indexOf(QStringLiteral("upload resumed at offset"));
+      if (marker >= 0) {
+        const int end = server_log.indexOf('\n', marker);
+        resumed_offset =
+            server_log.mid(marker, end < 0 ? -1 : end - marker).trimmed();
+      }
+      refresh();
+      const QVariantMap resume_row =
+          findByDisplayName(QStringLiteral("gui-resume-probe.bak"));
+      QString local_sha;
+      if (resume_file.open(QIODevice::ReadOnly)) {
+        const QByteArray bytes = resume_file.readAll();
+        local_sha = QString::fromLatin1(
+            QCryptographicHash::hash(bytes, QCryptographicHash::Sha256)
+                .toHex());
+      }
+      const QString remote_sha =
+          resume_row.value(QStringLiteral("sha256Short")).toString();
+      std::fprintf(stderr,
+                   "[resume-probe] first_partial=%d retried=%d finished=%d "
+                   "resumed_lines=%d offset=%s remote_sha=%s local_sha=%s\n",
+                   first_partial ? 1 : 0, retried ? 1 : 0, finished ? 1 : 0,
+                   resumed_lines, resumed_offset.toUtf8().constData(),
+                   remote_sha.toUtf8().constData(),
+                   local_sha.left(12).toUtf8().constData());
+      run->Check(first_partial && retried && finished && resumed_lines >= 1 &&
+                     remote_sha == local_sha.left(12),
+                 QStringLiteral("GUI 续传：服务端确认非零偏移且最终摘要一致"),
+                 resumed_offset.toUtf8());
+      QFile::remove(resume_path);
+    }
+
     const QString local_repo = work + QStringLiteral("/copy-repo-local");
     const QString download_repo = work + QStringLiteral("/copy-repo-down");
     QDir().mkpath(local_repo);
@@ -9071,7 +9166,7 @@ int RunRemoteTest(QQuickWindow* window, backup_modern::RemoteController* remote,
     if (product_ready) {
       RunRemoteProductFlow(remote, &run, work, host, port_text, product_user,
                            password, fingerprint,
-                           /*test_repository_copy=*/true);
+                           /*test_repository_copy=*/true, &server);
     }
   }
 
