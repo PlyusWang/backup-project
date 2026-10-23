@@ -73,6 +73,8 @@ else
       record_pass "A.remote_chain_test 零警告"
     fi
     if timeout --signal=KILL 300 "$UNIT_BIN" >"$TEST_ROOT/unit.log" 2>&1; then
+      mkdir -p tests/output
+      cp "$TEST_ROOT/unit.log" tests/output/remote-chain-unit.log 2>/dev/null || true
       record_pass "A.remote_chain_test 运行（$(tail -1 "$TEST_ROOT/unit.log")）"
     else
       record_fail "A.remote_chain_test 运行" \

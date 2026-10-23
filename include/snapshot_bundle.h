@@ -96,6 +96,25 @@ bool ExtractSnapshotBundle(const std::string& bundle_path,
                            SnapshotBundleInfo* info,
                            std::string* error_message);
 
+// 把已经验证过的三件套以“崩溃后也不会出现可见半成品”的顺序发布到仓库：
+//
+//   仓库目录 flock（同仓库发布串行）
+//   -> 目标 .bak 已存在则失败（NoReplace 语义，不碰它）
+//   -> 没有 .bak 时清理上次崩溃留下的孤儿 .manifest/.identity
+//   -> 发布 .identity -> .manifest -> .bak（.bak 最后出现，是可见提交点）
+//
+// 进程在任意一步被 SIGKILL：要么 .bak 不存在（读取方看不到快照），要么三件套
+// 已经齐全。发布失败只回滚本次已发布的文件。
+bool PublishSnapshotFiles(const std::string& target_directory,
+                          const std::string& archive_name,
+                          const std::string& source_directory,
+                          std::string* error_message);
+
+// 崩溃注入测试钩子：stage 1=暂存完成、发布前；2=发布 .identity 后；
+// 3=发布 .manifest 后；4=发布 .bak 后、返回前。默认为空。
+using PublishStageHook = void (*)(int stage);
+PublishStageHook& PublishStageTestHook();
+
 }  // namespace net
 }  // namespace backupproject
 

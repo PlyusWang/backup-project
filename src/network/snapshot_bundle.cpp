@@ -22,6 +22,7 @@
 #include "snapshot_bundle.h"
 
 #include <fcntl.h>
+#include <sys/file.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
@@ -696,6 +697,105 @@ bool InspectSnapshotBundle(const std::string& bundle_path,
 // 回滚语义：任一成员失败，本次所有临时文件都被删掉；
 // 发布阶段失败则连已经发布的成员一起撤回（只删本次创建的文件）。
 // 绝不留下一套缺件的三件套——缓存目录里的东西要么验证完整，要么不存在。
+namespace {
+PublishStageHook g_publish_stage_hook = nullptr;
+}  // namespace
+
+PublishStageHook& PublishStageTestHook() { return g_publish_stage_hook; }
+
+bool PublishSnapshotFiles(const std::string& target_directory,
+                          const std::string& archive_name,
+                          const std::string& source_directory,
+                          std::string* error_message) {
+  if (!IsSingleComponentName(archive_name) ||
+      !backupproject::IsManagedBackupFileName(archive_name)) {
+    if (error_message != nullptr) *error_message = "非法的快照文件名";
+    return false;
+  }
+  const int dir_fd = ::open(target_directory.c_str(),
+                            O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+  if (dir_fd < 0) {
+    if (error_message != nullptr) *error_message = "无法打开目标仓库目录";
+    return false;
+  }
+  if (::flock(dir_fd, LOCK_EX) != 0) {
+    if (error_message != nullptr) *error_message = "无法锁定目标仓库目录";
+    ::close(dir_fd);
+    return false;
+  }
+  const std::string manifest =
+      backupproject::SnapshotManifestFileName(archive_name);
+  const std::string identity =
+      backupproject::SnapshotIdentityFileName(archive_name);
+  auto exists = [&dir_fd](const std::string& name) {
+    struct stat info;
+    return ::fstatat(dir_fd, name.c_str(), &info, AT_SYMLINK_NOFOLLOW) == 0;
+  };
+  if (exists(archive_name)) {
+    if (error_message != nullptr) {
+      *error_message = "目标已存在同名备份：" + archive_name;
+    }
+    ::close(dir_fd);
+    return false;
+  }
+  // 没有 .bak 时，这两个副文件可能是上次崩溃留下的孤儿。只清理**能按本产品
+  // 格式前缀认出来**的普通文件：普通用户放在这里的同名前缀文件、符号链接、
+  // 目录一律不删，并让本次发布失败。
+  auto looks_like_orphan = [&dir_fd](const std::string& name,
+                                     const char* magic) {
+    const int fd =
+        ::openat(dir_fd, name.c_str(), O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
+    if (fd < 0) return false;
+    char header[32] = {0};
+    const ssize_t got = ::read(fd, header, sizeof(header) - 1);
+    ::close(fd);
+    const std::size_t length = std::strlen(magic);
+    return got >= static_cast<ssize_t>(length) &&
+           std::memcmp(header, magic, length) == 0;
+  };
+  for (const std::string& name : {manifest, identity}) {
+    struct stat info;
+    if (::fstatat(dir_fd, name.c_str(), &info, AT_SYMLINK_NOFOLLOW) != 0) {
+      continue;
+    }
+    const char* magic = name == identity ? "BPIDENT2" : "BPMANIFEST3";
+    if (!S_ISREG(info.st_mode) || !looks_like_orphan(name, magic)) {
+      if (error_message != nullptr) {
+        *error_message = "目标已存在同名副文件且不是可识别的崩溃残留：" + name;
+      }
+      ::close(dir_fd);
+      return false;
+    }
+    if (::unlinkat(dir_fd, name.c_str(), 0) != 0) {
+      if (error_message != nullptr) {
+        *error_message = "无法清理崩溃残留：" + name;
+      }
+      ::close(dir_fd);
+      return false;
+    }
+  }
+  if (g_publish_stage_hook != nullptr) g_publish_stage_hook(1);
+  const std::string source_prefix = source_directory + "/";
+  const std::string target_prefix = target_directory + "/";
+  std::vector<std::string> published;
+  const std::string order[3] = {identity, manifest, archive_name};
+  for (std::size_t index = 0; index < 3; ++index) {
+    const std::string& name = order[index];
+    if (!PublishNoReplace(source_prefix + name, target_prefix + name,
+                          error_message)) {
+      for (const std::string& path : published) ::unlink(path.c_str());
+      ::close(dir_fd);
+      return false;
+    }
+    published.push_back(target_prefix + name);
+    if (g_publish_stage_hook != nullptr) {
+      g_publish_stage_hook(static_cast<int>(index) + 2);
+    }
+  }
+  ::close(dir_fd);
+  return true;
+}
+
 bool ExtractSnapshotBundle(const std::string& bundle_path,
                            const std::string& target_directory,
                            SnapshotBundleInfo* info,
@@ -738,7 +838,6 @@ bool ExtractSnapshotBundle(const std::string& bundle_path,
 
   std::vector<char> buffer(kCopyChunkBytes);
   std::vector<std::string> part_paths;
-  std::vector<std::string> final_paths;
 
   bool ok = true;
   for (std::size_t i = 0; ok && i < index.members.size(); ++i) {
@@ -779,7 +878,8 @@ bool ExtractSnapshotBundle(const std::string& bundle_path,
     // 路径只用**第一遍已校验过的**成员名拼接，因此不存在 ../ 逃逸；发布用
     // NoReplace，目标已存在同名文件时明确失败，不覆盖缓存里已有的内容。
     const std::string final_path = target_directory + "/" + indexed.name;
-    const std::string part_path = staging.Child("member-" + std::to_string(i));
+    // 暂存成员直接使用最终名字：发布阶段 PublishSnapshotFiles 按名字取源文件。
+    const std::string part_path = staging.Child(indexed.name);
     const int out =
         ::open(part_path.c_str(), O_WRONLY | O_CREAT | O_EXCL, 0600);
     if (out < 0) {
@@ -837,7 +937,6 @@ bool ExtractSnapshotBundle(const std::string& bundle_path,
       break;
     }
     part_paths.push_back(part_path);
-    final_paths.push_back(final_path);
   }
   ::close(fd);
 
@@ -848,30 +947,11 @@ bool ExtractSnapshotBundle(const std::string& bundle_path,
     return false;
   }
 
-  // 全部成员都验证通过之后才发布：任何一步失败都会把本次已经发布的成员撤掉，
-  // 绝不留下一套缺件的三件套。
-  // 回滚范围由 published 界定：[0, published)
-  // 是本函数已经发布出去的成员，需要连同临时文件一起删；之后的我还在 .part
-  // 名下，删临时文件即可。
-  std::size_t published = 0;
-  for (; published < part_paths.size(); ++published) {
-    std::string publish_error;
-    if (!PublishNoReplace(part_paths[published], final_paths[published],
-                          &publish_error)) {
-      if (error_message != nullptr) {
-        *error_message =
-            "无法发布 " + final_paths[published] + "：" + publish_error;
-      }
-      break;
-    }
-  }
-  if (published != part_paths.size()) {
-    for (std::size_t i = 0; i < part_paths.size(); ++i) {
-      ::unlink(part_paths[i].c_str());
-      if (i < published) {
-        ::unlink(final_paths[i].c_str());
-      }
-    }
+  // 全部成员都验证通过之后，用 .identity -> .manifest -> .bak 的顺序发布。
+  // .bak 最后出现，是唯一可见提交点：进程在任意一步被 SIGKILL，读取方要么
+  // 看不到 .bak（因此不把这份快照当有效对象），要么三件套已经齐全。
+  if (!PublishSnapshotFiles(target_directory, index.archive_name,
+                            staging.path(), error_message)) {
     return false;
   }
 
