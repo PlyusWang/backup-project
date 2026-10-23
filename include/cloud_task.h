@@ -63,6 +63,7 @@ struct CloudTaskOutcome {
   bool rebuilt_full_baseline = false;
   bool no_changes = false;
   std::string snapshot_id;
+  std::string sha256;
   std::string parent_snapshot_id;
   std::uint64_t generation = 0;
   std::string archive_name;

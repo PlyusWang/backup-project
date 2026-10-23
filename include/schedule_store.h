@@ -180,6 +180,8 @@ struct ScheduleHistoryEntry {
 
   // 只有真的产出了归档时非空。
   std::string archive_file_name;
+  std::string cloud_snapshot_id;
+  std::string cloud_sha256;
 
   ChangeSummary changes;
 

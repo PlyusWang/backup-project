@@ -13,8 +13,10 @@ struct CloudRetentionRequest {
   CloudCredentials credentials;
   std::string expected_repository_id;
   std::size_t retain_count = 0;
-  // 只删除这些 display_name 对应的快照；不在名单里的快照永不删除。
-  std::vector<std::string> owned_archive_names;
+  // 只删除这些稳定 snapshot_id 对应的快照；sha256 必须与远端对象一致。
+  // 显示名称不参与归属判定。旧版只有名称的记录不进入自动删除。
+  std::vector<std::string> owned_snapshot_ids;
+  std::vector<std::string> owned_sha256;
   std::string cache_root;
   bool dry_run = false;
 };

@@ -260,23 +260,44 @@ std::string CloudOwnedLedgerPath(const std::string& repository_id,
   return config + name;
 }
 
-bool AppendCloudOwned(const std::string& path, const std::string& name) {
-  if (path.empty() || name.empty()) return false;
-  std::ofstream out(path, std::ios::app);
-  if (!out) return false;
-  out << name << '\n';
-  return out.good();
+bool AppendCloudOwned(const std::string& path, const std::string& id,
+                      const std::string& sha256) {
+  if (path.empty() || id.size() != 32 || sha256.size() != 64) return false;
+  const int fd =
+      ::open(path.c_str(), O_WRONLY | O_CREAT | O_APPEND | O_NOFOLLOW, 0600);
+  if (fd < 0) return false;
+  if (::fchmod(fd, 0600) != 0) {
+    ::close(fd);
+    return false;
+  }
+  const std::string line = "BPSOWN1 " + id + " " + sha256 + "\n";
+  bool ok = ::write(fd, line.data(), line.size()) ==
+            static_cast<ssize_t>(line.size());
+  if (::fsync(fd) != 0) ok = false;
+  ::close(fd);
+  return ok;
 }
 
-std::vector<std::string> ReadCloudOwned(const std::string& path) {
-  std::vector<std::string> names;
-  std::set<std::string> seen;
+bool ReadCloudOwned(const std::string& path, std::vector<std::string>* ids,
+                    std::vector<std::string>* shas) {
+  ids->clear();
+  shas->clear();
   std::ifstream in(path);
   std::string line;
+  std::set<std::string> seen;
   while (std::getline(in, line)) {
-    if (!line.empty() && seen.insert(line).second) names.push_back(line);
+    if (line.empty()) continue;
+    if (line.rfind("BPSOWN1 ", 0) != 0) return false;
+    const std::string rest = line.substr(8);
+    if (rest.size() != 32 + 1 + 64 || rest[32] != ' ') return false;
+    const std::string id = rest.substr(0, 32);
+    const std::string sha = rest.substr(33);
+    if (seen.insert(id + sha).second) {
+      ids->push_back(id);
+      shas->push_back(sha);
+    }
   }
-  return names;
+  return true;
 }
 
 }  // namespace
@@ -969,16 +990,21 @@ bool RunRealtimeBackupOnce(const RealtimeConfig& config,
     if (!cloud.no_changes && config.retain_count > 0) {
       const std::string ledger =
           CloudOwnedLedgerPath(config.cloud_repository_id, config.source_path);
-      if (AppendCloudOwned(ledger, cloud.archive_name)) {
-        backupproject::CloudRetentionRequest retention;
-        retention.credentials = task.credentials;
-        retention.expected_repository_id = config.cloud_repository_id;
-        retention.retain_count = config.retain_count;
-        retention.owned_archive_names = ReadCloudOwned(ledger);
-        backupproject::CloudRetentionResult retention_result;
-        std::string retention_error;
-        backupproject::RunCloudRetention(retention, &retention_result,
-                                         &retention_error);
+      if (AppendCloudOwned(ledger, cloud.snapshot_id, cloud.sha256)) {
+        std::vector<std::string> owned_ids;
+        std::vector<std::string> owned_shas;
+        if (ReadCloudOwned(ledger, &owned_ids, &owned_shas)) {
+          backupproject::CloudRetentionRequest retention;
+          retention.credentials = task.credentials;
+          retention.expected_repository_id = config.cloud_repository_id;
+          retention.retain_count = config.retain_count;
+          retention.owned_snapshot_ids = owned_ids;
+          retention.owned_sha256 = owned_shas;
+          backupproject::CloudRetentionResult retention_result;
+          std::string retention_error;
+          backupproject::RunCloudRetention(retention, &retention_result,
+                                           &retention_error);
+        }
       }
     }
     if (cloud.no_changes) {
