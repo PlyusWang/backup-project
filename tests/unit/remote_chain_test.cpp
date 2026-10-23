@@ -3636,6 +3636,8 @@ void TestCrashConsistentPublish() {
     Check(listed && records.size() == (stage == 4 ? 1u : 0u),
           "G2 stage " + std::to_string(stage) + " 仓库列表不把半成品当备份",
           std::to_string(records.size()));
+    std::printf("  NOTE G2 stage %d: bak_visible=%d records=%zu\n", stage,
+                bak_visible ? 1 : 0, records.size());
     if (stage < 4) {
       backupproject::net::PublishStageTestHook() = nullptr;
       backupproject::net::SnapshotBundleInfo info;
