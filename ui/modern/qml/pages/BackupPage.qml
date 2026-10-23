@@ -16,6 +16,12 @@ Item {
 
     // 页面不直接改 root.currentPage：跳转由 Main.qml 决定，页面之间保持解耦。
     signal openSettings()
+    signal openCloud()
+
+    // 目标仓库：local 走既有本地仓库控制器；cloud 走 RemoteController 的
+    // 同一套共享选项/远端增量核心。选择只保存在页面（快速备份是一次性操作），
+    // 定时/实时任务的目标仓库才需要持久化。
+    property string backupTarget: "local"
 
     ScrollView {
         id: pageScroll
@@ -64,6 +70,55 @@ Item {
                     spacing: 6
 
                     Text {
+                        text: "目标仓库"
+                        font.pixelSize: 16
+                        font.weight: Font.DemiBold
+                        color: theme.textSecondary
+                    }
+
+                    SegmentedTabs {
+                        objectName: "backupTargetTabs"
+                        Layout.preferredWidth: 360
+                        enabled: !controller.busy && !remote.busy
+                        currentKey: page.backupTarget
+                        model: [
+                            { "key": "local", "text": "本地仓库" },
+                            { "key": "cloud", "text": "云端仓库" }
+                        ]
+                        onActivated: function (key) {
+                            page.backupTarget = key
+                        }
+                    }
+
+                    Text {
+                        visible: page.backupTarget === "cloud"
+                                 && !remote.authenticated
+                        Layout.fillWidth: true
+                        text: "云端仓库需要先登录。登录后回到这里即可直接备份，"
+                            + "不需要再手动复制。"
+                        font.pixelSize: 14
+                        color: theme.textSecondary
+                        wrapMode: Text.WordWrap
+                    }
+
+                    AppButton {
+                        visible: page.backupTarget === "cloud"
+                                 && !remote.authenticated
+                        text: "去云端仓库登录"
+                        onClicked: page.openCloud()
+                    }
+                }
+            }
+
+            AppCard {
+                Layout.fillWidth: true
+                Layout.topMargin: 4
+
+                ColumnLayout {
+                    anchors.fill: parent
+                    spacing: 6
+
+                    Text {
                         text: "源目录"
                         font.pixelSize: 16
                         font.weight: Font.DemiBold
@@ -101,6 +156,7 @@ Item {
             // 去设置页的入口，不在这一页偷偷替用户建目录。
             AppCard {
                 Layout.fillWidth: true
+                visible: page.backupTarget === "local"
 
                 ColumnLayout {
                     anchors.fill: parent
@@ -194,7 +250,9 @@ Item {
                     // 规则仍然只有那两条，判定也仍然只写在面板里。
                     // 增量 + 非 MyPack 是核心明确拒绝的组合：界面直接禁用，
                     // 并在策略说明里讲清原因，而不是让用户点了才看到失败。
-                    enabled: !controller.busy
+                    enabled: (page.backupTarget === "cloud"
+                                  ? (!remote.busy && remote.authenticated)
+                                  : !controller.busy)
                               && panel.strategyCombinationAllowed
                     // 三个算法一律传冻结的字符串键；
                     // 密码与确认密码原样交给控制器，界面不在这里做任何加工
@@ -216,13 +274,23 @@ Item {
 
                         // 策略与三个算法键一起交给控制器；组合是否被支持由共享
                         // 核心的 IsSupportedBackupMode 判定，界面不自己放行。
-                        const started = controller.startBackupWithStrategy(
-                            panel.strategyKey,
-                            panel.packKey,
-                            panel.compressionKey,
-                            panel.encryptionKey,
-                            panel.password,
-                            panel.confirmPassword)
+                        const started = page.backupTarget === "cloud"
+                            ? remote.backupRemoteWithOptions(
+                                  controller.sourcePath,
+                                  panel.strategyKey === "incremental",
+                                  panel.packKey,
+                                  panel.compressionKey,
+                                  panel.encryptionKey,
+                                  panel.password,
+                                  controller.includeRules,
+                                  controller.excludeRules)
+                            : controller.startBackupWithStrategy(
+                                  panel.strategyKey,
+                                  panel.packKey,
+                                  panel.compressionKey,
+                                  panel.encryptionKey,
+                                  panel.password,
+                                  panel.confirmPassword)
 
                         if (started)
                             panel.clearPasswords()
@@ -291,12 +359,57 @@ Item {
 
             StatusBanner {
                 objectName: "backupStatusBanner"
+                visible: page.backupTarget === "local"
                 Layout.fillWidth: true
                 pageScope: "backup"
                 scope: controller.statusScope
                 kind: controller.statusKind
                 title: controller.statusTitle
                 message: controller.statusMessage
+            }
+
+            // 云端快速备份的进度/结论直接来自 RemoteController；只有云端
+            // 目标显示，避免本地状态与远端状态混在一起。
+            ColumnLayout {
+                Layout.fillWidth: true
+                visible: page.backupTarget === "cloud" && remote.busy
+                spacing: 4
+
+                Rectangle {
+                    Layout.fillWidth: true
+                    Layout.preferredHeight: 6
+                    radius: 3
+                    color: theme.hover
+                    clip: true
+
+                    Rectangle {
+                        width: parent.width * Math.max(0, remote.progressRatio)
+                        height: parent.height
+                        radius: 3
+                        color: theme.accent
+                        visible: remote.progressRatio >= 0
+                    }
+                }
+
+                Text {
+                    objectName: "quickCloudProgressText"
+                    Layout.fillWidth: true
+                    text: remote.transferPhaseText + "  " + remote.progressText
+                    font.pixelSize: 14
+                    color: theme.textSecondary
+                    elide: Text.ElideRight
+                }
+            }
+
+            StatusBanner {
+                objectName: "quickCloudStatusBanner"
+                visible: page.backupTarget === "cloud"
+                Layout.fillWidth: true
+                pageScope: "remote"
+                scope: remote.statusScope
+                kind: remote.statusKind
+                title: remote.statusTitle
+                message: remote.statusMessage
             }
 
             Item { Layout.fillHeight: true }

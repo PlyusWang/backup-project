@@ -24,6 +24,7 @@
 #include "backup_catalog.h"
 #include "backup_credentials.h"
 #include "backup_engine.h"
+#include "cloud_task.h"
 #include "incremental_backup.h"
 #include "source_manifest.h"
 
@@ -505,12 +506,6 @@ bool ScheduledBackupService::EvaluateInternal(std::int64_t now_sec, bool force,
     SetError(error_message, "Schedule store must not be null");
     return false;
   }
-  if (repository_path_.empty()) {
-    SetError(error_message,
-             "Cannot run the scheduled backup: no repository is configured");
-    return false;
-  }
-
   ScheduleDocument document;
   const ScheduleLoadStatus load_status = store_->Load(&document, error_message);
   if (load_status == ScheduleLoadStatus::kError) return false;
@@ -558,6 +553,91 @@ bool ScheduledBackupService::EvaluateInternal(std::int64_t now_sec, bool force,
     }
     return true;
   };
+
+  // ---- 云端目标：共享执行层 + 0600 凭据文件 ----
+  //
+  // 云端任务不经过本地 catalog/retention；远端链由 RunRemoteBackup 的缓存
+  // 与父快照关系维护。只有云端正式确认快照后才写成功历史。
+  if (document.config.repository_type == "cloud") {
+    std::string cloud_error;
+    if (!ValidateScheduleConfig(document.config, &cloud_error)) {
+      result->status = ScheduleEvaluationStatus::kConfigInvalid;
+      result->diagnostic = cloud_error;
+      return true;
+    }
+    backupproject::Filter cloud_filter;
+    if (!BuildScheduleFilter(document.config, &cloud_filter, &cloud_error)) {
+      result->status = ScheduleEvaluationStatus::kConfigInvalid;
+      result->diagnostic = cloud_error;
+      return true;
+    }
+    backupproject::CloudTaskRequest task;
+    if (!backupproject::LoadCloudCredentialsFile(
+            document.config.cloud_credentials_file, &task.credentials,
+            &cloud_error)) {
+      return finish_failed("Cloud credentials could not be loaded: " +
+                           cloud_error);
+    }
+    if (backupproject::CloudRepositoryId(task.credentials) !=
+        document.config.cloud_repository_id) {
+      return finish_failed(
+          "Cloud credentials no longer match the repository saved in this "
+          "task; refusing to silently switch repositories");
+    }
+    task.expected_repository_id = document.config.cloud_repository_id;
+    task.source_directory = document.config.source_path;
+    task.filter = cloud_filter;
+    task.options.pack_method = document.config.pack_method;
+    task.options.compression_method = document.config.compression_method;
+    task.options.encryption_method = document.config.encryption_method;
+    task.allow_incremental =
+        document.config.strategy == BackupStrategy::kIncremental;
+    std::string credential;
+    if (document.config.encryption_method != EncryptionMethod::kNone) {
+      if (!ReadCredentialFile(document.config.encryption_password_file,
+                              &credential, &cloud_error)) {
+        return finish_failed(
+            "The credential file for unattended encryption could not be "
+            "read: " +
+            cloud_error);
+      }
+      task.options.password = credential;
+    }
+    backupproject::CloudTaskOutcome outcome;
+    const bool ok = backupproject::RunCloudTask(task, &outcome, &cloud_error);
+    if (!credential.empty()) credential.assign(credential.size(), '\0');
+    if (!ok) return finish_failed("Cloud backup failed: " + cloud_error);
+
+    document.state.next_run_time_sec = ScheduleNextRunTime(now_sec, interval);
+    result->next_run_time_sec = document.state.next_run_time_sec;
+    ScheduleHistoryEntry entry;
+    entry.scheduled_at_sec = now_sec;
+    entry.started_at_sec = now_sec;
+    entry.finished_at_sec = now_sec;
+    if (outcome.no_changes) {
+      result->status = ScheduleEvaluationStatus::kSkippedNoChanges;
+      entry.result = ScheduleRunResult::kSkippedNoChanges;
+      entry.diagnostic = "cloud repository: no changes";
+    } else {
+      result->status = ScheduleEvaluationStatus::kCreatedSnapshot;
+      result->archive_file_name = outcome.archive_name;
+      result->diagnostic = "cloud repository";
+      entry.result = ScheduleRunResult::kSuccessCreated;
+      entry.archive_file_name = outcome.archive_name;
+      entry.diagnostic = "cloud repository";
+    }
+    AppendHistoryEntry(&document.state, entry);
+    std::string save_error;
+    if (!store_->Save(document, &save_error)) {
+      result->diagnostic +=
+          " (and the schedule state could not be saved: " + save_error + ")";
+    }
+    return true;
+  }
+  if (repository_path_.empty()) {
+    return finish_failed(
+        "Cannot run the scheduled backup: no local repository is configured");
+  }
 
   // ---- 自愈 + 仓库可用性 ----
   //

@@ -44,6 +44,7 @@
 #include "backup_credentials.h"
 #include "backup_engine.h"
 #include "backup_option_keys.h"
+#include "cloud_task.h"
 #include "incremental_delta.h"
 #include "source_digest.h"
 #include "source_manifest.h"
@@ -866,12 +867,6 @@ bool RunRealtimeBackupOnce(const RealtimeConfig& config,
     return false;
   }
 
-  BackupCatalog catalog;
-  if (!catalog.EnsureRepository(repository_path, error_message)) {
-    outcome->kind = RealtimeOutcome::Kind::kFailed;
-    return false;
-  }
-
   BackupOptions options;
   options.pack_method = config.pack_method;
   options.compression_method = config.compression_method;
@@ -884,6 +879,63 @@ bool RunRealtimeBackupOnce(const RealtimeConfig& config,
       return false;
     }
     options.password = credential;
+  }
+
+  // ---- 云端目标：与快速/定时共用 CloudTask 执行层 ----
+  if (config.repository_type == "cloud") {
+    std::string cloud_error;
+    backupproject::CloudTaskRequest task;
+    if (!backupproject::LoadCloudCredentialsFile(
+            config.cloud_credentials_file, &task.credentials, &cloud_error)) {
+      outcome->kind = RealtimeOutcome::Kind::kFailed;
+      SetError(error_message,
+               "Cloud credentials could not be loaded: " + cloud_error);
+      return false;
+    }
+    if (backupproject::CloudRepositoryId(task.credentials) !=
+        config.cloud_repository_id) {
+      outcome->kind = RealtimeOutcome::Kind::kFailed;
+      SetError(error_message,
+               "Cloud credentials no longer match the repository saved in this "
+               "task; refusing to silently switch repositories");
+      return false;
+    }
+    task.expected_repository_id = config.cloud_repository_id;
+    task.source_directory = config.source_path;
+    task.filter = filter;
+    task.options = options;
+    task.allow_incremental = config.strategy == BackupStrategy::kIncremental;
+    backupproject::CloudTaskOutcome cloud;
+    const bool ok = backupproject::RunCloudTask(task, &cloud, &cloud_error);
+    if (!credential.empty()) credential.assign(credential.size(), '\0');
+    if (!ok) {
+      outcome->kind = RealtimeOutcome::Kind::kFailed;
+      SetError(error_message, "Cloud backup failed: " + cloud_error);
+      return false;
+    }
+    if (cloud.no_changes) {
+      outcome->kind = RealtimeOutcome::Kind::kNoChanges;
+      outcome->summary_text = "云端没有变化，跳过";
+    } else if (cloud.produced_delta) {
+      outcome->kind = RealtimeOutcome::Kind::kDelta;
+      outcome->snapshot_file_name = cloud.archive_name;
+      outcome->summary_text = "创建云端增量实时快照";
+    } else if (config.strategy == BackupStrategy::kIncremental) {
+      outcome->kind = RealtimeOutcome::Kind::kFullBaseline;
+      outcome->snapshot_file_name = cloud.archive_name;
+      outcome->summary_text = "创建云端完整基线";
+    } else {
+      outcome->kind = RealtimeOutcome::Kind::kFullSnapshot;
+      outcome->snapshot_file_name = cloud.archive_name;
+      outcome->summary_text = "创建云端完整实时快照";
+    }
+    return true;
+  }
+
+  BackupCatalog catalog;
+  if (!catalog.EnsureRepository(repository_path, error_message)) {
+    outcome->kind = RealtimeOutcome::Kind::kFailed;
+    return false;
   }
 
   std::string snapshot_file_name;

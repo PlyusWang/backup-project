@@ -210,6 +210,10 @@ struct RemoteRequest {
   // lineage、要不要 bootstrap 缓存）都由 core 决定，GUI 不参与。
   std::string source_directory;
   bool allow_incremental = false;
+  backupproject::Filter filter;
+  backupproject::BackupOptions backup_options;
+  std::vector<std::string> include_rules;
+  std::vector<std::string> exclude_rules;
   // kBackup：显示名留空时由 core 按链规则生成。
   // kRestore：目标目录。kRestoreRaw：下载之后本地恢复的目标目录。
   std::string restore_destination;
@@ -647,6 +651,13 @@ class RemoteController : public QObject {
   // 此时页面上已经有原因。
   Q_INVOKABLE bool backupRemote(const QString& source_directory,
                                 bool allow_incremental);
+  // 快速备份页使用：与 backupRemote 相同，但把共享选项/筛选规则显式带入。
+  // 密码只在本进程内存里存在，不写配置。
+  Q_INVOKABLE bool backupRemoteWithOptions(
+      const QString& source_directory, bool allow_incremental,
+      const QString& pack_key, const QString& compression_key,
+      const QString& encryption_key, const QString& password,
+      const QStringList& include_rules, const QStringList& exclude_rules);
   // 恢复某个远端快照（自动解析并下载整条依赖链）。snapshot_id 为空或目标目录
   // 为空都在本地被拒，一个字节都不发。
   Q_INVOKABLE bool restoreSnapshot(const QString& snapshot_id,

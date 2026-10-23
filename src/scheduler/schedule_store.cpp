@@ -302,6 +302,30 @@ bool ValidateScheduleConfig(const ScheduleConfig& config,
       !IsUsableCredentialPath(config.encryption_password_file, error_message)) {
     return false;
   }
+  // 目标仓库：空串按 local 兼容；cloud 必须同时有 0600 凭据文件与稳定标识。
+  const std::string repository_type =
+      config.repository_type.empty() ? "local" : config.repository_type;
+  if (repository_type != "local" && repository_type != "cloud") {
+    SetError(error_message, "Schedule repository_type must be local or cloud");
+    return false;
+  }
+  if (repository_type == "local") {
+    if (!config.cloud_credentials_file.empty() ||
+        !config.cloud_repository_id.empty()) {
+      SetError(error_message,
+               "Local schedule must not carry cloud repository fields");
+      return false;
+    }
+  } else {
+    if (!IsUsableCredentialPath(config.cloud_credentials_file, error_message)) {
+      return false;
+    }
+    if (config.cloud_repository_id.rfind("cloud://", 0) != 0) {
+      SetError(error_message,
+               "Cloud schedule needs a stable cloud:// repository id");
+      return false;
+    }
+  }
   if (config.interval_minutes < kMinIntervalMinutes ||
       config.interval_minutes > kMaxIntervalMinutes) {
     SetError(error_message, "Schedule interval must be between " +
@@ -679,6 +703,18 @@ std::string SerializeScheduleDocument(const ScheduleDocument& document) {
                     BackupStrategyKey(document.config.strategy), false);
   AppendIndent(&out, 2);
   AppendStringField(&out, "source_path", document.config.source_path, false);
+  if (!document.config.repository_type.empty() &&
+      document.config.repository_type != "local") {
+    AppendIndent(&out, 2);
+    AppendStringField(&out, "repository_type", document.config.repository_type,
+                      false);
+    AppendIndent(&out, 2);
+    AppendStringField(&out, "cloud_credentials_file",
+                      document.config.cloud_credentials_file, false);
+    AppendIndent(&out, 2);
+    AppendStringField(&out, "cloud_repository_id",
+                      document.config.cloud_repository_id, false);
+  }
   AppendIndent(&out, 2);
   AppendNumberField(&out, "interval_minutes", document.config.interval_minutes,
                     false);
@@ -790,7 +826,8 @@ const std::vector<const char*> kConfigFields = {
 // 无人值守加密的口令文件是后加的字段：没有它的旧文件必须继续读得进来，
 // 读到的是空串（= 不加密）。未知字段仍然报 unknown。
 const std::vector<const char*> kConfigOptionalFields = {
-    "encryption_password_file"};
+    "encryption_password_file", "repository_type", "cloud_credentials_file",
+    "cloud_repository_id"};
 const std::vector<const char*> kStateFields = {
     "next_run_time_sec", "last_success_time_sec", "last_manifest_entry_count",
     "managed_snapshots", "history"};
@@ -948,6 +985,15 @@ bool ParseConfig(const JsonValue& root, ScheduleConfig* config,
                              error_message)) {
     return false;
   }
+  if (!RequireOptionalString(*object, "repository_type", "config",
+                             &config->repository_type, error_message) ||
+      !RequireOptionalString(*object, "cloud_credentials_file", "config",
+                             &config->cloud_credentials_file, error_message) ||
+      !RequireOptionalString(*object, "cloud_repository_id", "config",
+                             &config->cloud_repository_id, error_message)) {
+    return false;
+  }
+  if (config->repository_type.empty()) config->repository_type = "local";
 
   // 规则条数与单条长度在这里再查一遍：Save() 侧查过，但读进来的文件可能
   // 根本没过过 Save()（手改、别的版本写的），读侧不能假设它守规矩。

@@ -7,6 +7,7 @@ TARGET := $(BUILD_DIR)/backupctl
 
 APP_SOURCES := app/backupctl.cpp
 CORE_SOURCES := src/core/archive_entry.cpp src/core/archive_pipeline.cpp \
+                src/cloud/cloud_task.cpp \
                 src/core/backup_engine.cpp src/core/backup_preview.cpp \
                 src/core/file_io.cpp \
                 src/core/source_digest.cpp \

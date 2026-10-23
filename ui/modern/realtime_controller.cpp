@@ -39,6 +39,9 @@
 #include <string>
 #include <utility>
 
+#include "backup_credentials.h"
+#include "cloud_task.h"
+
 // 只为订阅 BackupController::repositoryPathChanged 与拿到它的完整类型：
 // 仓库换掉之后，本控制器必须立刻跟上（见 OnRepositoryPathChanged）。
 #include "backup_controller.h"
@@ -1419,6 +1422,53 @@ bool RealtimeController::setEncryptionChoice(const QString& encryption_key,
   }
   draft_encryption_key_ = encryption_key;
   draft_credential_file_ = credential_file;
+  emit configChanged();
+  return true;
+}
+
+QString RealtimeController::cloudRepositoryIdForFile(
+    const QString& credentials_file) {
+  backupproject::CloudCredentials credentials;
+  std::string error;
+  if (!backupproject::LoadCloudCredentialsFile(credentials_file.toStdString(),
+                                               &credentials, &error)) {
+    SetStatus(QStringLiteral("error"), QStringLiteral("云端凭据文件不可用"),
+              QString::fromStdString(error));
+    return QString();
+  }
+  return QString::fromStdString(backupproject::CloudRepositoryId(credentials));
+}
+
+bool RealtimeController::setRepositoryTarget(const QString& repository_type,
+                                             const QString& credentials_file,
+                                             const QString& repository_id) {
+  if (repository_type == "local") {
+    config_.repository_type = "local";
+    config_.cloud_credentials_file.clear();
+    config_.cloud_repository_id.clear();
+    emit configChanged();
+    return true;
+  }
+  if (repository_type != "cloud") {
+    SetStatus(QStringLiteral("error"), QStringLiteral("目标仓库不可用"),
+              QStringLiteral("目标仓库只能是本地或云端。"));
+    return false;
+  }
+  std::string path_error;
+  if (!backupproject::IsUsableCredentialPath(credentials_file.toStdString(),
+                                             &path_error)) {
+    SetStatus(QStringLiteral("error"), QStringLiteral("云端凭据文件不可用"),
+              QString::fromStdString(path_error));
+    return false;
+  }
+  if (!repository_id.startsWith(QStringLiteral("cloud://"))) {
+    SetStatus(QStringLiteral("error"), QStringLiteral("云端仓库标识不可用"),
+              QStringLiteral("请先选择凭据文件并生成仓库标识。"));
+    return false;
+  }
+  config_.repository_type = "cloud";
+  config_.cloud_credentials_file = credentials_file.toStdString();
+  config_.cloud_repository_id = repository_id.toStdString();
   emit configChanged();
   return true;
 }

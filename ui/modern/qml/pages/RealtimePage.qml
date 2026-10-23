@@ -54,6 +54,9 @@ Item {
     property int draftEncryptionIndex: 0
     // 无人值守加密的口令文件草稿（只保存路径）。
     property string draftCredentialFile: ""
+    property string draftRepositoryType: realtime.repositoryType
+    property string draftCloudCredentialsFile: realtime.cloudCredentialsFile
+    property string draftCloudRepositoryId: realtime.cloudRepositoryId
 
     // 两个折叠区都默认收起，而且**不持久化**：折叠是这一屏的临时视图状态，
     // 不是配置；重新进入页面时回到"常用设置 + 运行状态优先"的默认样子。
@@ -118,6 +121,9 @@ Item {
         || page.encryptionKeys[page.draftEncryptionIndex]
            !== realtime.encryptionKey
         || page.draftCredentialFile !== realtime.credentialFile
+        || page.draftRepositoryType !== realtime.repositoryType
+        || page.draftCloudCredentialsFile !== realtime.cloudCredentialsFile
+        || page.draftCloudRepositoryId !== realtime.cloudRepositoryId
         || ruleEditor.rulesSignature !== page.savedRulesSignature
 
     // 用控制器状态覆盖全部草稿。触发点有两个：页面完成加载，以及 savedSignature
@@ -138,6 +144,9 @@ Item {
         page.draftEncryptionIndex =
             Math.max(0, page.encryptionKeys.indexOf(realtime.encryptionKey))
         page.draftCredentialFile = realtime.credentialFile
+        page.draftRepositoryType = realtime.repositoryType
+        page.draftCloudCredentialsFile = realtime.cloudCredentialsFile
+        page.draftCloudRepositoryId = realtime.cloudRepositoryId
         // 落盘配置里的规则读进共享编辑器（校验仍然走共享 builder）。读不懂时
         // 编辑器会显示共享核心给出的原因，这里不吞掉它。
         ruleEditor.loadRules(realtime.includeRules, realtime.excludeRules)
@@ -162,6 +171,8 @@ Item {
         realtime.maxWaitMs, realtime.retainCount, realtime.strategyKey,
         realtime.packKey, realtime.compressionKey,
         realtime.encryptionKey, realtime.credentialFile,
+        realtime.repositoryType, realtime.cloudCredentialsFile,
+        realtime.cloudRepositoryId,
         realtime.includeRules.join(","), realtime.excludeRules.join(",")
     ].join("|")
     onSavedSignatureChanged: syncFromController()
@@ -346,6 +357,74 @@ Item {
                     }
 
                     Text {
+                        text: "目标仓库"
+                        font.pixelSize: 16
+                        font.weight: Font.DemiBold
+                        color: theme.textSecondary
+                    }
+
+                    SegmentedTabs {
+                        objectName: "realtimeTargetTabs"
+                        Layout.preferredWidth: 360
+                        enabled: !realtime.libraryBusy
+                        currentKey: page.draftRepositoryType
+                        model: [
+                            { "key": "local", "text": "本地仓库" },
+                            { "key": "cloud", "text": "云端仓库" }
+                        ]
+                        onActivated: function (key) {
+                            page.draftRepositoryType = key
+                        }
+                    }
+
+                    ColumnLayout {
+                        Layout.fillWidth: true
+                        visible: page.draftRepositoryType === "cloud"
+                        spacing: 6
+
+                        Text {
+                            text: "0600 云端凭据文件（密码不进配置）"
+                            font.pixelSize: 14
+                            color: theme.textSecondary
+                        }
+
+                        RowLayout {
+                            Layout.fillWidth: true
+                            spacing: 8
+
+                            AppTextField {
+                                objectName: "realtimeCloudCredentialsField"
+                                Layout.fillWidth: true
+                                text: page.draftCloudCredentialsFile
+                                onTextEdited: page.draftCloudCredentialsFile = text
+                                placeholderText: "绝对路径，例如 /home/me/cloud.env"
+                            }
+
+                            AppButton {
+                                text: "生成仓库标识"
+                                enabled: page.draftCloudCredentialsFile.length > 0
+                                onClicked: {
+                                    const id = realtime.cloudRepositoryIdForFile(
+                                        page.draftCloudCredentialsFile)
+                                    if (id.length > 0)
+                                        page.draftCloudRepositoryId = id
+                                }
+                            }
+                        }
+
+                        Text {
+                            objectName: "realtimeCloudRepositoryId"
+                            Layout.fillWidth: true
+                            text: page.draftCloudRepositoryId.length > 0
+                                  ? "仓库标识：" + page.draftCloudRepositoryId
+                                  : "尚未生成仓库标识"
+                            font.pixelSize: 13
+                            color: theme.textSecondary
+                            wrapMode: Text.WrapAnywhere
+                        }
+                    }
+
+                    Text {
                         text: "备份目录"
                         font.pixelSize: 16
                         font.weight: Font.DemiBold
@@ -479,6 +558,19 @@ Item {
                             // 不存在"目录存了、策略没存"的中间态；规则文本来自
                             // 共享编辑器，失败原因由控制器写进状态栏。
                             onClicked: {
+                                let targetId = page.draftCloudRepositoryId
+                                if (page.draftRepositoryType === "cloud"
+                                        && targetId.length === 0
+                                        && page.draftCloudCredentialsFile.length > 0) {
+                                    targetId = realtime.cloudRepositoryIdForFile(
+                                        page.draftCloudCredentialsFile)
+                                    page.draftCloudRepositoryId = targetId
+                                }
+                                if (!realtime.setRepositoryTarget(
+                                        page.draftRepositoryType,
+                                        page.draftCloudCredentialsFile,
+                                        targetId))
+                                    return
                                 if (!realtime.setEncryptionChoice(
                                         page.encryptionKeyValue,
                                         page.draftCredentialFile))

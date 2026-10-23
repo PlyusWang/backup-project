@@ -98,6 +98,11 @@ class ScheduleController : public QObject,
   Q_PROPERTY(QString encryptionKey READ encryptionKey NOTIFY configChanged)
   // 无人值守加密的口令文件草稿（只保存路径，口令内容由核心里读取）。
   Q_PROPERTY(QString credentialFile READ credentialFile NOTIFY configChanged)
+  Q_PROPERTY(QString repositoryType READ repositoryType NOTIFY configChanged)
+  Q_PROPERTY(QString cloudCredentialsFile READ cloudCredentialsFile NOTIFY
+                 configChanged)
+  Q_PROPERTY(
+      QString cloudRepositoryId READ cloudRepositoryId NOTIFY configChanged)
   Q_PROPERTY(QStringList includeRules READ includeRules NOTIFY configChanged)
   Q_PROPERTY(QStringList excludeRules READ excludeRules NOTIFY configChanged)
   // 当前真实支持的模式。QML 只显示这一行，不做"未实现的按钮"。
@@ -162,6 +167,17 @@ class ScheduleController : public QObject,
   QString compressionKey() const;
   QString encryptionKey() const;
   QString credentialFile() const { return draft_credential_file_; }
+  QString repositoryType() const {
+    return QString::fromStdString(document_.config.repository_type.empty()
+                                      ? "local"
+                                      : document_.config.repository_type);
+  }
+  QString cloudCredentialsFile() const {
+    return QString::fromStdString(document_.config.cloud_credentials_file);
+  }
+  QString cloudRepositoryId() const {
+    return QString::fromStdString(document_.config.cloud_repository_id);
+  }
   QStringList includeRules() const;
   QStringList excludeRules() const;
   QString supportedModeText() const;
@@ -239,6 +255,13 @@ class ScheduleController : public QObject,
   // 只更新草稿，不写盘、不读文件；真正的校验与落盘仍然走 saveConfig。
   Q_INVOKABLE bool setEncryptionChoice(const QString& encryption_key,
                                        const QString& credential_file);
+  // 目标仓库草稿：local 清空云端字段；cloud 要求 0600 凭据路径与稳定
+  // cloud:// 标识。只改内存，随后由 saveConfig 落盘。
+  Q_INVOKABLE bool setRepositoryTarget(const QString& repository_type,
+                                       const QString& credentials_file,
+                                       const QString& repository_id);
+  // 从 0600 凭据文件计算稳定仓库标识；失败返回空串并把原因放进状态行。
+  Q_INVOKABLE QString cloudRepositoryIdForFile(const QString& credentials_file);
   // 备份管理页的 JOIN：file_name -> 来源 / 计划变化摘要。
   //
   // 依赖方向仍然是 ScheduleService -> BackupCatalog：这里只读 ScheduleStore

@@ -38,6 +38,7 @@
 #include <csignal>
 #include <cstdio>
 #include <cstring>
+#include <ctime>
 #include <functional>
 
 #include "app_paths.h"
@@ -47,16 +48,20 @@
 #include "backup_catalog.h"
 #include "backup_controller.h"
 #include "backup_engine.h"
+#include "cloud_task.h"
 #include "config_manager.h"
 #include "filter_rule_model.h"
 #include "incremental_delta.h"
 #include "operation_gate.h"
+#include "realtime_backup_service.h"
 #include "realtime_controller.h"
+#include "realtime_store.h"
 #include "remote_controller.h"
 #include "remote_incremental.h"
 #include "schedule_controller.h"
 #include "schedule_frequency.h"
 #include "schedule_store.h"
+#include "scheduled_backup_service.h"
 #include "scheduler_lock.h"
 #include "server_profile.h"
 
@@ -1651,6 +1656,223 @@ int RunRemoteProductFlow(backup_modern::RemoteController* remote, CheckRun* run,
       manifest_file.write(manifest_original);
       manifest_file.close();
     }
+
+    // ---- G4：快速备份控制器直接以“共享选项”写云端完整 + 增量，并恢复 ----
+    const QString quick_source = work + QStringLiteral("/quick-cloud-src");
+    const QString quick_restore = work + QStringLiteral("/quick-cloud-restore");
+    QDir().mkpath(quick_source);
+    QDir().mkpath(quick_restore);
+    writeText(quick_source + QStringLiteral("/a.txt"),
+              QStringLiteral("cloud-a-0\n"));
+    writeText(quick_source + QStringLiteral("/skip.bin"),
+              QStringLiteral("skip"));
+    const bool quick_full_accepted = remote->backupRemoteWithOptions(
+        quick_source, /*allow_incremental=*/false, QStringLiteral("mypack"),
+        QStringLiteral("huffman"), QStringLiteral("none"), QString(),
+        QStringList() << QStringLiteral("ext:txt"), QStringList());
+    const bool quick_full_ok =
+        quick_full_accepted && remote->waitForIdle(900000) &&
+        remote->lastErrorKindForTest() == QStringLiteral("none") &&
+        !remote->lastBackupProducedDeltaForTest() &&
+        !remote->lastBackupSnapshotIdForTest().isEmpty();
+    run->Check(quick_full_ok,
+               QStringLiteral("G4 快速备份直连云端：完整 + 筛选/压缩"),
+               remote->lastErrorKindForTest() + QStringLiteral(": ") +
+                   remote->lastDetailForTest());
+    const QString quick_full_id = remote->lastBackupSnapshotIdForTest();
+    writeText(quick_source + QStringLiteral("/a.txt"),
+              QStringLiteral("cloud-a-1\n"));
+    const bool quick_delta_accepted = remote->backupRemoteWithOptions(
+        quick_source, /*allow_incremental=*/true, QStringLiteral("mypack"),
+        QStringLiteral("huffman"), QStringLiteral("none"), QString(),
+        QStringList() << QStringLiteral("ext:txt"), QStringList());
+    const bool quick_delta_ok =
+        quick_delta_accepted && remote->waitForIdle(900000) &&
+        remote->lastErrorKindForTest() == QStringLiteral("none") &&
+        remote->lastBackupProducedDeltaForTest() &&
+        remote->lastBackupGenerationForTest() == 1;
+    run->Check(quick_delta_ok,
+               QStringLiteral("G4 快速备份直连云端：增量接在完整基线之后"),
+               remote->lastErrorKindForTest() + QStringLiteral(": ") +
+                   remote->lastDetailForTest());
+    const QString quick_delta_id = remote->lastBackupSnapshotIdForTest();
+    const bool quick_restore_accepted =
+        !quick_delta_id.isEmpty() &&
+        remote->restoreSnapshot(quick_delta_id, quick_restore);
+    const bool quick_restore_ok =
+        quick_restore_accepted && remote->waitForIdle(900000) &&
+        remote->lastErrorKindForTest() == QStringLiteral("none") &&
+        !QFileInfo::exists(quick_restore + QStringLiteral("/skip.bin"));
+    QString restored_text;
+    QFile restored_file(quick_restore + QStringLiteral("/a.txt"));
+    if (restored_file.open(QIODevice::ReadOnly)) {
+      restored_text = QString::fromUtf8(restored_file.readAll());
+    }
+    run->Check(quick_restore_ok &&
+                   restored_text == QStringLiteral("cloud-a-1\n") &&
+                   !quick_full_id.isEmpty(),
+               QStringLiteral("G4 云端完整+增量链恢复：筛选生效且内容一致"),
+               remote->lastErrorKindForTest() + QStringLiteral(": ") +
+                   remote->lastDetailForTest());
+
+    // ---- G5/G6：定时/实时服务直接使用云端目标（真实本地服务端）----
+    const QString cloud_credentials = work + QStringLiteral("/cloud-creds.env");
+    {
+      QFile credentials(cloud_credentials);
+      if (credentials.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
+        credentials.write(
+            QStringLiteral("host=%1\nport=%2\nusername=%3\npassword=%4\n"
+                           "identity_mode=pin\npin=sha256:%5\n")
+                .arg(host, port_text, username, password, fingerprint)
+                .toUtf8());
+      }
+      QFile::setPermissions(cloud_credentials,
+                            QFileDevice::ReadOwner | QFileDevice::WriteOwner);
+    }
+    backupproject::CloudCredentials cloud_credentials_value;
+    std::string cloud_credentials_error;
+    const bool credentials_ok = backupproject::LoadCloudCredentialsFile(
+        cloud_credentials.toStdString(), &cloud_credentials_value,
+        &cloud_credentials_error);
+    const std::string cloud_repository_id =
+        backupproject::CloudRepositoryId(cloud_credentials_value);
+    run->Check(credentials_ok && !cloud_repository_id.empty(),
+               QStringLiteral("G5 云端凭据文件可读且仓库标识稳定"),
+               QString::fromStdString(cloud_credentials_error));
+
+    auto cloud_schedule_config = [&]() {
+      backupproject::ScheduleConfig config;
+      config.enabled = true;
+      config.trigger = backupproject::BackupTrigger::kScheduled;
+      config.strategy = backupproject::BackupStrategy::kFull;
+      config.source_path = quick_source.toStdString();
+      config.interval_minutes = 60;
+      config.retain_count = 4;
+      config.pack_method = backupproject::PackMethod::kMyPack;
+      config.compression_method = backupproject::CompressionMethod::kHuffman;
+      config.repository_type = "cloud";
+      config.cloud_credentials_file = cloud_credentials.toStdString();
+      config.cloud_repository_id = cloud_repository_id;
+      return config;
+    };
+    const QString schedule_cloud_path =
+        work + QStringLiteral("/cloud-schedule.json");
+    backupproject::ScheduleStore cloud_schedule_store(
+        schedule_cloud_path.toStdString());
+    backupproject::ScheduleDocument cloud_schedule_document;
+    cloud_schedule_document.config = cloud_schedule_config();
+    std::string schedule_error;
+    const bool schedule_saved =
+        cloud_schedule_store.Save(cloud_schedule_document, &schedule_error);
+    backupproject::ScheduleDocument reloaded_schedule;
+    std::string reload_error;
+    const bool schedule_reloaded =
+        cloud_schedule_store.Load(&reloaded_schedule, &reload_error) ==
+            backupproject::ScheduleLoadStatus::kLoaded &&
+        reloaded_schedule.config.repository_type == "cloud" &&
+        reloaded_schedule.config.cloud_credentials_file ==
+            cloud_credentials.toStdString() &&
+        reloaded_schedule.config.cloud_repository_id == cloud_repository_id;
+    run->Check(schedule_reloaded,
+               QStringLiteral("G3 定时云端仓库标识在重启后保持"),
+               QString::fromStdString(reload_error));
+    backupproject::ScheduledBackupService cloud_schedule_service(
+        std::string(), &cloud_schedule_store);
+    backupproject::ScheduleEvaluationResult schedule_result;
+    std::string schedule_run_error;
+    const bool schedule_ran =
+        schedule_saved && cloud_schedule_service.EvaluateNow(
+                              static_cast<std::int64_t>(::time(nullptr)),
+                              &schedule_result, &schedule_run_error);
+    run->Check(
+        schedule_ran &&
+            schedule_result.status ==
+                backupproject::ScheduleEvaluationStatus::kCreatedSnapshot &&
+            !schedule_result.archive_file_name.empty(),
+        QStringLiteral("G5 定时云端完整备份：从保存配置自动执行"),
+        QString::fromStdString(schedule_error + " / " + schedule_run_error));
+
+    writeText(quick_source + QStringLiteral("/a.txt"),
+              QStringLiteral("cloud-scheduled-1\n"));
+    cloud_schedule_store.Load(&cloud_schedule_document, &schedule_error);
+    cloud_schedule_document.config.strategy =
+        backupproject::BackupStrategy::kIncremental;
+    const bool schedule_saved_delta =
+        cloud_schedule_store.Save(cloud_schedule_document, &schedule_error);
+    const bool schedule_ran_delta =
+        schedule_saved_delta && cloud_schedule_service.EvaluateNow(
+                                    static_cast<std::int64_t>(::time(nullptr)),
+                                    &schedule_result, &schedule_run_error);
+    run->Check(
+        schedule_ran_delta &&
+            schedule_result.status ==
+                backupproject::ScheduleEvaluationStatus::kCreatedSnapshot &&
+            !schedule_result.archive_file_name.empty(),
+        QStringLiteral("G5 定时云端增量备份：真实触发并记录结果"),
+        QString::fromStdString(schedule_error + " / " + schedule_run_error));
+
+    auto cloud_realtime_config = [&]() {
+      backupproject::RealtimeConfig config;
+      config.enabled = true;
+      config.trigger = backupproject::BackupTrigger::kRealtime;
+      config.source_path = quick_source.toStdString();
+      config.debounce_ms = 100;
+      config.max_wait_ms = 1000;
+      config.retain_count = 4;
+      config.strategy = backupproject::BackupStrategy::kFull;
+      config.pack_method = backupproject::PackMethod::kMyPack;
+      config.compression_method = backupproject::CompressionMethod::kHuffman;
+      config.repository_type = "cloud";
+      config.cloud_credentials_file = cloud_credentials.toStdString();
+      config.cloud_repository_id = cloud_repository_id;
+      return config;
+    };
+    backupproject::RealtimeConfig realtime_config = cloud_realtime_config();
+    const QString realtime_cloud_path =
+        work + QStringLiteral("/cloud-realtime.json");
+    backupproject::RealtimeStore realtime_store(
+        realtime_cloud_path.toStdString());
+    std::string realtime_save_error;
+    backupproject::RealtimeConfig reloaded_realtime;
+    const bool realtime_saved =
+        realtime_store.Save(realtime_config, &realtime_save_error) &&
+        realtime_store.Load(&reloaded_realtime, &realtime_save_error) ==
+            backupproject::RealtimeLoadStatus::kLoaded &&
+        reloaded_realtime.repository_type == "cloud" &&
+        reloaded_realtime.cloud_credentials_file ==
+            cloud_credentials.toStdString() &&
+        reloaded_realtime.cloud_repository_id == cloud_repository_id;
+    run->Check(realtime_saved,
+               QStringLiteral("G3 实时云端仓库标识在重启后保持"),
+               QString::fromStdString(realtime_save_error));
+    backupproject::RealtimeEventSummary realtime_events;
+    realtime_events.generation = 1;
+    realtime_events.event_count = 1;
+    backupproject::RealtimeOutcome realtime_outcome;
+    std::string realtime_error;
+    const bool realtime_full = backupproject::RunRealtimeBackupOnce(
+        realtime_config, std::string(), std::string(), realtime_events,
+        static_cast<std::int64_t>(::time(nullptr)), &realtime_outcome,
+        &realtime_error);
+    run->Check(realtime_full &&
+                   realtime_outcome.kind ==
+                       backupproject::RealtimeOutcome::Kind::kFullSnapshot,
+               QStringLiteral("G6 实时云端完整备份：真实触发成功"),
+               QString::fromStdString(realtime_error));
+    writeText(quick_source + QStringLiteral("/a.txt"),
+              QStringLiteral("cloud-realtime-1\n"));
+    realtime_config.strategy = backupproject::BackupStrategy::kIncremental;
+    realtime_events.generation = 2;
+    std::string realtime_delta_error;
+    const bool realtime_delta = backupproject::RunRealtimeBackupOnce(
+        realtime_config, std::string(), std::string(), realtime_events,
+        static_cast<std::int64_t>(::time(nullptr)), &realtime_outcome,
+        &realtime_delta_error);
+    run->Check(
+        realtime_delta && realtime_outcome.kind ==
+                              backupproject::RealtimeOutcome::Kind::kDelta,
+        QStringLiteral("G6 实时云端增量备份：接在完整基线之后"),
+        QString::fromStdString(realtime_delta_error));
   }
 
   // ---- 清理：注销临时账号（正式数据不受影响）----

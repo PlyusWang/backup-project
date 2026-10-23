@@ -79,6 +79,12 @@ struct ScheduleConfig {
 
   std::string source_path;
 
+  // 目标仓库：空串 / "local" = 本地仓库（旧配置默认值）；"cloud" = 云端。
+  // 云端只保存凭据文件路径与稳定仓库标识，绝不保存密码。
+  std::string repository_type = "local";
+  std::string cloud_credentials_file;
+  std::string cloud_repository_id;
+
   std::uint32_t interval_minutes = kDefaultIntervalMinutes;
   std::uint32_t retain_count = kDefaultRetainCount;
 

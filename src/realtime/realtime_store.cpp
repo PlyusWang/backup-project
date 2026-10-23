@@ -279,6 +279,29 @@ bool ValidateRealtimeConfig(const RealtimeConfig& config,
       !IsUsableCredentialPath(config.encryption_password_file, error_message)) {
     return false;
   }
+  const std::string repository_type =
+      config.repository_type.empty() ? "local" : config.repository_type;
+  if (repository_type != "local" && repository_type != "cloud") {
+    SetError(error_message, "Realtime repository_type must be local or cloud");
+    return false;
+  }
+  if (repository_type == "local") {
+    if (!config.cloud_credentials_file.empty() ||
+        !config.cloud_repository_id.empty()) {
+      SetError(error_message,
+               "Local realtime task must not carry cloud repository fields");
+      return false;
+    }
+  } else {
+    if (!IsUsableCredentialPath(config.cloud_credentials_file, error_message)) {
+      return false;
+    }
+    if (config.cloud_repository_id.rfind("cloud://", 0) != 0) {
+      SetError(error_message,
+               "Cloud realtime task needs a stable cloud:// repository id");
+      return false;
+    }
+  }
   return true;
 }
 
@@ -632,7 +655,9 @@ RealtimeLoadStatus RealtimeStore::Load(RealtimeConfig* config,
               "version", "enabled", "trigger", "source_path", "debounce_ms",
               "max_wait_ms", "retain_count", "strategy", "pack", "compression",
               "encryption", "include_rules", "exclude_rules"},
-          std::vector<const char*>{"encryption_password_file"},
+          std::vector<const char*>{"encryption_password_file",
+                                   "repository_type", "cloud_credentials_file",
+                                   "cloud_repository_id"},
           "realtime config", error_message)) {
     return RealtimeLoadStatus::kError;
   }
@@ -720,6 +745,19 @@ RealtimeLoadStatus RealtimeStore::Load(RealtimeConfig* config,
                              error_message)) {
     return RealtimeLoadStatus::kError;
   }
+  for (const char* key :
+       {"repository_type", "cloud_credentials_file", "cloud_repository_id"}) {
+    if (root.Find(key) == nullptr) continue;
+    std::string* target = strcmp(key, "repository_type") == 0
+                              ? &config->repository_type
+                          : strcmp(key, "cloud_credentials_file") == 0
+                              ? &config->cloud_credentials_file
+                              : &config->cloud_repository_id;
+    if (!RealtimeRequireString(root, key, what, target, error_message)) {
+      return RealtimeLoadStatus::kError;
+    }
+  }
+  if (config->repository_type.empty()) config->repository_type = "local";
   if (!RealtimeRequireRuleList(root, "include_rules", what,
                                &config->include_rules, error_message)) {
     return RealtimeLoadStatus::kError;
@@ -771,6 +809,15 @@ bool RealtimeStore::Save(const RealtimeConfig& config,
   AppendStringField(&out, "encryption_password_file",
                     config.encryption_password_file);
   out += ",\n";
+  if (!config.repository_type.empty() && config.repository_type != "local") {
+    AppendStringField(&out, "repository_type", config.repository_type);
+    out += ",\n";
+    AppendStringField(&out, "cloud_credentials_file",
+                      config.cloud_credentials_file);
+    out += ",\n";
+    AppendStringField(&out, "cloud_repository_id", config.cloud_repository_id);
+    out += ",\n";
+  }
   AppendRules(&out, "include_rules", config.include_rules, false);
   // exclude_rules 必须是最后一行：AppendRules 的 last=true 决定不写尾逗号。
   AppendRules(&out, "exclude_rules", config.exclude_rules, true);
