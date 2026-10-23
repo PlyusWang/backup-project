@@ -1969,6 +1969,7 @@ int RunRemoteProductFlow(backup_modern::RemoteController* remote, CheckRun* run,
           cloud_credentials.toStdString(), &retention_creds,
           &retention_creds_error);
       std::vector<std::string> owned;
+      std::vector<std::string> owned_ids;
       bool created_all = creds_ok;
       for (int index = 0; index < 4 && created_all; ++index) {
         QFile source_file(retention_source + QStringLiteral("/data.txt"));
@@ -1990,6 +1991,7 @@ int RunRemoteProductFlow(backup_modern::RemoteController* remote, CheckRun* run,
           retention_creds_error = task_error;
         } else {
           owned.push_back(task_outcome.archive_name);
+          owned_ids.push_back(task_outcome.snapshot_id);
         }
       }
       backupproject::CloudRetentionRequest retention;
@@ -2007,11 +2009,24 @@ int RunRemoteProductFlow(backup_modern::RemoteController* remote, CheckRun* run,
       backupproject::CloudRetentionResult real;
       const bool real_ok = dry_ok && backupproject::RunCloudRetention(
                                          retention, &real, &retention_error);
+      const QString restore_destination =
+          work + QStringLiteral("/retention-restore");
+      QDir().mkpath(restore_destination);
+      const bool restored =
+          created_all && owned_ids.size() == 4 &&
+          remote->restoreSnapshot(QString::fromStdString(owned_ids[3]),
+                                  restore_destination) &&
+          remote->waitForIdle(300000) &&
+          remote->lastErrorKindForTest() == QStringLiteral("none");
+      QFile restored_file(restore_destination + QStringLiteral("/data.txt"));
+      const bool restored_ok =
+          restored && restored_file.exists() && restored_file.size() == 4096;
       run->Check(
           created_all && dry_ok && real_ok && dry.dry_run_delete.size() == 2 &&
-              real.deleted.size() == 2 && real.kept.size() == 2,
+              real.deleted.size() == 2 && real.kept.size() == 2 && restored_ok,
           QStringLiteral("F1 云端保留：4 个完整快照保留 2 个并安全删除旧 2"),
-          QString::fromStdString(retention_error));
+          QString::fromStdString(retention_error) +
+              QStringLiteral(" restore=") + remote->lastDetailForTest());
     }
 
     auto cloud_realtime_config = [&]() {
