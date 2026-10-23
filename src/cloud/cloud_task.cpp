@@ -1,8 +1,15 @@
 // src/cloud/cloud_task.cpp
 #include "cloud_task.h"
 
+#include <fcntl.h>
+#include <sys/wait.h>
+#include <unistd.h>
+
+#include <cerrno>
 #include <cstdlib>
+#include <cstring>
 #include <sstream>
+#include <vector>
 
 #include "backup_credentials.h"
 #include "remote_backup_client.h"
@@ -21,6 +28,71 @@ bool ParsePort(const std::string& text, std::uint16_t* port) {
   }
   if (consumed != text.size() || value == 0 || value > 65535) return false;
   *port = static_cast<std::uint16_t>(value);
+  return true;
+}
+
+// 从系统密钥库/密码管理器读取密码。命令由 0600 凭据文件所有者配置；
+// 输出只进内存，不写日志，也不出现在我们自己的 argv 里。
+bool RunPasswordCommand(const std::string& command, std::string* secret,
+                        std::string* error_message) {
+  if (command.empty()) {
+    if (error_message != nullptr) *error_message = "password_command 为空";
+    return false;
+  }
+  int pipe_fds[2];
+  if (::pipe(pipe_fds) != 0) {
+    if (error_message != nullptr) *error_message = "无法创建密码命令管道";
+    return false;
+  }
+  const pid_t child = ::fork();
+  if (child == 0) {
+    ::close(pipe_fds[0]);
+    if (::dup2(pipe_fds[1], STDOUT_FILENO) < 0) _exit(127);
+    ::close(pipe_fds[1]);
+    ::execl("/bin/sh", "sh", "-c", command.c_str(), nullptr);
+    _exit(127);
+  }
+  ::close(pipe_fds[1]);
+  if (child < 0) {
+    ::close(pipe_fds[0]);
+    if (error_message != nullptr) *error_message = "无法启动密码命令";
+    return false;
+  }
+  std::string output;
+  char buffer[1024];
+  bool too_long = false;
+  while (true) {
+    const ssize_t got = ::read(pipe_fds[0], buffer, sizeof(buffer));
+    if (got < 0 && errno == EINTR) continue;
+    if (got <= 0) break;
+    if (output.size() + static_cast<std::size_t>(got) > 4096) {
+      too_long = true;
+      break;
+    }
+    output.append(buffer, static_cast<std::size_t>(got));
+  }
+  ::close(pipe_fds[0]);
+  if (too_long) {
+    int status = 0;
+    ::waitpid(child, &status, 0);
+    if (error_message != nullptr) *error_message = "密码命令输出过长";
+    return false;
+  }
+  int status = 0;
+  while (::waitpid(child, &status, 0) < 0 && errno == EINTR) {
+  }
+  if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+    if (error_message != nullptr) *error_message = "密码命令执行失败";
+    return false;
+  }
+  while (!output.empty() && (output.back() == '\n' || output.back() == '\r')) {
+    output.pop_back();
+  }
+  if (output.empty() || output.find('\0') != std::string::npos) {
+    if (error_message != nullptr) *error_message = "密码命令没有输出有效密码";
+    return false;
+  }
+  *secret = output;
   return true;
 }
 
@@ -62,6 +134,8 @@ bool LoadCloudCredentialsFile(const std::string& path,
       parsed.username = value;
     } else if (key == "password") {
       parsed.password = value;
+    } else if (key == "password_command") {
+      parsed.password_command = value;
     } else if (key == "identity_mode") {
       parsed.identity_mode = value;
     } else if (key == "pin") {
@@ -77,11 +151,27 @@ bool LoadCloudCredentialsFile(const std::string& path,
       return false;
     }
   }
-  if (parsed.host.empty() || parsed.port == 0 || parsed.username.empty() ||
-      parsed.password.empty()) {
+  if (parsed.host.empty() || parsed.port == 0 || parsed.username.empty()) {
     if (error_message != nullptr) {
-      *error_message = "云端凭据文件缺少 host/port/username/password";
+      *error_message = "云端凭据文件缺少 host/port/username";
     }
+    return false;
+  }
+  if (!parsed.password.empty() && !parsed.password_command.empty()) {
+    if (error_message != nullptr) {
+      *error_message = "password 与 password_command 只能二选一";
+    }
+    return false;
+  }
+  if (parsed.password.empty() && parsed.password_command.empty()) {
+    if (error_message != nullptr) {
+      *error_message = "云端凭据文件缺少 password 或 password_command";
+    }
+    return false;
+  }
+  if (!parsed.password_command.empty() &&
+      !RunPasswordCommand(parsed.password_command, &parsed.password,
+                          error_message)) {
     return false;
   }
   if (parsed.identity_mode != "pin" && parsed.identity_mode != "certificate") {

@@ -1812,13 +1812,21 @@ int RunRemoteProductFlow(backup_modern::RemoteController* remote, CheckRun* run,
 
     // ---- G5/G6：定时/实时服务直接使用云端目标（真实本地服务端）----
     const QString cloud_credentials = work + QStringLiteral("/cloud-creds.env");
+    const QString cloud_password = work + QStringLiteral("/cloud-password");
     {
+      QFile password_file(cloud_password);
+      if (password_file.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
+        password_file.write(password.toUtf8());
+      }
+      QFile::setPermissions(cloud_password,
+                            QFileDevice::ReadOwner | QFileDevice::WriteOwner);
       QFile credentials(cloud_credentials);
       if (credentials.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
         credentials.write(
-            QStringLiteral("host=%1\nport=%2\nusername=%3\npassword=%4\n"
+            QStringLiteral("host=%1\nport=%2\nusername=%3\n"
+                           "password_command=/bin/cat %4\n"
                            "identity_mode=pin\npin=sha256:%5\n")
-                .arg(host, port_text, username, password, fingerprint)
+                .arg(host, port_text, username, cloud_password, fingerprint)
                 .toUtf8());
       }
       QFile::setPermissions(cloud_credentials,
@@ -1940,6 +1948,17 @@ int RunRemoteProductFlow(backup_modern::RemoteController* remote, CheckRun* run,
     run->Check(realtime_saved,
                QStringLiteral("G3 实时云端仓库标识在重启后保持"),
                QString::fromStdString(realtime_save_error));
+    const auto file_contains_password = [&](const QString& path) {
+      QFile file(path);
+      if (!file.open(QIODevice::ReadOnly)) return false;
+      return file.readAll().contains(password.toUtf8());
+    };
+    run->Check(
+        !file_contains_password(schedule_cloud_path) &&
+            !file_contains_password(realtime_cloud_path) &&
+            !file_contains_password(cloud_credentials),
+        QStringLiteral("无人值守凭据：密码不在 schedule/realtime/凭据文件中"),
+        QStringLiteral("password_command"));
     backupproject::RealtimeEventSummary realtime_events;
     realtime_events.generation = 1;
     realtime_events.event_count = 1;
@@ -1968,11 +1987,65 @@ int RunRemoteProductFlow(backup_modern::RemoteController* remote, CheckRun* run,
                               backupproject::RealtimeOutcome::Kind::kDelta,
         QStringLiteral("G6 实时云端增量备份：接在完整基线之后"),
         QString::fromStdString(realtime_delta_error));
+    const QString realtime_delta_archive =
+        QString::fromStdString(realtime_outcome.snapshot_file_name);
+
+    realtime_events.generation = 3;
+    std::string realtime_idle_error;
+    const bool realtime_idle = backupproject::RunRealtimeBackupOnce(
+        realtime_config, std::string(), std::string(), realtime_events,
+        static_cast<std::int64_t>(::time(nullptr)), &realtime_outcome,
+        &realtime_idle_error);
+    run->Check(
+        realtime_idle && realtime_outcome.kind ==
+                             backupproject::RealtimeOutcome::Kind::kNoChanges,
+        QStringLiteral("G6 连续触发无变化：不重复发布"),
+        QString::fromStdString(realtime_idle_error));
+
+    if (server_process != nullptr) {
+      const QString program = server_process->program();
+      const QStringList arguments = server_process->arguments();
+      server_process->kill();
+      server_process->waitForFinished(5000);
+      realtime_events.generation = 4;
+      std::string offline_error;
+      const bool offline = backupproject::RunRealtimeBackupOnce(
+          realtime_config, std::string(), std::string(), realtime_events,
+          static_cast<std::int64_t>(::time(nullptr)), &realtime_outcome,
+          &offline_error);
+      run->Check(!offline && realtime_outcome.kind ==
+                                 backupproject::RealtimeOutcome::Kind::kFailed,
+                 QStringLiteral("G6 断网：云端实时任务明确失败"),
+                 QString::fromStdString(offline_error));
+      server_process->start(program, arguments);
+      server_process->waitForStarted(10000);
+      bool relogin = false;
+      for (int attempt = 0; attempt < 40 && !relogin; ++attempt) {
+        WaitForAnimation(500);
+        if (server_process->state() != QProcess::Running) break;
+        relogin = remote->login(host, port_text, username, password) &&
+                  remote->waitForIdle(120000) && remote->authenticated();
+      }
+      std::string recovered_error;
+      const bool recovered =
+          relogin &&
+          backupproject::RunRealtimeBackupOnce(
+              realtime_config, std::string(), std::string(), realtime_events,
+              static_cast<std::int64_t>(::time(nullptr)), &realtime_outcome,
+              &recovered_error);
+      run->Check(
+          recovered && (realtime_outcome.kind ==
+                            backupproject::RealtimeOutcome::Kind::kNoChanges ||
+                        realtime_outcome.kind ==
+                            backupproject::RealtimeOutcome::Kind::kDelta),
+          QStringLiteral("G6 恢复网络后再次触发成功"),
+          QString::fromStdString(recovered_error));
+    }
 
     // G7：用最新云端增量快照做一次完整链恢复，核对内容。
     refresh();
-    const QVariantMap cloud_chain_row = findByDisplayName(
-        QString::fromStdString(realtime_outcome.snapshot_file_name));
+    const QVariantMap cloud_chain_row =
+        findByDisplayName(realtime_delta_archive);
     const QString cloud_chain_id =
         cloud_chain_row.value(QStringLiteral("id")).toString();
     const QString cloud_chain_restore =
