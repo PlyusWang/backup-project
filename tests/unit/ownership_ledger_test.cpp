@@ -162,6 +162,23 @@ int main() {
   Check(!backupproject::ReadOwnershipRecords(killed, &records, &error),
         "C SIGKILL 造成的半行记录被拒绝");
 
+  Check(
+      !backupproject::ReadOwnershipRecords("/proc/self/mem", &records, &error),
+      "C 首次读取直接 EIO：返回失败而不是空归属");
+  {
+    backupproject::SetOwnershipLedgerReadFaultForTesting(0, EIO);
+    Check(!backupproject::ReadOwnershipRecords(ledger, &records, &error),
+          "P2 首次 read EIO fail-closed");
+    backupproject::SetOwnershipLedgerReadFaultForTesting(120, EIO);
+    Check(!backupproject::ReadOwnershipRecords(ledger, &records, &error),
+          "P2 部分记录后 read EIO fail-closed");
+    backupproject::SetOwnershipLedgerReadFaultForTesting(0, EINTR);
+    Check(backupproject::ReadOwnershipRecords(ledger, &records, &error) &&
+              records.size() == 40,
+          "P2 EINTR 后重试并正常 EOF");
+    backupproject::SetOwnershipLedgerReadFaultForTesting(-1, 0);
+  }
+
   std::printf("ownership-ledger-test failures=%d\n", failures);
   return failures == 0 ? 0 : 1;
 }
