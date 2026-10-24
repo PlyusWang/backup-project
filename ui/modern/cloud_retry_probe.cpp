@@ -72,9 +72,13 @@ bool WriteSecret(const QString& path) {
 QString ProxyScript() {
   return QStringLiteral(R"PY(
 import socket, sys, threading
-listen_port = int(sys.argv[1]); target_port = int(sys.argv[2])
+listen_port = int(sys.argv[1]); target_port = int(sys.argv[2]); events_path = sys.argv[3]
+events = open(events_path, 'a', buffering=1)
+def event(text):
+    events.write(text + '\n')
 server = socket.socket(); server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
 server.bind(('127.0.0.1', listen_port)); server.listen(32)
+event('READY')
 first = True
 def pipe(a, b):
     try:
@@ -93,8 +97,10 @@ while True:
     client, _ = server.accept()
     if first:
         first = False
+        event('FAILED')
         client.close()
         continue
+    event('FORWARD')
     upstream = socket.create_connection(('127.0.0.1', target_port))
     threading.Thread(target=pipe, args=(client, upstream), daemon=True).start()
     threading.Thread(target=pipe, args=(upstream, client), daemon=True).start()
@@ -149,12 +155,20 @@ int RunCloudRetryProbe(const QString& work_root) {
         "retry fixture server started");
   auto start_proxy = [&]() {
     QProcess* proxy = new QProcess();
+    const QString events_path = dir + "/proxy1.events";
     proxy->start(QStringLiteral("python3"),
                  {QStringLiteral("-u"), QStringLiteral("-c"), ProxyScript(),
-                  QString::number(proxy_port), QString::number(server_port)});
-    if (!proxy->waitForStarted(5000) || !WaitPort(proxy_port, 5000)) {
-      Check(false, "retry fixture proxy started");
+                  QString::number(proxy_port), QString::number(server_port),
+                  events_path});
+    bool ready = false;
+    for (int i = 0; i < 100 && !ready; ++i) {
+      QThread::msleep(50);
+      QFile events(events_path);
+      if (events.open(QIODevice::ReadOnly)) {
+        ready = events.readAll().contains("READY");
+      }
     }
+    Check(proxy->waitForStarted(5000) && ready, "retry fixture proxy READY");
     return proxy;
   };
   QProcess* proxy = start_proxy();
@@ -229,6 +243,13 @@ int RunCloudRetryProbe(const QString& work_root) {
   scheduled_timer.start();
   const bool scheduled_ok = schedule_service.EvaluateNow(
       static_cast<std::int64_t>(::time(nullptr)), &result, &schedule_error);
+  QFile schedule_events(dir + "/proxy1.events");
+  schedule_events.open(QIODevice::ReadOnly);
+  const QString schedule_proxy_out =
+      QString::fromUtf8(schedule_events.readAll());
+  Check(schedule_proxy_out.count(QStringLiteral("FAILED")) == 1 &&
+            schedule_proxy_out.count(QStringLiteral("FORWARD")) >= 1,
+        "G2 定时：代理观测到 1 次注入失败、至少 1 次转发", schedule_proxy_out);
   Check(scheduled_ok &&
             result.status ==
                 backupproject::ScheduleEvaluationStatus::kCreatedSnapshot,
@@ -239,6 +260,7 @@ int RunCloudRetryProbe(const QString& work_root) {
   const bool listed = client.List(&snapshots, &error);
   Check(listed && snapshots.size() == 1, "D 定时：服务端只有一份正确快照",
         QString::number(snapshots.size()));
+
   QString snapshot_id;
   QString archive_name;
   if (!snapshots.empty()) {
@@ -282,12 +304,21 @@ int RunCloudRetryProbe(const QString& work_root) {
   proxy->waitForFinished(3000);
   const quint16 proxy2_port = FreePort();
   QProcess proxy2;
+  const QString proxy2_events = dir + "/proxy2.events";
   proxy2.start(QStringLiteral("python3"),
                {QStringLiteral("-u"), QStringLiteral("-c"), ProxyScript(),
-                QString::number(proxy2_port), QString::number(server_port)});
+                QString::number(proxy2_port), QString::number(server_port),
+                proxy2_events});
   QProcess* proxy_holder = &proxy2;
-  Check(proxy2.waitForStarted(5000) && WaitPort(proxy2_port, 5000),
-        "retry fixture realtime proxy");
+  bool proxy2_ready = false;
+  for (int i = 0; i < 100 && !proxy2_ready; ++i) {
+    QThread::msleep(50);
+    QFile events(proxy2_events);
+    if (events.open(QIODevice::ReadOnly)) {
+      proxy2_ready = events.readAll().contains("READY");
+    }
+  }
+  Check(proxy2.waitForStarted(5000) && proxy2_ready, "PROXY_READY realtime");
   const QString creds_rt = write_creds(proxy2_port, password);
   backupproject::RealtimeConfig realtime;
   realtime.enabled = true;
@@ -344,76 +375,158 @@ int RunCloudRetryProbe(const QString& work_root) {
         "D 永久错误：认证失败快速失败不重试",
         "elapsed=" + QString::number(bad_timer.elapsed()));
 
-  // A：超过 32 个版本 + 重启后账本驱动的淘汰。
+  // A：真实 ScheduledBackupService 生产链：40 次执行 > 32 历史，
+  // 账本持久化，服务重建后继续淘汰，最后恢复保留版本。
   {
     const QString direct_creds = write_creds(server_port, password);
-    backupproject::CloudCredentials stress_creds;
-    std::string stress_error;
+    document.config.cloud_credentials_file = direct_creds.toStdString();
+    backupproject::CloudCredentials direct_value;
+    std::string direct_error;
     backupproject::LoadCloudCredentialsFile(direct_creds.toStdString(),
-                                            &stress_creds, &stress_error);
-    std::vector<std::string> owned_ids;
-    std::vector<std::string> owned_shas;
+                                            &direct_value, &direct_error);
+    document.config.cloud_repository_id =
+        backupproject::CloudRepositoryId(direct_value);
+    QFile::remove(QString::fromStdString(backupproject::OwnershipLedgerPath(
+        document.config.cloud_repository_id, store.schedule_file_path())));
+    document.config.retain_count = 40;
+    std::string save_error;
+    Check(store.Save(document, &save_error), "A 生产链配置保存",
+          QString::fromStdString(save_error));
+    bool created = true;
     for (int i = 0; i < 40; ++i) {
-      QFile file(source + "/stress.txt");
+      QFile file(source + "/data.txt");
       if (file.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
-        file.write(QByteArray(64, 'a' + (i % 26)));
-        file.write(QString::number(i).toUtf8());
+        file.write(QByteArray("production-") + QByteArray::number(i) + "\n");
       }
       file.close();
-      backupproject::CloudTaskRequest task;
-      task.credentials = stress_creds;
-      task.expected_repository_id =
-          backupproject::CloudRepositoryId(stress_creds);
-      task.source_directory = source.toStdString();
-      task.allow_incremental = false;
-      backupproject::CloudTaskOutcome outcome;
+      backupproject::ScheduleEvaluationResult result;
       std::string run_error;
-      if (!backupproject::RunCloudTask(task, &outcome, &run_error)) {
-        Check(false, "A 40 版本创建", QString::fromStdString(run_error));
-        return 1;
+      if (!schedule_service.EvaluateNow(
+              static_cast<std::int64_t>(::time(nullptr)), &result,
+              &run_error) ||
+          result.status !=
+              backupproject::ScheduleEvaluationStatus::kCreatedSnapshot) {
+        created = false;
+        Check(false, "A 生产链第 " + QString::number(i + 1) + " 次执行",
+              QString::fromStdString(run_error) + " status=" +
+                  QString::number(static_cast<int>(result.status)) +
+                  " diag=" + QString::fromStdString(result.diagnostic));
+        break;
       }
-      owned_ids.push_back(outcome.snapshot_id);
-      owned_shas.push_back(outcome.sha256);
     }
-    backupproject::CloudRetentionRequest retention;
-    retention.credentials = stress_creds;
-    retention.expected_repository_id =
-        backupproject::CloudRepositoryId(stress_creds);
-    retention.retain_count = 36;
-    retention.owned_snapshot_ids = owned_ids;
-    retention.owned_sha256 = owned_shas;
-    backupproject::CloudRetentionResult result;
-    Check(backupproject::RunCloudRetention(retention, &result, &stress_error) &&
-              result.deleted.size() == 4,
-          "A >32 版本：保留 36、删除 4", QString::fromStdString(stress_error));
+    Check(created, "A 生产链实际执行 40 次定时备份");
+    backupproject::ScheduleDocument after_runs;
+    std::string reload_error;
+    const bool reloaded = store.Load(&after_runs, &reload_error) ==
+                          backupproject::ScheduleLoadStatus::kLoaded;
+    Check(reloaded && after_runs.state.history.size() == 32,
+          "A 执行器 history 最多 32 条",
+          QString::number(after_runs.state.history.size()));
+    const std::string ledger_path = backupproject::OwnershipLedgerPath(
+        document.config.cloud_repository_id, store.schedule_file_path());
+    std::vector<backupproject::OwnershipRecord> records;
+    std::fprintf(stderr, "[A] ledger=%s repo=%s\n", ledger_path.c_str(),
+                 document.config.cloud_repository_id.c_str());
+    Check(backupproject::ReadOwnershipRecords(ledger_path, &records,
+                                              &reload_error) &&
+              records.size() == 40,
+          "A 执行器长期账本保存 40 条", QString::number(records.size()));
 
-    const QString ledger = dir + "/stress.ledger";
-    for (std::size_t i = 0; i < owned_ids.size(); ++i) {
-      backupproject::AppendOwnershipRecord(
-          ledger.toStdString(),
-          backupproject::OwnershipRecord{owned_ids[i], owned_shas[i]},
-          &stress_error);
+    document.config.retain_count = 36;
+    store.Save(document, &save_error);
+    backupproject::ScheduleEvaluationResult keep36;
+    std::string keep36_error;
+    const bool keep36_ok = schedule_service.EvaluateNow(
+        static_cast<std::int64_t>(::time(nullptr)), &keep36, &keep36_error);
+    std::vector<backupproject::OwnershipRecord> records36;
+    std::string records36_error;
+    const bool records36_ok = backupproject::ReadOwnershipRecords(
+        ledger_path, &records36, &records36_error);
+    std::vector<backupproject::net::RemoteSnapshotInfo> after36;
+    client.List(&after36, &error);
+    std::size_t owned36 = 0;
+    for (const auto& snap : after36) {
+      for (const auto& record : records36) {
+        if (snap.snapshot_id == record.snapshot_id) ++owned36;
+      }
     }
-    std::vector<backupproject::OwnershipRecord> persisted;
-    Check(backupproject::ReadOwnershipRecords(ledger.toStdString(), &persisted,
-                                              &stress_error) &&
-              persisted.size() == 40,
-          "A 重启前账本保存 40 条");
-    backupproject::CloudRetentionRequest reloaded;
-    reloaded.credentials = stress_creds;
-    reloaded.expected_repository_id =
-        backupproject::CloudRepositoryId(stress_creds);
-    reloaded.retain_count = 32;
-    for (const auto& record : persisted) {
-      reloaded.owned_snapshot_ids.push_back(record.snapshot_id);
-      reloaded.owned_sha256.push_back(record.sha256);
+    Check(
+        keep36_ok &&
+            keep36.status != backupproject::ScheduleEvaluationStatus::kFailed &&
+            records36_ok && owned36 == 36,
+        "A 生产链按账本保留 36",
+        QString::number(owned36) +
+            " err=" + QString::fromStdString(keep36_error));
+
+    // 重建服务实例与 store，模拟进程重启后的磁盘恢复。
+    backupproject::ScheduleStore reloaded_store(schedule_path.toStdString());
+    backupproject::ScheduleDocument reloaded_doc;
+    std::string reload_error2;
+    reloaded_store.Load(&reloaded_doc, &reload_error2);
+    reloaded_doc.config.retain_count = 32;
+    reloaded_store.Save(reloaded_doc, &save_error);
+    backupproject::ScheduledBackupService rebuilt_service(std::string(),
+                                                          &reloaded_store);
+    backupproject::ScheduleEvaluationResult keep32;
+    std::string keep32_error;
+    const bool keep32_ok = rebuilt_service.EvaluateNow(
+        static_cast<std::int64_t>(::time(nullptr)), &keep32, &keep32_error);
+    std::vector<backupproject::OwnershipRecord> records32;
+    std::string records32_error;
+    const bool records32_ok = backupproject::ReadOwnershipRecords(
+        ledger_path, &records32, &records32_error);
+    std::vector<backupproject::net::RemoteSnapshotInfo> after32;
+    client.List(&after32, &error);
+    std::size_t owned32 = 0;
+    QString latest_id;
+    for (const auto& snap : after32) {
+      for (const auto& record : records32) {
+        if (snap.snapshot_id == record.snapshot_id) {
+          ++owned32;
+          latest_id = QString::fromStdString(snap.snapshot_id);
+        }
+      }
     }
-    backupproject::CloudRetentionResult reloaded_result;
-    Check(backupproject::RunCloudRetention(reloaded, &reloaded_result,
-                                           &stress_error) &&
-              reloaded_result.deleted.size() == 4,
-          "A 重启后按持久账本保留 32、删除 4",
-          QString::fromStdString(stress_error));
+    Check(
+        keep32_ok &&
+            keep32.status != backupproject::ScheduleEvaluationStatus::kFailed &&
+            records32_ok && owned32 == 32,
+        "A 服务重建后按持久账本保留 32",
+        QString::number(owned32) +
+            " err=" + QString::fromStdString(keep32_error));
+
+    const QString restore40 = dir + "/restore40";
+    QDir().mkpath(restore40);
+    const QString downloaded40 = dir + "/downloaded40.bak";
+    backupproject::net::RemoteSnapshotInfo downloaded_info;
+    const bool downloaded_ok =
+        !latest_id.isEmpty() &&
+        client.DownloadArchiveFile(latest_id.toStdString(),
+                                   downloaded40.toStdString(), true,
+                                   backupproject::net::RemoteProgressCallback(),
+                                   &downloaded_info, &error);
+    const QString extracted40 = dir + "/extracted40";
+    QDir().mkpath(extracted40);
+    backupproject::net::SnapshotBundleInfo bundle_info;
+    std::string extract_error;
+    const bool extracted_ok =
+        downloaded_ok &&
+        backupproject::net::ExtractSnapshotBundle(downloaded40.toStdString(),
+                                                  extracted40.toStdString(),
+                                                  &bundle_info, &extract_error);
+    backupproject::BackupEngine engine;
+    std::string restore_error;
+    const bool restored40 =
+        extracted_ok &&
+        engine.Restore((extracted40 + QString::fromStdString("/") +
+                        QString::fromStdString(bundle_info.archive_name))
+                           .toStdString(),
+                       restore40.toStdString(), &restore_error);
+    QFile restored_file(restore40 + "/data.txt");
+    Check(restored40 && restored_file.open(QIODevice::ReadOnly) &&
+              restored_file.readAll() == QByteArray("production-39\n"),
+          "A 淘汰后保留版本恢复内容一致",
+          QString::fromStdString(extract_error + " / " + restore_error));
   }
 
   proxy_holder->kill();

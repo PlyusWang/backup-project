@@ -131,7 +131,13 @@ bool ReadOwnershipRecords(const std::string& ledger_path,
   while (true) {
     const ssize_t got = ::read(fd, buffer, sizeof(buffer));
     if (got < 0 && errno == EINTR) continue;
-    if (got <= 0) break;
+    if (got < 0) {
+      ::flock(fd, LOCK_UN);
+      ::close(fd);
+      SetError(error_message, "读取归属账本失败");
+      return false;
+    }
+    if (got == 0) break;
     content.append(buffer, static_cast<std::size_t>(got));
   }
   ::flock(fd, LOCK_UN);

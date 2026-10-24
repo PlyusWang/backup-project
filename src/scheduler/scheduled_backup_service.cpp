@@ -639,30 +639,46 @@ bool ScheduledBackupService::EvaluateInternal(std::int64_t now_sec, bool force,
       entry.cloud_sha256 = outcome.sha256;
       entry.diagnostic = "cloud repository";
     }
+    const std::string ledger_path = backupproject::OwnershipLedgerPath(
+        task.expected_repository_id, store_->schedule_file_path());
+    bool ledger_ready = true;
+    std::string ledger_error;
+    if (!outcome.no_changes &&
+        !backupproject::AppendOwnershipRecord(
+            ledger_path,
+            backupproject::OwnershipRecord{outcome.snapshot_id, outcome.sha256},
+            &ledger_error)) {
+      ledger_ready = false;
+      result->diagnostic +=
+          " (cloud ownership ledger not saved: " + ledger_error + ")";
+    }
     AppendHistoryEntry(&document.state, entry);
-    if (document.config.retain_count > 0) {
-      backupproject::CloudRetentionRequest retention;
-      retention.credentials = task.credentials;
-      retention.expected_repository_id = task.expected_repository_id;
-      retention.retain_count = document.config.retain_count;
-      for (const auto& history_entry : document.state.history) {
-        if (!history_entry.cloud_snapshot_id.empty() &&
-            !history_entry.cloud_sha256.empty()) {
-          retention.owned_snapshot_ids.push_back(
-              history_entry.cloud_snapshot_id);
-          retention.owned_sha256.push_back(history_entry.cloud_sha256);
-        }
-      }
-      backupproject::CloudRetentionResult retention_result;
-      std::string retention_error;
-      if (!backupproject::RunCloudRetention(retention, &retention_result,
-                                            &retention_error)) {
+    if (document.config.retain_count > 0 && ledger_ready) {
+      std::vector<backupproject::OwnershipRecord> owned;
+      if (!backupproject::ReadOwnershipRecords(ledger_path, &owned,
+                                               &ledger_error)) {
         result->diagnostic +=
-            " (cloud retention stopped: " + retention_error + ")";
+            " (cloud retention stopped: " + ledger_error + ")";
       } else {
-        result->diagnostic += " (cloud retention deleted " +
-                              std::to_string(retention_result.deleted.size()) +
-                              ")";
+        backupproject::CloudRetentionRequest retention;
+        retention.credentials = task.credentials;
+        retention.expected_repository_id = task.expected_repository_id;
+        retention.retain_count = document.config.retain_count;
+        for (const auto& record : owned) {
+          retention.owned_snapshot_ids.push_back(record.snapshot_id);
+          retention.owned_sha256.push_back(record.sha256);
+        }
+        backupproject::CloudRetentionResult retention_result;
+        std::string retention_error;
+        if (!backupproject::RunCloudRetention(retention, &retention_result,
+                                              &retention_error)) {
+          result->diagnostic +=
+              " (cloud retention stopped: " + retention_error + ")";
+        } else {
+          result->diagnostic +=
+              " (cloud retention deleted " +
+              std::to_string(retention_result.deleted.size()) + ")";
+        }
       }
     }
     std::string save_error;
