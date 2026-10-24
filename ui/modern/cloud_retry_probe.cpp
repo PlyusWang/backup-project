@@ -6,6 +6,7 @@
 #include <QFile>
 #include <QProcess>
 #include <QRegularExpression>
+#include <QStandardPaths>
 #include <QTcpServer>
 #include <QTcpSocket>
 #include <QTemporaryDir>
@@ -73,13 +74,14 @@ QString ProxyScript() {
   return QStringLiteral(R"PY(
 import socket, sys, threading
 listen_port = int(sys.argv[1]); target_port = int(sys.argv[2]); events_path = sys.argv[3]
+fail_first = (sys.argv[4] if len(sys.argv) > 4 else '1') == '1'
 events = open(events_path, 'a', buffering=1)
 def event(text):
     events.write(text + '\n')
 server = socket.socket(); server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
 server.bind(('127.0.0.1', listen_port)); server.listen(32)
 event('READY')
-first = True
+first = fail_first
 def pipe(a, b):
     try:
         while True:
@@ -110,6 +112,11 @@ while True:
 }  // namespace
 
 int RunCloudRetryProbe(const QString& work_root) {
+  std::printf(
+      "[isolation] QtAppConfig=%s\n",
+      QStandardPaths::writableLocation(QStandardPaths::AppConfigLocation)
+          .toUtf8()
+          .constData());
   const QString dir =
       work_root.isEmpty()
           ? QDir::tempPath() + QStringLiteral("/cloud-retry-probe-") +
@@ -159,7 +166,7 @@ int RunCloudRetryProbe(const QString& work_root) {
     proxy->start(QStringLiteral("python3"),
                  {QStringLiteral("-u"), QStringLiteral("-c"), ProxyScript(),
                   QString::number(proxy_port), QString::number(server_port),
-                  events_path});
+                  events_path, QStringLiteral("1")});
     bool ready = false;
     for (int i = 0; i < 100 && !ready; ++i) {
       QThread::msleep(50);
@@ -308,7 +315,7 @@ int RunCloudRetryProbe(const QString& work_root) {
   proxy2.start(QStringLiteral("python3"),
                {QStringLiteral("-u"), QStringLiteral("-c"), ProxyScript(),
                 QString::number(proxy2_port), QString::number(server_port),
-                proxy2_events});
+                proxy2_events, QStringLiteral("1")});
   QProcess* proxy_holder = &proxy2;
   bool proxy2_ready = false;
   for (int i = 0; i < 100 && !proxy2_ready; ++i) {
@@ -362,6 +369,51 @@ int RunCloudRetryProbe(const QString& work_root) {
   Check(rt_text.count(QStringLiteral("FAILED")) == 1 &&
             rt_text.count(QStringLiteral("FORWARD")) >= 1,
         "G2 实时：代理观测到 1 次注入失败、至少 1 次转发", rt_text);
+
+  // G3 负向控制：代理不注入失败时，“必须出现一次 FAILED”的断言必须失败。
+  {
+    const quint16 proxy3_port = FreePort();
+    const QString proxy3_events = dir + "/proxy3.events";
+    QProcess proxy3;
+    proxy3.start(QStringLiteral("python3"),
+                 {QStringLiteral("-u"), QStringLiteral("-c"), ProxyScript(),
+                  QString::number(proxy3_port), QString::number(server_port),
+                  proxy3_events, QStringLiteral("0")});
+    bool ready3 = false;
+    for (int i = 0; i < 100 && !ready3; ++i) {
+      QThread::msleep(50);
+      QFile events(proxy3_events);
+      if (events.open(QIODevice::ReadOnly))
+        ready3 = events.readAll().contains("READY");
+    }
+    Check(proxy3.waitForStarted(5000) && ready3, "G3 负向代理 READY");
+    const QString creds3 = write_creds(proxy3_port, password);
+    backupproject::RealtimeConfig negative = realtime;
+    negative.cloud_credentials_file = creds3.toStdString();
+    backupproject::CloudCredentials nc;
+    std::string nce;
+    backupproject::LoadCloudCredentialsFile(creds3.toStdString(), &nc, &nce);
+    negative.cloud_repository_id = backupproject::CloudRepositoryId(nc);
+    backupproject::RealtimeEventSummary events;
+    events.generation = 99;
+    events.event_count = 1;
+    backupproject::RealtimeOutcome out;
+    std::string nerr;
+    const bool negative_ok = backupproject::RunRealtimeBackupOnce(
+        negative, std::string(), std::string(), events,
+        static_cast<std::int64_t>(::time(nullptr)), &out, &nerr);
+    QFile ne(proxy3_events);
+    ne.open(QIODevice::ReadOnly);
+    const QString nt = QString::fromUtf8(ne.readAll());
+    const int negative_failures = nt.count(QStringLiteral("FAILED"));
+    const int negative_forwards = nt.count(QStringLiteral("FORWARD"));
+    Check(negative_ok && negative_failures == 0 && negative_forwards >= 1,
+          "G3 负向控制：无注入时 FAILED 计数为 0（正向断言会失败）",
+          "failed=" + QString::number(negative_failures) +
+              " forward=" + QString::number(negative_forwards));
+    proxy3.kill();
+    proxy3.waitForFinished(3000);
+  }
 
   // 永久错误：错误密码不得重试 3 次。
   const QString bad_creds = write_creds(server_port, "definitely-wrong");
@@ -663,7 +715,7 @@ int RunCloudRetryProbe(const QString& work_root) {
           QString::fromStdString(corrupt_result.diagnostic));
   }
 
-  // P1：账本写入失败时跳过自动淘汰，旧快照保留。
+  // P1：账本写入失败时跳过自动淘汰；逐 snapshot_id + sha256 验证旧对象保留。
   {
     const QString cpath = write_creds(server_port, password);
     backupproject::CloudCredentials c;
@@ -685,33 +737,93 @@ int RunCloudRetryProbe(const QString& work_root) {
     const std::string lp = backupproject::OwnershipLedgerPath(
         doc.config.cloud_repository_id, st.schedule_file_path());
     backupproject::ScheduleEvaluationResult r;
-    auto run = [&]() {
+    auto run = [&](const QByteArray& text) {
       QFile f(source + "/data.txt");
-      if (f.open(QIODevice::WriteOnly | QIODevice::Truncate)) f.write("wf");
+      if (f.open(QIODevice::WriteOnly | QIODevice::Truncate)) f.write(text);
       f.close();
       return svc.EvaluateNow(static_cast<std::int64_t>(::time(nullptr)), &r,
                              &e);
     };
-    Check(run() && run(), "P1 前置两次备份", QString::fromStdString(e));
+    auto list_ok =
+        [&](std::vector<backupproject::net::RemoteSnapshotInfo>* out) {
+          return client.List(out, &error);
+        };
+    auto id_sha_map =
+        [](const std::vector<backupproject::net::RemoteSnapshotInfo>& snaps) {
+          std::map<std::string, std::string> m;
+          for (const auto& s : snaps) m[s.snapshot_id] = s.sha256;
+          return m;
+        };
+    auto all_preserved =
+        [](const std::map<std::string, std::string>& before_map,
+           const std::vector<backupproject::net::RemoteSnapshotInfo>& after) {
+          std::map<std::string, std::string> after_map;
+          for (const auto& s : after) after_map[s.snapshot_id] = s.sha256;
+          for (const auto& kv : before_map) {
+            const auto it = after_map.find(kv.first);
+            if (it == after_map.end() || it->second != kv.second) return false;
+          }
+          return true;
+        };
+    const bool first_ok =
+        run("wf-first") &&
+        r.status == backupproject::ScheduleEvaluationStatus::kCreatedSnapshot;
+    Check(first_ok, "P1 前置第一次备份", QString::fromStdString(e));
+    const bool second_ok =
+        run("wf-second") &&
+        r.status == backupproject::ScheduleEvaluationStatus::kCreatedSnapshot;
+    Check(second_ok, "P1 前置第二次备份", QString::fromStdString(e));
+
     std::vector<backupproject::net::RemoteSnapshotInfo> before;
-    client.List(&before, &error);
+    const bool list_before = list_ok(&before);
+    Check(list_before, "P1 故障前 List 成功", QString::fromStdString(error));
+    const std::map<std::string, std::string> before_map = id_sha_map(before);
+
     const QString saved = QString::fromStdString(lp) + ".saved";
     QFile::remove(saved);
-    Check(QFile::rename(QString::fromStdString(lp), saved) &&
-              QDir().mkpath(QString::fromStdString(lp)),
-          "P1 阻塞账本路径");
-    const bool ran = run();
-    std::vector<backupproject::net::RemoteSnapshotInfo> after;
-    client.List(&after, &error);
-    bool kept = before.size() <= after.size();
-    Check(ran &&
-              r.status ==
-                  backupproject::ScheduleEvaluationStatus::kCreatedSnapshot &&
-              r.diagnostic.find("ownership ledger not saved") !=
-                  std::string::npos &&
-              kept,
-          "P1 账本写失败：保留旧快照并报告",
+    const bool blocked = QFile::rename(QString::fromStdString(lp), saved) &&
+                         QDir().mkpath(QString::fromStdString(lp));
+    Check(blocked, "P1 阻塞账本路径");
+    const bool failed_run =
+        blocked && run("wf-failure") &&
+        r.status == backupproject::ScheduleEvaluationStatus::kCreatedSnapshot &&
+        r.diagnostic.find("ownership ledger not saved") != std::string::npos;
+    Check(failed_run, "P1 账本写失败且备份本身成功",
           QString::fromStdString(r.diagnostic));
+
+    std::vector<backupproject::net::RemoteSnapshotInfo> after;
+    const bool list_after = list_ok(&after);
+    Check(list_after, "P1 故障后 List 成功", QString::fromStdString(error));
+    Check(list_before && list_after && all_preserved(before_map, after),
+          "P1 旧快照逐 ID/SHA 全部保留");
+    std::map<std::string, std::string> after_map = id_sha_map(after);
+    std::vector<std::string> new_ids;
+    for (const auto& s : after) {
+      if (before_map.find(s.snapshot_id) == before_map.end()) {
+        new_ids.push_back(s.snapshot_id);
+      }
+    }
+    Check(new_ids.size() == 1 && !after_map[new_ids[0]].empty(),
+          "P1 故障期间只创建一个新快照", QString::number(new_ids.size()));
+
+    std::vector<backupproject::net::RemoteSnapshotInfo> after_negative = after;
+    if (!after_negative.empty()) after_negative.erase(after_negative.begin());
+    Check(!all_preserved(before_map, after_negative),
+          "P1 负向控制：从 after 移除一个旧快照后断言必须失败");
+
+    QDir(QString::fromStdString(lp)).removeRecursively();
+    const bool restored = QFile::rename(saved, QString::fromStdString(lp));
+    const bool recovery_ok =
+        restored && run("wf-recovery") &&
+        r.status == backupproject::ScheduleEvaluationStatus::kCreatedSnapshot;
+    std::vector<backupproject::OwnershipRecord> records;
+    const bool ledger_ok =
+        recovery_ok && backupproject::ReadOwnershipRecords(lp, &records, &e);
+    Check(
+        ledger_ok && records.size() == 3 &&
+            r.diagnostic.find("cloud retention deleted 1") != std::string::npos,
+        "P1 故障解除后恢复记账并淘汰",
+        QString::fromStdString(r.diagnostic + " / " + e));
   }
 
   proxy_holder->kill();
