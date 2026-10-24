@@ -529,6 +529,133 @@ int RunCloudRetryProbe(const QString& work_root) {
           QString::fromStdString(extract_error + " / " + restore_error));
   }
 
+  // G4：名称复用后的真实删除 + 账本损坏后 fail-closed。
+  {
+    const QString direct_creds = write_creds(server_port, password);
+    backupproject::CloudCredentials creds;
+    std::string creds_error;
+    backupproject::LoadCloudCredentialsFile(direct_creds.toStdString(), &creds,
+                                            &creds_error);
+    auto run_full = [&](const QString& text,
+                        backupproject::CloudTaskOutcome* out) {
+      QFile file(source + "/reuse-delete.txt");
+      if (file.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
+        file.write(text.toUtf8());
+      }
+      file.close();
+      backupproject::CloudTaskRequest task;
+      task.credentials = creds;
+      task.expected_repository_id = backupproject::CloudRepositoryId(creds);
+      task.source_directory = source.toStdString();
+      task.allow_incremental = false;
+      std::string run_error;
+      return backupproject::RunCloudTask(task, out, &run_error);
+    };
+    backupproject::CloudTaskOutcome a;
+    backupproject::CloudTaskOutcome w;
+    backupproject::CloudTaskOutcome z;
+    const bool created = run_full(QStringLiteral("A"), &a) &&
+                         run_full(QStringLiteral("W"), &w) &&
+                         run_full(QStringLiteral("Z"), &z);
+    const bool deleted_a = created && client.Delete(a.snapshot_id, &error);
+    const QString replacement = dir + "/reuse-replacement.bak";
+    QFile replacement_file(replacement);
+    if (replacement_file.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
+      replacement_file.write(QByteArray(4096, 'b'));
+    }
+    replacement_file.close();
+    backupproject::net::RemoteSnapshotInfo b;
+    const bool reuploaded =
+        deleted_a &&
+        client.UploadArchiveFile(replacement.toStdString(), a.archive_name,
+                                 backupproject::net::RemoteProgressCallback(),
+                                 &b, &error);
+    backupproject::CloudRetentionRequest retention;
+    retention.credentials = creds;
+    retention.expected_repository_id = backupproject::CloudRepositoryId(creds);
+    retention.retain_count = 1;
+    retention.owned_snapshot_ids = {a.snapshot_id, w.snapshot_id,
+                                    z.snapshot_id};
+    retention.owned_sha256 = {a.sha256, w.sha256, z.sha256};
+    retention.dry_run = false;
+    backupproject::CloudRetentionResult result;
+    std::string retention_error;
+    const bool deleted_w = reuploaded &&
+                           backupproject::RunCloudRetention(retention, &result,
+                                                            &retention_error) &&
+                           result.deleted.size() == 1;
+    std::vector<backupproject::net::RemoteSnapshotInfo> after;
+    client.List(&after, &error);
+    bool b_present = false;
+    bool w_present = false;
+    bool z_present = false;
+    QString b_sha;
+    for (const auto& snap : after) {
+      if (snap.snapshot_id == b.snapshot_id) {
+        b_present = true;
+        b_sha = QString::fromStdString(snap.sha256);
+      }
+      if (snap.snapshot_id == w.snapshot_id) w_present = true;
+      if (snap.snapshot_id == z.snapshot_id) z_present = true;
+    }
+    const QString downloaded_b = dir + "/reuse-b.bak";
+    backupproject::net::RemoteSnapshotInfo downloaded_b_info;
+    const bool b_downloaded =
+        b_present && client.DownloadArchiveFile(
+                         b.snapshot_id, downloaded_b.toStdString(), true,
+                         backupproject::net::RemoteProgressCallback(),
+                         &downloaded_b_info, &error);
+    QFile b_file(downloaded_b);
+    const bool b_ok = b_downloaded && b_file.open(QIODevice::ReadOnly) &&
+                      b_file.size() == 4096;
+    Check(deleted_w && b_present && !w_present && z_present && b_ok &&
+              b_sha == QString::fromStdString(b.sha256),
+          "G4 名称复用真实删除：Y 保留、Z 保留、W 删除",
+          QString::fromStdString(retention_error));
+
+    // 账本损坏：保留合法记录后追加坏行，下一次执行必须停止淘汰。
+    const std::string ledger = backupproject::OwnershipLedgerPath(
+        document.config.cloud_repository_id, store.schedule_file_path());
+    std::vector<backupproject::OwnershipRecord> before_corrupt;
+    std::string corrupt_error;
+    Check(backupproject::ReadOwnershipRecords(ledger, &before_corrupt,
+                                              &corrupt_error) &&
+              !before_corrupt.empty(),
+          "G4 损坏前账本可读", QString::fromStdString(corrupt_error));
+    {
+      QFile corrupt(QString::fromStdString(ledger));
+      if (corrupt.open(QIODevice::WriteOnly | QIODevice::Append)) {
+        corrupt.write("BROKEN LINE\n");
+      }
+    }
+    std::vector<backupproject::net::RemoteSnapshotInfo> before_snaps;
+    client.List(&before_snaps, &error);
+    document.config.retain_count = 1;
+    store.Save(document, &save_error);
+    backupproject::ScheduleEvaluationResult corrupt_result;
+    std::string corrupt_run_error;
+    const bool corrupt_ok =
+        schedule_service.EvaluateNow(static_cast<std::int64_t>(::time(nullptr)),
+                                     &corrupt_result, &corrupt_run_error);
+    std::vector<backupproject::net::RemoteSnapshotInfo> after_corrupt;
+    client.List(&after_corrupt, &error);
+    std::size_t preserved = 0;
+    for (const auto& before : before_snaps) {
+      for (const auto& after_snap : after_corrupt) {
+        if (before.snapshot_id == after_snap.snapshot_id) {
+          ++preserved;
+          break;
+        }
+      }
+    }
+    Check(corrupt_ok &&
+              corrupt_result.diagnostic.find("cloud retention stopped") !=
+                  std::string::npos &&
+              preserved == before_snaps.size(),
+          "G4 账本读错误 fail-closed：不删除任何旧快照",
+          QString::fromStdString(corrupt_result.diagnostic));
+  }
+
   proxy_holder->kill();
   proxy_holder->waitForFinished(3000);
   server.kill();
