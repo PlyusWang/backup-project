@@ -5,6 +5,7 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+#include <atomic>
 #include <cerrno>
 #include <cstdint>
 #include <cstdio>
@@ -15,6 +16,10 @@
 
 namespace backupproject {
 namespace {
+#ifdef BACKUP_TEST_HOOKS
+std::atomic<int> g_read_fault_after{-1};
+std::atomic<int> g_read_fault_errno{0};
+#endif
 
 void SetError(std::string* error_message, const std::string& text) {
   if (error_message != nullptr) *error_message = text;
@@ -40,6 +45,13 @@ bool WriteAll(int fd, const char* data, std::size_t size) {
 }
 
 }  // namespace
+
+#ifdef BACKUP_TEST_HOOKS
+void SetOwnershipLedgerReadFaultForTesting(int after_bytes, int error_number) {
+  g_read_fault_errno.store(error_number);
+  g_read_fault_after.store(after_bytes);
+}
+#endif
 
 std::string OwnershipLedgerPath(const std::string& repository_id,
                                 const std::string& task_identity) {
@@ -129,7 +141,20 @@ bool ReadOwnershipRecords(const std::string& ledger_path,
   std::string content;
   char buffer[4096];
   while (true) {
-    const ssize_t got = ::read(fd, buffer, sizeof(buffer));
+    ssize_t got;
+#ifdef BACKUP_TEST_HOOKS
+    const int fault_after = g_read_fault_after.exchange(-1);
+    if (fault_after >= 0 &&
+        content.size() >= static_cast<std::size_t>(fault_after)) {
+      errno = g_read_fault_errno.load();
+      got = -1;
+    } else {
+      if (fault_after >= 0) g_read_fault_after.store(fault_after);
+      got = ::read(fd, buffer, sizeof(buffer));
+    }
+#else
+    got = ::read(fd, buffer, sizeof(buffer));
+#endif
     if (got < 0 && errno == EINTR) continue;
     if (got < 0) {
       ::flock(fd, LOCK_UN);

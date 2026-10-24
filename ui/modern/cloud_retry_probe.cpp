@@ -356,6 +356,12 @@ int RunCloudRetryProbe(const QString& work_root) {
   const bool realtime_listed = client.List(&snapshots, &error);
   Check(realtime_listed && snapshots.size() == 2, "D 实时：服务端快照数正确",
         QString::number(snapshots.size()));
+  QFile rt_events(proxy2_events);
+  rt_events.open(QIODevice::ReadOnly);
+  const QString rt_text = QString::fromUtf8(rt_events.readAll());
+  Check(rt_text.count(QStringLiteral("FAILED")) == 1 &&
+            rt_text.count(QStringLiteral("FORWARD")) >= 1,
+        "G2 实时：代理观测到 1 次注入失败、至少 1 次转发", rt_text);
 
   // 永久错误：错误密码不得重试 3 次。
   const QString bad_creds = write_creds(server_port, "definitely-wrong");
@@ -427,10 +433,11 @@ int RunCloudRetryProbe(const QString& work_root) {
     std::vector<backupproject::OwnershipRecord> records;
     std::fprintf(stderr, "[A] ledger=%s repo=%s\n", ledger_path.c_str(),
                  document.config.cloud_repository_id.c_str());
-    Check(backupproject::ReadOwnershipRecords(ledger_path, &records,
-                                              &reload_error) &&
-              records.size() == 40,
-          "A 执行器长期账本保存 40 条", QString::number(records.size()));
+    const bool ledger_read_ok = backupproject::ReadOwnershipRecords(
+        ledger_path, &records, &reload_error);
+    const std::size_t ledger_count = records.size();
+    Check(ledger_read_ok && ledger_count == 40, "A 执行器长期账本保存 40 条",
+          QString::number(ledger_count));
 
     document.config.retain_count = 36;
     store.Save(document, &save_error);
@@ -654,6 +661,57 @@ int RunCloudRetryProbe(const QString& work_root) {
               preserved == before_snaps.size(),
           "G4 账本读错误 fail-closed：不删除任何旧快照",
           QString::fromStdString(corrupt_result.diagnostic));
+  }
+
+  // P1：账本写入失败时跳过自动淘汰，旧快照保留。
+  {
+    const QString cpath = write_creds(server_port, password);
+    backupproject::CloudCredentials c;
+    std::string ce;
+    backupproject::LoadCloudCredentialsFile(cpath.toStdString(), &c, &ce);
+    const QString sp = dir + "/wf-schedule.json";
+    backupproject::ScheduleStore st(sp.toStdString());
+    backupproject::ScheduleDocument doc;
+    doc.config.enabled = true;
+    doc.config.source_path = source.toStdString();
+    doc.config.retain_count = 2;
+    doc.config.pack_method = backupproject::PackMethod::kMyPack;
+    doc.config.repository_type = "cloud";
+    doc.config.cloud_credentials_file = cpath.toStdString();
+    doc.config.cloud_repository_id = backupproject::CloudRepositoryId(c);
+    std::string e;
+    st.Save(doc, &e);
+    backupproject::ScheduledBackupService svc(std::string(), &st);
+    const std::string lp = backupproject::OwnershipLedgerPath(
+        doc.config.cloud_repository_id, st.schedule_file_path());
+    backupproject::ScheduleEvaluationResult r;
+    auto run = [&]() {
+      QFile f(source + "/data.txt");
+      if (f.open(QIODevice::WriteOnly | QIODevice::Truncate)) f.write("wf");
+      f.close();
+      return svc.EvaluateNow(static_cast<std::int64_t>(::time(nullptr)), &r,
+                             &e);
+    };
+    Check(run() && run(), "P1 前置两次备份", QString::fromStdString(e));
+    std::vector<backupproject::net::RemoteSnapshotInfo> before;
+    client.List(&before, &error);
+    const QString saved = QString::fromStdString(lp) + ".saved";
+    QFile::remove(saved);
+    Check(QFile::rename(QString::fromStdString(lp), saved) &&
+              QDir().mkpath(QString::fromStdString(lp)),
+          "P1 阻塞账本路径");
+    const bool ran = run();
+    std::vector<backupproject::net::RemoteSnapshotInfo> after;
+    client.List(&after, &error);
+    bool kept = before.size() <= after.size();
+    Check(ran &&
+              r.status ==
+                  backupproject::ScheduleEvaluationStatus::kCreatedSnapshot &&
+              r.diagnostic.find("ownership ledger not saved") !=
+                  std::string::npos &&
+              kept,
+          "P1 账本写失败：保留旧快照并报告",
+          QString::fromStdString(r.diagnostic));
   }
 
   proxy_holder->kill();

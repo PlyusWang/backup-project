@@ -25,6 +25,11 @@ bool ReadOwnershipRecords(const std::string& ledger_path,
                           std::vector<OwnershipRecord>* records,
                           std::string* error_message);
 
+#ifdef BACKUP_TEST_HOOKS
+// 测试专用：在已读取 after_bytes 后一次性注入 errno。after_bytes<0 关闭。
+void SetOwnershipLedgerReadFaultForTesting(int after_bytes, int error_number);
+#endif
+
 }  // namespace backupproject
 
 #endif
