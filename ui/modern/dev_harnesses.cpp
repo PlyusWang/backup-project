@@ -1999,9 +1999,12 @@ int RunRemoteProductFlow(backup_modern::RemoteController* remote, CheckRun* run,
         text = QString::fromUtf8(current.readAll());
       }
       text.remove(QRegularExpression(
-          QStringLiteral("\n\s*\"cloud_snapshot_id\": \"[^\"]*\",")));
+          QStringLiteral("\\n\\s*\"cloud_snapshot_id\": \"[^\"]*\",")));
       text.remove(QRegularExpression(
-          QStringLiteral("\n\s*\"cloud_sha256\": \"[^\"]*\",")));
+          QStringLiteral("\\n\\s*\"cloud_sha256\": \"[^\"]*\",")));
+      run->Check(!text.contains(QStringLiteral("cloud_snapshot_id")) &&
+                     !text.contains(QStringLiteral("cloud_sha256")),
+                 QStringLiteral("A 旧版 fixture 确实移除了两个新字段"));
       const QString old_path =
           work + QStringLiteral("/cloud-schedule-old.json");
       QFile old_file(old_path);
