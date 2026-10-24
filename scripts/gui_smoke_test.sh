@@ -23,7 +23,7 @@ echo "[gui-smoke] offscreen 启动自检..."
 LOG_FILE="$ROOT_DIR/tests/output/gui-smoke.log"
 mkdir -p "$(dirname "$LOG_FILE")"
 set +e
-QT_QPA_PLATFORM=offscreen timeout 60 ./build/backup-gui-modern --smoke-test >"$LOG_FILE" 2>&1
+"$ROOT_DIR/scripts/isolated_gui_test.sh" "$ROOT_DIR/build/backup-gui-modern" --smoke-test >"$LOG_FILE" 2>&1
 status=$?
 set -e
 
