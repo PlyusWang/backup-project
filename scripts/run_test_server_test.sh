@@ -25,4 +25,6 @@ BACKUP_REMOTE_PASSWORD="acceptance-only-password" ./build/backupctl remote login
 kill -INT "$PID"
 wait "$PID" || true
 PID=""
+grep "[test-server]" ""
+
 echo "[run-test-server] PASS port=$PORT fingerprint=$FP account=$USER"
