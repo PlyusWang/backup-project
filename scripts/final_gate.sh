@@ -86,6 +86,7 @@ run remote-incremental bash scripts/remote_incremental_test.sh
 run copy-staging bash scripts/copy_staging_test.sh
 run ownership-ledger bash scripts/ownership_ledger_test.sh
 run config-manifest bash scripts/config_manifest_test.sh
+run run-test-server bash scripts/run_test_server_test.sh
 run cloud-retry bash scripts/cloud_retry_probe.sh
 # 远端可靠性与下载路径契约（本轮新增）：remote download 的内容落在调用方给定的
 # 路径上，不是 "<快照ID>.bak" —— 上一轮的临时脚本正是踩了这个假设，把一次完全
