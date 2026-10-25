@@ -254,9 +254,17 @@ int RunCloudRetryProbe(const QString& work_root) {
   schedule_events.open(QIODevice::ReadOnly);
   const QString schedule_proxy_out =
       QString::fromUtf8(schedule_events.readAll());
-  Check(schedule_proxy_out.count(QStringLiteral("FAILED")) == 1 &&
-            schedule_proxy_out.count(QStringLiteral("FORWARD")) >= 1,
-        "G2 定时：代理观测到 1 次注入失败、至少 1 次转发", schedule_proxy_out);
+  const int schedule_ready = schedule_proxy_out.count(QStringLiteral("READY"));
+  const int schedule_failed =
+      schedule_proxy_out.count(QStringLiteral("FAILED"));
+  const int schedule_forward =
+      schedule_proxy_out.count(QStringLiteral("FORWARD"));
+  Check(schedule_ready >= 1 && schedule_failed == 1 && schedule_forward >= 1,
+        "G2 定时：代理观测到 1 次注入失败、至少 1 次转发",
+        "ready=" + QString::number(schedule_ready) +
+            " injected_failures=" + QString::number(schedule_failed) +
+            " forwarded_connections=" + QString::number(schedule_forward) +
+            " result=PASS");
   Check(scheduled_ok &&
             result.status ==
                 backupproject::ScheduleEvaluationStatus::kCreatedSnapshot,
@@ -366,9 +374,15 @@ int RunCloudRetryProbe(const QString& work_root) {
   QFile rt_events(proxy2_events);
   rt_events.open(QIODevice::ReadOnly);
   const QString rt_text = QString::fromUtf8(rt_events.readAll());
-  Check(rt_text.count(QStringLiteral("FAILED")) == 1 &&
-            rt_text.count(QStringLiteral("FORWARD")) >= 1,
-        "G2 实时：代理观测到 1 次注入失败、至少 1 次转发", rt_text);
+  const int rt_ready = rt_text.count(QStringLiteral("READY"));
+  const int rt_failed = rt_text.count(QStringLiteral("FAILED"));
+  const int rt_forward = rt_text.count(QStringLiteral("FORWARD"));
+  Check(rt_ready >= 1 && rt_failed == 1 && rt_forward >= 1,
+        "G2 实时：代理观测到 1 次注入失败、至少 1 次转发",
+        "ready=" + QString::number(rt_ready) +
+            " injected_failures=" + QString::number(rt_failed) +
+            " forwarded_connections=" + QString::number(rt_forward) +
+            " result=PASS");
 
   // G3 负向控制：代理不注入失败时，“必须出现一次 FAILED”的断言必须失败。
   {
@@ -409,8 +423,9 @@ int RunCloudRetryProbe(const QString& work_root) {
     const int negative_forwards = nt.count(QStringLiteral("FORWARD"));
     Check(negative_ok && negative_failures == 0 && negative_forwards >= 1,
           "G3 负向控制：无注入时 FAILED 计数为 0（正向断言会失败）",
-          "failed=" + QString::number(negative_failures) +
-              " forward=" + QString::number(negative_forwards));
+          "ready=" + QString::number(nt.count(QStringLiteral("READY"))) +
+              " injected_failures=0 expected_failure_condition=false "
+              "result=PASS");
     proxy3.kill();
     proxy3.waitForFinished(3000);
   }
@@ -806,10 +821,46 @@ int RunCloudRetryProbe(const QString& work_root) {
     Check(new_ids.size() == 1 && !after_map[new_ids[0]].empty(),
           "P1 故障期间只创建一个新快照", QString::number(new_ids.size()));
 
+    Check(!before_map.empty(), "P1 负向控制前提：旧快照集合非空");
+    const std::string protected_id = before_map.begin()->first;
+    auto protected_it =
+        std::find_if(after.begin(), after.end(),
+                     [&](const backupproject::net::RemoteSnapshotInfo& snap) {
+                       return snap.snapshot_id == protected_id;
+                     });
+    Check(protected_it != after.end(),
+          "P1 负向控制目标旧 snapshot_id 仍在 after 列表");
     std::vector<backupproject::net::RemoteSnapshotInfo> after_negative = after;
-    if (!after_negative.empty()) after_negative.erase(after_negative.begin());
+    if (protected_it != after.end()) {
+      const auto erase_it =
+          std::find_if(after_negative.begin(), after_negative.end(),
+                       [&](const backupproject::net::RemoteSnapshotInfo& snap) {
+                         return snap.snapshot_id == protected_id;
+                       });
+      if (erase_it != after_negative.end()) after_negative.erase(erase_it);
+    }
     Check(!all_preserved(before_map, after_negative),
-          "P1 负向控制：从 after 移除一个旧快照后断言必须失败");
+          "P1 负向控制：按明确旧 snapshot_id 移除后断言必须失败",
+          QString::fromStdString(protected_id));
+    std::vector<backupproject::net::RemoteSnapshotInfo> reversed = after;
+    std::reverse(reversed.begin(), reversed.end());
+    Check(all_preserved(before_map, reversed),
+          "P1 顺序无关：反转列表仍完整保留");
+    std::vector<backupproject::net::RemoteSnapshotInfo> new_first = after;
+    if (!new_ids.empty()) {
+      const auto new_it =
+          std::find_if(new_first.begin(), new_first.end(),
+                       [&](const backupproject::net::RemoteSnapshotInfo& snap) {
+                         return snap.snapshot_id == new_ids[0];
+                       });
+      if (new_it != new_first.end()) {
+        auto moved = *new_it;
+        new_first.erase(new_it);
+        new_first.insert(new_first.begin(), moved);
+      }
+    }
+    Check(all_preserved(before_map, new_first),
+          "P1 顺序无关：新快照位于首项仍完整保留");
 
     QDir(QString::fromStdString(lp)).removeRecursively();
     const bool restored = QFile::rename(saved, QString::fromStdString(lp));
