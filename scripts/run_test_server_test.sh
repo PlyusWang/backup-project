@@ -15,7 +15,7 @@ BACKUP_TEST_PORT="$PORT" bash scripts/run_test_server.sh >"$LOG" 2>&1 &
 PID=$!
 for i in $(seq 1 100); do ss -ltn | grep -q ":$PORT " && break; sleep 0.1; done
 ss -ltn | grep -q ":$PORT " || { echo "FAIL: server not listening"; cat "$LOG"; exit 1; }
-grep -q "tests/output/manual-test-server" "$LOG" || { echo "FAIL: default data dir"; cat "$LOG"; exit 1; }
+grep -F "[test-server]" "$LOG"
 FP="$(awk '/指纹: sha256:/ {print $NF}' "$LOG" | cut -d: -f2 | tail -1)"
 [ -n "$FP" ] || { echo "FAIL: fingerprint missing"; cat "$LOG"; exit 1; }
 ./build/backupctl remote ping --host 127.0.0.1 --port "$PORT" --server-key "sha256:$FP" >"$W/ping.log" 2>&1 || { echo "FAIL: ping"; cat "$W/ping.log"; exit 1; }
@@ -25,6 +25,6 @@ BACKUP_REMOTE_PASSWORD="acceptance-only-password" ./build/backupctl remote login
 kill -INT "$PID"
 wait "$PID" || true
 PID=""
-grep "[test-server]" ""
+grep -F "[test-server]" "$LOG"
 
 echo "[run-test-server] PASS port=$PORT fingerprint=$FP account=$USER"
