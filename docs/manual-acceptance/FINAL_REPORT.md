@@ -2,7 +2,7 @@
 
 ## 版本身份
 
-- 最终 HEAD：`ac9e5c71c4c262089d39582e8cca9f91e04fd433`
+- 最终 HEAD：`见 VERSION.txt`
 - 分支：`feature/unified-product-manual-acceptance-prep`
 - 基线：`a6dc901`
 
@@ -25,7 +25,7 @@
 
 ## 最终门禁
 
-- 57 个不同入口，114 条 tee 输出，failed suites = 0。
+- 58 个不同入口，116 条 tee 记录，failed suites = 0。
 - 原始日志：`evidence/final-gate/final-gate.log`。
 
 ## 干净构建和基本往返

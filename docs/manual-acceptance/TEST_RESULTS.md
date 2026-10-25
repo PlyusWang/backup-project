@@ -4,7 +4,7 @@
 
 | 测试 | 结果 | 证据 |
 |---|---|---|
-| final_gate | PASS（57 入口 / 114 tee 行 / 0 失败） | evidence/final-gate/final-gate.log |
+| final_gate | PASS（58 入口 / 116 tee 行 / 0 失败） | evidence/final-gate/final-gate.log |
 | run-test-server 无参数/端口/目录/指纹 | PASS | evidence/run-test-server.log |
 | 客户端 ping/register/login + Ctrl+C | PASS | evidence/run-test-server.log |
 | clean build | PASS | evidence/clean-build/build.log |
@@ -23,3 +23,6 @@
 | 真实 ECS | NOT_RUN | — |
 
 最终门禁统计以 `evidence/final-gate/final-gate.log` 为准；不同入口数与 tee 重复行分开统计。
+
+
+run-test-server 无参数启动、默认数据目录、BACKUP_TEST_PORT 覆盖、指纹、ping/register/login、Ctrl+C 退出均实际执行通过。
