@@ -100,14 +100,14 @@ else
   record_fail "B.1 配置仓库" "$(first_line)"
 fi
 
-# 自动触发不接受加密：组合校验必须直接拒绝，绝不静默降级。
+# 未配置安全口令时拒绝加密任务，绝不静默降级。
 if cli realtime set --source "$CLI_WORK/src" \
     --encryption aes-256-ctr-hmac-sha256 >"$OUT" 2>&1; then
-  record_fail "B.2 realtime 拒绝加密" "命令居然成功了"
+  record_fail "B.2 realtime 缺少安全口令时拒绝加密" "命令居然成功了"
 elif grep -q '需要先配置' "$OUT"; then
-  record_pass "B.2 realtime 拒绝加密并说明原因"
+  record_pass "B.2 realtime 缺少安全口令时拒绝加密并说明原因"
 else
-  record_fail "B.2 realtime 拒绝加密并说明原因" "$(first_line)"
+  record_fail "B.2 realtime 缺少安全口令时拒绝加密并说明原因" "$(first_line)"
 fi
 
 if cli realtime set --source "$CLI_WORK/src" --debounce-ms 200 --max-wait-ms 1000 \

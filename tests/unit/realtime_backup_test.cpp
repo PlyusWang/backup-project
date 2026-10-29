@@ -4,7 +4,7 @@
 // 是不是真的绑在实际 archive bytes 上。
 //
 // 要钉住的（对应设计文档第 27 节的判别用例）：
-//   * Realtime 只是 Trigger：Full 走 BackupEngine、Incremental 走
+//   * Realtime 只是 Trigger：Full 走 RunManagedFullBackup、Incremental 走
 //     RunIncrementalBackup，两份策略语义各自由原实现负责；
 //   * Full 是保守的：每个 settled generation 都建一份完整快照，excluded-only
 //     也会建（内容里没有 excluded 文件）；
@@ -292,6 +292,14 @@ int main() {
         }
       }
       test_support::Check(all_verified, "INC-RTB T4 全部 marker 都 verified");
+      bool all_sidecars = !records.empty();
+      for (const bp::RealtimeSnapshotRecord& record : records) {
+        const std::string archive = repository + "/" + record.file_name;
+        all_sidecars = all_sidecars &&
+                       test_support::Exists(archive + ".manifest") &&
+                       test_support::Exists(archive + ".identity");
+      }
+      test_support::Check(all_sidecars, "INC-RTB T4 完整基线副文件齐全");
       test_support::Check(ordered, "INC-RTB T4 history 按 created_time 升序");
       const std::vector<std::string> entries =
           test_support::DirEntries(repository);
@@ -302,8 +310,8 @@ int main() {
         }
       }
       test_support::Check(no_temp, "INC-RTB T4 不留 .tmp 半成品");
-      test_support::Check(RepoEntryCount(repository) == 6,
-                          "INC-RTB T4 仓库里只有 3 份归档 + 3 个 marker",
+      test_support::Check(RepoEntryCount(repository) == 12,
+                          "INC-RTB T4 仓库里只有 3 组归档、副文件与 marker",
                           std::to_string(RepoEntryCount(repository)));
     }
 
@@ -625,8 +633,8 @@ int main() {
                 NextTime(), &outcome, "INC-RTB M4 准备");
       }
       const std::size_t before = RepoEntryCount(repo2);
-      test_support::Check(before == 6,
-                          "INC-RTB M4 准备：3 份快照 + 3 个 marker",
+      test_support::Check(before == 12,
+                          "INC-RTB M4 准备：3 组归档、副文件与 marker",
                           std::to_string(before));
 
       config2.retain_count = 1;
@@ -646,12 +654,16 @@ int main() {
         test_support::Check(
             failed.retention_deleted == 0,
             "INC-RTB M4 判别：没有可信 marker 就不执行破坏性 retention");
-        test_support::Check(RepoEntryCount(repo2) == before + 1,
-                            "INC-RTB M4 归档保留（4 份 .bak + 3 个 marker）",
+        test_support::Check(RepoEntryCount(repo2) == before + 3,
+                            "INC-RTB M4 保留 4 组归档与副文件、3 个 marker",
                             std::to_string(RepoEntryCount(repo2)));
         test_support::Check(
             test_support::Exists(repo2 + "/" + failed.snapshot_file_name),
             "INC-RTB M4 新归档还在仓库里");
+        const std::string archive = repo2 + "/" + failed.snapshot_file_name;
+        test_support::Check(test_support::Exists(archive + ".manifest") &&
+                                test_support::Exists(archive + ".identity"),
+                            "INC-RTB M4 marker 失败仍保留完整基线副文件");
       }
 
       // marker 恢复可写之后，retention 才真的开始淘汰。

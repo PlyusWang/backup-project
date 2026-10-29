@@ -95,9 +95,9 @@ run remote-reliability bash scripts/remote_reliability_test.sh
 run secure-transport-sanitize env SECURE_TRANSPORT_TEST_EXTRA_FLAGS="-g -O1 -fsanitize=address,undefined -fno-omit-frame-pointer" bash scripts/secure_transport_test.sh
 run quality bash scripts/quality_test.sh
 
-# quality 会 make clean：把两个 GUI 重新构建出来，后面 test.sh 的 GUI parity 用例
-# 与 modern_gui / gui_smoke 才是在"GUI 真的存在"的前提下跑的。
-make -j4 gui-all > "$GUI_BUILD_LOG" 2>&1
+# quality 会 make clean：重建 GUI、服务器和证书工具，保证后续 GUI 与网络专项
+# 都从本轮源码取得实际所需的产物。
+make -j4 gui-all server cert-tool > "$GUI_BUILD_LOG" 2>&1
 echo "GATE gui-rebuild exit=$? warnings=$(grep -ci warning "$GUI_BUILD_LOG" || true)" | tee -a "$LOG"
 
 run suite-main bash scripts/test.sh

@@ -218,6 +218,13 @@ int main() {
       all_verified = all_verified && record.verified;
     }
     test_support::Check(all_verified, "INC-RTR T1 留下来的都 verified");
+    bool all_sidecars = !records.empty();
+    for (const bp::RealtimeSnapshotRecord& record : records) {
+      const std::string archive = repository + "/" + record.file_name;
+      all_sidecars = all_sidecars && Exists(archive + ".manifest") &&
+                     Exists(archive + ".identity");
+    }
+    test_support::Check(all_sidecars, "INC-RTR T1 保留点的完整基线副文件齐全");
 
     if (names.size() == 5) {
       test_support::Check(!Exists(repository + "/" + names[0]) &&
@@ -226,12 +233,19 @@ int main() {
       test_support::Check(!Exists(MarkerPath(repository, names[0])) &&
                               !Exists(MarkerPath(repository, names[1])),
                           "INC-RTR T1 判别：marker 跟着归档一起清（不留孤儿）");
+      bool removed_sidecars = true;
+      for (std::size_t index = 0; index < 2; ++index) {
+        const std::string archive = repository + "/" + names[index];
+        removed_sidecars = removed_sidecars && !Exists(archive + ".manifest") &&
+                           !Exists(archive + ".identity");
+      }
+      test_support::Check(removed_sidecars, "INC-RTR T1 淘汰归档的副文件一起清除");
       test_support::Check(Exists(repository + "/" + names[4]) &&
                               Exists(MarkerPath(repository, names[4])),
                           "INC-RTR T1 最新一份的归档与 marker 都在");
     }
-    test_support::Check(RepoEntryCount(repository) == 6,
-                        "INC-RTR T1 仓库里就是 3 份归档 + 3 个 marker",
+    test_support::Check(RepoEntryCount(repository) == 12,
+                        "INC-RTR T1 仓库里只有 3 组归档、副文件与 marker",
                         std::to_string(RepoEntryCount(repository)));
     std::vector<std::string> leftovers;
     for (const std::string& name : test_support::DirEntries(repository)) {
