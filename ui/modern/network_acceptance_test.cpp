@@ -140,6 +140,62 @@ int RunNetworkAcceptanceTest(QQuickWindow* window,
     return !image.isNull() &&
            image.save(output_directory + QLatin1Char('/') + name);
   };
+  const auto capture_session = [&](const QString& name,
+                                   const QString& username) {
+    Pump(100);
+    if (!RevealRemoteItem(window, "remoteAccountStateText")) return false;
+    Pump(100);
+    QQuickItem* state =
+        FindItem(window->contentItem(), "remoteAccountStateText");
+    QQuickItem* account = FindItem(window->contentItem(), "remoteAccountText");
+    QQuickItem* scroll = FindItem(window->contentItem(), "remotePageScroll");
+    QQuickItem* flick =
+        scroll == nullptr
+            ? nullptr
+            : scroll->property("contentItem").value<QQuickItem*>();
+    const auto in_view = [&](QQuickItem* item) {
+      if (item == nullptr || flick == nullptr || !item->isVisible())
+        return false;
+      const qreal top = item->mapToItem(flick, QPointF()).y();
+      return top >= 0 && top + item->height() <= flick->height();
+    };
+    return remote->authenticated() && in_view(state) && in_view(account) &&
+           state->property("text").toString() ==
+               QStringLiteral("状态：已登录") &&
+           account->property("text").toString() ==
+               QStringLiteral("当前账户：") + username &&
+           capture(name);
+  };
+  const auto certificate_feedback = [&](const QString& kind,
+                                        const QString& summary,
+                                        const QString& suggestion) {
+    Pump(100);
+    QObject* dialog =
+        window->findChild<QObject*>(QStringLiteral("userErrorDialog"));
+    QQuickItem* content =
+        dialog == nullptr
+            ? nullptr
+            : dialog->property("contentItem").value<QQuickItem*>();
+    QQuickItem* summary_item =
+        content == nullptr ? nullptr : FindItem(content, "userErrorSummary");
+    QQuickItem* suggestion_item =
+        content == nullptr ? nullptr : FindItem(content, "userErrorSuggestion");
+    QQuickItem* form = FindItem(window->contentItem(), "remoteLoginError");
+    const QString form_message = remote->loginError();
+    return dialog != nullptr && dialog->property("visible").toBool() &&
+           remote->lastErrorKindForTest() == kind && summary_item != nullptr &&
+           suggestion_item != nullptr && summary_item->isVisible() &&
+           suggestion_item->isVisible() &&
+           summary_item->property("text").toString() == summary &&
+           suggestion_item->property("text").toString() == suggestion &&
+           form != nullptr && form->isVisible() &&
+           form->property("text").toString() == form_message &&
+           form_message == summary + suggestion &&
+           !form_message.contains(QStringLiteral("BPSEC1")) &&
+           !form_message.contains(QStringLiteral("路径")) &&
+           !form_message.contains(QStringLiteral("权限")) &&
+           !form_message.contains(QStringLiteral("空间"));
+  };
   QObject* management =
       window->findChild<QObject*>(QStringLiteral("managementPage"));
   QObject* page = window->findChild<QObject*>(QStringLiteral("remotePage"));
@@ -183,7 +239,9 @@ int RunNetworkAcceptanceTest(QQuickWindow* window,
           "DIRECT_BPSEC2_LOGIN_WITHOUT_SSH"))
     return 1;
   if (page != nullptr) page->setProperty("draftUser", direct_user);
-  check(capture(QStringLiteral("17-network-direct-certificate-session.png")),
+  check(capture_session(
+            QStringLiteral("17-network-direct-certificate-session.png"),
+            direct_user),
         "DIRECT_SESSION_SCREENSHOT");
 
   const auto round_trip = [&](const QString& prefix) {
@@ -461,6 +519,13 @@ int RunNetworkAcceptanceTest(QQuickWindow* window,
       "WRONG_SERVER_ID_REJECTED");
   show_configuration(QStringLiteral("direct"), roots,
                      QStringLiteral("wrong-server-id"));
+  check(
+      certificate_feedback(
+          QStringLiteral("server-certificate-wrong-server-id"),
+          QStringLiteral("服务器身份与预期不一致，连接已停止。"),
+          QStringLiteral(
+              "请向服务器管理员核对服务器身份文件和预期的服务器标识后重试。")),
+      "WRONG_SERVER_ID_DIALOG_AND_FORM");
   check(capture(QStringLiteral("19-network-wrong-server-id.png")),
         "WRONG_SERVER_ID_SCREENSHOT");
   DismissError(window);
@@ -473,6 +538,12 @@ int RunNetworkAcceptanceTest(QQuickWindow* window,
             remote->lastErrorKindForTest() != QStringLiteral("auth"),
         "UNTRUSTED_ROOT_REJECTED");
   show_configuration(QStringLiteral("direct"), wrong_roots, server_id);
+  check(certificate_feedback(
+            QStringLiteral("server-certificate-untrusted"),
+            QStringLiteral("服务器证书的签发者不在可信根列表中，连接已停止。"),
+            QStringLiteral(
+                "请向服务器管理员确认可信根文件，并从可信渠道导入后重试。")),
+        "UNTRUSTED_ROOT_DIALOG_AND_FORM");
   check(capture(QStringLiteral("20-network-untrusted-root.png")),
         "UNTRUSTED_ROOT_SCREENSHOT");
   DismissError(window);
@@ -496,9 +567,10 @@ int RunNetworkAcceptanceTest(QQuickWindow* window,
                 remote->authenticated() && remote->tunnelReady(),
             "REAL_SSH_BPSEC2_LOGIN")) {
     if (page != nullptr) page->setProperty("draftUser", ssh_user);
-    check(
-        capture(QStringLiteral("18-network-real-ssh-certificate-session.png")),
-        "REAL_SSH_SESSION_SCREENSHOT");
+    check(capture_session(
+              QStringLiteral("18-network-real-ssh-certificate-session.png"),
+              ssh_user),
+          "REAL_SSH_SESSION_SCREENSHOT");
     round_trip(QStringLiteral("ssh"));
   }
   const qint64 owned_pid = remote->tunnelPidForTest();

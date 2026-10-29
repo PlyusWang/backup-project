@@ -19,6 +19,7 @@
 #include <QTemporaryDir>
 #include <QTimer>
 #include <QUuid>
+#include <QVariantMap>
 #include <cstdio>
 #include <functional>
 
@@ -331,6 +332,39 @@ int RunCredentialUiTest(QQuickWindow* window,
                   expected_digest,
           scheduled ? "SCHEDULE_SESSION_AES_CHAIN_RESTORE_SHA256"
                     : "REALTIME_SESSION_AES_CHAIN_RESTORE_SHA256");
+    if (scheduled) {
+      Settle();
+      const QVariantList history = schedule->history();
+      const QString diagnostic = history.value(0)
+                                     .toMap()
+                                     .value(QStringLiteral("diagnostic"))
+                                     .toString();
+      check(!diagnostic.isEmpty() &&
+                schedule->lastResultText().contains(
+                    QStringLiteral("备份已完成")) &&
+                !schedule->lastResultText().contains(diagnostic),
+            "SCHEDULE_RESULT_KEEPS_TECHNICAL_DIAGNOSTIC_IN_DETAILS");
+      QQuickItem* details =
+          item(QStringLiteral("scheduleHistoryDetailsToggle0"));
+      QQuickItem* raw = item(QStringLiteral("scheduleHistoryDiagnostic0"));
+      QQuickItem* summary = item(QStringLiteral("scheduleHistorySummary0"));
+      if (!check(details != nullptr && raw != nullptr && summary != nullptr &&
+                     !raw->isVisible() &&
+                     !summary->property("text").toString().contains(diagnostic),
+                 "SCHEDULE_HISTORY_DIAGNOSTIC_COLLAPSED_BY_DEFAULT"))
+        return 1;
+      check(Click(window, details, scroll_name) &&
+                Reveal(window, raw, scroll_name) &&
+                raw->property("text").toString() == diagnostic,
+            "SCHEDULE_HISTORY_DETAILS_SHOW_ORIGINAL_DIAGNOSTIC");
+      check(Click(window, details, scroll_name) && !raw->isVisible() &&
+                schedule->history()
+                        .value(0)
+                        .toMap()
+                        .value(QStringLiteral("diagnostic"))
+                        .toString() == diagnostic,
+            "SCHEDULE_HISTORY_DETAILS_COLLAPSE_PRESERVES_DIAGNOSTIC");
+    }
     check(
         scheduled ? save_scheduled_enabled(false) : realtime->setEnabled(false),
         scheduled ? "SCHEDULE_TASK_DISABLED_AFTER_EXECUTION"
@@ -362,6 +396,27 @@ int RunCredentialUiTest(QQuickWindow* window,
                   .contains(QStringLiteral("输入")),
           scheduled ? "SCHEDULE_RELOAD_REQUIRES_UNLOCK"
                     : "REALTIME_RELOAD_REQUIRES_UNLOCK");
+    page->setProperty("advancedExpanded", true);
+    Settle();
+    QQuickItem* note = item(prefix + QStringLiteral("EncryptionNote"));
+    QQuickItem* viewport = scroll->property("contentItem").value<QQuickItem*>();
+    const auto in_view = [&](QQuickItem* control) {
+      if (control == nullptr || !control->isVisible() || viewport == nullptr)
+        return false;
+      const QPointF position = control->mapToItem(viewport, QPointF());
+      return position.x() >= 0 && position.y() >= 0 &&
+             position.x() + control->width() <= viewport->width() &&
+             position.y() + control->height() <= viewport->height();
+    };
+    if (!check(Reveal(window, first, scroll_name) && in_view(first) &&
+                   in_view(confirmation) && in_view(note) &&
+                   first->property("text").toString().isEmpty() &&
+                   confirmation->property("text").toString().isEmpty() &&
+                   note->property("text").toString().contains(
+                       QStringLiteral("输入")),
+               scheduled ? "SCHEDULE_PASSWORD_CAPTURE_FIELDS_AND_UNLOCK_NOTE"
+                         : "REALTIME_PASSWORD_CAPTURE_FIELDS_AND_UNLOCK_NOTE"))
+      return 1;
     capture(scheduled ? QStringLiteral("17-schedule-session-password.png")
                       : QStringLiteral("18-realtime-session-password.png"));
   }

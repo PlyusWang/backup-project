@@ -1148,9 +1148,6 @@ QString ScheduleController::lastResultText() const {
     text += QStringLiteral(" · %1").arg(
         QString::fromStdString(last.archive_file_name));
   }
-  if (!last.diagnostic.empty()) {
-    text += QStringLiteral(" · ") + QString::fromStdString(last.diagnostic);
-  }
   return text;
 }
 

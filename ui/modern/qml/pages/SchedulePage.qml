@@ -1067,35 +1067,62 @@ Item {
                         color: theme.textSecondary
                     }
 
-                    Repeater {
-                        objectName: "scheduleHistoryList"
-                        // 控制器按最新优先提供历史，折叠只影响这一屏的显示数量。
-                        model: page.visibleHistory
-                        delegate: ColumnLayout {
-                            required property var modelData
-                            Layout.fillWidth: true
-                            spacing: 2
-                            Text {
-                                Layout.fillWidth: true
-                                // 历史条目拆两行：第一行是时间与结果，第二行
-                                // 是变化量、归档名和诊断信息（可能为空）。
-                                text: modelData["timeText"]
-                                      + "  ·  " + modelData["resultText"]
-                                font.pixelSize: 15
-                                color: theme.textPrimary
-                            }
-                            Text {
-                                Layout.fillWidth: true
-                                text: modelData["changesText"]
-                                      + (modelData["archiveName"] !== ""
-                                         ? "  ·  " + modelData["archiveName"]
-                                         : "")
-                                      + (modelData["diagnostic"] !== ""
-                                         ? "  ·  " + modelData["diagnostic"]
-                                         : "")
-                                font.pixelSize: 14
-                                color: theme.textSecondary
-                                wrapMode: Text.WordWrap
+                    Column {
+                        id: historyColumn
+                        Layout.fillWidth: true
+                        spacing: 6
+
+                        Repeater {
+                            objectName: "scheduleHistoryList"
+                            // 展示顺序与数量由页面提供；外层布局只管理稳定容器。
+                            model: page.visibleHistory
+                            delegate: Column {
+                                id: historyEntry
+                                required property var modelData
+                                required property int index
+                                property bool detailsExpanded: false
+                                width: historyColumn.width
+                                height: implicitHeight
+                                spacing: 2
+
+                                Text {
+                                    width: parent.width
+                                    text: modelData["timeText"]
+                                          + "  ·  " + modelData["resultText"]
+                                    font.pixelSize: 15
+                                    color: theme.textPrimary
+                                    wrapMode: Text.WordWrap
+                                }
+                                Text {
+                                    objectName: "scheduleHistorySummary" + index
+                                    width: parent.width
+                                    text: modelData["changesText"]
+                                          + (modelData["archiveName"] !== ""
+                                             ? "  ·  " + modelData["archiveName"]
+                                             : "")
+                                    font.pixelSize: 14
+                                    color: theme.textSecondary
+                                    wrapMode: Text.WordWrap
+                                }
+                                AppButton {
+                                    objectName: "scheduleHistoryDetailsToggle" + index
+                                    visible: modelData["diagnostic"] !== ""
+                                    text: historyEntry.detailsExpanded
+                                          ? "收起详情" : "详情"
+                                    variant: "flat"
+                                    onClicked: historyEntry.detailsExpanded =
+                                        !historyEntry.detailsExpanded
+                                }
+                                Text {
+                                    objectName: "scheduleHistoryDiagnostic" + index
+                                    width: parent.width
+                                    visible: historyEntry.detailsExpanded
+                                             && modelData["diagnostic"] !== ""
+                                    text: modelData["diagnostic"]
+                                    font.pixelSize: 14
+                                    color: theme.textSecondary
+                                    wrapMode: Text.WordWrap
+                                }
                             }
                         }
                     }
