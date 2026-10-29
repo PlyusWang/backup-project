@@ -739,6 +739,14 @@ QString RemoteController::ClassifyFailure(const std::string& status_name,
     }
     return QStringLiteral("server");
   }
+  // 证书身份失败有明确的下一步，必须先于通用握手错误归类。
+  static const char* const kCertificateFailures[] = {
+      "server-certificate-wrong-server-id", "server-certificate-untrusted",
+      "server-certificate-expired",         "server-certificate-key-mismatch",
+      "server-certificate-missing",         "server-certificate-invalid"};
+  for (const char* failure : kCertificateFailures) {
+    if (Contains(detail, failure)) return QString::fromLatin1(failure);
+  }
   // 原始归档单独恢复（kRestoreRaw）的三个专有失败。必须排在通用规则**之前**：
   // 那些原因里含"依赖链""加密"等字样，落到通用规则上会被归成 integrity 之类，
   // 用户就拿不到"改用产品级恢复 / 请填密码 /
@@ -846,6 +854,11 @@ QString RemoteController::ClassifyFailure(const std::string& status_name,
 // 这里不含内部错误码，技术详情留在 last_detail_ 与 stderr。
 // 与 TitleForFailure 成对：新增一个 kind 必须同时加两处，否则标题与正文会打架。
 QString RemoteController::DescribeFailure(const QString& error_kind) {
+  if (error_kind.startsWith(QStringLiteral("server-certificate-"))) {
+    const UserFacingError explained =
+        ExplainOperationError(error_kind, QStringLiteral("验证服务器身份"));
+    return explained.summary + explained.suggestion;
+  }
   if (error_kind == QStringLiteral("credentials")) {
     return QStringLiteral("登录失败：用户名或密码不正确。");
   }
@@ -960,7 +973,7 @@ QString RemoteController::DescribeFailure(const QString& error_kind) {
   }
   if (error_kind == QStringLiteral("handshake")) {
     return QStringLiteral(
-        "已经连上服务器，但 BPSEC1 安全握手没有通过：两端没有就会话密钥"
+        "已经连上服务器，但安全握手没有通过：两端没有就会话密钥"
         "达成一致（握手字节被改动、或两端版本不一致）。"
         "这次操作一个字节都没有发出去，云端数据没有变化。");
   }
@@ -995,6 +1008,9 @@ QString RemoteController::DescribeFailure(const QString& error_kind) {
 // 图标旁那一行短标题。没有匹配的 kind 时退化成"操作失败"，
 // 因此它永远不会返回空串（空的标题会画出一个空横幅）。
 QString RemoteController::TitleForFailure(const QString& error_kind) {
+  if (error_kind.startsWith(QStringLiteral("server-certificate-"))) {
+    return QStringLiteral("服务器身份验证未通过");
+  }
   if (error_kind == QStringLiteral("credentials")) {
     return QStringLiteral("登录失败");
   }
@@ -1517,7 +1533,8 @@ QString RemoteController::SurfaceFailureMessage(RemoteOpResult::Kind kind,
       error_kind == QStringLiteral("handshake") ||
       error_kind == QStringLiteral("pin-missing") ||
       error_kind == QStringLiteral("connect-refused") ||
-      error_kind == QStringLiteral("pin-mismatch");
+      error_kind == QStringLiteral("pin-mismatch") ||
+      error_kind.startsWith(QStringLiteral("server-certificate-"));
   if (connection_layer) {
     return DescribeFailure(error_kind);
   }

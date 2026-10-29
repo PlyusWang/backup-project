@@ -16,6 +16,45 @@ UserFacingError ExplainOperationError(const QString& technical,
   UserFacingError error;
   error.title = action + QStringLiteral("没有完成");
 
+  if (Contains(technical, "server-certificate-wrong-server-id")) {
+    error.summary = QStringLiteral("服务器身份与预期不一致，连接已停止。");
+    error.suggestion = QStringLiteral(
+        "请向服务器管理员核对服务器身份文件和预期的服务器标识后重试。");
+    return error;
+  }
+  if (Contains(technical, "server-certificate-untrusted")) {
+    error.summary =
+        QStringLiteral("服务器证书的签发者不在可信根列表中，连接已停止。");
+    error.suggestion = QStringLiteral(
+        "请向服务器管理员确认可信根文件，并从可信渠道导入后重试。");
+    return error;
+  }
+  if (Contains(technical, "server-certificate-expired")) {
+    error.summary =
+        QStringLiteral("服务器身份证书已过期或尚未生效，连接已停止。");
+    error.suggestion = QStringLiteral(
+        "请检查本机时间；时间正确时，请向服务器管理员索取有效的身份证书。");
+    return error;
+  }
+  if (Contains(technical, "server-certificate-key-mismatch")) {
+    error.summary =
+        QStringLiteral("服务器证书与实际使用的身份密钥不一致，连接已停止。");
+    error.suggestion = QStringLiteral(
+        "请向服务器管理员核对服务器的身份证书和密钥配置后重试。");
+    return error;
+  }
+  if (Contains(technical, "server-certificate-missing")) {
+    error.summary = QStringLiteral("服务器没有提供身份证书，连接已停止。");
+    error.suggestion =
+        QStringLiteral("请向服务器管理员确认地址、端口和证书配置后重试。");
+    return error;
+  }
+  if (Contains(technical, "server-certificate-invalid")) {
+    error.summary = QStringLiteral("服务器身份证书无效，连接已停止。");
+    error.suggestion =
+        QStringLiteral("请向服务器管理员核对身份证书和可信根文件后重试。");
+    return error;
+  }
   if (Contains(technical, "not empty")) {
     error.summary =
         QStringLiteral("目标文件夹中已有文件，请选择一个空文件夹。");
