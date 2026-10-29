@@ -19,8 +19,7 @@ UserFacingError ExplainOperationError(const QString& technical,
   if (Contains(technical, "not empty")) {
     error.summary =
         QStringLiteral("目标文件夹中已有文件，请选择一个空文件夹。");
-    error.suggestion =
-        QStringLiteral("换一个空的恢复目录，或先清空该目录后重试。");
+    error.suggestion = QStringLiteral("选择一个新的空文件夹后重试。");
     return error;
   }
   if (Contains(technical, "no snapshot with a usable content manifest") ||
@@ -60,6 +59,12 @@ UserFacingError ExplainOperationError(const QString& technical,
     error.suggestion = QStringLiteral("重新输入正确的密码后再试一次。");
     return error;
   }
+  if (Contains(technical, "authentication") || Contains(technical, "HMAC")) {
+    error.summary =
+        QStringLiteral("备份认证未通过，密码可能不正确或文件已损坏。");
+    error.suggestion = QStringLiteral("确认原密码，并检查备份文件是否完整。");
+    return error;
+  }
   if (Contains(technical, "chain") || Contains(technical, "parent") ||
       Contains(technical, "依赖")) {
     error.summary = QStringLiteral("备份的依赖链不完整，无法安全恢复。");
@@ -83,7 +88,7 @@ UserFacingError ExplainOperationError(const QString& technical,
   error.summary = QStringLiteral("操作未能完成，已有数据没有被覆盖。");
   error.suggestion = QStringLiteral(
       "请检查路径、权限与可用空间后重试；"
-      "技术细节可在下方展开。");
+      "具体原因可在详情中查看。");
   return error;
 }
 

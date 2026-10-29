@@ -68,6 +68,7 @@ Item {
     // 作为“备份管理 / 云端仓库”标签页的内容嵌入时，本页不再画自己的大标题：
     // 外层已经有一条页面标题与标签栏，重复的标题会让用户以为进错了页面。
     property bool embedded: false
+    readonly property real contentInset: column.x
 
     // ---------- 草稿 ----------
     // 输入框里的是草稿：只有点"登录 / 注册 / 上传 / 下载"时才交给控制器。
@@ -421,6 +422,7 @@ Item {
             // 内容宽度在 [64, 1400] 之间随窗口取并水平居中：宽屏上不拉成
             // 一行读不完的长文本，窄屏上保留 32 的边距。
             id: column
+            objectName: "remoteContentColumn"
             x: Math.max(32, (pageScroll.availableWidth - width) / 2)
             y: 20
             width: Math.min(pageScroll.availableWidth - 64, 1400)
@@ -885,8 +887,7 @@ Item {
                     // 指纹）。指纹错了就是一个输入问题，"应用"之后原因写在这
                     // 张表单自己的错误行里，不弹对话框，也不占用页面底部横幅。
                     // ---------- 自建 + 证书 ----------
-                    // 可信根与预期 server_id 都必须由用户明确给出；为空时提交
-                    // 会被拒绝，程序绝不回退到内置官方根。
+                    // 根文件不含服务器标识；从通过该根验证的身份证书读取。
                     ColumnLayout {
                         Layout.fillWidth: true
                         Layout.topMargin: 4
@@ -928,7 +929,7 @@ Item {
                         }
 
                         Text {
-                            text: "预期服务器标识（server_id）"
+                            text: "服务器身份"
                             font.pixelSize: 15
                             color: theme.textSecondary
                             Layout.topMargin: 4
@@ -938,7 +939,7 @@ Item {
                             objectName: "remoteExpectedServerIdField"
                             Layout.fillWidth: true
                             enabled: !remote.busy
-                            placeholderText: "例如 my-server"
+                            placeholderText: "导入身份文件后自动填写，也可填写管理员提供的标识"
                             text: page.draftExpectedServerId
                             onTextEdited: {
                                 page.draftExpectedServerId = text
@@ -950,8 +951,26 @@ Item {
 
                         Text {
                             Layout.fillWidth: true
-                            text: "证书认证会校验服务器签名、可信根与服务器标识；"
-                                + "任何一项不匹配都会明确失败，不会自动降级。"
+                            text: "请向管理员获取可信根和服务器身份文件。"
+                                + "登录时会再次核对所连接服务器的身份。"
+                            font.pixelSize: 14
+                            color: theme.textSecondary
+                            wrapMode: Text.WordWrap
+                        }
+
+                        AppButton {
+                            objectName: "remoteImportIdentityButton"
+                            text: "导入服务器身份文件"
+                            iconName: "folder"
+                            enabled: !remote.busy
+                            onClicked: identityDialog.open()
+                        }
+
+                        Text {
+                            objectName: "remoteImportIdentityMessage"
+                            Layout.fillWidth: true
+                            visible: serverIdentity.message.length > 0
+                            text: serverIdentity.message
                             font.pixelSize: 14
                             color: theme.textSecondary
                             wrapMode: Text.WordWrap
@@ -1677,47 +1696,56 @@ Item {
                     // 给 string 属性就会显示成 "undefined"。默认值在这里统一
                     // 给，卡片内部不必再判空（rawArchive / restorable 的默认
                     // 值是 true，所以用 !== false 判断）。
-                    Repeater {
-                        id: snapshotRepeater
-                        objectName: "remoteSnapshotRepeater"
-                        model: remote.snapshots
+                    // 动态卡片由普通 Column 定位，外层布局只持有稳定容器。
+                    Column {
+                        id: cloudRecordColumn
+                        Layout.fillWidth: true
+                        visible: remote.snapshots.length > 0
+                        spacing: 12
 
-                        delegate: RemoteSnapshotCard {
-                            required property var modelData
-                            Layout.fillWidth: true
-                            snapshotId: String(modelData["id"] || "")
-                            nameText: String(modelData["name"] || "")
-                            sizeText: String(modelData["sizeText"] || "")
-                            createdText: String(modelData["createdText"] || "")
-                            kindText: String(modelData["kindText"] || "")
-                            kindKey: String(modelData["kind"] || "")
-                            rawArchive: modelData["rawArchive"] === true
-                            copyToLocalVisible: true
-                            copyToLocalEnabled:
-                                remote.authenticated && !remote.busy
-                            onCopyToLocalRequested:
-                                remote.copySnapshotToLocalRepository(
-                                    snapshotId)
-                            generationVisible:
-                                modelData["generationVisible"] !== false
-                            generation: Number(modelData["generation"] || 0)
-                            parentShort: String(modelData["parentShort"] || "")
-                            typeNote: String(modelData["typeNote"] || "")
-                            restoreLabel:
-                                String(modelData["restoreLabel"] || "恢复")
-                            restorable: modelData["restorable"] !== false
-                            restoreHint: String(modelData["restoreHint"] || "")
-                            busy: remote.busy
-                            onRestoreRequested: function (snapshotId, name) {
-                                page.requestRestore(
-                                    snapshotId, name,
-                                    modelData["rawArchive"] === true)
-                            }
-                            onDownloadRequested: function (snapshotId, name) {
-                                page.requestDownload(snapshotId, name)
-                            }
-                            onDeleteRequested: function (snapshotId, name) {
-                                page.requestDelete(snapshotId, name)
+                        Repeater {
+                            id: snapshotRepeater
+                            objectName: "remoteSnapshotRepeater"
+                            model: remote.snapshots
+
+                            delegate: RemoteSnapshotCard {
+                                required property var modelData
+                                width: cloudRecordColumn.width
+                                height: implicitHeight
+                                snapshotId: String(modelData["id"] || "")
+                                nameText: String(modelData["name"] || "")
+                                sizeText: String(modelData["sizeText"] || "")
+                                createdText: String(modelData["createdText"] || "")
+                                kindText: String(modelData["kindText"] || "")
+                                kindKey: String(modelData["kind"] || "")
+                                rawArchive: modelData["rawArchive"] === true
+                                copyToLocalVisible: true
+                                copyToLocalEnabled:
+                                    remote.authenticated && !remote.busy
+                                onCopyToLocalRequested:
+                                    remote.copySnapshotToLocalRepository(
+                                        snapshotId)
+                                generationVisible:
+                                    modelData["generationVisible"] !== false
+                                generation: Number(modelData["generation"] || 0)
+                                parentShort: String(modelData["parentShort"] || "")
+                                typeNote: String(modelData["typeNote"] || "")
+                                restoreLabel:
+                                    String(modelData["restoreLabel"] || "恢复")
+                                restorable: modelData["restorable"] !== false
+                                restoreHint: String(modelData["restoreHint"] || "")
+                                busy: remote.busy
+                                onRestoreRequested: function (snapshotId, name) {
+                                    page.requestRestore(
+                                        snapshotId, name,
+                                        modelData["rawArchive"] === true)
+                                }
+                                onDownloadRequested: function (snapshotId, name) {
+                                    page.requestDownload(snapshotId, name)
+                                }
+                                onDeleteRequested: function (snapshotId, name) {
+                                    page.requestDelete(snapshotId, name)
+                                }
                             }
                         }
                     }
@@ -1783,12 +1811,8 @@ Item {
                     Text {
                         objectName: "remoteUploadExplanation"
                         Layout.fillWidth: true
-                        text: "这是低层操作：把一个已经存在的 .bak 原样" +
-                              "放到云端，与上面的“远端备份”不是一回事——" +
-                              "它不参与增量链，也不会出现在链恢复里。" +
-                              "上传之后，列表里那一条是【原始归档】：" +
-                              "要取回来就用它的“恢复”" +
-                              "（下载后按本地格式独立恢复）或“下载归档”。"
+                        text: "上传已有的 .bak 文件，可从云端列表下载或单独恢复。" +
+                              "增量还原点请通过“远端备份”创建。"
                         font.pixelSize: 15
                         color: theme.textSecondary
                         wrapMode: Text.WrapAnywhere
@@ -1920,8 +1944,8 @@ Item {
                             variant: "flat"
                             iconName: "settings"
                             text: page.technicalExpanded
-                                  ? "收起技术详情"
-                                  : "技术详情"
+                                  ? "收起详情"
+                                  : "详情"
                             onClicked:
                                 page.technicalExpanded =
                                     !page.technicalExpanded
@@ -1975,8 +1999,7 @@ Item {
         }
     }
 
-    // 链恢复的目标目录：选完立刻发起恢复。用户只需要选"恢复到哪里"，
-    // 依赖链的解析与下载全部由 core 负责。
+    // 链恢复先选择目标目录，再确认归档密码。依赖链由 core 解析。
     FolderDialog {
         id: restoreDialog
         objectName: "remoteRestoreFolderDialog"
@@ -1986,10 +2009,68 @@ Item {
             if (chosen === "")
                 return
             page.draftRestorePath = chosen
-            const target = page.pendingRestoreId
+            if (page.pendingRestoreId !== "")
+                chainRestoreDialog.open()
+        }
+    }
+
+    Dialog {
+        id: chainRestoreDialog
+        objectName: "remoteChainRestoreDialog"
+        anchors.centerIn: parent
+        modal: true
+        padding: 18
+        closePolicy: Popup.CloseOnEscape
+        onClosed: {
+            chainRestorePasswordField.text = ""
             page.pendingRestoreId = ""
-            if (target !== "")
-                remote.restoreSnapshot(target, chosen)
+        }
+
+        ColumnLayout {
+            width: Math.min(430, page.width - 64)
+            spacing: 12
+            Text {
+                text: "恢复备份"
+                font.pixelSize: 20
+                font.weight: Font.DemiBold
+                color: theme.textPrimary
+            }
+            Text {
+                Layout.fillWidth: true
+                text: page.pendingRestoreName + "\n恢复到：" + page.draftRestorePath
+                color: theme.textSecondary
+                font.pixelSize: 15
+                wrapMode: Text.WrapAnywhere
+            }
+            AppTextField {
+                id: chainRestorePasswordField
+                objectName: "remoteChainRestorePasswordField"
+                Layout.fillWidth: true
+                echoMode: TextInput.Password
+                placeholderText: "归档密码（未加密的备份可留空）"
+            }
+            RowLayout {
+                Layout.fillWidth: true
+                Item { Layout.fillWidth: true }
+                AppButton {
+                    objectName: "remoteChainRestoreCancelButton"
+                    text: "取消"
+                    onClicked: chainRestoreDialog.close()
+                }
+                AppButton {
+                    objectName: "remoteChainRestoreConfirmButton"
+                    text: "恢复"
+                    variant: "primary"
+                    enabled: !remote.busy && page.pendingRestoreId !== ""
+                    onClicked: {
+                        remote.restoreSnapshot(page.pendingRestoreId,
+                                               page.draftRestorePath,
+                                               chainRestorePasswordField.text)
+                        chainRestorePasswordField.text = ""
+                        chainRestoreDialog.close()
+                    }
+                }
+            }
         }
     }
 
@@ -2461,6 +2542,21 @@ Item {
                 remote.localPathFromUrl(rootsDialog.selectedFile)
             if (chosen !== "") {
                 page.draftTrustedRoots = chosen
+                remote.setCertificateSettings(page.draftTrustedRoots,
+                                              page.draftExpectedServerId)
+            }
+        }
+    }
+
+    FileDialog {
+        id: identityDialog
+        objectName: "remoteServerIdentityDialog"
+        title: "选择管理员提供的服务器身份文件"
+        fileMode: FileDialog.OpenFile
+        onAccepted: {
+            const chosen = remote.localPathFromUrl(identityDialog.selectedFile)
+            if (serverIdentity.importCertificate(page.draftTrustedRoots, chosen)) {
+                page.draftExpectedServerId = serverIdentity.serverId
                 remote.setCertificateSettings(page.draftTrustedRoots,
                                               page.draftExpectedServerId)
             }

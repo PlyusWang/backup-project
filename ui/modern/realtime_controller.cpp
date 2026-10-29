@@ -163,9 +163,9 @@ QString SnapshotKindText(const std::string& outcome_kind) {
 
 // baseline / delta：这一份快照在依赖链里扮演什么角色。
 QString SnapshotBasisText(const std::string& outcome_kind) {
-  if (outcome_kind == "delta") return QStringLiteral("delta");
+  if (outcome_kind == "delta") return QStringLiteral("增量备份");
   if (outcome_kind == "full" || outcome_kind == "full-baseline") {
-    return QStringLiteral("baseline");
+    return QStringLiteral("完整备份");
   }
   return QStringLiteral("-");
 }
@@ -255,6 +255,8 @@ RealtimeController::RealtimeController(QString realtime_file_path,
 // 先停表、拆 notifier，再 detach 后台任务。detach 而非 waitForFinished：
 // 退出路径不阻塞，而后台任务只操作值类型与文件，不会回调进已经析构的 this。
 RealtimeController::~RealtimeController() {
+  backupproject::ClearSessionCredential(
+      "/@backup-project-session/realtime-archive");
   // 析构时先停表、再 detach：绝不留下一个还会回调进已析构对象的定时器。
   debounce_timer_.stop();
   retry_timer_.stop();
@@ -900,7 +902,10 @@ RealtimeRunResult RealtimeController::ListOnly(std::string repository_path) {
 // 打包方式的翻译。每项的字段名（fileName / createdText / ...）是 QML 契约。
 void RealtimeController::ApplySnapshots(const RealtimeRunResult& result) {
   QVariantList items;
-  for (const backupproject::RealtimeSnapshotRecord& record : result.snapshots) {
+  // 核心按创建顺序列举；页面显示最新记录在前，不改动持久化或淘汰顺序。
+  for (auto iterator = result.snapshots.rbegin();
+       iterator != result.snapshots.rend(); ++iterator) {
+    const backupproject::RealtimeSnapshotRecord& record = *iterator;
     QVariantMap item;
     item.insert(QStringLiteral("fileName"),
                 QString::fromStdString(record.file_name));
@@ -913,8 +918,8 @@ void RealtimeController::ApplySnapshots(const RealtimeRunResult& result) {
         QString::fromLatin1(backupproject::BackupStrategyKey(record.strategy)));
     item.insert(QStringLiteral("strategyText"),
                 record.strategy == backupproject::BackupStrategy::kFull
-                    ? QStringLiteral("Full")
-                    : QStringLiteral("Incremental"));
+                    ? QStringLiteral("完整备份")
+                    : QStringLiteral("增量备份"));
     item.insert(QStringLiteral("kindText"),
                 SnapshotKindText(record.outcome_kind));
     item.insert(QStringLiteral("basisText"),
@@ -1232,8 +1237,7 @@ bool RealtimeController::saveConfig(bool enabled, const QString& source_path,
     restore_watch();
     return false;
   }
-  // 加密方式与凭据路径来自界面草稿；口令内容不在这里，由运行期从
-  // 0600 文件读取。
+  // 配置只保存会话引用或高级文件路径，口令不写入配置和日志。
   if (!backupproject::ParseEncryptionMethodKey(
           draft_encryption_key_.toStdString(), &next.encryption_method)) {
     SetStatus(kError, QStringLiteral("未知的加密方式"), draft_encryption_key_);
@@ -1397,6 +1401,39 @@ QString RealtimeController::encryptionKey() const {
       backupproject::EncryptionMethodKey(config_.encryption_method));
 }
 
+bool RealtimeController::sessionPasswordUnlocked() const {
+  return backupproject::SessionCredentialAvailable(
+      "/@backup-project-session/realtime-archive");
+}
+
+bool RealtimeController::unlockArchivePassword(const QString& password,
+                                               const QString& confirmation) {
+  if (libraryBusy()) return false;
+  if (password != confirmation) {
+    SetStatus(QStringLiteral("error"), QStringLiteral("两次密码不一致"),
+              QStringLiteral("请重新输入并确认密码。"));
+    return false;
+  }
+  std::string error;
+  if (!backupproject::SetSessionCredential(
+          "/@backup-project-session/realtime-archive", password.toStdString(),
+          &error)) {
+    SetStatus(QStringLiteral("error"), QStringLiteral("密码未解锁"),
+              QString::fromStdString(error));
+    return false;
+  }
+  draft_credential_file_ =
+      QStringLiteral("/@backup-project-session/realtime-archive");
+  emit configChanged();
+  return true;
+}
+
+void RealtimeController::lockArchivePassword() {
+  backupproject::ClearSessionCredential(
+      "/@backup-project-session/realtime-archive");
+  emit configChanged();
+}
+
 bool RealtimeController::setEncryptionChoice(const QString& encryption_key,
                                              const QString& credential_file) {
   backupproject::EncryptionMethod method =
@@ -1432,7 +1469,7 @@ QString RealtimeController::cloudRepositoryIdForFile(
   std::string error;
   if (!backupproject::LoadCloudCredentialsFile(credentials_file.toStdString(),
                                                &credentials, &error)) {
-    SetStatus(QStringLiteral("error"), QStringLiteral("云端凭据文件不可用"),
+    SetStatus(QStringLiteral("error"), QStringLiteral("云端连接不可用"),
               QString::fromStdString(error));
     return QString();
   }
@@ -1497,20 +1534,16 @@ QString RealtimeController::supportedModeText() const {
 }
 
 QString RealtimeController::encryptionNote() const {
-  // 唯一来源：核心那句“无人值守加密需要什么”。GUI 不复制一份字面量。
-  if (draft_encryption_key_ == QStringLiteral("none")) {
+  if (sessionPasswordUnlocked()) {
+    return QStringLiteral("本次会话已解锁，重新打开程序后需要再次输入密码。");
+  }
+  if (draft_credential_file_.isEmpty() ||
+      backupproject::IsSessionCredentialReference(
+          draft_credential_file_.toStdString())) {
     return QStringLiteral(
-        "选择加密后，需要指定一个仅本人可读（0600）的口令文件；"
-        "程序不会把口令明文写入配置。");
+        "请输入并确认归档密码，本次会话内自动备份可直接使用。");
   }
-  if (draft_credential_file_.isEmpty()) {
-    return QString::fromStdString(
-        backupproject::UnattendedEncryptionDisabledReason(
-            backupproject::BackupTrigger::kRealtime));
-  }
-  return QStringLiteral(
-      "加密口令将在每次触发时从该文件读取；"
-      "文件不可读时这一轮备份会明确失败。");
+  return QStringLiteral("使用高级口令文件；文件不可读时将暂停加密备份。");
 }
 
 bool RealtimeController::watching() const { return watcher_.attached(); }

@@ -250,7 +250,8 @@ void PrintCliUsage(const std::string& program_name, std::ostream& output) {
          "changes since\n"
       << "    the previous snapshot and needs one to exist in the "
          "repository;\n"
-      << "    it also requires --pack mypack and --encryption none.\n"
+      << "    it requires --pack mypack; encrypted deltas authenticate their "
+         "dependency metadata.\n"
       << "  " << program_name
       << " preview <source_directory> [--include <rule>]... [--exclude "
          "<rule>]...\n"
@@ -592,11 +593,12 @@ int RunBackupCommand(const CliContext& context,
     return kCliExitSuccess;
   }
 
-  // 非增量路径：engine.Backup 拿到的已经是仓库内的完整路径，命名规则一行
-  // 都没有复制到这里 —— 复制一份就等于有了第二套命名规则。
-  BackupEngine engine;
-  if (!engine.Backup(source_directory, archive_path, filter, options,
-                     &error_message)) {
+  // 完整快照也发布可信副文件，下一次改用增量时可直接复用这份基线。
+  IncrementalOutcome outcome;
+  if (!RunManagedFullBackup(source_directory, repository, file_name,
+                            RepositoryIdentity(repository), filter, options,
+                            include_rules, exclude_rules, &outcome,
+                            &error_message)) {
     PrintError(error_message);
     return kCliExitOperationFailed;
   }
@@ -743,9 +745,15 @@ int RunRestoreCommand(const CliContext& context,
   // wants_password 的语义是"归档自己声明了 password_hint"，不是"用户想输
   // 密码"。判错的两个方向都不可接受：多问一次会让未加密归档的恢复凭空多
   // 一步；少问一次会让加密归档的恢复在 core 里失败，而用户以为流程走完了。
-  const bool wants_password =
+  bool wants_password =
       IdentifyArchiveFile(archive_path, &info, &identify_error) &&
       !info.password_hint.empty();
+  if (ClassifySnapshotFile(archive_path, nullptr) == SnapshotFileKind::kDelta) {
+    ContainerHeader payload_header;
+    if (InspectDeltaPayloadHeader(archive_path, &payload_header, nullptr)) {
+      wants_password = payload_header.encryption_method != 0;
+    }
+  }
 
   RestoreOptions options;
   std::string secret;

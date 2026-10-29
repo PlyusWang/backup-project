@@ -26,6 +26,8 @@ AbstractButton {
 
     background: Rectangle {
         radius: 7
+        border.width: control.activeFocus ? 1 : 0
+        border.color: theme.accent
         // 底色不参与颜色动画：所有随交互变化的面都拆成"固定主题色 + 只动画
         // opacity"的覆盖层。"transparent" 是 RGBA(0,0,0,0)，拿它和不透明色做
         // ColorAnimation 会逐分量插值出"半透明黑"——浅色主题下就是鼠标划过 /

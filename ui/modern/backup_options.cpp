@@ -99,19 +99,12 @@ QString BackupOptionsCatalog::validate(const QString& trigger,
     return QStringLiteral(
         "增量备份目前只支持 MyPack 打包格式，请改用 MyPack 或选择完整备份。");
   }
-  if (parsed_strategy == BackupStrategy::kIncremental &&
-      parsed_encryption != EncryptionMethod::kNone) {
-    return QStringLiteral(
-        "增量备份暂不支持加密：增量包的依赖信息没有独立认证，"
-        "请改用完整备份。");
-  }
   const bool unattended = parsed_trigger == BackupTrigger::kScheduled ||
                           parsed_trigger == BackupTrigger::kRealtime;
   if (unattended && parsed_encryption != EncryptionMethod::kNone &&
       !credential_configured) {
     return QStringLiteral(
-        "定时和实时任务要使用加密，请先选择一个仅本人可读（0600）的"
-        "口令文件。");
+        "请先输入并确认归档密码，或在高级设置中选择口令文件。");
   }
   return QStringLiteral("当前选项组合不可用。");
 }

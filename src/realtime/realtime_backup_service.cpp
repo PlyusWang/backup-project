@@ -998,9 +998,11 @@ bool RunRealtimeBackupOnce(const RealtimeConfig& config,
       return false;
     }
     snapshot_file_name = archive_path.substr(archive_path.rfind('/') + 1);
-    BackupEngine engine;
-    if (!engine.Backup(config.source_path, archive_path, filter, options,
-                       error_message)) {
+    IncrementalOutcome full_outcome;
+    if (!RunManagedFullBackup(
+            config.source_path, repository_path, snapshot_file_name,
+            repository_identity, filter, options, config.include_rules,
+            config.exclude_rules, &full_outcome, error_message)) {
       if (!credential.empty()) {
         credential.assign(credential.size(), '\0');
         credential.clear();

@@ -63,14 +63,60 @@ Item {
     // 控制器提供，页面只认下标对应的 key。
     property int draftCompressionIndex: 0
     property int draftEncryptionIndex: 0
-    // 无人值守加密的口令文件草稿。只保存路径，口令内容由核心在运行时读取。
+    // 配置草稿只保存会话引用或高级口令文件路径。
     property string draftCredentialFile: ""
     property string draftRepositoryType: schedule.repositoryType
     property string draftCloudCredentialsFile: schedule.cloudCredentialsFile
     property string draftCloudRepositoryId: schedule.cloudRepositoryId
 
+    property bool savingConfig: false
+    property bool passwordFileExpanded: false
+    property bool cloudFileExpanded: false
+
+    function clearPasswordInputs() {
+        if (archivePasswordField)
+            archivePasswordField.text = ""
+        if (archivePasswordConfirmationField)
+            archivePasswordConfirmationField.text = ""
+    }
+
+    function useLoggedInConnection() {
+        if (!remote.sharedSessionReady)
+            return
+        page.draftCloudCredentialsFile = remote.sharedSessionReference
+        page.draftCloudRepositoryId = remote.sharedSessionRepositoryId
+    }
+
+    function prepareCredentials() {
+        if (page.draftRepositoryType === "cloud"
+                && page.draftCloudCredentialsFile.length === 0)
+            page.useLoggedInConnection()
+        if (page.encryptionKeyValue === "none") {
+            page.clearPasswordInputs()
+            page.draftCredentialFile = ""
+        } else if (archivePasswordField.text.length > 0
+                   || archivePasswordConfirmationField.text.length > 0) {
+            if (!schedule.unlockArchivePassword(
+                    archivePasswordField.text,
+                    archivePasswordConfirmationField.text))
+                return false
+            page.draftCredentialFile = schedule.credentialFile
+            page.clearPasswordInputs()
+        }
+        return true
+    }
+
+    onVisibleChanged: {
+        if (!visible)
+            page.clearPasswordInputs()
+    }
+    Component.onDestruction: page.clearPasswordInputs()
+
     // 高级设置默认收起：一打开页面先看到日常要用的那几项。
     property bool advancedExpanded: false
+    property bool historyExpanded: false
+    readonly property var visibleHistory: page.historyExpanded
+        ? schedule.history : schedule.history.slice(0, 3)
 
     // key 是页面与核心之间的协议，label 由控制器给出（见下面几行）：这样
     // 界面上不会一处写 Full、一处写完整快照。下标落空时统一退到 0，用户看到
@@ -96,7 +142,8 @@ Item {
         page.packKeys[page.draftPackIndex],
         page.compressionKeys[page.draftCompressionIndex],
         page.encryptionKeyValue,
-        page.draftCredentialFile.length > 0)
+        page.draftCredentialFile.length > 0
+            || archivePasswordField.text.length > 0)
 
     // 频率单位来自控制器（背后是共享核心的分钟边界），界面不自己定义单位表。
     // 单位表来自控制器，背后是共享核心的分钟边界（分钟 / 小时 / 天）。页面
@@ -132,6 +179,10 @@ Item {
         page.draftRepositoryType = schedule.repositoryType
         page.draftCloudCredentialsFile = schedule.cloudCredentialsFile
         page.draftCloudRepositoryId = schedule.cloudRepositoryId
+        page.passwordFileExpanded = page.draftCredentialFile.length > 0
+            && page.draftCredentialFile.indexOf("/@backup-project-session/") !== 0
+        page.cloudFileExpanded = page.draftCloudCredentialsFile.length > 0
+            && page.draftCloudCredentialsFile !== remote.sharedSessionReference
         // 落盘配置里的规则读进共享编辑器（校验仍然走共享 builder）。读不懂时
         // 编辑器会显示共享核心给出的原因，这里不吞掉它。
         ruleEditor.loadRules(schedule.includeRules, schedule.excludeRules)
@@ -152,7 +203,10 @@ Item {
         schedule.cloudRepositoryId,
         schedule.includeRules.join(","), schedule.excludeRules.join(",")
     ].join("|")
-    onSavedSignatureChanged: syncFromController()
+    onSavedSignatureChanged: {
+        if (!page.savingConfig)
+            syncFromController()
+    }
 
     Component.onCompleted: syncFromController()
 
@@ -296,8 +350,18 @@ Item {
                         spacing: 6
 
                         Text {
-                            text: "0600 云端凭据文件（host/port/username/"
-                                + "password/pin 或 server_id；密码不进配置）"
+                            objectName: "scheduleCloudSessionStatus"
+                            Layout.fillWidth: true
+                            text: page.draftCloudCredentialsFile.length > 0
+                                  && page.draftCloudCredentialsFile !== remote.sharedSessionReference
+                                  ? "已选择高级凭据文件，将在执行时验证连接。"
+                                  : !remote.sharedSessionReady
+                                  ? "尚未登录云端，请先在备份管理中登录。重启后需要重新登录。"
+                                  : page.draftCloudRepositoryId.length > 0
+                                    && page.draftCloudCredentialsFile === remote.sharedSessionReference
+                                    && page.draftCloudRepositoryId !== remote.sharedSessionRepositoryId
+                                    ? "当前登录连接已更换，请确认后重新选择。"
+                                    : "已登录云端，本次会话可直接使用。"
                             font.pixelSize: 14
                             color: theme.textSecondary
                             wrapMode: Text.WordWrap
@@ -305,37 +369,64 @@ Item {
 
                         RowLayout {
                             Layout.fillWidth: true
-                            spacing: 8
-
-                            AppTextField {
-                                objectName: "scheduleCloudCredentialsField"
-                                Layout.fillWidth: true
-                                text: page.draftCloudCredentialsFile
-                                onTextEdited: page.draftCloudCredentialsFile = text
-                                placeholderText: "绝对路径，例如 /home/me/cloud.env"
-                            }
-
                             AppButton {
-                                text: "生成仓库标识"
-                                enabled: page.draftCloudCredentialsFile.length > 0
-                                onClicked: {
-                                    const id = schedule.cloudRepositoryIdForFile(
-                                        page.draftCloudCredentialsFile)
-                                    if (id.length > 0)
-                                        page.draftCloudRepositoryId = id
-                                }
+                                objectName: "scheduleUseCloudSessionButton"
+                                text: "使用已登录连接"
+                                enabled: remote.sharedSessionReady && !schedule.libraryBusy
+                                onClicked: page.useLoggedInConnection()
+                            }
+                            AppButton {
+                                objectName: "scheduleCloudFileToggle"
+                                text: page.cloudFileExpanded ? "收起高级设置" : "高级：凭据文件"
+                                variant: "flat"
+                                onClicked: page.cloudFileExpanded = !page.cloudFileExpanded
                             }
                         }
 
-                        Text {
-                            objectName: "scheduleCloudRepositoryId"
+                        ColumnLayout {
                             Layout.fillWidth: true
-                            text: page.draftCloudRepositoryId.length > 0
-                                  ? "仓库标识：" + page.draftCloudRepositoryId
-                                  : "尚未生成仓库标识"
-                            font.pixelSize: 13
-                            color: theme.textSecondary
-                            wrapMode: Text.WrapAnywhere
+                            visible: page.cloudFileExpanded
+                            spacing: 6
+                            Text {
+                                text: "云端凭据文件（仅本人可读）"
+                                color: theme.textSecondary
+                                font.pixelSize: 14
+                            }
+                            RowLayout {
+                                Layout.fillWidth: true
+                                spacing: 8
+                                AppTextField {
+                                    objectName: "scheduleCloudCredentialsField"
+                                    Layout.fillWidth: true
+                                    text: page.draftCloudCredentialsFile === remote.sharedSessionReference
+                                          ? "" : page.draftCloudCredentialsFile
+                                    onTextEdited: {
+                                        page.draftCloudCredentialsFile = text
+                                        page.draftCloudRepositoryId = ""
+                                    }
+                                    placeholderText: "选择云端凭据文件的绝对路径"
+                                }
+                                AppButton {
+                                    text: "验证连接设置"
+                                    enabled: page.draftCloudCredentialsFile.length > 0
+                                    onClicked: {
+                                        const id = schedule.cloudRepositoryIdForFile(
+                                            page.draftCloudCredentialsFile)
+                                        if (id.length > 0)
+                                            page.draftCloudRepositoryId = id
+                                    }
+                                }
+                            }
+                            Text {
+                                objectName: "scheduleCloudRepositoryId"
+                                Layout.fillWidth: true
+                                text: page.draftCloudRepositoryId.length > 0
+                                      ? "仓库标识：" + page.draftCloudRepositoryId
+                                      : "尚未验证连接设置"
+                                font.pixelSize: 13
+                                color: theme.textSecondary
+                                wrapMode: Text.WrapAnywhere
+                            }
                         }
                     }
 
@@ -533,35 +624,49 @@ Item {
                             // 先把加密选择交给控制器草稿（只改内存），
                             // 再由唯一的保存入口整份提交。任何一步拒绝都不写盘。
                             onClicked: {
-                                let targetId = page.draftCloudRepositoryId
-                                if (page.draftRepositoryType === "cloud"
-                                        && targetId.length === 0
-                                        && page.draftCloudCredentialsFile.length > 0) {
-                                    targetId = schedule.cloudRepositoryIdForFile(
-                                        page.draftCloudCredentialsFile)
-                                    page.draftCloudRepositoryId = targetId
+                                page.savingConfig = true
+                                try {
+                                    if (!page.prepareCredentials())
+                                        return
+                                    let targetId = page.draftCloudRepositoryId
+                                    if (page.draftRepositoryType === "cloud"
+                                            && targetId.length === 0
+                                            && page.draftCloudCredentialsFile.length > 0) {
+                                        targetId = schedule.cloudRepositoryIdForFile(
+                                            page.draftCloudCredentialsFile)
+                                        page.draftCloudRepositoryId = targetId
+                                    }
+                                    if (!schedule.setRepositoryTarget(
+                                            page.draftRepositoryType,
+                                            page.draftCloudCredentialsFile,
+                                            targetId))
+                                        return
+                                    if (!schedule.setEncryptionChoice(
+                                            page.encryptionKeyValue,
+                                            page.draftCredentialFile))
+                                        return
+                                    const saved = schedule.saveConfigFromFrequencyText(
+                                        page.draftEnabled,
+                                        page.draftSource,
+                                        page.draftFrequencyValue,
+                                        page.draftFrequencyUnit,
+                                        page.draftRetain,
+                                        page.packKeys[page.draftPackIndex],
+                                        page.compressionKeys[
+                                            page.draftCompressionIndex],
+                                        ruleEditor.includeRuleTexts,
+                                        ruleEditor.excludeRuleTexts,
+                                        page.strategyKeys[page.draftStrategyIndex])
+                                    if (saved) {
+                                        if (page.encryptionKeyValue === "none"
+                                                || page.draftCredentialFile.indexOf(
+                                                    "/@backup-project-session/") !== 0)
+                                            schedule.lockArchivePassword()
+                                        page.syncFromController()
+                                    }
+                                } finally {
+                                    page.savingConfig = false
                                 }
-                                if (!schedule.setRepositoryTarget(
-                                        page.draftRepositoryType,
-                                        page.draftCloudCredentialsFile,
-                                        targetId))
-                                    return
-                                if (!schedule.setEncryptionChoice(
-                                        page.encryptionKeyValue,
-                                        page.draftCredentialFile))
-                                    return
-                                schedule.saveConfigFromFrequencyText(
-                                    page.draftEnabled,
-                                    page.draftSource,
-                                    page.draftFrequencyValue,
-                                    page.draftFrequencyUnit,
-                                    page.draftRetain,
-                                    page.packKeys[page.draftPackIndex],
-                                    page.compressionKeys[
-                                        page.draftCompressionIndex],
-                                    ruleEditor.includeRuleTexts,
-                                    ruleEditor.excludeRuleTexts,
-                                    page.strategyKeys[page.draftStrategyIndex])
                             }
                         }
 
@@ -737,28 +842,58 @@ Item {
 
                             ColumnLayout {
                                 Layout.fillWidth: true
-                                spacing: 4
+                                spacing: 8
                                 visible: page.encryptionKeyValue !== "none"
 
+                                AppTextField {
+                                    id: archivePasswordField
+                                    objectName: "scheduleArchivePasswordField"
+                                    Layout.fillWidth: true
+                                    enabled: !schedule.libraryBusy
+                                    echoMode: TextInput.Password
+                                    placeholderText: schedule.sessionPasswordUnlocked
+                                                     ? "输入新归档密码（留空沿用已解锁密码）"
+                                                     : "归档密码"
+                                }
+
+                                AppTextField {
+                                    id: archivePasswordConfirmationField
+                                    objectName: "scheduleArchivePasswordConfirmationField"
+                                    Layout.fillWidth: true
+                                    enabled: !schedule.libraryBusy
+                                    echoMode: TextInput.Password
+                                    placeholderText: "再次输入归档密码"
+                                }
+
                                 Text {
-                                    text: "口令文件（权限 0600）"
-                                    font.pixelSize: 16
+                                    Layout.fillWidth: true
+                                    text: "保存后在本次会话内解锁；重启程序后需要重新输入密码。"
                                     color: theme.textSecondary
+                                    font.pixelSize: 14
+                                    wrapMode: Text.WordWrap
+                                }
+
+                                AppButton {
+                                    objectName: "schedulePasswordFileToggle"
+                                    text: page.passwordFileExpanded ? "收起高级设置" : "高级：口令文件"
+                                    variant: "flat"
+                                    onClicked: page.passwordFileExpanded = !page.passwordFileExpanded
                                 }
 
                                 RowLayout {
                                     Layout.fillWidth: true
                                     spacing: 8
+                                    visible: page.passwordFileExpanded
 
                                     AppTextField {
                                         objectName: "scheduleCredentialField"
                                         Layout.fillWidth: true
                                         enabled: !schedule.libraryBusy
-                                        placeholderText:
-                                            "选择仅本人可读的口令文件"
-                                        text: page.draftCredentialFile
-                                        onTextEdited:
-                                            page.draftCredentialFile = text
+                                        placeholderText: "选择仅本人可读的口令文件"
+                                        text: page.draftCredentialFile.indexOf(
+                                                  "/@backup-project-session/") === 0
+                                              ? "" : page.draftCredentialFile
+                                        onTextEdited: page.draftCredentialFile = text
                                     }
 
                                     AppButton {
@@ -904,11 +1039,24 @@ Item {
                     anchors.fill: parent
                     spacing: 6
 
-                    Text {
-                        text: "运行历史"
-                        font.pixelSize: 16
-                        font.weight: Font.DemiBold
-                        color: theme.textSecondary
+                    RowLayout {
+                        Layout.fillWidth: true
+                        Text {
+                            text: "运行历史"
+                            font.pixelSize: 16
+                            font.weight: Font.DemiBold
+                            color: theme.textSecondary
+                        }
+                        Item { Layout.fillWidth: true }
+                        AppButton {
+                            objectName: "scheduleHistoryToggle"
+                            visible: schedule.history.length > 3
+                            text: page.historyExpanded ? "收起"
+                                : "查看全部（" + schedule.history.length + "）"
+                            variant: "flat"
+                            onClicked: page.historyExpanded =
+                                !page.historyExpanded
+                        }
                     }
 
                     Text {
@@ -921,9 +1069,8 @@ Item {
 
                     Repeater {
                         objectName: "scheduleHistoryList"
-                        // delegate 读的是 ScheduleController 保证存在的字段；
-                        // 历史条目只增不改，页面不做任何排序或裁剪。
-                        model: schedule.history
+                        // 控制器按最新优先提供历史，折叠只影响这一屏的显示数量。
+                        model: page.visibleHistory
                         delegate: ColumnLayout {
                             required property var modelData
                             Layout.fillWidth: true
@@ -933,7 +1080,7 @@ Item {
                                 // 历史条目拆两行：第一行是时间与结果，第二行
                                 // 是变化量、归档名和诊断信息（可能为空）。
                                 text: modelData["timeText"]
-                                      + "  ·  " + modelData["resultKey"]
+                                      + "  ·  " + modelData["resultText"]
                                 font.pixelSize: 15
                                 color: theme.textPrimary
                             }

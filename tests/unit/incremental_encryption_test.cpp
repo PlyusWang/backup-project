@@ -1,0 +1,344 @@
+// incremental_encryption_test.cpp
+//
+// 完整基线与真实 delta 的加密闭环：兼容旧未加密归档、独立进程恢复、
+// 错误密码、外层元数据认证、密码变更和缺失父快照。
+
+#include <sys/stat.h>
+#include <sys/wait.h>
+#include <unistd.h>
+
+#include <cstdint>
+#include <cstdio>
+#include <iostream>
+#include <string>
+#include <vector>
+
+#include "backup_catalog.h"
+#include "crypto.h"
+#include "incremental_backup.h"
+#include "incremental_delta.h"
+#include "incremental_restore.h"
+#include "snapshot_bundle.h"
+#include "source_digest.h"
+#include "test_support.h"
+
+namespace bp = backupproject;
+
+namespace {
+
+std::string BinaryFixture(std::size_t size) {
+  std::string bytes(size, '\0');
+  std::uint32_t state = 0x582ab7u;
+  for (char& byte : bytes) {
+    state = state * 1664525u + 1013904223u;
+    byte = static_cast<char>(state >> 24);
+  }
+  return bytes;
+}
+
+bool SameContents(const std::string& source, const std::string& destination) {
+  for (const std::string name :
+       {"bulk.bin", "small.txt", "中文.txt", "empty"}) {
+    std::string actual;
+    std::string expected;
+    if (!bp::ContentDigestOfFile(source + "/" + name, &expected, nullptr) ||
+        !bp::ContentDigestOfFile(destination + "/" + name, &actual, nullptr) ||
+        actual != expected)
+      return false;
+  }
+  return !test_support::Exists(destination + "/deleted.txt");
+}
+
+bool RestoreInNewProcess(const std::string& repository, const std::string& name,
+                         const std::string& destination,
+                         const std::string& password) {
+  int secret_pipe[2];
+  if (::pipe(secret_pipe) != 0) return false;
+  const pid_t child = ::fork();
+  if (child == 0) {
+    ::close(secret_pipe[1]);
+    if (::dup2(secret_pipe[0], STDIN_FILENO) < 0) ::_exit(120);
+    ::close(secret_pipe[0]);
+    ::execl("/proc/self/exe", "incremental_encryption_test", "--restore",
+            repository.c_str(), name.c_str(), destination.c_str(),
+            static_cast<char*>(nullptr));
+    ::_exit(121);
+  }
+  ::close(secret_pipe[0]);
+  if (child < 0) {
+    ::close(secret_pipe[1]);
+    return false;
+  }
+  const std::string secret_line = password + "\n";
+  const bool sent =
+      ::write(secret_pipe[1], secret_line.data(), secret_line.size()) ==
+      static_cast<ssize_t>(secret_line.size());
+  ::close(secret_pipe[1]);
+  int status = 0;
+  return ::waitpid(child, &status, 0) == child && sent && WIFEXITED(status) &&
+         WEXITSTATUS(status) == 0;
+}
+
+bool RunIncremental(const std::string& source, const std::string& repository,
+                    const std::string& name, const bp::BackupOptions& options,
+                    bp::IncrementalOutcome* outcome, std::string* error,
+                    const bp::ArchiveProgressCallback& progress = {}) {
+  return bp::RunIncrementalBackup(
+      source, repository, name, bp::RepositoryIdentity(repository),
+      bp::Filter(), options, {}, {}, "", outcome, error, progress);
+}
+
+// 仅修改本测试刚生成的合成归档；重算公开摘要后认证仍必须拒绝元数据改变。
+bool ChangeFixtureEnvelope(const std::string& path) {
+  bp::DeltaEnvelope envelope;
+  std::string bytes;
+  if (!bp::ReadDeltaEnvelope(path, &envelope, nullptr) ||
+      !test_support::ReadFile(path, &bytes))
+    return false;
+  const std::string original = bp::SerializeDeltaEnvelope(envelope);
+  envelope.created_unix_seconds += 1;
+  envelope.snapshot_id = bp::ComputeDeltaSnapshotId(envelope);
+  const std::string changed = bp::SerializeDeltaEnvelope(envelope);
+  if (original.size() != changed.size()) return false;
+  bytes.replace(bp::kDeltaFixedHeaderSize, original.size(), changed);
+  return test_support::WriteFile(path, bytes, 0600);
+}
+
+void TestRoundTrip(bp::EncryptionMethod encryption, const std::string& label) {
+  test_support::Section("INC-ENC " + label);
+  const std::string work =
+      test_support::FreshDir("incremental-encryption-" + label);
+  const std::string source = work + "/src";
+  const std::string repository = work + "/repo";
+  test_support::Check(test_support::Mkdir(source, 0755) &&
+                          test_support::Mkdir(repository, 0755),
+                      label + " isolated directories");
+  test_support::Check(
+      test_support::WriteFile(source + "/bulk.bin", BinaryFixture(1u << 20),
+                              0644) &&
+          test_support::WriteFile(source + "/small.txt", "before", 0644) &&
+          test_support::WriteFile(source + "/deleted.txt", "remove me", 0644) &&
+          test_support::WriteFile(source + "/empty", "", 0644),
+      label + " synthetic binary, empty and small fixtures");
+  std::string error;
+  std::string random_bytes;
+  if (!bp::crypto::RandomBytes(96, &random_bytes, &error)) {
+    test_support::Check(false, label + " runtime secret generation", error);
+    return;
+  }
+  const std::string first_password = bp::crypto::ToHex(
+      reinterpret_cast<const unsigned char*>(random_bytes.data()), 32);
+  const std::string second_password = bp::crypto::ToHex(
+      reinterpret_cast<const unsigned char*>(random_bytes.data() + 32), 32);
+  const std::string wrong_password = bp::crypto::ToHex(
+      reinterpret_cast<const unsigned char*>(random_bytes.data() + 64), 32);
+  bp::BackupOptions options;
+  options.encryption_method = encryption;
+  if (encryption != bp::EncryptionMethod::kNone)
+    options.password = first_password;
+  bp::IncrementalOutcome outcome;
+  test_support::Check(
+      bp::RunManagedFullBackup(source, repository, "base.bak",
+                               bp::RepositoryIdentity(repository), bp::Filter(),
+                               options, {}, {}, &outcome, &error),
+      label + " full backup creates a reusable baseline", error);
+  bp::SnapshotIdentity identity;
+  test_support::Check(
+      bp::LoadVerifiedSnapshotIdentity(repository, "base.bak", &identity,
+                                       nullptr, &error) &&
+          identity.sidecars_verified,
+      label + " full manifest and identity are bound to actual bytes", error);
+
+  test_support::WriteFile(source + "/small.txt", "after: a small edit", 0644);
+  test_support::WriteFile(source + "/中文.txt", "new file in Chinese path",
+                          0644);
+  ::unlink((source + "/deleted.txt").c_str());
+  std::vector<bp::ArchiveProgress> progress;
+  test_support::Check(
+      RunIncremental(source, repository, "delta.bak", options, &outcome, &error,
+                     [&progress](const bp::ArchiveProgress& value) {
+                       progress.push_back(value);
+                     }) &&
+          outcome.kind == bp::IncrementalOutcome::Kind::kDelta,
+      label + " full then small edit creates an actual delta", error);
+  bool writing_start = false;
+  bool writing_end = false;
+  for (const auto& value : progress) {
+    if (value.phase != "writing" || value.bytes_total == 0) continue;
+    writing_start = writing_start || value.bytes_done == 0;
+    writing_end = writing_end || value.bytes_done == value.bytes_total;
+  }
+  test_support::Check(writing_start && writing_end,
+                      label + " delta forwards actual payload byte progress");
+  struct stat full_info;
+  struct stat delta_info;
+  test_support::Check(
+      ::stat((repository + "/base.bak").c_str(), &full_info) == 0 &&
+          ::stat((repository + "/delta.bak").c_str(), &delta_info) == 0 &&
+          delta_info.st_size < full_info.st_size / 8,
+      label + " physical delta excludes unchanged 1 MiB payload");
+  bp::DeltaEnvelope envelope;
+  test_support::Check(
+      bp::ReadDeltaEnvelope(repository + "/delta.bak", &envelope, &error) &&
+          envelope.format_version ==
+              (encryption == bp::EncryptionMethod::kNone ? 1u : 2u),
+      label + " format version matches authentication requirements", error);
+  test_support::Check(bp::VerifyDeltaAuthentication(repository + "/delta.bak",
+                                                    options.password, &error),
+                      label + " envelope authentication succeeds", error);
+  const std::string destination = work + "/restored";
+  test_support::Check(
+      RestoreInNewProcess(repository, "delta.bak", destination,
+                          options.password) &&
+          SameContents(source, destination),
+      label +
+          " fresh process restores added/changed/deleted files with SHA-256");
+  std::vector<bp::BackupRecord> listed;
+  bp::BackupCatalog catalog;
+  bool truthful = false;
+  if (catalog.List(repository, &listed, &error)) {
+    for (const auto& record : listed) {
+      if (record.file_name == "delta.bak") {
+        truthful = record.incremental_delta && record.recognized_archive &&
+                   record.encryption_method == encryption &&
+                   record.password_required ==
+                       (encryption != bp::EncryptionMethod::kNone);
+      }
+    }
+  }
+  test_support::Check(truthful,
+                      label + " catalog reports true type and encryption");
+  test_support::Check(
+      RunIncremental(source, repository, "unchanged.bak", options, &outcome,
+                     &error) &&
+          outcome.kind == bp::IncrementalOutcome::Kind::kNoChanges &&
+          !test_support::Exists(repository + "/unchanged.bak"),
+      label + " unchanged content produces no new snapshot", error);
+
+  if (encryption == bp::EncryptionMethod::kNone) {
+    std::string existing;
+    std::string after_attempt;
+    test_support::ReadFile(repository + "/delta.bak", &existing);
+    test_support::WriteFile(source + "/small.txt", "later fixture content",
+                            0644);
+    test_support::Check(
+        !RunIncremental(source, repository, "delta.bak", options, &outcome,
+                        &error) &&
+            test_support::ReadFile(repository + "/delta.bak", &after_attempt) &&
+            after_attempt == existing,
+        label + " publishing an existing delta name preserves the original",
+        error);
+  }
+
+  if (encryption != bp::EncryptionMethod::kNone) {
+    const std::string downloaded = work + "/downloaded";
+    test_support::Mkdir(downloaded, 0700);
+    bp::net::SnapshotBundleInfo bundle;
+    const bool bundled =
+        bp::net::BuildSnapshotBundle(repository, "base.bak",
+                                     work + "/base.bundle", &bundle, &error) &&
+        bp::net::BuildSnapshotBundle(repository, "delta.bak",
+                                     work + "/delta.bundle", &bundle, &error);
+    std::string orphan_identity;
+    test_support::ReadFile(repository + "/delta.bak.identity",
+                           &orphan_identity);
+    const bool extracted =
+        bundled &&
+        bp::net::ExtractSnapshotBundle(work + "/base.bundle", downloaded,
+                                       &bundle, &error) &&
+        test_support::WriteFile(downloaded + "/delta.bak.identity",
+                                orphan_identity, 0600) &&
+        bp::net::ExtractSnapshotBundle(work + "/delta.bundle", downloaded,
+                                       &bundle, &error);
+    test_support::Check(
+        extracted &&
+            RestoreInNewProcess(downloaded, "delta.bak",
+                                work + "/bundle-restored", options.password) &&
+            SameContents(source, work + "/bundle-restored"),
+        label +
+            " BPSNAP transports v2/v3 material and recovers v3 orphan identity",
+        error);
+    bp::RestoreOptions wrong;
+    wrong.password = wrong_password;
+    test_support::Check(!bp::RestoreSnapshotChain(repository, "delta.bak",
+                                                  work + "/wrong-password",
+                                                  wrong, nullptr, &error) &&
+                            !test_support::Exists(work + "/wrong-password"),
+                        label + " wrong password publishes no destination",
+                        error);
+    options.password = second_password;
+    test_support::Check(
+        RunIncremental(source, repository, "changed-password.bak", options,
+                       &outcome, &error) &&
+            outcome.kind == bp::IncrementalOutcome::Kind::kFullBaseline &&
+            !outcome.baseline_reason.empty(),
+        label +
+            " changed password starts full baseline even without source "
+            "changes",
+        error);
+    test_support::Check(
+        RestoreInNewProcess(repository, "changed-password.bak",
+                            work + "/new-password", options.password) &&
+            SameContents(source, work + "/new-password"),
+        label + " new password restores without the old password");
+    std::string identity_bytes;
+    const std::string identity_path =
+        repository + "/changed-password.bak.identity";
+    test_support::ReadFile(identity_path, &identity_bytes);
+    const std::size_t tag = identity_bytes.find("metadata_hmac=");
+    if (tag != std::string::npos) {
+      const std::size_t value = tag + std::string("metadata_hmac=").size();
+      identity_bytes[value] = identity_bytes[value] == 'a' ? 'b' : 'a';
+    }
+    test_support::Check(
+        tag != std::string::npos &&
+            test_support::WriteFile(identity_path, identity_bytes, 0600) &&
+            bp::RunIncrementalBackup(
+                source, repository, "metadata-rebuilt.bak",
+                bp::RepositoryIdentity(repository), bp::Filter(), options, {},
+                {}, "changed-password.bak", &outcome, &error) &&
+            outcome.kind == bp::IncrementalOutcome::Kind::kFullBaseline,
+        label + " untrusted baseline metadata cannot cause an unchanged skip",
+        error);
+    options.password = first_password;
+    std::string original_delta;
+    test_support::ReadFile(repository + "/delta.bak", &original_delta);
+    test_support::Check(
+        ChangeFixtureEnvelope(repository + "/delta.bak") &&
+            !bp::VerifyDeltaAuthentication(repository + "/delta.bak",
+                                           options.password, &error),
+        label + " metadata change fails MAC even after public ID recomputation",
+        error);
+    test_support::WriteFile(repository + "/delta.bak", original_delta, 0600);
+  }
+  test_support::Check(::rename((repository + "/base.bak").c_str(),
+                               (repository + "/base.off").c_str()) == 0,
+                      label + " isolate missing-parent case");
+  bp::RestoreOptions restore;
+  restore.password = options.password;
+  test_support::Check(
+      !bp::RestoreSnapshotChain(repository, "delta.bak",
+                                work + "/missing-parent", restore, nullptr,
+                                &error) &&
+          !test_support::Exists(work + "/missing-parent"),
+      label + " missing parent refuses restore without publishing output",
+      error);
+}
+
+}  // namespace
+
+int main(int argc, char** argv) {
+  if (argc == 5 && std::string(argv[1]) == "--restore") {
+    bp::RestoreOptions options;
+    if (!std::getline(std::cin, options.password)) return 2;
+    std::string error;
+    const bool restored = bp::RestoreSnapshotChain(argv[2], argv[3], argv[4],
+                                                   options, nullptr, &error);
+    if (!restored) std::fprintf(stderr, "restore failed: %s\n", error.c_str());
+    return restored ? 0 : 1;
+  }
+  TestRoundTrip(bp::EncryptionMethod::kNone, "none");
+  TestRoundTrip(bp::EncryptionMethod::kAes256CtrHmacSha256, "aes");
+  TestRoundTrip(bp::EncryptionMethod::kDesCbcHmacSha256, "des");
+  return test_support::Finish("incremental_encryption_test");
+}

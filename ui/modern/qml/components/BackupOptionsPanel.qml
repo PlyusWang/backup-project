@@ -92,14 +92,13 @@ Item {
         + panel.compressionLabels[panel.compressionIndex] + " · "
         + panel.encryptionLabels[panel.encryptionIndex]
 
-    // 增量策略的说明。刻意把两件容易被误解的事说清楚：
-    // 第一次会建完整基线，以及增量 v1 只支持 MyPack。
+    // 展示实际支持的策略；组合是否可用仍由共享核心校验。
     readonly property string strategyHelper: {
         if (panel.strategyKey !== "incremental")
             return "每次备份都生成一份完整、自包含的归档。"
         return "第一次（或基线不可信时）建立完整基线，之后只写变化部分；"
                + "没有变化就不创建新快照。恢复时自动按依赖链还原。"
-               + "增量目前只支持 MyPack 打包方式，且不支持加密。"
+               + "增量备份使用 MyPack 打包方式，可选择密码加密。"
     }
 
     // 选了增量但打包方式不是 MyPack：界面直接说明，而不是等核心拒绝。
@@ -107,31 +106,11 @@ Item {
     readonly property bool strategyPackCombinationAllowed:
         panel.strategyKey !== "incremental" || panel.packKey === "mypack"
 
-    // 增量 v1 不支持加密：外层信封（父绑定 + 删除列表）不受内层 HMAC 覆盖。
-    // 界面上加密选项在增量下直接置灰，说明写在 strategyHelper 与这一行提示里。
-    readonly property bool strategyEncryptionCombinationAllowed:
-        panel.strategyKey !== "incremental" || panel.encryptionKey === "none"
+    readonly property string combinationError: backupOptions.validate(
+        "manual", panel.strategyKey, panel.packKey, panel.compressionKey,
+        panel.encryptionKey, true)
     readonly property bool strategyCombinationAllowed:
-        panel.strategyPackCombinationAllowed
-            && panel.strategyEncryptionCombinationAllowed
-    readonly property string strategyEncryptionHelper:
-        panel.strategyKey === "incremental"
-            ? "增量 v1 不支持加密，加密方式已固定为 none。"
-            : ""
-
-    // 从加密切到增量时**不静默**改掉用户的选择：把加密复位成 none，并且
-    // 让上面那句提示出现。切回 full 时提示随之消失（加密并不自动恢复——
-    // 那会把"我什么时候选的加密"变成一个谜）。
-    property bool strategyResetEncryptionNotice: false
-    onStrategyKeyChanged: {
-        if (panel.strategyKey === "incremental"
-            && panel.encryptionKey !== "none") {
-            panel.encryptionKey = "none"
-            panel.strategyResetEncryptionNotice = true
-        } else if (panel.strategyKey !== "incremental") {
-            panel.strategyResetEncryptionNotice = false
-        }
-    }
+        panel.combinationError.length === 0
 
     // 每个算法的说明只在它被选中时显示。刻意不写"最快""压缩率最高"这类
     // 没有前提条件的断言：Fast USTAR 的差别在 I/O 实现，不是对所有文件都更快。
@@ -180,7 +159,6 @@ Item {
 
     // 清的是输入框本身 —— password / confirmPassword 是它 text 的
     // readonly 绑定，所以不存在"清了一处、另一处还留着"的可能。
-    // 所以不存在"清了一处、另一处还留着"的可能。
     //
     // 顺带把"已请求过校验"复位：清空是成功提交之后的动作，不是用户输错了，
     // 复位后那行红色提示立刻消失，而不是跳成"密码不能为空"。
@@ -190,9 +168,13 @@ Item {
         panel.passwordValidationRequested = false
     }
 
+    onVisibleChanged: {
+        if (!visible)
+            panel.clearPasswords()
+    }
+
     // 用户按下"开始备份"时才请求校验。单独给一个函数而不是让
     // BackupPage 直接写属性，是为了让"什么算一次提交尝试"只有面板自己知道。
-    // 是为了让"什么算一次提交尝试"只有面板自己知道。
     function requestPasswordValidation() {
         panel.passwordValidationRequested = true
     }
@@ -391,27 +373,19 @@ Item {
                         Layout.maximumWidth: 420
                         model: panel.encryptionLabels
                         currentIndex: panel.encryptionIndex
-                        // 增量 v1 不支持加密：选项直接置灰，
-                        // 而不是让用户选完才被拒绝。
                         enabled: !controller.busy
-                            && panel.strategyKey !== "incremental"
                         onActivated: panel.encryptionKey =
                             panel.encryptionKeys[currentIndex]
                     }
 
-                    // 增量下的那一句原因（含"刚从加密切过来"的提示）。它不是
-                    // 安全断言，只是把核心的拒绝理由提前说出来。
+                    // 只展示共享核心返回的组合错误，不改变用户选中的加密方式。
                     Text {
                         objectName: "incrementalEncryptionNotice"
                         Layout.fillWidth: true
-                        visible: panel.strategyKey === "incremental"
-                        text: panel.strategyResetEncryptionNotice
-                              ? "增量 v1 不支持加密，加密方式已复位为 none。"
-                              : panel.strategyEncryptionHelper
+                        visible: panel.combinationError.length > 0
+                        text: panel.combinationError
                         font.pixelSize: 15
-                        color: panel.strategyEncryptionCombinationAllowed
-                            ? theme.textSecondary
-                            : theme.error
+                        color: theme.error
                         wrapMode: Text.WordWrap
                     }
 

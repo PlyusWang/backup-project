@@ -91,7 +91,7 @@ struct ScheduleConfig {
   PackMethod pack_method = PackMethod::kMyPack;
   CompressionMethod compression_method = CompressionMethod::kNone;
   EncryptionMethod encryption_method = EncryptionMethod::kNone;
-  // 无人值守加密的唯一凭据来源：一个仅本人可读（0600）的口令文件。
+  // 无人值守加密的会话引用，或仅本人可读（0600）的高级口令文件。
   // 空串 = 没有配置；此时 encryption_method 必须是 kNone，否则校验拒绝。
   // 口令内容只在本进程运行期读取，绝不写进 schedule.json / 日志 / history。
   std::string encryption_password_file;

@@ -29,7 +29,18 @@ struct CloudCredentials {
   std::string server_key_pin;
   std::string trusted_roots_file;
   std::string expected_server_id;
+  // 会话 SSH 通道的逻辑目标；不进入凭据文件，不随本地转发端口变化。
+  std::string repository_host;
+  std::uint16_t repository_port = 0;
 };
+
+inline constexpr const char* kSessionCloudCredentialsReference =
+    "/@backup-project-session/cloud";
+bool SetSessionCloudCredentials(const CloudCredentials& credentials,
+                                std::string* error_message);
+void ClearSessionCloudCredentials();
+bool SessionCloudCredentialsAvailable();
+std::string SessionCloudRepositoryId();
 
 // 读取 0600 凭据文件。格式是每行 key=value：
 //   host=, port=, username=

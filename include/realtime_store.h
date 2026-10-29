@@ -66,7 +66,7 @@ struct RealtimeConfig {
   PackMethod pack_method = PackMethod::kMyPack;
   CompressionMethod compression_method = CompressionMethod::kNone;
   EncryptionMethod encryption_method = EncryptionMethod::kNone;
-  // 无人值守加密的唯一凭据来源（仅本人可读的 0600 文件）。
+  // 无人值守加密的会话引用，或仅本人可读的 0600 高级文件。
   // 空串 = 未配置；此时加密方式必须为 none，否则校验拒绝。
   std::string encryption_password_file;
   std::vector<std::string> include_rules;

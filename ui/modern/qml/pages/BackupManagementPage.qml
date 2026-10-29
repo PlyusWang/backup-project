@@ -55,12 +55,14 @@ Item {
         // ---------- 页头 ----------
         ColumnLayout {
             Layout.fillWidth: true
-            Layout.leftMargin: 32
-            Layout.rightMargin: 32
+            Layout.leftMargin: page.currentTab === "cloud"
+                ? cloudPage.contentInset : localColumn.x
+            Layout.rightMargin: Layout.leftMargin
             Layout.topMargin: 24
             spacing: 10
 
             Text {
+                objectName: "managementTitle"
                 text: "备份管理"
                 font.pixelSize: 30
                 font.weight: Font.DemiBold
@@ -68,7 +70,7 @@ Item {
             }
 
             Text {
-                text: "本地仓库与云端仓库使用同一套备份、恢复和依赖链语义。"
+                text: "查看、恢复和管理您的备份。"
                 font.pixelSize: 17
                 color: theme.textSecondary
             }
@@ -107,6 +109,7 @@ Item {
 
                 ColumnLayout {
                     id: localColumn
+                    objectName: "managementLocalColumn"
                     x: Math.max(32, (localScroll.availableWidth - width) / 2)
                     y: 16
                     width: Math.min(localScroll.availableWidth - 64, 1400)
@@ -321,60 +324,70 @@ Item {
                         color: theme.textSecondary
                     }
 
-                    Repeater {
-                        model: controller.backupRecords
+                    // 动态卡片由普通 Column 定位，外层布局只持有稳定容器。
+                    Column {
+                        id: localRecordColumn
+                        Layout.fillWidth: true
+                        visible: controller.backupRecords.length > 0
+                        spacing: 16
 
-                        delegate: BackupRecordCard {
-                            required property var modelData
+                        Repeater {
+                            model: controller.backupRecords
 
-                            fileNameText: String(modelData["fileName"] || "")
-                            sizeText: String(modelData["sizeText"] || "")
-                            modifiedText: String(
-                                modelData["modifiedTimeText"] || "")
-                            recognized: Boolean(
-                                modelData["recognizedArchive"])
-                            formatVersion: Number(
-                                modelData["formatVersion"] || 0)
-                            entryCountText: String(
-                                modelData["entryCount"] || 0)
-                            diagnosticText: String(
-                                modelData["diagnostic"] || "")
-                            hasPipelineMethods: Boolean(
-                                modelData["hasPipelineMethods"])
-                            packMethodText: String(
-                                modelData["packMethodText"] || "")
-                            compressionMethodText: String(
-                                modelData["compressionMethodText"] || "")
-                            encryptionMethodText: String(
-                                modelData["encryptionMethodText"] || "")
-                            passwordRequired: Boolean(
-                                modelData["passwordRequired"])
-                            recordKind: String(
-                                modelData["recordKind"] || "full")
-                            isDelta: Boolean(modelData["isDelta"])
-                            parentFileName: String(
-                                modelData["parentFileName"] || "")
-                            chainRestorable:
-                            modelData["chainRestorable"] === undefined
-                                ? true
-                                : Boolean(modelData["chainRestorable"])
-                            chainDiagnostic: String(
-                                modelData["chainDiagnostic"] || "")
-                            originText:
-                            schedule.originForFile(
-                                String(modelData["fileName"] || ""))
-                            scheduledChangesText:
-                            schedule.changesForFile(
-                                String(modelData["fileName"] || ""))
-                            // 复制到云端是产品动作，依赖云端会话；未登录时
-                            // 按钮仍然可见但禁用，用户能看到“为什么现在不能点”。
-                            copyToCloudVisible: true
-                            copyToCloudEnabled:
-                                remote.authenticated && !controller.busy
-                            busy: controller.busy || controller.catalogBusy
-                            onCopyToCloudRequested: {
-                                remote.copyLocalArchiveToCloud(
+                            delegate: BackupRecordCard {
+                                required property var modelData
+                                width: localRecordColumn.width
+                                height: implicitHeight
+
+                                fileNameText: String(modelData["fileName"] || "")
+                                sizeText: String(modelData["sizeText"] || "")
+                                modifiedText: String(
+                                    modelData["modifiedTimeText"] || "")
+                                recognized: Boolean(
+                                    modelData["recognizedArchive"])
+                                formatVersion: Number(
+                                    modelData["formatVersion"] || 0)
+                                entryCountText: String(
+                                    modelData["entryCount"] || 0)
+                                diagnosticText: String(
+                                    modelData["diagnostic"] || "")
+                                hasPipelineMethods: Boolean(
+                                    modelData["hasPipelineMethods"])
+                                packMethodText: String(
+                                    modelData["packMethodText"] || "")
+                                compressionMethodText: String(
+                                    modelData["compressionMethodText"] || "")
+                                encryptionMethodText: String(
+                                    modelData["encryptionMethodText"] || "")
+                                passwordRequired: Boolean(
+                                    modelData["passwordRequired"])
+                                recordKind: String(
+                                    modelData["recordKind"] || "full")
+                                isDelta: Boolean(modelData["isDelta"])
+                                parentFileName: String(
+                                    modelData["parentFileName"] || "")
+                                chainRestorable:
+                                modelData["chainRestorable"] === undefined
+                                    ? true
+                                    : Boolean(modelData["chainRestorable"])
+                                chainDiagnostic: String(
+                                    modelData["chainDiagnostic"] || "")
+                                originText:
+                                schedule.originForFile(
                                     String(modelData["fileName"] || ""))
+                                scheduledChangesText:
+                                schedule.changesForFile(
+                                    String(modelData["fileName"] || ""))
+                                // 复制到云端是产品动作，依赖云端会话；未登录时
+                                // 按钮仍然可见但禁用，用户能看到“为什么现在不能点”。
+                                copyToCloudVisible: true
+                                copyToCloudEnabled:
+                                    remote.authenticated && !controller.busy
+                                busy: controller.busy || controller.catalogBusy
+                                onCopyToCloudRequested: {
+                                    remote.copyLocalArchiveToCloud(
+                                        String(modelData["fileName"] || ""))
+                                }
                             }
                         }
                     }
@@ -399,6 +412,7 @@ Item {
             // 云端不是另一套备份方式：它复用 RemotePage 的连接、认证、
             // 列表、恢复、下载与删除，只把这部分嵌进统一的仓库入口。
             RemotePage {
+                id: cloudPage
                 embedded: true
             }
         }

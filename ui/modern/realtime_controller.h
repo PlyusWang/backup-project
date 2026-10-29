@@ -119,6 +119,8 @@ class RealtimeController : public QObject {
   Q_PROPERTY(QString encryptionKey READ encryptionKey NOTIFY configChanged)
   // 无人值守加密的口令文件草稿（只保存路径）。
   Q_PROPERTY(QString credentialFile READ credentialFile NOTIFY configChanged)
+  Q_PROPERTY(bool sessionPasswordUnlocked READ sessionPasswordUnlocked NOTIFY
+                 configChanged)
   Q_PROPERTY(QString repositoryType READ repositoryType NOTIFY configChanged)
   Q_PROPERTY(QString cloudCredentialsFile READ cloudCredentialsFile NOTIFY
                  configChanged)
@@ -188,6 +190,7 @@ class RealtimeController : public QObject {
   QString compressionKey() const;
   QString encryptionKey() const;
   QString credentialFile() const { return draft_credential_file_; }
+  bool sessionPasswordUnlocked() const;
   QString repositoryType() const {
     return QString::fromStdString(
         config_.repository_type.empty() ? "local" : config_.repository_type);
@@ -261,6 +264,9 @@ class RealtimeController : public QObject {
                                        const QString& credentials_file,
                                        const QString& repository_id);
   Q_INVOKABLE QString cloudRepositoryIdForFile(const QString& credentials_file);
+  Q_INVOKABLE bool unlockArchivePassword(const QString& password,
+                                         const QString& confirmation);
+  Q_INVOKABLE void lockArchivePassword();
   Q_INVOKABLE bool setEncryptionChoice(const QString& encryption_key,
                                        const QString& credential_file);
 

@@ -330,7 +330,12 @@ BackupController::BackupController(const QString& config_file_path,
                 // 列表失败只写 catalogError，不碰 status banner：
                 // 管理页自己的错误不该覆盖一次刚成功的备份/恢复提示。
                 backup_records_.clear();
-                catalog_error_ = outcome.error_message;
+                const UserFacingError explained = ExplainOperationError(
+                    outcome.error_message, QStringLiteral("读取备份仓库"));
+                catalog_error_ = explained.summary + QStringLiteral(" ") +
+                                 explained.suggestion;
+                emit userError(explained.title, explained.summary,
+                               explained.suggestion, outcome.error_message);
               }
               emit backupRecordsChanged();
               emit catalogStateChanged();
@@ -506,11 +511,17 @@ void BackupController::LoadConfig() {
       refreshBackups();
       return;
     case backupproject::ConfigLoadStatus::kError:
-      // 配置坏掉时如实报告，并把 ConfigManager 的原始诊断原样带出来。
+      // 配置错误按统一方式展示。
       // 不自动改写、不自动删除、不猜默认值 ——
       // 用户的配置只有用户能决定怎么处理。
-      SetStatus(QString::fromLatin1(kError), QStringLiteral("配置读取失败"),
-                QString::fromStdString(error_message));
+      {
+        const QString technical = QString::fromStdString(error_message);
+        const UserFacingError explained =
+            ExplainOperationError(technical, QStringLiteral("读取配置"));
+        SetStatus(
+            QString::fromLatin1(kError), explained.title,
+            explained.summary + QStringLiteral(" ") + explained.suggestion);
+      }
       return;
   }
 }
@@ -806,19 +817,16 @@ bool BackupController::StartBackupWithStrategy(
   request.progress = [this](const backupproject::ArchiveProgress& progress) {
     OnArchiveProgress(progress);
   };
-  if (strategy == BackupStrategy::kIncremental) {
-    // 增量在后台自己决定 baseline / delta / 不写，所以它需要仓库本身、
-    // 快照名与规则原文（规则是链 identity 的一部分）。
-    request.repository_directory = repository_path_;
-    request.repository_identity =
-        QString::fromStdString(backupproject::RepositoryIdentity(repository));
-    request.snapshot_file_name = QFileInfo(archive).fileName();
-    for (const QString& rule : include_rules_) {
-      request.include_rules.push_back(rule.toStdString());
-    }
-    for (const QString& rule : exclude_rules_) {
-      request.exclude_rules.push_back(rule.toStdString());
-    }
+  // 完整与增量都需要仓库和规则身份，以发布可供后续增量使用的基线。
+  request.repository_directory = repository_path_;
+  request.repository_identity =
+      QString::fromStdString(backupproject::RepositoryIdentity(repository));
+  request.snapshot_file_name = QFileInfo(archive).fileName();
+  for (const QString& rule : include_rules_) {
+    request.include_rules.push_back(rule.toStdString());
+  }
+  for (const QString& rule : exclude_rules_) {
+    request.exclude_rules.push_back(rule.toStdString());
   }
   // file name 只用于状态提示，来自 Catalog 生成的归档名，与密码无关。
   return Start(request, QFileInfo(archive).fileName());
@@ -868,9 +876,17 @@ bool BackupController::startManagedRestore(const QString& file_name,
   backupproject::ArchiveFileInfo info;
   const bool identified =
       backupproject::IdentifyArchiveFile(archive_path, &info, nullptr);
-  if (identified &&
-      info.kind == backupproject::ArchiveFileInfo::Kind::kContainerV2 &&
-      info.encryption_method != backupproject::EncryptionMethod::kNone) {
+  backupproject::ContainerHeader delta_header;
+  const bool encrypted_delta =
+      backupproject::ClassifySnapshotFile(archive_path, nullptr) ==
+          backupproject::SnapshotFileKind::kDelta &&
+      backupproject::InspectDeltaPayloadHeader(archive_path, &delta_header,
+                                               nullptr) &&
+      delta_header.encryption_method != 0;
+  if (encrypted_delta ||
+      (identified &&
+       info.kind == backupproject::ArchiveFileInfo::Kind::kContainerV2 &&
+       info.encryption_method != backupproject::EncryptionMethod::kNone)) {
     SetStatus(QString::fromLatin1(kError), QStringLiteral("无法恢复"),
               QStringLiteral("此备份已加密，请输入恢复密码。"));
     return false;
@@ -926,24 +942,15 @@ bool BackupController::startManagedRestoreWithPassword(
     return false;
   }
 
-  // 是否需要密码由归档自己的 header 决定，不信 QML 传进来的任何标志。
-  backupproject::ArchiveFileInfo info;
-  const bool identified =
-      backupproject::IdentifyArchiveFile(archive_path, &info, nullptr);
   OperationRequest request;
   request.kind = Kind::kRestore;
   request.first_path = QString::fromStdString(archive_path);
   request.second_path = destination_path;
   request.repository_directory = repository_path_;
   request.snapshot_file_name = file_name;
-  if (identified &&
-      info.kind == backupproject::ArchiveFileInfo::Kind::kContainerV2 &&
-      info.encryption_method != backupproject::EncryptionMethod::kNone) {
-    request.restore_is_v2 = true;
-    request.restore_options.password = password.toStdString();
-  }
-  // legacy 与未加密的 v2 都走按 magic 分流的旧入口：它们根本不需要密码，
-  // 硬塞一个 RestoreOptions 进去只会让代码看起来像在用密码。
+  // 完整与增量共用同一恢复入口，密码传给整条链，由各层认证决定是否使用。
+  request.restore_is_v2 = true;
+  request.restore_options.password = password.toStdString();
   return Start(request, file_name);
 }
 
@@ -1096,7 +1103,7 @@ bool BackupController::Start(const OperationRequest& request,
   SetStatus(QString::fromLatin1(kRunning),
             request.kind == Kind::kBackup ? QStringLiteral("正在备份……")
                                           : QStringLiteral("正在恢复……"),
-            QStringLiteral("正在复制目录，期间界面仍可正常操作。"));
+            QStringLiteral("正在处理文件，界面仍可正常操作。"));
   // 函数指针 + 值拷贝的参数：后台线程拿到的是自己的副本，不需要加锁。
   // request（含密码）按值拷进后台任务，本函数返回后本地副本立即销毁。
   watcher_.setFuture(
@@ -1114,14 +1121,20 @@ void BackupController::OnArchiveProgress(
                                                          {"writing", 4},
                                                          {"finishing", 5}};
   const auto found = kPhaseCodes.find(progress.phase);
-  progress_phase_.store(found == kPhaseCodes.end() ? 0 : found->second);
-  progress_items_done_.store(progress.items_done);
-  progress_items_total_.store(progress.items_total);
-  progress_bytes_done_.store(progress.bytes_done);
-  progress_bytes_total_.store(progress.bytes_total);
-  // 只投递一次通知，不在后台线程里碰 QML 对象。
+  const int phase = found == kPhaseCodes.end() ? 0 : found->second;
+  // 每份通知携带同一时刻的计数，避免后台已写到 100% 时，排队中的
+  // 中间进度通知全都读到最后一个值。属性在 GUI 线程一起更新。
   QMetaObject::invokeMethod(
-      this, [this]() { emit progressChanged(); }, Qt::QueuedConnection);
+      this,
+      [this, phase, progress]() {
+        progress_phase_.store(phase);
+        progress_items_done_.store(progress.items_done);
+        progress_items_total_.store(progress.items_total);
+        progress_bytes_done_.store(progress.bytes_done);
+        progress_bytes_total_.store(progress.bytes_total);
+        emit progressChanged();
+      },
+      Qt::QueuedConnection);
 }
 
 QString BackupController::progressPhase() const {
@@ -1155,6 +1168,9 @@ qulonglong BackupController::progressBytesTotal() const {
 }
 
 double BackupController::progressRatio() const {
+  // 百分比只表示正在写入的真实字节；扫描、压缩与最终发布没有
+  // 可比较的总工作量，使用活动状态。
+  if (progressPhase() != QStringLiteral("writing")) return -1.0;
   const qulonglong total = progress_bytes_total_.load();
   if (total == 0) return -1.0;
   const double ratio = static_cast<double>(progress_bytes_done_.load()) /
@@ -1238,10 +1254,14 @@ OperationOutcome BackupController::RunOperation(OperationRequest request) {
     }
   } else if (request.kind == Kind::kBackup) {
     if (request.backup_flavor == BackupFlavor::kModernV2) {
-      // 三项都由用户在界面上选择，这里不再写死任何一项。
-      outcome.succeeded =
-          engine.Backup(first, second, request.filter, request.backup_options,
-                        &error_message, request.progress);
+      // 完整快照同时发布可信基线，后续增量可直接续接这份备份。
+      backupproject::IncrementalOutcome full;
+      outcome.succeeded = backupproject::RunManagedFullBackup(
+          first, request.repository_directory.toStdString(),
+          request.snapshot_file_name.toStdString(),
+          request.repository_identity.toStdString(), request.filter,
+          request.backup_options, request.include_rules, request.exclude_rules,
+          &full, &error_message, request.progress);
     } else {
       // legacy v0.1：旧格式始终保留一条被真实执行的回归入口。
       outcome.succeeded =

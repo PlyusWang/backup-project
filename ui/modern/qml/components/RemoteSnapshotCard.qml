@@ -43,6 +43,7 @@ Rectangle {
     property bool restorable: true
     property string restoreHint: ""   // 不能恢复时的一句话
     property bool busy: false
+    property bool detailsExpanded: false
 
     // 下载到本地仓库（与“下载归档”是两件事：前者进入仓库、成为可管理 / 可恢复的
     // 本地备份；后者只是把 blob 存到用户选择的路径）。默认隐藏，由统一的
@@ -150,7 +151,7 @@ Rectangle {
             // ——那是一个编出来的语义。
             Text {
                 objectName: "remoteSnapshotGenerationText"
-                visible: card.generationVisible
+                visible: card.detailsExpanded && card.generationVisible
                 text: "代数 " + card.generation
                 font.pixelSize: 15
                 color: theme.textSecondary
@@ -158,7 +159,7 @@ Rectangle {
 
             Text {
                 objectName: "remoteSnapshotParentText"
-                visible: card.kindKey === "incremental"
+                visible: card.detailsExpanded && card.kindKey === "incremental"
                     && card.parentShort !== ""
                 text: "父 " + card.parentShort
                 font.pixelSize: 15
@@ -174,12 +175,20 @@ Rectangle {
 
             Text {
                 objectName: "remoteSnapshotTime"
+                visible: card.detailsExpanded
                 text: card.createdText
                 font.pixelSize: 15
                 color: theme.textSecondary
             }
 
             Item { Layout.fillWidth: true }
+
+            AppButton {
+                objectName: "remoteSnapshotDetailsButton"
+                text: card.detailsExpanded ? "收起详情" : "详情"
+                variant: "flat"
+                onClicked: card.detailsExpanded = !card.detailsExpanded
+            }
         }
 
         // 这一条"是什么"：只有原始归档需要解释（它是手动上传的归档，不参与
@@ -187,8 +196,18 @@ Rectangle {
         Text {
             objectName: "remoteSnapshotTypeNote"
             Layout.fillWidth: true
-            visible: card.typeNote !== ""
+            visible: card.detailsExpanded && card.typeNote !== ""
             text: card.typeNote
+            font.pixelSize: 14
+            color: theme.textSecondary
+            wrapMode: Text.WrapAnywhere
+        }
+
+        Text {
+            objectName: "remoteSnapshotId"
+            Layout.fillWidth: true
+            visible: card.detailsExpanded
+            text: "编号：" + card.snapshotId
             font.pixelSize: 14
             color: theme.textSecondary
             wrapMode: Text.WrapAnywhere
