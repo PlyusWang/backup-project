@@ -48,6 +48,7 @@
 #include "backup_catalog.h"
 #include "container_format.h"
 #include "crypto.h"
+#include "file_io.h"
 #include "source_digest.h"
 
 namespace backupproject {
@@ -369,7 +370,9 @@ bool IsValidDeltaTombstone(const std::string& path,
 // 而不是忽略，所以新增字段不能偷偷追加，只能连 format_version 一起升级。
 std::string SerializeDeltaEnvelope(const DeltaEnvelope& envelope) {
   std::string out;
-  out += "BPDELTA1\n";
+  out += envelope.format_version == kAuthenticatedDeltaFormatVersion
+             ? "BPDELTA2\n"
+             : "BPDELTA1\n";
   AppendKeyValue("format_version", std::to_string(envelope.format_version),
                  &out);
   AppendKeyValue("snapshot_id", envelope.snapshot_id, &out);
@@ -391,6 +394,9 @@ std::string SerializeDeltaEnvelope(const DeltaEnvelope& envelope) {
                  &out);
   AppendKeyValue("removed", std::to_string(envelope.removed), &out);
   AppendKeyValue("payload_sha256", envelope.payload_sha256, &out);
+  if (envelope.format_version == kAuthenticatedDeltaFormatVersion) {
+    AppendKeyValue("envelope_hmac", envelope.envelope_hmac, &out);
+  }
   for (const std::string& path : envelope.tombstones) {
     AppendKeyValue("tombstone", path, &out);
   }
@@ -406,6 +412,9 @@ std::string SerializeDeltaEnvelope(const DeltaEnvelope& envelope) {
 std::string ComputeDeltaSnapshotId(const DeltaEnvelope& envelope) {
   DeltaEnvelope copy = envelope;
   copy.snapshot_id.clear();
+  if (copy.format_version == kAuthenticatedDeltaFormatVersion) {
+    copy.envelope_hmac.assign(64, '0');
+  }
   return ContentDigestOfBytes(SerializeDeltaEnvelope(copy));
 }
 
@@ -434,8 +443,9 @@ bool ParseDeltaEnvelope(const std::string& text, DeltaEnvelope* envelope,
                                 std::to_string(text.size()) + " bytes");
     return false;
   }
-  const std::string header = "BPDELTA1\n";
-  if (text.compare(0, std::min(header.size(), text.size()), header) != 0) {
+  const bool authenticated = text.compare(0, 9, "BPDELTA2\n") == 0;
+  const std::string header = authenticated ? "BPDELTA2\n" : "BPDELTA1\n";
+  if (text.compare(0, header.size(), header) != 0) {
     SetError(error_message,
              "Invalid delta envelope: missing or wrong version header");
     return false;
@@ -479,7 +489,9 @@ bool ParseDeltaEnvelope(const std::string& text, DeltaEnvelope* envelope,
     std::uint64_t number = 0;
     std::int64_t signed_number = 0;
     if (key == "format_version") {
-      if (!ParseUint64(value, &number) || number != kDeltaFormatVersion) {
+      if (!ParseUint64(value, &number) ||
+          number != (authenticated ? kAuthenticatedDeltaFormatVersion
+                                   : kDeltaFormatVersion)) {
         SetError(error_message,
                  "Invalid delta envelope: unsupported format version '" +
                      value + "'");
@@ -537,6 +549,8 @@ bool ParseDeltaEnvelope(const std::string& text, DeltaEnvelope* envelope,
       envelope->removed = number;
     } else if (key == "payload_sha256") {
       envelope->payload_sha256 = value;
+    } else if (key == "envelope_hmac" && authenticated) {
+      envelope->envelope_hmac = value;
     } else if (key == "tombstone") {
       if (envelope->tombstones.size() >= kMaxDeltaTombstones) {
         SetError(error_message, "Invalid delta envelope: too many tombstones");
@@ -583,6 +597,11 @@ bool ParseDeltaEnvelope(const std::string& text, DeltaEnvelope* envelope,
           std::string("Invalid delta envelope: missing key '") + key + "'");
       return false;
     }
+  }
+  if (authenticated && (seen["envelope_hmac"] != 1 ||
+                        !IsContentDigest(envelope->envelope_hmac))) {
+    SetError(error_message, "Invalid delta envelope: missing or invalid HMAC");
+    return false;
   }
   // 身份与摘要字段必须是 SHA-256 十六进制。形状不对不是“缺字段”，而是文件被
   // 改过或根本不是本工具写的，只能拒。
@@ -684,6 +703,7 @@ bool SnapshotIdOfFile(const std::string& path, std::string* id,
 bool LooksLikeDelta(const unsigned char* data, std::size_t size) {
   if (data == nullptr || size < kDeltaMagicSize) return false;
   for (std::size_t index = 0; index < kDeltaMagicSize; ++index) {
+    if (index == 6 && (data[index] == '1' || data[index] == '2')) continue;
     if (data[index] != kDeltaMagic[index]) return false;
   }
   return true;
@@ -730,6 +750,7 @@ namespace {
 // 所以只有这一份实现（magic / version / header size / envelope 长度上界 /
 // payload 长度上界 / 文件长度必须正好等于三段之和）。
 struct DeltaLayout {
+  std::uint16_t format_version = kDeltaFormatVersion;
   // 两个长度都是**已经校验过**的值：非零、在上界内、且与文件长度自洽，
   // 因此调用方可以直接把它们当偏移量用，不需要再判一次。
   std::uint32_t envelope_len = 0;
@@ -768,7 +789,9 @@ bool ReadDeltaLayout(int fd, std::uint64_t file_size, DeltaLayout* layout,
       static_cast<std::uint16_t>(header[8] | (header[9] << 8));
   const std::uint16_t fixed_size =
       static_cast<std::uint16_t>(header[10] | (header[11] << 8));
-  if (version != kDeltaFormatVersion || fixed_size != kDeltaFixedHeaderSize) {
+  const std::uint16_t magic_version =
+      header[6] == '2' ? kAuthenticatedDeltaFormatVersion : kDeltaFormatVersion;
+  if (version != magic_version || fixed_size != kDeltaFixedHeaderSize) {
     SetError(error_message,
              "Invalid delta: unsupported format version or header size");
     return false;
@@ -803,6 +826,7 @@ bool ReadDeltaLayout(int fd, std::uint64_t file_size, DeltaLayout* layout,
   }
   layout->envelope_len = envelope_len;
   layout->payload_len = payload_len;
+  layout->format_version = version;
   return true;
 }
 
@@ -907,6 +931,11 @@ bool ReadDeltaEnvelope(const std::string& delta_file, DeltaEnvelope* envelope,
     return false;
   }
   if (!ParseDeltaEnvelope(text, envelope, error_message)) return false;
+  if (envelope->format_version != layout.format_version) {
+    SetError(error_message,
+             "Invalid delta: header and envelope versions differ");
+    return false;
+  }
   // 自校验：snapshot_id 必须真的是这份 envelope 的摘要。
   if (ComputeDeltaSnapshotId(*envelope) != envelope->snapshot_id) {
     SetError(error_message,
@@ -1233,10 +1262,76 @@ bool VerifyFullSnapshotPayload(const std::string& container_file,
 // 原子性：rename 在同一文件系统内原子，读者只会看到完整可用的 delta 或根本
 // 没有，不会看到半截文件；失败时临时文件全部 unlink，已存在的目标文件不会被
 // 动过。本函数不做互斥，同一目标路径的并发写由调用方的 OperationGate 保证。
+namespace {
+
+bool DeltaAuthenticationTag(const DeltaEnvelope& envelope,
+                            const ContainerHeader& header,
+                            const std::string& password, std::string* tag,
+                            std::string* error_message) {
+  if (header.encryption_method == 0 ||
+      envelope.format_version != kAuthenticatedDeltaFormatVersion) {
+    SetError(error_message,
+             "Authenticated deltas require an encrypted payload");
+    return false;
+  }
+  std::string cipher_key;
+  std::string mac_key;
+  if (!DeriveKeys(password, header, &cipher_key, &mac_key, error_message)) {
+    return false;
+  }
+  // 与容器自身的 MAC 使用独立子密钥；盐和迭代参数沿用已验证的容器格式。
+  const std::string envelope_key =
+      crypto::HmacSha256Raw(mac_key, "BKPINC2 envelope key\n");
+  DeltaEnvelope normalized = envelope;
+  normalized.envelope_hmac.assign(64, '0');
+  *tag = crypto::HmacSha256Hex(
+      envelope_key, "BKPINC2 envelope\n" + SerializeDeltaEnvelope(normalized));
+  return true;
+}
+
+}  // namespace
+
+bool VerifyDeltaAuthentication(const std::string& delta_file,
+                               const std::string& password,
+                               std::string* error_message,
+                               DeltaEnvelope* authenticated_envelope) {
+  DeltaEnvelope envelope;
+  ContainerHeader header;
+  if (!ReadDeltaEnvelope(delta_file, &envelope, error_message) ||
+      !VerifyDeltaPayload(delta_file, error_message) ||
+      !InspectDeltaPayloadHeader(delta_file, &header, error_message)) {
+    return false;
+  }
+  if (envelope.format_version == kDeltaFormatVersion) {
+    if (header.encryption_method == 0) {
+      if (authenticated_envelope != nullptr) *authenticated_envelope = envelope;
+      return true;
+    }
+    SetError(error_message,
+             "Encrypted v1 deltas have no authenticated envelope and cannot "
+             "be restored safely");
+    return false;
+  }
+  std::string tag;
+  if (!DeltaAuthenticationTag(envelope, header, password, &tag,
+                              error_message)) {
+    return false;
+  }
+  if (!crypto::ConstantTimeEquals(tag, envelope.envelope_hmac)) {
+    SetError(error_message,
+             "Authentication failed: wrong password or tampered incremental "
+             "envelope");
+    return false;
+  }
+  if (authenticated_envelope != nullptr) *authenticated_envelope = envelope;
+  return true;
+}
+
 bool WriteDeltaFile(const std::string& delta_file,
                     const DeltaEnvelope& envelope,
                     const std::vector<ArchiveEntry>& changed_entries,
-                    const BackupOptions& options, std::string* error_message) {
+                    const BackupOptions& options, std::string* error_message,
+                    const ArchiveProgressCallback& progress) {
   if (changed_entries.size() > kMaxDeltaEntries) {
     SetError(error_message, "Too many entries for one delta: " +
                                 std::to_string(changed_entries.size()));
@@ -1283,17 +1378,30 @@ bool WriteDeltaFile(const std::string& delta_file,
   bool ok = false;
   do {
     if (!RunBackupPipelineFromEntries(changed_entries, temp_container, options,
-                                      error_message)) {
+                                      error_message, progress)) {
       break;
     }
     std::uint64_t payload_len = 0;
     if (!FileSizeOf(temp_container, &payload_len, error_message)) break;
 
     DeltaEnvelope filled = envelope;
+    filled.format_version = options.encryption_method == EncryptionMethod::kNone
+                                ? kDeltaFormatVersion
+                                : kAuthenticatedDeltaFormatVersion;
+    filled.envelope_hmac.clear();
     if (!DigestOfFile(temp_container, &filled.payload_sha256, error_message)) {
       break;
     }
     filled.snapshot_id = ComputeDeltaSnapshotId(filled);
+    if (filled.format_version == kAuthenticatedDeltaFormatVersion) {
+      ContainerHeader payload_header;
+      if (!InspectContainerFile(temp_container, &payload_header,
+                                error_message) ||
+          !DeltaAuthenticationTag(filled, payload_header, options.password,
+                                  &filled.envelope_hmac, error_message)) {
+        break;
+      }
+    }
     const std::string text = SerializeDeltaEnvelope(filled);
     if (text.size() > kMaxDeltaEnvelopeBytes) {
       SetError(error_message, "Delta envelope is too large");
@@ -1304,8 +1412,11 @@ bool WriteDeltaFile(const std::string& delta_file,
     for (std::size_t index = 0; index < kDeltaMagicSize; ++index) {
       header[index] = kDeltaMagic[index];
     }
-    header[8] = static_cast<unsigned char>(kDeltaFormatVersion & 0xFF);
-    header[9] = static_cast<unsigned char>((kDeltaFormatVersion >> 8) & 0xFF);
+    if (filled.format_version == kAuthenticatedDeltaFormatVersion) {
+      header[6] = '2';
+    }
+    header[8] = static_cast<unsigned char>(filled.format_version & 0xFF);
+    header[9] = static_cast<unsigned char>((filled.format_version >> 8) & 0xFF);
     header[10] = static_cast<unsigned char>(kDeltaFixedHeaderSize & 0xFF);
     header[11] =
         static_cast<unsigned char>((kDeltaFixedHeaderSize >> 8) & 0xFF);
@@ -1353,10 +1464,8 @@ bool WriteDeltaFile(const std::string& delta_file,
                "Cannot close the delta file: " + ErrnoText(errno));
       break;
     }
-    if (::rename(temp_delta.c_str(), delta_file.c_str()) != 0) {
-      const std::string text_error = ErrnoText(errno);
+    if (!PublishNoReplace(temp_delta, delta_file, error_message)) {
       ::unlink(temp_delta.c_str());
-      SetError(error_message, "Cannot publish the delta file: " + text_error);
       break;
     }
     ok = true;

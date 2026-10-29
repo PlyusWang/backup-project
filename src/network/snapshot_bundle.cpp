@@ -759,7 +759,11 @@ bool PublishSnapshotFiles(const std::string& target_directory,
       continue;
     }
     const char* magic = name == identity ? "BPIDENT2" : "BPMANIFEST3";
-    if (!S_ISREG(info.st_mode) || !looks_like_orphan(name, magic)) {
+    const bool recognizable =
+        S_ISREG(info.st_mode) &&
+        (looks_like_orphan(name, magic) ||
+         (name == identity && looks_like_orphan(name, "BPIDENT3\n")));
+    if (!recognizable) {
       if (error_message != nullptr) {
         *error_message = "目标已存在同名副文件且不是可识别的崩溃残留：" + name;
       }

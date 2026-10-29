@@ -54,7 +54,10 @@
 #include <vector>
 
 #include "backup_catalog.h"
+#include "crypto.h"
+#include "file_system.h"
 #include "incremental_delta.h"
+#include "incremental_restore.h"
 #include "source_digest.h"
 
 namespace backupproject {
@@ -367,6 +370,36 @@ std::string SerializeSnapshotIdentity(const std::string& snapshot_file_name,
                                       const std::string& filter_identity,
                                       const std::string& strategy_identity);
 
+bool SnapshotMetadataTag(
+    const std::string& snapshot_path, const std::string& snapshot_file_name,
+    const std::string& snapshot_id, const std::string& manifest_digest,
+    const std::string& source_identity, const std::string& filter_identity,
+    const std::string& strategy_identity, const std::string& password,
+    std::string* tag, std::string* error_message) {
+  ContainerHeader header;
+  const bool is_delta =
+      ClassifySnapshotFile(snapshot_path, nullptr) == SnapshotFileKind::kDelta;
+  if (!(is_delta
+            ? InspectDeltaPayloadHeader(snapshot_path, &header, error_message)
+            : InspectContainerFile(snapshot_path, &header, error_message))) {
+    return false;
+  }
+  std::string cipher_key;
+  std::string mac_key;
+  if (header.encryption_method == 0 ||
+      !DeriveKeys(password, header, &cipher_key, &mac_key, error_message)) {
+    return false;
+  }
+  const std::string key =
+      crypto::HmacSha256Raw(mac_key, "BPIDENT3 metadata key\n");
+  *tag = crypto::HmacSha256Hex(
+      key, "BPIDENT3 metadata\n" +
+               SerializeSnapshotIdentity(snapshot_file_name, snapshot_id,
+                                         manifest_digest, source_identity,
+                                         filter_identity, strategy_identity));
+  return true;
+}
+
 // 快照已经写出来之后，两个副文件必须一起成功；任何一个失败就把本轮写下的
 // 东西全部撤回。只撤自己刚创建的那些：这里不碰任何既有文件。
 // 发布顺序固定：先 manifest，后 identity。两个文件不是一次 rename 写完的，
@@ -385,7 +418,8 @@ bool PublishSnapshotSidecars(
     const std::vector<ManifestEntry>& entries,
     const std::string& repository_identity, const std::string& source_directory,
     const std::string& source_identity, const std::string& filter_identity,
-    const std::string& strategy_identity, std::string* error_message) {
+    const std::string& strategy_identity, const BackupOptions& options,
+    std::string* error_message) {
   const std::string manifest_path = JoinPath(
       repository_directory, SnapshotManifestFileName(snapshot_file_name));
   const std::string identity_path = JoinPath(
@@ -405,9 +439,23 @@ bool PublishSnapshotSidecars(
     ::unlink(snapshot_path.c_str());
     return false;
   }
-  const std::string identity_text = SerializeSnapshotIdentity(
+  std::string identity_text = SerializeSnapshotIdentity(
       snapshot_file_name, snapshot_id, manifest_digest, source_identity,
       filter_identity, strategy_identity);
+  if (options.encryption_method != EncryptionMethod::kNone) {
+    std::string tag;
+    if (!SnapshotMetadataTag(snapshot_path, snapshot_file_name, snapshot_id,
+                             manifest_digest, source_identity, filter_identity,
+                             strategy_identity, options.password, &tag,
+                             error_message)) {
+      ::unlink(manifest_path.c_str());
+      ::unlink(snapshot_path.c_str());
+      return false;
+    }
+    identity_text.replace(0, std::string("BPIDENT2\nversion=2\n").size(),
+                          "BPIDENT3\nversion=3\n");
+    identity_text += "metadata_hmac=" + tag + "\n";
+  }
   if (!WriteManifestFile(identity_path, identity_text, error_message)) {
     ::unlink(manifest_path.c_str());
     ::unlink(snapshot_path.c_str());
@@ -430,20 +478,17 @@ void SetIncrementalManifestBuiltHookForTesting(void (*hook)(void* context),
   g_manifest_built_hook_context = context;
 }
 
-// 加密在这里是**明确拒绝**而不是"暂未实现"：BKPINC1 外层信封（parent 绑定
-// 与 tombstone 列表）是明文，内层容器的 HMAC 覆盖不到它，接受一个加密 delta
-// 等于接受一组未经认证的路径指令。拒绝必须发生在建基线之前——否则用户先
-// 拿到一份看着可用的基线，第二次才炸。
+// 加密增量写成 BKPINC2，外层父绑定与删除指令由独立子密钥认证。
 bool IsSupportedIncrementalEncryption(EncryptionMethod encryption) {
-  return encryption == EncryptionMethod::kNone;
+  return encryption == EncryptionMethod::kNone ||
+         encryption == EncryptionMethod::kAes256CtrHmacSha256 ||
+         encryption == EncryptionMethod::kDesCbcHmacSha256;
 }
 
 std::string UnsupportedIncrementalEncryptionReason() {
   return std::string(
-      "Incremental v1 does not support encryption: the incremental envelope "
-      "is not authenticated by the encrypted inner container, so its parent "
-      "and tombstone fields would be unprotected. Use the full strategy for "
-      "encrypted backups.");
+      "Encrypted v1 deltas have no authenticated envelope and cannot be "
+      "restored safely; create a new encrypted backup with this version.");
 }
 
 // USTAR 表达不了 tombstone 与 parent dependency，硬套只会产出恢复语义对不上
@@ -478,7 +523,7 @@ namespace {
 //   filter=<64 hex>
 //   strategy=<64 hex>
 //
-//   BPIDENT2                      （当前格式：多三件绑定 + 一个版本号）
+//   BPIDENT2                      （未加密格式：三件绑定 + 一个版本号）
 //   version=2
 //   snapshot_file_name=<escaped>
 //   snapshot_id=<64 hex>
@@ -490,8 +535,8 @@ namespace {
 // BPIDENT1 仍然读得出来，但结果是"没有绑定"——调用方必须把它当成不可信基线
 // （多建一份完整快照，绝不错误跳过）。升级语义因此是单向安全的。
 // 文件头是格式的硬边界：解析先比头，再谈字段，所以旧文件不会被硬塞进新规则。
-// 版本号只认 2：将来要加字段就抬到 3，让旧读侧明确失败，
-// 而不是"多出来的字段被忽略、语义静默变化"。
+// BPIDENT3 用于新建的加密快照：在 v2 字段之外增加 metadata_hmac，
+// 密钥从容器 MAC key 域分离派生。v1/v2 读取规则保持不变。
 constexpr const char* kIdentityV1Header = "BPIDENT1\n";
 constexpr const char* kIdentityV2Header = "BPIDENT2\n";
 constexpr std::uint64_t kIdentityVersion2 = 2;
@@ -570,6 +615,7 @@ struct SnapshotIdentityRecord {
   std::string source_identity;
   std::string filter_identity;
   std::string strategy_identity;
+  std::string metadata_hmac;
 };
 
 // 只写 v2：字段顺序固定、每行一个 key=value、以换行结尾。写侧的字段集合与
@@ -607,7 +653,9 @@ bool ParseSnapshotIdentity(const std::string& text,
     return false;
   }
   *record = SnapshotIdentityRecord{};
+  const bool is_v3 = text.compare(0, 9, "BPIDENT3\n") == 0;
   const bool is_v2 =
+      is_v3 ||
       text.compare(0,
                    std::min(std::string(kIdentityV2Header).size(), text.size()),
                    kIdentityV2Header) == 0;
@@ -619,8 +667,9 @@ bool ParseSnapshotIdentity(const std::string& text,
     SetError(error_message, "Invalid snapshot identity: wrong header");
     return false;
   }
-  const std::string header = is_v2 ? kIdentityV2Header : kIdentityV1Header;
-  record->version = is_v2 ? kIdentityVersion2 : 1;
+  const std::string header =
+      is_v3 ? "BPIDENT3\n" : (is_v2 ? kIdentityV2Header : kIdentityV1Header);
+  record->version = is_v3 ? 3 : (is_v2 ? kIdentityVersion2 : 1);
 
   int seen_version = 0;
   int seen_name = 0;
@@ -629,6 +678,7 @@ bool ParseSnapshotIdentity(const std::string& text,
   int seen_source = 0;
   int seen_filter = 0;
   int seen_strategy = 0;
+  int seen_hmac = 0;
   std::size_t position = header.size();
   while (position < text.size()) {
     const std::size_t newline = text.find('\n', position);
@@ -683,7 +733,7 @@ bool ParseSnapshotIdentity(const std::string& text,
           return false;
         }
       }
-      if (number != kIdentityVersion2) {
+      if (number != record->version) {
         SetError(
             error_message,
             "Invalid snapshot identity: unsupported version '" + value + "'");
@@ -712,6 +762,9 @@ bool ParseSnapshotIdentity(const std::string& text,
     } else if (key == "strategy") {
       ++seen_strategy;
       record->strategy_identity = value;
+    } else if (key == "metadata_hmac" && is_v3) {
+      ++seen_hmac;
+      record->metadata_hmac = value;
     } else {
       SetError(error_message,
                "Invalid snapshot identity: unknown key '" + key + "'");
@@ -720,6 +773,10 @@ bool ParseSnapshotIdentity(const std::string& text,
   }
   if (seen_source != 1 || seen_filter != 1 || seen_strategy != 1) {
     SetError(error_message, "Invalid snapshot identity: missing key");
+    return false;
+  }
+  if (is_v3 && seen_hmac != 1) {
+    SetError(error_message, "Invalid snapshot identity: missing metadata HMAC");
     return false;
   }
   if (is_v2) {
@@ -885,7 +942,7 @@ bool LoadVerifiedSnapshotIdentity(const std::string& repository_directory,
     identity->sidecar_diagnostic = identity_error;
     return true;
   }
-  if (record.version != kIdentityVersion2) {
+  if (record.version != kIdentityVersion2 && record.version != 3) {
     identity->sidecar_diagnostic =
         "the identity sidecar is an old version without a snapshot binding";
     return true;
@@ -917,6 +974,7 @@ bool LoadVerifiedSnapshotIdentity(const std::string& repository_directory,
   identity->source_identity = record.source_identity;
   identity->filter_identity = record.filter_identity;
   identity->strategy_identity = record.strategy_identity;
+  identity->metadata_hmac = record.metadata_hmac;
   identity->manifest_digest = actual_manifest_digest;
   identity->sidecars_verified = true;
   if (manifest_entries != nullptr) *manifest_entries = std::move(entries);
@@ -1203,17 +1261,16 @@ bool PlanDependencyAwareRetention(
 //   * 挂新 delta 之前先问链深：与其产出"创建成功、恢复才发现链太深"的快照，
 //     不如老实再建一份完整基线；
 //   * outcome 在入口就复位，失败路径上调用方看到的永远是"什么都没做"。
-bool RunIncrementalBackup(const std::string& source_directory,
-                          const std::string& repository_directory,
-                          const std::string& snapshot_file_name,
-                          const std::string& repository_identity,
-                          const Filter& filter, const BackupOptions& options,
-                          const std::vector<std::string>& include_rules,
-                          const std::vector<std::string>& exclude_rules,
-                          const std::string& baseline_snapshot_name,
-                          IncrementalOutcome* outcome,
-                          std::string* error_message,
-                          const ArchiveProgressCallback& progress) {
+static bool RunRepositoryBackup(
+    const std::string& source_directory,
+    const std::string& repository_directory,
+    const std::string& snapshot_file_name,
+    const std::string& repository_identity, const Filter& filter,
+    const BackupOptions& options, const std::vector<std::string>& include_rules,
+    const std::vector<std::string>& exclude_rules,
+    const std::string& baseline_snapshot_name, IncrementalOutcome* outcome,
+    std::string* error_message, const ArchiveProgressCallback& progress,
+    bool force_full) {
   if (outcome == nullptr) {
     SetError(error_message, "Incremental outcome output must not be null");
     return false;
@@ -1223,14 +1280,30 @@ bool RunIncrementalBackup(const std::string& source_directory,
     SetError(error_message, "A snapshot file name must be a single component");
     return false;
   }
+  if (source_directory.empty() || repository_directory.empty()) {
+    SetError(error_message, "Source directory and repository must be provided");
+    return false;
+  }
+  struct stat source_info;
+  if (::lstat(source_directory.c_str(), &source_info) != 0 ||
+      !S_ISDIR(source_info.st_mode)) {
+    SetError(error_message, "Source is not a directory: " + source_directory);
+    return false;
+  }
+  FileSystem file_system;
+  if (!file_system.IsDestinationOutsideSource(
+          source_directory, JoinPath(repository_directory, snapshot_file_name),
+          error_message)) {
+    return false;
+  }
   // 打包方式与加密方式的边界在核心里也要拦一次：前端已经报过同一句话，
   // 但"只有前端拦"意味着任何直接调用核心的路径都能产出格式上不该存在的
   // 组合。这里拒绝，且不写任何文件。
-  if (!IsSupportedIncrementalPack(options.pack_method)) {
+  if (!force_full && !IsSupportedIncrementalPack(options.pack_method)) {
     SetError(error_message, UnsupportedIncrementalPackReason());
     return false;
   }
-  if (options.encryption_method != EncryptionMethod::kNone) {
+  if (!IsSupportedIncrementalEncryption(options.encryption_method)) {
     SetError(error_message, UnsupportedIncrementalEncryptionReason());
     return false;
   }
@@ -1245,6 +1318,7 @@ bool RunIncrementalBackup(const std::string& source_directory,
                              options.encryption_method);
 
   // 1) 当前源树的强 manifest（内容身份）。
+  if (progress) progress(ArchiveProgress{"scanning", 0, 0, 0, 0});
   std::vector<ManifestEntry> current;
   if (!BuildStrongSourceManifest(source_directory, &filter, &current,
                                  error_message)) {
@@ -1265,7 +1339,7 @@ bool RunIncrementalBackup(const std::string& source_directory,
       baseline.clear();
       reason = "the requested baseline snapshot name is not a managed name";
     }
-  } else {
+  } else if (!force_full) {
     FindIncrementalBaseline(repository_directory, source_directory,
                             repository_identity, filter_identity,
                             strategy_identity, &baseline, &reason);
@@ -1296,12 +1370,38 @@ bool RunIncrementalBackup(const std::string& source_directory,
                    : "the recorded baseline is not usable (" + load_error + ")";
       baseline.clear();
     } else {
+      if (options.encryption_method != EncryptionMethod::kNone) {
+        SnapshotChain chain;
+        RestoreOptions restore_options;
+        restore_options.password = options.password;
+        std::string authentication_error;
+        std::string metadata_tag;
+        if (identity.metadata_hmac.empty() ||
+            !SnapshotMetadataTag(
+                identity.archive_path, baseline, identity.snapshot_id,
+                identity.manifest_digest, identity.source_identity,
+                identity.filter_identity, identity.strategy_identity,
+                options.password, &metadata_tag, &authentication_error) ||
+            !crypto::ConstantTimeEquals(metadata_tag, identity.metadata_hmac) ||
+            !ResolveSnapshotChain(repository_directory, baseline, &chain,
+                                  &authentication_error) ||
+            !AuthenticateSnapshotChain(chain, restore_options,
+                                       &authentication_error)) {
+          reason =
+              "the current password cannot authenticate the previous "
+              "snapshot metadata or chain; a new encrypted full "
+              "baseline was created";
+          baseline.clear();
+        }
+      }
       // 再挂一个 delta 会不会越过恢复侧的上界？会的话就不挂：与其产出
       // "创建成功、恢复才发现链太深"的快照，不如老实再建一份完整基线。
       std::size_t parent_depth = 0;
       std::string depth_error;
-      if (!SnapshotDeltaDepth(repository_directory, baseline, &parent_depth,
-                              &depth_error)) {
+      if (baseline.empty()) {
+        // 密码或认证改变后不再依赖旧链，下面统一建立完整基线。
+      } else if (!SnapshotDeltaDepth(repository_directory, baseline,
+                                     &parent_depth, &depth_error)) {
         reason = "the recorded baseline is not usable (" + depth_error + ")";
         baseline.clear();
       } else if (parent_depth >= kMaxDeltaChainDepth) {
@@ -1346,7 +1446,7 @@ bool RunIncrementalBackup(const std::string& source_directory,
                                  target, snapshot_id, current_digest, current,
                                  repository_identity, source_directory,
                                  source_identity, filter_identity,
-                                 strategy_identity, error_message)) {
+                                 strategy_identity, options, error_message)) {
       return false;
     }
     outcome->kind = IncrementalOutcome::Kind::kFullBaseline;
@@ -1438,7 +1538,8 @@ bool RunIncrementalBackup(const std::string& source_directory,
   }
 
   if (!WriteDeltaFile(JoinPath(repository_directory, snapshot_file_name),
-                      envelope, changed_entries, options, error_message)) {
+                      envelope, changed_entries, options, error_message,
+                      progress)) {
     return false;
   }
   const std::string delta_path =
@@ -1448,10 +1549,11 @@ bool RunIncrementalBackup(const std::string& source_directory,
     ::unlink(delta_path.c_str());
     return false;
   }
-  if (!PublishSnapshotSidecars(
-          repository_directory, snapshot_file_name, delta_path, snapshot_id,
-          current_digest, current, repository_identity, source_directory,
-          source_identity, filter_identity, strategy_identity, error_message)) {
+  if (!PublishSnapshotSidecars(repository_directory, snapshot_file_name,
+                               delta_path, snapshot_id, current_digest, current,
+                               repository_identity, source_directory,
+                               source_identity, filter_identity,
+                               strategy_identity, options, error_message)) {
     return false;
   }
 
@@ -1461,6 +1563,39 @@ bool RunIncrementalBackup(const std::string& source_directory,
   outcome->summary = summary;
   outcome->summary_text = "Incremental delta written on top of " + baseline;
   return true;
+}
+
+bool RunIncrementalBackup(const std::string& source_directory,
+                          const std::string& repository_directory,
+                          const std::string& snapshot_file_name,
+                          const std::string& repository_identity,
+                          const Filter& filter, const BackupOptions& options,
+                          const std::vector<std::string>& include_rules,
+                          const std::vector<std::string>& exclude_rules,
+                          const std::string& baseline_snapshot_name,
+                          IncrementalOutcome* outcome,
+                          std::string* error_message,
+                          const ArchiveProgressCallback& progress) {
+  return RunRepositoryBackup(
+      source_directory, repository_directory, snapshot_file_name,
+      repository_identity, filter, options, include_rules, exclude_rules,
+      baseline_snapshot_name, outcome, error_message, progress, false);
+}
+
+bool RunManagedFullBackup(const std::string& source_directory,
+                          const std::string& repository_directory,
+                          const std::string& snapshot_file_name,
+                          const std::string& repository_identity,
+                          const Filter& filter, const BackupOptions& options,
+                          const std::vector<std::string>& include_rules,
+                          const std::vector<std::string>& exclude_rules,
+                          IncrementalOutcome* outcome,
+                          std::string* error_message,
+                          const ArchiveProgressCallback& progress) {
+  return RunRepositoryBackup(
+      source_directory, repository_directory, snapshot_file_name,
+      repository_identity, filter, options, include_rules, exclude_rules,
+      std::string(), outcome, error_message, progress, true);
 }
 
 // ---- 依赖图 ----

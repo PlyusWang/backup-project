@@ -244,6 +244,12 @@ class RemoteController : public QObject {
   Q_PROPERTY(QString host READ host NOTIFY endpointChanged)
   Q_PROPERTY(QString portText READ portText NOTIFY endpointChanged)
   Q_PROPERTY(QString username READ username NOTIFY endpointChanged)
+  Q_PROPERTY(bool sharedSessionReady READ sharedSessionReady NOTIFY
+                 sharedSessionChanged)
+  Q_PROPERTY(QString sharedSessionRepositoryId READ sharedSessionRepositoryId
+                 NOTIFY sharedSessionChanged)
+  Q_PROPERTY(
+      QString sharedSessionReference READ sharedSessionReference CONSTANT)
   // 服务端传输身份 pin（"sha256:<64 位十六进制>" 或 "hex:<64 位十六进制>"）。
   // 与地址 / 端口同属"连接配置"，但**没有默认值**：不填就不能连接。
   Q_PROPERTY(QString serverKeyPin READ serverKeyPin NOTIFY serverKeyPinChanged)
@@ -516,6 +522,9 @@ class RemoteController : public QObject {
   // 不新增服务端 logout opcode —— 服务端 token 到期前仍然有效，这一点写在
   // 06-KNOWN-LIMITATIONS.md 里，不假装它是撤销。
   Q_INVOKABLE void logoutLocal();
+  bool sharedSessionReady() const;
+  QString sharedSessionRepositoryId() const;
+  QString sharedSessionReference() const;
 
   // 注销账户：服务端删除该账户以及它的全部云端备份（不可撤销）。
   //
@@ -661,7 +670,8 @@ class RemoteController : public QObject {
   // 恢复某个远端快照（自动解析并下载整条依赖链）。snapshot_id 为空或目标目录
   // 为空都在本地被拒，一个字节都不发。
   Q_INVOKABLE bool restoreSnapshot(const QString& snapshot_id,
-                                   const QString& destination_directory);
+                                   const QString& destination_directory,
+                                   const QString& password = QString());
   // 恢复一份**原始归档**（lineage 为空的远端条目）——用户看到的按钮与产品级
   // 一样叫"恢复"，区别只在实现：它下载那一个 blob，由 core 按**内容**认出格式，
   // 再交给既有的本地恢复核心独立恢复；它不需要、也不使用任何远端依赖链。
@@ -821,6 +831,7 @@ class RemoteController : public QObject {
                  const QString& suggestion, const QString& technical);
   void endpointChanged();
   void sessionChanged();
+  void sharedSessionChanged();
   void reachabilityChanged();
   void deleteAccountErrorChanged();
   void loginErrorChanged();
@@ -1011,6 +1022,10 @@ class RemoteController : public QObject {
   QString server_key_pin_;
   // 只存在于内存；退出登录与析构时擦除。绝不落盘、绝不进日志。
   QString password_;
+  std::uint64_t shared_config_generation_ = 0;
+  std::uint64_t login_config_generation_ = 0;
+  void ClearSharedSession();
+  void PublishSharedSession();
 
   bool authenticated_ = false;
   bool busy_ = false;

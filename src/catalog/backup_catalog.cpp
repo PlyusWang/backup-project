@@ -441,6 +441,20 @@ bool BackupCatalog::List(const std::string& repository,
         record.format_version =
             static_cast<std::uint16_t>(delta_envelope.format_version);
         record.parent_file_name = delta_envelope.parent_file_name;
+        ContainerHeader payload_header;
+        if (InspectDeltaPayloadHeader(candidate, &payload_header,
+                                      &envelope_error)) {
+          record.has_pipeline_methods = true;
+          ParsePackMethodId(payload_header.pack_method, &record.pack_method);
+          ParseCompressionMethodId(payload_header.compression_method,
+                                   &record.compression_method);
+          ParseEncryptionMethodId(payload_header.encryption_method,
+                                  &record.encryption_method);
+          record.password_required = payload_header.encryption_method != 0;
+        } else {
+          record.recognized_archive = false;
+          record.diagnostic = envelope_error;
+        }
         // 依赖链能不能恢复：这里只确认父文件还在（廉价判断）。
         // 身份是否真的对得上由恢复路径校验。
         const std::string parent_path =

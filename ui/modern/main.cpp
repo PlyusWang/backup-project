@@ -71,6 +71,10 @@
 //                                       自动备份页 / 实时备份页生成同一条
 //                                       DSL，非法输入三处 得到同一句来自共享
 //                                       builder 的原因
+//   --ux-acceptance-test                下拉输入、布局、卡片和历史列表专项
+//   --workflow-acceptance <输出目录>    本地进度、加密增量与身份导入专项
+//   --credential-ui-test <输出目录>     自动任务解锁和云端会话生命周期专项
+//   --network-acceptance <材料> <输出>  隔离 BPSEC2 直连和 SSH 备份恢复专项
 //   --native-frame                      退回系统原生标题栏（Wayland 兜底）
 //
 // 这些开关让没有显示器的环境也能验证界面：离屏平台插件把窗口真正建出来，
@@ -145,9 +149,11 @@
 #include "backup_options.h"
 #include "cloud_retry_probe.h"
 #include "config_manager.h"
+#include "credential_ui_test.h"
 #include "dev_harnesses.h"
 #include "filter_rule_model.h"
 #include "incremental_delta.h"
+#include "network_acceptance_test.h"
 #include "operation_gate.h"
 #include "realtime_controller.h"
 #include "remote_controller.h"
@@ -156,7 +162,10 @@
 #include "schedule_frequency.h"
 #include "schedule_store.h"
 #include "scheduler_lock.h"
+#include "server_identity_import.h"
 #include "server_profile.h"
+#include "ux_acceptance_test.h"
+#include "workflow_acceptance_test.h"
 namespace {
 int g_qml_warnings = 0;
 
@@ -409,6 +418,14 @@ int main(int argc, char* argv[]) {
   // 移到一个 popup 行上，所以同样在窗口建好之后才分派。
   const bool combo_hover_test =
       arguments.contains(QStringLiteral("--combo-hover-test"));
+  const bool ux_acceptance_test =
+      arguments.contains(QStringLiteral("--ux-acceptance-test"));
+  const int workflow_acceptance_index =
+      arguments.indexOf(QStringLiteral("--workflow-acceptance"));
+  const int credential_ui_index =
+      arguments.indexOf(QStringLiteral("--credential-ui-test"));
+  const int network_acceptance_index =
+      arguments.indexOf(QStringLiteral("--network-acceptance"));
   const int incremental_test_index =
       arguments.indexOf(QStringLiteral("--incremental-test"));
   const int screenshot_index =
@@ -450,6 +467,20 @@ int main(int argc, char* argv[]) {
   // 而不是悄悄退化成默认行为（那会让测试以为它隔离了配置，其实没有）。
   if (config_file_index >= 0 && config_file_index + 1 >= arguments.size()) {
     std::fprintf(stderr, "--config-file 需要一个配置文件路径参数\n");
+    return 2;
+  }
+  if (workflow_acceptance_index >= 0 &&
+      workflow_acceptance_index + 1 >= arguments.size()) {
+    std::fprintf(stderr, "--workflow-acceptance 需要输出目录参数\n");
+    return 2;
+  }
+  if (credential_ui_index >= 0 && credential_ui_index + 1 >= arguments.size()) {
+    std::fprintf(stderr, "--credential-ui-test 需要输出目录参数\n");
+    return 2;
+  }
+  if (network_acceptance_index >= 0 &&
+      network_acceptance_index + 2 >= arguments.size()) {
+    std::fprintf(stderr, "--network-acceptance 需要测试材料与输出目录参数\n");
     return 2;
   }
   if (schedule_file_index >= 0 && schedule_file_index + 1 >= arguments.size()) {
@@ -525,7 +556,9 @@ int main(int argc, char* argv[]) {
       screenshot_index >= 0 || screenshot_remote_index >= 0 ||
       acceptance_shots_index >= 0 || self_test_index >= 0 ||
       repository_test_index >= 0 || realtime_test || backup_options_test ||
-      schedule_test || filter_ux_test || combo_hover_test || remote_test ||
+      schedule_test || filter_ux_test || combo_hover_test ||
+      ux_acceptance_test || remote_test || workflow_acceptance_index >= 0 ||
+      credential_ui_index >= 0 || network_acceptance_index >= 0 ||
       remote_acceptance_index >= 0 || remote_smoke_index >= 0;
   QString config_file_path = ResolveConfigFilePath(arguments);
   QString schedule_file_path = ResolveScheduleFilePath(arguments);
@@ -599,6 +632,7 @@ int main(int argc, char* argv[]) {
   // "同一时刻只有一个本地仓库 writer"，而远程网络 I/O 不改动本地仓库的任何
   // 持久状态（上传只读一个用户选定的 .bak，下载写的是用户指定的新路径）。
   backup_modern::RemoteController remote_controller;
+  backup_modern::ServerIdentityImport server_identity;
   // 传输续传状态跟着配置文件走：换了 --config-file 的测试不会读写到真实用户
   // 的 resume/ 目录。
   remote_controller.setResumeDirectory(
@@ -637,6 +671,8 @@ int main(int argc, char* argv[]) {
                                            &realtime_controller);
   engine.rootContext()->setContextProperty(QStringLiteral("remote"),
                                            &remote_controller);
+  engine.rootContext()->setContextProperty(QStringLiteral("serverIdentity"),
+                                           &server_identity);
   // 窗口用不用系统边框由 C++ 决定、QML 只读：窗口标志必须在窗口创建时定下来，
   // 之后再改会出现“已经画了一帧才换边框”的闪动。
   engine.rootContext()->setContextProperty(QStringLiteral("useNativeFrame"),
@@ -656,6 +692,26 @@ int main(int argc, char* argv[]) {
   // 已经建好的窗口，提前返回会让这两条路径测的不是真实情况。
   window->show();
   WaitForAnimation(200);
+
+  if (ux_acceptance_test) {
+    return RunUxAcceptanceTest(window, &theme, &schedule_controller,
+                               &realtime_controller);
+  }
+  if (workflow_acceptance_index >= 0) {
+    return RunWorkflowAcceptanceTest(
+        window, &controller, &server_identity,
+        arguments.at(workflow_acceptance_index + 1));
+  }
+  if (credential_ui_index >= 0) {
+    return RunCredentialUiTest(
+        window, &schedule_controller, &realtime_controller, &remote_controller,
+        &controller, arguments.at(credential_ui_index + 1));
+  }
+  if (network_acceptance_index >= 0) {
+    return RunNetworkAcceptanceTest(window, &remote_controller,
+                                    arguments.at(network_acceptance_index + 1),
+                                    arguments.at(network_acceptance_index + 2));
+  }
 
   // 页面建好之后再启动计划：此时 QML 已经绑好了 schedule 的属性，
   // 第一步读盘的结果能直接反映到界面上。

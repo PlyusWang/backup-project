@@ -9,6 +9,8 @@
 #include <cstring>
 #include <fstream>
 #include <iterator>
+#include <map>
+#include <mutex>
 
 namespace backupproject {
 namespace {
@@ -19,6 +21,38 @@ void SetError(std::string* error_message, const std::string& text) {
 
 bool ContainsNul(const std::string& text) {
   return text.find('\0') != std::string::npos;
+}
+
+void WipeSecret(std::string* secret) {
+  volatile char* bytes = secret->empty() ? nullptr : &(*secret)[0];
+  for (std::size_t i = 0; i < secret->size(); ++i) bytes[i] = '\0';
+  secret->clear();
+}
+
+struct SessionCredentials {
+  std::mutex mutex;
+  std::map<std::string, std::string> secrets;
+  ~SessionCredentials() {
+    for (auto& item : secrets) WipeSecret(&item.second);
+  }
+};
+
+SessionCredentials& Credentials() {
+  static SessionCredentials credentials;
+  return credentials;
+}
+
+bool ReadSessionCredential(const std::string& reference, std::string* secret,
+                           std::string* error_message) {
+  auto& credentials = Credentials();
+  std::lock_guard<std::mutex> lock(credentials.mutex);
+  const auto found = credentials.secrets.find(reference);
+  if (found == credentials.secrets.end()) {
+    SetError(error_message, "归档密码尚未解锁，请在本次程序会话中重新输入密码");
+    return false;
+  }
+  if (secret != nullptr) *secret = found->second;
+  return true;
 }
 
 // lstat 而不是 stat：符号链接必须被明确拒绝，而不是顺着链接去检查目标。
@@ -74,6 +108,46 @@ bool InspectCredentialFile(const std::string& path, struct stat* info,
 
 }  // namespace
 
+bool IsSessionCredentialReference(const std::string& path) {
+  return path.rfind(kSessionCredentialPrefix, 0) == 0;
+}
+
+bool SetSessionCredential(const std::string& reference,
+                          const std::string& secret,
+                          std::string* error_message) {
+  if (error_message != nullptr) error_message->clear();
+  if (!IsSessionCredentialReference(reference) ||
+      !IsUsableCredentialPath(reference, error_message)) {
+    SetError(error_message, "无效的会话凭据引用");
+    return false;
+  }
+  if (secret.empty() || secret.size() > kMaxCredentialFileBytes ||
+      ContainsNul(secret)) {
+    SetError(error_message, "密码不能为空、过长或包含空字符");
+    return false;
+  }
+  auto& credentials = Credentials();
+  std::lock_guard<std::mutex> lock(credentials.mutex);
+  auto& stored = credentials.secrets[reference];
+  WipeSecret(&stored);
+  stored = secret;
+  return true;
+}
+
+void ClearSessionCredential(const std::string& reference) {
+  auto& credentials = Credentials();
+  std::lock_guard<std::mutex> lock(credentials.mutex);
+  const auto found = credentials.secrets.find(reference);
+  if (found != credentials.secrets.end()) {
+    WipeSecret(&found->second);
+    credentials.secrets.erase(found);
+  }
+}
+
+bool SessionCredentialAvailable(const std::string& reference) {
+  return ReadSessionCredential(reference, nullptr, nullptr);
+}
+
 bool IsUsableCredentialPath(const std::string& path,
                             std::string* error_message) {
   if (path.empty()) {
@@ -99,6 +173,9 @@ bool IsUsableCredentialPath(const std::string& path,
 bool ValidateCredentialFile(const std::string& path,
                             std::string* error_message) {
   if (error_message != nullptr) error_message->clear();
+  if (IsSessionCredentialReference(path)) {
+    return ReadSessionCredential(path, nullptr, error_message);
+  }
   struct stat info;
   if (!InspectCredentialFile(path, &info, error_message)) return false;
   return true;
@@ -112,6 +189,10 @@ bool ReadCredentialFile(const std::string& path, std::string* secret,
   }
   secret->clear();
   if (error_message != nullptr) error_message->clear();
+  // 会话引用永不退回文件系统，即使存在同名文件也不能作为秘密来源。
+  if (IsSessionCredentialReference(path)) {
+    return ReadSessionCredential(path, secret, error_message);
+  }
   struct stat info;
   if (!InspectCredentialFile(path, &info, error_message)) return false;
 

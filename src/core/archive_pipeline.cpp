@@ -803,10 +803,6 @@ bool RunBackupPipelineFromEntries(const std::vector<ArchiveEntry>& entries,
     }
   }
 
-  if (ok && progress) {
-    progress(ArchiveProgress{"finishing", entries.size(), entries.size(),
-                             payload_bytes, header.payload_size});
-  }
   // 自检而不是输入校验：payload_bytes 是刚刚自己写出去的字节数，对不上说明
   // header 与写入逻辑已经不同步（例如 DesPaddedSize 的算法改过），是编程错误。
   if (ok && payload_bytes != header.payload_size) {
@@ -814,6 +810,15 @@ bool RunBackupPipelineFromEntries(const std::vector<ArchiveEntry>& entries,
         error_message,
         "Internal error: payload size does not match the container header");
     ok = false;
+  }
+  if (ok && progress) {
+    // DES 的末尾 padding 由 Finish 写出，也属于真实 payload 字节。
+    if (last_reported_payload != payload_bytes) {
+      progress(ArchiveProgress{"writing", entries.size(), entries.size(),
+                               payload_bytes, header.payload_size});
+    }
+    progress(
+        ArchiveProgress{"finishing", entries.size(), entries.size(), 0, 0});
   }
   if (ok) {
     unsigned char digest[crypto::kSha256DigestSize];
@@ -1506,6 +1511,31 @@ bool VerifyContainerPayloadBytes(const std::string& container_file,
   }
   if (header != nullptr) *header = local;
   return true;
+}
+
+bool AuthenticateContainerFile(const std::string& container_file,
+                               const std::string& password,
+                               std::string* error_message) {
+  FileSource source;
+  if (!source.Open(container_file, error_message)) return false;
+  unsigned char bytes[container_v2::kHeaderSize];
+  if (!source.ReadAt(0, bytes, sizeof(bytes), error_message)) return false;
+  ContainerHeader header;
+  if (!DecodeContainerHeader(bytes, sizeof(bytes), &header, error_message)) {
+    return false;
+  }
+  if (source.size() != container_v2::kHeaderSize + header.payload_size) {
+    SetError(error_message,
+             "Container payload size does not match the file size");
+    return false;
+  }
+  std::string cipher_key;
+  std::string mac_key;
+  if (header.encryption_method != 0 &&
+      !DeriveKeys(password, header, &cipher_key, &mac_key, error_message)) {
+    return false;
+  }
+  return AuthenticatePayload(source, header, mac_key, error_message);
 }
 
 // 只读元数据：读 magic 与 header，不解密、不读 payload，因此不需要密码，可以在

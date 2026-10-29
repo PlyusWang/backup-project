@@ -71,6 +71,20 @@ QString ChangeText(qulonglong added, qulonglong removed, qulonglong modified,
       .arg(metadata_changed);
 }
 
+QString HistoryResultText(backupproject::ScheduleRunResult result) {
+  switch (result) {
+    case backupproject::ScheduleRunResult::kSuccessCreated:
+      return QStringLiteral("备份已完成");
+    case backupproject::ScheduleRunResult::kSkippedNoChanges:
+      return QStringLiteral("没有变化，已跳过");
+    case backupproject::ScheduleRunResult::kSuccessWithRetentionWarning:
+      return QStringLiteral("备份已完成，部分旧版本未清理");
+    case backupproject::ScheduleRunResult::kFailed:
+      return QStringLiteral("备份未完成");
+  }
+  return QStringLiteral("备份未完成");
+}
+
 }  // namespace
 
 // 构造只做连接与常量设置，**不做任何 I/O**：读盘走 start() / reload()，测试
@@ -113,6 +127,8 @@ ScheduleController::ScheduleController(QString schedule_file_path,
 // 析构只释放 runner 锁，不等待也不取消可能在飞的评估（那次写盘照样会完成）。
 // 正常退出时 main.cpp 在事件循环结束后才销毁控制器。
 ScheduleController::~ScheduleController() {
+  backupproject::ClearSessionCredential(
+      "/@backup-project-session/schedule-archive");
   // 析构时释放 runner 锁：flock 随 fd 关闭自动释放，这里显式做一次，
   // 让"谁持有锁"在代码里也是清楚的。
   lock_.Release();
@@ -495,8 +511,7 @@ void ScheduleController::OnEvaluationFinished() {
               QStringLiteral("下一次运行时间未到，本轮不执行。"));
   } else if (outcome.skipped_no_changes) {
     SetStatus(kIdle, QStringLiteral("源目录没有变化，已跳过"),
-              QStringLiteral(
-                  "按计划只创建有变化的完整快照，因此这一轮不生成新归档。"));
+              QStringLiteral("当前内容已备份，本次未创建新版本。"));
   } else if (outcome.retention_warning) {
     SetStatus(
         kWarning, QStringLiteral("计划备份成功，但旧版本淘汰失败"),
@@ -508,8 +523,8 @@ void ScheduleController::OnEvaluationFinished() {
   } else if (outcome.created) {
     SetStatus(
         kSuccess,
-        outcome.baseline_reset ? QStringLiteral("已重建基线快照")
-                               : QStringLiteral("已创建新的完整快照"),
+        outcome.baseline_reset ? QStringLiteral("已重建完整备份")
+                               : QStringLiteral("备份已完成"),
         (outcome.first_snapshot
              ? QStringLiteral("首次快照：") +
                    ChangeText(outcome.added, outcome.removed, outcome.modified,
@@ -661,8 +676,7 @@ bool ScheduleController::saveConfigFromText(
 // 顺序不能变：先在副本 config 上做完全部解析与校验，通过之后才动 document_ 与
 // 磁盘——失败时内存与文件都保持原样，不存在"存了一半"的中间态。
 //
-// 加密在这里被强制成 kNone，理由由核心的 UnattendedEncryptionDisabledReason
-// 提供：无人值守任务没有安全的持久密钥来源，不是"暂时隐藏一个选项"。
+// 加密方式和凭据引用沿用当前配置；会话解锁由共享凭据读取路径处理。
 //
 // 保存成功 = 磁盘上有一份合法配置 = 挂起理由消失，这是唯一的自动恢复点。
 bool ScheduleController::saveConfig(bool enabled, const QString& source_path,
@@ -730,8 +744,7 @@ bool ScheduleController::saveConfig(bool enabled, const QString& source_path,
     SetStatus(kError, QStringLiteral("未知的压缩方式"), compression_key);
     return false;
   }
-  // 加密方式与凭据路径来自界面草稿。口令内容不在这里，也不在任何
-  // 配置文件里：运行期由 ScheduledBackupService 从 0600 文件读取。
+  // 配置只保存会话引用或高级文件路径，口令不写入配置和日志。
   if (!backupproject::ParseEncryptionMethodKey(
           draft_encryption_key_.toStdString(), &config.encryption_method)) {
     SetStatus(kError, QStringLiteral("未知的加密方式"), draft_encryption_key_);
@@ -791,8 +804,8 @@ bool ScheduleController::saveConfig(bool enabled, const QString& source_path,
 
 bool ScheduleController::setEnabled(bool enabled) {
   return saveConfig(enabled, sourcePath(), intervalMinutes(), retainCount(),
-                    packKey(), compressionKey(), includeRules(),
-                    excludeRules());
+                    packKey(), compressionKey(), includeRules(), excludeRules(),
+                    strategyKey());
 }
 
 // 备份管理页的 JOIN：file_name -> 来源。只读计划存储自己的 managed 名单，
@@ -971,6 +984,39 @@ QString ScheduleController::encryptionKey() const {
       backupproject::EncryptionMethodKey(document_.config.encryption_method));
 }
 
+bool ScheduleController::sessionPasswordUnlocked() const {
+  return backupproject::SessionCredentialAvailable(
+      "/@backup-project-session/schedule-archive");
+}
+
+bool ScheduleController::unlockArchivePassword(const QString& password,
+                                               const QString& confirmation) {
+  if (libraryBusy()) return false;
+  if (password != confirmation) {
+    SetStatus(QStringLiteral("error"), QStringLiteral("两次密码不一致"),
+              QStringLiteral("请重新输入并确认密码。"));
+    return false;
+  }
+  std::string error;
+  if (!backupproject::SetSessionCredential(
+          "/@backup-project-session/schedule-archive", password.toStdString(),
+          &error)) {
+    SetStatus(QStringLiteral("error"), QStringLiteral("密码未解锁"),
+              QString::fromStdString(error));
+    return false;
+  }
+  draft_credential_file_ =
+      QStringLiteral("/@backup-project-session/schedule-archive");
+  emit configChanged();
+  return true;
+}
+
+void ScheduleController::lockArchivePassword() {
+  backupproject::ClearSessionCredential(
+      "/@backup-project-session/schedule-archive");
+  emit configChanged();
+}
+
 bool ScheduleController::setEncryptionChoice(const QString& encryption_key,
                                              const QString& credential_file) {
   backupproject::EncryptionMethod method =
@@ -1008,7 +1054,7 @@ QString ScheduleController::cloudRepositoryIdForFile(
   std::string error;
   if (!backupproject::LoadCloudCredentialsFile(credentials_file.toStdString(),
                                                &credentials, &error)) {
-    SetStatus(QStringLiteral("error"), QStringLiteral("云端凭据文件不可用"),
+    SetStatus(QStringLiteral("error"), QStringLiteral("云端连接不可用"),
               QString::fromStdString(error));
     return QString();
   }
@@ -1072,20 +1118,16 @@ QString ScheduleController::supportedModeText() const {
 }
 
 QString ScheduleController::encryptionNote() const {
-  // 唯一来源：核心那句“无人值守加密需要什么”。GUI 不复制一份字面量。
-  if (draft_encryption_key_ == QStringLiteral("none")) {
+  if (sessionPasswordUnlocked()) {
+    return QStringLiteral("本次会话已解锁，重新打开程序后需要再次输入密码。");
+  }
+  if (draft_credential_file_.isEmpty() ||
+      backupproject::IsSessionCredentialReference(
+          draft_credential_file_.toStdString())) {
     return QStringLiteral(
-        "选择加密后，需要指定一个仅本人可读（0600）的口令文件；"
-        "程序不会把口令明文写入配置。");
+        "请输入并确认归档密码，本次会话内自动备份可直接使用。");
   }
-  if (draft_credential_file_.isEmpty()) {
-    return QString::fromStdString(
-        backupproject::UnattendedEncryptionDisabledReason(
-            backupproject::BackupTrigger::kScheduled));
-  }
-  return QStringLiteral(
-      "加密口令将在每次运行时从该文件读取；"
-      "文件不可读时这一轮备份会明确失败。");
+  return QStringLiteral("使用高级口令文件；文件不可读时将暂停加密备份。");
 }
 
 QString ScheduleController::lastRunText() const {
@@ -1101,8 +1143,7 @@ QString ScheduleController::lastResultText() const {
   const backupproject::ScheduleHistoryEntry& last =
       document_.state.history.back();
   QString text = QStringLiteral("%1 · %2").arg(
-      FormatLocalTime(last.finished_at_sec),
-      QString::fromUtf8(backupproject::ScheduleRunResultText(last.result)));
+      FormatLocalTime(last.finished_at_sec), HistoryResultText(last.result));
   if (!last.archive_file_name.empty()) {
     text += QStringLiteral(" · %1").arg(
         QString::fromStdString(last.archive_file_name));
@@ -1142,21 +1183,20 @@ QVariantList ScheduleController::managedSnapshots() const {
   return list;
 }
 
-// 运行历史 -> QVariantList：resultKey 给样式、resultText 给人看，两者都来自
-// 共享核心的映射函数，不在这里拼字符串。
+// 运行历史 -> QVariantList：核心 key 保持不变，展示文本在 GUI 层本地化。
 QVariantList ScheduleController::history() const {
   QVariantList list;
-  for (const backupproject::ScheduleHistoryEntry& entry :
-       document_.state.history) {
+  // 仅反转展示顺序；落盘历史与保留策略继续使用原有顺序。
+  for (auto iterator = document_.state.history.rbegin();
+       iterator != document_.state.history.rend(); ++iterator) {
+    const backupproject::ScheduleHistoryEntry& entry = *iterator;
     QVariantMap item;
     item.insert(QStringLiteral("timeText"),
                 FormatLocalTime(entry.finished_at_sec));
     item.insert(
         QStringLiteral("resultKey"),
         QString::fromLatin1(backupproject::ScheduleRunResultKey(entry.result)));
-    item.insert(
-        QStringLiteral("resultText"),
-        QString::fromUtf8(backupproject::ScheduleRunResultText(entry.result)));
+    item.insert(QStringLiteral("resultText"), HistoryResultText(entry.result));
     item.insert(
         QStringLiteral("changesText"),
         ChangeText(entry.changes.added, entry.changes.removed,

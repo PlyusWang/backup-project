@@ -98,6 +98,8 @@ class ScheduleController : public QObject,
   Q_PROPERTY(QString encryptionKey READ encryptionKey NOTIFY configChanged)
   // 无人值守加密的口令文件草稿（只保存路径，口令内容由核心里读取）。
   Q_PROPERTY(QString credentialFile READ credentialFile NOTIFY configChanged)
+  Q_PROPERTY(bool sessionPasswordUnlocked READ sessionPasswordUnlocked NOTIFY
+                 configChanged)
   Q_PROPERTY(QString repositoryType READ repositoryType NOTIFY configChanged)
   Q_PROPERTY(QString cloudCredentialsFile READ cloudCredentialsFile NOTIFY
                  configChanged)
@@ -167,6 +169,7 @@ class ScheduleController : public QObject,
   QString compressionKey() const;
   QString encryptionKey() const;
   QString credentialFile() const { return draft_credential_file_; }
+  bool sessionPasswordUnlocked() const;
   QString repositoryType() const {
     return QString::fromStdString(document_.config.repository_type.empty()
                                       ? "local"
@@ -253,6 +256,9 @@ class ScheduleController : public QObject,
   Q_INVOKABLE bool setEnabled(bool enabled);
   // 保存前的加密选择。界面每改一次加密方式 / 口令文件就调用它：
   // 只更新草稿，不写盘、不读文件；真正的校验与落盘仍然走 saveConfig。
+  Q_INVOKABLE bool unlockArchivePassword(const QString& password,
+                                         const QString& confirmation);
+  Q_INVOKABLE void lockArchivePassword();
   Q_INVOKABLE bool setEncryptionChoice(const QString& encryption_key,
                                        const QString& credential_file);
   // 目标仓库草稿：local 清空云端字段；cloud 要求 0600 凭据路径与稳定

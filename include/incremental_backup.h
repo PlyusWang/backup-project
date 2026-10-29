@@ -44,15 +44,7 @@ namespace backupproject {
 bool IsSupportedIncrementalPack(PackMethod pack);
 std::string UnsupportedIncrementalPackReason();
 
-// 增量第一版**不支持加密**，而且必须是"明确拒绝"，不是"先跑一次基线、
-// 第二次 delta 才失败"，更不是静默降级成不加密。
-//
-// 原因不是"没实现"，而是产品语义没有闭环：
-//   * BKPINC1 外层信封（parent 绑定 + tombstone 列表）是明文，内层容器的
-//     HMAC 覆盖不到它；接受一个加密 delta 等于接受一组未经认证的路径指令；
-//   * snapshot_id 是内容摘要，不是认证标签，它证明不了"写它的人有密码"。
-//
-// 未来的 authenticated incremental envelope 才能重新开放这条组合。
+// 加密增量使用带独立外层认证的 BKPINC2；旧 BKPINC1 仅接受未加密 payload。
 bool IsSupportedIncrementalEncryption(EncryptionMethod encryption);
 std::string UnsupportedIncrementalEncryptionReason();
 
@@ -140,6 +132,8 @@ struct SnapshotIdentity {
   std::string source_identity;
   std::string filter_identity;
   std::string strategy_identity;
+  // 加密快照的 BPIDENT3 元数据认证标签；旧副文件为空。
+  std::string metadata_hmac;
 
   // delta 才有：父文件名、父身份、父 manifest 摘要、generation。
   std::string parent_file_name;
@@ -216,6 +210,19 @@ bool RunIncrementalBackup(const std::string& source_directory,
                           const std::vector<std::string>& include_rules,
                           const std::vector<std::string>& exclude_rules,
                           const std::string& baseline_snapshot_name,
+                          IncrementalOutcome* outcome,
+                          std::string* error_message,
+                          const ArchiveProgressCallback& progress = {});
+
+// 每次明确创建完整快照，并发布可供后续增量验证的 manifest/identity。
+// 与增量基线共用强内容摘要和 payload 绑定，避免独立扫描产生过期副文件。
+bool RunManagedFullBackup(const std::string& source_directory,
+                          const std::string& repository_directory,
+                          const std::string& snapshot_file_name,
+                          const std::string& repository_identity,
+                          const Filter& filter, const BackupOptions& options,
+                          const std::vector<std::string>& include_rules,
+                          const std::vector<std::string>& exclude_rules,
                           IncrementalOutcome* outcome,
                           std::string* error_message,
                           const ArchiveProgressCallback& progress = {});

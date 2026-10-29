@@ -50,6 +50,11 @@ bool ResolveSnapshotChain(const std::string& repository_directory,
                           const std::string& target_file_name,
                           SnapshotChain* chain, std::string* error_message);
 
+// 在任何恢复写入前认证整条链；也用于创建增量前确认密码仍能解锁父链。
+bool AuthenticateSnapshotChain(const SnapshotChain& chain,
+                               const RestoreOptions& options,
+                               std::string* error_message);
+
 // 恢复到任意 restore point。
 //
 //   * 目标是完整快照时，行为与既有 RunRestorePipeline 完全一致；

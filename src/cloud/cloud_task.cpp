@@ -11,6 +11,7 @@
 #include <chrono>
 #include <cstdlib>
 #include <cstring>
+#include <mutex>
 #include <sstream>
 #include <vector>
 
@@ -19,6 +20,28 @@
 
 namespace backupproject {
 namespace {
+
+struct CloudSession {
+  std::mutex mutex;
+  CloudCredentials credentials;
+  bool available = false;
+
+  void Clear() {
+    volatile char* bytes =
+        credentials.password.empty() ? nullptr : &credentials.password[0];
+    for (std::size_t i = 0; i < credentials.password.size(); ++i) {
+      bytes[i] = '\0';
+    }
+    credentials = CloudCredentials{};
+    available = false;
+  }
+  ~CloudSession() { Clear(); }
+};
+
+CloudSession& Session() {
+  static CloudSession session;
+  return session;
+}
 
 bool ParsePort(const std::string& text, std::uint16_t* port) {
   if (text.empty()) return false;
@@ -139,12 +162,67 @@ bool RunPasswordCommand(const std::string& command, std::string* secret,
 
 }  // namespace
 
+bool SetSessionCloudCredentials(const CloudCredentials& credentials,
+                                std::string* error_message) {
+  if (credentials.host.empty() || credentials.port == 0 ||
+      credentials.username.empty() || credentials.password.empty() ||
+      !credentials.password_command.empty() ||
+      (credentials.identity_mode != "pin" &&
+       credentials.identity_mode != "certificate") ||
+      (credentials.identity_mode == "pin" &&
+       credentials.server_key_pin.empty()) ||
+      (credentials.identity_mode == "certificate" &&
+       credentials.expected_server_id.empty())) {
+    if (error_message != nullptr) *error_message = "当前云端连接尚未完成登录";
+    return false;
+  }
+  auto& session = Session();
+  std::lock_guard<std::mutex> lock(session.mutex);
+  session.Clear();
+  session.credentials = credentials;
+  session.available = true;
+  return true;
+}
+
+void ClearSessionCloudCredentials() {
+  auto& session = Session();
+  std::lock_guard<std::mutex> lock(session.mutex);
+  session.Clear();
+}
+
+bool SessionCloudCredentialsAvailable() {
+  auto& session = Session();
+  std::lock_guard<std::mutex> lock(session.mutex);
+  return session.available;
+}
+
+std::string SessionCloudRepositoryId() {
+  auto& session = Session();
+  std::lock_guard<std::mutex> lock(session.mutex);
+  return session.available ? CloudRepositoryId(session.credentials)
+                           : std::string();
+}
+
 bool LoadCloudCredentialsFile(const std::string& path,
                               CloudCredentials* credentials,
                               std::string* error_message) {
   if (credentials == nullptr) {
     if (error_message != nullptr) *error_message = "凭据输出指针为空";
     return false;
+  }
+  if (IsSessionCredentialReference(path)) {
+    auto& session = Session();
+    std::lock_guard<std::mutex> lock(session.mutex);
+    if (path != kSessionCloudCredentialsReference || !session.available) {
+      *credentials = CloudCredentials{};
+      if (error_message != nullptr) {
+        *error_message =
+            "尚未登录云端，请先在备份管理中登录；重启后需要重新登录";
+      }
+      return false;
+    }
+    *credentials = session.credentials;
+    return true;
   }
   std::string content;
   if (!ReadCredentialFile(path, &content, error_message)) return false;
@@ -237,8 +315,13 @@ bool LoadCloudCredentialsFile(const std::string& path,
 }
 
 std::string CloudRepositoryId(const CloudCredentials& credentials) {
-  std::string id = "cloud://" + credentials.host + ":" +
-                   std::to_string(credentials.port) + "/" +
+  const std::string& host = credentials.repository_host.empty()
+                                ? credentials.host
+                                : credentials.repository_host;
+  const auto port = credentials.repository_port == 0
+                        ? credentials.port
+                        : credentials.repository_port;
+  std::string id = "cloud://" + host + ":" + std::to_string(port) + "/" +
                    credentials.username;
   if (credentials.identity_mode == "certificate") {
     id += "#cert:" + credentials.expected_server_id;

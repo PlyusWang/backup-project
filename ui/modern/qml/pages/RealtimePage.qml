@@ -52,16 +52,62 @@ Item {
     property int draftPackIndex: 0
     property int draftCompressionIndex: 0
     property int draftEncryptionIndex: 0
-    // 无人值守加密的口令文件草稿（只保存路径）。
+    // 配置草稿只保存会话引用或高级口令文件路径。
     property string draftCredentialFile: ""
     property string draftRepositoryType: realtime.repositoryType
     property string draftCloudCredentialsFile: realtime.cloudCredentialsFile
     property string draftCloudRepositoryId: realtime.cloudRepositoryId
 
+    property bool savingConfig: false
+    property bool passwordFileExpanded: false
+    property bool cloudFileExpanded: false
+
+    function clearPasswordInputs() {
+        if (archivePasswordField)
+            archivePasswordField.text = ""
+        if (archivePasswordConfirmationField)
+            archivePasswordConfirmationField.text = ""
+    }
+
+    function useLoggedInConnection() {
+        if (!remote.sharedSessionReady)
+            return
+        page.draftCloudCredentialsFile = remote.sharedSessionReference
+        page.draftCloudRepositoryId = remote.sharedSessionRepositoryId
+    }
+
+    function prepareCredentials() {
+        if (page.draftRepositoryType === "cloud"
+                && page.draftCloudCredentialsFile.length === 0)
+            page.useLoggedInConnection()
+        if (page.encryptionKeyValue === "none") {
+            page.clearPasswordInputs()
+            page.draftCredentialFile = ""
+        } else if (archivePasswordField.text.length > 0
+                   || archivePasswordConfirmationField.text.length > 0) {
+            if (!realtime.unlockArchivePassword(
+                    archivePasswordField.text,
+                    archivePasswordConfirmationField.text))
+                return false
+            page.draftCredentialFile = realtime.credentialFile
+            page.clearPasswordInputs()
+        }
+        return true
+    }
+
+    onVisibleChanged: {
+        if (!visible)
+            page.clearPasswordInputs()
+    }
+    Component.onDestruction: page.clearPasswordInputs()
+
     // 两个折叠区都默认收起，而且**不持久化**：折叠是这一屏的临时视图状态，
     // 不是配置；重新进入页面时回到"常用设置 + 运行状态优先"的默认样子。
     property bool advancedExpanded: false
     property bool technicalExpanded: false
+    property bool historyExpanded: false
+    readonly property var visibleSnapshots: page.historyExpanded
+        ? realtime.snapshots : realtime.snapshots.slice(0, 3)
 
     // keys 是与核心约定的取值，labels 是给人看的文案（来自控制器）。两个数组
     // 必须同序等长：下拉框只认下标，下标再经 keys 还原成取值，一旦错位就会把
@@ -88,7 +134,8 @@ Item {
         page.packKeys[page.draftPackIndex],
         page.compressionKeys[page.draftCompressionIndex],
         page.encryptionKeyValue,
-        page.draftCredentialFile.length > 0)
+        page.draftCredentialFile.length > 0
+            || archivePasswordField.text.length > 0)
 
     // 备份方式的短解释：只解释当前选中的那一种，避免两个术语同时出现。
     // 措辞与自动备份页逐字一致（三个页面统一产品语言）。
@@ -147,6 +194,10 @@ Item {
         page.draftRepositoryType = realtime.repositoryType
         page.draftCloudCredentialsFile = realtime.cloudCredentialsFile
         page.draftCloudRepositoryId = realtime.cloudRepositoryId
+        page.passwordFileExpanded = page.draftCredentialFile.length > 0
+            && page.draftCredentialFile.indexOf("/@backup-project-session/") !== 0
+        page.cloudFileExpanded = page.draftCloudCredentialsFile.length > 0
+            && page.draftCloudCredentialsFile !== remote.sharedSessionReference
         // 落盘配置里的规则读进共享编辑器（校验仍然走共享 builder）。读不懂时
         // 编辑器会显示共享核心给出的原因，这里不吞掉它。
         ruleEditor.loadRules(realtime.includeRules, realtime.excludeRules)
@@ -175,7 +226,10 @@ Item {
         realtime.cloudRepositoryId,
         realtime.includeRules.join(","), realtime.excludeRules.join(",")
     ].join("|")
-    onSavedSignatureChanged: syncFromController()
+    onSavedSignatureChanged: {
+        if (!page.savingConfig)
+            syncFromController()
+    }
 
     // 首次进入页面时用控制器状态初始化草稿；与下面的 savedSignature 监听一起，
     // 保证草稿始终是"当前已保存配置"的副本。
@@ -383,44 +437,83 @@ Item {
                         spacing: 6
 
                         Text {
-                            text: "0600 云端凭据文件（密码不进配置）"
+                            objectName: "realtimeCloudSessionStatus"
+                            Layout.fillWidth: true
+                            text: page.draftCloudCredentialsFile.length > 0
+                                  && page.draftCloudCredentialsFile !== remote.sharedSessionReference
+                                  ? "已选择高级凭据文件，将在执行时验证连接。"
+                                  : !remote.sharedSessionReady
+                                  ? "尚未登录云端，请先在备份管理中登录。重启后需要重新登录。"
+                                  : page.draftCloudRepositoryId.length > 0
+                                    && page.draftCloudCredentialsFile === remote.sharedSessionReference
+                                    && page.draftCloudRepositoryId !== remote.sharedSessionRepositoryId
+                                    ? "当前登录连接已更换，请确认后重新选择。"
+                                    : "已登录云端，本次会话可直接使用。"
                             font.pixelSize: 14
                             color: theme.textSecondary
+                            wrapMode: Text.WordWrap
                         }
 
                         RowLayout {
                             Layout.fillWidth: true
-                            spacing: 8
-
-                            AppTextField {
-                                objectName: "realtimeCloudCredentialsField"
-                                Layout.fillWidth: true
-                                text: page.draftCloudCredentialsFile
-                                onTextEdited: page.draftCloudCredentialsFile = text
-                                placeholderText: "绝对路径，例如 /home/me/cloud.env"
-                            }
-
                             AppButton {
-                                text: "生成仓库标识"
-                                enabled: page.draftCloudCredentialsFile.length > 0
-                                onClicked: {
-                                    const id = realtime.cloudRepositoryIdForFile(
-                                        page.draftCloudCredentialsFile)
-                                    if (id.length > 0)
-                                        page.draftCloudRepositoryId = id
-                                }
+                                objectName: "realtimeUseCloudSessionButton"
+                                text: "使用已登录连接"
+                                enabled: remote.sharedSessionReady && !realtime.libraryBusy
+                                onClicked: page.useLoggedInConnection()
+                            }
+                            AppButton {
+                                objectName: "realtimeCloudFileToggle"
+                                text: page.cloudFileExpanded ? "收起高级设置" : "高级：凭据文件"
+                                variant: "flat"
+                                onClicked: page.cloudFileExpanded = !page.cloudFileExpanded
                             }
                         }
 
-                        Text {
-                            objectName: "realtimeCloudRepositoryId"
+                        ColumnLayout {
                             Layout.fillWidth: true
-                            text: page.draftCloudRepositoryId.length > 0
-                                  ? "仓库标识：" + page.draftCloudRepositoryId
-                                  : "尚未生成仓库标识"
-                            font.pixelSize: 13
-                            color: theme.textSecondary
-                            wrapMode: Text.WrapAnywhere
+                            visible: page.cloudFileExpanded
+                            spacing: 6
+                            Text {
+                                text: "云端凭据文件（仅本人可读）"
+                                color: theme.textSecondary
+                                font.pixelSize: 14
+                            }
+                            RowLayout {
+                                Layout.fillWidth: true
+                                spacing: 8
+                                AppTextField {
+                                    objectName: "realtimeCloudCredentialsField"
+                                    Layout.fillWidth: true
+                                    text: page.draftCloudCredentialsFile === remote.sharedSessionReference
+                                          ? "" : page.draftCloudCredentialsFile
+                                    onTextEdited: {
+                                        page.draftCloudCredentialsFile = text
+                                        page.draftCloudRepositoryId = ""
+                                    }
+                                    placeholderText: "选择云端凭据文件的绝对路径"
+                                }
+                                AppButton {
+                                    text: "验证连接设置"
+                                    enabled: page.draftCloudCredentialsFile.length > 0
+                                    onClicked: {
+                                        const id = realtime.cloudRepositoryIdForFile(
+                                            page.draftCloudCredentialsFile)
+                                        if (id.length > 0)
+                                            page.draftCloudRepositoryId = id
+                                    }
+                                }
+                            }
+                            Text {
+                                objectName: "realtimeCloudRepositoryId"
+                                Layout.fillWidth: true
+                                text: page.draftCloudRepositoryId.length > 0
+                                      ? "仓库标识：" + page.draftCloudRepositoryId
+                                      : "尚未验证连接设置"
+                                font.pixelSize: 13
+                                color: theme.textSecondary
+                                wrapMode: Text.WrapAnywhere
+                            }
                         }
                     }
 
@@ -558,35 +651,49 @@ Item {
                             // 不存在"目录存了、策略没存"的中间态；规则文本来自
                             // 共享编辑器，失败原因由控制器写进状态栏。
                             onClicked: {
-                                let targetId = page.draftCloudRepositoryId
-                                if (page.draftRepositoryType === "cloud"
-                                        && targetId.length === 0
-                                        && page.draftCloudCredentialsFile.length > 0) {
-                                    targetId = realtime.cloudRepositoryIdForFile(
-                                        page.draftCloudCredentialsFile)
-                                    page.draftCloudRepositoryId = targetId
+                                page.savingConfig = true
+                                try {
+                                    if (!page.prepareCredentials())
+                                        return
+                                    let targetId = page.draftCloudRepositoryId
+                                    if (page.draftRepositoryType === "cloud"
+                                            && targetId.length === 0
+                                            && page.draftCloudCredentialsFile.length > 0) {
+                                        targetId = realtime.cloudRepositoryIdForFile(
+                                            page.draftCloudCredentialsFile)
+                                        page.draftCloudRepositoryId = targetId
+                                    }
+                                    if (!realtime.setRepositoryTarget(
+                                            page.draftRepositoryType,
+                                            page.draftCloudCredentialsFile,
+                                            targetId))
+                                        return
+                                    if (!realtime.setEncryptionChoice(
+                                            page.encryptionKeyValue,
+                                            page.draftCredentialFile))
+                                        return
+                                    const saved = realtime.saveConfigFromText(
+                                        page.draftEnabled,
+                                        page.draftSource,
+                                        page.draftDebounce,
+                                        page.draftMaxWait,
+                                        page.draftRetain,
+                                        page.packKeys[page.draftPackIndex],
+                                        page.compressionKeys[
+                                            page.draftCompressionIndex],
+                                        ruleEditor.includeRuleTexts,
+                                        ruleEditor.excludeRuleTexts,
+                                        page.strategyKeys[page.draftStrategyIndex])
+                                    if (saved) {
+                                        if (page.encryptionKeyValue === "none"
+                                                || page.draftCredentialFile.indexOf(
+                                                    "/@backup-project-session/") !== 0)
+                                            realtime.lockArchivePassword()
+                                        page.syncFromController()
+                                    }
+                                } finally {
+                                    page.savingConfig = false
                                 }
-                                if (!realtime.setRepositoryTarget(
-                                        page.draftRepositoryType,
-                                        page.draftCloudCredentialsFile,
-                                        targetId))
-                                    return
-                                if (!realtime.setEncryptionChoice(
-                                        page.encryptionKeyValue,
-                                        page.draftCredentialFile))
-                                    return
-                                realtime.saveConfigFromText(
-                                    page.draftEnabled,
-                                    page.draftSource,
-                                    page.draftDebounce,
-                                    page.draftMaxWait,
-                                    page.draftRetain,
-                                    page.packKeys[page.draftPackIndex],
-                                    page.compressionKeys[
-                                        page.draftCompressionIndex],
-                                    ruleEditor.includeRuleTexts,
-                                    ruleEditor.excludeRuleTexts,
-                                    page.strategyKeys[page.draftStrategyIndex])
                             }
                         }
 
@@ -845,28 +952,58 @@ Item {
 
                             ColumnLayout {
                                 Layout.fillWidth: true
-                                spacing: 4
+                                spacing: 8
                                 visible: page.encryptionKeyValue !== "none"
 
+                                AppTextField {
+                                    id: archivePasswordField
+                                    objectName: "realtimeArchivePasswordField"
+                                    Layout.fillWidth: true
+                                    enabled: !realtime.libraryBusy
+                                    echoMode: TextInput.Password
+                                    placeholderText: realtime.sessionPasswordUnlocked
+                                                     ? "输入新归档密码（留空沿用已解锁密码）"
+                                                     : "归档密码"
+                                }
+
+                                AppTextField {
+                                    id: archivePasswordConfirmationField
+                                    objectName: "realtimeArchivePasswordConfirmationField"
+                                    Layout.fillWidth: true
+                                    enabled: !realtime.libraryBusy
+                                    echoMode: TextInput.Password
+                                    placeholderText: "再次输入归档密码"
+                                }
+
                                 Text {
-                                    text: "口令文件（权限 0600）"
-                                    font.pixelSize: 16
+                                    Layout.fillWidth: true
+                                    text: "保存后在本次会话内解锁；重启程序后需要重新输入密码。"
                                     color: theme.textSecondary
+                                    font.pixelSize: 14
+                                    wrapMode: Text.WordWrap
+                                }
+
+                                AppButton {
+                                    objectName: "realtimePasswordFileToggle"
+                                    text: page.passwordFileExpanded ? "收起高级设置" : "高级：口令文件"
+                                    variant: "flat"
+                                    onClicked: page.passwordFileExpanded = !page.passwordFileExpanded
                                 }
 
                                 RowLayout {
                                     Layout.fillWidth: true
                                     spacing: 8
+                                    visible: page.passwordFileExpanded
 
                                     AppTextField {
                                         objectName: "realtimeCredentialField"
                                         Layout.fillWidth: true
                                         enabled: !realtime.libraryBusy
-                                        placeholderText:
-                                            "选择仅本人可读的口令文件"
-                                        text: page.draftCredentialFile
-                                        onTextEdited:
-                                            page.draftCredentialFile = text
+                                        placeholderText: "选择仅本人可读的口令文件"
+                                        text: page.draftCredentialFile.indexOf(
+                                                  "/@backup-project-session/") === 0
+                                              ? "" : page.draftCredentialFile
+                                        onTextEdited: page.draftCredentialFile = text
                                     }
 
                                     AppButton {
@@ -999,7 +1136,7 @@ Item {
                         spacing: 12
 
                         Text {
-                            text: "技术详情"
+                            text: "详情"
                             font.pixelSize: 18
                             font.weight: Font.DemiBold
                             color: theme.textSecondary
@@ -1197,6 +1334,16 @@ Item {
                         Item { Layout.fillWidth: true }
 
                         AppButton {
+                            objectName: "realtimeHistoryToggle"
+                            visible: realtime.snapshots.length > 3
+                            text: page.historyExpanded ? "收起"
+                                : "查看全部（" + realtime.snapshots.length + "）"
+                            variant: "flat"
+                            onClicked: page.historyExpanded =
+                                !page.historyExpanded
+                        }
+
+                        AppButton {
                             objectName: "refreshRealtimeSnapshotsButton"
                             text: "刷新"
                             iconName: "refresh"
@@ -1222,7 +1369,7 @@ Item {
                         // 列表数据全部来自控制器：每条都经过"marker 与归档
                         // 是否对得上"的验证；verified 为假的记录也照列，
                         // 并带上 diagnostic。页面不判断策略、不拼大小与时间。
-                        model: realtime.snapshots
+                        model: page.visibleSnapshots
                         delegate: ColumnLayout {
                             required property var modelData
                             Layout.fillWidth: true

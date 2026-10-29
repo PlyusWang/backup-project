@@ -239,12 +239,12 @@ int main() {
          "Manual + Incremental + huffman 支持"},
         {bp::BackupTrigger::kManual, bp::BackupStrategy::kIncremental,
          bp::PackMethod::kMyPack, bp::CompressionMethod::kNone,
-         bp::EncryptionMethod::kAes256CtrHmacSha256, false,
-         "Manual + Incremental + aes 被拒绝"},
+         bp::EncryptionMethod::kAes256CtrHmacSha256, true,
+         "Manual + Incremental + aes 使用认证信封"},
         {bp::BackupTrigger::kManual, bp::BackupStrategy::kIncremental,
          bp::PackMethod::kMyPack, bp::CompressionMethod::kNone,
-         bp::EncryptionMethod::kDesCbcHmacSha256, false,
-         "Manual + Incremental + des 被拒绝"},
+         bp::EncryptionMethod::kDesCbcHmacSha256, true,
+         "Manual + Incremental + des 使用认证信封"},
         {bp::BackupTrigger::kManual, bp::BackupStrategy::kIncremental,
          bp::PackMethod::kUstar, bp::CompressionMethod::kNone,
          bp::EncryptionMethod::kNone, false,
@@ -310,9 +310,8 @@ int main() {
     encrypted.strategy = bp::BackupStrategy::kIncremental;
     encrypted.encryption_method = bp::EncryptionMethod::kAes256CtrHmacSha256;
     test_support::Check(
-        bp::UnsupportedBackupOptionCombinationReason(encrypted).find(
-            "does not support encryption") != std::string::npos,
-        "INC-C OPT 增量 + 加密的理由说明信封未被认证");
+        bp::UnsupportedBackupOptionCombinationReason(encrypted).empty(),
+        "INC-C OPT 加密增量格式闭环后组合可用");
     bp::BackupOptionCombination ustar;
     ustar.strategy = bp::BackupStrategy::kIncremental;
     ustar.pack_method = bp::PackMethod::kUstar;
@@ -336,13 +335,12 @@ int main() {
     std::string error;
     bp::BackupOptions encrypted;
     encrypted.encryption_method = bp::EncryptionMethod::kAes256CtrHmacSha256;
-    encrypted.password = "correct horse battery staple";
+    encrypted.password.clear();
     test_support::Check(!RunIncrementalWith(source, repository, "enc.bak", "",
                                             encrypted, &outcome, &error),
-                        "INC-C CORE 增量 + 加密被核心拒绝");
-    test_support::Check(
-        error.find("does not support encryption") != std::string::npos,
-        "INC-C CORE 拒绝理由说明信封未被认证", error);
+                        "INC-C CORE 加密增量没有密码时被核心拒绝");
+    test_support::Check(error.find("password") != std::string::npos,
+                        "INC-C CORE 拒绝理由明确需要密码", error);
     test_support::Check(
         !test_support::Exists(SnapshotPath(repository, "enc.bak")),
         "INC-C CORE 拒绝后没有留下快照");
@@ -997,7 +995,7 @@ int main() {
                                   restore_options, &report, &error),
         "INC-C ENC 判别：加密 delta 不再被恢复路径接受", error);
     test_support::Check(
-        error.find("does not support encryption") != std::string::npos,
+        error.find("no authenticated envelope") != std::string::npos,
         "INC-C ENC 拒绝理由说明信封未被认证", error);
     test_support::Check(!test_support::Exists(destination),
                         "INC-C ENC 拒绝时不留下目标目录");

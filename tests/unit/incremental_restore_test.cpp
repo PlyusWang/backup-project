@@ -20,7 +20,6 @@
 #include <unistd.h>
 
 #include <csignal>
-
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -118,10 +117,12 @@ bool CorruptDeltaPayload(const std::string& delta_file) {
       (static_cast<std::uint32_t>(header[13]) << 8) |
       (static_cast<std::uint32_t>(header[14]) << 16) |
       (static_cast<std::uint32_t>(header[15]) << 24);
-  const off_t payload_offset = static_cast<off_t>(sizeof(header) + envelope_len);
+  const off_t payload_offset =
+      static_cast<off_t>(sizeof(header) + envelope_len);
   const unsigned char garbage[8] = {0xFF, 0xFF, 0xFF, 0xFF,
                                     0xFF, 0xFF, 0xFF, 0xFF};
-  const ssize_t written = ::pwrite(fd, garbage, sizeof(garbage), payload_offset);
+  const ssize_t written =
+      ::pwrite(fd, garbage, sizeof(garbage), payload_offset);
   ::close(fd);
   return written == static_cast<ssize_t>(sizeof(garbage));
 }
@@ -145,7 +146,8 @@ void DropTreeForcingModes(const std::string& path) {
 
 // 与产品一致的临时条目**所有权标记**：目录名 + 标记内容同时匹配才会被回收。
 // 没有标记的同名目录（= 用户自建）一律不碰，这是本轮 P0 的安全契约。
-std::string TempOwnerMarkerPath(const std::string& destination, long owner_pid) {
+std::string TempOwnerMarkerPath(const std::string& destination,
+                                long owner_pid) {
   return destination + "." + std::to_string(owner_pid) + ".owner";
 }
 
@@ -220,9 +222,10 @@ void CheckClaimInjectIntact(const std::string& file, const std::string& label,
                           info.st_ino == static_cast<ino_t>(ino) &&
                           (info.st_mode & 07777) == static_cast<mode_t>(mode),
                       label + "：inode 与权限位都没变");
-  test_support::Check(test_support::ReadFile(path + "/precious.txt", &content) &&
-                          content == "USER-DATA-MUST-SURVIVE\n",
-                      label + "：受保护内容一个字节都没少", content);
+  test_support::Check(
+      test_support::ReadFile(path + "/precious.txt", &content) &&
+          content == "USER-DATA-MUST-SURVIVE\n",
+      label + "：受保护内容一个字节都没少", content);
 }
 
 // 一次受支持的增量备份（MyPack + 不压缩 + 不加密）。
@@ -231,10 +234,10 @@ bool MakeSnapshot(const std::string& source, const std::string& repository,
                   std::string* error) {
   bp::Filter filter;
   bp::BackupOptions options;
-  return bp::RunIncrementalBackup(
-      source, repository, name, "repo-identity", filter, options,
-      std::vector<std::string>(), std::vector<std::string>(), "", outcome,
-      error);
+  return bp::RunIncrementalBackup(source, repository, name, "repo-identity",
+                                  filter, options, std::vector<std::string>(),
+                                  std::vector<std::string>(), "", outcome,
+                                  error);
 }
 
 }  // namespace
@@ -712,9 +715,9 @@ int main() {
     }
   }
 
-  // ---- 压缩与增量正交；加密与增量**不相容**（PR #18 closure 收紧的合同）----
+  // ---- 压缩与加密均支持增量；加密 delta 必须认证外层信封 ----
   test_support::Section(
-      "INC-R 9. 压缩照旧；增量 + 加密被明确拒绝，完整备份仍然支持加密");
+      "INC-R 9. 加密基线与 BKPINC2 恢复；缺失或错误密码不得发布目标");
   {
     const std::string work4 = test_support::FreshDir("inc-chain-crypto");
     const std::string src4 = work4 + "/src";
@@ -733,24 +736,101 @@ int main() {
     bp::BackupOptions encrypted;
     encrypted.compression_method = bp::CompressionMethod::kLzssHuffman;
     encrypted.encryption_method = bp::EncryptionMethod::kAes256CtrHmacSha256;
-    encrypted.password = "correct horse battery staple";
+    encrypted.password = work4 + "-session";
     std::string error;
     bp::IncrementalOutcome outcome;
-    // PR #18 v1 的合同：增量 + 加密 = 明确拒绝，而且是在**建任何东西之前**。
+    // 加密仍然要求密码；拒绝时归档和副文件都不能发布。
+    bp::BackupOptions missing_password = encrypted;
+    missing_password.password.clear();
     test_support::Check(
-        !bp::RunIncrementalBackup(src4, repo4, "c0.bak", repository_identity,
-                                  filter, encrypted, {}, {}, "", &outcome,
-                                  &error),
-        "INC-R T9 判别：增量 + 加密被拒绝（旧 HEAD 会接受）", error);
-    test_support::Check(
-        error.find("does not support encryption") != std::string::npos,
-        "INC-R T9 拒绝理由说明外层信封未被认证", error);
-    test_support::Check(!test_support::Exists(repo4 + "/c0.bak"),
+        !bp::RunIncrementalBackup(src4, repo4, "missing.bak",
+                                  repository_identity, filter, missing_password,
+                                  {}, {}, "", &outcome, &error),
+        "INC-R T9 加密缺少密码时被拒绝", error);
+    test_support::Check(error.find("password") != std::string::npos,
+                        "INC-R T9 拒绝理由说明缺少密码", error);
+    test_support::Check(!test_support::Exists(repo4 + "/missing.bak"),
                         "INC-R T9 拒绝之后没有留下基线");
     test_support::Check(
-        !test_support::Exists(repo4 + "/c0.bak.manifest") &&
-            !test_support::Exists(repo4 + "/c0.bak.identity"),
+        !test_support::Exists(repo4 + "/missing.bak.manifest") &&
+            !test_support::Exists(repo4 + "/missing.bak.identity"),
         "INC-R T9 拒绝之后没有留下副文件");
+
+    error.clear();
+    test_support::Check(
+        bp::RunIncrementalBackup(src4, repo4, "c0.bak", repository_identity,
+                                 filter, encrypted, {}, {}, "", &outcome,
+                                 &error) &&
+            outcome.kind == bp::IncrementalOutcome::Kind::kFullBaseline,
+        "INC-R T9 加密增量的完整基线成功", error);
+    test_support::Check(test_support::Exists(repo4 + "/c0.bak.manifest") &&
+                            test_support::Exists(repo4 + "/c0.bak.identity"),
+                        "INC-R T9 加密基线发布完整副文件");
+    bp::RestoreOptions restore_options;
+    restore_options.password = encrypted.password;
+    bp::RestoreReport encrypted_report;
+    const std::string base_restored = work4 + "/encrypted-base-restored";
+    error.clear();
+    test_support::Check(
+        bp::RestoreSnapshotChain(repo4, "c0.bak", base_restored,
+                                 restore_options, &encrypted_report, &error),
+        "INC-R T9 加密基线带正确密码恢复成功", error);
+    std::string base_detail;
+    test_support::Check(
+        test_support::CompareTrees(src4, base_restored, &base_detail),
+        "INC-R T9 加密基线恢复与源树一致", base_detail);
+
+    test_support::WriteFile(src4 + "/small.txt", "encrypted-changed", 0644);
+    error.clear();
+    test_support::Check(
+        bp::RunIncrementalBackup(src4, repo4, "c1.bak", repository_identity,
+                                 filter, encrypted, {}, {}, "", &outcome,
+                                 &error) &&
+            outcome.kind == bp::IncrementalOutcome::Kind::kDelta &&
+            outcome.parent_file_name == "c0.bak",
+        "INC-R T9 加密变化生成依赖基线的真实 delta", error);
+    bp::DeltaEnvelope authenticated_envelope;
+    error.clear();
+    test_support::Check(
+        bp::VerifyDeltaAuthentication(repo4 + "/c1.bak", encrypted.password,
+                                      &error, &authenticated_envelope) &&
+            authenticated_envelope.format_version ==
+                bp::kAuthenticatedDeltaFormatVersion &&
+            authenticated_envelope.envelope_hmac.size() == 64,
+        "INC-R T9 BKPINC2 的外层信封通过密码认证", error);
+    const std::string encrypted_restored = work4 + "/encrypted-restored";
+    error.clear();
+    test_support::Check(
+        bp::RestoreSnapshotChain(repo4, "c1.bak", encrypted_restored,
+                                 restore_options, &encrypted_report, &error),
+        "INC-R T9 加密增量链带正确密码恢复成功", error);
+    std::string encrypted_tree;
+    test_support::Check(MakeOracle(src4, oracle4, "authenticated-crypto",
+                                   filter, &encrypted_tree, &error),
+                        "INC-R T9 加密链状态的完整恢复 oracle 成功", error);
+    std::string encrypted_detail;
+    test_support::Check(
+        test_support::CompareTrees(encrypted_tree, encrypted_restored,
+                                   &encrypted_detail),
+        "INC-R T9 加密链恢复 == 同状态的完整恢复", encrypted_detail);
+    bp::RestoreOptions wrong;
+    wrong.password = encrypted.password + "-wrong";
+    const std::string wrong_chain = work4 + "/encrypted-wrong";
+    error.clear();
+    test_support::Check(
+        !bp::RestoreSnapshotChain(repo4, "c1.bak", wrong_chain, wrong,
+                                  &encrypted_report, &error),
+        "INC-R T9 加密链拒绝错误密码", error);
+    test_support::Check(!test_support::Exists(wrong_chain),
+                        "INC-R T9 错误密码不得发布加密链目标目录");
+    const std::string missing_chain = work4 + "/encrypted-missing";
+    error.clear();
+    test_support::Check(!bp::RestoreSnapshotChain(
+                            repo4, "c1.bak", missing_chain,
+                            bp::RestoreOptions{}, &encrypted_report, &error),
+                        "INC-R T9 加密链拒绝缺失密码", error);
+    test_support::Check(!test_support::Exists(missing_chain),
+                        "INC-R T9 缺少密码不得发布加密链目标目录");
 
     // 同一组算法换成**压缩**（不加密）：仍然完全支持，而且链可以恢复。
     bp::BackupOptions compressed;
@@ -766,19 +846,18 @@ int main() {
     test_support::WriteFile(src4 + "/small.txt", "small-changed", 0644);
     error.clear();
     bp::IncrementalOutcome second;
-    test_support::Check(
-        bp::RunIncrementalBackup(src4, repo4, "k1.bak", repository_identity,
-                                 filter, compressed, {}, {}, "", &second,
-                                 &error) &&
-            second.kind == bp::IncrementalOutcome::Kind::kDelta,
-        "INC-R T9 压缩（不加密）的 delta 成功", error);
+    test_support::Check(bp::RunIncrementalBackup(
+                            src4, repo4, "k1.bak", repository_identity, filter,
+                            compressed, {}, {}, "", &second, &error) &&
+                            second.kind == bp::IncrementalOutcome::Kind::kDelta,
+                        "INC-R T9 压缩（不加密）的 delta 成功", error);
     const std::string restored = work4 + "/restored";
     bp::RestoreReport report;
     error.clear();
-    test_support::Check(bp::RestoreSnapshotChain(repo4, "k1.bak", restored,
-                                                 bp::RestoreOptions{}, &report,
-                                                 &error),
-                        "INC-R T9 压缩链恢复成功", error);
+    test_support::Check(
+        bp::RestoreSnapshotChain(repo4, "k1.bak", restored,
+                                 bp::RestoreOptions{}, &report, &error),
+        "INC-R T9 压缩链恢复成功", error);
     std::string tree;
     test_support::Check(
         MakeOracle(src4, oracle4, "crypto", filter, &tree, &error),
@@ -800,16 +879,12 @@ int main() {
                             bytes.find("small-changed") == std::string::npos,
                         "INC-R T9 判别：完整备份的 payload 是密文");
     const std::string full_restored = work4 + "/full-restored";
-    bp::RestoreOptions restore_options;
-    restore_options.password = encrypted.password;
     bp::RestoreReport full_report;
     error.clear();
-    test_support::Check(bp::RunRestorePipeline(full_archive, full_restored,
-                                               restore_options, &full_report,
-                                               &error),
-                        "INC-R T9 加密的完整备份带密码恢复成功", error);
-    bp::RestoreOptions wrong;
-    wrong.password = "wrong password";
+    test_support::Check(
+        bp::RunRestorePipeline(full_archive, full_restored, restore_options,
+                               &full_report, &error),
+        "INC-R T9 加密的完整备份带密码恢复成功", error);
     const std::string restored_wrong = work4 + "/restored-wrong";
     bp::RestoreReport wrong_report;
     test_support::Check(!bp::RunRestorePipeline(full_archive, restored_wrong,
@@ -818,7 +893,6 @@ int main() {
     test_support::Check(!test_support::Exists(restored_wrong),
                         "INC-R T9 恢复失败时不留半个目标目录");
   }
-
 
   // ---- R-01：链上任何一个 delta 失败都必须让整次恢复失败 ----
   //
@@ -916,11 +990,11 @@ int main() {
         MakeSnapshot(source, repository, "s2.bak", &outcome, &error) &&
             outcome.kind == bp::IncrementalOutcome::Kind::kDelta,
         "INC-R T11 第一个 delta 建立成功", error);
-    test_support::Check(::chmod((source + "/ro").c_str(), 0755) == 0 &&
-                            test_support::WriteFile(source + "/ro/new.txt",
-                                                    "new", 0644) &&
-                            ::chmod((source + "/ro").c_str(), 0500) == 0,
-                        "INC-R T11 只读目录里加上 ro/new.txt 后收回 0500");
+    test_support::Check(
+        ::chmod((source + "/ro").c_str(), 0755) == 0 &&
+            test_support::WriteFile(source + "/ro/new.txt", "new", 0644) &&
+            ::chmod((source + "/ro").c_str(), 0500) == 0,
+        "INC-R T11 只读目录里加上 ro/new.txt 后收回 0500");
     test_support::Check(
         MakeSnapshot(source, repository, "s3.bak", &outcome, &error) &&
             outcome.kind == bp::IncrementalOutcome::Kind::kDelta,
@@ -943,24 +1017,27 @@ int main() {
     const std::string destination = work + "/restored";
     bp::RestoreReport report;
     error.clear();
-    const bool ok = bp::RestoreSnapshotChain(repository, "s3.bak", destination,
-                                             bp::RestoreOptions{}, &report,
-                                             &error);
-    test_support::Check(!ok, "INC-R T11 判别：最后一个 delta 合并失败即整次失败",
-                        error);
+    const bool ok =
+        bp::RestoreSnapshotChain(repository, "s3.bak", destination,
+                                 bp::RestoreOptions{}, &report, &error);
+    test_support::Check(
+        !ok, "INC-R T11 判别：最后一个 delta 合并失败即整次失败", error);
     test_support::Check(!test_support::Exists(destination),
                         "INC-R T11 判别：失败时 destination 一个字节都没发布");
     test_support::Check(error.find("ro/new.txt") != std::string::npos,
                         "INC-R T11 失败出在合并 ro/new.txt 这一步", error);
-    test_support::Check(!test_support::Exists(TempPath(destination, ".container")),
-                        "INC-R T11 失败后中间容器文件清理掉了");
+    test_support::Check(
+        !test_support::Exists(TempPath(destination, ".container")),
+        "INC-R T11 失败后中间容器文件清理掉了");
     // R-01 残留修复（本轮）：staging 里那棵只读子树以前会让"尽力而为"的清理
     // 留下一整棵删不掉的中间目录，而且跨 pid 累积。修复后失败路径也必须把
     // 自己的 staging / overlay 收干净。
-    test_support::Check(!test_support::Exists(TempPath(destination, ".staging")),
-                        "INC-R T11 失败后 staging 不留残留");
-    test_support::Check(!test_support::Exists(TempPath(destination, ".overlay")),
-                        "INC-R T11 失败后 overlay 不留残留");
+    test_support::Check(
+        !test_support::Exists(TempPath(destination, ".staging")),
+        "INC-R T11 失败后 staging 不留残留");
+    test_support::Check(
+        !test_support::Exists(TempPath(destination, ".overlay")),
+        "INC-R T11 失败后 overlay 不留残留");
     // 无论上面是红是绿，都把注入树收掉，避免它污染后续用例。
     DropTreeForcingModes(TempPath(destination, ".staging"));
     DropTreeForcingModes(TempPath(destination, ".overlay"));
@@ -995,9 +1072,9 @@ int main() {
         "INC-R T12 预置挡路的 container 残留");
     bp::RestoreReport report;
     error.clear();
-    const bool ok = bp::RestoreSnapshotChain(repository, "s3.bak", destination,
-                                             bp::RestoreOptions{}, &report,
-                                             &error);
+    const bool ok =
+        bp::RestoreSnapshotChain(repository, "s3.bak", destination,
+                                 bp::RestoreOptions{}, &report, &error);
     test_support::Check(!ok, "INC-R T12 判别：中间 delta 提取失败即整次失败",
                         error);
     test_support::Check(!test_support::Exists(destination),
@@ -1041,17 +1118,19 @@ int main() {
                         "INC-R T13 把 delta 的 payload 改成垃圾（长度不变）");
     bp::RestoreReport report;
     error.clear();
-    const bool ok = bp::RestoreSnapshotChain(repository, "s2.bak", destination,
-                                             bp::RestoreOptions{}, &report,
-                                             &error);
+    const bool ok =
+        bp::RestoreSnapshotChain(repository, "s2.bak", destination,
+                                 bp::RestoreOptions{}, &report, &error);
     test_support::Check(!ok, "INC-R T13 判别：容器恢复失败即整次失败", error);
     test_support::Check(!test_support::Exists(destination),
                         "INC-R T13 判别：失败时不发布");
     test_support::Check(!error.empty(), "INC-R T13 失败带诊断信息", error);
-    test_support::Check(!test_support::Exists(TempPath(destination, ".staging")),
-                        "INC-R T13 失败后 staging 清理掉了");
-    test_support::Check(!test_support::Exists(TempPath(destination, ".overlay")),
-                        "INC-R T13 失败后 overlay 清理掉了");
+    test_support::Check(
+        !test_support::Exists(TempPath(destination, ".staging")),
+        "INC-R T13 失败后 staging 清理掉了");
+    test_support::Check(
+        !test_support::Exists(TempPath(destination, ".overlay")),
+        "INC-R T13 失败后 overlay 清理掉了");
     test_support::Check(
         !test_support::Exists(TempPath(destination, ".container")),
         "INC-R T13 失败后 container 清理掉了");
@@ -1087,10 +1166,11 @@ int main() {
     const std::string destination = work + "/restored";
     bp::RestoreReport report;
     error.clear();
-    const bool ok = bp::RestoreSnapshotChain(repository, "s2.bak", destination,
-                                             bp::RestoreOptions{}, &report,
-                                             &error);
-    test_support::Check(!ok, "INC-R T14 判别：tombstone 删不掉即整次失败", error);
+    const bool ok =
+        bp::RestoreSnapshotChain(repository, "s2.bak", destination,
+                                 bp::RestoreOptions{}, &report, &error);
+    test_support::Check(!ok, "INC-R T14 判别：tombstone 删不掉即整次失败",
+                        error);
     test_support::Check(!test_support::Exists(destination),
                         "INC-R T14 判别：失败时不发布");
     test_support::Check(error.find("tombstone") != std::string::npos,
@@ -1122,9 +1202,9 @@ int main() {
         ::mkdir(TempPath(dest_null, ".container").c_str(), 0755) == 0,
         "INC-R T15 预置挡路的 container 残留");
     bp::RestoreReport null_report;
-    const bool null_ok = bp::RestoreSnapshotChain(
-        repository, "s2.bak", dest_null, bp::RestoreOptions{}, &null_report,
-        nullptr);
+    const bool null_ok =
+        bp::RestoreSnapshotChain(repository, "s2.bak", dest_null,
+                                 bp::RestoreOptions{}, &null_report, nullptr);
     test_support::Check(!null_ok,
                         "INC-R T15 判别：error_message=nullptr 时失败仍然返回 "
                         "false");
@@ -1141,14 +1221,15 @@ int main() {
         "INC-R T15 预置挡路的 container 残留（空 destination 版）");
     bp::RestoreReport empty_report;
     error.clear();
-    const bool empty_ok = bp::RestoreSnapshotChain(
-        repository, "s2.bak", dest_empty, bp::RestoreOptions{}, &empty_report,
-        &error);
+    const bool empty_ok =
+        bp::RestoreSnapshotChain(repository, "s2.bak", dest_empty,
+                                 bp::RestoreOptions{}, &empty_report, &error);
     test_support::Check(!empty_ok, "INC-R T15 判别：空 destination 版也失败",
                         error);
-    test_support::Check(test_support::Exists(dest_empty) &&
-                            test_support::DirEntries(dest_empty).empty(),
-                        "INC-R T15 判别：原本存在的空 destination 没有被发布成半成品");
+    test_support::Check(
+        test_support::Exists(dest_empty) &&
+            test_support::DirEntries(dest_empty).empty(),
+        "INC-R T15 判别：原本存在的空 destination 没有被发布成半成品");
     test_support::RemoveTree(TempPath(dest_empty, ".container"));
 
     // (c) 失败之后同一个仓库再做一次有效恢复：必须完全正常。
@@ -1160,10 +1241,9 @@ int main() {
                                  bp::RestoreOptions{}, &ok_report, &error),
         "INC-R T15 失败之后再次执行有效恢复成功", error);
     std::string content;
-    test_support::Check(
-        test_support::ReadFile(dest_ok + "/a.txt", &content) &&
-            content == "a-v2",
-        "INC-R T15 再次恢复的结果正确", content);
+    test_support::Check(test_support::ReadFile(dest_ok + "/a.txt", &content) &&
+                            content == "a-v2",
+                        "INC-R T15 再次恢复的结果正确", content);
   }
   {
     // 10.7 对照：**基座**恢复失败走的本来就是 do-while 的 break（这条一直
@@ -1193,9 +1273,9 @@ int main() {
                         "INC-R T16 把工作目录设成 0500");
     bp::RestoreReport report;
     error.clear();
-    const bool ok = bp::RestoreSnapshotChain(repository, "s2.bak", destination,
-                                             bp::RestoreOptions{}, &report,
-                                             &error);
+    const bool ok =
+        bp::RestoreSnapshotChain(repository, "s2.bak", destination,
+                                 bp::RestoreOptions{}, &report, &error);
     ::chmod(work.c_str(), 0755);
     test_support::Check(!ok, "INC-R T16 判别：基座恢复失败即整次失败", error);
     test_support::Check(!test_support::Exists(destination),
@@ -1211,8 +1291,9 @@ int main() {
     test_support::Check(MakeStubbornResidue(unmarked_residue),
                         "INC-R T16 预置无标记的同 pid 0500 staging 残留");
     error.clear();
-    const bool ok_blocked = bp::RestoreSnapshotChain(
-        repository, "s2.bak", destination, bp::RestoreOptions{}, &report, &error);
+    const bool ok_blocked =
+        bp::RestoreSnapshotChain(repository, "s2.bak", destination,
+                                 bp::RestoreOptions{}, &report, &error);
     struct stat residue_info;
     std::string residue_body;
     test_support::Check(!ok_blocked,
@@ -1220,11 +1301,10 @@ int main() {
                         error);
     test_support::Check(!test_support::Exists(destination),
                         "INC-R T16 判别：被拒绝时不发布");
-    test_support::Check(
-        ::lstat(unmarked_residue.c_str(), &residue_info) == 0 &&
-            S_ISDIR(residue_info.st_mode) &&
-            (residue_info.st_mode & 07777) == 0500,
-        "INC-R T16 无标记残留未被删除、权限位也未被改成 0700");
+    test_support::Check(::lstat(unmarked_residue.c_str(), &residue_info) == 0 &&
+                            S_ISDIR(residue_info.st_mode) &&
+                            (residue_info.st_mode & 07777) == 0500,
+                        "INC-R T16 无标记残留未被删除、权限位也未被改成 0700");
     test_support::Check(
         test_support::ReadFile(unmarked_residue + "/residue", &residue_body) &&
             residue_body == "residue",
@@ -1246,11 +1326,12 @@ int main() {
                                 TempOwnerMarkerText(self), 0600),
         "INC-R T16 补上属于本 pid 的所有权标记");
     error.clear();
-    const bool ok_after = bp::RestoreSnapshotChain(
-        repository, "s2.bak", destination, bp::RestoreOptions{}, &report, &error);
+    const bool ok_after =
+        bp::RestoreSnapshotChain(repository, "s2.bak", destination,
+                                 bp::RestoreOptions{}, &report, &error);
     struct stat marked_info;
-    test_support::Check(!ok_after,
-                        "INC-R T16 有标记的同 pid 残留也必须 fail-closed", error);
+    test_support::Check(
+        !ok_after, "INC-R T16 有标记的同 pid 残留也必须 fail-closed", error);
     test_support::Check(!test_support::Exists(destination),
                         "INC-R T16 判别：被拒绝时不发布");
     test_support::Check(
@@ -1258,8 +1339,9 @@ int main() {
             S_ISDIR(marked_info.st_mode) &&
             (marked_info.st_mode & 07777) == 0500,
         "INC-R T16 有标记的同 pid 残留也未被删除、权限位未被改");
-    test_support::Check(test_support::Exists(TempOwnerMarkerPath(destination, self)),
-                        "INC-R T16 残留还在时标记必须保留（否则再也无法回收）");
+    test_support::Check(
+        test_support::Exists(TempOwnerMarkerPath(destination, self)),
+        "INC-R T16 残留还在时标记必须保留（否则再也无法回收）");
     DropStubbornResidue(unmarked_residue);
     test_support::RemoveTree(TempOwnerMarkerPath(destination, self));
   }
@@ -1318,9 +1400,9 @@ int main() {
     if (dead_pid3 > 0) {
       ::waitpid(dead_pid3, &child_status, 0);
     }
-    test_support::Check(dead_pid > 0 && live_pid > 0 && dead_pid2 > 0 &&
-                            dead_pid3 > 0,
-                        "INC-R T17 fork 出构造用的死/活 pid");
+    test_support::Check(
+        dead_pid > 0 && live_pid > 0 && dead_pid2 > 0 && dead_pid3 > 0,
+        "INC-R T17 fork 出构造用的死/活 pid");
 
     if (dead_pid > 0 && live_pid > 0) {
       const std::string dead_suffix =
@@ -1331,7 +1413,8 @@ int main() {
       // 1) 死 pid 的 staging 目录 + container 文件：应当被回收。
       const std::string stale_staging = destination + dead_suffix + ".staging";
       const std::string stale_overlay = destination + dead_suffix + ".overlay";
-      const std::string stale_container = destination + dead_suffix + ".container";
+      const std::string stale_container =
+          destination + dead_suffix + ".container";
       test_support::Mkdir(stale_staging, 0755);
       test_support::WriteFile(stale_staging + "/left.txt", "left", 0644);
       test_support::Mkdir(stale_overlay, 0755);
@@ -1355,7 +1438,8 @@ int main() {
       const std::string not_a_number = destination + ".notanumber.staging";
       const std::string wrong_kind = destination + dead_suffix + ".staging.bak";
       const std::string other_destination = work + "/restored-other";
-      const std::string other_stale = other_destination + dead_suffix + ".staging";
+      const std::string other_stale =
+          other_destination + dead_suffix + ".staging";
       test_support::Mkdir(not_a_number, 0755);
       test_support::Mkdir(wrong_kind, 0755);
       test_support::Mkdir(other_stale, 0755);
@@ -1370,8 +1454,9 @@ int main() {
       const std::string dead_suffix2 =
           "." + std::to_string(static_cast<long>(dead_pid2));
       const std::string symlink_path = destination + dead_suffix2 + ".overlay";
-      test_support::Check(::symlink(precious.c_str(), symlink_path.c_str()) == 0,
-                          "INC-R T17 造出指回 precious 的软链接残留");
+      test_support::Check(
+          ::symlink(precious.c_str(), symlink_path.c_str()) == 0,
+          "INC-R T17 造出指回 precious 的软链接残留");
       test_support::Check(
           test_support::WriteFile(
               TempOwnerMarkerPath(destination, static_cast<long>(dead_pid2)),
@@ -1386,15 +1471,17 @@ int main() {
 
       bp::RestoreReport report;
       error.clear();
-      const bool ok = bp::RestoreSnapshotChain(
-          repository, "s1.bak", destination, bp::RestoreOptions{}, &report,
-          &error);
-      test_support::Check(ok, "INC-R T17 正常恢复成功（回收不影响发布）", error);
+      const bool ok =
+          bp::RestoreSnapshotChain(repository, "s1.bak", destination,
+                                   bp::RestoreOptions{}, &report, &error);
+      test_support::Check(ok, "INC-R T17 正常恢复成功（回收不影响发布）",
+                          error);
       test_support::Check(test_support::Exists(destination + "/a.txt"),
                           "INC-R T17 恢复结果正确");
 
-      test_support::Check(!test_support::Exists(stale_staging),
-                          "INC-R T17 死 pid 的 staging 残留被回收（含只读子树）");
+      test_support::Check(
+          !test_support::Exists(stale_staging),
+          "INC-R T17 死 pid 的 staging 残留被回收（含只读子树）");
       test_support::Check(!test_support::Exists(stale_overlay),
                           "INC-R T17 死 pid 的 overlay 残留被回收");
       test_support::Check(!test_support::Exists(stale_container),
@@ -1415,10 +1502,9 @@ int main() {
       test_support::Check(
           test_support::Exists(unmarked + "/user-file.txt"),
           "INC-R T17 无标记的同名用户目录原样保留（来源证明生效）");
-      test_support::Check(
-          !test_support::Exists(
-              TempOwnerMarkerPath(destination, static_cast<long>(dead_pid))),
-          "INC-R T17 回收后死 pid 的所有权标记被清掉");
+      test_support::Check(!test_support::Exists(TempOwnerMarkerPath(
+                              destination, static_cast<long>(dead_pid))),
+                          "INC-R T17 回收后死 pid 的所有权标记被清掉");
 
       // 收尾：把活着的子进程和注入树收掉。
       ::kill(live_pid, SIGTERM);
@@ -1474,16 +1560,17 @@ int main() {
 
     // (1) 同 UID 用户自建、名字**完全符合**回收规则的普通目录，里面放重要文件。
     //     它的"标记"是伪造的（内容不对），因此必须原样保留。
-    const std::string forged = destination + "." + std::to_string(pid0) + ".staging";
+    const std::string forged =
+        destination + "." + std::to_string(pid0) + ".staging";
     test_support::Mkdir(forged, 0755);
     test_support::WriteFile(forged + "/precious.txt", "user-data", 0644);
-    test_support::WriteFile(TempOwnerMarkerPath(destination, pid0),
-                            "THIS-IS-NOT-OUR-MAGIC\n" + std::to_string(pid0) +
-                                "\n",
-                            0600);
+    test_support::WriteFile(
+        TempOwnerMarkerPath(destination, pid0),
+        "THIS-IS-NOT-OUR-MAGIC\n" + std::to_string(pid0) + "\n", 0600);
 
     // (2) 真正由本软件留下的旧残留：目录 + 内容正确的标记 → 应当被回收。
-    const std::string real = destination + "." + std::to_string(pid1) + ".staging";
+    const std::string real =
+        destination + "." + std::to_string(pid1) + ".staging";
     test_support::Mkdir(real, 0755);
     test_support::WriteFile(real + "/left.txt", "left", 0644);
     test_support::Mkdir(real + "/ro", 0500);  // 只读子树：清理仍须成功
@@ -1497,16 +1584,17 @@ int main() {
     test_support::WriteFile(precious_dir + "/treasure.txt", "treasure", 0644);
     const std::string link_entry =
         destination + "." + std::to_string(pid2) + ".overlay";
-    test_support::Check(::symlink(precious_dir.c_str(), link_entry.c_str()) == 0,
-                        "INC-R T18 造出合规名字的软链接条目");
+    test_support::Check(
+        ::symlink(precious_dir.c_str(), link_entry.c_str()) == 0,
+        "INC-R T18 造出合规名字的软链接条目");
     test_support::WriteFile(TempOwnerMarkerPath(destination, pid2),
                             TempOwnerMarkerText(pid2), 0600);
 
     bp::RestoreReport report;
     error.clear();
-    const bool ok = bp::RestoreSnapshotChain(repository, "s1.bak", destination,
-                                             bp::RestoreOptions{}, &report,
-                                             &error);
+    const bool ok =
+        bp::RestoreSnapshotChain(repository, "s1.bak", destination,
+                                 bp::RestoreOptions{}, &report, &error);
     test_support::Check(ok, "INC-R T18 正常恢复成功（回收不影响发布）", error);
     std::string restored;
     test_support::Check(
@@ -1519,14 +1607,17 @@ int main() {
                         "INC-R T18 无标记的同名用户目录未被删除");
     test_support::Check(test_support::Exists(forged + "/precious.txt"),
                         "INC-R T18 无标记目录里的受保护文件未被删除");
-    test_support::Check(test_support::Exists(TempOwnerMarkerPath(destination, pid0)),
-                        "INC-R T18 伪造的标记文件未被删除");
+    test_support::Check(
+        test_support::Exists(TempOwnerMarkerPath(destination, pid0)),
+        "INC-R T18 伪造的标记文件未被删除");
 
     // 有来源证明的旧残留应当被回收（含 0500 只读子树）。
-    test_support::Check(!test_support::Exists(real),
-                        "INC-R T18 有标记的旧 staging 残留被回收（含只读子树）");
-    test_support::Check(!test_support::Exists(TempOwnerMarkerPath(destination, pid1)),
-                        "INC-R T18 有标记的旧残留其标记也一并清掉");
+    test_support::Check(
+        !test_support::Exists(real),
+        "INC-R T18 有标记的旧 staging 残留被回收（含只读子树）");
+    test_support::Check(
+        !test_support::Exists(TempOwnerMarkerPath(destination, pid1)),
+        "INC-R T18 有标记的旧残留其标记也一并清掉");
 
     // 软链接：目标必须完好，链接条目本身被摘掉。
     test_support::Check(test_support::Exists(precious_dir + "/treasure.txt"),
@@ -1534,8 +1625,9 @@ int main() {
     struct stat link_info;
     test_support::Check(::lstat(link_entry.c_str(), &link_info) != 0,
                         "INC-R T18 合规名字的软链接条目本身被摘掉");
-    test_support::Check(!test_support::Exists(TempOwnerMarkerPath(destination, pid2)),
-                        "INC-R T18 软链接条目的标记也已清掉");
+    test_support::Check(
+        !test_support::Exists(TempOwnerMarkerPath(destination, pid2)),
+        "INC-R T18 软链接条目的标记也已清掉");
 
     // 本轮自己的标记：正常结束后不应残留。
     const std::string self_pid_text =
@@ -1549,7 +1641,8 @@ int main() {
     DropTreeForcingModes(real);
   }
   {
-    // 10.10 destination 词法规范化：尾斜杠不得再破坏恢复（本轮 P1 修复的回归）。
+    // 10.10 destination 词法规范化：尾斜杠不得再破坏恢复（本轮 P1
+    // 修复的回归）。
     const std::string work = test_support::FreshDir("inc-trailing-slash");
     const std::string source = work + "/src";
     const std::string repository = work + "/repo";
@@ -1571,9 +1664,9 @@ int main() {
                                  bp::RestoreOptions{}, &report, &error),
         "INC-R T19 单尾斜杠（已存在空目录）恢复成功", error);
     std::string got;
-    test_support::Check(
-        test_support::ReadFile(with_slash + "/a.txt", &got) && got == "slash-v1",
-        "INC-R T19 单尾斜杠恢复内容正确", got);
+    test_support::Check(test_support::ReadFile(with_slash + "/a.txt", &got) &&
+                            got == "slash-v1",
+                        "INC-R T19 单尾斜杠恢复内容正确", got);
 
     const std::string many_slash = work + "/dest-many";
     error.clear();
@@ -1581,9 +1674,9 @@ int main() {
         bp::RestoreSnapshotChain(repository, "s1.bak", many_slash + "///",
                                  bp::RestoreOptions{}, &report, &error),
         "INC-R T19 多尾斜杠（目标不存在）恢复成功", error);
-    test_support::Check(
-        test_support::ReadFile(many_slash + "/a.txt", &got) && got == "slash-v1",
-        "INC-R T19 多尾斜杠恢复内容正确", got);
+    test_support::Check(test_support::ReadFile(many_slash + "/a.txt", &got) &&
+                            got == "slash-v1",
+                        "INC-R T19 多尾斜杠恢复内容正确", got);
 
     const std::string plain = work + "/dest-plain";
     error.clear();
@@ -1600,9 +1693,9 @@ int main() {
         !bp::RestoreSnapshotChain(repository, "s1.bak", with_slash,
                                   bp::RestoreOptions{}, &report, &error),
         "INC-R T19 非空目标被拒绝", error);
-    test_support::Check(
-        test_support::ReadFile(with_slash + "/a.txt", &got) && got == "slash-v1",
-        "INC-R T19 非空目标内容未被覆盖", got);
+    test_support::Check(test_support::ReadFile(with_slash + "/a.txt", &got) &&
+                            got == "slash-v1",
+                        "INC-R T19 非空目标内容未被覆盖", got);
 
     error.clear();
     test_support::Check(
@@ -1622,7 +1715,7 @@ int main() {
         "INC-R T19 尾斜杠恢复后不留所有权标记");
   }
 
-{
+  {
     // ============================================================
     // 10.11 P0-A：所有权标记路径**绝不能**覆盖或删除既有的用户对象。
     //
@@ -1648,8 +1741,7 @@ int main() {
         MakeSnapshot(source, repository, "s1.bak", &outcome, &error),
         "INC-R T20 基线建立成功", error);
 
-    const std::string self_pid =
-        std::to_string(static_cast<long>(::getpid()));
+    const std::string self_pid = std::to_string(static_cast<long>(::getpid()));
 
     struct FileState {
       bool ok = false;
@@ -1686,15 +1778,15 @@ int main() {
       const bool ok = try_restore(dest);
       const FileState after = state_of(marker);
       std::string content;
-      test_support::Check(!ok,
-                          "INC-R T20 A1 标记路径被既有文件占用时 fail-closed", error);
-      test_support::Check(after.ok && before.ino == after.ino &&
-                              before.dev == after.dev,
-                          "INC-R T20 A1 既有文件的 inode 未被替换");
       test_support::Check(
-          test_support::ReadFile(marker, &content) &&
-              content == "USER-SENTINEL-CONTENT",
-          "INC-R T20 A1 既有文件内容未被 O_TRUNC 截断", content);
+          !ok, "INC-R T20 A1 标记路径被既有文件占用时 fail-closed", error);
+      test_support::Check(
+          after.ok && before.ino == after.ino && before.dev == after.dev,
+          "INC-R T20 A1 既有文件的 inode 未被替换");
+      test_support::Check(test_support::ReadFile(marker, &content) &&
+                              content == "USER-SENTINEL-CONTENT",
+                          "INC-R T20 A1 既有文件内容未被 O_TRUNC 截断",
+                          content);
       test_support::Check(!test_support::Exists(dest),
                           "INC-R T20 A1 失败时不发布目标");
     }
@@ -1711,15 +1803,15 @@ int main() {
       const bool ok = try_restore(dest);
       const FileState after = state_of(victim);
       std::string content;
-      test_support::Check(!ok,
-                          "INC-R T20 A2 标记路径被硬链接占用时 fail-closed", error);
       test_support::Check(
-          test_support::ReadFile(victim, &content) &&
-              content == "HARDLINK-VICTIM",
-          "INC-R T20 A2 硬链接另一个名字下的文件内容未被毁掉", content);
-      test_support::Check(after.ok && before.ino == after.ino &&
-                              before.nlink == after.nlink,
-                          "INC-R T20 A2 硬链接本身未被摘掉（链接数不变）");
+          !ok, "INC-R T20 A2 标记路径被硬链接占用时 fail-closed", error);
+      test_support::Check(test_support::ReadFile(victim, &content) &&
+                              content == "HARDLINK-VICTIM",
+                          "INC-R T20 A2 硬链接另一个名字下的文件内容未被毁掉",
+                          content);
+      test_support::Check(
+          after.ok && before.ino == after.ino && before.nlink == after.nlink,
+          "INC-R T20 A2 硬链接本身未被摘掉（链接数不变）");
     }
 
     {
@@ -1732,15 +1824,16 @@ int main() {
                           "INC-R T20 A3 造出同名软链接");
       const bool ok = try_restore(dest);
       struct stat info;
-      test_support::Check(!ok,
-                          "INC-R T20 A3 标记路径被软链接占用时 fail-closed", error);
-      test_support::Check(::lstat(marker.c_str(), &info) == 0 &&
-                              S_ISLNK(info.st_mode),
-                          "INC-R T20 A3 既有软链接未被无条件 unlink 摘掉");
-      std::string content;
       test_support::Check(
-          test_support::ReadFile(victim, &content) && content == "SYMLINK-VICTIM",
-          "INC-R T20 A3 软链接目标未被 follow，内容不变", content);
+          !ok, "INC-R T20 A3 标记路径被软链接占用时 fail-closed", error);
+      test_support::Check(
+          ::lstat(marker.c_str(), &info) == 0 && S_ISLNK(info.st_mode),
+          "INC-R T20 A3 既有软链接未被无条件 unlink 摘掉");
+      std::string content;
+      test_support::Check(test_support::ReadFile(victim, &content) &&
+                              content == "SYMLINK-VICTIM",
+                          "INC-R T20 A3 软链接目标未被 follow，内容不变",
+                          content);
     }
 
     {
@@ -1751,8 +1844,8 @@ int main() {
       test_support::WriteFile(marker + "/inside.txt", "DIR-INSIDE", 0644);
       const bool ok = try_restore(dest);
       std::string content;
-      test_support::Check(!ok,
-                          "INC-R T20 A4 标记路径被目录占用时 fail-closed", error);
+      test_support::Check(!ok, "INC-R T20 A4 标记路径被目录占用时 fail-closed",
+                          error);
       test_support::Check(
           test_support::ReadFile(marker + "/inside.txt", &content) &&
               content == "DIR-INSIDE",
@@ -1763,21 +1856,21 @@ int main() {
       // A5：同名只读文件——unlink 只看父目录写权限，旧实现会把它删掉。
       const std::string dest = work + "/a5";
       const std::string marker = dest + "." + self_pid + ".owner";
-      test_support::Check(test_support::WriteFile(marker, "READONLY-SENTINEL", 0444),
-                          "INC-R T20 A5 造出同名只读文件");
+      test_support::Check(
+          test_support::WriteFile(marker, "READONLY-SENTINEL", 0444),
+          "INC-R T20 A5 造出同名只读文件");
       const FileState before = state_of(marker);
       const bool ok = try_restore(dest);
       const FileState after = state_of(marker);
       std::string content;
-      test_support::Check(!ok,
-                          "INC-R T20 A5 标记路径被只读文件占用时 fail-closed", error);
-      test_support::Check(after.ok && before.ino == after.ino &&
-                              before.mode == after.mode,
-                          "INC-R T20 A5 只读文件未被删除、权限未被改动");
       test_support::Check(
-          test_support::ReadFile(marker, &content) &&
-              content == "READONLY-SENTINEL",
-          "INC-R T20 A5 只读文件内容不变", content);
+          !ok, "INC-R T20 A5 标记路径被只读文件占用时 fail-closed", error);
+      test_support::Check(
+          after.ok && before.ino == after.ino && before.mode == after.mode,
+          "INC-R T20 A5 只读文件未被删除、权限未被改动");
+      test_support::Check(test_support::ReadFile(marker, &content) &&
+                              content == "READONLY-SENTINEL",
+                          "INC-R T20 A5 只读文件内容不变", content);
     }
 
     {
@@ -1794,7 +1887,8 @@ int main() {
         const int pfd = ::open(progress.c_str(),
                                O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, 0644);
         const std::string child_marker =
-            dest + "." + std::to_string(static_cast<long>(::getpid())) + ".owner";
+            dest + "." + std::to_string(static_cast<long>(::getpid())) +
+            ".owner";
         const bool made = ::mkfifo(child_marker.c_str(), 0600) == 0;
         if (pfd >= 0) {
           const std::string line =
@@ -1805,12 +1899,11 @@ int main() {
         ::alarm(20);  // 卡死时的硬超时
         bp::RestoreReport report;
         std::string child_error;
-        const bool ok = bp::RestoreSnapshotChain(
-            repository, "s1.bak", dest, bp::RestoreOptions{}, &report,
-            &child_error);
-        const std::string line =
-            std::string("done ok=") + (ok ? "1" : "0") + " err=" + child_error +
-            "\n";
+        const bool ok = bp::RestoreSnapshotChain(repository, "s1.bak", dest,
+                                                 bp::RestoreOptions{}, &report,
+                                                 &child_error);
+        const std::string line = std::string("done ok=") + (ok ? "1" : "0") +
+                                 " err=" + child_error + "\n";
         if (pfd >= 0) {
           const ssize_t wrote = ::write(pfd, line.data(), line.size());
           (void)wrote;
@@ -1826,14 +1919,15 @@ int main() {
       test_support::ReadFile(progress, &progress_text);
       const bool blocked = progress_text.find("done") == std::string::npos;
       const bool killed = WIFSIGNALED(status) && WTERMSIG(status) == SIGALRM;
-      test_support::Check(!blocked && !killed,
-                          "INC-R T20 A6 FIFO 占位时恢复不卡死（旧实现永久阻塞）",
-                          "progress=[" + progress_text + "] sigalrm=" +
-                              (killed ? "yes" : "no"));
+      test_support::Check(
+          !blocked && !killed,
+          "INC-R T20 A6 FIFO 占位时恢复不卡死（旧实现永久阻塞）",
+          "progress=[" + progress_text +
+              "] sigalrm=" + (killed ? "yes" : "no"));
       struct stat info;
-      test_support::Check(::lstat(child_marker.c_str(), &info) == 0 &&
-                              S_ISFIFO(info.st_mode),
-                          "INC-R T20 A6 既有 FIFO 未被删除");
+      test_support::Check(
+          ::lstat(child_marker.c_str(), &info) == 0 && S_ISFIFO(info.st_mode),
+          "INC-R T20 A6 既有 FIFO 未被删除");
       test_support::Check(!test_support::Exists(dest),
                           "INC-R T20 A6 冲突时 fail-closed 不发布目标");
     }
@@ -1849,10 +1943,9 @@ int main() {
       std::string content;
       test_support::Check(ok, "INC-R T20 A7 合法的同 pid 标记被复用，恢复成功",
                           error);
-      test_support::Check(
-          test_support::ReadFile(dest + "/a.txt", &content) &&
-              content == "owner-v1",
-          "INC-R T20 A7 恢复内容正确", content);
+      test_support::Check(test_support::ReadFile(dest + "/a.txt", &content) &&
+                              content == "owner-v1",
+                          "INC-R T20 A7 恢复内容正确", content);
       test_support::Check(!test_support::Exists(marker),
                           "INC-R T20 A7 结束后自己的标记被撤掉");
     }
@@ -1884,8 +1977,7 @@ int main() {
         MakeSnapshot(source, repository, "s1.bak", &outcome, &error),
         "INC-R T21 基线建立成功", error);
 
-    const std::string self_pid =
-        std::to_string(static_cast<long>(::getpid()));
+    const std::string self_pid = std::to_string(static_cast<long>(::getpid()));
     auto try_restore = [&](const std::string& dest) {
       bp::RestoreReport report;
       error.clear();
@@ -1906,17 +1998,17 @@ int main() {
       make_user_dir(stale, "precious.txt", "USER-DATA-B1", 0755);
       const bool ok = try_restore(dest);
       std::string content;
-      test_support::Check(!ok,
-                          "INC-R T21 B1 无标记的同 pid staging 占位时 fail-closed",
-                          error);
+      test_support::Check(
+          !ok, "INC-R T21 B1 无标记的同 pid staging 占位时 fail-closed", error);
       test_support::Check(
           test_support::ReadFile(stale + "/precious.txt", &content) &&
               content == "USER-DATA-B1",
           "INC-R T21 B1 用户目录及其内容一个字节都没少", content);
       test_support::Check(!test_support::Exists(dest),
                           "INC-R T21 B1 失败时不发布目标");
-      test_support::Check(!test_support::Exists(dest + "." + self_pid + ".owner"),
-                          "INC-R T21 B1 冲突失败后不留下自己的标记");
+      test_support::Check(
+          !test_support::Exists(dest + "." + self_pid + ".owner"),
+          "INC-R T21 B1 冲突失败后不留下自己的标记");
       DropTreeForcingModes(stale);
     }
 
@@ -1927,9 +2019,8 @@ int main() {
       make_user_dir(stale, "precious.txt", "USER-DATA-B2", 0755);
       const bool ok = try_restore(dest);
       std::string content;
-      test_support::Check(!ok,
-                          "INC-R T21 B2 无标记的同 pid overlay 占位时 fail-closed",
-                          error);
+      test_support::Check(
+          !ok, "INC-R T21 B2 无标记的同 pid overlay 占位时 fail-closed", error);
       test_support::Check(
           test_support::ReadFile(stale + "/precious.txt", &content) &&
               content == "USER-DATA-B2",
@@ -1944,13 +2035,13 @@ int main() {
       test_support::WriteFile(container, "USER-CONTAINER-B3", 0644);
       const bool ok = try_restore(dest);
       std::string content;
-      test_support::Check(!ok,
-                          "INC-R T21 B3 无标记的同 pid container 占位时 fail-closed",
-                          error);
       test_support::Check(
-          test_support::ReadFile(container, &content) &&
-              content == "USER-CONTAINER-B3",
-          "INC-R T21 B3 用户 container 文件未被无条件 unlink", content);
+          !ok, "INC-R T21 B3 无标记的同 pid container 占位时 fail-closed",
+          error);
+      test_support::Check(test_support::ReadFile(container, &content) &&
+                              content == "USER-CONTAINER-B3",
+                          "INC-R T21 B3 用户 container 文件未被无条件 unlink",
+                          content);
     }
 
     {
@@ -1964,15 +2055,14 @@ int main() {
       const bool ok = try_restore(dest);
       struct stat info;
       std::string content;
-      test_support::Check(!ok,
-                          "INC-R T21 B4 container 是软链接时 fail-closed", error);
-      test_support::Check(::lstat(container.c_str(), &info) == 0 &&
-                              S_ISLNK(info.st_mode),
-                          "INC-R T21 B4 用户软链接未被摘掉");
+      test_support::Check(!ok, "INC-R T21 B4 container 是软链接时 fail-closed",
+                          error);
       test_support::Check(
-          test_support::ReadFile(victim, &content) &&
-              content == "CONTAINER-LINK-TARGET",
-          "INC-R T21 B4 软链接目标完好", content);
+          ::lstat(container.c_str(), &info) == 0 && S_ISLNK(info.st_mode),
+          "INC-R T21 B4 用户软链接未被摘掉");
+      test_support::Check(test_support::ReadFile(victim, &content) &&
+                              content == "CONTAINER-LINK-TARGET",
+                          "INC-R T21 B4 软链接目标完好", content);
     }
 
     {
@@ -1983,12 +2073,11 @@ int main() {
       const bool ok = try_restore(dest);
       struct stat info;
       std::string content;
-      test_support::Check(!ok,
-                          "INC-R T21 B5 无标记的 0500 staging 占位时 fail-closed",
-                          error);
-      test_support::Check(::lstat(stale.c_str(), &info) == 0 &&
-                              (info.st_mode & 07777) == 0500,
-                          "INC-R T21 B5 用户目录权限位未被改成 0700");
+      test_support::Check(
+          !ok, "INC-R T21 B5 无标记的 0500 staging 占位时 fail-closed", error);
+      test_support::Check(
+          ::lstat(stale.c_str(), &info) == 0 && (info.st_mode & 07777) == 0500,
+          "INC-R T21 B5 用户目录权限位未被改成 0700");
       test_support::Check(
           test_support::ReadFile(stale + "/precious.txt", &content) &&
               content == "USER-DATA-B5",
@@ -2020,16 +2109,16 @@ int main() {
                           "INC-R T21 B6 判别：被拒绝时不发布");
       test_support::Check(
           ::lstat(stale_staging.c_str(), &keep_info) == 0 &&
-              S_ISDIR(keep_info.st_mode) &&
-              (keep_info.st_mode & 07777) == 0500,
+              S_ISDIR(keep_info.st_mode) && (keep_info.st_mode & 07777) == 0500,
           "INC-R T21 B6 只读 staging 残留被原样保留（权限位未改）");
       test_support::Check(test_support::Exists(stale_overlay + "/left.txt"),
                           "INC-R T21 B6 overlay 残留被原样保留");
+      test_support::Check(test_support::ReadFile(stale_container, &content) &&
+                              content == "junk",
+                          "INC-R T21 B6 container 残留被原样保留", content);
       test_support::Check(
-          test_support::ReadFile(stale_container, &content) && content == "junk",
-          "INC-R T21 B6 container 残留被原样保留", content);
-      test_support::Check(test_support::Exists(dest + "." + self_pid + ".owner"),
-                          "INC-R T21 B6 残留还在时标记必须保留");
+          test_support::Exists(dest + "." + self_pid + ".owner"),
+          "INC-R T21 B6 残留还在时标记必须保留");
       DropTreeForcingModes(stale_staging);
       DropTreeForcingModes(stale_overlay);
       test_support::RemoveTree(stale_container);
@@ -2048,14 +2137,13 @@ int main() {
       const bool ok = try_restore(dest);
       std::string content;
       test_support::Check(ok, "INC-R T21 B7 不合规的同级文件不影响恢复", error);
-      test_support::Check(
-          test_support::ReadFile(not_number, &content) &&
-              content == "keep-notanumber",
-          "INC-R T21 B7 非数字 pid 的同级文件未被删除", content);
-      test_support::Check(
-          test_support::ReadFile(wrong_kind, &content) &&
-              content == "keep-wrongkind",
-          "INC-R T21 B7 后缀不合规的同级文件未被删除", content);
+      test_support::Check(test_support::ReadFile(not_number, &content) &&
+                              content == "keep-notanumber",
+                          "INC-R T21 B7 非数字 pid 的同级文件未被删除",
+                          content);
+      test_support::Check(test_support::ReadFile(wrong_kind, &content) &&
+                              content == "keep-wrongkind",
+                          "INC-R T21 B7 后缀不合规的同级文件未被删除", content);
       test_support::Check(
           test_support::ReadFile(other, &content) && content == "keep-other",
           "INC-R T21 B7 无关同级文件未被删除", content);
@@ -2066,15 +2154,17 @@ int main() {
       const std::string dest = work + "/b8";
       const bool ok = try_restore(dest);
       std::string content;
-      test_support::Check(ok, "INC-R T21 B8 干净目录下正常恢复成功（对照）", error);
+      test_support::Check(ok, "INC-R T21 B8 干净目录下正常恢复成功（对照）",
+                          error);
+      test_support::Check(test_support::ReadFile(dest + "/a.txt", &content) &&
+                              content == "owner-v1",
+                          "INC-R T21 B8 恢复内容正确", content);
       test_support::Check(
-          test_support::ReadFile(dest + "/a.txt", &content) &&
-              content == "owner-v1",
-          "INC-R T21 B8 恢复内容正确", content);
-      test_support::Check(!test_support::Exists(dest + "." + self_pid + ".owner"),
-                          "INC-R T21 B8 不留所有权标记");
-      test_support::Check(!test_support::Exists(dest + "." + self_pid + ".staging"),
-                          "INC-R T21 B8 不留 staging 残留");
+          !test_support::Exists(dest + "." + self_pid + ".owner"),
+          "INC-R T21 B8 不留所有权标记");
+      test_support::Check(
+          !test_support::Exists(dest + "." + self_pid + ".staging"),
+          "INC-R T21 B8 不留 staging 残留");
     }
   }
 
@@ -2101,8 +2191,7 @@ int main() {
         MakeSnapshot(source, repository, "s1.bak", &outcome, &error),
         "INC-R T22 基线建立成功", error);
 
-    const std::string self_pid =
-        std::to_string(static_cast<long>(::getpid()));
+    const std::string self_pid = std::to_string(static_cast<long>(::getpid()));
     auto try_restore = [&](const std::string& dest) {
       bp::RestoreReport report;
       error.clear();
@@ -2132,8 +2221,7 @@ int main() {
           !ok, "INC-R T22 C1 同 pid 的 0000 残留也必须 fail-closed", error);
       test_support::Check(
           ::lstat((stale + "/zero").c_str(), &zero_info) == 0 &&
-              S_ISDIR(zero_info.st_mode) &&
-              (zero_info.st_mode & 07777) == 0000,
+              S_ISDIR(zero_info.st_mode) && (zero_info.st_mode & 07777) == 0000,
           "INC-R T22 C1 未认领的对象权限位未被改动（仍是 0000）");
       test_support::Check(::lstat(stale.c_str(), &zero_info) == 0,
                           "INC-R T22 C1 残留目录本身仍在");
@@ -2211,8 +2299,8 @@ int main() {
     //
     // 抓到它的是现代 GUI 的端到端套件：backup-options 区的
     // "AES 正确密码恢复成功" 变成了
-    // \`Cannot open the destination parent directory ...: No such file or directory\`。
-    // 这里补一条单元级回归，让它在被改坏的第一时间就红。
+    // \`Cannot open the destination parent directory ...: No such file or
+    // directory\`。 这里补一条单元级回归，让它在被改坏的第一时间就红。
     // ============================================================
     test_support::Section("INC-R 10.14 父目录不存在时仍能恢复");
     const std::string work = test_support::FreshDir("inc-parent-missing");
@@ -2234,17 +2322,16 @@ int main() {
                         "INC-R T23 前置：父目录确实不存在");
     bp::RestoreReport report;
     error.clear();
-    const bool ok = bp::RestoreSnapshotChain(repository, "s1.bak", destination,
-                                             bp::RestoreOptions{}, &report,
-                                             &error);
+    const bool ok =
+        bp::RestoreSnapshotChain(repository, "s1.bak", destination,
+                                 bp::RestoreOptions{}, &report, &error);
     std::string content;
     test_support::Check(ok, "INC-R T23 父目录不存在时恢复成功", error);
     test_support::Check(
         test_support::ReadFile(destination + "/a.txt", &content) &&
             content == "parent-v1",
         "INC-R T23 恢复内容正确", content);
-    const std::string self_pid =
-        std::to_string(static_cast<long>(::getpid()));
+    const std::string self_pid = std::to_string(static_cast<long>(::getpid()));
     test_support::Check(
         !test_support::Exists(destination + "." + self_pid + ".staging"),
         "INC-R T23 不留 staging 残留");
@@ -2264,12 +2351,15 @@ int main() {
     //     RemoveTempEntryAt(parent_fd, staging_name);
     //     RemoveTempEntryAt(parent_fd, overlay_name);
     // 于是
-    //   * mkdir(staging) 失败（EEXIST）时 staging **不是本轮创建的**，却仍被递归删除；
-    //   * mkdir(staging) 成功、mkdir(overlay) 失败时 overlay 不是本轮创建的，同样被删。
+    //   * mkdir(staging) 失败（EEXIST）时 staging
+    //   **不是本轮创建的**，却仍被递归删除；
+    //   * mkdir(staging) 成功、mkdir(overlay) 失败时 overlay
+    //   不是本轮创建的，同样被删。
     //
     // 怎么确定性命中：产品在进入时先查一遍同名冲突，之后才认领；冲突对象必须出现在
     // 这两步**之间**，纯文件系统事实做不到。因此用 LD_PRELOAD 注入（方案二，
-    // 注入器见 time-control/claiminject.c）：命中时先真的把受保护目录与哨兵建出来，
+    // 注入器见
+    // time-control/claiminject.c）：命中时先真的把受保护目录与哨兵建出来，
     // 再返回**真实的 EEXIST**，所以产品看到的是完全正常的内核错误。
     //
     // 没有装配注入器时这两条用例**明确报 SKIP**（不是静默通过）——只有配套的
@@ -2288,8 +2378,7 @@ int main() {
         MakeSnapshot(source, repository, "s1.bak", &outcome, &error),
         "INC-R T24 基线建立成功", error);
 
-    const std::string self_pid =
-        std::to_string(static_cast<long>(::getpid()));
+    const std::string self_pid = std::to_string(static_cast<long>(::getpid()));
     const char* inject_env = ::getenv("R9_CLAIM_INJECT_FILE");
     const std::string inject_file =
         (inject_env != nullptr) ? std::string(inject_env) : std::string();
@@ -2324,15 +2413,15 @@ int main() {
             ReadClaimInjectState(inject_file, "eexist", &dev, &ino, &mode);
         struct stat info;
         std::string content;
-        test_support::Check(have_state, "INC-R T24 A 注入器确实命中了 staging 认领");
+        test_support::Check(have_state,
+                            "INC-R T24 A 注入器确实命中了 staging 认领");
         test_support::Check(!ok, "INC-R T24 A 认领失败即整次失败", error);
+        test_support::Check(error.find(staging_full) != std::string::npos ||
+                                error.find(staging_name) != std::string::npos,
+                            "INC-R T24 A 失败诊断指向 staging", error);
         test_support::Check(
-            error.find(staging_full) != std::string::npos ||
-                error.find(staging_name) != std::string::npos,
-            "INC-R T24 A 失败诊断指向 staging", error);
-        test_support::Check(::lstat(staging_full.c_str(), &info) == 0 &&
-                                S_ISDIR(info.st_mode),
-                            "INC-R T24 A 未认领的 staging 目录仍然存在");
+            ::lstat(staging_full.c_str(), &info) == 0 && S_ISDIR(info.st_mode),
+            "INC-R T24 A 未认领的 staging 目录仍然存在");
         test_support::Check(
             have_state && info.st_dev == static_cast<dev_t>(dev) &&
                 info.st_ino == static_cast<ino_t>(ino) &&
@@ -2377,14 +2466,15 @@ int main() {
             ReadClaimInjectState(inject_file, "eexist", &dev, &ino, &mode);
         struct stat info;
         std::string content;
-        test_support::Check(have_state, "INC-R T24 B 注入器确实命中了 overlay 认领");
+        test_support::Check(have_state,
+                            "INC-R T24 B 注入器确实命中了 overlay 认领");
         test_support::Check(!ok, "INC-R T24 B 认领失败即整次失败", error);
+        test_support::Check(error.find("already exists") != std::string::npos,
+                            "INC-R T24 B 失败原因是名字已被占用（真实 EEXIST）",
+                            error);
         test_support::Check(
-            error.find("already exists") != std::string::npos,
-            "INC-R T24 B 失败原因是名字已被占用（真实 EEXIST）", error);
-        test_support::Check(::lstat(overlay_full.c_str(), &info) == 0 &&
-                                S_ISDIR(info.st_mode),
-                            "INC-R T24 B 未认领的 overlay 目录仍然存在");
+            ::lstat(overlay_full.c_str(), &info) == 0 && S_ISDIR(info.st_mode),
+            "INC-R T24 B 未认领的 overlay 目录仍然存在");
         test_support::Check(
             have_state && info.st_dev == static_cast<dev_t>(dev) &&
                 info.st_ino == static_cast<ino_t>(ino) &&
@@ -2405,7 +2495,8 @@ int main() {
       }
     }
 
-    // ---- 场景 C：注入器在场但目标不是本轮的临时名字 → 正常恢复必须照常成功 ----
+    // ---- 场景 C：注入器在场但目标不是本轮的临时名字 → 正常恢复必须照常成功
+    // ----
     {
       const std::string dest = work + "/claim-c";
       if (!inject_armed) {
@@ -2413,9 +2504,8 @@ int main() {
             "  SKIP  INC-R T24 C 注入器对照（需要 LD_PRELOAD 注入器）\n");
       } else {
         test_support::Check(
-            WriteClaimInjectDirectives(inject_file,
-                                       {"mkdir-race 1 " + work +
-                                        "/never-used-path"}),
+            WriteClaimInjectDirectives(
+                inject_file, {"mkdir-race 1 " + work + "/never-used-path"}),
             "INC-R T24 C 把注入目标指向一个不会被用到的路径");
         bp::RestoreReport report;
         error.clear();
@@ -2423,10 +2513,9 @@ int main() {
             repository, "s1.bak", dest, bp::RestoreOptions{}, &report, &error);
         std::string content;
         test_support::Check(ok, "INC-R T24 C 注入器不影响正常恢复", error);
-        test_support::Check(
-            test_support::ReadFile(dest + "/a.txt", &content) &&
-                content == "claim-v1",
-            "INC-R T24 C 恢复内容正确", content);
+        test_support::Check(test_support::ReadFile(dest + "/a.txt", &content) &&
+                                content == "claim-v1",
+                            "INC-R T24 C 恢复内容正确", content);
         test_support::Check(
             !test_support::Exists(dest + "." + self_pid + ".owner"),
             "INC-R T24 C 正常收尾不留标记");
@@ -2439,17 +2528,20 @@ int main() {
     // 10.16 mkdirat 成功、身份却取不到时**不得按名字递归删除**（本轮 P0-A）。
     //
     // 缺陷：ClaimTempDirectoryAt() 在 mkdirat 成功之后才 fstatat 取身份；取不到
-    // 就把 id_known 留成 false。而 RollbackJustCreatedEntry() 只在 id_known 为真
-    // 时才比对 dev/ino —— 于是**身份缺失反而绕过了身份检查**，直接对当前这个名字
+    // 就把 id_known 留成 false。而 RollbackJustCreatedEntry() 只在 id_known
+    // 为真 时才比对 dev/ino ——
+    // 于是**身份缺失反而绕过了身份检查**，直接对当前这个名字
     // 递归删除。那个名字此刻完全可能已经指向别人的对象。
     //
-    // 确定性命中：注入器让 mkdirat(staging) **真的成功**，随即把该名字换成受保护
-    // 目录（含哨兵），并让紧随其后的那一次 fstatat(staging) 失败 —— 这正是
+    // 确定性命中：注入器让 mkdirat(staging)
+    // **真的成功**，随即把该名字换成受保护 目录（含哨兵），并让紧随其后的那一次
+    // fstatat(staging) 失败 —— 这正是
     // "创建成功、身份取不到、名字已经不是我们的"这个中间态。
     //
-    //   A：只有 staging 的身份取不到（overlay 正常）—— 旧代码在**最终清理**里删；
-    //   B：staging 身份取不到 **且** overlay 被占 —— 旧代码走**回滚**分支删；
-    //   C：两段链上 delta 循环里的 overlay 身份取不到。
+    //   A：只有 staging 的身份取不到（overlay 正常）——
+    //   旧代码在**最终清理**里删； B：staging 身份取不到 **且** overlay 被占 ——
+    //   旧代码走**回滚**分支删； C：两段链上 delta 循环里的 overlay
+    //   身份取不到。
     //
     // 没有装配注入器时明确报 SKIP（不是静默通过）。
     // ============================================================
@@ -2461,8 +2553,7 @@ int main() {
     test_support::Mkdir(repository, 0755);
     bp::IncrementalOutcome outcome;
     std::string error;
-    const std::string self_pid =
-        std::to_string(static_cast<long>(::getpid()));
+    const std::string self_pid = std::to_string(static_cast<long>(::getpid()));
     const std::string inject_file = ClaimInjectFile();
     const bool inject_armed = ClaimInjectArmed();
     test_support::WriteFile(source + "/a.txt", "ident-v1", 0644);
@@ -2519,7 +2610,8 @@ int main() {
       }
     }
 
-    // ---- 场景 B：staging 身份取不到 **且** overlay 被占（旧代码走回滚分支）----
+    // ---- 场景 B：staging 身份取不到 **且** overlay
+    // 被占（旧代码走回滚分支）----
     {
       const std::string dest = work + "/ident-b";
       const std::string staging_name = "ident-b." + self_pid + ".staging";
@@ -2532,9 +2624,9 @@ int main() {
             "注入器）\n");
       } else {
         test_support::Check(
-            WriteClaimInjectDirectives(
-                inject_file, {"mkdirat-swap 1 " + staging_name,
-                              "mkdirat-eexist 1 " + overlay_name}),
+            WriteClaimInjectDirectives(inject_file,
+                                       {"mkdirat-swap 1 " + staging_name,
+                                        "mkdirat-eexist 1 " + overlay_name}),
             "INC-R T25 B 写下注入目标");
         bp::RestoreReport report;
         error.clear();
@@ -2583,7 +2675,8 @@ int main() {
       const std::string overlay_full = dest + "." + self_pid + ".overlay";
       if (!inject_armed) {
         std::printf(
-            "  SKIP  INC-R T25 C 首次 overlay 认领身份不可验证（需要 LD_PRELOAD "
+            "  SKIP  INC-R T25 C 首次 overlay 认领身份不可验证（需要 "
+            "LD_PRELOAD "
             "注入器）\n");
       } else {
         test_support::Check(
@@ -2592,18 +2685,18 @@ int main() {
             "INC-R T25 C 写下注入目标");
         bp::RestoreReport report;
         error.clear();
-        const bool ok = bp::RestoreSnapshotChain(
-            chain_repository, "c1.bak", dest, bp::RestoreOptions{}, &report,
-            &error);
+        const bool ok =
+            bp::RestoreSnapshotChain(chain_repository, "c1.bak", dest,
+                                     bp::RestoreOptions{}, &report, &error);
         test_support::Check(!ok, "INC-R T25 C 身份取不到即整次失败", error);
         test_support::Check(error.find("identity") != std::string::npos,
                             "INC-R T25 C 诊断指出身份不可验证", error);
-        CheckClaimInjectIntact(inject_file, "INC-R T25 C", overlay_full, "swap");
+        CheckClaimInjectIntact(inject_file, "INC-R T25 C", overlay_full,
+                               "swap");
         test_support::Check(!test_support::Exists(dest),
                             "INC-R T25 C 不得把失败报成成功并发布目标");
-        test_support::Check(
-            !test_support::Exists(staging_full),
-            "INC-R T25 C 本轮自己创建的 staging 被正确回收");
+        test_support::Check(!test_support::Exists(staging_full),
+                            "INC-R T25 C 本轮自己创建的 staging 被正确回收");
         test_support::Check(
             !test_support::Exists(dest + "." + self_pid + ".container"),
             "INC-R T25 C 中间容器被回收");
@@ -2638,18 +2731,18 @@ int main() {
             "INC-R T25 D 写下注入目标");
         bp::RestoreReport report;
         error.clear();
-        const bool ok = bp::RestoreSnapshotChain(
-            chain_repository, "c1.bak", dest, bp::RestoreOptions{}, &report,
-            &error);
+        const bool ok =
+            bp::RestoreSnapshotChain(chain_repository, "c1.bak", dest,
+                                     bp::RestoreOptions{}, &report, &error);
         test_support::Check(!ok, "INC-R T25 D delta 认领失败即整次失败", error);
         test_support::Check(error.find("identity") != std::string::npos,
                             "INC-R T25 D 诊断指出身份不可验证", error);
-        CheckClaimInjectIntact(inject_file, "INC-R T25 D", overlay_full, "swap");
+        CheckClaimInjectIntact(inject_file, "INC-R T25 D", overlay_full,
+                               "swap");
         test_support::Check(!test_support::Exists(dest),
                             "INC-R T25 D 失败时不发布目标");
-        test_support::Check(
-            !test_support::Exists(staging_full),
-            "INC-R T25 D 本轮自己创建的 staging 被正确回收");
+        test_support::Check(!test_support::Exists(staging_full),
+                            "INC-R T25 D 本轮自己创建的 staging 被正确回收");
         test_support::Check(
             !test_support::Exists(dest + "." + self_pid + ".container"),
             "INC-R T25 D 中间容器被回收");
@@ -2673,9 +2766,9 @@ int main() {
     // RunRestorePipeline 建出来，而这段时间里别人完全可以先在那个名字下放一个
     // 目录；收尾的按名字删除就会把它当成自己的残留删掉。
     //
-    // 确定性命中：注入器在**父目录被建出来的那一瞬间**（MakeDirectories 的那一次
-    // mkdir）先由"别人"把父目录建好，并放进一个受保护的同名 staging 目录 ——
-    // 这正是"父目录在调用过程中被创建，且其下有未知对象"。
+    // 确定性命中：注入器在**父目录被建出来的那一瞬间**（MakeDirectories
+    // 的那一次 mkdir）先由"别人"把父目录建好，并放进一个受保护的同名 staging
+    // 目录 —— 这正是"父目录在调用过程中被创建，且其下有未知对象"。
     // ============================================================
     test_support::Section("INC-R 10.17 父目录由他人在调用过程中创建");
     const std::string work = test_support::FreshDir("inc-parent-race");
@@ -2685,8 +2778,7 @@ int main() {
     test_support::Mkdir(repository, 0755);
     bp::IncrementalOutcome outcome;
     std::string error;
-    const std::string self_pid =
-        std::to_string(static_cast<long>(::getpid()));
+    const std::string self_pid = std::to_string(static_cast<long>(::getpid()));
     const std::string inject_file = ClaimInjectFile();
     const bool inject_armed = ClaimInjectArmed();
     test_support::WriteFile(source + "/a.txt", "race-v1", 0644);
@@ -2694,7 +2786,8 @@ int main() {
         MakeSnapshot(source, repository, "s1.bak", &outcome, &error),
         "INC-R T26 基线建立成功", error);
 
-    // ---- 场景 D：父目录在调用过程中出现，且其下已有一个未知的同名 staging ----
+    // ---- 场景 D：父目录在调用过程中出现，且其下已有一个未知的同名 staging
+    // ----
     {
       const std::string missing_parent = work + "/pb/nope/deeper";
       const std::string dest = missing_parent + "/restored";
@@ -2705,11 +2798,10 @@ int main() {
         std::printf(
             "  SKIP  INC-R T26 D 父目录被别人抢占（需要 LD_PRELOAD 注入器）\n");
       } else {
-        test_support::Check(
-            WriteClaimInjectDirectives(
-                inject_file, {"mkdir-race 1 " + missing_parent,
-                              "protect " + staging_full}),
-            "INC-R T26 D 写下注入目标");
+        test_support::Check(WriteClaimInjectDirectives(
+                                inject_file, {"mkdir-race 1 " + missing_parent,
+                                              "protect " + staging_full}),
+                            "INC-R T26 D 写下注入目标");
         bp::RestoreReport report;
         error.clear();
         const bool ok = bp::RestoreSnapshotChain(
@@ -2740,10 +2832,9 @@ int main() {
             "  SKIP  INC-R T26 E 父目录被别人抢先建出来（需要 LD_PRELOAD "
             "注入器）\n");
       } else {
-        test_support::Check(
-            WriteClaimInjectDirectives(inject_file,
-                                       {"mkdir-race 1 " + race_parent}),
-            "INC-R T26 E 写下注入目标");
+        test_support::Check(WriteClaimInjectDirectives(
+                                inject_file, {"mkdir-race 1 " + race_parent}),
+                            "INC-R T26 E 写下注入目标");
         bp::RestoreReport report;
         error.clear();
         const bool ok = bp::RestoreSnapshotChain(
@@ -2751,10 +2842,9 @@ int main() {
         std::string content;
         test_support::Check(ok, "INC-R T26 E 父目录被别人抢先建出来仍能恢复",
                             error);
-        test_support::Check(
-            test_support::ReadFile(dest + "/a.txt", &content) &&
-                content == "race-v1",
-            "INC-R T26 E 恢复内容正确", content);
+        test_support::Check(test_support::ReadFile(dest + "/a.txt", &content) &&
+                                content == "race-v1",
+                            "INC-R T26 E 恢复内容正确", content);
         test_support::Check(
             !test_support::Exists(dest + "." + self_pid + ".staging"),
             "INC-R T26 E 不留 staging 残留");

@@ -852,10 +852,8 @@ bool ScheduledBackupService::EvaluateInternal(std::int64_t now_sec, bool force,
     BackupOptions incremental_options;
     incremental_options.pack_method = document.config.pack_method;
     incremental_options.compression_method = document.config.compression_method;
-    // 增量 v1 的 BKPINC1 信封是明文且没有独立 MAC，配置层已经拒绝
-    // incremental + encryption；这里保持 none，避免绕过校验的调用方
-    // 产出“看起来加密了、信封却可被改写”的链。
-    incremental_options.encryption_method = EncryptionMethod::kNone;
+    incremental_options.encryption_method = document.config.encryption_method;
+    incremental_options.password = credential;
 
     IncrementalOutcome outcome;
     if (!RunIncrementalBackup(
@@ -973,9 +971,12 @@ bool ScheduledBackupService::EvaluateInternal(std::int64_t now_sec, bool force,
                                   now_sec, &archive_path, &work_error)) {
       return finish_failed(work_error);
     }
-    BackupEngine engine;
-    if (!engine.Backup(document.config.source_path, archive_path, filter,
-                       options, &work_error)) {
+    IncrementalOutcome full_outcome;
+    if (!RunManagedFullBackup(
+            document.config.source_path, repository_path_,
+            BaseNameOf(archive_path), RepositoryIdentity(repository_path_),
+            filter, options, document.config.include_rules,
+            document.config.exclude_rules, &full_outcome, &work_error)) {
       wipe_credential();
       return finish_failed(work_error);
     }

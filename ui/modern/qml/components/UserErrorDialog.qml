@@ -92,7 +92,7 @@ Dialog {
             Layout.fillWidth: true
             visible: dialog.technical.length > 0
             variant: "flat"
-            text: dialog.technicalExpanded ? "收起技术详情" : "查看技术详情"
+            text: dialog.technicalExpanded ? "收起详情" : "查看详情"
             onClicked: dialog.technicalExpanded = !dialog.technicalExpanded
         }
 

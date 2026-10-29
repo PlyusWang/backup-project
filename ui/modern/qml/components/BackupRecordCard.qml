@@ -67,6 +67,7 @@ Rectangle {
     required property string originText
     required property string scheduledChangesText
     property bool busy: false
+    property bool detailsExpanded: false
 
     // 本地 -> 云端复制。按钮是否出现 / 可用由“统一备份管理”页决定：
     // 未登录云端时按钮仍然可见但禁用，用户能看出“为什么现在不能点”。
@@ -133,7 +134,7 @@ Rectangle {
         Text {
             objectName: "backupRecordMeta"
             Layout.fillWidth: true
-            text: card.sizeText + " · 文件修改时间 " + card.modifiedText
+            text: card.sizeText
             font.pixelSize: 15
             color: theme.textSecondary
             wrapMode: Text.WordWrap
@@ -144,11 +145,12 @@ Rectangle {
         Text {
             objectName: "backupRecordRecognition"
             Layout.fillWidth: true
+            visible: card.detailsExpanded || !card.recognized
             text: card.recognized
                   ? "已识别归档格式 · v" + card.formatVersion + " · "
                     + card.entryCountText + " 个条目"
                     + (card.hasPipelineMethods ? "" : " · Legacy v0.1")
-                  : "无法识别归档头"
+                  : "无法识别这份备份文件"
             font.pixelSize: 15
             color: card.recognized ? theme.textPrimary : theme.warning
             wrapMode: Text.WordWrap
@@ -159,8 +161,9 @@ Rectangle {
         Text {
             objectName: "backupRecordSnapshotKind"
             Layout.fillWidth: true
+            visible: card.recognized
             text: card.isDelta
-                  ? (card.parentFileName !== ""
+                  ? (card.detailsExpanded && card.parentFileName !== ""
                      ? "增量备份 · 父快照 " + card.parentFileName
                      : "增量备份")
                   : "完整备份"
@@ -205,7 +208,7 @@ Rectangle {
         Text {
             objectName: "backupRecordPipeline"
             Layout.fillWidth: true
-            visible: card.hasPipelineMethods
+            visible: card.detailsExpanded && card.hasPipelineMethods
             text: card.hasPipelineMethods
                   ? card.packMethodText + " · " + card.compressionMethodText
                     + " · " + card.encryptionMethodText
@@ -220,6 +223,7 @@ Rectangle {
         Text {
             objectName: "backupRecordOrigin"
             Layout.fillWidth: true
+            visible: card.detailsExpanded
             text: card.originText
                   + (card.scheduledChangesText !== ""
                     ? "  ·  " + card.scheduledChangesText
@@ -233,7 +237,7 @@ Rectangle {
         Text {
             objectName: "backupRecordPasswordRequired"
             Layout.fillWidth: true
-            visible: card.passwordRequired
+            visible: card.detailsExpanded && card.passwordRequired
             text: "需要密码恢复"
             font.pixelSize: 15
             color: theme.textPrimary
@@ -243,8 +247,8 @@ Rectangle {
         Text {
             objectName: "backupRecordRecognitionNote"
             Layout.fillWidth: true
-            visible: card.recognized
-            text: "恢复时仍会执行完整归档校验。"
+            visible: card.detailsExpanded
+            text: "文件修改时间：" + card.modifiedText
             font.pixelSize: 14
             color: theme.textSecondary
             wrapMode: Text.WordWrap
@@ -268,6 +272,13 @@ Rectangle {
         RowLayout {
             Layout.fillWidth: true
             spacing: 10
+
+            AppButton {
+                objectName: "backupRecordDetailsButton"
+                text: card.detailsExpanded ? "收起详情" : "详情"
+                variant: "flat"
+                onClicked: card.detailsExpanded = !card.detailsExpanded
+            }
 
             Item { Layout.fillWidth: true }
 

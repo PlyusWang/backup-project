@@ -144,6 +144,11 @@ bool VerifyContainerPayloadBytes(const std::string& container_file,
                                  ContainerHeader* header,
                                  std::string* error_message);
 
+// 只读校验容器摘要及密码认证，不解密、不建立恢复目录。
+bool AuthenticateContainerFile(const std::string& container_file,
+                               const std::string& password,
+                               std::string* error_message);
+
 }  // namespace backupproject
 
 #endif  // BACKUP_PROJECT_INCLUDE_ARCHIVE_PIPELINE_H_

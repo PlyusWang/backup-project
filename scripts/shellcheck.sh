@@ -46,6 +46,10 @@ else
     scripts/claim_failure_test.sh
     scripts/remote_reliability_test.sh
     scripts/shellcheck.sh
+    scripts/workflow_acceptance_test.sh
+    scripts/network_acceptance_test.sh
+    scripts/session_credentials_test.sh
+    scripts/credential_ui_test.sh
     packaging/ecs/verify-ecs-deployment.sh
   )
 fi

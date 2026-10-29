@@ -129,8 +129,14 @@ run realtime bash scripts/realtime_test.sh
 # 新结构由契约测试 + 真实服务端 GUI 流程覆盖；旧脚本保留在仓库里供历史审计，
 # 但不再进入正式门禁，避免用“改断言”掩盖结构变化。
 run unified-gui bash scripts/unified_gui_contract_test.sh
+run ux-acceptance bash scripts/isolated_gui_test.sh ./build/backup-gui-modern --ux-acceptance-test
+run combo-hover bash scripts/isolated_gui_test.sh ./build/backup-gui-modern --combo-hover-test
 run remote-gui bash scripts/isolated_gui_test.sh ./build/backup-gui-modern --remote-test
 run gui_smoke bash scripts/gui_smoke_test.sh
+run workflow-acceptance bash scripts/workflow_acceptance_test.sh
+run network-acceptance bash scripts/network_acceptance_test.sh
+run session-credentials bash scripts/session_credentials_test.sh
+run credential-ui bash scripts/credential_ui_test.sh
 run archive_pipeline bash scripts/archive_pipeline_test.sh
 run backup_catalog bash scripts/backup_catalog_test.sh
 run compression bash scripts/compression_test.sh
@@ -155,3 +161,4 @@ run ustar bash scripts/ustar_test.sh
 failed=$(grep -c "^GATE .* exit=[^0]" "$LOG" || true)
 echo "[gate] failed suites = $failed" | tee -a "$LOG"
 grep -E "^GATE |failed suites|ASAN: aggregate|RSS_BOUND|ASAN: transfer" "$LOG"
+test "$failed" -eq 0

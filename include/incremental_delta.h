@@ -41,11 +41,11 @@
 //
 //   * payload（所有真实路径与内容）在容器里，受容器自己的 MAC 保护；选了加密
 //     时它就是密文。
-//   * envelope 是**明文**：Catalog 必须在没有密码的情况下知道"这是 delta、
-//     父是谁、能不能恢复"。它刻意不写源目录绝对路径，只写 identity 摘要。
-//   * envelope 自身没有独立的 MAC。篡改它不会得到"悄悄错恢复"：parent digest
-//     与上一份快照记录的 digest 对不上时，解析链会直接拒绝。也就是说攻击者
-//     能造成的后果是"链被拒绝"，不是"恢复到错误内容"。
+//   * envelope 是明文：Catalog 可在没有密码时显示父链；它只写身份摘要，
+//     不写源目录绝对路径。明文元数据不提供名称和变化计数的保密性。
+//   * BKPINC1 只接受未加密 payload，公开摘要不构成密码认证。
+//   * 加密快照写 BKPINC2；独立子密钥的 HMAC 绑定信封与完整内层容器摘要。
+//     恢复在应用父链和删除指令前验证 HMAC，不把公开 snapshot_id 当认证标签。
 //
 // 本文件是纯 C++17：不依赖 Qt，也不依赖任何第三方库。
 
@@ -66,6 +66,7 @@ inline constexpr unsigned char kDeltaMagic[8] = {'B', 'K', 'P', 'I',
                                                  'N', 'C', '1', '\0'};
 inline constexpr std::size_t kDeltaMagicSize = sizeof(kDeltaMagic);
 inline constexpr std::uint16_t kDeltaFormatVersion = 1;
+inline constexpr std::uint16_t kAuthenticatedDeltaFormatVersion = 2;
 // magic + version + header_size + envelope_len + payload_len
 inline constexpr std::size_t kDeltaFixedHeaderSize = 24;
 inline constexpr std::size_t kMaxDeltaEnvelopeBytes = 8u * 1024u * 1024u;
@@ -77,6 +78,10 @@ inline constexpr std::size_t kMaxDeltaEntries = 2000000u;
 // delta 的自描述信封。字段全部是值类型。
 struct DeltaEnvelope {
   std::uint32_t format_version = kDeltaFormatVersion;
+
+  // BKPINC2 的外层认证标签。HMAC 同时绑定父链、删除指令和完整内层容器摘要。
+  // BKPINC1 没有此字段，仍按原格式读取未加密快照。
+  std::string envelope_hmac;
 
   // 这份 delta 自己的身份：64 位十六进制，内容 = 规范化 envelope 去掉本字段
   // 之后的摘要。它让"同一个 snapshot 被引用两次"可以被识别出来。
@@ -155,7 +160,14 @@ std::string ComputeDeltaSnapshotId(const DeltaEnvelope& envelope);
 bool WriteDeltaFile(const std::string& delta_file,
                     const DeltaEnvelope& envelope,
                     const std::vector<ArchiveEntry>& changed_entries,
-                    const BackupOptions& options, std::string* error_message);
+                    const BackupOptions& options, std::string* error_message,
+                    const ArchiveProgressCallback& progress = {});
+
+// 只读认证；在使用 BKPINC2 的父链或删除指令之前调用。v1 仅允许未加密 payload。
+bool VerifyDeltaAuthentication(const std::string& delta_file,
+                               const std::string& password,
+                               std::string* error_message,
+                               DeltaEnvelope* authenticated_envelope = nullptr);
 
 // 只读信封：不需要密码、不读 payload。
 bool ReadDeltaEnvelope(const std::string& delta_file, DeltaEnvelope* envelope,
@@ -168,10 +180,8 @@ bool ExtractDeltaPayload(const std::string& delta_file,
 
 // 读内层 container 的 header：不需要密码、不抽取 payload、不触碰内容。
 //
-// 恢复路径用它确认"这份 delta 的 payload 没有被加密"。v1 的合同是
-// Incremental + encryption 明确拒绝，创建路径由共享校验拦住；读侧要有同一条
-// 合同，因为旧版本写出来的加密 delta 的**明文外层信封**（parent / tombstones）
-// 并不受内层 HMAC 覆盖，接受它等于接受一组未经认证的路径指令。
+// 用于显示算法和判定密码需求。恢复仍拒绝没有外层认证的旧版加密 BKPINC1；
+// BKPINC2 的独立外层认证由 VerifyDeltaAuthentication 执行。
 bool InspectDeltaPayloadHeader(const std::string& delta_file,
                                ContainerHeader* header,
                                std::string* error_message);

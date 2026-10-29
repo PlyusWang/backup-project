@@ -38,6 +38,8 @@
 #include <map>
 #include <utility>
 
+#include "cloud_task.h"
+
 // 产品级远端备份 / 链恢复：与 backupctl remote backup / remote restore
 // 用的是**同一个** core。GUI 不重新实现任何增量判断（有没有可信基线、父是谁、
 // 代数、lineage、要不要 bootstrap 缓存）——它只把"源目录 + 策略"和
@@ -359,9 +361,28 @@ RemoteController::RemoteController(QObject* parent) : QObject(parent) {
   // 结束忙碌。订阅放在构造函数里，保证**任何**状态变化都不会被漏掉。
   QObject::connect(&tunnel_, &SshTunnelManager::stateChanged, this,
                    &RemoteController::OnTunnelStateChanged);
+  QObject::connect(this, &RemoteController::sessionChanged, this, [this]() {
+    if (!authenticated_) ClearSharedSession();
+  });
+  const auto invalidate_shared_session = [this]() {
+    ++shared_config_generation_;
+    ClearSharedSession();
+  };
+  QObject::connect(this, &RemoteController::endpointChanged, this,
+                   invalidate_shared_session);
+  QObject::connect(this, &RemoteController::connectionChanged, this,
+                   invalidate_shared_session);
+  QObject::connect(this, &RemoteController::serverKeyPinChanged, this,
+                   invalidate_shared_session);
+  QObject::connect(&tunnel_, &SshTunnelManager::stateChanged, this, [this]() {
+    if (connection_mode_ == ConnectionMode::kSshTunnel && !tunnel_.IsReady()) {
+      ClearSharedSession();
+    }
+  });
 }
 
 RemoteController::~RemoteController() {
+  ClearSharedSession();
   // 后台线程可能正拿着 client_ 在跑：先让进度回调放手，再等它结束，
   // 最后才销毁任何东西。关窗守卫（Main.qml 的 onClosing）已经挡住"传输中
   // 关窗"，这里是最后一道保险。
@@ -391,6 +412,65 @@ QString RemoteController::sessionText() const {
     return QStringLiteral("当前账户：%1（已登录）").arg(username_);
   }
   return QStringLiteral("未登录");
+}
+
+bool RemoteController::sharedSessionReady() const {
+  return backupproject::SessionCloudCredentialsAvailable();
+}
+
+QString RemoteController::sharedSessionRepositoryId() const {
+  return QString::fromStdString(backupproject::SessionCloudRepositoryId());
+}
+
+QString RemoteController::sharedSessionReference() const {
+  return QString::fromLatin1(backupproject::kSessionCloudCredentialsReference);
+}
+
+void RemoteController::ClearSharedSession() {
+  backupproject::ClearSessionCloudCredentials();
+  emit sharedSessionChanged();
+}
+
+void RemoteController::PublishSharedSession() {
+  if (!authenticated_ || password_.isEmpty() ||
+      login_config_generation_ != shared_config_generation_) {
+    ClearSharedSession();
+    return;
+  }
+  backupproject::CloudCredentials credentials;
+  credentials.host = endpoint_.host;
+  credentials.port = endpoint_.port;
+  credentials.username = username_.toStdString();
+  credentials.password = password_.toStdString();
+  credentials.identity_mode = auth_mode_.toStdString();
+  credentials.server_key_pin = server_key_pin_.toStdString();
+  credentials.trusted_roots_file = trusted_roots_file_.toStdString();
+  credentials.expected_server_id = expected_server_id_.toStdString();
+  if (connection_mode_ == ConnectionMode::kOfficialCloud) {
+    const auto& official = backupproject::net::OfficialCloudProfile();
+    credentials.host = official.host;
+    credentials.port = official.port;
+    credentials.identity_mode = "certificate";
+    credentials.trusted_roots_file.clear();
+    credentials.expected_server_id = official.expected_server_id;
+    credentials.server_key_pin.clear();
+  } else if (connection_mode_ == ConnectionMode::kSshTunnel) {
+    if (!TunnelMatchesEndpoint()) {
+      ClearSharedSession();
+      return;
+    }
+    credentials.repository_host =
+        "ssh/" + ssh_host_.toStdString() + "/" + endpoint_.host;
+    credentials.repository_port = endpoint_.port;
+    credentials.host = "127.0.0.1";
+    credentials.port = static_cast<std::uint16_t>(tunnel_.localPort());
+  }
+  std::string error;
+  if (!backupproject::SetSessionCloudCredentials(credentials, &error)) {
+    backupproject::ClearSessionCloudCredentials();
+  }
+  credentials.password.assign(credentials.password.size(), '\0');
+  emit sharedSessionChanged();
 }
 
 // 服务器可达性：空串表示"还没有试过"，于是界面什么都不说。
@@ -1825,12 +1905,12 @@ RemoteOpResult RemoteController::RunOperation(
         result.ok = false;
         break;
       }
-      // 恢复不需要口令：增量链的外层信封由内层身份记录保护（与 CLI 同一条
-      // 结论）。整条依赖链的解析、下载、逐成员校验、逐跳应用全在 core 里。
+      backupproject::RestoreOptions restore_options;
+      restore_options.password = request.restore_password;
       backupproject::net::RemoteRestoreOutcome outcome;
       result.ok = backupproject::net::RunRemoteRestore(
           client, cache, request.snapshot_id, request.restore_destination,
-          backupproject::RestoreOptions(), &outcome, &error);
+          restore_options, &outcome, &error);
       if (result.ok) {
         result.restore_chain_length = outcome.chain_length;
         result.restore_delta_count = outcome.delta_count;
@@ -1910,10 +1990,14 @@ RemoteOpResult RemoteController::RunOperation(
                   remote_parent->second.sha256 == local_parent->second.sha256 &&
                   known.parent_snapshot_id ==
                       remote_parent->second.snapshot_id &&
+                  !known.lineage.empty() &&
+                  known.lineage == remote_parent->second.lineage &&
                   known.generation == remote_parent->second.generation + 1;
             } else {
-              same =
-                  known.snapshot_kind == 0 && known.parent_snapshot_id.empty();
+              same = known.snapshot_kind == 0 &&
+                     known.parent_snapshot_id.empty() &&
+                     (object.bundle ? !known.lineage.empty()
+                                    : known.lineage.empty());
             }
           }
           if (!same) {
@@ -1927,18 +2011,20 @@ RemoteOpResult RemoteController::RunOperation(
         }
         backupproject::net::RemoteUploadOptions options;
         options.snapshot_kind = record.incremental_delta ? 1 : 0;
+        if (object.bundle) options.lineage = lineage;
         if (record.incremental_delta) {
           const auto parent = remote_by_name.find(record.parent_file_name);
           const auto local_parent = objects.find(record.parent_file_name);
           if (parent == remote_by_name.end() || local_parent == objects.end() ||
-              parent->second.sha256 != local_parent->second.sha256) {
+              parent->second.sha256 != local_parent->second.sha256 ||
+              parent->second.lineage.empty()) {
             error =
                 "父快照没有以相同内容复制到云端：" + record.parent_file_name;
             result.ok = false;
             break;
           }
           options.parent_snapshot_id = parent->second.snapshot_id;
-          options.lineage = lineage;
+          options.lineage = parent->second.lineage;
         }
         RemoteSnapshotInfo uploaded;
         if (!client->UploadSnapshotFile(object.path, record.file_name, options,
@@ -2381,6 +2467,7 @@ void RemoteController::ApplyResult(const RemoteOpResult& result) {
   switch (result.kind) {
     case RemoteOpResult::Kind::kRegister:
       ClearSurfaceError(ErrorSurface::kRegister);
+      ClearSharedSession();
       authenticated_ = false;
       SetStatus(QStringLiteral("success"), QStringLiteral("注册成功"),
                 QStringLiteral("账号已经创建，现在可以点“登录”。"));
@@ -2391,6 +2478,7 @@ void RemoteController::ApplyResult(const RemoteOpResult& result) {
         authenticated_ = true;
         emit sessionChanged();
       }
+      PublishSharedSession();
       SetStatus(QStringLiteral("success"), QStringLiteral("登录成功"),
                 QStringLiteral("正在读取云端备份列表…"));
       break;
@@ -2653,6 +2741,8 @@ bool RemoteController::login(const QString& host, const QString& port_text,
   password_ = password;
   RemoteRequest request;
   request.kind = RemoteOpResult::Kind::kLogin;
+  ClearSharedSession();
+  login_config_generation_ = shared_config_generation_;
   request.endpoint = endpoint_;
   // pin 与地址是同一份快照：每一处提交都显式带上它（见头文件里的说明）。
   request.endpoint.server_key_pin = serverKeyPin().toStdString();
@@ -2672,6 +2762,7 @@ void RemoteController::logoutLocal() {
     return;
   }
   client_.Disconnect();
+  ClearSharedSession();
   // 断开之后"服务器可不可达"重新变成未知：界面不再声称任何结论。
   SetReachability(RemoteReachability::kUnknown);
   if (authenticated_) {
@@ -3044,7 +3135,8 @@ bool RemoteController::backupRemoteWithOptions(
 // core 里；GUI 不预先创建目标目录，也不替 core 判断它可不可用 ——
 // "不存在或为空目录"这条契约由恢复核心统一裁决，两条路径说法一致。
 bool RemoteController::restoreSnapshot(const QString& snapshot_id,
-                                       const QString& destination_directory) {
+                                       const QString& destination_directory,
+                                       const QString& password) {
   const QString id = snapshot_id.trimmed();
   const QString destination = destination_directory.trimmed();
   if (id.isEmpty()) {
@@ -3070,7 +3162,9 @@ bool RemoteController::restoreSnapshot(const QString& snapshot_id,
   request.username = username_.toStdString();
   request.snapshot_id = id.toStdString();
   request.restore_destination = destination.toStdString();
+  request.restore_password = password.toStdString();
   Submit(request);
+  WipeSecret(&request.restore_password);
   return true;
 }
 

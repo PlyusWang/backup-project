@@ -43,6 +43,13 @@ record_fail() { FAIL=$((FAIL + 1)); echo "  FAIL  $1 -- $2" >&2; }
 
 first_line() { head -n 1 "$OUT" | cut -c1-200; }
 
+# 完整快照也携带 manifest / identity 副文件；快照数量与名称只取真实归档。
+snapshot_names() {
+  find "$1" -maxdepth 1 -type f -name '*.bak' -printf '%f\n' | sort
+}
+
+snapshot_count() { snapshot_names "$1" | wc -l; }
+
 expect_exit() {
   local name="$1" expected="$2"
   shift 2
@@ -176,6 +183,7 @@ run_unit incremental_crash_test
 # PR #18 closure：路径安全 / 父绑定 / hardlink / 选项矩阵 / 依赖删除 /
 # 副文件生命周期 / payload 绑定 / 深度上界。
 run_unit incremental_closure_test
+run_unit incremental_encryption_test
 
 # ============================================================
 echo "[schedule-test] B. CLI pipeline parity"
@@ -376,13 +384,13 @@ expect_exit "D.14 schedule run（首次，建立快照）" 0 \
 expect_grep "D.15 首次运行创建完整快照" "Created a new full snapshot"
 expect_grep "D.16 首次快照被标注出来" "first snapshot"
 
-SCHED_BAK_1="$(ls "$SCHED/repo" | head -1)"
+SCHED_BAK_1="$(snapshot_names "$SCHED/repo" | head -1)"
 expect_file "D.17 仓库里有一份计划快照" "$SCHED/repo/$SCHED_BAK_1"
 
 expect_exit "D.18 schedule run（无变化，必须 skip）" 0 \
   "$BACKUPCTL" --config-file "$CONFIG" --schedule-file "$STORE" schedule run
 expect_grep "D.19 无变化时跳过" "Skipped: the source has not changed"
-COUNT_AFTER_SKIP="$(ls "$SCHED/repo" | wc -l)"
+COUNT_AFTER_SKIP="$(snapshot_count "$SCHED/repo")"
 if [ "$COUNT_AFTER_SKIP" = "1" ]; then
   record_pass "D.20 跳过时没有产生新归档"
 else
@@ -403,7 +411,7 @@ printf 'three\n' > "$SCHED/src/c.txt"
 sleep 1
 printf 'four\n' > "$SCHED/src/d.txt"
 "$BACKUPCTL" --config-file "$CONFIG" --schedule-file "$STORE" schedule run >/dev/null 2>&1
-COUNT_AFTER_RETAIN="$(ls "$SCHED/repo" | wc -l)"
+COUNT_AFTER_RETAIN="$(snapshot_count "$SCHED/repo")"
 if [ "$COUNT_AFTER_RETAIN" = "2" ]; then
   record_pass "D.24 retention 让仓库稳定在 retain=2"
 else
@@ -553,7 +561,7 @@ expect_grep "D2.23 规则被清空" "Include rules:  (none)"
 expect_exit "D2.24 建立 baseline" 0 \
   "$BACKUPCTL" --config-file "$FIX_CONFIG" --schedule-file "$FIX_STORE" schedule run
 expect_grep "D2.25 建立的是完整快照" "Created a new full snapshot"
-FIX_BAK="$(ls -t "$FIX/repo-a" | head -1)"
+FIX_BAK="$(snapshot_names "$FIX/repo-a" | head -1)"
 expect_exit "D2.26 源没变时照样 skip" 0 \
   "$BACKUPCTL" --config-file "$FIX_CONFIG" --schedule-file "$FIX_STORE" schedule run
 expect_grep "D2.27 无变化跳过" "Skipped: the source has not changed"
@@ -563,7 +571,7 @@ expect_exit "D2.28 手工删掉 baseline 之后再跑一轮" 0 \
   "$BACKUPCTL" --config-file "$FIX_CONFIG" --schedule-file "$FIX_STORE" schedule run
 expect_grep "D2.29 明确报告基线被重建" "baseline reset"
 expect_grep "D2.30 建立的是新的完整快照" "Created a new full snapshot"
-FIX_COUNT_A="$(ls "$FIX/repo-a" | wc -l)"
+FIX_COUNT_A="$(snapshot_count "$FIX/repo-a")"
 if [ "$FIX_COUNT_A" = "1" ]; then
   record_pass "D2.31 仓库里又恰好只剩一份快照"
 else
@@ -580,13 +588,13 @@ expect_exit "D2.34 换到另一个仓库" 0 \
 expect_exit "D2.35 换仓库后立即检查并运行" 0 \
   "$BACKUPCTL" --config-file "$FIX_CONFIG" --schedule-file "$FIX_STORE" schedule run
 expect_grep "D2.36 新仓库拿到的是基线快照" "baseline reset"
-FIX_COUNT_B="$(ls "$FIX/repo-b" | wc -l)"
+FIX_COUNT_B="$(snapshot_count "$FIX/repo-b")"
 if [ "$FIX_COUNT_B" = "1" ]; then
   record_pass "D2.37 新仓库里有且只有一份快照"
 else
   record_fail "D2.37 新仓库里有且只有一份快照" "实际 $FIX_COUNT_B 份"
 fi
-FIX_COUNT_A2="$(ls "$FIX/repo-a" | wc -l)"
+FIX_COUNT_A2="$(snapshot_count "$FIX/repo-a")"
 if [ "$FIX_COUNT_A2" = "1" ]; then
   record_pass "D2.38 旧仓库没有被写入"
 else
@@ -647,13 +655,13 @@ CC_TAB=$'\t'
   --source "$CC/src" --interval-minutes 1 --retain 10 >/dev/null 2>&1
 "$BACKUPCTL" --config-file "$CC_CONFIG" --schedule-file "$CC_STORE" schedule enable >/dev/null 2>&1
 "$BACKUPCTL" --config-file "$CC_CONFIG" --schedule-file "$CC_STORE" schedule run >/dev/null 2>&1
-CC_S1="$(ls -1 "$CC/repo")"
+CC_S1="$(snapshot_names "$CC/repo")"
 cp "$CC_STORE" "$CC/state-S1.json"
 cp "$CC_MANIFEST" "$CC/manifest-S1.dat"
 sleep 1
 printf 'v2\n' > "$CC/src/file.txt"
 "$BACKUPCTL" --config-file "$CC_CONFIG" --schedule-file "$CC_STORE" schedule run >/dev/null 2>&1
-CC_S2="$(ls -1 "$CC/repo" | grep -v -x "$CC_S1")"
+CC_S2="$(snapshot_names "$CC/repo" | grep -F -v -x "$CC_S1")"
 cp "$CC_STORE" "$CC/state-S2.json"
 cp "$CC_MANIFEST" "$CC/manifest-S2.dat"
 
@@ -675,11 +683,11 @@ cc_place() {
 cc_case() {
   local id="$1" label="$2" expect="$3" recovery_id="${4:-}"
   local result new
-  ls -1 "$CC/repo" | sort > "$CC/before.txt"
+  snapshot_names "$CC/repo" > "$CC/before.txt"
   "$BACKUPCTL" --config-file "$CC_CONFIG" --schedule-file "$CC_STORE" schedule run >"$OUT" 2>&1
   result="$("$BACKUPCTL" --config-file "$CC_CONFIG" --schedule-file "$CC_STORE" schedule history 2>/dev/null |
             awk 'NR>1 && NF>1 {k=$3} END{print k}')"
-  ls -1 "$CC/repo" | sort > "$CC/after.txt"
+  snapshot_names "$CC/repo" > "$CC/after.txt"
   new="$(comm -13 "$CC/before.txt" "$CC/after.txt" | head -1)"
   if [ "$result" = "$expect" ]; then
     record_pass "$id $label（$result）"
@@ -708,7 +716,7 @@ cc_case "D3.01" "正常配对、源没变，必须 skip" "skipped_no_changes"
 cc_place state-S1.json manifest-S2.dat
 cc_case "D3.02" "旧 state + 新 manifest 绝不能 skip" "success_created" "D3.03"
 expect_grep "D3.04 明确报告基线被重建" "baseline reset"
-CC_COUNT="$(ls -1 "$CC/repo" | wc -l)"
+CC_COUNT="$(snapshot_count "$CC/repo")"
 if [ "$CC_COUNT" = "3" ]; then
   record_pass "D3.05 仓库里现在是三份快照（S1、S2、重建的那一份）"
 else
@@ -1156,7 +1164,7 @@ IND_STORE="$IND/schedule.json"
   --source "$IND/src" --interval-minutes 1 --retain 5 >/dev/null 2>&1
 "$BACKUPCTL" --config-file "$IND_CONFIG" --schedule-file "$IND_STORE" schedule enable >/dev/null 2>&1
 "$BACKUPCTL" --config-file "$IND_CONFIG" --schedule-file "$IND_STORE" schedule run >/dev/null 2>&1
-OLDEST="$(ls -t "$IND/repo" | tail -1)"
+OLDEST="$(snapshot_names "$IND/repo" | head -1)"
 
 sleep 1
 printf 'v2\n' > "$IND/src/file.txt"
@@ -1469,7 +1477,7 @@ printf 'c\n' > "$KC/src/a.txt"
 
 expect_exit "K.08 C1 CLI backup 写进配置好的仓库" 0 \
   "$BACKUPCTL" --config-file "$KC/config.json" backup "$KC/src"
-KC_NAME="$(ls -1 "$KC/repo-a" | head -n 1)"
+KC_NAME="$(snapshot_names "$KC/repo-a" | head -n 1)"
 if [ -n "$KC_NAME" ]; then
   record_pass "K.09 C1 归档由程序命名并落在仓库里（$KC_NAME）"
 else
@@ -1483,16 +1491,18 @@ expect_exit "K.12 C2 换仓库之后 CLI backup 落到新仓库" 0 \
   env "$BACKUPCTL" --config-file "$KC/config.json" config repository set "$KC/repo-b"
 expect_exit "K.13 C2 第二次 backup" 0 \
   "$BACKUPCTL" --config-file "$KC/config.json" backup "$KC/src"
-if [ "$(ls -1 "$KC/repo-b" | wc -l)" = "1" ]; then
+KC_COUNT_B="$(snapshot_count "$KC/repo-b")"
+KC_NAME_B="$(snapshot_names "$KC/repo-b" | head -n 1)"
+if [ "$KC_COUNT_B" = "1" ]; then
   record_pass "K.14 C2 新仓库里有且只有一份"
 else
-  record_fail "K.14 C2 新仓库里有且只有一份" "实际 $(ls -1 "$KC/repo-b" | wc -l) 份"
+  record_fail "K.14 C2 新仓库里有且只有一份" "实际 $KC_COUNT_B 份"
 fi
 "$BACKUPCTL" --config-file "$KC/config.json" repository list >"$OUT" 2>&1
-expect_grep "K.15 C2 CLI repository list 看到它" "$(ls -1 "$KC/repo-b" | head -n 1)"
+expect_grep "K.15 C2 CLI repository list 看到它" "$KC_NAME_B"
 
 expect_exit "K.16 C4 restore 只接受仓库内的单组件名字" 0 \
-  "$BACKUPCTL" --config-file "$KC/config.json" restore "$(ls -1 "$KC/repo-b" | head -n 1)" "$KC/dest"
+  "$BACKUPCTL" --config-file "$KC/config.json" restore "$KC_NAME_B" "$KC/dest"
 for bad in "../x.bak" "sub/x.bak" ".." "x" "a\\b.bak"; do
   expect_exit "K.17 C4 拒绝非法名字 [$bad]" 1 \
     "$BACKUPCTL" --config-file "$KC/config.json" restore "$bad" "$KC/dest2"

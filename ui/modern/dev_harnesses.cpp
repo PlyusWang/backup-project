@@ -27,6 +27,7 @@
 #include <QQuickWindow>
 #include <QRandomGenerator>
 #include <QRegularExpression>
+#include <QScopeGuard>
 #include <QSet>
 #include <QStandardPaths>
 #include <QStringList>
@@ -3638,7 +3639,9 @@ QString ScheduleConfigSignature(const backupproject::ScheduleConfig& config) {
 QVariantMap LastHistory(const backup_modern::ScheduleController& schedule) {
   const QVariantList history = schedule.history();
   if (history.isEmpty()) return QVariantMap();
-  return history.last().toMap();
+  // The presentation model is newest first; persistent history remains oldest
+  // first. Tests of the latest run must use the presentation model's front.
+  return history.first().toMap();
 }
 }  // namespace
 
@@ -4124,6 +4127,25 @@ int RunRepositoryTest(QQuickWindow* window,
   // 调用方依旧 fail closed，禁用按钮不构成任何保证。
   {
     QTemporaryDir chain_dir;
+    // Early assertion failures must not persist a repository inside a temporary
+    // directory that is about to disappear. Declare after chain_dir so rollback
+    // runs before that fixture is removed, and restore the original source too.
+    bool needs_repository_restore = false;
+    const auto restore_repository_on_exit = qScopeGuard([&]() {
+      if (!needs_repository_restore) return;
+      if (!controller->waitForIdle(600000)) {
+        std::fprintf(stderr, "chain cleanup: operation did not become idle\n");
+      }
+      controller->setSourcePath(source);
+      if (!controller->saveRepositoryPath(repository)) {
+        std::fprintf(stderr, "chain cleanup: restore repository failed: %s\n",
+                     qPrintable(controller->statusMessage()));
+        return;
+      }
+      if (!controller->waitForCatalogIdle(600000)) {
+        std::fprintf(stderr, "chain cleanup: restored catalog timed out\n");
+      }
+    });
     const QString chain_repo = chain_dir.filePath(QStringLiteral("repo"));
     const QString chain_src = chain_dir.filePath(QStringLiteral("src"));
     QDir().mkpath(chain_repo);
@@ -4132,6 +4154,7 @@ int RunRepositoryTest(QQuickWindow* window,
                        QByteArray("one\n"))) {
       return ChainFail("临时源目录写入失败", chain_src);
     }
+    needs_repository_restore = true;
     if (!controller->saveRepositoryPath(chain_repo)) {
       return ChainFail("保存临时仓库失败", controller->statusMessage());
     }
@@ -4182,8 +4205,8 @@ int RunRepositoryTest(QQuickWindow* window,
     }
     std::printf("chain: 完整快照 ok（完整备份 / 恢复可用）\n");
 
-    // B. 健康的增量：字段是"增量 + 父快照 + 可恢复"，卡片显示种类与父快照，
-    //    恢复可用。增量只支持 mypack + 不加密，所以这两个 key 是写死的。
+    // B. 健康的增量：字段是"增量 + 父快照 + 可恢复"，简洁卡片显示种类，
+    //    展开详情显示父快照，恢复可用。本场景使用未加密 MyPack。
     //
     //    第一次增量通常还没有可续的链，引擎会先重建一份完整基线（那一份
     //    不是 delta），所以要"改一次源 + 跑一次增量"直到真的拿到 delta。
@@ -4235,10 +4258,31 @@ int RunRepositoryTest(QQuickWindow* window,
     if (card == nullptr) {
       return ChainFail("管理页找不到增量卡片", delta_name);
     }
+    if (card->property("detailsExpanded").toBool() ||
+        CardText(card, "backupRecordSnapshotKind") !=
+            QStringLiteral("增量备份")) {
+      return ChainFail("增量卡片默认简洁视图不对",
+                       CardText(card, "backupRecordSnapshotKind"));
+    }
+    QQuickItem* details_button =
+        FindItemByName(card, QStringLiteral("backupRecordDetailsButton"));
+    if (details_button == nullptr || !details_button->isVisible() ||
+        !details_button->isEnabled() ||
+        !QMetaObject::invokeMethod(details_button, "clicked") ||
+        !card->property("detailsExpanded").toBool() ||
+        FindRecordCard(window, delta_name) != card) {
+      return ChainFail("无法展开当前增量卡片详情", delta_name);
+    }
     const QString delta_kind_text = CardText(card, "backupRecordSnapshotKind");
     if (!delta_kind_text.contains(QStringLiteral("增量备份")) ||
         !delta_kind_text.contains(parent_name)) {
       return ChainFail("增量卡片没有显示种类 / 父快照", delta_kind_text);
+    }
+    if (!QMetaObject::invokeMethod(details_button, "clicked") ||
+        card->property("detailsExpanded").toBool() ||
+        CardText(card, "backupRecordSnapshotKind") !=
+            QStringLiteral("增量备份")) {
+      return ChainFail("增量卡片详情无法收起", delta_name);
     }
     if (CardVisible(card, "backupRecordChainBroken")) {
       return ChainFail("健康增量不该显示断链警告", delta_name);
@@ -4306,6 +4350,8 @@ int RunRepositoryTest(QQuickWindow* window,
     if (!controller->waitForCatalogIdle(600000)) {
       return ChainFail("切回原仓库后列表超时", QString());
     }
+    controller->setSourcePath(source);
+    needs_repository_restore = false;
   }
 
   // 3.5 产物字节：界面展示 uid / gid / user / group / symlink / FIFO，筛选预览
@@ -4794,10 +4840,8 @@ int RunCloseGuardTest(QQuickWindow* window,
 //
 // 共享 AppComboBox 下拉行的状态回归。
 //
-// 被钉住的不变量：hover 底色只能来自 row.hovered，键盘高亮只能由**Qt 导航的
-// 结果**推断（popup ListView 的 currentIndex 变化且当前没有指针活动）。
-// highlightedIndex 既不能证明键盘高亮（鼠标划过也会改它），监听按键也收不到
-// 事件（焦点在 ComboBox 上，不在 popup 的 ListView），所以两者都不用。
+// 选中项始终有主题背景；打开时焦点落在选中项。hover 底色随指针离开而消失，
+// 键盘光标由真实导航键移动，不把鼠标留下的 highlightedIndex 当作焦点。
 //
 // 这个自检真的把指针移到行上、移走，也真的把 ↓ 送进真实焦点链，然后逐行读
 // 运行期状态（hovered / 覆盖层 opacity / currentIndex / 输入方式闸门）。
@@ -4906,7 +4950,8 @@ int RunComboHoverTest(QQuickWindow* window, backup_modern::AppTheme* theme) {
             ->findChild<QQuickItem*>(QStringLiteral("comboItemBackground"))
             ->property("color")
             .value<QColor>();
-    return hoverOpacity(row) > 0.01 || keyboardOpacity(row) > 0.01 ||
+    return layerOpacity(row, "comboItemSelectedLayer") > 0.01 ||
+           hoverOpacity(row) > 0.01 || keyboardOpacity(row) > 0.01 ||
            base.alpha() > 0;
   };
   // 覆盖层 opacity 的判据是 > 0.01 而不是 == 1：层是用动画淡入淡出的，
@@ -4982,16 +5027,15 @@ int RunComboHoverTest(QQuickWindow* window, backup_modern::AppTheme* theme) {
     return nullptr;
   };
 
-  // ---- Mouse 1：打开 popup，指针不在任何地方，键盘模式必须是关的 ----
-  run.Check(
-      !keyboardActive() && hoverRows(rows).isEmpty() &&
-          keyboardRows(rows).isEmpty(),
-      QStringLiteral("Mouse 1 打开 popup：无 hover 底色、无键盘光标、模式关闭"),
-      QStringLiteral("hover 行=%1 键盘行=%2 模式=%3 | %4")
-          .arg(hoverRows(rows).join(QStringLiteral(",")),
-               keyboardRows(rows).join(QStringLiteral(",")))
-          .arg(keyboardActive())
-          .arg(describe(rows)));
+  // ---- Mouse 1：打开 popup，当前选择与键盘起点立即可见 ----
+  run.Check(keyboardActive() && hoverRows(rows).isEmpty() &&
+                keyboardRows(rows) == QStringList{QString::number(path_index)},
+            QStringLiteral("Mouse 1 打开 popup：当前选择与键盘起点立即高亮"),
+            QStringLiteral("hover 行=%1 键盘行=%2 模式=%3 | %4")
+                .arg(hoverRows(rows).join(QStringLiteral(",")),
+                     keyboardRows(rows).join(QStringLiteral(",")))
+                .arg(keyboardActive())
+                .arg(describe(rows)));
   run.Check(listIndex() == path_index &&
                 combo->property("currentIndex").toInt() == path_index,
             QStringLiteral("Mouse 1 打开时键盘位置同步到当前已选择项"),
@@ -5005,8 +5049,8 @@ int RunComboHoverTest(QQuickWindow* window, backup_modern::AppTheme* theme) {
                             : selected_row->findChild<QQuickItem*>(
                                   QStringLiteral("comboItemCheck"));
     run.Check(check != nullptr && check->property("visible").toBool() &&
-                  !hasBackground({path_index, selected_row}),
-              QStringLiteral("Mouse 1 已选择项（路径）只有勾号，没有底色"));
+                  hasBackground({path_index, selected_row}),
+              QStringLiteral("Mouse 1 已选择项（路径）有勾号与可见底色"));
   }
 
   // ---- Mouse 2：指针 hover “文件类型” ----
@@ -5024,23 +5068,23 @@ int RunComboHoverTest(QQuickWindow* window, backup_modern::AppTheme* theme) {
                 .arg(keyboardActive())
                 .arg(describe(rows)));
 
-  // ---- Mouse 3：指针移出，但 highlightedIndex / listCur 都还停在那一行 ----
+  // ---- Mouse 3：鼠标离开后不改变键盘位置，也不留下 hover ----
   movePointerTo(QPointF(4, 4), pointer);
   WaitForAnimation(220);
   rows = collectRows();
   const int retained_hl = combo->property("highlightedIndex").toInt();
   const int retained_list = listIndex();
-  run.Check(
-      !rowAt(type_index)->property("hovered").toBool() &&
-          retained_hl == type_index && retained_list == type_index,
-      QStringLiteral("Mouse 3 指针离开后索引仍停在被划过的那一行（Qt 的行为）"),
-      QStringLiteral("hovered=%1 highlightedIndex=%2 listCur=%3")
-          .arg(rowAt(type_index)->property("hovered").toBool())
-          .arg(retained_hl)
-          .arg(retained_list));
+  run.Check(!rowAt(type_index)->property("hovered").toBool() &&
+                retained_list == path_index &&
+                combo->property("currentIndex").toInt() == path_index,
+            QStringLiteral("Mouse 3 指针划过不改变当前选择或键盘起点"),
+            QStringLiteral("hovered=%1 highlightedIndex=%2 listCur=%3")
+                .arg(rowAt(type_index)->property("hovered").toBool())
+                .arg(retained_hl)
+                .arg(retained_list));
   run.Check(!keyboardActive() && hoverRows(rows).isEmpty() &&
                 keyboardRows(rows).isEmpty(),
-            QStringLiteral("Mouse 3 索引留在那一行，但视觉上没有任何底色"),
+            QStringLiteral("Mouse 3 指针离开后没有 hover 或键盘光标残留"),
             QStringLiteral("hover 行=%1 键盘行=%2 模式=%3 | %4")
                 .arg(hoverRows(rows).join(QStringLiteral(",")),
                      keyboardRows(rows).join(QStringLiteral(",")))
@@ -5071,8 +5115,7 @@ int RunComboHoverTest(QQuickWindow* window, backup_modern::AppTheme* theme) {
       listIndex() == before_down + 1,
       QStringLiteral("Keyboard 1 ↓ 让 popup 的 currentIndex 前移一项"),
       QStringLiteral("listCur %1 -> %2").arg(before_down).arg(listIndex()));
-  run.Check(keyboardActive(),
-            QStringLiteral("Keyboard 1 ↓ 之后键盘模式打开（由导航结果推断）"),
+  run.Check(keyboardActive(), QStringLiteral("Keyboard 1 ↓ 之后键盘模式打开"),
             QStringLiteral("模式=%1").arg(keyboardActive()));
   run.Check(
       keyboardRows(rows) == QStringList{QString::number(listIndex())},
@@ -5150,7 +5193,7 @@ int RunComboHoverTest(QQuickWindow* window, backup_modern::AppTheme* theme) {
   rows = collectRows();
   run.Check(!keyboardActive() && hoverRows(rows).isEmpty() &&
                 keyboardRows(rows).isEmpty(),
-            QStringLiteral("Mouse 6 指针离开后没有任何底色残留"),
+            QStringLiteral("Mouse 6 指针离开后没有 hover 或键盘光标残留"),
             describe(rows));
 
   // ---- Keyboard 5：Enter 采纳，Esc 不改选择 ----
@@ -5190,15 +5233,17 @@ int RunComboHoverTest(QQuickWindow* window, backup_modern::AppTheme* theme) {
   QMetaObject::invokeMethod(popup, "open");
   WaitForAnimation(320);
   rows = collectRows();
-  run.Check(!keyboardActive() && keyboardRows(rows).isEmpty() &&
-                hoverRows(rows).isEmpty(),
-            QStringLiteral(
-                "Reopen 重新打开下拉：没有 stale 键盘光标、没有 stale 灰底"),
-            QStringLiteral("键盘行=%1 hover 行=%2 模式=%3 | %4")
-                .arg(keyboardRows(rows).join(QStringLiteral(",")),
-                     hoverRows(rows).join(QStringLiteral(",")))
-                .arg(keyboardActive())
-                .arg(describe(rows)));
+  run.Check(
+      keyboardActive() &&
+          keyboardRows(rows) ==
+              QStringList{QString::number(selected_after_enter)} &&
+          listIndex() == selected_after_enter && hoverRows(rows).isEmpty(),
+      QStringLiteral("Reopen 重新打开下拉：焦点同步当前选择，没有 hover 残留"),
+      QStringLiteral("键盘行=%1 hover 行=%2 模式=%3 | %4")
+          .arg(keyboardRows(rows).join(QStringLiteral(",")),
+               hoverRows(rows).join(QStringLiteral(",")))
+          .arg(keyboardActive())
+          .arg(describe(rows)));
 
   QMetaObject::invokeMethod(popup, "close");
   WaitForAnimation(200);

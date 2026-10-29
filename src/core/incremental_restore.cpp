@@ -39,6 +39,7 @@
 #include "file_io.h"
 #include "file_system.h"
 #include "incremental_backup.h"
+#include "source_digest.h"
 
 // O_PATH 是 Linux 2.6.39+ 的原语：只把目录项**绑定**成对象，不打开内容。
 // 本文件用它来"先拿到对象、再判类型、最后才决定要不要真的打开"——这是让
@@ -1151,18 +1152,24 @@ bool ResolveSnapshotChain(const std::string& repository_directory,
       break;
     }
 
-    // 读侧与写侧是同一条加密合同：加密的 delta 一律不接受。它的明文外层信封
-    // （parent / tombstones）不受内层 HMAC 覆盖，接受它等于接受一组未经认证的
-    // 路径指令。旧版本写出来的这种 delta 因此也不再可恢复。
+    // 旧 BKPINC1 没有外层认证，仍拒绝加密 payload。BKPINC2 在真正恢复前
+    // 由 AuthenticateSnapshotChain 认证，不把这里的无密码检查当认证。
     ContainerHeader payload_header;
     std::string payload_error;
     if (!InspectDeltaPayloadHeader(path, &payload_header, &payload_error)) {
       SetError(error_message, payload_error);
       return false;
     }
-    if (payload_header.encryption_method !=
-        static_cast<std::uint8_t>(EncryptionMethod::kNone)) {
+    if (identity.envelope.format_version == kDeltaFormatVersion &&
+        payload_header.encryption_method !=
+            static_cast<std::uint8_t>(EncryptionMethod::kNone)) {
       SetError(error_message, UnsupportedIncrementalEncryptionReason());
+      return false;
+    }
+    if (identity.envelope.format_version == kAuthenticatedDeltaFormatVersion &&
+        payload_header.encryption_method == 0) {
+      SetError(error_message,
+               "Authenticated deltas require an encrypted payload");
       return false;
     }
 
@@ -1193,7 +1200,25 @@ bool ResolveSnapshotChain(const std::string& repository_directory,
   return true;
 }
 
-// 面向调用方的唯一入口：解析链 → 恢复 base → 逐个应用 delta → 原子发布。
+bool AuthenticateSnapshotChain(const SnapshotChain& chain,
+                               const RestoreOptions& options,
+                               std::string* error_message) {
+  if (chain.files.empty()) {
+    SetError(error_message, "The snapshot chain is empty");
+    return false;
+  }
+  if (!AuthenticateContainerFile(chain.files.front(), options.password,
+                                 error_message))
+    return false;
+  for (std::size_t index = 1; index < chain.files.size(); ++index) {
+    if (!VerifyDeltaAuthentication(chain.files[index], options.password,
+                                   error_message))
+      return false;
+  }
+  return true;
+}
+
+// 面向调用方的唯一入口：解析链 → 认证 → 恢复 base → 应用 delta → 原子发布。
 //
 // destination 的预检是"不存在，或存在但是空目录"。这不是洁癖：只有一次 rename
 // 才能保证"要么旧内容原样、要么新内容完整"，合并进一个非空目录做不到这点。
@@ -1217,6 +1242,7 @@ bool RestoreSnapshotChain(const std::string& repository_directory,
                             error_message)) {
     return false;
   }
+  if (!AuthenticateSnapshotChain(chain, options, error_message)) return false;
   // 规范化必须在**任何**路径构造与预检之前做，理由见 NormalizeDestination。
   const std::string destination = NormalizeDestination(destination_directory);
   if (destination.empty()) {
@@ -1532,7 +1558,8 @@ bool RestoreSnapshotChain(const std::string& repository_directory,
     for (std::size_t index = 1; index < chain.files.size(); ++index) {
       const std::string& delta = chain.files[index];
       DeltaEnvelope envelope;
-      if (!ReadDeltaEnvelope(delta, &envelope, error_message)) {
+      if (!VerifyDeltaAuthentication(delta, options.password, error_message,
+                                     &envelope)) {
         delta_failed = true;
         break;
       }
@@ -1541,6 +1568,16 @@ bool RestoreSnapshotChain(const std::string& repository_directory,
         break;
       }
       container_present = true;
+      std::string extracted_digest;
+      if (!ContentDigestOfFile(inner_container, &extracted_digest,
+                               error_message) ||
+          extracted_digest != envelope.payload_sha256) {
+        SetError(error_message,
+                 "The extracted delta payload differs from its "
+                 "authenticated envelope");
+        delta_failed = true;
+        break;
+      }
       // 下游可能刚把父目录建出来（destination 的父目录原先不存在），
       // 所以这里重新取一次 fd 再做相对回收 / 排他认领。
       parent_fd = parent_dir.Ensure(destination_parent);
