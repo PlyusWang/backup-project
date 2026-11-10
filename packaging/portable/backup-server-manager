@@ -1,0 +1,71 @@
+#!/bin/sh
+set -eu
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+if [ -x "$SCRIPT_DIR/bin/backup-server-admin.sh" ]; then
+  PACKAGE_ROOT="$SCRIPT_DIR"
+  BIN_DIR="$PACKAGE_ROOT/bin"
+  DEFAULT_SERVER_ROOT="$PACKAGE_ROOT"
+  DEFAULT_CONFIG_FILE="$PACKAGE_ROOT/server.conf"
+else
+  PACKAGE_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+  BIN_DIR="$SCRIPT_DIR"
+  DEFAULT_SERVER_ROOT="$PACKAGE_ROOT/var"
+  DEFAULT_CONFIG_FILE="$PACKAGE_ROOT/etc/server.conf"
+fi
+
+SERVER_ROOT="${BACKUP_SERVER_ROOT:-$DEFAULT_SERVER_ROOT}"
+CONFIG_FILE="${BACKUP_SERVER_CONFIG:-$DEFAULT_CONFIG_FILE}"
+ROOT_PUBLIC="${BACKUP_SERVER_ROOT_PUBLIC:-$SERVER_ROOT/private/root.key.pub}"
+
+if [ -x "$BIN_DIR/backup-cert-tool" ]; then
+  CERT_TOOL="$BIN_DIR/backup-cert-tool"
+else
+  CERT_TOOL="$PACKAGE_ROOT/tools/backup-cert-tool"
+fi
+
+export BACKUP_SERVER_ROOT="$SERVER_ROOT"
+export BACKUP_SERVER_ADMIN="$BIN_DIR/backup-server-admin"
+export BACKUP_SERVER_BIN="$BIN_DIR/backup-server"
+export BACKUP_SERVER_KEYGEN="$BIN_DIR/backup-server-keygen"
+export BACKUP_CERT_TOOL="$CERT_TOOL"
+
+# Mark only package-derived paths so initialization can rebase them when a
+# custom instance root is entered. Explicit BACKUP_SERVER_* overrides stay fixed.
+if [ -z "${BACKUP_SERVER_CONFIG+x}" ]; then
+  export BACKUP_SERVER_CONFIG="$CONFIG_FILE"
+  export BACKUP_SERVER_CONFIG_DEFAULT=1
+else
+  export BACKUP_SERVER_CONFIG_DEFAULT=0
+fi
+if [ -z "${BACKUP_SERVER_ROOT_PUBLIC+x}" ]; then
+  export BACKUP_SERVER_ROOT_PUBLIC="$ROOT_PUBLIC"
+  export BACKUP_SERVER_ROOT_PUBLIC_DEFAULT=1
+else
+  export BACKUP_SERVER_ROOT_PUBLIC_DEFAULT=0
+fi
+if [ -z "${BACKUP_SERVER_DATA+x}" ]; then
+  export BACKUP_SERVER_DATA="$SERVER_ROOT/data"
+  export BACKUP_SERVER_DATA_DEFAULT=1
+else
+  export BACKUP_SERVER_DATA_DEFAULT=0
+fi
+if [ -z "${BACKUP_SERVER_DB+x}" ]; then
+  export BACKUP_SERVER_DB="$SERVER_ROOT/state/metadata.sqlite3"
+  export BACKUP_SERVER_DB_DEFAULT=1
+else
+  export BACKUP_SERVER_DB_DEFAULT=0
+fi
+if [ -z "${BACKUP_SERVER_PID_FILE+x}" ]; then
+  export BACKUP_SERVER_PID_FILE="$SERVER_ROOT/state/backup-server.pid"
+  export BACKUP_SERVER_PID_FILE_DEFAULT=1
+else
+  export BACKUP_SERVER_PID_FILE_DEFAULT=0
+fi
+if [ -z "${BACKUP_SERVER_LOG+x}" ]; then
+  export BACKUP_SERVER_LOG="$SERVER_ROOT/logs/server.log"
+  export BACKUP_SERVER_LOG_DEFAULT=1
+else
+  export BACKUP_SERVER_LOG_DEFAULT=0
+fi
+exec "$BIN_DIR/backup-server-admin.sh" "$@"

@@ -4838,25 +4838,16 @@ int RunCloseGuardTest(QQuickWindow* window,
 // 非当前页整体不可见，用 visible 永远测不出"这一页会不会显示这条消息"。
 // ---- --combo-hover-test ----
 //
-// 共享 AppComboBox 下拉行的状态回归。
-//
-// 选中项始终有主题背景；打开时焦点落在选中项。hover 底色随指针离开而消失，
-// 键盘光标由真实导航键移动，不把鼠标留下的 highlightedIndex 当作焦点。
-//
-// 这个自检真的把指针移到行上、移走，也真的把 ↓ 送进真实焦点链，然后逐行读
-// 运行期状态（hovered / 覆盖层 opacity / currentIndex / 输入方式闸门）。
+// 共享 AppComboBox 下拉行的状态回归：鼠标与键盘共用 activeIndex，已提交值
+// 通过独立勾号显示，任意时刻只允许一个活动候选项。
 int RunComboHoverTest(QQuickWindow* window, backup_modern::AppTheme* theme) {
   CheckRun run;
   run.prefix = "[combo-hover]";
 
-  // 底色不写死 RGB：hover / keyboard 两种颜色都从 AppTheme 读。写死的话，
-  // 即使 QML 换了颜色、主题改错，断言也照样通过。
-  const QColor hover_color = theme->property("hover").value<QColor>();
-  const QColor keyboard_color = theme->property("accentSoft").value<QColor>();
-  run.Check(hover_color.isValid() && keyboard_color.isValid(),
-            QStringLiteral("主题给出了 hover / keyboard 两种颜色"),
-            QStringLiteral("hover=%1 keyboard=%2")
-                .arg(hover_color.name(), keyboard_color.name()));
+  const QColor active_color = theme->property("accentSoft").value<QColor>();
+  const QColor active_border = theme->property("accent").value<QColor>();
+  run.Check(active_color.isValid() && active_border.isValid(),
+            QStringLiteral("主题给出了活动候选项的填充和边框颜色"));
 
   GoToPage(window, "quick");
   window->setWidth(1280);
@@ -4930,64 +4921,62 @@ int RunComboHoverTest(QQuickWindow* window, backup_modern::AppTheme* theme) {
         });
     return rows;
   };
-  const auto layerOpacity = [](const QPair<int, QQuickItem*>& row,
-                               const char* name) -> qreal {
-    QQuickItem* layer =
-        row.second->findChild<QQuickItem*>(QString::fromLatin1(name));
-    return layer == nullptr ? -1.0 : layer->property("opacity").toReal();
+  const auto activeLayer = [](const QPair<int, QQuickItem*>& row) {
+    return row.second->findChild<QQuickItem*>(
+        QStringLiteral("comboItemActiveLayer"));
   };
-  const auto hoverOpacity =
-      [&layerOpacity](const QPair<int, QQuickItem*>& row) {
-        return layerOpacity(row, "comboItemHoverLayer");
-      };
-  const auto keyboardOpacity =
-      [&layerOpacity](const QPair<int, QQuickItem*>& row) {
-        return layerOpacity(row, "comboItemKeyboardLayer");
-      };
-  const auto hasBackground = [&](const QPair<int, QQuickItem*>& row) -> bool {
-    const QColor base =
-        row.second
-            ->findChild<QQuickItem*>(QStringLiteral("comboItemBackground"))
-            ->property("color")
-            .value<QColor>();
-    return layerOpacity(row, "comboItemSelectedLayer") > 0.01 ||
-           hoverOpacity(row) > 0.01 || keyboardOpacity(row) > 0.01 ||
-           base.alpha() > 0;
+  const auto activeRows = [](const QList<QPair<int, QQuickItem*>>& rows) {
+    QStringList names;
+    for (const auto& row : rows) {
+      if (row.second->property("active").toBool())
+        names << QString::number(row.first);
+    }
+    return names;
   };
-  // 覆盖层 opacity 的判据是 > 0.01 而不是 == 1：层是用动画淡入淡出的，
-  // 等待结束时可能停在 0.98 之类的中间值。
-  const auto rowsWhere =
-      [&](const QList<QPair<int, QQuickItem*>>& rows,
-          const std::function<qreal(const QPair<int, QQuickItem*>&)>& opacity) {
-        QStringList names;
-        for (const auto& row : rows) {
-          if (opacity(row) > 0.01) names << QString::number(row.first);
-        }
-        return names;
-      };
+  const auto hasCheck = [](const QPair<int, QQuickItem*>& row) {
+    QQuickItem* check = row.second->findChild<QQuickItem*>(
+        QStringLiteral("comboItemCheck"));
+    return check != nullptr && check->property("visible").toBool();
+  };
+  const auto hasActiveVisual = [&](const QPair<int, QQuickItem*>& row) {
+    QQuickItem* layer = activeLayer(row);
+    return layer != nullptr && row.second->property("active").toBool();
+  };
   const auto describe = [&](const QList<QPair<int, QQuickItem*>>& rows) {
     QStringList parts;
     for (const auto& row : rows) {
-      parts << QStringLiteral("%1[h=%2 k=%3 hv=%4 sel=%5]")
+      QQuickItem* layer = activeLayer(row);
+      parts << QStringLiteral("%1[active=%2 border=%3 hovered=%4 selected=%5]")
                    .arg(row.first)
-                   .arg(hoverOpacity(row), 0, 'f', 0)
-                   .arg(keyboardOpacity(row), 0, 'f', 0)
+                   .arg(row.second->property("active").toBool() ? 1 : 0)
+                   .arg(layer == nullptr ? -1.0
+                                         : layer->property("border.width").toReal(),
+                        0, 'f', 0)
                    .arg(row.second->property("hovered").toBool() ? 1 : 0)
                    .arg(row.second->property("isSelected").toBool() ? 1 : 0);
     }
     return parts.join(QStringLiteral(" "));
   };
-  const auto hoverRows = [&](const QList<QPair<int, QQuickItem*>>& rows) {
-    return rowsWhere(rows, hoverOpacity);
+  const auto activeIndex = [combo]() {
+    return combo->property("activeIndex").toInt();
+  };
+  const auto hoverRows = [](const QList<QPair<int, QQuickItem*>>& rows) {
+    QStringList names;
+    for (const auto& row : rows) {
+      if (row.second->property("hovered").toBool())
+        names << QString::number(row.first);
+    }
+    return names;
+  };
+  const auto listIndex = [activeIndex]() { return activeIndex(); };
+  const auto keyboardActive = [popup, activeIndex]() {
+    return popup->property("visible").toBool() && activeIndex() >= 0;
   };
   const auto keyboardRows = [&](const QList<QPair<int, QQuickItem*>>& rows) {
-    return rowsWhere(rows, keyboardOpacity);
+    return activeRows(rows);
   };
-  const auto keyboardActive = [combo]() {
-    return combo->property("keyboardNavigationActive").toBool();
-  };
-  const auto listIndex = [list]() {
-    return list->property("currentIndex").toInt();
+  const auto keyboardOpacity = [&](const QPair<int, QQuickItem*>& row) {
+    return row.second->property("active").toBool() ? 1.0 : 0.0;
   };
   // 指针事件自己造：offscreen 平台没有真实指针，QTest::mouseMove 也无从产生
   // hover。把 QHoverEvent 直接送给窗口，走的仍是 QQuickWindow 正常的事件分发
@@ -5027,68 +5016,57 @@ int RunComboHoverTest(QQuickWindow* window, backup_modern::AppTheme* theme) {
     return nullptr;
   };
 
-  // ---- Mouse 1：打开 popup，当前选择与键盘起点立即可见 ----
-  run.Check(keyboardActive() && hoverRows(rows).isEmpty() &&
-                keyboardRows(rows) == QStringList{QString::number(path_index)},
-            QStringLiteral("Mouse 1 打开 popup：当前选择与键盘起点立即高亮"),
-            QStringLiteral("hover 行=%1 键盘行=%2 模式=%3 | %4")
-                .arg(hoverRows(rows).join(QStringLiteral(",")),
-                     keyboardRows(rows).join(QStringLiteral(",")))
-                .arg(keyboardActive())
-                .arg(describe(rows)));
-  run.Check(listIndex() == path_index &&
-                combo->property("currentIndex").toInt() == path_index,
-            QStringLiteral("Mouse 1 打开时键盘位置同步到当前已选择项"),
-            QStringLiteral("listCur=%1 currentIndex=%2")
-                .arg(listIndex())
-                .arg(combo->property("currentIndex").toInt()));
+  // ---- 打开 popup：活动候选与已提交值同步，勾号独立显示 ----
+  run.Check(activeIndex() == path_index &&
+                activeRows(rows) == QStringList{QString::number(path_index)},
+            QStringLiteral("打开时仅当前选中项具有活动高亮"),
+            QStringLiteral("activeIndex=%1 | %2").arg(activeIndex()).arg(describe(rows)));
   {
     QQuickItem* selected_row = rowAt(path_index);
-    QQuickItem* check = selected_row == nullptr
-                            ? nullptr
-                            : selected_row->findChild<QQuickItem*>(
-                                  QStringLiteral("comboItemCheck"));
-    run.Check(check != nullptr && check->property("visible").toBool() &&
-                  hasBackground({path_index, selected_row}),
-              QStringLiteral("Mouse 1 已选择项（路径）有勾号与可见底色"));
+    run.Check(selected_row != nullptr && hasCheck({path_index, selected_row}) &&
+                  hasActiveVisual({path_index, selected_row}),
+              QStringLiteral("当前选中项同时显示活动高亮和独立勾号"));
   }
 
-  // ---- Mouse 2：指针 hover “文件类型” ----
+  // ---- 鼠标移动到“文件类型”：活动状态转移到同一候选 ----
   QPointF pointer = centerOf(rowAt(type_index));
   movePointerTo(pointer, centerOf(rowAt(path_index)));
   WaitForAnimation(150);
   rows = collectRows();
   run.Check(hoverRows(rows) == QStringList{QString::number(type_index)} &&
-                keyboardRows(rows).isEmpty() && !keyboardActive(),
-            QStringLiteral(
-                "Mouse 2 只有“文件类型”有 hover 灰底，且没有误触发键盘模式"),
-            QStringLiteral("hover 行=%1 键盘行=%2 模式=%3 | %4")
+                keyboardRows(rows) == QStringList{QString::number(type_index)} &&
+                activeIndex() == type_index &&
+                activeRows(rows) == QStringList{QString::number(type_index)},
+            QStringLiteral("鼠标 hover 与活动高亮落在同一个候选上"),
+            QStringLiteral("hover=%1 active=%2 | %3")
                 .arg(hoverRows(rows).join(QStringLiteral(",")),
-                     keyboardRows(rows).join(QStringLiteral(",")))
-                .arg(keyboardActive())
+                     activeRows(rows).join(QStringLiteral(",")))
                 .arg(describe(rows)));
+  const QString screenshot_path = qEnvironmentVariable(
+      "BACKUP_COMBO_TEST_SCREENSHOT");
+  if (!screenshot_path.isEmpty()) {
+    run.Check(window->grabWindow().save(screenshot_path),
+              QStringLiteral("保存实际 GUI 下拉框截图"), screenshot_path);
+  }
 
-  // ---- Mouse 3：鼠标离开后不改变键盘位置，也不留下 hover ----
+  // ---- 鼠标离开：activeIndex 保持唯一高亮，hover 状态消失 ----
   movePointerTo(QPointF(4, 4), pointer);
   WaitForAnimation(220);
   rows = collectRows();
-  const int retained_hl = combo->property("highlightedIndex").toInt();
-  const int retained_list = listIndex();
+  const int retained_current = combo->property("currentIndex").toInt();
   run.Check(!rowAt(type_index)->property("hovered").toBool() &&
-                retained_list == path_index &&
-                combo->property("currentIndex").toInt() == path_index,
-            QStringLiteral("Mouse 3 指针划过不改变当前选择或键盘起点"),
-            QStringLiteral("hovered=%1 highlightedIndex=%2 listCur=%3")
+                retained_current == path_index && activeIndex() == type_index,
+            QStringLiteral("鼠标划过不提交选择值，离开后活动候选仍可见"),
+            QStringLiteral("hovered=%1 activeIndex=%2 currentIndex=%3")
                 .arg(rowAt(type_index)->property("hovered").toBool())
-                .arg(retained_hl)
-                .arg(retained_list));
-  run.Check(!keyboardActive() && hoverRows(rows).isEmpty() &&
-                keyboardRows(rows).isEmpty(),
-            QStringLiteral("Mouse 3 指针离开后没有 hover 或键盘光标残留"),
-            QStringLiteral("hover 行=%1 键盘行=%2 模式=%3 | %4")
+                .arg(activeIndex())
+                .arg(retained_current));
+  run.Check(hoverRows(rows).isEmpty() &&
+                activeRows(rows) == QStringList{QString::number(type_index)},
+            QStringLiteral("鼠标离开后无 hover 残影，只有 activeIndex 高亮"),
+            QStringLiteral("hover 行=%1 active 行=%2 | %3")
                 .arg(hoverRows(rows).join(QStringLiteral(",")),
-                     keyboardRows(rows).join(QStringLiteral(",")))
-                .arg(keyboardActive())
+                     activeRows(rows).join(QStringLiteral(",")))
                 .arg(describe(rows)));
 
   // ---- Mouse 4：重新进入，hover 立刻接管 ----
@@ -5096,7 +5074,7 @@ int RunComboHoverTest(QQuickWindow* window, backup_modern::AppTheme* theme) {
   WaitForAnimation(150);
   rows = collectRows();
   run.Check(hoverRows(rows) == QStringList{QString::number(type_index)},
-            QStringLiteral("Mouse 4 指针重新进入：hover 立刻接管"),
+            QStringLiteral("鼠标重新进入后仍使用同一 activeIndex"),
             describe(rows));
 
   // ---- Keyboard 1：真实焦点链上的 ↓ ----
@@ -5113,13 +5091,13 @@ int RunComboHoverTest(QQuickWindow* window, backup_modern::AppTheme* theme) {
   rows = collectRows();
   run.Check(
       listIndex() == before_down + 1,
-      QStringLiteral("Keyboard 1 ↓ 让 popup 的 currentIndex 前移一项"),
+      QStringLiteral("键盘 ↓ 让 activeIndex 前移一项"),
       QStringLiteral("listCur %1 -> %2").arg(before_down).arg(listIndex()));
-  run.Check(keyboardActive(), QStringLiteral("Keyboard 1 ↓ 之后键盘模式打开"),
-            QStringLiteral("模式=%1").arg(keyboardActive()));
+  run.Check(keyboardActive(), QStringLiteral("键盘导航保持 popup 活动状态"),
+            QStringLiteral("活动=%1").arg(keyboardActive()));
   run.Check(
       keyboardRows(rows) == QStringList{QString::number(listIndex())},
-      QStringLiteral("Keyboard 1 键盘光标正好落在 Qt 移动到的那个 row 上"),
+      QStringLiteral("键盘导航后的活动高亮正好落在 activeIndex 行"),
       QStringLiteral("键盘行=%1 listCur=%2 | %3")
           .arg(keyboardRows(rows).join(QStringLiteral(",")))
           .arg(listIndex())
@@ -5132,7 +5110,7 @@ int RunComboHoverTest(QQuickWindow* window, backup_modern::AppTheme* theme) {
   rows = collectRows();
   run.Check(listIndex() == first_keyboard_row + 1 &&
                 keyboardRows(rows) == QStringList{QString::number(listIndex())},
-            QStringLiteral("Keyboard 2 再 ↓：光标整体下移一行，上一行立刻熄灭"),
+            QStringLiteral("键盘再 ↓：活动候选下移一行且上一行熄灭"),
             QStringLiteral("键盘行=%1 listCur=%2 | %3")
                 .arg(keyboardRows(rows).join(QStringLiteral(",")))
                 .arg(listIndex())
@@ -5144,7 +5122,7 @@ int RunComboHoverTest(QQuickWindow* window, backup_modern::AppTheme* theme) {
   rows = collectRows();
   run.Check(listIndex() == first_keyboard_row &&
                 keyboardRows(rows) == QStringList{QString::number(listIndex())},
-            QStringLiteral("Keyboard 3 ↑ 把光标移回上一行"),
+            QStringLiteral("键盘 ↑ 把活动候选移回上一行"),
             QStringLiteral("键盘行=%1 listCur=%2")
                 .arg(keyboardRows(rows).join(QStringLiteral(",")))
                 .arg(listIndex()));
@@ -5165,7 +5143,7 @@ int RunComboHoverTest(QQuickWindow* window, backup_modern::AppTheme* theme) {
         listIndex() == path_index && keyboardActive() &&
             keyboardOpacity({path_index, selected_row}) > 0.01 &&
             check != nullptr && check->property("visible").toBool(),
-        QStringLiteral("Keyboard 4 键盘光标落在已选择项上：光标与勾号同时可见"),
+        QStringLiteral("活动候选落在已选择项上：活动层与勾号同时可见"),
         QStringLiteral("listCur=%1 键盘层=%2 勾号=%3")
             .arg(listIndex())
             .arg(keyboardOpacity({path_index, selected_row}))
@@ -5177,23 +5155,22 @@ int RunComboHoverTest(QQuickWindow* window, backup_modern::AppTheme* theme) {
   movePointerTo(back_to_type, QPointF(4, 4));
   WaitForAnimation(220);
   rows = collectRows();
-  run.Check(!keyboardActive() && keyboardRows(rows).isEmpty() &&
+  run.Check(activeIndex() == type_index &&
+                activeRows(rows) == QStringList{QString::number(type_index)} &&
                 hoverRows(rows) == QStringList{QString::number(type_index)},
-            QStringLiteral(
-                "Mouse 5 键盘模式下移动鼠标：键盘光标立即消失、hover 接管"),
-            QStringLiteral("hover 行=%1 键盘行=%2 模式=%3 | %4")
+            QStringLiteral("鼠标移动后仍只有同一个 activeIndex 高亮"),
+            QStringLiteral("hover 行=%1 active 行=%2 | %3")
                 .arg(hoverRows(rows).join(QStringLiteral(",")),
-                     keyboardRows(rows).join(QStringLiteral(",")))
-                .arg(keyboardActive())
+                     activeRows(rows).join(QStringLiteral(",")))
                 .arg(describe(rows)));
 
   // ---- Mouse 6：指针再离开 -> 仍然什么都不留 ----
   movePointerTo(QPointF(4, 4), back_to_type);
   WaitForAnimation(200);
   rows = collectRows();
-  run.Check(!keyboardActive() && hoverRows(rows).isEmpty() &&
-                keyboardRows(rows).isEmpty(),
-            QStringLiteral("Mouse 6 指针离开后没有 hover 或键盘光标残留"),
+  run.Check(hoverRows(rows).isEmpty() &&
+                activeRows(rows) == QStringList{QString::number(type_index)},
+            QStringLiteral("鼠标离开后没有 hover 残留，活动候选保持唯一"),
             describe(rows));
 
   // ---- Keyboard 5：Enter 采纳，Esc 不改选择 ----
@@ -5206,7 +5183,7 @@ int RunComboHoverTest(QQuickWindow* window, backup_modern::AppTheme* theme) {
   run.Check(!popup->property("visible").toBool() &&
                 combo->property("currentIndex").toInt() == enter_target &&
                 !keyboardActive(),
-            QStringLiteral("Keyboard 5 Enter 采纳当前键盘行并关闭下拉"),
+            QStringLiteral("Enter 提交 activeIndex 并关闭下拉"),
             QStringLiteral("visible=%1 currentIndex=%2 期望=%3 模式=%4")
                 .arg(popup->property("visible").toBool())
                 .arg(combo->property("currentIndex").toInt())
@@ -5223,7 +5200,7 @@ int RunComboHoverTest(QQuickWindow* window, backup_modern::AppTheme* theme) {
       !popup->property("visible").toBool() &&
           combo->property("currentIndex").toInt() == selected_after_enter &&
           !keyboardActive(),
-      QStringLiteral("Keyboard 6 Esc 关闭下拉且不改动已选择的值"),
+      QStringLiteral("Escape 关闭下拉且不改动已选择的值"),
       QStringLiteral("visible=%1 currentIndex=%2 期望=%3")
           .arg(popup->property("visible").toBool())
           .arg(combo->property("currentIndex").toInt())
@@ -5238,7 +5215,7 @@ int RunComboHoverTest(QQuickWindow* window, backup_modern::AppTheme* theme) {
           keyboardRows(rows) ==
               QStringList{QString::number(selected_after_enter)} &&
           listIndex() == selected_after_enter && hoverRows(rows).isEmpty(),
-      QStringLiteral("Reopen 重新打开下拉：焦点同步当前选择，没有 hover 残留"),
+      QStringLiteral("重新打开下拉：activeIndex 从当前选择恢复，没有 hover 残留"),
       QStringLiteral("键盘行=%1 hover 行=%2 模式=%3 | %4")
           .arg(keyboardRows(rows).join(QStringLiteral(",")),
                hoverRows(rows).join(QStringLiteral(",")))
@@ -8507,6 +8484,66 @@ int RunRemoteTest(QQuickWindow* window, backup_modern::RemoteController* remote,
                     QStringLiteral("management") &&
                 page != nullptr && EffectivelyVisible(window, "remotePage"),
             QStringLiteral("REMOTE-01 能进入“备份管理 / 云端仓库”"));
+  // 身份模式切换必须清除另一条信任路径的草稿和控制器状态。否则从
+  // BPSEC2 切到 BPSEC1 再切回来时，旧根或 server_id 会在用户看不见时继续生效。
+  QObject* auth_mode_tabs = objectByName("remoteAuthModeTabs");
+  const bool auth_tabs_ready = auth_mode_tabs != nullptr && page != nullptr;
+  if (auth_tabs_ready) {
+    remote->setServerKind(QStringLiteral("custom"));
+    remote->setConnectionMode(QStringLiteral("direct"));
+    remote->setAuthMode(QStringLiteral("certificate"));
+    remote->setCertificateSettings(QStringLiteral("/tmp/stale-root.pub"),
+                                   QStringLiteral("stale-server-id"));
+    page->setProperty("draftAuthMode", QStringLiteral("certificate"));
+    page->setProperty("draftTrustedRoots",
+                      QStringLiteral("/tmp/stale-root.pub"));
+    page->setProperty("draftExpectedServerId",
+                      QStringLiteral("stale-server-id"));
+    QMetaObject::invokeMethod(auth_mode_tabs, "activated", Qt::DirectConnection,
+                              Q_ARG(QString, QStringLiteral("pin")));
+  }
+  run.Check(auth_tabs_ready &&
+                page->property("draftAuthMode").toString() ==
+                    QStringLiteral("pin") &&
+                page->property("draftTrustedRoots").toString().isEmpty() &&
+                page->property("draftExpectedServerId").toString().isEmpty() &&
+                remote->trustedRootsFile().isEmpty() &&
+                remote->expectedServerId().isEmpty(),
+            QStringLiteral("REMOTE-01 身份模式切换清除旧证书信任材料"));
+  if (auth_tabs_ready) {
+    QMetaObject::invokeMethod(auth_mode_tabs, "activated", Qt::DirectConnection,
+                              Q_ARG(QString, QStringLiteral("certificate")));
+  }
+  run.Check(auth_tabs_ready &&
+                page->property("draftAuthMode").toString() ==
+                    QStringLiteral("certificate") &&
+                page->property("draftTrustedRoots").toString().isEmpty() &&
+                page->property("draftExpectedServerId").toString().isEmpty() &&
+                remote->trustedRootsFile().isEmpty() &&
+                remote->expectedServerId().isEmpty(),
+            QStringLiteral("REMOTE-01 切回证书认证要求重新导入身份"));
+
+  // 后续 REMOTE-01 用例依赖产品默认的 BPSEC1 路径；探针结束后必须恢复
+  // 控制器和页面草稿，不能把证书模式泄漏到后续真实远程操作。
+  const bool pin_restored = remote->setAuthMode(QStringLiteral("pin"));
+  if (auth_tabs_ready) {
+    QMetaObject::invokeMethod(auth_mode_tabs, "activated", Qt::DirectConnection,
+                              Q_ARG(QString, QStringLiteral("pin")));
+  }
+  if (page != nullptr) {
+    page->setProperty("draftAuthMode", QStringLiteral("pin"));
+  }
+  run.Check(pin_restored && auth_tabs_ready &&
+                remote->authMode() == QStringLiteral("pin") &&
+                page->property("draftAuthMode").toString() ==
+                    QStringLiteral("pin") &&
+                remote->trustedRootsFile().isEmpty() &&
+                remote->expectedServerId().isEmpty() &&
+                page->property("draftTrustedRoots").toString().isEmpty() &&
+                page->property("draftExpectedServerId").toString().isEmpty(),
+            QStringLiteral("REMOTE-01 探针结束恢复 BPSEC1 状态"));
+
+
   goToPage(0);
   run.Check(page != nullptr && !EffectivelyVisible(window, "remotePage"),
             QStringLiteral("REMOTE-01 离开之后这一页确实不再显示"));

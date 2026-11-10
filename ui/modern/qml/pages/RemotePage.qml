@@ -567,6 +567,9 @@ Item {
                                     onActivated: function (key) {
                                         if (!remote.setAuthMode(key))
                                             return
+                                        page.draftTrustedRoots = ""
+                                        page.draftExpectedServerId = ""
+                                        remote.setCertificateSettings("", "")
                                         page.draftAuthMode = remote.authMode
                                     }
                                 }

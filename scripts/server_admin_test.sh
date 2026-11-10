@@ -29,8 +29,7 @@ set -uo pipefail
 
 ROOT_DIR="$(cd "$(dirname "$BASH_SOURCE")/.." && pwd)"
 cd "$ROOT_DIR"
-TEST_ROOT="$ROOT_DIR/testdata/server-admin"
-rm -rf "$TEST_ROOT"
+TEST_ROOT="${BACKUP_SERVER_ADMIN_TEST_ROOT:-$(mktemp -d "${TMPDIR:-/tmp}/bp-server-admin-test.XXXXXX")}"
 mkdir -p "$TEST_ROOT/data" "$TEST_ROOT/state" "$TEST_ROOT/logs" \
   "$TEST_ROOT/repo" "$TEST_ROOT/src"
 
@@ -298,7 +297,7 @@ WRAPPER_HOME="$TEST_ROOT/wrapper-home.txt"
 BACKUP_SERVER_ROOT="$TEST_ROOT" timeout --signal=KILL 60 \
   bash scripts/backup-server-admin.sh </dev/null > "$WRAPPER_HOME" 2>&1 || true
 if grep -q "^传输身份指纹: $BACKUP_REMOTE_SERVER_KEY" "$WRAPPER_HOME" \
-   && grep -q '5. 服务器身份信息' "$WRAPPER_HOME"; then
+   && grep -q '5. 服务器身份与连接信息' "$WRAPPER_HOME"; then
   record_pass "菜单首页直接显示指纹，并且第 5 项就是“服务器身份信息”"
 else
   record_fail "菜单首页" "$(head -8 "$WRAPPER_HOME" | tr '\n' ' ')"

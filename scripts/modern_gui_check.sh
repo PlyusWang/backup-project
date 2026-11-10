@@ -2915,101 +2915,53 @@ expect_present "$REMOTE_PAGE_QML" '"覆盖并重新下载"' \
 
 echo "[modern-gui] 22) 共享 ComboBox 的下拉行状态（hover / 键盘光标 / 已选择）"
 #
-# 三轮人工验收踩的是同一个坑的三种形态，根因都是"用一个残影当输入状态用"：
-#
-#   第一轮：background 里 row.highlighted（= control.highlightedIndex === index）
-#           与 row.hovered 返回同一块 theme.hover。打开下拉时 Qt 就把
-#           highlightedIndex 设成当前已选择项，于是那一行从打开起就是灰的，
-#           鼠标移开也不会消失。
-#   第二轮：换成"键盘高亮 + accentSoft"之后仍然残留 —— highlightedIndex 会被
-#           鼠标改脏（实测：指针移出 popup 后 highlightedIndex=4、row.hovered=false，
-#           那一行照样被画出一块底色）。
-#   第三轮：改成监听 Keys.onPressed 之后，真实桌面里键盘高亮**永远不亮** ——
-#           真实 xcb 窗口实测：点开下拉后焦点在 ComboBox 上，按键由 ComboBox 处理，
-#           popup 的 ListView 收不到 Keys；而它才是真正移动的对象
-#           （0 -> 1 -> 2 -> 1，control.currentIndex 在 Enter 之前一直不变）。
-#
-# 结论：不要监听"用户有没有按键"，要观察"Qt 把键盘位置移到了哪里"。
-# 键盘模式 = popup ListView 的 currentIndex 变了 && 没有指针活动 && 不是打开时的
-# 初次同步。键盘光标就画在 currentIndex 那一行，与"已选择项"可以叠加。
+# 鼠标移动和键盘导航都更新同一个 activeIndex。测试运行期检查唯一活动行、
+# 独立已选标记、Enter/Escape 和关闭后重新打开的状态恢复。
 COMBO_QML="$QML_DIR/components/AppComboBox.qml"
 
-# --- 视觉：三种状态各走各的通道 ---
+# --- 视觉：鼠标和键盘共用一个候选高亮 ---
 expect_present "$COMBO_QML" "hoverEnabled: true" \
   "下拉行显式打开 hover（默认值来自系统 style hint，headless 下不一定为真）"
-expect_present "$COMBO_QML" "opacity: row.hovered ? 1 : 0" \
-  "唯一的 hover 灰由 row.hovered 决定"
-expect_present "$COMBO_QML" "objectName: \"comboItemHoverLayer\"" \
-  "hover 是一个独立的固定色覆盖层"
-expect_present "$COMBO_QML" "objectName: \"comboItemKeyboardLayer\"" \
-  "键盘光标是另一个独立的固定色覆盖层"
-expect_present "$COMBO_QML" "opacity: row.keyboardHighlighted ? 1 : 0" \
-  "键盘层由 keyboardHighlighted 决定"
-expect_missing "$COMBO_QML" "Behavior on color" \
-  "两个覆盖层都不做颜色动画（浅色主题那一闪的根因）"
-# hover 层必须画在键盘层之上：两者同时亮时看到的是 hover。
-hover_layer_line="$(grep -n 'objectName: "comboItemHoverLayer"' "$COMBO_QML" | cut -d: -f1)"
-keyboard_layer_line="$(grep -n 'objectName: "comboItemKeyboardLayer"' "$COMBO_QML" | cut -d: -f1)"
-if [[ -n "$keyboard_layer_line" && -n "$hover_layer_line" && "$keyboard_layer_line" -lt "$hover_layer_line" ]]; then
-  record_pass "hover 覆盖层画在键盘层之上（鼠标优先级更高）"
+expect_present "$COMBO_QML" "property int activeIndex: -1" \
+  "下拉只有一个可操作候选索引"
+expect_present "$COMBO_QML" "control.activeIndex = row.index" \
+  "鼠标移动更新 activeIndex"
+expect_present "$COMBO_QML" "currentIndex: control.activeIndex" \
+  "列表导航位置绑定 activeIndex"
+expect_present "$COMBO_QML" 'objectName: "comboItemActiveLayer"' \
+  "活动候选只有一个视觉层"
+expect_present "$COMBO_QML" "color: row.active ? theme.accentSoft" \
+  "活动候选使用统一强调底色"
+expect_present "$COMBO_QML" "border.width: row.active ? 2 : 0" \
+  "活动候选使用统一边框"
+if [[ "$(grep -c 'objectName: "comboItemActiveLayer"' "$COMBO_QML")" -eq 1 ]]; then
+  record_pass "唯一活动层只定义一次"
 else
-  record_fail "hover / 键盘覆盖层的叠放顺序不对"
+  record_fail "活动层重复定义或缺失"
 fi
 
-# --- 输入方式：由导航结果推断，不监听按键 ---
-expect_present "$COMBO_QML" "property bool keyboardNavigationActive: false" \
-  "有一个明确的输入方式闸门（纯 presentation 状态）"
-expect_present "$COMBO_QML" "onCurrentIndexChanged: control.noteNavigationResult()" \
-  "键盘模式来自 popup ListView 的导航结果"
-expect_present "$COMBO_QML" "function noteNavigationResult()" \
-  "推断逻辑有独立入口"
-expect_present "$COMBO_QML" "if (control.suppressNavigationInference) return" \
-  "打开 popup 时的初次同步不算导航"
-expect_present "$COMBO_QML" "if (control.pointerHovering) return" \
-  "有行正被 hover 时不推断键盘模式（hover 引起的 currentIndex 变化归鼠标）"
-expect_missing "$COMBO_QML" "Timer {" \
-  "推断不需要任何延时窗口（同步标志就够，也不引入额外类型）"
-expect_present "$COMBO_QML" "Qt.callLater(function () {" \
-  "初次同步的抑制在下一个事件循环解除（不用 sleep）"
-# 只看代码行：注释里解释"前两轮试过 Keys.onPressed / 接管事件"是正常的历史说明。
-expect_missing_code "$COMBO_QML" "Keys.onPressed" \
-  "不再监听按键：真实桌面里按键根本不到 popup"
-# 只禁"放行按键"那一种写法；WheelHandler 里的 event.accepted = true 是滚轮自己的
-# 处理，和键盘无关，不在这一条的范围内。
-expect_missing_code "$COMBO_QML" "event.accepted = false" \
-  "不接管任何按键，Qt 的方向键行为保持原样"
+# --- 输入方式：不维护第二套视觉状态 ---
+expect_missing_code "$COMBO_QML" "keyboardNavigationActive" \
+  "不维护独立键盘高亮状态"
+# ComboBox 接收焦点后自行处理方向键，鼠标导航也直接更新同一 activeIndex。
+expect_present "$COMBO_QML" "Keys.onPressed" \
+  "方向键由 ComboBox 的统一导航入口处理"
+expect_present "$COMBO_QML" "event.accepted = true" \
+  "处理后的键盘或滚轮事件被消费，避免重复移动"
 expect_present "$COMBO_QML" "onHoveredChanged: {" \
-  "指针进入某一行时记录 hover 状态并让位"
-expect_present "$COMBO_QML" "control.pointerHovering = row.hovered" \
-  "当前是否有 delegate 真的 hovered"
+  "指针进入候选行时更新 activeIndex"
 expect_present "$COMBO_QML" "onOpened: {" \
-  "每次打开 popup 都复位"
+  "每次打开 popup 都从当前值同步活动候选"
 expect_present "$COMBO_QML" "onClosed: {" \
-  "关闭时也复位"
+  "关闭时清除活动候选"
 
-# --- 禁止再用 highlightedIndex 直接推断输入来源 ---
-expect_missing "$COMBO_QML" "control.highlightedIndex === index" \
-  "没有任何视觉分支直接拿 highlightedIndex 当状态"
-combo_highlight_code_hits="$(grep -nF 'control.highlightedIndex' "$COMBO_QML" \
-  | grep -vE '^[0-9]+:[[:space:]]*//' | wc -l)"
-if [[ "$combo_highlight_code_hits" -eq 1 ]]; then
-  record_pass "代码里只剩 Qt 自己的那一条 ListView 绑定用 highlightedIndex"
-else
-  record_fail "代码里有 $combo_highlight_code_hits 处在用 highlightedIndex（应当只有 1 处）"
-fi
-expect_present "$COMBO_QML" "currentIndex: control.highlightedIndex" \
-  "剩下那一处是 ListView 的 currentIndex 绑定，不是视觉状态"
-expect_present "$COMBO_QML" "control.keyboardRowIndex === index" \
-  "键盘光标画在 popup ListView 的 currentIndex 那一行上"
-# 键盘光标与"已选择项"可以叠加：keyboardHighlighted 不许再排除 isSelected。
-keyboard_rule="$(grep -A3 'property bool keyboardHighlighted' "$COMBO_QML")"
-if printf '%s' "$keyboard_rule" | grep -q "isSelected"; then
-  record_fail "键盘光标把已选择项排除了（键盘导航回当前值时会看不见光标）"
-else
-  record_pass "键盘光标不排除已选择项，可以与勾号叠加"
-fi
+# highlightedIndex 不参与视觉判断；活动层只读取 row.active。
+expect_missing_code "$COMBO_QML" "control.highlightedIndex === index" \
+  "没有使用 highlightedIndex 作为视觉状态"
+expect_present "$COMBO_QML" "control.activeIndex === index" \
+  "活动层只读取统一的 activeIndex"
 
-# --- 已选择项：勾号 + 强调色文字，不占底色 ---
+# --- 已选择项：勾号 + 强调色文字 ---
 expect_present "$COMBO_QML" 'objectName: "comboItemCheck"' \
   "已选择项有独立的勾号标记"
 expect_present "$COMBO_QML" "row.isSelected ? Font.DemiBold : Font.Normal" \
@@ -3017,7 +2969,7 @@ expect_present "$COMBO_QML" "row.isSelected ? Font.DemiBold : Font.Normal" \
 expect_present "$COMBO_QML" "row.isSelected ? theme.accent : theme.textPrimary" \
   "已选择项用强调色文字区分"
 
-# --- 运行期：真实指针 + 真实焦点链上的方向键 ---
+# --- 运行期：真实窗口事件分发 + 真实焦点链上的方向键 ---
 set +e
 QT_QPA_PLATFORM=offscreen QSG_RHI_BACKEND=software timeout 240 \
   ./build/backup-gui-modern --combo-hover-test \
@@ -3034,23 +2986,22 @@ else
   record_fail "共享下拉状态自检退出码 $combo_status"
   grep 'FAIL' "$TEST_STATE_DIR/combo-hover.log" | tail -8
 fi
-for pattern in "Mouse 1 打开 popup：无 hover 底色、无键盘光标、模式关闭" \
-               "Mouse 1 已选择项（路径）只有勾号，没有底色" \
-               "Mouse 2 只有“文件类型”有 hover 灰底，且没有误触发键盘模式" \
-               "Mouse 3 指针离开后索引仍停在被划过的那一行" \
-               "Mouse 3 索引留在那一行，但视觉上没有任何底色" \
-               "Mouse 4 指针重新进入：hover 立刻接管" \
-               "Keyboard 1 ↓ 让 popup 的 currentIndex 前移一项" \
-               "Keyboard 1 ↓ 之后键盘模式打开（由导航结果推断）" \
-               "Keyboard 1 键盘光标正好落在 Qt 移动到的那个 row 上" \
-               "Keyboard 2 再 ↓：光标整体下移一行，上一行立刻熄灭" \
-               "Keyboard 3 ↑ 把光标移回上一行" \
-               "Keyboard 4 键盘光标落在已选择项上：光标与勾号同时可见" \
-               "Mouse 5 键盘模式下移动鼠标：键盘光标立即消失、hover 接管" \
-               "Mouse 6 指针离开后没有任何底色残留" \
-               "Keyboard 5 Enter 采纳当前键盘行并关闭下拉" \
-               "Keyboard 6 Esc 关闭下拉且不改动已选择的值" \
-               "Reopen 重新打开下拉：没有 stale 键盘光标、没有 stale 灰底"; do
+for pattern in "打开时仅当前选中项具有活动高亮" \
+               "当前选中项同时显示活动高亮和独立勾号" \
+               "鼠标 hover 与活动高亮落在同一个候选上" \
+               "鼠标划过不提交选择值，离开后活动候选仍可见" \
+               "鼠标离开后无 hover 残影，只有 activeIndex 高亮" \
+               "鼠标重新进入后仍使用同一 activeIndex" \
+               "键盘 ↓ 让 activeIndex 前移一项" \
+               "键盘导航后的活动高亮正好落在 activeIndex 行" \
+               "键盘再 ↓：活动候选下移一行且上一行熄灭" \
+               "键盘 ↑ 把活动候选移回上一行" \
+               "活动候选落在已选择项上：活动层与勾号同时可见" \
+               "鼠标移动后仍只有同一个 activeIndex 高亮" \
+               "鼠标离开后没有 hover 残留，活动候选保持唯一" \
+               "Enter 提交 activeIndex 并关闭下拉" \
+               "Escape 关闭下拉且不改动已选择的值" \
+               "重新打开下拉：activeIndex 从当前选择恢复，没有 hover 残留"; do
   if grep -qF -- "$pattern" "$TEST_STATE_DIR/combo-hover.log"; then
     record_pass "下拉状态自检：$pattern"
   else

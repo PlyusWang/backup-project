@@ -22,9 +22,8 @@ ROOT_DIR="$(cd "$(dirname "$BASH_SOURCE")/.." && pwd)"
 BACKUPCTL="$ROOT_DIR/build/backupctl"
 ARCHIVE_CLI="$ROOT_DIR/build/archive-cli"
 GUI="$ROOT_DIR/build/backup-gui-modern"
-# 放在已被 .gitignore 覆盖的 testdata/ 下面：测试失败时留下的现场不会变成
-# "未跟踪文件"，也就不会有人手滑把它提交进去。
-TEST_ROOT="$ROOT_DIR/testdata/schedule"
+# 每轮使用全新临时目录，成功后删除，失败时保留现场；不覆盖仓库里的旧测试数据。
+TEST_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/bp-schedule-test.XXXXXX")"
 OUT="$TEST_ROOT/last-output.txt"
 
 # 全应用单实例锁现在只由 Unix UID 决定（/run/user/<uid>/backup-project.lock），
@@ -100,10 +99,6 @@ expect_magic() {
 }
 
 # ---- 构建 ----
-
-chmod -R u+rwX "$TEST_ROOT" 2>/dev/null || true
-rm -rf "$TEST_ROOT"
-mkdir -p "$TEST_ROOT"
 
 # archive-cli 是测试夹具，不在默认产品构建里（见 Makefile）：脚本要自己
 # 显式构建它。

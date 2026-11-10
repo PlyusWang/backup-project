@@ -225,6 +225,45 @@ int RunNetworkAcceptanceTest(QQuickWindow* window,
         "DIRECT_CERTIFICATE_CONFIGURATION");
   remote->setCertificateSettings(roots, server_id);
   show_configuration(QStringLiteral("direct"), roots, server_id);
+  QObject* auth_mode_tabs =
+      window->findChild<QObject*>(QStringLiteral("remoteAuthModeTabs"));
+  const bool auth_tabs_ready = auth_mode_tabs != nullptr;
+  check(auth_tabs_ready, "AUTH_MODE_TABS_PRESENT");
+  if (auth_tabs_ready) {
+    QMetaObject::invokeMethod(auth_mode_tabs, "activated", Qt::DirectConnection,
+                              Q_ARG(QString, QStringLiteral("pin")));
+  }
+  check(auth_tabs_ready && remote->authMode() == QStringLiteral("pin") &&
+            page->property("draftAuthMode").toString() ==
+                QStringLiteral("pin") &&
+            page->property("draftTrustedRoots").toString().isEmpty() &&
+            page->property("draftExpectedServerId").toString().isEmpty() &&
+            remote->trustedRootsFile().isEmpty() &&
+            remote->expectedServerId().isEmpty(),
+        "BPSEC2_TO_BPSEC1_CLEARS_CERTIFICATE_IDENTITY");
+  if (auth_tabs_ready) {
+    QMetaObject::invokeMethod(auth_mode_tabs, "activated", Qt::DirectConnection,
+                              Q_ARG(QString, QStringLiteral("certificate")));
+  }
+  const int dispatched_before_missing_identity =
+      remote->dispatchedRequestCountForTest();
+  const bool accepted_without_identity =
+      remote->login(host, port, QStringLiteral("must-not-connect"),
+                    QStringLiteral("synthetic-password"));
+  check(auth_tabs_ready && remote->authMode() == QStringLiteral("certificate") &&
+            page->property("draftAuthMode").toString() ==
+                QStringLiteral("certificate") &&
+            page->property("draftTrustedRoots").toString().isEmpty() &&
+            page->property("draftExpectedServerId").toString().isEmpty() &&
+            remote->trustedRootsFile().isEmpty() &&
+            remote->expectedServerId().isEmpty() &&
+            !accepted_without_identity &&
+            remote->dispatchedRequestCountForTest() ==
+                dispatched_before_missing_identity &&
+            remote->lastErrorKindForTest() == QStringLiteral("validation"),
+        "BPSEC1_TO_BPSEC2_REQUIRES_NEW_CERTIFICATE_IDENTITY");
+  remote->setCertificateSettings(roots, server_id);
+  show_configuration(QStringLiteral("direct"), roots, server_id);
   const QString account_secret =
       QUuid::createUuid().toString(QUuid::WithoutBraces);
   const QString direct_user = QStringLiteral("network-direct");

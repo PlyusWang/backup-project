@@ -95,6 +95,54 @@ Item {
         return true
     }
 
+    // 启停操作和普通保存使用同一条校验、持久化路径。enabledValue 是
+    // 本次要保存的真实运行状态；失败时控制器状态不会先显示为已启用。
+    function saveDraft(enabledValue) {
+        page.savingConfig = true
+        try {
+            if (!page.prepareCredentials())
+                return false
+            let targetId = page.draftCloudRepositoryId
+            if (page.draftRepositoryType === "cloud"
+                    && targetId.length === 0
+                    && page.draftCloudCredentialsFile.length > 0) {
+                targetId = realtime.cloudRepositoryIdForFile(
+                    page.draftCloudCredentialsFile)
+                page.draftCloudRepositoryId = targetId
+            }
+            if (!realtime.setRepositoryTarget(
+                        page.draftRepositoryType,
+                        page.draftCloudCredentialsFile,
+                        targetId))
+                return false
+            if (!realtime.setEncryptionChoice(
+                        page.encryptionKeyValue,
+                        page.draftCredentialFile))
+                return false
+            const saved = realtime.saveConfigFromText(
+                enabledValue,
+                page.draftSource,
+                page.draftDebounce,
+                page.draftMaxWait,
+                page.draftRetain,
+                page.packKeys[page.draftPackIndex],
+                page.compressionKeys[page.draftCompressionIndex],
+                ruleEditor.includeRuleTexts,
+                ruleEditor.excludeRuleTexts,
+                page.strategyKeys[page.draftStrategyIndex])
+            if (saved) {
+                if (page.encryptionKeyValue === "none"
+                        || page.draftCredentialFile.indexOf(
+                            "/@backup-project-session/") !== 0)
+                    realtime.lockArchivePassword()
+                page.syncFromController()
+            }
+            return saved
+        } finally {
+            page.savingConfig = false
+        }
+    }
+
     onVisibleChanged: {
         if (!visible)
             page.clearPasswordInputs()
@@ -375,13 +423,13 @@ Item {
                         Text {
                             text: "●"
                             font.pixelSize: 18
-                            color: page.draftEnabled
+                            color: realtime.enabled
                                     ? theme.success
                                    : theme.textDisabled
                         }
 
                         Text {
-                            text: page.draftEnabled
+                            text: realtime.enabled
                                    ? "实时备份已启用"
                                   : "实时备份已停用"
                             font.pixelSize: 18
@@ -399,14 +447,11 @@ Item {
                         Item { Layout.fillWidth: true }
 
                         AppButton {
-                            // 该按钮只翻转草稿，不直接调控制器：启用属于配置，
-                            // 要与目录、策略一起提交，避免出现半生效状态。
-                            // libraryBusy 时禁用，避免与正在跑的备份抢配置。
                             objectName: "realtimeEnabledToggle"
-                            text: page.draftEnabled ? "停用" : "启用"
-                            variant: page.draftEnabled ? "secondary" : "primary"
+                            text: realtime.enabled ? "停用" : "启用"
+                            variant: realtime.enabled ? "secondary" : "primary"
                             enabled: !realtime.libraryBusy
-                            onClicked: page.draftEnabled = !page.draftEnabled
+                            onClicked: page.saveDraft(!realtime.enabled)
                         }
                     }
 
@@ -650,51 +695,7 @@ Item {
                             // 一次调用提交整份配置：全部字段校验通过后才落盘，
                             // 不存在"目录存了、策略没存"的中间态；规则文本来自
                             // 共享编辑器，失败原因由控制器写进状态栏。
-                            onClicked: {
-                                page.savingConfig = true
-                                try {
-                                    if (!page.prepareCredentials())
-                                        return
-                                    let targetId = page.draftCloudRepositoryId
-                                    if (page.draftRepositoryType === "cloud"
-                                            && targetId.length === 0
-                                            && page.draftCloudCredentialsFile.length > 0) {
-                                        targetId = realtime.cloudRepositoryIdForFile(
-                                            page.draftCloudCredentialsFile)
-                                        page.draftCloudRepositoryId = targetId
-                                    }
-                                    if (!realtime.setRepositoryTarget(
-                                            page.draftRepositoryType,
-                                            page.draftCloudCredentialsFile,
-                                            targetId))
-                                        return
-                                    if (!realtime.setEncryptionChoice(
-                                            page.encryptionKeyValue,
-                                            page.draftCredentialFile))
-                                        return
-                                    const saved = realtime.saveConfigFromText(
-                                        page.draftEnabled,
-                                        page.draftSource,
-                                        page.draftDebounce,
-                                        page.draftMaxWait,
-                                        page.draftRetain,
-                                        page.packKeys[page.draftPackIndex],
-                                        page.compressionKeys[
-                                            page.draftCompressionIndex],
-                                        ruleEditor.includeRuleTexts,
-                                        ruleEditor.excludeRuleTexts,
-                                        page.strategyKeys[page.draftStrategyIndex])
-                                    if (saved) {
-                                        if (page.encryptionKeyValue === "none"
-                                                || page.draftCredentialFile.indexOf(
-                                                    "/@backup-project-session/") !== 0)
-                                            realtime.lockArchivePassword()
-                                        page.syncFromController()
-                                    }
-                                } finally {
-                                    page.savingConfig = false
-                                }
-                            }
+                            onClicked: page.saveDraft(realtime.enabled)
                         }
 
                         Item { Layout.fillWidth: true }

@@ -13,9 +13,8 @@ set -uo pipefail
 
 ROOT_DIR="$(cd "$(dirname "$BASH_SOURCE")/.." && pwd)"
 BACKUPCTL="$ROOT_DIR/build/backupctl"
-TEST_ROOT="$ROOT_DIR/testdata/realtime"
+TEST_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/bp-realtime-test.XXXXXX")"
 OUT="$TEST_ROOT/last-output.txt"
-mkdir -p "$TEST_ROOT"
 
 PASS=0
 FAIL=0
@@ -313,4 +312,5 @@ if [ "$FAIL" -ne 0 ]; then
   echo "[realtime-test] some cases failed" >&2
   exit 1
 fi
+rm -rf "$TEST_ROOT"
 echo "[realtime-test] all cases passed"

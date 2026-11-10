@@ -431,6 +431,15 @@ void RemoteController::ClearSharedSession() {
   emit sharedSessionChanged();
 }
 
+void RemoteController::InvalidateConnectionForSettingsChange() {
+  if (busy_ || (!authenticated_ && !client_.connected())) {
+    return;
+  }
+  logoutLocal();
+  SetStatus(QStringLiteral("warning"), QStringLiteral("连接设置已更改"),
+            QStringLiteral("本机登录状态已清除，请按新身份配置重新登录。"));
+}
+
 void RemoteController::PublishSharedSession() {
   if (!authenticated_ || password_.isEmpty() ||
       login_config_generation_ != shared_config_generation_) {
@@ -505,18 +514,17 @@ QString RemoteController::statusScope() const {
                                                    : QStringLiteral("remote");
 }
 
-// total 为 0 表示"还不知道总量"（连接 / 校验阶段），此时比例是 0 而不是
-// NaN —— QML 的进度条不接受 NaN。结果强制夹在 [0,1]：服务端上报的总量与
-// 本地已发字节来自不同时机，短暂超过 100% 是可能的。
+// total 为 0 表示连接或校验阶段尚无可靠总量；用 -1 让界面显示忙碌状态，
+// 不把未知进度伪装成 0%。有总量时将比例限制在 [0,1]。
 double RemoteController::progressRatio() const {
   const std::uint64_t total = bytes_total_.load();
   if (total == 0) {
-    return 0.0;
+    return -1.0;
   }
   const double ratio =
       static_cast<double>(bytes_done_.load()) / static_cast<double>(total);
   if (ratio < 0.0) {
-    return 0.0;
+    return -1.0;
   }
   return ratio > 1.0 ? 1.0 : ratio;
 }
@@ -1458,6 +1466,8 @@ void RemoteController::CommitEndpoint(const QString& host, int port,
       username_ == username) {
     return;
   }
+  if (busy_) return;
+  InvalidateConnectionForSettingsChange();
   endpoint_.host = host.toStdString();
   endpoint_.port = static_cast<std::uint16_t>(port);
   // pin 与地址 / 端口是同一份"上一次真正生效的连接配置"：这里再对齐一次，
@@ -2452,7 +2462,7 @@ void RemoteController::ApplyResult(const RemoteOpResult& result) {
             ? QStringLiteral("下载到本地仓库")
             : QStringLiteral("云端操作");
     const UserFacingError explained =
-        ExplainOperationError(QString::fromStdString(result.detail), action);
+        ExplainOperationError(result.error_kind, action);
     emit userError(explained.title, explained.summary, explained.suggestion,
                    QString::fromStdString(result.detail));
     // 登录 / 注册 / 注销各自有错误行：原因写在那里，页面底部的横幅也不能继续
@@ -3390,8 +3400,10 @@ bool RemoteController::setAuthMode(const QString& mode) {
     return mode == QStringLiteral("certificate");
   }
   if (auth_mode_ == mode) return true;
+  if (busy_) return false;
+  InvalidateConnectionForSettingsChange();
   auth_mode_ = mode;
-  // 切换身份验证方式不会改变连接方式，也不会动已经在跑的隧道。
+  // 切换身份验证方式会丢弃旧 socket；SSH 隧道只负责传输，不参与身份选择。
   ClearSurfaceError(ErrorSurface::kServerKey);
   emit connectionChanged();
   return true;
@@ -3399,6 +3411,12 @@ bool RemoteController::setAuthMode(const QString& mode) {
 
 void RemoteController::setCertificateSettings(
     const QString& trusted_roots_file, const QString& expected_server_id) {
+  if (trusted_roots_file_ == trusted_roots_file &&
+      expected_server_id_ == expected_server_id) {
+    return;
+  }
+  if (busy_) return;
+  InvalidateConnectionForSettingsChange();
   trusted_roots_file_ = trusted_roots_file;
   expected_server_id_ = expected_server_id;
   emit connectionChanged();
@@ -3443,6 +3461,9 @@ bool RemoteController::setConnectionMode(const QString& mode) {
   if (connection_mode_ == next) {
     return true;
   }
+  if (busy_) return false;
+  InvalidateConnectionForSettingsChange();
+  tunnel_.Stop();
   connection_mode_ = next;
 
   // 切进官方云端时，把人工 pin 那一套反馈收起来：官方模式既没有指纹输入框，
@@ -3472,6 +3493,9 @@ void RemoteController::setSshHost(const QString& host) {
   if (ssh_host_ == text) {
     return;
   }
+  if (busy_) return;
+  InvalidateConnectionForSettingsChange();
+  tunnel_.Stop();
   ssh_host_ = text;
   emit connectionChanged();
 }
@@ -3489,6 +3513,9 @@ void RemoteController::setSshLocalPort(const QString& port_text) {
   if (ssh_local_port_ == value) {
     return;
   }
+  if (busy_) return;
+  InvalidateConnectionForSettingsChange();
+  tunnel_.Stop();
   ssh_local_port_ = value;
   emit connectionChanged();
 }
@@ -3498,6 +3525,9 @@ void RemoteController::setSshProgram(const QString& program) {
   if (ssh_program_ == text) {
     return;
   }
+  if (busy_) return;
+  InvalidateConnectionForSettingsChange();
+  tunnel_.Stop();
   ssh_program_ = text;
   emit connectionChanged();
 }
@@ -3837,6 +3867,8 @@ void RemoteController::CommitHostPort(const QString& host, int port) {
       endpoint_.port == static_cast<std::uint16_t>(port)) {
     return;
   }
+  if (busy_) return;
+  InvalidateConnectionForSettingsChange();
   endpoint_.host = host.toStdString();
   endpoint_.port = static_cast<std::uint16_t>(port);
   endpoint_.server_key_pin = serverKeyPin().toStdString();

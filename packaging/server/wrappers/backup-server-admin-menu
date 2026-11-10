@@ -7,4 +7,9 @@
 set -e
 export BACKUP_SERVER_ROOT=/var/lib/backup-project-server
 export BACKUP_SERVER_ADMIN=/usr/lib/backup-project-server/bin/backup-server-admin
+export BACKUP_SERVER_CONFIG=/etc/backup-project-server/server.conf
+export BACKUP_SERVER_LOG=/var/log/backup-project-server/server.log
+export BACKUP_SERVER_ROOT_PUBLIC=/var/lib/backup-project-server/private/root.key.pub
+export BACKUP_SERVER_KEYGEN=/usr/lib/backup-project-server/bin/backup-server-keygen
+export BACKUP_CERT_TOOL=/usr/lib/backup-project-server/bin/backup-cert-tool
 exec /usr/lib/backup-project-server/bin/backup-server-admin.sh "$@"

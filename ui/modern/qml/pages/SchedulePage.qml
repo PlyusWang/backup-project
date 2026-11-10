@@ -159,6 +159,70 @@ Item {
         ? "增量备份：首次建立完整基线，之后只保存变化，更节省空间。"
         : "完整备份：每次生成一份可以独立恢复的完整备份。"
 
+    readonly property bool draftDirty: page.draftSource !== schedule.sourcePath
+        || page.draftFrequencyValue !== schedule.frequencyValueText
+        || page.draftFrequencyUnit !== schedule.frequencyUnitKey
+        || page.draftRetain !== String(schedule.retainCount)
+        || page.strategyKeys[page.draftStrategyIndex] !== schedule.strategyKey
+        || page.packKeys[page.draftPackIndex] !== schedule.packKey
+        || page.compressionKeys[page.draftCompressionIndex]
+           !== schedule.compressionKey
+        || page.encryptionKeys[page.draftEncryptionIndex]
+           !== schedule.encryptionKey
+        || page.draftCredentialFile !== schedule.credentialFile
+        || page.draftRepositoryType !== schedule.repositoryType
+        || page.draftCloudCredentialsFile !== schedule.cloudCredentialsFile
+        || page.draftCloudRepositoryId !== schedule.cloudRepositoryId
+        || ruleEditor.rulesSignature !== page.savedRulesSignature
+
+    // 启停操作与保存设置共用同一条提交路径。传入的 enabledValue 是本次
+    // 要写入的实际状态；只有核心保存成功后，控制器状态和界面才会改变。
+    function saveDraft(enabledValue) {
+        page.savingConfig = true
+        try {
+            if (!page.prepareCredentials())
+                return false
+            let targetId = page.draftCloudRepositoryId
+            if (page.draftRepositoryType === "cloud"
+                    && targetId.length === 0
+                    && page.draftCloudCredentialsFile.length > 0) {
+                targetId = schedule.cloudRepositoryIdForFile(
+                    page.draftCloudCredentialsFile)
+                page.draftCloudRepositoryId = targetId
+            }
+            if (!schedule.setRepositoryTarget(
+                        page.draftRepositoryType,
+                        page.draftCloudCredentialsFile,
+                        targetId))
+                return false
+            if (!schedule.setEncryptionChoice(
+                        page.encryptionKeyValue,
+                        page.draftCredentialFile))
+                return false
+            const saved = schedule.saveConfigFromFrequencyText(
+                enabledValue,
+                page.draftSource,
+                page.draftFrequencyValue,
+                page.draftFrequencyUnit,
+                page.draftRetain,
+                page.packKeys[page.draftPackIndex],
+                page.compressionKeys[page.draftCompressionIndex],
+                ruleEditor.includeRuleTexts,
+                ruleEditor.excludeRuleTexts,
+                page.strategyKeys[page.draftStrategyIndex])
+            if (saved) {
+                if (page.encryptionKeyValue === "none"
+                        || page.draftCredentialFile.indexOf(
+                            "/@backup-project-session/") !== 0)
+                    schedule.lockArchivePassword()
+                page.syncFromController()
+            }
+            return saved
+        } finally {
+            page.savingConfig = false
+        }
+    }
+
     // 控制器 -> 草稿的单向同步。只在页面完成加载和已保存配置的指纹变化时
     // 调用：用户在输入框里打字期间不会被后台的属性刷新覆盖掉草稿。
     function syncFromController() {
@@ -203,6 +267,9 @@ Item {
         schedule.cloudRepositoryId,
         schedule.includeRules.join(","), schedule.excludeRules.join(",")
     ].join("|")
+    readonly property string savedRulesSignature:
+        schedule.includeRules.join("\n")
+        + "\u0000" + schedule.excludeRules.join("\n")
     onSavedSignatureChanged: {
         if (!page.savingConfig)
             syncFromController()
@@ -292,15 +359,13 @@ Item {
                         Text {
                             text: "●"
                             font.pixelSize: 18
-                            color: page.draftEnabled
+                            color: schedule.enabled
                                     ? theme.success
                                    : theme.textDisabled
                         }
 
                         Text {
-                            // 状态点与文字都跟着**草稿**走：屏幕上的状态就是
-                            // 按"保存设置"后会生效的状态，不显示已落盘的旧值。
-                            text: page.draftEnabled
+                            text: schedule.enabled
                                    ? "定时备份已启用"
                                   : "定时备份已停用"
                             font.pixelSize: 18
@@ -311,15 +376,19 @@ Item {
                         Item { Layout.fillWidth: true }
 
                         AppButton {
-                            // 只翻转草稿，不写 store：真正生效要等"保存设置"。
-                            // libraryBusy 期间禁用，避免正在跑的库操作与配置
-                            // 变更同时发生。
                             objectName: "scheduleEnabledToggle"
-                            text: page.draftEnabled ? "停用" : "启用"
-                            variant: page.draftEnabled ? "secondary" : "primary"
+                            text: schedule.enabled ? "停用" : "启用"
+                            variant: schedule.enabled ? "secondary" : "primary"
                             enabled: !schedule.libraryBusy
-                            onClicked: page.draftEnabled = !page.draftEnabled
+                            onClicked: page.saveDraft(!schedule.enabled)
                         }
+                    }
+
+                    Text {
+                        visible: page.draftDirty
+                        text: "改动尚未保存"
+                        font.pixelSize: 14
+                        color: theme.warning
                     }
 
                     Text {
@@ -623,51 +692,7 @@ Item {
                             // 在共享核心里。
                             // 先把加密选择交给控制器草稿（只改内存），
                             // 再由唯一的保存入口整份提交。任何一步拒绝都不写盘。
-                            onClicked: {
-                                page.savingConfig = true
-                                try {
-                                    if (!page.prepareCredentials())
-                                        return
-                                    let targetId = page.draftCloudRepositoryId
-                                    if (page.draftRepositoryType === "cloud"
-                                            && targetId.length === 0
-                                            && page.draftCloudCredentialsFile.length > 0) {
-                                        targetId = schedule.cloudRepositoryIdForFile(
-                                            page.draftCloudCredentialsFile)
-                                        page.draftCloudRepositoryId = targetId
-                                    }
-                                    if (!schedule.setRepositoryTarget(
-                                            page.draftRepositoryType,
-                                            page.draftCloudCredentialsFile,
-                                            targetId))
-                                        return
-                                    if (!schedule.setEncryptionChoice(
-                                            page.encryptionKeyValue,
-                                            page.draftCredentialFile))
-                                        return
-                                    const saved = schedule.saveConfigFromFrequencyText(
-                                        page.draftEnabled,
-                                        page.draftSource,
-                                        page.draftFrequencyValue,
-                                        page.draftFrequencyUnit,
-                                        page.draftRetain,
-                                        page.packKeys[page.draftPackIndex],
-                                        page.compressionKeys[
-                                            page.draftCompressionIndex],
-                                        ruleEditor.includeRuleTexts,
-                                        ruleEditor.excludeRuleTexts,
-                                        page.strategyKeys[page.draftStrategyIndex])
-                                    if (saved) {
-                                        if (page.encryptionKeyValue === "none"
-                                                || page.draftCredentialFile.indexOf(
-                                                    "/@backup-project-session/") !== 0)
-                                            schedule.lockArchivePassword()
-                                        page.syncFromController()
-                                    }
-                                } finally {
-                                    page.savingConfig = false
-                                }
-                            }
+                            onClicked: page.saveDraft(schedule.enabled)
                         }
 
                         AppButton {

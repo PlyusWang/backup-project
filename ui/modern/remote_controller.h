@@ -1026,6 +1026,9 @@ class RemoteController : public QObject {
   std::uint64_t login_config_generation_ = 0;
   void ClearSharedSession();
   void PublishSharedSession();
+  // 身份、地址或传输模式改变后，已有 socket 不能继续承载旧握手；空闲时
+  // 立即丢弃旧连接与会话，下一次操作必须按新配置重新认证。
+  void InvalidateConnectionForSettingsChange();
 
   bool authenticated_ = false;
   bool busy_ = false;

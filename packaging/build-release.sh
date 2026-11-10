@@ -68,7 +68,8 @@ for needed in \
   packaging/server/wrappers/backup-server-keygen packaging/server/wrappers/backup-cert-tool \
   packaging/server/wrappers/backup-server-purge-data \
   packaging/portable/install-client.sh packaging/portable/uninstall-client.sh \
-  packaging/portable/install-server.sh packaging/portable/uninstall.sh; do
+  packaging/portable/install-server.sh packaging/portable/backup-server-manager \
+  packaging/portable/uninstall.sh; do
   [ -f "$needed" ] || die "打包层缺少文件：$needed（是不是被 .gitignore 吞了？）"
 done
 setup_reproducible_env
@@ -501,6 +502,7 @@ pack_server_tarball() {
   mv "$tree/portable-root/usr/lib/backup-project-server/share/backup-project" "$tree/share/backup-project"
   mv "$tree/portable-root/usr/lib/backup-project-server/share/doc/backup-project/." "$tree/docs/" 2>/dev/null || true
   install -m 0755 packaging/portable/install-server.sh "$tree/install.sh"
+  install -m 0755 packaging/portable/backup-server-manager "$tree/backup-server-manager"
   install -m 0755 packaging/portable/uninstall.sh "$tree/uninstall.sh"
   install -m 0644 packaging/server/server.conf "$tree/packaging/server/server.conf"
   install -m 0644 packaging/server/backup-project-server.service "$tree/packaging/server/"

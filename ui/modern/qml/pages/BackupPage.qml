@@ -376,6 +376,7 @@ Item {
                 spacing: 4
 
                 Rectangle {
+                    visible: remote.progressRatio >= 0
                     Layout.fillWidth: true
                     Layout.preferredHeight: 6
                     radius: 3
@@ -389,6 +390,14 @@ Item {
                         color: theme.accent
                         visible: remote.progressRatio >= 0
                     }
+                }
+
+                BusyIndicator {
+                    objectName: "quickCloudBusyIndicator"
+                    visible: remote.progressRatio < 0
+                    running: visible
+                    Layout.preferredWidth: 20
+                    Layout.preferredHeight: 20
                 }
 
                 Text {
