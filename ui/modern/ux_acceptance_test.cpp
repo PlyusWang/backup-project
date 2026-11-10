@@ -9,6 +9,7 @@
 #include <QFile>
 #include <QImage>
 #include <QKeyEvent>
+#include <QList>
 #include <QMouseEvent>
 #include <QQmlComponent>
 #include <QQmlContext>
@@ -18,6 +19,7 @@
 #include <QTemporaryDir>
 #include <QTimer>
 #include <QWheelEvent>
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <functional>
@@ -208,49 +210,83 @@ int RunUxAcceptanceTest(QQuickWindow* window, backup_modern::AppTheme* theme,
     combo->forceActiveFocus();
     Key(&input_window, Qt::Key_Return);
     check(popup->property("visible").toBool(), "Enter opens popup");
-    QQuickItem* selected_layer = nullptr;
-    std::function<void(QQuickItem*)> find_selected = [&](QQuickItem* item) {
-      if (item->objectName() == QLatin1String("comboItemSelectedLayer") &&
-          item->opacity() > 0.5)
-        selected_layer = item;
-      for (QQuickItem* child : item->childItems()) find_selected(child);
+    const auto rows = [list]() {
+      QList<QQuickItem*> result;
+      std::function<void(QQuickItem*)> collect = [&](QQuickItem* parent) {
+        if (parent->objectName() == QLatin1String("comboItemRow"))
+          result.append(parent);
+        for (QQuickItem* child : parent->childItems()) collect(child);
+      };
+      collect(list);
+      return result;
     };
-    find_selected(list);
-    check(selected_layer != nullptr &&
-              selected_layer->property("color").value<QColor>() ==
-                  theme->accentSoft(),
-          "popup immediately highlights current selection using theme");
+    const auto activeRows = [&rows]() {
+      QList<int> result;
+      for (QQuickItem* row : rows()) {
+        if (row->property("active").toBool())
+          result.append(row->property("index").toInt());
+      }
+      std::sort(result.begin(), result.end());
+      return result;
+    };
+    const auto checkedRows = [&rows]() {
+      QList<int> result;
+      for (QQuickItem* row : rows()) {
+        QQuickItem* check = FindItem(row, "comboItemCheck");
+        if (check != nullptr && check->isVisible())
+          result.append(row->property("index").toInt());
+      }
+      std::sort(result.begin(), result.end());
+      return result;
+    };
+    const auto activeThemeLayerMatches = [&rows, theme](int index) {
+      for (QQuickItem* row : rows()) {
+        if (row->property("index").toInt() != index ||
+            !row->property("active").toBool())
+          continue;
+        QQuickItem* layer = FindItem(row, "comboItemActiveLayer");
+        return layer != nullptr &&
+               layer->property("color").value<QColor>() == theme->accentSoft();
+      }
+      return false;
+    };
+    check(combo->property("activeIndex").toInt() == 22 &&
+              activeRows() == QList<int>{22} &&
+              checkedRows() == QList<int>{22} &&
+              activeThemeLayerMatches(22),
+          "popup opens with one themed active candidate and an independent selected check");
     capture(&input_window, dark ? "05-combobox-selected-dark.png"
                                 : "05-combobox-selected-light.png");
     Key(&input_window, Qt::Key_Home);
-    check(combo->property("keyboardRowIndex").toInt() == 0,
-          "popup Home moves keyboard focus");
+    check(combo->property("activeIndex").toInt() == 0 &&
+              activeRows() == QList<int>{0} &&
+              combo->property("currentIndex").toInt() == 22,
+          "popup Home moves the sole active highlight without changing selection");
     Key(&input_window, Qt::Key_PageDown);
-    check(combo->property("keyboardRowIndex").toInt() > 0 &&
+    check(combo->property("activeIndex").toInt() > 0 &&
+              activeRows().size() == 1 &&
               combo->property("currentIndex").toInt() == 22,
           "popup PageDown navigates without committing");
-    bool keyboard_visible = false;
-    std::function<void(QQuickItem*)> find_keyboard = [&](QQuickItem* item) {
-      if (item->objectName() == QLatin1String("comboItemKeyboardLayer") &&
-          item->opacity() > 0.5)
-        keyboard_visible = true;
-      for (QQuickItem* child : item->childItems()) find_keyboard(child);
-    };
-    find_keyboard(list);
-    check(keyboard_visible, "popup keyboard focus has visible highlight");
+    check(activeRows().size() == 1 &&
+              activeRows().first() == combo->property("activeIndex").toInt(),
+          "popup keyboard focus uses the same single active highlight");
     capture(&input_window, dark ? "06-combobox-keyboard-dark.png"
                                 : "06-combobox-keyboard-light.png");
     Key(&input_window, Qt::Key_End);
-    check(combo->property("keyboardRowIndex").toInt() == 23,
-          "popup End moves to last item");
+    check(combo->property("activeIndex").toInt() == 23 &&
+              activeRows() == QList<int>{23} &&
+              combo->property("currentIndex").toInt() == 22,
+          "popup End moves active highlight to last item only");
     Key(&input_window, Qt::Key_PageUp);
-    check(combo->property("keyboardRowIndex").toInt() < 23 &&
+    check(combo->property("activeIndex").toInt() < 23 &&
+              activeRows().size() == 1 &&
               combo->property("currentIndex").toInt() == 22,
           "popup PageUp navigates without committing");
     Key(&input_window, Qt::Key_End);
     Key(&input_window, Qt::Key_Up);
-    check(combo->property("keyboardRowIndex").toInt() == 22,
-          "popup Up moves one item");
+    check(combo->property("activeIndex").toInt() == 22 &&
+              activeRows() == QList<int>{22},
+          "popup Up moves the unified active highlight one item");
     Key(&input_window, Qt::Key_Down);
     Key(&input_window, Qt::Key_Return);
     check(!popup->property("visible").toBool() &&
@@ -287,9 +323,10 @@ int RunUxAcceptanceTest(QQuickWindow* window, backup_modern::AppTheme* theme,
       if (row != nullptr) {
         const int expected = row->property("index").toInt();
         Pointer(&input_window, row, false);
-        QQuickItem* hover = FindItem(row, "comboItemHoverLayer");
-        check(hover != nullptr && hover->opacity() > 0.5,
-              "mouse hover has visible feedback");
+        check(combo->property("activeIndex").toInt() == expected &&
+                  activeRows() == QList<int>{expected} &&
+                  combo->property("currentIndex").toInt() == 23,
+              "mouse hover moves the sole active highlight, preserving committed check");
         Pointer(&input_window, row, true);
         check(!popup->property("visible").toBool() &&
                   combo->property("currentIndex").toInt() == expected,
