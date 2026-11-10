@@ -21,6 +21,8 @@
 #include "backup_catalog.h"
 #include "backup_engine.h"
 #include "incremental_backup.h"
+#include "incremental_delta.h"
+#include "incremental_restore.h"
 #include "scheduled_backup_service.h"
 #include "scheduler_lock.h"
 #include "test_support.h"
@@ -1218,7 +1220,76 @@ void TestBaselineBinding() {
                         JoinNames(RepoArchives(env.repository)));
   }
 
-  // T4：删掉的是**旧的、非 baseline** 的那一份 -> baseline 仍然有效 -> 照样
+  // T4：两个基线快照落在同一秒时，纳秒时间仍应优先于文件名排序。
+  // 故意让较旧 F0 的文件名字典序更大，避免依赖时间戳文件名碰巧表达时间。
+  {
+    const Env env = MakeEnv("baseline-same-second-mtime", 12);
+    bp::ScheduleConfig config = LoadConfig(env);
+    config.strategy = bp::BackupStrategy::kIncremental;
+    SaveConfig(env, config);
+    Write(env.source + "/a.txt", "F0");
+
+    bp::ScheduleEvaluationResult result;
+    ExpectNow("TIME-BASE-01 F0 is created", env, env.repository, 2000,
+              bp::ScheduleEvaluationStatus::kCreatedSnapshot, &result);
+    const std::string f0 = result.archive_file_name;
+    Write(env.source + "/a.txt", "D1");
+    ExpectNow("TIME-BASE-02 D1 is created", env, env.repository, 1000,
+              bp::ScheduleEvaluationStatus::kCreatedSnapshot, &result);
+    const std::string d1 = result.archive_file_name;
+    bp::DeltaEnvelope d1_envelope;
+    std::string error;
+    test_support::Check(
+        bp::ReadDeltaEnvelope(env.repository + "/" + d1, &d1_envelope,
+                              &error) &&
+            d1_envelope.parent_file_name == f0,
+        "TIME-BASE-03 D1 is a delta whose parent is F0", error);
+    test_support::Check(f0 > d1,
+                        "TIME-BASE-04 older F0 sorts after newer D1 by name",
+                        f0 + " vs " + d1);
+
+    const std::int64_t same_second = 1700000000;
+    test_support::Check(
+        test_support::SetTimes(env.repository + "/" + f0, same_second,
+                               100000000) &&
+            test_support::SetTimes(env.repository + "/" + d1, same_second,
+                                   900000000),
+        "TIME-BASE-05 F0 and D1 have controlled same-second mtimes");
+    bp::BackupCatalog catalog;
+    std::vector<bp::BackupRecord> records;
+    test_support::Check(catalog.List(env.repository, &records, &error) &&
+                            records.size() == 2 &&
+                            records[0].file_name == d1 &&
+                            records[0].modified_time_sec == same_second &&
+                            records[0].modified_time_nsec == 900000000,
+                        "TIME-BASE-06 catalog sorts same-second mtimes by nanoseconds",
+                        error);
+
+    Write(env.source + "/a.txt", "D2");
+    ExpectNow("TIME-BASE-07 D2 is created from the latest baseline", env,
+              env.repository, 3000,
+              bp::ScheduleEvaluationStatus::kCreatedSnapshot, &result);
+    bp::DeltaEnvelope d2_envelope;
+    test_support::Check(
+        bp::ReadDeltaEnvelope(env.repository + "/" + result.archive_file_name,
+                              &d2_envelope, &error) &&
+            d2_envelope.parent_file_name == d1,
+        "TIME-BASE-08 D2 parent is newest D1 despite reversed file-name order",
+        error + " parent=" + d2_envelope.parent_file_name + " expected=" + d1);
+    const std::string restored = env.root + "/restored-d2";
+    bp::RestoreOptions options;
+    bp::RestoreReport report;
+    test_support::Check(
+        bp::RestoreSnapshotChain(env.repository, result.archive_file_name,
+                                 restored, options, &report, &error),
+        "TIME-BASE-09 D2 restores through the selected baseline", error);
+    std::string content;
+    test_support::ReadFile(restored + "/a.txt", &content);
+    test_support::Check(content == "D2", "TIME-BASE-10 restored D2 has latest data",
+                        content);
+  }
+
+  // T5：删掉的是**旧的、非 baseline** 的那一份 -> baseline 仍然有效 -> 照样
   // skip。
   {
     const Env env = MakeEnv("baseline-keep-old", 12);
