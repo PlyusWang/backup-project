@@ -190,6 +190,7 @@ portable_remove_systemd_unit() {
 # install.sh sources only these shared checks, after validating its manifest.
 if [ "${BASH_SOURCE[0]}" != "$0" ]; then return 0; fi
 
+UNINSTALL_SCRIPT="$(realpath -e -- "${BASH_SOURCE[0]}")"
 PREFIX=""
 PURGE_DATA=0
 
@@ -223,5 +224,5 @@ if [ "$PURGE_DATA" -eq 1 ]; then
   portable_log "已删除数据与配置"
 else
   portable_log "保留：$PREFIX/var（数据/数据库/私钥）与 $PREFIX/etc（配置/secret）"
-  portable_log "要删除它们：$0 --prefix $PREFIX --purge-data"
+  portable_log "要删除它们：$(printf '%q' "$UNINSTALL_SCRIPT") --prefix $(printf '%q' "$PREFIX") --purge-data"
 fi

@@ -114,4 +114,4 @@ if [ "$NO_DESKTOP" -eq 0 ] && [ -f "$SRC_DIR/packaging/client/backup-project.des
 fi
 
 log "安装完成：$PREFIX/bin/backupctl、$PREFIX/bin/backup-gui-modern"
-log "卸载：$SRC_DIR/packaging/portable/uninstall-client.sh --prefix $PREFIX"
+log "卸载：$(printf '%q' "$SRC_DIR/packaging/portable/uninstall-client.sh") --prefix $(printf '%q' "$PREFIX")"

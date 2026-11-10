@@ -5,6 +5,7 @@ import hashlib
 import os
 from pathlib import Path
 import shutil
+import shlex
 import subprocess
 import tempfile
 import time
@@ -37,6 +38,8 @@ Path(env['HOME']).mkdir()
 package=ROOT/'package'
 (package/'bin').mkdir(parents=True)
 (package/'packaging/client').mkdir(parents=True)
+(package/'packaging/portable').mkdir(parents=True)
+shutil.copy2(REPO/'packaging/portable/uninstall-client.sh',package/'packaging/portable/uninstall-client.sh')
 for name in ('backupctl','backup-gui-modern'):
     p=package/'bin'/name
     p.write_text('#!/bin/sh\nprintf "%s\\n" "$0" "$@" >"$BP_DESKTOP_CAPTURE"\n')
@@ -69,6 +72,12 @@ for index,prefix in enumerate(prefixes):
     with log.open('w') as stream:
         subprocess.run(['bash',str(package/'install.sh'),'--prefix',str(prefix)],env=env,
                        stdout=stream,stderr=subprocess.STDOUT,check=True)
+    uninstall_line=next(line.split('卸载：',1)[1] for line in log.read_text().splitlines() if '卸载：' in line)
+    uninstall_argv=shlex.split(uninstall_line)
+    check(uninstall_argv==[str(package/'packaging/portable/uninstall-client.sh'),'--prefix',str(prefix)]
+          and Path(uninstall_argv[0]).is_file(),
+          f'prefix {index} printed uninstall command preserves exact executable and arguments')
+    subprocess.run(uninstall_argv+['--help'],env=env,stdout=subprocess.PIPE,stderr=subprocess.STDOUT,check=True)
     key=hashlib.sha256(str(prefix/'lib/backup-project').encode()).hexdigest()[:16]
     desktop=Path(env['XDG_DATA_HOME'])/'applications'/f'backup-project-{key}.desktop'
     installed_icon=Path(env['XDG_DATA_HOME'])/'icons/hicolor/256x256/apps'/f'backup-project-{key}.png'

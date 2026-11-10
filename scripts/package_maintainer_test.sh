@@ -533,7 +533,7 @@ printf '#!/usr/bin/env bash\nexit 0\n' >"$PORTABLE_PACKAGE/bin/launch-server.sh"
 printf '#!/usr/bin/env bash\n[ "$1" = --output ] || exit 2\nprintf "synthetic non-key\\n" >"$2"\n' \
   >"$PORTABLE_PACKAGE/bin/backup-server-keygen"
 printf '#!/usr/bin/env bash\nexit 0\n' >"$PORTABLE_PACKAGE/backup-server-manager"
-chmod +x "$PORTABLE_PACKAGE/bin/launch-server.sh" "$PORTABLE_PACKAGE/bin/backup-server-keygen"
+chmod +x "$PORTABLE_PACKAGE/bin/launch-server.sh" "$PORTABLE_PACKAGE/bin/backup-server-keygen" "$PORTABLE_PACKAGE/uninstall.sh"
 (cd "$PORTABLE_PACKAGE" && find . -type f ! -name MANIFEST.sha256 -print0 |
   sort -z | xargs -0 sha256sum >MANIFEST.sha256)
 # Only the copied installer sees these exported functions. They cannot operate
@@ -588,6 +588,44 @@ TMPDIR="$PORTABLE_STAGING" bash "$PORTABLE_PACKAGE/install.sh" --prefix "$PORTAB
   [ -f "$PORTABLE_NEW_SPACES/var/state/transport.key" ] && [ ! -s "$PORTABLE_CALLS" ] ||
   fail 'no-systemd space install did not publish synthetic files in the requested prefix'
 record_pass 'full no-systemd portable installer still handles a new prefix with spaces without service calls'
+
+python3 - "$PORTABLE_ROOT/full-install-portable-spaces.log" "$PORTABLE_PACKAGE" "$PORTABLE_NEW_SPACES" <<'PY'
+import os
+from pathlib import Path
+import shlex
+import subprocess
+import sys
+log, package, prefix = Path(sys.argv[1]), Path(sys.argv[2]), Path(sys.argv[3])
+lines = log.read_text().splitlines()
+for label, expected in (
+        ('手工启动：', [str(prefix/'bin/launch-server.sh'), '--config', str(prefix/'etc/server.conf')]),
+        ('管理菜单：', [str(prefix/'bin/backup-server-manager')]),
+        ('卸载：', [str(package/'uninstall.sh'), '--prefix', str(prefix)])):
+    matching = [line.split(label, 1)[1] for line in lines if label in line]
+    if len(matching) != 1 or shlex.split(matching[0]) != expected or not os.access(expected[0], os.X_OK):
+        raise RuntimeError('Printed installer command does not resolve: ' + label)
+subprocess.run([str(package/'uninstall.sh'), '--prefix', str(prefix), '--help'],
+               stdout=subprocess.PIPE, stderr=subprocess.STDOUT, check=True)
+PY
+record_pass 'portable installer prints runnable exact launch/menu/uninstall commands for paths with spaces'
+
+bash "$PORTABLE_PACKAGE/uninstall.sh" --prefix "$PORTABLE_NEW_SPACES" \
+  >"$PORTABLE_ROOT/uninstall-spaces-command.log" 2>&1 || fail 'space-prefix uninstall failed'
+python3 - "$PORTABLE_ROOT/uninstall-spaces-command.log" "$PORTABLE_PACKAGE/uninstall.sh" "$PORTABLE_NEW_SPACES" <<'PY'
+from pathlib import Path
+import shlex
+import subprocess
+import sys
+log, script, prefix = Path(sys.argv[1]), Path(sys.argv[2]), Path(sys.argv[3])
+matches = [line.split('要删除它们：', 1)[1] for line in log.read_text().splitlines() if '要删除它们：' in line]
+expected = [str(script.resolve()), '--prefix', str(prefix), '--purge-data']
+if len(matches) != 1 or shlex.split(matches[0]) != expected:
+    raise RuntimeError('Printed data-removal command does not preserve its exact path and arguments')
+subprocess.run(expected + ['--help'], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, check=True)
+if not (prefix/'etc/server.conf').is_file() or not (prefix/'var/state/transport.key').is_file():
+    raise RuntimeError('Ordinary uninstall or help removed retained configuration or identity')
+PY
+record_pass 'space-prefix uninstall prints an exact purge command while preserving configuration and identity'
 
 reset_portable_mock
 write_portable_unit "$PORTABLE_A"
