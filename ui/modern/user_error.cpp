@@ -16,6 +16,47 @@ UserFacingError ExplainOperationError(const QString& technical,
   UserFacingError error;
   error.title = action + QStringLiteral("没有完成");
 
+  // 远程控制器已经把协议失败归类为稳定的 error_kind；优先按分类翻译，
+  // 不再依赖底层英文详情里是否恰好包含某个单词。
+  if (technical == QStringLiteral("credentials")) {
+    error.title = QStringLiteral("登录失败");
+    error.summary = QStringLiteral("用户名或密码不正确。");
+    error.suggestion = QStringLiteral("请检查账号信息后重新登录。");
+    return error;
+  }
+  if (technical == QStringLiteral("pin-mismatch")) {
+    error.summary = QStringLiteral("服务器身份指纹与当前服务器不一致。");
+    error.suggestion = QStringLiteral("请向服务器管理员核对指纹后重试。");
+    return error;
+  }
+  if (technical == QStringLiteral("connect-refused")) {
+    error.summary = QStringLiteral("目标服务器没有接受连接。");
+    error.suggestion = QStringLiteral("请确认服务器已启动，地址和端口填写正确。");
+    return error;
+  }
+  if (technical == QStringLiteral("network")) {
+    error.summary = QStringLiteral("连接在操作完成前中断。");
+    error.suggestion = QStringLiteral("请检查网络后重试；已有数据不会被覆盖。");
+    return error;
+  }
+  if (technical == QStringLiteral("not-logged-in")) {
+    error.summary = QStringLiteral("登录状态已失效。");
+    error.suggestion = QStringLiteral("请重新登录后再试。");
+    return error;
+  }
+  if (technical == QStringLiteral("raw-auth")) {
+    error.title = action + QStringLiteral("失败");
+    error.summary = QStringLiteral("归档密码错误，或备份完整性校验失败。");
+    error.suggestion = QStringLiteral("请使用创建备份时的密码，并确认归档文件完整。");
+    return error;
+  }
+  if (technical == QStringLiteral("chain-conflict")) {
+    error.title = QStringLiteral("增量备份未能继续");
+    error.summary = QStringLiteral("所选基线与当前增量链不兼容。");
+    error.suggestion = QStringLiteral("请使用可验证的同一条链，或明确创建新的完整备份。");
+    return error;
+  }
+
   if (Contains(technical, "server-certificate-wrong-server-id")) {
     error.summary = QStringLiteral("服务器身份与预期不一致，连接已停止。");
     error.suggestion = QStringLiteral(
@@ -127,7 +168,7 @@ UserFacingError ExplainOperationError(const QString& technical,
   error.summary = QStringLiteral("操作未能完成，已有数据没有被覆盖。");
   error.suggestion = QStringLiteral(
       "请检查路径、权限与可用空间后重试；"
-      "具体原因可在详情中查看。");
+      "必要的技术诊断已写入本机日志。");
   return error;
 }
 

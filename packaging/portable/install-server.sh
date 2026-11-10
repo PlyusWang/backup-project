@@ -104,6 +104,14 @@ rm -rf "$PREFIX/bin.old.$$"
 [ -d "$PREFIX/bin" ] && mv "$PREFIX/bin" "$PREFIX/bin.old.$$"
 mv "$PREFIX/.bin.staging.$$" "$PREFIX/bin"
 rm -rf "$PREFIX/bin.old.$$"
+if [ -f "$SRC_DIR/packaging/portable/backup-server-manager" ]; then
+  install -m 0755 "$SRC_DIR/packaging/portable/backup-server-manager" \
+    "$PREFIX/bin/backup-server-manager"
+elif [ -f "$SRC_DIR/backup-server-manager" ]; then
+  install -m 0755 "$SRC_DIR/backup-server-manager" "$PREFIX/bin/backup-server-manager"
+else
+  die "安装包缺少 backup-server-manager"
+fi
 mkdir -p "$PREFIX/share" "$PREFIX/docs"
 cp -a "$STAGE/share/." "$PREFIX/share/" 2>/dev/null || true
 cp -a "$STAGE/docs/." "$PREFIX/docs/" 2>/dev/null || true
@@ -178,5 +186,5 @@ else
   log "手工启动：$PREFIX/bin/launch-server.sh --config $CONF"
 fi
 
-log "安装完成。管理菜单：$PREFIX/bin/backup-server-admin.sh（需要 BACKUP_SERVER_ROOT=$PREFIX）"
+log "安装完成。管理菜单：$PREFIX/bin/backup-server-manager"
 log "卸载：$PREFIX/docs/uninstall.sh --prefix $PREFIX"

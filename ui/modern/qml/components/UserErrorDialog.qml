@@ -90,7 +90,7 @@ Dialog {
         AppButton {
             objectName: "userErrorTechnicalToggle"
             Layout.fillWidth: true
-            visible: dialog.technical.length > 0
+            visible: false
             variant: "flat"
             text: dialog.technicalExpanded ? "收起详情" : "查看详情"
             onClicked: dialog.technicalExpanded = !dialog.technicalExpanded
@@ -99,7 +99,7 @@ Dialog {
         Rectangle {
             Layout.fillWidth: true
             Layout.preferredHeight: Math.min(180, technicalText.implicitHeight + 20)
-            visible: dialog.technicalExpanded
+            visible: false
             color: theme.background
             radius: 8
             border.width: 1

@@ -1,5 +1,5 @@
 // AppComboBox.qml
-// 统一下拉框：选中、键盘焦点与鼠标悬停分别显示，输入行为跟随桌面习惯。
+// 统一下拉框：当前候选项只使用一套交互高亮，已选值另显示勾选标记。
 
 import QtQuick
 import QtQuick.Controls.Basic
@@ -12,21 +12,15 @@ ComboBox {
     leftPadding: 14
     rightPadding: 14
     hoverEnabled: true
-    focusPolicy: Qt.StrongFocus
     // 滚轮在下面统一处理，避免原生处理与自定义处理重复切换两次。
     wheelEnabled: false
 
-    property bool keyboardNavigationActive: false
-    property bool pointerHovering: false
-    property int navigationIndex: -1
+    // Popup 里只有一个“当前可操作项”：鼠标移动和键盘移动都写这里。
+    // currentIndex 仍表示已经提交的值，Escape 关闭时不会修改它。
+    property int activeIndex: -1
     property real wheelRemainder: 0
-    readonly property int keyboardRowIndex: navigationIndex
     readonly property int pageStep: Math.max(1,
         Math.floor(contentList.height / 44) - 1)
-
-    function notePointerActivity() {
-        control.keyboardNavigationActive = false
-    }
 
     function selectIndex(index) {
         if (index < 0 || index >= control.count)
@@ -42,8 +36,7 @@ ComboBox {
             return
         const next = Math.max(0, Math.min(control.count - 1, index))
         if (control.popup.visible) {
-            control.keyboardNavigationActive = true
-            control.navigationIndex = next
+            control.activeIndex = next
             contentList.positionViewAtIndex(next, ListView.Contain)
         } else {
             control.selectIndex(next)
@@ -56,8 +49,8 @@ ComboBox {
         if (event.modifiers & (Qt.AltModifier | Qt.ControlModifier
                                | Qt.MetaModifier))
             return
-        const index = control.popup.visible
-            ? control.navigationIndex : control.currentIndex
+        const index = control.popup.visible ? control.activeIndex
+                                            : control.currentIndex
         switch (event.key) {
         case Qt.Key_Up:
             control.navigate(index - 1)
@@ -82,7 +75,7 @@ ComboBox {
             if (!control.popup.visible) {
                 control.popup.open()
             } else {
-                const next = control.navigationIndex
+                const next = control.activeIndex
                 control.popup.close()
                 control.selectIndex(next)
             }
@@ -168,15 +161,12 @@ ComboBox {
         implicitHeight: Math.min(contentList.contentHeight + 12, 320)
         padding: 6
         onOpened: {
-            control.navigationIndex = Math.max(0, control.currentIndex)
-            control.keyboardNavigationActive = true
-            control.pointerHovering = false
-            contentList.positionViewAtIndex(control.navigationIndex,
+            control.activeIndex = Math.max(0, control.currentIndex)
+            contentList.positionViewAtIndex(control.activeIndex,
                                             ListView.Contain)
         }
         onClosed: {
-            control.keyboardNavigationActive = false
-            control.pointerHovering = false
+            control.activeIndex = -1
         }
         background: Rectangle {
             radius: 10
@@ -189,9 +179,9 @@ ComboBox {
             id: contentList
             objectName: "comboPopupList"
             clip: true
-            implicitHeight: contentHeight + 12
+            implicitHeight: Math.min(contentHeight, 308)
             model: control.popup.visible ? control.delegateModel : null
-            currentIndex: control.navigationIndex
+            currentIndex: control.activeIndex
             boundsBehavior: Flickable.StopAtBounds
             flickDeceleration: 2200
             Keys.priority: Keys.BeforeItem
@@ -210,7 +200,9 @@ ComboBox {
                         event.accepted = false
                         return
                     }
-                    control.notePointerActivity()
+                    control.activeIndex = Math.max(0, Math.min(
+                        control.count - 1,
+                        control.activeIndex + (delta > 0 ? 1 : -1)))
                     const max = Math.max(0,
                         contentList.contentHeight - contentList.height)
                     contentList.contentY = Math.max(0, Math.min(max,
@@ -234,16 +226,19 @@ ComboBox {
         implicitHeight: 44
         hoverEnabled: true
         readonly property bool isSelected: control.currentIndex === index
-        readonly property bool keyboardHighlighted:
-            control.keyboardNavigationActive
-            && control.keyboardRowIndex === index
-        highlighted: row.keyboardHighlighted
+        readonly property bool active:
+            control.popup.visible && control.activeIndex === index
+        highlighted: row.active
         onHoveredChanged: {
-            control.pointerHovering = row.hovered
-            if (row.hovered)
-                control.notePointerActivity()
+            if (row.hovered) {
+                control.activeIndex = row.index
+                contentList.positionViewAtIndex(row.index, ListView.Contain)
+            }
         }
-        onPressed: control.notePointerActivity()
+        onClicked: {
+            control.selectIndex(row.index)
+            control.popup.close()
+        }
 
         contentItem: Item {
             Text {
@@ -276,27 +271,13 @@ ComboBox {
             radius: 7
             color: "transparent"
             Rectangle {
-                objectName: "comboItemSelectedLayer"
+                objectName: "comboItemActiveLayer"
                 anchors.fill: parent
                 radius: parent.radius
-                color: theme.accentSoft
-                opacity: row.isSelected ? 1 : 0
-            }
-            Rectangle {
-                objectName: "comboItemKeyboardLayer"
-                anchors.fill: parent
-                radius: parent.radius
-                color: "transparent"
-                border.width: 2
+                // 鼠标移动会更新 activeIndex；悬停填充不能再留下第二个高亮行。
+                color: row.active ? theme.accentSoft : "transparent"
+                border.width: row.active ? 2 : 0
                 border.color: theme.accent
-                opacity: row.keyboardHighlighted ? 1 : 0
-            }
-            Rectangle {
-                objectName: "comboItemHoverLayer"
-                anchors.fill: parent
-                radius: parent.radius
-                color: theme.hover
-                opacity: row.hovered ? 1 : 0
             }
         }
     }
