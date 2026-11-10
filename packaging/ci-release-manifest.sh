@@ -214,4 +214,39 @@ else
   expect_eq "SHA256SUMS 里每一项都实际重算通过" "0" "$bad"
 fi
 
+# Check the shipped files, not merely a directory created during assembly.
+# Release documents must match the recorded source commit byte for byte, so an
+# empty file or a placeholder cannot satisfy the required-document contract.
+REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+DOC_WORK="$(mktemp -d)"
+trap 'rm -rf "$DOC_WORK"' EXIT
+SERVER_DOCS=(server-quick-start.md self-hosted-server.md release-layout.md secure_transport.md
+             install-server.md upgrade-server.md release-packaging.md)
+for key in server_deb server_tar; do
+  artifact="$REL/${EXPECTED[$key]}"
+  [ -f "$artifact" ] || continue
+  unpacked="$DOC_WORK/$key"
+  if ! ci_unpack "$key 必需文档" "$artifact" "$unpacked"; then continue; fi
+  case "$key" in
+    server_deb) doc_root="$unpacked/usr/lib/backup-project-server/share/doc/backup-project" ;;
+    server_tar) doc_root="$unpacked/backup-project-server-$V-linux-x86_64/docs" ;;
+  esac
+  for doc in "${SERVER_DOCS[@]}"; do
+    shipped="$doc_root/$doc"
+    if [ ! -f "$shipped" ] || [ -L "$shipped" ] || [ ! -s "$shipped" ]; then
+      ci_fail "$key 必需文档缺失、非普通文件或为空：$doc"
+      continue
+    fi
+    expected_doc="$DOC_WORK/expected-$doc"
+    if [ -z "$EXPECT_COMMIT" ] ||
+       ! git -C "$REPO_DIR" show "$EXPECT_COMMIT:docs/$doc" >"$expected_doc" 2>"$DOC_WORK/git-error"; then
+      ci_fail "$key 必需文档无法核对发行 commit 的源文件：$doc"
+    elif ! cmp -s "$expected_doc" "$shipped"; then
+      ci_fail "$key 必需文档内容与发行 commit 不一致：$doc"
+    else
+      ci_pass "$key 必需文档内容与发行 commit 一致：$doc"
+    fi
+  done
+done
+
 ci_finish "release-manifest"
