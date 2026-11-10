@@ -32,6 +32,7 @@ ONLY="all"
 SKIP_APPIMAGE=0
 SKIP_STAGE=0
 JOBS="$(nproc 2>/dev/null || echo 4)"
+APPIMAGE_RUNTIME_FILE="${APPIMAGE_RUNTIME_FILE:-}"
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -270,8 +271,12 @@ pack_client_appimage() {
   ( cd "$appdir" && find . -type f ! -name MANIFEST.sha256 -printf '%P\n' | LC_ALL=C sort | xargs -r sha256sum > MANIFEST.sha256 )
   find "$appdir" -exec touch -h -d "@$SOURCE_DATE_EPOCH" {} + 2>/dev/null || true
   rm -f "$out"
+  local runtime_args=()
+  if [ -n "$APPIMAGE_RUNTIME_FILE" ]; then
+    runtime_args=(--runtime-file "$APPIMAGE_RUNTIME_FILE")
+  fi
   VERSION="$VERSION" ARCH=x86_64 APPIMAGE_EXTRACT_AND_RUN=1 SOURCE_DATE_EPOCH="$SOURCE_DATE_EPOCH" \
-    "$tools/appimagetool-x86_64.AppImage" --no-appstream "$appdir" "$out" > "$WORK/appimagetool.log" 2>&1 || {
+    "$tools/appimagetool-x86_64.AppImage" "${runtime_args[@]}" --no-appstream "$appdir" "$out" > "$WORK/appimagetool.log" 2>&1 || {
       tail -30 "$WORK/appimagetool.log" >&2; die "appimagetool 失败"; }
   [ -f "$out" ] || die "appimagetool 没有产出 $out"
   log "  AppImage: $(basename "$out") ($(size_of "$out") 字节)"
