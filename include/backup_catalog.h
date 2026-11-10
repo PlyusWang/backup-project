@@ -74,8 +74,9 @@ struct BackupRecord {
 
   // 归档文件自身的字节数。
   std::uint64_t archive_size = 0;
-  // 归档文件自身的 mtime（秒）。
+  // 归档文件自身的 mtime，纳秒字段用于区分同一秒内的快照先后。
   std::int64_t modified_time_sec = 0;
+  std::uint32_t modified_time_nsec = 0;
 
   // header（legacy v0.1 的全局 header，或 v2 的 160 字节外层 container
   // header）是否被当前实现认识。注意这只说明 header 可读，既不保证归档内容
@@ -150,8 +151,8 @@ class BackupCatalog {
   bool EnsureRepository(const std::string& repository,
                         std::string* error_message) const;
 
-  // 列出仓库里的备份：按 modified_time_sec 从新到旧，时间相同再按 file_name
-  // 升序。只扫直接子项，不递归；只有普通文件参与，软链接与目录一律不算。
+  // 列出仓库里的备份：按 mtime 秒、纳秒从新到旧，时间完全相同再按
+  // file_name 升序。只扫直接子项，不递归；只有普通文件参与，软链接与目录一律不算。
   //
   // 单个 .bak 坏掉不会让整个 List 失败：它照样出现在结果里，只是
   // recognized_archive = false 且 diagnostic 非空。List 只在仓库打不开、
