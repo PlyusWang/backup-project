@@ -555,7 +555,17 @@ while true; do
   printf ' 11. 存储概览\n'
   printf '  0. 退出\n\n'
   printf '请选择：'
-  read -r choice || break
+  if ! read -r choice; then
+    # A closed stdin is fine for an already configured instance, but an
+    # uninitialized instance must not look like a successful no-op. This
+    # keeps automation and service wrappers fail-closed without blocking the
+    # interactive initialization path.
+    if ! instance_initialized && ! instance_ready; then
+      printf '%s\n' '数据目录不存在：未初始化的服务器需要通过菜单完成初始化。' >&2
+      exit 1
+    fi
+    break
+  fi
   case "$choice" in
     1) init_server; pause ;;
     2) start_server; pause ;;

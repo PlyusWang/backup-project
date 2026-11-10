@@ -172,7 +172,7 @@ bool ReadSecretLine(int fd, bool require_tty, const std::string& prompt,
     }
   }
 
-  if (!prompt.empty() && !WriteAll(fd, prompt)) {
+  if (!is_terminal && !prompt.empty() && !WriteAll(fd, prompt)) {
     SetError(error_message,
              "Cannot read a password: failed to write the prompt");
     return false;
@@ -194,6 +194,14 @@ bool ReadSecretLine(int fd, bool require_tty, const std::string& prompt,
         return false;
       }
       guard = new TerminalModeGuard(fd, saved);
+      // Flush stale keystrokes and disable echo before displaying the prompt,
+      // so input typed as soon as the prompt appears is never discarded.
+      if (!prompt.empty() && !WriteAll(fd, prompt)) {
+        delete guard;
+        SetError(error_message,
+                 "Cannot read a password: failed to write the prompt");
+        return false;
+      }
     }
 
     // 逐字节读：这里读的是行规程（canonical mode）下的终端，一次 read 最多
