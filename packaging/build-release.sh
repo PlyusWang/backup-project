@@ -226,17 +226,21 @@ build_appdir() {
   # 启动同一个 AppImage，而不是只支持有 X 的机器。每个插件只有几十 KB。
   export EXTRA_QT_PLUGINS="platforms/libqoffscreen.so;platforms/libqminimal.so"
   export APPIMAGE_EXTRACT_AND_RUN=1
-  if [ -n "$APPIMAGE_RUNTIME_FILE" ]; then
-    export LDAI_RUNTIME_FILE="$APPIMAGE_RUNTIME_FILE"
-  fi
   export PATH="$WORK/bin:$PATH"
 
   log "== linuxdeploy + plugin-qt（带 Qt 运行时与 QML 模块）=="
   # 在 $WORK 里运行：linuxdeploy --output appimage 会在当前目录留下一个
   # Backup_Project-x86_64.AppImage，放在仓库根上会让"工作树干净"这条门禁失败。
-  if ! ( cd "$WORK" && ARCH=x86_64 "$WORK/bin/linuxdeploy" --appdir "$appdir" --plugin qt \
-       --desktop-file "$appdir/usr/share/applications/backup-project.desktop" \
-       --icon-file "$appdir/backup-project.png" --output appimage ) \
+  if ! ( cd "$WORK" && \
+       if [ -n "$APPIMAGE_RUNTIME_FILE" ]; then
+         LDAI_RUNTIME_FILE="$APPIMAGE_RUNTIME_FILE" ARCH=x86_64 "$WORK/bin/linuxdeploy" --appdir "$appdir" --plugin qt \
+           --desktop-file "$appdir/usr/share/applications/backup-project.desktop" \
+           --icon-file "$appdir/backup-project.png" --output appimage
+       else
+         ARCH=x86_64 "$WORK/bin/linuxdeploy" --appdir "$appdir" --plugin qt \
+           --desktop-file "$appdir/usr/share/applications/backup-project.desktop" \
+           --icon-file "$appdir/backup-project.png" --output appimage
+       fi ) \
        > "$WORK/linuxdeploy.log" 2>&1; then
     tail -40 "$WORK/linuxdeploy.log" >&2
     die "linuxdeploy 失败"
