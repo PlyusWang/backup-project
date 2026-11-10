@@ -792,4 +792,46 @@ else
   record_fail "路径含空格的 BPSEC2 初始化" "20700-20750 端口均已占用"
 fi
 
+# BPSEC1 must expose the exact client pin immediately after initialization,
+# before the server creates its metadata database.
+BPSEC1_ROOT="$TEST_ROOT/manager-bpsec1"
+BPSEC1_PORT=""
+for candidate in $(seq 20751 20800); do
+  if ! ss -ltnH "sport = :$candidate" 2>/dev/null | grep -q .; then
+    BPSEC1_PORT="$candidate"
+    break
+  fi
+done
+BPSEC1_OUTPUT="$TEST_ROOT/manager-bpsec1-init.log"
+if [ -n "$BPSEC1_PORT" ]; then
+  printf '1\n\n\n%s\nn\n\n0\n' "$BPSEC1_PORT" | \
+    env BACKUP_SERVER_ROOT="$BPSEC1_ROOT" \
+        BACKUP_SERVER_CONFIG="$BPSEC1_ROOT/server.conf" \
+        BACKUP_SERVER_DATA="$BPSEC1_ROOT/data" \
+        BACKUP_SERVER_DB="$BPSEC1_ROOT/state/metadata.sqlite3" \
+        BACKUP_SERVER_PID_FILE="$BPSEC1_ROOT/state/server.pid" \
+        BACKUP_SERVER_LOG="$BPSEC1_ROOT/logs/server.log" \
+        BACKUP_SERVER_ADMIN="$ADMIN" \
+        BACKUP_SERVER_BIN="$MANAGER_TOOLS/backup-server" \
+        BACKUP_SERVER_KEYGEN="$MANAGER_TOOLS/backup-server-keygen" \
+        BACKUP_CERT_TOOL="$MANAGER_TOOLS/backup-cert-tool" \
+        timeout --signal=KILL 60 bash "$ROOT_DIR/scripts/backup-server-admin.sh" \
+          > "$BPSEC1_OUTPUT" 2>&1
+  if grep -q '^认证模式：BPSEC1 公钥指纹$' "$BPSEC1_OUTPUT" \
+     && grep -q "^服务器地址：127.0.0.1$" "$BPSEC1_OUTPUT" \
+     && grep -q "^业务端口：$BPSEC1_PORT$" "$BPSEC1_OUTPUT" \
+     && grep -Eq 'sha256:[0-9a-f]{64}' "$BPSEC1_OUTPUT" \
+     && [ -f "$BPSEC1_ROOT/state/transport.key" ] \
+     && [ "$(stat -c '%a' "$BPSEC1_ROOT/state/transport.key")" = 600 ] \
+     && [ ! -e "$BPSEC1_ROOT/state/metadata.sqlite3" ] \
+     && ! grep -q '\.bpcert' "$BPSEC1_OUTPUT"; then
+    record_pass "BPSEC1 初始化后在数据库创建前显示地址与指纹且不伪造证书"
+  else
+    record_fail "BPSEC1 初始化连接信息" \
+      "$(grep -E '认证模式|服务器地址|业务端口|sha256:|不适用' "$BPSEC1_OUTPUT" | tr '\n' ' ')"
+  fi
+else
+  record_fail "BPSEC1 初始化连接信息" "20751-20800 端口均已占用"
+fi
+
 finish
