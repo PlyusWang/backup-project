@@ -721,4 +721,75 @@ else
     "$(grep -m1 '传输身份指纹' "$TEST_ROOT/wrapper-src-ok.txt" | tr '\n' ' ')"
 fi
 
+# ---- 17. 路径含空格时仍能初始化 BPSEC2 身份 ----
+MANAGER_ROOT="$TEST_ROOT/manager instance with spaces"
+MANAGER_TOOLS="$TEST_ROOT/manager tools with spaces"
+mkdir -p "$MANAGER_TOOLS"
+ln -s "$ROOT_DIR/build/backup-server" "$MANAGER_TOOLS/backup-server"
+ln -s "$ROOT_DIR/build/backup-server-keygen" "$MANAGER_TOOLS/backup-server-keygen"
+ln -s "$ROOT_DIR/build/backup-cert-tool" "$MANAGER_TOOLS/backup-cert-tool"
+MANAGER_PORT=""
+for candidate in $(seq 20700 20750); do
+  if ! ss -ltnH "sport = :$candidate" 2>/dev/null | grep -q .; then
+    MANAGER_PORT="$candidate"
+    break
+  fi
+done
+MANAGER_OUTPUT="$TEST_ROOT/manager-bpsec2-space.log"
+MANAGER_REPEAT_OUTPUT="$TEST_ROOT/manager-repeat-init.log"
+if [ -n "$MANAGER_PORT" ]; then
+  printf '1\n\n\n%s\ny\nmanager-space-test-%s\n\n8\n\n0\n' \
+    "$MANAGER_PORT" "$MANAGER_PORT" | \
+    env BACKUP_SERVER_ROOT="$MANAGER_ROOT" \
+        BACKUP_SERVER_CONFIG="$MANAGER_ROOT/server.conf" \
+        BACKUP_SERVER_DATA="$MANAGER_ROOT/data" \
+        BACKUP_SERVER_DB="$MANAGER_ROOT/state/metadata.sqlite3" \
+        BACKUP_SERVER_PID_FILE="$MANAGER_ROOT/state/server.pid" \
+        BACKUP_SERVER_LOG="$MANAGER_ROOT/logs/server.log" \
+        BACKUP_SERVER_ADMIN="$ADMIN" \
+        BACKUP_SERVER_BIN="$MANAGER_TOOLS/backup-server" \
+        BACKUP_SERVER_KEYGEN="$MANAGER_TOOLS/backup-server-keygen" \
+        BACKUP_CERT_TOOL="$MANAGER_TOOLS/backup-cert-tool" \
+        timeout --signal=KILL 60 bash "$ROOT_DIR/scripts/backup-server-admin.sh" \
+          > "$MANAGER_OUTPUT" 2>&1
+  if grep -q 'verdict *= *TRUSTED' "$MANAGER_OUTPUT" \
+     && grep -Fq "$MANAGER_ROOT/private/root.key.pub" "$MANAGER_OUTPUT" \
+     && grep -Fq "$MANAGER_ROOT/state/server.bpcert" "$MANAGER_OUTPUT" \
+     && grep -q "manager-space-test-$MANAGER_PORT" "$MANAGER_OUTPUT" \
+     && grep -q '^require_bpsec2 = true$' "$MANAGER_ROOT/server.conf" \
+     && [ "$(stat -c '%a' "$MANAGER_ROOT/private/root.key")" = "600" ] \
+     && [ "$(stat -c '%a' "$MANAGER_ROOT/private/root.key.pub")" = "644" ] \
+     && [ "$(stat -c '%a' "$MANAGER_ROOT/state/transport.key")" = "600" ] \
+     && [ "$(stat -c '%a' "$MANAGER_ROOT/secrets.env")" = "600" ] \
+     && ! find "$MANAGER_ROOT" -maxdepth 1 -name '.server-init.*' -print -quit | grep -q .; then
+    record_pass "路径含空格时 BPSEC2 初始化、可信根与身份路径显示正常"
+  else
+    record_fail "路径含空格的 BPSEC2 初始化" \
+      "$(tail -8 "$MANAGER_OUTPUT" | tr '\n' ' ')"
+  fi
+  ROOT_KEY_BEFORE="$(sha256sum "$MANAGER_ROOT/private/root.key" | cut -d' ' -f1)"
+  printf '1\n\n0\n' | \
+    env BACKUP_SERVER_ROOT="$MANAGER_ROOT" \
+        BACKUP_SERVER_CONFIG="$MANAGER_ROOT/server.conf" \
+        BACKUP_SERVER_DATA="$MANAGER_ROOT/data" \
+        BACKUP_SERVER_DB="$MANAGER_ROOT/state/metadata.sqlite3" \
+        BACKUP_SERVER_PID_FILE="$MANAGER_ROOT/state/server.pid" \
+        BACKUP_SERVER_LOG="$MANAGER_ROOT/logs/server.log" \
+        BACKUP_SERVER_ADMIN="$ADMIN" \
+        BACKUP_SERVER_BIN="$MANAGER_TOOLS/backup-server" \
+        BACKUP_SERVER_KEYGEN="$MANAGER_TOOLS/backup-server-keygen" \
+        BACKUP_CERT_TOOL="$MANAGER_TOOLS/backup-cert-tool" \
+        timeout --signal=KILL 60 bash "$ROOT_DIR/scripts/backup-server-admin.sh" \
+          > "$MANAGER_REPEAT_OUTPUT" 2>&1
+  ROOT_KEY_AFTER="$(sha256sum "$MANAGER_ROOT/private/root.key" | cut -d' ' -f1)"
+  if grep -q '初始化已拒绝，不会覆盖已有内容' "$MANAGER_REPEAT_OUTPUT" \
+     && [ "$ROOT_KEY_BEFORE" = "$ROOT_KEY_AFTER" ]; then
+    record_pass "重复 BPSEC2 初始化被拒绝，根私钥保持不变"
+  else
+    record_fail "重复 BPSEC2 初始化保护" "已有根私钥变化或未明确拒绝"
+  fi
+else
+  record_fail "路径含空格的 BPSEC2 初始化" "20700-20750 端口均已占用"
+fi
+
 finish
