@@ -551,7 +551,7 @@ init_server() {
     [ -n "$pubkey" ] || { printf '无法从 keygen 结果取得公钥，初始化停止。\n'; exit 1; }
     if [[ "$use_cert" =~ ^[Yy]$ ]]; then
       if [ "$cert_mode" = 1 ]; then
-        "$CERT_TOOL" root-init --root-key "$init_dir/private/root.key" --root-id "${server_id}-root" >/dev/null || exit 1
+        "$CERT_TOOL" root-init --root-key "$init_dir/private/root.key" --root-id "${server_id:0:123}-root" >/dev/null || exit 1
         "$CERT_TOOL" issue-server --root-key "$init_dir/private/root.key" --server-id "$server_id" \
           --server-pubkey "hex:$pubkey" --out "$init_dir/state/server.bpcert" >/dev/null || exit 1
       else
@@ -831,7 +831,14 @@ import_certificate() (
   }
   mkdir -p "$SERVER_ROOT/state" || return 1
   bundle="$(mktemp -d "$SERVER_ROOT/state/client-identity.XXXXXXXX")" || return 1
-  trap 'rm -rf "$bundle"; [ -z "$candidate" ] || rm -f "$candidate"' EXIT
+  cleanup_certificate_import() {
+    # A signal can arrive after the atomic configuration rename but before
+    # the caller observes success. Keep any bundle the committed config uses.
+    if [ -n "$bundle" ] && [ "$(configured_cert)" = "$bundle/server.bpcert" ]; then bundle=''; fi
+    [ -z "$bundle" ] || rm -rf -- "$bundle"
+    [ -z "$candidate" ] || rm -f -- "$candidate"
+  }
+  trap cleanup_certificate_import EXIT
   # Discard comments so even an accidental secret in a comment is not shared.
   head -c 65537 "$roots" >"$bundle/root-input" || return 1
   head -c 4097 "$certificate" >"$bundle/server.bpcert" || return 1
@@ -857,12 +864,60 @@ import_certificate() (
   trap - EXIT
 )
 
+create_test_certificate() (
+  local server_id confirmation key_public bundle='' private_dir='' candidate=''
+  [ -x "$CERT_TOOL" ] && [ -x "$KEYGEN_BIN" ] || return 1
+  printf '新证书 server_id [self-hosted-%s]：' "$(configured_port)"; read -r server_id || return 1
+  [ -n "$server_id" ] || server_id="self-hosted-$(configured_port)"
+  printf '将创建独立测试根，为当前传输身份签发证书，并切换为仅 BPSEC2。\n'
+  printf '客户端需通过可信渠道取得新根公钥；已有密钥、证书与备份不会删除。\n'
+  printf '确认请输入 CREATE TEST CERTIFICATE：'; read -r confirmation || return 1
+  [ "$confirmation" = 'CREATE TEST CERTIFICATE' ] || { printf '已取消，原身份与配置未改变。\n'; return 1; }
+  key_public="$("$KEYGEN_BIN" --show --key-file "$(config_value transport_key)" |
+    sed -n 's/.*公钥 (hex): //p')" || return 1
+  [ -n "$key_public" ] || return 1
+  umask 077
+  mkdir -p "$SERVER_ROOT/private" "$SERVER_ROOT/state" || return 1
+  private_dir="$(mktemp -d "$SERVER_ROOT/private/test-root.XXXXXXXX")" || return 1
+  cleanup_test_certificate() {
+    if [ -n "$bundle" ] && [ "$(configured_cert)" = "$bundle/server.bpcert" ]; then
+      bundle=''; private_dir=''
+    fi
+    [ -z "$bundle" ] || rm -rf -- "$bundle"
+    [ -z "$private_dir" ] || rm -rf -- "$private_dir"
+    [ -z "$candidate" ] || rm -f -- "$candidate"
+  }
+  trap cleanup_test_certificate EXIT
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
+  bundle="$(mktemp -d "$SERVER_ROOT/state/client-identity.XXXXXXXX")" || return 1
+  "$CERT_TOOL" root-init --root-key "$private_dir/root.key" --root-id "${server_id:0:123}-root" || return 1
+  "$CERT_TOOL" issue-server --root-key "$private_dir/root.key" --server-id "$server_id" \
+    --server-pubkey "hex:$key_public" --out "$bundle/server.bpcert" || return 1
+  mv -- "$private_dir/root.key.pub" "$bundle/trusted-root.pub" || return 1
+  chmod 755 "$bundle" && chmod 644 "$bundle/trusted-root.pub" "$bundle/server.bpcert" || return 1
+  check_certificate_pair "$bundle/server.bpcert" "$bundle/trusted-root.pub" || return 1
+  candidate="$(mktemp "$(dirname "$CONFIG_FILE")/.server.conf.XXXXXXXX")" || return 1
+  write_config_candidate "$candidate" certificate "$bundle/server.bpcert" require_bpsec2 true || return 1
+  commit_config_candidate "$candidate" || return 1
+  candidate=''
+  printf '测试证书已签发并保存。启动服务器后使用 BPSEC2 连接。\n'
+  printf '根私钥：%s/root.key（0600，仅供签发，不能共享给客户端）\n' "$private_dir"
+  printf '客户端可信根公钥：%s/trusted-root.pub\n服务器身份文件：%s/server.bpcert\n' "$bundle" "$bundle"
+  bundle=''; private_dir=''
+  trap - EXIT
+)
+
 certificate_menu() {
   certificate_page
-  printf '\n  1. 安全导入已有可信根公钥与服务器证书（需停机）\n  回车返回\n请选择：'
+  printf '\n  1. 安全导入已有可信根公钥与服务器证书（需停机）\n'
+  printf '  2. 为当前身份签发本机测试证书（需停机与确认）\n  回车返回\n请选择：'
   local choice
   read -r choice || return 0
-  case "$choice" in 1) with_stopped_instance import_certificate; pause ;; esac
+  case "$choice" in
+    1) with_stopped_instance import_certificate; pause ;;
+    2) with_stopped_instance create_test_certificate; pause ;;
+  esac
 }
 
 edit_configuration() (
