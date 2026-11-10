@@ -5309,8 +5309,8 @@ int RunFilterUxTest(QQuickWindow* window,
     QString advanced_toggle;
     QString advanced_section;
   };
-  // 页面下标 = Main.qml 里 StackLayout 的顺序（0 首页 / 1 备份 / 2 自动备份 /
-  // 3 备份管理 / 4 设置 / 5 实时备份），不是侧栏导航的顺序。
+  // 页面下标 = Main.qml 里 StackLayout 的顺序（0 首页 / 1 快速备份 / 2 定时备份 /
+  // 3 实时备份 / 4 备份管理），不是侧栏导航的顺序。
   // 三条用例共用下面同一段断言代码：某一页换了控件名、默认值或错误文案，都会
   // 在同一个断言上失败，不会留下"只测过备份页"的盲区。
   const PageCase kCases[] = {
@@ -5319,7 +5319,7 @@ int RunFilterUxTest(QQuickWindow* window,
       {"自动备份页", 2, QStringLiteral("schedule"), schedule_model,
        QStringLiteral("scheduleAdvancedToggle"),
        QStringLiteral("scheduleAdvancedSection")},
-      {"实时备份页", 5, QStringLiteral("realtime"), realtime_model,
+      {"实时备份页", 3, QStringLiteral("realtime"), realtime_model,
        QStringLiteral("realtimeAdvancedToggle"),
        QStringLiteral("realtimeAdvancedSection")},
   };
