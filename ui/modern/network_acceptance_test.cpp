@@ -112,6 +112,10 @@ int RunNetworkAcceptanceTest(QQuickWindow* window,
   const QDir fixture(fixture_directory);
   const QString port =
       QString::fromUtf8(Read(fixture.filePath("backup.port"))).trimmed();
+  const QString bpsec1_port =
+      QString::fromUtf8(Read(fixture.filePath("bpsec1.port"))).trimmed();
+  const QString bpsec1_pin =
+      QString::fromUtf8(Read(fixture.filePath("bpsec1.server-key"))).trimmed();
   const QString ssh_target =
       QString::fromUtf8(Read(fixture.filePath("ssh.target"))).trimmed();
   const QString roots = fixture.filePath("root.key.pub");
@@ -121,8 +125,14 @@ int RunNetworkAcceptanceTest(QQuickWindow* window,
   const QString host = QStringLiteral("127.0.0.1");
   bool valid_port = false;
   const int port_number = port.toInt(&valid_port);
+  bool valid_bpsec1_port = false;
+  const int bpsec1_port_number = bpsec1_port.toInt(&valid_bpsec1_port);
   if (!check(QFileInfo(fixture_directory).isDir() && valid_port &&
                  port_number > 1024 && port_number <= 65535 &&
+                 valid_bpsec1_port && bpsec1_port_number > 1024 &&
+                 bpsec1_port_number <= 65535 &&
+                 bpsec1_pin.startsWith(QStringLiteral("sha256:")) &&
+                 bpsec1_pin.size() == 71 &&
                  ssh_target.endsWith(QStringLiteral("@127.0.0.1")) &&
                  QFileInfo(wrapper).isExecutable() && QFile::exists(roots) &&
                  QFile::exists(wrong_roots) && QDir().mkpath(output_directory),
@@ -130,6 +140,8 @@ int RunNetworkAcceptanceTest(QQuickWindow* window,
     return 1;
   std::printf("NETWORK platform=%s endpoint=127.0.0.1:%d\n",
               qPrintable(QGuiApplication::platformName()), port_number);
+  std::printf("NETWORK bpsec1_endpoint=127.0.0.1:%d pin=%s\n",
+              bpsec1_port_number, qPrintable(bpsec1_pin));
   const auto completed = [&](bool accepted) {
     return accepted && remote->waitForIdle(180000) &&
            remote->lastErrorKindForTest() == QStringLiteral("none");
@@ -404,6 +416,84 @@ int RunNetworkAcceptanceTest(QQuickWindow* window,
     check(hashes_match, qPrintable(prefix.toUpper() +
                                    QStringLiteral("_RESTORE_CHAIN_SHA256")));
   };
+  const auto run_bpsec1_session = [&](bool over_ssh) {
+    const QString mode = over_ssh ? QStringLiteral("ssh")
+                                  : QStringLiteral("direct");
+    const QString label = over_ssh ? QStringLiteral("SSH_BPSEC1")
+                                   : QStringLiteral("TCP_BPSEC1");
+    const QString username = over_ssh ? QStringLiteral("network-ssh-pin")
+                                       : QStringLiteral("network-direct-pin");
+    const QString account_password =
+        QUuid::createUuid().toString(QUuid::WithoutBraces);
+    remote->logoutLocal();
+    remote->stopTunnel();
+    const bool configured =
+        remote->setServerKind(QStringLiteral("custom")) &&
+        remote->setConnectionMode(mode) &&
+        remote->setAuthMode(QStringLiteral("pin")) &&
+        remote->setServerKeyPin(bpsec1_pin);
+    if (configured) remote->setCertificateSettings(QString(), QString());
+    if (page != nullptr) {
+      page->setProperty("draftServerKind", QStringLiteral("custom"));
+      page->setProperty("draftConnectionMode", mode);
+      page->setProperty("draftAuthMode", QStringLiteral("pin"));
+      page->setProperty("draftHost", host);
+      page->setProperty("draftPort", bpsec1_port);
+      page->setProperty("draftServerKeyPin", bpsec1_pin);
+      page->setProperty("draftTrustedRoots", QString());
+      page->setProperty("draftExpectedServerId", QString());
+      page->setProperty("draftSshHost", ssh_target);
+      page->setProperty("draftSshLocalPort", QString());
+    }
+    if (over_ssh) {
+      remote->setSshProgram(wrapper);
+      remote->setSshHost(ssh_target);
+      remote->setSshLocalPort(QString());
+    }
+    check(configured && remote->authMode() == QStringLiteral("pin") &&
+              remote->serverKeyPin() == bpsec1_pin &&
+              remote->trustedRootsFile().isEmpty() &&
+              remote->expectedServerId().isEmpty(),
+          qPrintable(label + QStringLiteral("_PIN_CONFIGURATION")));
+    const bool registered = completed(remote->registerAccount(
+        host, bpsec1_port, username, account_password, account_password));
+    check(registered && remote->authMode() == QStringLiteral("pin") &&
+              remote->tunnelReady() == over_ssh,
+          qPrintable(label + QStringLiteral("_REGISTER")));
+    remote->logoutLocal();
+    const bool logged_in =
+        completed(remote->login(host, bpsec1_port, username, account_password));
+    check(logged_in && remote->authenticated() &&
+              remote->authMode() == QStringLiteral("pin") &&
+              remote->tunnelReady() == over_ssh,
+          qPrintable(label + QStringLiteral("_LOGIN")));
+    if (logged_in) {
+      if (page != nullptr) page->setProperty("draftUser", username);
+      round_trip(over_ssh ? QStringLiteral("bpsec1-ssh")
+                          : QStringLiteral("bpsec1-direct"));
+    }
+    remote->logoutLocal();
+    remote->stopTunnel();
+    check(!remote->authenticated() && !remote->tunnelReady(),
+          qPrintable(label + QStringLiteral("_CLEANUP")));
+  };
+  run_bpsec1_session(false);
+  run_bpsec1_session(true);
+  remote->logoutLocal();
+  remote->stopTunnel();
+  const bool restored_certificate_mode =
+      remote->setConnectionMode(QStringLiteral("direct")) &&
+      remote->setAuthMode(QStringLiteral("certificate"));
+  remote->setCertificateSettings(roots, server_id);
+  show_configuration(QStringLiteral("direct"), roots, server_id);
+  const bool restored_certificate_login =
+      restored_certificate_mode &&
+      completed(remote->login(host, port, direct_user, account_secret));
+  check(restored_certificate_login && remote->authenticated() &&
+            remote->authMode() == QStringLiteral("certificate") &&
+            !remote->tunnelReady(),
+        "BPSEC1_TO_BPSEC2_RECONNECTS_WITH_NEW_CERTIFICATE_IDENTITY");
+  if (page != nullptr) page->setProperty("draftUser", direct_user);
   round_trip(QStringLiteral("direct"));
   const auto encrypted_cloud_round_trip = [&]() {
     const QString source = fixture.filePath(QStringLiteral("cloud-aes-source"));

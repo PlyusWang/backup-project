@@ -12,6 +12,7 @@ mkdir -p "$TASK_OUTPUT"
 TASK_OUTPUT="$(cd "$TASK_OUTPUT" && pwd)"
 TASK_RUNTIME="$(mktemp -d "$TASK_OUTPUT/runtime-XXXXXX")"
 TASK_SERVER_PID=""
+TASK_BPSEC1_SERVER_PID=""
 TASK_SSHD_PID=""
 cleanup() {
   local code=$?
@@ -20,11 +21,15 @@ cleanup() {
     kill "$TASK_SERVER_PID" 2>/dev/null || true
     wait "$TASK_SERVER_PID" 2>/dev/null || true
   fi
+  if [ -n "$TASK_BPSEC1_SERVER_PID" ]; then
+    kill "$TASK_BPSEC1_SERVER_PID" 2>/dev/null || true
+    wait "$TASK_BPSEC1_SERVER_PID" 2>/dev/null || true
+  fi
   if [ -n "$TASK_SSHD_PID" ]; then
     kill "$TASK_SSHD_PID" 2>/dev/null || true
     wait "$TASK_SSHD_PID" 2>/dev/null || true
   fi
-  for log in server.out server.log sshd.log sshd.out; do
+  for log in server.out server.log bpsec1-server.out bpsec1-server.log sshd.log sshd.out; do
     if [ -f "$TASK_RUNTIME/$log" ]; then
       cp "$TASK_RUNTIME/$log" "$TASK_OUTPUT/$log"
     fi
@@ -70,6 +75,15 @@ if [ "${#TASK_SERVER_PUBLIC}" -ne 64 ]; then
   echo "NETWORK FAIL: cannot obtain generated server public key" >&2
   exit 1
 fi
+"$TASK_REPO/build/backup-server-keygen" --output "$TASK_RUNTIME/bpsec1-transport.key" \
+  > "$TASK_RUNTIME/bpsec1-keygen.log"
+TASK_BPSEC1_PUBLIC="$("$TASK_REPO/build/backup-server-keygen" --show \
+  --key-file "$TASK_RUNTIME/bpsec1-transport.key" | sed -n 's/.*--server-key sha256:\([0-9a-f]*\)$/sha256:\1/p')"
+if [[ ! "$TASK_BPSEC1_PUBLIC" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+  echo "NETWORK FAIL: cannot obtain BPSEC1 server key pin" >&2
+  exit 1
+fi
+printf '%s\n' "$TASK_BPSEC1_PUBLIC" > "$TASK_RUNTIME/bpsec1.server-key"
 "$TASK_REPO/build/backup-cert-tool" issue-server --root-key "$TASK_RUNTIME/root.key" \
   --server-id acceptance-loopback-server --server-pubkey "$TASK_SERVER_PUBLIC" \
   --out "$TASK_RUNTIME/server.bpcert" > "$TASK_RUNTIME/issue.log"
@@ -92,15 +106,17 @@ import sys
 runtime = Path(sys.argv[1])
 ssh = sys.argv[2]
 user = sys.argv[3]
-listeners = [socket.socket(), socket.socket()]
+listeners = [socket.socket(), socket.socket(), socket.socket()]
 for listener in listeners:
     listener.bind(('127.0.0.1', 0))
-backup_port, ssh_port = [listener.getsockname()[1] for listener in listeners]
+backup_port, bpsec1_port, ssh_port = [listener.getsockname()[1] for listener in listeners]
 for listener in listeners:
     listener.close()
 runtime.joinpath('backup.port').write_text(str(backup_port))
+runtime.joinpath('bpsec1.port').write_text(str(bpsec1_port))
 runtime.joinpath('ssh.target').write_text(f'{user}@127.0.0.1')
 runtime.joinpath('secrets.env').write_text(f'BACKUP_TOKEN_SECRET={secrets.token_hex(32)}\n')
+runtime.joinpath('bpsec1-secrets.env').write_text(f'BACKUP_TOKEN_SECRET={secrets.token_hex(32)}\n')
 host_type, host_public = runtime.joinpath('ssh-host.pub').read_text().split()[:2]
 runtime.joinpath('known_hosts').write_text(f'[127.0.0.1]:{ssh_port} {host_type} {host_public}\n')
 config = f'''Port {ssh_port}
@@ -117,7 +133,7 @@ UsePAM no
 PermitRootLogin prohibit-password
 StrictModes yes
 AllowTcpForwarding local
-PermitOpen 127.0.0.1:{backup_port}
+PermitOpen 127.0.0.1:{backup_port} 127.0.0.1:{bpsec1_port}
 GatewayPorts no
 X11Forwarding no
 PrintMotd no
@@ -132,7 +148,7 @@ arguments = [ssh, '-F', '/dev/null', '-p', str(ssh_port), '-i', str(runtime / 's
 wrapper = runtime / 'fixture-ssh'
 wrapper.write_text('#!/bin/sh\nexec ' + ' '.join(shlex.quote(x) for x in arguments) + ' "$@"\n')
 wrapper.chmod(0o700)
-for name in ['secrets.env', 'sshd_config', 'known_hosts', 'authorized_keys']:
+for name in ['secrets.env', 'bpsec1-secrets.env', 'sshd_config', 'known_hosts', 'authorized_keys']:
     runtime.joinpath(name).chmod(0o600)
 PY
 
@@ -153,6 +169,15 @@ TASK_BACKUP_PORT="$(cat "$TASK_RUNTIME/backup.port")"
   --pid-file "$TASK_RUNTIME/server.pid" --log-file "$TASK_RUNTIME/server.log" \
   > "$TASK_RUNTIME/server.out" 2>&1 &
 TASK_SERVER_PID=$!
+TASK_BPSEC1_PORT="$(cat "$TASK_RUNTIME/bpsec1.port")"
+mkdir -p "$TASK_RUNTIME/bpsec1-blobs"
+"$TASK_REPO/build/backup-server" --bind 127.0.0.1 --port "$TASK_BPSEC1_PORT" \
+  --root "$TASK_RUNTIME/bpsec1-blobs" --db "$TASK_RUNTIME/bpsec1-metadata.sqlite3" \
+  --secret-file "$TASK_RUNTIME/bpsec1-secrets.env" \
+  --transport-key-file "$TASK_RUNTIME/bpsec1-transport.key" \
+  --pid-file "$TASK_RUNTIME/bpsec1-server.pid" --log-file "$TASK_RUNTIME/bpsec1-server.log" \
+  > "$TASK_RUNTIME/bpsec1-server.out" 2>&1 &
+TASK_BPSEC1_SERVER_PID=$!
 if ! python3 - "$TASK_RUNTIME" <<'PY'
 from pathlib import Path
 import socket
@@ -160,7 +185,8 @@ import sys
 import time
 
 runtime = Path(sys.argv[1])
-ports = [int(runtime.joinpath('backup.port').read_text())]
+ports = [int(runtime.joinpath('backup.port').read_text()),
+         int(runtime.joinpath('bpsec1.port').read_text())]
 ports.append(int(next(line.split()[1] for line in runtime.joinpath('sshd_config').read_text().splitlines()
                       if line.startswith('Port '))))
 deadline = time.monotonic() + 10
