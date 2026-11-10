@@ -24,6 +24,7 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 APPIMAGE="$(find "$REL" -maxdepth 1 -name '*.AppImage' -print -quit 2>/dev/null || true)"
 CLIENT_DEB="$(find "$REL" -maxdepth 1 -name 'backup-project-client_*.deb' -print -quit 2>/dev/null || true)"
 CLIENT_TAR="$(find "$REL" -maxdepth 1 -name 'backup-project-client-*-linux-x86_64.tar.xz' -print -quit 2>/dev/null || true)"
+SERVER_DEB="$(find "$REL" -maxdepth 1 -name 'backup-project-server_*.deb' -print -quit 2>/dev/null || true)"
 SERVER_TAR="$(find "$REL" -maxdepth 1 -name 'backup-project-server-*-linux-x86_64.tar.xz' -print -quit 2>/dev/null || true)"
 VERSION="$(grep -m1 '^version' "$REL/RELEASE-INFO.txt" 2>/dev/null | awk '{print $3}')"
 [ -n "$VERSION" ] || VERSION="0.0.0"
@@ -66,7 +67,8 @@ make_client_deb_variant() {  # make_client_deb_variant <输出 deb> <片段>
 # 只看退出码不够：还要确认失败原因里出现了该规则的标志，证明打中的是目标分支。
 expect_scan_reason() {  # expect_scan_reason <标签> <脚本> <目录> <正则>
   local label="$1" script="$2" dir="$3" pattern="$4" out
-  if out="$(bash "$script" "$dir" 2>&1)"; then
+  shift 4
+  if out="$(bash "$script" "$dir" "$@" 2>&1)"; then
     ci_fail "$label（本应失败却成功了）"
     return
   fi
@@ -573,12 +575,52 @@ cp -a "$REL"/backup-project-server_*.deb "$REL"/backup-project-server-*-linux-x8
 expect_ok "P3-01 客户端目录里带另一族合法制品：family=client 通过"   bash "$HERE/ci-release-manifest.sh" "$d" --family client
 expect_fail "P3-01 客户端目录里带另一族合法制品：family=all 仍失败（本族不齐）"   bash "$HERE/ci-release-manifest.sh" "$d" --family all
 
-# 断言总数口径：本套件定义 100 条断言。本地非 root 环境 100 条全部执行；CI 的 root
-# 容器里跳过 3 条依赖文件权限的用例（记 SKIP），97 + 3 仍然等于 100 —— 少了或多了都会
+# Server tar and deb must contain the actual release documents. Regenerate the
+# outer hashes after each mutation: rejection must come from document checking.
+ci_section "服务端发行包的必需文档及真实内容"
+if [ -z "$SERVER_TAR" ] || [ -z "$SERVER_DEB" ]; then
+  ci_fail '找不到服务端 tar/deb：无法验证必需文档拒绝规则'
+else
+  for format in tar deb; do
+    for doc_case in missing empty changed symlink; do
+      d="$WORK/server-doc-$format-$doc_case"
+      mkdir -p "$d/src" "$d/rel"
+      cp "$REL/RELEASE-INFO.txt" "$d/rel/"
+      if [ "$format" = tar ]; then
+        tar -xJf "$SERVER_TAR" -C "$d/src"
+        top="$(find "$d/src" -mindepth 1 -maxdepth 1 -type d -print -quit)"
+        target="$top/docs/install-server.md"
+        cp "$SERVER_DEB" "$d/rel/"
+      else
+        dpkg-deb -R "$SERVER_DEB" "$d/src"
+        target="$d/src/usr/lib/backup-project-server/share/doc/backup-project/install-server.md"
+        cp "$SERVER_TAR" "$d/rel/"
+      fi
+      case "$doc_case" in
+        missing) rm "$target" ;;
+        empty) : >"$target" ;;
+        changed) printf '# 合成占位内容，不能冒充正式安装指南。\n' >"$target" ;;
+        symlink) mv "$target" "$target.saved"; ln -s install-server.md.saved "$target" ;;
+      esac
+      if [ "$format" = tar ]; then
+        tar -cJf "$d/rel/$(basename "$SERVER_TAR")" -C "$d/src" "$(basename "$top")"
+      else
+        dpkg-deb -b "$d/src" "$d/rel/$(basename "$SERVER_DEB")" >/dev/null
+      fi
+      (cd "$d/rel" && find . -maxdepth 1 -type f ! -name SHA256SUMS -printf '%P\n' |
+        LC_ALL=C sort | xargs -r sha256sum >SHA256SUMS)
+      expect_scan_reason "服务端 $format 的 $doc_case 文档必须拒绝" \
+        "$HERE/ci-release-manifest.sh" "$d/rel" "$format.*必需文档.*install-server.md" --family server
+    done
+  done
+fi
+
+# 断言总数口径：本套件定义 108 条断言。本地非 root 环境 108 条全部执行；CI 的 root
+# 容器里跳过 3 条依赖文件权限的用例（记 SKIP），105 + 3 仍然等于 108 —— 少了或多了都会
 # 被 ci_finish 拦住。只在正对照制品齐全时断言总数：制品缺失的目录本来就会在对应小节里
 # 明确 ci_fail（例如"找不到客户端 .deb"），不需要再叠一条口径告警。
-if [ -n "$APPIMAGE" ] && [ -n "$CLIENT_DEB" ] && [ -n "$CLIENT_TAR" ] && [ -n "$SERVER_TAR" ]; then
-  ci_finish "packaging-quality" 100
+if [ -n "$APPIMAGE" ] && [ -n "$CLIENT_DEB" ] && [ -n "$CLIENT_TAR" ] && [ -n "$SERVER_TAR" ] && [ -n "$SERVER_DEB" ]; then
+  ci_finish "packaging-quality" 108
 else
   ci_finish "packaging-quality"
 fi

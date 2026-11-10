@@ -472,7 +472,8 @@ server_payload() {  # $1 = 目标树根
   local doc
   for doc in docs/server-quick-start.md docs/self-hosted-server.md docs/release-layout.md docs/secure_transport.md \
              docs/install-server.md docs/upgrade-server.md docs/release-packaging.md; do
-    [ -f "$doc" ] && install -m 0644 "$doc" "$tree/usr/lib/backup-project-server/share/doc/backup-project/"
+    [ -s "$doc" ] || die "服务端必需文档缺失或为空：$doc"
+    install -m 0644 "$doc" "$tree/usr/lib/backup-project-server/share/doc/backup-project/"
   done
   local wrapper
   for wrapper in backup-server backup-project-server backup-server-admin backup-server-admin-menu \
@@ -538,7 +539,8 @@ pack_server_tarball() {
   rm -rf "${tree:?}/bin" "${tree:?}/etc"
   mv "$tree/portable-root/usr/lib/backup-project-server/bin" "$tree/bin"
   mv "$tree/portable-root/usr/lib/backup-project-server/share/backup-project" "$tree/share/backup-project"
-  mv "$tree/portable-root/usr/lib/backup-project-server/share/doc/backup-project/." "$tree/docs/" 2>/dev/null || true
+  cp -a "$tree/portable-root/usr/lib/backup-project-server/share/doc/backup-project/." "$tree/docs/" ||
+    die "复制服务端 portable 文档失败"
   install -m 0755 packaging/portable/install-server.sh "$tree/install.sh"
   install -m 0755 packaging/portable/backup-server-manager "$tree/backup-server-manager"
   install -m 0755 packaging/portable/uninstall.sh "$tree/uninstall.sh"
