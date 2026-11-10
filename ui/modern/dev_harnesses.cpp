@@ -9771,11 +9771,10 @@ int RunGuiContractTest(QQuickWindow* window,
   CheckRun run;
   run.prefix = "[gui-contract]";
 
-  // 页面顺序必须与 Main.qml 的 StackLayout 一致。
-  const char* kBannerNames[7] = {
+  // 顶层页面按 Main.qml 的 pageKeys 顺序；仓库设置是管理页内的区域。
+  const char* kBannerNames[5] = {
       "homeStatusBanner",       "backupStatusBanner",   "scheduleStatusBanner",
-      "managementStatusBanner", "settingsStatusBanner", "realtimeStatusBanner",
-      "remoteStatusBanner"};
+      "realtimeStatusBanner",   "managementStatusBanner"};
 
   const auto goToPage = [window](int page) {
     window->setProperty("currentPageKey", QString::fromLatin1(kPageKeys[page]));
@@ -9784,6 +9783,7 @@ int RunGuiContractTest(QQuickWindow* window,
     WaitForAnimation(60);
   };
   const auto banner = [window, &kBannerNames](int page) -> QObject* {
+    if (page < 0 || page >= 5) return nullptr;
     return window->findChild<QObject*>(QString::fromLatin1(kBannerNames[page]));
   };
   const auto bannerTitle = [&banner](int page) {
@@ -9798,28 +9798,26 @@ int RunGuiContractTest(QQuickWindow* window,
            item->property("title").toString() == title;
   };
   const auto itemByName = [window](const char* name) -> QQuickItem* {
-    return window->findChild<QQuickItem*>(QString::fromLatin1(name));
+    return FindItemByName(window->contentItem(), QString::fromLatin1(name));
   };
 
-  // ---- HOME：三个按钮必须完整在卡片里 ----
+  // ---- HOME：四个按钮必须完整在卡片里 ----
   const auto checkHomeCards = [&](int width, int height, const QString& label) {
     window->setWidth(width);
     window->setHeight(height);
     goToPage(0);
 
     qreal minimum_margin = -1.0;
-    qreal baseline = -1.0;
     bool all_inside = true;
     bool aligned = true;
     QString detail;
+    QList<QPair<qreal, qreal>> card_rows;
 
-    for (int index = 0; index < 3; ++index) {
-      const QQuickItem* card = itemByName(index == 0   ? "homeCard0"
-                                          : index == 1 ? "homeCard1"
-                                                       : "homeCard2");
-      const QQuickItem* button = itemByName(index == 0   ? "homeAction0"
-                                            : index == 1 ? "homeAction1"
-                                                         : "homeAction2");
+    for (int index = 0; index < 4; ++index) {
+      const QString card_name = QStringLiteral("homeCard%1").arg(index);
+      const QString button_name = QStringLiteral("homeAction%1").arg(index);
+      const QQuickItem* card = itemByName(card_name.toLatin1().constData());
+      const QQuickItem* button = itemByName(button_name.toLatin1().constData());
       if (card == nullptr || button == nullptr) {
         run.Check(false, QStringLiteral("%1 找得到卡片与按钮").arg(label),
                   QStringLiteral("card=%1 button=%2")
@@ -9839,13 +9837,19 @@ int RunGuiContractTest(QQuickWindow* window,
 
       const qreal window_y =
           button->mapToItem(window->contentItem(), QPointF(0, 0)).y();
-      if (baseline < 0.0)
-        baseline = window_y;
-      else if (std::abs(window_y - baseline) > 1.0)
-        aligned = false;
+      const qreal card_y =
+          card->mapToItem(window->contentItem(), QPointF(0, 0)).y();
+      for (const auto& row : card_rows) {
+        if (std::abs(row.first - card_y) <= 1.0 &&
+            std::abs(row.second - window_y) > 1.0) {
+          aligned = false;
+          detail += QStringLiteral("按钮 %1 与同排未对齐 ").arg(index);
+        }
+      }
+      card_rows.append(qMakePair(card_y, window_y));
     }
 
-    // HOME-01：三个按钮都在卡片内，且底边距统一为正。
+    // HOME-01：四个按钮都在卡片内，且底边距统一为正。
     run.Check(all_inside && minimum_margin >= 12.0,
               QStringLiteral("%1 HOME-01 按钮完整落在卡片内且底边距 >= 12px")
                   .arg(label),
@@ -9861,17 +9865,26 @@ int RunGuiContractTest(QQuickWindow* window,
               QStringLiteral("%1 HOME-03 卡片下边框没有被按钮压住").arg(label),
               QStringLiteral("最小底边距=%1").arg(minimum_margin));
     // HOME-04：卡片本身也必须在页面内（窄窗口下不能溢出到窗口外）。
-    const QQuickItem* row_card = itemByName("homeCard0");
-    const qreal card_bottom =
-        row_card
-            ->mapToItem(window->contentItem(), QPointF(0, row_card->height()))
-            .y();
-    const bool card_visible_in_window =
-        card_bottom <= static_cast<qreal>(height);
+    bool card_visible_in_window = true;
+    qreal maximum_card_bottom = 0.0;
+    for (int index = 0; index < 4; ++index) {
+      const QQuickItem* card =
+          itemByName(QStringLiteral("homeCard%1").arg(index)
+                        .toLatin1().constData());
+      const qreal card_bottom =
+          card->mapToItem(window->contentItem(), QPointF(0, card->height()))
+              .y();
+      maximum_card_bottom = std::max(maximum_card_bottom, card_bottom);
+      card_visible_in_window =
+          card_visible_in_window && card_bottom <= static_cast<qreal>(height);
+    }
     run.Check(
         card_visible_in_window,
         QStringLiteral("%1 HOME-04 卡片没有溢出窗口").arg(label),
-        QStringLiteral("卡片底部=%1 窗口高=%2").arg(card_bottom).arg(height));
+        QStringLiteral("最底卡片=%1 所有卡片均在窗口内=%2 窗口高=%3")
+            .arg(maximum_card_bottom)
+            .arg(card_visible_in_window)
+            .arg(height));
   };
 
   checkHomeCards(1180, 760, QStringLiteral("正常窗口 1180x760"));
@@ -9904,8 +9917,8 @@ int RunGuiContractTest(QQuickWindow* window,
           !pageShows(3, controller->statusTitle()) &&
           !pageShows(2, controller->statusTitle()) &&
           !pageShows(0, controller->statusTitle()),
-      QStringLiteral("MSG-01 设置 / 管理 / 自动备份 / 首页都不显示它"),
-      QStringLiteral("settings=[%1] management=[%2] schedule=[%3] home=[%4]")
+      QStringLiteral("MSG-01 管理 / 实时 / 自动备份 / 首页都不显示它"),
+      QStringLiteral("management=[%1] realtime=[%2] schedule=[%3] home=[%4]")
           .arg(bannerTitle(4), bannerTitle(3), bannerTitle(2), bannerTitle(0)));
   const QString backup_error_title = controller->statusTitle();
 
@@ -9914,8 +9927,8 @@ int RunGuiContractTest(QQuickWindow* window,
                 !pageShows(3, backup_error_title) &&
                 !pageShows(2, backup_error_title) &&
                 !pageShows(0, backup_error_title),
-            QStringLiteral("MSG-01 切到设置之后这条错误不再出现在任何页面"),
-            QStringLiteral("settings=[%1]").arg(bannerTitle(4)));
+            QStringLiteral("MSG-01 切到管理页之后这条错误不再出现在任何页面"),
+            QStringLiteral("management=[%1]").arg(bannerTitle(4)));
   run.Check(controller->statusKind() == QStringLiteral("idle"),
             QStringLiteral("MSG-01 离开备份页即消费掉这条错误"),
             controller->statusKind());
@@ -9925,32 +9938,44 @@ int RunGuiContractTest(QQuickWindow* window,
             QStringLiteral("MSG-01 回到备份页不会自动复现旧错误"),
             bannerTitle(1));
 
-  // MSG-02：设置页的成功提示同样只属于设置页，离开即消费。
+  // MSG-02：管理页内的仓库设置成功提示只属于设置区域，离开即消费。
   const QString repository = temp.filePath(QStringLiteral("repo"));
   goToPage(4);
+  if (QObject* management = window->findChild<QObject*>(
+          QStringLiteral("managementPage"))) {
+    management->setProperty("currentTab", QStringLiteral("local"));
+    management->setProperty("localSection", QStringLiteral("settings"));
+    management->setProperty("settingsExpanded", true);
+    WaitForAnimation(60);
+  }
+  const QQuickItem* settings_section =
+      itemByName("localRepositorySettings");
+  run.Check(settings_section != nullptr &&
+                settings_section->property("visible").toBool(),
+            QStringLiteral("MSG-02 仓库设置区域已展开"));
   const bool saved = controller->saveRepositoryPath(repository);
   run.Check(saved && controller->statusKind() == QStringLiteral("success") &&
-                controller->statusScope() == QStringLiteral("settings"),
+                controller->statusScope() == QStringLiteral("management"),
             QStringLiteral("MSG-02 设置页保存成功"),
             controller->statusTitle() + QStringLiteral("/") +
                 controller->statusScope());
   const QString settings_title = controller->statusTitle();
   run.Check(pageShows(4, settings_title),
-            QStringLiteral("MSG-02 设置页显示它"));
+            QStringLiteral("MSG-02 管理页仓库设置区域显示它"));
   run.Check(
       !pageShows(1, settings_title) && !pageShows(3, settings_title) &&
           !pageShows(2, settings_title) && !pageShows(0, settings_title),
-      QStringLiteral("MSG-02 备份 / 管理 / 自动备份 / 首页都不显示它"),
-      QStringLiteral("backup=[%1] management=[%2] schedule=[%3] home=[%4]")
-          .arg(bannerTitle(1), bannerTitle(3), bannerTitle(2), bannerTitle(0)));
+      QStringLiteral("MSG-02 备份 / 自动备份 / 首页都不显示它"),
+      QStringLiteral("backup=[%1] schedule=[%2] home=[%3]")
+          .arg(bannerTitle(1), bannerTitle(2), bannerTitle(0)));
   goToPage(1);
   run.Check(controller->statusKind() == QStringLiteral("idle") &&
                 !pageShows(4, settings_title),
-            QStringLiteral("MSG-02 离开设置页即消费掉这条成功提示"),
+            QStringLiteral("MSG-02 离开管理页即消费掉这条成功提示"),
             controller->statusKind());
   goToPage(4);
   run.Check(!pageShows(4, settings_title),
-            QStringLiteral("MSG-02 回到设置页不会自动复现旧提示"),
+            QStringLiteral("MSG-02 回到管理页不会自动复现旧提示"),
             bannerTitle(4));
 
   // MSG-03：severity 与 scope 正交 —— 四种 severity 的位置与失效时机完全一样。
@@ -9958,13 +9983,13 @@ int RunGuiContractTest(QQuickWindow* window,
   for (const char* severity : kSeverities) {
     const QString kind = QString::fromLatin1(severity);
     const QString title = QStringLiteral("severity-测试-%1").arg(kind);
-    goToPage(3);
+    goToPage(4);
     controller->setStatusForTest(kind, QStringLiteral("management"), title,
                                  QStringLiteral("detail"));
-    const bool shown_on_own_page = pageShows(3, title);
+    const bool shown_on_own_page = pageShows(4, title);
     const bool hidden_elsewhere =
-        !pageShows(1, title) && !pageShows(4, title) && !pageShows(2, title) &&
-        !pageShows(0, title) && !pageShows(5, title) && !pageShows(6, title);
+        !pageShows(0, title) && !pageShows(1, title) && !pageShows(2, title) &&
+        !pageShows(3, title);
     goToPage(1);
     const bool consumed = controller->statusKind() == QStringLiteral("idle");
     run.Check(shown_on_own_page && hidden_elsewhere && consumed,
@@ -10015,12 +10040,10 @@ int RunGuiContractTest(QQuickWindow* window,
           !pageShows(4, controller->statusTitle()) &&
           !pageShows(3, controller->statusTitle()) &&
           !pageShows(2, controller->statusTitle()) &&
-          !pageShows(0, controller->statusTitle()) &&
-          !pageShows(5, controller->statusTitle()) &&
-          !pageShows(6, controller->statusTitle()),
+          !pageShows(0, controller->statusTitle()),
       QStringLiteral("MSG-04 完成提示只回到备份页，没有出现在当前页或其它页"),
       QStringLiteral(
-          "backup=[%1] settings=[%2] management=[%3] schedule=[%4] home=[%5]")
+          "backup=[%1] management=[%2] realtime=[%3] schedule=[%4] home=[%5]")
           .arg(bannerTitle(1), bannerTitle(4), bannerTitle(3), bannerTitle(2),
                bannerTitle(0)));
 
