@@ -147,6 +147,7 @@
 #include "archive_pipeline.h"
 #include "backup_controller.h"
 #include "backup_options.h"
+#include "baseline_ui_test.h"
 #include "cloud_retry_probe.h"
 #include "config_manager.h"
 #include "credential_ui_test.h"
@@ -420,6 +421,8 @@ int main(int argc, char* argv[]) {
       arguments.contains(QStringLiteral("--combo-hover-test"));
   const bool ux_acceptance_test =
       arguments.contains(QStringLiteral("--ux-acceptance-test"));
+  const bool baseline_picker_test =
+      arguments.contains(QStringLiteral("--baseline-picker-test"));
   const int workflow_acceptance_index =
       arguments.indexOf(QStringLiteral("--workflow-acceptance"));
   const int credential_ui_index =
@@ -557,9 +560,10 @@ int main(int argc, char* argv[]) {
       acceptance_shots_index >= 0 || self_test_index >= 0 ||
       repository_test_index >= 0 || realtime_test || backup_options_test ||
       schedule_test || filter_ux_test || combo_hover_test ||
-      ux_acceptance_test || remote_test || workflow_acceptance_index >= 0 ||
-      credential_ui_index >= 0 || network_acceptance_index >= 0 ||
-      remote_acceptance_index >= 0 || remote_smoke_index >= 0;
+      ux_acceptance_test || baseline_picker_test || remote_test ||
+      workflow_acceptance_index >= 0 || credential_ui_index >= 0 ||
+      network_acceptance_index >= 0 || remote_acceptance_index >= 0 ||
+      remote_smoke_index >= 0;
   QString config_file_path = ResolveConfigFilePath(arguments);
   QString schedule_file_path = ResolveScheduleFilePath(arguments);
   QString realtime_file_path = ResolveRealtimeFilePath(arguments);
@@ -693,6 +697,9 @@ int main(int argc, char* argv[]) {
   window->show();
   WaitForAnimation(200);
 
+  if (baseline_picker_test) {
+    return RunBaselinePickerTest(window, &theme);
+  }
   if (ux_acceptance_test) {
     return RunUxAcceptanceTest(window, &theme, &schedule_controller,
                                &realtime_controller);

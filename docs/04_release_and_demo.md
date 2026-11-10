@@ -520,8 +520,11 @@ CAP_MKNOD）与**把文件还原成别的属主**需要 root。演示机没有 r
   密码不写 config、不写日志、不回显、不以明文进归档；
 * `des-cbc-hmac-sha256` 是 **legacy / educational**（56 bit 密钥）：保留它是为了
   讲清分组密码、CBC 链与 PKCS#7，DES-CBC 一定比 AES 版本多 1..8 字节的 padding；
-* **增量不支持加密**：带 `--encryption` 的增量会在写盘前被拒绝（外层信封不受内层
-  保护）；计划任务与实时任务的 `--encryption` 只接受 `none`，理由会明确打印出来；
+* **本地增量支持认证加密**：AES 使用 BKPINC2，先验证独立子密钥 HMAC，再应用外层
+  父绑定与删除记录；BKPINC1 只支持未加密 payload，无法认证的旧密文链不能作为基线。
+  增量 payload 支持 MyPack、USTAR、Fast USTAR。计划/实时任务的加密必须提供权限 0600
+  的口令文件，否则保存配置时明确拒绝。GUI 远端路径同样使用共享核心；CLI remote
+  尚没有归档格式和密码输入参数，使用默认 MyPack + none；
 * GUI 里不用终端也能演示加密：备份页 → **高级选项** → 加密方式 + 密码 / 确认密码 →
   开始备份；到备份管理页点这条记录的"恢复"，会弹"此备份已加密，请输入恢复密码"。
   自动证据在 `scripts/modern_gui_check.sh` 的 `--backup-options-test`（四种算法组合、
@@ -714,7 +717,9 @@ BPSEC2 证书），或 `backupctl remote ping --official-cloud`。演示前先�
 
     $B remote delete-account --user demo --confirm demo --host 127.0.0.1 --port 18765
 
-已知边界：远端增量只支持 MyPack + 不压缩 / 不加密；链深上限 64，到顶后引擎自动重建
+已知边界：CLI remote 暂没有归档格式和密码输入参数，默认使用 MyPack + 不压缩 / 不加密；
+GUI 远端路径可传递选项和归档密码，共享核心支持 MyPack、USTAR、Fast USTAR。
+链深上限 64，到顶后引擎自动重建
 完整基线；远端没有"整条链一次删"的命令，只能按后代优先逐个删。
 
 ### 12.2 本地链：不想起服务端时用这条

@@ -7,7 +7,7 @@
 //   * 旧 reader 不可能把 delta 当成完整归档（顶层 magic 不同）；
 //   * payload 真的复用现有流水线：抽出来就是一份标准 v2 container，
 //     现有 restore 能原样读它；
-//   * 坏字节一律拒绝：截断、magic 不对、长度不符、摘要不符、USTAR 被拒；
+//   * 坏字节一律拒绝：截断、magic 不对、长度不符和摘要不符；
 //   * 只有变化部分进 payload（不是"把 Full 改个名字"）。
 
 #include <sys/stat.h>
@@ -19,6 +19,7 @@
 
 #include "archive_pipeline.h"
 #include "container_format.h"
+#include "incremental_backup.h"
 #include "incremental_delta.h"
 #include "source_digest.h"
 #include "source_manifest.h"
@@ -309,25 +310,17 @@ int main() {
                         "INC-F T4 拒绝：把完整归档当 delta 读");
   }
 
-  // ---- F5：只允许 MyPack（第一版）----
-  test_support::Section("INC-F 5. 第一版只支持 MyPack，其余明确拒绝");
+  // ---- F5：支持的 pack 能力显式列举，未知枚举 fail closed ----
+  test_support::Section("INC-F 5. 增量 pack 能力");
   {
-    const std::string delta = work + "/delta3.inc";
-    bp::DeltaEnvelope envelope =
-        MakeEnvelope("base.bak", std::string(64, 'a'), std::string(64, 'b'));
-    std::vector<bp::ArchiveEntry> entries;
-    entries.push_back(RootEntry(source));
-    entries.push_back(FileEntry(source + "/a.txt", "a.txt", "alpha"));
-    bp::BackupOptions options;
-    options.pack_method = bp::PackMethod::kUstar;
-    std::string error;
     test_support::Check(
-        !bp::WriteDeltaFile(delta, envelope, entries, options, &error),
-        "INC-F T5 USTAR 被明确拒绝，绝不静默降级");
-    test_support::Check(error.find("MyPack") != std::string::npos,
-                        "INC-F T5 拒绝理由说清了为什么", error);
-    test_support::Check(!test_support::Exists(delta),
-                        "INC-F T5 被拒绝时不留半成品文件");
+        bp::IsSupportedIncrementalPack(bp::PackMethod::kMyPack) &&
+            bp::IsSupportedIncrementalPack(bp::PackMethod::kUstar) &&
+            bp::IsSupportedIncrementalPack(bp::PackMethod::kFastUstar),
+        "INC-F T5 MyPack、USTAR 与 Fast USTAR 均支持增量");
+    const auto invalid_pack = static_cast<bp::PackMethod>(255);
+    test_support::Check(!bp::IsSupportedIncrementalPack(invalid_pack),
+                        "INC-F T5 未知 pack 枚举仍被拒绝");
   }
 
   // ---- F6：delta 只装变化部分 ----

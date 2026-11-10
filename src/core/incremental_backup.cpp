@@ -47,6 +47,7 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <filesystem>
 #include <functional>
 #include <map>
 #include <string>
@@ -491,16 +492,19 @@ std::string UnsupportedIncrementalEncryptionReason() {
       "restored safely; create a new encrypted backup with this version.");
 }
 
-// USTAR 表达不了 tombstone 与 parent dependency，硬套只会产出恢复语义对不上
-// 的链，所以这条组合也只放行 MyPack。
 bool IsSupportedIncrementalPack(PackMethod pack) {
-  return pack == PackMethod::kMyPack;
+  switch (pack) {
+    case PackMethod::kMyPack:
+    case PackMethod::kUstar:
+    case PackMethod::kFastUstar:
+      return true;
+  }
+  return false;
 }
 
 std::string UnsupportedIncrementalPackReason() {
-  return "Incremental backup currently supports the MyPack pack method only: "
-         "USTAR cannot express tombstones or parent dependencies, so an "
-         "incremental chain built on it could not be applied correctly.";
+  return "Incremental backup requires a supported pack method: MyPack, USTAR, "
+         "or Fast USTAR.";
 }
 
 // 副文件名的构造点。后缀常量在本文件里有两处（这里与 SplitSidecarName）：
@@ -981,7 +985,227 @@ bool LoadVerifiedSnapshotIdentity(const std::string& repository_directory,
   return true;
 }
 
-// 候选按文件名倒序 = 最新的在前（Catalog 生成的名字带时间戳，字典序即时间序）。
+// 身份只记录规范的绝对词法路径；不 realpath 源，也不改变旧身份摘要算法。
+// 两次 lstat 保留根软链接拒绝，并拒绝被词法规整改变含义的 symlink/.. 输入。
+bool NormalizeBackupSourceDirectory(const std::string& input,
+                                    std::string* normalized,
+                                    std::string* error_message) {
+  if (normalized == nullptr) {
+    SetError(error_message, "Normalized source path output must not be null");
+    return false;
+  }
+  struct stat original;
+  if (input.empty() || input.find('\0') != std::string::npos ||
+      ::lstat(input.c_str(), &original) != 0 || !S_ISDIR(original.st_mode)) {
+    SetError(error_message, "Source is not a directory: " + input);
+    return false;
+  }
+  std::error_code error;
+  std::filesystem::path path =
+      std::filesystem::absolute(std::filesystem::u8path(input), error)
+          .lexically_normal();
+  if (error) {
+    SetError(error_message,
+             "Cannot make source path absolute: " + error.message());
+    return false;
+  }
+  while (path != path.root_path() && path.filename().empty())
+    path = path.parent_path();
+  const std::string result = path.u8string();
+  struct stat checked;
+  if (::lstat(result.c_str(), &checked) != 0 || !S_ISDIR(checked.st_mode)) {
+    SetError(error_message,
+             "Source is not a directory or is a symbolic link: " + result);
+    return false;
+  }
+  if (original.st_dev != checked.st_dev || original.st_ino != checked.st_ino) {
+    SetError(error_message,
+             "Source path normalization changes the selected directory");
+    return false;
+  }
+  *normalized = result;
+  return true;
+}
+
+namespace {
+
+// 枚举和实际创建增量都走这里，界面上“可用”的含义不能弱于写入时的要求。
+// 查询结果只是当时的事实；真正写入前仍会重新检查，防止扫描后仓库被改动。
+bool CheckIncrementalBaseline(const std::string& repository,
+                              const std::string& source,
+                              const std::string& repository_identity,
+                              const std::string& filter_identity,
+                              const std::string& strategy_identity,
+                              const BackupOptions& options,
+                              IncrementalBaselineCandidate* candidate,
+                              std::vector<ManifestEntry>* manifest_entries,
+                              const std::function<bool()>& cancelled = {}) {
+  const auto reject = [candidate](BaselineAvailability availability,
+                                  const std::string& diagnostic) {
+    candidate->availability = availability;
+    candidate->diagnostic = diagnostic;
+    return false;
+  };
+  SnapshotIdentity target;
+  std::string error;
+  std::vector<ManifestEntry> entries;
+  if (!LoadVerifiedSnapshotIdentity(repository, candidate->file_name, &target,
+                                    &entries, &error)) {
+    return reject(BaselineAvailability::kInvalidSnapshot, error);
+  }
+  candidate->kind = target.kind;
+  candidate->snapshot_id = target.snapshot_id;
+  candidate->parent_snapshot_id = target.parent_snapshot_id;
+  candidate->parent_file_name = target.parent_file_name;
+  candidate->lineage_id = target.kind == SnapshotFileKind::kContainer
+                              ? target.snapshot_id
+                              : target.base_generation_id;
+  candidate->manifest_digest = target.manifest_digest;
+  if (!target.sidecars_verified) {
+    return reject(BaselineAvailability::kInvalidSnapshot,
+                  target.sidecar_diagnostic);
+  }
+  const auto compatible = [&](const SnapshotIdentity& identity) {
+    if (identity.manifest_binding.repository_identity != repository_identity ||
+        identity.manifest_binding.source_path != source ||
+        identity.source_identity !=
+            SourceIdentityDigest(source, repository_identity)) {
+      return reject(BaselineAvailability::kDifferentSource,
+                    "the baseline belongs to a different source or repository");
+    }
+    if (identity.filter_identity != filter_identity) {
+      return reject(BaselineAvailability::kDifferentFilters,
+                    "the filter rules changed since the baseline");
+    }
+    if (identity.strategy_identity != strategy_identity) {
+      return reject(BaselineAvailability::kDifferentStrategy,
+                    "the pack / compression / encryption settings differ");
+    }
+    return true;
+  };
+  if (!compatible(target)) return false;
+
+  SnapshotChain chain;
+  if (!ResolveSnapshotChain(repository, candidate->file_name, &chain, &error)) {
+    return reject(BaselineAvailability::kBrokenChain, error);
+  }
+  // 每个祖先都核对源、参数与 BPIDENT3，不只验证末端。父快照的身份副文件
+  // 同样是不可信输入，不能用一个合法末端替它背书。
+  for (const std::string& name : chain.file_names) {
+    if (cancelled && cancelled())
+      return reject(BaselineAvailability::kInvalidSnapshot,
+                    "baseline candidate scan cancelled");
+    SnapshotIdentity ancestor;
+    if (name == candidate->file_name) {
+      ancestor = target;
+    } else if (!LoadVerifiedSnapshotIdentity(repository, name, &ancestor,
+                                             nullptr, &error) ||
+               !ancestor.sidecars_verified) {
+      return reject(BaselineAvailability::kBrokenChain,
+                    error.empty() ? ancestor.sidecar_diagnostic : error);
+    }
+    if (!compatible(ancestor)) return false;
+    if (options.encryption_method != EncryptionMethod::kNone) {
+      std::string tag;
+      if (ancestor.metadata_hmac.empty() ||
+          !SnapshotMetadataTag(
+              ancestor.archive_path, name, ancestor.snapshot_id,
+              ancestor.manifest_digest, ancestor.source_identity,
+              ancestor.filter_identity, ancestor.strategy_identity,
+              options.password, &tag, &error) ||
+          !crypto::ConstantTimeEquals(tag, ancestor.metadata_hmac)) {
+        return reject(BaselineAvailability::kAuthenticationFailed,
+                      "the current password cannot authenticate the baseline "
+                      "metadata or an ancestor");
+      }
+    }
+    if (cancelled && cancelled())
+      return reject(BaselineAvailability::kInvalidSnapshot,
+                    "baseline candidate scan cancelled");
+    // 与 AuthenticateSnapshotChain 使用相同的 full/delta 认证入口，
+    // 按跳执行便于只读扫描在祖先之间响应取消。
+    const bool authenticated =
+        ancestor.kind == SnapshotFileKind::kContainer
+            ? AuthenticateContainerFile(ancestor.archive_path, options.password,
+                                        &error)
+            : VerifyDeltaAuthentication(ancestor.archive_path, options.password,
+                                        &error);
+    if (!authenticated) {
+      return reject(BaselineAvailability::kAuthenticationFailed,
+                    "the current password cannot authenticate the baseline "
+                    "chain: " +
+                        error);
+    }
+  }
+  if (chain.delta_count >= kMaxDeltaChainDepth) {
+    return reject(BaselineAvailability::kDepthLimit,
+                  "the dependency chain has reached the maximum depth of " +
+                      std::to_string(kMaxDeltaChainDepth) + " deltas");
+  }
+  candidate->availability = BaselineAvailability::kUsable;
+  candidate->diagnostic.clear();
+  if (manifest_entries != nullptr) *manifest_entries = std::move(entries);
+  return true;
+}
+
+IncrementalBaselineCandidate CandidateFromRecord(const BackupRecord& record) {
+  IncrementalBaselineCandidate candidate;
+  candidate.file_name = record.file_name;
+  candidate.modified_time_sec = record.modified_time_sec;
+  candidate.encryption_method = record.encryption_method;
+  candidate.kind = record.incremental_delta ? SnapshotFileKind::kDelta
+                                            : SnapshotFileKind::kContainer;
+  return candidate;
+}
+
+}  // namespace
+
+bool ListIncrementalBaselineCandidates(
+    const std::string& repository_directory, const std::string& source_path,
+    const std::string& repository_identity, const BackupOptions& options,
+    const std::vector<std::string>& include_rules,
+    const std::vector<std::string>& exclude_rules,
+    std::vector<IncrementalBaselineCandidate>* candidates,
+    std::string* error_message, const std::function<bool()>& cancelled) {
+  if (candidates == nullptr) {
+    SetError(error_message, "Baseline candidates output must not be null");
+    return false;
+  }
+  candidates->clear();
+  std::string normalized_source;
+  if (!NormalizeBackupSourceDirectory(source_path, &normalized_source,
+                                      error_message))
+    return false;
+  BackupCatalog catalog;
+  std::vector<BackupRecord> records;
+  if (!catalog.List(repository_directory, &records, error_message))
+    return false;
+  const std::string filters =
+      FilterIdentityDigest(include_rules, exclude_rules);
+  const std::string strategy =
+      StrategyIdentityDigest(options.pack_method, options.compression_method,
+                             options.encryption_method);
+  for (const BackupRecord& record : records) {
+    if (cancelled && cancelled()) {
+      candidates->clear();
+      SetError(error_message, "Baseline candidate scan cancelled");
+      return false;
+    }
+    IncrementalBaselineCandidate candidate = CandidateFromRecord(record);
+    CheckIncrementalBaseline(repository_directory, normalized_source,
+                             repository_identity, filters, strategy, options,
+                             &candidate, nullptr, cancelled);
+    if (cancelled && cancelled()) {
+      candidates->clear();
+      SetError(error_message, "Baseline candidate scan cancelled");
+      return false;
+    }
+    candidates->push_back(std::move(candidate));
+  }
+  return true;
+}
+
+// 沿用 Catalog 按归档 mtime 从新到旧的顺序，时间相同时按文件名稳定排序。
 // 第一份"磁盘事实自洽、身份三件又对得上"的候选胜出；任何一条不满足就
 // continue 看下一份，绝不回头放宽条件。
 bool FindIncrementalBaseline(const std::string& repository_directory,
@@ -1261,8 +1485,7 @@ bool PlanDependencyAwareRetention(
 //     不如老实再建一份完整基线；
 //   * outcome 在入口就复位，失败路径上调用方看到的永远是"什么都没做"。
 static bool RunRepositoryBackup(
-    const std::string& source_directory,
-    const std::string& repository_directory,
+    const std::string& source_path, const std::string& repository_directory,
     const std::string& snapshot_file_name,
     const std::string& repository_identity, const Filter& filter,
     const BackupOptions& options, const std::vector<std::string>& include_rules,
@@ -1279,16 +1502,14 @@ static bool RunRepositoryBackup(
     SetError(error_message, "A snapshot file name must be a single component");
     return false;
   }
-  if (source_directory.empty() || repository_directory.empty()) {
+  if (source_path.empty() || repository_directory.empty()) {
     SetError(error_message, "Source directory and repository must be provided");
     return false;
   }
-  struct stat source_info;
-  if (::lstat(source_directory.c_str(), &source_info) != 0 ||
-      !S_ISDIR(source_info.st_mode)) {
-    SetError(error_message, "Source is not a directory: " + source_directory);
+  std::string source_directory;
+  if (!NormalizeBackupSourceDirectory(source_path, &source_directory,
+                                      error_message))
     return false;
-  }
   FileSystem file_system;
   if (!file_system.IsDestinationOutsideSource(
           source_directory, JoinPath(repository_directory, snapshot_file_name),
@@ -1330,88 +1551,56 @@ static bool RunRepositoryBackup(
     g_manifest_built_hook(g_manifest_built_hook_context);
   }
 
-  // 2) 找基线。
-  std::string baseline = baseline_snapshot_name;
+  // 2) 自动选择会跳过不可认证的新链，继续检查更旧的兼容链。
+  // 显式选择则必须成功，不能悄悄换父节点或改建完整快照。
+  std::string baseline;
   std::string reason;
-  if (!baseline.empty()) {
-    if (!IsManagedBackupFileName(baseline)) {
-      baseline.clear();
-      reason = "the requested baseline snapshot name is not a managed name";
-    }
-  } else if (!force_full) {
-    FindIncrementalBaseline(repository_directory, source_directory,
-                            repository_identity, filter_identity,
-                            strategy_identity, &baseline, &reason);
-  }
-
-  // 基线必须**重新验一遍**，哪怕它是 FindIncrementalBaseline 刚挑出来的、
-  // 或者是调用方明确指定的：副文件与归档内容的绑定要逐项对上磁盘事实，
-  // 参数身份也要与这一次相同。"文件还在"远远不够。
   std::vector<ManifestEntry> previous;
-  if (!baseline.empty()) {
-    SnapshotIdentity identity;
-    std::string load_error;
-    std::vector<ManifestEntry> loaded;
-    const bool loaded_ok = LoadVerifiedSnapshotIdentity(
-        repository_directory, baseline, &identity, &loaded, &load_error);
-    bool usable =
-        loaded_ok && identity.sidecars_verified &&
-        identity.manifest_binding.repository_identity == repository_identity &&
-        identity.manifest_binding.source_path == source_directory &&
-        identity.source_identity == source_identity &&
-        identity.filter_identity == filter_identity &&
-        identity.strategy_identity == strategy_identity;
-    if (usable && identity.kind == SnapshotFileKind::kUnknown) usable = false;
-    if (!usable) {
-      reason = loaded_ok
-                   ? "the recorded baseline is no longer trustworthy (" +
-                         identity.sidecar_diagnostic + ")"
-                   : "the recorded baseline is not usable (" + load_error + ")";
-      baseline.clear();
-    } else {
-      if (options.encryption_method != EncryptionMethod::kNone) {
-        SnapshotChain chain;
-        RestoreOptions restore_options;
-        restore_options.password = options.password;
-        std::string authentication_error;
-        std::string metadata_tag;
-        if (identity.metadata_hmac.empty() ||
-            !SnapshotMetadataTag(
-                identity.archive_path, baseline, identity.snapshot_id,
-                identity.manifest_digest, identity.source_identity,
-                identity.filter_identity, identity.strategy_identity,
-                options.password, &metadata_tag, &authentication_error) ||
-            !crypto::ConstantTimeEquals(metadata_tag, identity.metadata_hmac) ||
-            !ResolveSnapshotChain(repository_directory, baseline, &chain,
-                                  &authentication_error) ||
-            !AuthenticateSnapshotChain(chain, restore_options,
-                                       &authentication_error)) {
-          reason =
-              "the current password cannot authenticate the previous "
-              "snapshot metadata or chain; a new encrypted full "
-              "baseline was created";
-          baseline.clear();
-        }
-      }
-      // 再挂一个 delta 会不会越过恢复侧的上界？会的话就不挂：与其产出
-      // "创建成功、恢复才发现链太深"的快照，不如老实再建一份完整基线。
-      std::size_t parent_depth = 0;
-      std::string depth_error;
-      if (baseline.empty()) {
-        // 密码或认证改变后不再依赖旧链，下面统一建立完整基线。
-      } else if (!SnapshotDeltaDepth(repository_directory, baseline,
-                                     &parent_depth, &depth_error)) {
-        reason = "the recorded baseline is not usable (" + depth_error + ")";
-        baseline.clear();
-      } else if (parent_depth >= kMaxDeltaChainDepth) {
-        reason = "the dependency chain has reached the maximum depth of " +
-                 std::to_string(kMaxDeltaChainDepth) +
-                 " deltas; a new full baseline was created";
-        baseline.clear();
-      } else {
-        previous = std::move(loaded);
-      }
+  if (!force_full && !baseline_snapshot_name.empty()) {
+    IncrementalBaselineCandidate candidate;
+    candidate.file_name = baseline_snapshot_name;
+    if (!IsManagedBackupFileName(candidate.file_name)) {
+      SetError(error_message,
+               "Requested incremental baseline has an invalid "
+               "snapshot file name");
+      return false;
     }
+    if (!CheckIncrementalBaseline(repository_directory, source_directory,
+                                  repository_identity, filter_identity,
+                                  strategy_identity, options, &candidate,
+                                  &previous)) {
+      SetError(error_message, "Requested incremental baseline is not usable: " +
+                                  candidate.diagnostic);
+      return false;
+    }
+    baseline = candidate.file_name;
+  } else if (!force_full) {
+    BackupCatalog catalog;
+    std::vector<BackupRecord> records;
+    if (!catalog.List(repository_directory, &records, error_message))
+      return false;
+    std::vector<std::string> depth_limited_lineages;
+    for (const BackupRecord& record : records) {
+      IncrementalBaselineCandidate candidate = CandidateFromRecord(record);
+      if (CheckIncrementalBaseline(repository_directory, source_directory,
+                                   repository_identity, filter_identity,
+                                   strategy_identity, options, &candidate,
+                                   &previous)) {
+        // 自动轮换到新完整基线时，不回头从同一条已满链的祖先创建隐式分支。
+        // 用户仍可在候选列表中明确选择旧恢复点建立分支。
+        if (std::find(depth_limited_lineages.begin(),
+                      depth_limited_lineages.end(),
+                      candidate.lineage_id) != depth_limited_lineages.end())
+          continue;
+        baseline = candidate.file_name;
+        break;
+      }
+      if (candidate.availability == BaselineAvailability::kDepthLimit)
+        depth_limited_lineages.push_back(candidate.lineage_id);
+      if (reason.empty()) reason = candidate.diagnostic;
+    }
+    if (baseline.empty() && reason.empty())
+      reason = "there is no trustworthy compatible baseline in the repository";
   }
 
   // 3) 没有可信基线 -> 建一份完整 baseline。绝不写一个指向不存在父亲的 delta。

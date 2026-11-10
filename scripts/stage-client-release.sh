@@ -26,7 +26,7 @@
 set -uo pipefail
 
 ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
-cd "$ROOT_DIR"
+cd "$ROOT_DIR" || exit 1
 
 OUT_DIR="dist/client"
 WITH_GUI=1
@@ -65,17 +65,34 @@ else
   STAMP="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 fi
 
+# Explicit release overrides stay on make's command line; ordinary staging
+# continues to use build/ and the Makefile's default compiler flags.
+BUILD_DIR="${BACKUP_RELEASE_BUILD_DIR:-build}"
+MAKE_ARGS=("BUILD_DIR=$BUILD_DIR")
+if [ "${BACKUP_RELEASE_CXXFLAGS+x}" = x ]; then
+  MAKE_ARGS+=("CXXFLAGS=$BACKUP_RELEASE_CXXFLAGS")
+fi
+# The recipe is expanded by make, not by this shell.
+# shellcheck disable=SC2016
+if ! BUILD_CXXFLAGS="$(make "${MAKE_ARGS[@]}" --no-print-directory -s \
+    --eval '.PHONY: backup-release-print-cxxflags' \
+    --eval 'backup-release-print-cxxflags:;@$(info $(CXXFLAGS))' \
+    backup-release-print-cxxflags)"; then
+  echo "错误：无法读取实际 CXXFLAGS。" >&2
+  exit 1
+fi
+
 echo "== 构建客户端（commit $SHORT）=="
 GUI_NOTE="included"
 if [ "$WITH_GUI" -eq 1 ]; then
-  if ! make client > /tmp/stage-client-build.log 2>&1; then
+  if ! make "${MAKE_ARGS[@]}" client > /tmp/stage-client-build.log 2>&1; then
     echo "错误：make client 失败，最后 15 行：" >&2
     tail -15 /tmp/stage-client-build.log >&2
     exit 1
   fi
 else
   GUI_NOTE="excluded (--no-gui)"
-  if ! make client-cli > /tmp/stage-client-build.log 2>&1; then
+  if ! make "${MAKE_ARGS[@]}" client-cli > /tmp/stage-client-build.log 2>&1; then
     echo "错误：make client-cli 失败，最后 15 行：" >&2
     tail -15 /tmp/stage-client-build.log >&2
     exit 1
@@ -85,9 +102,9 @@ fi
 rm -rf "$OUT_DIR"
 mkdir -p "$OUT_DIR/bin" "$OUT_DIR/share/backup-project" "$OUT_DIR/docs"
 
-cp build/backupctl "$OUT_DIR/bin/backupctl"
+cp "$BUILD_DIR/backupctl" "$OUT_DIR/bin/backupctl"
 if [ "$WITH_GUI" -eq 1 ]; then
-  cp build/backup-gui-modern "$OUT_DIR/bin/backup-gui-modern"
+  cp "$BUILD_DIR/backup-gui-modern" "$OUT_DIR/bin/backup-gui-modern"
 fi
 cp resources/security/official-root-ed25519.pub "$OUT_DIR/share/backup-project/"
 for doc in docs/client-quick-start.md docs/release-layout.md docs/secure_transport.md; do
@@ -109,6 +126,7 @@ built_at_utc      = $STAMP
 working_tree      = $( [ "$DIRTY" = "yes" ] && echo "dirty（构建内容可能与 commit 不一致）" || echo "clean" )
 gui               = $GUI_NOTE
 compiler          = $CXX_VERSION
+cxxflags          = $BUILD_CXXFLAGS
 built_with        = make $( [ "$WITH_GUI" -eq 1 ] && echo client || echo client-cli )
 official_root     = share/backup-project/official-root-ed25519.pub
 EOF

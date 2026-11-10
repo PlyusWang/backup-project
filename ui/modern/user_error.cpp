@@ -16,6 +16,57 @@ UserFacingError ExplainOperationError(const QString& technical,
   UserFacingError error;
   error.title = action + QStringLiteral("没有完成");
 
+  struct ClassifiedError {
+    const char* kind;
+    const char* title;
+    const char* summary;
+    const char* suggestion;
+  };
+  static const ClassifiedError classified_errors[] = {
+      {"ssh-auth", "SSH 认证失败", "SSH 服务器未接受当前登录凭据。",
+       "请检查 SSH 用户和密钥，并确认密钥已加入 ssh-agent。"},
+      {"ssh-hostkey", "SSH 服务器身份校验失败",
+       "SSH 主机密钥未知或与已保存的密钥不一致。",
+       "请向管理员核对主机密钥后更新可信记录。"},
+      {"ssh-timeout", "SSH 连接超时", "未能在等待时间内建立 SSH 转发通道。",
+       "请检查 SSH 主机、端口、网络和转发权限后重试。"},
+      {"ssh-host-unreachable", "无法连接 SSH 服务器",
+       "SSH 主机无法访问或拒绝连接。", "请检查 SSH 地址、端口和网络连接。"},
+      {"ssh-forward", "SSH 端口转发失败",
+       "本地转发端口被占用，或服务器拒绝转发。",
+       "请选择空闲的本地端口，并向管理员确认转发权限。"},
+      {"ssh-exit", "SSH 通道已关闭", "SSH 进程已退出，当前通道不可用。",
+       "请重新建立 SSH 通道后重试。"},
+      {"ssh-missing", "无法启动 SSH", "本机没有可用的 ssh 命令。",
+       "请安装 OpenSSH 客户端，或选择正确的 ssh 程序路径。"},
+      {"ssh-spawn", "无法启动 SSH", "系统未能启动 ssh 进程。",
+       "请检查 ssh 程序路径、执行权限和可用系统资源。"},
+      {"ssh-invalid-target", "SSH 地址无效", "SSH 主机配置无法识别。",
+       "请填写 SSH 配置别名或“用户名@主机名”。"},
+      {"tunnel-not-ready", "SSH 通道尚未就绪",
+       "业务连接需要的 SSH 通道还未建立。",
+       "请先建立 SSH 通道，再连接备份服务器。"},
+      {"timeout", "连接超时", "服务器未能在等待时间内响应。",
+       "请检查服务器地址、端口和网络后重试。"},
+      {"target-exists", "下载失败", "目标路径已经存在，未覆盖原文件。",
+       "请选择新的目标路径，或确认已有文件后使用覆盖操作。"},
+      {"raw-password", "恢复失败", "这份归档需要密码。",
+       "请输入创建归档时使用的密码后重试。"},
+      {"raw-corrupt", "恢复失败", "归档内容不完整或完整性校验失败。",
+       "请重新下载完整归档，或改用完整的备份副本。"},
+      {"integrity", "完整性校验失败", "收到的备份内容与记录的摘要不一致。",
+       "请重新下载；若仍失败，请检查服务器上的备份副本。"},
+      {"raw-destination", "恢复失败", "恢复目标不可写、已有文件或路径无效。",
+       "请选择有写入权限的新空文件夹。"},
+  };
+  for (const ClassifiedError& classified : classified_errors) {
+    if (technical != QLatin1String(classified.kind)) continue;
+    error.title = QString::fromUtf8(classified.title);
+    error.summary = QString::fromUtf8(classified.summary);
+    error.suggestion = QString::fromUtf8(classified.suggestion);
+    return error;
+  }
+
   // 远程控制器已经把协议失败归类为稳定的 error_kind；优先按分类翻译，
   // 不再依赖底层英文详情里是否恰好包含某个单词。
   if (technical == QStringLiteral("credentials")) {
@@ -31,7 +82,8 @@ UserFacingError ExplainOperationError(const QString& technical,
   }
   if (technical == QStringLiteral("connect-refused")) {
     error.summary = QStringLiteral("目标服务器没有接受连接。");
-    error.suggestion = QStringLiteral("请确认服务器已启动，地址和端口填写正确。");
+    error.suggestion =
+        QStringLiteral("请确认服务器已启动，地址和端口填写正确。");
     return error;
   }
   if (technical == QStringLiteral("network")) {
@@ -47,13 +99,15 @@ UserFacingError ExplainOperationError(const QString& technical,
   if (technical == QStringLiteral("raw-auth")) {
     error.title = action + QStringLiteral("失败");
     error.summary = QStringLiteral("归档密码错误，或备份完整性校验失败。");
-    error.suggestion = QStringLiteral("请使用创建备份时的密码，并确认归档文件完整。");
+    error.suggestion =
+        QStringLiteral("请使用创建备份时的密码，并确认归档文件完整。");
     return error;
   }
   if (technical == QStringLiteral("chain-conflict")) {
     error.title = QStringLiteral("增量备份未能继续");
     error.summary = QStringLiteral("所选基线与当前增量链不兼容。");
-    error.suggestion = QStringLiteral("请使用可验证的同一条链，或明确创建新的完整备份。");
+    error.suggestion =
+        QStringLiteral("请使用可验证的同一条链，或明确创建新的完整备份。");
     return error;
   }
 
@@ -94,6 +148,20 @@ UserFacingError ExplainOperationError(const QString& technical,
     error.summary = QStringLiteral("服务器身份证书无效，连接已停止。");
     error.suggestion =
         QStringLiteral("请向服务器管理员核对身份证书和可信根文件后重试。");
+    return error;
+  }
+  if (Contains(technical, "Requested incremental baseline")) {
+    error.title = QStringLiteral("增量备份未能继续");
+    if (Contains(technical, "cannot authenticate")) {
+      error.summary = QStringLiteral("所选基线或其祖先无法通过身份认证。");
+      error.suggestion =
+          QStringLiteral("请使用原归档密码，或明确选择完整备份建立新基线。");
+    } else {
+      error.summary =
+          QStringLiteral("所选基线不可用、参数不兼容或依赖链不完整。");
+      error.suggestion =
+          QStringLiteral("重新检查并选择可用基线，或明确选择完整备份。");
+    }
     return error;
   }
   if (Contains(technical, "not empty")) {

@@ -246,12 +246,10 @@ void PrintCliUsage(const std::string& program_name, std::ostream& output) {
       << "    The archive is written into the configured repository, with a "
          "name the\n"
       << "    program generates; there is no way to give it a path.\n"
-      << "    --strategy defaults to full. incremental stores only the "
-         "changes since\n"
-      << "    the previous snapshot and needs one to exist in the "
-         "repository;\n"
-      << "    it requires --pack mypack; encrypted deltas authenticate their "
-         "dependency metadata.\n"
+      << "    --strategy 默认为 full；incremental "
+         "从最近可验证且参数兼容的快照续接。\n"
+      << "    没有可用基线时建立完整备份。\n"
+      << "    支持 mypack、ustar、fast-ustar；加密增量会认证依赖元数据。\n"
       << "  " << program_name
       << " preview <source_directory> [--include <rule>]... [--exclude "
          "<rule>]...\n"
@@ -1158,7 +1156,7 @@ int ScheduleSet(const CliContext& context,
   std::cout << "Strategy: " << BackupStrategyKey(config.strategy) << "\n";
   if (config.strategy == BackupStrategy::kIncremental &&
       !IsSupportedIncrementalPack(config.pack_method)) {
-    // 增量只支持 MyPack：在配置这一层就说清楚，而不是等第一次 delta 才发现。
+    // 使用共享能力校验，在配置阶段拒绝未知 pack，而不是等写入 delta 才失败。
     std::cout << "Note: " << UnsupportedIncrementalPackReason() << "\n";
   }
   return kCliExitSuccess;

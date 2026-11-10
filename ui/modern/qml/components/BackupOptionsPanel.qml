@@ -98,13 +98,14 @@ Item {
             return "每次备份都生成一份完整、自包含的归档。"
         return "第一次（或基线不可信时）建立完整基线，之后只写变化部分；"
                + "没有变化就不创建新快照。恢复时自动按依赖链还原。"
-               + "增量备份使用 MyPack 打包方式，可选择密码加密。"
+               + "增量备份支持 MyPack、USTAR 和 Fast USTAR，可选择密码加密。"
     }
 
-    // 选了增量但打包方式不是 MyPack：界面直接说明，而不是等核心拒绝。
+    // 能力和核心共享：只有未知 pack 才会被拒绝。
     // 真正的判定仍然在核心（共享校验），这里只是即时反馈。
     readonly property bool strategyPackCombinationAllowed:
-        panel.strategyKey !== "incremental" || panel.packKey === "mypack"
+        panel.strategyKey !== "incremental" ||
+        panel.packKeys.indexOf(panel.packKey) !== -1
 
     readonly property string combinationError: backupOptions.validate(
         "manual", panel.strategyKey, panel.packKey, panel.compressionKey,

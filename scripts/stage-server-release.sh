@@ -24,7 +24,7 @@
 set -uo pipefail
 
 ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
-cd "$ROOT_DIR"
+cd "$ROOT_DIR" || exit 1
 
 OUT_DIR="dist/server"
 ALLOW_DIRTY=0
@@ -60,10 +60,27 @@ else
   STAMP="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 fi
 
+# Explicit release overrides stay on make's command line; ordinary staging
+# continues to use build/ and the Makefile's default compiler flags.
+BUILD_DIR="${BACKUP_RELEASE_BUILD_DIR:-build}"
+MAKE_ARGS=("BUILD_DIR=$BUILD_DIR")
+if [ "${BACKUP_RELEASE_CXXFLAGS+x}" = x ]; then
+  MAKE_ARGS+=("CXXFLAGS=$BACKUP_RELEASE_CXXFLAGS")
+fi
+# The recipe is expanded by make, not by this shell.
+# shellcheck disable=SC2016
+if ! BUILD_CXXFLAGS="$(make "${MAKE_ARGS[@]}" --no-print-directory -s \
+    --eval '.PHONY: backup-release-print-cxxflags' \
+    --eval 'backup-release-print-cxxflags:;@$(info $(CXXFLAGS))' \
+    backup-release-print-cxxflags)"; then
+  echo "错误：无法读取实际 CXXFLAGS。" >&2
+  exit 1
+fi
+
 echo "== 构建服务端（commit $SHORT）=="
 BUILD_LOG="$(mktemp "${TMPDIR:-/tmp}/stage-server-build.XXXXXXXX")"
 trap 'rm -f "$BUILD_LOG"' EXIT
-if ! make server cert-tool > "$BUILD_LOG" 2>&1; then
+if ! make "${MAKE_ARGS[@]}" server cert-tool > "$BUILD_LOG" 2>&1; then
   echo "错误：make server cert-tool 失败，最后 15 行：" >&2
   tail -15 "$BUILD_LOG" >&2
   exit 1
@@ -72,10 +89,10 @@ fi
 rm -rf "$OUT_DIR"
 mkdir -p "$OUT_DIR/bin" "$OUT_DIR/tools" "$OUT_DIR/share/backup-project" "$OUT_DIR/docs"
 
-cp build/backup-server "$OUT_DIR/bin/backup-server"
-cp build/backup-server-admin "$OUT_DIR/bin/backup-server-admin"
-cp build/backup-server-keygen "$OUT_DIR/bin/backup-server-keygen"
-cp build/backup-cert-tool "$OUT_DIR/tools/backup-cert-tool"
+cp "$BUILD_DIR/backup-server" "$OUT_DIR/bin/backup-server"
+cp "$BUILD_DIR/backup-server-admin" "$OUT_DIR/bin/backup-server-admin"
+cp "$BUILD_DIR/backup-server-keygen" "$OUT_DIR/bin/backup-server-keygen"
+cp "$BUILD_DIR/backup-cert-tool" "$OUT_DIR/tools/backup-cert-tool"
 # 真正给管理员用的交互式入口是 scripts/backup-server-admin.sh。之前 staging
 # 只放了底层命令，装完没有菜单可用 —— 这是 Release 可用性缺口（PR 要求 §32）。
 cp scripts/backup-server-admin.sh "$OUT_DIR/bin/backup-server-admin.sh"
@@ -102,6 +119,7 @@ commit_short      = $SHORT
 built_at_utc      = $STAMP
 working_tree      = $( [ "$DIRTY" = "yes" ] && echo "dirty（构建内容可能与 commit 不一致）" || echo "clean" )
 compiler          = $CXX_VERSION
+cxxflags          = $BUILD_CXXFLAGS
 built_with        = make server cert-tool
 private_keys      = none（服务端包内不含任何私钥）
 official_root     = share/backup-project/official-root-ed25519.pub

@@ -98,6 +98,7 @@ TASK_USER="$(id -un)"
 python3 - "$TASK_RUNTIME" "$TASK_SSH" "$TASK_USER" <<'PY'
 import os
 from pathlib import Path
+import pwd
 import secrets
 import shlex
 import socket
@@ -115,10 +116,18 @@ for listener in listeners:
 runtime.joinpath('backup.port').write_text(str(backup_port))
 runtime.joinpath('bpsec1.port').write_text(str(bpsec1_port))
 runtime.joinpath('ssh.target').write_text(f'{user}@127.0.0.1')
+while True:
+    missing_user = 'bp-no-user-' + secrets.token_hex(8)
+    try:
+        pwd.getpwnam(missing_user)
+    except KeyError:
+        break
+runtime.joinpath('ssh.invalid-target').write_text(f'{missing_user}@127.0.0.1')
 runtime.joinpath('secrets.env').write_text(f'BACKUP_TOKEN_SECRET={secrets.token_hex(32)}\n')
 runtime.joinpath('bpsec1-secrets.env').write_text(f'BACKUP_TOKEN_SECRET={secrets.token_hex(32)}\n')
 host_type, host_public = runtime.joinpath('ssh-host.pub').read_text().split()[:2]
 runtime.joinpath('known_hosts').write_text(f'[127.0.0.1]:{ssh_port} {host_type} {host_public}\n')
+runtime.joinpath('empty_known_hosts').write_text('')
 config = f'''Port {ssh_port}
 ListenAddress 127.0.0.1
 HostKey "{runtime / 'ssh-host'}"
@@ -140,15 +149,18 @@ PrintMotd no
 LogLevel VERBOSE
 '''
 runtime.joinpath('sshd_config').write_text(config)
-arguments = [ssh, '-F', '/dev/null', '-p', str(ssh_port), '-i', str(runtime / 'ssh-client'),
-             '-o', f'UserKnownHostsFile={runtime / "known_hosts"}',
-             '-o', f'GlobalKnownHostsFile={runtime / "known_hosts"}',
-             '-o', 'StrictHostKeyChecking=yes', '-o', 'IdentitiesOnly=yes',
-             '-o', 'IdentityAgent=none']
-wrapper = runtime / 'fixture-ssh'
-wrapper.write_text('#!/bin/sh\nexec ' + ' '.join(shlex.quote(x) for x in arguments) + ' "$@"\n')
-wrapper.chmod(0o700)
-for name in ['secrets.env', 'bpsec1-secrets.env', 'sshd_config', 'known_hosts', 'authorized_keys']:
+for name, hosts in [('fixture-ssh', 'known_hosts'),
+                    ('fixture-ssh-untrusted', 'empty_known_hosts')]:
+    arguments = [ssh, '-F', '/dev/null', '-p', str(ssh_port), '-i', str(runtime / 'ssh-client'),
+                 '-o', f'UserKnownHostsFile={runtime / hosts}',
+                 '-o', f'GlobalKnownHostsFile={runtime / hosts}',
+                 '-o', 'StrictHostKeyChecking=yes', '-o', 'IdentitiesOnly=yes',
+                 '-o', 'IdentityAgent=none']
+    wrapper = runtime / name
+    wrapper.write_text('#!/bin/sh\nexec ' + ' '.join(shlex.quote(x) for x in arguments) + ' "$@"\n')
+    wrapper.chmod(0o700)
+for name in ['secrets.env', 'bpsec1-secrets.env', 'sshd_config', 'known_hosts',
+             'empty_known_hosts', 'authorized_keys']:
     runtime.joinpath(name).chmod(0o600)
 PY
 

@@ -1928,11 +1928,10 @@ Item {
                     page.pendingDownloadId, page.draftDownloadPath, true)
             }
 
-            // 技术详情默认折叠，是唯一出现编号、摘要与英文原始原因的地方；
-            // 文本只读、PlainText、允许鼠标选中复制——排障时要把这一段贴给
-            // 别人，不能只能靠截图。
-            // ---------- 4. 技术详情（默认折叠）----------
+            // 原始协议诊断保留在控制器与日志中，普通页面只显示中文原因和建议。
             AppCard {
+                objectName: "remoteTechnicalCard"
+                visible: false
                 Layout.fillWidth: true
 
                 ColumnLayout {

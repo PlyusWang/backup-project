@@ -31,6 +31,7 @@
 #include "realtime_controller.h"
 #include "schedule_controller.h"
 #include "schedule_store.h"
+#include "user_error.h"
 
 namespace {
 
@@ -100,6 +101,27 @@ int RunUxAcceptanceTest(QQuickWindow* window, backup_modern::AppTheme* theme,
     std::printf("[ux-acceptance] %s %s\n", condition ? "PASS" : "FAIL", label);
     condition ? ++passed : ++failed;
   };
+  for (const char* kind : {"ssh-auth", "ssh-hostkey", "ssh-timeout",
+                           "ssh-host-unreachable", "ssh-forward", "ssh-exit",
+                           "raw-password", "raw-corrupt", "integrity"}) {
+    const auto error = backup_modern::ExplainOperationError(
+        QString::fromLatin1(kind), QStringLiteral("连接"));
+    check(!error.title.isEmpty() && !error.summary.isEmpty() &&
+              !error.suggestion.isEmpty() &&
+              !error.suggestion.contains(
+                  QStringLiteral("检查路径、权限与可用空间")),
+          kind);
+  }
+  check(backup_modern::ExplainOperationError(QStringLiteral("ssh-auth"), {})
+                    .title == QStringLiteral("SSH 认证失败") &&
+            backup_modern::ExplainOperationError(QStringLiteral("ssh-hostkey"),
+                                                 {})
+                    .title == QStringLiteral("SSH 服务器身份校验失败") &&
+            backup_modern::ExplainOperationError(QStringLiteral("ssh-timeout"),
+                                                 {})
+                    .title == QStringLiteral("SSH 连接超时"),
+        "SSH authentication, host identity and timeout have distinct "
+        "explanations");
   const QString screenshot_directory =
       qEnvironmentVariable("BACKUP_UX_SCREENSHOTS");
   if (!screenshot_directory.isEmpty()) {
@@ -120,6 +142,12 @@ int RunUxAcceptanceTest(QQuickWindow* window, backup_modern::AppTheme* theme,
   check(engine != nullptr, "QML engine available");
   if (engine == nullptr) return 1;
 
+  window->setProperty("currentPageKey", QStringLiteral("remote"));
+  Settle();
+  QQuickItem* technical_card =
+      FindItem(window->contentItem(), "remoteTechnicalCard");
+  check(technical_card != nullptr && !technical_card->isVisible(),
+        "remote page hides raw technical errors");
   const bool original_dark = theme->dark();
   window->setProperty("currentPageKey", QStringLiteral("home"));
   window->setWidth(1440);
@@ -252,16 +280,17 @@ int RunUxAcceptanceTest(QQuickWindow* window, backup_modern::AppTheme* theme,
     };
     check(combo->property("activeIndex").toInt() == 22 &&
               activeRows() == QList<int>{22} &&
-              checkedRows() == QList<int>{22} &&
-              activeThemeLayerMatches(22),
-          "popup opens with one themed active candidate and an independent selected check");
+              checkedRows() == QList<int>{22} && activeThemeLayerMatches(22),
+          "popup opens with one themed active candidate and an independent "
+          "selected check");
     capture(&input_window, dark ? "05-combobox-selected-dark.png"
                                 : "05-combobox-selected-light.png");
     Key(&input_window, Qt::Key_Home);
     check(combo->property("activeIndex").toInt() == 0 &&
               activeRows() == QList<int>{0} &&
               combo->property("currentIndex").toInt() == 22,
-          "popup Home moves the sole active highlight without changing selection");
+          "popup Home moves the sole active highlight without changing "
+          "selection");
     Key(&input_window, Qt::Key_PageDown);
     check(combo->property("activeIndex").toInt() > 0 &&
               activeRows().size() == 1 &&
@@ -326,7 +355,8 @@ int RunUxAcceptanceTest(QQuickWindow* window, backup_modern::AppTheme* theme,
         check(combo->property("activeIndex").toInt() == expected &&
                   activeRows() == QList<int>{expected} &&
                   combo->property("currentIndex").toInt() == 23,
-              "mouse hover moves the sole active highlight, preserving committed check");
+              "mouse hover moves the sole active highlight, preserving "
+              "committed check");
         Pointer(&input_window, row, true);
         check(!popup->property("visible").toBool() &&
                   combo->property("currentIndex").toInt() == expected,
@@ -373,6 +403,14 @@ int RunUxAcceptanceTest(QQuickWindow* window, backup_modern::AppTheme* theme,
     local_card->setWidth(880);
     Settle();
     local_card->setHeight(local_card->implicitHeight());
+    QQuickItem* local_restore = FindItem(local_card, "backupRecordRestore");
+    QQuickItem* local_delete = FindItem(local_card, "backupRecordDelete");
+    QQuickItem* local_copy = FindItem(local_card, "backupRecordCopyToCloud");
+    check(local_restore != nullptr && local_delete != nullptr &&
+              local_copy != nullptr && local_restore->height() > 0 &&
+              local_restore->height() == local_delete->height() &&
+              local_restore->implicitHeight() == local_copy->implicitHeight(),
+          "local record action buttons share one height");
     const qreal collapsed_height = local_card->implicitHeight();
     QQuickItem* details = FindItem(local_card, "backupRecordDetailsButton");
     QQuickItem* pipeline = FindItem(local_card, "backupRecordPipeline");
@@ -428,6 +466,17 @@ int RunUxAcceptanceTest(QQuickWindow* window, backup_modern::AppTheme* theme,
     remote_card->setProperty("createdText", QStringLiteral("2026-10-29"));
     Settle();
     remote_card->setHeight(remote_card->implicitHeight());
+    QQuickItem* remote_restore =
+        FindItem(remote_card, "remoteSnapshotRestoreButton");
+    QQuickItem* remote_download =
+        FindItem(remote_card, "remoteSnapshotDownloadButton");
+    QQuickItem* remote_delete =
+        FindItem(remote_card, "remoteSnapshotDeleteButton");
+    check(remote_restore != nullptr && remote_download != nullptr &&
+              remote_delete != nullptr && remote_restore->height() > 0 &&
+              remote_restore->height() == remote_download->height() &&
+              remote_restore->height() == remote_delete->height(),
+          "remote record action buttons share one height");
     QQuickItem* details = FindItem(remote_card, "remoteSnapshotDetailsButton");
     QQuickItem* time = FindItem(remote_card, "remoteSnapshotTime");
     check(details != nullptr && time != nullptr && !time->isVisible(),

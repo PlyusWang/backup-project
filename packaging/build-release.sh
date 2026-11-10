@@ -83,6 +83,10 @@ RELEASE_DIR="$OUT_ROOT/$VERSION"
 WORK="$REPO_ROOT/dist/.packaging-work"
 rm -rf "$WORK" "$RELEASE_DIR"
 mkdir -p "$WORK" "$RELEASE_DIR"
+# WORK was recreated above, so both product families share fresh release
+# objects without reusing or cleaning the development build/ directory.
+RELEASE_BUILD_DIR="$WORK/build"
+RELEASE_CXXFLAGS="${BACKUP_RELEASE_CXXFLAGS:--std=c++17 -Wall -Wextra -Wpedantic -O2}"
 log "版本 $VERSION（deb: $DEB_VERSION）架构 $DEB_ARCH"
 log "制品目录：$RELEASE_DIR"
 
@@ -100,6 +104,16 @@ TREE="$(git rev-parse 'HEAD^{tree}')"
 BRANCH="$(git rev-parse --abbrev-ref HEAD)"
 STAMP="$(date -u -d "@$SOURCE_DATE_EPOCH" +%Y-%m-%dT%H:%M:%SZ)"
 
+staged_cxxflags() {
+  local info="$REPO_ROOT/dist/$1/BUILD-INFO.txt"
+  # --skip-stage may reuse an older stage whose flags were never recorded.
+  if [ -f "$info" ] && grep -q '^cxxflags[[:space:]]*=' "$info"; then
+    sed -n 's/^cxxflags[[:space:]]*=[[:space:]]*//p' "$info"
+  else
+    printf '%s\n' 'unknown (stage metadata missing)'
+  fi
+}
+
 write_build_info() {
   local dir="$1" product="$2"
   mkdir -p "$dir"
@@ -114,6 +128,7 @@ working_tree      = clean
 build_os          = $OS_PRETTY
 build_glibc       = $GLIBC_VERSION
 compiler          = $CXX_VERSION
+cxxflags          = $(staged_cxxflags "${product%%-*}")
 qt_version        = $QT_VERSION
 architecture      = $DEB_ARCH
 source_date_epoch = $SOURCE_DATE_EPOCH
@@ -150,7 +165,7 @@ build_deb() {  # $1=deb_dir $2=tree $3=out $4=depends
   done
   [ -f "$deb_dir/conffiles" ] && cp "$deb_dir/conffiles" "$root/DEBIAN/conffiles"
   local installed_size
-  installed_size="$(( ( $(du -sk "$root" | awk '{print $1}') + 1023 ) / 1024 ))"
+  installed_size="$(installed_size_kib "$root")"
   sed -e "s|@VERSION@|$DEB_VERSION|" -e "s|@ARCH@|$DEB_ARCH|" \
       -e "s|@DEPENDS@|$depends|" -e "s|@INSTALLED_SIZE@|$installed_size|" \
       "$deb_dir/control.in" > "$root/DEBIAN/control"
@@ -174,7 +189,9 @@ tar_reproducible() {  # $1=out $2=父目录 $3=顶层目录名
 # ============================================================
 stage_client() {
   log "== staging 客户端（scripts/stage-client-release.sh，唯一的真值来源）=="
-  MAKEFLAGS="-j$JOBS" bash scripts/stage-client-release.sh --out dist/client --version "$VERSION" \
+  MAKEFLAGS="-j$JOBS" BACKUP_RELEASE_BUILD_DIR="$RELEASE_BUILD_DIR" \
+    BACKUP_RELEASE_CXXFLAGS="$RELEASE_CXXFLAGS" \
+    bash scripts/stage-client-release.sh --out dist/client --version "$VERSION" \
     > "$WORK/stage-client.log" 2>&1 || { tail -30 "$WORK/stage-client.log" >&2; die "客户端 staging 失败"; }
   tail -6 "$WORK/stage-client.log"
 }
@@ -422,7 +439,9 @@ EOF
 # ============================================================
 stage_server() {
   log "== staging 服务端（scripts/stage-server-release.sh）=="
-  MAKEFLAGS="-j$JOBS" bash scripts/stage-server-release.sh --out dist/server --version "$VERSION" \
+  MAKEFLAGS="-j$JOBS" BACKUP_RELEASE_BUILD_DIR="$RELEASE_BUILD_DIR" \
+    BACKUP_RELEASE_CXXFLAGS="$RELEASE_CXXFLAGS" \
+    bash scripts/stage-server-release.sh --out dist/server --version "$VERSION" \
     > "$WORK/stage-server.log" 2>&1 || { tail -30 "$WORK/stage-server.log" >&2; die "服务端 staging 失败"; }
   tail -6 "$WORK/stage-server.log"
   [ -f dist/server/bin/backup-server-admin.sh ] || die "服务端 staging 里没有管理员菜单脚本（scripts/backup-server-admin.sh）"
@@ -494,7 +513,7 @@ EOF
               "$tree/usr/lib/backup-project-server/bin/backup-cert-tool" 2>/dev/null || true)"
   [ -n "$depends" ] || die "dpkg-shlibdeps 没有算出服务端依赖"
   # adduser 是 Essential:yes，但显式写上更清楚；systemd 只在真机安装时需要。
-  depends="$depends, adduser, init-system-helpers (>= 1.51)"
+  depends="$depends, adduser, init-system-helpers (>= 1.51), iproute2, util-linux"
   log "  依赖（dpkg-shlibdeps）：$depends"
   build_deb "$tmp_deb_dir" "$tree" "$RELEASE_DIR/backup-project-server_${DEB_VERSION}_${DEB_ARCH}.deb" "$depends"
 }
@@ -530,6 +549,14 @@ pack_server_tarball() {
 # ============================================================
 # 顶层流程
 # ============================================================
+if [ "$SKIP_STAGE" -eq 1 ]; then
+  for family in client server; do
+    if [ "$ONLY" = all ] || [ "$ONLY" = "$family" ]; then
+      validate_stage_build_info "$REPO_ROOT/dist/$family/BUILD-INFO.txt" "$COMMIT" "$VERSION" ||
+        die "--skip-stage 的 $family staging 与当前干净版本不一致，拒绝重写制品身份"
+    fi
+  done
+fi
 if [ "$ONLY" = "all" ] || [ "$ONLY" = "client" ]; then
   if [ "$SKIP_STAGE" -eq 0 ]; then stage_client; fi
   build_appdir
@@ -558,6 +585,12 @@ log "== SHA256SUMS 与 RELEASE-INFO.txt =="
   echo "build_os      = $OS_PRETTY"
   echo "build_glibc   = $GLIBC_VERSION"
   echo "compiler      = $CXX_VERSION"
+  if [ "$ONLY" = "all" ] || [ "$ONLY" = "client" ]; then
+    echo "client_cxxflags = $(staged_cxxflags client)"
+  fi
+  if [ "$ONLY" = "all" ] || [ "$ONLY" = "server" ]; then
+    echo "server_cxxflags = $(staged_cxxflags server)"
+  fi
   echo "qt_version    = $QT_VERSION"
   echo "source_date_epoch = $SOURCE_DATE_EPOCH"
   echo "build_timestamp   = $STAMP"

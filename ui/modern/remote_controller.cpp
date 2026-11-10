@@ -30,6 +30,7 @@
 #include <QFile>
 #include <QFileInfo>
 #include <QMetaObject>
+#include <QRegularExpression>
 #include <QTimer>
 #include <QtConcurrent/QtConcurrentRun>
 #include <algorithm>
@@ -71,6 +72,31 @@ namespace {
 using backupproject::net::RemoteSnapshotInfo;
 using backupproject::net::RemoteTransferProgress;
 using backupproject::net::Status;
+
+QString SanitizeRemoteDiagnostic(const QString& technical,
+                                 const QString& known_password) {
+  QString text = technical;
+  if (!known_password.isEmpty()) {
+    text.replace(known_password, QStringLiteral("<redacted>"));
+  }
+  // SSH 配置或代理程序也可能写 stderr，不能只依赖 OpenSSH 不回显凭据。
+  // 私钥块可能已被隧道层截尾；出现任一边界时整段省略，避免留下密钥正文。
+  static const QRegularExpression private_key(
+      QStringLiteral("-----[A-Z ]*PRIVATE KEY-----"),
+      QRegularExpression::CaseInsensitiveOption);
+  if (text.contains(private_key)) {
+    return QStringLiteral("<private-key diagnostic redacted>");
+  }
+  static const QRegularExpression secret_line(QStringLiteral(
+      "(?i)\\b([a-z0-9_-]*(?:pass(?:word|phrase)?|token|secret|authorization|"
+      "private[_ -]?key|api[_ "
+      "-]?key))\\b[\"']?\\s*(?:[:=]|\\s)\\s*[^\\r\\n]*"));
+  text.replace(secret_line, QStringLiteral("\\1=<redacted>"));
+  static const QRegularExpression bearer(
+      QStringLiteral("(?i)\\bBearer\\s+[^\\r\\n]*"));
+  text.replace(bearer, QStringLiteral("Bearer <redacted>"));
+  return SshTunnelManager::SanitizeSshStderr(text.toUtf8());
+}
 
 // 流式 SHA-256：复制路径上的“内容相同”必须由实际字节回答，不能由名字或
 // 长度回答。返回的十六进制与协议里的 SHA-256 字段同一编码。
@@ -1324,6 +1350,20 @@ void RemoteController::OnProgressNotify() {
 
 // ---- 输入校验 ----
 
+void RemoteController::ReportUserError(const QString& error_kind,
+                                       const QString& action,
+                                       const QString& technical) {
+  if (!technical.isEmpty()) {
+    const QString diagnostic = SanitizeRemoteDiagnostic(technical, password_);
+    std::fprintf(stderr, "[remote] %s (%s): %s\n", action.toUtf8().constData(),
+                 error_kind.toUtf8().constData(),
+                 diagnostic.toUtf8().constData());
+  }
+  const UserFacingError explained = ExplainOperationError(error_kind, action);
+  emit userError(explained.title, explained.summary, explained.suggestion,
+                 QString());
+}
+
 // last_error_kind_ 由调用方先设置好（横幅标题要用它），这里只负责把同一句
 // 话投递到正确的容器，并且只在值真的发生变化时才发信号。
 void RemoteController::ReportSurfaceError(ErrorSurface surface,
@@ -2388,12 +2428,14 @@ void RemoteController::ApplyResult(const RemoteOpResult& result) {
       last_raw_restore_downloaded_bytes_ = result.raw_downloaded_bytes;
       last_raw_restore_entries_ = result.raw_restored_entries;
     }
-    std::fprintf(
-        stderr, "[remote] %s 没有完成：%s%s%s\n",
-        KindName(result.kind).toUtf8().constData(),
-        result.status_name.empty() ? "" : result.status_name.c_str(),
-        result.status_name.empty() ? "" : " ",
-        result.detail.empty() ? "(没有更多信息)" : result.detail.c_str());
+    const QString diagnostic = SanitizeRemoteDiagnostic(
+        QString::fromStdString(result.detail), password_);
+    std::fprintf(stderr, "[remote] %s 没有完成：%s%s%s\n",
+                 KindName(result.kind).toUtf8().constData(),
+                 result.status_name.empty() ? "" : result.status_name.c_str(),
+                 result.status_name.empty() ? "" : " ",
+                 diagnostic.isEmpty() ? "(没有更多信息)"
+                                      : diagnostic.toUtf8().constData());
     if (raw_needs_password) {
       // 这不是失败，是"还差一样东西"。那份归档与目标目录都留着，页面切到
       // 密码那一段；横幅只说下一步要做什么，不报错误——报错误会让用户以为
@@ -2447,7 +2489,7 @@ void RemoteController::ApplyResult(const RemoteOpResult& result) {
     const QString message =
         SurfaceFailureMessage(result.kind, result.error_kind, result.message);
     // 用户主动发起的操作失败：一条中文结论 + 下一步进对话框；原始协议原因
-    // 只作为折叠的技术详情。表单校验（缺字段 / 两次密码不一致）不走这里，
+    // 只写入脱敏的 stderr。表单校验（缺字段 / 两次密码不一致）不走这里，
     // 那些仍然在输入框附近提示。
     const QString action =
         result.kind == RemoteOpResult::Kind::kLogin ? QStringLiteral("登录")
@@ -2461,10 +2503,7 @@ void RemoteController::ApplyResult(const RemoteOpResult& result) {
         : result.kind == RemoteOpResult::Kind::kCopyToLocal
             ? QStringLiteral("下载到本地仓库")
             : QStringLiteral("云端操作");
-    const UserFacingError explained =
-        ExplainOperationError(result.error_kind, action);
-    emit userError(explained.title, explained.summary, explained.suggestion,
-                   QString::fromStdString(result.detail));
+    ReportUserError(result.error_kind, action);
     // 登录 / 注册 / 注销各自有错误行：原因写在那里，页面底部的横幅也不能继续
     // 挂着"正在登录"这种已经过期的运行状态（那是"点了没反应"的另一面：按钮
     // 早就停了，横幅还在转，而且 running 还是跨页可见的全局状态）。
@@ -3644,6 +3683,8 @@ void RemoteController::FailDeferredRequest() {
     // 表单里已经有原因了，横幅不能继续挂着"正在登录"这种过期状态。
     SetIdleBaseline();
   }
+  ReportUserError(last_error_kind_, QStringLiteral("建立安全通道"),
+                  tunnel_.diagnosticText());
   emit operationFinished(QStringLiteral("tunnel"), false);
 }
 
@@ -3672,6 +3713,8 @@ void RemoteController::OnTunnelStateChanged() {
       last_detail_ = tunnel_.diagnosticText().toStdString();
       SetBusy(false, QString());
       ReportSurfaceError(ErrorSurface::kBanner, tunnel_.failureText());
+      ReportUserError(last_error_kind_, QStringLiteral("建立安全通道"),
+                      tunnel_.diagnosticText());
       return;
     }
   }
@@ -3805,8 +3848,9 @@ QString RemoteController::CommitServerKeyPin(const QString& pin) {
   }
   if (busy_) {
     last_error_kind_ = QStringLiteral("busy");
-    ReportSurfaceError(ErrorSurface::kServerKey,
-                       QStringLiteral("正在处理连接请求，完成后再更改服务器身份指纹"));
+    ReportSurfaceError(
+        ErrorSurface::kServerKey,
+        QStringLiteral("正在处理连接请求，完成后再更改服务器身份指纹"));
     return QStringLiteral("invalid");
   }
   InvalidateConnectionForSettingsChange();

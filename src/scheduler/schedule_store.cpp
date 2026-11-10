@@ -280,7 +280,7 @@ bool ValidateScheduleConfig(const ScheduleConfig& config,
                  "'. Realtime backups use their own store (realtime.json).");
     return false;
   }
-  // 组合校验只有一份实现：产品矩阵 + "增量只支持 MyPack" + "计划不接受加密"。
+  // 组合校验只有一份实现：产品矩阵、增量 pack 能力与计划加密凭据要求。
   // 这里不再自己写 if 链——"GUI 能存、CLI 读不了"就是这么来的。
   BackupOptionCombination combination;
   combination.trigger = config.trigger;

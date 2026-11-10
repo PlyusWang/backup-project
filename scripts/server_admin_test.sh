@@ -27,8 +27,8 @@
 
 set -uo pipefail
 
-ROOT_DIR="$(cd "$(dirname "$BASH_SOURCE")/.." && pwd)"
-cd "$ROOT_DIR"
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$ROOT_DIR" || exit 1
 TEST_ROOT="${BACKUP_SERVER_ADMIN_TEST_ROOT:-$(mktemp -d "${TMPDIR:-/tmp}/bp-server-admin-test.XXXXXX")}"
 mkdir -p "$TEST_ROOT/data" "$TEST_ROOT/state" "$TEST_ROOT/logs" \
   "$TEST_ROOT/repo" "$TEST_ROOT/src"
@@ -99,7 +99,8 @@ else
   record_fail "传输身份私钥权限" "期望 0600，实际 $KEY_MODE"
   finish
 fi
-export BACKUP_REMOTE_SERVER_KEY="$(grep -oE 'sha256:[0-9a-f]{64}' "$KEYGEN_OUT" | head -1)"
+BACKUP_REMOTE_SERVER_KEY="$(grep -oE 'sha256:[0-9a-f]{64}' "$KEYGEN_OUT" | head -1)"
+export BACKUP_REMOTE_SERVER_KEY
 if [ -n "$BACKUP_REMOTE_SERVER_KEY" ]; then
   record_pass "客户端 pin 已从 keygen 输出读入环境变量 BACKUP_REMOTE_SERVER_KEY（不打印、不写常量）"
 else
@@ -287,7 +288,7 @@ if [ "$UNREADABLE_CODE" = "0" ] \
    && grep -q '^传输身份指纹: 不可用' "$TEST_ROOT/admin.txt" \
    && grep -q '原因:' "$TEST_ROOT/admin.txt" \
    && grep -q '用户数：' "$TEST_ROOT/admin.txt"; then
-  record_pass "身份私钥读不到时：显示“不可用 + 原因”，菜单其余输出照常（退出码 0）"
+  record_pass '身份私钥读不到时：显示“不可用 + 原因”，菜单其余输出照常（退出码 0）'
 else
   record_fail "身份私钥读不到时" \
     "exit=$UNREADABLE_CODE $(head -3 "$TEST_ROOT/admin.txt" | tr '\n' ' ')"
@@ -298,7 +299,7 @@ BACKUP_SERVER_ROOT="$TEST_ROOT" timeout --signal=KILL 60 \
   bash scripts/backup-server-admin.sh </dev/null > "$WRAPPER_HOME" 2>&1 || true
 if grep -q "^传输身份指纹: $BACKUP_REMOTE_SERVER_KEY" "$WRAPPER_HOME" \
    && grep -q '5. 服务器身份与连接信息' "$WRAPPER_HOME"; then
-  record_pass "菜单首页直接显示指纹，并且第 5 项就是“服务器身份信息”"
+  record_pass '菜单首页直接显示指纹，并且第 5 项就是“服务器身份信息”'
 else
   record_fail "菜单首页" "$(head -8 "$WRAPPER_HOME" | tr '\n' ' ')"
 fi
@@ -613,7 +614,7 @@ if ! grep -q "$SNAP_B1" "$TEST_ROOT/admin.txt" && grep -q "$SNAP_B2" "$TEST_ROOT
 else
   record_fail "删除单个快照之后的元数据" "$(head -4 "$TEST_ROOT/admin.txt" | tr '\n' ' ')"
 fi
-if ls "$DATA/users/$USER_B_ID/trash" 2>/dev/null | grep -q '.deleted'; then
+if find "$DATA/users/$USER_B_ID/trash" -maxdepth 1 -name "*.deleted*" -print -quit 2>/dev/null | grep -q .; then
   record_fail "删除之后 trash 里没有残留" "还有 .deleted 文件"
 else
   record_pass "删除之后 trash 里没有残留"
@@ -674,7 +675,7 @@ if awk -v name="$USER_B" '$2 == name { found = 1 } END { exit found ? 0 : 1 }' \
 else
   record_fail "跨用户隔离" "User B 受到了影响"
 fi
-if ls "$DATA/trash" 2>/dev/null | grep -q '^account-'; then
+if find "$DATA/trash" -maxdepth 1 -name "account-*" -print -quit 2>/dev/null | grep -q .; then
   record_fail "账户注销之后 trash 里没有残留" "还有 account-* 目录"
 else
   record_pass "账户注销之后 trash 里没有残留"
@@ -833,5 +834,587 @@ if [ -n "$BPSEC1_PORT" ]; then
 else
   record_fail "BPSEC1 初始化连接信息" "20751-20800 端口均已占用"
 fi
+
+# ---- 18. Stopped-instance certificate import and configuration updates ----
+run_manager() {
+  local input="$1" output="$2"
+  printf '%s' "$input" |
+    env BACKUP_SERVER_ROOT="$MANAGER_ROOT" \
+        BACKUP_SERVER_CONFIG="$MANAGER_ROOT/server.conf" \
+        BACKUP_SERVER_DATA="$MANAGER_ROOT/data" \
+        BACKUP_SERVER_DB="$MANAGER_ROOT/state/metadata.sqlite3" \
+        BACKUP_SERVER_PID_FILE="$MANAGER_ROOT/state/server.pid" \
+        BACKUP_SERVER_ADMIN="$ADMIN" \
+        BACKUP_SERVER_BIN="$MANAGER_TOOLS/backup-server" \
+        BACKUP_SERVER_KEYGEN="$MANAGER_TOOLS/backup-server-keygen" \
+        BACKUP_CERT_TOOL="$MANAGER_TOOLS/backup-cert-tool" \
+        timeout --signal=KILL 90 bash "$ROOT_DIR/scripts/backup-server-admin.sh" >"$output" 2>&1
+}
+manager_config_sha() { sha256sum "$MANAGER_ROOT/server.conf" | cut -d' ' -f1; }
+manager_import_input() { printf '8\n1\n%s\n%s\n%s\n\n0\n' "$1" "$2" "$3"; }
+
+if [ -f "$MANAGER_ROOT/server.conf" ]; then
+  IMPORT_SOURCE="$TEST_ROOT/import source with spaces"
+  mkdir -p "$IMPORT_SOURCE"
+  ./build/backup-cert-tool root-init --root-key "$IMPORT_SOURCE/root.key" --root-id manager-import-root \
+    >"$IMPORT_SOURCE/root-init.log" 2>&1
+  MANAGER_PUBLIC="$("$KEYGEN" --show --key-file "$MANAGER_ROOT/state/transport.key" |
+    sed -n 's/.*公钥 (hex): //p')"
+  ./build/backup-cert-tool issue-server --root-key "$IMPORT_SOURCE/root.key" \
+    --server-id manager-import-valid --server-pubkey "hex:$MANAGER_PUBLIC" \
+    --out "$IMPORT_SOURCE/valid.bpcert" >"$IMPORT_SOURCE/issue-valid.log" 2>&1
+  ./build/backup-cert-tool issue-server --root-key "$IMPORT_SOURCE/root.key" \
+    --server-id manager-import-expired --server-pubkey "hex:$MANAGER_PUBLIC" \
+    --not-before 1 --days 1 --out "$IMPORT_SOURCE/expired.bpcert" >"$IMPORT_SOURCE/issue-expired.log" 2>&1
+  "$KEYGEN" --output "$IMPORT_SOURCE/other-transport.key" >"$IMPORT_SOURCE/other-keygen.log" 2>&1
+  OTHER_PUBLIC="$("$KEYGEN" --show --key-file "$IMPORT_SOURCE/other-transport.key" |
+    sed -n 's/.*公钥 (hex): //p')"
+  ./build/backup-cert-tool issue-server --root-key "$IMPORT_SOURCE/root.key" \
+    --server-id manager-import-wrong-key --server-pubkey "hex:$OTHER_PUBLIC" \
+    --out "$IMPORT_SOURCE/wrong-key.bpcert" >"$IMPORT_SOURCE/issue-wrong-key.log" 2>&1
+  cp "$IMPORT_SOURCE/valid.bpcert" "$IMPORT_SOURCE/tampered.bpcert"
+  python3 - "$IMPORT_SOURCE/tampered.bpcert" <<'PY'
+from pathlib import Path
+import sys
+p = Path(sys.argv[1])
+b = bytearray(p.read_bytes())
+b[-1] ^= 1
+p.write_bytes(b)
+PY
+  TRANSPORT_BEFORE="$(sha256sum "$MANAGER_ROOT/state/transport.key" | cut -d' ' -f1)"
+  ROOT_KEY_BEFORE="$(sha256sum "$MANAGER_ROOT/private/root.key" | cut -d' ' -f1)"
+  IMPORT_ROOT_PRIVATE_BEFORE="$(sha256sum "$IMPORT_SOURCE/root.key" | cut -d' ' -f1)"
+  BEFORE="$(manager_config_sha)"
+  truncate -s 65537 "$IMPORT_SOURCE/oversized-root.pub"
+  truncate -s 4097 "$IMPORT_SOURCE/oversized.bpcert"
+  for failure in wrong-root expired wrong-key tampered cancelled oversized-root oversized-cert root-private; do
+    ROOT_INPUT="$IMPORT_SOURCE/root.key.pub"
+    CERT_INPUT="$IMPORT_SOURCE/valid.bpcert"
+    CONFIRMATION='IMPORT BPSEC2'
+    case "$failure" in
+      wrong-root) ROOT_INPUT="$MANAGER_ROOT/private/root.key.pub" ;;
+      expired) CERT_INPUT="$IMPORT_SOURCE/expired.bpcert" ;;
+      wrong-key) CERT_INPUT="$IMPORT_SOURCE/wrong-key.bpcert" ;;
+      tampered) CERT_INPUT="$IMPORT_SOURCE/tampered.bpcert" ;;
+      cancelled) CONFIRMATION=no ;;
+      oversized-root) ROOT_INPUT="$IMPORT_SOURCE/oversized-root.pub" ;;
+      oversized-cert) CERT_INPUT="$IMPORT_SOURCE/oversized.bpcert" ;;
+      root-private) ROOT_INPUT="$IMPORT_SOURCE/root.key" ;;
+    esac
+    run_manager "$(manager_import_input "$ROOT_INPUT" "$CERT_INPUT" "$CONFIRMATION")"$'\n' \
+      "$TEST_ROOT/manager-import-$failure.log"
+    if [ "$BEFORE" = "$(manager_config_sha)" ] &&
+        ! find "$MANAGER_ROOT/state" -maxdepth 1 -name 'client-identity.*' -print -quit | grep -q .; then
+      record_pass "证书导入拒绝 $failure，原配置和材料保持不变"
+    else
+      record_fail "证书导入拒绝 $failure" "配置变化或留下未提交的公钥材料"
+    fi
+  done
+  printf '# synthetic-private-comment-must-not-be-shared\n' >>"$IMPORT_SOURCE/root.key.pub"
+  run_manager "$(printf '8\n1\n%s\n%s\nIMPORT BPSEC2\n\n5\n\n8\n\n0\n' "$IMPORT_SOURCE/root.key.pub" "$IMPORT_SOURCE/valid.bpcert")"$'\n' \
+    "$TEST_ROOT/manager-import-valid.log"
+  IMPORTED_CERT="$(sed -n 's/^certificate = //p' "$MANAGER_ROOT/server.conf")"
+  IMPORTED_ROOT="$(dirname "$IMPORTED_CERT")/trusted-root.pub"
+  if grep -q '证书导入完成' "$TEST_ROOT/manager-import-valid.log" &&
+      [ -f "$IMPORTED_CERT" ] && [ -f "$IMPORTED_ROOT" ] &&
+      grep -q '^require_bpsec2 = true$' "$MANAGER_ROOT/server.conf" &&
+      [ -f "$MANAGER_ROOT/state/server.bpcert" ] &&
+      [ "$TRANSPORT_BEFORE" = "$(sha256sum "$MANAGER_ROOT/state/transport.key" | cut -d' ' -f1)" ] &&
+      [ "$ROOT_KEY_BEFORE" = "$(sha256sum "$MANAGER_ROOT/private/root.key" | cut -d' ' -f1)" ] &&
+      [ "$IMPORT_ROOT_PRIVATE_BEFORE" = "$(sha256sum "$IMPORT_SOURCE/root.key" | cut -d' ' -f1)" ] &&
+      ! grep -q 'synthetic-private-comment' "$IMPORTED_ROOT" &&
+      ./build/backup-cert-tool verify-server --cert "$IMPORTED_CERT" --roots "$IMPORTED_ROOT" \
+        >"$TEST_ROOT/manager-import-verify.log" 2>&1; then
+    record_pass '安全导入启用 BPSEC2，保持旧材料与私钥，公钥副本不携带源注释'
+  else
+    record_fail '安全导入已有证书' "$(tail -6 "$TEST_ROOT/manager-import-valid.log" | tr '\n' ' ')"
+  fi
+  if [ "$(grep -Fc "$IMPORTED_ROOT" "$TEST_ROOT/manager-import-valid.log")" -ge 3 ]; then
+    record_pass '同一菜单会话导入后身份页与证书页同步使用新根路径'
+  else
+    record_fail '同会话身份刷新' '仍显示旧根或未重新验证'
+  fi
+  run_manager $'8\n\n0\n' "$TEST_ROOT/manager-import-reopen.log"
+  if grep -Fq "$IMPORTED_ROOT" "$TEST_ROOT/manager-import-reopen.log" &&
+      grep -q 'verdict *= *TRUSTED' "$TEST_ROOT/manager-import-reopen.log"; then
+    record_pass '重启菜单后仍显示已提交的可信根绝对路径并验证配对'
+  else
+    record_fail '重新打开已导入证书' '根路径未持久化或验证失败'
+  fi
+
+  BEFORE="$(manager_config_sha)"
+  run_manager $'2\n\n8\n1\n\n9\n1\n\n3\n\n0\n' "$TEST_ROOT/manager-running-edits.log"
+  if [ "$BEFORE" = "$(manager_config_sha)" ] &&
+      [ "$(grep -c '请先停止服务器，再修改配置或证书' "$TEST_ROOT/manager-running-edits.log")" -ge 2 ] &&
+      ! ss -ltnH "sport = :$MANAGER_PORT" | grep -q .; then
+    record_pass '实际运行的实例拒绝证书与配置编辑，停止后端口释放'
+  else
+    record_fail '运行中修改保护' "$(tail -6 "$TEST_ROOT/manager-running-edits.log" | tr '\n' ' ')"
+  fi
+  # A server using the data root on a different port still holds this lock.
+  flock -F "$MANAGER_ROOT/data/.backup-server.lock" sleep 15 &
+  MANAGER_LOCK_HOLDER=$!
+  sleep 0.1
+  run_manager $'9\n1\n\n0\n' "$TEST_ROOT/manager-data-lock-edit.log"
+  kill -TERM "$MANAGER_LOCK_HOLDER" 2>/dev/null || true
+  wait "$MANAGER_LOCK_HOLDER" 2>/dev/null || true
+  if [ "$BEFORE" = "$(manager_config_sha)" ] &&
+      grep -q '持有数据目录锁' "$TEST_ROOT/manager-data-lock-edit.log"; then
+    record_pass '无 PID/监听提示时仍通过数据目录内核锁拒绝并发修改'
+  else
+    record_fail '数据目录锁保护' '配置变化或未拒绝'
+  fi
+
+  UPDATE_PORT=""
+  for candidate in $(seq 20801 20850); do
+    if ! ss -ltnH "sport = :$candidate" 2>/dev/null | grep -q .; then UPDATE_PORT="$candidate"; break; fi
+  done
+  NEW_LOG="$MANAGER_ROOT/logs/updated server.log"
+  printf 'same-session-log-sentinel\n' >"$NEW_LOG"
+  run_manager "$(printf '9\n1\n%s\n7\n45\n%s\n\nSAVE\n\n10\n\n9\n\n0\n' "$UPDATE_PORT" "$NEW_LOG")"$'\n' \
+    "$TEST_ROOT/manager-config-valid.log"
+  if grep -q '配置已保存' "$TEST_ROOT/manager-config-valid.log" &&
+      grep -q "^port = $UPDATE_PORT$" "$MANAGER_ROOT/server.conf" &&
+      grep -q '^workers = 7$' "$MANAGER_ROOT/server.conf" &&
+      grep -q '^io_timeout = 45$' "$MANAGER_ROOT/server.conf" &&
+      grep -Fxq "log_file = $NEW_LOG" "$MANAGER_ROOT/server.conf" &&
+      grep -Fxq "transport_key = $MANAGER_ROOT/state/transport.key" "$MANAGER_ROOT/server.conf" &&
+      grep -Fxq "certificate = $IMPORTED_CERT" "$MANAGER_ROOT/server.conf" &&
+      grep -q 'same-session-log-sentinel' "$TEST_ROOT/manager-config-valid.log"; then
+    record_pass '停机配置编辑保存端口/线程/超时/含空格日志路径，身份路径保持不变'
+  else
+    record_fail '合法配置保存' "$(tail -6 "$TEST_ROOT/manager-config-valid.log" | tr '\n' ' ')"
+  fi
+  BEFORE="$(manager_config_sha)"
+  run_manager $'9\n1\n\n99\n\n\n\nSAVE\n\n0\n' "$TEST_ROOT/manager-config-invalid.log"
+  if [ "$BEFORE" = "$(manager_config_sha)" ] &&
+      grep -q 'workers 必须在' "$TEST_ROOT/manager-config-invalid.log"; then
+    record_pass '复用启动器范围校验，非法配置不发布'
+  else
+    record_fail '非法配置拒绝' '原配置变化或未执行共享校验'
+  fi
+  INJECTION_LOG="$MANAGER_ROOT/logs/"'$(touch '"$TEST_ROOT"'/INJECTED)'
+  run_manager "$(printf '9\n1\n\n\n\n%s\n\n0\n' "$INJECTION_LOG")"$'\n' "$TEST_ROOT/manager-config-injection.log"
+  if [ "$BEFORE" = "$(manager_config_sha)" ] && [ ! -e "$TEST_ROOT/INJECTED" ] &&
+      grep -q '不支持的配置字符' "$TEST_ROOT/manager-config-injection.log"; then
+    record_pass '配置输入中的 shell 表达式被拒绝且没有执行'
+  else
+    record_fail '配置输入注入拒绝' '配置变化或产生表达式副作用'
+  fi
+  run_manager "$(printf '9\n1\n\n\n\n%s\n\n0\n' "$MANAGER_ROOT/state/transport.key")"$'\n' \
+    "$TEST_ROOT/manager-config-protected-log.log"
+  if [ "$BEFORE" = "$(manager_config_sha)" ] &&
+      grep -q '日志路径不能覆盖' "$TEST_ROOT/manager-config-protected-log.log" &&
+      [ "$TRANSPORT_BEFORE" = "$(sha256sum "$MANAGER_ROOT/state/transport.key" | cut -d' ' -f1)" ]; then
+    record_pass '日志路径不能覆盖传输私钥或其他受保护文件'
+  else
+    record_fail '日志覆盖身份保护' '配置或传输私钥发生改变'
+  fi
+  run_manager $'9\n1\n\n\n\n\n1\nno\n\n0\n' "$TEST_ROOT/manager-mode-cancel.log"
+  if [ "$BEFORE" = "$(manager_config_sha)" ]; then
+    record_pass '未明确确认时不允许 BPSEC1 降级'
+  else
+    record_fail '降级确认' '取消后配置发生改变'
+  fi
+  run_manager $'9\n1\n\n\n\n\n1\nALLOW BPSEC1\nSAVE\n\n0\n' "$TEST_ROOT/manager-mode-bpsec1.log"
+  MODE_B1_OK=0
+  grep -q '^require_bpsec2 = false$' "$MANAGER_ROOT/server.conf" && MODE_B1_OK=1
+  run_manager $'9\n1\n\n\n\n\n2\nSAVE\n\n0\n' "$TEST_ROOT/manager-mode-bpsec2.log"
+  if [ "$MODE_B1_OK" = 1 ] && grep -q '^require_bpsec2 = true$' "$MANAGER_ROOT/server.conf" &&
+      grep -q 'verdict *= *TRUSTED' "$TEST_ROOT/manager-mode-bpsec2.log" &&
+      [ "$TRANSPORT_BEFORE" = "$(sha256sum "$MANAGER_ROOT/state/transport.key" | cut -d' ' -f1)" ]; then
+    record_pass '明确确认后 BPSEC1/BPSEC2 切换，重验配对且传输私钥保持不变'
+  else
+    record_fail '认证模式切换' "$(tail -5 "$TEST_ROOT/manager-mode-bpsec2.log" | tr '\n' ' ')"
+  fi
+  cp -p "$MANAGER_ROOT/server.conf" "$TEST_ROOT/manager-public-restore.conf"
+  sed -i 's/^bind = .*/bind = 0.0.0.0/' "$MANAGER_ROOT/server.conf"
+  BEFORE="$(manager_config_sha)"
+  run_manager $'9\n1\n\n\n\n\n1\n\n0\n' "$TEST_ROOT/manager-mode-public-refused.log"
+  if [ "$BEFORE" = "$(manager_config_sha)" ] &&
+      grep -q '公网监听不允许' "$TEST_ROOT/manager-mode-public-refused.log"; then
+    record_pass '菜单保持公网监听必须使用 BPSEC2 的安全要求'
+  else
+    record_fail '公网降级拒绝' '配置变化或未拒绝'
+  fi
+  cp -p "$TEST_ROOT/manager-public-restore.conf" "$MANAGER_ROOT/server.conf"
+  if find "$MANAGER_ROOT" -maxdepth 2 -path '*/.server-config-backup.*/server.conf' -print -quit | grep -q . &&
+      ! find "$MANAGER_ROOT" -maxdepth 1 -name '.server.conf.*' -print -quit | grep -q .; then
+    record_pass '旧配置保留且失败/取消操作不留下候选配置'
+  else
+    record_fail '原子配置与备份' '备份缺失或候选配置残留'
+  fi
+  # A PID file must not authorize a different executable or a sibling instance.
+  python3 -c 'import time; time.sleep(30)' backup-server --root "$MANAGER_ROOT/data" \
+    --db "$MANAGER_ROOT/state/metadata.sqlite3" --pid-file "$MANAGER_ROOT/state/server.pid" &
+  FAKE_SERVER_PID=$!
+  printf '%s\n' "$FAKE_SERVER_PID" >"$MANAGER_ROOT/state/server.pid"
+  run_manager $'3\n\n0\n' "$TEST_ROOT/manager-stop-fake-pid.log"
+  FAKE_STILL_ALIVE=0
+  kill -0 "$FAKE_SERVER_PID" 2>/dev/null && FAKE_STILL_ALIVE=1
+  kill -TERM "$FAKE_SERVER_PID" 2>/dev/null || true
+  wait "$FAKE_SERVER_PID" 2>/dev/null || true
+  rm -f "$MANAGER_ROOT/state/server.pid"
+  if [ "$FAKE_STILL_ALIVE" = 1 ] && grep -q '没有找到属于当前实例' "$TEST_ROOT/manager-stop-fake-pid.log"; then
+    record_pass '伪造服务器参数和 PID 文件不能授权停止其他可执行程序'
+  else
+    record_fail '假 PID 停止保护' '伪装进程受到停止信号或未明确拒绝'
+  fi
+  OTHER_PORT="$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0)); print(s.getsockname()[1]); s.close()')"
+  mkdir -p "$MANAGER_ROOT/data-other"
+  "$MANAGER_TOOLS/backup-server" --bind 127.0.0.1 --port "$OTHER_PORT" \
+    --root "$MANAGER_ROOT/data-other" --db "$MANAGER_ROOT/state/metadata.sqlite3-other" \
+    --pid-file "$MANAGER_ROOT/state/server.pid-other" --secret-file "$MANAGER_ROOT/secrets.env" \
+    --transport-key-file "$MANAGER_ROOT/state/transport.key" >"$TEST_ROOT/prefix-server.log" 2>&1 &
+  PREFIX_SERVER_PID=$!
+  for _ in $(seq 1 30); do
+    ss -ltnH "sport = :$OTHER_PORT" | grep -q . && break
+    sleep 0.1
+  done
+  printf '%s\n' "$PREFIX_SERVER_PID" >"$MANAGER_ROOT/state/server.pid"
+  run_manager $'3\n\n0\n' "$TEST_ROOT/manager-stop-prefix-pid.log"
+  PREFIX_STILL_ALIVE=0
+  if kill -0 "$PREFIX_SERVER_PID" 2>/dev/null && ss -ltnH "sport = :$OTHER_PORT" | grep -q .; then
+    PREFIX_STILL_ALIVE=1
+  fi
+  kill -TERM "$PREFIX_SERVER_PID" 2>/dev/null || true
+  wait "$PREFIX_SERVER_PID" 2>/dev/null || true
+  rm -f "$MANAGER_ROOT/state/server.pid"
+  if [ "$PREFIX_STILL_ALIVE" = 1 ] && grep -q '没有找到属于当前实例' "$TEST_ROOT/manager-stop-prefix-pid.log"; then
+    record_pass '数据/数据库/PID 路径前缀相同的真实其他实例不会被停止'
+  else
+    record_fail '相似前缀实例停止保护' '其他实例受到影响或未明确拒绝'
+  fi
+
+  # Replacing a running payload leaves the old /proc/PID/exe marked deleted.
+  ORIGINAL_MANAGER_TOOLS="$MANAGER_TOOLS"
+  MANAGER_TOOLS="$TEST_ROOT/upgrade tools"
+  mkdir -p "$MANAGER_TOOLS"
+  cp "$ROOT_DIR/build/backup-server" "$MANAGER_TOOLS/backup-server"
+  ln -s "$ROOT_DIR/build/backup-server-keygen" "$MANAGER_TOOLS/backup-server-keygen"
+  ln -s "$ROOT_DIR/build/backup-cert-tool" "$MANAGER_TOOLS/backup-cert-tool"
+  run_manager $'2\n\n0\n' "$TEST_ROOT/manager-start-before-payload-replace.log"
+  UPGRADE_SERVER_PID="$(cat "$MANAGER_ROOT/state/server.pid" 2>/dev/null || true)"
+  DELETED_EXE=''
+  case "$UPGRADE_SERVER_PID" in
+    ''|*[!0-9]*) ;;
+    *)
+      cp "$MANAGER_TOOLS/backup-server" "$MANAGER_TOOLS/backup-server.new"
+      mv "$MANAGER_TOOLS/backup-server.new" "$MANAGER_TOOLS/backup-server"
+      DELETED_EXE="$(readlink "/proc/$UPGRADE_SERVER_PID/exe" 2>/dev/null || true)"
+      ;;
+  esac
+  run_manager $'3\n\n0\n' "$TEST_ROOT/manager-stop-replaced-payload.log"
+  if [ "$DELETED_EXE" = "$MANAGER_TOOLS/backup-server (deleted)" ] &&
+      grep -q '服务器已停止' "$TEST_ROOT/manager-stop-replaced-payload.log" &&
+      ! ss -ltnH "sport = :$UPDATE_PORT" | grep -q .; then
+    record_pass '合法载荷升级后仍可精确识别并停止原实例（deleted exe）'
+  else
+    record_fail '升级载荷停止兼容' '原实例未被精确识别或端口仍在监听'
+  fi
+  MANAGER_TOOLS="$ORIGINAL_MANAGER_TOOLS"
+
+  NO_TOOLS_PATH="$TEST_ROOT/no-management-tools"
+  mkdir -p "$NO_TOOLS_PATH"
+  ln -s "$(command -v dirname)" "$NO_TOOLS_PATH/dirname"
+  MISSING_TOOL_CODE=0
+  env PATH="$NO_TOOLS_PATH" BACKUP_SERVER_ROOT="$MANAGER_ROOT" BACKUP_SERVER_ADMIN="$ADMIN" \
+    /bin/bash "$ROOT_DIR/scripts/backup-server-admin.sh" </dev/null \
+      >"$TEST_ROOT/manager-missing-ss.log" 2>&1 || MISSING_TOOL_CODE=$?
+  if [ "$MISSING_TOOL_CODE" != 0 ] && grep -q '缺少 ss' "$TEST_ROOT/manager-missing-ss.log"; then
+    record_pass '缺少 ss 时明确失败，不把不可检测的端口当作空闲'
+  else
+    record_fail 'ss 运行依赖拒绝' '缺少 ss 时未安全失败'
+  fi
+  ln -s "$(command -v ss)" "$NO_TOOLS_PATH/ss"
+  MISSING_TOOL_CODE=0
+  env PATH="$NO_TOOLS_PATH" BACKUP_SERVER_ROOT="$MANAGER_ROOT" BACKUP_SERVER_ADMIN="$ADMIN" \
+    /bin/bash "$ROOT_DIR/scripts/backup-server-admin.sh" </dev/null \
+      >"$TEST_ROOT/manager-missing-flock.log" 2>&1 || MISSING_TOOL_CODE=$?
+  if [ "$MISSING_TOOL_CODE" != 0 ] && grep -q '缺少 flock' "$TEST_ROOT/manager-missing-flock.log"; then
+    record_pass '缺少 flock 时明确失败，不跳过实例锁'
+  else
+    record_fail 'flock 运行依赖拒绝' '缺少 flock 时未安全失败'
+  fi
+
+
+  MOCK_TOOLS="$TEST_ROOT/service mocks"
+  mkdir -p "$MOCK_TOOLS"
+  cat >"$MOCK_TOOLS/systemctl" <<'MOCK'
+#!/bin/sh
+printf '%s\n' "$*" >>"$BACKUP_TEST_SYSTEMCTL_LOG"
+MOCK
+  chmod +x "$MOCK_TOOLS/systemctl"
+  (
+    # shellcheck source=/dev/null
+    source <(sed -n '/^installed_instance_matches() {/,/^}/p; /^service_manager_action() {/,/^}/p' "$ROOT_DIR/scripts/backup-server-admin.sh")
+    export PATH="$MOCK_TOOLS:$PATH" BACKUP_TEST_SYSTEMCTL_LOG="$TEST_ROOT/systemctl-actions.log"
+    export BACKUP_SERVER_SERVICE=backup-project-server
+    export SERVER_ROOT=/var/lib/backup-project-server
+    export CONFIG_FILE=/etc/backup-project-server/server.conf
+    export DATA_ROOT=/var/lib/backup-project-server/data
+    export DB_PATH=/var/lib/backup-project-server/state/metadata.sqlite3
+    export PID_FILE=/run/backup-project-server/backup-server.pid
+    service_manager_action start && service_manager_action stop
+  ) >"$TEST_ROOT/systemctl-routing.log" 2>&1
+  printf 'start backup-project-server.service\nstop backup-project-server.service\n' >"$TEST_ROOT/systemctl-actions.expected"
+  if cmp -s "$TEST_ROOT/systemctl-actions.expected" "$TEST_ROOT/systemctl-actions.log"; then
+    record_pass '安装版启停只调用固定 systemd unit（本地 mock，不操作宿主服务）'
+  else
+    record_fail 'systemd 路由' 'mock 未收到精确的固定 unit 操作'
+  fi
+  (
+    # shellcheck source=/dev/null
+    source <(sed -n '/^installed_instance_matches() {/,/^}/p; /^service_manager_action() {/,/^}/p' "$ROOT_DIR/scripts/backup-server-admin.sh")
+    export PATH="$MOCK_TOOLS:$PATH" BACKUP_TEST_SYSTEMCTL_LOG="$TEST_ROOT/systemctl-actions.log"
+    export BACKUP_SERVER_SERVICE=ssh
+    export SERVER_ROOT=/var/lib/backup-project-server
+    export CONFIG_FILE=/etc/backup-project-server/server.conf
+    export DATA_ROOT=/var/lib/backup-project-server/data
+    export DB_PATH=/var/lib/backup-project-server/state/metadata.sqlite3
+    export PID_FILE=/run/backup-project-server/backup-server.pid
+    if service_manager_action stop; then exit 1; fi
+    export BACKUP_SERVER_SERVICE=backup-project-server
+    export DATA_ROOT="$TEST_ROOT/another-instance/data"
+    if service_manager_action start; then exit 1; fi
+  ) >"$TEST_ROOT/systemctl-mismatch.log" 2>&1
+  if [ "$?" = 0 ] && cmp -s "$TEST_ROOT/systemctl-actions.expected" "$TEST_ROOT/systemctl-actions.log"; then
+    record_pass '非固定 unit 或实例路径不符时拒绝 systemd 操作'
+  else
+    record_fail 'systemd 实例隔离' '错误 unit/实例触发了 mock 操作'
+  fi
+  (
+    # shellcheck source=/dev/null
+    source <(sed -n '/^installed_instance_matches() {/,/^}/p; /^service_manager_action() {/,/^}/p' "$ROOT_DIR/scripts/backup-server-admin.sh")
+    export BACKUP_SERVER_SERVICE=backup-project-server
+    export SERVER_ROOT=/var/lib/backup-project-server
+    export CONFIG_FILE=/etc/backup-project-server/server.conf
+    export DATA_ROOT=/var/lib/backup-project-server/data
+    export DB_PATH=/var/lib/backup-project-server/state/metadata.sqlite3
+    export PID_FILE=/run/backup-project-server/backup-server.pid
+    PATH="$NO_TOOLS_PATH"
+    if service_manager_action start; then exit 1; fi
+  ) >"$TEST_ROOT/systemctl-unavailable.log" 2>&1
+  if grep -q '请使用服务器便携包' "$TEST_ROOT/systemctl-unavailable.log"; then
+    record_pass '无可用 systemd 时明确要求便携入口，不回退为 root 子进程'
+  else
+    record_fail '无 systemd 的安装版启动' '未明确拒绝并指向便携入口'
+  fi
+
+  # Simulate root/other-owner metadata to cover the ownership branch without
+  # claiming that an unprivileged test proves real root permissions.
+  OWNER_MOCKS="$TEST_ROOT/owner mocks"
+  OWNER_DATA="$TEST_ROOT/owner mock data"
+  mkdir -p "$OWNER_MOCKS" "$OWNER_DATA"
+  export BACKUP_TEST_REAL_STAT
+  BACKUP_TEST_REAL_STAT="$(command -v stat)"
+  export BACKUP_TEST_REAL_ID
+  BACKUP_TEST_REAL_ID="$(command -v id)"
+  export BACKUP_TEST_OWNER_DATA="$OWNER_DATA"
+  export BACKUP_TEST_OWNER_CHANGED="$TEST_ROOT/mock-owner-changed"
+  export BACKUP_TEST_CHOWN_LOG="$TEST_ROOT/mock-chown-actions.log"
+  cat >"$OWNER_MOCKS/stat" <<'MOCK'
+#!/bin/sh
+if [ "$1" = -c ] && [ "$2" = '%u:%g' ]; then
+  if [ "$3" = "$BACKUP_TEST_OWNER_DATA" ]; then printf '2000:2000\n'; exit 0; fi
+  if [ "$3" = "$BACKUP_TEST_OWNER_DATA/.backup-server.lock" ] && [ -e "$BACKUP_TEST_OWNER_CHANGED" ]; then
+    printf '2000:2000\n'; exit 0
+  fi
+fi
+exec "$BACKUP_TEST_REAL_STAT" "$@"
+MOCK
+  cat >"$OWNER_MOCKS/chown" <<'MOCK'
+#!/bin/sh
+printf '%s\n' "$*" >>"$BACKUP_TEST_CHOWN_LOG"
+: >"$BACKUP_TEST_OWNER_CHANGED"
+MOCK
+  cat >"$OWNER_MOCKS/id" <<'MOCK'
+#!/bin/sh
+if [ "$1" = -u ]; then printf '0\n'; exit 0; fi
+exec "$BACKUP_TEST_REAL_ID" "$@"
+MOCK
+  chmod +x "$OWNER_MOCKS/stat" "$OWNER_MOCKS/chown" "$OWNER_MOCKS/id"
+  (
+    # shellcheck source=/dev/null
+    source <(sed -n '/^with_stopped_instance() (/,/^)/p' "$ROOT_DIR/scripts/backup-server-admin.sh")
+    instance_initialized() { return 0; }
+    owned_pid() { return 1; }
+    port_listener_exists() { return 1; }
+    configured_port() { printf '18765\n'; }
+    export DATA_ROOT="$OWNER_DATA"
+    PATH="$OWNER_MOCKS:$PATH"
+    with_stopped_instance true
+  ) >"$TEST_ROOT/lock-new-owner-mock.log" 2>&1
+  OWNER_NEW_RESULT=$?
+  printf '%s\n' "--no-dereference --reference=$OWNER_DATA $OWNER_DATA/.backup-server.lock" >"$TEST_ROOT/mock-chown-actions.expected"
+  if [ "$OWNER_NEW_RESULT" = 0 ] &&
+      cmp -s "$TEST_ROOT/mock-chown-actions.expected" "$BACKUP_TEST_CHOWN_LOG" &&
+      [ "$(stat -c %a "$OWNER_DATA/.backup-server.lock")" = 600 ]; then
+    record_pass '模拟 sudo 新建锁路径只同步新锁的实例属主/组（真实 root 权限未验）'
+  else
+    record_fail '新锁属主分支' 'mock chown 参数或新锁模式不正确'
+  fi
+  rm -f "$BACKUP_TEST_OWNER_CHANGED"
+  (
+    # shellcheck source=/dev/null
+    source <(sed -n '/^with_stopped_instance() (/,/^)/p' "$ROOT_DIR/scripts/backup-server-admin.sh")
+    instance_initialized() { return 0; }
+    owned_pid() { return 1; }
+    port_listener_exists() { return 1; }
+    configured_port() { printf '18765\n'; }
+    export DATA_ROOT="$OWNER_DATA"
+    PATH="$OWNER_MOCKS:$PATH"
+    if with_stopped_instance true; then exit 1; fi
+  ) >"$TEST_ROOT/lock-existing-owner-mock.log" 2>&1
+  if [ "$?" = 0 ] && grep -q '未修改其属主' "$TEST_ROOT/lock-existing-owner-mock.log" &&
+      cmp -s "$TEST_ROOT/mock-chown-actions.expected" "$BACKUP_TEST_CHOWN_LOG"; then
+    record_pass '已有锁属主不一致时拒绝，绝不盲目 chown 既有文件'
+  else
+    record_fail '旧锁属主拒绝' '未拒绝或调用了 chown'
+  fi
+
+
+  export ADMIN_BIN="$ADMIN"
+  ADMIN_MOCKS="$TEST_ROOT/admin routing mocks"
+  mkdir -p "$ADMIN_MOCKS"
+  cat >"$ADMIN_MOCKS/runuser" <<'MOCK'
+#!/bin/bash
+printf 'ARG=%q\n' "$@" >>"$BACKUP_TEST_RUNUSER_LOG"
+MOCK
+  cat >"$ADMIN_MOCKS/backend" <<'MOCK'
+#!/bin/bash
+printf 'ARG=%q\n' "$@" >>"$BACKUP_TEST_DIRECT_ADMIN_LOG"
+MOCK
+  chmod +x "$ADMIN_MOCKS/runuser" "$ADMIN_MOCKS/backend"
+  (
+    # shellcheck source=/dev/null
+    source <(sed -n '/^installed_instance_matches() {/,/^}/p; /^admin() {/,/^}/p' "$ROOT_DIR/scripts/backup-server-admin.sh")
+    instance_ready() { return 0; }
+    export PATH="$ADMIN_MOCKS:$OWNER_MOCKS:$PATH"
+    export BACKUP_TEST_RUNUSER_LOG="$TEST_ROOT/runuser-actions.log"
+    export BACKUP_SERVER_SERVICE=backup-project-server
+    export SERVER_ROOT=/var/lib/backup-project-server
+    export CONFIG_FILE=/etc/backup-project-server/server.conf
+    export DATA_ROOT=/var/lib/backup-project-server/data
+    export DB_PATH=/var/lib/backup-project-server/state/metadata.sqlite3
+    export PID_FILE=/run/backup-project-server/backup-server.pid
+    admin status
+  ) >"$TEST_ROOT/admin-installed-routing.log" 2>&1
+  printf 'ARG=%q\n' -u backup-project -- "$ADMIN" --server-root /var/lib/backup-project-server \
+    --root /var/lib/backup-project-server/data --db /var/lib/backup-project-server/state/metadata.sqlite3 \
+    status >"$TEST_ROOT/runuser-actions.expected"
+  if cmp -s "$TEST_ROOT/runuser-actions.expected" "$TEST_ROOT/runuser-actions.log"; then
+    record_pass '安装版 root 管理操作固定通过 runuser -u backup-project 调用共享后台（mock）'
+  else
+    record_fail '安装版管理用户路由' '未使用固定服务用户或参数错误'
+  fi
+  (
+    # shellcheck source=/dev/null
+    source <(sed -n '/^installed_instance_matches() {/,/^}/p; /^admin() {/,/^}/p' "$ROOT_DIR/scripts/backup-server-admin.sh")
+    instance_ready() { return 0; }
+    export PATH="$ADMIN_MOCKS:$OWNER_MOCKS:$PATH"
+    export BACKUP_TEST_RUNUSER_LOG="$TEST_ROOT/runuser-actions.log"
+    export BACKUP_SERVER_SERVICE=ssh
+    export SERVER_ROOT=/var/lib/backup-project-server
+    export CONFIG_FILE=/etc/backup-project-server/server.conf
+    export DATA_ROOT=/var/lib/backup-project-server/data
+    export DB_PATH=/var/lib/backup-project-server/state/metadata.sqlite3
+    export PID_FILE=/run/backup-project-server/backup-server.pid
+    if admin status; then exit 1; fi
+  ) >"$TEST_ROOT/admin-installed-mismatch.log" 2>&1
+  if [ "$?" = 0 ] && cmp -s "$TEST_ROOT/runuser-actions.expected" "$TEST_ROOT/runuser-actions.log"; then
+    record_pass '非固定安装实例不能利用 root 菜单切换用户调用后台'
+  else
+    record_fail '管理路由实例保护' '错误实例触发了 runuser'
+  fi
+  (
+    # shellcheck source=/dev/null
+    source <(sed -n '/^admin() {/,/^}/p' "$ROOT_DIR/scripts/backup-server-admin.sh")
+    instance_ready() { return 0; }
+    export BACKUP_SERVER_SERVICE=''
+    export SERVER_ROOT="$TEST_ROOT/portable"
+    export DATA_ROOT="$TEST_ROOT/portable/data"
+    export DB_PATH="$TEST_ROOT/portable/state/metadata.sqlite3"
+    export BACKUP_TEST_DIRECT_ADMIN_LOG="$TEST_ROOT/direct-admin-actions.log"
+    export ADMIN_BIN="$ADMIN_MOCKS/backend"
+    admin status
+  ) >"$TEST_ROOT/admin-portable-routing.log" 2>&1
+  printf 'ARG=%q\n' --server-root "$TEST_ROOT/portable" --root "$TEST_ROOT/portable/data" \
+    --db "$TEST_ROOT/portable/state/metadata.sqlite3" status >"$TEST_ROOT/direct-admin-actions.expected"
+  if cmp -s "$TEST_ROOT/direct-admin-actions.expected" "$TEST_ROOT/direct-admin-actions.log"; then
+    record_pass '便携实例保留当前普通用户直接调用共享管理后台'
+  else
+    record_fail '便携管理路由' '未直接调用共享后台或参数丢失'
+  fi
+
+
+  PARSER_ROOT="$TEST_ROOT/parser=instance with spaces"
+  PARSER_PORT="$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0)); print(s.getsockname()[1]); s.close()')"
+  run_parser_manager() {
+    printf '%s' "$1" |
+      env -u BACKUP_SERVER_DATA -u BACKUP_SERVER_DB -u BACKUP_SERVER_PID_FILE -u BACKUP_SERVER_CONFIG \
+        -u BACKUP_SERVER_LOG BACKUP_SERVER_ROOT="$PARSER_ROOT" BACKUP_SERVER_ADMIN="$ADMIN" \
+        BACKUP_SERVER_BIN="$MANAGER_TOOLS/backup-server" \
+        BACKUP_SERVER_KEYGEN="$MANAGER_TOOLS/backup-server-keygen" \
+        BACKUP_CERT_TOOL="$MANAGER_TOOLS/backup-cert-tool" \
+        timeout --signal=KILL 60 bash "$ROOT_DIR/scripts/backup-server-admin.sh" >"$2" 2>&1
+  }
+  run_parser_manager "$(printf '1\n\n\n%s\nn\n\n0\n' "$PARSER_PORT")"$'\n' \
+    "$TEST_ROOT/parser-init.log"
+  if [ -f "$PARSER_ROOT/server.conf" ]; then
+    sed -i 's/^port = .*/port = 1/; s|^data_root = .*|data_root = /invalid-first-root|; s|^database = .*|database = /invalid-first-db|; s|^pid_file = .*|pid_file = /invalid-first-pid|' "$PARSER_ROOT/server.conf"
+    {
+      printf '\n# duplicate keys use the last value, including inline comments\n'
+      printf 'port = %s # business port\n' "$PARSER_PORT"
+      printf 'data_root = %s/data # active root\n' "$PARSER_ROOT"
+      printf 'database = %s/state/metadata.sqlite3 # active database\n' "$PARSER_ROOT"
+      printf 'pid_file = %s/state/backup-server.pid # active PID\n' "$PARSER_ROOT"
+    } >>"$PARSER_ROOT/server.conf"
+    run_parser_manager $'2\n\n4\n\n3\n\n0\n' "$TEST_ROOT/parser-start-stop.log"
+    if grep -q '服务器已启动' "$TEST_ROOT/parser-start-stop.log" &&
+        grep -q '服务器已停止' "$TEST_ROOT/parser-start-stop.log" &&
+        grep -Fq "Data root:   $PARSER_ROOT/data" "$TEST_ROOT/parser-start-stop.log" &&
+        [ -f "$PARSER_ROOT/state/metadata.sqlite3" ] &&
+        ! ss -ltnH "sport = :$PARSER_PORT" | grep -q .; then
+      record_pass '注释/等号路径/最后重复键与启动器一致，真实 PID/停止匹配不截断路径'
+    else
+      record_fail '配置解析同一合同' "$(tail -6 "$TEST_ROOT/parser-start-stop.log" | tr '\n' ' ')"
+    fi
+  else
+    record_fail '配置解析同一合同' '等号路径实例初始化失败'
+  fi
+
+  cat >"$MOCK_TOOLS/journalctl" <<'MOCK'
+#!/bin/bash
+printf 'ARG=%q\n' "$@" >>"$BACKUP_TEST_JOURNAL_LOG"
+printf 'task-local-journal-sentinel\n'
+MOCK
+  chmod +x "$MOCK_TOOLS/journalctl"
+  (
+    # shellcheck source=/dev/null
+    source <(sed -n '/^installed_instance_matches() {/,/^}/p; /^logs_page() {/,/^}/p' "$ROOT_DIR/scripts/backup-server-admin.sh")
+    clear_screen() { return 0; }
+    config_value() { printf '\n'; }
+    export PATH="$MOCK_TOOLS:$PATH" BACKUP_TEST_JOURNAL_LOG="$TEST_ROOT/journal-actions.log"
+    export BACKUP_SERVER_SERVICE=backup-project-server
+    export SERVER_ROOT=/var/lib/backup-project-server
+    export CONFIG_FILE=/etc/backup-project-server/server.conf
+    export DATA_ROOT=/var/lib/backup-project-server/data
+    export DB_PATH=/var/lib/backup-project-server/state/metadata.sqlite3
+    export PID_FILE=/run/backup-project-server/backup-server.pid
+    logs_page
+  ) >"$TEST_ROOT/manager-journal-routing.log" 2>&1
+  printf 'ARG=%q\n' -u backup-project-server.service --no-pager -n 80 >"$TEST_ROOT/journal-actions.expected"
+  if cmp -s "$TEST_ROOT/journal-actions.expected" "$TEST_ROOT/journal-actions.log" &&
+      grep -q 'task-local-journal-sentinel' "$TEST_ROOT/manager-journal-routing.log"; then
+    record_pass '安装版空 log_file 从固定 unit 读取 journald（mock，无宿主日志访问）'
+  else
+    record_fail 'journald 菜单路由' '未调用固定 unit 或参数不正确'
+  fi
+
+
+fi
+
+
 
 finish

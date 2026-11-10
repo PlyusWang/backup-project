@@ -413,7 +413,8 @@ bool BackupCatalog::List(const std::string& repository,
     record.archive_path = candidate;
     record.archive_size = static_cast<std::uint64_t>(info.st_size);
     record.modified_time_sec = static_cast<std::int64_t>(info.st_mtime);
-    record.modified_time_nsec = static_cast<std::uint32_t>(info.st_mtim.tv_nsec);
+    record.modified_time_nsec =
+        static_cast<std::uint32_t>(info.st_mtim.tv_nsec);
 
     // 坏掉的 .bak 照样进列表，只是带上诊断信息。
     // 注意 diagnostic 用的是局部变量而不是 error_message：一个坏文件不能

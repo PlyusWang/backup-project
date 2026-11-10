@@ -50,6 +50,10 @@ else
     scripts/network_acceptance_test.sh
     scripts/session_credentials_test.sh
     scripts/credential_ui_test.sh
+    scripts/package_maintainer_test.sh
+    scripts/incremental_baseline_test.sh
+    scripts/server_manager_initialization_test.sh
+    scripts/deb_rootfs_lifecycle_test.sh
     packaging/ecs/verify-ecs-deployment.sh
   )
 fi

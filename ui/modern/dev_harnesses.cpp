@@ -268,6 +268,28 @@ struct CheckRun {
   }
 };
 
+struct UserErrorCapture {
+  explicit UserErrorCapture(backup_modern::RemoteController* remote) {
+    connection = QObject::connect(
+        remote, &backup_modern::RemoteController::userError, remote,
+        [this](const QString& title, const QString& summary,
+               const QString& suggestion, const QString& technical) {
+          ++count;
+          last = {title, summary, suggestion, technical};
+        });
+  }
+  ~UserErrorCapture() { QObject::disconnect(connection); }
+
+  void Reset() {
+    count = 0;
+    last.clear();
+  }
+
+  QMetaObject::Connection connection;
+  int count = 0;
+  QStringList last;
+};
+
 // 建一个文件（父目录一并建出来）。返回 false 说明环境本身有问题，
 // 这类失败必须报出来，否则后面所有断言都跑在一个不完整的源目录上。
 bool WriteTestFile(const QString& path, const QByteArray& content) {
@@ -1332,38 +1354,19 @@ int RunRemoteProductFlow(backup_modern::RemoteController* remote, CheckRun* run,
             remote->lastDetailForTest());
   }
 
-  // ---- GUI-P09：错 pin 时远端备份可见地失败，但不踢掉登录状态 ----
-  // ---- GUI-P09：服务器身份 pin 在**建立连接**时被强制 ----
-  //
-  // pin 是"连接建立时的期望值"：连接还活着的时候改 pin 不会立刻断线（这是
-  // **对**的产品行为，见 12-KNOWN-LIMITATIONS.md）。所以这里分两步，
-  // 在两种环境下都确定：
-  //   (1) 改错 pin 之后立刻做一次备份：连接还活着 -> 沿用现有连接、成功；
-  //       已被服务端按 io-timeout 关掉 -> 重连必须用**当前** pin，于是失败。
-  //       两种结果都接受（取决于服务端 io-timeout），但会话都不许被踢掉。
-  //       在 --remote-test（io-timeout 2）下走的是"被挡住"那一条，这一条同时
-  //       钉死了 RemoteArchiveClient::SetReconnectEndpoint 的语义：重连用的是
-  //       当前 pin，而不是很久以前那一次 Connect 存下来的旧值。
-  //   (2) 显式登录一次（登录**一定**新建连接）：错 pin 必须在这里被挡住，
-  //       而且分类必须是 pin-mismatch（不是笼统的网络错误）。
-  // pin 在**建立连接**时校验，因此：连接还活着时改 pin 不会踢掉当前会话
-  // （下一次连接才生效）；而显式 login 必然新建连接，所以一定被挡。
-  // 这正是要的行为：身份校验失败就拒绝，但不要顺手毁掉已登录的状态。
+  // ---- GUI-P09：应用新的 pin 会清除旧会话，后续操作必须重新认证 ----
   const QString good_pin = remote->serverKeyPin();
   const QString wrong_pin = QStringLiteral("sha256:") + QString(64, 'b');
   const bool pin_set = remote->setServerKeyPin(wrong_pin);
-  WaitForAnimation(4000);
-  const bool wrong_accepted =
+  const bool session_cleared = pin_set && !remote->authenticated();
+  const bool backup_accepted =
       remote->backupRemote(source, /*allow_incremental=*/false);
-  const bool wrong_idle = wrong_accepted && remote->waitForIdle(900000);
-  const QString wrong_kind = remote->lastErrorKindForTest();
-  const bool wrong_blocked = wrong_kind == QStringLiteral("pin-mismatch");
+  const QString backup_kind = remote->lastErrorKindForTest();
   run->Check(
-      pin_set && wrong_idle && remote->authenticated() &&
-          (wrong_blocked || wrong_kind == QStringLiteral("none")),
-      QStringLiteral(
-          "GUI-P09 错 pin：重连被挡住（连接还活着则沿用），会话不被踢掉"),
-      wrong_kind + QStringLiteral(": ") + remote->lastDetailForTest());
+      session_cleared && !backup_accepted && !remote->authenticated() &&
+          backup_kind == QStringLiteral("not-logged-in"),
+      QStringLiteral("GUI-P09 应用新 pin 后清除旧会话，未重新认证的备份被拒"),
+      backup_kind);
   const bool relogin_accepted =
       remote->login(host, port_text, username, password);
   const bool relogin_idle = relogin_accepted && remote->waitForIdle(300000);
@@ -2572,12 +2575,14 @@ int RunRemoteTunnelEcs(QQuickWindow* window,
 
   // ---- C08：SSH 认证失败 -> 明确失败，不把密码提示藏到后台 ----
   {
+    UserErrorCapture errors(remote);
     // SSH 认证失败必须被识别成 ssh-auth，文案也要指路 ssh-agent / 密钥：
     // 笼统的"连接失败"会把用户引向查网络，而真正的问题在凭据。
     remote->setConnectionModeForTest(QStringLiteral("ssh"));
     remote->setSshHostForTest(QStringLiteral("no-such-user@") + ssh_target);
     remote->ensureConnection(host, port_text);
     remote->waitForTunnelIdle(120000);
+    WaitForAnimation(120);
     run->Check(remote->tunnelFailureKindForTest() == QStringLiteral("ssh-auth"),
                QStringLiteral("C08 SSH 认证失败 -> ssh-auth"),
                remote->tunnelFailureKindForTest() + QStringLiteral(": ") +
@@ -2586,6 +2591,38 @@ int RunRemoteTunnelEcs(QQuickWindow* window,
         remote->tunnelFailureText().contains(QStringLiteral("ssh-agent")),
         QStringLiteral("C08b 文案让用户去配置 SSH 密钥 / ssh-agent"),
         remote->tunnelFailureText());
+    run->Check(errors.count == 1 &&
+                   errors.last.value(0) == QStringLiteral("SSH 认证失败") &&
+                   errors.last.value(1) ==
+                       QStringLiteral("SSH 服务器未接受当前登录凭据。") &&
+                   errors.last.value(2).contains(QStringLiteral("ssh-agent")) &&
+                   errors.last.value(3).isEmpty(),
+               QStringLiteral(
+                   "C08c 建立通道的实际认证失败只发出一次中文弹窗，无技术原文"),
+               QStringLiteral("signals=%1 title=%2 summary=%3")
+                   .arg(errors.count)
+                   .arg(errors.last.value(0), errors.last.value(1)));
+    remote->stopTunnel();
+    errors.Reset();
+    remote->applyServerKeyPin(pin);
+    const bool accepted = remote->login(
+        host, port_text, QStringLiteral("ssh-auth-probe"), password);
+    const bool finished = accepted && remote->waitForIdle(120000);
+    WaitForAnimation(120);
+    run->Check(
+        finished &&
+            remote->lastErrorKindForTest() == QStringLiteral("ssh-auth") &&
+            !remote->loginError().isEmpty() && errors.count == 1 &&
+            errors.last.value(0) == QStringLiteral("SSH 认证失败") &&
+            errors.last.value(1) ==
+                QStringLiteral("SSH 服务器未接受当前登录凭据。") &&
+            errors.last.value(2).contains(QStringLiteral("ssh-agent")) &&
+            errors.last.value(3).isEmpty(),
+        QStringLiteral(
+            "C08d 登录等待通道的实际认证失败只弹一次，保留登录行原因"),
+        QStringLiteral("signals=%1 kind=%2 login=%3")
+            .arg(errors.count)
+            .arg(remote->lastErrorKindForTest(), remote->loginError()));
     remote->stopTunnel();
   }
 
@@ -2679,8 +2716,10 @@ int RunRemoteTunnelEcs(QQuickWindow* window,
     remote->logoutLocal();
     remote->applyServerKeyPin(QStringLiteral("sha256:") +
                               QString(64, QLatin1Char('0')));
+    UserErrorCapture errors(remote);
     const bool accepted = remote->login(host, port_text, account, password);
     const bool finished = accepted && remote->waitForIdle(180000);
+    WaitForAnimation(120);
     run->Check(
         finished &&
             remote->lastErrorKindForTest() == QStringLiteral("pin-mismatch"),
@@ -2696,6 +2735,16 @@ int RunRemoteTunnelEcs(QQuickWindow* window,
                 QStringLiteral("无法连接到服务器，请稍后重试"),
         QStringLiteral("C10c 登录表单给的是身份校验的说法，不是“稍后重试”"),
         remote->loginError());
+    run->Check(errors.count == 1 &&
+                   errors.last.value(0).contains(QStringLiteral("登录")) &&
+                   errors.last.value(1).contains(QStringLiteral("指纹")) &&
+                   errors.last.value(2).contains(QStringLiteral("核对")) &&
+                   errors.last.value(3).isEmpty(),
+               QStringLiteral(
+                   "C10d 通道就绪后的 pin 失败只弹一次身份提示，无技术原文"),
+               QStringLiteral("signals=%1 summary=%2")
+                   .arg(errors.count)
+                   .arg(errors.last.value(1)));
     run->Check(registered, QStringLiteral("C10 前置：隔离测试账户已注册"));
     // 恢复正确的 pin，后面的检查才有意义。
     remote->applyServerKeyPin(pin);
@@ -3381,11 +3430,10 @@ int RunRemoteConnectionUx(QQuickWindow* window,
     restore_pin();
   }
 
-  // ---- C04：有活动连接时改 pin + 应用 -> 当前连接不被杀，下一次重连才换 ----
+  // ---- C04：忙碌时拒绝改 pin；空闲时应用新 pin 并清除旧会话 ----
   {
     remote->applyServerKeyPin(good_pin);
-    // 有活动操作时应用新指纹：不能打断当前连接，只能对下一次重连生效，并把这个
-    // 事实明确告诉用户。
+    // 有活动操作时拒绝改身份，避免显示值与当前操作实际使用的身份分离。
     const QString c04_user =
         QStringLiteral("gui-c04-%1")
             .arg(QRandomGenerator::global()->bounded(1000000, 9999999));
@@ -3398,9 +3446,7 @@ int RunRemoteConnectionUx(QQuickWindow* window,
                remote->lastErrorKindForTest() + QStringLiteral(": ") +
                    remote->lastDetailForTest());
     // 发起一条**真的在跑**的操作，然后趁它还在跑的时候改成**另一个**合法
-    // 指纹。busy_ 是在提交之前同步置位的，所以这里的顺序是确定的。
-    // 这条操作在提交时已经拷走了当时的 pin，所以它必须继续用旧 pin 跑完 ——
-    // 这正是"当前连接保持不变"的可观察含义。
+    // 指纹。busy_ 在提交之前同步置位，因此忙碌拒绝路径可直接检查。
     const QString new_pin =
         QStringLiteral("sha256:") + QString(64, QLatin1Char('2'));
     const bool started =
@@ -3409,12 +3455,11 @@ int RunRemoteConnectionUx(QQuickWindow* window,
     const QString state = remote->applyServerKeyPin(new_pin);
     run->Check(started && was_busy,
                QStringLiteral("C04a 应用 pin 时确实有一条活动操作"));
-    run->Check(
-        state == QStringLiteral("applied") &&
-            remote->pinApplyMessage().contains(
-                QStringLiteral("当前连接保持不变")),
-        QStringLiteral("C04b 活动连接时给出“当前连接保持不变，下次重连时生效”"),
-        remote->pinApplyMessage());
+    run->Check(state == QStringLiteral("invalid") &&
+                   remote->lastErrorKindForTest() == QStringLiteral("busy") &&
+                   remote->serverKeyPin() == good_pin,
+               QStringLiteral("C04b 忙碌时拒绝修改 pin 并保留原身份"),
+               remote->lastDetailForTest());
     const bool finished = remote->waitForIdle(180000);
     run->Check(finished &&
                    remote->lastErrorKindForTest() == QStringLiteral("none") &&
@@ -3422,8 +3467,12 @@ int RunRemoteConnectionUx(QQuickWindow* window,
                QStringLiteral("C04c 当前操作没有被“应用”打断，正常完成"),
                remote->lastErrorKindForTest() + QStringLiteral(": ") +
                    remote->lastDetailForTest());
-    run->Check(remote->serverKeyPin() == new_pin,
-               QStringLiteral("C04d 新 pin 已经是生效值（下一次重连会用它）"));
+    const QString idle_state = remote->applyServerKeyPin(new_pin);
+    run->Check(idle_state == QStringLiteral("applied") &&
+                   remote->serverKeyPin() == new_pin &&
+                   !remote->authenticated(),
+               QStringLiteral("C04d 空闲时应用新 pin 并要求重新登录"));
+    remote->applyServerKeyPin(good_pin);
     remote->logoutLocal();
   }
 
@@ -3486,9 +3535,11 @@ int RunRemoteConnectionUx(QQuickWindow* window,
           "localhost（前提不成立，不假装通过）\n");
       ++run->passed;
     } else {
+      UserErrorCapture errors(remote);
       remote->setSshHostForTest(QStringLiteral("localhost"));
       remote->ensureConnection(host, port_text);
       remote->waitForTunnelIdle(60000);
+      WaitForAnimation(120);
       run->Check(
           remote->tunnelFailureKindForTest() == QStringLiteral("ssh-hostkey"),
           QStringLiteral(
@@ -3499,6 +3550,17 @@ int RunRemoteConnectionUx(QQuickWindow* window,
           remote->tunnelFailureText().contains(QStringLiteral("身份校验失败")),
           QStringLiteral("C07b 文案告诉用户去检查 SSH 配置，而不是重试"),
           remote->tunnelFailureText());
+      run->Check(
+          errors.count == 1 &&
+              errors.last.value(0) ==
+                  QStringLiteral("SSH 服务器身份校验失败") &&
+              errors.last.value(1).contains(QStringLiteral("主机密钥")) &&
+              errors.last.value(2).contains(QStringLiteral("管理员")) &&
+              errors.last.value(3).isEmpty(),
+          QStringLiteral("C07d 主机密钥拒绝只弹一次中文身份提示，无技术原文"),
+          QStringLiteral("signals=%1 summary=%2")
+              .arg(errors.count)
+              .arg(errors.last.value(1)));
     }
     remote->stopTunnel();
     remote->setSshHostForTest(QStringLiteral("aliyun-ecs"));
@@ -3506,10 +3568,12 @@ int RunRemoteConnectionUx(QQuickWindow* window,
 
   // ---- C10 的前置：通道没建起来时，登录报的是**通道的**原因 ----
   {
+    UserErrorCapture errors(remote);
     remote->setConnectionMode(QStringLiteral("ssh"));
     remote->setSshHostForTest(QStringLiteral("no-such-host.invalid"));
     const bool accepted = remote->login(host, port_text, username, password);
     const bool finished = accepted && remote->waitForIdle(90000);
+    WaitForAnimation(120);
     const QString kind = remote->lastErrorKindForTest();
     run->Check(
         finished && kind == QStringLiteral("ssh-host-unreachable") &&
@@ -3519,6 +3583,17 @@ int RunRemoteConnectionUx(QQuickWindow* window,
             "C07c "
             "隧道建不起来时，登录说的是通道的原因，不是“无法连接到服务器”"),
         kind + QStringLiteral(": ") + remote->loginError());
+    run->Check(
+        errors.count == 1 &&
+            errors.last.value(0) == QStringLiteral("无法连接 SSH 服务器") &&
+            errors.last.value(1).contains(QStringLiteral("SSH 主机")) &&
+            errors.last.value(2).contains(QStringLiteral("网络")) &&
+            errors.last.value(3).isEmpty(),
+        QStringLiteral(
+            "C07e 登录等待通道失败只弹一次对应的中文提示，无技术原文"),
+        QStringLiteral("signals=%1 summary=%2")
+            .arg(errors.count)
+            .arg(errors.last.value(1)));
     remote->stopTunnel();
     remote->setSshHostForTest(QStringLiteral("aliyun-ecs"));
   }
@@ -4934,8 +5009,8 @@ int RunComboHoverTest(QQuickWindow* window, backup_modern::AppTheme* theme) {
     return names;
   };
   const auto hasCheck = [](const QPair<int, QQuickItem*>& row) {
-    QQuickItem* check = row.second->findChild<QQuickItem*>(
-        QStringLiteral("comboItemCheck"));
+    QQuickItem* check =
+        row.second->findChild<QQuickItem*>(QStringLiteral("comboItemCheck"));
     return check != nullptr && check->property("visible").toBool();
   };
   const auto hasActiveVisual = [&](const QPair<int, QQuickItem*>& row) {
@@ -4949,8 +5024,9 @@ int RunComboHoverTest(QQuickWindow* window, backup_modern::AppTheme* theme) {
       parts << QStringLiteral("%1[active=%2 border=%3 hovered=%4 selected=%5]")
                    .arg(row.first)
                    .arg(row.second->property("active").toBool() ? 1 : 0)
-                   .arg(layer == nullptr ? -1.0
-                                         : layer->property("border.width").toReal(),
+                   .arg(layer == nullptr
+                            ? -1.0
+                            : layer->property("border.width").toReal(),
                         0, 'f', 0)
                    .arg(row.second->property("hovered").toBool() ? 1 : 0)
                    .arg(row.second->property("isSelected").toBool() ? 1 : 0);
@@ -5020,7 +5096,9 @@ int RunComboHoverTest(QQuickWindow* window, backup_modern::AppTheme* theme) {
   run.Check(activeIndex() == path_index &&
                 activeRows(rows) == QStringList{QString::number(path_index)},
             QStringLiteral("打开时仅当前选中项具有活动高亮"),
-            QStringLiteral("activeIndex=%1 | %2").arg(activeIndex()).arg(describe(rows)));
+            QStringLiteral("activeIndex=%1 | %2")
+                .arg(activeIndex())
+                .arg(describe(rows)));
   {
     QQuickItem* selected_row = rowAt(path_index);
     run.Check(selected_row != nullptr && hasCheck({path_index, selected_row}) &&
@@ -5033,17 +5111,18 @@ int RunComboHoverTest(QQuickWindow* window, backup_modern::AppTheme* theme) {
   movePointerTo(pointer, centerOf(rowAt(path_index)));
   WaitForAnimation(150);
   rows = collectRows();
-  run.Check(hoverRows(rows) == QStringList{QString::number(type_index)} &&
-                keyboardRows(rows) == QStringList{QString::number(type_index)} &&
-                activeIndex() == type_index &&
-                activeRows(rows) == QStringList{QString::number(type_index)},
-            QStringLiteral("鼠标 hover 与活动高亮落在同一个候选上"),
-            QStringLiteral("hover=%1 active=%2 | %3")
-                .arg(hoverRows(rows).join(QStringLiteral(",")),
-                     activeRows(rows).join(QStringLiteral(",")))
-                .arg(describe(rows)));
-  const QString screenshot_path = qEnvironmentVariable(
-      "BACKUP_COMBO_TEST_SCREENSHOT");
+  run.Check(
+      hoverRows(rows) == QStringList{QString::number(type_index)} &&
+          keyboardRows(rows) == QStringList{QString::number(type_index)} &&
+          activeIndex() == type_index &&
+          activeRows(rows) == QStringList{QString::number(type_index)},
+      QStringLiteral("鼠标 hover 与活动高亮落在同一个候选上"),
+      QStringLiteral("hover=%1 active=%2 | %3")
+          .arg(hoverRows(rows).join(QStringLiteral(",")),
+               activeRows(rows).join(QStringLiteral(",")))
+          .arg(describe(rows)));
+  const QString screenshot_path =
+      qEnvironmentVariable("BACKUP_COMBO_TEST_SCREENSHOT");
   if (!screenshot_path.isEmpty()) {
     run.Check(window->grabWindow().save(screenshot_path),
               QStringLiteral("保存实际 GUI 下拉框截图"), screenshot_path);
@@ -5095,13 +5174,12 @@ int RunComboHoverTest(QQuickWindow* window, backup_modern::AppTheme* theme) {
       QStringLiteral("listCur %1 -> %2").arg(before_down).arg(listIndex()));
   run.Check(keyboardActive(), QStringLiteral("键盘导航保持 popup 活动状态"),
             QStringLiteral("活动=%1").arg(keyboardActive()));
-  run.Check(
-      keyboardRows(rows) == QStringList{QString::number(listIndex())},
-      QStringLiteral("键盘导航后的活动高亮正好落在 activeIndex 行"),
-      QStringLiteral("键盘行=%1 listCur=%2 | %3")
-          .arg(keyboardRows(rows).join(QStringLiteral(",")))
-          .arg(listIndex())
-          .arg(describe(rows)));
+  run.Check(keyboardRows(rows) == QStringList{QString::number(listIndex())},
+            QStringLiteral("键盘导航后的活动高亮正好落在 activeIndex 行"),
+            QStringLiteral("键盘行=%1 listCur=%2 | %3")
+                .arg(keyboardRows(rows).join(QStringLiteral(",")))
+                .arg(listIndex())
+                .arg(describe(rows)));
 
   // ---- Keyboard 2：再 ↓ 一次，光标整体下移一行 ----
   const int first_keyboard_row = listIndex();
@@ -5210,17 +5288,18 @@ int RunComboHoverTest(QQuickWindow* window, backup_modern::AppTheme* theme) {
   QMetaObject::invokeMethod(popup, "open");
   WaitForAnimation(320);
   rows = collectRows();
-  run.Check(
-      keyboardActive() &&
-          keyboardRows(rows) ==
-              QStringList{QString::number(selected_after_enter)} &&
-          listIndex() == selected_after_enter && hoverRows(rows).isEmpty(),
-      QStringLiteral("重新打开下拉：activeIndex 从当前选择恢复，没有 hover 残留"),
-      QStringLiteral("键盘行=%1 hover 行=%2 模式=%3 | %4")
-          .arg(keyboardRows(rows).join(QStringLiteral(",")),
-               hoverRows(rows).join(QStringLiteral(",")))
-          .arg(keyboardActive())
-          .arg(describe(rows)));
+  run.Check(keyboardActive() &&
+                keyboardRows(rows) ==
+                    QStringList{QString::number(selected_after_enter)} &&
+                listIndex() == selected_after_enter &&
+                hoverRows(rows).isEmpty(),
+            QStringLiteral(
+                "重新打开下拉：activeIndex 从当前选择恢复，没有 hover 残留"),
+            QStringLiteral("键盘行=%1 hover 行=%2 模式=%3 | %4")
+                .arg(keyboardRows(rows).join(QStringLiteral(",")),
+                     hoverRows(rows).join(QStringLiteral(",")))
+                .arg(keyboardActive())
+                .arg(describe(rows)));
 
   QMetaObject::invokeMethod(popup, "close");
   WaitForAnimation(200);
@@ -5309,8 +5388,8 @@ int RunFilterUxTest(QQuickWindow* window,
     QString advanced_toggle;
     QString advanced_section;
   };
-  // 页面下标 = Main.qml 里 StackLayout 的顺序（0 首页 / 1 快速备份 / 2 定时备份 /
-  // 3 实时备份 / 4 备份管理），不是侧栏导航的顺序。
+  // 页面下标 = Main.qml 里 StackLayout 的顺序（0 首页 / 1 快速备份 / 2 定时备份
+  // / 3 实时备份 / 4 备份管理），不是侧栏导航的顺序。
   // 三条用例共用下面同一段断言代码：某一页换了控件名、默认值或错误文案，都会
   // 在同一个断言上失败，不会留下"只测过备份页"的盲区。
   const PageCase kCases[] = {
@@ -8502,14 +8581,14 @@ int RunRemoteTest(QQuickWindow* window, backup_modern::RemoteController* remote,
     QMetaObject::invokeMethod(auth_mode_tabs, "activated", Qt::DirectConnection,
                               Q_ARG(QString, QStringLiteral("pin")));
   }
-  run.Check(auth_tabs_ready &&
-                page->property("draftAuthMode").toString() ==
-                    QStringLiteral("pin") &&
-                page->property("draftTrustedRoots").toString().isEmpty() &&
-                page->property("draftExpectedServerId").toString().isEmpty() &&
-                remote->trustedRootsFile().isEmpty() &&
-                remote->expectedServerId().isEmpty(),
-            QStringLiteral("REMOTE-01 身份模式切换清除旧证书信任材料"));
+  run.Check(
+      auth_tabs_ready &&
+          page->property("draftAuthMode").toString() == QStringLiteral("pin") &&
+          page->property("draftTrustedRoots").toString().isEmpty() &&
+          page->property("draftExpectedServerId").toString().isEmpty() &&
+          remote->trustedRootsFile().isEmpty() &&
+          remote->expectedServerId().isEmpty(),
+      QStringLiteral("REMOTE-01 身份模式切换清除旧证书信任材料"));
   if (auth_tabs_ready) {
     QMetaObject::invokeMethod(auth_mode_tabs, "activated", Qt::DirectConnection,
                               Q_ARG(QString, QStringLiteral("certificate")));
@@ -8533,16 +8612,15 @@ int RunRemoteTest(QQuickWindow* window, backup_modern::RemoteController* remote,
   if (page != nullptr) {
     page->setProperty("draftAuthMode", QStringLiteral("pin"));
   }
-  run.Check(pin_restored && auth_tabs_ready &&
-                remote->authMode() == QStringLiteral("pin") &&
-                page->property("draftAuthMode").toString() ==
-                    QStringLiteral("pin") &&
-                remote->trustedRootsFile().isEmpty() &&
-                remote->expectedServerId().isEmpty() &&
-                page->property("draftTrustedRoots").toString().isEmpty() &&
-                page->property("draftExpectedServerId").toString().isEmpty(),
-            QStringLiteral("REMOTE-01 探针结束恢复 BPSEC1 状态"));
-
+  run.Check(
+      pin_restored && auth_tabs_ready &&
+          remote->authMode() == QStringLiteral("pin") &&
+          page->property("draftAuthMode").toString() == QStringLiteral("pin") &&
+          remote->trustedRootsFile().isEmpty() &&
+          remote->expectedServerId().isEmpty() &&
+          page->property("draftTrustedRoots").toString().isEmpty() &&
+          page->property("draftExpectedServerId").toString().isEmpty(),
+      QStringLiteral("REMOTE-01 探针结束恢复 BPSEC1 状态"));
 
   goToPage(0);
   run.Check(page != nullptr && !EffectivelyVisible(window, "remotePage"),
@@ -9296,25 +9374,23 @@ int RunRemoteTest(QQuickWindow* window, backup_modern::RemoteController* remote,
                 .arg(directoryContains(xdg_root, password_bytes)));
 
   // ---- REMOTE-12：两套主题下的组件契约 ----
-  // 覆盖从最上面一张卡片到最后一张卡片的整页：只查上半页的话，
-  // "云端备份"与"技术详情"两张卡片布局塌掉是看不出来的。
+  // 检查可交互区域的几何；技术诊断不作为产品控件展示，单独断言保持隐藏。
   //
   // 账户区域现在有两个标签页，所以"关键控件"的集合随状态变化：
   //
-  //   已登录            账户卡片 + 上传 / 列表 / 状态栏 / 技术详情
+  //   已登录            账户卡片 + 上传 / 列表 / 状态栏
   //   未登录 + 登录标签  登录表单
   //   未登录 + 注册标签  注册表单（两个密码框）
   //
   // 三个阶段都要在两种主题下检查几何：只查一种状态，另一种状态里的标签页
   // 塌掉是看不出来的。
   const char* signed_in_names[] = {
-      "remoteHostField",      "remotePortField",
-      "remoteUserField",      "remoteServerKeyPinField",
-      "remoteAccountText",    "remoteAccountStateText",
-      "remoteLogoutButton",   "remoteDeleteAccountButton",
-      "remoteUploadButton",   "remoteRefreshButton",
-      "remoteListSummary",    "remoteStatusBanner",
-      "remoteTechnicalToggle"};
+      "remoteHostField",    "remotePortField",
+      "remoteUserField",    "remoteServerKeyPinField",
+      "remoteAccountText",  "remoteAccountStateText",
+      "remoteLogoutButton", "remoteDeleteAccountButton",
+      "remoteUploadButton", "remoteRefreshButton",
+      "remoteListSummary",  "remoteStatusBanner"};
   // 账户区域现在是一个分段控件（一个容器里两个分段），不再是两个独立按钮。
   const char* login_tab_names[] = {"remoteAccountTabs", "remotePasswordField",
                                    "remoteLoginButton"};
@@ -9347,6 +9423,15 @@ int RunRemoteTest(QQuickWindow* window, backup_modern::RemoteController* remote,
         signed_in_names, sizeof(signed_in_names) / sizeof(signed_in_names[0]),
         QStringLiteral("REMOTE-12 %1主题下已登录区域的关键控件都有正的几何")
             .arg(theme_label));
+    QQuickItem* technical_card = itemByName("remoteTechnicalCard");
+    QQuickItem* technical_toggle = itemByName("remoteTechnicalToggle");
+    QQuickItem* technical_text = itemByName("remoteTechnicalText");
+    run.Check(technical_card != nullptr && technical_toggle != nullptr &&
+                  technical_text != nullptr && !technical_card->isVisible() &&
+                  !technical_toggle->isVisible() &&
+                  !technical_text->isVisible(),
+              QStringLiteral("REMOTE-12 %1主题下技术卡片、开关和原文保持隐藏")
+                  .arg(theme_label));
     QQuickItem* host_field_item = itemByName("remoteHostField");
     if (host_field_item != nullptr && dark == 0) {
       light_text = host_field_item->property("color").value<QColor>();
@@ -9772,9 +9857,9 @@ int RunGuiContractTest(QQuickWindow* window,
   run.prefix = "[gui-contract]";
 
   // 顶层页面按 Main.qml 的 pageKeys 顺序；仓库设置是管理页内的区域。
-  const char* kBannerNames[5] = {
-      "homeStatusBanner",       "backupStatusBanner",   "scheduleStatusBanner",
-      "realtimeStatusBanner",   "managementStatusBanner"};
+  const char* kBannerNames[5] = {"homeStatusBanner", "backupStatusBanner",
+                                 "scheduleStatusBanner", "realtimeStatusBanner",
+                                 "managementStatusBanner"};
 
   const auto goToPage = [window](int page) {
     window->setProperty("currentPageKey", QString::fromLatin1(kPageKeys[page]));
@@ -9868,9 +9953,8 @@ int RunGuiContractTest(QQuickWindow* window,
     bool card_visible_in_window = true;
     qreal maximum_card_bottom = 0.0;
     for (int index = 0; index < 4; ++index) {
-      const QQuickItem* card =
-          itemByName(QStringLiteral("homeCard%1").arg(index)
-                        .toLatin1().constData());
+      const QQuickItem* card = itemByName(
+          QStringLiteral("homeCard%1").arg(index).toLatin1().constData());
       const qreal card_bottom =
           card->mapToItem(window->contentItem(), QPointF(0, card->height()))
               .y();
@@ -9878,13 +9962,12 @@ int RunGuiContractTest(QQuickWindow* window,
       card_visible_in_window =
           card_visible_in_window && card_bottom <= static_cast<qreal>(height);
     }
-    run.Check(
-        card_visible_in_window,
-        QStringLiteral("%1 HOME-04 卡片没有溢出窗口").arg(label),
-        QStringLiteral("最底卡片=%1 所有卡片均在窗口内=%2 窗口高=%3")
-            .arg(maximum_card_bottom)
-            .arg(card_visible_in_window)
-            .arg(height));
+    run.Check(card_visible_in_window,
+              QStringLiteral("%1 HOME-04 卡片没有溢出窗口").arg(label),
+              QStringLiteral("最底卡片=%1 所有卡片均在窗口内=%2 窗口高=%3")
+                  .arg(maximum_card_bottom)
+                  .arg(card_visible_in_window)
+                  .arg(height));
   };
 
   checkHomeCards(1180, 760, QStringLiteral("正常窗口 1180x760"));
@@ -9941,15 +10024,14 @@ int RunGuiContractTest(QQuickWindow* window,
   // MSG-02：管理页内的仓库设置成功提示只属于设置区域，离开即消费。
   const QString repository = temp.filePath(QStringLiteral("repo"));
   goToPage(4);
-  if (QObject* management = window->findChild<QObject*>(
-          QStringLiteral("managementPage"))) {
+  if (QObject* management =
+          window->findChild<QObject*>(QStringLiteral("managementPage"))) {
     management->setProperty("currentTab", QStringLiteral("local"));
     management->setProperty("localSection", QStringLiteral("settings"));
     management->setProperty("settingsExpanded", true);
     WaitForAnimation(60);
   }
-  const QQuickItem* settings_section =
-      itemByName("localRepositorySettings");
+  const QQuickItem* settings_section = itemByName("localRepositorySettings");
   run.Check(settings_section != nullptr &&
                 settings_section->property("visible").toBool(),
             QStringLiteral("MSG-02 仓库设置区域已展开"));
@@ -9962,12 +10044,11 @@ int RunGuiContractTest(QQuickWindow* window,
   const QString settings_title = controller->statusTitle();
   run.Check(pageShows(4, settings_title),
             QStringLiteral("MSG-02 管理页仓库设置区域显示它"));
-  run.Check(
-      !pageShows(1, settings_title) && !pageShows(3, settings_title) &&
-          !pageShows(2, settings_title) && !pageShows(0, settings_title),
-      QStringLiteral("MSG-02 备份 / 自动备份 / 首页都不显示它"),
-      QStringLiteral("backup=[%1] schedule=[%2] home=[%3]")
-          .arg(bannerTitle(1), bannerTitle(2), bannerTitle(0)));
+  run.Check(!pageShows(1, settings_title) && !pageShows(3, settings_title) &&
+                !pageShows(2, settings_title) && !pageShows(0, settings_title),
+            QStringLiteral("MSG-02 备份 / 自动备份 / 首页都不显示它"),
+            QStringLiteral("backup=[%1] schedule=[%2] home=[%3]")
+                .arg(bannerTitle(1), bannerTitle(2), bannerTitle(0)));
   goToPage(1);
   run.Check(controller->statusKind() == QStringLiteral("idle") &&
                 !pageShows(4, settings_title),
@@ -9987,9 +10068,9 @@ int RunGuiContractTest(QQuickWindow* window,
     controller->setStatusForTest(kind, QStringLiteral("management"), title,
                                  QStringLiteral("detail"));
     const bool shown_on_own_page = pageShows(4, title);
-    const bool hidden_elsewhere =
-        !pageShows(0, title) && !pageShows(1, title) && !pageShows(2, title) &&
-        !pageShows(3, title);
+    const bool hidden_elsewhere = !pageShows(0, title) &&
+                                  !pageShows(1, title) &&
+                                  !pageShows(2, title) && !pageShows(3, title);
     goToPage(1);
     const bool consumed = controller->statusKind() == QStringLiteral("idle");
     run.Check(shown_on_own_page && hidden_elsewhere && consumed,
@@ -11288,28 +11369,50 @@ int RunRealtimeTest(backup_modern::RealtimeController* realtime,
     run.Check(realtime->setEnabled(false),
               QStringLiteral("RT-63 先停用实时备份"));
     run.Check(!realtime->watching(), QStringLiteral("RT-64 停用后不再监听"));
+    const int next_repo_after_disable = CountArchives(repository_next);
+    const int old_repo_after_disable = CountArchives(repository);
+    run.Check(WriteTestFile(source + QStringLiteral("/after-disable.txt"),
+                            "disabled-change"),
+              QStringLiteral("RT-65 停用后修改源文件"));
+    WaitForAnimation(2500);
+    run.Check(!realtime->watching() && !realtime->libraryBusy() &&
+                  !realtime->pending(),
+              QStringLiteral("RT-66 停用后的变化没有排队或运行任务"),
+              realtime->watchStateText());
+    run.Check(CountArchives(repository_next) == next_repo_after_disable,
+              QStringLiteral("RT-67 停用后的变化没有在当前仓库产生快照"),
+              QString::number(CountArchives(repository_next)));
+    run.Check(CountArchives(repository) == old_repo_after_disable,
+              QStringLiteral("RT-68 停用后的变化没有在其它仓库产生快照"),
+              QString::number(CountArchives(repository)));
+    std::printf(
+        "[realtime] disabled-change watching=%d busy=%d pending=%d "
+        "snapshots=%d,%d\n",
+        realtime->watching() ? 1 : 0, realtime->libraryBusy() ? 1 : 0,
+        realtime->pending() ? 1 : 0, CountArchives(repository_next),
+        CountArchives(repository));
     run.Check(controller->saveRepositoryPath(repository),
-              QStringLiteral("RT-65 未启用状态下把仓库改回 A"),
+              QStringLiteral("RT-69 未启用状态下把仓库改回 A"),
               controller->statusMessage());
     run.Check(realtime->repositoryPath() == repository,
-              QStringLiteral("RT-66 未启用时依然跟上仓库路径"),
+              QStringLiteral("RT-70 未启用时依然跟上仓库路径"),
               realtime->repositoryPath());
     run.Check(!realtime->watching() && !realtime->watchDegraded() &&
                   realtime->watchCount() == 0,
-              QStringLiteral("RT-67 未启用时绝不无故启动 watcher"),
+              QStringLiteral("RT-71 未启用时绝不无故启动 watcher"),
               realtime->watchStateText());
     run.Check(realtime->waitForIdle(60000) &&
                   realtime->snapshotCount() == old_repo_before,
-              QStringLiteral("RT-68 快照列表跟着仓库刷新"),
+              QStringLiteral("RT-72 快照列表跟着仓库刷新"),
               QString::number(realtime->snapshotCount()) + QStringLiteral("/") +
                   QString::number(old_repo_before));
     WaitForAnimation(1500);
     run.Check(CountArchives(repository) == old_repo_before &&
                   !realtime->libraryBusy(),
-              QStringLiteral("RT-69 未启用时改仓库不写任何快照"),
+              QStringLiteral("RT-73 未启用时改仓库不写任何快照"),
               QString::number(CountArchives(repository)));
     run.Check(CountArchives(repository_next) == next_repo_before_disabled,
-              QStringLiteral("RT-70 也不写回上一个仓库"));
+              QStringLiteral("RT-74 也不写回上一个仓库"));
     std::printf("[realtime] disabled repo=%s snapshots=%d\n",
                 qPrintable(realtime->repositoryPath()),
                 realtime->snapshotCount());

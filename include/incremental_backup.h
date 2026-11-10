@@ -24,6 +24,7 @@
 #define BACKUP_PROJECT_INCLUDE_INCREMENTAL_BACKUP_H_
 
 #include <cstdint>
+#include <functional>
 #include <string>
 #include <vector>
 
@@ -35,8 +36,8 @@
 
 namespace backupproject {
 
-// 增量第一版只支持 MyPack 打包方式：USTAR 表达不了 tombstone 与 parent
-// dependency，硬套只会产出"恢复语义对不上"的链。
+// 增量依赖信息由 BKPINC 外层信封表达；变化文件仍由选定的 container
+// pack backend 编码，因此 MyPack、USTAR 与 Fast USTAR 都可用于增量。
 //
 // CLI 与 GUI 必须在**启动任务之前**用这一个判断拒绝，而不是等第一次 delta
 // 才失败——那时用户已经拿到一份看起来可用的基线，错误来得太晚了。
@@ -184,8 +185,8 @@ bool LoadVerifiedSnapshotIdentity(const std::string& repository_directory,
                                   std::vector<ManifestEntry>* manifest_entries,
                                   std::string* error_message);
 
-// 在仓库里找"当前可以当作基线的快照"：按文件名倒序找第一份两个副文件都在、
-// 都验证通过、身份又与给定值一致的快照。
+// 在仓库里找"当前可以当作基线的快照"：按 Catalog 的归档时间倒序找第一份
+// 两个副文件都在、都验证通过、身份又与给定值一致的快照。
 // 找不到时返回 false 并把原因写进 reason（不是错误——那是"需要建基线"）。
 bool FindIncrementalBaseline(const std::string& repository_directory,
                              const std::string& source_path,
@@ -195,10 +196,53 @@ bool FindIncrementalBaseline(const std::string& repository_directory,
                              std::string* baseline_file_name,
                              std::string* reason);
 
+// 新备份与远端 lineage 共享的源路径规范化。检查原路径及规范路径均为目录，
+// 拒绝根软链接和词法规整导致实际目录改变；不改变旧身份摘要或恢复算法。
+bool NormalizeBackupSourceDirectory(const std::string& input,
+                                    std::string* normalized,
+                                    std::string* error_message);
+
+// 只读基线检查使用与实际续接相同的认证规则。按 Catalog 的归档时间排序，
+// 不建立另一套索引，也不把密码放入返回值。只有 kUsable 可被显式选中。
+enum class BaselineAvailability {
+  kUsable,
+  kInvalidSnapshot,
+  kDifferentSource,
+  kDifferentFilters,
+  kDifferentStrategy,
+  kBrokenChain,
+  kAuthenticationFailed,
+  kDepthLimit,
+};
+
+struct IncrementalBaselineCandidate {
+  std::string file_name;
+  std::int64_t modified_time_sec = 0;
+  SnapshotFileKind kind = SnapshotFileKind::kUnknown;
+  EncryptionMethod encryption_method = EncryptionMethod::kNone;
+  std::string snapshot_id;
+  std::string parent_snapshot_id;
+  std::string parent_file_name;
+  std::string lineage_id;
+  std::string manifest_digest;
+  BaselineAvailability availability = BaselineAvailability::kInvalidSnapshot;
+  // 诊断日志使用的精确原因；GUI 按 availability 显示中文。
+  std::string diagnostic;
+};
+
+bool ListIncrementalBaselineCandidates(
+    const std::string& repository_directory, const std::string& source_path,
+    const std::string& repository_identity, const BackupOptions& options,
+    const std::vector<std::string>& include_rules,
+    const std::vector<std::string>& exclude_rules,
+    std::vector<IncrementalBaselineCandidate>* candidates,
+    std::string* error_message, const std::function<bool()>& cancelled = {});
+
 // 执行一次增量备份。
 //
 // snapshot_file_name 由调用方给出（BackupCatalog 负责命名），必须是单组件名字。
-// baseline_snapshot_name 非空时强制以它为父；为空时自动找当前基线。
+// baseline_snapshot_name 非空时强制以它为父，验证失败则拒绝，不改建完整备份；
+// 为空时自动选择最近可验证且兼容的快照，没有可用候选才建立完整基线。
 //
 // 失败时不留下半成品：delta 用临时文件 + rename 发布，manifest 在快照发布
 // 成功之后才写，写失败也不会让快照变成"看起来可用但没基线"的状态。

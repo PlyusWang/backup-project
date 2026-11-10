@@ -9,8 +9,8 @@ set -e
 SERVICE=backup-project-server
 case "${1:-remove}" in
   remove|purge)
-    echo "[backup-project-server] 卸载（remove / purge）不会删除用户数据：备份数据、元数据库、"
-    echo "[backup-project-server] 传输身份私钥、server.conf 与 secrets.env 都会留着。"
+    echo "[backup-project-server] remove / purge 都保留备份数据、元数据库、传输身份私钥和自动生成的 secrets.env。"
+    echo "[backup-project-server] remove 保留 server.conf；purge 会按 dpkg 的 conffile 规则删除 server.conf。"
     echo "[backup-project-server] 如果这次就想连数据一起清掉，请在包还没删掉时执行（本命令随包提供）："
     echo "[backup-project-server]   sudo backup-server-purge-data --dry-run                     # 先看要删什么"
     echo "[backup-project-server]   sudo backup-server-purge-data                             # 需要手打 DELETE ALL BACKUP DATA"

@@ -113,10 +113,30 @@ unit 的加固是**逐项评估**过的，不是"全打开"：
 
 菜单里能直接做：**用户管理**（列表 / 详情 / 删除用户及其备份）、
 **备份文件管理**（列出 / 查看含 SHA-256 / 删除单份）、**存储概览**、
-**服务器身份信息**（客户端要填的指纹与公钥）。
+**服务器身份信息**（客户端要填的指纹与公钥）。菜单“管理证书与可信根”支持安全导入
+已有根公钥与服务器证书：先停服务，校验签名、有效期和当前传输公钥，再输入
+`IMPORT BPSEC2` 确认；导入不接触根私钥或传输私钥，旧材料保留。
 
-为什么用 `sudo`：数据目录是 0750 `backup-project`，root 才能读；
-管理工具只在本机跑，不监听任何端口。
+菜单“查看与修改服务器配置”可修改端口、工作线程数、I/O 超时、日志路径和认证方式。
+输入 `SAVE` 前不会发布新配置，保存前使用启动器的 `--check-config` 校验；旧配置
+保存在配置目录下的 `.server-config-backup.<标识>/server.conf`。公网安全条件、
+数据路径和私钥路径不由该编辑器修改。允许 BPSEC1 需另输入 `ALLOW BPSEC1` 明确确认，
+切回仅 BPSEC2 时重新验证证书与传输身份。操作详情见
+[self-hosted-server.md](self-hosted-server.md)。
+
+证书导入和配置编辑都要求服务已停。在菜单选择“停止服务器”，完成编辑后再选择
+“启动服务器”；安装版只调用固定的 `backup-project-server.service`，并核实实际进程和
+端口，不以 root 另启服务端。若系统没有 systemd，使用服务器便携包的
+`./backup-server-manager` 管理独立实例。也可手动执行
+`sudo systemctl stop backup-project-server` / `sudo systemctl start backup-project-server`。
+
+菜单自身不绕过数据目录锁。需要 `ss`（`iproute2`）查询真实监听及 `flock`
+（`util-linux`，同时提供 `runuser`）防止与运行中的服务并发修改；Debian 包声明了这两项运行依赖，便携版
+所在系统也需安装它们。缺少工具时菜单明确失败。
+
+`sudo` 用于管理固定系统服务和受保护的实例配置；安装版的数据管理命令会通过
+`runuser -u backup-project` 调用共享后台，与服务端使用同一个数据目录锁。
+便携版保持当前用户直接调用后台。管理工具只在本机跑，不监听任何端口。
 
 要看状态但不进菜单：
 
@@ -225,8 +245,13 @@ regular file 的 sha256 对得上）通过之后，才**原子换入** `rollback
 
 ## 8. 卸载（数据不会被删）
 
-    sudo apt remove backup-project-server     # 删程序文件
-    sudo apt purge backup-project-server      # 仍然保留数据与配置
+    sudo apt remove backup-project-server     # 删除程序，保留配置、数据与身份
+    sudo apt purge backup-project-server      # 另删除 server.conf，保留数据、身份与生成的 secret
+
+`server.conf` 是 dpkg 管理的配置文件：`remove` 会保留它，`purge` 会删除它。
+自动生成的 `secrets.env`、`/var/lib/backup-project-server` 下的备份数据、数据库与
+传输身份私钥不随卸载或 purge 删除。如需保留监听地址、端口和证书路径等设置，请在 purge
+之前备份 `/etc/backup-project-server/server.conf`。
 
 输出会明确告诉你数据在哪里，卸载时的 `prerm` 也会再提醒一次。真要删数据只有一条路，
 而且**必须在包还没卸载时做**（`backup-server-purge-data` 是包提供的命令，`apt remove` 之后

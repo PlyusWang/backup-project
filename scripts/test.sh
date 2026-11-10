@@ -2318,23 +2318,22 @@ else
   record_pass "INC-04/05 GUI 增量（没有 build/backup-gui-modern，跳过 GUI 侧）"
 fi
 
-# INC-06 组合校验：增量 + 非 MyPack 必须在写任何东西之前被拒绝。
+# INC-06 组合校验：增量 + 未知 pack enum 必须在写任何东西之前被拒绝。
 rm -rf "$INC/repo-reject"
 mkdir -p "$INC/repo-reject"
 "$BACKUPCTL" --config-file "$INC_CONFIG" config repository set "$INC/repo-reject" \
   >/dev/null 2>&1
 set +e
 timeout --signal=KILL "$TIMEOUT_SECONDS" "$BACKUPCTL" --config-file "$INC_CONFIG" \
-  backup "$INC/src" --strategy incremental --pack ustar \
+  backup "$INC/src" --strategy incremental --pack invalid-pack \
   >"$INC/reject.out" 2>&1
 INC_REJECT_STATUS=$?
 set -e
 INC_REJECT_FILES="$(find "$INC/repo-reject" -type f | wc -l)"
-if [[ $INC_REJECT_STATUS -eq 2 && "$INC_REJECT_FILES" -eq 0 ]] &&
-   grep -qF 'MyPack' "$INC/reject.out"; then
-  record_pass "INC-06 增量 + USTAR 在写盘前被拒绝，且理由说明为什么"
+if [[ $INC_REJECT_STATUS -eq 2 && "$INC_REJECT_FILES" -eq 0 ]]; then
+  record_pass "INC-06 增量 + 未知 pack 在写盘前被拒绝"
 else
-  record_fail "INC-06 增量 + USTAR 被拒绝" \
+  record_fail "INC-06 增量 + 未知 pack 被拒绝" \
     "exit=$INC_REJECT_STATUS files=$INC_REJECT_FILES $(head -1 "$INC/reject.out")"
 fi
 

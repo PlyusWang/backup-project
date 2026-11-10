@@ -13,6 +13,13 @@ for arg in "$@"; do
   esac
 done
 if [ "$need_defaults" -eq 1 ]; then
+  # Match the service's lock-file owner. Running the default backend as root
+  # could create a root-owned lock that prevents the service user from starting.
+  if [ "$(id -u)" -eq 0 ]; then
+    command -v runuser >/dev/null 2>&1 || { echo '缺少 runuser，无法以安装版服务用户运行管理工具。' >&2; exit 1; }
+    exec runuser -u backup-project -- "$BIN" --server-root "$ROOT" \
+      --root "$ROOT/data" --db "$ROOT/state/metadata.sqlite3" "$@"
+  fi
   exec "$BIN" --server-root "$ROOT" --root "$ROOT/data" --db "$ROOT/state/metadata.sqlite3" "$@"
 fi
 exec "$BIN" "$@"

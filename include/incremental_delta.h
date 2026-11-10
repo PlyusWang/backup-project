@@ -22,7 +22,8 @@
 //   24+N    M     payload：一份完整、自包含的 v2 container（BKPCNT2）
 //
 // payload 直接复用现有流水线：pack → compression → encryption 一行代码都没有
-// 复制。第一版只允许 MyPack（见下），压缩与加密照旧可组合。
+// 复制。增量依赖和删除记录由外层表达，payload 支持 MyPack、USTAR 和 Fast
+// USTAR。
 //
 // ---- 自描述 ----
 //
@@ -146,9 +147,8 @@ std::string ComputeDeltaSnapshotId(const DeltaEnvelope& envelope);
 // 写出 delta。
 //
 // changed_entries 走完整 pipeline（pack → compression → encryption）生成内层
-// v2 container，再包进 BKPINC1 信封。第一版只接受 PackMethod::kMyPack：
-// USTAR 无法表达 tombstone / parent dependency，与其"伪装支持"不如明确拒绝，
-// 由调用方在共享校验里报同一句话。
+// v2 container，再包进 BKPINC1 信封。外层信封独立表达 tombstone / parent
+// dependency，不要求内层 pack 也表达这些信息。
 //
 // 条目表与备份流水线的约定完全一致：**第一条必须是源根目录**
 // （archive_path == "."，type == kDirectory）。delta 也要带上根目录的

@@ -26,6 +26,7 @@
 #include <QUrl>
 #include <QVariantList>
 #include <atomic>
+#include <memory>
 #include <vector>
 
 #include "archive_pipeline.h"
@@ -102,6 +103,12 @@ struct CatalogOutcome {
   QString error_message;
 };
 
+struct BaselineScanOutcome {
+  quint64 generation = 0;
+  QVariantList candidates;
+  QString error;
+};
+
 class BackupController : public QObject {
   Q_OBJECT
   // 三个 status* 属性是分开的：kind 决定 banner 的颜色和图标，
@@ -170,6 +177,12 @@ class BackupController : public QObject {
       QVariantList backupRecords READ backupRecords NOTIFY backupRecordsChanged)
   Q_PROPERTY(bool catalogBusy READ catalogBusy NOTIFY catalogStateChanged)
   Q_PROPERTY(QString catalogError READ catalogError NOTIFY catalogStateChanged)
+  Q_PROPERTY(QVariantList baselineCandidates READ baselineCandidates NOTIFY
+                 baselineCandidatesChanged)
+  Q_PROPERTY(bool baselineScanBusy READ baselineScanBusy NOTIFY
+                 baselineScanStateChanged)
+  Q_PROPERTY(QString baselineScanError READ baselineScanError NOTIFY
+                 baselineScanStateChanged)
 
  public:
   // 配置文件路径由调用方显式给出（正常启动由 main.cpp 从
@@ -181,6 +194,7 @@ class BackupController : public QObject {
   explicit BackupController(const QString& config_file_path,
                             OperationGate* operation_gate,
                             QObject* parent = nullptr);
+  ~BackupController() override;
 
   // 删除归档之后的计划状态同步。
   //
@@ -221,6 +235,21 @@ class BackupController : public QObject {
   QVariantList backupRecords() const { return backup_records_; }
   bool catalogBusy() const { return catalog_busy_; }
   QString catalogError() const { return catalog_error_; }
+  QVariantList baselineCandidates() const { return baseline_candidates_; }
+  bool baselineScanBusy() const { return baseline_scan_busy_; }
+  QString baselineScanError() const { return baseline_scan_error_; }
+
+  // 只读验证在后台执行，密码只属于本次请求。输入变化会作废迟到的结果。
+  Q_INVOKABLE bool refreshBaselineCandidates(const QString& pack_key,
+                                             const QString& compression_key,
+                                             const QString& encryption_key,
+                                             const QString& password);
+  Q_INVOKABLE void invalidateBaselineCandidates();
+  Q_INVOKABLE bool startBackupWithSelectedBaseline(
+      const QString& strategy_key, const QString& pack_key,
+      const QString& compression_key, const QString& encryption_key,
+      const QString& password, const QString& confirm_password,
+      const QString& baseline_snapshot_name);
 
   QStringList includeRules() const { return include_rules_; }
   QStringList excludeRules() const { return exclude_rules_; }
@@ -331,6 +360,8 @@ class BackupController : public QObject {
   void repositoryPathChanged();
   void backupRecordsChanged();
   void catalogStateChanged();
+  void baselineCandidatesChanged();
+  void baselineScanStateChanged();
   // 规则列表变化（增删清空）时发一次。
   void filtersChanged();
   // 任务结束时发一次，附带结果，便于 QML 或测试代码做后续动作。
@@ -385,6 +416,7 @@ class BackupController : public QObject {
     QString repository_directory;
     QString repository_identity;
     QString snapshot_file_name;
+    QString baseline_snapshot_name;
     std::vector<std::string> include_rules;
     std::vector<std::string> exclude_rules;
   };
@@ -399,11 +431,11 @@ class BackupController : public QObject {
   // 恢复是用户选的那个名字）；它不是输入状态，也不参与核心调用。
   bool Start(const OperationRequest& request, const QString& file_name);
   // 两个公开备份入口共用的实现：校验、编译规则、命名、交给后台线程。
-  bool StartBackupWithStrategy(BackupStrategy strategy, const QString& pack_key,
-                               const QString& compression_key,
-                               const QString& encryption_key,
-                               const QString& password,
-                               const QString& confirm_password);
+  bool StartBackupWithStrategy(
+      BackupStrategy strategy, const QString& pack_key,
+      const QString& compression_key, const QString& encryption_key,
+      const QString& password, const QString& confirm_password,
+      const QString& baseline_snapshot_name = QString());
 
   // 把界面收集的规则编成 Filter；失败时 error_message 里是原因。
   bool BuildFilter(Filter* filter, std::string* error_message) const;
@@ -435,6 +467,12 @@ class BackupController : public QObject {
   // latest request wins：扫描期间来的刷新请求只记这一位，当前扫描一结束就
   // 立刻用最新的 repository 重扫，不会堆出并行扫描。
   bool catalog_pending_ = false;
+  QVariantList baseline_candidates_;
+  bool baseline_scan_busy_ = false;
+  QString baseline_scan_error_;
+  quint64 baseline_generation_ = 0;
+  std::shared_ptr<std::atomic_bool> baseline_cancelled_;
+  QFutureWatcher<BaselineScanOutcome> baseline_watcher_;
 
   // busy_ 是界面唯一的“正在干活”依据：按钮禁用、输入框禁用、
   // 进度条动画全部绑它，避免三处各判一次、判出不一致的结果。
