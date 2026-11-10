@@ -3803,6 +3803,13 @@ QString RemoteController::CommitServerKeyPin(const QString& pin) {
   if (server_key_pin_ == text) {
     return QStringLiteral("unchanged");
   }
+  if (busy_) {
+    last_error_kind_ = QStringLiteral("busy");
+    ReportSurfaceError(ErrorSurface::kServerKey,
+                       QStringLiteral("正在处理连接请求，完成后再更改服务器身份指纹"));
+    return QStringLiteral("invalid");
+  }
+  InvalidateConnectionForSettingsChange();
   server_key_pin_ = text;
   endpoint_.server_key_pin = server_key_pin_.toStdString();
   emit serverKeyPinChanged();
