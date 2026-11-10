@@ -289,7 +289,7 @@ init_server() {
   init_dir="$(mktemp -d "$SERVER_ROOT/.server-init.XXXXXXXX")" || return 1
   trap 'rm -rf "$init_dir"' RETURN
   mkdir -p "$init_dir/state" "$init_dir/private" || return 1
-  keygen_output="$($KEYGEN_BIN --output "$init_dir/state/transport.key")" || return 1
+  keygen_output="$("$KEYGEN_BIN" --output "$init_dir/state/transport.key")" || return 1
   pubkey="$(printf '%s\n' "$keygen_output" | sed -n 's/.*公钥 (hex): //p' | head -1)"
   [ -n "$pubkey" ] || { printf '无法从 keygen 结果取得公钥，初始化停止。\n'; return 1; }
   if [[ "$use_cert" =~ ^[Yy]$ ]]; then
