@@ -1004,12 +1004,11 @@ bool FindIncrementalBaseline(const std::string& repository_directory,
     return false;
   }
 
-  // 文件名倒序 = 最新的在前（catalog 的名字带时间戳）。
-  std::vector<std::string> names;
-  for (const BackupRecord& record : listed) names.push_back(record.file_name);
-  std::sort(names.begin(), names.end(), std::greater<std::string>());
-
-  for (const std::string& name : names) {
+  // BackupCatalog::List 已按归档文件的实际 mtime 从新到旧排序（时间相同
+  // 才按文件名稳定排序）。直接沿用这个顺序；文件名可能由用户或导入工具
+  // 生成，不能把字典序当作创建时间。
+  for (const BackupRecord& record : listed) {
+    const std::string& name = record.file_name;
     // 候选的信任完全建立在"磁盘上的事实"上：归档身份（来自字节）、manifest
     // 摘要（来自副文件内容）、以及副文件自己声明的归属，三者必须自洽。
     // 只"能解析 + 文件存在 + 参数对得上"不再算数——那正是"换掉 .bak、留着旧
