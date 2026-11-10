@@ -641,7 +641,7 @@ int RunRemoteCommand(const CliContext& context,
   }
 
   // 一次调用把整条依赖链取回并逐字节验证后恢复，用户不需要手工下载 delta。
-  // 增量链不支持加密（外层信封不受内层保护），所以这里不向用户索要口令。
+  // 此 CLI remote 入口尚无归档密码参数；共享核心和 GUI 支持加密增量恢复。
   // 目标目录的契约（存在/为空/不覆盖）由本地恢复核心把关，CLI 不重复实现。
   if (subcommand == "restore") {
     if (options.positional.size() != 2) {
@@ -665,7 +665,7 @@ int RunRemoteCommand(const CliContext& context,
                                  options.username, &cache, &error)) {
       return Fail(error);
     }
-    // 增量链不支持加密（外层信封不受内层保护），所以恢复不需要口令。
+    // 当前 CLI 传入默认恢复选项；加密归档会因缺少密码被拒绝。
     net::RemoteRestoreOutcome outcome;
     if (!net::RunRemoteRestore(&client, cache, snapshot_id, target_directory,
                                RestoreOptions(), &outcome, &error)) {

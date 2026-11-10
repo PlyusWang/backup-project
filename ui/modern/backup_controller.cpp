@@ -180,6 +180,22 @@ QString LabelForKey(const DisplayLabel* table, std::size_t count,
   return QString();
 }
 
+QString IncrementalBaselineReasonText(const QString& technical) {
+  if (technical.contains(QStringLiteral("cannot authenticate")))
+    return QStringLiteral("当前归档密码无法认证已有快照或其祖先。");
+  if (technical.contains(QStringLiteral("maximum depth")))
+    return QStringLiteral("已有增量链达到深度上限。");
+  if (technical.contains(QStringLiteral("filter rules")))
+    return QStringLiteral("当前筛选规则与已有快照不同。");
+  if (technical.contains(QStringLiteral("pack / compression / encryption")))
+    return QStringLiteral("当前打包、压缩或加密参数与已有快照不同。");
+  if (technical.contains(QStringLiteral("different source or repository")))
+    return QStringLiteral("已有快照属于其他源目录或仓库。");
+  if (technical.contains(QStringLiteral("no trustworthy compatible baseline")))
+    return QStringLiteral("仓库中尚无可用的兼容基线。");
+  return QStringLiteral("已有快照的完整性或身份信息不符合续接要求。");
+}
+
 }  // namespace
 
 // ---- GUI 稳定 key 与核心 enum 的唯一映射 ----
@@ -271,7 +287,8 @@ BackupController::BackupController(const QString& config_file_path,
                   QStringLiteral("备份完成（完整基线）"),
                   QStringLiteral("增量策略：本轮没有可信基线，已建立完整基线"
                                  "快照。原因：%1")
-                      .arg(outcome.baseline_reason));
+                      .arg(IncrementalBaselineReasonText(
+                          outcome.baseline_reason)));
               refreshBackups();
             } else {
               SetStatus(QString::fromLatin1(kSuccess),
@@ -354,7 +371,170 @@ BackupController::BackupController(const QString& config_file_path,
             SetCatalogBusy(false);
           });
 
+  connect(&baseline_watcher_, &QFutureWatcher<BaselineScanOutcome>::finished,
+          this, [this]() {
+            const BaselineScanOutcome outcome = baseline_watcher_.result();
+            baseline_scan_busy_ = false;
+            if (outcome.generation == baseline_generation_) {
+              baseline_candidates_ = outcome.candidates;
+              baseline_scan_error_ = outcome.error;
+              emit baselineCandidatesChanged();
+            }
+            emit baselineScanStateChanged();
+          });
+  connect(this, &BackupController::sourcePathChanged, this,
+          &BackupController::invalidateBaselineCandidates);
+  connect(this, &BackupController::repositoryPathChanged, this,
+          &BackupController::invalidateBaselineCandidates);
+  connect(this, &BackupController::filtersChanged, this,
+          &BackupController::invalidateBaselineCandidates);
+  connect(this, &BackupController::busyChanged, this, [this]() {
+    if (busy_) invalidateBaselineCandidates();
+  });
+  connect(this, &BackupController::operationFinished, this,
+          [this](bool) { invalidateBaselineCandidates(); });
+
   LoadConfig();
+}
+
+BackupController::~BackupController() {
+  if (baseline_cancelled_) baseline_cancelled_->store(true);
+  // 进度回调使用控制器成员；后台工作结束后才能销毁这些成员。
+  watcher_.waitForFinished();
+  catalog_watcher_.waitForFinished();
+  baseline_watcher_.waitForFinished();
+}
+
+void BackupController::invalidateBaselineCandidates() {
+  if (baseline_cancelled_) baseline_cancelled_->store(true);
+  ++baseline_generation_;
+  baseline_candidates_.clear();
+  baseline_scan_error_.clear();
+  emit baselineCandidatesChanged();
+  emit baselineScanStateChanged();
+}
+
+bool BackupController::refreshBaselineCandidates(const QString& pack_key,
+                                                 const QString& compression_key,
+                                                 const QString& encryption_key,
+                                                 const QString& password) {
+  if (baseline_scan_busy_ || busy_) return false;
+  invalidateBaselineCandidates();
+  backupproject::BackupOptions options;
+  if (source_path_.isEmpty() || repository_path_.isEmpty()) {
+    baseline_scan_error_ = QStringLiteral("请先选择源目录和本地备份仓库。");
+  } else if (!ParsePackMethodKey(pack_key, &options.pack_method) ||
+             !ParseCompressionMethodKey(compression_key,
+                                        &options.compression_method) ||
+             !ParseEncryptionMethodKey(encryption_key,
+                                       &options.encryption_method)) {
+    baseline_scan_error_ = QStringLiteral("备份参数无效，请重新选择。");
+  } else if (options.encryption_method !=
+                 backupproject::EncryptionMethod::kNone &&
+             password.isEmpty()) {
+    baseline_scan_error_ = QStringLiteral("请输入归档密码后检查加密基线。");
+  }
+  if (!baseline_scan_error_.isEmpty()) {
+    emit baselineScanStateChanged();
+    return false;
+  }
+  if (options.encryption_method != backupproject::EncryptionMethod::kNone)
+    options.password = password.toStdString();
+  const std::string source = source_path_.toStdString();
+  const std::string repository = repository_path_.toStdString();
+  const std::string repository_identity =
+      backupproject::RepositoryIdentity(repository);
+  std::vector<std::string> includes;
+  std::vector<std::string> excludes;
+  for (const QString& rule : include_rules_)
+    includes.push_back(rule.toStdString());
+  for (const QString& rule : exclude_rules_)
+    excludes.push_back(rule.toStdString());
+  const quint64 generation = baseline_generation_;
+  const auto cancelled = std::make_shared<std::atomic_bool>(false);
+  baseline_cancelled_ = cancelled;
+  baseline_scan_busy_ = true;
+  emit baselineScanStateChanged();
+  baseline_watcher_.setFuture(
+      QtConcurrent::run([generation, source, repository, repository_identity,
+                         options, includes, excludes, cancelled]() {
+        BaselineScanOutcome outcome;
+        outcome.generation = generation;
+        std::vector<backupproject::IncrementalBaselineCandidate> candidates;
+        std::string error;
+        if (!backupproject::ListIncrementalBaselineCandidates(
+                repository, source, repository_identity, options, includes,
+                excludes, &candidates, &error,
+                [cancelled]() { return cancelled->load(); })) {
+          if (cancelled->load()) return outcome;
+          // 技术错误不包含请求密码，普通界面只保留可采取行动的原因。
+          outcome.error =
+              error.find("Source") != std::string::npos ||
+                      error.find("source path") != std::string::npos
+                  ? QStringLiteral(
+                        "源目录无效或路径含义不一致，请重新选择真实源目录。")
+                  : QStringLiteral(
+                        "无法读取备份仓库，请检查目录是否存在及读取权限。");
+          return outcome;
+        }
+        using Availability = backupproject::BaselineAvailability;
+        for (const auto& candidate : candidates) {
+          QString reason;
+          switch (candidate.availability) {
+            case Availability::kUsable:
+              reason = QStringLiteral("可用于继续增量");
+              break;
+            case Availability::kDifferentSource:
+              reason = QStringLiteral("属于其他源目录或仓库");
+              break;
+            case Availability::kDifferentFilters:
+              reason = QStringLiteral("筛选规则不同");
+              break;
+            case Availability::kDifferentStrategy:
+              reason = QStringLiteral("打包、压缩或加密参数不同");
+              break;
+            case Availability::kBrokenChain:
+              reason = QStringLiteral("依赖链不完整或父快照校验失败");
+              break;
+            case Availability::kAuthenticationFailed:
+              reason = QStringLiteral("当前密码无法认证快照或其祖先");
+              break;
+            case Availability::kDepthLimit:
+              reason = QStringLiteral("已达到增量链深度上限");
+              break;
+            case Availability::kInvalidSnapshot:
+              reason = QStringLiteral("归档或身份副文件缺失、损坏或不匹配");
+              break;
+          }
+          QVariantMap row;
+          row.insert(QStringLiteral("fileName"),
+                     QString::fromStdString(candidate.file_name));
+          row.insert(QStringLiteral("modifiedTime"),
+                     FormatModifiedTime(candidate.modified_time_sec));
+          row.insert(QStringLiteral("kind"),
+                     candidate.kind == backupproject::SnapshotFileKind::kDelta
+                         ? QStringLiteral("增量")
+                         : QStringLiteral("完整"));
+          row.insert(QStringLiteral("encryption"),
+                     EncryptionMethodText(candidate.encryption_method));
+          row.insert(QStringLiteral("usable"),
+                     candidate.availability == Availability::kUsable);
+          row.insert(QStringLiteral("reason"), reason);
+          row.insert(QStringLiteral("snapshotId"),
+                     QString::fromStdString(candidate.snapshot_id));
+          row.insert(QStringLiteral("parentSnapshotId"),
+                     QString::fromStdString(candidate.parent_snapshot_id));
+          row.insert(QStringLiteral("parentFileName"),
+                     QString::fromStdString(candidate.parent_file_name));
+          row.insert(QStringLiteral("lineageId"),
+                     QString::fromStdString(candidate.lineage_id));
+          row.insert(QStringLiteral("manifestDigest"),
+                     QString::fromStdString(candidate.manifest_digest));
+          outcome.candidates.push_back(row);
+        }
+        return outcome;
+      }));
+  return true;
 }
 
 // 相等就不发信号：QML 的双向绑定会把输入框的值再写回来一次，
@@ -669,6 +849,16 @@ bool BackupController::startBackupWithStrategy(
     const QString& strategy_key, const QString& pack_key,
     const QString& compression_key, const QString& encryption_key,
     const QString& password, const QString& confirm_password) {
+  return startBackupWithSelectedBaseline(strategy_key, pack_key,
+                                         compression_key, encryption_key,
+                                         password, confirm_password, QString());
+}
+
+bool BackupController::startBackupWithSelectedBaseline(
+    const QString& strategy_key, const QString& pack_key,
+    const QString& compression_key, const QString& encryption_key,
+    const QString& password, const QString& confirm_password,
+    const QString& baseline_snapshot_name) {
   // 解析失败绝不回退到 full：用户明确选了增量，就必须拿到增量或明确报错。
   BackupStrategy strategy = BackupStrategy::kFull;
   status_scope_ = QString::fromLatin1(kScopeBackup);
@@ -712,13 +902,15 @@ bool BackupController::startBackupWithStrategy(
     return false;
   }
   return StartBackupWithStrategy(strategy, pack_key, compression_key,
-                                 encryption_key, password, confirm_password);
+                                 encryption_key, password, confirm_password,
+                                 baseline_snapshot_name);
 }
 
 bool BackupController::StartBackupWithStrategy(
     BackupStrategy strategy, const QString& pack_key,
     const QString& compression_key, const QString& encryption_key,
-    const QString& password, const QString& confirm_password) {
+    const QString& password, const QString& confirm_password,
+    const QString& baseline_snapshot_name) {
   // 备份页的动作：成功 / 失败 / 校验提示都只属于备份页。
   status_scope_ = QString::fromLatin1(kScopeBackup);
   if (busy_) {
@@ -823,6 +1015,7 @@ bool BackupController::StartBackupWithStrategy(
   request.repository_identity =
       QString::fromStdString(backupproject::RepositoryIdentity(repository));
   request.snapshot_file_name = QFileInfo(archive).fileName();
+  request.baseline_snapshot_name = baseline_snapshot_name;
   for (const QString& rule : include_rules_) {
     request.include_rules.push_back(rule.toStdString());
   }
@@ -1232,7 +1425,8 @@ OperationOutcome BackupController::RunOperation(OperationRequest request) {
         request.snapshot_file_name.toStdString(),
         request.repository_identity.toStdString(), request.filter,
         request.backup_options, request.include_rules, request.exclude_rules,
-        std::string(), &incremental, &error_message, request.progress);
+        request.baseline_snapshot_name.toStdString(), &incremental,
+        &error_message, request.progress);
     outcome.succeeded = ok;
     outcome.incremental = true;
     if (ok) {

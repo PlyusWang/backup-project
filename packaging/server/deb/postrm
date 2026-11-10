@@ -18,15 +18,17 @@ case "${1:-remove}" in
       systemctl daemon-reload >/dev/null 2>&1 || true
       systemctl reset-failed "$SERVICE" >/dev/null 2>&1 || true
     fi
-    echo "[backup-project-server] 已 purge 包文件；用户数据 / 配置 / 身份私钥全部保留："
+    echo "[backup-project-server] 已 purge 包文件；dpkg 会删除配置文件 /etc/backup-project-server/server.conf。"
+    echo "[backup-project-server] 以下用户数据、身份私钥和自动生成的 secret 保留："
     echo "[backup-project-server]   /var/lib/backup-project-server   （备份数据、元数据库、传输身份私钥）"
-    echo "[backup-project-server]   /etc/backup-project-server      （server.conf、secrets.env）"
+    echo "[backup-project-server]   /etc/backup-project-server/secrets.env （自动生成的管理 secret）"
     echo "[backup-project-server] 系统用户 backup-project 也保留（数据还在，删用户没有意义）。"
     echo "[backup-project-server] 注意：backup-server-purge-data 已经随包删掉了，purge 之后调用它只会得到"
     echo "[backup-project-server] command not found。现在要删数据，请按 docs/install-server.md 的"
     echo "[backup-project-server] 「手工清理残留数据」一节操作（或重新装回本包，用 purge-data 删完再卸载）。"
     ;;
   remove)
+    echo "[backup-project-server] 已 remove 包文件；server.conf、secrets.env、备份数据和身份私钥保留。"
     rm -rf "$CACHE_DIR"
     if [ -d /run/systemd/system ] && command -v systemctl >/dev/null 2>&1; then
       systemctl daemon-reload >/dev/null 2>&1 || true

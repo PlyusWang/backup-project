@@ -825,7 +825,7 @@ class RemoteController : public QObject {
 
  signals:
   // 用户主动操作失败时的唯一主要反馈。summary / suggestion 是自然中文，
-  // technical 可以包含路径与错误码，但生成方保证其中没有口令、私钥或令牌。
+  // technical 保留为空；原始技术原因只写入脱敏的 stderr。
   // 后台定时 / 实时失败不弹这个信号：它们进运行记录与页面状态。
   void userError(const QString& title, const QString& summary,
                  const QString& suggestion, const QString& technical);
@@ -892,6 +892,9 @@ class RemoteController : public QObject {
   // 把一句话送到指定的错误容器（同一个容器里不重复发信号）。
   void ReportSurfaceError(ErrorSurface surface, const QString& message);
   void ClearSurfaceError(ErrorSurface surface);
+  // 主动操作失败的统一弹窗；技术原因只进入脱敏日志，不作为界面内容发送。
+  void ReportUserError(const QString& error_kind, const QString& action,
+                       const QString& technical = QString());
   // 输入校验：合规时把结果写进 out_*，否则把原因写进 surface 的错误行并返回
   // false。**不**改动 endpoint_/username_——那是 CommitEndpoint 的事，所以
   // 被拒的输入不会污染"上一次生效的地址"。

@@ -1243,8 +1243,7 @@ bool VerifyFullSnapshotPayload(const std::string& container_file,
 
 // 写出 delta 的唯一入口。前置条件（任一不满足即失败，不尽力而为）：
 //   * changed_entries.size() <= kMaxDeltaEntries；
-//   * options.pack_method == kMyPack：USTAR 表达不了 tombstone 与 parent
-//     依赖，与其伪装支持不如明确拒绝（共享校验层会报同一句话）；
+//   * options.pack_method 是支持的 pack backend：增量元数据由 BKPINC 外层承载；
 //   * envelope.removed == envelope.tombstones.size()；
 //   * parent_file_name 与每个 tombstone 都通过读侧那一对边界函数 ——
 //     写侧不产出自己随后会拒绝的东西；
@@ -1335,14 +1334,6 @@ bool WriteDeltaFile(const std::string& delta_file,
   if (changed_entries.size() > kMaxDeltaEntries) {
     SetError(error_message, "Too many entries for one delta: " +
                                 std::to_string(changed_entries.size()));
-    return false;
-  }
-  // 第一版只支持 MyPack：USTAR 表达不了 tombstone 与 parent dependency，
-  // 与其"伪装支持"不如明确拒绝。共享校验层会报同一句话。
-  if (options.pack_method != PackMethod::kMyPack) {
-    SetError(error_message,
-             "Incremental deltas require the MyPack pack method; USTAR cannot "
-             "express tombstone or parent dependencies");
     return false;
   }
   if (envelope.removed != envelope.tombstones.size()) {

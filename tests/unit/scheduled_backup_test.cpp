@@ -228,14 +228,12 @@ void TestTimeSemantics() {
   config.retain_count = 12;
   // PR #19：Realtime × {Full, Incremental} 两格现在都是真实支持的组合，六格
   // 全开。这条用例要钉的性质没有变：**没人实现的组合必须被明确拒绝，而不是
-  // 被当成 full 偷偷跑掉**——只是例子换成了仍然不受支持的那一个
-  // （Incremental + USTAR：USTAR 表达不了 tombstone 与 parent 依赖）。
+  // 被当成 full 偷偷跑掉**——只是例子换成未知 pack enum。
   config.trigger = bp::BackupTrigger::kScheduled;
   config.strategy = bp::BackupStrategy::kIncremental;
-  config.pack_method = bp::PackMethod::kUstar;
+  config.pack_method = static_cast<bp::PackMethod>(255);
   test_support::Check(
-      !bp::ValidateScheduleConfig(config, &error) &&
-          error.find("MyPack") != std::string::npos,
+      !bp::ValidateScheduleConfig(config, &error) && !error.empty(),
       "TIME-14 an unimplemented combination is refused, not faked", error);
   config.pack_method = bp::PackMethod::kMyPack;
   // 这一份 store 只属于 scheduled 触发：手工塞一个 realtime 进来不是

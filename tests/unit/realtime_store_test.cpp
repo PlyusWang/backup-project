@@ -97,8 +97,8 @@ int main() {
          bp::PackMethod::kMyPack, bp::EncryptionMethod::kAes256CtrHmacSha256,
          false, "Realtime + Incremental + aes 被拒绝"},
         {bp::BackupTrigger::kRealtime, bp::BackupStrategy::kIncremental,
-         bp::PackMethod::kUstar, bp::EncryptionMethod::kNone, false,
-         "Realtime + Incremental + ustar 被拒绝"},
+         bp::PackMethod::kUstar, bp::EncryptionMethod::kNone, true,
+         "Realtime + Incremental + ustar"},
     };
     for (const OptionCase& item : options) {
       bp::BackupOptionCombination combination;

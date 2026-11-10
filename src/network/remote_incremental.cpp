@@ -694,12 +694,8 @@ bool FindRemoteLineageHead(const std::vector<RemoteSnapshotInfo>& snapshots,
   return true;
 }
 
-// 三步：1) 找远端 head；2) 让既有引擎决定这次是 delta 还是完整基线；
-// 3) 打包上传，再核对服务端登记的父与代数。
-// 没有 head（或调用方不允许增量）时给引擎一个“不受管”的基线名，按公开契约
-// 引擎会强制产出一份完整 baseline，而不是去找缓存里可能已经过期的旧基线。
-// 上传后必须核对服务端返回的父与代数：服务端按父推导，对不上就是元数据出错，
-// 如实报错而不是把这次备份当成成功（宁可让用户重跑一次）。
+// 三步：1) 找远端 head；2) 用共享核心验证续接条件；
+// 3) 明确创建 delta 或完整基线，上传后核对服务端登记的父与代数。
 bool RunRemoteBackup(const RemoteBackupRequest& request,
                      RemoteBackupOutcome* outcome, std::string* error_message) {
   if (outcome == nullptr || request.client == nullptr) {
@@ -712,13 +708,13 @@ bool RunRemoteBackup(const RemoteBackupRequest& request,
     return false;
   }
 
-  const std::string lineage =
-      RemoteLineageId(request.cache, request.source_directory);
+  std::string normalized_source;
+  if (!NormalizeBackupSourceDirectory(request.source_directory,
+                                      &normalized_source, error_message))
+    return false;
+  const std::string lineage = RemoteLineageId(request.cache, normalized_source);
 
-  // 1) 远端链的 head。没有 head（或者调用方要求完整基线）时强制新建一份
-  //    完整基线：给引擎一个**不受管**的基线名，按 include/incremental_backup.h
-  //    的公开契约（baseline_snapshot_name 非空且不是受管名字 -> 清空基线），
-  //    引擎就会产出一份完整 baseline，而不是去找缓存里可能已经过期的旧基线。
+  // 没有远端 head 或明确要求完整备份时，直接调用正式完整备份入口。
   std::vector<RemoteSnapshotInfo> snapshots;
   if (!request.client->List(&snapshots, error_message)) {
     return false;
@@ -730,6 +726,7 @@ bool RunRemoteBackup(const RemoteBackupRequest& request,
       FindRemoteLineageHead(snapshots, lineage, &head, &head_reason);
 
   std::string baseline_name;
+  bool continue_incremental = have_head;
   std::string target_archive_name;
   if (have_head) {
     std::vector<RemoteSnapshotInfo> chain;
@@ -744,25 +741,59 @@ bool RunRemoteBackup(const RemoteBackupRequest& request,
         outcome->chain_root_bytes = snapshot.size_bytes;
       }
     }
+    // head 是内部自动选择，参数或密码变更时允许安全建立新完整基线。
+    // 校验复用公开候选 API；不能把它伪装成用户显式选择，再绕过拒绝规则。
+    std::vector<IncrementalBaselineCandidate> candidates;
+    if (!ListIncrementalBaselineCandidates(
+            request.cache.cache_directory, normalized_source,
+            request.cache.repository_identity, request.options,
+            request.include_rules, request.exclude_rules, &candidates,
+            error_message))
+      return false;
+    const auto selected = std::find_if(
+        candidates.begin(), candidates.end(), [&](const auto& candidate) {
+          return candidate.file_name == baseline_name;
+        });
+    continue_incremental =
+        selected != candidates.end() &&
+        selected->availability == BaselineAvailability::kUsable;
+    if (!continue_incremental)
+      outcome->baseline_reason = selected == candidates.end()
+                                     ? "the remote head is not available"
+                                     : selected->diagnostic;
   } else {
-    baseline_name = "remote-force-full-baseline";
     outcome->baseline_reason = head_reason;
   }
 
-  // 2) 让**既有引擎**决定这次是 delta 还是完整基线。
-  const std::uint64_t generation = have_head ? head.generation + 1 : 0;
-  const std::string new_name =
-      std::string(kRemoteArchivePrefix) + lineage.substr(0, 12) + "-" +
-      std::to_string(static_cast<long long>(::time(nullptr))) + "-g" +
-      std::to_string(generation) + ".bak";
+  const std::uint64_t generation =
+      continue_incremental ? head.generation + 1 : 0;
+  const std::string stem = std::string(kRemoteArchivePrefix) +
+                           lineage.substr(0, 12) + "-g" +
+                           std::to_string(generation);
+  // 同一秒内的手动完整备份也必须获得独立名字，不能覆盖缓存或误报已有文件。
+  BackupCatalog catalog;
+  std::string new_path;
+  if (!catalog.BuildArchivePath(request.cache.cache_directory, stem,
+                                static_cast<std::int64_t>(::time(nullptr)),
+                                &new_path, error_message))
+    return false;
+  const std::string new_name = new_path.substr(new_path.find_last_of('/') + 1);
 
   IncrementalOutcome incremental;
   std::string engine_error;
-  if (!RunIncrementalBackup(
-          request.source_directory, request.cache.cache_directory, new_name,
-          request.cache.repository_identity, request.filter, request.options,
-          request.include_rules, request.exclude_rules, baseline_name,
-          &incremental, &engine_error)) {
+  const bool engine_ok =
+      continue_incremental
+          ? RunIncrementalBackup(
+                normalized_source, request.cache.cache_directory, new_name,
+                request.cache.repository_identity, request.filter,
+                request.options, request.include_rules, request.exclude_rules,
+                baseline_name, &incremental, &engine_error)
+          : RunManagedFullBackup(
+                normalized_source, request.cache.cache_directory, new_name,
+                request.cache.repository_identity, request.filter,
+                request.options, request.include_rules, request.exclude_rules,
+                &incremental, &engine_error);
+  if (!engine_ok) {
     SetError(error_message, "增量引擎失败：" + engine_error);
     return false;
   }

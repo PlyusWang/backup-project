@@ -118,9 +118,12 @@ int RunNetworkAcceptanceTest(QQuickWindow* window,
       QString::fromUtf8(Read(fixture.filePath("bpsec1.server-key"))).trimmed();
   const QString ssh_target =
       QString::fromUtf8(Read(fixture.filePath("ssh.target"))).trimmed();
+  const QString invalid_ssh_target =
+      QString::fromUtf8(Read(fixture.filePath("ssh.invalid-target"))).trimmed();
   const QString roots = fixture.filePath("root.key.pub");
   const QString wrong_roots = fixture.filePath("wrong-root.key.pub");
   const QString wrapper = fixture.filePath("fixture-ssh");
+  const QString untrusted_wrapper = fixture.filePath("fixture-ssh-untrusted");
   const QString server_id = QStringLiteral("acceptance-loopback-server");
   const QString host = QStringLiteral("127.0.0.1");
   bool valid_port = false;
@@ -134,6 +137,11 @@ int RunNetworkAcceptanceTest(QQuickWindow* window,
                  bpsec1_pin.startsWith(QStringLiteral("sha256:")) &&
                  bpsec1_pin.size() == 71 &&
                  ssh_target.endsWith(QStringLiteral("@127.0.0.1")) &&
+                 invalid_ssh_target.endsWith(QStringLiteral("@127.0.0.1")) &&
+                 invalid_ssh_target != ssh_target &&
+                 QFileInfo(untrusted_wrapper).isExecutable() &&
+                 QFile::exists(fixture.filePath("empty_known_hosts")) &&
+                 Read(fixture.filePath("empty_known_hosts")).isEmpty() &&
                  QFileInfo(wrapper).isExecutable() && QFile::exists(roots) &&
                  QFile::exists(wrong_roots) && QDir().mkpath(output_directory),
              "ISOLATED_LOOPBACK_FIXTURE"))
@@ -229,6 +237,142 @@ int RunNetworkAcceptanceTest(QQuickWindow* window,
     page->setProperty("draftSshLocalPort", QString());
   };
 
+  // Both SSH failure paths must drive the production modal before any business
+  // request is sent. Every process uses only this fixture's key and trust file.
+  const QString probe_user = QStringLiteral("ssh-probe");
+  const QString probe_secret =
+      QUuid::createUuid().toString(QUuid::WithoutBraces);
+  const auto ssh_failure = [&](const QString& prefix, bool deferred_login,
+                               const QString& program, const QString& target,
+                               const QString& kind, const QString& title,
+                               const QString& summary,
+                               const QString& suggestion,
+                               const QString& screenshot) {
+    remote->stopTunnel();
+    remote->logoutLocal();
+    const bool configured = remote->setServerKind(QStringLiteral("custom")) &&
+                            remote->setConnectionMode(QStringLiteral("ssh")) &&
+                            remote->setAuthMode(QStringLiteral("certificate"));
+    remote->setCertificateSettings(roots, server_id);
+    remote->setSshProgram(program);
+    remote->setSshHost(target);
+    remote->setSshLocalPort(QString());
+    show_configuration(QStringLiteral("ssh"), roots, server_id);
+    if (page != nullptr) {
+      page->setProperty("draftSshHost", target);
+      page->setProperty("draftUser", probe_user);
+    }
+    check(configured, qPrintable(prefix + QStringLiteral("_CONFIGURED")));
+    int error_count = 0;
+    QString emitted_title;
+    QString emitted_summary;
+    QString emitted_suggestion;
+    QString emitted_technical;
+    const auto error_connection = QObject::connect(
+        remote, &backup_modern::RemoteController::userError, window,
+        [&](const QString& actual_title, const QString& actual_summary,
+            const QString& actual_suggestion, const QString& actual_technical) {
+          ++error_count;
+          emitted_title = actual_title;
+          emitted_summary = actual_summary;
+          emitted_suggestion = actual_suggestion;
+          emitted_technical = actual_technical;
+        });
+    const int dispatched_before = remote->dispatchedRequestCountForTest();
+    const bool accepted =
+        deferred_login ? remote->login(host, port, probe_user, probe_secret)
+                       : remote->ensureConnection(host, port);
+    const bool settled =
+        accepted && (deferred_login ? remote->waitForIdle(120000)
+                                    : remote->waitForTunnelIdle(120000));
+    Pump(150);
+    check(settled && remote->lastErrorKindForTest() == kind &&
+              remote->tunnelFailureKind() == kind && !remote->authenticated() &&
+              !remote->tunnelReady() && remote->tunnelPidForTest() == 0 &&
+              remote->dispatchedRequestCountForTest() == dispatched_before,
+          qPrintable(prefix + QStringLiteral("_REAL_SSH_FAILURE")));
+    check(error_count == 1 && emitted_title == title &&
+              emitted_summary == summary && emitted_suggestion == suggestion &&
+              emitted_technical.isEmpty(),
+          qPrintable(prefix + QStringLiteral("_ONE_CHINESE_ERROR")));
+    check(deferred_login ? !remote->loginError().isEmpty()
+                         : remote->statusKind() == QStringLiteral("error"),
+          qPrintable(prefix + QStringLiteral("_SURFACE_REASON_RETAINED")));
+
+    QObject* dialog =
+        window->findChild<QObject*>(QStringLiteral("userErrorDialog"));
+    QQuickItem* content =
+        dialog == nullptr
+            ? nullptr
+            : dialog->property("contentItem").value<QQuickItem*>();
+    const auto shown_text = [&](const char* name, const QString& expected) {
+      QQuickItem* item = content == nullptr ? nullptr : FindItem(content, name);
+      return item != nullptr && item->isVisible() && item->width() > 0 &&
+             item->height() > 0 &&
+             item->property("text").toString() == expected;
+    };
+    QQuickItem* technical_toggle =
+        content == nullptr ? nullptr
+                           : FindItem(content, "userErrorTechnicalToggle");
+    QQuickItem* technical_text =
+        content == nullptr ? nullptr : FindItem(content, "userErrorTechnical");
+    const bool modal_visible =
+        dialog != nullptr && dialog->property("visible").toBool() &&
+        dialog->property("modal").toBool() &&
+        dialog->property("technical").toString().isEmpty() &&
+        shown_text("userErrorTitle", title) &&
+        shown_text("userErrorSummary", summary) &&
+        shown_text("userErrorSuggestion", suggestion) &&
+        technical_toggle != nullptr && !technical_toggle->isVisible() &&
+        technical_text != nullptr && !technical_text->isVisible();
+    check(modal_visible,
+          qPrintable(prefix + QStringLiteral("_REAL_ERROR_MODAL")));
+    check(modal_visible && capture(screenshot),
+          qPrintable(prefix + QStringLiteral("_ERROR_MODAL_SCREENSHOT")));
+    DismissError(window);
+    check(dialog != nullptr && !dialog->property("visible").toBool(),
+          qPrintable(prefix + QStringLiteral("_ERROR_MODAL_DISMISSED")));
+    QObject::disconnect(error_connection);
+    remote->stopTunnel();
+    remote->logoutLocal();
+  };
+  const QString auth_title = QStringLiteral("SSH 认证失败");
+  const QString auth_summary = QStringLiteral("SSH 服务器未接受当前登录凭据。");
+  const QString auth_suggestion =
+      QStringLiteral("请检查 SSH 用户和密钥，并确认密钥已加入 ssh-agent。");
+  ssh_failure(QStringLiteral("SSH_AUTH_ENSURE"), false, wrapper,
+              invalid_ssh_target, QStringLiteral("ssh-auth"), auth_title,
+              auth_summary, auth_suggestion,
+              QStringLiteral("23-network-ssh-auth-ensure-error.png"));
+  ssh_failure(QStringLiteral("SSH_AUTH_DEFERRED_LOGIN"), true, wrapper,
+              invalid_ssh_target, QStringLiteral("ssh-auth"), auth_title,
+              auth_summary, auth_suggestion,
+              QStringLiteral("24-network-ssh-auth-login-error.png"));
+  const QString hostkey_title = QStringLiteral("SSH 服务器身份校验失败");
+  const QString hostkey_summary =
+      QStringLiteral("SSH 主机密钥未知或与已保存的密钥不一致。");
+  const QString hostkey_suggestion =
+      QStringLiteral("请向管理员核对主机密钥后更新可信记录。");
+  ssh_failure(QStringLiteral("SSH_HOSTKEY_ENSURE"), false, untrusted_wrapper,
+              ssh_target, QStringLiteral("ssh-hostkey"), hostkey_title,
+              hostkey_summary, hostkey_suggestion,
+              QStringLiteral("25-network-ssh-hostkey-ensure-error.png"));
+  ssh_failure(QStringLiteral("SSH_HOSTKEY_DEFERRED_LOGIN"), true,
+              untrusted_wrapper, ssh_target, QStringLiteral("ssh-hostkey"),
+              hostkey_title, hostkey_summary, hostkey_suggestion,
+              QStringLiteral("26-network-ssh-hostkey-login-error.png"));
+  // Restore the trusted transport before the original four positive sessions.
+  remote->setSshProgram(wrapper);
+  remote->setSshHost(ssh_target);
+  remote->setSshLocalPort(QString());
+  if (page != nullptr) {
+    page->setProperty("draftSshHost", ssh_target);
+    page->setProperty("draftUser", QString());
+  }
+  check(!remote->busy() && !remote->authenticated() && !remote->tunnelReady() &&
+            remote->sshProgram() == wrapper && remote->sshHost() == ssh_target,
+        "SSH_NEGATIVE_FIXTURE_STATE_RESTORED");
+
   remote->logoutLocal();
   remote->stopTunnel();
   check(remote->setServerKind(QStringLiteral("custom")) &&
@@ -245,14 +389,14 @@ int RunNetworkAcceptanceTest(QQuickWindow* window,
     QMetaObject::invokeMethod(auth_mode_tabs, "activated", Qt::DirectConnection,
                               Q_ARG(QString, QStringLiteral("pin")));
   }
-  check(auth_tabs_ready && remote->authMode() == QStringLiteral("pin") &&
-            page->property("draftAuthMode").toString() ==
-                QStringLiteral("pin") &&
-            page->property("draftTrustedRoots").toString().isEmpty() &&
-            page->property("draftExpectedServerId").toString().isEmpty() &&
-            remote->trustedRootsFile().isEmpty() &&
-            remote->expectedServerId().isEmpty(),
-        "BPSEC2_TO_BPSEC1_CLEARS_CERTIFICATE_IDENTITY");
+  check(
+      auth_tabs_ready && remote->authMode() == QStringLiteral("pin") &&
+          page->property("draftAuthMode").toString() == QStringLiteral("pin") &&
+          page->property("draftTrustedRoots").toString().isEmpty() &&
+          page->property("draftExpectedServerId").toString().isEmpty() &&
+          remote->trustedRootsFile().isEmpty() &&
+          remote->expectedServerId().isEmpty(),
+      "BPSEC2_TO_BPSEC1_CLEARS_CERTIFICATE_IDENTITY");
   if (auth_tabs_ready) {
     QMetaObject::invokeMethod(auth_mode_tabs, "activated", Qt::DirectConnection,
                               Q_ARG(QString, QStringLiteral("certificate")));
@@ -262,18 +406,18 @@ int RunNetworkAcceptanceTest(QQuickWindow* window,
   const bool accepted_without_identity =
       remote->login(host, port, QStringLiteral("must-not-connect"),
                     QStringLiteral("synthetic-password"));
-  check(auth_tabs_ready && remote->authMode() == QStringLiteral("certificate") &&
-            page->property("draftAuthMode").toString() ==
-                QStringLiteral("certificate") &&
-            page->property("draftTrustedRoots").toString().isEmpty() &&
-            page->property("draftExpectedServerId").toString().isEmpty() &&
-            remote->trustedRootsFile().isEmpty() &&
-            remote->expectedServerId().isEmpty() &&
-            !accepted_without_identity &&
-            remote->dispatchedRequestCountForTest() ==
-                dispatched_before_missing_identity &&
-            remote->lastErrorKindForTest() == QStringLiteral("validation"),
-        "BPSEC1_TO_BPSEC2_REQUIRES_NEW_CERTIFICATE_IDENTITY");
+  check(
+      auth_tabs_ready && remote->authMode() == QStringLiteral("certificate") &&
+          page->property("draftAuthMode").toString() ==
+              QStringLiteral("certificate") &&
+          page->property("draftTrustedRoots").toString().isEmpty() &&
+          page->property("draftExpectedServerId").toString().isEmpty() &&
+          remote->trustedRootsFile().isEmpty() &&
+          remote->expectedServerId().isEmpty() && !accepted_without_identity &&
+          remote->dispatchedRequestCountForTest() ==
+              dispatched_before_missing_identity &&
+          remote->lastErrorKindForTest() == QStringLiteral("validation"),
+      "BPSEC1_TO_BPSEC2_REQUIRES_NEW_CERTIFICATE_IDENTITY");
   remote->setCertificateSettings(roots, server_id);
   show_configuration(QStringLiteral("direct"), roots, server_id);
   const QString account_secret =
@@ -417,21 +561,20 @@ int RunNetworkAcceptanceTest(QQuickWindow* window,
                                    QStringLiteral("_RESTORE_CHAIN_SHA256")));
   };
   const auto run_bpsec1_session = [&](bool over_ssh) {
-    const QString mode = over_ssh ? QStringLiteral("ssh")
-                                  : QStringLiteral("direct");
-    const QString label = over_ssh ? QStringLiteral("SSH_BPSEC1")
-                                   : QStringLiteral("TCP_BPSEC1");
+    const QString mode =
+        over_ssh ? QStringLiteral("ssh") : QStringLiteral("direct");
+    const QString label =
+        over_ssh ? QStringLiteral("SSH_BPSEC1") : QStringLiteral("TCP_BPSEC1");
     const QString username = over_ssh ? QStringLiteral("network-ssh-pin")
-                                       : QStringLiteral("network-direct-pin");
+                                      : QStringLiteral("network-direct-pin");
     const QString account_password =
         QUuid::createUuid().toString(QUuid::WithoutBraces);
     remote->logoutLocal();
     remote->stopTunnel();
-    const bool configured =
-        remote->setServerKind(QStringLiteral("custom")) &&
-        remote->setConnectionMode(mode) &&
-        remote->setAuthMode(QStringLiteral("pin")) &&
-        remote->setServerKeyPin(bpsec1_pin);
+    const bool configured = remote->setServerKind(QStringLiteral("custom")) &&
+                            remote->setConnectionMode(mode) &&
+                            remote->setAuthMode(QStringLiteral("pin")) &&
+                            remote->setServerKeyPin(bpsec1_pin);
     if (configured) remote->setCertificateSettings(QString(), QString());
     if (page != nullptr) {
       page->setProperty("draftServerKind", QStringLiteral("custom"));

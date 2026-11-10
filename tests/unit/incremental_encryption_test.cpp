@@ -3,6 +3,7 @@
 // 完整基线与真实 delta 的加密闭环：兼容旧未加密归档、独立进程恢复、
 // 错误密码、外层元数据认证、密码变更和缺失父快照。
 
+#include <fcntl.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -11,6 +12,7 @@
 #include <cstdio>
 #include <iostream>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "backup_catalog.h"
@@ -86,6 +88,156 @@ bool RunIncremental(const std::string& source, const std::string& repository,
   return bp::RunIncrementalBackup(
       source, repository, name, bp::RepositoryIdentity(repository),
       bp::Filter(), options, {}, {}, "", outcome, error, progress);
+}
+
+bool RunIncrementalFrom(const std::string& source,
+                        const std::string& repository, const std::string& name,
+                        const std::string& baseline,
+                        const bp::BackupOptions& options,
+                        bp::IncrementalOutcome* outcome, std::string* error) {
+  return bp::RunIncrementalBackup(
+      source, repository, name, bp::RepositoryIdentity(repository),
+      bp::Filter(), options, {}, {}, baseline, outcome, error);
+}
+
+bool SamePackChainContents(const std::string& source,
+                           const std::string& destination) {
+  for (const char* name :
+       {"bulk.bin", "small.txt", "empty", "中文.txt", "new.txt"}) {
+    const std::string path(name);
+    std::string expected;
+    std::string actual;
+    if (!bp::ContentDigestOfFile(source + "/" + path, &expected, nullptr) ||
+        !bp::ContentDigestOfFile(destination + "/" + path, &actual, nullptr) ||
+        expected != actual) {
+      return false;
+    }
+  }
+  return !test_support::Exists(destination + "/deleted.txt");
+}
+
+bool StandardTarLists(const std::string& path) {
+  const pid_t child = ::fork();
+  if (child < 0) return false;
+  if (child == 0) {
+    const int null_fd = ::open("/dev/null", O_WRONLY | O_CLOEXEC);
+    if (null_fd >= 0) {
+      ::dup2(null_fd, STDOUT_FILENO);
+      ::dup2(null_fd, STDERR_FILENO);
+      ::close(null_fd);
+    }
+    ::execlp("tar", "tar", "-tf", path.c_str(), static_cast<char*>(nullptr));
+    ::_exit(127);
+  }
+  int status = 0;
+  return ::waitpid(child, &status, 0) == child && WIFEXITED(status) &&
+         WEXITSTATUS(status) == 0;
+}
+
+void TestPackChain(bp::PackMethod pack, bp::EncryptionMethod encryption,
+                   const std::string& pack_name,
+                   const std::string& encryption_name) {
+  const std::string label = pack_name + "-" + encryption_name;
+  test_support::Section("INC-PACK " + label);
+  const std::string work = test_support::FreshDir("inc-pack-" + label);
+  const std::string source = work + "/src";
+  const std::string repository = work + "/repo";
+  test_support::Check(test_support::Mkdir(source, 0755) &&
+                          test_support::Mkdir(repository, 0755),
+                      label + " isolated source and repository");
+  test_support::Check(
+      test_support::WriteFile(source + "/bulk.bin", BinaryFixture(1u << 20),
+                              0644) &&
+          test_support::WriteFile(source + "/small.txt", "F0", 0644) &&
+          test_support::WriteFile(source + "/deleted.txt", "remove in D2",
+                                  0644) &&
+          test_support::WriteFile(source + "/empty", "", 0644),
+      label + " F0 fixtures");
+  bp::BackupOptions options;
+  options.pack_method = pack;
+  options.encryption_method = encryption;
+  if (encryption != bp::EncryptionMethod::kNone) {
+    options.password = "A09 test archive password";
+  }
+  std::string error;
+  bp::IncrementalOutcome outcome;
+  test_support::Check(
+      bp::RunManagedFullBackup(source, repository, "base.bak",
+                               bp::RepositoryIdentity(repository), bp::Filter(),
+                               options, {}, {}, &outcome, &error),
+      label + " F0 full baseline", error);
+  test_support::WriteFile(source + "/small.txt", "D1 modified content", 0644);
+  test_support::WriteFile(source + "/中文.txt", "D1 added content", 0644);
+  test_support::Check(
+      RunIncrementalFrom(source, repository, "delta1.bak", "base.bak", options,
+                         &outcome, &error) &&
+          outcome.kind == bp::IncrementalOutcome::Kind::kDelta,
+      label + " D1 is a true incremental delta", error);
+  test_support::WriteFile(source + "/small.txt", "D2 modified content", 0644);
+  test_support::WriteFile(source + "/new.txt", "D2 added content", 0644);
+  ::unlink((source + "/deleted.txt").c_str());
+  test_support::Check(
+      RunIncrementalFrom(source, repository, "delta2.bak", "delta1.bak",
+                         options, &outcome, &error) &&
+          outcome.kind == bp::IncrementalOutcome::Kind::kDelta,
+      label + " D2 chains from D1 with add/modify/delete", error);
+  bp::DeltaEnvelope first;
+  bp::DeltaEnvelope second;
+  test_support::Check(
+      bp::ReadDeltaEnvelope(repository + "/delta1.bak", &first, &error) &&
+          bp::ReadDeltaEnvelope(repository + "/delta2.bak", &second, &error) &&
+          first.parent_file_name == "base.bak" &&
+          second.parent_file_name == "delta1.bak" && second.added == 1 &&
+          second.modified == 1 && second.removed == 1,
+      label + " BKPINC envelope records exact parent and change counts", error);
+  const std::string inner = work + "/delta2-inner.bak";
+  bp::ContainerHeader header;
+  test_support::Check(
+      bp::ExtractDeltaPayload(repository + "/delta2.bak", inner, &error) &&
+          bp::InspectContainerFile(inner, &header, &error) &&
+          header.pack_method == static_cast<std::uint8_t>(pack),
+      label + " inner container retains the selected pack", error);
+  if ((pack == bp::PackMethod::kUstar || pack == bp::PackMethod::kFastUstar) &&
+      encryption == bp::EncryptionMethod::kNone) {
+    std::string container;
+    const bool have_container = test_support::ReadFile(inner, &container);
+    const std::uint64_t payload_offset = bp::container_v2::kHeaderSize;
+    const bool payload_in_bounds =
+        have_container && header.compressed_size == header.packed_size &&
+        header.payload_size == header.compressed_size &&
+        payload_offset <= container.size() &&
+        header.packed_size <= container.size() - payload_offset;
+    const std::string packed_path = work + "/delta2.tar";
+    const bool extracted =
+        payload_in_bounds &&
+        test_support::WriteFile(
+            packed_path,
+            container.substr(static_cast<std::size_t>(payload_offset),
+                             static_cast<std::size_t>(header.packed_size)),
+            0600);
+    test_support::Check(extracted && StandardTarLists(packed_path),
+                        label + " packed payload is readable by standard tar",
+                        error);
+  }
+  const std::string restored = work + "/restored";
+  bp::RestoreOptions restore;
+  restore.password = options.password;
+  test_support::Check(
+      bp::RestoreSnapshotChain(repository, "delta2.bak", restored, restore,
+                               nullptr, &error) &&
+          SamePackChainContents(source, restored),
+      label + " R2 restores D2 content and per-file SHA-256", error);
+  if (encryption != bp::EncryptionMethod::kNone) {
+    bp::RestoreOptions wrong_password;
+    wrong_password.password = "incorrect password";
+    const std::string rejected = work + "/wrong-password";
+    test_support::Check(
+        !bp::RestoreSnapshotChain(repository, "delta2.bak", rejected,
+                                  wrong_password, nullptr, &error) &&
+            !test_support::Exists(rejected),
+        label + " wrong password rejects without publishing a destination",
+        error);
+  }
 }
 
 // 仅修改本测试刚生成的合成归档；重算公开摘要后认证仍必须拒绝元数据改变。
@@ -293,12 +445,22 @@ void TestRoundTrip(bp::EncryptionMethod encryption, const std::string& label) {
     test_support::Check(
         tag != std::string::npos &&
             test_support::WriteFile(identity_path, identity_bytes, 0600) &&
-            bp::RunIncrementalBackup(
-                source, repository, "metadata-rebuilt.bak",
+            !bp::RunIncrementalBackup(
+                source, repository, "metadata-explicit.bak",
                 bp::RepositoryIdentity(repository), bp::Filter(), options, {},
                 {}, "changed-password.bak", &outcome, &error) &&
+            !test_support::Exists(repository + "/metadata-explicit.bak"),
+        label +
+            " explicitly selected untrusted metadata refuses without output",
+        error);
+    error.clear();
+    test_support::Check(
+        bp::RunIncrementalBackup(source, repository, "metadata-rebuilt.bak",
+                                 bp::RepositoryIdentity(repository),
+                                 bp::Filter(), options, {}, {}, "", &outcome,
+                                 &error) &&
             outcome.kind == bp::IncrementalOutcome::Kind::kFullBaseline,
-        label + " untrusted baseline metadata cannot cause an unchanged skip",
+        label + " automatic mode cannot skip changes with untrusted metadata",
         error);
     options.password = first_password;
     std::string original_delta;
@@ -340,5 +502,15 @@ int main(int argc, char** argv) {
   TestRoundTrip(bp::EncryptionMethod::kNone, "none");
   TestRoundTrip(bp::EncryptionMethod::kAes256CtrHmacSha256, "aes");
   TestRoundTrip(bp::EncryptionMethod::kDesCbcHmacSha256, "des");
+  for (const auto& pack : {std::pair<bp::PackMethod, const char*>{
+                               bp::PackMethod::kMyPack, "mypack"},
+                           {bp::PackMethod::kUstar, "ustar"},
+                           {bp::PackMethod::kFastUstar, "fast-ustar"}}) {
+    TestPackChain(pack.first, bp::EncryptionMethod::kNone, pack.second, "none");
+    TestPackChain(pack.first, bp::EncryptionMethod::kAes256CtrHmacSha256,
+                  pack.second, "aes");
+    TestPackChain(pack.first, bp::EncryptionMethod::kDesCbcHmacSha256,
+                  pack.second, "des");
+  }
   return test_support::Finish("incremental_encryption_test");
 }

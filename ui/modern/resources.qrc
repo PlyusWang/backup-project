@@ -8,6 +8,7 @@
     <file>qml/components/AppIcon.qml</file>
     <file>qml/components/AppTextField.qml</file>
     <file>qml/components/BackupOptionsPanel.qml</file>
+    <file>qml/components/IncrementalBaselinePanel.qml</file>
     <file>qml/components/BackupRecordCard.qml</file>
     <file>qml/components/FilterEditorPanel.qml</file>
     <file>qml/components/FilterRuleEditor.qml</file>

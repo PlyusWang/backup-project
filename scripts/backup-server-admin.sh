@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 #
-# backup-server-admin.sh —— 备份服务器本机管理菜单（只在 ECS 本机使用）。
+# backup-server-admin.sh —— 自建服务器本机管理菜单。
 #
-# 它只做四件事：清屏、显示菜单、读选择、调用同目录下的 backup-server-admin。
-# 真正危险的数据操作**一个都不在这里做**：没有 SQL，没有 rm，没有直接改目录。
+# 用户和备份数据的操作调用共享管理工具；配置和证书更新使用停机锁与原子替换。
+# 本脚本不直接修改数据库或备份文件。
 #
 # ---- 实例身份（这一版的重点）----
 #
@@ -107,13 +107,44 @@ if [ ! -x "$ADMIN_BIN" ]; then
   echo "先构建：make server（产物在 build/backup-server-admin）" >&2
   exit 1
 fi
+for required_tool in ss flock; do
+  command -v "$required_tool" >/dev/null 2>&1 || {
+    printf '缺少 %s，无法安全管理实例；请安装 iproute2 与 util-linux。\n' "$required_tool" >&2
+    exit 1
+  }
+done
 config_value() {
   [ -f "$CONFIG_FILE" ] || return 0
-  awk -F= -v key="$1" '$1 ~ "^[[:space:]]*" key "[[:space:]]*$" { sub(/^[[:space:]]*/, "", $2); sub(/[[:space:]]*$/, "", $2); print $2; exit }' "$CONFIG_FILE"
+  # Match launch-server.sh: strip comments, split only the first '=', and
+  # let the last occurrence win. Never interpret a value as shell syntax.
+  awk -v wanted="$1" '
+    {
+      line = $0
+      sub(/#.*/, "", line)
+      equals = index(line, "=")
+      if (!equals) next
+      key = substr(line, 1, equals - 1)
+      value = substr(line, equals + 1)
+      sub(/^[[:space:]]*/, "", key); sub(/[[:space:]]*$/, "", key)
+      sub(/^[[:space:]]*/, "", value); sub(/[[:space:]]*$/, "", value)
+      if (key == wanted) { result = value; found = 1 }
+    }
+    END { if (found) print result }
+  ' "$CONFIG_FILE"
 }
 configured_port() { config_value port | head -1; }
 configured_cert() { config_value certificate | head -1; }
 configured_root_pub="${BACKUP_SERVER_ROOT_PUBLIC:-$SERVER_ROOT/private/root.key.pub}"
+# Imported public materials live together in a versioned directory. Deriving
+# the root from the committed certificate keeps the pair consistent on restart.
+refresh_client_root() {
+  local cert
+  cert="$(configured_cert)"
+  if [[ "$cert" == "$SERVER_ROOT"/state/client-identity.*/server.bpcert ]]; then
+    configured_root_pub="$(dirname "$cert")/trusted-root.pub"
+  fi
+}
+refresh_client_root
 if [ -z "${BACKUP_SERVER_DATA:-}" ] && [ -n "$(config_value data_root)" ]; then
   DATA_ROOT="$(config_value data_root)"
 fi
@@ -123,10 +154,13 @@ fi
 if [ -z "${BACKUP_SERVER_PID_FILE:-}" ] && [ -n "$(config_value pid_file)" ]; then
   PID_FILE="$(config_value pid_file)"
 fi
-if [ -z "${BACKUP_SERVER_LOG:-}" ]; then
+refresh_runtime_config() {
+  local configured_log
+  refresh_client_root
   configured_log="$(config_value log_file)"
   [ -z "$configured_log" ] || LOG_FILE="$configured_log"
-fi
+}
+refresh_runtime_config
 
 # Paths derived by the portable wrapper must follow the instance root entered
 # during initialization. Caller-supplied BACKUP_SERVER_* paths stay fixed.
@@ -147,25 +181,68 @@ instance_initialized() {
 }
 instance_ready() { [ -d "$DATA_ROOT" ] && [ -f "$DB_PATH" ]; }
 
+# 0 = listening, 1 = free, 2 = cannot determine.
+port_listener_state() {
+  local port="$1" listeners
+  case "$port" in ''|*[!0-9]*) return 2 ;; esac
+  [ "$port" -ge 1 ] && [ "$port" -le 65535 ] || return 2
+  listeners="$(ss -ltnH "sport = :$port" 2>/dev/null)" || return 2
+  [ -n "$listeners" ]
+}
+
 port_listener_exists() {
-  local port="$1"
-  case "$port" in ''|*[!0-9]*) return 1 ;; esac
-  [ "$port" -ge 1 ] && [ "$port" -le 65535 ] || return 1
-  ss -ltnH "sport = :$port" 2>/dev/null | grep -q .
+  local state=0
+  port_listener_state "$1" || state=$?
+  if [ "$state" = 2 ]; then
+    printf '无法检查端口 %s 的监听状态，按已占用处理。\n' "$1" >&2
+  fi
+  [ "$state" != 1 ]
+}
+
+pid_starttime() {
+  local pid="$1" status rest
+  local -a fields=()
+  IFS= read -r status <"/proc/$pid/stat" 2>/dev/null || return 1
+  rest="${status##*) }"
+  read -r -a fields <<<"$rest"
+  [ -n "${fields[19]:-}" ] || return 1
+  printf '%s\n' "${fields[19]}"
 }
 
 pid_is_ours() {
-  local pid="$1" cmd
+  local pid="$1" expected_exe actual_exe before index
+  local roots=0 databases=0 pid_files=0
+  local -a args=()
   case "$pid" in ''|*[!0-9]*) return 1 ;; esac
   [ "$pid" -gt 1 ] 2>/dev/null || return 1
   kill -0 "$pid" 2>/dev/null || return 1
-  [ -r "/proc/$pid/cmdline" ] || return 1
-  cmd="$(tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null || true)"
-  case "$cmd" in
-    *backup-server*"--root"*"$DATA_ROOT"*"--db"*"$DB_PATH"*) return 0 ;;
-    *) return 1 ;;
-  esac
+  before="$(pid_starttime "$pid")" || return 1
+  expected_exe="$(readlink -f "$SERVER_BIN")" || return 1
+  actual_exe="$(readlink "/proc/$pid/exe")" || return 1
+  # dpkg can replace the payload while the old executable is still running.
+  # Its original absolute path must still be exactly the configured server.
+  case "$actual_exe" in "$expected_exe"|"$expected_exe (deleted)") ;; *) return 1 ;; esac
+  mapfile -d '' -t args <"/proc/$pid/cmdline" 2>/dev/null || return 1
+  for ((index=1; index<${#args[@]}; index++)); do
+    case "${args[$index]}" in
+      --root)
+        index=$((index + 1))
+        [ "${args[$index]:-}" = "$DATA_ROOT" ] || return 1
+        roots=$((roots + 1)) ;;
+      --db)
+        index=$((index + 1))
+        [ "${args[$index]:-}" = "$DB_PATH" ] || return 1
+        databases=$((databases + 1)) ;;
+      --pid-file)
+        index=$((index + 1))
+        [ "${args[$index]:-}" = "$PID_FILE" ] || return 1
+        pid_files=$((pid_files + 1)) ;;
+    esac
+  done
+  [ "$roots" = 1 ] && [ "$databases" = 1 ] && [ "$pid_files" = 1 ] &&
+    [ "$before" = "$(pid_starttime "$pid")" ]
 }
+
 
 owned_pid() {
   [ -f "$PID_FILE" ] || return 1
@@ -184,7 +261,16 @@ clear_screen() {
 }
 
 admin() {
-  instance_ready || { echo "服务器尚未初始化：请先选择“初始化服务器”。"; return 1; }
+  instance_ready || { echo '服务器尚未初始化：请先选择“初始化服务器”。'; return 1; }
+  if [ -n "${BACKUP_SERVER_SERVICE:-}" ]; then
+    installed_instance_matches || return 1
+    if [ "$(id -u)" = 0 ]; then
+      command -v runuser >/dev/null 2>&1 || { printf '缺少 runuser，无法切换到安装版服务用户。\n'; return 1; }
+      runuser -u backup-project -- "$ADMIN_BIN" --server-root "$SERVER_ROOT" \
+        --root "$DATA_ROOT" --db "$DB_PATH" "$@"
+      return "$?"
+    fi
+  fi
   "$ADMIN_BIN" --server-root "$SERVER_ROOT" --root "$DATA_ROOT" \
     --db "$DB_PATH" "$@"
 }
@@ -209,10 +295,18 @@ banner() {
     printf '状态：尚未初始化\n'
   fi
   if instance_initialized || instance_ready; then
+    local listener_state=0
+    port_listener_state "$(configured_port)" || listener_state=$?
     if pid="$(owned_pid 2>/dev/null)"; then
-      printf '进程状态：运行中（PID %s）\n' "$pid"
-    elif port_listener_exists "$(configured_port)"; then
+      if [ "$listener_state" = 0 ]; then
+        printf '进程状态：运行中（PID %s，业务端口已监听）\n' "$pid"
+      else
+        printf '进程状态：已确认实例进程（PID %s），业务端口监听尚未确认\n' "$pid"
+      fi
+    elif [ "$listener_state" = 0 ]; then
       printf '进程状态：端口 %s 已监听，但进程不属于当前实例管理器\n' "$(configured_port)"
+    elif [ "$listener_state" = 2 ]; then
+      printf '进程状态：无法核实业务端口监听，请检查 ss 与系统权限。\n'
     else
       printf '进程状态：已初始化，当前未运行\n'
     fi
@@ -227,8 +321,12 @@ print_client_connection_info() {
   printf '服务器地址：%s\n业务端口：%s\n' "$bind" "$port"
   cert="$(configured_cert)"
   if [ -n "$cert" ]; then
-    printf '认证模式：BPSEC2\n客户端可信根公钥：%s\n服务器身份文件：%s\n' \
-      "$configured_root_pub" "$cert"
+    if [ "$(config_value require_bpsec2)" = true ]; then
+      printf '认证模式：BPSEC2（仅接受证书身份）\n'
+    else
+      printf '认证模式：BPSEC1 指纹 + 可选 BPSEC2 证书\n'
+    fi
+    printf '客户端可信根公钥：%s\n服务器身份文件：%s\n' "$configured_root_pub" "$cert"
     return 0
   fi
   key="$(config_value transport_key)"
@@ -238,6 +336,15 @@ print_client_connection_info() {
   else
     printf '传输身份指纹：不可用（找不到已配置的身份私钥）\n'
   fi
+}
+
+# server.conf has no quoting syntax: comments and trailing whitespace cannot
+# represent literal path bytes. Reject them before creating identity material.
+initialization_path_supported() {
+  local path="$1"
+  case "$path" in /*) ;; *) return 1 ;; esac
+  case "$path" in *'#'*|*$'\r'*|*$'\n'*) return 1 ;; esac
+  [[ ! "$path" =~ [[:space:]]$ ]]
 }
 
 init_server() {
@@ -277,19 +384,20 @@ init_server() {
   else
     configured_root_pub="${BACKUP_SERVER_ROOT_PUBLIC:-$SERVER_ROOT/private/root.key.pub}"
   fi
-  case "$SERVER_ROOT" in /*) ;; *) printf '实例目录必须是绝对路径。\n'; return 1 ;; esac
   local secret_file="$SERVER_ROOT/secrets.env" key_file="$SERVER_ROOT/state/transport.key"
   local root_key="$SERVER_ROOT/private/root.key" cert_path="$SERVER_ROOT/state/server.bpcert"
-  if [ -e "$DB_PATH" ] || [ -e "$CONFIG_FILE" ] || [ -e "$key_file" ] || [ -e "$secret_file" ] ||
-      [ -e "$root_key" ] || [ -e "${root_key}.pub" ] || [ -e "$configured_root_pub" ] || [ -e "$cert_path" ] ||
-      { [ -d "$DATA_ROOT" ] && find "$DATA_ROOT" -mindepth 1 -print -quit | grep -q .; }; then
-    printf '目标目录已有数据库、配置、密钥或备份文件，初始化已拒绝，不会覆盖。\n'
-    return 1
-  fi
+  local path
+  for path in "$SERVER_ROOT" "$DATA_ROOT" "$DB_PATH" "$PID_FILE" "$LOG_FILE" \
+      "$CONFIG_FILE" "$configured_root_pub"; do
+    initialization_path_supported "$path" || {
+      printf '实例路径必须是绝对路径，且不能包含 #、换行或结尾空白；尚未创建身份文件。\n'
+      return 1
+    }
+  done
   printf '监听地址 [127.0.0.1]：'; read -r bind || return 0; [ -n "$bind" ] || bind=127.0.0.1
   printf '业务端口 [18765]：'; read -r port || return 0; [ -n "$port" ] || port=18765
   if [ "$bind" != "127.0.0.1" ]; then
-    printf '当前服务端只支持 127.0.0.1 回环监听，未生成配置。\n'
+    printf '当前初始化向导仅配置 127.0.0.1 回环监听；其他机器可使用 SSH 隧道，未生成配置。\n'
     return 1
   fi
   case "$port" in ''|*[!0-9]*) printf '端口必须是 1 到 65535 的整数。\n'; return 1 ;; esac
@@ -299,33 +407,100 @@ init_server() {
   fi
   printf '是否初始化 BPSEC2 证书身份（y/N）：'; read -r use_cert || return 0
   [ -x "$KEYGEN_BIN" ] || { printf '找不到 backup-server-keygen：%s\n' "$KEYGEN_BIN"; return 1; }
+  [ -x "$LAUNCHER" ] || { printf '找不到安全启动器：%s\n' "$LAUNCHER"; return 1; }
   if [[ "$use_cert" =~ ^[Yy]$ ]]; then
     [ -x "$CERT_TOOL" ] || { printf '找不到 backup-cert-tool：%s\n' "$CERT_TOOL"; return 1; }
     printf 'server_id [self-hosted-%s]：' "$port"; read -r server_id || return 0
     [ -n "$server_id" ] || server_id="self-hosted-$port"
   fi
-  mkdir -p "$SERVER_ROOT" || return 1
-  local keygen_output pubkey certificate="" require_bpsec2=false
-  local init_dir config_tmp
-  init_dir="$(mktemp -d "$SERVER_ROOT/.server-init.XXXXXXXX")" || return 1
-  trap 'rm -rf "$init_dir"' RETURN
-  mkdir -p "$init_dir/state" "$init_dir/private" || return 1
-  keygen_output="$("$KEYGEN_BIN" --output "$init_dir/state/transport.key")" || return 1
-  pubkey="$(printf '%s\n' "$keygen_output" | sed -n 's/.*公钥 (hex): //p' | head -1)"
-  [ -n "$pubkey" ] || { printf '无法从 keygen 结果取得公钥，初始化停止。\n'; return 1; }
-  if [[ "$use_cert" =~ ^[Yy]$ ]]; then
-    [ -x "$CERT_TOOL" ] || { printf '找不到 backup-cert-tool：%s\n' "$CERT_TOOL"; return 1; }
-    root_key="$SERVER_ROOT/private/root.key"
-    cert_path="$SERVER_ROOT/state/server.bpcert"
-    "$CERT_TOOL" root-init --root-key "$init_dir/private/root.key" --root-id "${server_id}-root" >/dev/null || return 1
-    "$CERT_TOOL" issue-server --root-key "$init_dir/private/root.key" --server-id "$server_id" \
-      --server-pubkey "hex:$pubkey" --out "$init_dir/state/server.bpcert" >/dev/null || return 1
-    certificate="$cert_path"
-    require_bpsec2=true
-  fi
-  head -c 32 /dev/urandom | sha256sum | awk '{print "BACKUP_TOKEN_SECRET="$1}' > "$init_dir/secrets.env"
-  chmod 600 "$init_dir/secrets.env"
-  cat > "$init_dir/server.conf" <<EOF
+  # The persistent lock inode is never removed. A second initializer must not
+  # bypass the first by opening a newly created file at the same pathname.
+  (
+    umask 077
+    mkdir -p "$SERVER_ROOT" || exit 1
+    local init_lock="$SERVER_ROOT/.backup-server-initialize.lock" init_fd
+    [ ! -L "$init_lock" ] && { [ ! -e "$init_lock" ] || [ -f "$init_lock" ]; } || {
+      printf '初始化锁不是普通文件，操作已拒绝。\n'; exit 1;
+    }
+    if [ ! -e "$init_lock" ]; then
+      (set -o noclobber; : >"$init_lock") 2>/dev/null || true
+    fi
+    [ ! -L "$init_lock" ] && [ -f "$init_lock" ] &&
+      [ "$(stat -c %u "$init_lock")" = "$(id -u)" ] &&
+      [ "$(stat -c %h "$init_lock")" = 1 ] || {
+      printf '初始化锁的类型或属主无效，操作已拒绝。\n'; exit 1;
+    }
+    exec {init_fd}>>"$init_lock" || exit 1
+    [ ! -L "$init_lock" ] &&
+      [ "$(stat -Lc '%d:%i' "/dev/fd/$init_fd")" = "$(stat -Lc '%d:%i' "$init_lock")" ] || exit 1
+    flock -n "$init_fd" || { printf '另一初始化操作正在运行，请稍后重试。\n'; exit 1; }
+    # Recheck after obtaining the lock; ln below also refuses any concurrent
+    # external creation without replacing a single existing identity file.
+    for path in "$DB_PATH" "$CONFIG_FILE" "$key_file" "$secret_file" \
+        "$root_key" "${root_key}.pub" "$configured_root_pub" "$cert_path"; do
+      if [ -e "$path" ] || [ -L "$path" ]; then
+        printf '目标目录已有数据库、配置或身份材料，初始化已拒绝，不会覆盖。\n'; exit 1
+      fi
+    done
+    if [ -d "$DATA_ROOT" ]; then
+      local existing_data
+      existing_data="$(find "$DATA_ROOT" -mindepth 1 -maxdepth 1 -print -quit)" || exit 1
+      [ -z "$existing_data" ] || { printf '目标目录已有备份文件，初始化已拒绝。\n'; exit 1; }
+    fi
+    local init_dir keygen_output pubkey certificate='' require_bpsec2=false
+    local -a published_paths=() published_refs=() temporary_files=()
+    init_dir="$(mktemp -d "$SERVER_ROOT/.server-init.XXXXXXXX")" || exit 1
+    cleanup_initialization() {
+      local result="$?" index rollback_failed=0
+      trap - EXIT INT TERM
+      if [ "$result" != 0 ]; then
+        for ((index=${#published_paths[@]}-1; index>=0; index--)); do
+          # Only unlink the exact inode created by this transaction.
+          if [ "${published_paths[$index]}" -ef "${published_refs[$index]}" ]; then
+            rm -f -- "${published_paths[$index]}" || rollback_failed=1
+          fi
+        done
+        if [ "$rollback_failed" = 0 ]; then
+          printf '初始化未完成，本次创建的身份与配置已撤回，可修正问题后重试。\n' >&2
+        else
+          printf '初始化未完成，部分文件无法撤回；请检查目录权限，现有材料不会自动覆盖。\n' >&2
+        fi
+      fi
+      for path in "${temporary_files[@]}"; do rm -f -- "$path"; done
+      rm -rf -- "$init_dir"
+      exit "$result"
+    }
+    trap cleanup_initialization EXIT
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+    publish_initialization_file() {
+      local source="$1" target="$2" staged
+      mkdir -p "$(dirname "$target")" || return 1
+      staged="$(mktemp "$(dirname "$target")/.server-init-file.XXXXXXXX")" || return 1
+      temporary_files+=("$staged")
+      cp -p -- "$source" "$staged" || return 1
+      # A same-directory hard link is atomic, works across source filesystems,
+      # and unlike mv never overwrites an identity created after the recheck.
+      published_paths+=("$target")
+      published_refs+=("$staged")
+      ln -- "$staged" "$target" || return 1
+    }
+    mkdir -p "$init_dir/state" "$init_dir/private" || exit 1
+    keygen_output="$("$KEYGEN_BIN" --output "$init_dir/state/transport.key")" || exit 1
+    pubkey="$(printf '%s\n' "$keygen_output" | sed -n 's/.*公钥 (hex): //p' | head -1)"
+    [ -n "$pubkey" ] || { printf '无法从 keygen 结果取得公钥，初始化停止。\n'; exit 1; }
+    if [[ "$use_cert" =~ ^[Yy]$ ]]; then
+      "$CERT_TOOL" root-init --root-key "$init_dir/private/root.key" --root-id "${server_id}-root" >/dev/null || exit 1
+      "$CERT_TOOL" issue-server --root-key "$init_dir/private/root.key" --server-id "$server_id" \
+        --server-pubkey "hex:$pubkey" --out "$init_dir/state/server.bpcert" >/dev/null || exit 1
+      "$CERT_TOOL" verify-server --cert "$init_dir/state/server.bpcert" \
+        --roots "$init_dir/private/root.key.pub" >/dev/null || exit 1
+      certificate="$cert_path"
+      require_bpsec2=true
+    fi
+    head -c 32 /dev/urandom | sha256sum | awk '{print "BACKUP_TOKEN_SECRET="$1}' > "$init_dir/secrets.env" || exit 1
+    chmod 600 "$init_dir/secrets.env" || exit 1
+    cat > "$init_dir/server.conf" <<EOF
 bind = $bind
 port = $port
 data_root = $DATA_ROOT
@@ -346,27 +521,48 @@ max_login_failures = 5
 login_lockout_seconds = 60
 quiet = false
 EOF
-  chmod 600 "$init_dir/server.conf"
-  mkdir -p "$DATA_ROOT" "$SERVER_ROOT/state" "$SERVER_ROOT/logs" "$SERVER_ROOT/private" \
-    "$(dirname "$CONFIG_FILE")" || return 1
-  mv "$init_dir/state/transport.key" "$key_file" || return 1
-  mv "$init_dir/secrets.env" "$secret_file" || return 1
-  if [[ "$use_cert" =~ ^[Yy]$ ]]; then
-    mv "$init_dir/private/root.key" "$root_key" || return 1
-    mkdir -p "$(dirname "$configured_root_pub")" || return 1
-    mv "$init_dir/private/root.key.pub" "$configured_root_pub" || return 1
-    mv "$init_dir/state/server.bpcert" "$cert_path" || return 1
-  fi
-  config_tmp="$(mktemp "$(dirname "$CONFIG_FILE")/.server.conf.XXXXXXXX")" || return 1
-  cp "$init_dir/server.conf" "$config_tmp" && chmod 600 "$config_tmp" && mv "$config_tmp" "$CONFIG_FILE" || {
-    rm -f "$config_tmp"
-    return 1
-  }
-  trap - RETURN
-  rm -rf "$init_dir"
+    chmod 600 "$init_dir/server.conf" || exit 1
+    mkdir -p "$DATA_ROOT" "$SERVER_ROOT/state" "$SERVER_ROOT/logs" "$SERVER_ROOT/private" || exit 1
+    publish_initialization_file "$init_dir/state/transport.key" "$key_file" || exit 1
+    publish_initialization_file "$init_dir/secrets.env" "$secret_file" || exit 1
+    if [[ "$use_cert" =~ ^[Yy]$ ]]; then
+      publish_initialization_file "$init_dir/private/root.key" "$root_key" || exit 1
+      publish_initialization_file "$init_dir/private/root.key.pub" "$configured_root_pub" || exit 1
+      publish_initialization_file "$init_dir/state/server.bpcert" "$cert_path" || exit 1
+    fi
+    BACKUP_SERVER_BIN="$SERVER_BIN" BACKUP_CERT_TOOL="$CERT_TOOL" \
+      "$LAUNCHER" --check-config --config "$init_dir/server.conf" || exit 1
+    # The configuration is the commit point: no launcher can see a new instance
+    # until every identity file and the shared configuration check have passed.
+    publish_initialization_file "$init_dir/server.conf" "$CONFIG_FILE" || exit 1
+  ) || return 1
   printf '\n初始化完成。之后可选择启动服务器。\n'
   print_client_connection_info || return 1
 }
+
+# Installed instances belong to one fixed systemd unit, never a root-run child.
+installed_instance_matches() {
+  [ "${BACKUP_SERVER_SERVICE:-}" = backup-project-server ] &&
+    [ "$SERVER_ROOT" = /var/lib/backup-project-server ] &&
+    [ "$CONFIG_FILE" = /etc/backup-project-server/server.conf ] &&
+    [ "$DATA_ROOT" = /var/lib/backup-project-server/data ] &&
+    [ "$DB_PATH" = /var/lib/backup-project-server/state/metadata.sqlite3 ] &&
+    [ "$PID_FILE" = /run/backup-project-server/backup-server.pid ] || {
+      printf '安装版服务与实例路径不匹配，操作已拒绝。\n'; return 1;
+    }
+}
+
+service_manager_action() {
+  local action="$1"
+  installed_instance_matches || return 1
+  if [ ! -d /run/systemd/system ] || ! command -v systemctl >/dev/null 2>&1; then
+    printf '当前环境没有可用的 systemd；请使用服务器便携包的 ./backup-server-manager 管理独立实例。\n'
+    return 1
+  fi
+  case "$action" in start|stop) ;; *) return 1 ;; esac
+  systemctl "$action" backup-project-server.service
+}
+
 
 start_server() {
   if ! instance_initialized; then printf '请先初始化服务器。\n'; return 1; fi
@@ -378,21 +574,45 @@ start_server() {
   fi
   [ -x "$SERVER_BIN" ] || { printf '找不到服务端：%s\n' "$SERVER_BIN"; return 1; }
   [ -f "$CONFIG_FILE" ] || { printf '找不到配置：%s\n' "$CONFIG_FILE"; return 1; }
+  if [ -n "${BACKUP_SERVER_SERVICE:-}" ]; then
+    service_manager_action start || return 1
+    for _ in $(seq 1 20); do
+      if pid="$(owned_pid 2>/dev/null)" && port_listener_state "$(configured_port)"; then
+        printf 'systemd 服务器已启动（PID %s）。\n' "$pid"; return 0
+      fi
+      sleep 0.1
+    done
+    printf 'systemd 已返回，但尚未确认当前实例的进程与监听，请查看状态和日志。\n'
+    return 1
+  fi
   mkdir -p "$(dirname "$LOG_FILE")" "$(dirname "$PID_FILE")"
   [ -x "$LAUNCHER" ] || { printf '找不到安全启动器：%s\n' "$LAUNCHER"; return 1; }
   BACKUP_SERVER_BIN="$SERVER_BIN" BACKUP_CERT_TOOL="$CERT_TOOL" \
     BACKUP_SERVER_CONF="$CONFIG_FILE" "$LAUNCHER" --config "$CONFIG_FILE" >>"$LOG_FILE" 2>&1 &
   sleep 0.2
-  if pid="$(owned_pid 2>/dev/null)"; then printf '服务器已启动（PID %s）。\n' "$pid"; else printf '服务器未能启动，请查看日志：%s\n' "$LOG_FILE"; return 1; fi
+  if pid="$(owned_pid 2>/dev/null)" && port_listener_state "$(configured_port)"; then printf '服务器已启动（PID %s）。\n' "$pid"; else printf '服务器未能启动，请查看日志：%s\n' "$LOG_FILE"; return 1; fi
 }
 
 stop_server() {
-  local pid
+  local pid start
+  if [ -n "${BACKUP_SERVER_SERVICE:-}" ]; then
+    service_manager_action stop || return 1
+    if owned_pid >/dev/null 2>&1; then
+      printf 'systemd 已返回，但当前实例进程尚未退出，请查看服务状态。\n'; return 1
+    fi
+    printf 'systemd 服务器已停止。\n'; return 0
+  fi
   pid="$(owned_pid 2>/dev/null || true)"
   [ -n "$pid" ] || { printf '没有找到属于当前实例的运行进程。\n'; return 0; }
+  start="$(pid_starttime "$pid")" || return 1
+  pid_is_ours "$pid" && [ "$start" = "$(pid_starttime "$pid")" ] || {
+    printf '进程身份已改变，拒绝发送停止信号。\n'; return 1;
+  }
   kill -TERM "$pid" 2>/dev/null || { printf '停止信号发送失败。\n'; return 1; }
   for _ in $(seq 1 50); do
-    kill -0 "$pid" 2>/dev/null || { printf '服务器已停止。\n'; return 0; }
+    if ! kill -0 "$pid" 2>/dev/null || [ "$start" != "$(pid_starttime "$pid" 2>/dev/null)" ]; then
+      printf '服务器已停止。\n'; return 0
+    fi
     sleep 0.1
   done
   printf '服务器未在 5 秒内退出，未向其他进程发送信号。\n'; return 1
@@ -400,7 +620,13 @@ stop_server() {
 
 logs_page() {
   clear_screen
-  [ -f "$LOG_FILE" ] && tail -80 "$LOG_FILE" || printf '日志尚不存在：%s\n' "$LOG_FILE"
+  if [ -n "${BACKUP_SERVER_SERVICE:-}" ] && [ -z "$(config_value log_file)" ]; then
+    installed_instance_matches || return 1
+    command -v journalctl >/dev/null 2>&1 || { printf '缺少 journalctl，无法查看系统服务日志。\n'; return 1; }
+    journalctl -u backup-project-server.service --no-pager -n 80
+  else
+    [ -f "$LOG_FILE" ] && tail -80 "$LOG_FILE" || printf '日志尚不存在：%s\n' "$LOG_FILE"
+  fi
 }
 
 certificate_page() {
@@ -413,12 +639,239 @@ certificate_page() {
     "$CERT_TOOL" inspect-server --cert "$cert" || true
     if [ -f "$configured_root_pub" ]; then
       printf '\n证书信任检查：\n'
-      "$CERT_TOOL" verify-server --cert "$cert" --roots "$configured_root_pub" || true
+      check_certificate_pair "$cert" "$configured_root_pub" || true
     fi
   else
     printf 'BPSEC2：不适用（当前配置未启用服务器身份证书）。\n'
   fi
 }
+
+# Hold the same kernel lock as backup-server until the operation finishes.
+# PID files alone cannot detect a service started outside this menu.
+with_stopped_instance() (
+  local lock_file manager_lock_fd lock_created=0 data_owner
+  instance_initialized || { printf '请先初始化服务器。\n'; return 1; }
+  if owned_pid >/dev/null 2>&1 || port_listener_exists "$(configured_port)"; then
+    printf '请先停止服务器，再修改配置或证书。\n'; return 1
+  fi
+  command -v flock >/dev/null 2>&1 || { printf '缺少 flock，无法安全确认停机状态。\n'; return 1; }
+  lock_file="$DATA_ROOT/.backup-server.lock"
+  if [ -L "$lock_file" ] || { [ -e "$lock_file" ] && [ ! -f "$lock_file" ]; }; then
+    printf '数据目录锁不是普通文件，操作已拒绝。\n'; return 1
+  fi
+  umask 077
+  if [ ! -e "$lock_file" ]; then
+    # noclobber distinguishes our new lock from one created concurrently.
+    if (set -o noclobber; : >"$lock_file") 2>/dev/null; then lock_created=1; fi
+  fi
+  [ ! -L "$lock_file" ] && [ -f "$lock_file" ] || return 1
+  data_owner="$(stat -c '%u:%g' "$DATA_ROOT")" || return 1
+  if [ "$lock_created" = 1 ] && [ "$(stat -c '%u:%g' "$lock_file")" != "$data_owner" ]; then
+    [ "$(id -u)" = 0 ] && chown --no-dereference --reference="$DATA_ROOT" "$lock_file" || {
+      printf '无法让新锁文件归属实例数据用户，操作已拒绝。\n'; return 1;
+    }
+  fi
+  [ ! -L "$lock_file" ] && [ -f "$lock_file" ] &&
+    [ "$(stat -c '%u:%g' "$lock_file")" = "$data_owner" ] &&
+    [ "$(stat -c '%h' "$lock_file")" = 1 ] || {
+      printf '已有锁文件的属主或类型与数据目录不匹配，操作已拒绝，未修改其属主。\n'; return 1;
+    }
+  exec {manager_lock_fd}>>"$lock_file" || return 1
+  # Opening in append mode writes nothing. Check the opened inode as well, so
+  # replacement of the pathname cannot make us lock a different file.
+  [ ! -L "$lock_file" ] &&
+    [ "$(stat -Lc '%d:%i' "/dev/fd/$manager_lock_fd")" = "$(stat -Lc '%d:%i' "$lock_file")" ] || return 1
+  flock -n "$manager_lock_fd" || { printf '实例仍在运行或另一管理操作持有数据目录锁，操作已拒绝。\n'; return 1; }
+  "$@"
+)
+
+# Preserve unrelated keys and their formatting. Values are data, never shell.
+write_config_candidate() {
+  local output="$1" line key selected match
+  shift
+  local -a updates=("$@")
+  cp -p "$CONFIG_FILE" "$output" || return 1
+  {
+    while IFS= read -r line || [ -n "$line" ]; do
+      key="${line%%=*}"
+      key="${key#"${key%%[![:space:]]*}"}"
+      key="${key%"${key##*[![:space:]]}"}"
+      match=0
+      for ((selected=0; selected<${#updates[@]}; selected+=2)); do
+        [ "$key" != "${updates[$selected]}" ] || match=1
+      done
+      [ "$match" = 1 ] || printf '%s\n' "$line"
+    done <"$CONFIG_FILE"
+    for ((selected=0; selected<${#updates[@]}; selected+=2)); do
+      printf '%s = %s\n' "${updates[$selected]}" "${updates[$((selected + 1))]}"
+    done
+  } >"$output"
+}
+
+commit_config_candidate() {
+  local candidate="$1" history
+  BACKUP_SERVER_BIN="$SERVER_BIN" BACKUP_CERT_TOOL="$CERT_TOOL" \
+    "$LAUNCHER" --check-config --config "$candidate" || return 1
+  history="$(mktemp -d "$(dirname "$CONFIG_FILE")/.server-config-backup.XXXXXXXX")" || return 1
+  chmod 700 "$history"
+  cp -p "$CONFIG_FILE" "$history/server.conf" || return 1
+  mv -f "$candidate" "$CONFIG_FILE" || return 1
+  printf '配置已保存；旧配置保留于：%s/server.conf\n' "$history"
+}
+
+check_certificate_pair() {
+  local certificate="$1" roots="$2" cert_public key_public
+  "$CERT_TOOL" verify-server --cert "$certificate" --roots "$roots" || return 1
+  cert_public="$("$CERT_TOOL" inspect-server --cert "$certificate" |
+    sed -n 's/^server_public_key[[:space:]]*=[[:space:]]*//p')" || return 1
+  key_public="$("$KEYGEN_BIN" --show --key-file "$(config_value transport_key)" |
+    sed -n 's/.*公钥 (hex): //p')" || return 1
+  [ -n "$key_public" ] && [ "$cert_public" = "$key_public" ] || {
+    printf '证书公钥与当前服务器传输身份不匹配，操作已拒绝。\n'; return 1;
+  }
+}
+
+import_certificate() (
+  local roots certificate confirmation bundle candidate=''
+  [ -x "$CERT_TOOL" ] && [ -x "$KEYGEN_BIN" ] || return 1
+  printf '已有可信根公钥文件（绝对路径，不要提供根私钥）：'; read -r roots || return 1
+  printf '已有服务器身份文件（绝对路径）：'; read -r certificate || return 1
+  case "$roots:$certificate" in *$'\n'*|*$'\r'*) return 1 ;; esac
+  [[ "$roots" == /* && "$certificate" == /* ]] &&
+    [ -f "$roots" ] && [ -r "$roots" ] && [ -f "$certificate" ] && [ -r "$certificate" ] || {
+    printf '必须提供可读文件的绝对路径。\n'; return 1;
+  }
+  [ "$(stat -c %s "$roots")" -le 65536 ] && [ "$(stat -c %s "$certificate")" -le 4096 ] || {
+    printf '根公钥文件不得超过 65536 字节，证书不得超过 4096 字节。\n'; return 1;
+  }
+  mkdir -p "$SERVER_ROOT/state" || return 1
+  bundle="$(mktemp -d "$SERVER_ROOT/state/client-identity.XXXXXXXX")" || return 1
+  trap 'rm -rf "$bundle"; [ -z "$candidate" ] || rm -f "$candidate"' EXIT
+  # Discard comments so even an accidental secret in a comment is not shared.
+  head -c 65537 "$roots" >"$bundle/root-input" || return 1
+  head -c 4097 "$certificate" >"$bundle/server.bpcert" || return 1
+  [ "$(stat -c %s "$bundle/root-input")" -le 65536 ] &&
+    [ "$(stat -c %s "$bundle/server.bpcert")" -le 4096 ] || return 1
+  awk '{ sub(/#.*/, ""); if ($0 ~ /[^[:space:]]/) print }' "$bundle/root-input" >"$bundle/trusted-root.pub" || return 1
+  rm -f "$bundle/root-input"
+  chmod 755 "$bundle" && chmod 644 "$bundle/trusted-root.pub" "$bundle/server.bpcert" || return 1
+  check_certificate_pair "$bundle/server.bpcert" "$bundle/trusted-root.pub" || return 1
+  printf '根公钥文件 SHA-256：'
+  sha256sum "$bundle/trusted-root.pub" | cut -d' ' -f1
+  printf '请通过可信渠道核对以上根与服务器身份。导入会启用仅 BPSEC2 认证，不更换传输私钥。\n'
+  printf '确认信任并导入请输入 IMPORT BPSEC2：'; read -r confirmation || return 1
+  [ "$confirmation" = 'IMPORT BPSEC2' ] || { printf '已取消，原配置与材料未改变。\n'; return 1; }
+  candidate="$(mktemp "$(dirname "$CONFIG_FILE")/.server.conf.XXXXXXXX")" || return 1
+  write_config_candidate "$candidate" certificate "$bundle/server.bpcert" require_bpsec2 true || return 1
+  commit_config_candidate "$candidate" || return 1
+  candidate=''
+  configured_root_pub="$bundle/trusted-root.pub"
+  printf '证书导入完成。旧证书、根公钥和所有私钥均保留。\n'
+  printf '客户端可信根公钥：%s\n服务器身份文件：%s\n' "$configured_root_pub" "$bundle/server.bpcert"
+  bundle=''
+  trap - EXIT
+)
+
+certificate_menu() {
+  certificate_page
+  printf '\n  1. 安全导入已有可信根公钥与服务器证书（需停机）\n  回车返回\n请选择：'
+  local choice
+  read -r choice || return 0
+  case "$choice" in 1) with_stopped_instance import_certificate; pause ;; esac
+}
+
+edit_configuration() (
+  local port workers io_timeout log_path mode confirmation candidate=''
+  local require_bpsec2 cert
+  printf '业务端口 [%s]：' "$(configured_port)"; read -r port || return 1
+  [ -n "$port" ] || port="$(configured_port)"
+  printf '工作线程数 [%s]：' "$(config_value workers)"; read -r workers || return 1
+  [ -n "$workers" ] || workers="$(config_value workers)"
+  printf 'I/O 超时秒数 [%s]：' "$(config_value io_timeout)"; read -r io_timeout || return 1
+  [ -n "$io_timeout" ] || io_timeout="$(config_value io_timeout)"
+  printf '日志文件绝对路径 [%s]：' "$(config_value log_file)"; read -r log_path || return 1
+  [ -n "$log_path" ] || log_path="$(config_value log_file)"
+  [[ "$port" =~ ^[0-9]{1,5}$ && "$workers" =~ ^[0-9]{1,2}$ && "$io_timeout" =~ ^[0-9]{1,4}$ ]] || {
+    printf '端口、线程数和超时必须是有效范围内的整数。\n'; return 1;
+  }
+  if [ -n "$log_path" ]; then
+    case "$log_path" in
+      /*) ;;
+      *) printf '日志路径必须是绝对路径。\n'; return 1 ;;
+    esac
+    case "$log_path" in *$'\n'*|*$'\r'*|*'#'*|*'='*|*'$('*|*'`'*|*';'*|*'|'*|*'&'*|*'<'*|*'>'*)
+      printf '日志路径含不支持的配置字符，未保存。\n'; return 1 ;;
+    esac
+  fi
+  if [ -n "$log_path" ]; then
+    local resolved_log protected
+    resolved_log="$(realpath -m "$log_path")" || return 1
+    case "$resolved_log" in
+      "$DATA_ROOT"|"$DATA_ROOT"/*|"$SERVER_ROOT/private"|"$SERVER_ROOT/private"/*)
+        printf '日志不能写入备份数据或私钥目录。\n'; return 1 ;;
+    esac
+    for protected in "$CONFIG_FILE" "$DB_PATH" "$PID_FILE" "$configured_root_pub" \
+        "$(config_value secret_file)" "$(config_value transport_key)" "$(configured_cert)"; do
+      [ -n "$protected" ] || continue
+      if [ "$resolved_log" = "$(realpath -m "$protected")" ] || [ "$log_path" -ef "$protected" ]; then
+        printf '日志路径不能覆盖配置、数据库或身份文件。\n'; return 1
+      fi
+    done
+  fi
+  if [ "$port" != "$(configured_port)" ] && port_listener_exists "$port"; then
+    printf '新端口已被占用，未保存。\n'; return 1
+  fi
+  require_bpsec2="$(config_value require_bpsec2)"
+  cert="$(configured_cert)"
+  printf '认证：回车保留；1 允许 BPSEC1（保留已有证书）；2 仅 BPSEC2：'; read -r mode || return 1
+  case "$mode" in
+    '') ;;
+    1)
+      case "$(config_value bind)" in
+        127.0.0.1|::1|localhost) ;;
+        *) printf '公网监听不允许在菜单中降级为 BPSEC1。\n'; return 1 ;;
+      esac
+      printf '允许 BPSEC1 后客户端可用指纹认证。确认请输入 ALLOW BPSEC1：'; read -r confirmation || return 1
+      [ "$confirmation" = 'ALLOW BPSEC1' ] || { printf '已取消。\n'; return 1; }
+      require_bpsec2=false
+      ;;
+    2)
+      [ -n "$cert" ] && [ -f "$configured_root_pub" ] || {
+        printf '请先通过证书菜单安全导入 BPSEC2 材料。\n'; return 1;
+      }
+      check_certificate_pair "$cert" "$configured_root_pub" || return 1
+      require_bpsec2=true
+      ;;
+    *) printf '认证选项无效，未保存。\n'; return 1 ;;
+  esac
+  candidate="$(mktemp "$(dirname "$CONFIG_FILE")/.server.conf.XXXXXXXX")" || return 1
+  trap '[ -z "$candidate" ] || rm -f "$candidate"' EXIT
+  write_config_candidate "$candidate" port "$port" workers "$workers" io_timeout "$io_timeout" \
+    log_file "$log_path" require_bpsec2 "$require_bpsec2" || return 1
+  printf '确认保存以上设置请输入 SAVE：'; read -r confirmation || return 1
+  [ "$confirmation" = SAVE ] || { printf '已取消，原配置未改变。\n'; return 1; }
+  commit_config_candidate "$candidate" || return 1
+  candidate=''
+  trap - EXIT
+)
+
+configuration_menu() {
+  clear_screen
+  printf '服务器配置：%s\n数据目录：%s\n数据库：%s\n日志：%s\nPID 文件：%s\n' \
+    "$CONFIG_FILE" "$DATA_ROOT" "$DB_PATH" "$LOG_FILE" "$PID_FILE"
+  printf '\n  1. 修改端口、线程数、超时、日志与认证方式（需停机）\n  回车返回\n请选择：'
+  local choice
+  read -r choice || return 0
+  case "$choice" in
+    1)
+      with_stopped_instance edit_configuration
+      # The edit runs under a subshell lock; refresh values in the menu process.
+      refresh_runtime_config
+      pause
+      ;;
+  esac
+}
+
 
 # ---- 用户管理 ----
 
@@ -577,7 +1030,7 @@ while true; do
   printf '  6. 用户管理\n'
   printf '  7. 备份文件管理\n'
   printf '  8. 管理证书与可信根\n'
-  printf '  9. 查看服务器配置路径\n'
+  printf '  9. 查看与修改服务器配置\n'
   printf ' 10. 查看运行日志\n'
   printf ' 11. 存储概览\n'
   printf '  0. 退出\n\n'
@@ -607,15 +1060,10 @@ while true; do
     6) user_menu ;;
     7) snapshot_menu ;;
     8)
-      certificate_page
-      pause
+      certificate_menu
+      refresh_runtime_config
       ;;
-    9)
-      clear_screen
-      printf '服务器配置：%s\n数据目录：%s\n数据库：%s\n日志：%s\nPID 文件：%s\n' \
-        "$CONFIG_FILE" "$DATA_ROOT" "$DB_PATH" "$LOG_FILE" "$PID_FILE"
-      pause
-      ;;
+    9) configuration_menu ;;
     10)
       logs_page
       pause

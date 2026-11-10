@@ -405,8 +405,8 @@ Encrypt-then-MAC 是本项目能给的最强组合，但同样不是经过审计
 - 依赖方向是单向的：ScheduledBackupService → ScheduleStore / BackupCatalog /
   BackupEngine；反过来不存在，所以删掉 schedule.json 之后仓库里的 .bak 照样能
   列出、恢复、删除（include/scheduled_backup_service.h:24-30）。
-- 计划路径不接受加密：无人值守没有安全的持久口令来源（include/backup_mode.h:112-117、
-  src/scheduler/scheduled_backup_service.cpp:699-700）。
+- 计划与实时任务支持加密：CLI 从通过权限检查的口令文件读取凭据，GUI 使用当前会话
+  解锁的凭据。GUI 重启后需要重新解锁；缺少凭据时拒绝执行，不降级为未加密。
 
 ### 4.9 Realtime：`src/realtime/*`
 
@@ -522,8 +522,9 @@ BPSEC1 是本项目自己的认证加密传输层，位于 BPNET1 之下，不�
   format_version，把"这份副文件属于哪个 .bak"钉死（include/incremental_backup.h:63-88）。
 - 身份不是"读得出来的声明值"，而是**实际字节**：payload 必须通过
   `VerifyContainerPayloadBytes`（include/incremental_backup.h:119-122）。
-- 增量第一版只支持 MyPack、不支持加密，而且是明确拒绝，不是"先跑一次基线、
-  第二次 delta 才失败"，也不是静默降级（include/incremental_backup.h:38-57）。
+- 共享增量核心的 payload 可以由 MyPack、USTAR 或 Fast USTAR 编码。未加密链用 BKPINC1；
+  加密链使用 BKPINC2，由独立子密钥认证外层信封与内层容器摘要。GUI 远端路径也传递
+  BackupOptions 和 RestoreOptions；CLI remote 暂没有归档格式/密码输入参数。
 - 上限：链深 64、tombstone 200 万、单 delta 条目 200 万
   （include/incremental_delta.h:71-75）。
 - 远端侧只做"下载 + 验证 + 翻译成本地仓库"，增量算法本身一行都没有重写
@@ -699,10 +700,11 @@ include/archive_pipeline.h:74-78）。
 4. **计划路径的 Full 变化检测是 metadata-first**：same-size + same-mtime 的人为
    原地改写逃得过检测；增量路径用内容摘要，不受这条影响
    （include/source_manifest.h:15-21、src/scheduler/scheduled_backup_service.cpp:668-673）。
-5. **增量第一版只支持 MyPack、不支持加密**，理由是信封明文不受内层 HMAC 覆盖
-   （include/incremental_backup.h:38-57）。
-6. **自动触发（计划 / 实时）一律不加密**：无人值守没有安全的持久口令来源
-   （include/backup_mode.h:112-117）。
+5. **CLI remote 暂没有归档格式和密码输入参数**，使用默认 MyPack/none；GUI 和共享
+   核心支持 MyPack/USTAR/Fast USTAR，加密时由 BKPINC2 独立认证外层父绑定和容器摘要
+   （docs/remote_incremental.md、include/incremental_delta.h）。
+6. **自动任务加密需要凭据**：CLI 使用安全口令文件，GUI 使用当前会话解锁的凭据；
+   重启 GUI 后不会自动恢复会话密码，缺少凭据时禁止加密任务执行。
 7. **服务端 token 无状态**：12 小时内无法单独吊销，只能等过期或注销账户
    （include/remote_auth.h:10-13）。
 8. **服务端并发有上限**：最大并发客户端 = `worker_count`，SQLite 写入串行化

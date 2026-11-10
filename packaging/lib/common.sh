@@ -39,6 +39,42 @@ require_clean_tree() {
   fi
 }
 
+# Reused staging must identify exactly the requested clean source version.
+validate_stage_build_info() {
+  local info="$1" expected_commit="$2" expected_version="$3" field expected actual
+  [ -f "$info" ] && [ ! -L "$info" ] || {
+    printf '[release] 缺少普通文件形式的 staging 构建信息：%s\n' "$info" >&2
+    return 1
+  }
+  for field in commit version working_tree; do
+    case "$field" in
+      commit) expected="$expected_commit" ;;
+      version) expected="$expected_version" ;;
+      working_tree) expected=clean ;;
+    esac
+    actual="$(awk -v wanted="$field" '
+      {
+        equals = index($0, "=")
+        if (!equals) next
+        key = substr($0, 1, equals - 1)
+        value = substr($0, equals + 1)
+        sub(/^[[:space:]]*/, "", key); sub(/[[:space:]]*$/, "", key)
+        sub(/^[[:space:]]*/, "", value); sub(/[[:space:]]*$/, "", value)
+        if (key == wanted) { result = value; count++ }
+      }
+      END { if (count != 1) exit 1; print result }
+    ' "$info")" || {
+      printf '[release] staging 的 %s 字段缺失或重复：%s\n' "$field" "$info" >&2
+      return 1
+    }
+    [ "$actual" = "$expected" ] || {
+      printf '[release] staging 的 %s 与请求不一致：%s\n' "$field" "$info" >&2
+      return 1
+    }
+  done
+}
+
+
 # 版本号：只接受 semver 形状（可带 +build 元数据）。没有 tag 时调用方给
 # "0.0.0+g<sha>"；打包脚本**从不**创建 tag。
 validate_version() {
@@ -122,6 +158,24 @@ publish_dir() {
 
 sha256_of() { sha256sum "$1" | awk '{print $1}'; }
 size_of()   { stat -c %s "$1"; }
+
+# Debian's Installed-Size is expressed in KiB. Count each installed filesystem
+# object in KiB units, excluding the control metadata used only to build the deb.
+installed_size_kib() {  # $1 = package staging root
+  local root="$1"
+  [ -d "$root" ] || { printf 'Installed-Size root is not a directory: %s\n' "$root" >&2; return 1; }
+  # Relative paths keep the DEBIAN exclusion independent of trailing slashes.
+  # Device + inode identify hardlinks, matching dpkg-gencontrol's accounting.
+  ( cd "$root" && find . -mindepth 1 -path ./DEBIAN -prune -o -printf '%D %i %y %s\n' ) |
+    awk '$3 == "f" || $3 == "l" {
+           key = $1 ":" $2
+           if (!(key in seen)) total += int(($4 + 1023) / 1024)
+           seen[key] = 1
+           next
+         }
+         { total++ }
+         END { print total + 0 }'
+}
 
 # ---- 制品安全检查规则（构建期自查与 CI 正式扫描共用同一份实现）----------
 #

@@ -7,7 +7,7 @@
 //   Trigger:  Manual / Scheduled / Realtime
 //   Strategy: Full / Incremental
 //
-// 本版本真正实现并对外承诺的三种：
+// 本版本支持 Manual / Scheduled / Realtime 与 Full / Incremental 六种组合。
 //
 //   Manual    + Full
 //   Scheduled + Full
@@ -79,15 +79,15 @@ std::string UnsupportedBackupModeReason(BackupTrigger trigger,
 // trigger × strategy 只回答"这个产品组合存在吗"。真正决定"这一组选项能不能
 // 跑"的还有三个算法维度：
 //
-//   * 增量第一版只支持 MyPack（USTAR 表达不了 tombstone 与 parent 依赖）；
-//   * 增量第一版不支持加密（外层信封不受内层 HMAC 覆盖）；
-//   * 计划路径不支持加密（无人值守没有安全的口令来源）。
+//   * 增量 payload 支持 MyPack、USTAR 与 Fast USTAR（依赖和 tombstone 在 BKPINC
+//   外层）；
+//   * 加密增量使用 BKPINC2 的独立认证信封（AES/DES）；未加密兼容 BKPINC1；
+//   * 自动任务加密需要可用凭据；CLI 使用安全口令文件，GUI 使用会话解锁。
 //
 // 少判一条的后果不是"少一个功能"，而是**先存进去、第二次运行才炸**：
 //
-//   schedule set --strategy incremental --pack ustar     （旧行为：接受）
-//     第一轮：建立完整 baseline（成功）
-//     第二轮：真的要做 delta 时失败
+//   schedule set --strategy incremental --pack <unknown>  （旧行为：接受）
+//     配置校验必须在写入任务前拒绝未知 pack enum。
 //
 // 用户此时已经拿到一份看起来可用的基线，而错误来得太晚。所以这一组判断必须
 // 在**保存配置 / 启动任务之前**回答，而且四个入口（Manual CLI、Modern GUI
@@ -99,9 +99,9 @@ struct BackupOptionCombination {
   PackMethod pack_method = PackMethod::kMyPack;
   CompressionMethod compression_method = CompressionMethod::kNone;
   EncryptionMethod encryption_method = EncryptionMethod::kNone;
-  // 无人值守加密的**唯一**前提：已经配置了一个可通过安全检查的口令文件。
-  // 它不是一个“能力开关”，而是对配置事实的描述：校验层先把配置里的
-  // 口令文件路径读出来，再用这个字段告诉共享真值表。
+  // 自动任务加密的前提是当前已有可用凭据。CLI 校验安全口令文件，
+  // GUI 会话解锁后提供仅当前会话有效的凭据；这个字段描述校验结果，
+  // 不能用来绕过凭据读取或在缺少密码时降级为未加密。
   //
   // 手动触发忽略这个字段（密码在启动任务时由用户输入）。
   bool unattended_credential_available = false;

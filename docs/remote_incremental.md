@@ -24,9 +24,9 @@
 
 增量引擎眼中的一份快照是三件套：
 
-    <name>.bak        归档本体（完整快照或 BKPINC1 delta）
+    <name>.bak        归档本体（完整快照或 BKPINC1/BKPINC2 delta）
     <name>.manifest   强 manifest（每个文件的内容摘要）
-    <name>.identity   BPIDENT2 身份记录
+    <name>.identity   BPIDENT2 / 加密快照的 BPIDENT3 身份记录
 
 生成下一份 delta 需要**父的三件套**，恢复链上的每一跳同样需要。只上传 .bak
 的话，远端链在"副文件验证"这一步必然失败（LoadVerifiedSnapshotIdentity 会报
@@ -92,21 +92,20 @@ RemoteMaintenance::DeleteSnapshot（动磁盘之前）各查一次；管理工�
 
 ### remote backup <源目录> [--strategy incremental|full]
 
-1. 连上并按 pin 完成 BPSEC1 握手，登录；
-2. 算这条链的 lineage（= 引擎的 source identity：源路径 + 逻辑仓库身份）；
-3. LIST 找到这条 lineage 的 head（没有被任何快照引用为父的那一个；多个候选取
-   最新的）；
-4. **把整条链的材料下载并逐字节验证**进本地缓存（缓存命中就不重复下载）；
-5. 调既有的 RunIncrementalBackup，基线就是 head 的本地归档名；
-6. 引擎给出 kDelta / kFullBaseline / kNoChanges 三选一：
-   * kDelta -> 打包新 delta 上传，声明 parent = head；
-   * kFullBaseline -> 打包完整基线上传，声明 full（引擎判断无法续链时的如实行为）；
-   * kNoChanges -> 不上传，打印"源目录没有变化"；
-7. 校验服务端回填的 generation 与本地预期一致。
+1. 按配置的 BPSEC1 指纹或 BPSEC2 证书身份完成认证并登录；
+2. 根据规范化的源目录路径和逻辑仓库身份计算 lineage；
+3. LIST 找到这条 lineage 的 head（没有被其他快照引用为父的最新快照）；
+4. 把整条链的材料下载并逐字节验证到本地缓存，缓存命中时也须验证；
+5. 使用共享基线检查核对源、筛选规则、打包/压缩/加密参数及整条链的认证。
+   head 可用时，以其本地归档名为父执行增量；参数或归档密码改变等导致无法续接时，
+   安全地建立新的完整基线，保留旧链，不忽略认证失败；材料下载或完整性检查失败则报错；
+6. 有变化时上传真实 delta，声明 parent = head；新完整基线声明 full，父为空；
+   已有可信兼容基线且源目录没有有效变化时，不创建快照，也不上传；
+7. 校验服务端回填的父快照和 generation 与本地预期一致。
 
---strategy full 会强制新建一份完整基线（给引擎一个不受管的基线名，按
-include/incremental_backup.h 的公开契约清空基线），它与增量路径共用同一条
-lineage，所以之后仍然可以继续增量。
+`--strategy full` 直接调用共享完整备份入口，强制创建完整基线，不使用虚构的父快照名。
+新完整基线仍属于该源的 lineage，后续可以继续增量。旧的加密链仍须使用原归档密码恢复；
+账号密码不参与归档加密。GUI 本地仓库提供的手工基线选择不用于远端自动 head 选择。
 
 ### remote restore <快照ID> <目标目录>
 
@@ -148,8 +147,9 @@ lineage，所以之后仍然可以继续增量。
 
 ## 9. 已知限制
 
-* 远端增量只支持 MyPack + 不压缩/不加密的组合（沿用引擎的限制：外层信封不受
-  内层保护，加密的 delta 等于接受未认证的路径指令）；
+* GUI 远端备份/恢复可向共享核心传递打包选项和归档密码；共享核心支持 MyPack、USTAR、
+  Fast USTAR 与 none/AES/DES。CLI remote 暂没有归档格式或归档密码输入参数，使用默认的
+  MyPack + 不压缩/不加密；账号密码只用于登录，不会自动用作归档密码；
 * 链深度上限 64 个 delta（引擎的上限），到顶后引擎会自动重建完整基线；
 * 缓存目录不会自动清理（删掉它是安全的，只是下一次要重新下载）；
 * 远端没有"批量删除整条链"的命令：按后代优先逐个删（叶子先删），

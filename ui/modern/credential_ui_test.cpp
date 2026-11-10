@@ -555,18 +555,16 @@ int RunCredentialUiTest(QQuickWindow* window,
       busy_pin_result == QStringLiteral("invalid") &&
       remote->serverKeyPin() == active_pin &&
       remote->serverKeyPinError().contains(QStringLiteral("正在处理"));
-  const bool login_completed = pending_login && remote->busy() &&
-                               mutation_rejected &&
-                               remote->waitForIdle(30000) &&
-                               remote->lastErrorKindForTest() ==
-                                   QStringLiteral("none") &&
-                               remote->authenticated() &&
-                               remote->sharedSessionReady();
+  const bool login_completed =
+      pending_login && remote->busy() && mutation_rejected &&
+      remote->waitForIdle(30000) &&
+      remote->lastErrorKindForTest() == QStringLiteral("none") &&
+      remote->authenticated() && remote->sharedSessionReady();
   check(login_completed, "BUSY_LOGIN_REJECTS_PIN_CHANGE");
   const QString applied_pin = remote->applyServerKeyPin(attempted_pin);
   const bool changed_pin_invalidates_session =
-      applied_pin == QStringLiteral("applied") &&
-      !remote->authenticated() && !remote->sharedSessionReady();
+      applied_pin == QStringLiteral("applied") && !remote->authenticated() &&
+      !remote->sharedSessionReady();
   check(changed_pin_invalidates_session,
         "APPLIED_PIN_CHANGE_INVALIDATES_OLD_SESSION");
   remote->applyServerKeyPin(active_pin);

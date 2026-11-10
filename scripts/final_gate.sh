@@ -47,6 +47,7 @@ run() {
 }
 
 run lint bash scripts/lint.sh
+run package-maintainer bash scripts/package_maintainer_test.sh
 # ShellCheck：只覆盖显式清单里的脚本；工具缺失时**失败而不是跳过**。
 # 版本与严重级别由脚本自己打印，见 scripts/shellcheck.sh 的说明。
 run shellcheck bash scripts/shellcheck.sh
@@ -112,6 +113,8 @@ run bundle-source-mutation-sanitize env BUNDLE_SOURCE_MUTATION_SANITIZE=1 bash s
 run account-deletion bash scripts/account_deletion_test.sh
 run same-instance-truth bash scripts/same_instance_truth_test.sh
 run server-admin bash scripts/server_admin_test.sh
+run server-manager-initialization bash scripts/server_manager_initialization_test.sh
+run incremental-baseline bash scripts/incremental_baseline_test.sh
 # 原始归档的"单独恢复"（QML -> RemoteController -> RunRemoteRawRestore ->
 # 既有本地恢复核心）：RAW-R01..RAW-R05 五条由 --remote-test 里的真服务端走一遍，
 # 本脚本只断言那些条目真的跑了并且全部通过。
@@ -131,6 +134,7 @@ run realtime bash scripts/realtime_test.sh
 run unified-gui bash scripts/unified_gui_contract_test.sh
 run ux-acceptance bash scripts/isolated_gui_test.sh ./build/backup-gui-modern --ux-acceptance-test
 run combo-hover bash scripts/isolated_gui_test.sh ./build/backup-gui-modern --combo-hover-test
+run baseline-picker-ui bash scripts/isolated_gui_test.sh ./build/backup-gui-modern --baseline-picker-test
 run remote-gui bash scripts/isolated_gui_test.sh ./build/backup-gui-modern --remote-test
 run gui_smoke bash scripts/gui_smoke_test.sh
 run workflow-acceptance bash scripts/workflow_acceptance_test.sh

@@ -232,6 +232,15 @@ Item {
                 Layout.topMargin: 4
             }
 
+            IncrementalBaselinePanel {
+                id: baselinePicker
+                objectName: "incrementalBaselinePanel"
+                optionsPanel: panel
+                Layout.fillWidth: true
+                visible: page.backupTarget === "local"
+                         && panel.strategyKey === "incremental"
+            }
+
             RowLayout {
                 Layout.fillWidth: true
                 Layout.topMargin: 14
@@ -248,7 +257,7 @@ Item {
                     // 校验改成点击时请求：面板先亮出错误，
                     // 合法才真的调用控制器。
                     // 规则仍然只有那两条，判定也仍然只写在面板里。
-                    // 增量 + 非 MyPack 是核心明确拒绝的组合：界面直接禁用，
+                    // 增量 + 未知 pack 是核心明确拒绝的组合：界面直接禁用，
                     // 并在策略说明里讲清原因，而不是让用户点了才看到失败。
                     enabled: (page.backupTarget === "cloud"
                                   ? (!remote.busy && remote.authenticated)
@@ -284,13 +293,15 @@ Item {
                                   panel.password,
                                   controller.includeRules,
                                   controller.excludeRules)
-                            : controller.startBackupWithStrategy(
+                            : controller.startBackupWithSelectedBaseline(
                                   panel.strategyKey,
                                   panel.packKey,
                                   panel.compressionKey,
                                   panel.encryptionKey,
                                   panel.password,
-                                  panel.confirmPassword)
+                                  panel.confirmPassword,
+                                  panel.strategyKey === "incremental"
+                                      ? baselinePicker.selectedFileName : "")
 
                         if (started)
                             panel.clearPasswords()

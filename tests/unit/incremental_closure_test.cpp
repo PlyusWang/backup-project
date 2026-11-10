@@ -39,7 +39,7 @@ namespace bp = backupproject;
 
 namespace {
 
-// 一次增量备份的便捷入口：MyPack + 不压缩 + 不加密（唯一受支持的增量组合）。
+// 一次增量备份的便捷入口：MyPack + 不压缩 + 不加密。
 bool RunIncremental(const std::string& source, const std::string& repository,
                     const std::string& name, const std::string& baseline,
                     bp::IncrementalOutcome* outcome, std::string* error) {
@@ -197,8 +197,11 @@ void MutateSourceHook(void* context) {
   MutationHook* hook = static_cast<MutationHook*>(context);
   hook->fired = true;
   if (hook->replace_symlink) {
-    ::unlink(hook->path.c_str());
-    ::symlink(hook->content.c_str(), hook->path.c_str());
+    if (::unlink(hook->path.c_str()) != 0 ||
+        ::symlink(hook->content.c_str(), hook->path.c_str()) != 0) {
+      hook->fired = false;
+      return;
+    }
   } else {
     test_support::WriteFile(hook->path, hook->content, 0644);
   }
@@ -247,12 +250,11 @@ int main() {
          "Manual + Incremental + des 使用认证信封"},
         {bp::BackupTrigger::kManual, bp::BackupStrategy::kIncremental,
          bp::PackMethod::kUstar, bp::CompressionMethod::kNone,
-         bp::EncryptionMethod::kNone, false,
-         "Manual + Incremental + ustar 被拒绝"},
+         bp::EncryptionMethod::kNone, true, "Manual + Incremental + ustar"},
         {bp::BackupTrigger::kManual, bp::BackupStrategy::kIncremental,
          bp::PackMethod::kFastUstar, bp::CompressionMethod::kNone,
-         bp::EncryptionMethod::kNone, false,
-         "Manual + Incremental + fast-ustar 被拒绝"},
+         bp::EncryptionMethod::kNone, true,
+         "Manual + Incremental + fast-ustar"},
         {bp::BackupTrigger::kScheduled, bp::BackupStrategy::kFull,
          bp::PackMethod::kMyPack, bp::CompressionMethod::kNone,
          bp::EncryptionMethod::kNone, true, "Scheduled + Full + none"},
@@ -266,8 +268,7 @@ int main() {
          "Scheduled + Incremental + mypack + none"},
         {bp::BackupTrigger::kScheduled, bp::BackupStrategy::kIncremental,
          bp::PackMethod::kUstar, bp::CompressionMethod::kNone,
-         bp::EncryptionMethod::kNone, false,
-         "Scheduled + Incremental + ustar 被拒绝"},
+         bp::EncryptionMethod::kNone, true, "Scheduled + Incremental + ustar"},
         {bp::BackupTrigger::kScheduled, bp::BackupStrategy::kIncremental,
          bp::PackMethod::kMyPack, bp::CompressionMethod::kNone,
          bp::EncryptionMethod::kAes256CtrHmacSha256, false,
@@ -286,8 +287,7 @@ int main() {
          "Realtime + aes 仍然被拒绝"},
         {bp::BackupTrigger::kRealtime, bp::BackupStrategy::kIncremental,
          bp::PackMethod::kUstar, bp::CompressionMethod::kNone,
-         bp::EncryptionMethod::kNone, false,
-         "Realtime + Incremental + ustar 仍然被拒绝"},
+         bp::EncryptionMethod::kNone, true, "Realtime + Incremental + ustar"},
     };
     for (const Case& item : cases) {
       bp::BackupOptionCombination combination;
@@ -312,13 +312,13 @@ int main() {
     test_support::Check(
         bp::UnsupportedBackupOptionCombinationReason(encrypted).empty(),
         "INC-C OPT 加密增量格式闭环后组合可用");
-    bp::BackupOptionCombination ustar;
-    ustar.strategy = bp::BackupStrategy::kIncremental;
-    ustar.pack_method = bp::PackMethod::kUstar;
+    bp::BackupOptionCombination unknown_pack;
+    unknown_pack.strategy = bp::BackupStrategy::kIncremental;
+    unknown_pack.pack_method = static_cast<bp::PackMethod>(255);
     test_support::Check(
-        bp::UnsupportedBackupOptionCombinationReason(ustar).find("MyPack") !=
-            std::string::npos,
-        "INC-C OPT 增量 + USTAR 的理由点名 MyPack");
+        !bp::IsSupportedBackupOptionCombination(unknown_pack) &&
+            !bp::UnsupportedBackupOptionCombinationReason(unknown_pack).empty(),
+        "INC-C OPT 未知增量 pack 仍 fail closed");
   }
 
   // ---- C2：核心自己必须拒绝非法组合（不能只靠前端）----
@@ -346,14 +346,15 @@ int main() {
         "INC-C CORE 拒绝后没有留下快照");
 
     error.clear();
-    bp::BackupOptions ustar;
-    ustar.pack_method = bp::PackMethod::kUstar;
-    test_support::Check(!RunIncrementalWith(source, repository, "ustar.bak", "",
-                                            ustar, &outcome, &error),
-                        "INC-C CORE 增量 + USTAR 被核心拒绝");
+    bp::BackupOptions unknown_pack;
+    unknown_pack.pack_method = static_cast<bp::PackMethod>(255);
     test_support::Check(
-        !test_support::Exists(SnapshotPath(repository, "ustar.bak")),
-        "INC-C CORE 拒绝后没有留下 USTAR 快照");
+        !RunIncrementalWith(source, repository, "unknown-pack.bak", "",
+                            unknown_pack, &outcome, &error),
+        "INC-C CORE 未知增量 pack 被核心拒绝");
+    test_support::Check(
+        !test_support::Exists(SnapshotPath(repository, "unknown-pack.bak")),
+        "INC-C CORE 拒绝后没有留下快照");
   }
 
   // ---- C3：delta 路径在应用那一刻的边界 ----
@@ -904,9 +905,15 @@ int main() {
     test_support::WriteFile(source + "/a.txt", "65", 0644);
     bp::IncrementalOutcome beyond;
     error.clear();
-    test_support::Check(RunIncremental(source, repository, "s065.bak", previous,
-                                       &beyond, &error),
-                        "INC-C DEPTH 越界时仍然完成一次备份", error);
+    test_support::Check(
+        !RunIncremental(source, repository, "explicit-too-deep.bak", previous,
+                        &beyond, &error) &&
+            !test_support::Exists(repository + "/explicit-too-deep.bak"),
+        "INC-C DEPTH 显式选择已满基线时拒绝且不发布", error);
+    error.clear();
+    test_support::Check(
+        RunIncremental(source, repository, "s065.bak", "", &beyond, &error),
+        "INC-C DEPTH 自动模式越界时仍然完成一次备份", error);
     test_support::Check(
         beyond.kind == bp::IncrementalOutcome::Kind::kFullBaseline &&
             beyond.baseline_reason.find("maximum depth") != std::string::npos,

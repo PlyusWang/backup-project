@@ -6,6 +6,7 @@
 # 所以这里显式给出 deb 的实例根；脚本自己会在路径不存在时 fail closed。
 set -e
 export BACKUP_SERVER_ROOT=/var/lib/backup-project-server
+export BACKUP_SERVER_SERVICE=backup-project-server
 export BACKUP_SERVER_ADMIN=/usr/lib/backup-project-server/bin/backup-server-admin
 export BACKUP_SERVER_CONFIG=/etc/backup-project-server/server.conf
 export BACKUP_SERVER_LOG=/var/log/backup-project-server/server.log

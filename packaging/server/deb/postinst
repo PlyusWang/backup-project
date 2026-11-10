@@ -37,7 +37,23 @@ have_systemd()  { [ -d /run/systemd/system ] && command -v systemctl >/dev/null 
 service_state() { systemctl is-active "$SERVICE" 2>/dev/null || true; }
 dpkg_version()  { dpkg-query -W -f '${Version}' "$PKG" 2>/dev/null || true; }
 
-conf_value() { sed -n "s|^[[:space:]]*$1[[:space:]]*=[[:space:]]*||p" "$CONF_DIR/server.conf" | sed -n '1p'; }
+conf_value() {
+  # Same value rules as launch-server.sh and the interactive manager.
+  awk -v wanted="$1" '
+    {
+      line = $0
+      sub(/#.*/, "", line)
+      equals = index(line, "=")
+      if (!equals) next
+      key = substr(line, 1, equals - 1)
+      value = substr(line, equals + 1)
+      sub(/^[[:space:]]*/, "", key); sub(/[[:space:]]*$/, "", key)
+      sub(/^[[:space:]]*/, "", value); sub(/[[:space:]]*$/, "", value)
+      if (key == wanted) { result = value; found = 1 }
+    }
+    END { if (found) print result }
+  ' "$CONF_DIR/server.conf"
+}
 
 # ---------------------------------------------------------------- 回滚材料
 # preinst 写、这里读。三个条件缺一不可：
@@ -126,13 +142,21 @@ service_healthy() {
   return 1
 }
 
-start_and_check() {
+restart_and_check() {
   systemctl daemon-reload >/dev/null 2>&1 || true
-  systemctl enable "$SERVICE" >/dev/null 2>&1 || true
   # 失败升级会让 unit 撞上 StartLimitBurst：先清掉失败状态，否则重启会被拒绝。
   systemctl reset-failed "$SERVICE" >/dev/null 2>&1 || true
   systemctl restart "$SERVICE" >/dev/null 2>&1 || true
   service_healthy
+}
+
+start_and_check() {
+  systemctl daemon-reload >/dev/null 2>&1 || true
+  if ! systemctl enable "$SERVICE" >/dev/null 2>&1; then
+    err "无法启用服务自启动：systemctl enable $SERVICE 失败"
+    return 1
+  fi
+  restart_and_check
 }
 
 commit_install() {
@@ -140,17 +164,35 @@ commit_install() {
   log "安装/升级提交：已删除回滚材料（$ROLLBACK_DIR）"
 }
 
-# 前置检查：上一次失败升级如果已经回滚过，dpkg 元数据（新版本号）与磁盘载荷
-# （旧版本）就是不一致的。这里必须 fail closed，不能让一次 dpkg --configure -a
-# 把"其实装的是旧版本"悄悄变成"升级成功"。
+# 在还原任何旧文件之前留下状态：部分恢复或恢复后启动失败也可能让磁盘载荷
+# 与 dpkg 版本不一致。写不出这个标记就不开始恢复，避免重试时误报升级成功。
+record_rollback_state() {
+  local failed marker
+  failed="$(dpkg_version)"
+  [ -n "$failed" ] || { err "读不到失败升级的 dpkg 版本，拒绝开始回滚。"; return 1; }
+  marker="$ROLLBACK_DIR/.rolled-back.$$"
+  if ! printf '%s\t%s\n' "$OLD_VERSION" "$failed" > "$marker" ||
+     ! mv -f "$marker" "$ROLLBACK_DIR/rolled-back"; then
+    rm -f "$marker"
+    err "无法记录回滚版本状态，拒绝开始回滚。"
+    return 1
+  fi
+}
+
+# 前置检查：上一次回滚只要开始过，磁盘就可能已有旧版本或部分恢复的载荷。
+# 这里必须 fail closed，不能让一次 dpkg --configure -a 把它报成升级成功。
 check_rolled_back_state() {
   [ -f "$ROLLBACK_DIR/rolled-back" ] || return 0
   local restored failed cur
   restored="$(cut -f1 "$ROLLBACK_DIR/rolled-back")"
   failed="$(cut -f2 "$ROLLBACK_DIR/rolled-back")"
   cur="$(dpkg_version)"
+  if [ -z "$restored" ] || [ -z "$failed" ] || [ -z "$cur" ]; then
+    err "回滚版本状态不完整或无法读取 dpkg 版本，拒绝提交安装。"
+    exit 1
+  fi
   if [ "$cur" = "$failed" ]; then
-    err "dpkg 说已安装 $cur，但磁盘上的程序载荷是自动回滚恢复的 $restored（上一次升级失败）。"
+    err "dpkg 说已安装 $cur，但上次回滚已开始恢复 $restored，磁盘载荷可能是旧版本或尚未恢复完整。"
     err "在元数据与载荷一致之前，这里不会报告成功。二选一："
     err "  sudo apt install --reinstall ./<版本 $restored 的 .deb>    # 回到可用版本"
     err "  或修好 $failed 的问题后重新执行那次升级"
@@ -183,9 +225,10 @@ fail_and_maybe_rollback() {
 
   log "开始自动回滚：$OLD_VERSION ← 只还原程序载荷（/usr/lib、/usr/bin、unit、tmpfiles 片段）"
   log "  不碰 $CONF_DIR（配置与 secret）、不碰 $INSTANCE_ROOT（数据、元数据库、身份私钥）"
-  if restore_payload && start_and_check; then
+  # 自启动配置失败不应阻止恢复旧服务。回滚只重启并验证旧载荷；整个升级
+  # 仍返回失败，且版本状态标记会阻止 configure 重试把旧载荷当作新版本提交。
+  if record_rollback_state && restore_payload && restart_and_check; then
     log "ROLLBACK OK：已恢复 $OLD_VERSION，service state=$(service_state)，端口 $(conf_value port) 已就绪"
-    printf '%s\t%s\n' "$OLD_VERSION" "$(dpkg_version)" > "$ROLLBACK_DIR/rolled-back"
     err "升级失败（exit 非零），但旧版本已自动恢复并可运行。"
     err "注意：dpkg 的元数据仍然记着刚才那个起不来的版本；Debian 的 maintainer script 没有事务回滚，"
     err "      要让元数据与磁盘载荷一致，请显式重装： sudo apt install --reinstall ./<版本 $OLD_VERSION 的 .deb>"

@@ -6,6 +6,7 @@
 
 #include "backup_mode.h"
 #include "backup_option_keys.h"
+#include "incremental_backup.h"
 
 namespace backup_modern {
 namespace {
@@ -56,7 +57,7 @@ QString BackupOptionsCatalog::strategyNote(const QString& strategy) const {
   if (strategy == QStringLiteral("incremental")) {
     return QStringLiteral(
         "第一次（或基线不可信时）建立完整基线，之后只写变化部分；"
-        "没有变化就不创建新快照。目前只支持 MyPack 打包格式。");
+        "没有变化就不创建新快照。支持 MyPack、USTAR 和 Fast USTAR 打包格式。");
   }
   return QStringLiteral("每次备份都生成一份完整、自包含的归档。");
 }
@@ -95,9 +96,8 @@ QString BackupOptionsCatalog::validate(const QString& trigger,
   }
   // 翻译成用户能理解的一句原因。判定本身仍然只来自共享真值表。
   if (parsed_strategy == BackupStrategy::kIncremental &&
-      parsed_pack != PackMethod::kMyPack) {
-    return QStringLiteral(
-        "增量备份目前只支持 MyPack 打包格式，请改用 MyPack 或选择完整备份。");
+      !backupproject::IsSupportedIncrementalPack(parsed_pack)) {
+    return QStringLiteral("请选择 MyPack、USTAR 或 Fast USTAR 打包格式。");
   }
   const bool unattended = parsed_trigger == BackupTrigger::kScheduled ||
                           parsed_trigger == BackupTrigger::kRealtime;

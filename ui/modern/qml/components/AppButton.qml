@@ -27,9 +27,9 @@ AbstractButton {
     readonly property bool primary: variant === "primary"
     readonly property bool flat: variant === "flat"
 
-    // 主按钮更高（46 vs 42）：层级差异在静态截图里也要看得出来，而不是只有
-    // hover 才暴露。宽度下限 96 给短标签留着，flat 的横向留白更小（22）。
-    implicitHeight: primary ? 46 : 42
+    // 同一操作栏的主次按钮共用高度，层级由背景、边框和字重区分。
+    // 宽度下限 96 给短标签留着，flat 的横向留白更小（22）。
+    implicitHeight: 42
     implicitWidth: Math.max(96, contentRoot.implicitWidth + (flat ? 22 : 40))
     padding: 0
     // hoverEnabled 必须显式打开：AbstractButton 默认不跟踪悬停，覆盖层依赖的

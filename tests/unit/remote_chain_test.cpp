@@ -2050,6 +2050,111 @@ IndexProbe ProbeIndexRestore(RedTeamServer* fixture,
   return probe;
 }
 
+void TestRemoteBaselineCompatibility(bool encrypted) {
+  const int checks_before = g_checks;
+  const int failures_before = g_failures;
+  RedTeamServer* fixture = SharedServer();
+  Check(fixture != nullptr, "A03-REMOTE shared isolated server");
+  if (fixture == nullptr) return;
+  const std::string suffix = encrypted ? "encrypted" : "plain";
+  const std::string source = fixture->base + "/a03-source-" + suffix;
+  std::string error;
+  backupproject::net::RemoteCacheLayout cache;
+  Check(PrepareSharedCache('a', "a03-baseline-" + suffix, &cache, &error) &&
+            MakeDirectoryTree(source) &&
+            WriteFile(source + "/中文.txt", "first") &&
+            WriteFile(source + "/empty", ""),
+        "A03-REMOTE actual source and cache fixture", error);
+  backupproject::net::RemoteBackupRequest request;
+  request.client = &fixture->client;
+  request.cache = cache;
+  request.source_directory = source + "/./";
+  request.allow_incremental = false;
+  if (encrypted) {
+    request.options.encryption_method =
+        backupproject::EncryptionMethod::kAes256CtrHmacSha256;
+    request.options.password = "synthetic-remote-old-password";
+  }
+  backupproject::net::RemoteBackupOutcome f0;
+  Check(backupproject::net::RunRemoteBackup(request, &f0, &error) &&
+            !f0.produced_delta && f0.generation == 0 &&
+            f0.parent_snapshot_id.empty(),
+        "A03-REMOTE first explicit full uses managed full entry", error);
+  request.allow_incremental = true;
+  request.source_directory = source + "/";
+  Check(WriteFile(source + "/中文.txt", "second") &&
+            WriteFile(source + "/added", "added"),
+        "A03-REMOTE modify and add");
+  backupproject::net::RemoteBackupOutcome d1;
+  Check(backupproject::net::RunRemoteBackup(request, &d1, &error) &&
+            d1.produced_delta && d1.generation == 1 &&
+            d1.parent_snapshot_id == f0.snapshot_id,
+        "A03-REMOTE equivalent source spelling continues actual delta", error);
+  backupproject::net::RemoteBackupOutcome unchanged;
+  request.source_directory = source + "/./";
+  Check(backupproject::net::RunRemoteBackup(request, &unchanged, &error) &&
+            unchanged.no_changes && unchanged.snapshot_id.empty(),
+        "A03-REMOTE no-change alias uploads no snapshot", error);
+  request.allow_incremental = false;
+  backupproject::net::RemoteBackupOutcome forced;
+  Check(backupproject::net::RunRemoteBackup(request, &forced, &error) &&
+            !forced.produced_delta && forced.generation == 0 &&
+            forced.parent_snapshot_id.empty() &&
+            forced.snapshot_id != f0.snapshot_id,
+        "A03-REMOTE forced full does not reuse a sentinel or parent", error);
+  backupproject::net::RemoteBackupOutcome forced_again;
+  Check(backupproject::net::RunRemoteBackup(request, &forced_again, &error) &&
+            !forced_again.produced_delta && forced_again.generation == 0 &&
+            forced_again.archive_name != forced.archive_name,
+        "A03-REMOTE repeated full has a distinct managed cache filename",
+        error);
+  request.allow_incremental = true;
+  if (encrypted)
+    request.options.password = "synthetic-remote-new-password";
+  else
+    request.options.pack_method = backupproject::PackMethod::kUstar;
+  backupproject::net::RemoteBackupOutcome changed;
+  Check(backupproject::net::RunRemoteBackup(request, &changed, &error) &&
+            !changed.produced_delta && changed.rebuilt_full_baseline &&
+            changed.generation == 0 && changed.parent_snapshot_id.empty() &&
+            !changed.baseline_reason.empty(),
+        encrypted ? "A03-REMOTE changed password creates safe encrypted root"
+                  : "A03-REMOTE changed pack creates compatible full root",
+        error);
+  backupproject::RestoreOptions old_options;
+  old_options.password = encrypted ? "synthetic-remote-old-password" : "";
+  backupproject::net::RemoteRestoreOutcome restored;
+  const std::string old_destination = fixture->base + "/a03-old-" + suffix;
+  Check(backupproject::net::RunRemoteRestore(&fixture->client, cache,
+                                             d1.snapshot_id, old_destination,
+                                             old_options, &restored, &error),
+        "A03-REMOTE old lineage still restores with original password", error);
+  bool old_equal = true;
+  for (const std::string name : {"中文.txt", "empty", "added"}) {
+    std::string expected, actual;
+    old_equal &= ReadFile(source + "/" + name, &expected) &&
+                 ReadFile(old_destination + "/" + name, &actual) &&
+                 Sha256HexOf(expected) == Sha256HexOf(actual);
+  }
+  Check(old_equal, "A03-REMOTE old lineage per-file SHA-256 equality");
+  backupproject::RestoreOptions new_options;
+  new_options.password = request.options.password;
+  const std::string new_destination = fixture->base + "/a03-new-" + suffix;
+  Check(backupproject::net::RunRemoteRestore(
+            &fixture->client, cache, changed.snapshot_id, new_destination,
+            new_options, &restored, &error),
+        "A03-REMOTE new full root restores with current options", error);
+  bool new_equal = true;
+  for (const std::string name : {"中文.txt", "empty", "added"}) {
+    std::string expected, actual;
+    new_equal &= ReadFile(source + "/" + name, &expected) &&
+                 ReadFile(new_destination + "/" + name, &actual) &&
+                 Sha256HexOf(expected) == Sha256HexOf(actual);
+  }
+  Check(new_equal, "A03-REMOTE new root per-file SHA-256 equality");
+  EndCase("A03-REMOTE", checks_before, failures_before);
+}
+
 void TestRemoteIndexAttacks() {
   std::printf("[chain] RT3 缓存索引 .remote-index.tsv 审查\n");
   const int checks_before = g_checks;
@@ -3666,7 +3771,15 @@ void TestCrashConsistentPublish() {
   RemoveTree(root);
 }
 
-int main() {
+int main(int argc, char** argv) {
+  if (argc == 2 &&
+      std::string(argv[1]) == "--encrypted-baseline-compatibility") {
+    TestRemoteBaselineCompatibility(true);
+    ShutdownSharedServer();
+    std::printf("remote-encrypted-baseline-test: %d/%d checks passed\n",
+                g_checks - g_failures, g_checks);
+    return g_failures == 0 ? 0 : 1;
+  }
   std::printf("远端增量链单元测试\n");
   TestSnapshotBundle();
   TestChainResolution();
@@ -3676,6 +3789,7 @@ int main() {
   TestBundleMaliciousConstructions();
   TestExtractionLocalAttacks();
   TestCrashConsistentPublish();
+  TestRemoteBaselineCompatibility(false);
   TestRemoteIndexAttacks();
   TestCacheIsolation();
   TestMetadataArchiveCrossCheck();
