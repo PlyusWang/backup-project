@@ -122,8 +122,53 @@ def run_menu(label, lines, success=True):
 
 
 # Fresh default BPSEC1 and BPSEC2 initialization through the actual menu.
-run_menu('new-bpsec1', ['', '', '21789', 'n', ''])
+bpsec1_instance, _ = run_menu('new-bpsec1', ['', '', '21789', 'n', ''])
+# Installed instances begin with BPSEC1: certificate management must be able
+# to sign the same identity without requiring manual key/certificate commands.
+def manage_certificate(label, instance, server_id, confirmation, interrupt=False):
+    env = {k: v for k, v in os.environ.items()
+           if not k.startswith('BACKUP_SERVER_') and k != 'BACKUP_CERT_TOOL'}
+    env.update(BACKUP_SERVER_ROOT=str(instance),
+               BACKUP_SERVER_ADMIN=str(repo / 'build/backup-server-admin'),
+               BACKUP_SERVER_BIN=str(repo / 'build/backup-server'),
+               BACKUP_SERVER_KEYGEN=str(keygen), BACKUP_CERT_TOOL=str(certtool))
+    if interrupt:
+        env.update(PATH=str(signal_tools) + os.pathsep + env['PATH'],
+                   TEST_SIGNAL_CONFIG=str(instance / 'server.conf'),
+                   TEST_SIGNAL_MARKER=str(root / (label + '.marker')))
+    return command(label, ['bash', repo / 'scripts/backup-server-admin.sh'],
+                   data='\n'.join(['8', '2', server_id, confirmation, '', '0', '']),
+                   env=env, timeout=30)
+
+
+bpsec1_config_before = (bpsec1_instance / 'server.conf').read_bytes()
+bpsec1_key_before = digest(bpsec1_instance / 'state/transport.key')
+manage_certificate('test-certificate-cancelled', bpsec1_instance,
+                   'menu-test-server', 'CANCEL')
+check('cancelled-test-certificate-keeps-config',
+      (bpsec1_instance / 'server.conf').read_bytes() == bpsec1_config_before)
+manage_certificate('test-certificate-invalid-id', bpsec1_instance,
+                   'x' * 129, 'CREATE TEST CERTIFICATE')
+check('invalid-test-certificate-keeps-config-and-cleans-materials',
+      (bpsec1_instance / 'server.conf').read_bytes() == bpsec1_config_before
+      and not list((bpsec1_instance / 'private').glob('test-root.*'))
+      and not list((bpsec1_instance / 'state').glob('client-identity.*')))
+issued = manage_certificate('test-certificate-signed', bpsec1_instance,
+                            'menu-test-server', 'CREATE TEST CERTIFICATE')
+check('test-certificate-enables-bpsec2',
+      'require_bpsec2 = true' in (bpsec1_instance / 'server.conf').read_text()
+      and re.search(r'^verdict\s*=\s*TRUSTED$', issued.stdout, re.M) is not None)
+check('test-certificate-keeps-transport-identity',
+      digest(bpsec1_instance / 'state/transport.key') == bpsec1_key_before)
+private_roots = list((bpsec1_instance / 'private').glob('test-root.*/root.key'))
+client_materials = list((bpsec1_instance / 'state').glob('client-identity.*'))
+check('test-root-private-and-client-materials-separated',
+      len(private_roots) == len(client_materials) == 1
+      and private_roots[0].stat().st_mode & 0o777 == 0o600
+      and {p.name for p in client_materials[0].iterdir()}
+          == {'trusted-root.pub', 'server.bpcert'})
 run_menu('new-bpsec2', ['', '', '21789', 'y', '', '', 'new-test-server'])
+run_menu('new-bpsec2-max-length-id', ['', '', '21789', 'y', '', '', 'x' * 128])
 import_lines = ['', '', '21789', 'y', '2', str(original), 'IMPORT IDENTITY',
                 '2', str(root_pub), str(certificate), 'IMPORT BPSEC2']
 instance, process = run_menu('import-bpsec2', import_lines)
@@ -170,6 +215,53 @@ command('expired-issue', [certtool, 'issue-server', '--root-key', root_key,
 expired_lines = list(import_lines)
 expired_lines[9] = str(expired)
 run_menu('certificate-expired', expired_lines, False)
+# Interrupt the real manager immediately after its successful atomic config
+# rename. Its EXIT handler must retain the now-referenced certificate bundle.
+signal_tools = root / 'signal-tools'
+signal_tools.mkdir()
+signal_mv = signal_tools / 'mv'
+signal_mv.write_text("""#!/usr/bin/env bash
+/usr/bin/mv "$@" || exit $?
+if [ "${!#}" = "${TEST_SIGNAL_CONFIG:-}" ]; then
+  : >"$TEST_SIGNAL_MARKER"
+  kill -TERM "$PPID"
+fi
+""")
+signal_mv.chmod(0o700)
+interrupted_result = manage_certificate('test-certificate-interrupted-after-commit', bpsec1_instance,
+                   'interrupted-test-server', 'CREATE TEST CERTIFICATE', interrupt=True)
+check('test-certificate-commit-interruption-executed',
+      (root / 'test-certificate-interrupted-after-commit.marker').is_file()
+      and '测试证书已签发并保存' not in interrupted_result.stdout)
+signal_config = (bpsec1_instance / 'server.conf').read_text()
+signal_cert = Path(re.search(r'^certificate = (.+)$', signal_config, re.M).group(1))
+check('interrupted-commit-retains-published-certificate', signal_cert.is_file()
+      and (signal_cert.parent / 'trusted-root.pub').is_file()
+      and digest(bpsec1_instance / 'state/transport.key') == bpsec1_key_before)
+command('interrupted-certificate-still-trusted', [certtool, 'verify-server',
+        '--cert', signal_cert, '--roots', signal_cert.parent / 'trusted-root.pub'])
+
+import_env = {k: v for k, v in os.environ.items()
+              if not k.startswith('BACKUP_SERVER_') and k != 'BACKUP_CERT_TOOL'}
+import_env.update(BACKUP_SERVER_ROOT=str(instance),
+                  BACKUP_SERVER_ADMIN=str(repo / 'build/backup-server-admin'),
+                  BACKUP_SERVER_BIN=str(repo / 'build/backup-server'),
+                  BACKUP_SERVER_KEYGEN=str(keygen), BACKUP_CERT_TOOL=str(certtool),
+                  PATH=str(signal_tools) + os.pathsep + import_env['PATH'],
+                  TEST_SIGNAL_CONFIG=str(instance / 'server.conf'),
+                  TEST_SIGNAL_MARKER=str(root / 'certificate-import-interrupted.marker'))
+interrupted_import = command('certificate-import-interrupted-after-commit',
+        ['bash', repo / 'scripts/backup-server-admin.sh'], env=import_env,
+        data='\n'.join(['8', '1', str(root_pub), str(certificate), 'IMPORT BPSEC2', '', '0', '']))
+check('certificate-import-commit-interruption-executed',
+      (root / 'certificate-import-interrupted.marker').is_file()
+      and '证书导入完成' not in interrupted_import.stdout)
+import_config = (instance / 'server.conf').read_text()
+import_cert = Path(re.search(r'^certificate = (.+)$', import_config, re.M).group(1))
+check('interrupted-import-retains-published-bundle', import_cert.is_file()
+      and (import_cert.parent / 'trusted-root.pub').is_file())
+command('interrupted-import-still-trusted', [certtool, 'verify-server',
+        '--cert', import_cert, '--roots', import_cert.parent / 'trusted-root.pub'])
 check('all-original-material-preserved', all(digest(p) == before
       for p, before in source_digests.items())
       and original.stat().st_mode & 0o777 == 0o600)
