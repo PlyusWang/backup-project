@@ -204,6 +204,7 @@ banner() {
     admin status || true
   elif instance_initialized; then
     printf '状态：已初始化，数据库尚未创建\n'
+    print_client_connection_info
   else
     printf '状态：尚未初始化\n'
   fi
@@ -217,6 +218,26 @@ banner() {
     fi
   fi
   printf '\n'
+}
+
+print_client_connection_info() {
+  local bind port cert key
+  bind="$(config_value bind)"; [ -n "$bind" ] || bind=127.0.0.1
+  port="$(configured_port)"
+  printf '服务器地址：%s\n业务端口：%s\n' "$bind" "$port"
+  cert="$(configured_cert)"
+  if [ -n "$cert" ]; then
+    printf '认证模式：BPSEC2\n客户端可信根公钥：%s\n服务器身份文件：%s\n' \
+      "$configured_root_pub" "$cert"
+    return 0
+  fi
+  key="$(config_value transport_key)"
+  printf '认证模式：BPSEC1 公钥指纹\n服务器身份私钥：%s（私钥内容不会显示）\n' "$key"
+  if [ -x "$KEYGEN_BIN" ] && [ -n "$key" ] && [ -f "$key" ]; then
+    "$KEYGEN_BIN" --show --key-file "$key" || return 1
+  else
+    printf '传输身份指纹：不可用（找不到已配置的身份私钥）\n'
+  fi
 }
 
 init_server() {
@@ -344,9 +365,7 @@ EOF
   trap - RETURN
   rm -rf "$init_dir"
   printf '\n初始化完成。之后可选择启动服务器。\n'
-  if [ -n "$certificate" ]; then
-    printf '客户端可信根公钥：%s\n服务器身份文件：%s\n' "$configured_root_pub" "$certificate"
-  fi
+  print_client_connection_info || return 1
 }
 
 start_server() {
@@ -535,7 +554,15 @@ snapshot_menu() {
 # 因此只有一份实现。
 identity_page() {
   clear_screen
-  admin transport-identity
+  if ! instance_initialized; then
+    printf '请先初始化服务器。\n'
+    return 1
+  fi
+  if [ -n "$(configured_cert)" ]; then
+    certificate_page
+  else
+    print_client_connection_info
+  fi
 }
 
 # ---- 主循环 ----
