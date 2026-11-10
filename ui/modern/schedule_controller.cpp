@@ -20,6 +20,7 @@
 #include <QDir>
 #include <QEventLoop>
 #include <QFileInfo>
+#include <QUuid>
 #include <QVariantMap>
 #include <QtConcurrent/QtConcurrentRun>
 #include <cstdint>
@@ -127,6 +128,9 @@ ScheduleController::ScheduleController(QString schedule_file_path,
 // 析构只释放 runner 锁，不等待也不取消可能在飞的评估（那次写盘照样会完成）。
 // 正常退出时 main.cpp 在事件循环结束后才销毁控制器。
 ScheduleController::~ScheduleController() {
+  for (const QString& reference : owned_archive_session_references_)
+    backupproject::ClearSessionCredential(reference.toStdString());
+  owned_archive_session_references_.clear();
   backupproject::ClearSessionCredential(
       "/@backup-project-session/schedule-archive");
   // 析构时释放 runner 锁：flock 随 fd 关闭自动释放，这里显式做一次，
@@ -180,6 +184,12 @@ void ScheduleController::LoadFromDisk() {
     document_ = std::move(document);
   }
   config_loaded_ = true;
+  draft_repository_type_ =
+      QString::fromStdString(document_.config.repository_type);
+  draft_cloud_credentials_file_ =
+      QString::fromStdString(document_.config.cloud_credentials_file);
+  draft_cloud_repository_id_ =
+      QString::fromStdString(document_.config.cloud_repository_id);
   // 草稿从已保存配置初始化：用户不碰加密控件时，保存不会悄悄把加密方式
   // 改回 none。
   draft_encryption_key_ = QString::fromLatin1(
@@ -209,9 +219,12 @@ void ScheduleController::ApplyRunnerLock() {
       document_.config.enabled && config_loaded_ && !config_invalid_;
 
   if (!should_run) {
-    if (lock_.held()) {
-      lock_.Release();
-      tick_.stop();
+    tick_.stop();
+    if (lock_.held()) lock_.Release();
+    if (pending_) {
+      pending_ = false;
+      pending_force_ = false;
+      emit pendingChanged();
     }
     // 挂起与"未启用"是两件事：前者是配置坏了，用户需要看到不同的说法。
     if (config_invalid_) {
@@ -751,6 +764,9 @@ bool ScheduleController::saveConfig(bool enabled, const QString& source_path,
     return false;
   }
   config.encryption_password_file = draft_credential_file_.toStdString();
+  config.repository_type = draft_repository_type_.toStdString();
+  config.cloud_credentials_file = draft_cloud_credentials_file_.toStdString();
+  config.cloud_repository_id = draft_cloud_repository_id_.toStdString();
 
   config.include_rules.clear();
   for (const QString& rule : include_rules) {
@@ -789,7 +805,12 @@ bool ScheduleController::saveConfig(bool enabled, const QString& source_path,
     return false;
   }
 
+  const QString previous_credential = credentialFile();
   document_ = next;
+  if (previous_credential != credentialFile() &&
+      owned_archive_session_references_.removeAll(previous_credential) > 0) {
+    backupproject::ClearSessionCredential(previous_credential.toStdString());
+  }
   emit configChanged();
   // 保存成功 = 磁盘上现在有一份合法配置 = 挂起理由消失。这是唯一的自动恢复点。
   SetConfigInvalid(false);
@@ -802,10 +823,38 @@ bool ScheduleController::saveConfig(bool enabled, const QString& source_path,
   return true;
 }
 
+// 停用只改变已保存的启用状态，不提交其它尚未验证的目标或密码草稿。
 bool ScheduleController::setEnabled(bool enabled) {
-  return saveConfig(enabled, sourcePath(), intervalMinutes(), retainCount(),
-                    packKey(), compressionKey(), includeRules(), excludeRules(),
-                    strategyKey());
+  if (enabled) {
+    return saveConfig(enabled, sourcePath(), intervalMinutes(), retainCount(),
+                      packKey(), compressionKey(), includeRules(),
+                      excludeRules(), strategyKey());
+  }
+  const QString encryption_draft = draft_encryption_key_;
+  const QString credential_draft = draft_credential_file_;
+  const QString target_draft = draft_repository_type_;
+  const QString cloud_file_draft = draft_cloud_credentials_file_;
+  const QString cloud_id_draft = draft_cloud_repository_id_;
+  draft_encryption_key_ = QString::fromLatin1(
+      backupproject::EncryptionMethodKey(document_.config.encryption_method));
+  draft_credential_file_ =
+      QString::fromStdString(document_.config.encryption_password_file);
+  draft_repository_type_ =
+      QString::fromStdString(document_.config.repository_type);
+  draft_cloud_credentials_file_ =
+      QString::fromStdString(document_.config.cloud_credentials_file);
+  draft_cloud_repository_id_ =
+      QString::fromStdString(document_.config.cloud_repository_id);
+  const bool saved = saveConfig(enabled, sourcePath(), intervalMinutes(),
+                                retainCount(), packKey(), compressionKey(),
+                                includeRules(), excludeRules(), strategyKey());
+  draft_encryption_key_ = encryption_draft;
+  draft_credential_file_ = credential_draft;
+  draft_repository_type_ = target_draft;
+  draft_cloud_credentials_file_ = cloud_file_draft;
+  draft_cloud_repository_id_ = cloud_id_draft;
+  emit configChanged();
+  return saved;
 }
 
 // 备份管理页的 JOIN：file_name -> 来源。只读计划存储自己的 managed 名单，
@@ -985,8 +1034,10 @@ QString ScheduleController::encryptionKey() const {
 }
 
 bool ScheduleController::sessionPasswordUnlocked() const {
-  return backupproject::SessionCredentialAvailable(
-      "/@backup-project-session/schedule-archive");
+  return backupproject::IsSessionCredentialReference(
+             draft_credential_file_.toStdString()) &&
+         backupproject::SessionCredentialAvailable(
+             draft_credential_file_.toStdString());
 }
 
 bool ScheduleController::unlockArchivePassword(const QString& password,
@@ -997,21 +1048,36 @@ bool ScheduleController::unlockArchivePassword(const QString& password,
               QStringLiteral("请重新输入并确认密码。"));
     return false;
   }
+  const QString reference =
+      QStringLiteral("/@backup-project-session/schedule-archive-") +
+      QUuid::createUuid().toString(QUuid::WithoutBraces);
   std::string error;
-  if (!backupproject::SetSessionCredential(
-          "/@backup-project-session/schedule-archive", password.toStdString(),
-          &error)) {
+  if (!backupproject::SetSessionCredential(reference.toStdString(),
+                                           password.toStdString(), &error)) {
     SetStatus(QStringLiteral("error"), QStringLiteral("密码未解锁"),
               QString::fromStdString(error));
     return false;
   }
-  draft_credential_file_ =
-      QStringLiteral("/@backup-project-session/schedule-archive");
+  // 至多保留已生效密码与本次草稿；失败编辑不能替换已生效引用。
+  for (auto it = owned_archive_session_references_.begin();
+       it != owned_archive_session_references_.end();) {
+    if (*it == credentialFile()) {
+      ++it;
+    } else {
+      backupproject::ClearSessionCredential(it->toStdString());
+      it = owned_archive_session_references_.erase(it);
+    }
+  }
+  owned_archive_session_references_.append(reference);
+  draft_credential_file_ = reference;
   emit configChanged();
   return true;
 }
 
 void ScheduleController::lockArchivePassword() {
+  for (const QString& reference : owned_archive_session_references_)
+    backupproject::ClearSessionCredential(reference.toStdString());
+  owned_archive_session_references_.clear();
   backupproject::ClearSessionCredential(
       "/@backup-project-session/schedule-archive");
   emit configChanged();
@@ -1065,10 +1131,9 @@ bool ScheduleController::setRepositoryTarget(const QString& repository_type,
                                              const QString& credentials_file,
                                              const QString& repository_id) {
   if (repository_type == "local") {
-    document_.config.repository_type = "local";
-    document_.config.cloud_credentials_file.clear();
-    document_.config.cloud_repository_id.clear();
-    emit configChanged();
+    draft_repository_type_ = QStringLiteral("local");
+    draft_cloud_credentials_file_.clear();
+    draft_cloud_repository_id_.clear();
     return true;
   }
   if (repository_type != "cloud") {
@@ -1088,10 +1153,9 @@ bool ScheduleController::setRepositoryTarget(const QString& repository_type,
               QStringLiteral("请先选择凭据文件并生成仓库标识。"));
     return false;
   }
-  document_.config.repository_type = "cloud";
-  document_.config.cloud_credentials_file = credentials_file.toStdString();
-  document_.config.cloud_repository_id = repository_id.toStdString();
-  emit configChanged();
+  draft_repository_type_ = QStringLiteral("cloud");
+  draft_cloud_credentials_file_ = credentials_file;
+  draft_cloud_repository_id_ = repository_id;
   return true;
 }
 

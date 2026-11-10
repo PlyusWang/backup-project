@@ -33,10 +33,9 @@
 // **直接失败**（kNoPinConfigured，信息里是"没有配置服务端传输公钥/指纹"），
 // 客户端不做"第一次见到谁就信谁"。
 //
-// 它**不落盘**：本页的 host / port 本来就没有持久化落点（见下面端点的说明），
-// pin 与它们是同一类东西，不为了它单独新造一套配置系统。所以它只存在于内存，
-// 由调用方在**第一次连接之前**设置：界面上的"服务器身份指纹"输入框，
-// 或者 main.cpp 里 --remote-test / --remote-smoke 两条自检路径。
+// pin 与 host / port 都是可公开的连接设置，由独立 profile 保存；用户名、
+// 密码、token 与登录状态不在其中。首次连接前须由用户输入、已保存的 profile
+// 或显式自检参数提供合法 pin，连接时仍核对真实握手公钥。
 //
 // ---- 并发 ----
 //
@@ -239,11 +238,12 @@ class RemoteController : public QObject {
   // 用户名密码合不合规，都在那一次调用里判完，不存在"先写一半再登录"的
   // 中间态。这里回读的是**上一次真正生效**的那一组值。
   //
-  // 不做持久化：config.json 里只有仓库路径，没有自然落点，就不为了三个
-  // 字段新造一套配置系统（见 06-KNOWN-LIMITATIONS.md）。
+  // 公开连接设置存于独立 profile；用户名、密码、token 与登录状态不保存。
   Q_PROPERTY(QString host READ host NOTIFY endpointChanged)
   Q_PROPERTY(QString portText READ portText NOTIFY endpointChanged)
   Q_PROPERTY(QString username READ username NOTIFY endpointChanged)
+  Q_PROPERTY(QString connectionProfileError READ connectionProfileError NOTIFY
+                 connectionProfileErrorChanged)
   Q_PROPERTY(bool sharedSessionReady READ sharedSessionReady NOTIFY
                  sharedSessionChanged)
   Q_PROPERTY(QString sharedSessionRepositoryId READ sharedSessionRepositoryId
@@ -548,6 +548,9 @@ class RemoteController : public QObject {
   Q_INVOKABLE void setLocalRepositoryPath(const QString& path);
   // 传输续传状态的落盘目录（由 main.cpp 按配置目录给出）。为空 = 不跨进程续传。
   Q_INVOKABLE void setResumeDirectory(const QString& path);
+  // main 在 QML 加载前指定路径并加载公开连接设置；不自动连接或恢复登录。
+  bool setConnectionProfilePath(const QString& path);
+  QString connectionProfileError() const { return connection_profile_error_; }
   Q_INVOKABLE bool downloadArchive(const QString& snapshot_id,
                                    const QString& target_path,
                                    bool allow_overwrite);
@@ -830,6 +833,7 @@ class RemoteController : public QObject {
   void userError(const QString& title, const QString& summary,
                  const QString& suggestion, const QString& technical);
   void endpointChanged();
+  void connectionProfileErrorChanged();
   void sessionChanged();
   void sharedSessionChanged();
   void reachabilityChanged();
@@ -1021,7 +1025,7 @@ class RemoteController : public QObject {
   // 失败。见 .cpp 里 CommitEndpoint / setServerKeyPin / 各个提交点。
   backupproject::net::RemoteEndpoint endpoint_;
   QString username_;
-  // 服务器身份 pin：可以公开，但同样只存在于内存（不落盘，见文件顶部说明）。
+  // 服务器身份 pin：公开连接设置，可由独立 profile 恢复。
   QString server_key_pin_;
   // 只存在于内存；退出登录与析构时擦除。绝不落盘、绝不进日志。
   QString password_;
@@ -1032,6 +1036,11 @@ class RemoteController : public QObject {
   // 身份、地址或传输模式改变后，已有 socket 不能继续承载旧握手；空闲时
   // 立即丢弃旧连接与会话，下一次操作必须按新配置重新认证。
   void InvalidateConnectionForSettingsChange();
+  void SaveConnectionProfile();
+  void SetConnectionProfileError(const QString& message);
+  QString connection_profile_path_;
+  QString connection_profile_error_;
+  bool loading_connection_profile_ = false;
 
   bool authenticated_ = false;
   bool busy_ = false;
@@ -1064,8 +1073,7 @@ class RemoteController : public QObject {
 
   // ---- 连接方式的内部状态 ----
   //
-  // 连接方式与通道配置。与 host / port / pin 一样**只存在于内存**：当前
-  // 部署的唯一事实来源是 ~/.ssh/config，产品不另造一套持久化。
+  // 公开连接设置可跨进程保存；SSH 密钥和密码仍由 OpenSSH 管理。
   ConnectionMode connection_mode_ = ConnectionMode::kSshTunnel;
   // 身份验证独立于连接方式。默认 pin：既有 .bpserver/手工指纹路径不变；
   // 官方模式在 Submit 时强制 certificate，不读这两个字段。

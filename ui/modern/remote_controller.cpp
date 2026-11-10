@@ -29,11 +29,14 @@
 #include <QEventLoop>
 #include <QFile>
 #include <QFileInfo>
+#include <QJsonDocument>
+#include <QJsonObject>
 #include <QMetaObject>
 #include <QRegularExpression>
 #include <QTimer>
 #include <QtConcurrent/QtConcurrentRun>
 #include <algorithm>
+#include <cerrno>
 #include <cstdio>
 #include <cstring>
 #include <map>
@@ -48,6 +51,7 @@
 #include "backup_catalog.h"
 #include "backup_mode.h"
 #include "backup_option_keys.h"
+#include "bpcert.h"
 #include "copy_staging.h"
 #include "file_io.h"
 #include "incremental_backup.h"
@@ -400,11 +404,157 @@ RemoteController::RemoteController(QObject* parent) : QObject(parent) {
                    invalidate_shared_session);
   QObject::connect(this, &RemoteController::serverKeyPinChanged, this,
                    invalidate_shared_session);
+  QObject::connect(this, &RemoteController::endpointChanged, this,
+                   &RemoteController::SaveConnectionProfile);
+  QObject::connect(this, &RemoteController::connectionChanged, this,
+                   &RemoteController::SaveConnectionProfile);
+  QObject::connect(this, &RemoteController::serverKeyPinChanged, this,
+                   &RemoteController::SaveConnectionProfile);
   QObject::connect(&tunnel_, &SshTunnelManager::stateChanged, this, [this]() {
     if (connection_mode_ == ConnectionMode::kSshTunnel && !tunnel_.IsReady()) {
       ClearSharedSession();
     }
   });
+}
+
+void RemoteController::SetConnectionProfileError(const QString& message) {
+  if (connection_profile_error_ == message) return;
+  connection_profile_error_ = message;
+  emit connectionProfileErrorChanged();
+}
+
+bool RemoteController::setConnectionProfilePath(const QString& path) {
+  if (busy_ || authenticated_) return false;
+  connection_profile_path_ = path;
+  SetConnectionProfileError(QString());
+  if (path.isEmpty()) return true;
+  const auto invalid = [this]() {
+    SetConnectionProfileError(
+        QStringLiteral("无法读取已保存的连接设置，请重新设置连接。"));
+    return false;
+  };
+  // 不跟随链接，不阻塞于 FIFO；即使文件在检查后增长，也最多读取 65537 字节。
+  const int fd = ::open(QFile::encodeName(path).constData(),
+                        O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK);
+  if (fd < 0) return errno == ENOENT ? true : invalid();
+  struct stat metadata {};
+  QByteArray bytes;
+  bool readable = ::fstat(fd, &metadata) == 0 && S_ISREG(metadata.st_mode) &&
+                  metadata.st_size <= 65536;
+  while (readable && bytes.size() <= 65536) {
+    char chunk[4096];
+    const ssize_t count =
+        ::read(fd, chunk, qMin<qsizetype>(sizeof(chunk), 65537 - bytes.size()));
+    if (count < 0 && errno == EINTR) continue;
+    if (count < 0) readable = false;
+    if (count <= 0) break;
+    bytes.append(chunk, static_cast<qsizetype>(count));
+  }
+  ::close(fd);
+  if (!readable || bytes.size() > 65536) return invalid();
+  QJsonParseError parse_error;
+  const QJsonDocument document = QJsonDocument::fromJson(bytes, &parse_error);
+  if (parse_error.error != QJsonParseError::NoError || !document.isObject())
+    return invalid();
+  const QJsonObject object = document.object();
+  const QStringList fields = {QStringLiteral("auth_mode"),
+                              QStringLiteral("connection_mode"),
+                              QStringLiteral("expected_server_id"),
+                              QStringLiteral("host"),
+                              QStringLiteral("port"),
+                              QStringLiteral("server_key_pin"),
+                              QStringLiteral("ssh_host"),
+                              QStringLiteral("ssh_local_port"),
+                              QStringLiteral("trusted_roots_file"),
+                              QStringLiteral("version")};
+  if (object.keys() != fields || object.value("version").toInt(-1) != 1 ||
+      !object.value("version").isDouble())
+    return invalid();
+  for (const QString& field : fields) {
+    if (field == QStringLiteral("version") || field == QStringLiteral("port") ||
+        field == QStringLiteral("ssh_local_port"))
+      continue;
+    if (!object.value(field).isString()) return invalid();
+    for (QChar character : object.value(field).toString())
+      if (character.category() == QChar::Other_Control) return invalid();
+  }
+  const QString mode = object.value("connection_mode").toString();
+  const QString auth = object.value("auth_mode").toString();
+  const int port = object.value("port").toInt(-1);
+  const int local_port = object.value("ssh_local_port").toInt(-1);
+  const QString host = object.value("host").toString();
+  const QString ssh_host = object.value("ssh_host").toString();
+  const QString identity = object.value("expected_server_id").toString();
+  const QString pin = object.value("server_key_pin").toString();
+  QString ssh_error;
+  if ((mode != QStringLiteral("official") && mode != QStringLiteral("direct") &&
+       mode != QStringLiteral("ssh")) ||
+      (auth != QStringLiteral("certificate") &&
+       auth != QStringLiteral("pin")) ||
+      host.isEmpty() || host != host.trimmed() ||
+      host.contains(QRegularExpression(QStringLiteral("\\s"))) ||
+      (!ssh_host.isEmpty() &&
+       !SshTunnelManager::IsValidSshTarget(ssh_host, &ssh_error)) ||
+      (!identity.isEmpty() && !backupproject::crypto::Bpcert1IsValidIdentity(
+                                  identity.toStdString())) ||
+      pin != pin.trimmed() || !object.value("port").isDouble() || port < 1 ||
+      port > 65535 || !object.value("ssh_local_port").isDouble() ||
+      local_port < 0 || local_port > 65535)
+    return invalid();
+  // 全部结构校验完成后才应用；pin 仍复用唯一的共享解析入口。
+  loading_connection_profile_ = true;
+  if (!pin.isEmpty() && !setServerKeyPin(pin)) {
+    loading_connection_profile_ = false;
+    return invalid();
+  }
+  InvalidateConnectionForSettingsChange();
+  endpoint_.host = object.value("host").toString().toStdString();
+  endpoint_.port = static_cast<std::uint16_t>(port);
+  server_key_pin_ = pin;
+  endpoint_.server_key_pin = pin.toStdString();
+  connection_mode_ =
+      mode == QStringLiteral("official") ? ConnectionMode::kOfficialCloud
+      : mode == QStringLiteral("ssh")    ? ConnectionMode::kSshTunnel
+                                         : ConnectionMode::kDirect;
+  auth_mode_ = auth;
+  trusted_roots_file_ = object.value("trusted_roots_file").toString();
+  expected_server_id_ = object.value("expected_server_id").toString();
+  ssh_host_ = object.value("ssh_host").toString();
+  ssh_local_port_ = local_port;
+  emit endpointChanged();
+  emit connectionChanged();
+  emit serverKeyPinChanged();
+  loading_connection_profile_ = false;
+  return true;
+}
+
+void RemoteController::SaveConnectionProfile() {
+  if (connection_profile_path_.isEmpty() || loading_connection_profile_) return;
+  // 白名单独立构造；不序列化 controller/session/request，避免口令或 token
+  // 落盘。
+  const QJsonObject object{
+      {QStringLiteral("version"), 1},
+      {QStringLiteral("connection_mode"), connectionMode()},
+      {QStringLiteral("auth_mode"), auth_mode_},
+      {QStringLiteral("host"), QString::fromStdString(endpoint_.host)},
+      {QStringLiteral("port"), static_cast<int>(endpoint_.port)},
+      {QStringLiteral("server_key_pin"), serverKeyPin()},
+      {QStringLiteral("trusted_roots_file"), trusted_roots_file_},
+      {QStringLiteral("expected_server_id"), expected_server_id_},
+      {QStringLiteral("ssh_host"), ssh_host_},
+      {QStringLiteral("ssh_local_port"), ssh_local_port_}};
+  const QByteArray bytes = QJsonDocument(object).toJson(QJsonDocument::Compact);
+  std::string error;
+  const bool saved =
+      bytes.size() <= 65536 &&
+      backupproject::EnsurePrivateDirectoryFor(
+          connection_profile_path_.toStdString(), &error) &&
+      backupproject::WriteFileAtomicallyReplacing(
+          connection_profile_path_.toStdString(), bytes.toStdString(), &error);
+  SetConnectionProfileError(
+      saved ? QString()
+            : QStringLiteral("连接设置未能保存，关闭程序后可能丢失。请检查配置"
+                             "目录的访问权限。"));
 }
 
 RemoteController::~RemoteController() {

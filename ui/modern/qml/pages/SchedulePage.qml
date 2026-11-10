@@ -100,7 +100,7 @@ Item {
                     archivePasswordField.text,
                     archivePasswordConfirmationField.text))
                 return false
-            page.draftCredentialFile = schedule.credentialFile
+            page.draftCredentialFile = schedule.draftCredentialFile
             page.clearPasswordInputs()
         }
         return true
@@ -177,6 +177,21 @@ Item {
 
     // 启停操作与保存设置共用同一条提交路径。传入的 enabledValue 是本次
     // 要写入的实际状态；只有核心保存成功后，控制器状态和界面才会改变。
+    function toggleEnabled() {
+        if (!schedule.enabled)
+            return page.saveDraft(true)
+        // 停用仅改变已保存的启用状态；保留其它尚未保存的编辑。
+        page.savingConfig = true
+        try {
+            const saved = schedule.setEnabled(false)
+            if (saved)
+                page.draftEnabled = false
+            return saved
+        } finally {
+            page.savingConfig = false
+        }
+    }
+
     function saveDraft(enabledValue) {
         page.savingConfig = true
         try {
@@ -380,7 +395,7 @@ Item {
                             text: schedule.enabled ? "停用" : "启用"
                             variant: schedule.enabled ? "secondary" : "primary"
                             enabled: !schedule.libraryBusy
-                            onClicked: page.saveDraft(!schedule.enabled)
+                            onClicked: page.toggleEnabled()
                         }
                     }
 
@@ -702,7 +717,10 @@ Item {
                             text: "立即执行一次"
                             iconName: "backup"
                             enabled: !schedule.libraryBusy && schedule.enabled
-                            onClicked: schedule.runNow()
+                            onClicked: {
+                                if (page.saveDraft(true))
+                                    schedule.runNow()
+                            }
                         }
 
                         Item { Layout.fillWidth: true }
@@ -713,7 +731,7 @@ Item {
                     Text {
                         objectName: "runScheduleNowHintText"
                         Layout.fillWidth: true
-                        text: "立即检查当前状态，并在需要时创建备份。"
+                        text: "先保存当前设置，再立即检查源目录并在需要时创建备份。"
                         font.pixelSize: 14
                         color: theme.textSecondary
                         wrapMode: Text.WordWrap

@@ -89,7 +89,7 @@ Item {
                     archivePasswordField.text,
                     archivePasswordConfirmationField.text))
                 return false
-            page.draftCredentialFile = realtime.credentialFile
+            page.draftCredentialFile = realtime.draftCredentialFile
             page.clearPasswordInputs()
         }
         return true
@@ -97,6 +97,21 @@ Item {
 
     // 启停操作和普通保存使用同一条校验、持久化路径。enabledValue 是
     // 本次要保存的真实运行状态；失败时控制器状态不会先显示为已启用。
+    function toggleEnabled() {
+        if (!realtime.enabled)
+            return page.saveDraft(true)
+        // 停用仅改变已保存的启用状态；保留其它尚未保存的编辑。
+        page.savingConfig = true
+        try {
+            const saved = realtime.setEnabled(false)
+            if (saved)
+                page.draftEnabled = false
+            return saved
+        } finally {
+            page.savingConfig = false
+        }
+    }
+
     function saveDraft(enabledValue) {
         page.savingConfig = true
         try {
@@ -451,7 +466,7 @@ Item {
                             text: realtime.enabled ? "停用" : "启用"
                             variant: realtime.enabled ? "secondary" : "primary"
                             enabled: !realtime.libraryBusy
-                            onClicked: page.saveDraft(!realtime.enabled)
+                            onClicked: page.toggleEnabled()
                         }
                     }
 

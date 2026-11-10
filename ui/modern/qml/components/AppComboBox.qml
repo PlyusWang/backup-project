@@ -26,7 +26,8 @@ ComboBox {
         if (index < 0 || index >= control.count)
             return
         const changed = control.currentIndex !== index
-        control.currentIndex = index
+        if (!comboSelection.setCurrentIndex(control, index))
+            return
         if (changed)
             control.activated(index)
     }

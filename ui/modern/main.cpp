@@ -145,10 +145,12 @@
 #include "app_theme.h"
 #include "application_instance_lock.h"
 #include "archive_pipeline.h"
+#include "automation_ui_test.h"
 #include "backup_controller.h"
 #include "backup_options.h"
 #include "baseline_ui_test.h"
 #include "cloud_retry_probe.h"
+#include "combo_selection.h"
 #include "config_manager.h"
 #include "credential_ui_test.h"
 #include "dev_harnesses.h"
@@ -425,6 +427,8 @@ int main(int argc, char* argv[]) {
       arguments.contains(QStringLiteral("--baseline-picker-test"));
   const int workflow_acceptance_index =
       arguments.indexOf(QStringLiteral("--workflow-acceptance"));
+  const int automation_ui_index =
+      arguments.indexOf(QStringLiteral("--automation-ui-test"));
   const int credential_ui_index =
       arguments.indexOf(QStringLiteral("--credential-ui-test"));
   const int network_acceptance_index =
@@ -475,6 +479,10 @@ int main(int argc, char* argv[]) {
   if (workflow_acceptance_index >= 0 &&
       workflow_acceptance_index + 1 >= arguments.size()) {
     std::fprintf(stderr, "--workflow-acceptance 需要输出目录参数\n");
+    return 2;
+  }
+  if (automation_ui_index >= 0 && automation_ui_index + 1 >= arguments.size()) {
+    std::fprintf(stderr, "--automation-ui-test 需要输出目录参数\n");
     return 2;
   }
   if (credential_ui_index >= 0 && credential_ui_index + 1 >= arguments.size()) {
@@ -562,8 +570,8 @@ int main(int argc, char* argv[]) {
       schedule_test || filter_ux_test || combo_hover_test ||
       ux_acceptance_test || baseline_picker_test || remote_test ||
       workflow_acceptance_index >= 0 || credential_ui_index >= 0 ||
-      network_acceptance_index >= 0 || remote_acceptance_index >= 0 ||
-      remote_smoke_index >= 0;
+      automation_ui_index >= 0 || network_acceptance_index >= 0 ||
+      remote_acceptance_index >= 0 || remote_smoke_index >= 0;
   QString config_file_path = ResolveConfigFilePath(arguments);
   QString schedule_file_path = ResolveScheduleFilePath(arguments);
   QString realtime_file_path = ResolveRealtimeFilePath(arguments);
@@ -641,6 +649,8 @@ int main(int argc, char* argv[]) {
   // 的 resume/ 目录。
   remote_controller.setResumeDirectory(
       QFileInfo(config_file_path).absolutePath() + QStringLiteral("/resume"));
+  remote_controller.setConnectionProfilePath(config_file_path +
+                                             QStringLiteral(".remote.json"));
   // 三个页面的筛选规则编辑器共用同一个 presentation 组件，但每个页面有**自己**
   // 的规则列表：备份页的模型直接挂在 BackupController 上（编辑即生效），计划页
   // 与实时页是"草稿 + 保存"，所以它们的模型不带落点（构造参数为 nullptr），
@@ -655,10 +665,13 @@ int main(int argc, char* argv[]) {
     return backup_modern::RunCloudRetryProbe(QString());
   }
 
+  backup_modern::ComboSelection combo_selection;
   QQmlApplicationEngine engine;
   // 用上下文属性而不是注册 QML 类型：QML 侧直接写 theme.accent /
   // controller.busy， 不需要任何 import 声明，也就不会碰到模块路径问题。
   engine.rootContext()->setContextProperty(QStringLiteral("theme"), &theme);
+  engine.rootContext()->setContextProperty(QStringLiteral("comboSelection"),
+                                           &combo_selection);
   engine.rootContext()->setContextProperty(QStringLiteral("controller"),
                                            &controller);
   engine.rootContext()->setContextProperty(QStringLiteral("backupOptions"),
@@ -708,6 +721,11 @@ int main(int argc, char* argv[]) {
     return RunWorkflowAcceptanceTest(
         window, &controller, &server_identity,
         arguments.at(workflow_acceptance_index + 1));
+  }
+  if (automation_ui_index >= 0) {
+    return RunAutomationUiTest(window, &controller, &schedule_controller,
+                               &realtime_controller,
+                               arguments.at(automation_ui_index + 1));
   }
   if (credential_ui_index >= 0) {
     return RunCredentialUiTest(
