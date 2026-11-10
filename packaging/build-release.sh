@@ -226,6 +226,9 @@ build_appdir() {
   # 启动同一个 AppImage，而不是只支持有 X 的机器。每个插件只有几十 KB。
   export EXTRA_QT_PLUGINS="platforms/libqoffscreen.so;platforms/libqminimal.so"
   export APPIMAGE_EXTRACT_AND_RUN=1
+  if [ -n "$APPIMAGE_RUNTIME_FILE" ]; then
+    export LDAI_RUNTIME_FILE="$APPIMAGE_RUNTIME_FILE"
+  fi
   export PATH="$WORK/bin:$PATH"
 
   log "== linuxdeploy + plugin-qt（带 Qt 运行时与 QML 模块）=="
