@@ -319,6 +319,11 @@ print_client_connection_info() {
   bind="$(config_value bind)"; [ -n "$bind" ] || bind=127.0.0.1
   port="$(configured_port)"
   printf '服务器地址：%s\n业务端口：%s\n' "$bind" "$port"
+  case "$bind" in
+    127.0.0.1) printf '此地址供服务器本机客户端或 SSH 隧道使用。\n' ;;
+    0.0.0.0) printf '0.0.0.0 表示全部 IPv4 网卡；客户端请填写实际可达的局域网或公网地址。\n' ;;
+    *) printf '其他机器需能访问此地址与端口；公网访问还需网络放行。\n' ;;
+  esac
   cert="$(configured_cert)"
   if [ -n "$cert" ]; then
     if [ "$(config_value require_bpsec2)" = true ]; then
@@ -331,6 +336,7 @@ print_client_connection_info() {
   fi
   key="$(config_value transport_key)"
   printf '认证模式：BPSEC1 公钥指纹\n服务器身份私钥：%s（私钥内容不会显示）\n' "$key"
+  printf '客户端可信根公钥：不适用\n服务器身份文件：不适用\n'
   if [ -x "$KEYGEN_BIN" ] && [ -n "$key" ] && [ -f "$key" ]; then
     "$KEYGEN_BIN" --show --key-file "$key" || return 1
   else
@@ -396,22 +402,71 @@ init_server() {
   done
   printf '监听地址 [127.0.0.1]：'; read -r bind || return 0; [ -n "$bind" ] || bind=127.0.0.1
   printf '业务端口 [18765]：'; read -r port || return 0; [ -n "$port" ] || port=18765
-  if [ "$bind" != "127.0.0.1" ]; then
-    printf '当前初始化向导仅配置 127.0.0.1 回环监听；其他机器可使用 SSH 隧道，未生成配置。\n'
-    return 1
-  fi
+  local octet
+  local -a octets=()
+  [[ "$bind" =~ ^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$ ]] || {
+    printf '监听地址必须是 IPv4 地址，例如 127.0.0.1；尚未创建身份文件。\n'; return 1;
+  }
+  IFS=. read -r -a octets <<<"$bind"
+  for octet in "${octets[@]}"; do
+    if ((10#$octet > 255)) || { [ "$octet" != 0 ] && [[ "$octet" == 0* ]]; }; then
+      printf '监听地址不是有效的 IPv4 地址。\n'; return 1
+    fi
+  done
   case "$port" in ''|*[!0-9]*) printf '端口必须是 1 到 65535 的整数。\n'; return 1 ;; esac
-  if [ "$port" -lt 1 ] || [ "$port" -gt 65535 ] || port_listener_exists "$port"; then
+  if [ "${#port}" -gt 5 ] || [ "$port" -lt 1 ] || [ "$port" -gt 65535 ] || port_listener_exists "$port"; then
     printf '端口无效或已被占用：%s\n' "$port"
     return 1
   fi
   printf '是否初始化 BPSEC2 证书身份（y/N）：'; read -r use_cert || return 0
+  if [ "$bind" != 127.0.0.1 ] && [[ ! "$use_cert" =~ ^[Yy]$ ]]; then
+    printf '非回环监听必须使用 BPSEC2；未生成配置。也可保留回环监听并使用 SSH 隧道。\n'; return 1
+  fi
   [ -x "$KEYGEN_BIN" ] || { printf '找不到 backup-server-keygen：%s\n' "$KEYGEN_BIN"; return 1; }
   [ -x "$LAUNCHER" ] || { printf '找不到安全启动器：%s\n' "$LAUNCHER"; return 1; }
+  local key_mode key_source='' cert_mode=1 roots_source='' certificate_source=''
+  local confirmation public_reason='' allow_public=false
+  printf '传输身份：1. 生成新身份  2. 导入已有私钥 [1]：'; read -r key_mode || return 0
+  case "$key_mode" in
+    ''|1) ;;
+    2)
+      printf '已有传输身份私钥的绝对路径（0600，不会修改原文件）：'; read -r key_source || return 0
+      initialization_path_supported "$key_source" || { printf '请提供支持的绝对路径。\n'; return 1; }
+      "$KEYGEN_BIN" --show --key-file "$key_source" || return 1
+      printf '确认复制以上身份到新实例请输入 IMPORT IDENTITY：'; read -r confirmation || return 0
+      [ "$confirmation" = 'IMPORT IDENTITY' ] || { printf '已取消，未创建实例。\n'; return 1; }
+      ;;
+    *) printf '传输身份选项无效。\n'; return 1 ;;
+  esac
   if [[ "$use_cert" =~ ^[Yy]$ ]]; then
     [ -x "$CERT_TOOL" ] || { printf '找不到 backup-cert-tool：%s\n' "$CERT_TOOL"; return 1; }
-    printf 'server_id [self-hosted-%s]：' "$port"; read -r server_id || return 0
-    [ -n "$server_id" ] || server_id="self-hosted-$port"
+    printf '证书来源：1. 创建本机测试根并签发  2. 导入已有根公钥与证书 [1]：'; read -r cert_mode || return 0
+    case "$cert_mode" in
+      ''|1)
+        cert_mode=1
+        printf 'server_id [self-hosted-%s]：' "$port"; read -r server_id || return 0
+        [ -n "$server_id" ] || server_id="self-hosted-$port"
+        ;;
+      2)
+        printf '可信根公钥的绝对路径（不要提供根私钥）：'; read -r roots_source || return 0
+        printf '服务器身份证书的绝对路径：'; read -r certificate_source || return 0
+        initialization_path_supported "$roots_source" && initialization_path_supported "$certificate_source" || {
+          printf '证书与根公钥必须是支持的绝对路径。\n'; return 1;
+        }
+        printf '请先通过可信渠道核对根公钥，确认导入请输入 IMPORT BPSEC2：'; read -r confirmation || return 0
+        [ "$confirmation" = 'IMPORT BPSEC2' ] || { printf '已取消，未创建实例。\n'; return 1; }
+        ;;
+      *) printf '证书来源选项无效。\n'; return 1 ;;
+    esac
+  fi
+  if [ "$bind" != 127.0.0.1 ]; then
+    printf '此监听地址可被其他机器访问；本向导不会修改防火墙或网络放行规则。\n'
+    printf '启用非回环监听的用途（会写入配置和日志）：'; read -r public_reason || return 0
+    case "$public_reason" in ''|*'#'*|*$'\r'*|*$'\n'*) printf '用途不能为空或包含注释、换行。\n'; return 1 ;; esac
+    [[ ! "$public_reason" =~ ^[[:space:]]*$ ]] || return 1
+    printf '确认仅允许 BPSEC2 客户端，开放此地址请输入 ALLOW PUBLIC：'; read -r confirmation || return 0
+    [ "$confirmation" = 'ALLOW PUBLIC' ] || { printf '已取消，未创建实例。\n'; return 1; }
+    allow_public=true
   fi
   # The persistent lock inode is never removed. A second initializer must not
   # bypass the first by opening a newly created file at the same pathname.
@@ -447,7 +502,7 @@ init_server() {
       existing_data="$(find "$DATA_ROOT" -mindepth 1 -maxdepth 1 -print -quit)" || exit 1
       [ -z "$existing_data" ] || { printf '目标目录已有备份文件，初始化已拒绝。\n'; exit 1; }
     fi
-    local init_dir keygen_output pubkey certificate='' require_bpsec2=false
+    local init_dir keygen_output pubkey cert_public certificate='' require_bpsec2=false
     local -a published_paths=() published_refs=() temporary_files=()
     init_dir="$(mktemp -d "$SERVER_ROOT/.server-init.XXXXXXXX")" || exit 1
     cleanup_initialization() {
@@ -481,20 +536,48 @@ init_server() {
       cp -p -- "$source" "$staged" || return 1
       # A same-directory hard link is atomic, works across source filesystems,
       # and unlike mv never overwrites an identity created after the recheck.
+      # -T also refuses a concurrently created directory or directory symlink.
       published_paths+=("$target")
       published_refs+=("$staged")
-      ln -- "$staged" "$target" || return 1
+      ln -T -- "$staged" "$target" || return 1
     }
     mkdir -p "$init_dir/state" "$init_dir/private" || exit 1
-    keygen_output="$("$KEYGEN_BIN" --output "$init_dir/state/transport.key")" || exit 1
+    if [ -n "$key_source" ]; then
+      keygen_output="$("$KEYGEN_BIN" --import "$key_source" --output "$init_dir/state/transport.key")" || exit 1
+    else
+      keygen_output="$("$KEYGEN_BIN" --output "$init_dir/state/transport.key")" || exit 1
+    fi
     pubkey="$(printf '%s\n' "$keygen_output" | sed -n 's/.*公钥 (hex): //p' | head -1)"
     [ -n "$pubkey" ] || { printf '无法从 keygen 结果取得公钥，初始化停止。\n'; exit 1; }
     if [[ "$use_cert" =~ ^[Yy]$ ]]; then
-      "$CERT_TOOL" root-init --root-key "$init_dir/private/root.key" --root-id "${server_id}-root" >/dev/null || exit 1
-      "$CERT_TOOL" issue-server --root-key "$init_dir/private/root.key" --server-id "$server_id" \
-        --server-pubkey "hex:$pubkey" --out "$init_dir/state/server.bpcert" >/dev/null || exit 1
+      if [ "$cert_mode" = 1 ]; then
+        "$CERT_TOOL" root-init --root-key "$init_dir/private/root.key" --root-id "${server_id}-root" >/dev/null || exit 1
+        "$CERT_TOOL" issue-server --root-key "$init_dir/private/root.key" --server-id "$server_id" \
+          --server-pubkey "hex:$pubkey" --out "$init_dir/state/server.bpcert" >/dev/null || exit 1
+      else
+        [ -f "$roots_source" ] && [ -r "$roots_source" ] && [ ! -L "$roots_source" ] &&
+          [ -f "$certificate_source" ] && [ -r "$certificate_source" ] && [ ! -L "$certificate_source" ] || {
+          printf '证书与可信根必须是可读的普通文件，不能是符号链接。\n'; exit 1;
+        }
+        [ "$(stat -c %s "$roots_source")" -le 65536 ] && [ "$(stat -c %s "$certificate_source")" -le 4096 ] || {
+          printf '根公钥或证书文件超出长度限制。\n'; exit 1;
+        }
+        head -c 65537 "$roots_source" >"$init_dir/private/root-input" || exit 1
+        head -c 4097 "$certificate_source" >"$init_dir/state/server.bpcert" || exit 1
+        [ "$(stat -c %s "$init_dir/private/root-input")" -le 65536 ] &&
+          [ "$(stat -c %s "$init_dir/state/server.bpcert")" -le 4096 ] || exit 1
+        awk '{ sub(/#.*/, ""); if ($0 ~ /[^[:space:]]/) print }' \
+          "$init_dir/private/root-input" >"$init_dir/private/root.key.pub" || exit 1
+        rm -f "$init_dir/private/root-input"
+      fi
+      chmod 644 "$init_dir/private/root.key.pub" "$init_dir/state/server.bpcert" || exit 1
       "$CERT_TOOL" verify-server --cert "$init_dir/state/server.bpcert" \
-        --roots "$init_dir/private/root.key.pub" >/dev/null || exit 1
+        --roots "$init_dir/private/root.key.pub" || exit 1
+      cert_public="$("$CERT_TOOL" inspect-server --cert "$init_dir/state/server.bpcert" |
+        sed -n 's/^server_public_key[[:space:]]*=[[:space:]]*//p')" || exit 1
+      [ -n "$cert_public" ] && [ "$cert_public" = "$pubkey" ] || {
+        printf '证书公钥与传输身份不匹配，初始化已拒绝。\n'; exit 1;
+      }
       certificate="$cert_path"
       require_bpsec2=true
     fi
@@ -509,8 +592,8 @@ secret_file = $secret_file
 transport_key = $key_file
 certificate = $certificate
 require_bpsec2 = $require_bpsec2
-allow_public_bind = false
-public_bind_reason =
+allow_public_bind = $allow_public
+public_bind_reason = $public_reason
 allow_public_bind_insecure = false
 log_file = $LOG_FILE
 pid_file = $PID_FILE
@@ -526,7 +609,9 @@ EOF
     publish_initialization_file "$init_dir/state/transport.key" "$key_file" || exit 1
     publish_initialization_file "$init_dir/secrets.env" "$secret_file" || exit 1
     if [[ "$use_cert" =~ ^[Yy]$ ]]; then
-      publish_initialization_file "$init_dir/private/root.key" "$root_key" || exit 1
+      if [ "$cert_mode" = 1 ]; then
+        publish_initialization_file "$init_dir/private/root.key" "$root_key" || exit 1
+      fi
       publish_initialization_file "$init_dir/private/root.key.pub" "$configured_root_pub" || exit 1
       publish_initialization_file "$init_dir/state/server.bpcert" "$cert_path" || exit 1
     fi
