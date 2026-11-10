@@ -48,6 +48,7 @@ run() {
 
 run lint bash scripts/lint.sh
 run package-maintainer bash scripts/package_maintainer_test.sh
+run client-desktop-integration bash scripts/client_desktop_integration_test.sh
 # ShellCheck：只覆盖显式清单里的脚本；工具缺失时**失败而不是跳过**。
 # 版本与严重级别由脚本自己打印，见 scripts/shellcheck.sh 的说明。
 run shellcheck bash scripts/shellcheck.sh

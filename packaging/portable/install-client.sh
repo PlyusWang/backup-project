@@ -28,6 +28,15 @@ die() { echo "[install] ERROR: $*" >&2; exit 1; }
 log() { echo "[install] $*"; }
 
 case "$PREFIX" in ""|/) die "拒绝安装在 \$PREFIX=$PREFIX" ;; esac
+[[ ! "$PREFIX" =~ [[:cntrl:]] ]] || die "安装路径不能包含控制字符"
+PREFIX="$(realpath -m -- "$PREFIX")"
+[ "$PREFIX" != / ] || die "拒绝安装在根目录"
+if [ "$NO_DESKTOP" -eq 0 ]; then
+  [[ "$PREFIX" != *%* ]] || die "桌面入口不支持包含 % 的安装路径；请更换路径，或添加 --no-desktop 仅安装程序"
+  DATA_HOME="${XDG_DATA_HOME:-$HOME/.local/share}"
+  [[ "$DATA_HOME" = /* && ! "$DATA_HOME" =~ [[:cntrl:]] ]] || die "桌面资源目录必须是无控制字符的绝对路径"
+  DATA_HOME="$(realpath -m -- "$DATA_HOME")"
+fi
 [ -f "$SRC_DIR/MANIFEST.sha256" ] || die "找不到 MANIFEST.sha256"
 ( cd "$SRC_DIR" && sha256sum -c --quiet MANIFEST.sha256 ) || die "包内容与 MANIFEST.sha256 不一致"
 
@@ -61,13 +70,47 @@ if [ -f "$SRC_DIR/THIRD-PARTY-NOTICES.txt" ]; then
 fi
 
 if [ "$NO_DESKTOP" -eq 0 ] && [ -f "$SRC_DIR/packaging/client/backup-project.desktop" ]; then
-  APPDIR="${XDG_DATA_HOME:-$HOME/.local/share}/applications"
-  mkdir -p "$APPDIR"
-  sed -e "s|^Exec=.*|Exec=$PREFIX/bin/backup-gui-modern|" \
-      -e "s|^TryExec=.*|TryExec=$PREFIX/bin/backup-gui-modern|" \
-      "$SRC_DIR/packaging/client/backup-project.desktop" > "$APPDIR/backup-project.desktop"
+  APPDIR="$DATA_HOME/applications"
+  ICONDIR="$DATA_HOME/icons/hicolor/256x256/apps"
+  APP_ID="backup-project-$(printf '%s' "$LIB_ROOT" | sha256sum | cut -c1-16)"
+  ICON_SOURCE="$LIB_ROOT/share/icons/hicolor/256x256/apps/backup-project.png"
+  [ -f "$ICON_SOURCE" ] || die "包内缺少正式图标：$ICON_SOURCE"
+  mkdir -p "$APPDIR" "$ICONDIR"
+  install -m 0644 "$ICON_SOURCE" "$ICONDIR/$APP_ID.png"
+  # Escape the Exec argument first, then the desktop string layer. TryExec
+  # and Icon are plain string paths, so they only need the latter.
+  desktop_value() { DESKTOP_VALUE="${1//\\/\\\\}"; }
+  desktop_exec() {
+    local value="$1" escaped='' character index
+    for ((index=0; index<${#value}; index++)); do
+      character="${value:index:1}"
+      case "$character" in
+        \\|'"'|'$'|'`') escaped+="\\$character" ;;
+        '%') escaped+='%%' ;;
+        *) escaped+="$character" ;;
+      esac
+    done
+    desktop_value "$escaped"
+    printf '"%s"' "$DESKTOP_VALUE"
+  }
+
+  DESKTOP_FILE="$APPDIR/$APP_ID.desktop"
+  DESKTOP_TMP="$(mktemp "$APPDIR/.$APP_ID.XXXXXXXX")"
+  while IFS= read -r line || [ -n "$line" ]; do
+    case "$line" in
+      Exec=*) printf 'Exec=%s\n' "$(desktop_exec "$PREFIX/bin/backup-gui-modern")" ;;
+      TryExec=*) desktop_value "$PREFIX/bin/backup-gui-modern"; printf 'TryExec=%s\n' "$DESKTOP_VALUE" ;;
+      Icon=*) desktop_value "$ICONDIR/$APP_ID.png"; printf 'Icon=%s\n' "$DESKTOP_VALUE" ;;
+      *) printf '%s\n' "$line" ;;
+    esac
+  done <"$SRC_DIR/packaging/client/backup-project.desktop" >"$DESKTOP_TMP"
+  desktop_value "$LIB_ROOT"
+  printf 'X-Backup-Project-Prefix=%s\n' "$DESKTOP_VALUE" >>"$DESKTOP_TMP"
+  chmod 0644 "$DESKTOP_TMP"
+  mv -f "$DESKTOP_TMP" "$DESKTOP_FILE"
   command -v update-desktop-database >/dev/null 2>&1 && update-desktop-database "$APPDIR" >/dev/null 2>&1 || true
-  log "已安装桌面入口：$APPDIR/backup-project.desktop"
+  command -v gtk-update-icon-cache >/dev/null 2>&1 && gtk-update-icon-cache -f -t "$DATA_HOME/icons/hicolor" >/dev/null 2>&1 || true
+  log "已安装桌面入口：$DESKTOP_FILE"
 fi
 
 log "安装完成：$PREFIX/bin/backupctl、$PREFIX/bin/backup-gui-modern"

@@ -319,6 +319,8 @@ pack_client_tarball() {
   done
   mkdir -p "$tree/share/backup-project" "$tree/docs" "$tree/packaging/client" "$tree/packaging/portable"
   install -m 0644 resources/security/official-root-ed25519.pub "$tree/share/backup-project/"
+  install -d -m 0755 "$tree/share/icons/hicolor/256x256/apps"
+  install -m 0644 "$appdir/backup-project.png" "$tree/share/icons/hicolor/256x256/apps/backup-project.png"
   printf '%s\n' "$VERSION" > "$tree/share/backup-project/VERSION"
   local doc
   for doc in docs/client-quick-start.md docs/release-layout.md docs/secure_transport.md docs/install-client.md docs/release-packaging.md; do
@@ -353,6 +355,8 @@ pack_client_deb() {
   install -m 0755 packaging/client/wrappers/backupctl.sh "$tree/usr/bin/backupctl"
   install -m 0755 packaging/client/wrappers/backup-project "$tree/usr/bin/backup-project"
   install -m 0644 packaging/client/backup-project.desktop "$tree/usr/share/applications/backup-project.desktop"
+  install -d -m 0755 "$tree/usr/share/icons/hicolor/256x256/apps"
+  install -m 0644 "$WORK/appdir/backup-project.png" "$tree/usr/share/icons/hicolor/256x256/apps/backup-project.png"
   install -d -m 0755 "$tree/usr/lib/backup-project-client/share/backup-project"
   install -m 0644 resources/security/official-root-ed25519.pub "$tree/usr/lib/backup-project-client/share/backup-project/"
   printf '%s\n' "$VERSION" > "$tree/usr/lib/backup-project-client/share/backup-project/VERSION"
@@ -429,8 +433,11 @@ EOF
   done
   unset IFS
   case "$depends" in *libc6*) : ;; *) die "Depends 里缺少 libc6（系统依赖不该被过滤掉）" ;; esac
-  log "  剩余依赖都是目标机必须提供的系统库（且不含任何随包组件）"
-  log "  依赖（dpkg-shlibdeps，已去掉自带的 Qt）：$depends"
+  # CJK glyphs are a runtime requirement for the Chinese product interface;
+  # Qt's ELF dependencies cannot discover missing system fonts.
+  depends="$depends, fonts-noto-cjk"
+  log "  剩余依赖都是目标机必须提供的系统库与中文字体（且不含任何随包组件）"
+  log "  依赖（dpkg-shlibdeps 与中文字体，已去掉自带的 Qt）：$depends"
   build_deb packaging/client/deb "$tree" "$RELEASE_DIR/backup-project-client_${DEB_VERSION}_${DEB_ARCH}.deb" "$depends"
 }
 
@@ -598,7 +605,7 @@ log "== SHA256SUMS 与 RELEASE-INFO.txt =="
   echo
   echo "客户端： AppImage（免安装，自带 Qt）/ .deb / portable tar.xz"
   echo "服务端： .deb（systemd + 管理菜单 + 专用系统用户）/ portable tar.xz"
-  echo "本目录不含私钥、token secret、证书私钥材料。"
+  echo "本发行包不包含本项目运行或测试实例的身份私钥、归档口令或 token secret。"
 } > "$RELEASE_DIR/RELEASE-INFO.txt"
 
 # ---- 制品自查：私钥扫描 + 清单核对 ----
