@@ -191,12 +191,12 @@ if [ "$USE_SYSTEMD" -eq 1 ]; then
     systemctl restart backup-project-server.service && log "服务已启动（systemctl status backup-project-server）" \
       || log "WARN: 服务启动失败，看 journalctl -u backup-project-server"
   else
-    log "WARN: 配置自检未通过，服务未启动：$PREFIX/bin/launch-server.sh --check-config --config $CONF"
+    log "WARN: 配置自检未通过，服务未启动：$(printf '%q' "$PREFIX/bin/launch-server.sh") --check-config --config $(printf '%q' "$CONF")"
   fi
 else
   log "跳过 systemd（--no-systemd 或当前环境没有 systemd）"
-  log "手工启动：$PREFIX/bin/launch-server.sh --config $CONF"
+  log "手工启动：$(printf '%q' "$PREFIX/bin/launch-server.sh") --config $(printf '%q' "$CONF")"
 fi
 
-log "安装完成。管理菜单：$PREFIX/bin/backup-server-manager"
-log "卸载：$PREFIX/docs/uninstall.sh --prefix $PREFIX"
+log "安装完成。管理菜单：$(printf '%q' "$PREFIX/bin/backup-server-manager")"
+log "卸载：$(printf '%q' "$SRC_DIR/uninstall.sh") --prefix $(printf '%q' "$PREFIX")"
