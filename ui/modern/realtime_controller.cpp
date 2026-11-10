@@ -32,6 +32,7 @@
 #include <QEventLoop>
 #include <QFileInfo>
 #include <QSocketNotifier>
+#include <QUuid>
 #include <QtConcurrent/QtConcurrentRun>
 #include <algorithm>
 #include <chrono>
@@ -255,6 +256,9 @@ RealtimeController::RealtimeController(QString realtime_file_path,
 // 先停表、拆 notifier，再 detach 后台任务。detach 而非 waitForFinished：
 // 退出路径不阻塞，而后台任务只操作值类型与文件，不会回调进已经析构的 this。
 RealtimeController::~RealtimeController() {
+  for (const QString& reference : owned_archive_session_references_)
+    backupproject::ClearSessionCredential(reference.toStdString());
+  owned_archive_session_references_.clear();
   backupproject::ClearSessionCredential(
       "/@backup-project-session/realtime-archive");
   // 析构时先停表、再 detach：绝不留下一个还会回调进已析构对象的定时器。
@@ -283,10 +287,6 @@ void RealtimeController::LoadFromDisk() {
   switch (status) {
     case backupproject::RealtimeLoadStatus::kLoaded:
       config_ = config;
-      draft_encryption_key_ = QString::fromLatin1(
-          backupproject::EncryptionMethodKey(config_.encryption_method));
-      draft_credential_file_ =
-          QString::fromStdString(config_.encryption_password_file);
       config_loaded_ = true;
       // 读得懂不等于合法。结构校验用共享核心那一个函数，前端不复刻规则。
       if (!backupproject::ValidateRealtimeConfig(config_, &error)) {
@@ -306,6 +306,17 @@ void RealtimeController::LoadFromDisk() {
       config_error_ = true;
       load_error_ = QString::fromStdString(error);
       break;
+  }
+  if (config_loaded_) {
+    draft_repository_type_ = QString::fromStdString(config_.repository_type);
+    draft_cloud_credentials_file_ =
+        QString::fromStdString(config_.cloud_credentials_file);
+    draft_cloud_repository_id_ =
+        QString::fromStdString(config_.cloud_repository_id);
+    draft_encryption_key_ = QString::fromLatin1(
+        backupproject::EncryptionMethodKey(config_.encryption_method));
+    draft_credential_file_ =
+        QString::fromStdString(config_.encryption_password_file);
   }
   emit configChanged();
 }
@@ -1166,7 +1177,6 @@ bool RealtimeController::saveConfigFromText(
 //      ValidateRealtimeForEnable）失败都在**落盘之前**返回，绝不写半份配置；
 //   4) 落盘成功才替换内存配置；失败用 restore_watch 恢复原监听（若启用，
 //      BeginWatching 会合成 resync，保存期间的变化不会漏）。
-// 界面只提供“不加密”：无人值守的实时备份没有安全的持久密钥来源。
 bool RealtimeController::saveConfig(bool enabled, const QString& source_path,
                                     int debounce_ms, int max_wait_ms,
                                     int retain_count, const QString& pack_key,
@@ -1245,6 +1255,9 @@ bool RealtimeController::saveConfig(bool enabled, const QString& source_path,
     return false;
   }
   next.encryption_password_file = draft_credential_file_.toStdString();
+  next.repository_type = draft_repository_type_.toStdString();
+  next.cloud_credentials_file = draft_cloud_credentials_file_.toStdString();
+  next.cloud_repository_id = draft_cloud_repository_id_.toStdString();
 
   next.include_rules.clear();
   for (const QString& rule : include_rules) {
@@ -1290,7 +1303,12 @@ bool RealtimeController::saveConfig(bool enabled, const QString& source_path,
     return false;
   }
 
+  const QString previous_credential = credentialFile();
   config_ = next;
+  if (previous_credential != credentialFile() &&
+      owned_archive_session_references_.removeAll(previous_credential) > 0) {
+    backupproject::ClearSessionCredential(previous_credential.toStdString());
+  }
   config_loaded_ = true;
   config_error_ = false;
   load_error_.clear();
@@ -1299,6 +1317,8 @@ bool RealtimeController::saveConfig(bool enabled, const QString& source_path,
   if (config_.enabled) {
     BeginWatching();
   } else {
+    SetPending(false);
+    pending_generation_ = backupproject::RealtimeGeneration{};
     SetPhase(QString::fromLatin1(kPhaseDisabled),
              QStringLiteral("实时备份未启用"));
     SetStatus(kSuccess, QStringLiteral("实时配置已保存"),
@@ -1309,12 +1329,39 @@ bool RealtimeController::saveConfig(bool enabled, const QString& source_path,
   return true;
 }
 
-// 只改 enabled，其余字段原样回填 —— 因此仍然会走一遍完整校验（启用前必须过
-// ValidateRealtimeForEnable），不是“开关一拨就生效”。
+// 停用仅提交已保存的配置；未保存的目标或密码草稿不能阻止停止监听。
+// 启用仍使用正常保存入口，并执行共享核心的完整校验。
 bool RealtimeController::setEnabled(bool enabled) {
-  return saveConfig(enabled, sourcePath(), debounceMs(), maxWaitMs(),
-                    retainCount(), packKey(), compressionKey(), includeRules(),
-                    excludeRules(), strategyKey());
+  if (enabled) {
+    return saveConfig(enabled, sourcePath(), debounceMs(), maxWaitMs(),
+                      retainCount(), packKey(), compressionKey(),
+                      includeRules(), excludeRules(), strategyKey());
+  }
+  const QString encryption_draft = draft_encryption_key_;
+  const QString credential_draft = draft_credential_file_;
+  const QString target_draft = draft_repository_type_;
+  const QString cloud_file_draft = draft_cloud_credentials_file_;
+  const QString cloud_id_draft = draft_cloud_repository_id_;
+  draft_encryption_key_ = QString::fromLatin1(
+      backupproject::EncryptionMethodKey(config_.encryption_method));
+  draft_credential_file_ =
+      QString::fromStdString(config_.encryption_password_file);
+  draft_repository_type_ = QString::fromStdString(config_.repository_type);
+  draft_cloud_credentials_file_ =
+      QString::fromStdString(config_.cloud_credentials_file);
+  draft_cloud_repository_id_ =
+      QString::fromStdString(config_.cloud_repository_id);
+  const bool saved =
+      saveConfig(enabled, sourcePath(), debounceMs(), maxWaitMs(),
+                 retainCount(), packKey(), compressionKey(), includeRules(),
+                 excludeRules(), strategyKey());
+  draft_encryption_key_ = encryption_draft;
+  draft_credential_file_ = credential_draft;
+  draft_repository_type_ = target_draft;
+  draft_cloud_credentials_file_ = cloud_file_draft;
+  draft_cloud_repository_id_ = cloud_id_draft;
+  emit configChanged();
+  return saved;
 }
 
 // 用真实的 Filter 试加一条规则，返回空串表示合法。它只是输入时的即时反馈，
@@ -1402,8 +1449,10 @@ QString RealtimeController::encryptionKey() const {
 }
 
 bool RealtimeController::sessionPasswordUnlocked() const {
-  return backupproject::SessionCredentialAvailable(
-      "/@backup-project-session/realtime-archive");
+  return backupproject::IsSessionCredentialReference(
+             draft_credential_file_.toStdString()) &&
+         backupproject::SessionCredentialAvailable(
+             draft_credential_file_.toStdString());
 }
 
 bool RealtimeController::unlockArchivePassword(const QString& password,
@@ -1414,21 +1463,36 @@ bool RealtimeController::unlockArchivePassword(const QString& password,
               QStringLiteral("请重新输入并确认密码。"));
     return false;
   }
+  const QString reference =
+      QStringLiteral("/@backup-project-session/realtime-archive-") +
+      QUuid::createUuid().toString(QUuid::WithoutBraces);
   std::string error;
-  if (!backupproject::SetSessionCredential(
-          "/@backup-project-session/realtime-archive", password.toStdString(),
-          &error)) {
+  if (!backupproject::SetSessionCredential(reference.toStdString(),
+                                           password.toStdString(), &error)) {
     SetStatus(QStringLiteral("error"), QStringLiteral("密码未解锁"),
               QString::fromStdString(error));
     return false;
   }
-  draft_credential_file_ =
-      QStringLiteral("/@backup-project-session/realtime-archive");
+  // 至多保留已生效密码与本次草稿；失败编辑不能替换已生效引用。
+  for (auto it = owned_archive_session_references_.begin();
+       it != owned_archive_session_references_.end();) {
+    if (*it == credentialFile()) {
+      ++it;
+    } else {
+      backupproject::ClearSessionCredential(it->toStdString());
+      it = owned_archive_session_references_.erase(it);
+    }
+  }
+  owned_archive_session_references_.append(reference);
+  draft_credential_file_ = reference;
   emit configChanged();
   return true;
 }
 
 void RealtimeController::lockArchivePassword() {
+  for (const QString& reference : owned_archive_session_references_)
+    backupproject::ClearSessionCredential(reference.toStdString());
+  owned_archive_session_references_.clear();
   backupproject::ClearSessionCredential(
       "/@backup-project-session/realtime-archive");
   emit configChanged();
@@ -1480,10 +1544,9 @@ bool RealtimeController::setRepositoryTarget(const QString& repository_type,
                                              const QString& credentials_file,
                                              const QString& repository_id) {
   if (repository_type == "local") {
-    config_.repository_type = "local";
-    config_.cloud_credentials_file.clear();
-    config_.cloud_repository_id.clear();
-    emit configChanged();
+    draft_repository_type_ = QStringLiteral("local");
+    draft_cloud_credentials_file_.clear();
+    draft_cloud_repository_id_.clear();
     return true;
   }
   if (repository_type != "cloud") {
@@ -1503,10 +1566,9 @@ bool RealtimeController::setRepositoryTarget(const QString& repository_type,
               QStringLiteral("请先选择凭据文件并生成仓库标识。"));
     return false;
   }
-  config_.repository_type = "cloud";
-  config_.cloud_credentials_file = credentials_file.toStdString();
-  config_.cloud_repository_id = repository_id.toStdString();
-  emit configChanged();
+  draft_repository_type_ = QStringLiteral("cloud");
+  draft_cloud_credentials_file_ = credentials_file;
+  draft_cloud_repository_id_ = repository_id;
   return true;
 }
 

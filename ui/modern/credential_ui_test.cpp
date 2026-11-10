@@ -9,15 +9,21 @@
 #include <QElapsedTimer>
 #include <QEventLoop>
 #include <QFile>
+#include <QFileInfo>
 #include <QImage>
+#include <QJsonDocument>
+#include <QJsonObject>
 #include <QKeyEvent>
 #include <QMouseEvent>
 #include <QProcess>
+#include <QQmlContext>
+#include <QQmlEngine>
 #include <QQuickItem>
 #include <QQuickWindow>
 #include <QRandomGenerator>
 #include <QTemporaryDir>
 #include <QTimer>
+#include <QUrl>
 #include <QUuid>
 #include <QVariantMap>
 #include <cstdio>
@@ -32,6 +38,7 @@
 #include "remote_controller.h"
 #include "schedule_controller.h"
 #include "secure_transport.h"
+#include "server_identity_import.h"
 #include "x25519.h"
 
 namespace {
@@ -143,6 +150,276 @@ struct ServerGuard {
   }
 };
 
+int RunCertificateRestartStage(QQuickWindow* window,
+                               backup_modern::RemoteController* remote,
+                               const QString& output) {
+  int passed = 0;
+  int failed = 0;
+  const auto check = [&](bool ok, const char* label) {
+    std::printf("CERTIFICATE_RESTART %s=%s\n", label, ok ? "PASS" : "FAIL");
+    if (!ok)
+      std::fprintf(stderr, "CERTIFICATE_RESTART kind=%s\n",
+                   qPrintable(remote->lastErrorKindForTest()));
+    std::fflush(stdout);
+    ok ? ++passed : ++failed;
+    return ok;
+  };
+  const QDir fixture(
+      qEnvironmentVariable("BACKUP_CERTIFICATE_RESTART_FIXTURE"));
+  const QString stage =
+      qEnvironmentVariable("BACKUP_CERTIFICATE_RESTART_STAGE");
+  const QString profile =
+      qEnvironmentVariable("BACKUP_CERTIFICATE_RESTART_PROFILE");
+  const QString secret =
+      QString::fromUtf8(Read(fixture.filePath("restart.password"))).trimmed();
+  const QString roots = fixture.filePath("root.key.pub");
+  const QString server_id = QStringLiteral("acceptance-loopback-server");
+  const QString port =
+      QString::fromUtf8(Read(fixture.filePath("backup.port"))).trimmed();
+  const QString bp1_port =
+      QString::fromUtf8(Read(fixture.filePath("bpsec1.port"))).trimmed();
+  const QString pin =
+      QString::fromUtf8(Read(fixture.filePath("bpsec1.server-key"))).trimmed();
+  const QString host = QStringLiteral("127.0.0.1");
+  const QString user = QStringLiteral("certificate-restart");
+  window->resize(1280, 980);
+  window->requestActivate();
+  window->setProperty("currentPageKey", QStringLiteral("management"));
+  QObject* management =
+      window->findChild<QObject*>(QStringLiteral("managementPage"));
+  if (management)
+    management->setProperty("currentTab", QStringLiteral("cloud"));
+  Settle();
+  QObject* page = window->findChild<QObject*>(QStringLiteral("remotePage"));
+  QObject* roots_dialog =
+      window->findChild<QObject*>(QStringLiteral("remoteTrustedRootsDialog"));
+  QObject* identity_dialog =
+      window->findChild<QObject*>(QStringLiteral("remoteServerIdentityDialog"));
+  auto* identity = qobject_cast<backup_modern::ServerIdentityImport*>(
+      qmlContext(window)
+          ->contextProperty(QStringLiteral("serverIdentity"))
+          .value<QObject*>());
+  if (!check(page && roots_dialog && identity_dialog && identity &&
+                 secret.size() >= 16 && !profile.isEmpty() &&
+                 QDir().mkpath(output),
+             "REAL_GUI_AND_PRIVATE_FIXTURE"))
+    return 1;
+  check(!remote->authenticated() && !remote->sharedSessionReady() &&
+            remote->username().isEmpty() && remote->tunnelPidForTest() == 0 &&
+            page->property("draftPassword").toString().isEmpty(),
+        "FRESH_GUI_PROCESS_HAS_NO_CREDENTIALS_OR_SESSION");
+  const auto select = [&](QObject* dialog, const QString& path) {
+    return dialog->setProperty("selectedFile", QUrl::fromLocalFile(path)) &&
+           QMetaObject::invokeMethod(dialog, "accepted", Qt::DirectConnection);
+  };
+  const auto tabs = [&](const char* name, const QString& key) {
+    QObject* control = window->findChild<QObject*>(QString::fromLatin1(name));
+    const bool ok = control && QMetaObject::invokeMethod(control, "activated",
+                                                         Qt::DirectConnection,
+                                                         Q_ARG(QString, key));
+    Settle();
+    return ok;
+  };
+  const auto completed = [&](bool accepted) {
+    return accepted && remote->waitForIdle(45000) &&
+           remote->lastErrorKindForTest() == QStringLiteral("none");
+  };
+  const auto login = [&]() {
+    return completed(remote->login(host, port, user, secret));
+  };
+  const auto capture = [&](const QString& name) {
+    Reveal(window,
+           FindItem(window->contentItem(),
+                    QStringLiteral("remoteExpectedServerIdField")),
+           QStringLiteral("remotePageScroll"));
+    Settle();
+    const QImage image = window->grabWindow();
+    return !image.isNull() && image.save(output + QLatin1Char('/') + name);
+  };
+  const auto identity_matches = [&]() {
+    return remote->authMode() == QStringLiteral("certificate") &&
+           remote->trustedRootsFile() == roots &&
+           remote->expectedServerId() == server_id &&
+           page->property("draftTrustedRoots").toString() == roots &&
+           page->property("draftExpectedServerId").toString() == server_id;
+  };
+  if (stage == QStringLiteral("invalid-profile")) {
+    const QFileInfo before_info(profile);
+    const bool regular = before_info.isFile() && !before_info.isSymLink();
+    const QByteArray before = regular ? Read(profile) : QByteArray();
+    check(!remote->connectionProfileError().isEmpty() &&
+              remote->trustedRootsFile().isEmpty() &&
+              remote->expectedServerId().isEmpty() &&
+              remote->serverKeyPin().isEmpty() &&
+              (regular ? Read(profile) == before : QFileInfo(profile).exists()),
+          "MALFORMED_DISK_PROFILE_REJECTED_WITHOUT_OVERWRITE");
+  } else if (stage == QStringLiteral("prepare")) {
+    if (!check(remote->connectionProfileError().isEmpty() &&
+                   tabs("remoteConnectionModeTabs", QStringLiteral("direct")) &&
+                   remote->setServerKeyPin(pin) &&
+                   completed(remote->registerAccount(host, bp1_port, user,
+                                                     secret, secret)) &&
+                   completed(remote->login(host, bp1_port, user, secret)),
+               "REAL_BPSEC1_SESSION_BEFORE_SWITCH"))
+      return 1;
+    check(tabs("remoteAuthModeTabs", QStringLiteral("certificate")) &&
+              !remote->authenticated() && !remote->sharedSessionReady() &&
+              remote->trustedRootsFile().isEmpty() &&
+              remote->expectedServerId().isEmpty(),
+          "BPSEC1_TO_BPSEC2_DROPS_OLD_SESSION_AND_REQUIRES_IDENTITY");
+    const int dispatched = remote->dispatchedRequestCountForTest();
+    check(!remote->login(host, port, user, secret) &&
+              remote->lastErrorKindForTest() == QStringLiteral("validation") &&
+              remote->dispatchedRequestCountForTest() == dispatched,
+          "MISSING_CERTIFICATE_IDENTITY_NEVER_DISPATCHES");
+    QKeyEvent escape(QEvent::KeyPress, Qt::Key_Escape, Qt::NoModifier);
+    QCoreApplication::sendEvent(window, &escape);
+    Settle();
+    if (!check(
+            select(roots_dialog, roots) &&
+                select(identity_dialog,
+                       fixture.filePath("renamed-not-the-server-id.bpcert")) &&
+                identity->serverId() == server_id && identity_matches(),
+            "REAL_ROOT_AND_CERTIFICATE_DIALOG_READ_SIGNED_SERVER_ID"))
+      return 1;
+    const QByteArray trusted_profile = Read(profile);
+    for (const QString& rejected :
+         {QStringLiteral("tampered.bpcert"), QStringLiteral("expired.bpcert"),
+          QStringLiteral("wrong-root")}) {
+      if (rejected == QStringLiteral("wrong-root"))
+        page->setProperty("draftTrustedRoots",
+                          fixture.filePath("wrong-root.key.pub"));
+      const QString candidate = rejected == QStringLiteral("wrong-root")
+                                    ? fixture.filePath("server.bpcert")
+                                    : fixture.filePath(rejected);
+      check(select(identity_dialog, candidate) &&
+                identity->serverId().isEmpty() &&
+                !identity->message().isEmpty() &&
+                remote->trustedRootsFile() == roots &&
+                remote->expectedServerId() == server_id &&
+                Read(profile) == trusted_profile,
+            qPrintable(QStringLiteral("REJECTED_IMPORT_PRESERVES_TRUST_") +
+                       rejected));
+      page->setProperty("draftTrustedRoots", roots);
+    }
+    if (!check(completed(
+                   remote->registerAccount(host, port, user, secret, secret)) &&
+                   login() && identity_matches() && !remote->tunnelReady(),
+               "IMPORTED_BPSEC2_IDENTITY_REACHES_REAL_DIRECT_SERVER"))
+      return 1;
+    check(tabs("remoteConnectionModeTabs", QStringLiteral("ssh")) &&
+              !remote->authenticated() && !remote->sharedSessionReady() &&
+              identity_matches(),
+          "TCP_TO_SSH_INVALIDATES_SESSION_AND_PRESERVES_CERTIFICATE_IDENTITY");
+    remote->setSshProgram(fixture.filePath("fixture-ssh"));
+    remote->setSshHost(
+        QString::fromUtf8(Read(fixture.filePath("ssh.target"))).trimmed());
+    if (!check(login() && remote->tunnelReady() &&
+                   remote->tunnelOwnedForTest() && identity_matches(),
+               "IMPORTED_IDENTITY_REACHES_REAL_SSH_SERVER"))
+      return 1;
+    check(tabs("remoteConnectionModeTabs", QStringLiteral("direct")) &&
+              !remote->authenticated() && !remote->tunnelReady() &&
+              identity_matches() && login(),
+          "SSH_TO_TCP_RECONNECTS_WITH_CURRENT_CERTIFICATE_IDENTITY");
+    remote->logoutLocal();
+    check(capture(QStringLiteral("01-imported-direct-profile.png")),
+          "IMPORTED_PROFILE_SCREENSHOT");
+  } else if (stage == QStringLiteral("reopen-direct") ||
+             stage == QStringLiteral("reopen-ssh")) {
+    const QString expected_mode = stage == QStringLiteral("reopen-direct")
+                                      ? QStringLiteral("direct")
+                                      : QStringLiteral("ssh");
+    if (!check(identity_matches() &&
+                   remote->connectionMode() == expected_mode &&
+                   page->property("draftConnectionMode").toString() ==
+                       expected_mode &&
+                   remote->host() == host && remote->portText() == port &&
+                   remote->connectionProfileError().isEmpty(),
+               "NEW_GUI_LOADS_DISK_PROFILE_AND_QML_FIELDS_CONSISTENTLY"))
+      return 1;
+    // Only the fixture executable is injected; it is intentionally never loaded
+    // from the persisted product profile. OpenSSH owns authentication secrets.
+    remote->setSshProgram(fixture.filePath("fixture-ssh"));
+    if (!check(login() && identity_matches() &&
+                   remote->tunnelReady() ==
+                       (expected_mode == QStringLiteral("ssh")),
+               "NEW_GUI_REAUTHENTICATES_WITH_IMPORTED_IDENTITY"))
+      return 1;
+    remote->logoutLocal();
+    remote->stopTunnel();
+    if (expected_mode == QStringLiteral("direct")) {
+      for (bool wrong_root : {false, true}) {
+        remote->setCertificateSettings(
+            wrong_root ? fixture.filePath("wrong-root.key.pub") : roots,
+            wrong_root ? server_id : QStringLiteral("wrong-server-id"));
+        const bool accepted = remote->login(host, port, user, secret);
+        check(
+            accepted && remote->waitForIdle(45000) &&
+                !remote->authenticated() && !remote->sharedSessionReady() &&
+                remote->lastErrorKindForTest() ==
+                    (wrong_root ? QStringLiteral("server-certificate-untrusted")
+                                : QStringLiteral(
+                                      "server-certificate-wrong-server-id")),
+            wrong_root
+                ? "REOPENED_GUI_REJECTS_WRONG_ROOT_WITH_EXACT_CLASS"
+                : "REOPENED_GUI_REJECTS_WRONG_SERVER_ID_WITH_EXACT_CLASS");
+        QKeyEvent escape(QEvent::KeyPress, Qt::Key_Escape, Qt::NoModifier);
+        QCoreApplication::sendEvent(window, &escape);
+        Settle();
+      }
+      remote->setCertificateSettings(roots, server_id);
+      const bool switched =
+          tabs("remoteAuthModeTabs", QStringLiteral("pin")) &&
+          tabs("remoteAuthModeTabs", QStringLiteral("certificate"));
+      check(switched && remote->trustedRootsFile().isEmpty() &&
+                remote->expectedServerId().isEmpty() &&
+                page->property("draftTrustedRoots").toString().isEmpty() &&
+                page->property("draftExpectedServerId").toString().isEmpty() &&
+                QJsonDocument::fromJson(Read(profile))
+                    .object()
+                    .value("expected_server_id")
+                    .toString()
+                    .isEmpty(),
+            "REOPENED_GUI_BPSEC2_BPSEC1_BPSEC2_CLEARS_STALE_IDENTITY_ON_DISK_"
+            "AND_UI");
+      check(
+          select(roots_dialog, roots) &&
+              select(identity_dialog, fixture.filePath("server.bpcert")) &&
+              identity_matches() && login(),
+          "REOPENED_GUI_REIMPORTS_AND_REAUTHENTICATES_AFTER_AUTH_MODE_SWITCH");
+      remote->logoutLocal();
+      check(tabs("remoteConnectionModeTabs", QStringLiteral("ssh")) &&
+                identity_matches(),
+            "SAVE_SSH_PROFILE_FOR_THIRD_GUI_PROCESS");
+    }
+    check(capture(stage + QStringLiteral(".png")), "REOPEN_PROFILE_SCREENSHOT");
+  } else {
+    check(false, "KNOWN_RESTART_STAGE");
+  }
+  if (stage != QStringLiteral("invalid-profile")) {
+    const QByteArray disk = Read(profile);
+    const QJsonObject object = QJsonDocument::fromJson(disk).object();
+    check(!disk.isEmpty() && !disk.contains(secret.toUtf8()) &&
+              !object.contains("username") && !object.contains("password") &&
+              !object.contains("token") && !object.contains("ssh_program") &&
+              object.value("expected_server_id").toString() == server_id &&
+              object.value("trusted_roots_file").toString() == roots,
+          "DISK_PROFILE_HAS_PUBLIC_SETTINGS_WITHOUT_CREDENTIALS");
+    check(QFileInfo(profile).permissions() ==
+              (QFileDevice::ReadOwner | QFileDevice::WriteOwner |
+               QFileDevice::ReadUser | QFileDevice::WriteUser),
+          "DISK_PROFILE_PRIVATE_PERMISSIONS");
+  }
+  remote->logoutLocal();
+  remote->stopTunnel();
+  std::printf("CERTIFICATE_RESTART stage=%s pid=%lld passed=%d failed=%d\n",
+              qPrintable(stage),
+              static_cast<long long>(QCoreApplication::applicationPid()),
+              passed, failed);
+  return failed == 0 ? 0 : 1;
+}
+
 }  // namespace
 
 int RunCredentialUiTest(QQuickWindow* window,
@@ -151,6 +428,8 @@ int RunCredentialUiTest(QQuickWindow* window,
                         backup_modern::RemoteController* remote,
                         backup_modern::BackupController* controller,
                         const QString& output) {
+  if (!qEnvironmentVariable("BACKUP_CERTIFICATE_RESTART_STAGE").isEmpty())
+    return RunCertificateRestartStage(window, remote, output);
   int passed = 0;
   int failed = 0;
   const auto check = [&](bool ok, const char* label) {

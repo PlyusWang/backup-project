@@ -96,8 +96,10 @@ class ScheduleController : public QObject,
   Q_PROPERTY(QString packKey READ packKey NOTIFY configChanged)
   Q_PROPERTY(QString compressionKey READ compressionKey NOTIFY configChanged)
   Q_PROPERTY(QString encryptionKey READ encryptionKey NOTIFY configChanged)
-  // 无人值守加密的口令文件草稿（只保存路径，口令内容由核心里读取）。
+  // 已保存与待提交的凭据引用分开，均不包含口令内容。
   Q_PROPERTY(QString credentialFile READ credentialFile NOTIFY configChanged)
+  Q_PROPERTY(
+      QString draftCredentialFile READ draftCredentialFile NOTIFY configChanged)
   Q_PROPERTY(bool sessionPasswordUnlocked READ sessionPasswordUnlocked NOTIFY
                  configChanged)
   Q_PROPERTY(QString repositoryType READ repositoryType NOTIFY configChanged)
@@ -168,7 +170,10 @@ class ScheduleController : public QObject,
   QString packKey() const;
   QString compressionKey() const;
   QString encryptionKey() const;
-  QString credentialFile() const { return draft_credential_file_; }
+  QString credentialFile() const {
+    return QString::fromStdString(document_.config.encryption_password_file);
+  }
+  QString draftCredentialFile() const { return draft_credential_file_; }
   bool sessionPasswordUnlocked() const;
   QString repositoryType() const {
     return QString::fromStdString(document_.config.repository_type.empty()
@@ -350,6 +355,11 @@ class ScheduleController : public QObject,
   // 只保存路径；口令内容永远不进入这个进程的 GUI 状态。
   QString draft_encryption_key_ = QStringLiteral("none");
   QString draft_credential_file_;
+  // 每次密码编辑用独立引用；实际配置在保存成功前继续使用原秘密。
+  QStringList owned_archive_session_references_;
+  QString draft_repository_type_ = QStringLiteral("local");
+  QString draft_cloud_credentials_file_;
+  QString draft_cloud_repository_id_;
   bool config_loaded_ = false;
   QString load_error_;
 

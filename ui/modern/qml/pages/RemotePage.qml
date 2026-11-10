@@ -462,6 +462,16 @@ Item {
                     spacing: 6
 
                     Text {
+                        objectName: "remoteConnectionProfileError"
+                        Layout.fillWidth: true
+                        visible: remote.connectionProfileError.length > 0
+                        text: remote.connectionProfileError
+                        color: theme.error
+                        font.pixelSize: 14
+                        wrapMode: Text.WordWrap
+                    }
+
+                    Text {
                         text: "服务器账户"
                         font.pixelSize: 16
                         font.weight: Font.DemiBold

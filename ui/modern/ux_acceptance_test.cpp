@@ -189,6 +189,50 @@ int RunUxAcceptanceTest(QQuickWindow* window, backup_modern::AppTheme* theme,
   check(popup != nullptr && list != nullptr, "popup content available");
   if (popup == nullptr || list == nullptr) return 1;
 
+  QQmlComponent bound_component(engine);
+  bound_component.setData(
+      R"(
+import QtQuick
+import "qrc:/qml/components"
+Item {
+    property int committedIndex: 0
+    AppComboBox {
+        objectName: "boundCombo"
+        width: 360
+        model: ["first", "second", "third"]
+        currentIndex: parent.committedIndex
+        onActivated: function(index) { parent.committedIndex = index }
+    }
+})",
+      QUrl(QStringLiteral("qrc:/qml/combo-binding-test.qml")));
+  std::unique_ptr<QObject> bound_object(bound_component.create());
+  QQuickItem* bound_root = qobject_cast<QQuickItem*>(bound_object.get());
+  QQuickItem* bound_combo =
+      bound_root ? FindItem(bound_root, "boundCombo") : nullptr;
+  check(bound_combo != nullptr, "bound ComboBox fixture created");
+  if (bound_root != nullptr && bound_combo != nullptr) {
+    bound_root->setParentItem(input_window.contentItem());
+    bound_root->setY(170);
+    bound_root->setSize(QSizeF(380, 80));
+    input_window.requestActivate();
+    Settle();
+    Pointer(&input_window, bound_combo, true);
+    Key(&input_window, Qt::Key_Home);
+    Key(&input_window, Qt::Key_Down);
+    Key(&input_window, Qt::Key_Return);
+    check(bound_root->property("committedIndex").toInt() == 1 &&
+              bound_combo->property("currentIndex").toInt() == 1,
+          "user selection commits through bound model");
+    bound_root->setProperty("committedIndex", 2);
+    Settle();
+    check(bound_combo->property("currentIndex").toInt() == 2,
+          "selection preserves binding after external normalization");
+    Key(&input_window, Qt::Key_Home);
+    check(bound_root->property("committedIndex").toInt() == 0,
+          "selection after external update uses synchronized value");
+    bound_root->setVisible(false);
+  }
+
   for (bool dark : {false, true}) {
     theme->setDark(dark);
     input_window.setColor(theme->background());
