@@ -22,12 +22,15 @@ Item {
     // 不按窗口宽度：侧栏固定 228，窗口宽度不能直接代表卡片可用空间。
     readonly property int columns: page.width >= 900 ? 4
                                  : (page.width >= 560 ? 2 : 1)
+    // 两列布局在最小窗口中仍需把状态区留在可视范围内；卡片内容的
+    // 固定高度足以容纳标题、说明和按钮，窄屏不再沿用宽屏高度。
+    readonly property int cardHeight: page.width >= 900 ? 216 : 214
 
     ColumnLayout {
         id: column
         anchors.horizontalCenter: parent.horizontalCenter
         anchors.top: parent.top
-        anchors.topMargin: 32
+        anchors.topMargin: page.width >= 900 ? 32 : 20
         width: Math.min(parent.width - 64, 1080)
         spacing: 18
 
@@ -48,7 +51,7 @@ Item {
         GridLayout {
             id: entries
             Layout.fillWidth: true
-            Layout.topMargin: 6
+            Layout.topMargin: page.width >= 900 ? 6 : 2
             columns: page.columns
             columnSpacing: 16
             rowSpacing: 16
@@ -95,7 +98,7 @@ Item {
                     // 和几何断言（按钮必须落在卡片内，同一行按钮纵坐标一致）。
                     objectName: "homeCard" + index
                     Layout.fillWidth: true
-                    Layout.preferredHeight: 216
+                    Layout.preferredHeight: page.cardHeight
                     Layout.alignment: Qt.AlignTop
 
                     ColumnLayout {

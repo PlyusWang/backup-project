@@ -585,8 +585,9 @@ CatalogOutcome BackupController::RunCatalogList(const QString& repository) {
 // ---- 保存 repository 设置 ----
 
 bool BackupController::saveRepositoryPath(const QString& path) {
-  // 保存仓库是设置页的动作。
-  status_scope_ = QString::fromLatin1(kScopeSettings);
+  // 设置编辑嵌在备份管理页；提示必须归属实际可见的页面作用域，
+  // 否则保存成功或失败后管理页的状态栏无法显示它。
+  status_scope_ = QString::fromLatin1(kScopeManagement);
   // 改仓库会写 config.json，并让之后所有备份落到另一个地方。它同样是一个
   // "会改动持久状态"的业务操作，所以在评估在飞的时候必须被拒绝。
   OperationGuard guard(operation_gate_, OperationGate::Kind::kRepositoryChange);
