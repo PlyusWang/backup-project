@@ -12,7 +12,10 @@
 // 父进程靠"在 PTY master 上等到提示文本出现"来同步，而不是 sleep：
 // 提示语是产品自己写到终端上的，等它出现再喂输入，既没有竞态也不依赖时序。
 
+#include "terminal_secret.h"
+
 #include <fcntl.h>
+#include <poll.h>
 #include <signal.h>
 #include <stdlib.h>
 #include <sys/ioctl.h>
@@ -26,8 +29,8 @@
 #include <cstdint>
 #include <cstdio>
 #include <string>
+#include <thread>
 
-#include "terminal_secret.h"
 #include "test_support.h"
 
 namespace bp = backupproject;
@@ -169,33 +172,46 @@ void TestWithPty() {
   test_support::Check((before.c_lflag & ECHO) != 0,
                       "SEC-12 echo starts enabled");
 
+  std::string secret;
+  bool read_ok = false;
+  std::thread reader([&] {
+    read_ok = bp::ReadSecretLine(pty.slave, /*require_tty=*/true,
+                                 "password: ", &secret, &error);
+  });
+
+  // The implementation deliberately flushes input queued before the prompt
+  // to avoid accepting keystrokes entered for another prompt. Wait for the
+  // actual prompt before writing the test password so this unit test follows
+  // the same ordering as a user.
+  char prompt[128];
+  std::string prompt_text;
+  for (int attempts = 0;
+       attempts < 100 && prompt_text.find("password: ") == std::string::npos;
+       ++attempts) {
+    struct pollfd ready = {pty.master, POLLIN, 0};
+    if (poll(&ready, 1, 30) <= 0) continue;
+    const ssize_t count = read(pty.master, prompt, sizeof(prompt) - 1);
+    if (count > 0) prompt_text.append(prompt, static_cast<std::size_t>(count));
+  }
   const std::string payload = "pty-secret\n";
   ssize_t ignored = write(pty.master, payload.data(), payload.size());
   (void)ignored;
+  reader.join();
 
-  std::string secret;
-  test_support::Check(bp::ReadSecretLine(pty.slave, /*require_tty=*/true,
-                                         "password: ", &secret, &error),
-                      "SEC-13 a secret is read from a real tty", error);
+  test_support::Check(read_ok, "SEC-13 a secret is read from a real tty",
+                      error);
   test_support::Check(secret == "pty-secret",
                       "SEC-14 the tty value is read verbatim", secret);
 
   struct termios after;
-  test_support::Check(tcgetattr(pty.slave, &after) == 0 &&
-                          (after.c_lflag & ECHO) != 0,
-                      "SEC-15 echo is restored after the read");
+  test_support::Check(
+      tcgetattr(pty.slave, &after) == 0 && (after.c_lflag & ECHO) != 0,
+      "SEC-15 echo is restored after the read");
 
   // 提示语确实被写到了终端上（父进程在上面的 PTY 集成测试里就是靠它同步的）。
-  char buffer[128];
-  const ssize_t count = read(pty.master, buffer, sizeof(buffer) - 1);
-  if (count > 0) {
-    buffer[count] = '\0';
-    test_support::Check(std::string(buffer).find("password: ") != std::string::npos,
-                        "SEC-16 the prompt is written to the terminal", buffer);
-  } else {
-    test_support::Check(false, "SEC-16 the prompt is written to the terminal",
-                        "nothing readable on the master");
-  }
+  test_support::Check(prompt_text.find("password: ") != std::string::npos,
+                      "SEC-16 the prompt is written to the terminal",
+                      prompt_text);
 
   ClosePty(&pty);
 }
