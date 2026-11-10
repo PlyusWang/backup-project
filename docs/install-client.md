@@ -23,6 +23,13 @@
 Qt 运行时和 QML 模块都在 AppImage 里，目标机器不需要装 Qt，也不需要本仓库的
 源码或 build 目录。
 
+中文界面需要系统中文字体；AppImage 和 portable 包不自带 CJK 字体。Debian/Ubuntu
+的精简安装环境请先执行：
+
+    sudo apt install fonts-noto-cjk
+
+Debian 客户端包将该字体包列为依赖，使用 `apt install ./...deb` 时会一并安装。
+
 命令行入口也在这一个文件里：
 
     ./Backup-Project-Client-<版本>-x86_64.AppImage backupctl --help
@@ -45,7 +52,7 @@ Qt 运行时和 QML 模块都在 AppImage 里，目标机器不需要装 Qt，�
     /usr/lib/backup-project-client/           自带的 Qt 运行时 + QML 模块
     /usr/share/applications/backup-project.desktop
 
-依赖由 `dpkg-shlibdeps` 按真实 ELF 需求算出（不是手写的库列表）。
+系统库依赖由 `dpkg-shlibdeps` 按真实 ELF 需求算出，另显式依赖中文字体 `fonts-noto-cjk`。
 
 **卸载只删程序文件**：
 
@@ -68,6 +75,9 @@ Qt 运行时和 QML 模块都在 AppImage 里，目标机器不需要装 Qt，�
     ./uninstall.sh --prefix ~/.local
 
 同样是"只删程序文件"：用户数据一个字都不动。
+桌面入口与正式图标按安装目录区分，包含空格的 `--prefix` 也可使用；卸载其中一个
+安装不会删除另一个安装目录的入口与图标。创建桌面入口时，路径不能包含 `%`；
+可更换路径，或使用 `--no-desktop` 仅安装程序。
 
 ## 4. 第一次用
 

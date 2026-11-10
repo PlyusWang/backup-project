@@ -153,20 +153,59 @@ int ChainFail(const char* what, const QString& detail) {
   return 1;
 }
 
-// 把备份页滚到指定位置。展开后的高级选项在页面下半部分，窗口一屏放不下，
-// 不滚动的话抓到的"展开状态"只有标题那一行，评审时看不出面板长什么样。
-// 滚的是 ScrollView 的 Flickable；越界值由 Flickable 自己夹到边界。
-void ScrollBackupPage(QQuickWindow* window, int content_y) {
+// 直接赋 contentY 不会被 Flickable 自动夹到边界；先等展开动画的几何稳定，
+// 再按真实 originY 和内容高度滚动，避免抓到越界后的空白画面。
+bool ScrollBackupPage(QQuickWindow* window, int content_y) {
   QQuickItem* scroll =
       FindItemByName(window->contentItem(), QStringLiteral("backupPageScroll"));
   if (scroll == nullptr) {
-    return;
+    return false;
   }
   QObject* flickable = qobject_cast<QObject*>(
       scroll->property("contentItem").value<QQuickItem*>());
-  if (flickable != nullptr) {
-    flickable->setProperty("contentY", content_y);
+  if (flickable == nullptr) {
+    return false;
   }
+  QElapsedTimer timeout;
+  QElapsedTimer stable;
+  timeout.start();
+  stable.start();
+  double previous_minimum = -1;
+  double previous_maximum = -1;
+  while (timeout.elapsed() < 5000) {
+    QEventLoop loop;
+    QTimer::singleShot(20, &loop, &QEventLoop::quit);
+    window->requestUpdate();
+    loop.exec();
+    const double minimum = flickable->property("originY").toDouble();
+    const double height = flickable->property("height").toDouble();
+    const double content_height =
+        flickable->property("contentHeight").toDouble();
+    const double maximum = minimum + std::max(0.0, content_height - height);
+    if (!std::isfinite(minimum) || !std::isfinite(maximum) ||
+        !std::isfinite(height) || !std::isfinite(content_height) ||
+        height <= 0) {
+      stable.restart();
+      continue;
+    }
+    if (std::abs(minimum - previous_minimum) > 0.5 ||
+        std::abs(maximum - previous_maximum) > 0.5) {
+      previous_minimum = minimum;
+      previous_maximum = maximum;
+      stable.restart();
+      continue;
+    }
+    if (stable.elapsed() < 120) {
+      continue;
+    }
+    const double target =
+        std::clamp(static_cast<double>(content_y), minimum, maximum);
+    flickable->setProperty("contentY", target);
+    const double actual = flickable->property("contentY").toDouble();
+    return std::isfinite(actual) && actual >= minimum - 0.5 &&
+           actual <= maximum + 0.5 && std::abs(actual - target) <= 0.5;
+  }
+  return false;
 }
 
 // v2 容器 header 的整数字段一律 little-endian（偏移表见
@@ -3785,9 +3824,34 @@ int CaptureScreenshots(QQuickWindow* window, backup_modern::AppTheme* theme,
   // 不用在文档里写死带时间戳的路径。
   const auto grab = [window, &directory](const QString& name, bool dark) {
     WaitForAnimation(300);
-    const QImage image = window->grabWindow();
-    if (image.isNull()) {
-      std::fprintf(stderr, "grabWindow() 返回空图像\n");
+    QImage image;
+    bool content_visible = false;
+    QElapsedTimer timeout;
+    timeout.start();
+    while (timeout.elapsed() < 3000 && !content_visible) {
+      window->requestUpdate();
+      WaitForAnimation(40);
+      image = window->grabWindow();
+      if (image.isNull()) {
+        continue;
+      }
+      const QRect content(image.width() * 26 / 100, image.height() * 12 / 100,
+                          image.width() * 70 / 100, image.height() * 84 / 100);
+      QMap<QRgb, int> colors;
+      int samples = 0;
+      int dominant = 0;
+      for (int y = content.top(); y <= content.bottom(); y += 4) {
+        for (int x = content.left(); x <= content.right(); x += 4) {
+          dominant = std::max(dominant, ++colors[image.pixel(x, y)]);
+          ++samples;
+        }
+      }
+      content_visible =
+          colors.size() >= 16 && samples - dominant > samples / 100;
+    }
+    if (!content_visible) {
+      std::fprintf(stderr, "截图 %s 的主内容为空白或尚未绘制\n",
+                   qPrintable(name));
       return false;
     }
     const QString path =
@@ -3926,13 +3990,19 @@ int CaptureScreenshots(QQuickWindow* window, backup_modern::AppTheme* theme,
     theme->setDark(dark == 1);
     GoToPage(window, "quick");
     panel->setProperty("expanded", true);
-    ScrollBackupPage(window, 100000);
+    if (!ScrollBackupPage(window, 100000)) {
+      std::fprintf(stderr, "截图：展开面板滚动范围不正确或几何未稳定\n");
+      return 1;
+    }
     if (!grab(QStringLiteral("backup-expanded"), dark == 1)) {
       return 1;
     }
   }
   panel->setProperty("expanded", false);
-  ScrollBackupPage(window, 0);
+  if (!ScrollBackupPage(window, 0)) {
+    std::fprintf(stderr, "截图：无法恢复备份页的有效滚动位置\n");
+    return 1;
+  }
 
   // 加密归档的恢复密码对话框。这个对象每张记录卡片都有，但"未加密记录 +
   // 恢复密码对话框"这个画面在真实使用中不会出现，所以只有仓库里确实存在

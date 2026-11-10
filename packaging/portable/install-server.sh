@@ -13,7 +13,7 @@
 #   <prefix>/etc/            server.conf、secrets.env
 #   <prefix>/var/data/       备份 blob
 #   <prefix>/var/state/      元数据库 + 传输身份私钥
-#   <prefix>/lib/systemd/system/backup-project-server.service   （--no-systemd 时没有）
+#   /etc/systemd/system/backup-project-server.service          （--no-systemd 时没有）
 #
 # 安全性质与 deb 完全一致：默认只监听 127.0.0.1；已存在的 secrets.env /
 # transport.key / 数据库 / data 目录**绝不覆盖**；失败时清理自己的 staging。
@@ -25,7 +25,6 @@ PORT=18765
 BIND=127.0.0.1
 SVC_USER=backup-project
 MAKE_USER=1
-CONFIRM=0
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -58,6 +57,18 @@ fi
 log "校验包内容（MANIFEST.sha256）"
 if ! ( cd "$SRC_DIR" && sha256sum -c --quiet MANIFEST.sha256 ); then
   die "包内容与 MANIFEST.sha256 不一致，拒绝安装"
+fi
+
+# Reuse the uninstaller's ownership checks without executing its main routine.
+# shellcheck source=packaging/portable/uninstall.sh
+source "$SRC_DIR/uninstall.sh"
+PREFIX="$(portable_prefix_path "$PREFIX" 1)" || die '安装前缀不安全'
+portable_check_removal_paths "$PREFIX" 1 || die '安装目录存在符号链接，保留现有文件'
+USE_SYSTEMD=0
+if [ "$NO_SYSTEMD" -eq 0 ] && [ -d /run/systemd/system ] && [ "$(id -u)" -eq 0 ]; then
+  USE_SYSTEMD=1
+  portable_systemd_install_preflight "$PREFIX" /etc/systemd/system/backup-project-server.service ||
+    die 'systemd 安装检查失败，未修改程序、配置、身份或服务'
 fi
 
 # ---- 2. 并发锁 + 原子 staging ----
@@ -164,8 +175,9 @@ else
 fi
 
 # ---- 7. systemd（可选）----
-if [ "$NO_SYSTEMD" -eq 0 ] && [ -d /run/systemd/system ] && [ "$(id -u)" -eq 0 ]; then
+if [ "$USE_SYSTEMD" -eq 1 ]; then
   UNIT=/etc/systemd/system/backup-project-server.service
+  portable_systemd_install_preflight "$PREFIX" "$UNIT" || die 'systemd unit 在安装期间变化，保留该服务'
   sed -e "s|^ExecStart=.*|ExecStart=$PREFIX/bin/launch-server.sh --config $CONF|" \
       -e "s|^User=.*|User=$SVC_USER|" \
       -e "s|^Group=.*|Group=$SVC_USER|" \

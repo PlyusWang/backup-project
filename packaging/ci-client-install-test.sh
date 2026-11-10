@@ -33,8 +33,20 @@ expect_file "自带 Qt（/usr/lib/backup-project-client/lib/libQt6Core.so.6）" 
 expect_file "自带 QML 模块" /usr/lib/backup-project-client/qml/QtQuick
 dpkg-deb --info "$DEB" > /tmp/client-deb-info.txt
 expect_contains "control 里有 Depends" /tmp/client-deb-info.txt '^ Depends:'
-expect_contains "desktop 文件没有假图标（不含 Icon=）" /usr/share/applications/backup-project.desktop '^Exec=/usr/bin/backup-project'
-if grep -q '^Icon=' /usr/share/applications/backup-project.desktop; then ci_fail "desktop 文件出现了 Icon=（仓库没有正式图标资源）"; else ci_pass "desktop 文件没有伪造 Icon="; fi
+expect_contains "desktop 使用安装入口" /usr/share/applications/backup-project.desktop '^Exec=/usr/bin/backup-project$'
+expect_contains "desktop 使用正式图标名" /usr/share/applications/backup-project.desktop '^Icon=backup-project$'
+CLIENT_ICON=/usr/share/icons/hicolor/256x256/apps/backup-project.png
+expect_file "hicolor 中包含与 desktop 匹配的正式图标" "$CLIENT_ICON"
+expect_eq "正式图标为可读 PNG" "89504e470d0a1a0a" "$(od -An -tx1 -N8 "$CLIENT_ICON" | tr -d ' \n')"
+expect_contains "客户端依赖包含中文字体" /tmp/client-deb-info.txt 'fonts-noto-cjk'
+expect_ok "安装桌面入口与字体检查工具" apt-get install -y -qq desktop-file-utils fontconfig
+expect_ok "桌面入口通过 freedesktop 解析" desktop-file-validate /usr/share/applications/backup-project.desktop
+expect_eq "中文字体包已安装" "install ok installed" "$(dpkg-query -W '-f=${Status}' fonts-noto-cjk)"
+if fc-match -f '%{family}\n' ':lang=zh-cn' | grep -q 'Noto.*CJK'; then
+  ci_pass "Fontconfig 实际解析到 Noto CJK 中文字体"
+else
+  ci_fail "Fontconfig 未解析到所需中文字体"
+fi
 
 ci_section "3. 安装后真的能跑（机器上没有 Qt 开发包）"
 expect_ok "backupctl --help" backupctl --help

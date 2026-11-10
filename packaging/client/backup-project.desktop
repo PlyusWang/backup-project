@@ -13,6 +13,4 @@ Terminal=false
 Categories=Utility;Archiving;FileTools;
 Keywords=backup;archive;restore;cloud;
 Keywords[zh_CN]=备份;归档;恢复;云端;
-# 仓库里没有正式的品牌图标资源（AppIcon.qml 是矢量绘制，不是图片资产），
-# 所以这里**不**放 Icon= 键：宁可只做最小集成，也不临时画一个假图标。
-# 将来有正式图标时补 Icon= 一行即可。
+Icon=backup-project
