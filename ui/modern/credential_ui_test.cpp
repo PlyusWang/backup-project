@@ -545,13 +545,31 @@ int RunCredentialUiTest(QQuickWindow* window,
         "IDENTITY_SETTINGS_INVALIDATE_SHARED_LOGIN");
   if (!check(login(), "LOGIN_AFTER_IDENTITY_CHANGE")) return 1;
   remote->logoutLocal();
+  const QString active_pin = remote->serverKeyPin();
   const bool pending_login =
       remote->loginWithPin(host, port_text, username, login_password, pin);
-  remote->setSshHost(QStringLiteral("different-transport-alias"));
-  check(pending_login && remote->waitForIdle(30000) &&
-            remote->lastErrorKindForTest() == QStringLiteral("none") &&
-            !remote->sharedSessionReady(),
-        "OLD_ASYNC_LOGIN_CANNOT_PUBLISH_AFTER_CONFIGURATION_CHANGE");
+  const QString attempted_pin =
+      QStringLiteral("sha256:") + QString(64, QLatin1Char('0'));
+  const QString busy_pin_result = remote->applyServerKeyPin(attempted_pin);
+  const bool mutation_rejected =
+      busy_pin_result == QStringLiteral("invalid") &&
+      remote->serverKeyPin() == active_pin &&
+      remote->serverKeyPinError().contains(QStringLiteral("正在处理"));
+  const bool login_completed = pending_login && remote->busy() &&
+                               mutation_rejected &&
+                               remote->waitForIdle(30000) &&
+                               remote->lastErrorKindForTest() ==
+                                   QStringLiteral("none") &&
+                               remote->authenticated() &&
+                               remote->sharedSessionReady();
+  check(login_completed, "BUSY_LOGIN_REJECTS_PIN_CHANGE");
+  const QString applied_pin = remote->applyServerKeyPin(attempted_pin);
+  const bool changed_pin_invalidates_session =
+      applied_pin == QStringLiteral("applied") &&
+      !remote->authenticated() && !remote->sharedSessionReady();
+  check(changed_pin_invalidates_session,
+        "APPLIED_PIN_CHANGE_INVALIDATES_OLD_SESSION");
+  remote->applyServerKeyPin(active_pin);
   remote->logoutLocal();
   window->setProperty("currentPageKey", QStringLiteral("management"));
   QObject* management =
