@@ -3,6 +3,7 @@
 // backup-server-keygen：生成 / 查看 BPSEC1 服务端长期身份密钥。
 //
 //   backup-server-keygen --output <文件>            生成新的身份私钥
+//   backup-server-keygen --import <文件> --output <文件> 安全复制已有身份
 //   backup-server-keygen --show --key-file <文件>   打印公钥与指纹
 //
 // 私钥文件是 32 字节原始 X25519 标量（已 clamp），权限 0600、O_NOFOLLOW、
@@ -13,8 +14,7 @@
 
 // ---- 本文件的实现边界 ----
 //
-// 这个工具只做两件事：生成新的服务端传输身份私钥，或从已有私钥文件打印公钥
-// 与指纹。它不参与握手、不读网络配置、不改任何其它文件。
+// 生成、导入身份及查看公钥均复用共享密钥模块；不参与握手或读取网络配置。
 //
 // 安全边界（与 secure_transport 的约定一致）：私钥只由 SaveTransportIdentity
 // 写到 --output 指定的文件（0600、O_NOFOLLOW、必须是普通文件），已存在时明确
@@ -40,13 +40,15 @@ void PrintUsage(std::FILE* out, const char* program) {
       "  %s --output <文件>              "
       "生成新的传输身份私钥（0600，不覆盖已有文件）\n"
       "  %s --show --key-file <文件>     打印已有私钥对应的公钥与指纹\n"
+      "  %s --import <原私钥> --output <新文件>\n"
+      "                                  校验后复制身份（0600，不覆盖）\n"
       "\n"
       "私钥只写在 --output 指定的文件里，不打印、不进日志、不进 Git。\n"
       "公钥不是秘密：客户端用 \"sha256:<指纹>\" 或 \"hex:<公钥>\" 作为\n"
       "--server-key 的值（见 docs/secure_transport.md）。\n"
       "\n"
       "退出码: 0 成功 / 1 运行失败 / 2 用法错误\n",
-      program, program);
+      program, program, program);
 }
 
 // 只输出公开材料：公钥 hex、SHA-256 指纹，以及两种可直接粘进 --server-key 的
@@ -65,14 +67,16 @@ void PrintKeyMaterial(const backupproject::net::TransportIdentity& identity) {
 
 }  // namespace
 
-// 手写参数解析（工具足够小，不引入命令行库）。两条互斥的用法在解析之后统一
+// 手写参数解析（工具足够小，不引入命令行库）。互斥的用法在解析之后统一
 // 校验：--show 必须配 --key-file，生成必须配 --output，混用一律按用法错误
 // （退出码 2）拒绝，而不是取其中一个继续跑。
 int main(int argc, char** argv) {
   const char* program = argc > 0 ? argv[0] : "backup-server-keygen";
   std::string output_path;
   std::string key_file;
+  std::string import_path;
   bool show = false;
+  bool import_requested = false;
 
   for (int index = 1; index < argc; ++index) {
     const std::string name = argv[index];
@@ -92,6 +96,9 @@ int main(int argc, char** argv) {
     const std::string value = argv[++index];
     if (name == "--output") {
       output_path = value;
+    } else if (name == "--import") {
+      import_requested = true;
+      import_path = value;
     } else if (name == "--key-file") {
       key_file = value;
     } else {
@@ -101,6 +108,11 @@ int main(int argc, char** argv) {
     }
   }
 
+  if (import_requested && import_path.empty()) {
+    std::fprintf(stderr, "Error: --import 需要非空的私钥文件路径。\n");
+    return 2;
+  }
+
   std::string error;
   if (show) {
     if (key_file.empty()) {
@@ -108,8 +120,9 @@ int main(int argc, char** argv) {
       PrintUsage(stderr, program);
       return 2;
     }
-    if (!output_path.empty()) {
-      std::fprintf(stderr, "Error: --show 不能和 --output 一起用。\n\n");
+    if (!output_path.empty() || import_requested) {
+      std::fprintf(stderr,
+                   "Error: --show 不能和 --output 或 --import 一起用。\n\n");
       PrintUsage(stderr, program);
       return 2;
     }
@@ -136,7 +149,16 @@ int main(int argc, char** argv) {
   }
 
   backupproject::net::TransportIdentity identity;
-  if (!backupproject::net::GenerateTransportIdentity(&identity, &error)) {
+  // Import uses the same no-follow, exact-length and private-mode checks as
+  // server startup, then the same exclusive creation path as key generation.
+  if (import_requested) {
+    if (!backupproject::net::LoadTransportIdentity(import_path, &identity,
+                                                   &error)) {
+      std::fprintf(stderr, "Error: 导入身份密钥失败: %s\n", error.c_str());
+      return 1;
+    }
+  } else if (!backupproject::net::GenerateTransportIdentity(&identity,
+                                                            &error)) {
     std::fprintf(stderr, "Error: 生成身份密钥失败: %s\n", error.c_str());
     return 1;
   }
@@ -145,8 +167,8 @@ int main(int argc, char** argv) {
     std::fprintf(stderr, "Error: %s\n", error.c_str());
     return 1;
   }
-  std::printf("已生成传输身份私钥: %s（权限 0600，请勿复制到别处）\n",
-              output_path.c_str());
+  std::printf("%s传输身份私钥: %s（权限 0600，勿公开）\n",
+              import_requested ? "已导入" : "已生成", output_path.c_str());
   PrintKeyMaterial(identity);
   return 0;
 }

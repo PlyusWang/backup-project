@@ -43,7 +43,8 @@ done
 case "$command" in
   root-init) printf 'mock root private\n' >"$key"; chmod 600 "$key"; printf 'mock root public\n' >"$key.pub"; chmod 644 "$key.pub" ;;
   issue-server) printf 'mock server certificate\n' >"$output"; chmod 644 "$output" ;;
-  verify-server|inspect-server) exit 0 ;;
+  verify-server) exit 0 ;;
+  inspect-server) printf 'server_public_key = mock-public-key\n' ;;
   *) exit 1 ;;
 esac
 MOCK
@@ -60,6 +61,13 @@ MOCK
 cat >"$TEST_ROOT/tools/ln" <<'MOCK'
 #!/bin/bash
 target="${!#}"
+if [ "$target" = "${TEST_RACE_CREATE_TARGET:-}" ]; then
+  if [ "${TEST_RACE_CREATE_TYPE:-}" = symlink ]; then
+    /usr/bin/ln -s "$TEST_RACE_DIRECTORY" "$target" || exit 1
+  else
+    mkdir "$target" || exit 1
+  fi
+fi
 if [ "$target" = "${TEST_FAIL_LINK_TARGET:-}" ]; then
   if [ "${TEST_EXTERNAL_CREATE:-0}" = 1 ]; then printf 'external-owned-sentinel\n' >"$target"; fi
   echo 'injected no-clobber link failure' >&2
@@ -99,7 +107,7 @@ no_partial_identity() {
 }
 run_init() (
   setup_instance "$1"
-  init_server <<<"${2:-$'\n\n18769\nn\n'}"
+  init_server <<<"${2:-$'\n\n18769\nn\n\n'}"
 )
 
 GOOD_ROOT="$TEST_ROOT/space = instance"
@@ -131,7 +139,7 @@ done
 ) >"$TEST_ROOT/unsupported-config.log" 2>&1 && pass 'external unencodable configuration path rejected' || fail 'external unencodable configuration path rejected'
 
 CERT_ROOT="$TEST_ROOT/certificate instance"
-if run_init "$CERT_ROOT" $'\n\n18770\ny\nmock-server\n' >"$TEST_ROOT/certificate.log" 2>&1 &&
+if run_init "$CERT_ROOT" $'\n\n18770\ny\n\n\nmock-server\n' >"$TEST_ROOT/certificate.log" 2>&1 &&
     [ -f "$CERT_ROOT/state/server.bpcert" ] && [ -f "$CERT_ROOT/private/root.key.pub" ] &&
     grep -q 'require_bpsec2 = true' "$CERT_ROOT/server.conf"; then
   pass 'BPSEC2 initialization commits verified mock certificate materials'
@@ -151,7 +159,7 @@ assert 'transaction termination rolls back published identity files' no_partial_
 if run_init "$TERM_ROOT" >"$TEST_ROOT/retry-termination.log" 2>&1; then pass 'termination permits retry with the same instance directory'; else fail 'termination permits retry with the same instance directory'; fi
 
 FINAL_ROOT="$TEST_ROOT/fail-final-config"
-if TEST_FAIL_LINK_TARGET="$FINAL_ROOT/server.conf" run_init "$FINAL_ROOT" $'\n\n18771\ny\nmock-server\n' >"$TEST_ROOT/fail-final-config.log" 2>&1; then
+if TEST_FAIL_LINK_TARGET="$FINAL_ROOT/server.conf" run_init "$FINAL_ROOT" $'\n\n18771\ny\n\n\nmock-server\n' >"$TEST_ROOT/fail-final-config.log" 2>&1; then
   fail 'final configuration publication failure rejected'
 else pass 'final configuration publication failure rejected'; fi
 assert 'failed final commit rolls back BPSEC2 identities' no_partial_identity "$FINAL_ROOT"
@@ -200,6 +208,26 @@ elif grep -q '另一初始化操作正在运行' "$TEST_ROOT/concurrent-second.l
 else fail 'concurrent second initializer lock diagnostic'; fi
 : >"$GATE.release"
 if wait "$FIRST_PID" && [ -f "$CONCURRENT_ROOT/server.conf" ]; then pass 'first initializer completes after competing attempt'; else fail 'first concurrent initializer'; fi
+
+# A concurrent directory must never turn an exact publication target into a
+# destination directory, including a symlink to a directory outside the instance.
+for race_type in directory symlink; do
+  race_root="$TEST_ROOT/publication-$race_type-race"
+  race_directory="$race_root/state/transport.key"
+  if [ "$race_type" = symlink ]; then
+    race_directory="$TEST_ROOT/external-publication-directory"
+    mkdir -p "$race_directory"
+  fi
+  if TEST_RACE_CREATE_TARGET="$race_root/state/transport.key" \
+      TEST_RACE_CREATE_TYPE="$race_type" TEST_RACE_DIRECTORY="$race_directory" \
+      run_init "$race_root" >"$TEST_ROOT/publication-$race_type-race.log" 2>&1; then
+    fail "concurrent $race_type publication refused"
+  elif [ -d "$race_directory" ] &&
+      [ -z "$(find "$race_directory" -mindepth 1 -print -quit)" ] &&
+      [ ! -e "$race_root/server.conf" ] && [ ! -e "$race_root/secrets.env" ]; then
+    pass "concurrent $race_type publication refused without leaking an identity link"
+  else fail "concurrent $race_type publication left identity material"; fi
+done
 
 # Intercept exec while sourcing the unmodified POSIX wrapper in a Bash child.
 # No actual runuser or installed backend is invoked by these routing tests.

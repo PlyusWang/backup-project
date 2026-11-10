@@ -739,7 +739,7 @@ done
 MANAGER_OUTPUT="$TEST_ROOT/manager-bpsec2-space.log"
 MANAGER_REPEAT_OUTPUT="$TEST_ROOT/manager-repeat-init.log"
 if [ -n "$MANAGER_PORT" ]; then
-  printf '1\n\n\n%s\ny\nmanager-space-test-%s\n\n8\n\n0\n' \
+  printf '1\n\n\n%s\ny\n\n\nmanager-space-test-%s\n\n8\n\n0\n' \
     "$MANAGER_PORT" "$MANAGER_PORT" | \
     env BACKUP_SERVER_ROOT="$MANAGER_ROOT" \
         BACKUP_SERVER_CONFIG="$MANAGER_ROOT/server.conf" \
@@ -805,7 +805,7 @@ for candidate in $(seq 20751 20800); do
 done
 BPSEC1_OUTPUT="$TEST_ROOT/manager-bpsec1-init.log"
 if [ -n "$BPSEC1_PORT" ]; then
-  printf '1\n\n\n%s\nn\n\n0\n' "$BPSEC1_PORT" | \
+  printf '1\n\n\n%s\nn\n\n\n0\n' "$BPSEC1_PORT" | \
     env BACKUP_SERVER_ROOT="$BPSEC1_ROOT" \
         BACKUP_SERVER_CONFIG="$BPSEC1_ROOT/server.conf" \
         BACKUP_SERVER_DATA="$BPSEC1_ROOT/data" \
@@ -1359,7 +1359,7 @@ MOCK
         BACKUP_CERT_TOOL="$MANAGER_TOOLS/backup-cert-tool" \
         timeout --signal=KILL 60 bash "$ROOT_DIR/scripts/backup-server-admin.sh" >"$2" 2>&1
   }
-  run_parser_manager "$(printf '1\n\n\n%s\nn\n\n0\n' "$PARSER_PORT")"$'\n' \
+  run_parser_manager "$(printf '1\n\n\n%s\nn\n\n\n0\n' "$PARSER_PORT")"$'\n' \
     "$TEST_ROOT/parser-init.log"
   if [ -f "$PARSER_ROOT/server.conf" ]; then
     sed -i 's/^port = .*/port = 1/; s|^data_root = .*|data_root = /invalid-first-root|; s|^database = .*|database = /invalid-first-db|; s|^pid_file = .*|pid_file = /invalid-first-pid|' "$PARSER_ROOT/server.conf"
