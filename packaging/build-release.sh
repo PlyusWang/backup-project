@@ -22,6 +22,9 @@
 # 本脚本**不创建 tag、不发布 Release**：版本号是参数，发布是人的决定。
 
 set -Eeuo pipefail
+# 发行文件对其他用户可读、目录可遍历，不继承调用者的私有 umask。
+# 身份材料由初始化工具另外设置 0600/0700，不在发行构建中生成。
+umask 022
 source "$(dirname "${BASH_SOURCE[0]}")/lib/common.sh"
 
 usage() { sed -n '2,26p' "$0"; }

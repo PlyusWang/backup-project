@@ -308,63 +308,14 @@ Item {
                     }
                 }
 
-                // 真实进度：数据全部来自 controller（共享核心的
-                // ArchiveProgress 回调）。ratio < 0 表示这一阶段没有可靠
-                // 总量——此时只显示活动状态，不画一个假的百分比。
-                ColumnLayout {
+                OperationProgress {
+                    namePrefix: "backup"
                     Layout.fillWidth: true
                     Layout.preferredWidth: 320
-                    visible: controller.busy
-                    spacing: 4
-
-                    Rectangle {
-                        id: progressTrack
-                        Layout.fillWidth: true
-                        Layout.preferredHeight: 6
-                        radius: 3
-                        color: theme.hover
-                        clip: true
-
-                        // 有总量：按真实字节比例填充。
-                        Rectangle {
-                            visible: controller.progressRatio >= 0
-                            width: progressTrack.width
-                                   * Math.max(0, controller.progressRatio)
-                            height: parent.height
-                            radius: 3
-                            color: theme.accent
-                        }
-
-                        // 没有总量：一条循环滑动的活动指示，只是“在跑”。
-                        Rectangle {
-                            visible: controller.progressRatio < 0
-                            width: progressTrack.width * 0.28
-                            height: parent.height
-                            radius: 3
-                            color: theme.accent
-
-                            NumberAnimation on x {
-                                running: controller.busy
-                                         && controller.progressRatio < 0
-                                loops: Animation.Infinite
-                                from: -progressTrack.width * 0.28
-                                to: progressTrack.width
-                                duration: 1150
-                                easing.type: Easing.InOutQuad
-                            }
-                        }
-                    }
-
-                    Text {
-                        objectName: "backupProgressText"
-                        Layout.fillWidth: true
-                        text: controller.progressText.length > 0
-                              ? controller.progressText
-                              : "正在处理…"
-                        font.pixelSize: 14
-                        color: theme.textSecondary
-                        elide: Text.ElideRight
-                    }
+                    busy: controller.busy
+                    value: controller.progressRatio
+                    statusText: controller.progressText.length > 0
+                                ? controller.progressText : controller.statusTitle
                 }
             }
 
@@ -379,46 +330,14 @@ Item {
                 message: controller.statusMessage
             }
 
-            // 云端快速备份的进度/结论直接来自 RemoteController；只有云端
-            // 目标显示，避免本地状态与远端状态混在一起。
-            ColumnLayout {
+            OperationProgress {
+                namePrefix: "quickCloud"
                 Layout.fillWidth: true
-                visible: page.backupTarget === "cloud" && remote.busy
-                spacing: 4
-
-                Rectangle {
-                    visible: remote.progressRatio >= 0
-                    Layout.fillWidth: true
-                    Layout.preferredHeight: 6
-                    radius: 3
-                    color: theme.hover
-                    clip: true
-
-                    Rectangle {
-                        width: parent.width * Math.max(0, remote.progressRatio)
-                        height: parent.height
-                        radius: 3
-                        color: theme.accent
-                        visible: remote.progressRatio >= 0
-                    }
-                }
-
-                BusyIndicator {
-                    objectName: "quickCloudBusyIndicator"
-                    visible: remote.progressRatio < 0
-                    running: visible
-                    Layout.preferredWidth: 20
-                    Layout.preferredHeight: 20
-                }
-
-                Text {
-                    objectName: "quickCloudProgressText"
-                    Layout.fillWidth: true
-                    text: remote.transferPhaseText + "  " + remote.progressText
-                    font.pixelSize: 14
-                    color: theme.textSecondary
-                    elide: Text.ElideRight
-                }
+                busy: page.backupTarget === "cloud" && remote.busy
+                value: remote.progressRatio
+                statusText: remote.transferActive
+                            ? remote.transferPhaseText + "  " + remote.progressText
+                            : remote.statusTitle
             }
 
             StatusBanner {
