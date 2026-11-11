@@ -16,6 +16,7 @@
     <file>qml/components/SegmentedTabs.qml</file>
     <file>qml/components/RemoteSnapshotCard.qml</file>
     <file>qml/components/NavItem.qml</file>
+    <file>qml/components/OperationProgress.qml</file>
     <file>qml/components/StatusBanner.qml</file>
     <file>qml/components/UserErrorDialog.qml</file>
     <file>qml/pages/HomePage.qml</file>

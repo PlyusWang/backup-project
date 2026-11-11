@@ -1,8 +1,9 @@
 # 发行打包（release packaging）
 
 本文说明发行制品是怎么做出来的、为什么这么选基线、以及哪些性质是**可核验**的。
-所有数字都来自实际构建的实测输出（发行目录 `dist/release/<版本>/`，由
-`.github/workflows/release.yml` 在基线容器里产出）。
+本文中的容器表格描述 `.github/workflows/release.yml` 的构建设计。某一候选包的
+实际构建系统、glibc 要求和运行验证范围，以该包的 `RELEASE-INFO.txt`、ELF
+检查及对应测试日志为准，不能从 CI 配置推定本次候选已通过。
 
 **正式发行**：`v0.1.0`（2026-10-08，GitHub Releases）。
 
@@ -19,7 +20,9 @@
 
 开发机是 Ubuntu 24.04（glibc 2.39），而生产 ECS 是 Ubuntu 22.04（glibc 2.35）。
 本项目真实踩过一次：拿开发机构建的服务端二进制直接拷到 ECS，启动时报
-`GLIBC_2.38 not found`。所以发行制品只在**旧基线的干净容器**里构建。
+`GLIBC_2.38 not found`。因此，需要兼容旧系统的发行制品应在相应旧基线构建，
+再验证实际运行。下面是仓库 CI 的基线设计；本轮本地验收环境为 Ubuntu 24.04 /
+glibc 2.39，不能据下表把本轮候选称为已在旧基线构建。
 
 | 产品 | 构建基线 | 理由 |
 |---|---|---|
@@ -42,9 +45,10 @@ GUI 会直接报 `FolderDialog is not a type`。
 **结论**：客户端**构建**基线取 **Debian 12（Qt 6.4.2 / glibc 2.36）** ——
 Ubuntu 22.04 不能当构建机（它的 Qt 6.2.4 缺 FolderDialog）。
 
-但**运行时**是另一回事：发行包自带 Qt 6.4.2 与它的依赖（包括 ICU 72），
-所以在 Ubuntu 22.04 上跑得起来。CI 里有一个作业在干净的 ubuntu:22.04 容器里
-实测：AppImage 启动正常、.deb 装得上、GUI 起得来、QML 告警 0。
+CI 为上述 Debian 12 构建结果配置了 Ubuntu 22.04 运行检查；这与本轮在
+Ubuntu 24.04 / glibc 2.39 上构建和实测的候选不同。随包携带 Qt 及 ICU 不会消除
+主程序的 glibc 要求；本轮没有对应 22.04 运行证据，不承诺该系统兼容性。
+历史版本如有 22.04 实测，仍只适用于其原提交、制品摘要和日志。
 
 （本轮早些时候这里写过“22.04 不支持”，那是把 libicu*.so.72 当成系统依赖了 ——
 它其实在 AppImage 里。同一轮修掉的另一个问题是 .deb 的 Depends：dpkg-shlibdeps
@@ -75,6 +79,8 @@ BUILD-INFO 时间戳走 `SOURCE_DATE_EPOCH`、服务端 staging 补上管理员�
 
 * `SOURCE_DATE_EPOCH` = commit 时间（默认自动取，可显式覆盖）；
 * `TZ=UTC`、`LC_ALL=C`；
+* 在创建发行目录和元数据前显式设置 `umask 022`，不继承调用者的 `077`；
+  实例初始化仍由自己的私有权限规则生成 0600 密钥和 0700 私有目录；
 * tar：`--sort=name --owner=0 --group=0 --numeric-owner --mtime=@epoch`；
 * deb：`dpkg-deb --root-owner-group`，全部文件 mtime 固定为 epoch，md5sums 排序生成；
 * AppImage：AppDir 内所有文件 mtime 固定，`VERSION`/`ARCH` 固定。
@@ -111,12 +117,26 @@ client=debian:12），再做干净机器安装验收（debian:12 容器 + Ubuntu
 `workflow_dispatch`（人工，带版本号）与 `push` 到开发分支（开发期用）；
 `tag v*` 的触发只是设计保留，**本轮没有创建任何 tag**。
 
+ELF 报告必须保留 `readelf` / `ldd` 的非零返回与诊断；没有 `not found` 不能说明
+依赖检查成功。无解释器和 NEEDED 的合法静态对象单独分类。发行入口权限与此项
+检查的工具回归可独立运行，不构建或启动产品：
+
+```sh
+python3 tests/integration/test_release_permissions.py
+python3 tests/integration/test_release_elf_report.py
+```
+
+前者使用实际发行初始化及 tar/deb 辅助函数，核对继承 077/022 时的原始成员权限；
+后者包含截断 ELF、工具失败/警告、空依赖结果和缺库等正负对照。它们不替代最终
+五件制品的原始权限、逐 ELF、安装、GUI 和网络验证。
+
 ## 8. 已知限制
 
 * 架构只有 x86_64；没有 ARM64、没有 Windows、没有 macOS（未构建、未验证，因此
   不声称支持）；
-* Ubuntu 22.04 只能作为客户端**运行**环境（已验证），不能作为**构建**基线
-  （Qt 6.2.4 缺 FolderDialog，见第 2 节）；
+* Ubuntu 22.04 的系统 Qt 6.2.4 缺少 FolderDialog，不适合直接作为当前 GUI 的
+  构建基线。本轮候选实际验证环境为 Ubuntu 24.04 / glibc 2.39；22.04 运行兼容性
+  未经本轮验证，不能继承其他版本或 CI 配置的结论（见第 2 节）；
 * 上游仓库**没有 LICENSE 文件**：发行包的 `copyright` 如实记录这一点，不替权利人
   补许可证；正式对外发布前应由权利人决定许可证；
 * 桌面集成是最小的：仓库没有正式图标资源，所以 `.desktop` 里不放 `Icon=`；
