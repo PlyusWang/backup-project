@@ -135,6 +135,10 @@ struct SnapshotIdentity {
   std::string strategy_identity;
   // 加密快照的 BPIDENT3 元数据认证标签；旧副文件为空。
   std::string metadata_hmac;
+  // 用于恢复时区分兼容的缺失身份文件和已经存在但损坏的身份文件。
+  bool identity_sidecar_present = false;
+  bool identity_sidecar_parseable = false;
+  std::uint64_t identity_sidecar_version = 0;
 
   // delta 才有：父文件名、父身份、父 manifest 摘要、generation。
   std::string parent_file_name;
@@ -183,6 +187,13 @@ bool LoadVerifiedSnapshotIdentity(const std::string& repository_directory,
                                   const std::string& snapshot_file_name,
                                   SnapshotIdentity* identity,
                                   std::vector<ManifestEntry>* manifest_entries,
+                                  std::string* error_message);
+
+// 验证身份副文件的元数据认证标签。基线选择要求标签存在；恢复时允许旧
+// BPIDENT2 缺少标签，但只要存在 BPIDENT3 标签就必须验证通过。
+bool AuthenticateSnapshotMetadata(const SnapshotIdentity& identity,
+                                  const std::string& password,
+                                  bool require_metadata_hmac,
                                   std::string* error_message);
 
 // 在仓库里找"当前可以当作基线的快照"：按 Catalog 的归档时间倒序找第一份

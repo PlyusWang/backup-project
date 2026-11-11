@@ -920,6 +920,13 @@ bool LoadVerifiedSnapshotIdentity(const std::string& repository_directory,
     identity->manifest_digest = identity->envelope.current_manifest_digest;
   }
 
+  const std::string identity_path = JoinPath(
+      repository_directory, SnapshotIdentityFileName(snapshot_file_name));
+  struct stat identity_info;
+  const int identity_stat = ::lstat(identity_path.c_str(), &identity_info);
+  identity->identity_sidecar_present =
+      identity_stat == 0 || errno != ENOENT;
+
   // ---- manifest 副文件 ----
   std::vector<ManifestEntry> entries;
   ManifestBinding binding;
@@ -946,6 +953,8 @@ bool LoadVerifiedSnapshotIdentity(const std::string& repository_directory,
     identity->sidecar_diagnostic = identity_error;
     return true;
   }
+  identity->identity_sidecar_parseable = true;
+  identity->identity_sidecar_version = record.version;
   if (record.version != kIdentityVersion2 && record.version != 3) {
     identity->sidecar_diagnostic =
         "the identity sidecar is an old version without a snapshot binding";
@@ -982,6 +991,42 @@ bool LoadVerifiedSnapshotIdentity(const std::string& repository_directory,
   identity->manifest_digest = actual_manifest_digest;
   identity->sidecars_verified = true;
   if (manifest_entries != nullptr) *manifest_entries = std::move(entries);
+  return true;
+}
+
+bool AuthenticateSnapshotMetadata(const SnapshotIdentity& identity,
+                                  const std::string& password,
+                                  bool require_metadata_hmac,
+                                  std::string* error_message) {
+  if (!identity.sidecars_verified) {
+    if (require_metadata_hmac ||
+        (identity.identity_sidecar_present &&
+         !identity.identity_sidecar_parseable)) {
+      SetError(error_message,
+               "The snapshot does not have a verified identity sidecar");
+      return false;
+    }
+    return true;
+  }
+  if (identity.metadata_hmac.empty()) {
+    if (require_metadata_hmac) {
+      SetError(error_message,
+               "The encrypted snapshot identity has no metadata HMAC");
+      return false;
+    }
+    return true;
+  }
+  std::string tag;
+  if (!SnapshotMetadataTag(
+          identity.archive_path, identity.snapshot_file_name,
+          identity.snapshot_id, identity.manifest_digest,
+          identity.source_identity, identity.filter_identity,
+          identity.strategy_identity, password, &tag, error_message) ||
+      !crypto::ConstantTimeEquals(tag, identity.metadata_hmac)) {
+    SetError(error_message,
+             "The snapshot identity metadata authentication failed");
+    return false;
+  }
   return true;
 }
 
@@ -1105,19 +1150,12 @@ bool CheckIncrementalBaseline(const std::string& repository,
                     error.empty() ? ancestor.sidecar_diagnostic : error);
     }
     if (!compatible(ancestor)) return false;
-    if (options.encryption_method != EncryptionMethod::kNone) {
-      std::string tag;
-      if (ancestor.metadata_hmac.empty() ||
-          !SnapshotMetadataTag(
-              ancestor.archive_path, name, ancestor.snapshot_id,
-              ancestor.manifest_digest, ancestor.source_identity,
-              ancestor.filter_identity, ancestor.strategy_identity,
-              options.password, &tag, &error) ||
-          !crypto::ConstantTimeEquals(tag, ancestor.metadata_hmac)) {
-        return reject(BaselineAvailability::kAuthenticationFailed,
-                      "the current password cannot authenticate the baseline "
-                      "metadata or an ancestor");
-      }
+    if (options.encryption_method != EncryptionMethod::kNone &&
+        !AuthenticateSnapshotMetadata(ancestor, options.password, true,
+                                       &error)) {
+      return reject(BaselineAvailability::kAuthenticationFailed,
+                    "the current password cannot authenticate the baseline "
+                    "metadata or an ancestor");
     }
     if (cancelled && cancelled())
       return reject(BaselineAvailability::kInvalidSnapshot,

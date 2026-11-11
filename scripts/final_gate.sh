@@ -158,6 +158,7 @@ run same-instance-truth bash scripts/same_instance_truth_test.sh
 run server-admin bash scripts/server_admin_test.sh
 run server-manager-initialization bash scripts/server_manager_initialization_test.sh
 run incremental-baseline bash scripts/incremental_baseline_test.sh
+run incremental-encryption bash scripts/incremental_encryption_test.sh
 # 原始归档的"单独恢复"（QML -> RemoteController -> RunRemoteRawRestore ->
 # 既有本地恢复核心）：RAW-R01..RAW-R05 五条由 --remote-test 里的真服务端走一遍，
 # 本脚本只断言那些条目真的跑了并且全部通过。
