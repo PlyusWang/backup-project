@@ -53,6 +53,7 @@ else
     scripts/package_maintainer_test.sh
     scripts/client_desktop_integration_test.sh
     scripts/incremental_baseline_test.sh
+    scripts/incremental_encryption_test.sh
     scripts/server_manager_initialization_test.sh
     scripts/deb_rootfs_lifecycle_test.sh
     packaging/ecs/verify-ecs-deployment.sh

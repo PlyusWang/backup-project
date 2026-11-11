@@ -134,6 +134,39 @@ bool StandardTarLists(const std::string& path) {
          WEXITSTATUS(status) == 0;
 }
 
+bool TamperIdentityMetadataTag(const std::string& path) {
+  std::string identity;
+  if (!test_support::ReadFile(path, &identity)) return false;
+  const std::string key = "metadata_hmac=";
+  const std::size_t tag = identity.find(key);
+  if (tag == std::string::npos) return false;
+  const std::size_t value = tag + key.size();
+  if (value >= identity.size() || identity[value] == '\n') return false;
+  identity[value] = identity[value] == 'a' ? 'b' : 'a';
+  return test_support::WriteFile(path, identity, 0600);
+}
+
+bool RemoveIdentityMetadataTag(std::string* identity) {
+  const std::size_t tag = identity->find("metadata_hmac=");
+  if (tag == std::string::npos) return false;
+  const std::size_t end = identity->find('\n', tag);
+  if (end == std::string::npos) return false;
+  identity->erase(tag, end - tag + 1);
+  return true;
+}
+
+bool ConvertIdentityV3ToV2(const std::string& path) {
+  std::string identity;
+  if (!test_support::ReadFile(path, &identity) ||
+      identity.compare(0, 9, "BPIDENT3\n") != 0 ||
+      !RemoveIdentityMetadataTag(&identity)) {
+    return false;
+  }
+  identity.replace(0, std::string("BPIDENT3\nversion=3\n").size(),
+                   "BPIDENT2\nversion=2\n");
+  return test_support::WriteFile(path, identity, 0600);
+}
+
 void TestPackChain(
     bp::PackMethod pack, bp::EncryptionMethod encryption,
     const std::string& pack_name, const std::string& encryption_name,
@@ -238,6 +271,116 @@ void TestPackChain(
                                nullptr, &error) &&
           SamePackChainContents(source, restored),
       label + " R2 restores D2 content and per-file SHA-256", error);
+  if (pack == bp::PackMethod::kMyPack &&
+      compression == bp::CompressionMethod::kZstd &&
+      encryption == bp::EncryptionMethod::kAes256CtrHmacSha256) {
+    for (const std::string name : {"base.bak", "delta1.bak", "delta2.bak"}) {
+      const std::string identity_path =
+          repository + "/" + name + ".identity";
+      std::string original_identity;
+      const bool saved =
+          test_support::ReadFile(identity_path, &original_identity);
+      const bool tampered = saved && TamperIdentityMetadataTag(identity_path);
+      const std::string rejected = work + "/tampered-" + name;
+      error.clear();
+      const bool restore_rejected =
+          !bp::RestoreSnapshotChain(repository, "delta2.bak", rejected,
+                                    restore, nullptr, &error) &&
+          !test_support::Exists(rejected);
+      test_support::Check(tampered && restore_rejected,
+                          label + " restore rejects tampered " + name +
+                              " identity before publishing output",
+                          error);
+      test_support::Check(
+          saved && test_support::WriteFile(identity_path, original_identity,
+                                           0600),
+          label + " restores original " + name + " identity fixture");
+    }
+
+    std::string base_identity;
+    const std::string base_identity_path = repository + "/base.bak.identity";
+    test_support::ReadFile(base_identity_path, &base_identity);
+    const std::string malformed_identity_path =
+        work + "/malformed-base-identity";
+    std::string malformed_identity = base_identity;
+    const bool malformed_written =
+        RemoveIdentityMetadataTag(&malformed_identity) &&
+        test_support::WriteFile(base_identity_path, malformed_identity, 0600);
+    error.clear();
+    const bool malformed_rejected =
+        malformed_written &&
+        !bp::RestoreSnapshotChain(repository, "base.bak",
+                                  malformed_identity_path, restore, nullptr,
+                                  &error) &&
+        !test_support::Exists(malformed_identity_path);
+    test_support::Check(malformed_rejected,
+                        label + " restore rejects malformed BPIDENT3 before "
+                                "publishing output",
+                        error);
+    test_support::Check(
+        test_support::WriteFile(base_identity_path, base_identity, 0600),
+        label + " restores BPIDENT3 fixture after malformed-field test");
+
+    const std::string no_base_identity = work + "/base-identity.saved";
+    const bool moved_base_identity =
+        ::rename(base_identity_path.c_str(), no_base_identity.c_str()) == 0;
+    const std::string legacy_full_restore = work + "/missing-identity-full";
+    error.clear();
+    const bool full_without_identity =
+        moved_base_identity &&
+        bp::RestoreSnapshotChain(repository, "base.bak", legacy_full_restore,
+                                 restore, nullptr, &error);
+    const bool base_identity_restored =
+        !moved_base_identity ||
+        ::rename(no_base_identity.c_str(), base_identity_path.c_str()) == 0;
+    std::string base_small;
+    test_support::Check(
+        full_without_identity && base_identity_restored &&
+            test_support::ReadFile(legacy_full_restore + "/small.txt",
+                                   &base_small) &&
+            base_small == "F0",
+        label + " standalone full restore retains missing-identity "
+                "compatibility",
+        error);
+
+    const std::string delta2_identity = repository + "/delta2.bak.identity";
+    const std::string no_delta2_identity = work + "/delta2-identity.saved";
+    const bool moved_delta2_identity =
+        ::rename(delta2_identity.c_str(), no_delta2_identity.c_str()) == 0;
+    const std::string missing_target_identity_restore =
+        work + "/missing-target-identity";
+    error.clear();
+    const bool target_delta_without_identity =
+        moved_delta2_identity &&
+        bp::RestoreSnapshotChain(repository, "delta2.bak",
+                                 missing_target_identity_restore, restore,
+                                 nullptr, &error) &&
+        SamePackChainContents(source, missing_target_identity_restore);
+    const bool delta2_identity_restored =
+        !moved_delta2_identity ||
+        ::rename(no_delta2_identity.c_str(), delta2_identity.c_str()) == 0;
+    test_support::Check(
+        target_delta_without_identity && delta2_identity_restored,
+        label + " target delta without identity retains existing restore "
+                "behavior",
+        error);
+
+    test_support::Check(
+        ConvertIdentityV3ToV2(base_identity_path),
+        label + " converts an encrypted full snapshot fixture to BPIDENT2");
+    const std::string legacy_v2_restore = work + "/legacy-v2-full";
+    error.clear();
+    const bool restored_legacy_v2 =
+        bp::RestoreSnapshotChain(repository, "base.bak", legacy_v2_restore,
+                                 restore, nullptr, &error);
+    std::string legacy_small;
+    test_support::Check(
+        restored_legacy_v2 &&
+            test_support::ReadFile(legacy_v2_restore + "/small.txt",
+                                   &legacy_small) &&
+            legacy_small == "F0",
+        label + " encrypted BPIDENT2 full snapshot remains restorable", error);
+  }
   if (encryption != bp::EncryptionMethod::kNone) {
     bp::RestoreOptions wrong_password;
     wrong_password.password = "incorrect password";
@@ -510,7 +653,15 @@ int main(int argc, char** argv) {
     if (!restored) std::fprintf(stderr, "restore failed: %s\n", error.c_str());
     return restored ? 0 : 1;
   }
+  const bool restore_auth_only =
+      argc == 2 && std::string(argv[1]) == "--restore-auth-only";
   const bool zstd_only = argc == 2 && std::string(argv[1]) == "--zstd";
+  if (restore_auth_only) {
+    TestPackChain(bp::PackMethod::kMyPack,
+                  bp::EncryptionMethod::kAes256CtrHmacSha256,
+                  "mypack", "aes", bp::CompressionMethod::kZstd);
+    return test_support::Finish("incremental_encryption_test");
+  }
   if (!zstd_only) {
     TestRoundTrip(bp::EncryptionMethod::kNone, "none");
     TestRoundTrip(bp::EncryptionMethod::kAes256CtrHmacSha256, "aes");

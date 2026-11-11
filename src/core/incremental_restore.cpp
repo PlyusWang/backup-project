@@ -1242,6 +1242,29 @@ bool RestoreSnapshotChain(const std::string& repository_directory,
                             error_message)) {
     return false;
   }
+  for (const std::string& name : chain.file_names) {
+    SnapshotIdentity identity;
+    std::string identity_error;
+    if (!LoadVerifiedSnapshotIdentity(repository_directory, name, &identity,
+                                      nullptr, &identity_error)) {
+      SetError(error_message, identity_error.empty()
+                                  ? "Cannot inspect snapshot identity: " + name
+                                  : identity_error);
+      return false;
+    }
+    if (!identity.identity_sidecar_present) continue;
+    if (!identity.identity_sidecar_parseable || !identity.sidecars_verified) {
+      SetError(error_message,
+               "Snapshot '" + name +
+                   "' has an invalid or unbound identity sidecar: " +
+                   identity.sidecar_diagnostic);
+      return false;
+    }
+    if (!AuthenticateSnapshotMetadata(identity, options.password, false,
+                                      error_message)) {
+      return false;
+    }
+  }
   if (!AuthenticateSnapshotChain(chain, options, error_message)) return false;
   // 规范化必须在**任何**路径构造与预检之前做，理由见 NormalizeDestination。
   const std::string destination = NormalizeDestination(destination_directory);
