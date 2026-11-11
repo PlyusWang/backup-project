@@ -14,6 +14,9 @@
 #include <QFileInfo>
 #include <QGuiApplication>
 #include <QHoverEvent>
+#include <QJsonDocument>
+#include <QJsonObject>
+#include <QJsonParseError>
 #include <QKeyEvent>
 #include <QMap>
 #include <QMetaObject>
@@ -8834,17 +8837,49 @@ int RunRemoteTest(QQuickWindow* window, backup_modern::RemoteController* remote,
   const QString password =
       QStringLiteral("gui-secret-%1")
           .arg(QRandomGenerator::global()->bounded(100000, 999999));
-  // 状态目录的"上锁前快照"：登录之后这里必须一个字节都没变——token 与
-  // 口令都只在内存里。
+  // 先通过直连设置入口保存本轮真实端点，再检查登录是否写入秘密。
+  // 地址改变会合法更新公开 profile，不能把这次设置写入误判为会话落盘。
+  run.Check(remote->connectionMode() == QStringLiteral("direct") &&
+                remote->ensureConnection(host, port_text) && !remote->busy() &&
+                !remote->authenticated() && remote->host() == host &&
+                remote->portText() == port_text,
+            QStringLiteral("REMOTE-11 登录前已保存真实端点且未建立会话"));
   const QString state_directory = QFileInfo(config_file_path).absolutePath();
-  // 三个隔离配置文件必须落在同一个状态目录里：下面那两条"逐字节未变"的
-  // 断言才有意义。
   run.Check(QFileInfo(schedule_file_path).absolutePath() == state_directory &&
                 QFileInfo(realtime_file_path).absolutePath() == state_directory,
             QStringLiteral("REMOTE-11 三个隔离配置文件在同一个状态目录里"),
             state_directory);
-  // 状态目录快照：注册 / 登录 / 备份 / 下载几段结束之后都要与它比对，证明会话与
-  // 口令只活在内存里。
+  const QString profile_path =
+      config_file_path + QStringLiteral(".remote.json");
+  const QJsonObject expected_public_profile{
+      {QStringLiteral("version"), 1},
+      {QStringLiteral("connection_mode"), remote->connectionMode()},
+      {QStringLiteral("auth_mode"), remote->authMode()},
+      {QStringLiteral("host"), host},
+      {QStringLiteral("port"), port_text.toInt()},
+      {QStringLiteral("server_key_pin"), remote->serverKeyPin()},
+      {QStringLiteral("trusted_roots_file"), remote->trustedRootsFile()},
+      {QStringLiteral("expected_server_id"), remote->expectedServerId()},
+      {QStringLiteral("ssh_host"), remote->sshHost()},
+      {QStringLiteral("ssh_local_port"), remote->sshLocalPort().toInt()}};
+  const auto publicProfileMatches = [&profile_path,
+                                     &expected_public_profile]() {
+    QFile profile(profile_path);
+    if (!profile.open(QIODevice::ReadOnly)) return false;
+    QJsonParseError error;
+    const QJsonDocument json =
+        QJsonDocument::fromJson(profile.readAll(), &error);
+    struct stat metadata {};
+    return error.error == QJsonParseError::NoError && json.isObject() &&
+           json.object() == expected_public_profile &&
+           ::lstat(QFile::encodeName(profile_path).constData(), &metadata) ==
+               0 &&
+           S_ISREG(metadata.st_mode) && (metadata.st_mode & 0777) == 0600;
+  };
+  run.Check(publicProfileMatches(),
+            QStringLiteral("REMOTE-11 公开连接文件只含预期白名单且权限为0600"));
+  // 完整目录仍逐字节比较，公开 profile 也不排除；用户名、密码和 token
+  // 均不能进入此基线之后的磁盘变化。
   const QMap<QString, QByteArray> state_before =
       snapshotDirectory(state_directory);
 
@@ -8899,8 +8934,9 @@ int RunRemoteTest(QQuickWindow* window, backup_modern::RemoteController* remote,
           remote->statusScope() == QStringLiteral("remote"),
       QStringLiteral("REMOTE-05 传输结束后状态条回到 remote 页自己的 scope"),
       remote->statusKind() + QStringLiteral("/") + remote->statusScope());
-  run.Check(snapshotDirectory(state_directory) == state_before,
-            QStringLiteral("REMOTE-11 注册与登录没有在状态目录里写任何东西"),
+  run.Check(snapshotDirectory(state_directory) == state_before &&
+                publicProfileMatches(),
+            QStringLiteral("REMOTE-11 注册与登录未改变状态目录或公开连接文件"),
             QStringLiteral("之前 %1 个文件，之后 %2 个文件")
                 .arg(state_before.size())
                 .arg(snapshotDirectory(state_directory).size()));
