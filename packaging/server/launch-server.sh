@@ -140,6 +140,7 @@ case "$BIND" in
 esac
 PUBLIC_BIND=0
 if [ "$LOOPBACK" -eq 0 ]; then
+  [ "$ALLOW_PUBLIC" = "true" ] || cfg_error "bind=$BIND 是非回环地址：必须显式设置 allow_public_bind = true"
   PUBLIC_BIND=1
   [ -n "$CERTIFICATE" ] || cfg_error "bind=$BIND 是非回环地址：必须同时配置 certificate（BPSEC2 签名身份），产品自身也会拒绝启动"
   [ -n "$PUBLIC_REASON" ] || cfg_error "bind=$BIND 需要 public_bind_reason（会写进启动日志与事后审计）"
