@@ -924,8 +924,7 @@ bool LoadVerifiedSnapshotIdentity(const std::string& repository_directory,
       repository_directory, SnapshotIdentityFileName(snapshot_file_name));
   struct stat identity_info;
   const int identity_stat = ::lstat(identity_path.c_str(), &identity_info);
-  identity->identity_sidecar_present =
-      identity_stat == 0 || errno != ENOENT;
+  identity->identity_sidecar_present = identity_stat == 0 || errno != ENOENT;
 
   // ---- manifest 副文件 ----
   std::vector<ManifestEntry> entries;
@@ -999,9 +998,8 @@ bool AuthenticateSnapshotMetadata(const SnapshotIdentity& identity,
                                   bool require_metadata_hmac,
                                   std::string* error_message) {
   if (!identity.sidecars_verified) {
-    if (require_metadata_hmac ||
-        (identity.identity_sidecar_present &&
-         !identity.identity_sidecar_parseable)) {
+    if (require_metadata_hmac || (identity.identity_sidecar_present &&
+                                  !identity.identity_sidecar_parseable)) {
       SetError(error_message,
                "The snapshot does not have a verified identity sidecar");
       return false;
@@ -1017,11 +1015,11 @@ bool AuthenticateSnapshotMetadata(const SnapshotIdentity& identity,
     return true;
   }
   std::string tag;
-  if (!SnapshotMetadataTag(
-          identity.archive_path, identity.snapshot_file_name,
-          identity.snapshot_id, identity.manifest_digest,
-          identity.source_identity, identity.filter_identity,
-          identity.strategy_identity, password, &tag, error_message) ||
+  if (!SnapshotMetadataTag(identity.archive_path, identity.snapshot_file_name,
+                           identity.snapshot_id, identity.manifest_digest,
+                           identity.source_identity, identity.filter_identity,
+                           identity.strategy_identity, password, &tag,
+                           error_message) ||
       !crypto::ConstantTimeEquals(tag, identity.metadata_hmac)) {
     SetError(error_message,
              "The snapshot identity metadata authentication failed");
@@ -1152,7 +1150,7 @@ bool CheckIncrementalBaseline(const std::string& repository,
     if (!compatible(ancestor)) return false;
     if (options.encryption_method != EncryptionMethod::kNone &&
         !AuthenticateSnapshotMetadata(ancestor, options.password, true,
-                                       &error)) {
+                                      &error)) {
       return reject(BaselineAvailability::kAuthenticationFailed,
                     "the current password cannot authenticate the baseline "
                     "metadata or an ancestor");
