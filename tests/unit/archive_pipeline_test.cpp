@@ -1,6 +1,6 @@
 // archive_pipeline_test.cpp
 //
-// 归档流水线的专项测试：27 组合矩阵、metadata、特殊文件、socket 语义、
+// 归档流水线的专项测试：36 组合矩阵、metadata、特殊文件、socket 语义、
 // Filter 与扫描层的衔接。
 //
 // 全部结论都来自真实执行：backup 出来的 .bak 会被真的 restore 到一个临时目录，
@@ -16,6 +16,7 @@
 
 #include <cstdint>
 #include <cstdio>
+#include <iterator>
 #include <string>
 #include <vector>
 
@@ -60,6 +61,8 @@ const char* CompressionLabel(CompressionMethod method) {
       return "Huffman";
     case CompressionMethod::kLzssHuffman:
       return "LZSS-Huffman";
+    case CompressionMethod::kZstd:
+      return "Zstandard";
   }
   return "?";
 }
@@ -78,7 +81,7 @@ const char* EncryptionLabel(EncryptionMethod method) {
 
 const char* Password() { return "correct horse battery staple"; }
 
-// 一棵"普通目录树"：矩阵的 27 个组合都用它。
+// 一棵"普通目录树"：矩阵的全部组合都用它。
 void BuildRegularTree(const std::string& root) {
   test_support::Mkdir(root, 0755);
   test_support::WriteFile(root + "/hello.txt", "hello world\n", 0644);
@@ -141,17 +144,21 @@ struct MatrixRow {
   std::string wrong_password;
 };
 
-// 27 组合矩阵：每个组合都真的 backup → restore → 比较。
-void RunMatrix(const std::string& workdir, std::vector<MatrixRow>* rows) {
+// 每个组合都真的 backup → restore → 比较；预期数量由同一组选项表推导。
+std::size_t RunMatrix(const std::string& workdir,
+                      std::vector<MatrixRow>* rows) {
   const PackMethod packs[3] = {PackMethod::kMyPack, PackMethod::kUstar,
                                PackMethod::kFastUstar};
-  const CompressionMethod compressions[3] = {CompressionMethod::kNone,
-                                             CompressionMethod::kHuffman,
-                                             CompressionMethod::kLzssHuffman};
+  const CompressionMethod compressions[4] = {
+      CompressionMethod::kNone, CompressionMethod::kHuffman,
+      CompressionMethod::kLzssHuffman, CompressionMethod::kZstd};
   const EncryptionMethod encryptions[3] = {
       EncryptionMethod::kNone, EncryptionMethod::kDesCbcHmacSha256,
       EncryptionMethod::kAes256CtrHmacSha256};
 
+  const std::size_t expected =
+      std::size(packs) * std::size(compressions) * std::size(encryptions);
+  test_support::Section(std::to_string(expected) + "-combination matrix");
   const std::string source = workdir + "/source";
   BuildRegularTree(source);
 
@@ -252,6 +259,7 @@ void RunMatrix(const std::string& workdir, std::vector<MatrixRow>* rows) {
       }
     }
   }
+  return expected;
 }
 
 void PrintMatrix(const std::vector<MatrixRow>& rows) {
@@ -1168,8 +1176,7 @@ int main() {
   const std::string workdir = test_support::FreshDir("pipeline");
 
   std::vector<MatrixRow> rows;
-  test_support::Section("27-combination matrix");
-  RunMatrix(workdir, &rows);
+  const std::size_t expected = RunMatrix(workdir, &rows);
   PrintMatrix(rows);
   std::size_t passed = 0;
   for (const MatrixRow& row : rows) {
@@ -1178,8 +1185,10 @@ int main() {
     }
   }
   std::printf("\nMATRIX_TOTAL\t%zu/%zu\n", passed, rows.size());
-  test_support::Check(rows.size() == 27 && passed == 27,
-                      "27/27 matrix combinations pass");
+  test_support::Check(rows.size() == expected && passed == expected,
+                      std::to_string(expected) + "/" +
+                          std::to_string(expected) +
+                          " matrix combinations pass");
 
   RunMetadata(workdir);
   RunSpecialFiles(workdir, PackMethod::kMyPack);

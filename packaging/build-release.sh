@@ -209,8 +209,9 @@ build_appdir() {
   install -m 0644 packaging/client/AppImage.desktop "$appdir/usr/share/applications/backup-project.desktop"
   install -m 0644 resources/security/official-root-ed25519.pub "$appdir/usr/share/backup-project/"
   local doc
-  for doc in docs/client-quick-start.md docs/release-layout.md docs/secure_transport.md docs/install-client.md; do
-    [ -f "$doc" ] && install -m 0644 "$doc" "$appdir/usr/share/doc/backup-project/"
+  for doc in docs/client-quick-start.md docs/release-layout.md docs/secure_transport.md docs/install-client.md docs/ZSTANDARD_FORMAT.md; do
+    [ -s "$doc" ] || die "客户端必需文档缺失或为空：$doc"
+    install -m 0644 "$doc" "$appdir/usr/share/doc/backup-project/" || die "复制客户端文档失败：$doc"
   done
   write_build_info "$appdir/usr/share/backup-project" "client-appdir"
   printf '%s\n' "$VERSION" > "$appdir/usr/share/backup-project/VERSION"
@@ -323,8 +324,9 @@ pack_client_tarball() {
   install -m 0644 "$appdir/backup-project.png" "$tree/share/icons/hicolor/256x256/apps/backup-project.png"
   printf '%s\n' "$VERSION" > "$tree/share/backup-project/VERSION"
   local doc
-  for doc in docs/client-quick-start.md docs/release-layout.md docs/secure_transport.md docs/install-client.md docs/release-packaging.md; do
-    [ -f "$doc" ] && install -m 0644 "$doc" "$tree/docs/"
+  for doc in docs/client-quick-start.md docs/release-layout.md docs/secure_transport.md docs/install-client.md docs/release-packaging.md docs/ZSTANDARD_FORMAT.md; do
+    [ -s "$doc" ] || die "客户端必需文档缺失或为空：$doc"
+    install -m 0644 "$doc" "$tree/docs/" || die "复制客户端文档失败：$doc"
   done
   install -m 0755 packaging/portable/install-client.sh "$tree/install.sh"
   install -m 0755 packaging/portable/uninstall-client.sh "$tree/uninstall.sh"
@@ -361,8 +363,9 @@ pack_client_deb() {
   install -m 0644 resources/security/official-root-ed25519.pub "$tree/usr/lib/backup-project-client/share/backup-project/"
   printf '%s\n' "$VERSION" > "$tree/usr/lib/backup-project-client/share/backup-project/VERSION"
   local doc
-  for doc in docs/client-quick-start.md docs/release-layout.md docs/secure_transport.md docs/install-client.md docs/release-packaging.md; do
-    [ -f "$doc" ] && install -m 0644 "$doc" "$tree/usr/share/doc/backup-project-client/"
+  for doc in docs/client-quick-start.md docs/release-layout.md docs/secure_transport.md docs/install-client.md docs/release-packaging.md docs/ZSTANDARD_FORMAT.md; do
+    [ -s "$doc" ] || die "客户端必需文档缺失或为空：$doc"
+    install -m 0644 "$doc" "$tree/usr/share/doc/backup-project-client/" || die "复制客户端文档失败：$doc"
   done
   # 对象根是随包对象目录本身：lib/ plugins/ qml/ 里的共享对象都要清点。
   bash packaging/licenses/build-materials.sh "$tree/usr/lib/backup-project-client" \

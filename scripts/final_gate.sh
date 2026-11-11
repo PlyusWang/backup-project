@@ -46,6 +46,48 @@ run() {
   echo "GATE $name exit=$code seconds=$((end - start))" | tee -a "$LOG"
 }
 
+# The independent standard tool is required; retain a fresh corpus and log for
+# every run. FINAL_GATE_ZSTD_OUTPUT may name a different, nonexistent directory.
+run_zstd_regression() {
+  local output="${FINAL_GATE_ZSTD_OUTPUT:-}" parent zstd_log status=0
+  if ! command -v zstd >/dev/null 2>&1; then
+    echo "zstd is required for independent interoperability checks; cannot skip." >&2
+    return 1
+  fi
+  if [ -z "$output" ]; then
+    parent="$(mktemp -d "${TMPDIR:-/tmp}/backup-zstd-gate.XXXXXX")" || return 1
+    output="$parent/regression"
+  fi
+  case "$output" in /*) ;; *) output="$PWD/$output" ;; esac
+  zstd_log="${output}.log"
+  if [ -e "$output" ] || [ -L "$output" ] || [ -e "$zstd_log" ] || [ -L "$zstd_log" ]; then
+    echo "Zstandard output or log already exists: $output / $zstd_log" >&2
+    return 1
+  fi
+  mkdir -p "$(dirname "$output")" || return 1
+  printf '[zstd] output=%s log=%s\n' "$output" "$zstd_log"
+  (set -o noclobber; make test-zstd ZSTD_TEST_OUTPUT="$output" >"$zstd_log" 2>&1) || status=$?
+  cat "$zstd_log" || return 1
+  return "$status"
+}
+
+# Run the real controls and automatic services serially in the isolated GUI.
+run_automation_ui() {
+  local output="${FINAL_GATE_AUTOMATION_OUTPUT:-}" parent
+  if [ -z "$output" ]; then
+    parent="$(mktemp -d "${TMPDIR:-/tmp}/backup-automation-gate.XXXXXX")" || return 1
+    output="$parent/evidence"
+  fi
+  case "$output" in /*) ;; *) output="$PWD/$output" ;; esac
+  if [ -e "$output" ] || [ -L "$output" ]; then
+    echo "Automation UI output already exists: $output" >&2
+    return 1
+  fi
+  mkdir -p "$(dirname "$output")" || return 1
+  printf '[automation-ui] output=%s\n' "$output"
+  bash scripts/isolated_gui_test.sh ./build/backup-gui-modern --automation-ui-test "$output"
+}
+
 run lint bash scripts/lint.sh
 run package-maintainer bash scripts/package_maintainer_test.sh
 run client-desktop-integration bash scripts/client_desktop_integration_test.sh
@@ -136,6 +178,7 @@ run unified-gui bash scripts/unified_gui_contract_test.sh
 run ux-acceptance bash scripts/isolated_gui_test.sh ./build/backup-gui-modern --ux-acceptance-test
 run combo-hover bash scripts/isolated_gui_test.sh ./build/backup-gui-modern --combo-hover-test
 run baseline-picker-ui bash scripts/isolated_gui_test.sh ./build/backup-gui-modern --baseline-picker-test
+run automation-ui run_automation_ui
 run remote-gui bash scripts/isolated_gui_test.sh ./build/backup-gui-modern --remote-test
 run gui_smoke bash scripts/gui_smoke_test.sh
 run workflow-acceptance bash scripts/workflow_acceptance_test.sh
@@ -145,6 +188,7 @@ run credential-ui bash scripts/credential_ui_test.sh
 run archive_pipeline bash scripts/archive_pipeline_test.sh
 run backup_catalog bash scripts/backup_catalog_test.sh
 run compression bash scripts/compression_test.sh
+run zstd-standard run_zstd_regression
 run config_manager bash scripts/config_manager_test.sh
 run crypto bash scripts/crypto_test.sh
 run file_io bash scripts/file_io_test.sh

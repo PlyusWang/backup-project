@@ -2,7 +2,7 @@
 
 > 文档编号：01
 > 文档名称：数据备份与恢复系统需求分析
-> 状态：与 `main` 对齐（PR #27 合并后，commit `6d1e2ba`）
+> 状态：按当前源码维护；压缩格式新增 Zstandard，历史测试结果保留其原始范围。
 > 分档口径：docs/00_project_baseline.md 第 9～13 节（MUST / SHOULD / STRETCH）
 > 阅读提示：本文的"已实现 / 部分实现 / 未实现"按当前源码判定；引用的测试编号全部来自 `scripts/` 下的真实脚本。
 
@@ -111,7 +111,7 @@
 | FR-110 | 备份前按规则筛选条目：11 个字段 `name` / `path` / `stem` / `ext` / `type` / `size` / `mtime` / `uid` / `gid` / `user` / `group`；`--include` / `--exclude` 可重复；一条规则内多个子句是 AND，规则之间是 OR；exclude 优先；命中 exclude 的目录整体剪枝 | 已实现 | `Filter::AddRule`（语法唯一裁决点）；CLI `--include` / `--exclude` / `--clear-filters`；GUI 规则编辑器（`FilterRuleBuilder`） | FIL-01～FIL-37、`filter_semantics_test.sh`、`legacy_filter_test.sh`、`filter_rule_builder_test.sh` |
 | FR-111 | 备份前只读预览：列出"这次备份会收哪些条目"，不需要仓库、不写任何状态 | 已实现 | `backupctl preview <源目录>`；GUI「备份」页的文件预览；`PreviewBackupSelection` | PRV-01～PRV-43、CLI 与 GUI 预览对比用例 |
 | FR-120 | 打包（把条目表写成归档） | 已实现 | `--pack mypack \| ustar \| fast-ustar`，默认 MyPack v2；`src/archive/`；Archive v0.1（`BKPARCH` version 1）保留为只读兼容 | ARC 区、`ustar_test.sh`、`archive_pipeline_test.sh` |
-| FR-121 | 压缩（对打包后的字节流） | 已实现 | `--compression none \| huffman \| lzss-huffman`；`HUF1`（Canonical Huffman）与 `LZH1`（LZSS 32 KiB 窗口、最短匹配 3、最长匹配 258，外层再 Huffman，码长上限 32） | `compression_test.sh`、NOCMP-01～NOCMP-04（证明 payload 未被压缩/编码） |
+| FR-121 | 压缩（对打包后的字节流） | 已实现 | `--compression none \| huffman \| zstd`；HUF1 与 RFC 8878 Zstandard 受限子集均手写；LZH1 的归档、CLI 键与既有配置保留兼容，GUI 只在加载旧配置时提供旧格式项。Zstd 范围见 `ZSTANDARD_FORMAT.md` | `compression_test.sh`、`make test-zstd`（独立标准工具互操作与畸形输入）、`archive_pipeline_test.sh`、NOCMP-01～NOCMP-04 |
 | FR-122 | 加密（对压缩后的字节流） | 已实现 | `--encryption none \| aes-256-ctr-hmac-sha256 \| des-cbc-hmac-sha256`；外层容器 `BKPCNT2`（160 字节 header，带 salt / IV / auth tag / payload SHA-256）；PBKDF2-HMAC-SHA256 200000 轮派生 64 字节再按算法切分密钥；Encrypt-then-MAC，先验 tag 再解密 | `crypto_test.sh`、`archive_pipeline_test.sh`、BAD 区（篡改 / 截断） |
 | FR-123 | 口令来源与处理 | 已实现 | CLI 只从 `/dev/tty` 读（`terminal_secret`）；GUI 在输入框里收；不落盘、不进 argv / 环境变量 / 日志；归档里也不存口令 | CLI 区（出现 `--password` 之类的参数即用法错误）、`terminal_secret` 的读取约定、源码检索 |
 | FR-130 | 图形界面 | 已实现 | Qt 6 桌面 GUI：Qt Quick/QML 版（`make gui-modern`）7 个页面——首页 / 备份 / 自动备份 / 备份管理 / 设置 / 实时备份 / 远程备份；Qt Widgets 版（`make gui`）并行保留 | `modern_gui_check.sh`（通过 692 项、失败 0）、`gui_smoke_test.sh` |
@@ -253,7 +253,7 @@
 
 ### NFR-10 资源边界
 
-- 压缩、上传、下载、恢复都是流式的：峰值内存与输入规模无关（Huffman 只要 256 个频次与固定 I/O 缓冲；LZSS 要 32 KiB 窗口加 261 字节前瞻，外加一个私有临时文件）。
+- 压缩、上传、下载、恢复都是流式的：峰值内存与输入规模无关（Huffman 只要 256 个频次与固定 I/O 缓冲；LZSS 要 32 KiB 窗口加 261 字节前瞻，外加一个私有临时文件；Zstd 编码使用 64 KiB 独立匹配块，解码历史窗口最多 8 MiB）。
 - 协议与格式的所有长度字段先过上限再谈分配：单帧 payload ≤ 1 MiB，单条流 ≤ 4 TiB（显然不合理的拦截），单个材料包成员 ≤ 16 GiB，delta 信封 ≤ 8 MiB，tombstone 与条目数各有上限。协议里不存在"声明长度是 2^64-1 就去 resize"的路径。
 - 服务端的并发是有界的：固定 worker 池，最大并发客户端数 = worker 数，不生成 detached 线程；数据库访问用一把互斥锁加 busy timeout 串行化。
 - 传输有整体时间预算：握手可以设总超时，避免"每个超时周期挤一个字节"的对端把连接永远占住。
@@ -568,7 +568,7 @@ UML 里另外两个已有用例「查看备份状态」「查看备份历史」�
 | --- | --- | --- | --- |
 | §10.7 / §17 / §18 / §21 | 早期基线把图形界面规划成"页面层 + 一层脚本桥接 + C++ 核心"的三层结构 | Qt 6 桌面 GUI：Qt Quick/QML 版（7 个页面）+ Qt Widgets 版，两者直接链接同一份 C++ 核心，中间没有桥接层 | 课程评分对象是 C++ 核心本身，"核心必须能独立运行"这条基线要求在桌面形态下一样成立；桌面工具形态与本地备份的使用场景一致，也不用为了一门 C++ 课程再维护一套前端技术栈。核心与前端解耦的接口（`BackupEngine` / CLI）没有变 |
 | §10.4 打包 | "至少自主实现一种归档方案"，不调用 `tar` / `libarchive` | 自主实现三种打包方式（MyPack v2、USTAR、Fast USTAR），另保留 Archive v0.1 作为只读兼容 | USTAR 用来验证与 GNU tar 的互操作（只读、只用于测试对照），Fast USTAR 是省掉部分校验的折中；默认仍是 MyPack |
-| §10.5 压缩 | 首选 Huffman，可选后续 LZ77 / LZ78 | Canonical Huffman（`HUF1`）与 LZSS + Huffman（`LZH1`）两层 | LZSS 的窗口 32 KiB、最短匹配 3、最长匹配 258，正好让 length-3 装进一个字节；两种方式都做流式实现，峰值内存与输入规模无关 |
+| §10.5 压缩 | 首选 Huffman，可选后续 LZ77 / LZ78 | 手写 HUF1 与 RFC 8878 Zstandard 受限子集；保留 LZH1 兼容 | Zstandard 为后续产品扩展，不属于原课程基线；编码帧可交独立标准工具验证，读取范围见 `ZSTANDARD_FORMAT.md`；产品路径均为流式实现 |
 | §10.6 加密 | 候选 AES / DES / 流密码，最终按难度与教学价值确定 | AES-256-CTR + HMAC-SHA256 与 DES-CBC + HMAC-SHA256 两种组合，外加 PBKDF2-HMAC-SHA256 密钥派生；DES 明确标注只有 56 位有效强度、属于教学 / 兼容用途 | 保留 DES 是为了覆盖"分组密码 + CBC + PKCS#7"这条教学路径，同时用 AES-256 组合承担实际使用；两种算法都是手写实现，可逐表对照 FIPS / RFC / NIST 文档复核 |
 | §13.1～§13.4 网络四项 | 本地稳定后再做，作为 STRETCH | 全部落地：BPNET1 协议、账户体系、SQLite 云端元数据、BPSEC1/BPSEC2 传输加密；服务端只做"存储后端 + 传输边界" | 网络功能没有把打包 / 压缩 / 加密 / 增量搬到服务端重写一遍——那样会产生第二套实现，也会让服务端成为攻击面更大的组件 |
 | §13.5 增量备份 | 先做文件级增量，时间允许再做块级 | 文件级：内容摘要强 manifest 判断变化 + `BKPINC1` delta + 依赖链还原（含远端链与 `BPSNAP1` 材料包），链深上限 64；块级未做 | 内容摘要比 size + mtime 更能反映真实变化；依赖链一旦存在，retention 就必须变成依赖感知的，否则"删最旧"会直接造成不可恢复的数据丢失 |

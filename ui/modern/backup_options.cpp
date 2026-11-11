@@ -38,7 +38,7 @@ QStringList BackupOptionsCatalog::packLabels() const {
 
 QStringList BackupOptionsCatalog::compressionLabels() const {
   return {QStringLiteral("不压缩"), QStringLiteral("Huffman"),
-          QStringLiteral("LZSS + Huffman")};
+          QStringLiteral("Zstd")};
 }
 
 QStringList BackupOptionsCatalog::encryptionLabels() const {

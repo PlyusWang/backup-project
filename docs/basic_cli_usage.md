@@ -1,6 +1,6 @@
 # 基础 CLI 使用说明
 
-> 描述对象：当前 `main` 上的产品 CLI `backupctl`（构建产物 `build/backupctl`）。
+> 描述对象：当前源码中的产品 CLI `backupctl`（构建产物 `build/backupctl`）。
 > 归档格式见 `docs/format/`，筛选规则见 `docs/filter_usage.md`，定时备份见
 > `docs/scheduled_backup_usage.md`，网络备份见 `docs/network_backup_usage.md`。
 
@@ -16,8 +16,10 @@
   CAP_MKNOD，建不出来就明确失败并说清原因，不会静默降级成普通文件）；
 - 文件过滤：11 个字段 name / path / stem / ext / type / size / mtime /
   uid / gid / user / group，语法见 `docs/filter_usage.md`；
-- 打包 mypack / ustar / fast-ustar、压缩 none / huffman / lzss-huffman、
+- 打包 mypack / ustar / fast-ustar、压缩 none / huffman / zstd、
   加密 none / aes-256-ctr-hmac-sha256 / des-cbc-hmac-sha256；
+  `lzss-huffman` 保留为旧归档与旧配置的兼容键。Zstd 是手写 RFC 8878 受限子集，
+  支持范围与旧版本兼容说明见 [Zstandard 格式说明](ZSTANDARD_FORMAT.md)；
 - 定时备份、实时备份（inotify）、网络备份（backup-server + BPNET1）；
 - 文件名支持空格与 UTF-8（中文）；
 - 错误路径明确报错并返回非 0：源不存在、源不是目录、仓库不存在、

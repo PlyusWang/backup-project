@@ -23,7 +23,8 @@ pack
    ↓  compression
    ├─ None
    ├─ Canonical Huffman（HUF1）
-   └─ LZSS + Canonical Huffman（LZH1）
+   ├─ Zstandard（RFC 8878 受限子集）
+   └─ LZSS + Canonical Huffman（LZH1，旧格式兼容）
    ↓  encryption
    ├─ None
    ├─ DES-CBC + HMAC-SHA256（legacy / educational）
@@ -198,6 +199,16 @@ bit = 1 是 literal（后跟 1 字节），bit = 0 是 match（后跟 `uint16 di
 同一输入的压缩输出必须 **byte-for-byte 相同**：code length 用 (frequency, 子树最小
 符号) 的全序生成，不序列化指针树，不依赖任何无序容器的迭代顺序。
 
+### 5.3 Zstandard（压缩编号 3）
+
+`src/compression/zstd.cpp` 手写实现 RFC 8878 的受限子集，输出单个标准
+Zstandard frame：128 KiB 声明窗口、64 KiB 独立匹配块、显式原始长度与
+XXH64 内容校验。编解码的格式范围、8 MiB 解码窗口上限、标准工具验证和
+拒绝规则见 [Zstandard 格式说明](../ZSTANDARD_FORMAT.md)。
+
+该流仍位于 BKPCNT2 容器内部；整个 `.bak` 不是独立 `.zst` 文件。旧版读取器
+拒绝未知压缩编号 3，不能用旧客户端恢复新 Zstd 归档；本版本继续读取编号 0、1、2。
+
 ## 6. v2 外层容器
 
 ### 6.1 header（固定 160 字节）
@@ -208,7 +219,7 @@ bit = 1 是 literal（后跟 1 字节），bit = 0 是 match（后跟 `uint16 di
 | 8 | 2 | `version` | 固定 2 |
 | 10 | 2 | `header_size` | 固定 160 |
 | 12 | 1 | `pack_method` | 0 MyPack / 1 USTAR / 2 FastUSTAR |
-| 13 | 1 | `compression_method` | 0 None / 1 Huffman / 2 LZSS-Huffman |
+| 13 | 1 | `compression_method` | 0 None / 1 Huffman / 2 LZSS-Huffman（兼容） / 3 Zstandard |
 | 14 | 1 | `encryption_method` | 0 None / 1 DES-CBC-HMAC / 2 AES-256-CTR-HMAC |
 | 15 | 1 | `flags` | 固定 0 |
 | 16 | 8 | `entry_count` | |
@@ -317,6 +328,9 @@ decode）只用固定缓冲：256 KiB I/O 缓冲、256 个 uint64 的频次表�
 于校验，不用来分配内存。（`HuffmanCompress` / `HuffmanDecompress` 这类字符串接口确实是
 O(n)，但它们只服务单元测试与已知向量，产品流水线不调用它们——见
 `src/core/archive_pipeline.cpp` 里对 `*Stream` 的调用。）
+
+Zstandard 同样只走文件流接口；编码块为 64 KiB，解码块不超过 128 KiB，
+经校验的历史窗口最多 8 MiB。这个窗口上限限制解码资源，与归档总长度无关。
 
 因此这一层**没有**"每条流 1 GiB 上限"这种限制：合法的超大输入照常流式处理，能不能落盘
 只取决于磁盘空间（`tests/unit/stream_rlimit_test.cpp` 在 RLIMIT_AS 下压过大输入，

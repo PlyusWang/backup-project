@@ -27,6 +27,7 @@
 
 #include "backup_controller.h"
 #include "backup_credentials.h"
+#include "incremental_delta.h"
 #include "incremental_restore.h"
 #include "realtime_controller.h"
 #include "realtime_store.h"
@@ -181,6 +182,37 @@ bool Restored(const QString& repository, const QString& name,
   for (auto iterator = actual.cbegin(); iterator != actual.cend(); ++iterator)
     rows += iterator.key().toUtf8() + '\t' + iterator.value() + '\n';
   return !expected.isEmpty() && expected == actual && Write(evidence, rows);
+}
+
+// Read the real container selected by the automatic service. The subsequent
+// chain restore verifies its authenticated bytes and hashes the restored tree.
+bool SnapshotMethods(const QString& repository, const QString& name,
+                     backupproject::PackMethod pack,
+                     backupproject::EncryptionMethod encryption, bool delta,
+                     const QString& evidence,
+                     backupproject::CompressionMethod compression =
+                         backupproject::CompressionMethod::kZstd) {
+  if (name.isEmpty()) return false;
+  backupproject::ContainerHeader header;
+  std::string error;
+  const std::string path = (repository + "/" + name).toStdString();
+  const bool inspected =
+      delta ? backupproject::InspectDeltaPayloadHeader(path, &header, &error)
+            : backupproject::InspectContainerFile(path, &header, &error);
+  if (!inspected) {
+    std::fprintf(stderr, "AUTOMATION_UI container diagnostic=%s\n",
+                 error.c_str());
+    return false;
+  }
+  const QByteArray rows = "snapshot\tpack_id\tcompression_id\tencryption_id\n" +
+                          name.toUtf8() + '\t' +
+                          QByteArray::number(header.pack_method) + '\t' +
+                          QByteArray::number(header.compression_method) + '\t' +
+                          QByteArray::number(header.encryption_method) + '\n';
+  return header.pack_method == static_cast<std::uint8_t>(pack) &&
+         header.compression_method == static_cast<std::uint8_t>(compression) &&
+         header.encryption_method == static_cast<std::uint8_t>(encryption) &&
+         Write(evidence, rows);
 }
 
 }  // namespace
@@ -617,16 +649,26 @@ int RunAutomationUiTest(QQuickWindow* window,
             click(prefix + "EnabledToggle"),
         scheduled ? "SCHEDULE_AES_P_SAVED_AND_ENABLED"
                   : "REALTIME_AES_P_SAVED_AND_ENABLED");
+    QElapsedTimer baseline_elapsed;
+    baseline_elapsed.start();
     if (scheduled) click("runScheduleNowButton");
-    check(Wait([&]() {
-            return scheduled
-                       ? schedule_finished > initial_events &&
-                             !schedule->libraryBusy()
-                       : realtime_finished > initial_events &&
-                             !realtime->libraryBusy() && !realtime->pending();
-          }),
-          scheduled ? "SCHEDULE_AES_P_BASELINE_CREATED"
-                    : "REALTIME_AES_P_BASELINE_CREATED");
+    const bool baseline_completed = Wait(
+        [&]() {
+          return scheduled
+                     ? schedule_finished > initial_events &&
+                           !schedule->libraryBusy()
+                     : realtime_finished > initial_events &&
+                           !realtime->libraryBusy() && !realtime->pending();
+        },
+        180000);
+    check(baseline_completed, scheduled ? "SCHEDULE_AES_P_BASELINE_CREATED"
+                                        : "REALTIME_AES_P_BASELINE_CREATED");
+    std::printf(
+        "AUTOMATION_UI aes_phase=baseline service=%s elapsed_ms=%lld "
+        "completed=%d\n",
+        qPrintable(prefix), static_cast<long long>(baseline_elapsed.elapsed()),
+        baseline_completed);
+    std::fflush(stdout);
     const auto snapshot_name = [&]() {
       if (!scheduled) return realtime->lastSnapshotName();
       const auto list = schedule->managedSnapshots();
@@ -669,17 +711,30 @@ int RunAutomationUiTest(QQuickWindow* window,
                     : "REALTIME_Q_PASSWORD_ALONE_REMAINS_UNSAVED");
     const int events_before_change =
         scheduled ? schedule_finished : realtime_finished;
-    check(
+    QElapsedTimer active_trigger_elapsed;
+    active_trigger_elapsed.start();
+    const bool active_trigger_completed =
         Write(fixture + "/secret.txt", "AES changed after rejected draft\n") &&
-            (!scheduled || schedule->runNow()) && Wait([&]() {
+        (!scheduled || schedule->runNow()) &&
+        Wait(
+            [&]() {
               return scheduled
                          ? schedule_finished > events_before_change &&
                                !schedule->libraryBusy()
                          : realtime_finished > events_before_change &&
                                !realtime->libraryBusy() && !realtime->pending();
-            }),
-        scheduled ? "SCHEDULE_ACTIVE_TRIGGER_AFTER_REJECTED_Q"
-                  : "REALTIME_FILE_EVENT_AFTER_REJECTED_Q");
+            },
+            180000);
+    check(active_trigger_completed,
+          scheduled ? "SCHEDULE_ACTIVE_TRIGGER_AFTER_REJECTED_Q"
+                    : "REALTIME_FILE_EVENT_AFTER_REJECTED_Q");
+    std::printf(
+        "AUTOMATION_UI aes_phase=active-trigger service=%s elapsed_ms=%lld "
+        "completed=%d\n",
+        qPrintable(prefix),
+        static_cast<long long>(active_trigger_elapsed.elapsed()),
+        active_trigger_completed);
+    std::fflush(stdout);
     backupproject::SnapshotChain actual_chain;
     std::string chain_error;
     check(backupproject::ResolveSnapshotChain(task_repository.toStdString(),
@@ -710,6 +765,470 @@ int RunAutomationUiTest(QQuickWindow* window,
           scheduled ? "SCHEDULE_AES_DISABLED_WITH_INVALID_DRAFT"
                     : "REALTIME_AES_DISABLED_WITH_INVALID_DRAFT");
   }
+  // Load an actual legacy configuration, then edit through the same controls
+  // as a user. Keeping the repository/source unchanged isolates the compression
+  // strategy change: Zstd must establish its own full baseline in that
+  // repository.
+  for (const QString& prefix :
+       {QStringLiteral("schedule"), QStringLiteral("realtime")}) {
+    const bool scheduled = prefix == "schedule";
+    const QString label = prefix + "-legacy-migration";
+    const QString scroll_name = prefix + "PageScroll";
+    const QString save_name =
+        scheduled ? "saveScheduleButton" : "saveRealtimeButton";
+    const QString fixture = work.filePath(label + "-source");
+    const QString task_repository = work.filePath(label + "-repository");
+    const auto verify = [&](bool ok, const QString& suffix) {
+      return check(ok, qPrintable(label + "_" + suffix));
+    };
+    const auto click = [&](const QString& name) {
+      return Click(window, item(name), scroll_name);
+    };
+    const auto type = [&](const QString& suffix, const QString& value) {
+      return Type(window, item(prefix + suffix), value, scroll_name);
+    };
+    bool prepared =
+        !schedule->enabled() && !realtime->enabled() &&
+        QDir().mkpath(fixture + "/子目录/空目录") &&
+        Write(fixture + "/data.txt", "legacy config preserves its codec\n") &&
+        Write(fixture + "/子目录/中文.txt", "legacy migration 中文\n") &&
+        Write(fixture + "/empty.txt", "") &&
+        controller->saveRepositoryPath(task_repository) &&
+        navigate(scheduled ? "realtime" : "scheduled");
+    if (prepared && scheduled) {
+      prepared = schedule->setEncryptionChoice("none", "") &&
+                 schedule->setRepositoryTarget("local", "", "") &&
+                 schedule->saveConfigFromFrequencyText(
+                     false, fixture, "24", "hours", "6", "mypack",
+                     "lzss-huffman", {}, {}, "incremental");
+      schedule->reload();
+    } else if (prepared) {
+      prepared = realtime->setEncryptionChoice("none", "") &&
+                 realtime->setRepositoryTarget("local", "", "") &&
+                 realtime->saveConfigFromText(false, fixture, "200", "500", "6",
+                                              "mypack", "lzss-huffman", {}, {},
+                                              "incremental");
+      realtime->reload();
+    }
+    if (!verify(prepared && navigate(scheduled ? "scheduled" : "realtime"),
+                "PREEXISTING_CONFIG_LOADED")) {
+      schedule->stop();
+      realtime->stop();
+      return 1;
+    }
+    QQuickItem* scroll = item(scroll_name);
+    QQuickItem* page = scroll ? scroll->parentItem() : nullptr;
+    if (!verify(page != nullptr, "PAGE_CONTROLS")) return 1;
+    if (!page->property("advancedExpanded").toBool())
+      verify(click(prefix + "AdvancedToggle"), "OPEN_ADVANCED_BY_MOUSE");
+    const auto shows_legacy = [&]() {
+      QQuickItem* combo = item(prefix + "CompressionCombo");
+      return combo && combo->property("count").toInt() == 4 &&
+             combo->property("currentIndex").toInt() == 3 &&
+             combo->property("currentText").toString() ==
+                 "LZSS + Huffman（旧格式）" &&
+             (scheduled ? schedule->compressionKey()
+                        : realtime->compressionKey()) == "lzss-huffman";
+    };
+    const auto saved_method = [&](backupproject::CompressionMethod compression,
+                                  std::uint32_t retain,
+                                  const QString& evidence) {
+      std::string error;
+      backupproject::ScheduleDocument disk_schedule_legacy;
+      backupproject::RealtimeConfig disk_realtime_legacy;
+      const auto matches = [&](const auto& config) {
+        return !config.enabled && config.source_path == fixture.toStdString() &&
+               config.compression_method == compression &&
+               config.retain_count == retain &&
+               config.pack_method == backupproject::PackMethod::kMyPack &&
+               config.encryption_method ==
+                   backupproject::EncryptionMethod::kNone;
+      };
+      const bool valid =
+          scheduled
+              ? backupproject::ScheduleStore(
+                    schedule->storePath().toStdString())
+                            .Load(&disk_schedule_legacy, &error) ==
+                        backupproject::ScheduleLoadStatus::kLoaded &&
+                    matches(disk_schedule_legacy.config) &&
+                    schedule->configForTest().compression_method == compression
+              : backupproject::RealtimeStore(
+                    realtime->storePath().toStdString())
+                            .Load(&disk_realtime_legacy, &error) ==
+                        backupproject::RealtimeLoadStatus::kLoaded &&
+                    matches(disk_realtime_legacy) &&
+                    realtime->configForTest().compression_method == compression;
+      return valid && Write(evidence, Read(scheduled ? schedule->storePath()
+                                                     : realtime->storePath()));
+    };
+    verify(shows_legacy() &&
+               saved_method(backupproject::CompressionMethod::kLzssHuffman, 6,
+                            output + "/" + label + "-loaded-config.json"),
+           "EXACT_LEGACY_LABEL_KEY_AND_ENUM");
+    verify(capture(qPrintable(label + "-loaded.png")),
+           "ACTUAL_LEGACY_SCREENSHOT");
+    verify(
+        type("RetainField", "7") && click(save_name) && shows_legacy() &&
+            saved_method(backupproject::CompressionMethod::kLzssHuffman, 7,
+                         output + "/" + label + "-unrelated-save-config.json"),
+        "UNRELATED_EDIT_PRESERVES_LEGACY_CODEC");
+    const auto names = [&]() {
+      return QDir(task_repository).entryList({"*.bak"}, QDir::Files);
+    };
+    const auto created_since = [&](const QStringList& before_names) {
+      QStringList created;
+      for (const QString& name : names())
+        if (!before_names.contains(name)) created.push_back(name);
+      return created.size() == 1 ? created.front() : QString();
+    };
+    const auto events = [&]() {
+      return scheduled ? schedule_finished : realtime_finished;
+    };
+    const auto enabled_run = [&]() {
+      const int before_events = events();
+      return click(prefix + "EnabledToggle") &&
+             (scheduled ? schedule->enabled() && schedule->holdsRunnerLock()
+                        : realtime->enabled() && realtime->watching()) &&
+             (!scheduled || click("runScheduleNowButton")) &&
+             Wait(
+                 [&]() {
+                   return events() > before_events &&
+                          (scheduled ? !schedule->libraryBusy()
+                                     : !realtime->libraryBusy() &&
+                                           !realtime->pending());
+                 },
+                 180000) &&
+             (scheduled ? schedule->lastSucceeded()
+                        : realtime->lastSucceeded());
+    };
+    const QStringList before_legacy = names();
+    verify(before_legacy.isEmpty() && enabled_run(),
+           "LEGACY_SERVICE_F0_CREATED");
+    const QString legacy_name = created_since(before_legacy);
+    verify(SnapshotMethods(task_repository, legacy_name,
+                           backupproject::PackMethod::kMyPack,
+                           backupproject::EncryptionMethod::kNone, false,
+                           output + "/" + label + "-legacy-methods.tsv",
+                           backupproject::CompressionMethod::kLzssHuffman) &&
+               Restored(task_repository, legacy_name,
+                        work.filePath(label + "-legacy-restored"), fixture,
+                        output + "/" + label + "-legacy-sha256.tsv"),
+           "ACTUAL_ID2_BACKUP_RESTORES_SHA256");
+    verify(click(prefix + "EnabledToggle") &&
+               (scheduled ? !schedule->enabled()
+                          : !realtime->enabled() && !realtime->watching()),
+           "LEGACY_DISABLED_BEFORE_MIGRATION");
+    const bool selected_zstd =
+        Select(window, item(prefix + "CompressionCombo"), 2, scroll_name);
+    const bool saved_zstd = selected_zstd && click(save_name);
+    const bool disk_zstd =
+        saved_method(backupproject::CompressionMethod::kZstd, 7,
+                     output + "/" + label + "-explicit-zstd-config.json");
+    QQuickItem* compression_combo = item(prefix + "CompressionCombo");
+    std::printf(
+        "AUTOMATION_UI legacy_migration service=%s selected=%d saved=%d "
+        "key=%s index=%d count=%d text=%s draft=%d disk=%d\n",
+        qPrintable(prefix), selected_zstd, saved_zstd,
+        qPrintable(scheduled ? schedule->compressionKey()
+                             : realtime->compressionKey()),
+        compression_combo->property("currentIndex").toInt(),
+        compression_combo->property("count").toInt(),
+        qPrintable(compression_combo->property("currentText").toString()),
+        page->property("draftCompressionIndex").toInt(), disk_zstd);
+    std::fflush(stdout);
+    verify(
+        selected_zstd && saved_zstd &&
+            (scheduled ? schedule->compressionKey()
+                       : realtime->compressionKey()) == "zstd" &&
+            compression_combo->property("currentText").toString() == "Zstd" &&
+            compression_combo->property("count").toInt() == 3 && disk_zstd,
+        "EXPLICIT_GUI_CHOICE_MIGRATES_TO_ZSTD");
+    Reveal(window, compression_combo, scroll_name);
+    verify(capture(qPrintable(label + "-zstd-saved.png")),
+           "ACTUAL_ZSTD_SCREENSHOT");
+    const QStringList before_zstd = names();
+    verify(before_zstd.size() == 1 && enabled_run(),
+           "ZSTD_SERVICE_RUN_AFTER_MIGRATION");
+    const QString zstd_name = created_since(before_zstd);
+    backupproject::SnapshotChain migrated_chain;
+    std::string chain_error;
+    verify(!zstd_name.isEmpty() && zstd_name != legacy_name &&
+               names().size() == 2 &&
+               SnapshotMethods(task_repository, zstd_name,
+                               backupproject::PackMethod::kMyPack,
+                               backupproject::EncryptionMethod::kNone, false,
+                               output + "/" + label + "-zstd-methods.tsv") &&
+               backupproject::ResolveSnapshotChain(
+                   task_repository.toStdString(), zstd_name.toStdString(),
+                   &migrated_chain, &chain_error) &&
+               migrated_chain.delta_count == 0 &&
+               migrated_chain.file_names.size() == 1 &&
+               migrated_chain.file_names.front() == zstd_name.toStdString() &&
+               (scheduled || realtime->lastOutcomeKind() == "full-baseline") &&
+               Restored(task_repository, zstd_name,
+                        work.filePath(label + "-zstd-restored"), fixture,
+                        output + "/" + label + "-zstd-sha256.tsv"),
+           "ACTUAL_ID3_NEW_FULL_BASELINE_AND_RESTORE_SHA256");
+    verify(Restored(task_repository, legacy_name,
+                    work.filePath(label + "-legacy-after-migration"), fixture,
+                    output + "/" + label + "-legacy-still-readable-sha256.tsv"),
+           "LEGACY_ARCHIVE_STILL_RESTORES_AFTER_MIGRATION");
+    verify(
+        click(prefix + "EnabledToggle") &&
+            (scheduled ? !schedule->enabled() && !schedule->tickActiveForTest()
+                       : !realtime->enabled() && !realtime->watching()),
+        "MIGRATED_SERVICE_DISABLED");
+  }
+
+  check(navigate("quick"), "MANUAL_COMPRESSION_MIGRATION_PAGE");
+  QQuickItem* options_panel = item("backupOptionsPanel");
+  QQuickItem* manual_compression = item("compressionSelector");
+  if (!check(options_panel && manual_compression,
+             "MANUAL_COMPRESSION_MIGRATION_CONTROLS"))
+    return 1;
+  options_panel->setProperty("expanded", true);
+  options_panel->setProperty("compressionKey", "lzss-huffman");
+  Settle();
+  check(manual_compression->property("count").toInt() == 4 &&
+            manual_compression->property("currentIndex").toInt() == 3 &&
+            manual_compression->property("currentText")
+                .toString()
+                .contains(QStringLiteral("旧格式")),
+        "MANUAL_LEGACY_MODEL_RETAINS_SELECTED_KEY");
+  check(Select(window, manual_compression, 2, "backupPageScroll") &&
+            options_panel->property("compressionKey").toString() == "zstd" &&
+            manual_compression->property("count").toInt() == 3 &&
+            manual_compression->property("currentIndex").toInt() == 2 &&
+            manual_compression->property("currentText").toString() == "Zstd",
+        "MANUAL_MODEL_REPLACEMENT_PRESERVES_ZSTD_SELECTION");
+  check(capture("manual-legacy-migration-zstd-selected.png"),
+        "MANUAL_MIGRATED_COMPRESSION_SCREENSHOT");
+
+  // Exercise the same controls and live services with the new shared codec.
+  // Every case owns a source/repository so another task's baseline cannot make
+  // an incorrect format, stale source, or false incremental decision pass.
+  const QStringList zstd_pack_keys = {"mypack", "ustar", "fast-ustar"};
+  const backupproject::PackMethod zstd_packs[] = {
+      backupproject::PackMethod::kMyPack, backupproject::PackMethod::kUstar,
+      backupproject::PackMethod::kFastUstar};
+  for (const QString& prefix :
+       {QStringLiteral("schedule"), QStringLiteral("realtime")}) {
+    const bool scheduled = prefix == "schedule";
+    const QString scroll_name = prefix + "PageScroll";
+    const QString save_name =
+        scheduled ? "saveScheduleButton" : "saveRealtimeButton";
+    for (int pack_index = 0; pack_index < zstd_pack_keys.size(); ++pack_index) {
+      for (int encryption_index = 0; encryption_index < 2; ++encryption_index) {
+        const bool encrypted = encryption_index == 1;
+        const auto encryption =
+            encrypted ? backupproject::EncryptionMethod::kAes256CtrHmacSha256
+                      : backupproject::EncryptionMethod::kNone;
+        const QString case_name = prefix + "-zstd-" +
+                                  zstd_pack_keys[pack_index] +
+                                  (encrypted ? "-aes" : "-none");
+        const auto verify = [&](bool ok, const QString& suffix) {
+          return check(ok, qPrintable(case_name + "_" + suffix));
+        };
+        const QString fixture = work.filePath(case_name + "-source");
+        const QString task_repository =
+            work.filePath(case_name + "-repository");
+        const QString password =
+            encrypted ? QUuid::createUuid().toString(QUuid::WithoutBraces)
+                      : QString();
+        const auto click = [&](const QString& name) {
+          return Click(window, item(name), scroll_name);
+        };
+        const auto type = [&](const QString& suffix, const QString& value) {
+          return Type(window, item(prefix + suffix), value, scroll_name);
+        };
+        if (!verify(!schedule->enabled() && !realtime->enabled() &&
+                        QDir().mkpath(fixture + "/子目录/空目录") &&
+                        Write(fixture + "/small.txt", "Zstd F0 original\n") &&
+                        Write(fixture + "/removed.txt", "remove in D1\n") &&
+                        Write(fixture + "/子目录/中文.txt", "中文路径内容\n") &&
+                        Write(fixture + "/子目录/empty.txt", "") &&
+                        controller->saveRepositoryPath(task_repository) &&
+                        navigate(scheduled ? "scheduled" : "realtime"),
+                    "ISOLATED_FIXTURE")) {
+          schedule->stop();
+          realtime->stop();
+          return 1;
+        }
+        QQuickItem* scroll = item(scroll_name);
+        QQuickItem* page = scroll ? scroll->parentItem() : nullptr;
+        if (!verify(page != nullptr, "PAGE_CONTROLS")) return 1;
+        if (!page->property("advancedExpanded").toBool())
+          verify(click(prefix + "AdvancedToggle"), "OPEN_ADVANCED_BY_MOUSE");
+        bool configured =
+            type("SourceField", fixture) && type("RetainField", "6") &&
+            Select(window, item(prefix + "StrategyCombo"), 1, scroll_name) &&
+            Select(window, item(prefix + "PackCombo"), pack_index,
+                   scroll_name) &&
+            Select(window, item(prefix + "CompressionCombo"), 2, scroll_name) &&
+            Select(window, item(prefix + "EncryptionCombo"), encryption_index,
+                   scroll_name);
+        if (configured && encrypted)
+          configured = type("ArchivePasswordField", password) &&
+                       type("ArchivePasswordConfirmationField", password);
+        if (configured && scheduled)
+          configured = type("FrequencyValueField", "24") &&
+                       Select(window, item("scheduleFrequencyUnitCombo"), 1,
+                              scroll_name);
+        if (configured && !scheduled)
+          configured =
+              type("DebounceField", "200") && type("MaxWaitField", "500");
+        verify(configured && click(save_name) &&
+                   (scheduled ? !schedule->enabled() : !realtime->enabled()) &&
+                   (scheduled ? schedule->compressionKey()
+                              : realtime->compressionKey()) == "zstd" &&
+                   (scheduled ? schedule->packKey() : realtime->packKey()) ==
+                       zstd_pack_keys[pack_index],
+               "REAL_FORM_SAVED_WITH_EXACT_CODEC");
+        backupproject::ScheduleDocument disk_schedule_zstd;
+        backupproject::RealtimeConfig disk_realtime_zstd;
+        std::string config_error;
+        const bool disk_loaded =
+            scheduled ? backupproject::ScheduleStore(
+                            schedule->storePath().toStdString())
+                                .Load(&disk_schedule_zstd, &config_error) ==
+                            backupproject::ScheduleLoadStatus::kLoaded
+                      : backupproject::RealtimeStore(
+                            realtime->storePath().toStdString())
+                                .Load(&disk_realtime_zstd, &config_error) ==
+                            backupproject::RealtimeLoadStatus::kLoaded;
+        const auto matches_saved = [&](const auto& saved) {
+          return !saved.enabled && saved.source_path == fixture.toStdString() &&
+                 saved.compression_method ==
+                     backupproject::CompressionMethod::kZstd &&
+                 saved.pack_method == zstd_packs[pack_index] &&
+                 saved.encryption_method == encryption;
+        };
+        verify(disk_loaded &&
+                   (scheduled ? matches_saved(disk_schedule_zstd.config)
+                              : matches_saved(disk_realtime_zstd)) &&
+                   Write(output + "/" + case_name + "-config.json",
+                         Read(scheduled ? schedule->storePath()
+                                        : realtime->storePath())),
+               "DISK_CONFIG_RETAINS_ZSTD_PACK_AND_ENCRYPTION");
+        const auto snapshot_names = [&]() {
+          return QDir(task_repository).entryList({"*.bak"}, QDir::Files);
+        };
+        const auto created_since = [&](const QStringList& before_names) {
+          QStringList created;
+          for (const QString& name : snapshot_names())
+            if (!before_names.contains(name)) created.push_back(name);
+          return created.size() == 1 ? created.front() : QString();
+        };
+        const auto events = [&]() {
+          return scheduled ? schedule_finished : realtime_finished;
+        };
+        const auto completed = [&](int prior_events) {
+          return Wait(
+                     [&]() {
+                       return events() > prior_events &&
+                              (scheduled ? !schedule->libraryBusy()
+                                         : !realtime->libraryBusy() &&
+                                               !realtime->pending());
+                     },
+                     180000) &&
+                 (scheduled ? schedule->lastSucceeded()
+                            : realtime->lastSucceeded());
+        };
+        const int before_baseline = events();
+        const QStringList empty_repository = snapshot_names();
+        verify(
+            empty_repository.isEmpty() && click(prefix + "EnabledToggle") &&
+                (scheduled ? schedule->enabled() && schedule->holdsRunnerLock()
+                           : realtime->enabled() && realtime->watching()) &&
+                (!scheduled || click("runScheduleNowButton")) &&
+                completed(before_baseline),
+            "ENABLED_SERVICE_CREATED_F0");
+        const QString baseline = created_since(empty_repository);
+        backupproject::SnapshotChain baseline_chain;
+        std::string chain_error;
+        verify(
+            SnapshotMethods(task_repository, baseline, zstd_packs[pack_index],
+                            encryption, false,
+                            output + "/" + case_name + "-f0-methods.tsv") &&
+                backupproject::ResolveSnapshotChain(
+                    task_repository.toStdString(), baseline.toStdString(),
+                    &baseline_chain, &chain_error) &&
+                baseline_chain.delta_count == 0 &&
+                Restored(task_repository, baseline,
+                         work.filePath(case_name + "-f0-restored"), fixture,
+                         output + "/" + case_name + "-f0-sha256.tsv", password),
+            "REAL_F0_HEADER_AND_RESTORE_SHA256");
+        const QStringList before_delta_names = snapshot_names();
+        const int before_delta = events();
+        verify(Write(fixture + "/small.txt", "Zstd D1 modified\n") &&
+                   Write(fixture + "/子目录/新增.txt", "Zstd D1 added\n") &&
+                   QFile::remove(fixture + "/removed.txt") &&
+                   (!scheduled || click("runScheduleNowButton")) &&
+                   completed(before_delta),
+               "REAL_TRIGGER_AFTER_ADD_MODIFY_DELETE");
+        const QString delta = created_since(before_delta_names);
+        backupproject::SnapshotChain delta_chain;
+        backupproject::DeltaEnvelope envelope;
+        verify(
+            backupproject::ResolveSnapshotChain(task_repository.toStdString(),
+                                                delta.toStdString(),
+                                                &delta_chain, &chain_error) &&
+                delta_chain.delta_count == 1 &&
+                delta_chain.file_names.front() == baseline.toStdString() &&
+                backupproject::ReadDeltaEnvelope(
+                    (task_repository + "/" + delta).toStdString(), &envelope,
+                    &chain_error) &&
+                envelope.parent_file_name == baseline.toStdString() &&
+                envelope.added == 1 && envelope.modified == 1 &&
+                envelope.removed == 1 &&
+                SnapshotMethods(task_repository, delta, zstd_packs[pack_index],
+                                encryption, true,
+                                output + "/" + case_name + "-d1-methods.tsv") &&
+                Restored(task_repository, delta,
+                         work.filePath(case_name + "-d1-restored"), fixture,
+                         output + "/" + case_name + "-d1-sha256.tsv", password),
+            "REAL_D1_PARENT_CODEC_AND_RESTORE_SHA256");
+        const QStringList before_unchanged_names = snapshot_names();
+        const int before_unchanged = events();
+        if (!scheduled) realtime->reload();
+        verify((!scheduled || click("runScheduleNowButton")) &&
+                   completed(before_unchanged) &&
+                   snapshot_names() == before_unchanged_names &&
+                   (scheduled || realtime->lastOutcomeKind() == "no-changes"),
+               "UNCHANGED_SOURCE_CREATES_NO_SNAPSHOT");
+        if (encrypted) {
+          backupproject::RestoreOptions wrong;
+          wrong.password =
+              QUuid::createUuid().toString(QUuid::WithoutBraces).toStdString();
+          const QString rejected = work.filePath(case_name + "-wrong-password");
+          verify(!backupproject::RestoreSnapshotChain(
+                     task_repository.toStdString(), delta.toStdString(),
+                     rejected.toStdString(), wrong, nullptr, &chain_error) &&
+                     !QFileInfo::exists(rejected),
+                 "WRONG_AES_PASSWORD_PUBLISHES_NO_TARGET");
+        }
+        // Captures use the real xcb window and never include a plaintext
+        // secret.
+        verify(capture(qPrintable(case_name + "-enabled.png")),
+               "ACTUAL_WINDOW_SCREENSHOT");
+        const int before_disable = events();
+        const QStringList before_disabled_names = snapshot_names();
+        verify(
+            click(prefix + "EnabledToggle") &&
+                (scheduled
+                     ? !schedule->enabled() && !schedule->tickActiveForTest()
+                     : !realtime->enabled() && !realtime->watching() &&
+                           realtime->watchCount() == 0) &&
+                Write(fixture + "/small.txt", "changed after Zstd disable\n"),
+            "DISABLED_SERVICE_BEFORE_NEW_FILE_CHANGE");
+        Settle(1800);
+        verify(events() == before_disable &&
+                   snapshot_names() == before_disabled_names,
+               "POST_DISABLE_NO_EVENT_OR_SNAPSHOT");
+      }
+    }
+  }
+
   schedule->stop();
   realtime->stop();
   QObject::disconnect(schedule_connection);

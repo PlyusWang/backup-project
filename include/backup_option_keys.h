@@ -15,7 +15,7 @@
 //
 // key 的拼写不在这里发明——PackMethodName / CompressionMethodName /
 // EncryptionMethodName 已经是格式层的规范名字（"mypack" / "ustar" /
-// "fast-ustar" / "none" / "huffman" / "lzss-huffman" /
+// "fast-ustar" / "none" / "huffman" / "zstd" / "lzss-huffman" /
 // "des-cbc-hmac-sha256" / "aes-256-ctr-hmac-sha256"），
 // 本模块只补反向解析与展示文本。
 //

@@ -3,7 +3,7 @@
 # 归档流水线专项测试。
 #
 # 覆盖：
-#   * 27 组合矩阵（3 pack × 3 compression × 3 encryption）的 backup/restore/diff
+#   * 36 组合矩阵（3 pack × 4 compression × 3 encryption）的 backup/restore/diff
 #   * 元数据（07777 / uid / gid / mtime 秒+纳秒）与特殊文件（symlink/hardlink/FIFO/设备）
 #   * socket 语义、Filter 与扫描层的衔接
 #   * 容器 header 语义、截断、尾部垃圾、篡改、目标目录原子性
@@ -22,7 +22,7 @@
 set -uo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-cd "$ROOT_DIR"
+cd "$ROOT_DIR" || exit 1
 
 CXX="${CXX:-g++}"
 EXTRA_FLAGS="${ARCHIVE_PIPELINE_EXTRA_FLAGS:-}"
@@ -100,22 +100,28 @@ compile_and_run() {
     if ! "$CXX" -Iinclude -Itests/unit -std=c++17 -Wall -Wextra -Wpedantic \
         $EXTRA_FLAGS -O1 "$source" "$OUT_DIR/libarchivecore.a" -o "$binary" 2>&1; then
         echo "$name: 编译失败" >&2
-        FAILURES=$((FAILURES + 1))
         return 1
     fi
     "$binary" "$@"
-    local status=$?
-    if [[ $status -ne 0 ]]; then
-        FAILURES=$((FAILURES + 1))
+}
+
+run_logged() {
+    local log_file="$1"
+    shift
+    # pipefail 同时检查命令和 tee；只在父 shell 累计一次，不能让管道
+    # 左侧子 shell 的 FAILURES 修改丢失，也不能漏掉日志写入失败。
+    if "$@" 2>&1 | tee "$log_file"; then
+        return 0
     fi
-    return $status
+    FAILURES=$((FAILURES + 1))
+    return 1
 }
 
 build_library
 
-compile_and_run pipeline_test tests/unit/archive_pipeline_test.cpp | tee "$OUT_DIR/pipeline_test.log"
+run_logged "$OUT_DIR/pipeline_test.log" compile_and_run pipeline_test tests/unit/archive_pipeline_test.cpp
 
-compile_and_run container_test tests/unit/archive_container_test.cpp | tee "$OUT_DIR/container_test.log"
+run_logged "$OUT_DIR/container_test.log" compile_and_run container_test tests/unit/archive_container_test.cpp
 
 # 确定性 mutation 扫描：对 v2 容器 / 裸 packed 流 / HUF1 / LZH1 逐偏移翻 bit，
 # 要求"要么成功，要么干净失败"，绝不允许崩溃、越界、无限循环或半恢复。
@@ -123,12 +129,12 @@ compile_and_run container_test tests/unit/archive_container_test.cpp | tee "$OUT
 if [[ "${ARCHIVE_PIPELINE_SKIP_MUTATION:-0}" == "1" ]]; then
     echo "SKIP  mutation sweep"
 else
-    compile_and_run mutation_test tests/unit/archive_mutation_test.cpp | tee "$OUT_DIR/mutation_test.log"
+    run_logged "$OUT_DIR/mutation_test.log" compile_and_run mutation_test tests/unit/archive_mutation_test.cpp
 fi
 
 # 压缩 wire format 与冻结 fixture 的逐字节对照 + 流式接口的尺寸交叉校验。
-compile_and_run stream_test tests/unit/compression_stream_test.cpp \
-    "$ROOT_DIR/tests/fixtures/compression" | tee "$OUT_DIR/stream_test.log"
+run_logged "$OUT_DIR/stream_test.log" compile_and_run stream_test tests/unit/compression_stream_test.cpp \
+    "$ROOT_DIR/tests/fixtures/compression"
 
 # RLIMIT_AS：在 160 MiB 地址空间的子进程里跑 256 MiB 语料的备份 + 恢复。
 # sanitizer 构建会把地址空间放大好几倍，和低 RLIMIT_AS 天生冲突，所以跳过。
@@ -137,7 +143,7 @@ if [[ "$EXTRA_FLAGS" == *sanitize* ]]; then
 elif [[ "${ARCHIVE_PIPELINE_SKIP_RLIMIT:-0}" == "1" ]]; then
     echo "SKIP  RLIMIT_AS resource test（ARCHIVE_PIPELINE_SKIP_RLIMIT=1）"
 else
-    compile_and_run rlimit_test tests/unit/stream_rlimit_test.cpp | tee "$OUT_DIR/rlimit_test.log"
+    run_logged "$OUT_DIR/rlimit_test.log" compile_and_run rlimit_test tests/unit/stream_rlimit_test.cpp
 fi
 
 # ---- GNU tar 互操作 --------------------------------------------------------
@@ -233,14 +239,14 @@ else
     if "$CXX" -Iinclude -Itests/unit -std=c++17 -Wall -Wextra -Wpedantic \
         $EXTRA_FLAGS -O2 tests/unit/archive_bench.cpp "$OUT_DIR/libarchivecore.a" \
         -o "$BENCH" 2>&1; then
-        "$BENCH" "${ARCHIVE_PIPELINE_BENCH_BIG:-128}" \
-                 "${ARCHIVE_PIPELINE_BENCH_SMALL:-10000}" | tee "$OUT_DIR/bench.log"
-        if ! grep -q '^TARBENCH' "$OUT_DIR/bench.log"; then
-            FAILURES=$((FAILURES + 1))
-        fi
-        if grep -q 'FAIL$' "$OUT_DIR/bench.log"; then
-            echo "FAIL  benchmark 里有失败语料"
-            FAILURES=$((FAILURES + 1))
+        if run_logged "$OUT_DIR/bench.log" "$BENCH" "${ARCHIVE_PIPELINE_BENCH_BIG:-128}" \
+                      "${ARCHIVE_PIPELINE_BENCH_SMALL:-10000}"; then
+            # 命令/日志失败已由 run_logged 计数；内容检查仅在其成功后执行。
+            if ! grep -q '^TARBENCH' "$OUT_DIR/bench.log" || \
+               grep -q 'FAIL$' "$OUT_DIR/bench.log"; then
+                echo "FAIL  benchmark 缺少结果或含失败语料"
+                FAILURES=$((FAILURES + 1))
+            fi
         fi
     else
         echo "archive_bench: 编译失败" >&2

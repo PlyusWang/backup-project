@@ -31,6 +31,7 @@ enum class CompressionMethod : std::uint8_t {
   kNone = 0,
   kHuffman = 1,
   kLzssHuffman = 2,
+  kZstd = 3,  // RFC 8878 frames; never reuse the legacy IDs.
 };
 
 // 加密策略 id。数值就是 v2 container header 里的 encryption_method 字段。
