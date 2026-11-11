@@ -199,7 +199,8 @@ unit 的加固是**逐项评估**过的，不是"全打开"：
 1. `bind` 改成非回环地址（例如 `0.0.0.0`）；
 2. `certificate` 指向一张由离线根签发的服务器身份证书（BPCERT1）；
 3. `public_bind_reason` 写一句话理由（会进日志，供事后审计）；
-4. `require_bpsec2 = true`（只接受签名身份客户端，不做 BPSEC1 降级）。
+4. `require_bpsec2 = true`（只接受签名身份客户端，不做 BPSEC1 降级）；
+5. `allow_public_bind = true`（明确允许本次非回环监听，省略或为 false 都拒绝）。
 
 缺任何一条，启动器直接拒绝启动 —— 与产品自身的 fail-closed 合同一致。
 
