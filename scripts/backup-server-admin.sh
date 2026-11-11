@@ -5,7 +5,7 @@
 # 用户和备份数据的操作调用共享管理工具；配置和证书更新使用停机锁与原子替换。
 # 本脚本不直接修改数据库或备份文件。
 #
-# ---- 实例身份（这一版的重点）----
+# 实例身份与部署布局。
 #
 # 部署布局（scripts/deploy_aliyun_server.sh 安装出来的样子）：
 #
@@ -14,18 +14,13 @@
 #   <server-root>/data                           数据根
 #   <server-root>/state/metadata.sqlite3         元数据库
 #
-# 脚本从**自己所在的目录**推出这个布局，因此天然与同一个部署里的 backup-server
-# 指向同一个状态根。上一版硬编码成 "$HOME/backup-project-server/data/metadata.sqlite3"，
-# 而服务端用的是 state/metadata.sqlite3 —— 路径分叉加上 SQLite 的"文件不存在就
-# 新建"，让管理工具读到了一个**刚被自己创建出来的空库**，屏幕上显示"还没有任何
-# 用户"，人工验收因此以为 ECS 上没有任何用户（其实用户都在正确的库里）。
+# 从脚本目录推导部署根，使管理工具与服务端使用同一实例的状态目录。
+# 路径无效时明确失败，不创建数据库。首页显示主机、部署根、数据根、
+# 元数据库与服务名，便于确认当前管理的实例。
 #
-# 现在：路径错了就明确失败（fail closed），绝不创建空库；而且每次运行都会先打印
-# Host / Server root / Data root / Metadata DB / Service，让人一眼看出在看哪个实例。
+# 传输身份指纹。
 #
-# ---- 传输身份指纹（PR #21 UI closure）----
-#
-# 首页（banner 调用的 status）现在还会打印一行：
+# 首页状态显示传输身份指纹：
 #
 #   传输身份指纹: sha256:<64 位十六进制>
 #
@@ -60,11 +55,8 @@ if [ -x "$SCRIPT_DIR/backup-server-admin" ]; then
   SERVER_ROOT_DEFAULT="$(cd "$SCRIPT_DIR/.." && pwd)"
   SERVER_ROOT="${BACKUP_SERVER_ROOT:-$SERVER_ROOT_DEFAULT}"
 else
-  # 源码树里直接跑（<repo>/scripts/backup-server-admin.sh）：产物在 build/ 下，
-  # 这里**推不出**任何真实实例。以前它猜 $HOME/backup-project-server——猜错了就会
-  # 去读另一个实例（SQLite 还会顺手把不存在的文件建成空库），人工验收因此得出过
-  # 完全错误的结论。现在 fail closed：要么用部署后的脚本，要么显式给出
-  # BACKUP_SERVER_ROOT。
+  # 源码树中的管理工具位于 build/，脚本目录无法确定部署实例。
+  # 必须显式提供 BACKUP_SERVER_ROOT。
   ADMIN_BIN="${BACKUP_SERVER_ADMIN:-$SCRIPT_DIR/../build/backup-server-admin}"
   if [ -z "${BACKUP_SERVER_ROOT:-}" ]; then
     echo "ERROR: 这是源码树里的脚本，无法推断要管理哪个实例。" >&2
