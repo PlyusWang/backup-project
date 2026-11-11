@@ -15,7 +15,7 @@
 set -uo pipefail
 
 ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
-cd "$ROOT_DIR"
+cd "$ROOT_DIR" || exit 1
 
 PASS=0
 FAIL=0
@@ -91,8 +91,9 @@ echo "[remote-incremental] B. 端到端（真实服务端 + BPSEC1 + 增量引�
 
 WORK="$TEST_ROOT/e2e"
 mkdir -p "$WORK/data" "$WORK/state" "$WORK/logs" "$WORK/src" "$WORK/home/.config"
-# 缓存与配置落在测试自己的 HOME 里，绝不碰真实 HOME。
+# 配置与缓存均使用测试目录，不继承调用方的 XDG_CONFIG_HOME。
 export HOME="$WORK/home"
+export XDG_CONFIG_HOME="$HOME/.config"
 # 本地已验证缓存的位置（由服务端指纹与用户名决定）。B.4b 与 B.9 都要用它，
 # 所以在这里一次性定下来，不要在脚本中间再定义一遍。
 CACHE_ROOT="$HOME/.config/backup-project/backup-gui-modern/remote-cache"
@@ -111,7 +112,8 @@ if [ "$(stat -c '%a' "$WORK/transport.key" 2>/dev/null)" = "600" ]; then
 else
   record_fail "B.0 身份私钥权限 0600" "$(stat -c '%a' "$WORK/transport.key" 2>/dev/null)"
 fi
-export BACKUP_REMOTE_SERVER_KEY="$(grep -oE 'sha256:[0-9a-f]{64}' "$WORK/keygen.out" | head -1)"
+BACKUP_REMOTE_SERVER_KEY="$(grep -oE 'sha256:[0-9a-f]{64}' "$WORK/keygen.out" | head -1)"
+export BACKUP_REMOTE_SERVER_KEY
 if [ -n "$BACKUP_REMOTE_SERVER_KEY" ]; then
   record_pass "B.0 取得客户端 pin（指纹）"
 else
@@ -173,7 +175,8 @@ else
   exit 1
 fi
 
-export BACKUP_REMOTE_PASSWORD="pw-$(head -c 16 /dev/urandom | sha256sum | cut -c1-24)"
+BACKUP_REMOTE_PASSWORD="pw-$(head -c 16 /dev/urandom | sha256sum | cut -c1-24)"
+export BACKUP_REMOTE_PASSWORD
 USER_NAME="pr21-inc-$$"
 REMOTE=(--user "$USER_NAME" --host 127.0.0.1 --port "$PORT")
 run_remote() { ./build/backupctl remote "$@" 2>&1; }
@@ -319,12 +322,40 @@ rm -rf "$CACHE_ROOT"
 R1BLOB="$WORK/data/users/1/$R1_ID.bak"
 if [ -f "$R1BLOB" ]; then
   BLOB_SIZE="$(stat -c %s "$R1BLOB")"
-  printf 'X' | dd of="$R1BLOB" bs=1 seek=$((BLOB_SIZE / 2)) conv=notrunc 2>/dev/null
-  mkdir -p "$WORK/restore-tampered"
-  if run_remote restore "$R1_ID" "$WORK/restore-tampered" "${REMOTE[@]}" >"$WORK/tampered.log" 2>&1; then
-    record_fail "B.11 服务端 blob 被篡改时拒绝恢复" "竟然成功了"
+  BLOB_OFFSET=$((BLOB_SIZE / 2))
+  BLOB_SHA_BEFORE="$(sha256sum "$R1BLOB" | cut -d' ' -f1)"
+  BLOB_BYTE_BEFORE="$(od -An -tu1 -N1 -j "$BLOB_OFFSET" "$R1BLOB" |
+    tr -d '[:space:]')"
+  # 翻转最低位，保证原字节无论取何值都会改变，且不改变归档长度。
+  printf -v BLOB_BYTE_OCTAL '\\%03o' "$((BLOB_BYTE_BEFORE ^ 1))"
+  printf '%b' "$BLOB_BYTE_OCTAL" |
+    dd of="$R1BLOB" bs=1 seek="$BLOB_OFFSET" conv=notrunc 2>/dev/null
+  BLOB_BYTE_AFTER="$(od -An -tu1 -N1 -j "$BLOB_OFFSET" "$R1BLOB" |
+    tr -d '[:space:]')"
+  BLOB_SHA_AFTER="$(sha256sum "$R1BLOB" | cut -d' ' -f1)"
+  printf '[remote-incremental] cache-root=%s\n' "$CACHE_ROOT"
+  grep '本地缓存' "$WORK/r0.log"
+  printf '[remote-incremental] blob-offset=%s byte-before=%s byte-after=%s\n' \
+    "$BLOB_OFFSET" "$BLOB_BYTE_BEFORE" "$BLOB_BYTE_AFTER"
+  printf '[remote-incremental] sha-before=%s sha-after=%s\n' \
+    "$BLOB_SHA_BEFORE" "$BLOB_SHA_AFTER"
+  if [ "$(stat -c %s "$R1BLOB")" = "$BLOB_SIZE" ] &&
+     [ "$BLOB_BYTE_AFTER" = "$((BLOB_BYTE_BEFORE ^ 1))" ] &&
+     [ "$BLOB_SHA_BEFORE" != "$BLOB_SHA_AFTER" ]; then
+    record_pass "B.11 已翻转归档字节且长度不变"
   else
+    record_fail "B.11 归档字节变异" "字节、长度或摘要不符合预期"
+  fi
+  mkdir -p "$WORK/restore-tampered"
+  if run_remote restore "$R1_ID" "$WORK/restore-tampered" "${REMOTE[@]}" \
+      >"$WORK/tampered.log" 2>&1; then
+    record_fail "B.11 服务端 blob 被篡改时拒绝恢复" "竟然成功了"
+  elif grep -q 'does not match the declared size or SHA-256' \
+      "$WORK/tampered.log"; then
     record_pass "B.11 服务端 blob 被篡改时拒绝恢复"
+  else
+    record_fail "B.11 摘要校验拒绝恢复" \
+      "$(tail -1 "$WORK/tampered.log")"
   fi
   if [ -z "$(ls -A "$WORK/restore-tampered" 2>/dev/null)" ]; then
     record_pass "B.11 被拒绝时目标目录保持为空（原子发布）"
