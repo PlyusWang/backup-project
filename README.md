@@ -41,8 +41,8 @@ Huffman）/ `zstd`（手写 RFC 8878 受限子集）；旧的 `lzss-huffman` 归
 
 ### 增量备份
 
-增量 delta 用独立格式 `BKPINC1`，恢复时自动解析并应用整条依赖链
-（完整基线 → Δ1 → Δ2 → …）。详见第 9 节。
+未加密增量使用 `BKPINC1`，加密增量使用带认证的 `BKPINC2`。恢复时自动解析
+并应用整条依赖链（完整基线 → Δ1 → Δ2 → …）。详见第 9 节。
 
 ### 定时与实时
 
@@ -95,7 +95,7 @@ Modern Qt 6 QML GUI，7 个页面，是**正式发布的前端**，见第 5 节�
               ┌───────────▼────────────────────────────┐
               │  归档层：pack → compress → encrypt      │
               │  MyPack / USTAR / fast-ustar            │
-              │  Huffman / LZSS-Huffman                 │
+              │  Huffman / Zstd                         │
               │  容器 BKPCNT2（header + 分层解码）      │
               └───────────┬────────────────────────────┘
                           │
@@ -355,9 +355,9 @@ backupctl remote ping --host 127.0.0.1 --port 18765 \
 
 ## 9. 增量备份
 
-增量 delta 用独立格式 `BKPINC1`：完整快照继续用 v2 容器（`BKPCNT2`），一个字节
-不改；delta 必须是**另一种顶层 magic**——如果 delta 复用了 `BKPCNT2`，旧版本的
-reader 会把它当成一份完整快照，然后安静地恢复出错的东西，这比明确拒绝危险得多。
+未加密 delta 使用 `BKPINC1`，加密 delta 使用 `BKPINC2`；完整快照使用
+`BKPCNT2` 容器。不同的顶层 magic 用于区分完整归档和增量依赖；恢复加密增量前，
+先验证外层认证以及依赖链中存在的 BPIDENT3 身份记录，认证失败时不发布恢复目标。
 
 - **依赖链**：一份 delta 记录它的 `parent`。恢复任意一个 restore point 时由
   `ResolveSnapshotChain` 自动解析出「完整基线 → Δ1 → Δ2 → … → ΔN」整条链，并逐跳
@@ -369,8 +369,9 @@ reader 会把它当成一份完整快照，然后安静地恢复出错的东西�
   但手动 `repository delete` 不管这些。
 - **没有可用的基线时会自己建**：第一次增量、或基线不可信时先写一份完整基线；
   没有任何有效变化时什么都不写。
-- **不支持的组合显式拒绝**，不做 silent fallback——「选了增量却偷偷按全量跑」是
-  最危险的那种降级。
+- **共享能力组合**：MyPack、USTAR、Fast USTAR 均可用于完整或增量备份，
+  并与不压缩、Huffman、Zstd 及不加密、AES、DES 组合。手动、定时、实时共用
+  同一能力检查；自动加密缺少有效凭据时停止执行，不改为未加密备份。
 
 远端增量同理，但多一层：客户端把「归档 + 强 manifest + 身份记录」三件套打成一个
 `BPSNAP1` 材料包上传，服务端只当不透明字节存。生成下一份 delta 需要父的三件套，
@@ -381,13 +382,17 @@ reader 会把它当成一份完整快照，然后安静地恢复出错的东西�
 
 ## 10. 测试
 
-三个入口，各管一件事：
+当前测试入口如下：
 
 | 脚本 | 管什么 | 怎么跑 |
 | --- | --- | --- |
 | `scripts/test.sh` | 功能基线：CLI 的 backup / restore 全链路、错误路径、路径拓扑、归档往返、元数据、损坏归档拒绝、路径穿越拒绝、不支持的文件类型、payload 未压缩的证明，以及其他子系统的用例 | `bash scripts/test.sh` |
 | `scripts/final_gate.sh` | 总门禁：全量重建（含 sanitizer 构建）+ lint + 把全部独立套件各跑一遍，每个套件一行 `GATE <名字> exit=<码> 秒数` | `bash scripts/final_gate.sh`（日志在 `/tmp/final_gate.log`） |
-| `scripts/modern_gui_check.sh` | Modern GUI：构建 + offscreen 启动 + qmllint + 静态约束 + 端到端（含真起一个 `backup-server` 的远程页合同测试） | `bash scripts/modern_gui_check.sh`（日志在 `tests/output/modern-gui-check.log`） |
+| `scripts/workflow_acceptance_test.sh` | 本地备份、恢复与证书导入的 GUI 工作流 | `bash scripts/workflow_acceptance_test.sh` |
+| `scripts/network_acceptance_test.sh` | TCP/SSH 与 BPSEC1/BPSEC2 组合的真实网络 GUI 流程 | `bash scripts/network_acceptance_test.sh` |
+| `scripts/isolated_gui_test.sh` | 已构建 GUI 的隔离控件与定时/实时自动化 | `OUT=$(mktemp -d)/evidence; bash scripts/isolated_gui_test.sh ./build/backup-gui-modern --automation-ui-test "$OUT"` |
+
+旧 `modern_gui_check.sh` 绑定已退役页面，不再作为当前发行验收入口。
 
 **基线 `6d1e2ba` 上的实测结果**（历史记录，不是当前 main 的数字；当前发行的构建
 与验收见 `docs/release-packaging.md` 与 GitHub Releases）：
@@ -398,8 +403,8 @@ scripts/final_gate.sh        49/49 套件 exit=0，failed suites = 0，构建警
 scripts/modern_gui_check.sh  通过 692 项，失败 0
 ```
 
-`final_gate.sh` 的 49 个套件里包含功能基线、质量维度、各个格式与算法的独立
-套件、多个 ASan + UBSan 消毒剂套件，以及两套 GUI 检查。`modern_gui_check.sh` 与
+该历史门禁的 49 个套件里包含功能基线、质量维度、各个格式与算法的独立
+套件、多个 ASan + UBSan 消毒剂套件，以及两套 GUI 检查。历史 `modern_gui_check.sh` 与
 `gui_smoke_test.sh` 刻意分成两个脚本：后者只管旧版 Widgets GUI，一个坏掉不会把
 另一个的检查带塌。
 

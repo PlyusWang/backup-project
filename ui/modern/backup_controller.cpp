@@ -538,22 +538,17 @@ bool BackupController::refreshBaselineCandidates(const QString& pack_key,
   return true;
 }
 
-// 相等就不发信号：QML 的双向绑定会把输入框的值再写回来一次，
-// 少了这个判断会来回触发，形成绑定环。
-// 选项显示名：手动 / 自动 / 实时三个页面共用这一份。以前各页自己
-// 写一份，而且手动页漏了“推荐 / 兼容格式”这两条取舍提示。
-//
-// 顺序与 QML 侧列出的 key 一一对应：strategy 对 full / incremental，
-// pack 对 mypack / ustar / fast-ustar，compression 对 none / huffman /
-// lzss-huffman， encryption 对 none / aes-256-ctr-hmac-sha256 /
-// des-cbc-hmac-sha256。
+// 手动、定时、实时页面共用同一组选项显示名。
+// 顺序与 QML 选项 key 对应：strategy 为 full / incremental，
+// pack 为 mypack / ustar / fast-ustar，compression 为 none / huffman / zstd，
+// encryption 为 none / aes-256-ctr-hmac-sha256 / des-cbc-hmac-sha256。
 QStringList BackupController::optionStrategyLabels() const {
   return {QStringLiteral("完整备份"), QStringLiteral("增量备份")};
 }
 
 QStringList BackupController::optionPackLabels() const {
-  // “推荐 / 兼容格式”是给用户看的取舍提示：MyPack 是本项目自有格式
-  // （增量链只支持它），另两种是通用格式。三个页面都必须看到同一条提示。
+  // MyPack 是项目自有格式，另两种使用 USTAR 编码。
+  // 三种打包格式均可用于完整快照和增量变化文件的载荷。
   return {QStringLiteral("MyPack（推荐）"), QStringLiteral("USTAR（兼容格式）"),
           QStringLiteral("Fast USTAR（兼容格式）")};
 }
