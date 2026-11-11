@@ -114,6 +114,9 @@ run cert-tool bash scripts/cert_tool_test.sh
 run bpsec2 bash scripts/bpsec2_test.sh
 run server-profile bash scripts/server_profile_test.sh
 run bpsec2-loopback bash scripts/bpsec2_loopback_e2e.sh
+run server-certificate-loading python3 \
+  tests/integration/test_server_certificate_loading.py --bin-dir build \
+  --output "$(mktemp -d /tmp/server-certificate-gate-XXXXXX)/evidence"
 # 登录失败节流：真实服务端 + 真实客户端，断言锁定期间正确口令也被拒。
 run login-throttle bash scripts/login_throttle_test.sh
 # 前两个再在 ASan + UBSan 下跑一遍：手写大整数与标量归约的越界/回绕问题

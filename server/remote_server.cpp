@@ -683,10 +683,7 @@ bool RemoteServer::LoadSecret(std::string* error_message) {
 
 namespace {
 
-// 读整个文件。BPSEC2 的证书是几十到几百字节的公开材料，一次读完最简单。
-// 注意：4096 的检查发生在整份内容已经在内存里之后——它挡住的是"把任意大的
-// 文件交给 BPCERT1 解析器"，而不是内存峰值。证书是公开材料且只有几百字节，
-// 这个取舍是刻意的（真要限制峰值就得先 fstat 再按大小分配）。
+// BPCERT1 最长 4096 字节。多读一个字节用于判定超限，限制读取时的内存。
 bool ReadWholeFile(const std::string& path, std::string* out,
                    std::string* error_message) {
   std::ifstream input(path, std::ios::binary);
@@ -696,23 +693,29 @@ bool ReadWholeFile(const std::string& path, std::string* out,
     }
     return false;
   }
-  std::ostringstream buffer;
-  buffer << input.rdbuf();
-  *out = buffer.str();
-  // 上限先于解析：BPCERT1 本身有 4096 字节硬上限，先卡住长度就不必把一个
-  // 任意大的文件读进内存再被解析器拒绝（红队复核的 nit）。
-  if (out->size() > 4096) {
+  constexpr std::size_t kMaxCertificateBytes = 4096;
+  char buffer[kMaxCertificateBytes + 1];
+  input.read(buffer, sizeof(buffer));
+  if (input.bad() || (input.fail() && !input.eof())) {
+    if (error_message != nullptr) {
+      *error_message = "读取文件失败：" + path;
+    }
+    return false;
+  }
+  const auto size = static_cast<std::size_t>(input.gcount());
+  if (size > kMaxCertificateBytes) {
     if (error_message != nullptr) {
       *error_message = "文件超过 4096 字节上限：" + path;
     }
     return false;
   }
-  if (out->empty()) {
+  if (size == 0) {
     if (error_message != nullptr) {
       *error_message = "文件是空的：" + path;
     }
     return false;
   }
+  out->assign(buffer, size);
   return true;
 }
 
