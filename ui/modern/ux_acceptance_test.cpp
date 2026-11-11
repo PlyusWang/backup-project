@@ -415,6 +415,109 @@ Item {
   input_window.setColor(theme->background());
   combo->setVisible(false);
 
+  // 产品页面共用的进度呈现：测试阶段输入，不改控制器只读业务状态。
+  QQmlComponent progress_component(
+      engine,
+      QUrl(QStringLiteral("qrc:/qml/components/OperationProgress.qml")));
+  std::unique_ptr<QObject> progress_object(
+      progress_component.createWithInitialProperties(
+          {{QStringLiteral("namePrefix"), QStringLiteral("ux")},
+           {QStringLiteral("showRatio"), true}}));
+  QQuickItem* progress = qobject_cast<QQuickItem*>(progress_object.get());
+  check(progress != nullptr, "shared operation progress created");
+  if (progress != nullptr) {
+    progress->setParentItem(input_window.contentItem());
+    progress->setPosition(QPointF(30, 30));
+    progress->setWidth(560);
+    QQuickItem* bar = FindItem(progress, "uxProgressBar");
+    QQuickItem* fill = FindItem(progress, "uxProgressFill");
+    QQuickItem* busy = FindItem(progress, "uxBusyIndicator");
+    QQuickItem* text = FindItem(progress, "uxProgressText");
+    QQuickItem* ratio = FindItem(progress, "uxProgressRatioText");
+    const bool controls_ready = bar != nullptr && fill != nullptr &&
+                                busy != nullptr && text != nullptr &&
+                                ratio != nullptr;
+    check(controls_ready, "progress has measured, busy and phase displays");
+    if (controls_ready) {
+      for (bool dark : {false, true}) {
+        theme->setDark(dark);
+        input_window.setColor(theme->background());
+        progress->setProperty("busy", true);
+        progress->setProperty("value", -1.0);
+        progress->setProperty("statusText", QStringLiteral("正在扫描文件…"));
+        Settle();
+        progress->setHeight(progress->implicitHeight());
+        check(progress->isVisible() && !bar->isVisible() && busy->isVisible() &&
+                  busy->property("running").toBool() && !ratio->isVisible() &&
+                  text->property("text").toString() ==
+                      QStringLiteral("正在扫描文件…"),
+              "unknown work shows busy phase without a bar or percentage");
+        capture(&input_window, dark ? "20-progress-unknown-dark.png"
+                                    : "20-progress-unknown-light.png");
+
+        progress->setProperty("statusText", QStringLiteral("正在写入备份…"));
+        progress->setProperty("value", 0.0);
+        Settle();
+        progress->setHeight(progress->implicitHeight());
+        check(bar->isVisible() && fill->width() == 0 && !busy->isVisible() &&
+                  !busy->property("running").toBool() && ratio->isVisible() &&
+                  ratio->property("text").toString() == QStringLiteral("0%"),
+              "measured zero shows an empty cumulative bar, not busy motion");
+
+        progress->setProperty("value", 0.5);
+        Settle();
+        check(fill->parentItem()->width() > 0 &&
+                  std::abs(fill->width() / fill->parentItem()->width() - 0.5) <
+                      0.001 &&
+                  fill->x() == 0 &&
+                  fill->property("color").value<QColor>() == theme->accent() &&
+                  ratio->property("text").toString() == QStringLiteral("50%"),
+              "measured halfway fills the themed bar from its fixed origin");
+        capture(&input_window, dark ? "21-progress-measured-dark.png"
+                                    : "21-progress-measured-light.png");
+
+        progress->setProperty("value", 1.0);
+        Settle();
+        check(
+            std::abs(fill->width() - fill->parentItem()->width()) < 0.001 &&
+                ratio->property("text").toString() == QStringLiteral("100%") &&
+                progress->isVisible() && progress->property("busy").toBool() &&
+                text->property("text").toString() ==
+                    QStringLiteral("正在写入备份…"),
+            "all measured bytes retain the active phase until completion");
+
+        progress->setProperty("value", -1.0);
+        progress->setProperty("statusText", QStringLiteral("正在完成备份…"));
+        Settle();
+        progress->setHeight(progress->implicitHeight());
+        check(!bar->isVisible() && !ratio->isVisible() && busy->isVisible() &&
+                  busy->property("running").toBool() &&
+                  text->property("text").toString() ==
+                      QStringLiteral("正在完成备份…"),
+              "final publication switches to busy without resetting the bar");
+        capture(&input_window, dark ? "22-progress-finishing-dark.png"
+                                    : "22-progress-finishing-light.png");
+
+        progress->setProperty("busy", false);
+        Settle();
+        check(!progress->isVisible() && !bar->isVisible() &&
+                  !busy->property("running").toBool(),
+              "idle operation hides progress and stops busy animation");
+        progress->setProperty("busy", true);
+        progress->setProperty("statusText", QStringLiteral("正在扫描文件…"));
+        Settle();
+        check(!bar->isVisible() && !ratio->isVisible() && busy->isVisible() &&
+                  busy->property("running").toBool(),
+              "next operation starts as unknown without a stale percentage");
+      }
+    }
+    progress->setVisible(false);
+  } else {
+    std::fprintf(stderr, "%s\n", qPrintable(progress_component.errorString()));
+  }
+  theme->setDark(false);
+  input_window.setColor(theme->background());
+
   const QVariantMap local_properties = {
       {QStringLiteral("fileNameText"), QStringLiteral("backup-20261029.bak")},
       {QStringLiteral("sizeText"), QStringLiteral("12 KiB")},

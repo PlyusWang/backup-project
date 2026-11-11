@@ -18,6 +18,7 @@
 #include <QQuickWindow>
 #include <QTemporaryDir>
 #include <QUuid>
+#include <cmath>
 #include <cstdio>
 
 #include "backup_catalog.h"
@@ -235,9 +236,52 @@ int RunWorkflowAcceptanceTest(QQuickWindow* window,
   int intermediate = 0;
   bool progress_shot = false;
   bool phase_indeterminate = true;
+  int unknown_ui_updates = 0;
+  int measured_ui_updates = 0;
+  bool phase_ui_consistent = true;
+  bool unknown_progress_shot = false;
+  bool capturing_unknown_progress = false;
+  double last_writing_ratio = -1.0;
+  bool cumulative_writing = true;
   const auto connection = QObject::connect(
       controller, &backup_modern::BackupController::progressChanged, window,
       [&]() {
+        if (controller->busy() && !controller->progressPhase().isEmpty()) {
+          QQuickItem* bar =
+              FindItem(window->contentItem(), "backupProgressBar");
+          QQuickItem* busy =
+              FindItem(window->contentItem(), "backupBusyIndicator");
+          QQuickItem* text =
+              FindItem(window->contentItem(), "backupProgressText");
+          const double ratio = controller->progressRatio();
+          if (bar == nullptr || busy == nullptr || text == nullptr) {
+            phase_ui_consistent = false;
+          } else if (ratio < 0) {
+            ++unknown_ui_updates;
+            phase_ui_consistent =
+                phase_ui_consistent && !bar->isVisible() && busy->isVisible() &&
+                busy->property("running").toBool() &&
+                text->property("text").toString() == controller->progressText();
+            if (!unknown_progress_shot && !capturing_unknown_progress) {
+              capturing_unknown_progress = true;
+              const QImage image = window->grabWindow();
+              unknown_progress_shot =
+                  !image.isNull() &&
+                  image.save(output +
+                             QStringLiteral("/08a-local-backup-busy.png"));
+              capturing_unknown_progress = false;
+            }
+          } else {
+            ++measured_ui_updates;
+            phase_ui_consistent =
+                phase_ui_consistent && bar->isVisible() && !busy->isVisible() &&
+                !busy->property("running").toBool() &&
+                std::abs(bar->property("value").toDouble() - ratio) < 0.000001;
+            cumulative_writing =
+                cumulative_writing && ratio >= last_writing_ratio;
+            last_writing_ratio = ratio;
+          }
+        }
         if (controller->progressPhase() != QStringLiteral("writing")) {
           phase_indeterminate =
               phase_indeterminate && controller->progressRatio() < 0;
@@ -261,6 +305,11 @@ int RunWorkflowAcceptanceTest(QQuickWindow* window,
   check(intermediate >= 2, "REAL_INTERMEDIATE_BYTE_PROGRESS");
   check(phase_indeterminate, "UNKNOWN_PHASE_ACTIVITY");
   check(progress_shot, "PROGRESS_SCREENSHOT");
+  check(
+      unknown_ui_updates > 0 && measured_ui_updates > 0 && phase_ui_consistent,
+      "REAL_PHASE_PROGRESS_UI");
+  check(cumulative_writing, "MEASURED_PROGRESS_NEVER_DECREASES");
+  check(unknown_progress_shot, "UNKNOWN_PHASE_BUSY_SCREENSHOT");
   const QStringList archives =
       QDir(repository).entryList({QStringLiteral("*.bak")}, QDir::Files);
   if (!check(archives.size() == 1, "ONE_FULL_SNAPSHOT")) return 1;
@@ -270,8 +319,29 @@ int RunWorkflowAcceptanceTest(QQuickWindow* window,
                           QStringLiteral(".identity")),
         "FULL_BASELINE_SIDECARS");
   const QString restore = work.filePath(QStringLiteral("restore"));
+  window->setProperty("currentPageKey", QStringLiteral("management"));
+  if (management != nullptr)
+    management->setProperty("currentTab", QStringLiteral("local"));
+  Pump(100);
   const bool restore_started =
       controller->startManagedRestore(archives.first(), restore);
+  QQuickItem* restore_progress =
+      FindItem(window->contentItem(), "managementProgressRow");
+  QQuickItem* restore_busy =
+      FindItem(window->contentItem(), "managementBusyIndicator");
+  QQuickItem* restore_bar =
+      FindItem(window->contentItem(), "managementProgressBar");
+  QQuickItem* restore_text =
+      FindItem(window->contentItem(), "managementProgressText");
+  check(restore_started && restore_progress != nullptr &&
+            restore_progress->isVisible() && restore_busy != nullptr &&
+            restore_busy->isVisible() &&
+            restore_busy->property("running").toBool() &&
+            restore_bar != nullptr && !restore_bar->isVisible() &&
+            restore_text != nullptr &&
+            restore_text->property("text").toString().contains(
+                QStringLiteral("正在恢复")),
+        "RESTORE_BUSY_WITHOUT_PERCENTAGE");
   check(restore_started && controller->waitForIdle(180000) &&
             controller->lastSucceeded() &&
             Digest(large) == Digest(restore + QStringLiteral("/large.bin")),

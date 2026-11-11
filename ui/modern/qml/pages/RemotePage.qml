@@ -1859,56 +1859,18 @@ Item {
                 }
             }
 
-            // 上传与下载共用这一行：方向与字节数都来自网络层的真实回调，
-            // transferActive 为假时整行不占位，不是画上去的假进度。
-            // ---------- 传输进度 ----------
-            // 上传与下载共用一条：direction 与字节数都来自网络层的真实回调。
-            RowLayout {
+            // 连接、校验等未知总量阶段显示忙碌状态，传输时按真实字节累计。
+            OperationProgress {
                 objectName: "remoteProgressRow"
+                namePrefix: "remote"
                 Layout.fillWidth: true
-                visible: remote.transferActive
-                spacing: 12
-
-                Text {
-                    objectName: "remoteProgressText"
-                    text: remote.transferPhaseText + "  " + remote.progressText
-                    font.pixelSize: 15
-                    color: theme.textSecondary
-                }
-
-                ProgressBar {
-                    id: transferBar
-                    objectName: "remoteProgressBar"
-                    Layout.fillWidth: true
-                    Layout.maximumWidth: 360
-                    from: 0
-                    to: 1
-                    value: remote.progressRatio
-                    implicitHeight: 8
-
-                    background: Rectangle {
-                        radius: 4
-                        color: theme.hover
-                        border.width: 1
-                        border.color: theme.border
-                    }
-
-                    contentItem: Item {
-                        Rectangle {
-                            width: transferBar.visualPosition * parent.width
-                            height: parent.height
-                            radius: 4
-                            color: theme.accent
-                        }
-                    }
-                }
-
-                Text {
-                    objectName: "remoteProgressRatioText"
-                    text: Math.round(remote.progressRatio * 100) + "%"
-                    font.pixelSize: 15
-                    color: theme.textSecondary
-                }
+                Layout.maximumWidth: 640
+                busy: remote.busy
+                value: remote.progressRatio
+                showRatio: true
+                statusText: remote.transferActive
+                            ? remote.transferPhaseText + "  " + remote.progressText
+                            : remote.statusTitle
             }
 
             // 页面级横幅只放"刚刚发生的操作结论"，四个属性全部由控制器给
