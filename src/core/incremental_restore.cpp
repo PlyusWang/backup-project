@@ -1253,7 +1253,9 @@ bool RestoreSnapshotChain(const std::string& repository_directory,
       return false;
     }
     if (!identity.identity_sidecar_present) continue;
-    if (!identity.identity_sidecar_parseable || !identity.sidecars_verified) {
+    if (!identity.identity_sidecar_parseable ||
+        (!identity.sidecars_verified &&
+         !(chain.delta_count == 0 && identity.identity_sidecar_version == 1))) {
       SetError(error_message,
                "Snapshot '" + name +
                    "' has an invalid or unbound identity sidecar: " +

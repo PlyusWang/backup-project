@@ -167,6 +167,27 @@ bool ConvertIdentityV3ToV2(const std::string& path) {
   return test_support::WriteFile(path, identity, 0600);
 }
 
+bool ConvertIdentityToV1(const std::string& path) {
+  std::string identity;
+  if (!test_support::ReadFile(path, &identity)) return false;
+  const std::size_t header_end = identity.find("source=");
+  const std::size_t source_end = identity.find('\n', header_end);
+  const std::size_t filter_begin = identity.find("filter=", source_end);
+  const std::size_t filter_end = identity.find('\n', filter_begin);
+  const std::size_t strategy_begin = identity.find("strategy=", filter_end);
+  const std::size_t strategy_end = identity.find('\n', strategy_begin);
+  if (header_end == std::string::npos || source_end == std::string::npos ||
+      filter_begin == std::string::npos || filter_end == std::string::npos ||
+      strategy_begin == std::string::npos || strategy_end == std::string::npos) {
+    return false;
+  }
+  const std::string v1 = "BPIDENT1\n" +
+                         identity.substr(header_end, source_end - header_end + 1) +
+                         identity.substr(filter_begin, filter_end - filter_begin + 1) +
+                         identity.substr(strategy_begin, strategy_end - strategy_begin + 1);
+  return test_support::WriteFile(path, v1, 0600);
+}
+
 void TestPackChain(
     bp::PackMethod pack, bp::EncryptionMethod encryption,
     const std::string& pack_name, const std::string& encryption_name,
@@ -380,6 +401,34 @@ void TestPackChain(
                                    &legacy_small) &&
             legacy_small == "F0",
         label + " encrypted BPIDENT2 full snapshot remains restorable", error);
+
+    test_support::Check(ConvertIdentityToV1(base_identity_path),
+                        label + " converts an encrypted full snapshot fixture to BPIDENT1");
+    const std::string legacy_v1_restore = work + "/legacy-v1-full";
+    error.clear();
+    const bool restored_legacy_v1 =
+        bp::RestoreSnapshotChain(repository, "base.bak", legacy_v1_restore,
+                                 restore, nullptr, &error);
+    std::string legacy_v1_small;
+    test_support::Check(
+        restored_legacy_v1 &&
+            test_support::ReadFile(legacy_v1_restore + "/small.txt",
+                                   &legacy_v1_small) &&
+            legacy_v1_small == "F0",
+        label + " standalone full restore remains compatible with BPIDENT1",
+        error);
+    const std::string unbound_parent_restore = work + "/unbound-v1-parent";
+    error.clear();
+    test_support::Check(
+        !bp::RestoreSnapshotChain(repository, "delta2.bak",
+                                  unbound_parent_restore, restore, nullptr,
+                                  &error) &&
+            !test_support::Exists(unbound_parent_restore),
+        label + " BPIDENT1 cannot act as a trusted incremental ancestor",
+        error);
+    test_support::Check(
+        test_support::WriteFile(base_identity_path, base_identity, 0600),
+        label + " restores original identity after BPIDENT1 ancestor test");
   }
   if (encryption != bp::EncryptionMethod::kNone) {
     bp::RestoreOptions wrong_password;
