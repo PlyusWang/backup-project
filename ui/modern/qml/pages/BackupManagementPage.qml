@@ -264,6 +264,15 @@ Item {
                         }
                     }
 
+                    OperationProgress {
+                        namePrefix: "management"
+                        Layout.fillWidth: true
+                        busy: controller.busy
+                        value: controller.progressRatio
+                        statusText: controller.progressText.length > 0
+                                    ? controller.progressText : controller.statusTitle
+                    }
+
                     RowLayout {
                         Layout.fillWidth: true
                         visible: controller.catalogBusy
