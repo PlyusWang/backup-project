@@ -826,10 +826,7 @@ void SecureChannel::Reset() {
   corrupt_next_tag_ = false;
   peer_public_key_.clear();
   peer_fingerprint_.clear();
-  // BPSEC2 的两个字段也必须一起清。红队复核指出第一版漏了它们：同一条
-  // SecureChannel 复用（Reset 之后再握手失败）时，peer_server_id() 会继续
-  // 报上一次那张证书的身份 —— 一个"陈旧身份"。今天没有生产调用方读它，
-  // 但这是典型的"等有人读的时候就晚了"的状态泄漏。
+  // 同时清除对端证书身份，避免通道重用后仍返回上一次握手的身份。
   peer_server_id_.clear();
   peer_certificate_fingerprint_.clear();
   transcript_hash_.clear();
