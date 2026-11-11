@@ -34,7 +34,8 @@ Linux 环境下的数据备份与恢复软件，课程项目。核心用 C++17 �
 
 打包支持 `mypack`（本项目自有格式）、`ustar`（POSIX tar）、`fast-ustar`
 （同样的 wire format，只改 I/O 策略）；压缩支持 `none` / `huffman`（Canonical
-Huffman）/ `lzss-huffman`；加密支持 `none` /
+Huffman）/ `zstd`（手写 RFC 8878 受限子集）；旧的 `lzss-huffman` 归档和配置仍可读取，
+但新 GUI 不再将其作为新建选项；加密支持 `none` /
 `aes-256-ctr-hmac-sha256` / `des-cbc-hmac-sha256`。三者是可组合的三层流水线，
 顺序固定为 **打包 → 压缩 → 加密**。
 
@@ -293,8 +294,8 @@ reference**：它继续可构建、继续进 lint，`scripts/gui_smoke_test.sh` 
 
 - 命令行：`backupctl schedule watch` / `backupctl realtime watch` 在前台跑，直到
   `SIGINT` / `SIGTERM`；
-- 图形界面：Modern GUI 运行期间自己驱动（页面上的「启用」只是写配置，真正跑的
-  是这个进程）。
+- 图形界面：Modern GUI 运行期间自己驱动；页面上的“启用”会先校验并保存当前
+  设置，再启动对应任务，“停用”停止新的自动触发。
 
 CLI 与 GUI 共用一把计划锁：同时开着 GUI 又开着 `schedule watch` 时，一方持有、
 另一方在页面上如实显示「已被另一进程持有」，不会两边同时建快照。
@@ -308,10 +309,12 @@ CLI 与 GUI 共用一把计划锁：同时开着 GUI 又开着 `schedule watch` 
 **实时**用递归 inotify 监听源树，配一个 debounce / coalescing 状态机：短促的连续
 改动合并成一次备份（trailing edge），持续不断的改动也有 `--max-wait-ms` 上限兜底，
 不会永远不触发。监听队列溢出（`IN_Q_OVERFLOW`）或监听丢失时标记为降级并重扫，
-恢复后继续。多个自动化触发路径都**不允许加密**（`--encryption` 只能是 `none`），
-因为无人值守时没有地方安全地拿口令。
+恢复后继续。定时和实时都支持完整/增量，以及AES加密。GUI默认将归档密码仅保留
+在当前会话，重启后需要重新输入；CLI高级用法可显式提供受保护的 `--password-file`。
+凭据不可用时任务失败，不会自动降级成不加密。保存设置保持原启用状态；成功停用后，
+新的文件变化不再触发备份，历史记录仍会保留。
 
-用法见 `docs/scheduled_backup_usage.md` 与 `backupctl realtime --help`。
+用法见[定时与实时备份说明](docs/scheduled_backup_usage.md)与 `backupctl realtime --help`。
 
 ---
 
@@ -465,7 +468,7 @@ bash scripts/stage-server-release.sh     # 默认 dist/server/
 | `docs/ui/modern_qml_gui.md` | Modern GUI 的设计、逐页说明与已知限制 |
 | `docs/ui/desktop_gui.md` | 旧版 Widgets GUI（legacy） |
 | `docs/ui/filter_rule_builder.md` | Filter 规则构造中间层 |
-| `docs/scheduled_backup_usage.md` | 定时备份：变化检测、源清单绑定、保留策略 |
+| `docs/scheduled_backup_usage.md` | 定时与实时：完整/增量、启停保存、加密会话与恢复 |
 | `docs/network_backup_usage.md` | 远程备份：拓扑、BPSEC1、远端增量 |
 | `docs/release-layout.md` | 客户端 / 服务端发布布局与核对方式 |
 | `docs/release-packaging.md` | 发行制品怎么做的、基线怎么选的 |

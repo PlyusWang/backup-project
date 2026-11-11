@@ -174,13 +174,25 @@ bool CompressFile(const std::string& input_file, const std::string& output_file,
     return false;
   }
   std::uint64_t produced = 0;
-  const bool ok =
-      method == CompressionMethod::kHuffman
-          ? compression::HuffmanCompressStream(input_file, &sink, nullptr,
-                                               &produced, error_message)
-          : compression::LzssHuffmanCompressStream(input_file, &sink,
-                                                   workspace_directory, nullptr,
-                                                   &produced, error_message);
+  bool ok = false;
+  switch (method) {
+    case CompressionMethod::kHuffman:
+      ok = compression::HuffmanCompressStream(input_file, &sink, nullptr,
+                                              &produced, error_message);
+      break;
+    case CompressionMethod::kLzssHuffman:
+      ok = compression::LzssHuffmanCompressStream(input_file, &sink,
+                                                  workspace_directory, nullptr,
+                                                  &produced, error_message);
+      break;
+    case CompressionMethod::kZstd:
+      ok = compression::ZstdCompressStream(input_file, &sink, nullptr,
+                                           &produced, error_message);
+      break;
+    default:
+      SetError(error_message, "Unsupported compression method");
+      break;
+  }
   if (!ok) {
     sink.Abandon();
     return false;
@@ -228,15 +240,26 @@ bool DecompressFile(const std::string& input_file,
     return false;
   }
   std::uint64_t written = 0;
-  // 两个 Stream 解码器都会在写任何输出之前先把头部读完、把 original_size 与
-  // expected_size 对上，所以"解完几 GB 才发现长度不对"这条路径不存在。
-  const bool ok =
-      method == CompressionMethod::kHuffman
-          ? compression::HuffmanDecompressStream(
-                input_file, 0, &sink, expected_size, &written, error_message)
-          : compression::LzssHuffmanDecompressStream(
-                input_file, &sink, workspace_directory, expected_size, &written,
-                error_message);
+  // Every decoder enforces the container's exact length and output bound.
+  bool ok = false;
+  switch (method) {
+    case CompressionMethod::kHuffman:
+      ok = compression::HuffmanDecompressStream(
+          input_file, 0, &sink, expected_size, &written, error_message);
+      break;
+    case CompressionMethod::kLzssHuffman:
+      ok = compression::LzssHuffmanDecompressStream(
+          input_file, &sink, workspace_directory, expected_size, &written,
+          error_message);
+      break;
+    case CompressionMethod::kZstd:
+      ok = compression::ZstdDecompressStream(input_file, &sink, expected_size,
+                                             &written, error_message);
+      break;
+    default:
+      SetError(error_message, "Unsupported compression method");
+      break;
+  }
   if (!ok) {
     sink.Abandon();
     return false;
@@ -1230,6 +1253,16 @@ bool RunRestorePipeline(const std::string& archive_file,
       return false;
     }
     if (info.original_size != header.packed_size) {
+      SetError(error_message,
+               "Compressed stream original_size does not match the container "
+               "header");
+      return false;
+    }
+  } else if (compression == CompressionMethod::kZstd) {
+    compression::ZstdStreamInfo info;
+    if (!compression::ZstdReadStreamInfo(compressed_file, &info, error_message))
+      return false;
+    if (info.has_content_size && info.original_size != header.packed_size) {
       SetError(error_message,
                "Compressed stream original_size does not match the container "
                "header");

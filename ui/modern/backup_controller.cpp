@@ -161,6 +161,7 @@ struct DisplayLabel {
 const DisplayLabel kCompressionLabels[] = {
     {"none", "不压缩"},
     {"huffman", "Huffman"},
+    {"zstd", "Zstd"},
     {"lzss-huffman", "LZSS + Huffman"},
 };
 
@@ -559,7 +560,7 @@ QStringList BackupController::optionPackLabels() const {
 
 QStringList BackupController::optionCompressionLabels() const {
   return {QStringLiteral("不压缩"), QStringLiteral("Huffman"),
-          QStringLiteral("LZSS + Huffman")};
+          QStringLiteral("Zstd")};
 }
 
 QStringList BackupController::optionEncryptionLabels() const {

@@ -130,7 +130,7 @@ backupctl backup <src> [选项]                     Modern GUI「备份」页
    └───────┬──────────────┬───────────────┬─────────────────────┘
            ▼              ▼               ▼
     src/archive       src/compression    src/crypto
-    mypack_v2/ustar    huffman/lzss      aes/des + hmac + pbkdf2
+    mypack_v2/ustar    huffman/lzss/zstd  aes/des + hmac + pbkdf2
     container_format   codec_io          random/sha256
            └──────────────┴───────────────┘
                           ▼
@@ -341,13 +341,17 @@ GUI 主进程已经按 per-UID 持有那把锁）。远程网络 I/O 不占用 O
 
 ### 4.6 Compression：`src/compression/*`
 
-两个手写编解码，不链接任何第三方压缩库（include/compression.h:25）：
+三种手写编解码，不链接第三方压缩库。新配置提供 Huffman 与 Zstd，LZSS + Huffman 保留兼容：
 
 - `HUF1`：Canonical Huffman，276 字节头（256 字节码长表 + 原始长度 + 有效 bit 数），
   见 include/compression.h:11-16。流式入口 src/compression/huffman.cpp:679 / :726。
 - `LZH1`：LZSS + Canonical Huffman，20 字节头，内层是一个完整的 HUF1 流，
   见 include/compression.h:18-23。窗口 32 KiB、最短匹配 3、最长 258
   （include/compression.h:43-49）。流式入口 src/compression/lzss.cpp:659 / :730。
+- Zstandard：`src/compression/zstd.cpp` 自行实现 LZ 匹配、Huffman、FSE 与 XXH64，
+  输出标准 RFC 8878 frame。编码使用 64 KiB 独立匹配块；解码窗口上限 8 MiB，
+  只支持显式文档化的格式子集，不承诺读取任意 `.zst` 文件。范围和拒绝规则见
+  [Zstandard 格式说明](ZSTANDARD_FORMAT.md)。BKPCNT2 压缩编号为 3，旧编号不变。
 - 产品流水线只走 Stream（文件到文件）接口，峰值内存与输入大小无关
   （include/compression.h:83-91）；LZSS 的 token 流落在私有临时文件里
   （src/core/archive_pipeline.cpp:16-20）。

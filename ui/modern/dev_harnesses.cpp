@@ -10424,6 +10424,7 @@ int RunBackupOptionsTest(backup_modern::BackupController* controller,
   const CompressionCase compression_cases[] = {
       {"none", backupproject::CompressionMethod::kNone, "不压缩"},
       {"huffman", backupproject::CompressionMethod::kHuffman, "Huffman"},
+      {"zstd", backupproject::CompressionMethod::kZstd, "Zstd"},
       {"lzss-huffman", backupproject::CompressionMethod::kLzssHuffman,
        "LZSS + Huffman"},
   };
@@ -10584,8 +10585,13 @@ int RunBackupOptionsTest(backup_modern::BackupController* controller,
        kDesPassword, backupproject::PackMethod::kMyPack,
        backupproject::CompressionMethod::kNone,
        backupproject::EncryptionMethod::kDesCbcHmacSha256},
+      {QStringLiteral("mypack + zstd + aes"), QStringLiteral("mypack"),
+       QStringLiteral("zstd"), QStringLiteral("aes-256-ctr-hmac-sha256"),
+       kSentinelPassword, backupproject::PackMethod::kMyPack,
+       backupproject::CompressionMethod::kZstd,
+       backupproject::EncryptionMethod::kAes256CtrHmacSha256},
   };
-  const int kBackupCaseCount = 4;
+  const int kBackupCaseCount = 5;
   QString created_files[kBackupCaseCount];
   // 只用来把 file name 解析成真实路径：与产品入口走的是同一套 Catalog 逻辑。
   backupproject::BackupCatalog catalog;

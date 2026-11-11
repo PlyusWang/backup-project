@@ -63,8 +63,13 @@ Item {
     readonly property var strategyKeys: ["full", "incremental"]
     readonly property var packLabels: controller.optionPackLabels
     readonly property var packKeys: ["mypack", "ustar", "fast-ustar"]
-    readonly property var compressionLabels: controller.optionCompressionLabels
-    readonly property var compressionKeys: ["none", "huffman", "lzss-huffman"]
+    readonly property var compressionLabels: legacyCompressionLoaded
+        ? Array.from(controller.optionCompressionLabels).concat(["LZSS + Huffman（旧格式）"])
+        : controller.optionCompressionLabels
+    readonly property bool legacyCompressionLoaded: panel.compressionKey === "lzss-huffman"
+    readonly property var compressionKeys: legacyCompressionLoaded
+        ? ["none", "huffman", "zstd", "lzss-huffman"]
+        : ["none", "huffman", "zstd"]
     // 加密的显示顺序固定为：不加密 -> AES -> DES。DES 是课程用的旧算法，
     // 名字后面必须挂着这个标记，免得有人在真实数据上误选它。
     readonly property var encryptionLabels: controller.optionEncryptionLabels
@@ -125,6 +130,8 @@ Item {
     readonly property string compressionHelper: {
         if (panel.compressionKey === "huffman")
             return "基于字符频率的无损压缩。"
+        if (panel.compressionKey === "zstd")
+            return "Zstandard 标准格式，使用本项目手写编码器。"
         if (panel.compressionKey === "lzss-huffman")
             return "先利用重复片段，再进行 Huffman 编码；"
                 + "通常更适合重复较多的数据。"
@@ -336,10 +343,16 @@ Item {
                     }
 
                     AppComboBox {
+                        id: compressionSelector
                         objectName: "compressionSelector"
                         Layout.fillWidth: true
                         Layout.maximumWidth: 420
                         model: panel.compressionLabels
+                        // Replacing the legacy model must preserve the selected key.
+                        onModelChanged: Qt.callLater(function() {
+                            comboSelection.setCurrentIndex(
+                                compressionSelector, panel.compressionIndex)
+                        })
                         currentIndex: panel.compressionIndex
                         enabled: !controller.busy
                         onActivated: panel.compressionKey =

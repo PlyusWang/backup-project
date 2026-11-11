@@ -40,6 +40,7 @@ struct CompressionEntry {
 const CompressionEntry kCompressionEntries[] = {
     {"none", CompressionMethod::kNone, "None"},
     {"huffman", CompressionMethod::kHuffman, "Huffman"},
+    {"zstd", CompressionMethod::kZstd, "Zstd"},
     {"lzss-huffman", CompressionMethod::kLzssHuffman, "LZSS + Huffman"},
 };
 

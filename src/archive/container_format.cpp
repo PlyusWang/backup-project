@@ -84,6 +84,8 @@ const char* CompressionMethodName(CompressionMethod method) {
       return "huffman";
     case CompressionMethod::kLzssHuffman:
       return "lzss-huffman";
+    case CompressionMethod::kZstd:
+      return "zstd";
   }
   return "unknown";
 }
@@ -114,6 +116,9 @@ bool ParseCompressionMethodId(std::uint8_t id, CompressionMethod* method) {
       return true;
     case 2:
       *method = CompressionMethod::kLzssHuffman;
+      return true;
+    case 3:
+      *method = CompressionMethod::kZstd;
       return true;
     default:
       return false;

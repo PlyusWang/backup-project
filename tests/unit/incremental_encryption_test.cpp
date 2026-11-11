@@ -134,10 +134,12 @@ bool StandardTarLists(const std::string& path) {
          WEXITSTATUS(status) == 0;
 }
 
-void TestPackChain(bp::PackMethod pack, bp::EncryptionMethod encryption,
-                   const std::string& pack_name,
-                   const std::string& encryption_name) {
-  const std::string label = pack_name + "-" + encryption_name;
+void TestPackChain(
+    bp::PackMethod pack, bp::EncryptionMethod encryption,
+    const std::string& pack_name, const std::string& encryption_name,
+    bp::CompressionMethod compression = bp::CompressionMethod::kNone) {
+  const std::string label = pack_name + "-" + encryption_name + "-" +
+                            bp::CompressionMethodName(compression);
   test_support::Section("INC-PACK " + label);
   const std::string work = test_support::FreshDir("inc-pack-" + label);
   const std::string source = work + "/src";
@@ -155,6 +157,7 @@ void TestPackChain(bp::PackMethod pack, bp::EncryptionMethod encryption,
       label + " F0 fixtures");
   bp::BackupOptions options;
   options.pack_method = pack;
+  options.compression_method = compression;
   options.encryption_method = encryption;
   if (encryption != bp::EncryptionMethod::kNone) {
     options.password = "A09 test archive password";
@@ -195,10 +198,12 @@ void TestPackChain(bp::PackMethod pack, bp::EncryptionMethod encryption,
   test_support::Check(
       bp::ExtractDeltaPayload(repository + "/delta2.bak", inner, &error) &&
           bp::InspectContainerFile(inner, &header, &error) &&
-          header.pack_method == static_cast<std::uint8_t>(pack),
+          header.pack_method == static_cast<std::uint8_t>(pack) &&
+          header.compression_method == static_cast<std::uint8_t>(compression),
       label + " inner container retains the selected pack", error);
   if ((pack == bp::PackMethod::kUstar || pack == bp::PackMethod::kFastUstar) &&
-      encryption == bp::EncryptionMethod::kNone) {
+      encryption == bp::EncryptionMethod::kNone &&
+      compression == bp::CompressionMethod::kNone) {
     std::string container;
     const bool have_container = test_support::ReadFile(inner, &container);
     const std::uint64_t payload_offset = bp::container_v2::kHeaderSize;
@@ -219,6 +224,12 @@ void TestPackChain(bp::PackMethod pack, bp::EncryptionMethod encryption,
                         label + " packed payload is readable by standard tar",
                         error);
   }
+  test_support::Check(
+      RunIncrementalFrom(source, repository, "unchanged.bak", "delta2.bak",
+                         options, &outcome, &error) &&
+          outcome.kind == bp::IncrementalOutcome::Kind::kNoChanges &&
+          !test_support::Exists(repository + "/unchanged.bak"),
+      label + " no-change creates no snapshot", error);
   const std::string restored = work + "/restored";
   bp::RestoreOptions restore;
   restore.password = options.password;
@@ -499,18 +510,30 @@ int main(int argc, char** argv) {
     if (!restored) std::fprintf(stderr, "restore failed: %s\n", error.c_str());
     return restored ? 0 : 1;
   }
-  TestRoundTrip(bp::EncryptionMethod::kNone, "none");
-  TestRoundTrip(bp::EncryptionMethod::kAes256CtrHmacSha256, "aes");
-  TestRoundTrip(bp::EncryptionMethod::kDesCbcHmacSha256, "des");
+  const bool zstd_only = argc == 2 && std::string(argv[1]) == "--zstd";
+  if (!zstd_only) {
+    TestRoundTrip(bp::EncryptionMethod::kNone, "none");
+    TestRoundTrip(bp::EncryptionMethod::kAes256CtrHmacSha256, "aes");
+    TestRoundTrip(bp::EncryptionMethod::kDesCbcHmacSha256, "des");
+  }
   for (const auto& pack : {std::pair<bp::PackMethod, const char*>{
                                bp::PackMethod::kMyPack, "mypack"},
                            {bp::PackMethod::kUstar, "ustar"},
                            {bp::PackMethod::kFastUstar, "fast-ustar"}}) {
-    TestPackChain(pack.first, bp::EncryptionMethod::kNone, pack.second, "none");
+    if (!zstd_only) {
+      TestPackChain(pack.first, bp::EncryptionMethod::kNone, pack.second,
+                    "none");
+      TestPackChain(pack.first, bp::EncryptionMethod::kAes256CtrHmacSha256,
+                    pack.second, "aes");
+      TestPackChain(pack.first, bp::EncryptionMethod::kDesCbcHmacSha256,
+                    pack.second, "des");
+    }
+    TestPackChain(pack.first, bp::EncryptionMethod::kNone, pack.second, "none",
+                  bp::CompressionMethod::kZstd);
     TestPackChain(pack.first, bp::EncryptionMethod::kAes256CtrHmacSha256,
-                  pack.second, "aes");
+                  pack.second, "aes", bp::CompressionMethod::kZstd);
     TestPackChain(pack.first, bp::EncryptionMethod::kDesCbcHmacSha256,
-                  pack.second, "des");
+                  pack.second, "des", bp::CompressionMethod::kZstd);
   }
   return test_support::Finish("incremental_encryption_test");
 }

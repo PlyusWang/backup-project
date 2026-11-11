@@ -1,7 +1,7 @@
 // compression.h
 //
 // 手写压缩编解码：Canonical Huffman（HUF1）与 LZSS + Canonical
-// Huffman（LZH1）。
+// Huffman（LZH1），以及 RFC 8878 Zstandard 子集。
 //
 // 每个格式只有**一份**实现，两种后端：
 //   * 字符串接口（单元测试、已知向量、小数据）：内存后端；
@@ -143,6 +143,32 @@ bool LzssHuffmanDecompressStream(const std::string& input_file, FileSink* sink,
                                  std::uint64_t expected_original_size,
                                  std::uint64_t* written,
                                  std::string* error_message);
+
+// Standard Zstandard frames with bounded blocks/window; the supported subset
+// and explicit rejection rules are documented in docs/ZSTANDARD_FORMAT.md.
+// Decoding requires the trusted outer expected length; it is both a hard output
+// limit and an exact final-length check. String output is unchanged on failure.
+bool ZstdCompress(const std::string& input, std::string* output,
+                  std::string* error_message);
+bool ZstdDecompress(const std::string& input,
+                    std::uint64_t expected_original_size, std::string* output,
+                    std::string* error_message);
+struct ZstdStreamInfo {
+  bool has_content_size = false;
+  bool has_checksum = false;
+  std::uint64_t original_size = 0;
+  std::uint64_t window_size = 0;
+};
+// Header validation only; block/checksum validation occurs during decoding.
+bool ZstdReadStreamInfo(const std::string& input_file, ZstdStreamInfo* info,
+                        std::string* error_message);
+bool ZstdCompressStream(const std::string& input_file, FileSink* sink,
+                        std::uint64_t* original_size,
+                        std::uint64_t* stream_bytes,
+                        std::string* error_message);
+bool ZstdDecompressStream(const std::string& input_file, FileSink* sink,
+                          std::uint64_t expected_original_size,
+                          std::uint64_t* written, std::string* error_message);
 
 }  // namespace compression
 }  // namespace backupproject

@@ -107,8 +107,15 @@ if [ "$WITH_GUI" -eq 1 ]; then
   cp "$BUILD_DIR/backup-gui-modern" "$OUT_DIR/bin/backup-gui-modern"
 fi
 cp resources/security/official-root-ed25519.pub "$OUT_DIR/share/backup-project/"
-for doc in docs/client-quick-start.md docs/release-layout.md docs/secure_transport.md; do
-  [ -f "$doc" ] && cp "$doc" "$OUT_DIR/docs/"
+for doc in docs/client-quick-start.md docs/release-layout.md docs/secure_transport.md docs/ZSTANDARD_FORMAT.md; do
+  if [ ! -s "$doc" ]; then
+    echo "错误：客户端必需文档缺失或为空：$doc" >&2
+    exit 1
+  fi
+  if ! cp "$doc" "$OUT_DIR/docs/"; then
+    echo "错误：复制客户端文档失败：$doc" >&2
+    exit 1
+  fi
 done
 if [ -n "$VERSION_ARG" ]; then
   printf '%s\n' "$VERSION_ARG" > "$OUT_DIR/share/backup-project/VERSION"

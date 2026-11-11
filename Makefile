@@ -22,7 +22,7 @@ CORE_SOURCES := src/core/archive_entry.cpp src/core/archive_pipeline.cpp \
                 src/archive/mypack_v2.cpp src/archive/pack_stream.cpp \
                 src/archive/ustar.cpp src/catalog/backup_catalog.cpp \
                 src/config/config_manager.cpp src/compression/codec_io.cpp src/compression/huffman.cpp \
-                src/compression/lzss.cpp src/crypto/aes.cpp \
+                src/compression/lzss.cpp src/compression/zstd.cpp src/crypto/aes.cpp \
                 src/crypto/des.cpp src/crypto/hmac.cpp src/crypto/pbkdf2.cpp \
                 src/crypto/random.cpp src/crypto/sha256.cpp \
                 src/crypto/sha512.cpp \
@@ -156,6 +156,22 @@ DEPENDS += $(FIXTURE_OBJECTS:.o=.d)
 # 产品构建：三个产品产物（CLI + 服务端 + 测试夹具除外）。
 # archive-cli 是测试夹具，见上面的说明。
 all: $(TARGET) $(SERVER_TARGET)
+
+# The codec fixture has no product singleton and no GUI/server dependencies.
+ZSTD_CODEC_TARGET := $(BUILD_DIR)/zstd-codec
+ZSTD_CODEC_SOURCES := tests/tools/zstd_codec.cpp src/compression/zstd.cpp \
+                      src/compression/codec_io.cpp src/compression/huffman.cpp \
+                      src/compression/lzss.cpp src/core/file_io.cpp
+ZSTD_CODEC_OBJECTS := $(patsubst %.cpp,$(BUILD_DIR)/%.o,$(ZSTD_CODEC_SOURCES))
+DEPENDS += $(ZSTD_CODEC_OBJECTS:.o=.d)
+ZSTD_TEST_OUTPUT ?= $(BUILD_DIR)/zstd-regression
+.PHONY: zstd-codec test-zstd
+zstd-codec: $(ZSTD_CODEC_TARGET)
+$(ZSTD_CODEC_TARGET): $(ZSTD_CODEC_OBJECTS)
+	$(CXX) $(CXXFLAGS) $^ -o $@
+test-zstd: $(ZSTD_CODEC_TARGET)
+	python3 tests/zstd/regression.py $(abspath $(ZSTD_CODEC_TARGET)) $(abspath $(ZSTD_TEST_OUTPUT))
+
 
 # 两端可以分开构建（PR #23 的发布脚本就靠这两个目标）：
 #   make client -> backupctl + 现代 GUI（QML）

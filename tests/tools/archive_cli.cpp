@@ -47,7 +47,7 @@ void PrintUsage(std::ostream& output) {
             "container;\n"
          << "without them the legacy v0.1 archive format is used):\n"
          << "  --pack mypack|ustar|fast-ustar\n"
-         << "  --compression none|huffman|lzss-huffman\n"
+         << "  --compression none|huffman|zstd (legacy: lzss-huffman)\n"
          << "  --encryption none|aes-256-ctr-hmac-sha256|des-cbc-hmac-sha256\n"
          << "\n"
          << "Passwords are read interactively from /dev/tty, never from an "

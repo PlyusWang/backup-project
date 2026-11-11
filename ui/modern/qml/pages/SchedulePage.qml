@@ -126,8 +126,13 @@ Item {
     readonly property var strategyLabels: controller.optionStrategyLabels
     readonly property var packKeys: ["mypack", "ustar", "fast-ustar"]
     readonly property var packLabels: controller.optionPackLabels
-    readonly property var compressionKeys: ["none", "huffman", "lzss-huffman"]
-    readonly property var compressionLabels: controller.optionCompressionLabels
+    readonly property bool legacyCompressionLoaded: schedule.compressionKey === "lzss-huffman"
+    readonly property var compressionKeys: legacyCompressionLoaded
+        ? ["none", "huffman", "zstd", "lzss-huffman"]
+        : ["none", "huffman", "zstd"]
+    readonly property var compressionLabels: legacyCompressionLoaded
+        ? Array.from(controller.optionCompressionLabels).concat(["LZSS + Huffman（旧格式）"])
+        : controller.optionCompressionLabels
     // 三种备份方式共用同一组加密 key / 显示名（backupOptions 是唯一来源）。
     readonly property var encryptionKeys: ["none",
                                            "aes-256-ctr-hmac-sha256",
@@ -831,6 +836,12 @@ Item {
                                     implicitWidth: 210
                                     enabled: !schedule.libraryBusy
                                     model: page.compressionLabels
+                                    // Qt resets the index when the legacy row is removed.
+                                    // Restore the draft after the new model is ready.
+                                    onModelChanged: Qt.callLater(function() {
+                                        comboSelection.setCurrentIndex(
+                                            compressionBox, page.draftCompressionIndex)
+                                    })
                                     currentIndex: page.draftCompressionIndex
                                     onActivated: page.draftCompressionIndex =
                                         currentIndex

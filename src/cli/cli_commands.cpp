@@ -275,7 +275,8 @@ void PrintCliUsage(const std::string& program_name, std::ostream& output) {
       << " schedule show | set | enable | disable | run | history | watch\n"
       << "    schedule set takes --source --interval-minutes --retain "
          "--strategy\n"
-      << "      --pack --compression --encryption none --include --exclude, "
+      << "      --pack --compression --encryption --password-file --include "
+         "--exclude, "
          "plus\n"
       << "      --clear-filters (drop the stored rules first, then add the "
          "ones\n"
@@ -290,7 +291,8 @@ void PrintCliUsage(const std::string& program_name, std::ostream& output) {
       << " realtime show | set | enable | disable | watch | history\n"
       << "    realtime set takes --source --debounce-ms --max-wait-ms "
          "--retain\n"
-      << "      --strategy --pack --compression --encryption none --include\n"
+      << "      --strategy --pack --compression --encryption --password-file "
+         "--include\n"
       << "      --exclude, plus --clear-filters (drop the stored rules "
          "first,\n"
       << "      then add the ones given on this command line).\n"
@@ -324,7 +326,7 @@ void PrintCliUsage(const std::string& program_name, std::ostream& output) {
          "container;\n"
       << "these choose how it is packed, compressed and encrypted):\n"
       << "  --pack mypack|ustar|fast-ustar\n"
-      << "  --compression none|huffman|lzss-huffman\n"
+      << "  --compression none|huffman|zstd (legacy: lzss-huffman)\n"
       << "  --encryption none|aes-256-ctr-hmac-sha256|des-cbc-hmac-sha256\n"
       << "    DES-CBC is educational / legacy only. A password is read "
          "interactively\n"
@@ -458,7 +460,7 @@ int RunBackupCommand(const CliContext& context,
       if (!ParseCompressionMethodKey(value, &options.compression_method)) {
         return UsageError(context, "unknown compression method '" + value +
                                        "' (expected none, huffman or "
-                                       "lzss-huffman)");
+                                       "zstd; legacy: lzss-huffman)");
       }
       continue;
     }
@@ -1450,9 +1452,12 @@ namespace {
 
 // 归档**类型**以内容识别为准（recognized_archive 来自 magic sniff），
 // 不看扩展名也不看文件名：用户把 .bak 改了名也不影响这里的判断。
-// format_version 是归档自己声明的版本号，2 就是产品级的 v2 容器。
+// delta 与完整容器各有自己的版本号；不能把 BKPINC2 当成 BKPCNT2。
 std::string KindText(const BackupRecord& record) {
   if (!record.recognized_archive) return "unreadable";
+  if (record.incremental_delta) {
+    return "incremental-v" + std::to_string(record.format_version);
+  }
   return record.format_version == 2 ? "container-v2" : "legacy-v0.1";
 }
 
@@ -1522,6 +1527,18 @@ int RepositoryList(const CliContext& context) {
               << KindText(record) << "  " << PipelineText(record)
               << "  origin=" << (managed ? "scheduled" : "manual");
     if (record.password_required) std::cout << "  password-required";
+    if (record.incremental_delta) {
+      std::cout << "  parent="
+                << (record.parent_file_name.empty() ? "(unknown)"
+                                                    : record.parent_file_name)
+                << "  chain="
+                << (record.chain_restorable ? "parent-present-unverified"
+                                            : "unavailable");
+      // Catalog 这里只检查父文件存在，不把可读列表冒充整链认证。
+      if (!record.chain_restorable && !record.chain_diagnostic.empty()) {
+        std::cout << "  [" << record.chain_diagnostic << "]";
+      }
+    }
     if (!record.recognized_archive && !record.diagnostic.empty()) {
       std::cout << "  [" << record.diagnostic << "]";
     }
