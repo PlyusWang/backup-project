@@ -26,6 +26,7 @@ set -Eeuo pipefail
 # 身份材料由初始化工具另外设置 0600/0700，不在发行构建中生成。
 umask 022
 source "$(dirname "${BASH_SOURCE[0]}")/lib/common.sh"
+source "$PACKAGING_DIR/lib/qt-dialog-runtime.sh"
 
 usage() { sed -n '2,26p' "$0"; }
 
@@ -60,7 +61,8 @@ require_tool make g++ dpkg-deb tar xz sha256sum readelf awk stat file
 # 曾经把 packaging/client/wrappers/backupctl 静默吞掉，直到 CI 里 install 才报错。
 # 这里提前失败，并且把"少了哪个文件"直接说出来。
 for needed in \
-  packaging/lib/common.sh packaging/fetch-tools.sh packaging/tools.lock \
+  packaging/lib/common.sh packaging/lib/qt-dialog-runtime.sh \
+  packaging/client/dialog-runtime/Imports.qml packaging/fetch-tools.sh packaging/tools.lock \
   packaging/client/AppRun packaging/client/AppImage.desktop packaging/client/backup-project.desktop \
   packaging/client/make-icon.py packaging/client/wrappers/backupctl.sh packaging/client/wrappers/backup-project \
   packaging/server/server.conf packaging/server/launch-server.sh packaging/server/purge-data.sh \
@@ -233,6 +235,8 @@ build_appdir() {
     return 0
   fi
 
+  qt_dialog_runtime_preflight || die "Qt 文件对话框运行依赖不完整"
+
   bash packaging/fetch-tools.sh > "$WORK/fetch-tools.log" 2>&1 || { tail -20 "$WORK/fetch-tools.log" >&2; die "打包工具下载/校验失败"; }
   local tools="$REPO_ROOT/dist/.tools"
   mkdir -p "$WORK/bin"
@@ -241,7 +245,8 @@ build_appdir() {
 
   # 我们的 QML 是编进二进制的（qrc），linuxdeploy-plugin-qt 扫不到，必须显式
   # 告诉它去哪读 import 依赖；否则会出现"能构建、装到干净机器上缺 QML 模块"。
-  export QML_SOURCES_PATHS="$REPO_ROOT/ui/modern/qml"
+  local dialog_qml="$PACKAGING_DIR/client/dialog-runtime"
+  export QML_SOURCES_PATHS="$REPO_ROOT/ui/modern/qml:$dialog_qml"
   export EXTRA_QT_MODULES="QtQuick;QtQml;QtQuick.Controls;QtQuick.Layouts;QtQuick.Dialogs;QtQuick.Window;QtNetwork;QtConcurrent"
   # offscreen / minimal 平台插件也要带上：CI 与无显示环境（容器、远程维护）都要能
   # 启动同一个 AppImage，而不是只支持有 X 的机器。每个插件只有几十 KB。
@@ -267,6 +272,7 @@ build_appdir() {
     die "linuxdeploy 失败"
   fi
   tail -12 "$WORK/linuxdeploy.log"
+  qt_dialog_runtime_verify "$appdir/usr" || die "Qt 文件对话框运行时没有完整进入 AppDir"
 
   local qt_plugins plugin
   qt_plugins="$(qtpaths6 --query QT_INSTALL_PLUGINS 2>/dev/null || qmake6 -query QT_INSTALL_PLUGINS 2>/dev/null || true)"

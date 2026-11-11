@@ -3,9 +3,10 @@
 #
 #   bash packaging/licenses/build-materials.sh <随包对象根> <输出目录> [产品名]
 #
-# 为什么在构建容器里生成：随包的 .so 是从这台机器的发行版包里拷出来的，只有这台
-# 机器的 dpkg 数据库能**逐个文件**回答"它是哪个包提供的、什么版本、它的版权文件
-# 在哪"。判定全部来自包自带的机器可读 copyright（DEP-5）的 License: 字段 ——
+# 构建时逐个核对随包 .so 的提供包、版本和版权文件路径。
+# 系统安装的组件查本机 dpkg 数据库；用户目录
+# 提取的模块可通过 BACKUP_LICENSE_DEBS 显式列出 deb，以分号分隔。
+# 判定来自对应包的机器可读 copyright（DEP-5）的 License: 字段 ——
 # 不按库名猜许可，也不复制任何实现代码。
 #
 # 清点范围（对象根之下的**全部**共享对象，不只 lib/ 顶层）：旧版本只数
@@ -83,8 +84,9 @@ mapfile -t SONAMES < <(printf '%s\n' "${!COMPONENT_SEEN[@]}" | LC_ALL=C sort)
 {
   echo "# LICENSE-INVENTORY —— 随 ${PRODUCT} 分发的第三方共享库"
   echo
-  echo "生成方式：在**构建容器内部**逐个文件查 dpkg 数据库（\`dpkg -S\`），再读提供包"
-  echo "自带的机器可读 copyright（DEP-5）里的 \`License:\` 字段。不按库名猜许可。"
+  echo "生成方式：逐文件查询构建环境的 dpkg 数据库；未登记的对象可使用"
+  echo "显式提供且归属唯一的 deb 元数据。许可取对应包的 copyright"
+  echo "（DEP-5）中 \`License:\` 字段，不按库名猜许可。"
   echo
   echo "对象根：\`$OBJECT_ROOT\`；清点到的共享对象 **${#OBJECT_RELS[@]} 个路径 / ${#SONAMES[@]} 个组件**"
   echo "（含 lib/、plugins/、qml/ 等目录；同一个库的 soname 软链接只计一个组件，"
@@ -93,6 +95,45 @@ mapfile -t SONAMES < <(printf '%s\n' "${!COMPONENT_SEEN[@]}" | LC_ALL=C sort)
   echo "| soname | 提供包 | 版本 | 许可（来自该包 copyright） | 上游 | 再分发要求 | 随包材料 |"
   echo "|---|---|---|---|---|---|---|"
 } > "$DEST/LICENSE-INVENTORY.md"
+
+# 允许构建时使用用户目录中提取的同版本 QML 包，无需安装到主机。
+# 系统 dpkg 归属优先；显式 deb 列表只补充其未登记对象的元数据。
+# 同一文件名必须唯一属于一个给定 deb，缺版权文件或归属歧义均拒绝。
+license_from_deb() {
+  local wanted="$1" deb entries count=0 provider="" member=""
+  local -a license_debs=()
+  IFS=';' read -r -a license_debs <<< "${BACKUP_LICENSE_DEBS:-}"
+  for deb in "${license_debs[@]}"; do
+    [ -n "$deb" ] || continue
+    [ -f "$deb" ] || {
+      echo "许可元数据 deb 不存在：$deb" >&2
+      return 2
+    }
+    entries="$(dpkg-deb --fsys-tarfile "$deb" |
+      tar -tf - | awk -F/ -v so="$wanted" '$NF == so { print }')" || return 2
+    [ -n "$entries" ] || continue
+    count=$((count + $(printf '%s\n' "$entries" | wc -l)))
+    provider="$deb"
+  done
+  [ "$count" -ne 0 ] || return 1
+  [ "$count" -eq 1 ] || {
+    echo "deb 文件归属不唯一：$wanted" >&2
+    return 2
+  }
+  pkg="$(dpkg-deb -f "$provider" Package)" || return 2
+  ver="$(dpkg-deb -f "$provider" Version)" || return 2
+  member="./usr/share/doc/$pkg/copyright"
+  mkdir -p "$DEST/licenses/$pkg"
+  cpr="$DEST/licenses/$pkg/copyright"
+  dpkg-deb --fsys-tarfile "$provider" |
+    tar -xOf - "$member" > "$cpr" || return 2
+  [ -s "$cpr" ] || return 2
+  lic="$(grep -m1 '^License:' "$cpr" | sed 's/^License:[[:space:]]*//' || true)"
+  [ -n "$lic" ] || lic="（该包的 copyright 不是 DEP-5：按文件整体声明处理）"
+  # 记录包名、版本及包内路径，不写入本机临时目录。
+  cpr="deb:$pkg=$ver:usr/share/doc/$pkg/copyright"
+  return 0
+}
 
 for so in "${SONAMES[@]}"; do
   path="$(find /usr/lib /lib -maxdepth 3 -name "$so" -print -quit 2>/dev/null || true)"
@@ -133,7 +174,14 @@ for so in "${SONAMES[@]}"; do
       lic="（找不到该包的 copyright 文件）"
     fi
   else
-    pkg="NOT_PROVIDED_BY_A_PACKAGE"; ver="-"; lic="（不来自发行版包，需要人工核对）"
+    metadata_rc=0
+    license_from_deb "$so" || metadata_rc=$?
+    if [ "$metadata_rc" -eq 2 ]; then
+      echo "显式 deb 许可元数据无效：$so" >&2
+      exit 1
+    elif [ "$metadata_rc" -ne 0 ]; then
+      pkg="NOT_PROVIDED_BY_A_PACKAGE"; ver="-"; lic="（不来自发行版包，需要人工核对）"
+    fi
   fi
   upstream="$(lookup "$so" 2)"
   summary="$(lookup "$so" 3)"
