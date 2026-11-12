@@ -389,8 +389,7 @@ pack_client_deb() {
 backup-project-client $VERSION
 
 上游仓库：https://github.com/PlyusWang/backup-project
-上游仓库（commit $COMMIT）**没有 LICENSE 文件**，因此本包不对上游代码的许可
-做任何声明或推断 —— 这一点如实记在这里，而不是替权利人补一个许可证。
+上游源码按仓库根目录 LICENSE 中的 MIT License 授权。
 随包分发的第三方组件：Qt $QT_VERSION（LGPL-3.0，动态链接，见 THIRD-PARTY-NOTICES.txt）。
 EOF
   # 依赖来自两处：CLI 自己链接的系统库，以及**随包的 Qt 库**各自链接的系统库
@@ -517,8 +516,8 @@ pack_server_deb() {
 backup-project-server $VERSION
 
 上游仓库：https://github.com/PlyusWang/backup-project
-上游仓库（commit $COMMIT）**没有 LICENSE 文件**，本包不对上游代码的许可做任何
-声明或推断。本包不包含任何私钥：传输身份私钥由 backup-server-keygen 在目标机
+上游源码按仓库根目录 LICENSE 中的 MIT License 授权。本包不包含任何私钥：
+传输身份私钥由 backup-server-keygen 在目标机
 本机生成（0600），根私钥从不离开离线机器。
 EOF
   cp packaging/server/deb/conffiles "$tree/DEBIAN-conffiles" 2>/dev/null || true
