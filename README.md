@@ -443,9 +443,12 @@ bash scripts/stage-server-release.sh     # 默认 dist/server/
 即判失败。更上层的发行制品（AppImage / .deb / portable tar.xz）由
 `packaging/build-release.sh` 在旧基线容器里构建，见 `docs/release-packaging.md`。
 
-**正式发行版**：`v0.1.0`（2026-10-08）。发行制品由 `.github/workflows/release.yml`
-在 Debian 12（客户端）/ Ubuntu 20.04（服务端）基线容器里构建，并做安装、升级、
-失败回滚、可复现性、密钥扫描与第三方许可覆盖验收；版本号以 GitHub Releases 为准。
+**发布状态（2026-11-12）**：最新稳定版为 `v0.1.1`；当前最新候选为
+`v0.2.1-rc4`（GitHub Pre-release），源码提交 `0c07045`。RC4 发布说明记录了
+Ubuntu 桌面、自建服务器及真实阿里云 ECS 的构建和验收范围，具体证据与适用边界
+以该 Release 附件为准。GitHub Actions 的 main/PR 检查工作流刚加入，`0c07045`
+尚无对应的 status 或 check run；首次工作流运行完成前，不应将其描述为 CI 已通过。
+稳定版与候选版状态以 GitHub Releases 为准。
 
 ---
 

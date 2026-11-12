@@ -1,5 +1,8 @@
 # 最终报告
 
+> 历史验收报告：分支 `feature/unified-product-manual-acceptance-prep`，基线
+> `a6dc901`。其中的测试数量和限制只对应该基线，不代表 `v0.2.1-rc4`。
+
 ## 版本身份
 
 - 最终 HEAD：`见 VERSION.txt`
