@@ -1,5 +1,7 @@
 # 计划状态
 
+> 历史计划与测试状态：对应人工验收基线 `a6dc901`，其中的计数不代表 `v0.2.1-rc4`。
+
 - G0 PASS
 - G1 PASS（明确旧 snapshot_id、顺序无关）
 - G2 PASS（manifest fail-closed，config-manifest 8/0）
