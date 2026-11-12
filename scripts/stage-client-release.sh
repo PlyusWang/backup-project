@@ -107,6 +107,7 @@ if [ "$WITH_GUI" -eq 1 ]; then
   cp "$BUILD_DIR/backup-gui-modern" "$OUT_DIR/bin/backup-gui-modern"
 fi
 cp resources/security/official-root-ed25519.pub "$OUT_DIR/share/backup-project/"
+cp LICENSE "$OUT_DIR/docs/LICENSE"
 for doc in docs/client-quick-start.md docs/release-layout.md docs/secure_transport.md docs/ZSTANDARD_FORMAT.md; do
   if [ ! -s "$doc" ]; then
     echo "错误：客户端必需文档缺失或为空：$doc" >&2

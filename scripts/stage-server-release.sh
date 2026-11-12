@@ -101,6 +101,7 @@ cp packaging/portable/backup-server-manager "$OUT_DIR/backup-server-manager"
 chmod 0755 "$OUT_DIR/bin/backup-server-admin.sh" "$OUT_DIR/bin/launch-server.sh" \
   "$OUT_DIR/backup-server-manager"
 cp resources/security/official-root-ed25519.pub "$OUT_DIR/share/backup-project/"
+cp LICENSE "$OUT_DIR/docs/LICENSE"
 for doc in docs/server-quick-start.md docs/self-hosted-server.md docs/release-layout.md docs/secure_transport.md; do
   [ -f "$doc" ] && cp "$doc" "$OUT_DIR/docs/"
 done

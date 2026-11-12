@@ -8,7 +8,7 @@
 #   1) 把每件制品**解包**，并核对解出来的真实内容（解包失败即失败，不许跳过未知类型）；
 #   2) 用 packaging/lib/common.sh 里的统一规则做私钥/口令扫描 —— 与 CI 的
 #      ci-secret-scan.sh 是**同一份实现**（v0.1.1 的教训：两处各写一份必然漂移）；
-#   3) 逐个产品族核对 BUILD-INFO.txt / VERSION 的存在与内容（见下面的"真实路径"）。
+#   3) 按产品族核对 BUILD-INFO.txt / VERSION，并确认随包 MIT LICENSE 与源码一致。
 #
 # 为什么 BUILD-INFO 的路径要按产品族写死：五种制品的打包结构本来就不一样 ——
 #   AppImage            usr/share/backup-project/BUILD-INFO.txt
@@ -98,6 +98,16 @@ version_rel() {  # $1 = 制品基名
   esac
 }
 
+license_rel() {  # $1 = 制品基名
+  case "$1" in
+    *.AppImage) printf '%s' 'squashfs-root/usr/share/doc/backup-project/LICENSE' ;;
+    backup-project-client_*.deb) printf '%s' 'usr/share/doc/backup-project-client/LICENSE' ;;
+    backup-project-server_*.deb) printf '%s' 'usr/share/doc/backup-project-server/LICENSE' ;;
+    backup-project-client-*.tar.xz|backup-project-server-*.tar.xz) printf '%s' 'LICENSE' ;;
+    *) printf '%s' '' ;;
+  esac
+}
+
 # ---- portable tar 的严格布局（第3轮 P2-02）---------------------------------
 #
 # 契约（客户端 / 服务端一致，只有顶层目录名的大小写不同）：
@@ -153,16 +163,22 @@ for artifact in "$REL"/*; do
   [ -n "$rel" ] || die "不认识的发行文件形状（无法核对 BUILD-INFO）：$base"
   vrel="$(version_rel "$base")"
   [ -n "$vrel" ] || die "不认识的发行文件形状（无法核对 VERSION）：$base"
+  lrel="$(license_rel "$base")"
+  [ -n "$lrel" ] || die "不认识的发行文件形状（无法核对 LICENSE）：$base"
   case "$base" in
     *.tar.xz)
       # portable tar：先钉住唯一顶层目录，再按 <top>/... 取文件（不递归找同名文件）。
       top="$(tar_top_dir "$dest")"
       info="$(require_contract_file "$top" "$rel" "$base")"
-      vfile="$(require_contract_file "$top" "$vrel" "$base")" ;;
+      vfile="$(require_contract_file "$top" "$vrel" "$base")"
+      lfile="$(require_contract_file "$top" "$lrel" "$base")" ;;
     *)
       info="$(require_contract_file "$dest" "$rel" "$base")"
-      vfile="$(require_contract_file "$dest" "$vrel" "$base")" ;;
+      vfile="$(require_contract_file "$dest" "$vrel" "$base")"
+      lfile="$(require_contract_file "$dest" "$lrel" "$base")" ;;
   esac
+  cmp -s "$REPO_ROOT/LICENSE" "$lfile" \
+    || die "$base 随包 LICENSE 与本次构建源码的 MIT LICENSE 不一致"
   if [ -n "$EXPECT_VERSION" ]; then
     got_version="$(grep -m1 '^version' "$info" | awk '{print $3}')"
     [ "$got_version" = "$EXPECT_VERSION" ] \

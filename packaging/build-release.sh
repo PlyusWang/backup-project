@@ -218,6 +218,7 @@ build_appdir() {
     [ -s "$doc" ] || die "客户端必需文档缺失或为空：$doc"
     install -m 0644 "$doc" "$appdir/usr/share/doc/backup-project/" || die "复制客户端文档失败：$doc"
   done
+  install -m 0644 LICENSE "$appdir/usr/share/doc/backup-project/"
   write_build_info "$appdir/usr/share/backup-project" "client-appdir"
   printf '%s\n' "$VERSION" > "$appdir/usr/share/backup-project/VERSION"
 
@@ -337,6 +338,7 @@ pack_client_tarball() {
     [ -s "$doc" ] || die "客户端必需文档缺失或为空：$doc"
     install -m 0644 "$doc" "$tree/docs/" || die "复制客户端文档失败：$doc"
   done
+  install -m 0644 LICENSE "$tree/"
   install -m 0755 packaging/portable/install-client.sh "$tree/install.sh"
   install -m 0755 packaging/portable/uninstall-client.sh "$tree/uninstall.sh"
   install -m 0644 packaging/client/backup-project.desktop "$tree/packaging/client/"
@@ -376,6 +378,7 @@ pack_client_deb() {
     [ -s "$doc" ] || die "客户端必需文档缺失或为空：$doc"
     install -m 0644 "$doc" "$tree/usr/share/doc/backup-project-client/" || die "复制客户端文档失败：$doc"
   done
+  install -m 0644 LICENSE "$tree/usr/share/doc/backup-project-client/"
   # 对象根是随包对象目录本身：lib/ plugins/ qml/ 里的共享对象都要清点。
   bash packaging/licenses/build-materials.sh "$tree/usr/lib/backup-project-client" \
     "$tree/usr/share/doc/backup-project-client" "backup-project-client"
@@ -486,6 +489,7 @@ server_payload() {  # $1 = 目标树根
     [ -s "$doc" ] || die "服务端必需文档缺失或为空：$doc"
     install -m 0644 "$doc" "$tree/usr/lib/backup-project-server/share/doc/backup-project/"
   done
+  install -m 0644 dist/server/docs/LICENSE "$tree/usr/lib/backup-project-server/share/doc/backup-project/"
   local wrapper
   for wrapper in backup-server backup-project-server backup-server-admin backup-server-admin-menu \
                  backup-server-keygen backup-cert-tool backup-server-purge-data; do
@@ -510,6 +514,7 @@ pack_server_deb() {
   # 服务端不重新分发任何第三方二进制：只带一份说明这件事的声明
   install -m 0644 packaging/licenses/SERVER-NOTICES.txt \
     "$tree/usr/share/doc/backup-project-server/THIRD-PARTY-NOTICES.txt"
+  install -m 0644 LICENSE "$tree/usr/share/doc/backup-project-server/"
   write_build_info "$tree/usr/share/doc/backup-project-server" server
   write_manifest "$tree/usr/share/doc/backup-project-server" > /dev/null
   cat > "$tree/usr/share/doc/backup-project-server/copyright" <<EOF
@@ -561,6 +566,7 @@ pack_server_tarball() {
   install -m 0755 packaging/portable/install-server.sh "$tree/packaging/portable/"
   rm -rf "$tree/portable-root"
   install -m 0644 packaging/licenses/SERVER-NOTICES.txt "$tree/THIRD-PARTY-NOTICES.txt"
+  install -m 0644 LICENSE "$tree/"
   write_build_info "$tree" server
   write_manifest "$tree" > /dev/null
   tar_reproducible "$RELEASE_DIR/backup-project-server-$VERSION-linux-x86_64.tar.xz" "$stage_root" "$top"
