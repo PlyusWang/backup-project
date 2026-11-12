@@ -14,8 +14,7 @@
 # 本 workflow **不创建 tag、不发布 GitHub Release**：tag 触发只是把设计留在这里
 # （v*），正式发布必须等人工 review。第三方 Action 一律 pin 到 commit SHA。
 #
-# 开发期触发：特性分支上的 push。GitHub 只允许 dispatch 默认分支上的 workflow，
-# 所以 PR 还没合并之前用 push 触发同一份定义。
+# main 更新和面向 main 的 PR 都运行完整发行验证；手动 dispatch 可指定候选版本。
 
 name: Release packages
 
@@ -27,7 +26,9 @@ on:
         required: false
         default: ""
   push:
-    branches: ["feat/release-packaging"]
+    branches: ["main"]
+  pull_request:
+    branches: ["main"]
 
 permissions:
   contents: read
