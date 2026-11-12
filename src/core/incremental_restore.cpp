@@ -5,11 +5,10 @@
 // 本文件实现"恢复到任意一个 restore point"：解析 Full → Δ1 → … → ΔN 的依赖
 // 链，按顺序应用，最后原子地发布到 destination。
 //
-// 职责边界（刻意不越界）：
-//   * 不解析归档 / 容器的字节格式：base 与每个 delta 的 payload 都交给既有的
-//     RunRestorePipeline，本文件只处理"已经落地的两棵目录树"；
-//   * 不做认证：加密的 delta 在解析阶段就被拒绝，而不是"先解开再验"；
-//   * 不合并进活跃目录：destination 必须不存在或为空。
+// 恢复前先认证完整快照和整条增量链，再把 payload 交给既有的
+// RunRestorePipeline；本文件负责链解析、目录树应用和原子发布。
+// 旧 BKPINC1 只接受未加密 payload；加密增量使用 BKPINC2，先验证外层 HMAC，
+// 再应用父链和删除指令。destination 必须不存在或为空。
 //
 // 失败语义：任何一步失败都返回 false 且 destination 一个字节都不动；中间产物
 // 在退出前尽力删除。error_message 只是允许为 nullptr 的诊断出参，绝不能当状态
