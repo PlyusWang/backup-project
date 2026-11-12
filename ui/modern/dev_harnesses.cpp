@@ -9686,8 +9686,13 @@ int RunRemoteTest(QQuickWindow* window, backup_modern::RemoteController* remote,
     const bool accepted = remote->refreshList();
     const bool finished = accepted && remote->waitForIdle(120000);
     const QString kind = remote->lastErrorKindForTest();
+    // 服务端退出到重连之间可能已关闭监听端口，也可能先断开已建立连接；
+    // 两种情况都表示刷新失败，且都必须释放 busy 并保留登录态。
     run.Check(
-        finished && kind == QStringLiteral("network") && !remote->busy() &&
+        finished &&
+            (kind == QStringLiteral("network") ||
+             kind == QStringLiteral("connect-refused")) &&
+            !remote->busy() &&
             remote->authenticated(),
         QStringLiteral("REMOTE-15D 服务端不可用时刷新如实报错、busy 复位、"
                        "会话保留"),

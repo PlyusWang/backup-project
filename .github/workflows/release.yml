@@ -66,7 +66,7 @@ jobs:
             qml6-module-qtqml qml6-module-qtqml-workerscript \
             xvfb xauth fonts-dejavu-core libx11-6 libxcb1 libxkbcommon-x11-0 \
             libxcb-cursor0 libgl1 libegl1 libopengl0 libglx0 libgl1-mesa-dri \
-            libegl-mesa0 libfontconfig1 libfreetype6 libdbus-1-3 zstd
+            libegl-mesa0 libfontconfig1 libfreetype6 libdbus-1-3 zstd openssh-client
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
       - name: container workspace ownership (git safe.directory)
         run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
@@ -83,12 +83,20 @@ jobs:
             HOME=/home/backup-ci \
             XDG_RUNTIME_DIR=/tmp/backup-ci-runtime \
             bash scripts/test.sh
-      - name: modern GUI checks
+      - name: GUI smoke and controller workflows
         run: |
           runuser -u backup-ci -- env \
             HOME=/home/backup-ci \
             XDG_RUNTIME_DIR=/tmp/backup-ci-runtime \
-            bash scripts/modern_gui_check.sh
+            bash scripts/gui_smoke_test.sh
+          runuser -u backup-ci -- env \
+            HOME=/home/backup-ci \
+            XDG_RUNTIME_DIR=/tmp/backup-ci-runtime \
+            bash scripts/workflow_acceptance_test.sh
+          runuser -u backup-ci -- env \
+            HOME=/home/backup-ci \
+            XDG_RUNTIME_DIR=/tmp/backup-ci-runtime \
+            bash scripts/remote_connection_ux_test.sh
 
   prepare:
     name: version
@@ -274,7 +282,7 @@ jobs:
         run: |
           apt-get update
           DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-            ca-certificates dpkg-dev xz-utils file binutils iproute2 procps python3 python3-pil xvfb xauth fonts-dejavu-core libx11-6 libxcb1 libxkbcommon-x11-0 libxcb-cursor0 libgl1 libegl1 libopengl0 libglx0 libgl1-mesa-dri libegl-mesa0 libfontconfig1 libfreetype6 libdbus-1-3
+            git ca-certificates dpkg-dev xz-utils file binutils iproute2 procps python3 python3-pil xvfb xauth fonts-dejavu-core libx11-6 libxcb1 libxkbcommon-x11-0 libxcb-cursor0 libgl1 libegl1 libopengl0 libglx0 libgl1-mesa-dri libegl-mesa0 libfontconfig1 libfreetype6 libdbus-1-3
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           name: client-artifacts
