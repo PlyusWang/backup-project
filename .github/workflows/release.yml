@@ -72,10 +72,23 @@ jobs:
         run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
       - name: build products and GUI
         run: make -j4 all gui-modern test-fixtures
+      - name: prepare an unprivileged test account
+        run: |
+          useradd --create-home --shell /bin/bash backup-ci
+          chown -R backup-ci:backup-ci "$GITHUB_WORKSPACE"
+          install -d -o backup-ci -g backup-ci -m 0700 /tmp/backup-ci-runtime
       - name: core functional regression
-        run: bash scripts/test.sh
+        run: |
+          runuser -u backup-ci -- env \
+            HOME=/home/backup-ci \
+            XDG_RUNTIME_DIR=/tmp/backup-ci-runtime \
+            bash scripts/test.sh
       - name: modern GUI checks
-        run: bash scripts/modern_gui_check.sh
+        run: |
+          runuser -u backup-ci -- env \
+            HOME=/home/backup-ci \
+            XDG_RUNTIME_DIR=/tmp/backup-ci-runtime \
+            bash scripts/modern_gui_check.sh
 
   prepare:
     name: version
@@ -255,6 +268,8 @@ jobs:
         shell: bash
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - name: container workspace ownership (git safe.directory)
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
       - name: install tools
         run: |
           apt-get update
