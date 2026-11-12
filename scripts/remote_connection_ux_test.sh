@@ -32,12 +32,14 @@ LOG="${REMOTE_CONNECTION_UX_LOG:-tests/output/remote-connection-ux.log}"
 mkdir -p "$(dirname "$LOG")"
 PASS=0
 FAIL=0
+SKIP=0
 
 record_pass() { PASS=$((PASS + 1)); echo "  PASS  $1"; }
 record_fail() { FAIL=$((FAIL + 1)); echo "  FAIL  $1 -- $2" >&2; }
+record_skip() { SKIP=$((SKIP + 1)); echo "  SKIP  $1 -- $2"; }
 
 finish() {
-  echo "[remote-connection-ux] passed=$PASS failed=$FAIL"
+  echo "[remote-connection-ux] passed=$PASS skipped=$SKIP failed=$FAIL"
   echo "[remote-connection-ux] 日志：$LOG"
   [ "$FAIL" -eq 0 ] && exit 0 || exit 1
 }
@@ -121,8 +123,15 @@ expect_ok "C04d 新 pin 是生效值" "C04d "
 expect_ok "C05 找不到 ssh -> ssh-missing" "C05 "
 expect_ok "C05b 失败原因说清了是 ssh 命令的问题" "C05b "
 expect_ok "C06 SSH 主机不存在 -> ssh-host-unreachable" "C06 "
-expect_ok "C07 SSH host key 不被信任 -> fail closed" "C07 |C07 跳过"
-expect_ok "C07b 文案让用户去检查 SSH 配置" "C07b "
+if grep -qE '^\[remote-test\]   ok   C07 SSH host key 不被信任' "$LOG"; then
+  record_pass "C07 SSH host key 不被信任 -> fail closed"
+  expect_ok "C07b 文案让用户去检查 SSH 配置" "C07b "
+elif grep -qE '^\[remote-test\]   ok   C07 跳过：' "$LOG"; then
+  record_skip "C07 host key 未知拒绝用例" \
+    "runner 已信任 localhost，内层测试确认前置条件不成立"
+else
+  record_fail "C07 host key 用例有明确结果" "既没有执行通过，也没有报告前置条件不成立"
+fi
 expect_ok "C07c 登录说的是通道的原因" "C07c "
 
 # 汇总行必须 failed=0，而且连接层那一段的 FAIL 一条都不许有。

@@ -5,7 +5,12 @@
 实际构建系统、glibc 要求和运行验证范围，以该包的 `RELEASE-INFO.txt`、ELF
 检查及对应测试日志为准，不能从 CI 配置推定本次候选已通过。
 
-**正式发行**：`v0.1.0`（2026-10-08，GitHub Releases）。
+**发布状态（2026-11-12）**：最新稳定版为 `v0.1.1`；当前候选版为
+`v0.2.1-rc4`（GitHub Pre-release），对应提交 `0c07045`。RC4 发布说明记录了
+Ubuntu 桌面、自建服务器和真实阿里云 ECS 的验收；应以该候选的附件、摘要与运行
+记录为准，不能把历史验收文档中的未测试结论沿用到 RC4。
+
+仓库源码采用 MIT License，Qt 等随客户端分发的第三方组件仍按各自许可证提供声明。
 
 ## 1. 两个产品族
 
@@ -58,11 +63,11 @@ Ubuntu 24.04 / glibc 2.39 上构建和实测的候选不同。随包携带 Qt �
 ## 3. 构建入口
 
     # 完整发行（两个产品族）
-    bash packaging/build-release.sh --version 0.1.0
+    bash packaging/build-release.sh --version 0.2.1-rc4
 
     # 只出一个产品族
-    bash packaging/build-release.sh --version 0.1.0 --only server
-    bash packaging/build-release.sh --version 0.1.0 --only client
+    bash packaging/build-release.sh --version 0.2.1-rc4 --only server
+    bash packaging/build-release.sh --version 0.2.1-rc4 --only client
 
 内容来源是**既有 staging 脚本**（`scripts/stage-client-release.sh` /
 `scripts/stage-server-release.sh`）：干净工作树门禁、BUILD-INFO、MANIFEST、
@@ -113,9 +118,12 @@ BUILD-INFO 时间戳走 `SOURCE_DATE_EPOCH`、服务端 staging 补上管理员�
 
 `.github/workflows/release.yml`：在容器里构建（server=ubuntu:20.04、
 client=debian:12），再做干净机器安装验收（debian:12 容器 + Ubuntu 22.04/24.04
-真机 runner）。第三方 Action 全部 pin 到 commit SHA。触发方式：
-`workflow_dispatch`（人工，带版本号）与 `push` 到开发分支（开发期用）；
-`tag v*` 的触发只是设计保留，**本轮没有创建任何 tag**。
+真机 runner）。第三方 Action 全部 pin 到 commit SHA。Release 打包工作流由
+`workflow_dispatch` 手动启动；稳定版或候选版的发布仍以 GitHub Release 为准。
+`main` 的 push 和面向 `main` 的 pull request 会触发同一发行工作流，覆盖构建、测试
+和制品检查。本次修订为工作流增加上述触发方式；作为其父提交的 `0c07045` 在配置
+合入前没有 GitHub status 或 check run 记录。新工作流的通过状态应以本次修订进入
+`main` 后产生的 Actions 运行结果为准，不能用 RC4 的本地、公网或隔离环境验收替代。
 
 ELF 报告必须保留 `readelf` / `ldd` 的非零返回与诊断；没有 `not found` 不能说明
 依赖检查成功。无解释器和 NEEDED 的合法静态对象单独分类。发行入口权限与此项
@@ -137,8 +145,6 @@ python3 tests/integration/test_release_elf_report.py
 * Ubuntu 22.04 的系统 Qt 6.2.4 缺少 FolderDialog，不适合直接作为当前 GUI 的
   构建基线。本轮候选实际验证环境为 Ubuntu 24.04 / glibc 2.39；22.04 运行兼容性
   未经本轮验证，不能继承其他版本或 CI 配置的结论（见第 2 节）；
-* 上游仓库**没有 LICENSE 文件**：发行包的 `copyright` 如实记录这一点，不替权利人
-  补许可证；正式对外发布前应由权利人决定许可证；
 * 桌面集成是最小的：仓库没有正式图标资源，所以 `.desktop` 里不放 `Icon=`；
   AppImage 用的 PNG 是仓库自己 `AppIcon.qml` 矢量标记的导出，不是新画的品牌；
 * 便携安装不注册系统级服务发现（没有 `systemd-sysusers`、没有 `debconf` 集成）。

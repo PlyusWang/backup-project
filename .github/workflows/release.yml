@@ -14,8 +14,7 @@
 # 本 workflow **不创建 tag、不发布 GitHub Release**：tag 触发只是把设计留在这里
 # （v*），正式发布必须等人工 review。第三方 Action 一律 pin 到 commit SHA。
 #
-# 开发期触发：特性分支上的 push。GitHub 只允许 dispatch 默认分支上的 workflow，
-# 所以 PR 还没合并之前用 push 触发同一份定义。
+# main 更新和面向 main 的 PR 都运行完整发行验证；手动 dispatch 可指定候选版本。
 
 name: Release packages
 
@@ -27,7 +26,9 @@ on:
         required: false
         default: ""
   push:
-    branches: ["feat/release-packaging"]
+    branches: ["main"]
+  pull_request:
+    branches: ["main"]
 
 permissions:
   contents: read
@@ -43,6 +44,60 @@ env:
   TZ: UTC
 
 jobs:
+  source-tests:
+    name: source build + functional tests (Debian 12)
+    runs-on: ubuntu-24.04
+    container: debian:12
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: install build and test dependencies
+        run: |
+          apt-get update
+          DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            git ca-certificates g++ make pkg-config libsqlite3-dev python3 python3-pil \
+            qt6-base-dev qt6-base-dev-tools qt6-declarative-dev \
+            qt6-declarative-dev-tools qt6-qpa-plugins \
+            qml6-module-qtquick qml6-module-qtquick-controls \
+            qml6-module-qtquick-layouts qml6-module-qtquick-dialogs \
+            qml6-module-qt-labs-folderlistmodel qml6-module-qtquick-window \
+            qml6-module-qtquick-shapes qml6-module-qtquick-templates \
+            qml6-module-qtqml qml6-module-qtqml-workerscript \
+            xvfb xauth fonts-dejavu-core libx11-6 libxcb1 libxkbcommon-x11-0 \
+            libxcb-cursor0 libgl1 libegl1 libopengl0 libglx0 libgl1-mesa-dri \
+            libegl-mesa0 libfontconfig1 libfreetype6 libdbus-1-3 zstd openssh-client
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - name: container workspace ownership (git safe.directory)
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+      - name: build products and GUI
+        run: make -j4 all gui-modern test-fixtures
+      - name: prepare an unprivileged test account
+        run: |
+          useradd --create-home --shell /bin/bash backup-ci
+          chown -R backup-ci:backup-ci "$GITHUB_WORKSPACE"
+          install -d -o backup-ci -g backup-ci -m 0700 /tmp/backup-ci-runtime
+      - name: core functional regression
+        run: |
+          runuser -u backup-ci -- env \
+            HOME=/home/backup-ci \
+            XDG_RUNTIME_DIR=/tmp/backup-ci-runtime \
+            bash scripts/test.sh
+      - name: GUI smoke and controller workflows
+        run: |
+          runuser -u backup-ci -- env \
+            HOME=/home/backup-ci \
+            XDG_RUNTIME_DIR=/tmp/backup-ci-runtime \
+            bash scripts/gui_smoke_test.sh
+          runuser -u backup-ci -- env \
+            HOME=/home/backup-ci \
+            XDG_RUNTIME_DIR=/tmp/backup-ci-runtime \
+            bash scripts/workflow_acceptance_test.sh
+          runuser -u backup-ci -- env \
+            HOME=/home/backup-ci \
+            XDG_RUNTIME_DIR=/tmp/backup-ci-runtime \
+            bash scripts/remote_connection_ux_test.sh
+
   prepare:
     name: version
     runs-on: ubuntu-24.04
@@ -220,12 +275,14 @@ jobs:
       run:
         shell: bash
     steps:
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
       - name: install tools
         run: |
           apt-get update
           DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-            ca-certificates dpkg-dev xz-utils file binutils iproute2 procps python3 python3-pil xvfb xauth fonts-dejavu-core libx11-6 libxcb1 libxkbcommon-x11-0 libxcb-cursor0 libgl1 libegl1 libopengl0 libglx0 libgl1-mesa-dri libegl-mesa0 libfontconfig1 libfreetype6 libdbus-1-3
+            git ca-certificates dpkg-dev xz-utils file binutils iproute2 procps python3 python3-pil xvfb xauth fonts-dejavu-core libx11-6 libxcb1 libxkbcommon-x11-0 libxcb-cursor0 libgl1 libegl1 libopengl0 libglx0 libgl1-mesa-dri libegl-mesa0 libfontconfig1 libfreetype6 libdbus-1-3
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - name: container workspace ownership (git safe.directory)
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           name: client-artifacts
