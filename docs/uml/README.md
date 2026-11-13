@@ -1,5 +1,7 @@
 # UML 图
 
+当前最终版本为 [`Backup-Project-diagramsV4/`](Backup-Project-diagramsV4/)，包含与 V4.2 实验报告对应的 Draw.io、PlantUML 源文件、导出图和离线索引。下方 `export/` 与 `*.mdj` 是早期版本，作为历史资料保留。
+
 `docs/uml/` 下有两代产物，用途不同，不要混用。
 
 ## `export/` —— 当前权威图（提交在仓库里，可直接引用）

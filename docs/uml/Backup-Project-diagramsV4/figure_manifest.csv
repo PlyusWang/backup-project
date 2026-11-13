@@ -1,0 +1,18 @@
+﻿figure_id,name,authority,svg,png,pdf,a4_pdf
+01,图 1 本地用户用例图,sources/drawio/01_use_case_local.drawio,figures/svg/01_use_case_local.svg,,,figures/a4pdf/01_use_case_local.pdf
+02,图 2 远程与运维用例图,sources/drawio/02_use_case_remote.drawio,figures/svg/02_use_case_remote.svg,,,figures/a4pdf/02_use_case_remote.pdf
+03,图 3 前端控制器与写操作互斥控制类图,sources/drawio/03_class_frontend.drawio,figures/svg/03_class_frontend.svg,,,figures/a4pdf/03_class_frontend.pdf
+04,图 4 本地核心类与数据结构,sources/drawio/04_class_core.drawio,figures/svg/04_class_core.svg,,,figures/a4pdf/04_class_core.pdf
+05,图 5 定时与实时核心类图,sources/drawio/05_class_automation.drawio,figures/svg/05_class_automation.svg,,,figures/a4pdf/05_class_automation.pdf
+06,图 6 网络客户端与服务端核心类图,sources/drawio/06_class_network.drawio,figures/svg/06_class_network.svg,,,figures/a4pdf/06_class_network.pdf
+07,图 7 系统顶层构件图,sources/drawio/07_component_system.drawio,figures/svg/07_component_system.svg,,,figures/a4pdf/07_component_system.pdf
+08,图 8 本地备份与还原子系统构件图,sources/drawio/08_component_local.drawio,figures/svg/08_component_local.svg,,,figures/a4pdf/08_component_local.pdf
+09,图 9 GUI 手动完整备份顺序图,sources/puml/09_sequence_backup.puml,figures/svg/09_sequence_backup.svg,,,figures/a4pdf/09_sequence_backup.pdf
+10,图 10 完整 v2 容器恢复顺序图,sources/puml/10_sequence_restore.puml,figures/svg/10_sequence_restore.svg,,,figures/a4pdf/10_sequence_restore.pdf
+11,图 11 受管增量链恢复,sources/puml/11_sequence_restore_chain.puml,figures/svg/11_sequence_restore_chain.svg,,,figures/a4pdf/11_sequence_restore_chain.pdf
+12,图 12 远端增量备份顺序图,sources/puml/12_sequence_remote_backup.puml,figures/svg/12_sequence_remote_backup.svg,,,figures/a4pdf/12_sequence_remote_backup.pdf
+13,图 13 远端快照链还原顺序图,sources/puml/13_sequence_remote_restore.puml,figures/svg/13_sequence_remote_restore.svg,,,figures/a4pdf/13_sequence_remote_restore.pdf
+14,图 14 服务端数据库逻辑 E-R 图,sources/drawio/14_er_logical.drawio,figures/svg/14_er_logical.svg,,,figures/a4pdf/14_er_logical.pdf
+15,图 15 SQLite schema v2 物理 E-R 图,sources/drawio/15_er_physical.drawio,figures/svg/15_er_physical.svg,,,figures/a4pdf/15_er_physical.pdf
+16,图 16 服务端连接状态图,sources/drawio/16_state_connection.drawio,figures/svg/16_state_connection.svg,,,figures/a4pdf/16_state_connection.pdf
+17,图 17 GUI 写操作互斥状态图,sources/drawio/17_state_operation_gate.drawio,figures/svg/17_state_operation_gate.svg,,,figures/a4pdf/17_state_operation_gate.pdf

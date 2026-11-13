@@ -1,0 +1,9 @@
+% Windows 入口使用 TeX Gyre Termes 与 Fandol 字体。
+\IfFontExistsTF{TeXGyreTermesX-Regular.otf}{
+\setmainfont{TeXGyreTermesX-Regular.otf}[BoldFont=TeXGyreTermesX-Bold.otf,ItalicFont=TeXGyreTermesX-Italic.otf,BoldItalicFont=TeXGyreTermesX-BoldItalic.otf]
+}{
+\setmainfont{texgyretermes-regular.otf}[BoldFont=texgyretermes-bold.otf,ItalicFont=texgyretermes-italic.otf,BoldItalicFont=texgyretermes-bolditalic.otf]
+}
+\setCJKmainfont{FandolSong-Regular.otf}[BoldFont=FandolSong-Bold.otf,ItalicFont=FandolFang-Regular.otf]
+\setCJKsansfont{FandolHei-Regular.otf}[BoldFont=FandolHei-Bold.otf]
+\setCJKmonofont{FandolFang-Regular.otf}

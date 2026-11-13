@@ -1,0 +1,32 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1166.0" height="573.8" viewBox="0 0 1166.0 573.8">
+<rect width="100%" height="100%" fill="white"/>
+<rect x="38.0" y="18.0" width="310.0" height="182.0" rx="0" fill="white" stroke="#223044" stroke-width="1.5"/>
+<rect x="38.0" y="18.0" width="310.0" height="64.0" rx="0" fill="#eef4f9" stroke="#223044" stroke-width="1.5"/>
+<text x="193.0" y="41.0" text-anchor="middle" font-family="Noto Sans CJK SC" font-size="18.0" font-weight="700" fill="#223044">«entity»</text>
+<text x="193.0" y="66.2" text-anchor="middle" font-family="Noto Sans CJK SC" font-size="18.0" font-weight="700" fill="#223044">用户账户</text>
+<text x="51.0" y="103.0" text-anchor="start" font-family="Noto Sans CJK SC" font-size="16.0" font-weight="400" fill="#223044">用户 ID（标识）</text>
+<text x="51.0" y="125.4" text-anchor="start" font-family="Noto Sans CJK SC" font-size="16.0" font-weight="400" fill="#223044">唯一用户名</text>
+<text x="51.0" y="147.8" text-anchor="start" font-family="Noto Sans CJK SC" font-size="16.0" font-weight="400" fill="#223044">口令派生信息</text>
+<text x="51.0" y="170.2" text-anchor="start" font-family="Noto Sans CJK SC" font-size="16.0" font-weight="400" fill="#223044">创建时间</text>
+<rect x="628.0" y="18.0" width="430.0" height="182.0" rx="0" fill="white" stroke="#223044" stroke-width="1.5"/>
+<rect x="628.0" y="18.0" width="430.0" height="64.0" rx="0" fill="#eef4f9" stroke="#223044" stroke-width="1.5"/>
+<text x="843.0" y="41.0" text-anchor="middle" font-family="Noto Sans CJK SC" font-size="18.0" font-weight="700" fill="#223044">«entity»</text>
+<text x="843.0" y="66.2" text-anchor="middle" font-family="Noto Sans CJK SC" font-size="18.0" font-weight="700" fill="#223044">备份快照</text>
+<text x="641.0" y="103.0" text-anchor="start" font-family="Noto Sans CJK SC" font-size="16.0" font-weight="400" fill="#223044">快照 ID（标识）</text>
+<text x="641.0" y="125.4" text-anchor="start" font-family="Noto Sans CJK SC" font-size="16.0" font-weight="400" fill="#223044">所属用户、显示名、长度、摘要</text>
+<text x="641.0" y="147.8" text-anchor="start" font-family="Noto Sans CJK SC" font-size="16.0" font-weight="400" fill="#223044">磁盘存储名、创建时间</text>
+<text x="641.0" y="170.2" text-anchor="start" font-family="Noto Sans CJK SC" font-size="16.0" font-weight="400" fill="#223044">类型、父 ID、代数、lineage</text>
+<polyline points="348.0,133.0 628.0,133.0" fill="none" stroke="#223044" stroke-width="1.6"/>
+<text x="488.0" y="97.0" text-anchor="middle" font-family="Noto Sans CJK SC" font-size="19.0" font-weight="400" fill="#223044">1    拥有    0..*</text>
+<polyline points="1058.0,73.0 1123.0,73.0 1123.0,288.0 843.0,288.0 843.0,200.0" fill="none" stroke="#223044" stroke-width="1.6" stroke-dasharray="7 5"/>
+<text x="1035.5" y="325.0" text-anchor="middle" font-family="Noto Sans CJK SC" font-size="17.0" font-weight="400" fill="#223044">父 0..1 / 子 0..1</text>
+<rect x="38.0" y="363.0" width="380.0" height="130.0" rx="0" fill="white" stroke="#223044" stroke-width="1.5"/>
+<rect x="38.0" y="363.0" width="380.0" height="64.0" rx="0" fill="#eef4f9" stroke="#223044" stroke-width="1.5"/>
+<text x="228.0" y="386.0" text-anchor="middle" font-family="Noto Sans CJK SC" font-size="18.0" font-weight="700" fill="#223044">«entity»</text>
+<text x="228.0" y="411.2" text-anchor="middle" font-family="Noto Sans CJK SC" font-size="18.0" font-weight="700" fill="#223044">注销墓碑</text>
+<text x="51.0" y="448.0" text-anchor="start" font-family="Noto Sans CJK SC" font-size="16.0" font-weight="400" fill="#223044">历史用户 ID（标识）</text>
+<text x="51.0" y="470.4" text-anchor="start" font-family="Noto Sans CJK SC" font-size="16.0" font-weight="400" fill="#223044">注销时间</text>
+<text x="462.0" y="406.0" text-anchor="start" font-family="Noto Sans CJK SC" font-size="18.0" font-weight="400" fill="#223044">注销时删除账户与其快照元数据，并插入墓碑。</text>
+<text x="462.0" y="431.2" text-anchor="start" font-family="Noto Sans CJK SC" font-size="18.0" font-weight="400" fill="#223044">墓碑不依赖仍然存在的 users 行；因此不画墓碑到活动用户的外键。</text>
+<text x="22.0" y="545.0" text-anchor="start" font-family="Noto Sans CJK SC" font-size="17.0" font-weight="400" fill="#223044">虚线表示增量快照父链：同一用户、同一 lineage，单子节点；根快照无父快照。</text>
+</svg>

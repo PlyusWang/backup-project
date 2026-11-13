@@ -1,0 +1,48 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1156.0" height="621.0" viewBox="0 0 1156.0 621.0">
+<rect width="100%" height="100%" fill="white"/>
+<rect x="18.0" y="18.0" width="330.0" height="108.0" rx="0" fill="#eef4f9" stroke="#223044" stroke-width="1.5"/>
+<text x="183.0" y="43.0" text-anchor="middle" font-family="Noto Sans CJK SC" font-size="18.0" font-weight="700" fill="#223044">«component» 交互与自动触发</text>
+<text x="183.0" y="74.0" text-anchor="middle" font-family="Noto Sans CJK SC" font-size="16.0" font-weight="400" fill="#223044">CLI / GUI / scheduled</text>
+<text x="183.0" y="96.4" text-anchor="middle" font-family="Noto Sans CJK SC" font-size="16.0" font-weight="400" fill="#223044">realtime + inotify</text>
+<rect x="418.0" y="18.0" width="330.0" height="108.0" rx="0" fill="#eef4f9" stroke="#223044" stroke-width="1.5"/>
+<text x="583.0" y="43.0" text-anchor="middle" font-family="Noto Sans CJK SC" font-size="18.0" font-weight="700" fill="#223044">«component» 增量编排</text>
+<text x="583.0" y="74.0" text-anchor="middle" font-family="Noto Sans CJK SC" font-size="16.0" font-weight="400" fill="#223044">RunIncrementalBackup</text>
+<text x="583.0" y="96.4" text-anchor="middle" font-family="Noto Sans CJK SC" font-size="16.0" font-weight="400" fill="#223044">RestoreSnapshotChain</text>
+<rect x="818.0" y="18.0" width="320.0" height="108.0" rx="0" fill="#eef4f9" stroke="#223044" stroke-width="1.5"/>
+<text x="978.0" y="43.0" text-anchor="middle" font-family="Noto Sans CJK SC" font-size="18.0" font-weight="700" fill="#223044">«component» 仓库与配置</text>
+<text x="978.0" y="74.0" text-anchor="middle" font-family="Noto Sans CJK SC" font-size="16.0" font-weight="400" fill="#223044">ConfigManager</text>
+<text x="978.0" y="96.4" text-anchor="middle" font-family="Noto Sans CJK SC" font-size="16.0" font-weight="400" fill="#223044">BackupCatalog</text>
+<rect x="18.0" y="313.0" width="330.0" height="108.0" rx="0" fill="#eef4f9" stroke="#223044" stroke-width="1.5"/>
+<text x="183.0" y="338.0" text-anchor="middle" font-family="Noto Sans CJK SC" font-size="18.0" font-weight="700" fill="#223044">«component» 归档流水线模块</text>
+<text x="183.0" y="369.0" text-anchor="middle" font-family="Noto Sans CJK SC" font-size="16.0" font-weight="400" fill="#223044">RunBackupPipeline</text>
+<text x="183.0" y="391.4" text-anchor="middle" font-family="Noto Sans CJK SC" font-size="16.0" font-weight="400" fill="#223044">RunRestorePipeline</text>
+<rect x="418.0" y="313.0" width="330.0" height="108.0" rx="0" fill="#eef4f9" stroke="#223044" stroke-width="1.5"/>
+<text x="583.0" y="338.0" text-anchor="middle" font-family="Noto Sans CJK SC" font-size="18.0" font-weight="700" fill="#223044">«component» 扫描与打包</text>
+<text x="583.0" y="369.0" text-anchor="middle" font-family="Noto Sans CJK SC" font-size="16.0" font-weight="400" fill="#223044">ScanSourceTree + Filter</text>
+<text x="583.0" y="391.4" text-anchor="middle" font-family="Noto Sans CJK SC" font-size="16.0" font-weight="400" fill="#223044">MyPack / USTAR / Fast USTAR</text>
+<rect x="818.0" y="313.0" width="320.0" height="108.0" rx="0" fill="#eef4f9" stroke="#223044" stroke-width="1.5"/>
+<text x="978.0" y="338.0" text-anchor="middle" font-family="Noto Sans CJK SC" font-size="18.0" font-weight="700" fill="#223044">«component» 压缩与加密模块</text>
+<text x="978.0" y="369.0" text-anchor="middle" font-family="Noto Sans CJK SC" font-size="16.0" font-weight="400" fill="#223044">Huffman / Zstandard</text>
+<text x="978.0" y="391.4" text-anchor="middle" font-family="Noto Sans CJK SC" font-size="16.0" font-weight="400" fill="#223044">AES-CTR-HMAC / DES-CBC-HMAC</text>
+<polyline points="348.0,72.0 418.0,72.0" fill="none" stroke="#223044" stroke-width="1.6" stroke-dasharray="7 5"/>
+<polyline points="405.0,78.0 418.0,72.0 405.0,66.0" fill="none" stroke="#223044" stroke-width="1.6"/>
+<text x="402.0" y="148.0" text-anchor="middle" font-family="Noto Sans CJK SC" font-size="15.0" font-weight="400" fill="#223044">增量策略</text>
+<polyline points="188.0,126.0 188.0,313.0" fill="none" stroke="#223044" stroke-width="1.6" stroke-dasharray="7 5"/>
+<polyline points="182.0,300.0 188.0,313.0 194.0,300.0" fill="none" stroke="#223044" stroke-width="1.6"/>
+<text x="273.0" y="212.0" text-anchor="middle" font-family="Noto Sans CJK SC" font-size="15.0" font-weight="400" fill="#223044">完整策略</text>
+<polyline points="583.0,126.0 583.0,221.0 338.0,221.0 338.0,313.0" fill="none" stroke="#223044" stroke-width="1.6" stroke-dasharray="7 5"/>
+<polyline points="332.0,300.0 338.0,313.0 344.0,300.0" fill="none" stroke="#223044" stroke-width="1.6"/>
+<text x="473.0" y="194.0" text-anchor="middle" font-family="Noto Sans CJK SC" font-size="15.0" font-weight="400" fill="#223044">复用完整流水线</text>
+<polyline points="748.0,72.0 818.0,72.0" fill="none" stroke="#223044" stroke-width="1.6" stroke-dasharray="7 5"/>
+<polyline points="805.0,78.0 818.0,72.0 805.0,66.0" fill="none" stroke="#223044" stroke-width="1.6"/>
+<text x="823.0" y="143.0" text-anchor="middle" font-family="Noto Sans CJK SC" font-size="15.0" font-weight="400" fill="#223044">仓库材料</text>
+<polyline points="348.0,367.0 418.0,367.0" fill="none" stroke="#223044" stroke-width="1.6" stroke-dasharray="7 5"/>
+<polyline points="405.0,373.0 418.0,367.0 405.0,361.0" fill="none" stroke="#223044" stroke-width="1.6"/>
+<text x="383.0" y="343.0" text-anchor="middle" font-family="Noto Sans CJK SC" font-size="15.0" font-weight="400" fill="#223044">打包</text>
+<polyline points="278.0,421.0 278.0,468.0 978.0,468.0 978.0,421.0" fill="none" stroke="#223044" stroke-width="1.6" stroke-dasharray="7 5"/>
+<polyline points="984.0,434.0 978.0,421.0 972.0,434.0" fill="none" stroke="#223044" stroke-width="1.6"/>
+<text x="698.0" y="484.0" text-anchor="middle" font-family="Noto Sans CJK SC" font-size="15.0" font-weight="400" fill="#223044">流水线调用字节编解码</text>
+<rect x="28.0" y="523.0" width="1110.0" height="80.0" rx="0" fill="#eef4f9" stroke="#223044" stroke-width="1.5"/>
+<text x="583.0" y="556.0" text-anchor="middle" font-family="Noto Sans CJK SC" font-size="18.0" font-weight="400" fill="#223044">备份：扫描/筛选 → 打包 → 可选压缩 → 可选加密 → 容器发布</text>
+<text x="583.0" y="581.2" text-anchor="middle" font-family="Noto Sans CJK SC" font-size="18.0" font-weight="400" fill="#223044">还原：格式识别 → 认证 → 解密 → 解压 → 归档条目预检 → 暂存目录重建 → 发布</text>
+</svg>

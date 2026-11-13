@@ -1,0 +1,33 @@
+\begin{longtable}{L{0.25\linewidth}L{0.13\linewidth}L{0.53\linewidth}}
+\caption{users基表字段}\label{tab:db-users}\\\toprule 字段 & 类型 & 声明与业务含义\\\midrule\endfirsthead
+\toprule 字段 & 类型 & 声明与业务含义\\\midrule\endhead
+id & INTEGER & PRIMARY KEY； 用户 ID，整数主键\\
+username & TEXT & NOT NULL；UNIQUE； 账户名，唯一且非空\\
+password\_salt & BLOB & NOT NULL； 每用户随机salt，凭据派生参数\\
+password\_hash & BLOB & NOT NULL； 派生口令校验值，不是明文口令\\
+password\_iterations & INTEGER & NOT NULL； 口令派生迭代次数；业务层验证下限\\
+created\_at & INTEGER & NOT NULL； 创建时间，整数时间戳\\
+\bottomrule\end{longtable}
+
+\begin{longtable}{L{0.25\linewidth}L{0.13\linewidth}L{0.53\linewidth}}
+\caption{snapshots基表字段}\label{tab:db-snapshots}\\\toprule 字段 & 类型 & 声明与业务含义\\\midrule\endfirsthead
+\toprule 字段 & 类型 & 声明与业务含义\\\midrule\endhead
+id & TEXT & PRIMARY KEY； 快照 ID，文本主键\\
+user\_id & INTEGER & NOT NULL； 所属账户，真实外键引用users(id)\\
+display\_name & TEXT & NOT NULL； 展示名称，不作为服务端磁盘路径\\
+size\_bytes & INTEGER & NOT NULL； 声明字节数；非负等语义由应用检查\\
+sha256 & TEXT & NOT NULL； 归档/材料的SHA-256文本摘要\\
+created\_at & INTEGER & NOT NULL； 创建时间，整数时间戳\\
+storage\_name & TEXT & NOT NULL； 服务端生成的存储文件名\\
+snapshot\_kind & INTEGER & NOT NULL；DEFAULT 0； 0完整/legacy独立，1增量；应用校验\\
+parent\_id & TEXT & NOT NULL；DEFAULT ''； 无父为空串；没有数据库自外键\\
+generation & INTEGER & NOT NULL；DEFAULT 0； 链代数，应用检查父+1和上限\\
+lineage & TEXT & NOT NULL；DEFAULT ''； 应用层链归属标识；旧独立归档默认空串\\
+\bottomrule\end{longtable}
+
+\begin{longtable}{L{0.25\linewidth}L{0.13\linewidth}L{0.53\linewidth}}
+\caption{deleted\_users基表字段}\label{tab:db-deleted_users}\\\toprule 字段 & 类型 & 声明与业务含义\\\midrule\endfirsthead
+\toprule 字段 & 类型 & 声明与业务含义\\\midrule\endhead
+id & INTEGER & PRIMARY KEY； 已注销用户 ID，整数主键\\
+deleted\_at & INTEGER & NOT NULL； 注销时间，整数时间戳\\
+\bottomrule\end{longtable}

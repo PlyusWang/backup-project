@@ -1,0 +1,57 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="756.0" height="786.0" viewBox="0 0 756.0 786.0">
+<rect width="100%" height="100%" fill="white"/>
+<rect x="38.0" y="18.0" width="335.0" height="145.0" rx="0" fill="white" stroke="#223044" stroke-width="1.5"/>
+<rect x="38.0" y="18.0" width="335.0" height="38.0" rx="0" fill="#eef4f9" stroke="#223044" stroke-width="1.5"/>
+<text x="205.5" y="40.0" text-anchor="middle" font-family="Noto Sans CJK SC" font-size="18.0" font-weight="700" fill="#223044">BackupEngine</text>
+<text x="50.0" y="83.0" text-anchor="start" font-family="Noto Sans CJK SC" font-size="17.0" font-weight="400" fill="#223044">- file_system_: FileSystem</text>
+<text x="50.0" y="106.8" text-anchor="start" font-family="Noto Sans CJK SC" font-size="17.0" font-weight="400" fill="#223044">+ Backup(…): bool</text>
+<text x="50.0" y="130.6" text-anchor="start" font-family="Noto Sans CJK SC" font-size="17.0" font-weight="400" fill="#223044">+ Restore(…): bool</text>
+<rect x="403.0" y="18.0" width="335.0" height="145.0" rx="0" fill="white" stroke="#223044" stroke-width="1.5"/>
+<rect x="403.0" y="18.0" width="335.0" height="38.0" rx="0" fill="#eef4f9" stroke="#223044" stroke-width="1.5"/>
+<text x="570.5" y="40.0" text-anchor="middle" font-family="Noto Sans CJK SC" font-size="18.0" font-weight="700" fill="#223044">FileSystem</text>
+<text x="415.0" y="83.0" text-anchor="start" font-family="Noto Sans CJK SC" font-size="17.0" font-weight="400" fill="#223044">+ InspectPath(…): PathStatus</text>
+<text x="415.0" y="106.8" text-anchor="start" font-family="Noto Sans CJK SC" font-size="17.0" font-weight="400" fill="#223044">+ IsDestinationOutsideSource(…)</text>
+<text x="415.0" y="130.6" text-anchor="start" font-family="Noto Sans CJK SC" font-size="17.0" font-weight="400" fill="#223044">+ MakeDirectories(…): bool</text>
+<rect x="38.0" y="293.0" width="335.0" height="150.0" rx="0" fill="white" stroke="#223044" stroke-width="1.5"/>
+<rect x="38.0" y="293.0" width="335.0" height="38.0" rx="0" fill="#eef4f9" stroke="#223044" stroke-width="1.5"/>
+<text x="205.5" y="315.0" text-anchor="middle" font-family="Noto Sans CJK SC" font-size="18.0" font-weight="700" fill="#223044">Filter</text>
+<text x="50.0" y="358.0" text-anchor="start" font-family="Noto Sans CJK SC" font-size="17.0" font-weight="400" fill="#223044">+ AddRule(…): bool</text>
+<text x="50.0" y="381.8" text-anchor="start" font-family="Noto Sans CJK SC" font-size="17.0" font-weight="400" fill="#223044">+ ShouldIncludeFile(…): bool</text>
+<text x="50.0" y="405.6" text-anchor="start" font-family="Noto Sans CJK SC" font-size="17.0" font-weight="400" fill="#223044">+ ShouldPruneDirectory(…): bool</text>
+<rect x="403.0" y="293.0" width="335.0" height="230.0" rx="0" fill="white" stroke="#223044" stroke-width="1.5"/>
+<rect x="403.0" y="293.0" width="335.0" height="58.0" rx="0" fill="#eef4f9" stroke="#223044" stroke-width="1.5"/>
+<text x="570.5" y="315.0" text-anchor="middle" font-family="Noto Sans CJK SC" font-size="18.0" font-weight="700" fill="#223044">«struct»</text>
+<text x="570.5" y="340.2" text-anchor="middle" font-family="Noto Sans CJK SC" font-size="18.0" font-weight="700" fill="#223044">BackupOptions</text>
+<text x="415.0" y="376.0" text-anchor="start" font-family="Noto Sans CJK SC" font-size="17.0" font-weight="400" fill="#223044">+ pack_method: PackMethod</text>
+<text x="415.0" y="399.8" text-anchor="start" font-family="Noto Sans CJK SC" font-size="17.0" font-weight="400" fill="#223044">+ compression_method:</text>
+<text x="415.0" y="423.6" text-anchor="start" font-family="Noto Sans CJK SC" font-size="17.0" font-weight="400" fill="#223044">    CompressionMethod</text>
+<text x="415.0" y="447.4" text-anchor="start" font-family="Noto Sans CJK SC" font-size="17.0" font-weight="400" fill="#223044">+ encryption_method:</text>
+<text x="415.0" y="471.2" text-anchor="start" font-family="Noto Sans CJK SC" font-size="17.0" font-weight="400" fill="#223044">    EncryptionMethod</text>
+<text x="415.0" y="495.0" text-anchor="start" font-family="Noto Sans CJK SC" font-size="17.0" font-weight="400" fill="#223044">+ password: string</text>
+<rect x="38.0" y="593.0" width="335.0" height="150.0" rx="0" fill="white" stroke="#223044" stroke-width="1.5"/>
+<rect x="38.0" y="593.0" width="335.0" height="58.0" rx="0" fill="#eef4f9" stroke="#223044" stroke-width="1.5"/>
+<text x="205.5" y="615.0" text-anchor="middle" font-family="Noto Sans CJK SC" font-size="18.0" font-weight="700" fill="#223044">«struct»</text>
+<text x="205.5" y="640.2" text-anchor="middle" font-family="Noto Sans CJK SC" font-size="18.0" font-weight="700" fill="#223044">RestoreReport</text>
+<text x="50.0" y="676.0" text-anchor="start" font-family="Noto Sans CJK SC" font-size="17.0" font-weight="400" fill="#223044">+ restored_entries: uint64</text>
+<text x="50.0" y="699.8" text-anchor="start" font-family="Noto Sans CJK SC" font-size="17.0" font-weight="400" fill="#223044">+ skipped_ownership: uint64</text>
+<text x="50.0" y="723.6" text-anchor="start" font-family="Noto Sans CJK SC" font-size="17.0" font-weight="400" fill="#223044">+ notes: vector&lt;string&gt;</text>
+<rect x="403.0" y="593.0" width="335.0" height="175.0" rx="0" fill="white" stroke="#223044" stroke-width="1.5"/>
+<rect x="403.0" y="593.0" width="335.0" height="58.0" rx="0" fill="#eef4f9" stroke="#223044" stroke-width="1.5"/>
+<text x="570.5" y="615.0" text-anchor="middle" font-family="Noto Sans CJK SC" font-size="18.0" font-weight="700" fill="#223044">«struct»</text>
+<text x="570.5" y="640.2" text-anchor="middle" font-family="Noto Sans CJK SC" font-size="18.0" font-weight="700" fill="#223044">SnapshotChain</text>
+<text x="415.0" y="676.0" text-anchor="start" font-family="Noto Sans CJK SC" font-size="17.0" font-weight="400" fill="#223044">+ files: vector&lt;string&gt;</text>
+<text x="415.0" y="699.8" text-anchor="start" font-family="Noto Sans CJK SC" font-size="17.0" font-weight="400" fill="#223044">+ file_names: vector&lt;string&gt;</text>
+<text x="415.0" y="723.6" text-anchor="start" font-family="Noto Sans CJK SC" font-size="17.0" font-weight="400" fill="#223044">+ delta_count: uint64</text>
+<text x="415.0" y="747.4" text-anchor="start" font-family="Noto Sans CJK SC" font-size="17.0" font-weight="400" fill="#223044">+ base_generation_id: string</text>
+<polyline points="373.0,93.0 403.0,93.0" fill="none" stroke="#223044" stroke-width="1.5"/>
+<polygon points="373.0,93.0 383.0,87.0 393.0,93.0 383.0,99.0" fill="#223044" stroke="#223044" stroke-width="1.5"/>
+<text x="388.0" y="78.0" text-anchor="middle" font-family="Noto Sans CJK SC" font-size="15.0" font-weight="400" fill="#223044">1 : 1</text>
+<polyline points="188.0,163.0 188.0,293.0" fill="none" stroke="#223044" stroke-width="1.5" stroke-dasharray="7 5"/>
+<polyline points="182.0,280.0 188.0,293.0 194.0,280.0" fill="none" stroke="#223044" stroke-width="1.5"/>
+<text x="52.0" y="235.0" text-anchor="start" font-family="Noto Sans CJK SC" font-size="17.0" font-weight="400" fill="#223044">备份过滤规则</text>
+<polyline points="308.0,163.0 308.0,233.0 568.0,233.0 568.0,293.0" fill="none" stroke="#223044" stroke-width="1.5" stroke-dasharray="7 5"/>
+<polyline points="562.0,280.0 568.0,293.0 574.0,280.0" fill="none" stroke="#223044" stroke-width="1.5"/>
+<text x="417.0" y="212.0" text-anchor="start" font-family="Noto Sans CJK SC" font-size="17.0" font-weight="400" fill="#223044">使用选项</text>
+<polyline points="38.0,93.0 18.0,93.0 18.0,668.0 38.0,668.0" fill="none" stroke="#223044" stroke-width="1.5" stroke-dasharray="7 5"/>
+<polyline points="25.0,674.0 38.0,668.0 25.0,662.0" fill="none" stroke="#223044" stroke-width="1.5"/>
+</svg>

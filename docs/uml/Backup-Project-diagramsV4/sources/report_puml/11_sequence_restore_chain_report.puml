@@ -1,0 +1,54 @@
+@startuml
+skinparam defaultFontName Noto Sans CJK SC
+skinparam defaultFontSize 18
+skinparam backgroundColor white
+skinparam shadowing false
+skinparam sequenceMessageAlign center
+skinparam maxMessageSize 220
+skinparam ParticipantPadding 8
+skinparam BoxPadding 6
+skinparam sequenceGroupBackgroundColor white
+skinparam sequenceParticipantBackgroundColor #EEF4F9
+skinparam sequenceParticipantBorderColor #334155
+skinparam sequenceArrowColor #334155
+skinparam sequenceLifeLineBorderColor #94A3B8
+hide footbox
+actor 用户 as U
+participant "恢复入口\nGUI / CLI" as C
+participant "RestoreSnapshotChain\n增量链恢复" as R
+participant "归档与文件系统\n处理模块" as F
+group 父链验证与完整基线恢复
+ U -> C : 选择还原点和目标目录
+ C -> R : 恢复快照链
+ R -> R : 解析父链并验证身份\n检查认证和目标路径
+ alt 验证失败
+  R -> R : 记录错误，不写恢复目标
+ else 验证通过
+  R -> F : 排他创建暂存目录\n核验目录身份
+  F --> R : 暂存目录创建与核验结果
+  opt 暂存目录可用
+   R -> F : 将完整基线恢复到暂存目录
+   F --> R : 完整基线恢复结果
+  end
+ end
+end
+newpage
+group 增量处理与结果发布
+ opt 验证与基线恢复成功
+  loop 依次处理增量，前序成功时继续
+   R -> F : 提取并恢复到增量临时目录
+   R -> F : 应用删除标记，合并变更条目
+   F --> R : 当前增量的处理结果
+  end
+ end
+ alt 基线与全部增量成功
+  R -> F : 将暂存目录发布为恢复目标
+  F --> R : 发布结果
+ else 前置阶段或任一增量失败
+  R -> R : 返回失败，停止后续增量及发布
+ end
+ R -> F : 按对象身份回收本次临时资源
+ R --> C : 成功状态或错误原因
+ C --> U : 显示恢复结果
+end
+@enduml

@@ -1,0 +1,91 @@
+@startuml
+skinparam defaultFontName Noto Sans CJK SC
+skinparam defaultFontSize 15
+skinparam backgroundColor white
+skinparam shadowing false
+skinparam sequenceMessageAlign center
+skinparam maxMessageSize 180
+skinparam ParticipantPadding 15
+skinparam BoxPadding 8
+skinparam sequenceGroupBackgroundColor white
+skinparam sequenceGroupBorderColor #334155
+skinparam sequenceLifeLineBorderColor #94A3B8
+skinparam sequenceParticipantBackgroundColor #EEF4F9
+skinparam sequenceParticipantBorderColor #334155
+skinparam sequenceArrowColor #334155
+skinparam sequenceActivationBackgroundColor #E2E8F0
+hide footbox
+actor 用户 as U
+participant "BackupController\nGUI 主线程" as C
+participant "BackupCatalog /\nOperationGate" as G
+participant "RunOperation\n后台任务" as W
+participant "BackupEngine" as E
+participant "«module»\narchive_pipeline" as P
+participant "扫描 / 编解码 / I/O\n«module»" as IO
+U -> C : startBackupWithStrategy(full, options)
+activate C
+C -> C : 参数、口令、Filter 校验
+C -> G : EnsureRepository(); BuildArchivePath()
+G --> C : 结果
+alt 前置校验失败
+ C --> U : false / 错误原因
+else 前置校验通过
+ C -> G : Acquire(kManualBackup)
+ G --> C : acquired / reason
+ alt 闸门被占用
+  C --> U : false / 占用原因
+ else 闸门取得
+  C -> C : SetBusy(true)
+  C ->> W : QtConcurrent::run(RunOperation, request)
+  activate W
+  C --> U : true（任务已启动）
+  create E
+  W -> E : BackupEngine()
+  activate E
+  W -> E : Backup(source, archive, filter, options)
+  E -> P : RunBackupPipeline(...)
+  activate P
+  P -> IO : 路径拓扑检查；ScanSourceTree(filter)
+  IO --> P : entries / error
+  alt 扫描失败
+   P -> P : result = false
+  else 扫描成功
+   P -> P : RunBackupPipelineFromEntries(...)
+   loop 逐个归档条目
+    P -> IO : 序列化并写入当前条目
+    IO --> P : 写入结果
+   end
+   opt compression != none 且前序成功
+    P -> IO : 压缩 packed 字节流
+    IO --> P : compressed / error
+   end
+   opt encryption != none 且前序成功
+    P -> IO : 加密并计算 HMAC
+    IO --> P : payload / error
+   end
+   alt 打包 / 编解码失败
+    P -> P : result = false
+   else 前序全部成功
+    P -> IO : 写临时容器；PublishNoReplace
+    IO --> P : publish result
+   end
+  end
+  opt 存在本次临时资源
+   P -> IO : RAII 清理未发布临时产物
+  end
+  P --> E : bool / error
+  deactivate P
+  E --> W : bool / error
+  deactivate E
+  W -> E : ~BackupEngine()
+  destroy E
+  W ->> C : QFutureWatcher::finished（主线程回调）
+  deactivate W
+  C -> G : Release(kManualBackup)
+  C -> C : SetBusy(false)；更新状态 / 仓库列表
+  C ->> U : 完成状态：成功或失败原因
+ end
+end
+deactivate C
+
+@enduml

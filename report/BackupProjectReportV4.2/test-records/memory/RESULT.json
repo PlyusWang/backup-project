@@ -1,0 +1,55 @@
+{
+  "schema": 1,
+  "commit": "aa4960720e3a768688cf48bac4fc3976236f2baa",
+  "status": "completed_with_perf_environment_restriction",
+  "product_source_modified": false,
+  "root_and_sysctl_modified": false,
+  "valgrind": {
+    "complete": true,
+    "passed": true,
+    "commands": 4,
+    "checks": 19,
+    "error_summaries": [
+      0,
+      0,
+      0,
+      0
+    ],
+    "all_heap_blocks_freed": [
+      true,
+      true,
+      true,
+      true
+    ],
+    "exact_binary_sha256": "ec529a8829889ab00a8c08f8f35e7553bfaa2fc550451dd610b5ddc3d41c50f9",
+    "result": "valgrind/RESULT.json",
+    "scope": "small isolated CLI config, preview, backup and restore; mypack+zstd+none"
+  },
+  "gprof": {
+    "complete": true,
+    "profile_generated": true,
+    "roundtrip_passed": true,
+    "checks": 15,
+    "source_commit": "aa4960720e3a768688cf48bac4fc3976236f2baa",
+    "binary_sha256": "997355d4fed3a84567663fd097d92cad0d50319504eade0e77621984beec295a",
+    "result": "profiling-r2/RESULT.json",
+    "scope": "isolated fixed-source Zstandard codec only",
+    "sampling_limitation": "3 MiB sample; encode approximately 0.02 s and decode approximately 0.05 s sampled CPU time; not whole application throughput or a stable performance benchmark"
+  },
+  "perf": {
+    "attempted": true,
+    "measured": false,
+    "status": "environment_restricted",
+    "paranoid": "4",
+    "hardware_exit": 1,
+    "software_exit": 1,
+    "logs": [
+      "profiling-r2/perf-hardware-probe.log",
+      "profiling-r2/perf-software-probe.log"
+    ]
+  },
+  "preserved_failed_attempts": [
+    "profiling/RESULT.json"
+  ],
+  "completed_unix_seconds": 1794415927
+}

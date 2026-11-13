@@ -1,0 +1,50 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="760.0" height="753.4" viewBox="0 0 760.0 753.4">
+<rect width="100%" height="100%" fill="white"/>
+<rect x="18.0" y="18.0" width="724.0" height="625.0" rx="5" fill="white" stroke="#223044" stroke-width="1.5"/>
+<ellipse cx="380.0" cy="42.0" rx="8.0" ry="8.0" fill="#223044" stroke="#223044" stroke-width="1.5"/>
+<rect x="250.0" y="80.0" width="260.0" height="72.0" rx="5" fill="#eef4f9" stroke="#223044" stroke-width="1.5"/>
+<text x="380.0" y="108.0" text-anchor="middle" font-family="Noto Sans CJK SC" font-size="18.0" font-weight="400" fill="#223044">kConnected</text>
+<text x="380.0" y="133.2" text-anchor="middle" font-family="Noto Sans CJK SC" font-size="18.0" font-weight="400" fill="#223044">业务连接未登录</text>
+<polyline points="380.0,50.0 380.0,80.0" fill="none" stroke="#223044" stroke-width="1.5"/>
+<polygon points="374.0,67.0 380.0,80.0 386.0,67.0" fill="#223044" stroke="#223044" stroke-width="1.5"/>
+<rect x="250.0" y="270.0" width="260.0" height="72.0" rx="5" fill="#eef4f9" stroke="#223044" stroke-width="1.5"/>
+<text x="380.0" y="298.0" text-anchor="middle" font-family="Noto Sans CJK SC" font-size="18.0" font-weight="400" fill="#223044">kAuthenticated</text>
+<text x="380.0" y="323.2" text-anchor="middle" font-family="Noto Sans CJK SC" font-size="18.0" font-weight="400" fill="#223044">已认证</text>
+<polyline points="295.0,152.0 295.0,270.0" fill="none" stroke="#223044" stroke-width="1.5"/>
+<polygon points="289.0,257.0 295.0,270.0 301.0,257.0" fill="#223044" stroke="#223044" stroke-width="1.5"/>
+<text x="203.0" y="197.0" text-anchor="middle" font-family="Noto Sans CJK SC" font-size="17.0" font-weight="400" fill="#223044">LOGIN / RESUME</text>
+<text x="203.0" y="220.8" text-anchor="middle" font-family="Noto Sans CJK SC" font-size="17.0" font-weight="400" fill="#223044">成功</text>
+<polyline points="465.0,270.0 465.0,152.0" fill="none" stroke="#223044" stroke-width="1.5"/>
+<polygon points="471.0,165.0 465.0,152.0 459.0,165.0" fill="#223044" stroke="#223044" stroke-width="1.5"/>
+<text x="563.5" y="197.0" text-anchor="middle" font-family="Noto Sans CJK SC" font-size="17.0" font-weight="400" fill="#223044">LOGOUT</text>
+<text x="563.5" y="220.8" text-anchor="middle" font-family="Noto Sans CJK SC" font-size="17.0" font-weight="400" fill="#223044">账户失效</text>
+<rect x="60.0" y="540.0" width="285.0" height="72.0" rx="5" fill="#eef4f9" stroke="#223044" stroke-width="1.5"/>
+<text x="202.5" y="568.0" text-anchor="middle" font-family="Noto Sans CJK SC" font-size="18.0" font-weight="400" fill="#223044">kUploadInProgress</text>
+<text x="202.5" y="593.2" text-anchor="middle" font-family="Noto Sans CJK SC" font-size="18.0" font-weight="400" fill="#223044">上传中</text>
+<rect x="415.0" y="540.0" width="285.0" height="72.0" rx="5" fill="#eef4f9" stroke="#223044" stroke-width="1.5"/>
+<text x="557.5" y="568.0" text-anchor="middle" font-family="Noto Sans CJK SC" font-size="18.0" font-weight="400" fill="#223044">kDownloadInProgress</text>
+<text x="557.5" y="593.2" text-anchor="middle" font-family="Noto Sans CJK SC" font-size="18.0" font-weight="400" fill="#223044">下载中</text>
+<polyline points="320.0,342.0 320.0,418.0 203.0,418.0 203.0,540.0" fill="none" stroke="#223044" stroke-width="1.5"/>
+<polygon points="197.0,527.0 203.0,540.0 209.0,527.0" fill="#223044" stroke="#223044" stroke-width="1.5"/>
+<text x="296.0" y="472.0" text-anchor="middle" font-family="Noto Sans CJK SC" font-size="17.0" font-weight="400" fill="#223044">UPLOAD_BEGIN</text>
+<text x="296.0" y="495.8" text-anchor="middle" font-family="Noto Sans CJK SC" font-size="17.0" font-weight="400" fill="#223044">[校验通过]</text>
+<polyline points="440.0,342.0 440.0,418.0 558.0,418.0 558.0,540.0" fill="none" stroke="#223044" stroke-width="1.5"/>
+<polygon points="552.0,527.0 558.0,540.0 564.0,527.0" fill="#223044" stroke="#223044" stroke-width="1.5"/>
+<text x="467.0" y="472.0" text-anchor="middle" font-family="Noto Sans CJK SC" font-size="17.0" font-weight="400" fill="#223044">DOWNLOAD_BEGIN</text>
+<text x="467.0" y="495.8" text-anchor="middle" font-family="Noto Sans CJK SC" font-size="17.0" font-weight="400" fill="#223044">[校验通过]</text>
+<polyline points="60.0,576.0 38.0,576.0 38.0,306.0 250.0,306.0" fill="none" stroke="#223044" stroke-width="1.5"/>
+<polygon points="237.0,312.0 250.0,306.0 237.0,300.0" fill="#223044" stroke="#223044" stroke-width="1.5"/>
+<text x="150.5" y="376.0" text-anchor="middle" font-family="Noto Sans CJK SC" font-size="17.0" font-weight="400" fill="#223044">UPLOAD_END 成功</text>
+<text x="150.5" y="399.8" text-anchor="middle" font-family="Noto Sans CJK SC" font-size="17.0" font-weight="400" fill="#223044">/ AbortUpload</text>
+<polyline points="700.0,576.0 722.0,576.0 722.0,306.0 510.0,306.0" fill="none" stroke="#223044" stroke-width="1.5"/>
+<polygon points="523.0,300.0 510.0,306.0 523.0,312.0" fill="#223044" stroke="#223044" stroke-width="1.5"/>
+<text x="609.5" y="376.0" text-anchor="middle" font-family="Noto Sans CJK SC" font-size="17.0" font-weight="400" fill="#223044">DOWNLOAD_END</text>
+<text x="609.5" y="399.8" text-anchor="middle" font-family="Noto Sans CJK SC" font-size="17.0" font-weight="400" fill="#223044">/ CloseDownload</text>
+<polyline points="380.0,643.0 380.0,712.0" fill="none" stroke="#223044" stroke-width="1.5"/>
+<polygon points="374.0,699.0 380.0,712.0 386.0,699.0" fill="#223044" stroke="#223044" stroke-width="1.5"/>
+<ellipse cx="380.0" cy="723.0" rx="11.0" ry="11.0" fill="white" stroke="#223044" stroke-width="1.5"/>
+<ellipse cx="380.0" cy="723.0" rx="6.0" ry="6.0" fill="#223044" stroke="#223044" stroke-width="1.5"/>
+<text x="399.0" y="677.0" text-anchor="start" font-family="Noto Sans CJK SC" font-size="17.0" font-weight="400" fill="#223044">任意子状态：EOF / I/O 致命错误</text>
+<text x="399.0" y="700.8" text-anchor="start" font-family="Noto Sans CJK SC" font-size="17.0" font-weight="400" fill="#223044">或连接结束 / CleanupConnection；</text>
+<text x="399.0" y="724.6" text-anchor="start" font-family="Noto Sans CJK SC" font-size="17.0" font-weight="400" fill="#223044">销毁 context</text>
+</svg>

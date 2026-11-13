@@ -1,0 +1,89 @@
+\begingroup
+\normalsize
+\setlength{\tabcolsep}{4pt}
+\renewcommand{\arraystretch}{1.16}
+\begin{longtable}{@{}L{.14\linewidth}L{.36\linewidth}L{.21\linewidth}L{.23\linewidth}@{}}
+\caption{本地备份恢复测试用例}\label{tab:test-1}\\
+\toprule 用例 / 需求 & 输入、条件与操作 & 预期结果 & 实际结果与判定\\\midrule\endfirsthead
+\toprule 用例 / 需求 & 输入、条件与操作 & 预期结果 & 实际结果与判定\\\midrule\endhead
+\bottomrule\endfoot
+\textbf{A-TC-01}\par{\footnotesize FR-101/102} & 隔离源和仓库；归档与目标不存在；普通文本及2 MiB随机binary.bin。按scripts/test.sh夹具备份、恢复，执行diff、cmp和sha256比对 & 树结构和所有文件内容一致，二进制摘要一致。 & 恢复树与源树一致，二进制文件逐字节及摘要比较通过。\par\textbf{通过}\\\addlinespace[2pt]
+\textbf{A-TC-02}\par{\footnotesize FR-101/102} & 已准备仅含空文件的输入目录；empty.txt，0字节。备份恢复后检查文件存在且长度为0 & 空文件仍为空，不能遗漏或混为目录。 & 恢复后文件存在，长度为0。\par\textbf{通过}\\\addlinespace[2pt]
+\textbf{A-TC-03}\par{\footnotesize FR-101/102} & 输入有空子目录；目标不存在；empty-dir/不含任何子项。备份恢复后检查该目录及其内容 & 空目录存在且仍为空。 & 恢复后空子目录存在，目录中无条目。\par\textbf{通过}\\\addlinespace[2pt]
+\textbf{A-TC-04}\par{\footnotesize FR-101/102} & Linux UTF-8环境和多级目录；中文目录/带 空格.txt及嵌套文件。执行往返；按精确名称逐项检查 & 路径名、层级和字节保留。 & 恢复后的中文、空格路径及嵌套文件内容一致。\par\textbf{通过}\\\addlinespace[2pt]
+\textbf{A-TC-05}\par{\footnotesize FR-101} & 仓库可写；不存在源路径；不存在的source目录。调用产品backup，记录退出码、诊断及仓库变化 & 业务失败，说明源不存在，无伪成功归档。 & 返回失败并报告源路径不存在，未生成归档。\par\textbf{通过}\\\addlinespace[2pt]
+\textbf{A-TC-06}\par{\footnotesize FR-104} & 使用archive\_cli夹具隔离拓扑；archive路径位于source子树内。向夹具提供危险路径；检查源和产物 & 明确拒绝源内归档，不重复扫描输出文件。 & 拒绝源目录内的归档路径，未生成循环读取的产物。\par\textbf{通过}\\\addlinespace[2pt]
+\textbf{A-TC-07}\par{\footnotesize FR-104} & 有效归档；目标已含keep.txt哨兵；非空恢复目标。执行restore，比较哨兵及目标树 & 拒绝覆盖，既有非空内容保持。 & 拒绝非空目标，keep.txt及原目标内容保持不变。\par\textbf{通过}\\\addlinespace[2pt]
+\textbf{A-TC-08}\par{\footnotesize FR-103/104} & 隔离仓库；仓库外有哨兵；文件名../outside.bak。调用Resolve/Delete，比较仓库外哨兵 & 名称校验失败，不能访问或删除仓库外对象。 & 拒绝越界名称，仓库外哨兵文件内容保持不变。\par\textbf{通过}\\\addlinespace[2pt]
+\end{longtable}
+
+\begin{longtable}{@{}L{.14\linewidth}L{.36\linewidth}L{.21\linewidth}L{.23\linewidth}@{}}
+\caption{规则与元数据测试用例}\label{tab:test-2}\\
+\toprule 用例 / 需求 & 输入、条件与操作 & 预期结果 & 实际结果与判定\\\midrule\endfirsthead
+\toprule 用例 / 需求 & 输入、条件与操作 & 预期结果 & 实际结果与判定\\\midrule\endhead
+\bottomrule\endfoot
+\textbf{A-TC-09}\par{\footnotesize FR-110} & a.cpp与b.txt均存在；include ext:cpp；exclude name:a.cpp。应用规则，恢复后枚举最终集合 & exclude覆盖include，a.cpp不进入归档。 & 恢复结果不含a.cpp，排除规则优先。\par\textbf{通过}\\\addlinespace[2pt]
+\textbf{A-TC-10}\par{\footnotesize FR-110} & 混合.cpp、.txt、.bin输入；两个include分别为ext:cpp与ext:txt。执行筛选备份并枚举条目 & 多个include按OR，前两类进入，.bin不进入。 & .cpp和.txt文件进入归档，.bin文件被排除。\par\textbf{通过}\\\addlinespace[2pt]
+\textbf{A-TC-11}\par{\footnotesize FR-111} & 同一源树和同一规则；无过滤规则的预览数据集。先preview再实际backup，比较条目集合和状态变化 & 预览集合等于真实条目；预览自身不写仓库或任务状态。 & 预览与备份条目集合一致，预览未修改仓库和任务状态。\par\textbf{通过}\\\addlinespace[2pt]
+\textbf{A-TC-12}\par{\footnotesize FR-105} & 测试夹具可构造只读目录并按用例收尾；只读目录及其child文件。按metadata夹具备份恢复，检查child与目录模式 & 目录内文件可恢复；不因过早设置只读位漏掉子项。 & 子文件恢复完整，最终目录权限与原始权限一致。\par\textbf{通过}\\\addlinespace[2pt]
+\textbf{A-TC-13}\par{\footnotesize FR-201} & 支持POSIX软链接的隔离目录；link指向一个既有文件。按USTAR单元测试往返，用lstat/readlink验证 & 恢复为软链接且目标文本一致，不复制为普通文件。 & lstat识别为符号链接，readlink读出的目标文本一致。\par\textbf{通过}\\\addlinespace[2pt]
+\textbf{A-TC-14}\par{\footnotesize FR-201} & 在同一文件系统内创建两个指向同一inode的文件路径；分别用MyPack、USTAR和Fast USTAR备份恢复，核对内容及硬链接关系。 & 恢复后的两个路径共享inode，文件内容一致。 & 恢复后的两个路径指向同一inode，文件内容一致。\par\textbf{通过}\\\addlinespace[2pt]
+\end{longtable}
+
+\begin{longtable}{@{}L{.14\linewidth}L{.36\linewidth}L{.21\linewidth}L{.23\linewidth}@{}}
+\caption{归档与编码测试用例}\label{tab:test-3}\\
+\toprule 用例 / 需求 & 输入、条件与操作 & 预期结果 & 实际结果与判定\\\midrule\endfirsthead
+\toprule 用例 / 需求 & 输入、条件与操作 & 预期结果 & 实际结果与判定\\\midrule\endhead
+\bottomrule\endfoot
+\textbf{A-TC-15}\par{\footnotesize FR-120} & 构造合法普通文件及超界链接名；超出USTAR linkname容量的链接目标。调用USTAR编码并检查错误 & 明确拒绝无法表达字段，不截断生成错误归档。 & 编码返回失败并给出字段限制原因，未生成截断归档。\par\textbf{通过}\\\addlinespace[2pt]
+\textbf{A-TC-16}\par{\footnotesize FR-121} & 编译compression单元程序；单一重复字节组成的缓冲区。Huffman编码后解码并逐字节比较 & 单符号输入可往返，解码长度和字节一致。 & 单符号输入成功往返，解码长度与字节一致。\par\textbf{通过}\\\addlinespace[2pt]
+\textbf{A-TC-17}\par{\footnotesize FR-121} & 使用标准 Zstd 工具及项目编解码器，输入随机、重复、边界长度、损坏与截断数据；执行双向互操作并比较恢复内容。 & 支持范围内的标准流正确解码，内容一致；损坏、截断及未支持扩展被拒绝，失败不发布输出。 & 标准工具互操作及内容比较通过；损坏、截断和未支持的扩展被拒绝，原输出保持不变。\par\textbf{通过}\\\addlinespace[2pt]
+\textbf{A-TC-18}\par{\footnotesize FR-122/123} & 手动完整MyPack，交互口令或测试注入；AES-256-CTR-HMAC，固定测试目录和非空测试口令。生成容器，再以正确口令恢复并比较树 & 认证与恢复成功，归档不保存明文口令。 & 正确口令下认证及恢复通过，恢复树与输入一致。\par\textbf{通过}\\\addlinespace[2pt]
+\textbf{A-TC-19}\par{\footnotesize FR-122} & 已有加密容器，目标不存在；与写入时不同的恢复口令。调用恢复，记录错误并检查目标 & 认证失败，不发布部分目标，不产生可用的明文输出。 & 报告认证失败，目标未发布。\par\textbf{通过}\\\addlinespace[2pt]
+\textbf{A-TC-20}\par{\footnotesize FR-122/404} & 复制有效容器，隔离原件；payload单字节翻位。对副本恢复，检查诊断与目标 & 摘要或认证检查拒绝损坏输入，不发布部分目录树。 & 损坏内容被拒绝，未发布部分恢复目录。\par\textbf{通过}\\\addlinespace[2pt]
+\end{longtable}
+
+\begin{longtable}{@{}L{.14\linewidth}L{.36\linewidth}L{.21\linewidth}L{.23\linewidth}@{}}
+\caption{自动化与增量测试用例}\label{tab:test-4}\\
+\toprule 用例 / 需求 & 输入、条件与操作 & 预期结果 & 实际结果与判定\\\midrule\endfirsthead
+\toprule 用例 / 需求 & 输入、条件与操作 & 预期结果 & 实际结果与判定\\\midrule\endhead
+\bottomrule\endfoot
+\textbf{A-TC-21}\par{\footnotesize FR-140} & 任务已有有效完整基线；与基线相同的源树。到期Evaluate或立即EvaluateNow，比较前后归档数 & 报告无变化并跳过，不产生新快照；立即检查不强制生成快照。 & 报告无变化并跳过，归档数量不变。\par\textbf{通过}\\\addlinespace[2pt]
+\textbf{A-TC-22}\par{\footnotesize FR-140/404} & state曾记录基线，隔离仓库；删除被绑定的基线归档，保留manifest/state。再次运行计划评估 & 不能因manifest相同跳过；重建完整基线并说明原因。 & 发现基线缺失后创建完整快照，未误判为无变化。\par\textbf{通过}\\\addlinespace[2pt]
+\textbf{A-TC-23}\par{\footnotesize FR-141} & 使用注入时钟的去抖对象；窗口内连续两个事件批次。NoteEvents后检查Due，推进到静默/最大等待边界并Consume & 事件合并为一代，边界到期触发；数量为事件数。 & 窗口内事件合并，推进时钟到边界后触发一次消费。\par\textbf{通过}\\\addlinespace[2pt]
+\textbf{A-TC-24}\par{\footnotesize FR-305} & 已有强manifest完整基线；同长度改写文件并还原原mtime。执行incremental backup，核对种类和变更计数 & 识别内容变化并生成delta，不按size/mtime漏检。 & 同长度、同mtime的内容修改被识别，生成增量快照。\par\textbf{通过}\\\addlinespace[2pt]
+\textbf{A-TC-25}\par{\footnotesize FR-102/305} & 已有 USTAR 完整基线；修改、新增和删除文件后执行增量备份，检查快照类型和父依赖，再恢复最新快照并逐文件比较。 & 生成有效增量快照，依赖关系正确，恢复结果与源目录一致。 & 生成USTAR增量及正确父依赖，恢复后新增、修改、删除结果与源目录一致。\par\textbf{通过}\\\addlinespace[2pt]
+\textbf{A-TC-26}\par{\footnotesize FR-403} & base→delta链，后代为需保留还原点；淘汰计划仅拟删除仍被引用的base。调用单项删除/保留计划，检查全部链材料 & 保护被保留后代依赖的祖先并如实计数，不能断链。 & 依赖祖先被保留，仍可恢复保留的后代快照。\par\textbf{通过}\\\addlinespace[2pt]
+\end{longtable}
+
+\begin{longtable}{@{}L{.14\linewidth}L{.36\linewidth}L{.21\linewidth}L{.23\linewidth}@{}}
+\caption{GUI与网络测试用例}\label{tab:test-5}\\
+\toprule 用例 / 需求 & 输入、条件与操作 & 预期结果 & 实际结果与判定\\\midrule\endfirsthead
+\toprule 用例 / 需求 & 输入、条件与操作 & 预期结果 & 实际结果与判定\\\midrule\endhead
+\bottomrule\endfoot
+\textbf{A-TC-27}\par{\footnotesize FR-130} & Qt offscreen、独立配置与仓库；真实GUI受管备份/恢复/删除流程。执行 GUI 自检，检查控件、控制器和归档结果 & 控件正确调用核心；产物为v2，列表、恢复和删除与磁盘一致。 & 操作后界面列表、归档文件和恢复内容一致，删除结果同步。\par\textbf{通过}\\\addlinespace[2pt]
+\textbf{A-TC-28}\par{\footnotesize FR-304} & 本地服务器要求BPSEC2，测试证书有效；客户端配置不受信任的离线根。发起握手，观察业务请求是否到达 & 身份验证失败，不能继续登录或退回明文。 & 握手拒绝不可信根，未进入登录阶段。\par\textbf{通过}\\\addlinespace[2pt]
+\textbf{A-TC-29}\par{\footnotesize FR-304} & 服务端require\_bpsec2=true；BPSEC1 ClientHello。建立连接尝试降级握手 & 服务端拒绝BPSEC1，不接受降级业务会话。 & 服务端拒绝BPSEC1握手，未建立降级业务会话。\par\textbf{通过}\\\addlinespace[2pt]
+\textbf{A-TC-30}\par{\footnotesize FR-301/302} & 两个有效账户，A已上传快照；B请求A的快照id。以B会话调用下载或删除，直接检查A的blob与元数据 & 拒绝跨账户访问，A的数据不变。 & 账户B的下载和删除请求被拒绝，账户A数据保持不变。\par\textbf{通过}\\\addlinespace[2pt]
+\textbf{A-TC-31}\par{\footnotesize FR-302} & 服务端采用5次/60秒的测试配置；同名连续5次错误口令后立即给正确口令。达到阈值，再以正确口令登录并查限速记录 & 锁定窗口内正确口令同样被拒，不能靠猜中一次绕过。 & 达到阈值后正确口令仍被拒绝，锁定窗口生效。\par\textbf{通过}\\\addlinespace[2pt]
+\textbf{A-TC-32}\par{\footnotesize FR-303} & 已有schema1与旧用户/快照行；追加链列中途注入失败。打开可写存储触发迁移，检查列/版本，解除注入重开 & 失败整体回滚，重试成功且旧数据保留；只读路径不升级。 & 注入失败后结构及版本回滚；解除注入后迁移成功，旧记录保留。\par\textbf{通过}\\\addlinespace[2pt]
+\end{longtable}
+
+\begin{longtable}{@{}L{.14\linewidth}L{.36\linewidth}L{.21\linewidth}L{.23\linewidth}@{}}
+\caption{恢复安全测试用例}\label{tab:test-6}\\
+\toprule 用例 / 需求 & 输入、条件与操作 & 预期结果 & 实际结果与判定\\\midrule\endfirsthead
+\toprule 用例 / 需求 & 输入、条件与操作 & 预期结果 & 实际结果与判定\\\midrule\endhead
+\bottomrule\endfoot
+\textbf{A-TC-33}\par{\footnotesize FR-102/305} & 建立base、delta1、delta2；first从v1到v2，另增second，keep不变。恢复第三个还原点，与独立完整备份结果逐节点比较 & 两个delta及未改动内容都在，链恢复等于完整恢复。 & 链恢复结果与独立完整恢复结果逐节点一致。\par\textbf{通过}\\\addlinespace[2pt]
+\textbf{A-TC-34}\par{\footnotesize FR-102/404} & 非特权用户，前序链成功，目录ro为0500；最后delta新增ro/new.txt，合并不可写。恢复目标链并检查目标和中间资源 & 整体失败，错误指向合并，不发布目标，只清理由本次操作创建且已核验身份的资源。 & 最后增量合并失败使整次恢复失败，未发布目标。\par\textbf{通过}\\\addlinespace[2pt]
+\textbf{A-TC-35}\par{\footnotesize FR-102/404} & 三份快照有效；预置阻挡中间容器提取的对象。恢复最终还原点，检查失败和目标 & 中间提取失败传播至整次失败，不发布部分树。 & 中间容器提取失败后停止恢复，目标未发布。\par\textbf{通过}\\\addlinespace[2pt]
+\textbf{A-TC-36}\par{\footnotesize FR-102/404} & 有基线与一个delta；把增量数据改为同长度垃圾。尝试链恢复，核对诊断和发布状态 & 内层或预检拒绝损坏材料，返回失败且无目标发布。 & 损坏增量被拒绝，整次恢复失败，目标未发布。\par\textbf{通过}\\\addlinespace[2pt]
+\textbf{A-TC-37}\par{\footnotesize FR-102/404} & 非特权用户，基线含0500目录；delta含无法在只读父目录删除的删除标记。按测试夹具执行链恢复 & 删除标记失败使整次失败，不发布缺失删除的结果。 & 删除标记处理失败后终止恢复，未发布缺少删除操作的结果。\par\textbf{通过}\\\addlinespace[2pt]
+\textbf{A-TC-38}\par{\footnotesize FR-102/404} & 有效增量链，容器位置被阻挡；error\_message参数为nullptr。调用链恢复入口并检查bool和目标 & 无诊断指针仍返回false，不误报成功或发布目标。 & 诊断指针为空时仍返回false，目标未发布。\par\textbf{通过}\\\addlinespace[2pt]
+\textbf{A-TC-39}\par{\footnotesize FR-104/404} & 目标旁owner名字已是到哨兵的硬链接；同名owner硬链接及原始哨兵正文。调用恢复，检查inode、正文和目标 & 排他创建失败，不能O\_TRUNC哨兵；恢复失败且不发布。 & 排他创建失败，哨兵内容与inode不变，目标未发布。\par\textbf{通过}\\\addlinespace[2pt]
+\textbf{A-TC-40}\par{\footnotesize FR-102} & 有效快照，目标多级父目录不存在；missing/a/b/restored。经产品恢复入口运行并比对结果 & 可建立缺失父目录并成功恢复，不能因提前open父目录引入回归。 & 缺失的多级父目录被创建，恢复内容比较通过。\par\textbf{通过}\\\addlinespace[2pt]
+\textbf{A-TC-41}\par{\footnotesize FR-104/404} & 按专用测试进程装配LD\_PRELOAD，注入必须命中；首次增量临时目录已创建但身份查询失败。运行临时资源故障注入脚本，核对哨兵、标记、目标与汇总 & 返回失败，不删除身份无法验证的对象，保留标记与诊断，不发布目标。 & 注入命中后返回失败，未删除无法核验身份的对象，目标未发布。\par\textbf{通过}\\\addlinespace[2pt]
+\textbf{A-TC-42}\par{\footnotesize FR-104/404} & 原父目录缺失，装配注入器；父目录创建后，外来目录抢占暂存目录名。专用测试进程确定性造冲突，核对外来哨兵/inode/权限 & 保留外来对象，返回失败且不发布目标。 & 外来目录及哨兵的内容、inode和权限不变，恢复返回失败。\par\textbf{通过}\\\addlinespace[2pt]
+\end{longtable}
+
+\endgroup

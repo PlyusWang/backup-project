@@ -1,0 +1,132 @@
+<?xml version='1.0' encoding='utf-8'?>
+<mxfile host="app.diagrams.net">
+  <diagram id="远端连接状态转换" name="远端连接状态转换">
+    <mxGraphModel pageWidth="760.0" pageHeight="753.4" page="1">
+      <root>
+        <mxCell id="0" />
+        <mxCell id="1" parent="0" />
+        <mxCell id="2" parent="1" style="rounded=1;html=0;fillColor=white;strokeColor=#223044;strokeWidth=1.5;" vertex="1">
+          <mxGeometry as="geometry" x="18.0" y="18.0" width="724" height="625" />
+        </mxCell>
+        <mxCell id="3" parent="1" style="ellipse;html=0;fillColor=#223044;strokeColor=#223044;strokeWidth=1.5;" vertex="1">
+          <mxGeometry as="geometry" x="372.0" y="34.0" width="16" height="16" />
+        </mxCell>
+        <mxCell id="4" parent="1" style="rounded=1;html=0;fillColor=#eef4f9;strokeColor=#223044;strokeWidth=1.5;" vertex="1">
+          <mxGeometry as="geometry" x="250.0" y="80.0" width="260" height="72" />
+        </mxCell>
+        <mxCell id="5" parent="1" style="text;html=0;whiteSpace=wrap;align=center;fontFamily=Noto Sans CJK SC;fontSize=18;fontStyle=0;fontColor=#223044;" vertex="1" value="kConnected&#10;业务连接未登录">
+          <mxGeometry as="geometry" x="255.0" y="90.0" width="250" height="54.4" />
+        </mxCell>
+        <mxCell id="6" parent="1" style="edgeStyle=none;html=0;endArrow=block;startArrow=none;strokeColor=#223044;strokeWidth=1.5;dashed=0;" edge="1">
+          <mxGeometry as="geometry" relative="1">
+            <mxPoint as="sourcePoint" x="380.0" y="50.0" />
+            <mxPoint as="targetPoint" x="380.0" y="80.0" />
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="7" parent="1" style="rounded=1;html=0;fillColor=#eef4f9;strokeColor=#223044;strokeWidth=1.5;" vertex="1">
+          <mxGeometry as="geometry" x="250.0" y="270.0" width="260" height="72" />
+        </mxCell>
+        <mxCell id="8" parent="1" style="text;html=0;whiteSpace=wrap;align=center;fontFamily=Noto Sans CJK SC;fontSize=18;fontStyle=0;fontColor=#223044;" vertex="1" value="kAuthenticated&#10;已认证">
+          <mxGeometry as="geometry" x="255.0" y="280.0" width="250" height="54.4" />
+        </mxCell>
+        <mxCell id="9" parent="1" style="edgeStyle=none;html=0;endArrow=block;startArrow=none;strokeColor=#223044;strokeWidth=1.5;dashed=0;" edge="1">
+          <mxGeometry as="geometry" relative="1">
+            <mxPoint as="sourcePoint" x="295.0" y="152.0" />
+            <mxPoint as="targetPoint" x="295.0" y="270.0" />
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="10" parent="1" style="text;html=0;whiteSpace=wrap;align=center;fontFamily=Noto Sans CJK SC;fontSize=17;fontStyle=0;fontColor=#223044;" vertex="1" value="LOGIN / RESUME&#10;成功">
+          <mxGeometry as="geometry" x="118.0" y="180.0" width="170" height="51.599999999999994" />
+        </mxCell>
+        <mxCell id="11" parent="1" style="edgeStyle=none;html=0;endArrow=block;startArrow=none;strokeColor=#223044;strokeWidth=1.5;dashed=0;" edge="1">
+          <mxGeometry as="geometry" relative="1">
+            <mxPoint as="sourcePoint" x="465.0" y="270.0" />
+            <mxPoint as="targetPoint" x="465.0" y="152.0" />
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="12" parent="1" style="text;html=0;whiteSpace=wrap;align=center;fontFamily=Noto Sans CJK SC;fontSize=17;fontStyle=0;fontColor=#223044;" vertex="1" value="LOGOUT&#10;账户失效">
+          <mxGeometry as="geometry" x="476.0" y="180.0" width="175" height="51.599999999999994" />
+        </mxCell>
+        <mxCell id="13" parent="1" style="rounded=1;html=0;fillColor=#eef4f9;strokeColor=#223044;strokeWidth=1.5;" vertex="1">
+          <mxGeometry as="geometry" x="60.0" y="540.0" width="285" height="72" />
+        </mxCell>
+        <mxCell id="14" parent="1" style="text;html=0;whiteSpace=wrap;align=center;fontFamily=Noto Sans CJK SC;fontSize=18;fontStyle=0;fontColor=#223044;" vertex="1" value="kUploadInProgress&#10;上传中">
+          <mxGeometry as="geometry" x="65.0" y="550.0" width="275" height="54.4" />
+        </mxCell>
+        <mxCell id="15" parent="1" style="rounded=1;html=0;fillColor=#eef4f9;strokeColor=#223044;strokeWidth=1.5;" vertex="1">
+          <mxGeometry as="geometry" x="415.0" y="540.0" width="285" height="72" />
+        </mxCell>
+        <mxCell id="16" parent="1" style="text;html=0;whiteSpace=wrap;align=center;fontFamily=Noto Sans CJK SC;fontSize=18;fontStyle=0;fontColor=#223044;" vertex="1" value="kDownloadInProgress&#10;下载中">
+          <mxGeometry as="geometry" x="420.0" y="550.0" width="275" height="54.4" />
+        </mxCell>
+        <mxCell id="17" parent="1" style="edgeStyle=none;html=0;endArrow=block;startArrow=none;strokeColor=#223044;strokeWidth=1.5;dashed=0;" edge="1">
+          <mxGeometry as="geometry" relative="1">
+            <mxPoint as="sourcePoint" x="320.0" y="342.0" />
+            <mxPoint as="targetPoint" x="203.0" y="540.0" />
+            <Array as="points">
+              <mxPoint x="320.0" y="418.0" />
+              <mxPoint x="203.0" y="418.0" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="18" parent="1" style="text;html=0;whiteSpace=wrap;align=center;fontFamily=Noto Sans CJK SC;fontSize=17;fontStyle=0;fontColor=#223044;" vertex="1" value="UPLOAD_BEGIN&#10;[校验通过]">
+          <mxGeometry as="geometry" x="206.0" y="455.0" width="180" height="51.599999999999994" />
+        </mxCell>
+        <mxCell id="19" parent="1" style="edgeStyle=none;html=0;endArrow=block;startArrow=none;strokeColor=#223044;strokeWidth=1.5;dashed=0;" edge="1">
+          <mxGeometry as="geometry" relative="1">
+            <mxPoint as="sourcePoint" x="440.0" y="342.0" />
+            <mxPoint as="targetPoint" x="558.0" y="540.0" />
+            <Array as="points">
+              <mxPoint x="440.0" y="418.0" />
+              <mxPoint x="558.0" y="418.0" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="20" parent="1" style="text;html=0;whiteSpace=wrap;align=center;fontFamily=Noto Sans CJK SC;fontSize=17;fontStyle=0;fontColor=#223044;" vertex="1" value="DOWNLOAD_BEGIN&#10;[校验通过]">
+          <mxGeometry as="geometry" x="377.0" y="455.0" width="180" height="51.599999999999994" />
+        </mxCell>
+        <mxCell id="21" parent="1" style="edgeStyle=none;html=0;endArrow=block;startArrow=none;strokeColor=#223044;strokeWidth=1.5;dashed=0;" edge="1">
+          <mxGeometry as="geometry" relative="1">
+            <mxPoint as="sourcePoint" x="60.0" y="576.0" />
+            <mxPoint as="targetPoint" x="250.0" y="306.0" />
+            <Array as="points">
+              <mxPoint x="38.0" y="576.0" />
+              <mxPoint x="38.0" y="306.0" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="22" parent="1" style="text;html=0;whiteSpace=wrap;align=center;fontFamily=Noto Sans CJK SC;fontSize=17;fontStyle=0;fontColor=#223044;" vertex="1" value="UPLOAD_END 成功&#10;/ AbortUpload">
+          <mxGeometry as="geometry" x="48.0" y="359.0" width="205" height="51.599999999999994" />
+        </mxCell>
+        <mxCell id="23" parent="1" style="edgeStyle=none;html=0;endArrow=block;startArrow=none;strokeColor=#223044;strokeWidth=1.5;dashed=0;" edge="1">
+          <mxGeometry as="geometry" relative="1">
+            <mxPoint as="sourcePoint" x="700.0" y="576.0" />
+            <mxPoint as="targetPoint" x="510.0" y="306.0" />
+            <Array as="points">
+              <mxPoint x="722.0" y="576.0" />
+              <mxPoint x="722.0" y="306.0" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="24" parent="1" style="text;html=0;whiteSpace=wrap;align=center;fontFamily=Noto Sans CJK SC;fontSize=17;fontStyle=0;fontColor=#223044;" vertex="1" value="DOWNLOAD_END&#10;/ CloseDownload">
+          <mxGeometry as="geometry" x="507.0" y="359.0" width="205" height="51.599999999999994" />
+        </mxCell>
+        <mxCell id="25" parent="1" style="edgeStyle=none;html=0;endArrow=block;startArrow=none;strokeColor=#223044;strokeWidth=1.5;dashed=0;" edge="1">
+          <mxGeometry as="geometry" relative="1">
+            <mxPoint as="sourcePoint" x="380.0" y="643.0" />
+            <mxPoint as="targetPoint" x="380.0" y="712.0" />
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="26" parent="1" style="ellipse;html=0;fillColor=white;strokeColor=#223044;strokeWidth=1.5;" vertex="1">
+          <mxGeometry as="geometry" x="369.0" y="712.0" width="22" height="22" />
+        </mxCell>
+        <mxCell id="27" parent="1" style="ellipse;html=0;fillColor=#223044;strokeColor=#223044;strokeWidth=1.5;" vertex="1">
+          <mxGeometry as="geometry" x="374.0" y="717.0" width="12" height="12" />
+        </mxCell>
+        <mxCell id="28" parent="1" style="text;html=0;whiteSpace=wrap;align=left;fontFamily=Noto Sans CJK SC;fontSize=17;fontStyle=0;fontColor=#223044;" vertex="1" value="任意子状态：EOF / I/O 致命错误&#10;或连接结束 / CleanupConnection；&#10;销毁 context">
+          <mxGeometry as="geometry" x="395.0" y="660.0" width="345" height="75.39999999999999" />
+        </mxCell>
+      </root>
+    </mxGraphModel>
+  </diagram>
+</mxfile>

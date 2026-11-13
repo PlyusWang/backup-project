@@ -1,0 +1,41 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1351.0" height="771.0" viewBox="0 0 1351.0 771.0">
+<rect width="100%" height="100%" fill="white"/>
+<rect x="18.0" y="18.0" width="530.0" height="234.0" rx="0" fill="white" stroke="#223044" stroke-width="1.5"/>
+<rect x="18.0" y="18.0" width="530.0" height="64.0" rx="0" fill="#eef4f9" stroke="#223044" stroke-width="1.5"/>
+<text x="283.0" y="41.0" text-anchor="middle" font-family="Noto Sans CJK SC" font-size="18.0" font-weight="700" fill="#223044">«table»</text>
+<text x="283.0" y="66.2" text-anchor="middle" font-family="Noto Sans CJK SC" font-size="18.0" font-weight="700" fill="#223044">users</text>
+<text x="31.0" y="104.0" text-anchor="start" font-family="Noto Sans CJK SC" font-size="17.0" font-weight="400" fill="#223044">id INTEGER PRIMARY KEY</text>
+<text x="31.0" y="127.8" text-anchor="start" font-family="Noto Sans CJK SC" font-size="17.0" font-weight="400" fill="#223044">username TEXT UNIQUE NOT NULL</text>
+<text x="31.0" y="151.6" text-anchor="start" font-family="Noto Sans CJK SC" font-size="17.0" font-weight="400" fill="#223044">password_salt BLOB NOT NULL</text>
+<text x="31.0" y="175.39999999999998" text-anchor="start" font-family="Noto Sans CJK SC" font-size="17.0" font-weight="400" fill="#223044">password_hash BLOB NOT NULL</text>
+<text x="31.0" y="199.2" text-anchor="start" font-family="Noto Sans CJK SC" font-size="17.0" font-weight="400" fill="#223044">password_iterations INTEGER NOT NULL</text>
+<text x="31.0" y="223.0" text-anchor="start" font-family="Noto Sans CJK SC" font-size="17.0" font-weight="400" fill="#223044">created_at INTEGER NOT NULL</text>
+<rect x="753.0" y="18.0" width="580.0" height="364.0" rx="0" fill="white" stroke="#223044" stroke-width="1.5"/>
+<rect x="753.0" y="18.0" width="580.0" height="64.0" rx="0" fill="#eef4f9" stroke="#223044" stroke-width="1.5"/>
+<text x="1043.0" y="41.0" text-anchor="middle" font-family="Noto Sans CJK SC" font-size="18.0" font-weight="700" fill="#223044">«table»</text>
+<text x="1043.0" y="66.2" text-anchor="middle" font-family="Noto Sans CJK SC" font-size="18.0" font-weight="700" fill="#223044">snapshots</text>
+<text x="766.0" y="103.0" text-anchor="start" font-family="Noto Sans CJK SC" font-size="16.0" font-weight="400" fill="#223044">id TEXT PRIMARY KEY</text>
+<text x="766.0" y="125.4" text-anchor="start" font-family="Noto Sans CJK SC" font-size="16.0" font-weight="400" fill="#223044">user_id INTEGER NOT NULL  [FK → users.id]</text>
+<text x="766.0" y="147.8" text-anchor="start" font-family="Noto Sans CJK SC" font-size="16.0" font-weight="400" fill="#223044">display_name TEXT NOT NULL</text>
+<text x="766.0" y="170.2" text-anchor="start" font-family="Noto Sans CJK SC" font-size="16.0" font-weight="400" fill="#223044">size_bytes INTEGER NOT NULL</text>
+<text x="766.0" y="192.6" text-anchor="start" font-family="Noto Sans CJK SC" font-size="16.0" font-weight="400" fill="#223044">sha256 TEXT NOT NULL</text>
+<text x="766.0" y="215.0" text-anchor="start" font-family="Noto Sans CJK SC" font-size="16.0" font-weight="400" fill="#223044">created_at INTEGER NOT NULL</text>
+<text x="766.0" y="237.39999999999998" text-anchor="start" font-family="Noto Sans CJK SC" font-size="16.0" font-weight="400" fill="#223044">storage_name TEXT NOT NULL</text>
+<text x="766.0" y="259.79999999999995" text-anchor="start" font-family="Noto Sans CJK SC" font-size="16.0" font-weight="400" fill="#223044">snapshot_kind INTEGER NOT NULL DEFAULT 0</text>
+<text x="766.0" y="282.2" text-anchor="start" font-family="Noto Sans CJK SC" font-size="16.0" font-weight="400" fill="#223044">parent_id TEXT NOT NULL DEFAULT &#x27;&#x27;</text>
+<text x="766.0" y="304.6" text-anchor="start" font-family="Noto Sans CJK SC" font-size="16.0" font-weight="400" fill="#223044">generation INTEGER NOT NULL DEFAULT 0</text>
+<text x="766.0" y="327.0" text-anchor="start" font-family="Noto Sans CJK SC" font-size="16.0" font-weight="400" fill="#223044">lineage TEXT NOT NULL DEFAULT &#x27;&#x27;</text>
+<polyline points="548.0,98.0 753.0,98.0" fill="none" stroke="#223044" stroke-width="1.6"/>
+<text x="653.0" y="145.0" text-anchor="middle" font-family="Noto Sans CJK SC" font-size="17.0" font-weight="400" fill="#223044">1 ↔ 0..*</text>
+<text x="653.0" y="168.8" text-anchor="middle" font-family="Noto Sans CJK SC" font-size="17.0" font-weight="400" fill="#223044">实际外键</text>
+<rect x="18.0" y="398.0" width="530.0" height="130.0" rx="0" fill="white" stroke="#223044" stroke-width="1.5"/>
+<rect x="18.0" y="398.0" width="530.0" height="64.0" rx="0" fill="#eef4f9" stroke="#223044" stroke-width="1.5"/>
+<text x="283.0" y="421.0" text-anchor="middle" font-family="Noto Sans CJK SC" font-size="18.0" font-weight="700" fill="#223044">«table»</text>
+<text x="283.0" y="446.2" text-anchor="middle" font-family="Noto Sans CJK SC" font-size="18.0" font-weight="700" fill="#223044">deleted_users</text>
+<text x="31.0" y="484.0" text-anchor="start" font-family="Noto Sans CJK SC" font-size="17.0" font-weight="400" fill="#223044">id INTEGER PRIMARY KEY</text>
+<text x="31.0" y="507.8" text-anchor="start" font-family="Noto Sans CJK SC" font-size="17.0" font-weight="400" fill="#223044">deleted_at INTEGER NOT NULL</text>
+<rect x="28.0" y="633.0" width="1300.0" height="120.0" rx="0" fill="#eef4f9" stroke="#223044" stroke-width="1.5"/>
+<text x="47.0" y="665.0" text-anchor="start" font-family="Noto Sans CJK SC" font-size="18.0" font-weight="400" fill="#223044">显式索引：snapshots_by_user(user_id, created_at, id)；snapshots_by_parent(user_id, parent_id)</text>
+<text x="47.0" y="690.2" text-anchor="start" font-family="Noto Sans CJK SC" font-size="18.0" font-weight="400" fill="#223044">users.username 与 snapshots.id 另有 SQLite 自动唯一索引；未定义数据库视图。</text>
+<text x="47.0" y="715.4" text-anchor="start" font-family="Noto Sans CJK SC" font-size="18.0" font-weight="400" fill="#223044">parent_id → snapshots.id：仅业务关联，无 FOREIGN KEY、无 UNIQUE(parent_id) 物理约束。</text>
+</svg>

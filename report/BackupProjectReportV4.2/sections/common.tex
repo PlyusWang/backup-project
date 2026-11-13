@@ -1,0 +1,72 @@
+\section*{一、实验室名称}
+\addcontentsline{toc}{section}{一、实验室名称}
+主楼A2-402。
+
+\section*{二、实验项目名称}
+\addcontentsline{toc}{section}{二、实验项目名称}
+文件备份软件。
+
+\section*{三、实验目的}
+\addcontentsline{toc}{section}{三、实验目的}
+本实验综合运用 C++、数据结构和软件工程知识，开发面向 Linux 目录树的备份与恢复软件，实现归档管理、文件过滤、压缩加密、自动备份及远程存储。开发过程中结合 UML 建模、单元测试和集成测试，并通过文件恢复与内容比对验证备份结果。
+
+\section*{四、实验内容}
+\addcontentsline{toc}{section}{四、实验内容}
+基本内容是将源目录树保存到指定备份仓库，并从选定快照恢复到目标目录。在此基础上实现文件过滤、元数据与特殊文件支持、打包解包、压缩解压、口令加解密、Qt 6 图形界面、定时和实时备份，以及远端账户、快照存储、安全传输和文件级增量链。
+
+项目使用 Git 管理源码，采用 C++17 与 GNU Make 构建共享核心、客户端和服务端，通过单元测试、回环集成测试和故障注入检查实现。
+
+\section*{五、实验器材与软硬件环境}
+\addcontentsline{toc}{section}{五、实验器材与软硬件环境}
+实验使用联网 PC、Ubuntu 虚拟机及阿里云 ECS。备份与恢复测试使用独立的源目录、仓库和恢复目录。
+
+\begin{longtable}{L{.23\linewidth}L{.68\linewidth}}
+\caption{实验环境与软件配置}\label{tab:environment}\\\toprule 项目 & 配置及用途\\\midrule\endfirsthead
+\toprule 项目 & 配置及用途\\\midrule\endhead
+开发与功能测试环境 & Ubuntu 24.04.4 LTS，8 核 CPU。\\
+编译与构建工具 & g++ 14，C++17，GNU Make 4.3，Git。\\
+界面与数据库 & Qt 6.4.2，SQLite 3.45.1。\\
+测试与分析工具 & GoogleTest、Python、GNU tar、Zstd 命令行工具、OpenSSL、Valgrind、gprof、perf、ASan/UBSan。\\
+发行兼容环境 & Debian 12 用于客户端构建；Ubuntu 20.04 用于服务端构建；Ubuntu 22.04 用于客户端兼容及 systemd 测试。\\
+\bottomrule
+\end{longtable}
+
+\section*{六、实验步骤及操作}
+\addcontentsline{toc}{section}{六、实验步骤及操作}
+项目先确定备份与恢复两项核心用例，将需求编号映射到源码模块和测试脚本。初期实现本地备份与恢复，随后依次完善过滤、归档编码、自动触发、增量链及远端服务。迭代记录与 Git 提交保留各阶段的设计和验收结果。
+
+操作过程包括核对源码提交与工作树、构建 CLI 和 GUI、设置独立测试仓库、对样例目录执行备份及恢复，并用 \Code{diff}、\Code{cmp} 或 SHA-256 检查内容。随后测试过滤、编码选项和增量依赖链，对错误口令、损坏归档、非空目标与临时目录创建或归属确认失败进行异常测试；GUI 和远端回环在隔离环境完成。对应的已执行批次和复现命令见软件测试报告。
+
+\subsection*{项目组织与进度安排}
+\subsubsection*{人员分工}
+项目由3名成员分工完成，具体职责见下表。设计、开发、测试和文档编写过程中，成员之间根据实际需要互相检查并协助修正问题。
+
+\begin{center}
+\begin{tabularx}{\linewidth}{@{}lX@{}}
+\toprule
+成员 & 主要承担任务 \\
+\midrule
+成员 A（组长） & 负责软件总体架构、核心算法设计与实现、模块集成和程序测试。 \\
+成员 C & 负责图形界面实现与优化，并调试成员 A完成的相关程序模块。 \\
+成员 B & 负责 UML、数据库设计图和实验文档，协助调试前两位成员的工作成果。 \\
+\bottomrule
+\end{tabularx}
+\end{center}
+三人贡献均等。
+
+\subsubsection*{进度安排与里程碑}
+项目采用短迭代组织开发。Sprint 1/2 完成本地备份与恢复；后续 Phase 3 至 Phase 7 分别完成过滤、编码、自动化、远端及发行包制作与测试，主要里程碑见表\ref{tab:milestones}。\E{E11}
+
+\begin{longtable}{L{.22\linewidth}L{.23\linewidth}L{.44\linewidth}}
+\caption{项目里程碑}\label{tab:milestones}\\\toprule 阶段 & 记录时间 & 完成成果\\\midrule\endfirsthead
+\toprule 阶段 & 记录时间 & 完成成果\\\midrule\endhead
+Sprint 1/2 & 9月3日至9月12日 & 本地 Backup/Restore、路径修复、Archive v0.1、元数据和两套 GUI。\\
+Phase 3 & 9月17日至9月25日 & Filter、规则编辑器、仓库与配置；产品入口由任意归档路径转为仓库管理。\\
+Phase 4 & 9月26日 & v2 容器、压缩、加密接入；相关算法在同日完成实现与测试。\\
+Phase 5 & 9月27日至9月30日 & 定时、保留策略和 inotify 实时备份。\\
+Phase 6 & 9月28日至10月6日 & 增量、远端服务、BPSEC 与连接交互；与 Phase 5 同期开展。\\
+Phase 7 & 10月6日至10月7日 & 发行包制作、代码检查、文档整理及功能回归。\\
+后期修复与材料整合 & 10月8日至11月12日 & 完善增量恢复与临时资源管理，新增压缩和自动任务组合，完成发行包、桌面 GUI、公网 ECS 及持续集成测试。\\
+\bottomrule\end{longtable}
+具体工作安排和实际完成时间见图\ref{fig:backup-gantt-ab}至图\ref{fig:backup-gantt-f}。甘特图包含40项开发、测试与文档任务；末段记录项目收尾、验收和材料整理，当前均已完成。
+\input{gantt/report-include.tex}

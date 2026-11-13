@@ -1,0 +1,15 @@
+\begin{longtable}{L{.13\linewidth}L{.15\linewidth}R{.20\linewidth}R{.18\linewidth}R{.18\linewidth}}
+\caption{4 MiB输入的压缩大小与编解码时间}\label{tab:codec-performance}\\\toprule 数据 & 算法 & 压缩字节数 & 编码 / ms & 解码 / ms\\\midrule\endfirsthead
+\toprule 数据 & 算法 & 压缩字节数 & 编码 / ms & 解码 / ms\\\midrule\endhead
+\bottomrule\endfoot
+文本 & Huffman & 2,869,817 & 57.45 & 141.54\\
+文本 & Zstandard & 8,018 & 14.60 & 68.32\\
+重复 & Huffman & 4,194,580 & 65.28 & 165.65\\
+重复 & Zstandard & 17,298 & 16.13 & 74.06\\
+结构化 & Huffman & 2,462,262 & 52.13 & 123.26\\
+结构化 & Zstandard & 757,648 & 55.81 & 87.15\\
+随机 & Huffman & 4,194,580 & 63.79 & 162.12\\
+随机 & Zstandard & 4,194,514 & 45.50 & 54.58\\
+混合 & Huffman & 3,879,214 & 65.01 & 173.82\\
+混合 & Zstandard & 2,304,596 & 39.91 & 65.39\\
+\end{longtable}

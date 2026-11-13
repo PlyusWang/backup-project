@@ -1,0 +1,39 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1131.0" height="816.0" viewBox="0 0 1131.0 816.0">
+<rect width="100%" height="100%" fill="white"/>
+<rect x="213.0" y="18.0" width="900.0" height="780.0" rx="0" fill="white" stroke="#285681" stroke-width="1.5"/>
+<text x="235.0" y="47.0" text-anchor="start" font-family="Noto Sans CJK SC" font-size="19.0" font-weight="700" fill="#223044">Backup-Project 本地功能（系统边界）</text>
+<ellipse cx="88.0" cy="290.0" rx="12.0" ry="12.0" fill="white" stroke="#223044" stroke-width="1.5"/>
+<polyline points="88.0,302.0 88.0,344.0" fill="none" stroke="#223044" stroke-width="1.6"/>
+<polyline points="58.0,319.0 118.0,319.0" fill="none" stroke="#223044" stroke-width="1.6"/>
+<polyline points="88.0,344.0 63.0,375.0" fill="none" stroke="#223044" stroke-width="1.6"/>
+<polyline points="88.0,344.0 113.0,375.0" fill="none" stroke="#223044" stroke-width="1.6"/>
+<text x="88.0" y="399.0" text-anchor="middle" font-family="Noto Sans CJK SC" font-size="18.0" font-weight="400" fill="#223044">本地用户</text>
+<ellipse cx="428.0" cy="125.0" rx="165.0" ry="32.0" fill="#eef4f9" stroke="#223044" stroke-width="1.5"/>
+<text x="428.0" y="131.0" text-anchor="middle" font-family="Noto Sans CJK SC" font-size="17.0" font-weight="400" fill="#223044">UC-01 数据备份</text>
+<ellipse cx="888.0" cy="125.0" rx="165.0" ry="32.0" fill="#eef4f9" stroke="#223044" stroke-width="1.5"/>
+<text x="888.0" y="131.0" text-anchor="middle" font-family="Noto Sans CJK SC" font-size="17.0" font-weight="400" fill="#223044">UC-02 数据恢复</text>
+<ellipse cx="428.0" cy="275.0" rx="165.0" ry="32.0" fill="#eef4f9" stroke="#223044" stroke-width="1.5"/>
+<text x="428.0" y="281.0" text-anchor="middle" font-family="Noto Sans CJK SC" font-size="17.0" font-weight="400" fill="#223044">UC-03 配置过滤与预览</text>
+<ellipse cx="888.0" cy="275.0" rx="165.0" ry="32.0" fill="#eef4f9" stroke="#223044" stroke-width="1.5"/>
+<text x="888.0" y="268.0" text-anchor="middle" font-family="Noto Sans CJK SC" font-size="17.0" font-weight="400" fill="#223044">UC-04 设置备份密码</text>
+<text x="888.0" y="291.8" text-anchor="middle" font-family="Noto Sans CJK SC" font-size="17.0" font-weight="400" fill="#223044">（本次操作输入）</text>
+<ellipse cx="428.0" cy="425.0" rx="165.0" ry="32.0" fill="#eef4f9" stroke="#223044" stroke-width="1.5"/>
+<text x="428.0" y="431.0" text-anchor="middle" font-family="Noto Sans CJK SC" font-size="17.0" font-weight="400" fill="#223044">UC-05 配置定时备份</text>
+<ellipse cx="888.0" cy="425.0" rx="165.0" ry="32.0" fill="#eef4f9" stroke="#223044" stroke-width="1.5"/>
+<text x="888.0" y="431.0" text-anchor="middle" font-family="Noto Sans CJK SC" font-size="17.0" font-weight="400" fill="#223044">UC-06 定时备份</text>
+<ellipse cx="428.0" cy="575.0" rx="165.0" ry="32.0" fill="#eef4f9" stroke="#223044" stroke-width="1.5"/>
+<text x="428.0" y="581.0" text-anchor="middle" font-family="Noto Sans CJK SC" font-size="17.0" font-weight="400" fill="#223044">UC-07 实时备份</text>
+<ellipse cx="888.0" cy="575.0" rx="165.0" ry="32.0" fill="#eef4f9" stroke="#223044" stroke-width="1.5"/>
+<text x="888.0" y="581.0" text-anchor="middle" font-family="Noto Sans CJK SC" font-size="17.0" font-weight="400" fill="#223044">UC-15 管理备份仓库</text>
+<polyline points="118.0,338.0 183.0,125.0 263.0,125.0" fill="none" stroke="#223044" stroke-width="1.6"/>
+<polyline points="118.0,338.0 183.0,275.0 263.0,275.0" fill="none" stroke="#223044" stroke-width="1.6"/>
+<polyline points="118.0,338.0 183.0,425.0 263.0,425.0" fill="none" stroke="#223044" stroke-width="1.6"/>
+<polyline points="118.0,338.0 183.0,575.0 263.0,575.0" fill="none" stroke="#223044" stroke-width="1.6"/>
+<polyline points="118.0,338.0 168.0,773.0 1073.0,773.0 1073.0,125.0 1053.0,125.0" fill="none" stroke="#223044" stroke-width="1.6"/>
+<polyline points="118.0,338.0 168.0,773.0 1073.0,773.0 1073.0,275.0 1053.0,275.0" fill="none" stroke="#223044" stroke-width="1.6"/>
+<polyline points="118.0,338.0 168.0,773.0 1073.0,773.0 1073.0,425.0 1053.0,425.0" fill="none" stroke="#223044" stroke-width="1.6"/>
+<polyline points="118.0,338.0 168.0,773.0 1073.0,773.0 1073.0,575.0 1053.0,575.0" fill="none" stroke="#223044" stroke-width="1.6"/>
+<ellipse cx="650.5" cy="700.0" rx="182.5" ry="32.0" fill="#eef4f9" stroke="#223044" stroke-width="1.5"/>
+<text x="650.5" y="706.0" text-anchor="middle" font-family="Noto Sans CJK SC" font-size="17.0" font-weight="400" fill="#223044">UC-14 查看命令行帮助</text>
+<polyline points="118.0,338.0 188.0,700.0 468.0,700.0" fill="none" stroke="#223044" stroke-width="1.6"/>
+</svg>

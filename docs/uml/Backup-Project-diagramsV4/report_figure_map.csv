@@ -1,0 +1,20 @@
+﻿report_figure_name,package_file,editing_source
+本地用户用例与参与者,figures/a4pdf/01_use_case_local.pdf,sources/drawio/01_use_case_local.drawio
+远程与运维用例与参与者,figures/a4pdf/02_use_case_remote.pdf,sources/drawio/02_use_case_remote.drawio
+前端控制器与写操作互斥控制类图,figures/a4pdf/03_class_frontend.pdf,sources/drawio/03_class_frontend.drawio
+本地核心类与数据结构,figures/a4pdf/04_class_core.pdf,sources/drawio/04_class_core.drawio
+定时与实时核心类图,figures/a4pdf/05_class_automation.pdf,sources/drawio/05_class_automation.drawio
+网络客户端与服务端核心类图,figures/a4pdf/06_class_network.pdf,sources/drawio/06_class_network.drawio
+顶层系统构件图,figures/a4pdf/07_component_system.pdf,sources/drawio/07_component_system.drawio
+本地备份与还原子系统构件图,figures/a4pdf/08_component_local.pdf,sources/drawio/08_component_local.drawio
+GUI手动完整备份流程（报告插图）,figures/report/a4pdf/09_sequence_backup_report.pdf,sources/report_puml/09_sequence_backup_report.puml
+GUI手动完整备份流程（完整版）,figures/a4pdf/09_sequence_backup.pdf,sources/puml/09_sequence_backup.puml
+完整 v2 容器恢复流程,figures/a4pdf/10_sequence_restore.pdf,sources/puml/10_sequence_restore.puml
+受管增量链恢复流程（报告插图）,figures/report/a4pdf/11_sequence_restore_chain_report.pdf,sources/report_puml/11_sequence_restore_chain_report.puml
+受管增量链恢复流程（完整版）,figures/a4pdf/11_sequence_restore_chain.pdf,sources/puml/11_sequence_restore_chain.puml
+远端增量备份流程,figures/a4pdf/12_sequence_remote_backup.pdf,sources/puml/12_sequence_remote_backup.puml
+远端快照链还原流程,figures/a4pdf/13_sequence_remote_restore.pdf,sources/puml/13_sequence_remote_restore.puml
+服务端数据库逻辑 E-R 图,figures/a4pdf/14_er_logical.pdf,sources/drawio/14_er_logical.drawio
+SQLite schema v2 物理 E-R 图,figures/a4pdf/15_er_physical.pdf,sources/drawio/15_er_physical.drawio
+服务端连接状态图,figures/a4pdf/16_state_connection.pdf,sources/drawio/16_state_connection.drawio
+GUI写操作互斥状态图,figures/a4pdf/17_state_operation_gate.pdf,sources/drawio/17_state_operation_gate.drawio

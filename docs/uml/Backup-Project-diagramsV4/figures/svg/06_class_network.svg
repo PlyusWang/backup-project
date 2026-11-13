@@ -1,0 +1,52 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1166.0" height="748.8" viewBox="0 0 1166.0 748.8">
+<rect width="100%" height="100%" fill="white"/>
+<rect x="23.0" y="18.0" width="500.0" height="253.0" rx="0" fill="white" stroke="#223044" stroke-width="1.5"/>
+<rect x="23.0" y="18.0" width="500.0" height="43.0" rx="0" fill="#eef4f9" stroke="#223044" stroke-width="1.5"/>
+<text x="273.0" y="41.0" text-anchor="middle" font-family="Noto Sans CJK SC" font-size="18.0" font-weight="700" fill="#223044">RemoteArchiveClient</text>
+<text x="36.0" y="82.0" text-anchor="start" font-family="Noto Sans CJK SC" font-size="16.0" font-weight="400" fill="#223044">- fd_: int</text>
+<text x="36.0" y="104.4" text-anchor="start" font-family="Noto Sans CJK SC" font-size="16.0" font-weight="400" fill="#223044">- authenticated_: bool</text>
+<text x="36.0" y="126.8" text-anchor="start" font-family="Noto Sans CJK SC" font-size="16.0" font-weight="400" fill="#223044">- token_: string</text>
+<polyline points="23.0,153.0 523.0,153.0" fill="none" stroke="#223044" stroke-width="1.6"/>
+<text x="36.0" y="174.0" text-anchor="start" font-family="Noto Sans CJK SC" font-size="16.0" font-weight="400" fill="#223044">+ Connect(endpoint, error*): bool</text>
+<text x="36.0" y="196.4" text-anchor="start" font-family="Noto Sans CJK SC" font-size="16.0" font-weight="400" fill="#223044">+ Login(…): bool</text>
+<text x="36.0" y="218.8" text-anchor="start" font-family="Noto Sans CJK SC" font-size="16.0" font-weight="400" fill="#223044">+ UploadSnapshotFile(…): bool</text>
+<text x="36.0" y="241.2" text-anchor="start" font-family="Noto Sans CJK SC" font-size="16.0" font-weight="400" fill="#223044">+ DownloadArchiveFile(…): bool</text>
+<rect x="663.0" y="18.0" width="470.0" height="201.0" rx="0" fill="white" stroke="#223044" stroke-width="1.5"/>
+<rect x="663.0" y="18.0" width="470.0" height="43.0" rx="0" fill="#eef4f9" stroke="#223044" stroke-width="1.5"/>
+<text x="898.0" y="41.0" text-anchor="middle" font-family="Noto Sans CJK SC" font-size="18.0" font-weight="700" fill="#223044">RemoteServer</text>
+<text x="676.0" y="81.0" text-anchor="start" font-family="Noto Sans CJK SC" font-size="15.0" font-weight="400" fill="#223044">- store_: unique_ptr&lt;RemoteMetadataStore&gt;</text>
+<text x="676.0" y="102.0" text-anchor="start" font-family="Noto Sans CJK SC" font-size="15.0" font-weight="400" fill="#223044">- workers_: vector&lt;thread&gt;</text>
+<polyline points="663.0,127.0 1133.0,127.0" fill="none" stroke="#223044" stroke-width="1.6"/>
+<text x="676.0" y="147.0" text-anchor="start" font-family="Noto Sans CJK SC" font-size="15.0" font-weight="400" fill="#223044">+ Configure(…): bool</text>
+<text x="676.0" y="168.0" text-anchor="start" font-family="Noto Sans CJK SC" font-size="15.0" font-weight="400" fill="#223044">+ ServeConnection(fd, error*): bool</text>
+<text x="676.0" y="189.0" text-anchor="start" font-family="Noto Sans CJK SC" font-size="15.0" font-weight="400" fill="#223044">+ CleanupConnection(context*): void</text>
+<rect x="23.0" y="463.0" width="500.0" height="227.0" rx="0" fill="white" stroke="#223044" stroke-width="1.5"/>
+<rect x="23.0" y="463.0" width="500.0" height="43.0" rx="0" fill="#eef4f9" stroke="#223044" stroke-width="1.5"/>
+<text x="273.0" y="486.0" text-anchor="middle" font-family="Noto Sans CJK SC" font-size="18.0" font-weight="700" fill="#223044">SecureChannel</text>
+<text x="36.0" y="526.0" text-anchor="start" font-family="Noto Sans CJK SC" font-size="15.0" font-weight="400" fill="#223044">- established_: bool</text>
+<text x="36.0" y="547.0" text-anchor="start" font-family="Noto Sans CJK SC" font-size="15.0" font-weight="400" fill="#223044">- send_sequence_: uint64</text>
+<text x="36.0" y="568.0" text-anchor="start" font-family="Noto Sans CJK SC" font-size="15.0" font-weight="400" fill="#223044">- receive_sequence_: uint64</text>
+<polyline points="23.0,598.0 523.0,598.0" fill="none" stroke="#223044" stroke-width="1.6"/>
+<text x="36.0" y="618.0" text-anchor="start" font-family="Noto Sans CJK SC" font-size="15.0" font-weight="400" fill="#223044">+ HandshakeClient(…): bool</text>
+<text x="36.0" y="639.0" text-anchor="start" font-family="Noto Sans CJK SC" font-size="15.0" font-weight="400" fill="#223044">+ HandshakeClientWithCertificate(…): bool</text>
+<text x="36.0" y="660.0" text-anchor="start" font-family="Noto Sans CJK SC" font-size="15.0" font-weight="400" fill="#223044">+ SendFrame(…): bool</text>
+<rect x="663.0" y="463.0" width="470.0" height="201.0" rx="0" fill="white" stroke="#223044" stroke-width="1.5"/>
+<rect x="663.0" y="463.0" width="470.0" height="43.0" rx="0" fill="#eef4f9" stroke="#223044" stroke-width="1.5"/>
+<text x="898.0" y="486.0" text-anchor="middle" font-family="Noto Sans CJK SC" font-size="18.0" font-weight="700" fill="#223044">RemoteMetadataStore</text>
+<text x="676.0" y="526.0" text-anchor="start" font-family="Noto Sans CJK SC" font-size="15.0" font-weight="400" fill="#223044">- database_: sqlite3*</text>
+<text x="676.0" y="547.0" text-anchor="start" font-family="Noto Sans CJK SC" font-size="15.0" font-weight="400" fill="#223044">- mutex_: mutex</text>
+<polyline points="663.0,572.0 1133.0,572.0" fill="none" stroke="#223044" stroke-width="1.6"/>
+<text x="676.0" y="592.0" text-anchor="start" font-family="Noto Sans CJK SC" font-size="15.0" font-weight="400" fill="#223044">+ Open(…): bool</text>
+<text x="676.0" y="613.0" text-anchor="start" font-family="Noto Sans CJK SC" font-size="15.0" font-weight="400" fill="#223044">+ InsertSnapshot(…): StoreResult</text>
+<text x="676.0" y="634.0" text-anchor="start" font-family="Noto Sans CJK SC" font-size="15.0" font-weight="400" fill="#223044">+ DeleteUser(…): StoreResult</text>
+<polyline points="273.0,271.0 273.0,463.0" fill="none" stroke="#223044" stroke-width="1.6"/>
+<polygon points="273.0,271.0 279.0,281.0 273.0,291.0 267.0,281.0" fill="#223044" stroke="#223044" stroke-width="1.6"/>
+<text x="393.5" y="390.0" text-anchor="middle" font-family="Noto Sans CJK SC" font-size="15.0" font-weight="400" fill="#223044">1 / 1  channel_</text>
+<polyline points="903.0,219.0 903.0,463.0" fill="none" stroke="#223044" stroke-width="1.6"/>
+<polygon points="903.0,219.0 909.0,229.0 903.0,239.0 897.0,229.0" fill="#223044" stroke="#223044" stroke-width="1.6"/>
+<text x="1018.5" y="366.0" text-anchor="middle" font-family="Noto Sans CJK SC" font-size="15.0" font-weight="400" fill="#223044">1 / 0..1  store_</text>
+<polyline points="523.0,138.0 663.0,138.0" fill="none" stroke="#223044" stroke-width="1.6" stroke-dasharray="7 5"/>
+<polyline points="650.0,144.0 663.0,138.0 650.0,132.0" fill="none" stroke="#223044" stroke-width="1.6"/>
+<text x="593.0" y="107.0" text-anchor="middle" font-family="Noto Sans CJK SC" font-size="15.0" font-weight="400" fill="#223044">BPNET1 / BPSEC</text>
+<text x="22.0" y="720.0" text-anchor="start" font-family="Noto Sans CJK SC" font-size="17.0" font-weight="400" fill="#223044">每条连接创建 SecureChannel 与 ConnectionContext；连接结束时回收。</text>
+</svg>

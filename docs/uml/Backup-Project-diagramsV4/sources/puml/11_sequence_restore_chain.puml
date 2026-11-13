@@ -1,0 +1,107 @@
+@startuml
+skinparam defaultFontName Noto Sans CJK SC
+skinparam defaultFontSize 15
+skinparam backgroundColor white
+skinparam shadowing false
+skinparam sequenceMessageAlign center
+skinparam maxMessageSize 180
+skinparam ParticipantPadding 15
+skinparam BoxPadding 8
+skinparam sequenceGroupBackgroundColor white
+skinparam sequenceGroupBorderColor #334155
+skinparam sequenceLifeLineBorderColor #94A3B8
+skinparam sequenceParticipantBackgroundColor #EEF4F9
+skinparam sequenceParticipantBorderColor #334155
+skinparam sequenceArrowColor #334155
+skinparam sequenceActivationBackgroundColor #E2E8F0
+hide footbox
+actor "GUI / CLI" as C
+participant "«module»\nincremental_restore" as I
+participant "链 / 信封验证\n«module»" as V
+participant "«module»\narchive_pipeline" as P
+participant "staging / overlay\n文件系统" as S
+C -> I : RestoreSnapshotChain(repository, name, destination, ...)
+activate I
+I -> V : ResolveSnapshotChain：身份 / 父绑定 / 环 / 深度
+V --> I : chain / error
+I -> I : 规范化目标；要求不存在或为空
+alt 链或目标检查失败
+ I --> C : false
+else 前置检查通过
+ I -> S : 建父目录并固定 parent fd；owner 标记\n排他创建 staging / overlay；身份核验
+ S --> I : claims / error
+ alt 创建冲突或身份不可验证
+  I -> S : 仅回收可证明归属的资源；保留冲突对象
+  I --> C : false；保留必要来源标记
+ else 创建成功
+  I -> P : RunRestorePipeline(base, staging, ...)
+  activate P
+  P --> I : base_ok
+  deactivate P
+  alt base 恢复失败
+   I -> I : ok = false；跳过 delta 和发布
+  else base 恢复成功
+   loop index = 1 .. chain.size-1 [!delta_failed]
+    I -> V : ReadDeltaEnvelope；ExtractDeltaPayload
+    V --> I : inner_container / error
+    alt 信封 / payload 失败
+     I -> I : delta_failed = true；break
+    else 读取成功
+     I -> S : 固定父 fd；回收前轮 overlay；排他创建新 overlay
+     S --> I : claim result
+     alt 父 fd / overlay 创建失败
+      I -> I : delta_failed = true；break
+     else 创建成功
+      I -> P : RunRestorePipeline(inner_container, overlay, ...)
+      activate P
+      P --> I : overlay_ok
+      deactivate P
+      alt overlay 恢复失败
+       I -> I : delta_failed = true；break
+      else overlay 恢复成功
+       I -> S : 删除本次 inner_container
+       loop tombstones，按深度降序 [!delta_failed]
+        I -> V : 语法校验；解析路径且不穿越软链接祖先
+        V --> I : path / error
+        opt 语法与路径解析成功且条目存在
+         I -> S : RemoveTree(path)
+         S --> I : result
+        end
+        opt 任一 tombstone 致命失败
+         I -> I : delta_failed = true；break
+        end
+       end
+       opt !delta_failed
+        I -> S : MergeTree(overlay, staging, MergeContext)
+        S --> I : merge_ok
+        alt merge 失败
+         I -> I : delta_failed = true；break
+        else merge 成功
+         I -> S : 根 metadata 尽力应用；累计 report\n按身份回收本轮 overlay
+        end
+       end
+      end
+     end
+    end
+   end
+   alt delta_failed
+    I -> I : ok = false；禁止发布
+   else 全部 delta 成功
+    opt destination 是既存空目录
+     I -> S : rmdir(destination)
+     S --> I : result
+    end
+    opt 前序成功
+     I -> S : PublishReplacing(staging, destination)
+     S --> I : publish result
+     I -> I : 仅 publish 成功时 ok = true
+    end
+   end
+  end
+  I -> S : 以 parent fd + 对象身份回收本轮临时资源\n无残留且 marker_owned 时撤 owner 标记
+  I --> C : ok（诊断出参允许 nullptr）
+ end
+end
+deactivate I
+
+@enduml

@@ -1,0 +1,39 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1166.0" height="647.8" viewBox="0 0 1166.0 647.8">
+<rect width="100%" height="100%" fill="white"/>
+<rect x="38.0" y="18.0" width="490.0" height="201.0" rx="0" fill="white" stroke="#223044" stroke-width="1.5"/>
+<rect x="38.0" y="18.0" width="490.0" height="43.0" rx="0" fill="#eef4f9" stroke="#223044" stroke-width="1.5"/>
+<text x="283.0" y="41.0" text-anchor="middle" font-family="Noto Sans CJK SC" font-size="18.0" font-weight="700" fill="#223044">ScheduledBackupService</text>
+<text x="51.0" y="82.0" text-anchor="start" font-family="Noto Sans CJK SC" font-size="16.0" font-weight="400" fill="#223044">- repository_path_: string</text>
+<text x="51.0" y="104.4" text-anchor="start" font-family="Noto Sans CJK SC" font-size="16.0" font-weight="400" fill="#223044">- store_: ScheduleStore*</text>
+<polyline points="38.0,127.0 528.0,127.0" fill="none" stroke="#223044" stroke-width="1.6"/>
+<text x="51.0" y="148.0" text-anchor="start" font-family="Noto Sans CJK SC" font-size="16.0" font-weight="400" fill="#223044">+ Evaluate(…): bool</text>
+<text x="51.0" y="170.4" text-anchor="start" font-family="Noto Sans CJK SC" font-size="16.0" font-weight="400" fill="#223044">+ EvaluateNow(…): bool</text>
+<text x="51.0" y="192.8" text-anchor="start" font-family="Noto Sans CJK SC" font-size="16.0" font-weight="400" fill="#223044">+ RunRetention(…): bool</text>
+<rect x="693.0" y="18.0" width="430.0" height="109.0" rx="0" fill="white" stroke="#223044" stroke-width="1.5"/>
+<rect x="693.0" y="18.0" width="430.0" height="43.0" rx="0" fill="#eef4f9" stroke="#223044" stroke-width="1.5"/>
+<text x="908.0" y="41.0" text-anchor="middle" font-family="Noto Sans CJK SC" font-size="18.0" font-weight="700" fill="#223044">ScheduleStore</text>
+<polyline points="693.0,61.0 1123.0,61.0" fill="none" stroke="#223044" stroke-width="1.6"/>
+<text x="706.0" y="82.0" text-anchor="start" font-family="Noto Sans CJK SC" font-size="16.0" font-weight="400" fill="#223044">+ Load(…): bool</text>
+<text x="706.0" y="104.4" text-anchor="start" font-family="Noto Sans CJK SC" font-size="16.0" font-weight="400" fill="#223044">+ Save(…): bool</text>
+<polyline points="528.0,108.0 693.0,108.0" fill="none" stroke="#223044" stroke-width="1.6"/>
+<text x="610.5" y="79.0" text-anchor="middle" font-family="Noto Sans CJK SC" font-size="15.0" font-weight="400" fill="#223044">0..* → 1</text>
+<rect x="38.0" y="358.0" width="490.0" height="201.0" rx="0" fill="white" stroke="#223044" stroke-width="1.5"/>
+<rect x="38.0" y="358.0" width="490.0" height="43.0" rx="0" fill="#eef4f9" stroke="#223044" stroke-width="1.5"/>
+<text x="283.0" y="381.0" text-anchor="middle" font-family="Noto Sans CJK SC" font-size="18.0" font-weight="700" fill="#223044">InotifyWatcher</text>
+<text x="51.0" y="422.0" text-anchor="start" font-family="Noto Sans CJK SC" font-size="16.0" font-weight="400" fill="#223044">- fd_: int</text>
+<text x="51.0" y="444.4" text-anchor="start" font-family="Noto Sans CJK SC" font-size="16.0" font-weight="400" fill="#223044">- watches_: vector&lt;WatchTarget&gt;</text>
+<polyline points="38.0,467.0 528.0,467.0" fill="none" stroke="#223044" stroke-width="1.6"/>
+<text x="51.0" y="488.0" text-anchor="start" font-family="Noto Sans CJK SC" font-size="16.0" font-weight="400" fill="#223044">+ Attach(root, error*): bool</text>
+<text x="51.0" y="510.4" text-anchor="start" font-family="Noto Sans CJK SC" font-size="16.0" font-weight="400" fill="#223044">+ Drain(batch*, error*): bool</text>
+<text x="51.0" y="532.8" text-anchor="start" font-family="Noto Sans CJK SC" font-size="16.0" font-weight="400" fill="#223044">+ Rebuild(error*): bool</text>
+<rect x="693.0" y="358.0" width="430.0" height="201.0" rx="0" fill="white" stroke="#223044" stroke-width="1.5"/>
+<rect x="693.0" y="358.0" width="430.0" height="43.0" rx="0" fill="#eef4f9" stroke="#223044" stroke-width="1.5"/>
+<text x="908.0" y="381.0" text-anchor="middle" font-family="Noto Sans CJK SC" font-size="18.0" font-weight="700" fill="#223044">RealtimeDebouncer</text>
+<text x="706.0" y="421.0" text-anchor="start" font-family="Noto Sans CJK SC" font-size="15.0" font-weight="400" fill="#223044">- dirty_: bool</text>
+<text x="706.0" y="442.0" text-anchor="start" font-family="Noto Sans CJK SC" font-size="15.0" font-weight="400" fill="#223044">- generation_: uint64</text>
+<polyline points="693.0,467.0 1123.0,467.0" fill="none" stroke="#223044" stroke-width="1.6"/>
+<text x="706.0" y="487.0" text-anchor="start" font-family="Noto Sans CJK SC" font-size="15.0" font-weight="400" fill="#223044">+ NoteEvents(…): void</text>
+<text x="706.0" y="508.0" text-anchor="start" font-family="Noto Sans CJK SC" font-size="15.0" font-weight="400" fill="#223044">+ Due(now_ms): bool</text>
+<text x="706.0" y="529.0" text-anchor="start" font-family="Noto Sans CJK SC" font-size="15.0" font-weight="400" fill="#223044">+ Consume(now_ms): RealtimeGeneration</text>
+<text x="22.0" y="619.0" text-anchor="start" font-family="Noto Sans CJK SC" font-size="17.0" font-weight="400" fill="#223044">EvaluateNow 忽略到期时间；符合备份规则的文件无变化时仍可跳过。</text>
+</svg>

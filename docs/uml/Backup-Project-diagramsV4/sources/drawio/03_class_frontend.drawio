@@ -1,0 +1,198 @@
+<?xml version='1.0' encoding='utf-8'?>
+<mxfile host="app.diagrams.net" type="device" version="24.7.17">
+  <diagram id="03_class_frontend" name="图 3 前端控制器与共享闸门类图">
+    <mxGraphModel dx="1200" dy="1040" grid="1" gridSize="10" page="1" pageWidth="1166.0" pageHeight="853.8" math="0" shadow="0">
+      <root>
+        <mxCell id="0" />
+        <mxCell id="1" parent="0" />
+        <mxCell id="5" parent="1" vertex="1" style="rounded=0;html=0;fillColor=white;strokeColor=#223044;strokeWidth=1.5;">
+          <mxGeometry as="geometry" x="23.0" y="18.0" width="340" height="201" />
+        </mxCell>
+        <mxCell id="6" parent="1" vertex="1" style="rounded=0;html=0;fillColor=#eef4f9;strokeColor=#223044;strokeWidth=1.5;">
+          <mxGeometry as="geometry" x="23.0" y="18.0" width="340" height="43" />
+        </mxCell>
+        <mxCell id="7" parent="1" value="BackupController" vertex="1" style="text;html=0;whiteSpace=wrap;overflow=hidden;align=center;verticalAlign=top;spacing=4;fontFamily=Noto Sans CJK SC;fontSize=18;fontStyle=1;fontColor=#223044;">
+          <mxGeometry as="geometry" x="28.0" y="23.0" width="330" height="29.2" />
+        </mxCell>
+        <mxCell id="8" parent="1" value="- config_manager_: ConfigManager&#10;- catalog_: BackupCatalog" vertex="1" style="text;html=0;whiteSpace=wrap;overflow=hidden;align=left;verticalAlign=top;spacing=4;fontFamily=Noto Sans CJK SC;fontSize=16;fontStyle=0;fontColor=#223044;">
+          <mxGeometry as="geometry" x="32.0" y="66.0" width="322" height="46.0" />
+        </mxCell>
+        <mxCell id="9" parent="1" edge="1" style="edgeStyle=none;html=0;endArrow=none;endFill=1;startArrow=none;startFill=1;strokeColor=#223044;strokeWidth=1.6;dashed=0;">
+          <mxGeometry as="geometry" relative="1">
+            <mxPoint as="sourcePoint" x="23.0" y="127.0" />
+            <mxPoint as="targetPoint" x="363.0" y="127.0" />
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="10" parent="1" value="+ startBackupWithStrategy(…): bool&#10;+ startManagedRestore(…): bool&#10;+ saveRepositoryPath(…): bool" vertex="1" style="text;html=0;whiteSpace=wrap;overflow=hidden;align=left;verticalAlign=top;spacing=4;fontFamily=Noto Sans CJK SC;fontSize=16;fontStyle=0;fontColor=#223044;">
+          <mxGeometry as="geometry" x="32.0" y="132.0" width="322" height="67.0" />
+        </mxCell>
+        <mxCell id="11" parent="1" vertex="1" style="rounded=0;html=0;fillColor=white;strokeColor=#223044;strokeWidth=1.5;">
+          <mxGeometry as="geometry" x="793.0" y="18.0" width="350" height="201" />
+        </mxCell>
+        <mxCell id="12" parent="1" vertex="1" style="rounded=0;html=0;fillColor=#eef4f9;strokeColor=#223044;strokeWidth=1.5;">
+          <mxGeometry as="geometry" x="793.0" y="18.0" width="350" height="43" />
+        </mxCell>
+        <mxCell id="13" parent="1" value="ScheduleController" vertex="1" style="text;html=0;whiteSpace=wrap;overflow=hidden;align=center;verticalAlign=top;spacing=4;fontFamily=Noto Sans CJK SC;fontSize=18;fontStyle=1;fontColor=#223044;">
+          <mxGeometry as="geometry" x="798.0" y="23.0" width="340" height="29.2" />
+        </mxCell>
+        <mxCell id="14" parent="1" value="- store_: ScheduleStore&#10;- backup_controller_: BackupController*" vertex="1" style="text;html=0;whiteSpace=wrap;overflow=hidden;align=left;verticalAlign=top;spacing=4;fontFamily=Noto Sans CJK SC;fontSize=16;fontStyle=0;fontColor=#223044;">
+          <mxGeometry as="geometry" x="802.0" y="66.0" width="332" height="46.0" />
+        </mxCell>
+        <mxCell id="15" parent="1" edge="1" style="edgeStyle=none;html=0;endArrow=none;endFill=1;startArrow=none;startFill=1;strokeColor=#223044;strokeWidth=1.6;dashed=0;">
+          <mxGeometry as="geometry" relative="1">
+            <mxPoint as="sourcePoint" x="793.0" y="127.0" />
+            <mxPoint as="targetPoint" x="1143.0" y="127.0" />
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="16" parent="1" value="+ saveConfig(…): bool&#10;+ runNow(): bool&#10;+ OnArchiveDeleted(…): void" vertex="1" style="text;html=0;whiteSpace=wrap;overflow=hidden;align=left;verticalAlign=top;spacing=4;fontFamily=Noto Sans CJK SC;fontSize=16;fontStyle=0;fontColor=#223044;">
+          <mxGeometry as="geometry" x="802.0" y="132.0" width="332" height="67.0" />
+        </mxCell>
+        <mxCell id="17" parent="1" vertex="1" style="rounded=0;html=0;fillColor=white;strokeColor=#223044;strokeWidth=1.5;">
+          <mxGeometry as="geometry" x="793.0" y="373.0" width="350" height="201" />
+        </mxCell>
+        <mxCell id="18" parent="1" vertex="1" style="rounded=0;html=0;fillColor=#eef4f9;strokeColor=#223044;strokeWidth=1.5;">
+          <mxGeometry as="geometry" x="793.0" y="373.0" width="350" height="43" />
+        </mxCell>
+        <mxCell id="19" parent="1" value="RealtimeController" vertex="1" style="text;html=0;whiteSpace=wrap;overflow=hidden;align=center;verticalAlign=top;spacing=4;fontFamily=Noto Sans CJK SC;fontSize=18;fontStyle=1;fontColor=#223044;">
+          <mxGeometry as="geometry" x="798.0" y="378.0" width="340" height="29.2" />
+        </mxCell>
+        <mxCell id="20" parent="1" value="- watcher_: InotifyWatcher&#10;- debouncer_:&#10;    unique_ptr&lt;RealtimeDebouncer&gt;" vertex="1" style="text;html=0;whiteSpace=wrap;overflow=hidden;align=left;verticalAlign=top;spacing=4;fontFamily=Noto Sans CJK SC;fontSize=16;fontStyle=0;fontColor=#223044;">
+          <mxGeometry as="geometry" x="802.0" y="411" width="332" height="40.4" />
+        </mxCell>
+        <mxCell id="21" parent="1" edge="1" style="edgeStyle=none;html=0;endArrow=none;endFill=1;startArrow=none;startFill=1;strokeColor=#223044;strokeWidth=1.6;dashed=0;">
+          <mxGeometry as="geometry" relative="1">
+            <mxPoint as="sourcePoint" x="793.0" y="482.0" />
+            <mxPoint as="targetPoint" x="1143.0" y="482.0" />
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="22" parent="1" value="+ saveConfig(…): bool&#10;+ start(): void&#10;+ stop(): void" vertex="1" style="text;html=0;whiteSpace=wrap;overflow=hidden;align=left;verticalAlign=top;spacing=4;fontFamily=Noto Sans CJK SC;fontSize=16;fontStyle=0;fontColor=#223044;">
+          <mxGeometry as="geometry" x="802.0" y="487.0" width="332" height="67.0" />
+        </mxCell>
+        <mxCell id="23" parent="1" vertex="1" style="rounded=0;html=0;fillColor=white;strokeColor=#223044;strokeWidth=1.5;">
+          <mxGeometry as="geometry" x="403.0" y="323.0" width="335" height="175" />
+        </mxCell>
+        <mxCell id="24" parent="1" vertex="1" style="rounded=0;html=0;fillColor=#eef4f9;strokeColor=#223044;strokeWidth=1.5;">
+          <mxGeometry as="geometry" x="403.0" y="323.0" width="335" height="43" />
+        </mxCell>
+        <mxCell id="25" parent="1" value="OperationGate" vertex="1" style="text;html=0;whiteSpace=wrap;overflow=hidden;align=center;verticalAlign=top;spacing=4;fontFamily=Noto Sans CJK SC;fontSize=18;fontStyle=1;fontColor=#223044;">
+          <mxGeometry as="geometry" x="408.0" y="328.0" width="325" height="29.2" />
+        </mxCell>
+        <mxCell id="26" parent="1" value="- owner_: Kind" vertex="1" style="text;html=0;whiteSpace=wrap;overflow=hidden;align=left;verticalAlign=top;spacing=4;fontFamily=Noto Sans CJK SC;fontSize=16;fontStyle=0;fontColor=#223044;">
+          <mxGeometry as="geometry" x="412.0" y="371.0" width="317" height="25.0" />
+        </mxCell>
+        <mxCell id="27" parent="1" edge="1" style="edgeStyle=none;html=0;endArrow=none;endFill=1;startArrow=none;startFill=1;strokeColor=#223044;strokeWidth=1.6;dashed=0;">
+          <mxGeometry as="geometry" relative="1">
+            <mxPoint as="sourcePoint" x="403.0" y="406.0" />
+            <mxPoint as="targetPoint" x="738.0" y="406.0" />
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="28" parent="1" value="+ Acquire(Kind, reason*): bool&#10;+ Release(Kind): void&#10;+ busy(): bool" vertex="1" style="text;html=0;whiteSpace=wrap;overflow=hidden;align=left;verticalAlign=top;spacing=4;fontFamily=Noto Sans CJK SC;fontSize=16;fontStyle=0;fontColor=#223044;">
+          <mxGeometry as="geometry" x="412.0" y="411.0" width="317" height="67.0" />
+        </mxCell>
+        <mxCell id="29" parent="1" vertex="1" style="rounded=0;html=0;fillColor=white;strokeColor=#223044;strokeWidth=1.5;">
+          <mxGeometry as="geometry" x="23.0" y="623.0" width="330" height="149" />
+        </mxCell>
+        <mxCell id="30" parent="1" vertex="1" style="rounded=0;html=0;fillColor=#eef4f9;strokeColor=#223044;strokeWidth=1.5;">
+          <mxGeometry as="geometry" x="23.0" y="623.0" width="330" height="43" />
+        </mxCell>
+        <mxCell id="31" parent="1" value="ConfigManager" vertex="1" style="text;html=0;whiteSpace=wrap;overflow=hidden;align=center;verticalAlign=top;spacing=4;fontFamily=Noto Sans CJK SC;fontSize=18;fontStyle=1;fontColor=#223044;">
+          <mxGeometry as="geometry" x="28.0" y="628.0" width="320" height="29.2" />
+        </mxCell>
+        <mxCell id="32" parent="1" value="- config_file_path_: string" vertex="1" style="text;html=0;whiteSpace=wrap;overflow=hidden;align=left;verticalAlign=top;spacing=4;fontFamily=Noto Sans CJK SC;fontSize=16;fontStyle=0;fontColor=#223044;">
+          <mxGeometry as="geometry" x="32.0" y="671.0" width="312" height="25.0" />
+        </mxCell>
+        <mxCell id="33" parent="1" edge="1" style="edgeStyle=none;html=0;endArrow=none;endFill=1;startArrow=none;startFill=1;strokeColor=#223044;strokeWidth=1.6;dashed=0;">
+          <mxGeometry as="geometry" relative="1">
+            <mxPoint as="sourcePoint" x="23.0" y="706.0" />
+            <mxPoint as="targetPoint" x="353.0" y="706.0" />
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="34" parent="1" value="+ Load(…): ConfigLoadStatus&#10;+ Save(…): bool" vertex="1" style="text;html=0;whiteSpace=wrap;overflow=hidden;align=left;verticalAlign=top;spacing=4;fontFamily=Noto Sans CJK SC;fontSize=16;fontStyle=0;fontColor=#223044;">
+          <mxGeometry as="geometry" x="32.0" y="711.0" width="312" height="46.0" />
+        </mxCell>
+        <mxCell id="35" parent="1" vertex="1" style="rounded=0;html=0;fillColor=white;strokeColor=#223044;strokeWidth=1.5;">
+          <mxGeometry as="geometry" x="408.0" y="623.0" width="330" height="161" />
+        </mxCell>
+        <mxCell id="36" parent="1" vertex="1" style="rounded=0;html=0;fillColor=#eef4f9;strokeColor=#223044;strokeWidth=1.5;">
+          <mxGeometry as="geometry" x="408.0" y="623.0" width="330" height="43" />
+        </mxCell>
+        <mxCell id="37" parent="1" value="BackupCatalog" vertex="1" style="text;html=0;whiteSpace=wrap;overflow=hidden;align=center;verticalAlign=top;spacing=4;fontFamily=Noto Sans CJK SC;fontSize=18;fontStyle=1;fontColor=#223044;">
+          <mxGeometry as="geometry" x="413.0" y="628.0" width="320" height="29.2" />
+        </mxCell>
+        <mxCell id="38" parent="1" edge="1" style="edgeStyle=none;html=0;endArrow=none;endFill=1;startArrow=none;startFill=1;strokeColor=#223044;strokeWidth=1.6;dashed=0;">
+          <mxGeometry as="geometry" relative="1">
+            <mxPoint as="sourcePoint" x="408.0" y="666.0" />
+            <mxPoint as="targetPoint" x="738.0" y="666.0" />
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="39" parent="1" value="+ List(…): bool&#10;+ BuildArchivePath(…): bool&#10;+ Resolve(…): bool&#10;+ Delete(…): bool" vertex="1" style="text;html=0;whiteSpace=wrap;overflow=hidden;align=left;verticalAlign=top;spacing=4;fontFamily=Noto Sans CJK SC;fontSize=16;fontStyle=0;fontColor=#223044;">
+          <mxGeometry as="geometry" x="417.0" y="671.0" width="312" height="88.0" />
+        </mxCell>
+        <mxCell id="40" parent="1" edge="1" style="edgeStyle=none;html=0;endArrow=none;endFill=1;startArrow=none;startFill=1;strokeColor=#223044;strokeWidth=1.6;dashed=0;">
+          <mxGeometry as="geometry" relative="1">
+            <mxPoint as="sourcePoint" x="363.0" y="113.0" />
+            <mxPoint as="targetPoint" x="793.0" y="113.0" />
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="42" parent="1" value="1  ← backup_controller_  0..*" vertex="1" style="text;html=0;whiteSpace=wrap;overflow=hidden;align=center;verticalAlign=top;spacing=4;fontFamily=Noto Sans CJK SC;fontSize=16;fontStyle=0;fontColor=#223044;">
+          <mxGeometry as="geometry" x="383.0" y="74.0" width="390" height="25.0" />
+        </mxCell>
+        <mxCell id="43" parent="1" edge="1" style="edgeStyle=none;html=0;endArrow=none;endFill=1;startArrow=none;startFill=1;strokeColor=#223044;strokeWidth=1.6;dashed=0;">
+          <mxGeometry as="geometry" relative="1">
+            <mxPoint as="sourcePoint" x="193.0" y="219.0" />
+            <mxPoint as="targetPoint" x="403.0" y="363.0" />
+            <Array as="points">
+              <mxPoint x="193.0" y="363.0" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="45" parent="1" value="1 闸门引用" vertex="1" style="text;html=0;whiteSpace=wrap;overflow=hidden;align=center;verticalAlign=top;spacing=4;fontFamily=Noto Sans CJK SC;fontSize=16;fontStyle=0;fontColor=#223044;">
+          <mxGeometry as="geometry" x="203.0" y="316.0" width="180" height="25.0" />
+        </mxCell>
+        <mxCell id="46" parent="1" edge="1" style="edgeStyle=none;html=0;endArrow=none;endFill=1;startArrow=none;startFill=1;strokeColor=#223044;strokeWidth=1.6;dashed=0;">
+          <mxGeometry as="geometry" relative="1">
+            <mxPoint as="sourcePoint" x="953.0" y="219.0" />
+            <mxPoint as="targetPoint" x="571.0" y="323.0" />
+            <Array as="points">
+              <mxPoint x="953.0" y="293.0" />
+              <mxPoint x="571.0" y="293.0" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="47" parent="1" edge="1" style="edgeStyle=none;html=0;endArrow=none;endFill=1;startArrow=none;startFill=1;strokeColor=#223044;strokeWidth=1.6;dashed=0;">
+          <mxGeometry as="geometry" relative="1">
+            <mxPoint as="sourcePoint" x="793.0" y="468.0" />
+            <mxPoint as="targetPoint" x="738.0" y="468.0" />
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="48" parent="1" edge="1" style="edgeStyle=none;html=0;endArrow=none;endFill=1;startArrow=diamond;startFill=1;strokeColor=#223044;strokeWidth=1.6;dashed=0;">
+          <mxGeometry as="geometry" relative="1">
+            <mxPoint as="sourcePoint" x="78.0" y="219.0" />
+            <mxPoint as="targetPoint" x="78.0" y="623.0" />
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="50" parent="1" value="1 / 1" vertex="1" style="text;html=0;whiteSpace=wrap;overflow=hidden;align=center;verticalAlign=top;spacing=4;fontFamily=Noto Sans CJK SC;fontSize=16;fontStyle=0;fontColor=#223044;">
+          <mxGeometry as="geometry" x="31.0" y="468.0" width="110" height="25.0" />
+        </mxCell>
+        <mxCell id="51" parent="1" edge="1" style="edgeStyle=none;html=0;endArrow=none;endFill=1;startArrow=diamond;startFill=1;strokeColor=#223044;strokeWidth=1.6;dashed=0;">
+          <mxGeometry as="geometry" relative="1">
+            <mxPoint as="sourcePoint" x="313.0" y="219.0" />
+            <mxPoint as="targetPoint" x="573.0" y="623.0" />
+            <Array as="points">
+              <mxPoint x="313.0" y="263.0" />
+              <mxPoint x="373.0" y="263.0" />
+              <mxPoint x="373.0" y="558.0" />
+              <mxPoint x="573.0" y="558.0" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="53" parent="1" value="1 / 1" vertex="1" style="text;html=0;whiteSpace=wrap;overflow=hidden;align=center;verticalAlign=top;spacing=4;fontFamily=Noto Sans CJK SC;fontSize=16;fontStyle=0;fontColor=#223044;">
+          <mxGeometry as="geometry" x="413.0" y="519.0" width="120" height="25.0" />
+        </mxCell>
+        <mxCell id="technical-note" parent="1" vertex="1" value="实心菱形：按值组合；普通实线：非拥有指针关联。控制器继承 QObject。" style="text;align=left;fontFamily=Noto Sans CJK SC;fontSize=17;fontColor=#223044;">
+          <mxGeometry as="geometry" x="18.0" y="808.0" width="1130" height="27.799999999999997" />
+        </mxCell>
+      </root>
+    </mxGraphModel>
+  </diagram>
+</mxfile>

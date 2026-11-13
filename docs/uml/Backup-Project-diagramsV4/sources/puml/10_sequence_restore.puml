@@ -1,0 +1,93 @@
+@startuml
+skinparam defaultFontName Noto Sans CJK SC
+skinparam defaultFontSize 15
+skinparam backgroundColor white
+skinparam shadowing false
+skinparam sequenceMessageAlign center
+skinparam maxMessageSize 180
+skinparam ParticipantPadding 15
+skinparam BoxPadding 8
+skinparam sequenceGroupBackgroundColor white
+skinparam sequenceGroupBorderColor #334155
+skinparam sequenceLifeLineBorderColor #94A3B8
+skinparam sequenceParticipantBackgroundColor #EEF4F9
+skinparam sequenceParticipantBorderColor #334155
+skinparam sequenceArrowColor #334155
+skinparam sequenceActivationBackgroundColor #E2E8F0
+hide footbox
+actor "GUI / CLI 调用者" as C
+participant "«module»\narchive_pipeline" as P
+participant "FileSource /\n认证与解密模块" as F
+participant "解压模块" as D
+participant "PackedStreamReader" as R
+participant "staging / 目标\n文件系统" as S
+C -> P : RunRestorePipeline(archive, destination, options, report)
+activate P
+P -> P : 目标与 magic 检查（本图限定 v2）
+P -> F : Open / DecodeContainerHeader / 精确长度校验
+F --> P : header / error
+opt encryption != none 且前序成功
+ P -> F : DeriveKeys(password, header)
+ F --> P : keys / error
+end
+P -> F : AuthenticatePayload（前序成功时）
+F --> P : 验证结果
+alt 目标 / 头部 / 密钥 / 认证失败
+ P --> C : false；不解密、不发布
+else 校验通过
+ P -> S : 建同父目录私有 workspace；空间检查
+ S --> P : workspace / error
+ alt workspace 创建或空间检查失败
+  P --> C : false；清理已创建 workspace
+ else workspace 就绪
+ P -> F : DecryptPayload -> compressed.tmp
+ F --> P : result
+ P -> D : 校验压缩流长度；DecompressFile
+ D --> P : packed.tmp / error
+ alt workspace / 解密 / 解压失败
+  P -> S : 清理 workspace
+  P --> C : false
+ else 得到 packed 流
+  P -> R : Open(); Scan(pack_method)
+  activate R
+  R --> P : 完整预检结果、entries
+  deactivate R
+  alt 预检或条目数不一致
+   P -> S : 清理 workspace
+   P --> C : false；不创建 staging
+  else 预检通过
+   P -> S : 创建同父 staging；目录骨架（0700）
+   loop 逐条叶节点 [ok]
+    P -> S : 普通文件 / 软链接 / FIFO / 设备\n硬链接暂存到 pending
+    S --> P : ok / error
+   end
+   loop pending 非空且 ok（每轮必须有进展）
+    P -> S : 建立目标已出现的硬链接
+    S --> P : progress / error
+   end
+   loop 显式目录，深到浅 [ok]
+    P -> S : ApplyMetadata：ownership -> mode -> mtime
+    S --> P : ok / ownership 降级诊断
+   end
+   alt 重建或 metadata 致命失败
+    P -> S : staging_guard.Remove()
+    P --> C : false
+   else 重建成功
+    P -> S : rename(staging, destination)
+    S --> P : rename result
+    alt rename 失败
+     P -> S : staging_guard.Remove()
+     P --> C : false
+    else rename 成功
+     P -> P : staging_guard.Release()；更新 report
+     P --> C : true / RestoreReport
+    end
+   end
+   P -> S : workspace 析构清理
+  end
+ end
+end
+end
+deactivate P
+
+@enduml

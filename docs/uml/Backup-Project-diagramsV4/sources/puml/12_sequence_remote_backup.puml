@@ -1,0 +1,105 @@
+@startuml
+skinparam defaultFontName Noto Sans CJK SC
+skinparam defaultFontSize 15
+skinparam backgroundColor white
+skinparam shadowing false
+skinparam sequenceMessageAlign center
+skinparam maxMessageSize 180
+skinparam ParticipantPadding 15
+skinparam BoxPadding 8
+skinparam sequenceGroupBackgroundColor white
+skinparam sequenceGroupBorderColor #334155
+skinparam sequenceLifeLineBorderColor #94A3B8
+skinparam sequenceParticipantBackgroundColor #EEF4F9
+skinparam sequenceParticipantBorderColor #334155
+skinparam sequenceArrowColor #334155
+skinparam sequenceActivationBackgroundColor #E2E8F0
+hide footbox
+actor "GUI / CLI" as C
+participant "RemoteArchiveClient /\nSecureChannel" as A
+participant "«module»\nremote_incremental" as I
+participant "本地增量引擎 /\n材料包模块" as E
+participant "RemoteServer" as S
+participant "RemoteMetadataStore /\nblob 存储" as M
+C -> A : Connect(endpoint)
+activate A
+A -> S : BPSEC1 pin / BPSEC2 certificate 握手
+activate S
+S --> A : 握手结果
+alt 身份验证失败
+ A --> C : false；关闭连接
+else 安全通道建立
+ C -> A : LOGIN 或 RESUME
+ A -> S : 账户请求（受 BPSEC 保护）
+ S --> A : 会话结果
+ A --> C : result
+ alt 账户失败
+  C -> C : 中止业务请求
+ else 会话有效
+  C -> I : RunRemoteBackup(request)
+  activate I
+  I -> A : List()
+  A -> S : LIST
+  S --> A : 当前账户 snapshots
+  A --> I : snapshots / error
+  I -> I : FindRemoteLineageHead
+  opt have_head 且前序成功
+   I -> I : EnsureChainMaterial（缓存验证 / 缺失材料下载）
+  end
+  alt 列表或父材料失败
+   I --> C : false
+  else 材料准备完成
+   I -> E : RunIncrementalBackup(...)
+   E --> I : full baseline / delta / no changes / error
+   alt 引擎失败
+    I --> C : false
+   else no changes
+    I --> C : true；no_changes，不上传
+   else 生成归档
+    I -> E : BuildSnapshotBundle(...)
+    E --> I : bundle / error
+    alt 材料包失败
+     I -> E : 清理 outgoing bundle
+     I --> C : false
+    else bundle 完成
+     I -> A : UploadSnapshotFile(bundle, options)
+     A -> S : UPLOAD_BEGIN
+     S --> A : accepted / error
+     loop chunks [前序成功且尚有字节]
+      A -> S : UPLOAD_CHUNK
+      S --> A : chunk result
+     end
+     opt 全部 chunks 成功
+      A -> S : UPLOAD_END
+      S -> M : 校验长度 / SHA-256；发布 blob
+      M --> S : publish result
+      opt blob 已发布
+       S -> M : InsertSnapshot（同事务复核用户 / 父 / lineage / 代数 / 单子节点）
+       M --> S : StoreResult
+       alt 元数据失败
+        S -> M : 尝试回滚 blob；失败记日志
+       else 登记成功
+        S -> S : 构造 snapshot id / generation 回执
+       end
+      end
+      S --> A : result / snapshot info
+     end
+     A --> I : upload result
+     I -> E : 清理 outgoing bundle（成功 / 失败均执行）
+     alt 上传失败
+      I --> C : false
+     else 上传成功
+      I -> E : RememberSnapshotInIndex
+      I -> I : 核对回执父关系与 generation
+      I --> C : true 或回执不一致错误
+     end
+    end
+   end
+  end
+  deactivate I
+ end
+end
+deactivate S
+deactivate A
+
+@enduml

@@ -1,0 +1,89 @@
+@startuml
+skinparam defaultFontName Noto Sans CJK SC
+skinparam defaultFontSize 15
+skinparam backgroundColor white
+skinparam shadowing false
+skinparam sequenceMessageAlign center
+skinparam maxMessageSize 180
+skinparam ParticipantPadding 15
+skinparam BoxPadding 8
+skinparam sequenceGroupBackgroundColor white
+skinparam sequenceGroupBorderColor #334155
+skinparam sequenceLifeLineBorderColor #94A3B8
+skinparam sequenceParticipantBackgroundColor #EEF4F9
+skinparam sequenceParticipantBorderColor #334155
+skinparam sequenceArrowColor #334155
+skinparam sequenceActivationBackgroundColor #E2E8F0
+hide footbox
+actor "GUI / CLI" as C
+participant "«module»\nremote_incremental" as I
+participant "RemoteArchiveClient" as A
+participant "RemoteServer" as S
+participant "缓存 / 材料包验证\n«module»" as K
+participant "本地链恢复\n«module»" as L
+note over C,S
+前置条件：安全通道和账户会话有效；重连先 BPSEC 握手再 RESUME。
+end note
+C -> I : RunRemoteRestore(client, cache, snapshot_id, ...)
+activate I
+I -> A : EnsureChainMaterial：List()
+A -> S : LIST
+activate S
+S --> A : 当前账户 snapshots / error
+A --> I : snapshots / error
+deactivate S
+I -> I : ResolveRemoteChain -> base 到 target
+alt 列表 / 元数据链校验失败
+ I --> C : false
+else 元数据链有效
+ loop 逐个链成员 [前序成功]
+  I -> K : FetchSnapshotMaterial：核验缓存身份
+  K --> I : verified hit / miss
+  alt 已验证缓存命中
+   I -> I : 复用本地材料
+  else 缓存缺失或未通过核验
+   I -> A : DownloadArchiveFile(snapshot_id, ...)
+   activate A
+   A -> S : DOWNLOAD_BEGIN
+   S --> A : size / digest / error
+   loop 下载块 [前序成功且尚有字节]
+    A -> S : DOWNLOAD_CHUNK
+    S --> A : chunk
+   end
+   opt 所有块成功
+    A -> S : DOWNLOAD_END
+    S --> A : result
+   end
+   A --> I : 下载结果 / 字节数
+   deactivate A
+   opt 下载成功
+    I -> K : 校验材料包与成员摘要；解包、发布缓存材料
+    K --> I : result / archive name
+   end
+  end
+ end
+ alt 下载 / 材料验证失败
+  I --> C : false；不进入本地恢复
+ else 全部材料就绪
+  loop 全部成员及相邻父子边
+   I -> K : LoadVerifiedSnapshotIdentity；核对\n父文件名 / snapshot id / sidecars
+   K --> I : verified / error
+  end
+  alt 身份或父子边不匹配
+   I --> C : false；不发布目标
+  else 链材料验证通过
+   I -> L : RestoreSnapshotChain(cache, archive_name, destination, ...)
+   activate L
+   ref over L
+    图 11：base + delta overlay + 失败检查 + 发布
+    任一增量处理失败时返回 false，停止发布
+   end ref
+   L --> I : actual restore result / report
+   deactivate L
+   I --> C : bool / 链长度 / 下载字节数 / report
+  end
+ end
+end
+deactivate I
+
+@enduml

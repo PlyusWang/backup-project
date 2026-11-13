@@ -1,0 +1,85 @@
+% A4，四边 2cm，12pt，首行缩进 2 字，中文学术标题，页脚总页数。
+\usepackage[left=2cm,right=2cm,top=2cm,bottom=2cm]{geometry}
+\usepackage{fontspec}
+\usepackage{xeCJK}
+\usepackage{indentfirst}
+\usepackage{fancyhdr,lastpage}
+\usepackage{graphicx,booktabs,longtable,tabularx,array,enumitem,xurl,hyperref}
+\usepackage{amsmath,amssymb,caption,microtype}
+\usepackage{needspace}
+\usepackage{pdflscape}
+% 项目进度甘特图：仅载入图形定义，复用报告本身的 A4 页边距与页码。
+\input{gantt/gantt-style.tex}
+\hypersetup{hidelinks}
+\input{\fontconfiguration}
+\setlength{\parindent}{2em}
+\setlength{\parskip}{0pt}
+\linespread{1.0}
+\setlength{\emergencystretch}{2em}
+\raggedbottom
+\setlist[enumerate]{leftmargin=2em,itemsep=.2em,topsep=.2em}
+\setlist[itemize]{leftmargin=2em,itemsep=.2em,topsep=.2em}
+\renewcommand{\arraystretch}{1.15}
+\setlength{\LTpre}{.5em}
+\setlength{\LTpost}{.6em}
+\ctexset{section={format=\raggedright\bfseries\zihao{4},beforeskip=1.1em,afterskip=.6em},
+  subsection={format=\raggedright\bfseries\zihao{-4},beforeskip=.9em,afterskip=.45em},
+  subsubsection={format=\raggedright\bfseries\zihao{5},beforeskip=.7em,afterskip=.35em}}
+\pagestyle{fancy}\fancyhf{}\renewcommand{\headrulewidth}{0pt}\renewcommand{\footrulewidth}{0pt}
+\fancyfoot[C]{\zihao{5} 第 \thepage 页，共 \pageref{LastPage} 页}
+\captionsetup{font=small,labelsep=quad,hypcap=false}
+\renewcommand{\figurename}{图}\renewcommand{\tablename}{表}
+\newcolumntype{L}[1]{>{\raggedright\arraybackslash}p{#1}}
+\newcolumntype{R}[1]{>{\raggedleft\arraybackslash}p{#1}}
+\newcommand{\Code}[1]{\texttt{\footnotesize\nolinkurl{#1}}}
+\newcommand{\E}[1]{\textsuperscript{[#1]}}
+\newcommand{\figref}[1]{\hyperref[#1]{图~\ref*{#1}}}
+\newcommand{\tabref}[1]{\hyperref[#1]{表~\ref*{#1}}}
+\newcommand{\TechDocument}[1]{\clearpage\setcounter{section}{0}\begin{center}{\zihao{2}\bfseries #1\par}\end{center}\vspace{.6em}}
+\newcommand{\ReportFigure}[3]{%
+  \begin{center}
+    \includegraphics[width=.95\linewidth,height=.62\textheight,keepaspectratio]{#1}\par
+    \captionof{figure}{#2}\label{#3}
+  \end{center}}
+
+% 横向图页按阅读方向居中显示连续页码。
+% 局部清空原纵向 fancyhdr 页脚，防止旋转后在左侧重复出现。
+\newcommand{\ReportLandscapeFigure}[4][1]{%
+  \clearpage
+  \begingroup
+  \begin{landscape}
+    \pagestyle{empty}
+    \thispagestyle{empty}
+    \noindent\begin{minipage}[c][\textheight][c]{\linewidth}
+      \centering
+      \includegraphics[width=.98\linewidth,height=0.81\paperwidth,keepaspectratio,page=#1]{#2}\par
+      \vspace{0.1em}
+      \captionsetup{hypcap=false}\captionof{figure}{#3}\label{#4}
+      \vspace{0.4em}
+      {\zihao{5} 第 \thepage 页，共 \pageref{LastPage} 页}\par
+    \end{minipage}
+  \end{landscape}
+  \endgroup
+  \clearpage
+}
+
+
+\newcommand{\ReportLandscapeFigureContinued}[4][1]{%
+  \clearpage
+  \begingroup
+  \begin{landscape}
+    \pagestyle{empty}
+    \thispagestyle{empty}
+    \noindent\begin{minipage}[c][\textheight][c]{\linewidth}
+      \centering
+      \includegraphics[width=.98\linewidth,height=0.81\paperwidth,keepaspectratio,page=#1]{#2}\par
+      \vspace{0.1em}
+      \captionsetup{type=figure,hypcap=false}\ContinuedFloat\caption{#3}\label{#4}
+      \vspace{0.4em}
+      {\zihao{5} 第 \thepage 页，共 \pageref{LastPage} 页}\par
+    \end{minipage}
+  \end{landscape}
+  \endgroup
+  \clearpage
+}
+

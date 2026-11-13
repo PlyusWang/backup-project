@@ -1,0 +1,71 @@
+\begin{longtable}{@{}L{.22\linewidth}L{.34\linewidth}L{.38\linewidth}@{}}
+\caption{前端控制器的类设计}\label{tab:classes-0}\\
+\toprule 类或结构体 & 职责与关键属性 & 接口与对象关系\\\midrule\endfirsthead
+\toprule 类或结构体 & 职责与关键属性 & 接口与对象关系\\\midrule\endhead
+\bottomrule\endfoot
+
+备份控制器\par\Code{BackupController} & 管理本地备份与恢复，将后台结果传递给界面。\par \nolinkurl{config\_manager\_}：ConfigManager；catalog\_：BackupCatalog；\nolinkurl{operation\_gate\_}：OperationGate*非拥有 & \nolinkurl{startBackupWithStrategy}、\nolinkurl{startManagedRestore}；Qt入口收集参数，成功 /\allowbreak 失败由核心结果回传；后台线程不直接更新 QML。\\\addlinespace[4pt]
+
+定时任务控制器\par\Code{ScheduleController} & 计划配置、到期检查和删除观察。\par store\_：ScheduleStore；\nolinkurl{backup\_controller\_}为非拥有引用；共享 OperationGate & saveConfig、runNow、\nolinkurl{OnArchiveDeleted}；与备份控制器协调，不能在删除后重复获取同一 OperationGate。\\\addlinespace[4pt]
+
+实时任务控制器\par\Code{RealtimeController} & 实时配置、监听和界面生命周期。\par watcher\_：\nolinkurl{InotifyWatcher}；debouncer\_：unique\_ptr<\allowbreak \nolinkurl{RealtimeDebouncer}>\allowbreak ；store\_：RealtimeStore & saveConfig、start、stop；任务执行进程关闭时不再产生新触发。\\\addlinespace[4pt]
+
+写操作互斥控制\par\Code{OperationGate} & GUI主线程单持有者。\par owner\_：Kind，初始kNone & Acquire(Kind,QString*) $\to$\allowbreak bool；Release(Kind) $\to$\allowbreak void；busy() $\to$\allowbreak bool。获取非空且空闲才成功，释放必须匹配。\\\addlinespace[4pt]
+
+\end{longtable}
+
+\begin{longtable}{@{}L{.22\linewidth}L{.34\linewidth}L{.38\linewidth}@{}}
+\caption{本地核心与数据结构的类设计}\label{tab:classes-1}\\
+\toprule 类或结构体 & 职责与关键属性 & 接口与对象关系\\\midrule\endfirsthead
+\toprule 类或结构体 & 职责与关键属性 & 接口与对象关系\\\midrule\endhead
+\bottomrule\endfoot
+
+应用配置管理器\par\Code{ConfigManager} & 应用配置文件编解码与原子替换。\par \nolinkurl{config\_file\_path\_}：std::string，由调用者显式给出 & Load(AppConfig*,string*) const $\to$\allowbreak \nolinkurl{ConfigLoadStatus}；Save(const AppConfig\&,string*) const $\to$\allowbreak bool；不处理仓库可用性。\\\addlinespace[4pt]
+
+备份仓库目录管理器\par\Code{BackupCatalog} & 命名、解析、列表和依赖删除。\par 无持久实例成员；操作显式接收repository & List $\to$\allowbreak bool+\allowbreak vector<\allowbreak BackupRecord>\allowbreak ；\nolinkurl{BuildArchivePath} /\allowbreak Resolve /\allowbreak Delete /\allowbreak \nolinkurl{DeleteSnapshots} $\to$\allowbreak bool；归档头损坏时列出诊断。\\\addlinespace[4pt]
+
+备份与恢复引擎\par\Code{BackupEngine} & 提供备份与恢复的统一接口，组织路径检查和处理流程。\par file\_system\_：FileSystem，按值组合 & Backup /\allowbreak Restore重载 $\to$\allowbreak bool；v2 options重载调用流水线，旧重载保留legacy语义。\\\addlinespace[4pt]
+
+文件系统适配类\par\Code{FileSystem} & 路径检查和目录创建。\par 无持久实例成员；PathStatus枚举表示Missing /\allowbreak Directory /\allowbreak RegularFile /\allowbreak Other /\allowbreak Error & InspectPath(path,error) $\to$\allowbreak PathStatus；\nolinkurl{IsDestinationOutsideSource}、\nolinkurl{MakeDirectories} $\to$\allowbreak bool；系统错误通过诊断返回。\\\addlinespace[4pt]
+
+文件过滤器\par\Code{Filter} & 解析过滤规则，决定目录剪枝及条目选择。\par rules\_：vector<\allowbreak Rule>\allowbreak ；Rule含action与vector<\allowbreak Clause>\allowbreak  & AddRule(action,text,error) $\to$\allowbreak bool，失败不变更；\nolinkurl{ShouldPruneDirectory} /\allowbreak \nolinkurl{ShouldIncludeFile} /\allowbreak \nolinkurl{ShouldSkipSpecialEntry} $\to$\allowbreak bool。\\\addlinespace[4pt]
+
+备份选项结构体\par\Code{BackupOptions} & 保存本次备份的编码选项与口令。\par PackMethod pack\_method；\nolinkurl{CompressionMethod} \nolinkurl{compression\_method}；\nolinkurl{EncryptionMethod} \nolinkurl{encryption\_method}；string password & 默认MyPack /\allowbreak none /\allowbreak none；加密必须有口令，组合先由公共函数检查。\\\addlinespace[4pt]
+
+恢复报告结构体\par\Code{RestoreReport} & 记录恢复结果、属主跳过数和诊断。\par uint64\_t \nolinkurl{restored\_entries}、\nolinkurl{skipped\_ownership}；vector<\allowbreak string>\allowbreak  notes & 由恢复调用逐步累积，不能将notes非空等同于整次失败。\\\addlinespace[4pt]
+
+快照依赖链结构体\par\Code{SnapshotChain} & 保存从完整基线到目标快照的依赖顺序。\par vector<\allowbreak string>\allowbreak  files /\allowbreak file\_names；uint64\_t delta\_count；string \nolinkurl{target\_manifest\_digest} /\allowbreak \nolinkurl{base\_generation\_id} & 两个向量一一对应，base在前，target在后，解析自由函数填充。\\\addlinespace[4pt]
+
+\end{longtable}
+
+\begin{longtable}{@{}L{.22\linewidth}L{.34\linewidth}L{.38\linewidth}@{}}
+\caption{自动备份与事件处理的类设计}\label{tab:classes-2}\\
+\toprule 类或结构体 & 职责与关键属性 & 接口与对象关系\\\midrule\endfirsthead
+\toprule 类或结构体 & 职责与关键属性 & 接口与对象关系\\\midrule\endhead
+\bottomrule\endfoot
+
+定时备份服务\par\Code{ScheduledBackupService} & 变化检测、任务执行与保留。\par string \nolinkurl{repository\_path\_}；ScheduleStore* store\_非拥有 & Evaluate /\allowbreak EvaluateNow $\to$\allowbreak bool+\allowbreak \nolinkurl{ScheduleEvaluationResult}；\nolinkurl{SetRepositoryPath} $\to$\allowbreak void；RunRetention $\to$\allowbreak bool，结果枚举需独立检查。\\\addlinespace[4pt]
+
+计划存储类\par\Code{ScheduleStore} & 计划配置、状态、历史和manifest持久化。\par 文件路径字符串；与应用ConfigManager的schema分离 & Load /\allowbreak Save、LoadManifest /\allowbreak SaveManifest；分别读写计划文档与源清单；配置缺失和配置损坏采用不同状态。\\\addlinespace[4pt]
+
+文件系统监听器\par\Code{InotifyWatcher} & Linux递归监听及事件收集。\par int fd\_；string root\_；vector<\allowbreak WatchTarget>\allowbreak  watches\_；索引映射 & Attach /\allowbreak Rebuild /\allowbreak Drain $\to$\allowbreak bool；Detach $\to$\allowbreak void。新监听fd建成才替换旧fd，根丢失 /\allowbreak overflow显式上报。\\\addlinespace[4pt]
+
+实时事件去抖器\par\Code{RealtimeDebouncer} & 按静默窗口与最大等待时间合并事件。\par uint32\_t debounce\_ms\_ /\allowbreak max\_wait\_ms\_；bool dirty\_；int64\_t deadlines；uint64\_t event\_count\_ & NoteEvents /\allowbreak NoteResync $\to$\allowbreak void；Due $\to$\allowbreak bool；Consume $\to$\allowbreak \nolinkurl{RealtimeGeneration}；注入时间便于边界验证。\\\addlinespace[4pt]
+
+\end{longtable}
+
+\begin{longtable}{@{}L{.22\linewidth}L{.34\linewidth}L{.38\linewidth}@{}}
+\caption{网络服务与存储的类设计}\label{tab:classes-3}\\
+\toprule 类或结构体 & 职责与关键属性 & 接口与对象关系\\\midrule\endfirsthead
+\toprule 类或结构体 & 职责与关键属性 & 接口与对象关系\\\midrule\endhead
+\bottomrule\endfoot
+
+远端归档客户端\par\Code{RemoteArchiveClient} & 组织远端请求并维护当前账户会话。\par int fd\_；bool \nolinkurl{authenticated\_}；string token\_；SecureChannel channel\_；\nolinkurl{RemoteEndpoint} endpoint\_ & Connect、Login、\nolinkurl{UploadSnapshotFile}、\nolinkurl{DownloadArchiveFile}、Delete $\to$\allowbreak bool；凭据不进入缓存或日志。\\\addlinespace[4pt]
+
+安全传输通道\par\Code{SecureChannel} & BPSEC握手和认证加密记录。\par bool established\_；uint64\_t \nolinkurl{send\_sequence\_} /\allowbreak \nolinkurl{receive\_sequence\_}；双向密钥与会话材料 & \nolinkurl{HandshakeClient} /\allowbreak \nolinkurl{HandshakeServer}及证书变体、SendFrame /\allowbreak ReceiveFrame $\to$\allowbreak bool；失败不退明文，序号不能回绕。\\\addlinespace[4pt]
+
+远端备份服务器\par\Code{RemoteServer} & 管理固定 worker 池及服务端启动、运行与停止。\par \nolinkurl{RemoteServerConfig} config\_；unique\_ptr<\allowbreak \nolinkurl{RemoteMetadataStore}>\allowbreak  store\_；unique\_ptr<\allowbreak \nolinkurl{RemoteMaintenance}>\allowbreak  maintenance\_；listener与workers\_集合 & Configure /\allowbreak Start /\allowbreak Run $\to$\allowbreak bool；RequestStop /\allowbreak Stop $\to$\allowbreak void；仅RequestStop允许与Run并发，认证原语是自由函数而非成员认证对象。\\\addlinespace[4pt]
+
+远端元数据存储类\par\Code{RemoteMetadataStore} & SQLite元数据与链约束。\par sqlite3* database\_；string path\_；std::mutex mutex\_；不可复制 & Open /\allowbreak \nolinkurl{OpenExistingReadOnly} $\to$\allowbreak bool；\nolinkurl{InsertSnapshot} /\allowbreak Delete等 $\to$\allowbreak StoreResult；未打开时返回错误，应用层验证链。\\\addlinespace[4pt]
+
+\end{longtable}

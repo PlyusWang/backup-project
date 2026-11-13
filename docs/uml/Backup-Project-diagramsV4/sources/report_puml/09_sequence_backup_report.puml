@@ -1,0 +1,51 @@
+@startuml
+skinparam defaultFontName Noto Sans CJK SC
+skinparam defaultFontSize 18
+skinparam backgroundColor white
+skinparam shadowing false
+skinparam sequenceMessageAlign center
+skinparam maxMessageSize 220
+skinparam ParticipantPadding 8
+skinparam BoxPadding 6
+skinparam sequenceGroupBackgroundColor white
+skinparam sequenceParticipantBackgroundColor #EEF4F9
+skinparam sequenceParticipantBorderColor #334155
+skinparam sequenceArrowColor #334155
+skinparam sequenceLifeLineBorderColor #94A3B8
+hide footbox
+actor 用户 as U
+participant "BackupController\n图形界面" as C
+participant "RunOperation\n后台任务" as W
+participant "archive_pipeline\n归档流水线" as P
+group 输入检查与任务启动
+ U -> C : 开始完整备份
+ C -> C : 检查路径、规则和口令\n获取写操作权限
+ alt 检查失败或写操作忙
+  C --> U : 返回错误原因
+ else 检查通过
+  C -> C : 设置忙碌状态
+  C ->> W : 启动后台任务
+ end
+end
+opt 输入检查通过且后台任务成功启动
+ W -> P : BackupEngine::Backup\n调用 RunBackupPipeline
+ P -> P : 扫描、筛选并打包条目
+ opt 启用压缩且前序成功
+  P -> P : 压缩归档字节流
+ end
+end
+newpage
+opt 输入检查通过且后台任务成功启动
+ opt 启用加密且前序成功
+  P -> P : 加密并计算 HMAC
+ end
+ P -> P : 前序成功时写容器、关闭并发布
+ opt 操作失败
+  P -> P : 清理本次未发布的临时产物
+ end
+ P --> W : 成功状态或错误原因
+ W ->> C : 完成通知，传回任务结果
+ C -> C : 释放写操作权限，更新界面
+ C --> U : 显示操作结果
+end
+@enduml

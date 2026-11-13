@@ -1,0 +1,67 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1166.0" height="853.8" viewBox="0 0 1166.0 853.8">
+<rect width="100%" height="100%" fill="white"/>
+<rect x="23.0" y="18.0" width="340.0" height="201.0" rx="0" fill="white" stroke="#223044" stroke-width="1.5"/>
+<rect x="23.0" y="18.0" width="340.0" height="43.0" rx="0" fill="#eef4f9" stroke="#223044" stroke-width="1.5"/>
+<text x="193.0" y="41.0" text-anchor="middle" font-family="Noto Sans CJK SC" font-size="18.0" font-weight="700" fill="#223044">BackupController</text>
+<text x="36.0" y="82.0" text-anchor="start" font-family="Noto Sans CJK SC" font-size="16.0" font-weight="400" fill="#223044">- config_manager_: ConfigManager</text>
+<text x="36.0" y="104.4" text-anchor="start" font-family="Noto Sans CJK SC" font-size="16.0" font-weight="400" fill="#223044">- catalog_: BackupCatalog</text>
+<polyline points="23.0,127.0 363.0,127.0" fill="none" stroke="#223044" stroke-width="1.6"/>
+<text x="36.0" y="148.0" text-anchor="start" font-family="Noto Sans CJK SC" font-size="16.0" font-weight="400" fill="#223044">+ startBackupWithStrategy(…): bool</text>
+<text x="36.0" y="170.4" text-anchor="start" font-family="Noto Sans CJK SC" font-size="16.0" font-weight="400" fill="#223044">+ startManagedRestore(…): bool</text>
+<text x="36.0" y="192.8" text-anchor="start" font-family="Noto Sans CJK SC" font-size="16.0" font-weight="400" fill="#223044">+ saveRepositoryPath(…): bool</text>
+<rect x="793.0" y="18.0" width="350.0" height="201.0" rx="0" fill="white" stroke="#223044" stroke-width="1.5"/>
+<rect x="793.0" y="18.0" width="350.0" height="43.0" rx="0" fill="#eef4f9" stroke="#223044" stroke-width="1.5"/>
+<text x="968.0" y="41.0" text-anchor="middle" font-family="Noto Sans CJK SC" font-size="18.0" font-weight="700" fill="#223044">ScheduleController</text>
+<text x="806.0" y="82.0" text-anchor="start" font-family="Noto Sans CJK SC" font-size="16.0" font-weight="400" fill="#223044">- store_: ScheduleStore</text>
+<text x="806.0" y="104.4" text-anchor="start" font-family="Noto Sans CJK SC" font-size="16.0" font-weight="400" fill="#223044">- backup_controller_: BackupController*</text>
+<polyline points="793.0,127.0 1143.0,127.0" fill="none" stroke="#223044" stroke-width="1.6"/>
+<text x="806.0" y="148.0" text-anchor="start" font-family="Noto Sans CJK SC" font-size="16.0" font-weight="400" fill="#223044">+ saveConfig(…): bool</text>
+<text x="806.0" y="170.4" text-anchor="start" font-family="Noto Sans CJK SC" font-size="16.0" font-weight="400" fill="#223044">+ runNow(): bool</text>
+<text x="806.0" y="192.8" text-anchor="start" font-family="Noto Sans CJK SC" font-size="16.0" font-weight="400" fill="#223044">+ OnArchiveDeleted(…): void</text>
+<rect x="793.0" y="373.0" width="350.0" height="201.0" rx="0" fill="white" stroke="#223044" stroke-width="1.5"/>
+<rect x="793.0" y="373.0" width="350.0" height="43.0" rx="0" fill="#eef4f9" stroke="#223044" stroke-width="1.5"/>
+<text x="968.0" y="396.0" text-anchor="middle" font-family="Noto Sans CJK SC" font-size="18.0" font-weight="700" fill="#223044">RealtimeController</text>
+<text x="806.0" y="427.0" text-anchor="start" font-family="Noto Sans CJK SC" font-size="16.0" font-weight="400" fill="#223044">- watcher_: InotifyWatcher</text>
+<text x="806.0" y="449.4" text-anchor="start" font-family="Noto Sans CJK SC" font-size="16.0" font-weight="400" fill="#223044">- debouncer_:</text>
+<text x="806.0" y="471.8" text-anchor="start" font-family="Noto Sans CJK SC" font-size="16.0" font-weight="400" fill="#223044">    unique_ptr&lt;RealtimeDebouncer&gt;</text>
+<polyline points="793.0,482.0 1143.0,482.0" fill="none" stroke="#223044" stroke-width="1.6"/>
+<text x="806.0" y="503.0" text-anchor="start" font-family="Noto Sans CJK SC" font-size="16.0" font-weight="400" fill="#223044">+ saveConfig(…): bool</text>
+<text x="806.0" y="525.4" text-anchor="start" font-family="Noto Sans CJK SC" font-size="16.0" font-weight="400" fill="#223044">+ start(): void</text>
+<text x="806.0" y="547.8" text-anchor="start" font-family="Noto Sans CJK SC" font-size="16.0" font-weight="400" fill="#223044">+ stop(): void</text>
+<rect x="403.0" y="323.0" width="335.0" height="175.0" rx="0" fill="white" stroke="#223044" stroke-width="1.5"/>
+<rect x="403.0" y="323.0" width="335.0" height="43.0" rx="0" fill="#eef4f9" stroke="#223044" stroke-width="1.5"/>
+<text x="570.5" y="346.0" text-anchor="middle" font-family="Noto Sans CJK SC" font-size="18.0" font-weight="700" fill="#223044">OperationGate</text>
+<text x="416.0" y="387.0" text-anchor="start" font-family="Noto Sans CJK SC" font-size="16.0" font-weight="400" fill="#223044">- owner_: Kind</text>
+<polyline points="403.0,406.0 738.0,406.0" fill="none" stroke="#223044" stroke-width="1.6"/>
+<text x="416.0" y="427.0" text-anchor="start" font-family="Noto Sans CJK SC" font-size="16.0" font-weight="400" fill="#223044">+ Acquire(Kind, reason*): bool</text>
+<text x="416.0" y="449.4" text-anchor="start" font-family="Noto Sans CJK SC" font-size="16.0" font-weight="400" fill="#223044">+ Release(Kind): void</text>
+<text x="416.0" y="471.8" text-anchor="start" font-family="Noto Sans CJK SC" font-size="16.0" font-weight="400" fill="#223044">+ busy(): bool</text>
+<rect x="23.0" y="623.0" width="330.0" height="149.0" rx="0" fill="white" stroke="#223044" stroke-width="1.5"/>
+<rect x="23.0" y="623.0" width="330.0" height="43.0" rx="0" fill="#eef4f9" stroke="#223044" stroke-width="1.5"/>
+<text x="188.0" y="646.0" text-anchor="middle" font-family="Noto Sans CJK SC" font-size="18.0" font-weight="700" fill="#223044">ConfigManager</text>
+<text x="36.0" y="687.0" text-anchor="start" font-family="Noto Sans CJK SC" font-size="16.0" font-weight="400" fill="#223044">- config_file_path_: string</text>
+<polyline points="23.0,706.0 353.0,706.0" fill="none" stroke="#223044" stroke-width="1.6"/>
+<text x="36.0" y="727.0" text-anchor="start" font-family="Noto Sans CJK SC" font-size="16.0" font-weight="400" fill="#223044">+ Load(…): ConfigLoadStatus</text>
+<text x="36.0" y="749.4" text-anchor="start" font-family="Noto Sans CJK SC" font-size="16.0" font-weight="400" fill="#223044">+ Save(…): bool</text>
+<rect x="408.0" y="623.0" width="330.0" height="161.0" rx="0" fill="white" stroke="#223044" stroke-width="1.5"/>
+<rect x="408.0" y="623.0" width="330.0" height="43.0" rx="0" fill="#eef4f9" stroke="#223044" stroke-width="1.5"/>
+<text x="573.0" y="646.0" text-anchor="middle" font-family="Noto Sans CJK SC" font-size="18.0" font-weight="700" fill="#223044">BackupCatalog</text>
+<polyline points="408.0,666.0 738.0,666.0" fill="none" stroke="#223044" stroke-width="1.6"/>
+<text x="421.0" y="687.0" text-anchor="start" font-family="Noto Sans CJK SC" font-size="16.0" font-weight="400" fill="#223044">+ List(…): bool</text>
+<text x="421.0" y="709.4" text-anchor="start" font-family="Noto Sans CJK SC" font-size="16.0" font-weight="400" fill="#223044">+ BuildArchivePath(…): bool</text>
+<text x="421.0" y="731.8" text-anchor="start" font-family="Noto Sans CJK SC" font-size="16.0" font-weight="400" fill="#223044">+ Resolve(…): bool</text>
+<text x="421.0" y="754.2" text-anchor="start" font-family="Noto Sans CJK SC" font-size="16.0" font-weight="400" fill="#223044">+ Delete(…): bool</text>
+<polyline points="363.0,113.0 793.0,113.0" fill="none" stroke="#223044" stroke-width="1.6"/>
+<text x="578.0" y="90.0" text-anchor="middle" font-family="Noto Sans CJK SC" font-size="16.0" font-weight="400" fill="#223044">1  ← backup_controller_  0..*</text>
+<polyline points="193.0,219.0 193.0,363.0 403.0,363.0" fill="none" stroke="#223044" stroke-width="1.6"/>
+<text x="293.0" y="332.0" text-anchor="middle" font-family="Noto Sans CJK SC" font-size="16.0" font-weight="400" fill="#223044">1 闸门引用</text>
+<polyline points="953.0,219.0 953.0,293.0 571.0,293.0 571.0,323.0" fill="none" stroke="#223044" stroke-width="1.6"/>
+<polyline points="793.0,468.0 738.0,468.0" fill="none" stroke="#223044" stroke-width="1.6"/>
+<polyline points="78.0,219.0 78.0,623.0" fill="none" stroke="#223044" stroke-width="1.6"/>
+<polygon points="78.0,219.0 84.0,229.0 78.0,239.0 72.0,229.0" fill="#223044" stroke="#223044" stroke-width="1.6"/>
+<text x="86.0" y="484.0" text-anchor="middle" font-family="Noto Sans CJK SC" font-size="16.0" font-weight="400" fill="#223044">1 / 1</text>
+<polyline points="313.0,219.0 313.0,263.0 373.0,263.0 373.0,558.0 573.0,558.0 573.0,623.0" fill="none" stroke="#223044" stroke-width="1.6"/>
+<polygon points="313.0,219.0 319.0,229.0 313.0,239.0 307.0,229.0" fill="#223044" stroke="#223044" stroke-width="1.6"/>
+<text x="473.0" y="535.0" text-anchor="middle" font-family="Noto Sans CJK SC" font-size="16.0" font-weight="400" fill="#223044">1 / 1</text>
+<text x="22.0" y="825.0" text-anchor="start" font-family="Noto Sans CJK SC" font-size="17.0" font-weight="400" fill="#223044">实心菱形：按值组合；普通实线：非拥有指针关联。控制器继承 QObject。</text>
+</svg>
