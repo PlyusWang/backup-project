@@ -176,7 +176,7 @@ ECS，再在 ECS 本机运行 backup-server-admin：
 
 **每一次运行都会先打印"我在看哪个实例"**：
 
-    Host:        已脱密
+    Host:        demo-user
     Server root: /home/ubuntu/backup-project-server
     Data root:   /home/ubuntu/backup-project-server/data
     Metadata DB: /home/ubuntu/backup-project-server/state/metadata.sqlite3
